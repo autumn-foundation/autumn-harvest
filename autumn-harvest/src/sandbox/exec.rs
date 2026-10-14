@@ -661,12 +661,16 @@ fn spawn_error(command: &str, err: &io::Error) -> SandboxError {
         Some(libc::E2BIG) => SandboxError::Denied(format!(
             "the arguments and variables of {command:?} are too large for exec: {err}"
         )),
+        // The same command path fails the same way on a retry.
+        Some(libc::ENAMETOOLONG) => SandboxError::Denied(format!(
+            "the path of the runtime command {command:?} is too long for exec: {err}"
+        )),
         _ => SandboxError::Unavailable(format!("could not start {command:?}: {err}")),
     }
 }
 
 /// Send `SIGKILL` to each process of the group. A missing group is fine.
-fn kill_group(group: i32) {
+pub(crate) fn kill_group(group: i32) {
     // SAFETY: kill with a negative pid signals a process group. The group
     // id is the pid of the child, which leads a new session.
     unsafe {
@@ -1740,6 +1744,13 @@ mod tests {
         };
         let out = run(sh("ulimit -s")).await;
         assert_eq!(out.stdout.trim(), want.to_string());
+    }
+
+    #[test]
+    fn a_command_path_too_long_for_exec_is_a_denial() {
+        // The same command fails the same way on each retry.
+        let err = spawn_error("sh", &io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+        assert!(matches!(err, SandboxError::Denied(_)), "{err:?}");
     }
 
     #[test]

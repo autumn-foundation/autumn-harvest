@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use super::error::SandboxError;
-use super::request::MAX_EXEC_STRING_BYTES;
+use super::request::{MAX_EXEC_STRING_BYTES, MAX_NAME_BYTES};
 
 /// How strongly a backend isolates code from the host.
 ///
@@ -286,6 +286,17 @@ impl SandboxPolicy {
             super::request::validate_relative_path(&spec.file_name).map_err(|e| {
                 SandboxError::Config(format!("runtime {name:?} has a bad file name: {e}"))
             })?;
+            // Exec refuses a longer path with `ENAMETOOLONG` on each run.
+            let command = &spec.argv[0];
+            if command.len() >= EXEC_PATH_MAX
+                || command.split('/').any(|part| part.len() > MAX_NAME_BYTES)
+            {
+                return Err(SandboxError::Config(format!(
+                    "runtime {name:?} has a command path over the Linux limits: {} bytes in \
+                     all, and {MAX_NAME_BYTES} bytes a component",
+                    EXEC_PATH_MAX - 1
+                )));
+            }
             if spec.argv.iter().any(|a| a.len() > MAX_EXEC_STRING_BYTES) {
                 return Err(SandboxError::Config(format!(
                     "runtime {name:?} has an argument over the exec limit of \
@@ -466,9 +477,12 @@ impl SandboxPolicy {
 /// stack limit of 8 MiB.
 pub const MAX_EXEC_TOTAL_BYTES: usize = 2 * 1024 * 1024;
 
+/// The Linux `PATH_MAX`: the longest path that exec takes, with its NUL.
+const EXEC_PATH_MAX: usize = 4096;
+
 /// The executable path that exec also copies: `PATH_MAX` bytes and a NUL.
 /// A longer path fails with `ENAMETOOLONG`.
-const EXEC_FILENAME_BYTES: usize = 4096 + 1;
+const EXEC_FILENAME_BYTES: usize = EXEC_PATH_MAX + 1;
 
 /// The bytes that exec adds to each string: a NUL and a pointer.
 const EXEC_STRING_OVERHEAD: usize = 1 + 8;
@@ -674,6 +688,30 @@ mod tests {
     }
 
     #[test]
+    fn a_runtime_command_past_the_path_limits_is_a_config_error() {
+        let with_command = |command: String| {
+            SandboxPolicy::default().with_runtime(
+                "long",
+                RuntimeSpec {
+                    argv: vec![command],
+                    file_name: "main".into(),
+                },
+            )
+        };
+        let path = |parts: usize| format!("/{}", vec!["y".repeat(200); parts].join("/"));
+        // `NAME_MAX` is 255 bytes, and `PATH_MAX` holds 4095 and a NUL.
+        for command in ["x".repeat(256), path(21)] {
+            let result = with_command(command).validate();
+            assert!(
+                matches!(result, Err(SandboxError::Config(ref m)) if m.contains("path")),
+                "{result:?}"
+            );
+        }
+        with_command("x".repeat(255)).validate().unwrap();
+        with_command(path(20)).validate().unwrap();
+    }
+
+    #[test]
     fn a_runtime_string_over_the_exec_limit_is_a_config_error() {
         use crate::sandbox::request::MAX_EXEC_STRING_BYTES;
         let with_arg = |arg: String| {
@@ -764,7 +802,9 @@ mod tests {
         // Each argument fits the string limit, but all of them do not fit
         // the total limit of execve.
         let arg = "a".repeat(100 * 1024);
-        let argv: Vec<&str> = std::iter::repeat_n(arg.as_str(), 70).collect();
+        let argv: Vec<&str> = std::iter::once("sh")
+            .chain(std::iter::repeat_n(arg.as_str(), 70))
+            .collect();
         let policy = SandboxPolicy::default().with_runtime("big", RuntimeSpec::new(&argv, "x"));
         assert!(
             matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("exec")),

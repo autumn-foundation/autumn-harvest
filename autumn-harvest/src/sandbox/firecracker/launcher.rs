@@ -5,7 +5,7 @@
 //! real launcher: it runs Firecracker behind the jailer, or without a jail
 //! for development.
 //!
-//! Teardown kills the process, kills the cgroup with `cgroup.kill`, and
+//! Teardown kills the process group, kills the cgroup with `cgroup.kill`, and
 //! removes the VM directory, in that order. Without `cgroup.kill`, teardown
 //! freezes the cgroup and kills each process in it. The host never reads a
 //! pid from the jail, because the jailed VMM can write there.
@@ -1739,6 +1739,8 @@ struct RunningVm {
     down: bool,
     /// The lease of the launcher, held until the teardown is done.
     tenancy: Arc<Tenancy>,
+    /// The process group of the VMM: its pid, as it leads a new group.
+    group: Option<i32>,
 }
 
 impl RunningVm {
@@ -1781,6 +1783,7 @@ impl RunningVm {
                 }
             })
         });
+        let group = child.id().and_then(|pid| i32::try_from(pid).ok());
         Ok(Self {
             id,
             child,
@@ -1793,7 +1796,18 @@ impl RunningVm {
             exited_at: None,
             down: false,
             tenancy,
+            group,
         })
+    }
+
+    /// Kill each process of the VMM group, such as a helper of a wrapper.
+    /// The VMM is not reaped yet, so its pid still names this group.
+    fn kill_group(&self) {
+        if self.child.id().is_some()
+            && let Some(group) = self.group
+        {
+            crate::sandbox::exec::kill_group(group);
+        }
     }
 
     /// The kept tail of the VMM stderr, with each NUL as U+FFFD.
@@ -1818,6 +1832,7 @@ impl RunningVm {
         if self.down {
             return;
         }
+        self.kill_group();
         let _ = self.child.start_kill();
         let _ = tokio::time::timeout(KILL_WAIT, self.child.wait()).await;
         if let Some(cgroup) = &self.cgroup {
@@ -1852,7 +1867,12 @@ impl LaunchedVm for RunningVm {
     }
 
     fn exit_status(&mut self) -> Option<String> {
-        let status = self.child.try_wait().ok().flatten()?;
+        // The probe does not reap the VMM, so the teardown can still kill
+        // its group by its pid.
+        let status = match self.group {
+            Some(pid) => exit_of(pid)?,
+            None => self.child.try_wait().ok().flatten()?.to_string(),
+        };
         // Give the stderr reader a moment to take the last lines, so the
         // report holds the reason that the VMM printed.
         let first_seen = *self.exited_at.get_or_insert_with(std::time::Instant::now);
@@ -1882,6 +1902,7 @@ impl Drop for RunningVm {
         }
         // The async teardown did not run. Kill now, and clean up what can
         // be cleaned without waiting.
+        self.kill_group();
         let _ = self.child.start_kill();
         if let Some(cgroup) = &self.cgroup {
             // The kill is not instant, so this removal can fail. The
@@ -1896,6 +1917,41 @@ impl Drop for RunningVm {
             self.tenancy.keep_dir_if_left(&self.vm_dir);
         }
     }
+}
+
+/// The exit of the child `pid`, or `None` while it runs. `WNOWAIT` leaves it
+/// a zombie, so its pid and its group stay taken.
+fn exit_of(pid: i32) -> Option<String> {
+    let id = libc::id_t::try_from(pid).ok()?;
+    // SAFETY: siginfo_t is plain data, and all zeros is a valid value.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waitid writes only into `info`. WNOWAIT reaps nothing.
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            id,
+            &raw mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        // A child that cannot be checked counts as gone, so the backend
+        // tears it down.
+        return (err.kind() != std::io::ErrorKind::Interrupted)
+            .then(|| format!("an unknown status ({err})"));
+    }
+    // SAFETY: waitid filled `info`. With WNOHANG, si_pid stays 0 while the
+    // child runs.
+    let (found, code) = unsafe { (info.si_pid(), info.si_status()) };
+    if found == 0 {
+        return None;
+    }
+    Some(match info.si_code {
+        libc::CLD_EXITED => format!("exit status: {code}"),
+        libc::CLD_KILLED | libc::CLD_DUMPED => format!("signal: {code}"),
+        _ => format!("status {code}"),
+    })
 }
 
 /// Kill every process in the cgroup at `dir`, wait for it to empty, and
@@ -3187,6 +3243,60 @@ while True:
         assert!(
             !vm_dir.exists(),
             "the launcher did not try the directory again"
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Whether the process `pid` runs. A zombie is dead.
+    fn is_alive(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, rest)| !rest.starts_with('Z') && !rest.starts_with('X'))
+        })
+    }
+
+    #[tokio::test]
+    async fn an_unjailed_teardown_kills_each_process_of_the_vmm_group() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let launcher = new_launcher(unjailed(&dir, fc, BootMethod::ConfigFile)).unwrap();
+        let vm_dir = dir.join("vm");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        // A wrapper starts a helper in its group, then exits.
+        let pid_file = dir.join("helper.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!("sleep 30 & echo $! > {}", pid_file.display()));
+        let prepared = Prepared {
+            vsock: vm_dir.join("v.sock"),
+            vm_dir,
+            api_socket: None,
+            cgroup: None,
+            command,
+        };
+        let mut vm =
+            RunningVm::spawn("hsbx-test".into(), prepared, Arc::clone(&launcher.tenancy)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while vm.exit_status().is_none() {
+            assert!(Instant::now() < deadline, "the wrapper did not exit");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let helper: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(is_alive(helper), "the helper must outlive the wrapper");
+        vm.teardown().await;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while is_alive(helper) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !is_alive(helper),
+            "the teardown left a process of the VMM group"
         );
         drop(launcher);
         std::fs::remove_dir_all(dir).unwrap();
