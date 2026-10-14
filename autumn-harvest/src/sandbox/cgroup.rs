@@ -12,32 +12,41 @@ const POLL: Duration = Duration::from_millis(10);
 /// Kill every process in the cgroup at `dir`.
 ///
 /// `cgroup.kill` needs Linux 5.14. When the write fails, the cgroup is
-/// frozen so that no process can fork. Then each process in `cgroup.procs`
-/// gets `SIGKILL`, until none is left or `wait` ends.
+/// frozen first. The freeze is not instant, and a process that exits before
+/// it holds frees its pid for another process. So the kill waits up to
+/// `wait` until `cgroup.events` reports `frozen 1`. A frozen process cannot
+/// exit or fork. Then each pid in `cgroup.procs` names a process of the
+/// cgroup, and one pass of `SIGKILL` reaches each one. A cgroup that is not
+/// frozen in time gets no signal, and a later call kills it.
 pub fn kill(dir: &Path, wait: Duration) {
     if std::fs::write(dir.join("cgroup.kill"), b"1").is_ok() {
         return;
     }
     let _ = std::fs::write(dir.join("cgroup.freeze"), b"1");
     let deadline = Instant::now() + wait;
-    loop {
-        let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) else {
-            return;
-        };
-        let mut signalled = false;
-        for pid in procs
-            .lines()
-            .filter_map(|line| line.trim().parse::<libc::pid_t>().ok())
-            .filter(|pid| *pid > 0)
-        {
-            // SAFETY: kill reads no memory. A positive pid names one process.
-            signalled |= unsafe { libc::kill(pid, libc::SIGKILL) } == 0;
-        }
-        if !signalled || Instant::now() >= deadline {
+    while !is_frozen(dir) {
+        if Instant::now() >= deadline {
             return;
         }
         std::thread::sleep(POLL);
     }
+    let Ok(procs) = std::fs::read_to_string(dir.join("cgroup.procs")) else {
+        return;
+    };
+    for pid in procs
+        .lines()
+        .filter_map(|line| line.trim().parse::<libc::pid_t>().ok())
+        .filter(|pid| *pid > 0)
+    {
+        // SAFETY: kill reads no memory. A positive pid names one process.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+/// Whether `cgroup.events` reports the cgroup frozen.
+fn is_frozen(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("cgroup.events"))
+        .is_ok_and(|events| events.lines().any(|line| line == "frozen 1"))
 }
 
 /// Whether `cgroup.events` reports no process left. A cgroup that cannot be
@@ -58,4 +67,37 @@ pub fn kill_and_remove(dir: &Path, wait: Duration) {
         std::thread::sleep(POLL);
     }
     let _ = std::fs::remove_dir(dir);
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    use super::*;
+
+    #[test]
+    fn the_fallback_signals_no_pid_before_the_freeze_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory makes the kill write fail, as on Linux before 5.14.
+        std::fs::create_dir(dir.path().join("cgroup.kill")).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("10")
+            .spawn()
+            .unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
+        let events = dir.path().join("cgroup.events");
+        std::fs::write(&events, "populated 1\nfrozen 0\n").unwrap();
+        kill(dir.path(), Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "a pid got a signal before the freeze held"
+        );
+        // Once the cgroup is frozen, each process gets SIGKILL.
+        std::fs::write(&events, "populated 1\nfrozen 1\n").unwrap();
+        kill(dir.path(), Duration::ZERO);
+        let status = child.wait().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+    }
 }

@@ -2137,6 +2137,7 @@ while True:
             .spawn()
             .unwrap();
         std::fs::write(cgroup.join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
+        std::fs::write(cgroup.join("cgroup.events"), b"populated 1\nfrozen 1\n").unwrap();
         let waiter = std::thread::spawn(move || child.wait().unwrap());
         kill_cgroup(&cgroup).await;
         let status = waiter.join().unwrap();

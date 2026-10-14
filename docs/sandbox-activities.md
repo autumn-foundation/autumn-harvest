@@ -300,7 +300,10 @@ What each microVM gets:
 Teardown kills the process, then the cgroup through `cgroup.kill`, then
 removes the jail. It runs after success, error, timeout and cancel. It also
 runs when the caller drops the run future. The host never reads a pid from
-the jail. A cgroup that is still there after the teardown stays with the
+the jail. Without `cgroup.kill`, teardown freezes the cgroup and waits until
+it reports `frozen 1`. Only then does it send `SIGKILL` to each pid in it, so
+no pid can name another process. A cgroup that is still there after the
+teardown stays with the
 launcher. The launcher kills and removes it again before each launch and in
 each `sweep_stale`. Each microVM holds the launcher lease until its teardown
 ends, so a teardown that outlives the launcher keeps its owner live. The lease
