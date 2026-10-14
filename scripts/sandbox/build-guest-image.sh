@@ -110,15 +110,25 @@ if [ "$(id -u)" -ne 0 ]; then
   fi
   as_root=(fakeroot --)
 fi
+# The image controls its links. A root write through /sbin or /work could
+# then reach the host, so each write goes to a path that image_path
+# resolves inside the image, as a chroot would.
 docker export "${container}" | "${as_root[@]}" sh -euc '
   rootfs="$1"; agent="$2"; image="$3"
+  . "$4"
   tar --numeric-owner -x -C "${rootfs}"
   rm -f "${rootfs}/.dockerenv"
-  install -D -o 0 -g 0 -m 0755 "${agent}" "${rootfs}/sbin/harvest-guest-agent"
-  mkdir -p "${rootfs}/work" "${rootfs}/proc" "${rootfs}/sys" "${rootfs}/dev" "${rootfs}/tmp"
+  sbin="$(image_path "${rootfs}" /sbin)"
+  mkdir -p "${sbin}"
+  rm -f "${sbin}/harvest-guest-agent"
+  install -o 0 -g 0 -m 0755 "${agent}" "${sbin}/harvest-guest-agent"
+  for dir in /work /proc /sys /dev /tmp; do
+    mkdir -p "$(image_path "${rootfs}" "${dir}")"
+  done
   size_mib=$(( $(du -sm "${rootfs}" | cut -f1) + 64 ))
   mkfs.ext4 -q -F -L harvest-rootfs -d "${rootfs}" "${image}" "${size_mib}M"
-' build-rootfs "${work}/rootfs" "${agent}" "${stage}/rootfs.ext4"
+' build-rootfs "${work}/rootfs" "${agent}" "${stage}/rootfs.ext4" \
+  "${root}/scripts/sandbox/image-path.sh"
 
 # 4. The digests, then the new image replaces the old one. A failed rename
 # puts the old files back. A crash between the renames can still mix the

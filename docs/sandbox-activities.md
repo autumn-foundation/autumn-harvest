@@ -236,7 +236,9 @@ them in a stage directory first, so a failed build keeps the old image. A
 failed final rename puts the old files back. When that fails too, the script
 keeps the old files in a backup directory and names it. The root file system is a
 container image, `python:3.12-alpine` with `bash` and `nodejs` by default,
-plus the guest agent at `/sbin/harvest-guest-agent`. Set
+plus the guest agent at `/sbin/harvest-guest-agent`. The image controls its
+links, so the script resolves `/sbin` and each directory it makes inside the
+image, as a chroot would. No image link can take a root write to the host. Set
 `BASE_IMAGE` for another image, and pin it by digest. Run the script as root,
 or install `fakeroot`, so root owns the files in the image.
 

@@ -360,6 +360,49 @@ fn a_failed_publish_puts_back_the_old_image() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn image_links_cannot_take_a_build_write_out_of_the_image() {
+    use std::os::unix::fs::symlink;
+    let root = std::env::temp_dir().join(format!("hsbx-image-path-{}", std::process::id()));
+    std::fs::create_dir_all(root.join("usr/sbin")).expect("usr/sbin");
+    std::fs::create_dir_all(root.join("etc")).expect("etc");
+    let helper = repo_root().join("scripts/sandbox/image-path.sh");
+    let resolve = |path: &str| {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(". \"$1\"; image_path \"$2\" \"$3\"")
+            .arg("sh")
+            .arg(&helper)
+            .arg(&root)
+            .arg(path)
+            .output()
+            .expect("sh runs")
+    };
+    let resolved = |path: &str| {
+        let out = resolve(path);
+        assert!(out.status.success(), "{path}: {out:?}");
+        String::from_utf8(out.stdout).expect("utf-8").trim().to_owned()
+    };
+    let inside = |rel: &str| root.join(rel).display().to_string();
+    // An absolute link starts again at the image root, and `..` stops there.
+    symlink("/etc", root.join("abs")).expect("abs link");
+    assert_eq!(resolved("/abs/x"), inside("etc/x"));
+    symlink("../../../../../../etc", root.join("up")).expect("up link");
+    assert_eq!(resolved("/up"), inside("etc"));
+    // A merged `/usr` link stays inside the image.
+    symlink("usr/sbin", root.join("sbin")).expect("sbin link");
+    assert_eq!(resolved("/sbin"), inside("usr/sbin"));
+    assert_eq!(resolved("/work"), inside("work"));
+    symlink("loop", root.join("loop")).expect("loop link");
+    assert!(!resolve("/loop").status.success(), "a link loop must fail");
+    // The build writes the agent and its directories through the helper.
+    let script = read("scripts/sandbox/build-guest-image.sh");
+    assert!(script.contains("image_path \"${rootfs}\" /sbin"), "{script}");
+    assert!(!script.contains("install -D"), "install -D follows image links");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn a_publish_waits_for_a_launcher_that_pins() {
     use std::io::BufRead as _;
     const FILES: [&str; 3] = ["rootfs.ext4", "vmlinux", "image.sha256"];
