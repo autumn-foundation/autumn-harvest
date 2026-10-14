@@ -169,7 +169,7 @@ impl SnapshotMeta {
     /// valid, or holds other values. Each run would otherwise fail.
     fn check(config: &LauncherConfig, files: &SnapshotFiles) -> Result<Self, SandboxError> {
         let path = Self::path(&files.state);
-        let found: Self = std::fs::read(&path)
+        let found: Self = read_manifest(&path)
             .map_err(|e| e.to_string())
             .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
             .map_err(|e| {
@@ -1354,6 +1354,23 @@ const SNAPSHOT_MEMORY_FILE: &str = "snapshot.mem";
 /// the whole guest memory.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The most bytes of a snapshot manifest.
+const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+
+/// Read the snapshot manifest at `path`. A symbolic link is refused, and
+/// the read stops at [`MAX_MANIFEST_BYTES`].
+fn read_manifest(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_MANIFEST_BYTES).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// The release of the host kernel, which restores a snapshot.
 fn host_kernel() -> std::io::Result<String> {
     Ok(std::fs::read_to_string("/proc/sys/kernel/osrelease")?
@@ -1694,6 +1711,12 @@ fn check_trusted_files(
     if let BootMethod::Snapshot(files) = &config.boot {
         shared.push(&files.state);
         shared.push(&files.memory);
+        // The manifest binds the pair to its image, so no other user may
+        // change it. A missing one fails at the pin, with its own message.
+        let manifest = SnapshotMeta::path(&files.state);
+        if inspect(&manifest).is_ok() {
+            check_trusted_ancestors(&manifest, euid, inspect)?;
+        }
     }
     // A launch hard-links each image into its jail. A copy across file
     // systems would take time that no launch budget bounds.
@@ -2486,6 +2509,41 @@ mod tests {
             .map(|path| std::fs::read(path).unwrap())
             .collect();
         assert_eq!(kept, [b"old state".to_vec()]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_manifest_that_others_can_change_is_a_config_error() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir();
+        let files = SnapshotFiles {
+            state: dir.join("snap.state"),
+            memory: dir.join("snap.mem"),
+        };
+        std::fs::write(&files.state, b"state").unwrap();
+        std::fs::write(&files.memory, b"memory").unwrap();
+        let mut config = jailed(&dir);
+        config.boot = BootMethod::Snapshot(files.clone());
+        write_snapshot_meta(&config, &files);
+        let manifest = SnapshotMeta::path(&files.state);
+        let refused = |what: &str| {
+            let err = new_launcher(config.clone()).expect_err(what);
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains("snap.state.json")),
+                "{what}: {err:?}"
+            );
+        };
+        // A forged manifest could pass a snapshot of another image.
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o666)).unwrap();
+        refused("a manifest that others can write");
+        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let real = dir.join("real.json");
+        std::fs::rename(&manifest, &real).unwrap();
+        std::os::unix::fs::symlink(&real, &manifest).unwrap();
+        refused("a manifest behind a symbolic link");
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::rename(&real, &manifest).unwrap();
+        drop(new_launcher(config.clone()).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

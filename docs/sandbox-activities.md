@@ -197,10 +197,10 @@ runtime refuses a policy that allows the network on a backend without one.
   or that is unknown, is also critical. A kernel without KSM, or without a
   loaded KVM vendor module, is safe for that check.
 - Root owns each trusted path: the jail base, network namespace, Firecracker
-  and jailer binaries, kernel, root file system and snapshot. No such path
-  holds a symbolic link. Only root may write each directory above them,
-  except a sticky directory such as /tmp. The launcher refuses other paths,
-  and it refuses a jail uid or gid of 0.
+  and jailer binaries, kernel, root file system, snapshot and snapshot
+  manifest. No such path holds a symbolic link. Only root may write each
+  directory above them, except a sticky directory such as /tmp. The launcher
+  refuses other paths, and it refuses a jail uid or gid of 0.
 - A kernel, root file system and snapshot that the jail gid or others can
   read. A golden snapshot gets mode `0640` and the jail group.
 - A worker that runs as root. The launcher refuses a jailed configuration in
