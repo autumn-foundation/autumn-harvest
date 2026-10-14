@@ -1161,8 +1161,8 @@ impl SqliteRuntime {
     ///   unregistered activity or workflow, or a stuck cycle.
     ///
     /// The run then gets `WorkflowCancelled` as its last event, and its pending
-    /// tasks, unfired timers and staged signals are deleted. The drive that ends
-    /// the run returns [`RunState::Cancelled`].
+    /// tasks, unfired timers and unkeyed staged signals are deleted. The drive
+    /// that ends the run returns [`RunState::Cancelled`].
     ///
     /// A repeat call on a run with a pending request keeps the first reason.
     /// Use [`terminate`](Self::terminate) to stop a run at once.
@@ -1174,7 +1174,7 @@ impl SqliteRuntime {
     /// treats a cancel of a `CANCELLED` run as a no-op, but this backend refuses
     /// it. Returns a persistence error if the request cannot be written.
     pub fn cancel(&mut self, exec: ExecutionId, reason: &str) -> SqliteResult<()> {
-        self.refuse_unless_running(exec)?;
+        refuse_unless_running(&self.conn, exec)?;
         let reason = reason_or(reason, DEFAULT_CANCEL_REASON);
         store::request_cancel(&self.conn, exec, &reason)
     }
@@ -1194,21 +1194,13 @@ impl SqliteRuntime {
     /// treats a terminate of a terminal run as a no-op, but this backend refuses
     /// it. Returns a persistence error if the seal cannot be written.
     pub fn terminate(&mut self, exec: ExecutionId, reason: &str) -> SqliteResult<()> {
-        self.refuse_unless_running(exec)?;
+        refuse_unless_running(&self.conn, exec)?;
         let reason = reason_or(reason, DEFAULT_TERMINATE_REASON);
         let tx = self.conn.transaction()?;
         seal_with_cancel_event(&tx, exec, TERMINATED_STATE, &reason)?;
         tx.commit()?;
         self.workflow_panic_strikes.remove(&exec);
         Ok(())
-    }
-
-    /// Returns `Ok` only when `exec` is a stored, non-terminal execution.
-    ///
-    /// The single writer holds the only write handle, so no transition can
-    /// happen between this check and the caller's write.
-    fn refuse_unless_running(&self, exec: ExecutionId) -> SqliteResult<()> {
-        refuse_unless_running(&self.conn, exec)
     }
 
     /// End a cancel-requested `exec` `CANCELLED` (issue #2021).
@@ -1324,7 +1316,7 @@ impl SqliteRuntime {
         name: &str,
         input: Value,
     ) -> SqliteResult<Value> {
-        self.refuse_unless_running(exec)?;
+        refuse_unless_running(&self.conn, exec)?;
         let workflow_name = store::workflow_name_of(&self.conn, exec)?;
         let handler = *self
             .workflows
@@ -3117,6 +3109,9 @@ fn start_in_tx(
 }
 
 /// Returns `Ok` only when `exec` is a stored, non-terminal execution.
+///
+/// The single writer holds the only write handle, so no transition can
+/// happen between this check and the caller's write.
 fn refuse_unless_running(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> {
     let state = store::execution_state(conn, exec)?;
     if autumn_harvest::erase::is_terminal_state(&state) {
@@ -3323,7 +3318,8 @@ fn seal_with_cancel_event(
 
 /// Delete the pending tasks, unfired timers and staged signals of a sealed
 /// `exec`, inside the caller's transaction. No drive uses them again, and
-/// this backend has no retention pass.
+/// this backend has no retention pass. A keyed signal stays, so a retry of its
+/// key still dedupes (issue #2028).
 fn delete_open_rows(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> {
     queue::delete_pending_tasks_for_execution(conn, exec)?;
     queue::delete_unfired_timers_for_execution(conn, exec)?;

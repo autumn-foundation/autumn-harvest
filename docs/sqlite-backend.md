@@ -396,7 +396,8 @@ body does not run again, and `terminate` drops a pending cancel request.
 
 - The run gets the core `WorkflowCancelled { reason }` event as its last
   event, as on Postgres. Cleanup events come before it.
-- The pending tasks, unfired timers and staged signals are deleted.
+- The pending tasks, unfired timers and staged signals are deleted. A signal
+  with an idempotency key stays, so its key still dedupes (issue #2028).
 - An unknown id returns `SqliteError::ExecutionNotFound`. A terminal run
   returns `SqliteError::WorkflowNotRunning`. Postgres treats a repeat call on
   a terminal run as a no-op, but this backend refuses it.
@@ -512,6 +513,75 @@ awaited. The first drive after the upgrade appends them to history.
 `SqliteError::ExecutionNotFound` and a terminal one is
 `SqliteError::WorkflowNotRunning`, so a wakeup no drive could ever consume is
 rejected rather than silently lost.
+
+### Keyed signals, signals by workflow id, signal-with-start (issue #2028)
+
+A webhook can deliver the same event twice. Give the signal an idempotency
+key, and the run gets it once:
+
+```rust,ignore
+// `true`: staged. `false`: this run already holds the key.
+let staged = rt.send_signal_idempotent(exec, "approve", json!(true), Some("hook-42"))?;
+```
+
+- A partial unique index on `harvest_signals (exec_id, idempotency_key)`
+  enforces the key.
+- The key probe runs before the state check. A retry after the run ends
+  returns `Ok(false)`, not an error, as on Postgres.
+- A seal (cancel, terminate, failure, replace) keeps a keyed row, so its key
+  still dedupes. Unkeyed rows are deleted, as before.
+- An empty key is no key. A normal signal cannot use a `harvest.promise:`
+  key. That is `SqliteError::InvalidSignal`.
+
+Signal a run by its business id:
+
+```rust,ignore
+let delivery = rt.send_signal_by_workflow_id("order", "order-7", "approve", json!(true), None)?;
+// delivery.exec_id is the run that holds the signal.
+```
+
+- The call picks the `RUNNING` run of the `(workflow_name, workflow_id)`
+  key. A continue-as-new successor keeps the key, so the call reaches it.
+- With no running run, the newest run is terminal, and the call returns
+  `SqliteError::WorkflowNotRunning`. With no run at all, it returns
+  `SqliteError::WorkflowIdNotFound`. A blank id is
+  `SqliteError::BlankWorkflowId`.
+
+Start a run and signal it, or signal the run that exists:
+
+```rust,ignore
+let out = rt.signal_with_start(SignalWithStart {
+    workflow_name: "order",
+    workflow_id: "order-7",
+    input: json!({ "sku": "A1" }),
+    reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+    signal_name: "approve",
+    signal_payload: json!(true),
+    idempotency_key: Some("hook-42"),
+})?;
+// out.started_fresh, out.signal_delivered
+```
+
+One transaction holds the key probe, the start decision, any start or
+replace, and the signal stage. An error rolls back all of them. The next
+drive appends the signal before the body runs.
+
+| Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
+|---|---|---|---|---|
+| none | start + signal | start + signal | start + signal | start + signal |
+| `RUNNING` | signal | `AlreadyExists` | signal | cancel + start + signal |
+| `COMPLETED` / `FAILED` / `CANCELLED` | start + signal | `AlreadyExists` | start + signal | start + signal |
+| `TERMINATED` / `CONTINUED_AS_NEW` | start + signal | start + signal | start + signal | start + signal |
+
+A terminal prior is the difference from the plain start matrix in
+[§6](#6-starting-a-workflow). A signal cannot land on a terminal run, so
+the call starts a fresh run, as on Postgres. The fresh run seals the prior
+`CONTINUED_AS_NEW`.
+
+Both `send_signal_by_workflow_id` and `signal_with_start` dedupe a key
+across every run of the key, in any state. A retry after a continue-as-new,
+or after the first run ends, stages nothing and starts nothing. A promise key
+dedupes per run only, as on Postgres.
 
 ### Queries (issue #2022)
 

@@ -35,7 +35,9 @@
 //!   ingest compares `received_at` with the `fire_at` of a deadline timer. So a
 //!   signal delivered after an expired `wait_for_signal_timeout` deadline cannot
 //!   win the race (issue #476). This mirrors the Postgres `merge_wake_events`
-//!   order of `received_at` and `fires_at`.
+//!   order of `received_at` and `fires_at`. An optional `idempotency_key` is
+//!   unique per execution (issue #2028). A seal keeps a keyed row, so the key
+//!   still dedupes a retry.
 //! - `harvest_activity_attempts` — a per-attempt audit log. **Retryable** activity
 //!   failures live here, not in `harvest_events`, mirroring the Postgres engine's
 //!   `requeue_for_retry` (which stores the attempt error on the task-queue row,

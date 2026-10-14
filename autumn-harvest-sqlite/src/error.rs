@@ -61,7 +61,9 @@ pub enum SqliteError {
     /// `CONTINUED_AS_NEW`).
     ///
     /// [`send_signal`](crate::SqliteRuntime::send_signal) mirrors the Postgres
-    /// rejection of a signal to a terminal target. No drive consumes a row
+    /// rejection of a signal to a terminal target.
+    /// [`send_signal_by_workflow_id`](crate::SqliteRuntime::send_signal_by_workflow_id)
+    /// returns it when the newest run of the key is terminal (issue #2028). No drive consumes a row
     /// staged for a sealed run, so the wakeup would be lost silently. `update`
     /// also returns it (issue #2025), and so do
     /// [`cancel`](crate::SqliteRuntime::cancel) and

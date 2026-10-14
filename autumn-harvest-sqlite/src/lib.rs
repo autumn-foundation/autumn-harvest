@@ -254,7 +254,8 @@
 //! Both paths append the core `WorkflowCancelled` event as the last event, as
 //! Postgres does. Cleanup events come before it. The history replays on the
 //! core `WorkflowReplayer` when the body checks the request before its next new
-//! command. Both paths delete pending tasks, unfired timers and staged signals.
+//! command. Both paths delete pending tasks, unfired timers and unkeyed staged
+//! signals.
 //! The drives report [`RunState::Cancelled`] and [`RunState::Terminated`].
 //!
 //! ## Unsupported workflow primitives — rejected LOUDLY, by name
@@ -507,6 +508,18 @@
 //! [`SqliteError::WorkflowNotRunning`]. No drive could consume a row staged for
 //! either, so the call rejects it, as the Postgres engine does. A `RUNNING`
 //! execution stages the signal, and the next drive consumes it.
+//!
+//! **Keyed signals, signals by workflow id, and signal-with-start (issue
+//! #2028).**
+//! [`send_signal_idempotent`](crate::SqliteRuntime::send_signal_idempotent)
+//! stages a signal once per idempotency key. A partial unique index on
+//! `harvest_signals (exec_id, idempotency_key)` enforces the key.
+//! [`send_signal_by_workflow_id`](crate::SqliteRuntime::send_signal_by_workflow_id)
+//! signals the running run of a `(workflow_name, workflow_id)` key, and refuses
+//! a terminal one.
+//! [`signal_with_start`](crate::SqliteRuntime::signal_with_start) starts a run
+//! and signals it, or signals the run that exists, in one transaction. Both
+//! calls dedupe a key across the whole chain of runs of the key.
 //!
 //! There is deliberately **no import/seed-a-foreign-history API**. The
 //! cross-backend guarantee (a history written here replays on the core engine) is
