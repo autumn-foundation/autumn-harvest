@@ -231,7 +231,8 @@ scripts/sandbox/build-guest-image.sh /var/lib/harvest/image
 
 The script writes `vmlinux`, `rootfs.ext4` and `image.sha256`. It builds
 them in a stage directory first, so a failed build keeps the old image. A
-failed final rename puts the old files back. The root file system is a
+failed final rename puts the old files back. When that fails too, the script
+keeps the old files in a backup directory and names it. The root file system is a
 container image, `python:3.12-alpine` with `bash` and `nodejs` by default,
 plus the guest agent at `/sbin/harvest-guest-agent`. Set
 `BASE_IMAGE` for another image, and pin it by digest. Run the script as root,
@@ -371,7 +372,8 @@ jailer, so each restore sees the same paths.
 for its agent, pauses it and saves the files. No code runs in it. The files
 hold the guest memory, so the golden microVM must hold no secret. The new
 pair replaces an old pair only after both copies are complete, and a failed
-rename puts the old file back. The renames hold the directory lock, so a
+rename puts the old file back. When that fails too, the old file stays under a
+hidden backup name, and the error names it. The renames hold the directory lock, so a
 launcher that starts meanwhile waits. A host crash between the two renames
 can leave a mixed pair, so create the snapshot again after such a crash.
 

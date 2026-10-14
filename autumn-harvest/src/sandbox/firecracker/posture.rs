@@ -178,6 +178,34 @@ fn is_safe_cpu_status(status: &str) -> bool {
         .any(|safe| status.starts_with(safe))
 }
 
+/// The details of the critical findings for the CPU vulnerability status
+/// files in `entries`, each a name and a path.
+fn vulnerability_findings(
+    entries: impl Iterator<Item = std::io::Result<(String, std::path::PathBuf)>>,
+) -> Vec<String> {
+    let mut details = Vec::new();
+    let mut files = Vec::new();
+    // An entry that cannot be read hides a status, so it is critical too.
+    for entry in entries {
+        match entry {
+            Ok(file) => files.push(file),
+            Err(e) => details.push(format!("a vulnerability entry cannot be read: {e}")),
+        }
+    }
+    files.sort();
+    for (name, path) in files {
+        match std::fs::read_to_string(&path) {
+            Ok(state) if is_safe_cpu_status(state.trim()) => {}
+            Ok(state) => details.push(format!(
+                "{name}: {:?} is not a known safe status",
+                state.trim()
+            )),
+            Err(e) => details.push(format!("{name}: the state cannot be read: {e}")),
+        }
+    }
+    details
+}
+
 /// The detail of a critical finding for a kernel switch, or `None`.
 ///
 /// `owner` is the directory of the feature under `root`, and `file` is the
@@ -253,23 +281,16 @@ pub fn inspect_host(root: &Path, cgroup_mount: &Path) -> Vec<PostureFinding> {
     let vulnerabilities = root.join("sys/devices/system/cpu/vulnerabilities");
     match std::fs::read_dir(&vulnerabilities) {
         Ok(entries) => {
-            let mut names: Vec<_> = entries.filter_map(Result::ok).collect();
-            names.sort_by_key(std::fs::DirEntry::file_name);
-            for entry in names {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                match std::fs::read_to_string(entry.path()) {
-                    Ok(state) if is_safe_cpu_status(state.trim()) => {}
-                    Ok(state) => find(
-                        "cpu_vulnerability",
-                        format!("{name}: {:?} is not a known safe status", state.trim()),
-                        Severity::Critical,
-                    ),
-                    Err(e) => find(
-                        "cpu_vulnerability",
-                        format!("{name}: the state cannot be read: {e}"),
-                        Severity::Critical,
-                    ),
-                }
+            let entries = entries.map(|entry| {
+                entry.map(|entry| {
+                    (
+                        entry.file_name().to_string_lossy().into_owned(),
+                        entry.path(),
+                    )
+                })
+            });
+            for detail in vulnerability_findings(entries) {
+                find("cpu_vulnerability", detail, Severity::Critical);
             }
         }
         Err(e) => find(
@@ -551,6 +572,27 @@ mod tests {
             std::fs::write(&file, state).unwrap();
             assert_eq!(cpu(&root), want, "the status {state:?}");
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_vulnerability_entry_that_cannot_be_read_is_critical() {
+        let root = fake_sys();
+        let safe = root.join("sys/devices/system/cpu/vulnerabilities/l1tf");
+        let entries = || {
+            [
+                Ok(("l1tf".to_owned(), safe.clone())),
+                Err(std::io::Error::other("an injected entry error")),
+            ]
+            .into_iter()
+        };
+        let details = vulnerability_findings(entries());
+        assert_eq!(details.len(), 1, "{details:?}");
+        assert!(details[0].contains("injected"), "{details:?}");
+        assert_eq!(
+            vulnerability_findings(entries().take(1)),
+            Vec::<String>::new()
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -39,13 +39,20 @@ for file in "${files[@]}"; do
     moved+=("${file}")
     continue
   fi
+  # A failed restore keeps the backup, so the old files are not lost.
+  restored=1
   for back in ${moved[@]+"${moved[@]}"}; do
     if [ -e "${backup}/${back}" ]; then
-      mv -fT "${backup}/${back}" "${out}/${back}"
+      mv -fT "${backup}/${back}" "${out}/${back}" || restored=0
     else
-      rm -f "${out}/${back}"
+      rm -f "${out}/${back}" || restored=0
     fi
   done
+  if [ "${restored}" -eq 0 ]; then
+    trap - EXIT
+    echo "publish-image: could not put back the old image; its files are in ${backup}" >&2
+    exit 1
+  fi
   echo "publish-image: could not publish ${file}; ${out} keeps the old image" >&2
   exit 1
 done

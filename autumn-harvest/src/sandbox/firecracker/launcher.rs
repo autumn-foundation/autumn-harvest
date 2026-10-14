@@ -1284,9 +1284,20 @@ fn publish_snapshot(copies: &[(PathBuf, PathBuf)], gid: u32) -> std::io::Result<
 /// Rename each staged file over its target.
 ///
 /// Each old target first gets a hard link, so a failed rename can put back
-/// the targets that already moved. The old set then stays whole.
+/// the targets that already moved. The old set then stays whole. When a
+/// target cannot be put back, each backup stays, and the error names them.
 fn replace_all(moves: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
+    replace_all_with(moves, |from, to| std::fs::rename(from, to))
+}
+
+/// [`replace_all`] with `rename` for each rename, so a test can fail one.
+fn replace_all_with(
+    moves: &[(PathBuf, PathBuf)],
+    rename: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let mut backups = Vec::new();
+    // Set when the rollback fails. The backups then hold the old set.
+    let mut keep_backups = false;
     let result = (|| {
         for (_, to) in moves {
             let backup = staging_name(to);
@@ -1297,20 +1308,39 @@ fn replace_all(moves: &[(PathBuf, PathBuf)]) -> std::io::Result<()> {
             }
         }
         for (done, (temp, to)) in moves.iter().enumerate() {
-            if let Err(e) = std::fs::rename(temp, to) {
+            if let Err(e) = rename(temp, to) {
+                let mut failed = Vec::new();
                 for ((_, to), backup) in moves[..done].iter().zip(&backups) {
-                    let _ = backup.as_ref().map_or_else(
-                        || std::fs::remove_file(to),
-                        |backup| std::fs::rename(backup, to),
-                    );
+                    let restored = backup
+                        .as_ref()
+                        .map_or_else(|| std::fs::remove_file(to), |backup| rename(backup, to));
+                    if let Err(restore) = restored {
+                        failed.push(format!("{}: {restore}", to.display()));
+                    }
                 }
-                return Err(e);
+                if failed.is_empty() {
+                    return Err(e);
+                }
+                keep_backups = true;
+                let kept: Vec<String> = backups
+                    .iter()
+                    .flatten()
+                    .filter(|backup| backup.exists())
+                    .map(|backup| backup.display().to_string())
+                    .collect();
+                return Err(std::io::Error::other(format!(
+                    "{e}; the old files could not be put back ({}); they stay at {}",
+                    failed.join(", "),
+                    kept.join(", ")
+                )));
             }
         }
         Ok(())
     })();
-    for backup in backups.into_iter().flatten() {
-        let _ = std::fs::remove_file(backup);
+    if !keep_backups {
+        for backup in backups.into_iter().flatten() {
+            let _ = std::fs::remove_file(backup);
+        }
     }
     result
 }
@@ -2145,6 +2175,45 @@ mod tests {
         names.sort();
         // The moved staged files are gone, and no backup is left.
         assert_eq!(names, ["memory", "state"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_rollback_keeps_the_old_files() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("state"), b"old state").unwrap();
+        std::fs::write(dir.join("memory"), b"old memory").unwrap();
+        std::fs::write(dir.join("new-state"), b"new state").unwrap();
+        std::fs::write(dir.join("new-memory"), b"new memory").unwrap();
+        let moves = [
+            (dir.join("new-state"), dir.join("state")),
+            (dir.join("new-memory"), dir.join("memory")),
+        ];
+        // The first rename works. The second rename and the rollback fail.
+        let calls = std::cell::Cell::new(0);
+        let err = replace_all_with(&moves, |from, to| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                std::fs::rename(from, to)
+            } else {
+                Err(std::io::Error::other("an injected failure"))
+            }
+        })
+        .expect_err("the second rename fails");
+        assert!(err.to_string().contains("put back"), "{err}");
+        // The old state stays under its backup name, so it is not lost.
+        let kept: Vec<Vec<u8>> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".state.")
+            })
+            .map(|path| std::fs::read(path).unwrap())
+            .collect();
+        assert_eq!(kept, [b"old state".to_vec()]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
