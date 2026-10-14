@@ -2213,6 +2213,7 @@ impl RunningVm {
             Ok(child) => child,
             Err(e) => {
                 let _ = crate::sandbox::exec::remove_work_dir(&prepared.vm_dir);
+                tenancy.keep_dir_if_left(&prepared.vm_dir);
                 return Err(SandboxError::Unavailable(format!(
                     "cannot start the VMM for {id}: {e}"
                 )));
@@ -4125,6 +4126,29 @@ while True:
             swept_again(&launcher, &copies, || drop(vmm)),
             "the launcher did not try the copies again"
         );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_vm_directory_of_a_failed_spawn_is_tried_again() {
+        let dir = temp_dir();
+        let launcher = new_launcher(jailed(&dir)).unwrap();
+        let vm_dir = launcher.vm_root().join(new_vm_id(launcher.owner()));
+        let swept = swept_again(&launcher, &vm_dir, || {
+            let prepared = Prepared {
+                vsock: dir.join("v.sock"),
+                vm_dir: vm_dir.clone(),
+                api_socket: None,
+                cgroup: None,
+                command: tokio::process::Command::new(dir.join("missing")),
+                vmm: None,
+            };
+            let spawned =
+                RunningVm::spawn("hsbx-test".into(), prepared, Arc::clone(&launcher.tenancy));
+            assert!(spawned.is_err(), "a missing VMM must not start");
+        });
+        assert!(swept, "the launcher did not try the directory again");
         drop(launcher);
         std::fs::remove_dir_all(dir).unwrap();
     }

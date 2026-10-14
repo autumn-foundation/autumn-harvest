@@ -80,6 +80,13 @@ impl SandboxLimits {
     }
 }
 
+/// The fewest open file descriptors that a policy may give the code.
+///
+/// A run starts with stdin, stdout and stderr. The loader then opens the
+/// libraries, and the runtime opens the code file. Node 22 needs about 24
+/// to start, so 64 leaves room for each built-in runtime.
+pub const MIN_OPEN_FILES: u32 = 64;
+
 /// The limits that a request gets when it asks for none.
 pub const DEFAULT_LIMITS: SandboxLimits = SandboxLimits {
     wall_clock_ms: 30_000,
@@ -265,6 +272,7 @@ impl SandboxPolicy {
     /// Returns [`SandboxError::Config`] for one of these defects:
     ///
     /// - a default limit is over its ceiling, or a limit is zero;
+    /// - the default `max_open_files` is below [`MIN_OPEN_FILES`];
     /// - the size bounds allow no file, so no code file;
     /// - no runtime exists;
     /// - a runtime name or spec is not valid;
@@ -316,6 +324,14 @@ impl SandboxPolicy {
                     "default {field} {default} exceeds its ceiling {max}"
                 )));
             }
+        }
+        // Each run gets the default, because a request cannot set this limit.
+        // Fewer descriptors fail each run before the code starts.
+        if self.default_limits.max_open_files < MIN_OPEN_FILES {
+            return Err(SandboxError::Config(format!(
+                "limit max_open_files must be at least {MIN_OPEN_FILES}, so a runtime can start \
+                 and open the code file"
+            )));
         }
         if self.path_env.contains('\0') {
             return Err(SandboxError::Config("the PATH value holds NUL".into()));
@@ -843,6 +859,23 @@ mod tests {
             "{:?}",
             policy.validate()
         );
+    }
+
+    #[test]
+    fn a_policy_must_allow_the_descriptors_that_a_runtime_needs() {
+        let mut limits = DEFAULT_LIMITS;
+        limits.max_open_files = 3;
+        let policy = SandboxPolicy::default().with_limits(limits, MAX_LIMITS);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("max_open_files") && m.contains("64")),
+            "{:?}",
+            policy.validate()
+        );
+        limits.max_open_files = MIN_OPEN_FILES;
+        SandboxPolicy::default()
+            .with_limits(limits, MAX_LIMITS)
+            .validate()
+            .unwrap();
     }
 
     #[test]
