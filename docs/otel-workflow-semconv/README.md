@@ -216,7 +216,7 @@ Harvest does not yet conform to every rule of this draft:
 
 A maintainer files this text as a new issue in
 `open-telemetry/semantic-conventions`. Check that each link is public
-first. Pin the link to a tag or a commit.
+first. Replace `<commit>` with the commit that holds the reviewed draft.
 
 ```markdown
 ### Proposal: semantic conventions for durable workflow engines
@@ -248,7 +248,7 @@ A new `workflow` area at `development` stability:
 
 A draft Weaver model (`model/workflow/registry.yaml` and
 `model/workflow/spans.yaml`) is at
-https://github.com/autumn-foundation/autumn-harvest/tree/trunk-dev/docs/otel-workflow-semconv
+https://github.com/autumn-foundation/autumn-harvest/tree/<commit>/docs/otel-workflow-semconv
 
 Autumn Harvest emits these spans under its own `harvest.*` names. Its
 draft lists where it does not yet conform.
@@ -277,7 +277,8 @@ The steps to submit:
    co-propose. Upstream asks for a group of owners for a new area.
 3. Read the project process in the `open-telemetry/community` repository.
    A new area can need a project and a sponsor.
-4. File the section 9 text in `open-telemetry/semantic-conventions`.
+4. Replace `<commit>` in the section 9 link with a merged commit or a tag.
+   Then file the text in `open-telemetry/semantic-conventions`.
 5. Put the issue link in the status paragraph. Change `pending` to
    `submitted`.
 

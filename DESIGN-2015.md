@@ -113,6 +113,9 @@ code, guard quality, and style. The fixes:
 - Codex then found that the signal spans did not require the signal name.
   Their span names carry the workflow name only. Both now require
   `workflow.signal.name`, and a guard checks it.
+- Codex found that the issue text linked the moving `trunk-dev` branch.
+  The link now holds a `<commit>` placeholder, and the steps say to fill
+  it. A guard rejects a branch link.
 
 ### 0.6 Decisions
 

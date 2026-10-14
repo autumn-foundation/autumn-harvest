@@ -739,6 +739,11 @@ fn the_submission_status_is_recorded() {
                 text.is_some_and(|body| body.split_whitespace().count() > 50),
                 "a pending status needs the issue text in section 9"
             );
+            let body = text.unwrap_or_default();
+            assert!(
+                !body.contains("/trunk-dev/") && body.contains("/tree/<commit>/"),
+                "the section 9 link must name a `<commit>` placeholder, not a branch"
+            );
         }
         other => panic!("the status must be `pending`, `submitted` or `declined`, not `{other}`"),
     }
