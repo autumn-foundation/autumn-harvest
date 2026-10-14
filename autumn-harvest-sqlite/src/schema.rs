@@ -364,6 +364,88 @@ mod tests {
             workflow_id TEXT NOT NULL DEFAULT '', input_json TEXT NOT NULL, \
             state TEXT NOT NULL, output_json TEXT, error TEXT)";
 
+    // The pre-#2028 `harvest_signals` shape (no `idempotency_key`).
+    const OLD_HARVEST_SIGNALS_DDL: &str = "\
+        CREATE TABLE harvest_signals (\
+            signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, exec_id TEXT NOT NULL, \
+            name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+            delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0)";
+
+    fn old_database() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
+        conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
+        conn.execute_batch(OLD_HARVEST_SIGNALS_DDL).unwrap();
+        conn
+    }
+
+    fn signal_keys(conn: &Connection) -> Vec<(String, Option<String>)> {
+        let mut stmt = conn
+            .prepare("SELECT name, idempotency_key FROM harvest_signals ORDER BY signal_seq")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    // Issue #2028: an old table gains the key column and its unique index. A
+    // promise row takes its name as its key. Other rows keep no key.
+    #[test]
+    fn migrate_adds_the_signal_key_and_back_fills_promises() {
+        let conn = old_database();
+        conn.execute_batch(
+            "INSERT INTO harvest_signals (exec_id, name, payload_json) VALUES \
+             ('e1', 'go', '1'), ('e1', 'harvest.promise:p', '{}'), \
+             ('e1', 'harvest.promise:p', '{}'), ('e2', 'harvest.promise:p', '{}')",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            signal_keys(&conn),
+            vec![
+                ("go".to_string(), None),
+                (
+                    "harvest.promise:p".to_string(),
+                    Some("harvest.promise:p".to_string())
+                ),
+                ("harvest.promise:p".to_string(), None),
+                (
+                    "harvest.promise:p".to_string(),
+                    Some("harvest.promise:p".to_string())
+                ),
+            ],
+            "a duplicate legacy settlement keeps no key, so the index builds"
+        );
+        let dup = conn.execute(
+            "INSERT INTO harvest_signals (exec_id, name, payload_json, idempotency_key) \
+             VALUES ('e1', 'x', '1', 'harvest.promise:p')",
+            [],
+        );
+        assert!(dup.is_err(), "the unique index holds");
+    }
+
+    // Issue #2028: a fresh database has the key column and index at once.
+    #[test]
+    fn a_fresh_database_enforces_the_signal_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        migrate(&conn).unwrap();
+        assert!(column_exists(&conn, "harvest_signals", "idempotency_key").unwrap());
+        let insert = "INSERT INTO harvest_signals (exec_id, name, payload_json, idempotency_key) \
+                      VALUES (?1, 'go', '1', ?2)";
+        conn.execute(insert, ["e1", "k"]).unwrap();
+        conn.execute(insert, ["e2", "k"]).unwrap();
+        conn.execute(insert, rusqlite::params!["e1", None::<String>])
+            .unwrap();
+        conn.execute(insert, rusqlite::params!["e1", None::<String>])
+            .unwrap();
+        assert!(conn.execute(insert, ["e1", "k"]).is_err());
+    }
+
     // A fresh database already has the freeze columns from `SCHEMA`, so `migrate` is
     // a pure no-op (idempotent).
     #[test]

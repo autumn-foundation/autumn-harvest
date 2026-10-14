@@ -236,6 +236,22 @@ pub enum SqliteError {
         existing_state: String,
     },
 
+    /// No run exists for this `(workflow_name, workflow_id)` key (issue
+    /// #2028). [`send_signal_by_workflow_id`](crate::SqliteRuntime::send_signal_by_workflow_id)
+    /// returns it.
+    #[error("no workflow run for ({workflow_name}, {workflow_id})")]
+    WorkflowIdNotFound {
+        /// The workflow type of the request.
+        workflow_name: String,
+        /// The business id of the request.
+        workflow_id: String,
+    },
+
+    /// A call that addresses a run by its business id got a blank id (issue
+    /// #2028). A blank id has no reuse key, so it can match no run.
+    #[error("the workflow_id must not be blank")]
+    BlankWorkflowId,
+
     /// A signal broke a rule of its name. A `harvest.promise:` signal must
     /// carry a [`PromiseSettlement`](autumn_harvest::durable_promise::PromiseSettlement)
     /// (issue #1985).

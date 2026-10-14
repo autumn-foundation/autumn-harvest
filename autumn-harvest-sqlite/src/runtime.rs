@@ -192,6 +192,47 @@ pub struct StartOutcome {
     pub created: bool,
 }
 
+/// The result of [`SqliteRuntime::send_signal_by_workflow_id`] (issue #2028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalDelivery {
+    /// The run that holds the signal.
+    pub exec_id: ExecutionId,
+    /// `true` when this call staged the signal. `false` when the idempotency
+    /// key was already staged in the `(workflow_name, workflow_id)` chain.
+    pub delivered: bool,
+}
+
+/// The request of [`SqliteRuntime::signal_with_start`] (issue #2028).
+#[derive(Debug, Clone)]
+pub struct SignalWithStart<'a> {
+    /// The registered workflow type.
+    pub workflow_name: &'a str,
+    /// The business id. It must not be blank.
+    pub workflow_id: &'a str,
+    /// The input of a fresh run. An attach ignores it.
+    pub input: Value,
+    /// The reuse policy for a prior run of the key.
+    pub reuse_policy: WorkflowIdReusePolicy,
+    /// The signal name.
+    pub signal_name: &'a str,
+    /// The signal payload.
+    pub signal_payload: Value,
+    /// An optional idempotency key. An empty key is no key.
+    pub idempotency_key: Option<&'a str>,
+}
+
+/// The result of [`SqliteRuntime::signal_with_start`] (issue #2028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalWithStartOutcome {
+    /// The run that holds the signal.
+    pub exec_id: ExecutionId,
+    /// `true` when this call started the run.
+    pub started_fresh: bool,
+    /// `true` when this call staged the signal. `false` when the idempotency
+    /// key was already staged.
+    pub signal_delivered: bool,
+}
+
 /// The `error_type` of the `WorkflowFailed` event that seals an execution
 /// which reached an unsupported feature (issue #1834).
 pub const UNSUPPORTED_FEATURE_ERROR_TYPE: &str = "UnsupportedFeature";
@@ -1035,6 +1076,54 @@ impl SqliteRuntime {
             &payload,
             received_at.timestamp_millis(),
         )
+    }
+
+    /// Stub for the red phase (issue #2028).
+    ///
+    /// # Errors
+    ///
+    /// Always [`SqliteError::Unsupported`].
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn send_signal_idempotent(
+        &mut self,
+        _exec: ExecutionId,
+        _name: &str,
+        _payload: Value,
+        _idempotency_key: Option<&str>,
+    ) -> SqliteResult<bool> {
+        Err(SqliteError::Unsupported("send_signal_idempotent".into()))
+    }
+
+    /// Stub for the red phase (issue #2028).
+    ///
+    /// # Errors
+    ///
+    /// Always [`SqliteError::Unsupported`].
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn send_signal_by_workflow_id(
+        &mut self,
+        _workflow_name: &str,
+        _workflow_id: &str,
+        _name: &str,
+        _payload: Value,
+        _idempotency_key: Option<&str>,
+    ) -> SqliteResult<SignalDelivery> {
+        Err(SqliteError::Unsupported(
+            "send_signal_by_workflow_id".into(),
+        ))
+    }
+
+    /// Stub for the red phase (issue #2028).
+    ///
+    /// # Errors
+    ///
+    /// Always [`SqliteError::Unsupported`].
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn signal_with_start(
+        &mut self,
+        _request: SignalWithStart<'_>,
+    ) -> SqliteResult<SignalWithStartOutcome> {
+        Err(SqliteError::Unsupported("signal_with_start".into()))
     }
 
     /// Request a cooperative cancel of `exec` (issue #2021).

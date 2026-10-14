@@ -804,6 +804,35 @@ mod tests {
         );
     }
 
+    // Issue #2028: a seal deletes the unkeyed undelivered rows. A keyed row
+    // stays, so a retry of its key still dedupes. Delivered rows stay too.
+    #[test]
+    fn a_seal_keeps_keyed_and_delivered_signal_rows() {
+        let conn = open();
+        schema::migrate(&conn).unwrap();
+        let exec = ExecutionId::new();
+        conn.execute(
+            "INSERT INTO harvest_signals (exec_id, name, payload_json, delivered, idempotency_key) \
+             VALUES (?1, 'a', '1', 0, NULL), (?1, 'b', '1', 0, 'k'), (?1, 'c', '1', 1, NULL)",
+            params![exec.to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            delete_undelivered_signals_for_execution(&conn, exec).unwrap(),
+            1
+        );
+        let mut stmt = conn
+            .prepare("SELECT name FROM harvest_signals ORDER BY name")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(names, ["b", "c"]);
+    }
+
     // Issue #2020: the bounded signal read must stream rows in arrival order.
     // A temporary sort would first load every staged row, payload and all.
     #[test]

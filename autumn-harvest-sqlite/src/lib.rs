@@ -631,7 +631,7 @@ pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
 pub use crate::query::DEFAULT_QUERY_TIMEOUT;
 pub use crate::runtime::{
-    ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime, StartOutcome,
-    UNSUPPORTED_FEATURE_ERROR_TYPE,
+    ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SignalDelivery, SignalWithStart,
+    SignalWithStartOutcome, SqliteRuntime, StartOutcome, UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
 pub use crate::store::ActivityAttempt;
