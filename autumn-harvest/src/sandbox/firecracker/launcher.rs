@@ -572,6 +572,7 @@ impl FirecrackerLauncher {
         mounts: &str,
         netns_check: fn(&Path) -> Result<(), SandboxError>,
     ) -> Result<Self, SandboxError> {
+        use std::os::unix::fs::DirBuilderExt as _;
         // Firecracker refuses these at each launch. Refuse them once, here.
         let machine = config.machine;
         // The guest kernel and agent keep some memory, so a run needs more.
@@ -634,9 +635,15 @@ impl FirecrackerLauncher {
         let owner = uuid::Uuid::new_v4().simple().to_string()[..OWNER_TAG_HEX].to_owned();
         let vm_root = vm_root_of(&config.confinement, &exec_name);
         check_socket_paths(&vm_root, &config.confinement)?;
-        std::fs::create_dir_all(&vm_root).map_err(|e| {
-            SandboxError::Config(format!("cannot create {}: {e}", vm_root.display()))
-        })?;
+        // A jailed launcher refuses a VM root that group or others can write.
+        // The umask only takes bits away, so a new root has mode 0755 at most.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o755)
+            .create(&vm_root)
+            .map_err(|e| {
+                SandboxError::Config(format!("cannot create {}: {e}", vm_root.display()))
+            })?;
         if let Confinement::Jailer(jailer) = &config.confinement {
             check_trusted_files(&config, jailer, &vm_root)?;
         }
@@ -1944,7 +1951,8 @@ fn check_launcher_paths(config: &LauncherConfig) -> Result<(), SandboxError> {
 ///
 /// The root jailer builds each jail under `vm_root`, and it joins the network
 /// namespace. A user who can move either path can move a jail, or give an
-/// escaped VMM a network.
+/// escaped VMM a network. A user who can add to `vm_root` can name a live VM
+/// of another launcher, which the sweep then kills.
 ///
 /// The jail holds hard links to the kernel, the root file system and the
 /// snapshot files. A file that the jail uid owns, or that its group or
@@ -1969,6 +1977,16 @@ fn check_trusted_files(
     trusted.extend(jailer.netns.as_deref());
     for path in trusted {
         check_trusted_ancestors(path, euid, inspect)?;
+    }
+    // The sweep reads each entry of the VM root as a VM, and the cgroup of a
+    // dead owner's VM dies. A sticky directory still takes new entries from
+    // each user. So only the owner may write the VM root itself.
+    if inspect(vm_root)?.mode() & 0o022 != 0 {
+        return Err(SandboxError::Config(format!(
+            "the VM root {} must not be writable by group or others, because the sweep \
+             trusts its entries",
+            vm_root.display()
+        )));
     }
     let jail_uid = jailer.uid;
     let mut shared = vec![&config.image.kernel, &config.image.rootfs];
@@ -3789,37 +3807,70 @@ while True:
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// When set, `copies_keep_their_mode_under_a_strict_umask` copies into
-    /// this directory. Its parent run sets the variable and umask `0077`.
+    /// When set, a umask test runs in this directory. Its parent run sets the
+    /// variable and the umask.
     const UMASK_CHILD: &str = "HARVEST_TEST_UMASK_CHILD";
+
+    /// Run the test `name` again in a child under `umask`, and return `None`.
+    /// In that child, return the directory of the test. The umask is per
+    /// process, so only a child can change it.
+    fn in_child_with_umask(umask: &str, name: &str) -> Option<PathBuf> {
+        if let Some(dir) = std::env::var_os(UMASK_CHILD) {
+            return Some(PathBuf::from(dir));
+        }
+        let dir = temp_dir();
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("umask {umask} && exec \"$0\" \"$@\""))
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", name])
+            .env(UMASK_CHILD, &dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "{status}");
+        std::fs::remove_dir_all(dir).unwrap();
+        None
+    }
 
     #[test]
     fn copies_keep_their_mode_under_a_strict_umask() {
-        let Some(dir) = std::env::var_os(UMASK_CHILD) else {
-            // The umask is per process, so a child runs this test under it.
-            let dir = temp_dir();
-            let status = std::process::Command::new("sh")
-                .arg("-c")
-                .arg("umask 077 && exec \"$0\" \"$@\"")
-                .arg(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "sandbox::firecracker::launcher::tests::copies_keep_their_mode_under_a_strict_umask",
-                ])
-                .env(UMASK_CHILD, &dir)
-                .status()
-                .unwrap();
-            assert!(status.success(), "{status}");
-            std::fs::remove_dir_all(dir).unwrap();
+        let Some(dir) = in_child_with_umask(
+            "077",
+            "sandbox::firecracker::launcher::tests::copies_keep_their_mode_under_a_strict_umask",
+        ) else {
             return;
         };
-        let dir = PathBuf::from(dir);
         let fc = script(&dir, "firecracker", "exit 0");
         let ids = [file_id(&fc).unwrap()];
         let copies = copy_binaries(&dir.join("copies"), &[("firecracker", fc)], &ids).unwrap();
         // The jail uid runs the jailer's copy, which keeps this mode.
         let mode = std::fs::metadata(&copies[0]).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o555, "{mode:o}");
+    }
+
+    #[test]
+    fn a_new_vm_root_ignores_a_permissive_umask() {
+        let Some(dir) = in_child_with_umask(
+            "002",
+            "sandbox::firecracker::launcher::tests::a_new_vm_root_ignores_a_permissive_umask",
+        ) else {
+            return;
+        };
+        let config = jailed(&dir);
+        // Only the VM root may come from the umask, so the files lose group
+        // write.
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(perms.mode() & !0o022);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        drop(new_launcher(config).unwrap());
+        let mode = std::fs::metadata(dir.join("jail/firecracker"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o022, 0, "{mode:o}");
     }
 
     #[test]
@@ -3872,6 +3923,30 @@ while True:
         let err = new_launcher(config).expect_err("writable image");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("rootfs.ext4")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_vm_root_that_others_can_write_is_a_config_error() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        // A sticky ancestor that all can write, such as /tmp, stays allowed.
+        let base = dir.join("jail");
+        std::fs::create_dir_all(base.join("firecracker")).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        drop(new_launcher(config.clone()).unwrap());
+        // A local user could add a fake VM directory to the root itself.
+        // The sweep would then kill the cgroup of that name.
+        std::fs::set_permissions(
+            base.join("firecracker"),
+            std::fs::Permissions::from_mode(0o1777),
+        )
+        .unwrap();
+        let err = new_launcher(config).expect_err("a VM root that others can write");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("group or others")),
             "{err:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();
