@@ -33337,10 +33337,11 @@ fn reference_outcome(
 /// [`Worker::dispatch_leases`] collects these across a whole read.
 /// It settles them in one `ack_many`/`release_many` call, instead of
 /// one channel round trip per lease (Codex review, issue #1429).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum ReferenceDisposition {
-    /// Claimed and dispatched. The lease still owes an `ack`.
-    Dispatched(crate::dispatch::DispatchLease),
+    /// Claimed. The caller starts the task at once. The lease still owes an
+    /// `ack`.
+    Dispatched(crate::dispatch::DispatchLease, Box<ClaimedReference>),
     /// Not claimed; the row is already terminal. The lease owes an `ack`.
     AlreadyTerminal(crate::dispatch::DispatchLease),
     /// Not claimed and retryable. The lease owes a `release` after this
@@ -33351,6 +33352,146 @@ enum ReferenceDisposition {
     /// recovery, not the common claim path this batches. Nothing left
     /// for the caller to settle.
     Handled,
+}
+
+/// The pools that refused a reference of one dispatch batch (issue #1429).
+///
+/// A pool refuses a reference when it has no free permit, or when the
+/// shard's share of it is spent. See [`Worker::wait_for_refused_permit`].
+#[derive(Debug, Clone, Copy, Default)]
+struct RefusedPools {
+    workflow: bool,
+    activity: bool,
+}
+
+impl RefusedPools {
+    /// Note a reference that went back with no claim attempt.
+    const fn note(&mut self, kind: Option<crate::dispatch::DispatchKind>) {
+        match kind {
+            Some(crate::dispatch::DispatchKind::Workflow) => self.workflow = true,
+            Some(crate::dispatch::DispatchKind::Activity) => self.activity = true,
+            None => {}
+        }
+    }
+}
+
+/// The longest wait of a single-shard reader after a batch that gave every
+/// reference back (issue #1429).
+///
+/// A free permit of the refused pool ends the wait at once. The cap bounds
+/// two costs of the wait. A reference of the other kind that arrives during
+/// the wait waits up to this long. A backlog of refused references ahead of
+/// a claimable one costs one wait per read. The cap is fixed, because
+/// `poll_interval` can be seconds. It keeps the reader under 100 reads per
+/// second while a pool is full.
+const DISPATCH_REFUSED_WAIT: Duration = Duration::from_millis(10);
+
+/// A task that a dispatch reference claimed, before the task starts.
+#[derive(Debug)]
+struct ClaimedReference {
+    task: TaskQueueItem,
+    reservation: Option<DispatchReservation>,
+}
+
+/// How long a hint for the own row of a task that a dispatch batch claimed
+/// waits for the batch to ack the task's reference.
+///
+/// A channel drops a publish for a reference that it has leased out. A task
+/// can put its own row back to `PENDING` within milliseconds. An activity
+/// that fails fast and retries does this. So does one that a limit defers.
+/// The batch acks its references after its last claim. A hint that the task
+/// published before that ack was lost, and the row waited for the reconcile
+/// sweep. A healthy ack takes milliseconds. The bound keeps a stalled
+/// channel from holding the hint for the whole batch timeout. The task never
+/// waits, so it cannot hold a pooled connection that the batch needs.
+const DISPATCH_HINT_ACK_WAIT: Duration = Duration::from_secs(1);
+
+/// The channel of a task that a dispatch batch claimed.
+///
+/// A hint that names the task's own row goes out after the batch acks the
+/// task's reference, or after [`DISPATCH_HINT_ACK_WAIT`]. Every other hint,
+/// and every other call, goes straight to the inner channel.
+#[derive(Debug)]
+struct AckGatedChannel {
+    inner: Arc<dyn crate::dispatch::TaskDispatch>,
+    own_row: uuid::Uuid,
+    acked: tokio::sync::watch::Receiver<bool>,
+}
+
+#[async_trait::async_trait]
+impl crate::dispatch::TaskDispatch for AckGatedChannel {
+    async fn publish(&self, hints: &[crate::dispatch::DispatchHint]) -> HarvestResult<()> {
+        if *self.acked.borrow() || hints.iter().all(|hint| hint.task_id != self.own_row) {
+            return self.inner.publish(hints).await;
+        }
+        // The hint for the own row waits off the task. The task may hold a
+        // pooled connection here, and the batch ack may wait for one.
+        let (own, others): (Vec<_>, Vec<_>) = hints
+            .iter()
+            .cloned()
+            .partition(|hint| hint.task_id == self.own_row);
+        let inner = Arc::clone(&self.inner);
+        let mut acked = self.acked.clone();
+        tokio::spawn(async move {
+            // A dropped sender means the batch ended, so the wait ends too.
+            let _ =
+                tokio::time::timeout(DISPATCH_HINT_ACK_WAIT, acked.wait_for(|acked| *acked)).await;
+            if let Err(error) = inner.publish(&own).await {
+                tracing::warn!(
+                    error = %error,
+                    "dispatch publish failed; the reconcile sweep republishes this row"
+                );
+            }
+        });
+        if others.is_empty() {
+            return Ok(());
+        }
+        self.inner.publish(&others).await
+    }
+
+    async fn next(
+        &self,
+        queues: &[String],
+        consumer: &str,
+        max: usize,
+        wait: Duration,
+    ) -> HarvestResult<Vec<crate::dispatch::DispatchLease>> {
+        self.inner.next(queues, consumer, max, wait).await
+    }
+
+    async fn ack(&self, lease: &crate::dispatch::DispatchLease) -> HarvestResult<()> {
+        self.inner.ack(lease).await
+    }
+
+    async fn release(
+        &self,
+        lease: &crate::dispatch::DispatchLease,
+        delay: Duration,
+    ) -> HarvestResult<()> {
+        self.inner.release(lease, delay).await
+    }
+
+    async fn ack_many(&self, leases: &[crate::dispatch::DispatchLease]) -> HarvestResult<()> {
+        self.inner.ack_many(leases).await
+    }
+
+    async fn release_many(
+        &self,
+        leases: &[(crate::dispatch::DispatchLease, Duration)],
+    ) -> HarvestResult<()> {
+        self.inner.release_many(leases).await
+    }
+
+    async fn maintain(
+        &self,
+        queues: &[String],
+    ) -> HarvestResult<crate::dispatch::DispatchMaintenance> {
+        self.inner.maintain(queues).await
+    }
+
+    fn next_round_trips(&self, queue_count: usize) -> usize {
+        self.inner.next_round_trips(queue_count)
+    }
 }
 
 impl Worker {
@@ -35949,6 +36090,9 @@ impl Worker {
         // `DISPATCH_READ_MAX` separate acknowledgement round trips, despite
         // `ack_many` already existing on the trait.
         let mut to_ack: Vec<crate::dispatch::DispatchLease> = Vec::new();
+        // Opens after the batch ack. A task of this batch holds a hint for
+        // its own row until then. See [`DISPATCH_HINT_ACK_WAIT`].
+        let (acked_tx, acked_rx) = tokio::sync::watch::channel(false);
         // Each kind's fair share of this batch, snapshotted once per shard's
         // turn. See [`dispatch_kind_within_share`] for why the read-size
         // share is not enough on its own (Codex review, issue #1429).
@@ -35961,6 +36105,7 @@ impl Worker {
                 .div_ceil(divisor);
         let mut claimed_workflow = 0usize;
         let mut claimed_activity = 0usize;
+        let mut refused = RefusedPools::default();
         let mut leases = leases.into_iter();
         while let Some(lease) = leases.next() {
             if self.shutdown.is_cancelled() {
@@ -35984,6 +36129,7 @@ impl Worker {
                 // No permit for this pool, or this shard's own share of it is
                 // already spent this batch. Give the reference straight
                 // back, so a peer with capacity reads it on its next poll.
+                refused.note(lease.kind);
                 to_release.push((lease, Duration::ZERO));
                 continue;
             }
@@ -36003,7 +36149,15 @@ impl Worker {
                 .consume_reference(pool, shard, installed, lease, reservation, shard_count)
                 .await
             {
-                ReferenceDisposition::Dispatched(lease) => {
+                ReferenceDisposition::Dispatched(lease, claimed) => {
+                    self.dispatch_task(
+                        claimed.task,
+                        pool,
+                        shard,
+                        claimed.reservation,
+                        None,
+                        Some(acked_rx.clone()),
+                    );
                     dispatched += 1;
                     // Only a reference this shard actually dispatched spends
                     // its share of the pool (Codex review, issue #1429). A
@@ -36025,6 +36179,60 @@ impl Worker {
                 ReferenceDisposition::Handled => {}
             }
         }
+        self.settle_leases(state, installed, &to_ack, &to_release, &acked_tx)
+            .await;
+        // A multi-shard turn that dispatched nothing returns to its round,
+        // and the round waits when every shard is idle. A wait here would
+        // delay the turn of a busy shard.
+        if dispatched == 0 && shard_count == 1 {
+            let wait = installed.settings.poll_interval.min(DISPATCH_REFUSED_WAIT);
+            self.wait_for_refused_permit(refused, wait).await;
+        }
+        dispatched
+    }
+
+    /// Wait until a pool that refused a reference of one batch frees a
+    /// permit (issue #1429). `wait` caps the wait.
+    ///
+    /// The batch gives such a reference straight back, so a peer with a
+    /// permit can read it. The other pool can still have free permits, so
+    /// the next read still runs. Without this wait, the reader read the same
+    /// reference again at once and gave it back again. That loop made
+    /// thousands of channel calls per second. A channel call that completes
+    /// without a yield then starved the tasks of this worker.
+    async fn wait_for_refused_permit(&self, refused: RefusedPools, wait: Duration) {
+        if !refused.workflow && !refused.activity {
+            return;
+        }
+        // A refused pool can still show a free permit. A claimed task holds
+        // it as a reservation until its first poll, or the permit freed
+        // after the check. The reader yields, so that task can run, and the
+        // next read sees the pool again.
+        let shows_permit = (refused.workflow && self.workflow_semaphore.available_permits() > 0)
+            || (refused.activity && self.activity_semaphore.available_permits() > 0);
+        if shows_permit {
+            tokio::task::yield_now().await;
+            return;
+        }
+        tokio::select! {
+            () = self.shutdown.cancelled() => {}
+            () = tokio::time::sleep(wait) => {}
+            Ok(permit) = self.workflow_semaphore.acquire(), if refused.workflow => drop(permit),
+            Ok(permit) = self.activity_semaphore.acquire(), if refused.activity => drop(permit),
+        }
+    }
+
+    /// Settle one batch of [`Self::dispatch_leases`] in one `ack_many` and one
+    /// `release_many` call (issue #1429). The ack opens `acked` for the tasks
+    /// of the batch. See [`DISPATCH_HINT_ACK_WAIT`].
+    async fn settle_leases(
+        &self,
+        state: &mut DispatchLoopState,
+        installed: &crate::dispatch::InstalledDispatch,
+        to_ack: &[crate::dispatch::DispatchLease],
+        to_release: &[(crate::dispatch::DispatchLease, Duration)],
+        acked: &tokio::sync::watch::Sender<bool>,
+    ) {
         // A failed batched call is still self-healing. A stuck ack costs one
         // redelivery; a stuck release costs one visibility-timeout wait. So
         // neither error changes what this call returns. But swallowing it
@@ -36045,12 +36253,14 @@ impl Worker {
             // follow-up) — whichever this installed channel actually costs.
             let timeout = dispatch_batch_timeout(queues.len(), 2, to_ack.len());
             if let Err(error) =
-                dispatch_call_with_timeout(installed.channel.ack_many(&to_ack), "ack", timeout)
-                    .await
+                dispatch_call_with_timeout(installed.channel.ack_many(to_ack), "ack", timeout).await
             {
                 self.log_dispatch_error(state, &error, "dispatch batched ack failed");
             }
         }
+        // A failed ack opens the gate too. Its references come back by
+        // redelivery, and the reader acks a row that is not `PENDING`.
+        let _ = acked.send(true);
         if !to_release.is_empty() {
             let queues: HashSet<&str> = to_release
                 .iter()
@@ -36058,7 +36268,7 @@ impl Worker {
                 .collect();
             let timeout = dispatch_batch_timeout(queues.len(), 1, to_release.len());
             if let Err(error) = dispatch_call_with_timeout(
-                installed.channel.release_many(&to_release),
+                installed.channel.release_many(to_release),
                 "release",
                 timeout,
             )
@@ -36067,7 +36277,6 @@ impl Worker {
                 self.log_dispatch_error(state, &error, "dispatch batched release failed");
             }
         }
-        dispatched
     }
 
     /// Permits of one pool that no claimed task has reserved yet.
@@ -36277,8 +36486,10 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task (dispatch)"
                 );
-                self.dispatch_task(task, pool, shard, reservation, None);
-                ReferenceDisposition::Dispatched(lease)
+                ReferenceDisposition::Dispatched(
+                    lease,
+                    Box::new(ClaimedReference { task, reservation }),
+                )
             }
             Ok(None) => {
                 let probe = match queue::dispatch_probe(
@@ -37711,7 +37922,7 @@ impl Worker {
                             "claimed task (weighted)"
                         );
                         let permit = permits.take(&task.task_type);
-                        self.dispatch_task(task, pool, shard, None, permit);
+                        self.dispatch_task(task, pool, shard, None, permit, None);
                         return true;
                     }
                     Ok(None) => {
@@ -37769,7 +37980,7 @@ impl Worker {
                 // includes the `PENDING` wait behind a saturated worker (issue
                 // #1787) and the short permit wait after the claim.
                 let permit = permits.take(&task.task_type);
-                self.dispatch_task(task, pool, shard, None, permit);
+                self.dispatch_task(task, pool, shard, None, permit, None);
                 true
             }
             Ok(None) => {
@@ -37800,6 +38011,7 @@ impl Worker {
         shard: Option<crate::types::ShardId>,
         reservation: Option<DispatchReservation>,
         held_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        acked: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
         // Debug-only tripwire (issue #548 review): dispatch must never race
         // ahead of `spawn_monitoring_tasks`, which withholds a tuned
@@ -38435,8 +38647,18 @@ impl Worker {
         };
         // Every publish from this task body uses this worker's bound channel,
         // not the live slot (issue #1431). Another runtime can replace the
-        // slot after this worker starts.
-        let bound_channel = self.bound_channel();
+        // slot after this worker starts. A task that a dispatch batch claimed
+        // holds a hint for its own row until the batch ack. See
+        // [`DISPATCH_HINT_ACK_WAIT`].
+        let bound_channel = match (self.bound_channel(), acked) {
+            (Some(inner), Some(acked)) => Some(Arc::new(AckGatedChannel {
+                inner,
+                own_row: task_id,
+                acked,
+            })
+                as Arc<dyn crate::dispatch::TaskDispatch>),
+            (channel, _) => channel,
+        };
         let live = LiveClaim::new(
             &self.dispatched.live,
             claim_started_at.map(|started_at| (task_id, claim_attempt, started_at)),
