@@ -172,7 +172,8 @@ fn launcher_cgroup_values(machine: MachineSpec) -> [(String, String); 4] {
 /// # Errors
 ///
 /// [`SandboxError::Config`] for a key that is not a plain file name, a
-/// `cgroup.` core file, or a key that [`cgroup_values`] sets.
+/// `cgroup.` core file, or a key that [`cgroup_values`] sets. A key over
+/// `NAME_MAX` is also a config error, because the jailer cannot open it.
 pub fn check_extra_cgroups(config: &JailerConfig) -> Result<(), SandboxError> {
     let limits = launcher_cgroup_values(MachineSpec::default());
     for (key, value) in &config.extra_cgroups {
@@ -184,6 +185,8 @@ pub fn check_extra_cgroups(config: &JailerConfig) -> Result<(), SandboxError> {
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
         let problem = if !plain {
             "is not a plain controller file name"
+        } else if key.len() > MAX_NAME_BYTES {
+            "is over NAME_MAX, the longest file name"
         } else if key.starts_with("cgroup.") {
             "is a cgroup core file, not a limit"
         } else if limits.iter().any(|(limit, _)| limit == key) {
@@ -599,6 +602,21 @@ mod tests {
             ("cpu.weight".into(), "50".into()),
         ];
         check_extra_cgroups(&config).unwrap();
+    }
+
+    #[test]
+    fn an_extra_cgroup_name_over_name_max_is_a_config_error() {
+        // The jailer opens the file by this name at each launch.
+        let mut config = config();
+        let longest = format!("io.{}", "a".repeat(MAX_NAME_BYTES - "io.".len()));
+        config.extra_cgroups = vec![(longest.clone(), "1".into())];
+        check_extra_cgroups(&config).unwrap();
+        config.extra_cgroups = vec![(format!("{longest}a"), "1".into())];
+        let err = check_extra_cgroups(&config).expect_err("a name over NAME_MAX");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("file name")),
+            "{err:?}"
+        );
     }
 
     #[test]

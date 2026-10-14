@@ -230,7 +230,9 @@ runtime refuses a policy that allows the network on a backend without one.
   controller files. The launcher refuses `cpu.max`, `memory.max`,
   `memory.swap.max`, `pids.max` and the `cgroup.` core files, because it sets
   the limits itself. The jailer gets each value as an argument. So the
-  launcher also refuses values that do not fit the exec limits.
+  launcher also refuses values that do not fit the exec limits. A key over
+  255 bytes (`NAME_MAX`) is a config error too, because the jailer cannot
+  open that file.
 
 Call `verify_host` before the first run. It checks the versions and the host,
 including cgroup v2 at `JailerConfig::cgroup_root`. Under

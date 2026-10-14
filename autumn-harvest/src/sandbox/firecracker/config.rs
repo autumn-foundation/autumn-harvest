@@ -41,8 +41,9 @@ pub const FIRECRACKER_CMDLINE_SIZE: usize = 2048;
 ///
 /// Firecracker 1.17 adds `pci=off` and `root=/dev/vda ro`. On `x86_64` it also
 /// adds one `virtio_mmio.device=` entry for each device. For the drive, the
-/// vsock and the entropy device of a microVM, that is 130 bytes. The reserve
-/// leaves room for a later version.
+/// vsock and the entropy device of a microVM, that is 130 bytes. On `aarch64`
+/// it adds `earlycon=` when the line holds `console=`, which makes 55 bytes.
+/// The reserve leaves room for a later version.
 pub const FIRECRACKER_CMDLINE_RESERVE: usize = 256;
 
 /// The longest boot argument line that the launcher gives to Firecracker.
@@ -256,14 +257,16 @@ fn launcher_boot_args(image: &GuestImage, port: u32) -> Vec<String> {
     ]
 }
 
-/// Check that the init path is one kernel word. Check also that no extra
-/// boot argument replaces an argument of the launcher or reaches the guest
-/// agent as an option. The whole line must fit Firecracker.
+/// Check the boot arguments of `image` with the guest port `port`.
+///
+/// The init path must be one kernel word. No extra boot argument may replace
+/// an argument of the launcher or reach the guest agent as an option. The
+/// whole line must fit Firecracker.
 ///
 /// # Errors
 ///
 /// Returns [`SandboxError::Config`] that names the argument.
-pub fn check_boot_args(image: &GuestImage) -> Result<(), SandboxError> {
+pub fn check_boot_args(image: &GuestImage, port: u32) -> Result<(), SandboxError> {
     // The kernel splits the line at whitespace and removes double quotes.
     // So a space or a quote can add an argument, such as a second `init=`.
     // The line also ends at a NUL, so no argument may hold a control
@@ -313,14 +316,15 @@ pub fn check_boot_args(image: &GuestImage) -> Result<(), SandboxError> {
             )));
         }
     }
-    // Firecracker refuses a longer line at each boot, so a retry cannot help.
-    // `u32::MAX` has as many digits as the longest port.
-    let line = boot_args(image, u32::MAX).len();
+    // Firecracker adds its own arguments and then refuses a line over 2047
+    // bytes at each boot. So a retry cannot help.
+    let line = boot_args(image, port).len();
     if line > MAX_BOOT_ARGS_BYTES {
         return Err(SandboxError::Config(format!(
-            "the boot arguments take {line} bytes, but Firecracker takes at most \
-             {MAX_BOOT_ARGS_BYTES}: its line holds {FIRECRACKER_CMDLINE_SIZE} bytes with the NUL \
-             and the arguments that it adds"
+            "the boot arguments take {line} bytes, over the launcher limit of \
+             {MAX_BOOT_ARGS_BYTES}: Firecracker holds {} bytes, and the launcher keeps \
+             {FIRECRACKER_CMDLINE_RESERVE} of them for the arguments that Firecracker adds",
+            FIRECRACKER_CMDLINE_SIZE - 1
         )));
     }
     Ok(())
@@ -492,13 +496,16 @@ mod tests {
             let mut image = image();
             image.extra_boot_args.push(reserved.into());
             assert!(
-                matches!(check_boot_args(&image), Err(SandboxError::Config(_))),
+                matches!(
+                    check_boot_args(&image, GUEST_AGENT_PORT),
+                    Err(SandboxError::Config(_))
+                ),
                 "{reserved}"
             );
         }
         let mut image = image();
         image.extra_boot_args.push("harvest.debug=1".into());
-        check_boot_args(&image).unwrap();
+        check_boot_args(&image, GUEST_AGENT_PORT).unwrap();
     }
 
     #[test]
@@ -512,7 +519,10 @@ mod tests {
             let mut image = image();
             image.extra_boot_args.push(to_init.into());
             assert!(
-                matches!(check_boot_args(&image), Err(SandboxError::Config(_))),
+                matches!(
+                    check_boot_args(&image, GUEST_AGENT_PORT),
+                    Err(SandboxError::Config(_))
+                ),
                 "{to_init}"
             );
         }
@@ -522,7 +532,7 @@ mod tests {
             "mitigations=auto".into(),
             "random.trust_cpu=on".into(),
         ]);
-        check_boot_args(&image).unwrap();
+        check_boot_args(&image, GUEST_AGENT_PORT).unwrap();
     }
 
     #[test]
@@ -539,7 +549,10 @@ mod tests {
             let mut image = image();
             image.init = init.into();
             assert!(
-                matches!(check_boot_args(&image), Err(SandboxError::Config(_))),
+                matches!(
+                    check_boot_args(&image, GUEST_AGENT_PORT),
+                    Err(SandboxError::Config(_))
+                ),
                 "{init:?}"
             );
         }
@@ -547,13 +560,19 @@ mod tests {
         let mut image = image();
         image.extra_boot_args.push("\"init=/bin/sh\"".into());
         assert!(
-            matches!(check_boot_args(&image), Err(SandboxError::Config(_))),
+            matches!(
+                check_boot_args(&image, GUEST_AGENT_PORT),
+                Err(SandboxError::Config(_))
+            ),
             "a quoted extra argument"
         );
         let mut with_nul = self::tests::image();
         with_nul.extra_boot_args.push("harvest.debug=1\0".into());
         assert!(
-            matches!(check_boot_args(&with_nul), Err(SandboxError::Config(_))),
+            matches!(
+                check_boot_args(&with_nul, GUEST_AGENT_PORT),
+                Err(SandboxError::Config(_))
+            ),
             "an extra argument with a NUL"
         );
     }
@@ -565,7 +584,7 @@ mod tests {
         image
             .extra_boot_args
             .push(format!("harvest.pad={}", "a".repeat(3 * 1024)));
-        let err = check_boot_args(&image).expect_err("a 3 KiB boot argument");
+        let err = check_boot_args(&image, GUEST_AGENT_PORT).expect_err("a 3 KiB boot argument");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("Firecracker")),
             "{err:?}"
@@ -577,20 +596,28 @@ mod tests {
         // An extra argument adds a space and its own bytes to the line.
         let pad = |len: usize| format!("harvest.pad={}", "a".repeat(len - "harvest.pad=".len()));
         let mut image = image();
-        let room = MAX_BOOT_ARGS_BYTES - boot_args(&image, u32::MAX).len() - 1;
+        let room = MAX_BOOT_ARGS_BYTES - boot_args(&image, GUEST_AGENT_PORT).len() - 1;
         image.extra_boot_args.push(pad(room));
-        check_boot_args(&image).unwrap();
-        assert_eq!(boot_args(&image, u32::MAX).len(), MAX_BOOT_ARGS_BYTES);
+        check_boot_args(&image, GUEST_AGENT_PORT).unwrap();
+        assert_eq!(
+            boot_args(&image, GUEST_AGENT_PORT).len(),
+            MAX_BOOT_ARGS_BYTES
+        );
+        // The check measures the line with the port that the guest gets.
+        assert!(matches!(
+            check_boot_args(&image, u32::MAX - 1),
+            Err(SandboxError::Config(_))
+        ));
         // Firecracker 1.17 on x86_64 adds these for the three devices.
         let line = format!(
             "{} pci=off root=/dev/vda ro virtio_mmio.device=4K@0xc0001000:5 \
              virtio_mmio.device=4K@0xc0002000:6 virtio_mmio.device=4K@0xc0003000:7",
-            boot_args(&image, u32::MAX)
+            boot_args(&image, GUEST_AGENT_PORT)
         );
         assert!(line.len() < FIRECRACKER_CMDLINE_SIZE, "{}", line.len());
         image.extra_boot_args[0].push('a');
         assert!(matches!(
-            check_boot_args(&image),
+            check_boot_args(&image, GUEST_AGENT_PORT),
             Err(SandboxError::Config(_))
         ));
     }

@@ -549,7 +549,10 @@ impl FirecrackerLauncher {
     ///
     /// - the machine has no memory, or a vCPU count outside 1 to 32;
     /// - an API or snapshot boot has an API timeout of zero;
-    /// - an extra boot argument would replace a launcher argument;
+    /// - an extra boot argument would replace a launcher argument, or the boot
+    ///   line is longer than `config::MAX_BOOT_ARGS_BYTES`;
+    /// - an extra cgroup key is not a plain controller file name of at most
+    ///   `NAME_MAX` bytes;
     /// - a path is missing;
     /// - a snapshot boot has no jailer;
     /// - the jail uid or gid is 0, or this process is not root with a jail;
@@ -586,7 +589,7 @@ impl FirecrackerLauncher {
                 machine.vcpu_count, machine.mem_size_mib
             )));
         }
-        super::config::check_boot_args(&config.image)?;
+        super::config::check_boot_args(&config.image, config.guest_port)?;
         // The guest would listen on a port of its own choice.
         if config.guest_port == super::vsock::VMADDR_PORT_ANY {
             return Err(SandboxError::Config(
