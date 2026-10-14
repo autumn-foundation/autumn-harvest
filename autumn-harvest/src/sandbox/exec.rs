@@ -686,6 +686,8 @@ struct ChildSetup {
     file_bytes: libc::rlim_t,
     open_files: libc::rlim_t,
     processes: libc::rlim_t,
+    /// The soft and hard stack limits of the child.
+    stack: Option<(libc::rlim_t, libc::rlim_t)>,
 }
 
 impl ChildSetup {
@@ -702,6 +704,7 @@ impl ChildSetup {
             file_bytes: limits.max_file_bytes,
             open_files: libc::rlim_t::from(limits.max_open_files),
             processes: libc::rlim_t::from(limits.max_processes),
+            stack: stack_hard_limit().map(|hard| (child_stack_limit(hard), hard)),
         }
     }
 
@@ -758,6 +761,11 @@ impl ChildSetup {
             set_limit(libc::RLIMIT_DATA, self.data_bytes, self.data_bytes)?;
             set_limit(libc::RLIMIT_FSIZE, self.file_bytes, self.file_bytes)?;
             set_limit(libc::RLIMIT_NOFILE, self.open_files, self.open_files)?;
+            // The stack limit sets the exec allowance of the code, which
+            // `exec_capacity` reports.
+            if let Some((soft, hard)) = self.stack {
+                set_limit(libc::RLIMIT_STACK, soft, hard)?;
+            }
             // Linux counts processes per uid in each user namespace, from
             // 5.14 on. So the limit is exact for a dedicated uid, and for a
             // non-root run in its own user namespace.
@@ -775,6 +783,56 @@ impl ChildSetup {
         }
         Ok(())
     }
+}
+
+/// The stack limit that the executor gives each child, unless the hard limit
+/// is lower.
+const EXEC_STACK_BYTES: libc::rlim_t = 8 * 1024 * 1024;
+
+/// The stack limit of a child under the hard limit `hard`.
+const fn child_stack_limit(hard: libc::rlim_t) -> libc::rlim_t {
+    if hard < EXEC_STACK_BYTES {
+        hard
+    } else {
+        EXEC_STACK_BYTES
+    }
+}
+
+/// The exec allowance for all arguments and variables under the stack limit
+/// `stack`. Linux allows a quarter of the stack, at least 128 KiB and at
+/// most 6 MiB.
+const fn exec_capacity_for(stack: libc::rlim_t) -> u64 {
+    const MIN: u64 = 128 * 1024;
+    const MAX: u64 = 6 * 1024 * 1024;
+    let quarter = stack / 4;
+    if quarter < MIN {
+        MIN
+    } else if quarter > MAX {
+        MAX
+    } else {
+        quarter
+    }
+}
+
+/// The hard stack limit of this process, or `None` when it cannot be read.
+fn stack_hard_limit() -> Option<libc::rlim_t> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes a valid stack value.
+    (unsafe { libc::getrlimit(libc::RLIMIT_STACK, &raw mut limit) } == 0).then_some(limit.rlim_max)
+}
+
+/// The most bytes that one exec of this executor takes for all arguments
+/// and variables.
+///
+/// Each child gets a stack limit of 8 MiB, or the hard limit of the worker
+/// when that is lower. A worker with a smaller soft limit, as under systemd
+/// `LimitSTACK`, thus keeps the full allowance.
+#[must_use]
+pub fn exec_capacity() -> u64 {
+    exec_capacity_for(stack_hard_limit().map_or(0, child_stack_limit))
 }
 
 /// The rlimit resource type: glibc and musl declare it apart.
@@ -1625,6 +1683,31 @@ mod tests {
             !listed.lines().any(|l| l == HIGH.to_string()),
             "descriptor {HIGH} reached the child: {listed}"
         );
+    }
+
+    #[test]
+    fn the_exec_capacity_follows_the_child_stack_limit() {
+        let mib = 1024 * 1024;
+        assert_eq!(child_stack_limit(libc::RLIM_INFINITY), 8 * mib);
+        assert_eq!(child_stack_limit(16 * mib), 8 * mib);
+        assert_eq!(child_stack_limit(4 * mib), 4 * mib);
+        // Linux allows a quarter of the stack, at least 128 KiB.
+        assert_eq!(exec_capacity_for(8 * mib), 2 * mib);
+        assert_eq!(exec_capacity_for(mib), 256 * 1024);
+        assert_eq!(exec_capacity_for(64 * 1024), 128 * 1024);
+        assert_eq!(exec_capacity_for(0), 128 * 1024);
+    }
+
+    #[tokio::test]
+    async fn a_child_gets_the_stack_limit_of_the_executor() {
+        let hard = stack_hard_limit().unwrap();
+        let want = if hard == libc::RLIM_INFINITY {
+            8192
+        } else {
+            (hard / 1024).min(8192)
+        };
+        let out = run(sh("ulimit -s")).await;
+        assert_eq!(out.stdout.trim(), want.to_string());
     }
 
     #[test]

@@ -50,7 +50,10 @@ An agent sends a request as JSON. Unknown fields are an error.
 
 The policy bounds the size of each request and each outcome. Both bounds must
 fit the 64 MiB guest frame, or the policy is not valid. Each runtime with the
-largest request must also fit the 2 MiB total exec limit of Linux.
+largest request must also fit the 2 MiB total exec limit of Linux. The
+executor gives each child a stack limit of 8 MiB, or the hard limit when that
+is lower. The exec allowance is a quarter of it. So a process backend under a
+hard stack limit below 8 MiB refuses a policy over that smaller allowance.
 
 The outcome is JSON too:
 
@@ -186,10 +189,11 @@ runtime refuses a policy that allows the network on a backend without one.
 - Firecracker 1.14.4 or later on 1.14, or 1.15.1 or later. The first launch
   checks the versions of `firecracker` and `jailer`. It refuses older
   versions: CVE-2026-5747 and CVE-2026-1386.
-- KSM off, nested KVM off, and no CPU vulnerability that reports
-  `Vulnerable`. A KSM, nested KVM or CPU vulnerability state that cannot be
-  read, or that is unknown, is also critical. A kernel without KSM, or
-  without a loaded KVM vendor module, is safe for that check.
+- KSM off, nested KVM off, and each CPU vulnerability `Not affected` or
+  mitigated. Any other CPU status, such as `Vulnerable` or `Unknown`, is
+  critical. A KSM, nested KVM or CPU vulnerability state that cannot be read,
+  or that is unknown, is also critical. A kernel without KSM, or without a
+  loaded KVM vendor module, is safe for that check.
 - Root owns each trusted path: the jail base, network namespace, Firecracker
   and jailer binaries, kernel, root file system and snapshot. No such path
   holds a symbolic link. Only root may write each directory above them,
@@ -341,7 +345,10 @@ So a crashed worker leaves nothing behind after the next start. A sweep kills
 only the cgroups of owners with a lease or a VM directory under its own VM
 root. So launchers with other VM roots can share one cgroup parent. A dead
 lease stays until the microVMs and the cgroups of its owner are gone. A scan
-of the VM root or the cgroup parent that fails keeps each dead lease too.
+of the VM root or the cgroup parent that fails keeps each dead lease too. A
+sweep skips the VMs of a live owner. So a launcher keeps each VM directory
+that its teardown could not remove, and removes it again before each launch
+and in each sweep.
 
 The jailer puts each microVM cgroup under `JailerConfig::cgroup_parent`. That
 is outside the cgroup of a systemd service by default. So a stop of the

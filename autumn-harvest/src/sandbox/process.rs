@@ -42,6 +42,11 @@ impl SandboxBackend for ProcessBackend {
         true
     }
 
+    /// The allowance follows the stack limit of the worker.
+    fn exec_capacity(&self) -> Option<u64> {
+        Some(super::exec::exec_capacity())
+    }
+
     fn execute(
         &self,
         job: SandboxJob,

@@ -163,7 +163,7 @@ pub struct FirecrackerLauncher {
 }
 
 /// What a launcher shares with each of its microVMs: its lease, and the
-/// cgroups that a teardown could not remove.
+/// cgroups and VM directories that a teardown could not remove.
 ///
 /// A process of the microVM can still be alive in such a cgroup.
 /// [`FirecrackerLauncher::sweep_stale`] skips the cgroups of a live owner.
@@ -178,6 +178,9 @@ pub struct FirecrackerLauncher {
 struct Tenancy {
     lease: InstanceLease,
     leftovers: Mutex<Vec<PathBuf>>,
+    /// The VM directories that a teardown could not remove. The sweep skips
+    /// the VMs of a live owner, so only the launcher tries them again.
+    dirs: Mutex<Vec<PathBuf>>,
     /// The image that a jailed launcher pinned at its start.
     pinned: Option<PinnedImage>,
 }
@@ -257,6 +260,7 @@ impl Tenancy {
         Self {
             lease,
             leftovers: Mutex::new(Vec::new()),
+            dirs: Mutex::new(Vec::new()),
             pinned,
         }
     }
@@ -276,9 +280,31 @@ impl Tenancy {
             .push(cgroup.to_path_buf());
     }
 
-    /// Kill and remove each kept cgroup again. Keep each one that is still
-    /// there.
+    /// Keep the VM directory `dir` when it is still there.
+    fn keep_dir_if_left(&self, dir: &Path) {
+        if matches!(dir.try_exists(), Ok(false)) {
+            return;
+        }
+        tracing::warn!(
+            dir = %dir.display(),
+            "could not remove a sandbox VM directory; the launcher tries it again"
+        );
+        self.dirs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(dir.to_path_buf());
+    }
+
+    /// Kill and remove each kept cgroup again, and remove each kept VM
+    /// directory again. Keep each one that is still there.
     fn retry(&self) {
+        self.dirs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|dir| {
+                let _ = crate::sandbox::exec::remove_work_dir(dir);
+                !matches!(dir.try_exists(), Ok(false))
+            });
         self.leftovers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1693,7 +1719,7 @@ impl RunningVm {
         })
         .await;
         if !matches!(removed, Ok(Ok(()))) {
-            tracing::warn!(vm = %self.id, "could not remove a sandbox VM directory");
+            self.tenancy.keep_dir_if_left(&self.vm_dir);
         }
         self.down = true;
     }
@@ -1749,7 +1775,9 @@ impl Drop for RunningVm {
         if let Some(task) = self.stderr_task.take() {
             task.abort();
         }
-        let _ = crate::sandbox::exec::remove_work_dir(&self.vm_dir);
+        if crate::sandbox::exec::remove_work_dir(&self.vm_dir).is_err() {
+            self.tenancy.keep_dir_if_left(&self.vm_dir);
+        }
     }
 }
 
@@ -2969,6 +2997,40 @@ while True:
             std::fs::read(other.join("cgroup.kill")).unwrap(),
             b"",
             "the sweep killed a cgroup of another VM root"
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_vm_directory_that_teardown_cannot_remove_is_tried_again() {
+        let dir = temp_dir();
+        let launcher = new_launcher(jailed(&dir)).unwrap();
+        // A file in place of the VM directory makes the removal fail.
+        let vm_dir = launcher.vm_root().join(new_vm_id(launcher.owner()));
+        std::fs::write(&vm_dir, b"").unwrap();
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        let prepared = Prepared {
+            vsock: dir.join("v.sock"),
+            vm_dir: vm_dir.clone(),
+            api_socket: None,
+            cgroup: None,
+            command,
+        };
+        let mut vm =
+            RunningVm::spawn("hsbx-test".into(), prepared, Arc::clone(&launcher.tenancy)).unwrap();
+        vm.teardown().await;
+        drop(vm);
+        // The sweep skips the VMs of a live owner, so only the launcher
+        // can try the directory again.
+        std::fs::remove_file(&vm_dir).unwrap();
+        std::fs::create_dir(&vm_dir).unwrap();
+        std::fs::write(vm_dir.join("file"), b"left").unwrap();
+        launcher.sweep_stale();
+        assert!(
+            !vm_dir.exists(),
+            "the launcher did not try the directory again"
         );
         drop(launcher);
         std::fs::remove_dir_all(dir).unwrap();

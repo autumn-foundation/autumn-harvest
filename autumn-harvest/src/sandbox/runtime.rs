@@ -87,6 +87,15 @@ pub trait SandboxBackend: Send + Sync + 'static {
         None
     }
 
+    /// The most bytes that one exec of the backend takes for all arguments
+    /// and variables, or `None` for [`MAX_EXEC_TOTAL_BYTES`]. A runtime
+    /// refuses a policy whose largest run is above it.
+    ///
+    /// [`MAX_EXEC_TOTAL_BYTES`]: super::policy::MAX_EXEC_TOTAL_BYTES
+    fn exec_capacity(&self) -> Option<u64> {
+        None
+    }
+
     /// Run `job`. Stop and clean up when `cancel` fires.
     fn execute(
         &self,
@@ -168,6 +177,16 @@ impl SandboxRuntime {
                  backend can use",
                 ceiling >> 20,
                 capacity >> 20
+            )));
+        }
+        // A run past the exec allowance of the backend fails with `E2BIG`.
+        let exec = policy.max_exec_total_bytes();
+        if let Some(capacity) = backend.exec_capacity()
+            && exec > capacity
+        {
+            return Err(SandboxError::Config(format!(
+                "the largest run passes {exec} bytes to exec, above the {capacity} bytes that \
+                 the backend allows"
             )));
         }
         let overhead = DEFAULT_BACKEND_OVERHEAD.max(backend.overhead());
@@ -526,6 +545,42 @@ pub(crate) mod tests {
         default.memory_bytes = 256 << 20;
         let fits = SandboxPolicy::default().with_limits(default, max);
         SandboxRuntime::new(Arc::new(SmallBackend), fits).unwrap();
+    }
+
+    /// A microVM backend whose exec takes at most 128 KiB.
+    struct TightExecBackend;
+
+    impl SandboxBackend for TightExecBackend {
+        fn isolation(&self) -> IsolationLevel {
+            IsolationLevel::MicroVm
+        }
+
+        fn exec_capacity(&self) -> Option<u64> {
+            Some(128 * 1024)
+        }
+
+        fn execute(
+            &self,
+            _job: SandboxJob,
+            _cancel: CancellationToken,
+        ) -> BoxFuture<'_, Result<SandboxOutcome, SandboxError>> {
+            Box::pin(async { Err(SandboxError::Cancelled) })
+        }
+    }
+
+    #[test]
+    fn a_policy_over_the_exec_capacity_of_the_backend_is_a_config_error() {
+        let err = SandboxRuntime::new(Arc::new(TightExecBackend), SandboxPolicy::default())
+            .expect_err("128 KiB of arguments and variables do not fit 128 KiB");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("exec")),
+            "{err:?}"
+        );
+        let mut sizes = crate::sandbox::policy::DEFAULT_SIZE_BOUNDS;
+        sizes.max_arg_bytes = 16 * 1024;
+        sizes.max_env_bytes = 16 * 1024;
+        let fits = SandboxPolicy::default().with_sizes(sizes);
+        SandboxRuntime::new(Arc::new(TightExecBackend), fits).unwrap();
     }
 
     #[test]

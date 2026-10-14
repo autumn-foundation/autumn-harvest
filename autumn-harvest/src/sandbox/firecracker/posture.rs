@@ -170,6 +170,14 @@ fn is_absent(path: &Path) -> bool {
     matches!(path.try_exists(), Ok(false))
 }
 
+/// Whether a CPU vulnerability status is a known safe one. Each other
+/// status, such as `Vulnerable`, `Unknown` or an empty file, is not.
+fn is_safe_cpu_status(status: &str) -> bool {
+    ["Not affected", "Mitigation", "KVM: Mitigation"]
+        .iter()
+        .any(|safe| status.starts_with(safe))
+}
+
 /// The detail of a critical finding for a kernel switch, or `None`.
 ///
 /// `owner` is the directory of the feature under `root`, and `file` is the
@@ -250,12 +258,12 @@ pub fn inspect_host(root: &Path, cgroup_mount: &Path) -> Vec<PostureFinding> {
             for entry in names {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 match std::fs::read_to_string(entry.path()) {
-                    Ok(state) if state.trim_start().starts_with("Vulnerable") => find(
+                    Ok(state) if is_safe_cpu_status(state.trim()) => {}
+                    Ok(state) => find(
                         "cpu_vulnerability",
-                        format!("{name}: {}", state.trim()),
+                        format!("{name}: {:?} is not a known safe status", state.trim()),
                         Severity::Critical,
                     ),
-                    Ok(_) => {}
                     Err(e) => find(
                         "cpu_vulnerability",
                         format!("{name}: the state cannot be read: {e}"),
@@ -517,6 +525,32 @@ mod tests {
         // A module that is not loaded has no directory.
         std::fs::remove_dir_all(root.join("sys/module/kvm_intel")).unwrap();
         assert_eq!(nested(&root), 0, "no KVM module");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_cpu_vulnerability_status_is_critical() {
+        let cpu = |root: &Path| {
+            inspect_host(root, Path::new("/sys/fs/cgroup"))
+                .into_iter()
+                .filter(|f| f.check == "cpu_vulnerability" && f.severity == Severity::Critical)
+                .count()
+        };
+        let root = fake_sys();
+        let file = root.join("sys/devices/system/cpu/vulnerabilities/spectre_v2");
+        for (state, want) in [
+            ("Mitigation: Enhanced IBRS\n", 0),
+            ("Not affected\n", 0),
+            ("KVM: Mitigation: Split huge pages\n", 0),
+            ("Vulnerable\n", 1),
+            ("KVM: Vulnerable\n", 1),
+            ("Processor vulnerable\n", 1),
+            ("Unknown: Dependent on hypervisor status\n", 1),
+            ("", 1),
+        ] {
+            std::fs::write(&file, state).unwrap();
+            assert_eq!(cpu(&root), want, "the status {state:?}");
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

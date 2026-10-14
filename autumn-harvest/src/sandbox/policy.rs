@@ -379,6 +379,16 @@ impl SandboxPolicy {
             .saturating_add(OUTCOME_ENVELOPE_BYTES)
     }
 
+    /// The most bytes that one run of any runtime passes to exec.
+    #[must_use]
+    pub fn max_exec_total_bytes(&self) -> u64 {
+        self.runtimes
+            .values()
+            .map(|spec| self.max_exec_bytes(spec))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The most bytes that one run of `spec` passes to exec. Each string
     /// adds a NUL and a pointer, and each variable adds `=`.
     fn max_exec_bytes(&self, spec: &RuntimeSpec) -> u64 {
