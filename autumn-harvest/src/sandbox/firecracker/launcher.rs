@@ -557,6 +557,7 @@ impl FirecrackerLauncher {
                 ));
             }
             super::jailer::check_cgroup_parent(jailer)?;
+            super::jailer::check_limits(jailer)?;
             super::jailer::check_extra_cgroups(jailer)?;
             super::jailer::check_cgroup_root(jailer, mounts)?;
             // The jailer makes the chroot and the cgroup, then drops to the
@@ -3344,6 +3345,30 @@ while True:
             "the teardown left a process of the VMM group"
         );
         drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_vmm_file_limit_too_small_is_a_config_error() {
+        let dir = temp_dir();
+        let with_limit = |limit: Option<u64>| {
+            let mut config = jailed(&dir);
+            let Confinement::Jailer(jail) = &mut config.confinement else {
+                unreachable!("a jailed config");
+            };
+            jail.nofile_limit = limit;
+            config
+        };
+        // The VMM could not open its image, its sockets or its vCPUs.
+        for limit in [0, super::super::jailer::MIN_NOFILE_LIMIT - 1] {
+            let err = new_launcher(with_limit(Some(limit))).expect_err("too few files");
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains("no-file")),
+                "{limit}: {err:?}"
+            );
+        }
+        drop(new_launcher(with_limit(Some(super::super::jailer::MIN_NOFILE_LIMIT))).unwrap());
+        drop(new_launcher(with_limit(None)).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

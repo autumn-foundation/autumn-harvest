@@ -325,7 +325,9 @@ What each microVM gets:
 - the kernel arguments `reboot=k panic=1 8250.nr_uarts=0`;
 - an 8 GiB `fsize` limit on the VMM, by default. A golden snapshot writes
   the whole guest memory to one file, so `create_golden_snapshot` refuses a
-  limit below the guest memory.
+  limit below the guest memory;
+- a `no-file` limit of 1024 on the VMM, by default. The launcher refuses a
+  limit below 128 (`MIN_NOFILE_LIMIT`), because each launch would fail.
 
 `GuestImage::extra_boot_args` adds kernel arguments. The launcher refuses an
 extra argument that replaces one of its own, and a word that starts with `-`.

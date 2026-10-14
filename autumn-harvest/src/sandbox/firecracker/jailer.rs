@@ -56,7 +56,7 @@ pub struct JailerConfig {
     /// The `fsize` rlimit of the VMM, in bytes. It must hold a snapshot of
     /// the guest memory. The default is [`DEFAULT_FSIZE_LIMIT`].
     pub fsize_limit: Option<u64>,
-    /// The `no-file` rlimit of the VMM.
+    /// The `no-file` rlimit of the VMM, at least [`MIN_NOFILE_LIMIT`].
     pub nofile_limit: Option<u64>,
 }
 
@@ -178,6 +178,27 @@ pub fn check_extra_cgroups(config: &JailerConfig) -> Result<(), SandboxError> {
         )));
     }
     Ok(())
+}
+
+/// The smallest `no-file` rlimit of a VMM. The VMM opens its image, its
+/// sockets, and the KVM handles and event descriptors of each vCPU. This
+/// leaves room for 32 vCPUs.
+pub const MIN_NOFILE_LIMIT: u64 = 128;
+
+/// Check the rlimits of the VMM.
+///
+/// # Errors
+///
+/// [`SandboxError::Config`] for a `no-file` limit below
+/// [`MIN_NOFILE_LIMIT`]. Each launch would fail, and a retry cannot help.
+pub fn check_limits(config: &JailerConfig) -> Result<(), SandboxError> {
+    match config.nofile_limit {
+        Some(limit) if limit < MIN_NOFILE_LIMIT => Err(SandboxError::Config(format!(
+            "the jailer no-file limit of {limit} is below the {MIN_NOFILE_LIMIT} files that \
+             a VMM needs"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Check that `cgroup_parent` names a cgroup below `cgroup_root`.
