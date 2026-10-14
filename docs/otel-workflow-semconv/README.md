@@ -83,7 +83,8 @@ Prior art:
 | `workflow.signal.name` | string | The name of the signal. |
 | `workflow.signal.id` | string | The unique identifier of one signal. High-cardinality. |
 
-The spans also use the general `error.type` attribute on failure.
+Each span carries the general `error.type` attribute when its operation
+ends in an error.
 
 A high-cardinality attribute is for spans only. It must not become a metric
 attribute.
@@ -100,6 +101,9 @@ attribute.
 | `span.workflow.send_signal.producer` | `PRODUCER` | `send_signal {workflow.name}` | system, operation |
 | `span.workflow.deliver_signal.consumer` | `CONSUMER` | `deliver_signal {workflow.name}` | system, operation, name, run id |
 | `span.workflow.fire_timer.internal` | `INTERNAL` | `fire_timer` | system, operation, run id |
+
+Each span sets `workflow.operation.name` to its own operation. For example,
+a `schedule_workflow` span MUST NOT carry `execute_activity`.
 
 A run id is conditionally required where an engine can lack it. The span
 MUST carry the run id when the id is available before the span ends. A

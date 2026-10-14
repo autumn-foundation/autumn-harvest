@@ -98,6 +98,10 @@ code, guard quality, and style. The fixes:
 - The Codex review on the PR found that rule 2 let a replay emit the
   schedule spans again. Rule 2 now covers each operation that history
   records. The replay guard needs the schedule spans in that rule.
+- Codex also found that a span could carry another span's operation value,
+  that `error.type` was missing on some spans, and that the run id rule was
+  too weak. Each span ref now pins its operation value. Each span carries
+  `error.type` when its operation ends in an error. Guards check both.
 
 ### 0.6 Decisions
 

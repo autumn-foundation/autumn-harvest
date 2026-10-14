@@ -38,6 +38,9 @@ const SPAN_KINDS: &[&str] = &["internal", "producer", "consumer", "client", "ser
 /// Attributes that every span must require.
 const ALWAYS_REQUIRED: &[&str] = &["workflow.system.name", "workflow.operation.name"];
 
+/// The condition under which every span must carry `error.type`.
+const ERROR_CONDITION: &str = "If the operation ends in an error.";
+
 /// The page sections that the guards read.
 const MAPPING_SECTION: &str = "## 7. Mapping from Harvest";
 const ATTRIBUTES_SECTION: &str = "## 4. Attributes";
@@ -156,6 +159,14 @@ fn span_refs(group: &Value) -> BTreeMap<String, Value> {
         (id, level)
     });
     unique(SPANS, refs)
+}
+
+/// The `note` on the `ref` entry for `attribute` in a span group.
+fn ref_note(group: &Value, attribute: &str) -> Option<String> {
+    sequence(group, "attributes")
+        .iter()
+        .find(|entry| str_field(entry, "ref") == Some(attribute))
+        .and_then(|entry| str_field(entry, "note").map(str::to_owned))
 }
 
 /// The type of a registry attribute: a scalar name, or `enum`.
@@ -504,6 +515,14 @@ fn the_model_has_the_weaver_shape() {
             "`{id}` must end with `.{kind}`"
         );
         let refs = span_refs(&group);
+        let error = refs
+            .get("error.type")
+            .and_then(|level| level.get("conditionally_required").and_then(Value::as_str));
+        assert_eq!(
+            error,
+            Some(ERROR_CONDITION),
+            "`{id}` must make `error.type` conditionally required: {ERROR_CONDITION}"
+        );
         for attribute in ALWAYS_REQUIRED {
             assert_eq!(
                 refs.get(*attribute).and_then(Value::as_str),
@@ -588,12 +607,17 @@ fn the_operation_enum_names_one_span_each() {
         .filter_map(|member| str_field(member, "value").map(str::to_owned))
         .collect();
     let mut operations = BTreeSet::new();
-    for id in span_groups().keys() {
+    for (id, group) in span_groups() {
         let operation = id
             .strip_prefix("span.workflow.")
             .and_then(|rest| rest.split('.').next())
             .unwrap_or_default()
             .to_owned();
+        let pinned = format!("MUST be `{operation}`");
+        assert!(
+            ref_note(&group, "workflow.operation.name").is_some_and(|note| note.contains(&pinned)),
+            "`{id}` must pin the operation value in its ref note: {pinned}"
+        );
         assert!(
             operations.insert(operation),
             "two span groups share an operation: `{id}`"

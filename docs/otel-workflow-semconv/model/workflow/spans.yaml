@@ -17,6 +17,7 @@ groups:
       - ref: workflow.operation.name
         requirement_level: required
         sampling_relevant: true
+        note: The value MUST be `schedule_workflow`.
       - ref: workflow.name
         requirement_level: required
         sampling_relevant: true
@@ -27,7 +28,7 @@ groups:
         requirement_level: recommended
       - ref: error.type
         requirement_level:
-          conditionally_required: If the engine refuses to schedule the run.
+          conditionally_required: If the operation ends in an error.
 
   - id: span.workflow.execute_workflow.consumer
     type: span
@@ -46,6 +47,7 @@ groups:
       - ref: workflow.operation.name
         requirement_level: required
         sampling_relevant: true
+        note: The value MUST be `execute_workflow`.
       - ref: workflow.name
         requirement_level: required
         sampling_relevant: true
@@ -58,7 +60,7 @@ groups:
         requirement_level: recommended
       - ref: error.type
         requirement_level:
-          conditionally_required: If the cycle fails the workflow run.
+          conditionally_required: If the operation ends in an error.
 
   - id: span.workflow.start_child_workflow.producer
     type: span
@@ -77,12 +79,16 @@ groups:
       - ref: workflow.operation.name
         requirement_level: required
         sampling_relevant: true
+        note: The value MUST be `start_child_workflow`.
       - ref: workflow.name
         requirement_level: required
         sampling_relevant: true
       - ref: workflow.run.id
         requirement_level:
           conditionally_required: If the child run id is available before the span ends.
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the operation ends in an error.
 
   - id: span.workflow.schedule_activity.producer
     type: span
@@ -98,6 +104,7 @@ groups:
       - ref: workflow.operation.name
         requirement_level: required
         sampling_relevant: true
+        note: The value MUST be `schedule_activity`.
       - ref: workflow.activity.name
         requirement_level: required
         sampling_relevant: true
@@ -105,6 +112,9 @@ groups:
         requirement_level: required
       - ref: workflow.queue.name
         requirement_level: recommended
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the operation ends in an error.
 
   - id: span.workflow.execute_activity.consumer
     type: span
@@ -123,6 +133,7 @@ groups:
       - ref: workflow.operation.name
         requirement_level: required
         sampling_relevant: true
+        note: The value MUST be `execute_activity`.
       - ref: workflow.activity.name
         requirement_level: required
         sampling_relevant: true
@@ -134,7 +145,7 @@ groups:
         requirement_level: recommended
       - ref: error.type
         requirement_level:
-          conditionally_required: If the attempt fails.
+          conditionally_required: If the operation ends in an error.
 
   - id: span.workflow.send_signal.producer
     type: span
@@ -155,6 +166,7 @@ groups:
       - ref: workflow.operation.name
         requirement_level: required
         sampling_relevant: true
+        note: The value MUST be `send_signal`.
       - ref: workflow.run.id
         requirement_level:
           conditionally_required: If the caller addresses one run.
@@ -166,7 +178,7 @@ groups:
         requirement_level: opt_in
       - ref: error.type
         requirement_level:
-          conditionally_required: If the engine refuses the signal.
+          conditionally_required: If the operation ends in an error.
 
   - id: span.workflow.deliver_signal.consumer
     type: span
@@ -186,6 +198,7 @@ groups:
       - ref: workflow.operation.name
         requirement_level: required
         sampling_relevant: true
+        note: The value MUST be `deliver_signal`.
       - ref: workflow.name
         requirement_level: required
         sampling_relevant: true
@@ -195,6 +208,9 @@ groups:
         requirement_level: recommended
       - ref: workflow.signal.id
         requirement_level: opt_in
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the operation ends in an error.
 
   - id: span.workflow.fire_timer.internal
     type: span
@@ -213,5 +229,10 @@ groups:
       - ref: workflow.operation.name
         requirement_level: required
         sampling_relevant: true
+        note: The value MUST be `fire_timer`.
       - ref: workflow.run.id
         requirement_level: required
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the operation ends in an error.
+
