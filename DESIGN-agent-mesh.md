@@ -6,11 +6,9 @@ no delegation, no hop or cycle control, no budget split, and no rule over a
 sequence of tool calls. This change adds those primitives to
 `autumn-harvest-agent`.
 
-**No migration. No new `WorkflowEvent` variant.** `trunk-dev` made the AC16
-compile fix in #2138. One core engine change is a port of a separate
-`trunk-dev` fix: a redundant wake keeps resident activities parked
-(`resident.rs`). It removes a CI flake that this branch hit, and it lands
-on `trunk-dev` on its own. The change adds one
+**No migration. No new `WorkflowEvent` variant. No core engine change.**
+`trunk-dev` made the AC16 compile fix in #2138. It also took the resident
+fix that this branch hit in CI, as #2153. The change adds one
 activity, `agent_discover_peers`, and new optional fields on recorded
 payloads. Each new field is left out at its default, so a run with no
 mandate records the same bytes as before.
@@ -197,4 +195,4 @@ API and docs, and test quality. Each row names a finding and its fix.
 | F12 | Codex: the tool-call worker does not check the labels that the decision saw. A deploy can change a tool between the two. | `ToolCallRequest::labels` carries the recorded labels. The activity refuses a tool whose labels grew. | AC10 |
 | F13 | CI: the `verus` job fails on `trunk-dev` too. The pinned rolling Verus release has no assets now. | Pin the weekly release `0.2026.10.04.426d8b0`. All 33 proofs verify with it. `trunk-dev` made the same pin in #2138, and the merge keeps its version. | AC16 |
 | F14 | Review: a first `OnComplete` design read a complete label set as an approval. A waiting call in the same turn, a rejection, or carried labels then released the rule. | `Recheck::UntilApproved` releases a rule only on a recorded approval. The workflow holds the released rules. | AC10 |
-| F15 | CI: `resident_outcome_tests` failed in about 10 to 25% of runs on `trunk-dev` code. A redundant wake declined and replayed cold. | Port of the separate `trunk-dev` fix: each parked activity waits again. 40 of 40 local Postgres runs pass. | AC16 |
+| F15 | CI: `resident_outcome_tests` failed in about 10 to 25% of runs on `trunk-dev` code. A redundant wake declined and replayed cold. | Fixed on `trunk-dev` in #2153: each parked activity waits again. The branch carried a port until #2153 landed. | AC16 |
