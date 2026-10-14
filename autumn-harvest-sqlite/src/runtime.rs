@@ -141,6 +141,13 @@ pub enum RunState {
     WaitingSignal(String),
     /// Blocked awaiting a durable timer that has not yet fired.
     WaitingTimer,
+    /// Blocked awaiting the named workflow mutex (issue #2029). Another run
+    /// holds the key, or is ahead in its queue. A drive after the release
+    /// grants it.
+    WaitingMutex(String),
+    /// The run passed its `execution_timeout` and ended `TIMED_OUT` (issue
+    /// #2029). The payload is the stored error.
+    TimedOut(String),
     /// The run ended `CANCELLED` (issue #2021). The payload is the reason.
     Cancelled(String),
     /// The run ended `TERMINATED` (issue #2021). The payload is the reason, not
