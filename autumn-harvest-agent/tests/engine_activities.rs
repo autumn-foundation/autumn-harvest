@@ -60,6 +60,10 @@ fn turn_request() -> ModelTurnRequest {
         memory_scope: None,
         extra_tools: Vec::new(),
         tenant: None,
+        agent: None,
+        allowed_tools: None,
+        flow_labels: std::collections::BTreeSet::new(),
+        flow_released: autumn_harvest_agent::Released::new(),
     }
 }
 
@@ -146,6 +150,8 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
         step: 0,
         memory_scope: None,
         read_only: false,
+        allowed_tools: None,
+        labels: None,
         call: ToolCall {
             id: "c1".into(),
             name: "read".into(),
@@ -246,6 +252,7 @@ fn the_engine_registration_builds() {
             "agent_memory_snapshot",
             "agent_deliver",
             "agent_precheck",
+            "agent_discover_peers",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();
@@ -354,6 +361,8 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
             step: 0,
             memory_scope: None,
             read_only: false,
+            allowed_tools: None,
+            labels: None,
             call: ToolCall {
                 id: "c".into(),
                 name: "fail".into(),
@@ -579,6 +588,8 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
             step: 0,
             memory_scope: None,
             read_only: true,
+            allowed_tools: None,
+            labels: None,
             call: ToolCall {
                 id: "c".into(),
                 name: "write".into(),

@@ -17,6 +17,7 @@
 //! snapshot. It can write memory only with
 //! [`HeartbeatTask::allow_memory_writes`].
 
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::time::Duration;
 
@@ -99,6 +100,11 @@ pub struct HeartbeatTask {
     /// [`AgentTask::tenant`](crate::AgentTask::tenant).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// The flow labels that earlier ticks exercised. Pass the
+    /// `flow_labels` of the last report here with its messages. See
+    /// [`AgentTask::flow_labels`](crate::AgentTask::flow_labels).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 fn default_prompt() -> String {
@@ -136,6 +142,7 @@ impl HeartbeatTask {
             approval_timeout_secs: DEFAULT_HEARTBEAT_APPROVAL_TIMEOUT_SECS,
             allow_memory_writes: false,
             tenant: None,
+            flow_labels: BTreeSet::new(),
         }
     }
 
@@ -242,6 +249,7 @@ impl HeartbeatTask {
         task.unattended = true;
         task.unattended_memory_writes = self.allow_memory_writes;
         task.tenant.clone_from(&self.tenant);
+        task.flow_labels.clone_from(&self.flow_labels);
         task
     }
 }
@@ -342,6 +350,32 @@ mod tests {
         assert!(!task.read_only);
         assert!(task.unattended);
         assert_eq!(task.memory_tool_scope(), None);
+    }
+
+    #[test]
+    fn a_tick_carries_the_flow_labels_of_earlier_ticks() {
+        assert_eq!(
+            HeartbeatTask::new().agent_task().flow_labels,
+            BTreeSet::new()
+        );
+        let carried = HeartbeatTask {
+            flow_labels: BTreeSet::from(["untrusted_input".to_owned()]),
+            ..HeartbeatTask::new()
+        };
+        assert_eq!(
+            carried.agent_task().flow_labels,
+            BTreeSet::from(["untrusted_input".to_owned()]),
+            "a tick starts with the labels of the earlier ticks"
+        );
+        let old = serde_json::json!({"prompt": "tick"});
+        let decoded: HeartbeatTask = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.flow_labels, BTreeSet::new());
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("flow_labels")
+                .is_none()
+        );
     }
 
     #[test]

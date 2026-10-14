@@ -5,13 +5,18 @@
 //! delivery and the precheck. The engine runs its methods as activities, so
 //! each result is recorded once and replayed after that.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use tracing::Instrument;
+
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
+use crate::flow::{FlowRules, Released, call_labels};
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
+use crate::mesh::{DELEGATE_TOOL, Peer, delegate_definition, valid_name};
 use crate::message::{ContentPart, RunId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
@@ -96,6 +101,8 @@ pub struct AgentHarness {
     delivery: Arc<dyn Delivery>,
     precheck: Option<Arc<dyn Precheck>>,
     cache: Option<ResponseCache>,
+    roster: Vec<Peer>,
+    flow: FlowRules,
 }
 
 impl AgentHarness {
@@ -119,6 +126,8 @@ impl AgentHarness {
             delivery: Arc::new(LogDelivery),
             precheck: None,
             cache: None,
+            roster: Vec::new(),
+            flow: FlowRules::new(),
         }
     }
 
@@ -235,6 +244,44 @@ impl AgentHarness {
         self
     }
 
+    /// Add one peer to the roster. A run whose mandate names the peer can
+    /// delegate to it. When two peers share a name, the later one wins at
+    /// lookup.
+    #[must_use]
+    pub fn peer(mut self, peer: Peer) -> Self {
+        self.roster.push(peer);
+        self
+    }
+
+    /// Install flow rules. They gate each tool call against the labels that
+    /// the run tree has exercised.
+    #[must_use]
+    pub fn flow_rules(mut self, rules: FlowRules) -> Self {
+        self.flow = rules;
+        self
+    }
+
+    /// The peers of the roster that `names` lists, in name order.
+    ///
+    /// The result skips a name with no peer and a peer with an invalid name.
+    #[must_use]
+    pub fn discover_peers(&self, names: &[String]) -> Vec<Peer> {
+        let wanted: BTreeSet<&String> = names.iter().collect();
+        let mut found = BTreeMap::new();
+        for peer in self
+            .roster
+            .iter()
+            .filter(|peer| wanted.contains(&peer.name))
+        {
+            if valid_name(&peer.name) {
+                found.insert(peer.name.clone(), peer.clone());
+            } else {
+                tracing::warn!(peer = %peer.name, "a peer with an invalid name is left out");
+            }
+        }
+        found.into_values().collect()
+    }
+
     /// Set the time budget of one response-cache call. One turn makes at
     /// most three. Keep the sum of the model, policy, cache and budget-check
     /// budgets below the 15-minute `start_to_close` of `agent_model_turn`.
@@ -345,13 +392,46 @@ impl AgentHarness {
         &self,
         request: ModelTurnRequest,
         tenant: CacheTenant,
+        prepare: impl FnMut(&mut Vec<ContentPart>),
+    ) -> Result<(ModelTurn, Option<Duration>), String> {
+        let span = tracing::info_span!(
+            "agent_model_turn",
+            gen_ai.agent.name = tracing::field::Empty
+        );
+        if let Some(agent) = &request.agent {
+            span.record("gen_ai.agent.name", agent.as_str());
+        }
+        self.model_turn_spanned(request, tenant, prepare)
+            .instrument(span)
+            .await
+    }
+
+    /// The body of [`model_turn_timed_in`](Self::model_turn_timed_in).
+    async fn model_turn_spanned(
+        &self,
+        request: ModelTurnRequest,
+        tenant: CacheTenant,
         mut prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<(ModelTurn, Option<Duration>), String> {
-        let builtins = self.builtins(
+        let mut builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
         );
-        let tools: Vec<_> = self.visible(&builtins).map(Tool::definition).collect();
+        let allowed = request.allowed_tools.as_ref();
+        // Only a run with a mandate names its acting agent.
+        let mandate = request.agent.is_some();
+        // Under a mandate with no peer to offer, a `delegate` call is still a
+        // delegation. A hidden stand-in lets the decision treat it as the
+        // workflow tool, so the workflow refuses it with a named verdict.
+        let hidden_delegate = mandate && !builtins.iter().any(|tool| tool.name() == DELEGATE_TOOL);
+        if hidden_delegate {
+            builtins.push(Arc::new(WorkflowTool(delegate_definition(&[]))));
+        }
+        let tools: Vec<_> = self
+            .permitted(&builtins, allowed)
+            .filter(|tool| !(hidden_delegate && tool.name() == DELEGATE_TOOL))
+            .map(Tool::definition)
+            .collect();
         let chat = ChatRequest {
             messages: request.messages,
             tools,
@@ -393,6 +473,8 @@ impl AgentHarness {
                 usage: response.usage,
                 decisions: Vec::new(),
                 cache_hit,
+                labels: Vec::new(),
+                releases: Vec::new(),
             };
             let info = RunInfo {
                 run_id: RunId::new(request.run_id.clone()),
@@ -404,7 +486,13 @@ impl AgentHarness {
             self.decide_calls(
                 &mut turn,
                 &info,
-                (request.read_only, &builtins),
+                Scope {
+                    read_only: request.read_only,
+                    builtins: &builtins,
+                    allowed,
+                    exercised: &request.flow_labels,
+                    released: &request.flow_released,
+                },
                 &mut policy_budget,
             )
             .await;
@@ -486,9 +574,16 @@ impl AgentHarness {
         &self,
         turn: &mut ModelTurn,
         info: &RunInfo,
-        (read_only, builtins): (bool, &[Arc<dyn Tool>]),
+        scope: Scope<'_>,
         budget: &mut Duration,
     ) {
+        let Scope {
+            read_only,
+            builtins,
+            allowed,
+            exercised,
+            released,
+        } = scope;
         let started = tokio::time::Instant::now();
         let deadline = started + *budget;
         let read_only_policy: Arc<dyn ToolPolicy>;
@@ -503,14 +598,53 @@ impl AgentHarness {
         } else {
             self.policy.as_ref()
         };
+        // Each call that is not denied may run. Its labels count for the
+        // calls after it in this turn before it runs, so the check fails
+        // closed. A release counts only after the approval, so a call that
+        // waits releases nothing for the calls after it.
+        let mut seen = exercised.clone();
+        let can_release = self.flow.can_release();
         for call in turn.calls() {
+            if can_release {
+                turn.releases.push(Released::new());
+            }
+            if !permits(builtins, allowed, &call.name) {
+                turn.decisions.push(ToolDecision::Deny {
+                    reason: format!("the tool {:?} is not in this agent's mandate", call.name),
+                });
+                if !self.flow.is_empty() {
+                    turn.labels.push(BTreeSet::new());
+                }
+                continue;
+            }
             let tool = self.visible(builtins).find(|tool| tool.name() == call.name);
+            if tool.is_none() && !self.flow.is_empty() {
+                // This worker cannot label the call. Another worker with
+                // another tool list could run it with no labels.
+                turn.decisions.push(ToolDecision::Deny {
+                    reason: format!("unknown tool {:?}: flow rules need its labels", call.name),
+                });
+                turn.labels.push(BTreeSet::new());
+                continue;
+            }
             let decide = policy.decide(&call, tool, info);
-            let decision = tokio::time::timeout_at(deadline, decide)
+            let mut decision = tokio::time::timeout_at(deadline, decide)
                 .await
                 .unwrap_or_else(|_| ToolDecision::Deny {
                     reason: format!("the policy did not decide within {:?}", self.policy_timeout),
                 });
+            if !self.flow.is_empty() {
+                let labels = call_labels(tool);
+                let (flow, freed) = self.flow.decide(&seen, released, &labels);
+                decision = strictest(decision, flow);
+                if !matches!(decision, ToolDecision::Deny { .. }) {
+                    seen.extend(labels.iter().cloned());
+                    if let Some(slot) = turn.releases.last_mut() {
+                        *slot = freed;
+                    }
+                }
+                turn.labels.push(labels);
+            }
             turn.decisions.push(decision);
         }
         *budget = budget.saturating_sub(started.elapsed());
@@ -605,6 +739,14 @@ impl AgentHarness {
     pub async fn tool_call(&self, request: ToolCallRequest) -> Result<ToolOutcome, String> {
         let call = request.call;
         let builtins = self.builtins(request.memory_scope.as_ref(), std::iter::empty());
+        // A second check of the mandate. The decision and the call can run on
+        // workers with different tool lists.
+        if !permits(&builtins, request.allowed_tools.as_ref(), &call.name) {
+            return Ok(self.error_outcome(&format!(
+                "the tool {:?} is not in this agent's mandate",
+                call.name
+            )));
+        }
         let Some(tool) = self
             .visible(&builtins)
             .find(|tool| tool.name() == call.name)
@@ -615,6 +757,14 @@ impl AgentHarness {
         // run on workers with different tool lists, for example in a deploy.
         if request.read_only && tool.effect() >= ToolEffect::Write {
             return Ok(self.error_outcome("this run may only read data"));
+        }
+        // The same reason applies to the flow labels. A tool that gained a
+        // label after the decision did not pass the flow rules with it.
+        if let Some(recorded) = &request.labels
+            && !call_labels(Some(tool)).is_subset(recorded)
+        {
+            return Ok(self
+                .error_outcome("the tool labels changed after the decision; call the tool again"));
         }
         let ctx = ToolContext {
             run_id: RunId::new(request.run_id),
@@ -734,10 +884,21 @@ impl AgentHarness {
             .collect()
     }
 
+    /// The visible tools that `allowed` permits.
+    fn permitted<'a>(
+        &'a self,
+        builtins: &'a [Arc<dyn Tool>],
+        allowed: Option<&'a BTreeSet<String>>,
+    ) -> impl Iterator<Item = &'a dyn Tool> {
+        self.visible(builtins)
+            .filter(move |tool| permits(builtins, allowed, tool.name()))
+    }
+
     /// The built-in tools, then each app tool whose name no built-in takes.
     ///
     /// A built-in wins a name clash. Two tools with one name would make many
-    /// providers refuse the request.
+    /// providers refuse the request. Under a mandate, the built-ins always
+    /// hold `delegate`, so the name stays reserved.
     fn visible<'a>(&'a self, builtins: &'a [Arc<dyn Tool>]) -> impl Iterator<Item = &'a dyn Tool> {
         // With a store installed, `memory` stays reserved even when this run
         // gets no memory tool. An app tool of that name could otherwise slip
@@ -752,6 +913,42 @@ impl AgentHarness {
                 .map(AsRef::as_ref)
                 .filter(move |tool| !taken(tool.name())),
         )
+    }
+}
+
+/// What bounds the decisions of one turn.
+struct Scope<'a> {
+    /// Apply the read-only rules on top of the policy.
+    read_only: bool,
+    /// The built-in tools of the turn.
+    builtins: &'a [Arc<dyn Tool>],
+    /// The harness tools that the mandate permits. `None` means every tool.
+    allowed: Option<&'a BTreeSet<String>>,
+    /// The flow labels that the run tree exercised before the turn.
+    exercised: &'a BTreeSet<String>,
+    /// The flow rules that a person released before the turn.
+    released: &'a Released,
+}
+
+/// Whether the mandate permits the tool `name`.
+///
+/// The mandate never bounds a workflow tool, such as `delegate`. Its own
+/// switch governs it. The `memory` tool writes state that later runs read,
+/// so an allowlist must name it.
+fn permits(builtins: &[Arc<dyn Tool>], allowed: Option<&BTreeSet<String>>, name: &str) -> bool {
+    allowed.is_none_or(|allowed| allowed.contains(name))
+        || (name != MEMORY_TOOL && builtins.iter().any(|tool| tool.name() == name))
+}
+
+/// The stricter of two decisions: a deny, then an approval, then an allow.
+/// Two approvals keep the first reason.
+fn strictest(first: ToolDecision, second: ToolDecision) -> ToolDecision {
+    match (&first, &second) {
+        (ToolDecision::Deny { .. }, _) => first,
+        (_, ToolDecision::Deny { .. }) => second,
+        (ToolDecision::RequireApproval { .. }, _) => first,
+        (_, ToolDecision::RequireApproval { .. }) => second,
+        _ => first,
     }
 }
 
@@ -859,7 +1056,7 @@ fn cut_bytes(text: String, max: usize) -> String {
 }
 
 /// Cut `text` to `limit` characters and mark the cut.
-fn truncate(text: &str, limit: usize) -> String {
+pub(crate) fn truncate(text: &str, limit: usize) -> String {
     match text.char_indices().nth(limit) {
         None => text.to_owned(),
         Some((end, _)) => format!("{}{TRUNCATED}", &text[..end]),
