@@ -1140,6 +1140,8 @@ impl WorkflowReplayer {
     /// with the global timeout, no live deadline, and the resolved parent;
     /// [`replay_from_db`](Self::replay_from_db) passes the loaded execution row's
     /// own values.
+    // One linear setup per replay mode. A split would only move the lines.
+    #[allow(clippy::too_many_lines)]
     async fn replay_from_snapshot_effective(
         &self,
         snapshot: HistorySnapshot,
@@ -1166,21 +1168,6 @@ impl WorkflowReplayer {
                 reproduced_failure: None,
             };
         };
-        // Issue #2029: a run sealed TIMED_OUT replays up to its seal.
-        if let Some(seal) = timed_out_seal_start(&snapshot.events) {
-            let mut prefix = snapshot;
-            prefix.events.truncate(seal);
-            return self
-                .replay_canary_snapshot_effective(
-                    prefix,
-                    execution_timeout,
-                    deadline_at,
-                    parent_execution_id,
-                    workflow_id,
-                    queue_name,
-                )
-                .await;
-        }
 
         // Issue #798 (Codex round 21): borrow the candidate's declarative
         // handlers for the duration of the executor call.
@@ -1208,6 +1195,24 @@ impl WorkflowReplayer {
                 };
             }
         };
+        // Issue #2029: a run sealed TIMED_OUT replays up to its seal. The
+        // events are inflated first, as on the strict path.
+        if let Some(seal) = timed_out_seal_start(&events) {
+            let prefix = HistorySnapshot {
+                events: events[..seal].to_vec(),
+                ..snapshot
+            };
+            return self
+                .replay_canary_snapshot_effective(
+                    prefix,
+                    execution_timeout,
+                    deadline_at,
+                    parent_execution_id,
+                    workflow_id,
+                    queue_name,
+                )
+                .await;
+        }
         let total_events = events.len();
         // Issue #952: computed before `events` is moved into the runner.
         let failing_tail = history_ends_in_terminal_failure(&events);
