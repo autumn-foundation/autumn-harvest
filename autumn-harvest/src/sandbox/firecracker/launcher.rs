@@ -269,8 +269,9 @@ pub struct FirecrackerLauncher {
     exec_name: String,
     owner: String,
     /// Set after the first version check that passes.
-    /// The Firecracker version, once the first check passed.
-    versions_checked: tokio::sync::OnceCell<super::posture::Version>,
+    /// The VMM binaries and the Firecracker version of the last check that
+    /// passed. A binary replaced since then is checked again.
+    versions_checked: tokio::sync::Mutex<Option<(Vec<FileId>, super::posture::Version)>>,
     /// The lease and the leftover cgroups, shared with each microVM.
     tenancy: Arc<Tenancy>,
 }
@@ -634,7 +635,7 @@ impl FirecrackerLauncher {
             config,
             exec_name,
             owner,
-            versions_checked: tokio::sync::OnceCell::new(),
+            versions_checked: tokio::sync::Mutex::new(None),
             tenancy: Arc::new(Tenancy::new(lease, pinned)),
         })
     }
@@ -876,23 +877,34 @@ impl FirecrackerLauncher {
     /// Check the Firecracker and jailer versions once. A failed check runs
     /// again on the next call.
     async fn check_versions(&self) -> Result<super::posture::Version, SandboxError> {
-        let version = self
-            .versions_checked
-            .get_or_try_init(|| async {
-                use super::posture::{VmmBinary, probe_version};
-                let version =
-                    probe_version(&self.config.firecracker_bin, VmmBinary::Firecracker).await?;
-                if let Confinement::Jailer(jailer) = &self.config.confinement {
-                    probe_version(&jailer.jailer_bin, VmmBinary::Jailer).await?;
-                }
-                let meta = self.tenancy.pinned.as_ref().and_then(|p| p.meta.as_ref());
-                if let Some(meta) = meta {
-                    meta.check_firecracker(version)?;
-                }
-                Ok::<_, SandboxError>(version)
-            })
-            .await?;
-        Ok(*version)
+        use super::posture::{VmmBinary, probe_version};
+        let mut binaries = vec![self.config.firecracker_bin.as_path()];
+        if let Confinement::Jailer(jailer) = &self.config.confinement {
+            binaries.push(&jailer.jailer_bin);
+        }
+        // Each launch runs the binaries by path. A deploy can replace one
+        // while the worker runs, so a passed check holds only for its files.
+        let ids = binaries
+            .iter()
+            .map(|path| file_id(path))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut checked = self.versions_checked.lock().await;
+        if let Some((seen, version)) = checked.as_ref()
+            && *seen == ids
+        {
+            return Ok(*version);
+        }
+        let version = probe_version(&self.config.firecracker_bin, VmmBinary::Firecracker).await?;
+        if let Confinement::Jailer(jailer) = &self.config.confinement {
+            probe_version(&jailer.jailer_bin, VmmBinary::Jailer).await?;
+        }
+        let meta = self.tenancy.pinned.as_ref().and_then(|p| p.meta.as_ref());
+        if let Some(meta) = meta {
+            meta.check_firecracker(version)?;
+        }
+        *checked = Some((ids, version));
+        drop(checked);
+        Ok(version)
     }
 
     /// Create the VM directory and the command for `id`.
@@ -1354,18 +1366,47 @@ const SNAPSHOT_MEMORY_FILE: &str = "snapshot.mem";
 /// the whole guest memory.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// What identifies the file at a path. A replaced or rewritten file has
+/// another inode, size or change time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileId {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+/// The identity of the file at `path`.
+fn file_id(path: &Path) -> Result<FileId, SandboxError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| SandboxError::Config(format!("cannot inspect {}: {e}", path.display())))?;
+    Ok(FileId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        size: meta.size(),
+        mtime: (meta.mtime(), meta.mtime_nsec()),
+        ctime: (meta.ctime(), meta.ctime_nsec()),
+    })
+}
+
 /// The most bytes of a snapshot manifest.
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 
-/// Read the snapshot manifest at `path`. A symbolic link is refused, and
-/// the read stops at [`MAX_MANIFEST_BYTES`].
+/// Read the snapshot manifest at `path`. A symbolic link or a file that is
+/// not regular is refused, and the read stops at [`MAX_MANIFEST_BYTES`].
+/// The open does not block, so a FIFO cannot stall the launcher start.
 fn read_manifest(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("it is not a regular file"));
+    }
     let mut bytes = Vec::new();
     file.take(MAX_MANIFEST_BYTES).read_to_end(&mut bytes)?;
     Ok(bytes)
@@ -2544,6 +2585,59 @@ mod tests {
         std::fs::remove_file(&manifest).unwrap();
         std::fs::rename(&real, &manifest).unwrap();
         drop(new_launcher(config.clone()).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_manifest_that_is_not_a_file_is_a_config_error() {
+        let dir = temp_dir();
+        let files = SnapshotFiles {
+            state: dir.join("snap.state"),
+            memory: dir.join("snap.mem"),
+        };
+        std::fs::write(&files.state, b"state").unwrap();
+        std::fs::write(&files.memory, b"memory").unwrap();
+        let mut config = jailed(&dir);
+        config.boot = BootMethod::Snapshot(files.clone());
+        // A FIFO with no writer blocks a plain open for ever.
+        let fifo = std::ffi::CString::new(
+            SnapshotMeta::path(&files.state)
+                .into_os_string()
+                .into_encoded_bytes(),
+        )
+        .unwrap();
+        // SAFETY: mkfifo reads a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(new_launcher(config).map(drop)));
+        let result = result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the launcher start must not wait for a writer");
+        assert!(
+            matches!(result, Err(SandboxError::Config(ref m)) if m.contains("manifest")),
+            "{result:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_replaced_vmm_binary_is_checked_again() {
+        let dir = temp_dir();
+        let launcher = new_launcher(jailed(&dir)).unwrap();
+        assert_eq!(launcher.check_versions().await.unwrap(), (1, 17, 0));
+        // A deploy replaces Firecracker with a version that has a known escape.
+        let next = dir.join("firecracker.next");
+        crate::sandbox::firecracker::fake::write_executable(
+            &next,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'Firecracker v1.10.0'; exit 0; fi\n",
+        );
+        std::fs::rename(&next, &launcher.config().firecracker_bin).unwrap();
+        let err = launcher
+            .check_versions()
+            .await
+            .expect_err("the old check must not cover the new binary");
+        assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+        drop(launcher);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

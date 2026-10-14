@@ -380,7 +380,10 @@ fn image_links_cannot_take_a_build_write_out_of_the_image() {
     let resolved = |path: &str| {
         let out = resolve(path);
         assert!(out.status.success(), "{path}: {out:?}");
-        String::from_utf8(out.stdout).expect("utf-8").trim().to_owned()
+        String::from_utf8(out.stdout)
+            .expect("utf-8")
+            .trim()
+            .to_owned()
     };
     let inside = |rel: &str| root.join(rel).display().to_string();
     // An absolute link starts again at the image root, and `..` stops there.
@@ -396,8 +399,14 @@ fn image_links_cannot_take_a_build_write_out_of_the_image() {
     assert!(!resolve("/loop").status.success(), "a link loop must fail");
     // The build writes the agent and its directories through the helper.
     let script = read("scripts/sandbox/build-guest-image.sh");
-    assert!(script.contains("image_path \"${rootfs}\" /sbin"), "{script}");
-    assert!(!script.contains("install -D"), "install -D follows image links");
+    assert!(
+        script.contains("image_path \"${rootfs}\" /sbin"),
+        "{script}"
+    );
+    assert!(
+        !script.contains("install -D"),
+        "install -D follows image links"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 

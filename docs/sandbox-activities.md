@@ -190,7 +190,8 @@ runtime refuses a policy that allows the network on a backend without one.
   under it.
 - Firecracker 1.14.4 or later on 1.14, or 1.15.1 or later. The first launch
   checks the versions of `firecracker` and `jailer`. It refuses older
-  versions: CVE-2026-5747 and CVE-2026-1386.
+  versions: CVE-2026-5747 and CVE-2026-1386. A launch checks them again
+  when a deploy replaced or changed either binary since the last check.
 - KSM off, nested KVM off, and each CPU vulnerability `Not affected` or
   mitigated. Any other CPU status, such as `Vulnerable` or `Unknown`, is
   critical. A KSM, nested KVM or CPU vulnerability state that cannot be read,
