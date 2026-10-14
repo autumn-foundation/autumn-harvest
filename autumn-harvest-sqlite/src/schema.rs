@@ -40,6 +40,9 @@
 //!   failures live here, not in `harvest_events`, mirroring the Postgres engine's
 //!   `requeue_for_retry` (which stores the attempt error on the task-queue row,
 //!   not `harvest_events`). Only terminal outcomes reach the replayable log.
+//! - `harvest_mutex_locks`, `harvest_mutex_waiters` and `harvest_mutex_seq` —
+//!   the workflow mutex (issue #2029). A lock row holds a key. The waiter rows
+//!   form a FIFO queue per key. The counter mints each fencing `lock_seq`.
 
 /// The full schema, applied idempotently on
 /// [`SqliteRuntime::open`](crate::SqliteRuntime::open).
@@ -60,16 +63,30 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
                                            -- which injects StartWorkflowParams.workflow_id).
     input_json    TEXT NOT NULL,
     state         TEXT NOT NULL,          -- RUNNING | COMPLETED | FAILED | CANCELLED |
-                                           -- TERMINATED | CONTINUED_AS_NEW
+                                           -- TERMINATED | TIMED_OUT | CONTINUED_AS_NEW
     output_json   TEXT,
     error         TEXT,
     cancel_reason TEXT,                    -- a cooperative cancel request (issue #2021).
                                            -- NULL until `cancel` stores a request. The
                                            -- drive reads it only while the run is
                                            -- RUNNING. A terminal run keeps the value.
-    cancel_from_seq INTEGER                -- the history length when `cancel` stored
+    cancel_from_seq INTEGER,               -- the history length when `cancel` stored
                                            -- the request (issue #2021). It bounds the
                                            -- events that a cleanup can add.
+    execution_timeout_ms INTEGER,          -- the declared execution_timeout (issue
+                                           -- #2029). NULL = no timeout. A successor
+                                           -- re-anchors its deadline with it.
+    deadline_at INTEGER,                   -- the epoch-millisecond deadline of this run
+                                           -- (issue #2029). NULL = no deadline.
+    start_at INTEGER,                      -- the earliest epoch-millisecond a drive may
+                                           -- run this run (issue #2029). A retry
+                                           -- successor waits for its backoff here.
+    workflow_attempt INTEGER NOT NULL DEFAULT 1, -- the 1-based workflow retry attempt
+                                           -- (issue #2029).
+    retry_policy_json TEXT,                -- the frozen workflow-level RetryPolicy
+                                           -- (issue #2029). NULL = no retry.
+    retry_of_exec_id TEXT                  -- the failed run that this retry replaces
+                                           -- (issue #2029).
 );
 
 -- Non-unique lookup index for the (workflow_name, workflow_id) reuse-policy probe
@@ -221,6 +238,33 @@ CREATE INDEX IF NOT EXISTS idx_harvest_signals_exec_arrival
     ON harvest_signals (exec_id, delivered, received_at, signal_seq);
 DROP INDEX IF EXISTS idx_harvest_signals_exec_delivered;
 
+-- The workflow mutex (issue #2029). A lock row means the key is held. The
+-- grant and the release run in the drive transaction of the single writer.
+CREATE TABLE IF NOT EXISTS harvest_mutex_locks (
+    lock_key       TEXT PRIMARY KEY,
+    holder_exec_id TEXT NOT NULL,
+    lock_seq       INTEGER NOT NULL        -- the fencing token of the grant
+);
+CREATE INDEX IF NOT EXISTS idx_harvest_mutex_locks_holder
+    ON harvest_mutex_locks (holder_exec_id);
+
+-- The FIFO queue of runs that wait for a key. `waiter_seq` is the order.
+CREATE TABLE IF NOT EXISTS harvest_mutex_waiters (
+    waiter_seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+    lock_key       TEXT NOT NULL,
+    waiter_exec_id TEXT NOT NULL,
+    UNIQUE (lock_key, waiter_exec_id)
+);
+CREATE INDEX IF NOT EXISTS idx_harvest_mutex_waiters_exec
+    ON harvest_mutex_waiters (waiter_exec_id);
+
+-- One row. It mints a new `lock_seq` for each grant, so a token is never
+-- reused after a release.
+CREATE TABLE IF NOT EXISTS harvest_mutex_seq (
+    id   INTEGER PRIMARY KEY CHECK (id = 1),
+    last INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
     attempt_seq INTEGER PRIMARY KEY AUTOINCREMENT,
     exec_id     TEXT NOT NULL,
@@ -261,6 +305,10 @@ use crate::error::SqliteResult;
 /// - **issue #2021** — `harvest_executions.cancel_reason`, the stored cooperative
 ///   cancel request, and `cancel_from_seq`, the history length at the request.
 ///   Both are nullable, so an old row has no pending cancel.
+/// - **issue #2029** — `harvest_executions.execution_timeout_ms`, `deadline_at`,
+///   `start_at`, `workflow_attempt`, `retry_policy_json` and `retry_of_exec_id`.
+///   Each is nullable or has a default, so an old row has no timeout and no
+///   retry. The mutex tables are new, so `CREATE TABLE IF NOT EXISTS` adds them.
 ///
 /// # Errors
 ///
@@ -306,6 +354,22 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "cancel_from_seq",
         "ALTER TABLE harvest_executions ADD COLUMN cancel_from_seq INTEGER",
     )?;
+    // issue #2029: the execution timeout and the workflow retry.
+    for (column, ddl) in [
+        ("execution_timeout_ms", "INTEGER"),
+        ("deadline_at", "INTEGER"),
+        ("start_at", "INTEGER"),
+        ("workflow_attempt", "INTEGER NOT NULL DEFAULT 1"),
+        ("retry_policy_json", "TEXT"),
+        ("retry_of_exec_id", "TEXT"),
+    ] {
+        add_column_if_absent(
+            conn,
+            "harvest_executions",
+            column,
+            &format!("ALTER TABLE harvest_executions ADD COLUMN {column} {ddl}"),
+        )?;
+    }
     Ok(())
 }
 
@@ -409,6 +473,34 @@ mod tests {
         assert_eq!(state, "RUNNING");
         assert_eq!(reason, None);
         assert_eq!(from, None);
+    }
+
+    // Issue #2029: an old row gains the timeout and retry columns. It has no
+    // deadline, no start delay and no policy, and it is attempt 1.
+    #[test]
+    fn migrate_adds_the_timeout_and_retry_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
+        conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO harvest_executions (exec_id, workflow_name, input_json, state) \
+             VALUES ('e1', 'wf', '{}', 'RUNNING')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let row: (Option<i64>, Option<i64>, Option<i64>, i64, Option<String>, Option<String>) =
+            conn.query_row(
+                "SELECT execution_timeout_ms, deadline_at, start_at, workflow_attempt, \
+                 retry_policy_json, retry_of_exec_id FROM harvest_executions",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, None, None, 1, None, None));
     }
 
     // An old-schema `harvest_tasks` (missing the freeze columns) is brought up to

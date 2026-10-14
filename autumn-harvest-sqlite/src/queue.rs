@@ -605,6 +605,32 @@ pub fn enqueue_timer(
     Ok(())
 }
 
+/// Arm the durable row of an awaited cancellable timer (issue #2029). Returns
+/// `true` if it inserted a row.
+///
+/// A parked `TimerHandle::await_fire` pushes its arm again on every replay.
+/// An unfired row keeps its `fire_at`, so the deadline runs from the first
+/// await, as on Postgres. A spent row of an earlier arm is replaced.
+pub fn arm_awaited_timer(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    timer_id: &str,
+    fire_at: i64,
+) -> SqliteResult<bool> {
+    let unfired: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM harvest_timers WHERE exec_id = ?1 AND timer_id = ?2 AND fired = 0",
+            params![exec_id.to_string(), timer_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if unfired.is_some() {
+        return Ok(false);
+    }
+    enqueue_timer(conn, exec_id, timer_id, fire_at)?;
+    Ok(true)
+}
+
 /// Return the ids of all unfired timers for `exec_id` whose deadline has passed.
 pub fn due_timers(conn: &Connection, exec_id: ExecutionId, now: i64) -> SqliteResult<Vec<String>> {
     // `ORDER BY fire_at, arm_seq`: the secondary `arm_seq` key makes the fire order
@@ -763,6 +789,23 @@ pub fn move_undelivered_signals(
 ) -> SqliteResult<usize> {
     Ok(conn.execute(
         "UPDATE harvest_signals SET exec_id = ?2 WHERE exec_id = ?1 AND delivered = 0",
+        params![from.to_string(), to.to_string()],
+    )?)
+}
+
+/// Move every signal of `from` to the retry run `to`, as undelivered (issue
+/// #2029).
+///
+/// Postgres moves the whole mailbox to a workflow retry and marks it
+/// unconsumed. The retry replays from a new history, so it reads each signal
+/// again. Returns the number of rows moved.
+pub fn move_all_signals_to_retry(
+    conn: &Connection,
+    from: ExecutionId,
+    to: ExecutionId,
+) -> SqliteResult<usize> {
+    Ok(conn.execute(
+        "UPDATE harvest_signals SET exec_id = ?2, delivered = 0 WHERE exec_id = ?1",
         params![from.to_string(), to.to_string()],
     )?)
 }

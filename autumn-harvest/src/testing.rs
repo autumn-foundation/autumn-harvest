@@ -1489,6 +1489,27 @@ impl WorkflowReplayer {
                 };
             }
         };
+        // Issue #2029: the engine seals a run past its `execution_timeout`
+        // while the body is parked, so no command follows the last recorded
+        // event. Replay the events before the seal as an in-flight run, as
+        // the deploy canary does. A divergence before the seal still reports.
+        if let Some(seal) = timed_out_seal_start(&events) {
+            let mut prefix = events;
+            prefix.truncate(seal);
+            return self
+                .replay_canary_snapshot(HistorySnapshot {
+                    workflow_name,
+                    execution_id: exec_id,
+                    events: prefix,
+                    context_headers: None,
+                    execution_timeout: None,
+                    deadline_at: None,
+                    parent_execution_id: None,
+                    workflow_id,
+                    queue_name,
+                })
+                .await;
+        }
         let total_events = events.len();
         // Issue #952: computed before `events` is moved into the runner.
         let failing_tail = history_ends_in_terminal_failure(&events);
@@ -2304,6 +2325,21 @@ fn extract_input(events: &[WorkflowEvent]) -> Value {
 /// mapping below can never disagree with what the replay actually did.
 fn history_ends_in_terminal_failure(events: &[WorkflowEvent]) -> bool {
     crate::replay::HistoryMatcher::terminal_failure_tail_start(events).is_some()
+}
+
+/// Index of the `WorkflowExecutionTimedOut` seal that ends `events`, if any
+/// (issue #2029).
+///
+/// Only trailing decision boundaries and cascade records may follow the
+/// seal. A seal at index 0 is a truncated export, not a timed-out run, so it
+/// keeps strict treatment.
+fn timed_out_seal_start(events: &[WorkflowEvent]) -> Option<usize> {
+    let seal = events.iter().rposition(|event| {
+        !event.is_decision_boundary()
+            && !matches!(event, WorkflowEvent::ChildWorkflowCascadeApplied { .. })
+    })?;
+    (seal > 0 && matches!(events[seal], WorkflowEvent::WorkflowExecutionTimedOut { .. }))
+        .then_some(seal)
 }
 
 fn outcome_to_report(
@@ -7788,6 +7824,54 @@ mod tests {
         let replayer = WorkflowReplayer::new().register_fn("simple", simple_workflow);
         let report = replayer.replay_from_events(events).await;
         assert!(matches!(report.status, ReplayStatus::ReplaySucceeded));
+    }
+
+    fn timed_out(events: &mut Vec<WorkflowEvent>) {
+        events.push(WorkflowEvent::WorkflowExecutionTimedOut {
+            deadline: Utc::now(),
+            timed_out_at: Utc::now(),
+        });
+    }
+
+    // Issue #2029: a run sealed TIMED_OUT while its body waits on an
+    // activity replays clean.
+    #[tokio::test]
+    async fn a_run_timed_out_while_parked_replays() {
+        let (_exec_id, mut events) = activity_events();
+        events.pop();
+        timed_out(&mut events);
+        let replayer = WorkflowReplayer::new().register_fn("activity", activity_workflow);
+        let report = replayer.replay_from_events(events).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    // Issue #2029: a divergence before the seal still reports.
+    #[tokio::test]
+    async fn a_timed_out_run_that_diverged_still_reports() {
+        let (_exec_id, mut events) = activity_events();
+        events.pop();
+        if let WorkflowEvent::ActivityScheduled { name, .. } = &mut events[1] {
+            *name = "renamed".into();
+        }
+        timed_out(&mut events);
+        let replayer = WorkflowReplayer::new().register_fn("activity", activity_workflow);
+        let report = replayer.replay_from_events(events).await;
+        assert!(
+            matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn timed_out_seal_start_needs_a_run_before_the_seal() {
+        let (_exec_id, mut events) = activity_events();
+        timed_out(&mut events);
+        assert_eq!(timed_out_seal_start(&events), Some(3));
+        assert_eq!(timed_out_seal_start(&events[3..]), None);
+        assert_eq!(timed_out_seal_start(&events[..3]), None);
     }
 
     #[tokio::test]

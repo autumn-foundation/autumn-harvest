@@ -15712,7 +15712,6 @@ impl ActivityContext {
         }
     }
 
-    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) fn new_local_activity(
         state: SharedState,
         cancel: tokio_util::sync::CancellationToken,
@@ -15779,6 +15778,23 @@ impl ActivityContext {
         )
         .seed_heartbeat_details(heartbeat_details)
         .with_idempotency_key(key)
+    }
+
+    /// Build a local-activity context for an embedded backend, such as
+    /// `autumn-harvest-sqlite` (issue #2029).
+    ///
+    /// The context is the one the Postgres worker builds for its inline
+    /// local-activity path. `is_local()` is `true`, and a heartbeat reports
+    /// that local activities do not support it. The idempotency key derives
+    /// from `identity.activity_id`. The cancellation token never fires.
+    ///
+    /// Not for activity authors.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_embedded_local(state: SharedState, identity: ActivityIdentity) -> Self {
+        let key = IdempotencyKey::from_activity_exec_id(identity.activity_id);
+        Self::new_local_activity(state, tokio_util::sync::CancellationToken::new(), identity)
+            .with_idempotency_key(key)
     }
 
     /// Seed the checkpoint of the previous attempt and the auto-heartbeat

@@ -259,8 +259,7 @@
 //!
 //! ## Unsupported workflow primitives — rejected LOUDLY, by name
 //!
-//! Only the *fire-once* durable timer `ctx.timer(...)` is a supported timer. Every
-//! other out-of-subset primitive a workflow can reach surfaces as
+//! Every out-of-subset primitive a workflow can reach surfaces as
 //! [`SqliteError::Unsupported`] whose message NAMES the specific
 //! `WorkflowCommand` (never an opaque `"Unknown"`, Codex #1069 P2) — a workflow
 //! author gets an actionable failure, not a silent gap.
@@ -277,7 +276,6 @@
 //! - **External signals / cancels** — `ctx.signal_external_workflow(...)`
 //!   (`SignalExternalWorkflow`), `ctx.request_cancel_external_workflow(...)`
 //!   (`RequestCancelExternalWorkflow`).
-//! - **Local activities** — `ctx.execute_local_activity(...)` (`RunLocalActivity`).
 //! - **External activities** — task-token activities (`ScheduleExternalActivity`).
 //! - **Search attributes** — `ctx.upsert_search_attributes(...)`
 //!   (`UpsertSearchAttributes`).
@@ -287,12 +285,10 @@
 //! - **Worker sessions** — `ctx.create_session(...)` (issue #606; a session dispatch
 //!   carries the `session_id` / `schedule_to_start_override` `ScheduleActivity`
 //!   fields this single-writer backend cannot honor).
-//! - **Cancellable durable timers** — `ctx.start_timer(...)` and
-//!   `TimerHandle::await_fire`/`cancel`/`reset` (issue #768;
-//!   `ArmTimer`/`CancelTimer`). Use the fire-once `ctx.timer(...)` instead. These
-//!   were previously the opaque `Unsupported("Unknown")` (absent from the
-//!   command-name table); they are now named with a message pointing at the
-//!   supported alternative (Codex #1069 P2, `runtime.rs:840`).
+//! - **A batch that breaks a solo rule** — a mutex acquire beside another
+//!   awaitable (`AcquireMutex`), or a local activity beside a durable
+//!   awaitable or a second local activity (`RunLocalActivity`, issue #950).
+//!   Postgres rejects both shapes too.
 //!
 //! The command-name table (`runtime.rs`) is EXHAUSTIVE — a future core
 //! `WorkflowCommand` variant is a compile error in this backend, forcing an
@@ -328,10 +324,36 @@
 //! [`SqliteRuntime::set_history_event_hard_cap`] and
 //! [`SqliteRuntime::set_history_byte_hard_cap`].
 //!
+//! ## Timers, mutex, local activities, timeout and retry (issue #2029)
+//!
+//! Each primitive records the Postgres events, so its history replays on the
+//! core `WorkflowReplayer`.
+//!
+//! - **Cancellable timers.** `ctx.start_timer` appends `TimerStarted`. A parked
+//!   `TimerHandle::await_fire` arms the durable row once, so the deadline counts
+//!   from the first await. `cancel` deletes the unfired row and appends
+//!   `TimerCancelled`.
+//! - **Workflow mutex.** `ctx.mutex(key).acquire()` grants a free key to the
+//!   first run in its FIFO queue and appends `MutexGranted`. A run that waits
+//!   returns [`RunState::WaitingMutex`]. A release is fenced by `lock_seq`. A run
+//!   that ends releases every lock and queue place it holds. No step wakes a
+//!   waiter: the fleet poll drives it again.
+//! - **Local activities.** `#[activity(local = true)]` registers. The cycle
+//!   appends `LocalActivityScheduled`, then runs the body inline. Each attempt
+//!   appends `LocalActivityFailed` or `LocalActivityCompleted`, and a terminal
+//!   failure adds `LocalActivityExhausted`. A retry backoff blocks the drive.
+//! - **Execution timeout.** A start stores the deadline. Each cycle checks it
+//!   first. A run past it gets `WorkflowExecutionTimedOut`, ends `TIMED_OUT`,
+//!   and returns [`RunState::TimedOut`].
+//! - **Workflow retry.** A run that fails with a retryable error starts a retry
+//!   in the same transaction and appends `WorkflowRetryScheduled`.
+//!   [`SqliteRuntime::successor`] returns the retry. It waits for its backoff.
+//!
 //! ## Unsupported `WorkflowInfo`-level features — rejected at registration
 //!
 //! [`SqliteRuntime::register_workflow`](crate::SqliteRuntime::register_workflow)
-//! retains ONLY the workflow's `name` + `handler`. Every OTHER `WorkflowInfo` field
+//! retains the workflow's `name`, `handler`, `execution_timeout` and
+//! workflow-level `retry_policy` (issue #2029). Every OTHER `WorkflowInfo` field
 //! (populated by `#[workflow(...)]` attributes or the fluent builder) would
 //! otherwise be **silently dropped**. To close that class the SAME way the command
 //! layer already closes its own (above), `register_workflow` audits the incoming
@@ -342,13 +364,7 @@
 //! feature and pointing at the supported alternative (Codex #1069 P2,
 //! `runtime.rs:602` `execution_timeout`, `:686` `retry_policy`). The partition:
 //!
-//! - **REJECTED (would change lifecycle / admission / retry semantics if ignored):**
-//!   - `execution_timeout` (#243) — no execution-timeout scanner exists here, so a
-//!     declared hard deadline would never fire. Enforce a deadline inside the
-//!     workflow body with `ctx.timer(...)` / `ctx.sleep_until(...)` instead.
-//!   - workflow-level `retry_policy` — `#[workflow(retry(...))]` (#523) — no
-//!     workflow-level auto-retry orchestration here. Use per-activity retry
-//!     (`#[activity(retry = ...)]`, honored in full) or handle failure in the body.
+//! - **REJECTED (would change lifecycle or admission semantics if ignored):**
 //!   - `concurrency` (#247), `debounce` (#499), `batch` (#518), `throttle` (#607) —
 //!     pre-start admission-gate features with no single-writer analog.
 //!   - `quota` (#946) — per-tenant resource quota enforcement needs the shared
@@ -368,12 +384,13 @@
 //!   `catalog_consistency` deploy-time preflight check and its `/workflows/registered`
 //!   discovery endpoint, neither of which this backend has; the core execution path
 //!   never reads either field), and `module` (diagnostics).
-//! - **HONORED:** `name` (the registration key) and `handler` (the dispatch fn).
+//! - **HONORED:** `name` (the registration key), `handler` (the dispatch fn),
+//!   `execution_timeout` (#243) and the workflow-level `retry_policy` (#523). See
+//!   [issue #2029](#timers-mutex-local-activities-timeout-and-retry-issue-2029).
 //!
-//! Honoring the rejected features (execution-timeout enforcement, workflow-level
-//! retry orchestration, the admission gates) is real, out-of-v0.1-scope work tracked
-//! as issue #1068 follow-ups — hence rejection rather than a partial, silently-wrong
-//! implementation.
+//! Honoring the rejected admission gates is real, out-of-v0.1-scope work tracked
+//! as issue #1068 follow-ups — hence rejection rather than a partial,
+//! silently-wrong implementation.
 //!
 //! ## Unsupported `ActivityInfo`-level features — honored or rejected at registration
 //!
@@ -406,6 +423,7 @@
 //!     timeout is terminal here. Postgres retries it per the retry policy (issue
 //!     #1809, ADR 0005).
 //!   - `default_queue` — recorded on the task row (single-writer routing is a no-op).
+//!   - `is_local` — the body runs inline as a local activity (issue #2029).
 //! - **REJECTED:** each is a dispatch-admission or cross-worker semantic with no
 //!   single-writer analog, or a cap raiser. A cap raiser would otherwise silently
 //!   apply the STRICTER global cap.
@@ -415,8 +433,7 @@
 //!   - `default_schedule_to_start`: no queue-wait scanner.
 //!   - `circuit_breaker` (#369), `rate_limit_*` (#332), `max_concurrent` (#247).
 //!   - `requires`: capability routing.
-//!   - `is_local`: local-activity `RunLocalActivity` dispatch is a command-layer
-//!     non-goal.
+//!   - `default_schedule_to_close` on a local activity, as on Postgres.
 //!   - A raised `max_input_bytes` / `max_result_bytes` (#252).
 //! - **ACCEPTED, inert:** `name` (registration key), `module` (diagnostics), and a lone
 //!   `concurrency_key` (groups a cap that is not set).
@@ -617,6 +634,7 @@
 mod error;
 mod history_cap;
 mod lock;
+mod mutex;
 mod query;
 mod queue;
 mod runtime;

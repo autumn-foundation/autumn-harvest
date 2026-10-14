@@ -33,24 +33,87 @@ pub struct ActivityAttempt {
 
 // ── Executions ───────────────────────────────────────────────────────────────
 
+/// The timeout and retry settings of one run (issue #2029).
+///
+/// The start freezes them on the row. A successor gets them from its
+/// predecessor, not from the current registration.
+#[derive(Debug, Clone, Default)]
+pub struct RunConfig {
+    /// The declared `execution_timeout` in milliseconds. `None` = no timeout.
+    pub execution_timeout_ms: Option<i64>,
+    /// The epoch-millisecond deadline. `None` = no deadline.
+    pub deadline_at: Option<i64>,
+    /// The earliest epoch-millisecond a drive may run the run.
+    pub start_at: Option<i64>,
+    /// The 1-based workflow retry attempt.
+    pub attempt: u32,
+    /// The frozen workflow-level retry policy, as JSON.
+    pub retry_policy_json: Option<String>,
+    /// The failed run that this run retries.
+    pub retry_of: Option<ExecutionId>,
+}
+
 pub fn insert_execution(
     conn: &Connection,
     exec_id: ExecutionId,
     workflow_name: &str,
     workflow_id: &str,
     input: &Value,
+    config: &RunConfig,
 ) -> SqliteResult<()> {
     conn.execute(
-        "INSERT INTO harvest_executions (exec_id, workflow_name, workflow_id, input_json, state) \
-         VALUES (?1, ?2, ?3, ?4, 'RUNNING')",
+        "INSERT INTO harvest_executions (exec_id, workflow_name, workflow_id, input_json, state, \
+           execution_timeout_ms, deadline_at, start_at, workflow_attempt, retry_policy_json, \
+           retry_of_exec_id) \
+         VALUES (?1, ?2, ?3, ?4, 'RUNNING', ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             exec_id.to_string(),
             workflow_name,
             workflow_id,
-            serde_json::to_string(input)?
+            serde_json::to_string(input)?,
+            config.execution_timeout_ms,
+            config.deadline_at,
+            config.start_at,
+            config.attempt.max(1),
+            config.retry_policy_json,
+            config.retry_of.map(|e| e.to_string()),
         ],
     )?;
     Ok(())
+}
+
+/// The stored [`RunConfig`] of `exec_id` (issue #2029).
+pub fn run_config(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<RunConfig> {
+    let row = conn
+        .query_row(
+            "SELECT execution_timeout_ms, deadline_at, start_at, workflow_attempt, \
+             retry_policy_json, retry_of_exec_id FROM harvest_executions WHERE exec_id = ?1",
+            params![exec_id.to_string()],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(SqliteError::ExecutionNotFound(exec_id))?;
+    let (execution_timeout_ms, deadline_at, start_at, attempt, retry_policy_json, retry_of) = row;
+    let retry_of = retry_of
+        .map(|id| id.parse().map_err(|_| SqliteError::corrupt("retry_of_exec_id")))
+        .transpose()?;
+    Ok(RunConfig {
+        execution_timeout_ms,
+        deadline_at,
+        start_at,
+        attempt: u32::try_from(attempt).unwrap_or(1).max(1),
+        retry_policy_json,
+        retry_of,
+    })
 }
 
 pub fn execution_exists(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {
@@ -263,7 +326,7 @@ pub fn seal_execution(
         "UPDATE harvest_executions SET state = ?2 WHERE exec_id = ?1",
         params![exec_id.to_string(), sealed_state],
     )?;
-    Ok(())
+    crate::mutex::release_all(conn, exec_id)
 }
 
 /// Store a cooperative cancel request on a `RUNNING` row (issue #2021).
@@ -310,7 +373,7 @@ pub fn set_terminal_with_reason(
         "UPDATE harvest_executions SET state = ?2, error = ?3 WHERE exec_id = ?1",
         params![exec_id.to_string(), state, reason],
     )?;
-    Ok(())
+    crate::mutex::release_all(conn, exec_id)
 }
 
 pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) -> SqliteResult<()> {
@@ -318,7 +381,7 @@ pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) ->
         "UPDATE harvest_executions SET state = 'COMPLETED', output_json = ?2 WHERE exec_id = ?1",
         params![exec_id.to_string(), serde_json::to_string(output)?],
     )?;
-    Ok(())
+    crate::mutex::release_all(conn, exec_id)
 }
 
 pub fn set_failed(conn: &Connection, exec_id: ExecutionId, error: &str) -> SqliteResult<()> {
@@ -326,7 +389,7 @@ pub fn set_failed(conn: &Connection, exec_id: ExecutionId, error: &str) -> Sqlit
         "UPDATE harvest_executions SET state = 'FAILED', error = ?2 WHERE exec_id = ?1",
         params![exec_id.to_string(), error],
     )?;
-    Ok(())
+    crate::mutex::release_all(conn, exec_id)
 }
 
 // ── Event log ────────────────────────────────────────────────────────────────
@@ -384,7 +447,8 @@ pub fn load_history_sized(
 /// The successor that `exec_id` continued as, if any (issue #2023).
 ///
 /// Only a run that ends with `WorkflowContinuedAsNew` has one. A reuse-policy
-/// seal shares the `CONTINUED_AS_NEW` state but writes no such event.
+/// seal shares the `CONTINUED_AS_NEW` state but writes no such event. A failed
+/// run that ends with `WorkflowRetryScheduled` names its retry (issue #2029).
 pub fn successor_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
     let last: Option<String> = conn
         .query_row(
@@ -394,7 +458,13 @@ pub fn successor_of(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<Opt
         )
         .optional()?;
     match last.map(|json| serde_json::from_str(&json)).transpose()? {
-        Some(WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. }) => Ok(Some(new_exec_id)),
+        Some(
+            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. }
+            | WorkflowEvent::WorkflowRetryScheduled {
+                retry_exec_id: new_exec_id,
+                ..
+            },
+        ) => Ok(Some(new_exec_id)),
         _ => Ok(None),
     }
 }
@@ -420,6 +490,10 @@ pub fn history_has_activity_scheduled(events: &[WorkflowEvent], activity_id: &st
 /// re-arm, wedging the run. `> 0` means an arm is already recorded and unfired
 /// (a replay-cycle re-emit — skip it); `== 0` means every prior arm has fired, so
 /// a `StartTimer` for this id is a genuinely new arm that must be persisted.
+///
+/// A `TimerCancelled` ends an arm too (issue #2029). A cancellable timer can
+/// release its id to `ctx.timer`, and a reset cancels twice, so the count can
+/// go below zero. A caller treats any value up to zero as "no pending arm".
 pub fn pending_timer_arms(events: &[WorkflowEvent], timer_id: &str) -> i64 {
     let started = events
         .iter()
@@ -435,7 +509,15 @@ pub fn pending_timer_arms(events: &[WorkflowEvent], timer_id: &str) -> i64 {
                 if id.to_string() == timer_id)
         })
         .count();
-    i64::try_from(started).unwrap_or(i64::MAX) - i64::try_from(fired).unwrap_or(i64::MAX)
+    let cancelled = events
+        .iter()
+        .filter(|e| {
+            matches!(e, WorkflowEvent::TimerCancelled { timer_id: id }
+                if id.to_string() == timer_id)
+        })
+        .count();
+    let count = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    count(started) - count(fired) - count(cancelled)
 }
 
 // ── Activity attempt audit log ───────────────────────────────────────────────

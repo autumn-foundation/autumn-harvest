@@ -176,11 +176,12 @@ rt.register_workflow(&process_order_info());
 rt.register_activity(&reserve_inventory_info());
 ```
 
-- **`register_workflow(&WorkflowInfo)`** retains only the workflow's `name` +
-  `handler`. If the `#[workflow(...)]` attributes declare an
+- **`register_workflow(&WorkflowInfo)`** retains the workflow's `name`,
+  `handler`, `execution_timeout` and workflow-level `retry_policy` (issue
+  #2029). If the `#[workflow(...)]` attributes declare an
   execution/admission-affecting feature this v0.1 backend cannot honor
-  (`execution_timeout`, a workflow-level `retry_policy`, `concurrency`,
-  `debounce`, `batch`, `throttle`, a raised `max_input_bytes`), registration
+  (`concurrency`, `debounce`, `batch`, `throttle`, `quota`, a raised
+  `max_input_bytes`), registration
   **panics at setup time** naming the feature — never a silently-dropped setting.
 - **`register_activity(&ActivityInfo)`** is the default. It runs the
   `#[activity]` body with an `ActivityContext`. It honors the
@@ -188,8 +189,9 @@ rt.register_activity(&reserve_inventory_info());
   `retry` policy — `max_attempts` + backoff + non-retryable classification —
   `start_to_close`, `queue`) and **panics** for one it cannot
   (`heartbeat_timeout`, `schedule_to_start`, `circuit_breaker`, `rate_limit_*`,
-  `max_concurrent`, `is_local`, …). This keeps a declared setting from taking
-  silently-wrong effect.
+  `max_concurrent`, …). This keeps a declared setting from taking
+  silently-wrong effect. A `local = true` activity runs inline as a local
+  activity (issue #2029). Like Postgres, it cannot declare `schedule_to_close`.
 - **`register_activity_with_body(&ActivityInfo, body)`** runs the same audit,
   but runs a synchronous `Fn(Value) -> Result<Value, String>` closure in place of
   the `#[activity]` body. The closure gets no `ActivityContext`. Use it to stub an
@@ -280,7 +282,9 @@ match rt.run_until_blocked(exec).await? {
     RunState::Failed(err)       => println!("failed: {err}"),
     RunState::WaitingSignal(name) => println!("blocked on signal `{name}`"),
     RunState::WaitingTimer      => println!("blocked on a durable timer"),
+    RunState::WaitingMutex(key) => println!("blocked on the `{key}` mutex"),
     RunState::Cancelled(reason) => println!("cancelled: {reason}"),
+    RunState::TimedOut(error)   => println!("timed out: {error}"),
     RunState::Terminated(reason) => println!("terminated: {reason}"),
     RunState::ContinuedAsNew(next) => println!("continued as new; drive {next}"),
     RunState::InProgress        => {} // not returned by run_until_blocked
@@ -292,7 +296,7 @@ match rt.outcome(exec)? {
     ExecutionOutcome::Completed(output) => println!("{output}"),
     ExecutionOutcome::Failed(err)       => println!("{err}"),
     ExecutionOutcome::Running           => println!("still running"),
-    ExecutionOutcome::Terminated(state) => println!("terminal ({state}) — superseded, cancelled or terminated"),
+    ExecutionOutcome::Terminated(state) => println!("terminal ({state}) — superseded, cancelled, terminated or timed out"),
 }
 ```
 
@@ -462,6 +466,59 @@ A continuing run is exempt, because its successor starts a new history. The
 event count includes the decision's own appends. The byte count is the stored
 event JSON length when the decision starts. Postgres measures
 `pg_column_size` instead, so the two byte counts can differ.
+
+### Timers, mutex, local activities, timeout and retry (issue #2029)
+
+These primitives work as on Postgres. Each one records the Postgres events,
+so its history replays on the core `WorkflowReplayer`.
+
+**Cancellable timers.** `ctx.start_timer(id, secs)` appends `TimerStarted`.
+`TimerHandle::await_fire` arms the durable row once, so the deadline counts
+from the first await. `cancel` deletes the unfired row and appends
+`TimerCancelled`, and `await_fire` then returns `TimerOutcome::Cancelled`.
+`reset` cancels and arms again. A cancelled id can arm a `ctx.timer` later.
+
+**Workflow mutex.** `ctx.mutex(key).acquire()` queues the run for the key.
+The first run in the queue gets a free key, with a new fencing `lock_seq`,
+and the history gets `MutexGranted`. A run that waits returns
+`RunState::WaitingMutex(key)`. The guard's release frees the key. A run that
+ends, for any reason, releases every lock and queue place that it holds.
+
+No step wakes a waiter. `run_until_idle` and `poll_once` drive it again, and
+a release counts as progress, so `run_until_idle` makes one more pass. A held
+lock survives a reopen. An acquire must be the only awaitable in its batch,
+as on Postgres. Another awaitable beside it ends the run `FAILED`.
+
+**Local activities.** Register a `#[activity(local = true)]` fn as usual.
+`ctx.execute_local_activity` then appends `LocalActivityScheduled` and runs
+the body inline, after the decision commits. Each failed attempt appends
+`LocalActivityFailed`. Success appends `LocalActivityCompleted`. A terminal
+failure also appends `LocalActivityExhausted`. A crash resumes at the next
+attempt. Some limits apply:
+
+- The per-attempt budget is `start_to_close`, capped at 60 seconds. It is
+  checked after the body returns, as for a regular activity here.
+- A retry backoff sleeps in the drive, on the real clock, as Postgres sleeps
+  inline.
+- A local activity cannot share a batch with a durable awaitable or a second
+  local activity (issue #950). Such a batch ends the run `FAILED`.
+
+**Execution timeout.** `#[workflow(execution_timeout = "30s")]` stores a
+deadline at start, from the runtime clock. Each cycle checks it first. A run
+past it gets `WorkflowExecutionTimedOut`, ends `TIMED_OUT` with the error
+`timeout: WorkflowExecution for <name>`, and loses its open rows and locks.
+The drive returns `RunState::TimedOut(error)`. `ctx.deadline()` reports the
+deadline. A continue-as-new successor and a retry count a new deadline from
+their own start. A run that nothing drives times out at its next drive.
+
+**Workflow retry.** `#[workflow(retry = ..)]` freezes the policy at start.
+A run that returns a retryable error ends `FAILED`. The same transaction then
+starts a retry with the same input and the next attempt, and appends
+`WorkflowRetryScheduled`. The retry has its own exec id as its `workflow_id`,
+as on Postgres. It gets every signal of the failed run again. It waits for
+its backoff: before then a drive returns `RunState::WaitingTimer`.
+`successor(failed)` returns it. A panic, a replay divergence, a cap, a
+timeout, a cancel and a non-retryable error never retry.
 
 ---
 
@@ -701,14 +758,15 @@ specific command/feature. The run then ends `FAILED` (see below):
 - **Child workflows** (`spawn_child_workflow`, `spawn_child_workflow_detached`).
 - **External signals / cancels** (`signal_external_workflow`,
   `request_cancel_external_workflow`).
-- **Local activities** (`execute_local_activity`) and **external / task-token
-  activities**.
+- **External / task-token activities**.
 - **Search attributes** (`upsert_search_attributes`) and a **continue-as-new
   to a different type** (`continue_as_new_as_type`). The token is
   `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
   supported (see [§7](#7-the-drive-model)).
-- **Worker sessions** (`create_session`) and **cancellable durable timers**
-  (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
+- **Worker sessions** (`create_session`).
+- **A batch that breaks a solo rule**: a mutex acquire beside another
+  awaitable, or a local activity beside a durable awaitable or a second
+  local activity. The token is `AcquireMutex` or `RunLocalActivity`.
 
 A rejected execution ends `FAILED` (issue #1834). The drive that meets the
 feature rolls back the whole cycle. It then seals the run in a new
