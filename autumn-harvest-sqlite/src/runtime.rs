@@ -2714,8 +2714,8 @@ impl SqliteRuntime {
                 }
                 // Reject every OTHER unsupported command BY NAME via
                 // `command_name`. Examples are child workflows, external
-                // activities, signals and cancels, local activities, search
-                // attributes and detached children. No current variant is an
+                // activities, signals and cancels, local activities and
+                // detached children. No current variant is an
                 // opaque `"Unknown"` (Codex #1069 P2, `runtime.rs:840`). Dropping
                 // the uncommitted `tx` rolls back the whole batch. So an
                 // unsupported command after a supported one persists NEITHER the

@@ -395,21 +395,7 @@ fn present_columns(conn: &Connection) -> SqliteResult<Vec<&'static str>> {
 }
 
 /// One bound parameter of the listing query.
-enum Param {
-    Int(i64),
-    Real(f64),
-    Text(String),
-}
-
-impl ToSql for Param {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        match self {
-            Self::Int(v) => v.to_sql(),
-            Self::Real(v) => v.to_sql(),
-            Self::Text(v) => v.to_sql(),
-        }
-    }
-}
+type Param = rusqlite::types::Value;
 
 /// The SQL and the parameters of one page.
 ///
@@ -449,7 +435,9 @@ fn build_query(
         select.extend(["input_json", "output_json", "error"].map(column));
     }
 
-    let mut params = vec![Param::Int(filter.before.map_or(i64::MAX, ListCursor::raw))];
+    let mut params = vec![Param::Integer(
+        filter.before.map_or(i64::MAX, ListCursor::raw),
+    )];
     // The cursor is a bound, and not `(? IS NULL OR rowid < ?)`. The planner
     // cannot seek on an `OR`. The largest `rowid` stands in for no cursor,
     // and no insert counter reaches it.
@@ -465,7 +453,7 @@ fn build_query(
     }
     if let Some(prefix) = &filter.workflow_id_prefix {
         let len = i64::try_from(prefix.len()).unwrap_or(i64::MAX);
-        let n = bind(&mut params, Param::Int(len));
+        let n = bind(&mut params, Param::Integer(len));
         let p = bind(&mut params, Param::Text(prefix.clone()));
         terms.push(format!(
             "substr(cast({} as blob), 1, {n}) = cast({p} as blob)",
@@ -485,20 +473,23 @@ fn build_query(
     }
     let started = column("started_at");
     if let Some(at) = filter.started_after {
-        let p = bind(&mut params, Param::Int(at.timestamp_millis()));
+        let p = bind(&mut params, Param::Integer(at.timestamp_millis()));
         terms.push(format!(
             "typeof({started}) = 'integer' AND {started} >= {p}"
         ));
     }
     if let Some(at) = filter.started_before {
-        let p = bind(&mut params, Param::Int(at.timestamp_millis()));
+        let p = bind(&mut params, Param::Integer(at.timestamp_millis()));
         terms.push(format!("typeof({started}) = 'integer' AND {started} < {p}"));
     }
     let attrs = column("search_attrs");
     for (key, value) in &filter.search_attributes {
         terms.push(search_attr_term(&mut params, &attrs, key, value)?);
     }
-    let limit = bind(&mut params, Param::Int(i64::from(page_size(filter)) + 1));
+    let limit = bind(
+        &mut params,
+        Param::Integer(i64::from(page_size(filter)) + 1),
+    );
     let sql = format!(
         "SELECT {} FROM harvest_executions WHERE {} ORDER BY rowid DESC LIMIT {limit}",
         select.join(", "),
@@ -525,7 +516,7 @@ fn search_attr_term(
         Value::Number(number) => {
             let v = number.as_i64().map_or_else(
                 || Param::Real(number.as_f64().unwrap_or(f64::NAN)),
-                Param::Int,
+                Param::Integer,
             );
             let p = bind(params, v);
             format!("type IN ('integer', 'real') AND atom = {p}")

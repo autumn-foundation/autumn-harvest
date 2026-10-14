@@ -606,6 +606,88 @@ The handler can await any future, within a 5 second limit. It cannot await a
 durable command, such as an activity or a timer. Such a handler returns
 `SqliteError::UpdateTimedOut` and writes no event.
 
+### List, describe and search attributes (issue #2027)
+
+List the runs in a file, newest first, one page at a time:
+
+```rust
+use autumn_harvest_sqlite::{ExecutionFilter, StartOptions};
+use serde_json::json;
+
+// Start a run with a memo and a first search attribute.
+let mut first = serde_json::Map::new();
+first.insert("tenant".into(), json!("acme"));
+let started = rt.start_workflow_with_options(
+    "order",
+    json!({ "id": 7 }),
+    StartOptions {
+        workflow_id: Some("order-7".into()),
+        memo: Some(json!({ "owner": "ops" })),
+        search_attributes: first,
+        ..StartOptions::default()
+    },
+)?;
+
+// Inside a workflow, merge more attributes in:
+// ctx.upsert_search_attrs([("stage".to_string(), Some(json!("paid")))])?;
+
+let mut filter = ExecutionFilter::new()
+    .workflow_name("order")
+    .state("RUNNING")
+    .search_attribute("tenant", json!("acme"))
+    .limit(50);
+loop {
+    let page = rt.list_executions(&filter)?;
+    for run in &page.executions {
+        println!("{:?} {:?}", run.exec_id, run.state);
+    }
+    match page.next {
+        Some(cursor) => filter = filter.before(cursor),
+        None => break,
+    }
+}
+
+// One run, with its input, output and error:
+let run = rt.describe(started.exec_id)?;
+```
+
+- **Filters.** `workflow_name`, `exec_id`, `workflow_id_prefix`, `state`
+  (repeat it for several states), `started_after` (inclusive),
+  `started_before` (exclusive) and `search_attribute`. Set filters combine
+  with AND.
+- **Search attributes.** A filter tests equality. Numbers compare as numbers,
+  so `1` matches `1.0`. A filter value must be a JSON string, number, boolean
+  or `null`. Another value is `SqliteError::InvalidSearchAttribute`.
+- **Pages.** A page holds at most `limit` rows: 100 by default and 1000 at
+  most. `next` is the cursor of the next page, or `None` at the end.
+- **No payloads in a list.** `list_executions` reads no input, output or
+  error. `visit_executions(&filter, |run| ...)` passes the same rows with
+  their payloads, one row at a time.
+- **Damaged rows.** Each field is a `Stored` value: `Value`, `Null` or
+  `Unreadable`. A value in the wrong storage class, text that is not UTF-8,
+  or JSON that does not parse is `Unreadable`. One bad row does not fail
+  the page.
+- **A reader beside the writer.** `SqliteReader::open(path)` opens the file
+  `READ_ONLY` and takes no writer lock. It has the same three reads. It
+  reads a file that an older version wrote. A column that the file does not
+  have reads as `Null`.
+- **Upserts.** `ctx.upsert_search_attrs` merges its patch in the cycle
+  transaction, on the suspend path and on the terminal path, as on
+  Postgres. `None` removes a key. A cycle that rolls back keeps no patch.
+- **Memo.** The start sets it. No command changes it later. A start that
+  returns an existing run leaves that run's memo as it is.
+- **Continue-as-new.** The successor keeps the memo and the search
+  attributes.
+
+Limits:
+
+- A run written before issue #2027 has no `started_at`. A time filter does
+  not match it.
+- Search-attribute filters test equality only. There is no comparison,
+  `IN` or `EXISTS` predicate.
+- The name and state filters compare bytes, so they use no index. A filter
+  that matches few rows in a large file walks the table to fill a page.
+
 ---
 
 ## 9. Durability and crash recovery
@@ -703,8 +785,8 @@ specific command/feature. The run then ends `FAILED` (see below):
   `request_cancel_external_workflow`).
 - **Local activities** (`execute_local_activity`) and **external / task-token
   activities**.
-- **Search attributes** (`upsert_search_attributes`) and a **continue-as-new
-  to a different type** (`continue_as_new_as_type`). The token is
+- A **continue-as-new to a different type** (`continue_as_new_as_type`).
+  Search attributes are supported since issue #2027. The token is
   `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
   supported (see [§7](#7-the-drive-model)).
 - **Worker sessions** (`create_session`) and **cancellable durable timers**
