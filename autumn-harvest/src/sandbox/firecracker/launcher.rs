@@ -1464,6 +1464,7 @@ impl RunningVm {
         })
     }
 
+    /// The kept tail of the VMM stderr, with each NUL as U+FFFD.
     fn stderr_tail(&self) -> String {
         let bytes: Vec<u8> = self
             .stderr
@@ -1472,7 +1473,9 @@ impl RunningVm {
             .iter()
             .copied()
             .collect();
-        String::from_utf8_lossy(&bytes).trim().to_owned()
+        String::from_utf8_lossy(&bytes)
+            .trim()
+            .replace('\0', "\u{fffd}")
     }
 
     /// Kill the VMM, then its cgroup, then remove its directory. Each step
@@ -2834,6 +2837,38 @@ while True:
         sweeper.sweep_stale();
         assert_eq!(std::fs::read(left.join("cgroup.kill")).unwrap(), b"1");
         drop(sweeper);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_nul_in_the_vmm_stderr_does_not_reach_the_report() {
+        let dir = temp_dir();
+        let launcher = new_launcher(jailed(&dir)).unwrap();
+        let vm_dir = dir.join("vm");
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "printf 'boom\\000bad' >&2; exit 3"]);
+        let prepared = Prepared {
+            vsock: vm_dir.join("v.sock"),
+            vm_dir,
+            api_socket: None,
+            cgroup: None,
+            command,
+        };
+        let mut vm =
+            RunningVm::spawn("hsbx-test".into(), prepared, Arc::clone(&launcher.tenancy)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let report = loop {
+            if let Some(report) = vm.exit_status() {
+                break report;
+            }
+            assert!(Instant::now() < deadline, "the VMM did not exit");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(report.contains("boom"), "{report:?}");
+        assert!(!report.contains('\0'), "{report:?}");
+        vm.teardown().await;
+        drop((vm, launcher));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

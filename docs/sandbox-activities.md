@@ -98,6 +98,9 @@ A failure means that the code does not reach an outcome.
 | `SandboxProtocolViolation` | No | The guest sends a malformed, oversized or wrong answer, or speaks another protocol version. |
 | `SandboxCancelled` | Yes | The caller cancels the activity. The backend kills the run. |
 
+An error text can quote the VMM or the guest. Each NUL byte in it becomes
+U+FFFD before it reaches history or a model.
+
 ## Development: the process backend
 
 The process backend runs the code as a host process. It needs no KVM, so it

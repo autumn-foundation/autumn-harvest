@@ -37,6 +37,15 @@ impl SandboxError {
     pub const fn is_retryable(&self) -> bool {
         matches!(self, Self::Unavailable(_) | Self::Cancelled)
     }
+
+    /// The error text for history and for a model.
+    ///
+    /// The text can quote a VMM or a guest. Postgres `jsonb` rejects
+    /// `\u0000`, so each NUL becomes U+FFFD.
+    #[must_use]
+    pub fn message(&self) -> String {
+        self.to_string().replace('\0', "\u{fffd}")
+    }
 }
 
 impl From<SandboxError> for ActivityFailure {
@@ -45,7 +54,7 @@ impl From<SandboxError> for ActivityFailure {
             ERROR_TYPE_SANDBOX_CANCELLED, ERROR_TYPE_SANDBOX_PROTOCOL_VIOLATION,
             ERROR_TYPE_SANDBOX_UNAVAILABLE,
         };
-        let message = err.to_string();
+        let message = err.message();
         match err {
             SandboxError::Denied(_) | SandboxError::Config(_) => Self::sandbox_denied(message),
             SandboxError::Unavailable(_) => {
@@ -66,6 +75,17 @@ mod tests {
         ERROR_TYPE_SANDBOX_CANCELLED, ERROR_TYPE_SANDBOX_DENIED,
         ERROR_TYPE_SANDBOX_PROTOCOL_VIOLATION, ERROR_TYPE_SANDBOX_UNAVAILABLE,
     };
+
+    #[test]
+    fn a_nul_in_an_error_does_not_reach_history() {
+        let err = SandboxError::Unavailable("firecracker said a\0b".into());
+        let failure = ActivityFailure::from(err);
+        assert!(
+            failure.message.contains("firecracker said a"),
+            "{failure:?}"
+        );
+        assert!(!failure.message.contains('\0'), "{failure:?}");
+    }
 
     #[test]
     fn a_denial_and_a_config_error_are_not_retryable() {

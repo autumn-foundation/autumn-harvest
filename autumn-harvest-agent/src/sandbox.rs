@@ -108,7 +108,7 @@ pub fn tool_error(err: &SandboxError) -> AgentError {
         SandboxError::Config(_) => ErrorKind::Config,
         SandboxError::Unavailable(_) | SandboxError::Cancelled => ErrorKind::Unavailable,
     };
-    AgentError::new(kind, err.to_string())
+    AgentError::new(kind, err.message())
 }
 
 impl Tool for SandboxTool {
@@ -748,6 +748,13 @@ mod tests {
                 .map(String::as_str),
             Some("run-1:0:call-1")
         );
+    }
+
+    #[test]
+    fn a_nul_in_an_error_does_not_reach_the_model() {
+        let err = tool_error(&SandboxError::Unavailable("firecracker said a\0b".into()));
+        assert!(err.message().contains("firecracker said a"), "{err:?}");
+        assert!(!err.message().contains('\0'), "{err:?}");
     }
 
     #[test]
