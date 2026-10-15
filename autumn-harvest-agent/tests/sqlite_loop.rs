@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest_agent::Followups;
+use autumn_harvest_agent::bounds::json_len;
 use autumn_harvest_agent::{
     AgentError, Approval, ChatMessage, ChatRole, ErrorKind, ToolDecision, ToolEffect,
 };
@@ -708,7 +711,7 @@ async fn a_round_is_charged_against_the_whole_next_request() {
     let results = tool_results(&report);
     assert_eq!(results.len(), 3);
     assert!(
-        results[0].ends_with("…[truncated]"),
+        !results[0].contains("was dropped") && !results[0].contains("did not run"),
         "the first result fits"
     );
     assert!(
@@ -769,6 +772,90 @@ async fn a_huge_decision_reason_is_cut_and_the_run_goes_on() {
     assert!(results[0].starts_with(r#"{"error":"denied by policy: "#));
     assert!(results[0].contains("…[truncated]"), "{}", results[0].len());
     assert!(results[0].len() < 1_024, "{}", results[0].len());
+}
+
+/// One round of two calls that each return 300 bytes, under `cap`. Returns
+/// the report, the model calls, and the byte size of the second model request
+/// that the run recorded.
+async fn two_result_round(cap: Option<u64>) -> (autumn_harvest_agent::AgentReport, usize, u64) {
+    let (_dir, db) = fresh_db();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let model = ScriptedModel::new(vec![big_calls(2), answer("done", 1)]);
+    let harness = AgentHarness::new(model.clone()).tool(counted_big_tool(300, &runs));
+    let mut rt = runtime(&db, harness);
+    // The follow-up tool adds a tool definition to every request.
+    let mut task = AgentTask::new("go")
+        .followups(Followups::new(Duration::from_secs(3_600)))
+        .loop_guard(no_guard());
+    if let Some(cap) = cap {
+        task = task.max_request_bytes(cap);
+    }
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+    let second = rt
+        .load_history(exec)
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityScheduled { name, input, .. } if name == "agent_model_turn" => {
+                Some(json_len(input))
+            }
+            _ => None,
+        })
+        .nth(1)
+        .unwrap_or(0);
+    (report, model.calls(), second)
+}
+
+/// The round budget must match the next request to the byte. A request of
+/// exactly the cap completes, and one byte less drops the last result.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_round_budget_matches_the_next_request_to_the_byte() {
+    let (_, calls, size) = two_result_round(None).await;
+    assert_eq!(calls, 2);
+    assert!(size > 0);
+
+    let (fits, calls, _) = two_result_round(Some(size)).await;
+    assert_eq!(fits.stop, AgentStop::Completed, "a request of {size} bytes");
+    assert_eq!(calls, 2);
+
+    let (tight, calls, _) = two_result_round(Some(size - 1)).await;
+    assert_eq!(tight.stop, AgentStop::TranscriptFull);
+    assert_eq!(calls, 1, "the next request is never sent");
+    let results = tool_results(&tight);
+    assert!(!results[0].contains("was dropped"), "the first result fits");
+    assert!(
+        results[1].contains("its result was dropped"),
+        "one byte over drops the last result"
+    );
+}
+
+/// A call that waits for an approval must not open the wait when no result
+/// could reach the model.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gated_call_that_cannot_fit_never_waits_for_an_approval() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"data": "x".repeat(4_096)}))], 1),
+        answer("unreachable", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool("write", ToolEffect::Write, &recorder))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ));
+    let mut rt = runtime(&db, harness);
+
+    let task = AgentTask::new("go").max_request_bytes(2_048);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(
+        matches!(state, RunState::Completed(_)),
+        "no approval wait opens: {state:?}"
+    );
+    assert_eq!(recorder.runs(), Vec::<serde_json::Value>::new());
 }
 
 /// A read-only tool with a long flow label. A harness with flow rules

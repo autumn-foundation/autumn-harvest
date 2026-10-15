@@ -534,6 +534,52 @@ async fn a_turn_over_the_worker_result_cap_ends_as_in_production() {
     };
     assert_eq!(report.stop, AgentStop::ReplyTooLarge);
     assert!(evaluation.end_diverged);
+    // The dropped reply is a divergence, not an empty reworded answer.
+    assert_eq!(
+        evaluation.turns[1].verdict,
+        Verdict::Diverged(Divergence::Stop)
+    );
+}
+
+/// A worker records the turn with the call ids the provider gave. The
+/// evaluation gives a call that differs from the recorded one a new, longer
+/// id. The cap must still measure the provider ids (issue #2040).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_worker_result_cap_measures_the_ids_the_provider_gave() {
+    let source = one_lookup().await;
+    let request: autumn_harvest_agent::ModelTurnRequest = source
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::ActivityScheduled { name, input, .. } if name == "agent_model_turn" => {
+                Some(serde_json::from_value(input.clone()).unwrap())
+            }
+            _ => None,
+        })
+        .expect("the source asks the model");
+    // The candidate asks for another call than the source, so its id changes.
+    let replies = || {
+        vec![
+            calls(&[("c1", "lookup", json!({"q": "y"}))], 5),
+            answer("done", 5),
+        ]
+    };
+    let (harness, _) = candidate(ScriptedModel::new(replies()));
+    let turn = harness.model_turn(request).await.unwrap();
+    let as_recorded = autumn_harvest_agent::bounds::json_len(&turn);
+
+    for (cap, stop) in [
+        (as_recorded, AgentStop::Completed),
+        (as_recorded - 1, AgentStop::ReplyTooLarge),
+    ] {
+        let (harness, _) = candidate(ScriptedModel::new(replies()));
+        let evaluation = evaluate(&source, &Candidate::new(harness.max_result_bytes(cap)))
+            .await
+            .unwrap();
+        let RunEnd::Completed(report) = &evaluation.candidate else {
+            panic!("the candidate ends: {:?}", evaluation.candidate);
+        };
+        assert_eq!(report.stop, stop, "cap {cap}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

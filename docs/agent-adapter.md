@@ -722,7 +722,7 @@ The policy runs live, so use a policy with no side effects. It sees the
 recorded run id and the aligned call ids. A retryable model failure retries
 under the retry policy of `agent_model_turn`, as on a worker. A turn over the
 harness result cap (`AgentHarness::max_result_bytes`) is cut or dropped, as on
-a worker with no payload store.
+a worker with no payload store. A dropped reply reads as a `stop` divergence.
 
 A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn

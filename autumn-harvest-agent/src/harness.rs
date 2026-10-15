@@ -1224,6 +1224,29 @@ mod tests {
     }
 
     #[test]
+    fn a_long_reason_under_a_roomy_cap_stays_whole() {
+        let turn = turn_of(vec![call("a")], vec![deny(&"r".repeat(5_000))]);
+        assert_eq!(fit_turn(turn.clone(), 1_000_000), turn);
+    }
+
+    #[test]
+    fn an_error_of_any_content_fits_the_result_cap() {
+        // A NUL grows to seven bytes: six in the error JSON, and one more for
+        // the backslash when the outcome escapes the text again.
+        let cap = DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
+        let harness = AgentHarness::new(Arc::new(NoModel)).tool_output_limit(usize::MAX);
+        for unit in ["\u{0}", "\"", "é"] {
+            let message = unit.repeat(usize::try_from(cap).unwrap());
+            let outcome = harness.error_outcome(&message);
+            assert!(
+                json_len(&outcome) <= cap,
+                "{unit:?}: {}",
+                json_len(&outcome)
+            );
+        }
+    }
+
+    #[test]
     fn a_zero_turn_cap_is_no_cap() {
         let turn = turn_of(vec![ContentPart::Text("y".repeat(10_000))], Vec::new());
         assert_eq!(fit_turn(turn.clone(), 0), turn);
@@ -1256,19 +1279,23 @@ mod tests {
                 panic!("a decision with a reason: {decision:?}");
             };
             assert!(reason.ends_with(TRUNCATED), "{reason}");
-            assert!(reason.len() <= REASON_CUT_BYTES, "{}", reason.len());
+            // The documented limit, not the constant: a change must show here.
+            assert!(reason.len() <= 256, "{}", reason.len());
         }
     }
 
     #[test]
     fn a_reason_is_cut_on_a_char_boundary() {
-        let turn = turn_of(vec![call("a")], vec![deny(&"é".repeat(5_000))]);
+        // Three bytes per char. 256 less the marker is 242, which is not a
+        // multiple of three, so the cut must step back to a boundary.
+        let turn = turn_of(vec![call("a")], vec![deny(&"€".repeat(5_000))]);
         let fitted = fit_turn(turn, 2_048);
         let [ToolDecision::Deny { reason }] = fitted.decisions.as_slice() else {
             panic!("one cut reason: {:?}", fitted.decisions);
         };
         assert!(reason.ends_with(TRUNCATED));
-        assert!(reason.len() <= REASON_CUT_BYTES);
+        assert!(reason.len() <= 256, "{}", reason.len());
+        assert!(reason.len() > 200, "the cut keeps most of the limit");
     }
 
     #[test]
@@ -1286,6 +1313,34 @@ mod tests {
         assert_eq!(fitted.usage, turn.usage, "the paid call is still counted");
         assert_eq!(fitted.stop, turn.stop);
         assert!(json_len(&fitted) <= 1_024);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_fitted_turn_fits_or_is_the_typed_outcome(
+            text in "(\\PC|[\\x00-\\x1f]){0,2000}",
+            reasons in proptest::collection::vec("(\\PC|[\\x00-\\x1f]){0,2000}", 0..4),
+            cap in 300_u64..6_000,
+        ) {
+            let content = std::iter::once(ContentPart::Text(text))
+                .chain((0..reasons.len()).map(|index| call(&format!("c{index}"))))
+                .collect();
+            let decisions = reasons.iter().map(|reason| deny(reason)).collect();
+            let turn = turn_of(content, decisions);
+
+            proptest::prop_assert_eq!(&fit_turn(turn.clone(), 0), &turn);
+            let fitted = fit_turn(turn.clone(), cap);
+            if fitted.oversized {
+                proptest::prop_assert_eq!(&fitted.content, &Vec::<ContentPart>::new());
+                proptest::prop_assert_eq!(&fitted.decisions, &Vec::<ToolDecision>::new());
+                proptest::prop_assert_eq!(fitted.usage, turn.usage);
+            } else {
+                proptest::prop_assert!(json_len(&fitted) <= cap);
+                proptest::prop_assert_eq!(&fitted.content, &turn.content);
+                proptest::prop_assert_eq!(fitted.decisions.len(), turn.decisions.len());
+            }
+            proptest::prop_assert_eq!(fit_turn(fitted.clone(), cap), fitted);
+        }
     }
 
     #[test]

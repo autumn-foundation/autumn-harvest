@@ -226,7 +226,8 @@ pub enum Divergence {
     Calls,
     /// The calls agree, but a policy decision differs.
     Policy,
-    /// The calls and decisions agree, but the stop reasons differ.
+    /// The calls and decisions agree, but the stop reasons differ, or only
+    /// one side dropped its reply as too large.
     Stop,
     /// Only one side has this turn. The value names the side that lacks it.
     Missing(Side),
@@ -266,6 +267,10 @@ pub struct TurnDecision {
     pub text: String,
     /// Why the model stopped.
     pub stop: StopReason,
+    /// The reply exceeded the result cap and the worker dropped it (issue
+    /// #2040). Such a turn holds no text and no calls.
+    #[serde(default, skip_serializing_if = "crate::types::is_false")]
+    pub dropped: bool,
 }
 
 impl TurnDecision {
@@ -290,6 +295,7 @@ impl TurnDecision {
             calls,
             text: turn.text(),
             stop: turn.stop,
+            dropped: turn.oversized,
         }
     }
 }
@@ -1172,7 +1178,7 @@ fn verdict(recorded: Option<&TurnDecision>, candidate: Option<&TurnDecision>) ->
         Verdict::Diverged(Divergence::Calls)
     } else if decisions_of(recorded) != decisions_of(candidate) {
         Verdict::Diverged(Divergence::Policy)
-    } else if recorded.stop != candidate.stop {
+    } else if recorded.dropped != candidate.dropped || recorded.stop != candidate.stop {
         Verdict::Diverged(Divergence::Stop)
     } else if recorded.calls.is_empty() && recorded.text != candidate.text {
         Verdict::Reworded
@@ -1257,6 +1263,7 @@ mod tests {
                 .collect(),
             text: text.to_owned(),
             stop,
+            dropped: false,
         }
     }
 
@@ -1401,6 +1408,47 @@ mod tests {
         let id = turn.calls()[0].id.clone();
         assert!(id.starts_with("eval_0_0_c1"), "{id}");
         assert_ne!(id, "eval_0_0_c1");
+    }
+
+    #[test]
+    fn the_result_cap_cuts_a_long_reason_before_it_drops_the_reply() {
+        let mut turn = turn_of(&[call("c1", "a", json!(1))]);
+        turn.decisions = vec![ToolDecision::Deny {
+            reason: "r".repeat(5_000),
+        }];
+        let fitted = fit_result_cap(turn.clone(), &["c1".to_owned()], 2_048);
+        assert!(!fitted.oversized);
+        assert_eq!(fitted.content, turn.content);
+        let [ToolDecision::Deny { reason }] = fitted.decisions.as_slice() else {
+            panic!("one cut reason: {:?}", fitted.decisions);
+        };
+        assert!(reason.len() <= 256, "{}", reason.len());
+    }
+
+    #[test]
+    fn a_dropped_reply_is_a_divergence() {
+        let answer = decision(&[], "done", StopReason::EndTurn);
+        let dropped = TurnDecision {
+            text: String::new(),
+            dropped: true,
+            ..answer.clone()
+        };
+        assert_eq!(
+            verdict(Some(&answer), Some(&dropped)),
+            Verdict::Diverged(Divergence::Stop)
+        );
+        assert_eq!(
+            verdict(Some(&dropped), Some(&answer)),
+            Verdict::Diverged(Divergence::Stop)
+        );
+        assert_eq!(verdict(Some(&dropped), Some(&dropped)), Verdict::Same);
+        // The flag is left out at its default, so a recorded diff encodes as before.
+        assert!(
+            serde_json::to_value(&answer)
+                .unwrap()
+                .get("dropped")
+                .is_none()
+        );
     }
 
     #[test]

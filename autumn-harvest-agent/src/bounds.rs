@@ -176,6 +176,32 @@ mod tests {
         assert!(open.admit(u64::MAX), "a zero cap is no cap");
     }
 
+    proptest::proptest! {
+        #[test]
+        fn a_budget_that_starts_inside_the_cap_stays_inside_it(
+            cap in 1_u64..20_000,
+            floor in 0_u64..20_000,
+            placeholder in 0_u64..300,
+            sizes in proptest::collection::vec(0_u64..5_000, 0..24),
+        ) {
+            let mut budget = RoundBudget::new(cap, floor, placeholder);
+            proptest::prop_assert_eq!(budget.can_run(), floor <= cap);
+            let mut projected = floor;
+            for size in sizes {
+                let next = (projected + size).saturating_sub(placeholder);
+                let admitted = budget.admit(size);
+                proptest::prop_assert_eq!(admitted, next <= cap);
+                if admitted {
+                    projected = next;
+                }
+                proptest::prop_assert_eq!(budget.can_run(), projected <= cap);
+                if floor <= cap {
+                    proptest::prop_assert!(projected <= cap, "an admitted result stays inside the cap");
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_zero_budget_cap_admits_everything() {
         let mut budget = RoundBudget::new(0, u64::MAX, 10);

@@ -493,7 +493,7 @@ pub struct ToolCallRequest {
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
-const fn is_false(value: &bool) -> bool {
+pub(crate) const fn is_false(value: &bool) -> bool {
     !*value
 }
 

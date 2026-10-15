@@ -44,23 +44,26 @@ their defaults, so a recorded value encodes as before. The text of the
 fixed "did not run" and "dropped" answers changed. They reach only the report
 of a run that has ended.
 
-**Breaking changes.** `ModelTurn` and `AgentTask` gain a public field. A struct
-literal of either needs the new field. `AgentStop` is `#[non_exhaustive]`, so
+**Breaking changes.** `ModelTurn`, `AgentTask` and `eval::TurnDecision` gain a
+public field. A struct literal of one of them needs the new field. `AgentStop` is `#[non_exhaustive]`, so
 the new stop is not a break. A reader built before this change cannot decode
 `reply_too_large` in a recorded report. `exceeds_bytes(_, 0)` now returns
 `false`, and `max_tool_result_bytes(0)` returns `usize::MAX`.
 
 **Eval.** `eval::evaluate` follows a worker. A turn that exceeds the result cap
 is cut or dropped. A dropped reply ends the candidate run under
-`reply_too_large`. The run no longer fails. The per-turn verdict of a dropped
-reply can read as reworded. The run-level `end_diverged` flag shows the stop.
+`reply_too_large`. The run no longer fails. `TurnDecision::dropped` marks the
+turn, and a dropped reply reads as a `stop` divergence.
 
 **Tests.** Each behaviour change has a test that failed first. The `types`
 guards and one zero-cap budget test passed at red, because the stubs held the
-shape. The tests cover:
+shape. Later tests pin behaviour that already held, and a mutation run showed
+that they fail when the code is wrong. The tests cover:
 
 - a round that cannot fit, and a round charged against a large history;
+- the round budget to the byte, with a follow-up tool in the request;
 - a label that a call adds to the next request;
-- a reply over the cap, and a huge policy reason;
+- a reply over the cap, a huge policy reason, and a child that drops its reply;
 - a zero cap in the request check, the round and the tool results;
-- a task recorded before the change.
+- a task recorded before the change;
+- the eval cap, which measures the ids that the provider gave.
