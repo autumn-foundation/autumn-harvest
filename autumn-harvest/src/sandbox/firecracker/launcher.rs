@@ -320,12 +320,16 @@ struct PinnedImage {
     meta: Option<SnapshotMeta>,
     /// Each pinned file, with its stamp from before the pin checks it.
     stamps: Vec<(PathBuf, FileStamp)>,
+    /// The watch for a write to a pinned file.
+    watch: WriteWatch,
 }
 
 /// What a pin records of an image file.
 ///
-/// A hard link shares its inode, so a write in place reaches the pin. Such a
-/// write keeps the inode, but it changes the modification time.
+/// A hard link shares its inode, so a write in place reaches the pin. A
+/// plain write changes the modification time. A write that keeps the size
+/// and the time passes this check, as `cp -p` can, so [`WriteWatch`] also
+/// watches each file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FileStamp {
     dev: u64,
@@ -345,6 +349,88 @@ impl FileStamp {
             size: meta.size(),
             mtime: (meta.mtime(), meta.mtime_nsec()),
         })
+    }
+}
+
+/// An inotify watch for a write to the pinned image files.
+///
+/// The watch is on each inode, so it sees a write through any hard link. A
+/// link, an unlink and a read are not writes, so launches do not trip it.
+#[derive(Debug)]
+struct WriteWatch {
+    fd: std::os::fd::OwnedFd,
+    /// Set at the first event, and never cleared.
+    written: std::sync::atomic::AtomicBool,
+}
+
+impl WriteWatch {
+    /// Watch each file of `paths` for a write.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of `inotify_init1` or `inotify_add_watch`, such as
+    /// a full `fs.inotify` limit.
+    fn new(paths: &[PathBuf]) -> std::io::Result<Self> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::ffi::OsStrExt as _;
+        // SAFETY: inotify_init1 reads no memory.
+        let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor is new, and nothing else owns it.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        for path in paths {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+            // SAFETY: the path is a NUL-terminated string that outlives the
+            // call, and the descriptor is open.
+            let watch =
+                unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), libc::IN_MODIFY) };
+            if watch < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(Self {
+            fd,
+            written: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Whether a watched file had a write since the watch started.
+    ///
+    /// Each event counts: a write, a lost watch or an overflow. So does a
+    /// failed read, so the check fails closed.
+    fn written(&self) -> bool {
+        use std::os::fd::AsRawFd as _;
+        use std::sync::atomic::Ordering;
+        if self.written.load(Ordering::SeqCst) {
+            return true;
+        }
+        let mut events = [0u8; 4096];
+        loop {
+            // SAFETY: the buffer is valid for its length, and the descriptor
+            // is open.
+            let n = unsafe {
+                libc::read(
+                    self.fd.as_raw_fd(),
+                    events.as_mut_ptr().cast(),
+                    events.len(),
+                )
+            };
+            if n == 0 {
+                return false;
+            }
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                match e.kind() {
+                    std::io::ErrorKind::Interrupted => continue,
+                    std::io::ErrorKind::WouldBlock => return false,
+                    _ => {}
+                }
+            }
+            self.written.store(true, Ordering::SeqCst);
+            return true;
+        }
     }
 }
 
@@ -373,6 +459,26 @@ fn check_stamps(stamps: &[(PathBuf, FileStamp)]) -> Result<(), SandboxError> {
 }
 
 impl PinnedImage {
+    /// Check that no pinned file changed since the pin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Config`] when a file changed. A launch would
+    /// boot bytes that the pin did not check, and a retry cannot help until
+    /// the worker restarts.
+    fn check(&self) -> Result<(), SandboxError> {
+        check_stamps(&self.stamps)?;
+        if self.watch.written() {
+            return Err(SandboxError::Config(format!(
+                "a pinned image file in {} had a write in place after the pin; a hard link \
+                 shares its inode, so the write reaches the pin; publish an image by rename \
+                 and restart the worker",
+                self.dir.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Hard-link the image files of `config` into the directory of `owner`
     /// under `vm_root`. The construction checked that they are on the file
     /// system of the jail, so nothing is copied.
@@ -429,22 +535,32 @@ impl PinnedImage {
                 }),
                 BootMethod::ConfigFile | BootMethod::Api => None,
             };
-            let mut pinned = Self {
+            let kernel = link(&config.image.kernel, KERNEL_FILE)?;
+            let rootfs = link(&config.image.rootfs, ROOTFS_FILE)?;
+            // The links come in the order of `files`.
+            let links: Vec<PathBuf> = [&kernel, &rootfs]
+                .into_iter()
+                .chain(snapshot.iter().flat_map(|s| [&s.state, &s.memory]))
+                .cloned()
+                .collect();
+            let watch = WriteWatch::new(&links).map_err(|e| {
+                SandboxError::Config(format!(
+                    "cannot watch the pinned image in {} for writes: {e}; check the \
+                     fs.inotify limits",
+                    dir.display()
+                ))
+            })?;
+            let pinned = Self {
                 dir: dir.clone(),
-                kernel: link(&config.image.kernel, KERNEL_FILE)?,
-                rootfs: link(&config.image.rootfs, ROOTFS_FILE)?,
+                kernel,
+                rootfs,
                 snapshot,
                 meta,
-                stamps: Vec::new(),
+                stamps: links.into_iter().zip(stamps).collect(),
+                watch,
             };
-            // The links come in the order of `files`.
-            pinned.stamps = [&pinned.kernel, &pinned.rootfs]
-                .into_iter()
-                .chain(pinned.snapshot.iter().flat_map(|s| [&s.state, &s.memory]))
-                .cloned()
-                .zip(stamps)
-                .collect();
-            check_stamps(&pinned.stamps)?;
+            // The watch came after the links. The stamps cover a write before it.
+            pinned.check()?;
             Ok(pinned)
         })();
         if pinned.is_err() {
@@ -1105,7 +1221,8 @@ impl FirecrackerLauncher {
     ///
     /// Returns [`SandboxError::Config`] without the jailer, with an API
     /// timeout or a boot timeout of zero, or with a jailer `fsize` limit
-    /// below the guest memory. Returns
+    /// below the guest memory. A pinned image file that changed in place is
+    /// a config error too. Returns
     /// [`SandboxError::Unavailable`] when a step fails. The golden microVM is
     /// torn down on each path.
     pub async fn create_golden_snapshot(
@@ -1212,31 +1329,31 @@ impl FirecrackerLauncher {
         let config = self.config.clone();
         let meta_path = SnapshotMeta::path(&files.state);
         let out = out_dir.to_path_buf();
-        let stamps = self
-            .tenancy
-            .pinned
-            .as_ref()
-            .map(|pinned| pinned.stamps.clone());
+        let tenancy = Arc::clone(&self.tenancy);
+        let copy_error =
+            |e: std::io::Error| SandboxError::Unavailable(format!("cannot copy the snapshot: {e}"));
         tokio::task::spawn_blocking(move || {
-            let meta = SnapshotMeta::of(&config, (&kernel, &rootfs), firecracker)?;
+            let meta =
+                SnapshotMeta::of(&config, (&kernel, &rootfs), firecracker).map_err(copy_error)?;
             // The digests must come from the bytes that the golden microVM
-            // booted.
-            if let Some(stamps) = &stamps {
-                check_stamps(stamps).map_err(|e| std::io::Error::other(e.to_string()))?;
+            // booted. A changed file stays a config error.
+            if let Some(pinned) = &tenancy.pinned {
+                pinned.check()?;
             }
-            let meta = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
-            std::fs::create_dir_all(&out)?;
+            let meta = serde_json::to_vec(&meta)
+                .map_err(std::io::Error::other)
+                .map_err(copy_error)?;
+            std::fs::create_dir_all(&out).map_err(copy_error)?;
             // The manifest replaces the old one with the pair, as one set.
             let staged = staging_name(&meta_path);
-            std::fs::write(&staged, &meta)?;
+            std::fs::write(&staged, &meta).map_err(copy_error)?;
             copies.push((staged.clone(), meta_path));
             let published = publish_snapshot(&copies, gid);
             let _ = std::fs::remove_file(&staged);
-            published
+            published.map_err(copy_error)
         })
         .await
-        .map_err(|e| SandboxError::Unavailable(format!("the snapshot copy failed: {e}")))?
-        .map_err(|e| SandboxError::Unavailable(format!("cannot copy the snapshot: {e}")))?;
+        .map_err(|e| SandboxError::Unavailable(format!("the snapshot copy failed: {e}")))??;
         Ok(files)
     }
 
@@ -1253,7 +1370,7 @@ impl FirecrackerLauncher {
         // The image that this launcher pinned at its start.
         let pinned = self.tenancy.pinned.as_ref();
         if let Some(pinned) = pinned {
-            check_stamps(&pinned.stamps)?;
+            pinned.check()?;
         }
         let jail = super::jailer::jail_dir(jailer, &self.exec_name, id);
         let root = jail.join("root");
@@ -4851,6 +4968,57 @@ while True:
             matches!(&err, SandboxError::Config(m) if m.contains("in place")),
             "{err:?}"
         );
+        drop((vmm, launcher));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_write_in_place_that_keeps_the_stamp_fails_each_launch() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        let rootfs = config.image.rootfs.clone();
+        let launcher = new_launcher(config).unwrap();
+        // `cp -p` of a new image with the same size and modification time,
+        // as two images from the Nix store have.
+        let old = std::fs::metadata(&rootfs).unwrap();
+        let bytes = vec![b'x'; usize::try_from(old.len()).unwrap()];
+        std::fs::write(&rootfs, &bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&rootfs)
+            .unwrap()
+            .set_modified(old.modified().unwrap())
+            .unwrap();
+        let id = new_vm_id(launcher.owner());
+        let vmm = launcher.check_versions().await.unwrap();
+        let err = launcher
+            .prepare(&id, &BootMethod::ConfigFile, &vmm)
+            .await
+            .map(|_| ())
+            .expect_err("the pinned root file system changed in place");
+        assert!(
+            matches!(&err, SandboxError::Config(m) if m.contains("in place")),
+            "{err:?}"
+        );
+        drop((vmm, launcher));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn launches_that_link_the_pinned_image_do_not_trip_the_write_check() {
+        let dir = temp_dir();
+        let launcher = new_launcher(jailed(&dir)).unwrap();
+        let vmm = launcher.check_versions().await.unwrap();
+        // Each launch links the pinned files into its jail, and its drop
+        // unlinks them. Neither counts as a write.
+        for _ in 0..3 {
+            let id = new_vm_id(launcher.owner());
+            let prepared = launcher
+                .prepare(&id, &BootMethod::ConfigFile, &vmm)
+                .await
+                .unwrap();
+            drop(prepared);
+        }
         drop((vmm, launcher));
         std::fs::remove_dir_all(dir).unwrap();
     }
