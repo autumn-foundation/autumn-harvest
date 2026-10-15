@@ -228,6 +228,9 @@ runtime refuses a policy that allows the network on a backend without one.
   path that is not a network namespace handle.
   The microVM has no network device. The namespace also cuts the network of
   an escaped VMM.
+- A Firecracker binary whose file name is not a name in the jail root. The
+  jailer copies the binary to the root under its file name, so a name such
+  as `vmlinux` or `dev` is a config error.
 - One launcher per tenant, each with its own jail uid and gid. The microVMs
   of one launcher share their uid, so an escaped VMM can signal its
   siblings.

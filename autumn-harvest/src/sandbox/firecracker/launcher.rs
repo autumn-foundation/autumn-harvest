@@ -565,6 +565,8 @@ impl FirecrackerLauncher {
     /// - a path is missing;
     /// - a snapshot boot has no jailer;
     /// - the jail uid or gid is 0, or this process is not root with a jail;
+    /// - the file name of a jailed Firecracker binary is a name in the jail
+    ///   root;
     /// - the jail cannot read an image;
     /// - `JailerConfig::cgroup_root` is not the cgroup v2 mount of the jailer;
     /// - another user can change a binary, an image, the jail root or the
@@ -653,6 +655,14 @@ impl FirecrackerLauncher {
             }
         }
         let exec_name = super::jailer::exec_name(&config.firecracker_bin)?;
+        if matches!(config.confinement, Confinement::Jailer(_))
+            && JAIL_ROOT_NAMES.contains(&exec_name.as_str())
+        {
+            return Err(SandboxError::Config(format!(
+                "the Firecracker binary name {exec_name:?} is a name in the jail root, where \
+                 the jailer copies the binary, so each launch would fail"
+            )));
+        }
         let owner = uuid::Uuid::new_v4().simple().to_string()[..OWNER_TAG_HEX].to_owned();
         let vm_root = vm_root_of(&config.confinement, &exec_name);
         check_socket_paths(&vm_root, &config.confinement)?;
@@ -1439,6 +1449,19 @@ impl VmLauncher for FirecrackerLauncher {
 
 /// The API socket of an unjailed VM, in its directory.
 const UNJAILED_API_SOCKET: &str = "firecracker.socket";
+
+/// The names in a jail root before the jailer copies the Firecracker binary
+/// there. The jailer makes `dev` and `run`, and the launcher the rest.
+const JAIL_ROOT_NAMES: [&str; 8] = [
+    "dev",
+    "run",
+    KERNEL_FILE,
+    ROOTFS_FILE,
+    CONFIG_FILE,
+    super::config::VSOCK_SOCKET,
+    SNAPSHOT_STATE_FILE,
+    SNAPSHOT_MEMORY_FILE,
+];
 
 /// The snapshot state file name in the chroot.
 const SNAPSHOT_STATE_FILE: &str = "snapshot.state";
@@ -3570,6 +3593,25 @@ while True:
             assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_firecracker_name_that_the_jail_root_holds_is_a_config_error() {
+        // The jailer copies the binary to `<chroot>/<file name>`, over the
+        // kernel, the root file system or a directory of its own.
+        for name in ["vmlinux", "rootfs.ext4", "vm-config.json", "dev", "run"] {
+            let dir = temp_dir();
+            let bin = dir.join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let mut config = jailed(&dir);
+            config.firecracker_bin = script(&bin, name, "exit 0");
+            let err = new_launcher(config).expect_err("a colliding name");
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains("jail root")),
+                "{name}: {err:?}"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
