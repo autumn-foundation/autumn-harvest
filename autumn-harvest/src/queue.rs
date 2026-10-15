@@ -4249,6 +4249,25 @@ pub(crate) async fn claim_handler_started(
     Ok(row.is_some_and(|(held, started)| held == Some(true) && started == Some(claim.attempt)))
 }
 
+/// An activity result as its task row stores it (issue #2043).
+///
+/// The row holds the result in the column form. A stored-result reference
+/// holds no payload, only a pointer to the blob, so it stays as it is.
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError`] when the codec fails to encode.
+pub fn activity_row_output(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    output: &serde_json::Value,
+    is_stored_reference: bool,
+) -> crate::error::HarvestResult<serde_json::Value> {
+    if is_stored_reference {
+        return Ok(output.clone());
+    }
+    codecs.encode_column(output)
+}
+
 /// Complete the task that `claim` holds. A stale claim changes nothing.
 ///
 /// Returns [`ClaimWrite::LeaseLost`] for a stale claim. [`complete_task`] is

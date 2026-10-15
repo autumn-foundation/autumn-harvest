@@ -38,6 +38,14 @@ use crate::policy::RetryPolicy;
 /// in-flight attempt.
 pub const ERROR_TYPE_CIRCUIT_OPEN: &str = "CircuitOpen";
 
+/// Stable error-type name for an activity attempt whose stored input or
+/// checkpoint did not decode (issue #2043).
+///
+/// The worker raises it when a codec key is missing or a stored payload is
+/// bad. The failure is retryable, so the retry policy applies and an operator
+/// can restore the key. Its message never holds codec text.
+pub const ERROR_TYPE_PAYLOAD_DECODE_FAILED: &str = "PayloadDecodeFailed";
+
 /// Stable error-type name for worker-session breakage (issue #606).
 ///
 /// Synthesised by the broken-session scanner for every PENDING/RUNNING

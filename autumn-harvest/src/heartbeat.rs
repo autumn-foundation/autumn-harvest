@@ -35,6 +35,8 @@ use crate::context::StampedHeartbeat;
 #[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult};
 #[cfg(feature = "db")]
+use crate::payload_codec::PayloadCodecs;
+#[cfg(feature = "db")]
 use crate::queue::{ClaimWrite, TaskClaim};
 #[cfg(feature = "db")]
 use crate::telemetry::MetricsRecorder;
@@ -261,6 +263,30 @@ pub fn spawn_heartbeat_flusher_with(
     cancel: CancellationToken,
     options: HeartbeatFlushOptions,
 ) -> HeartbeatSlot {
+    spawn_heartbeat_flusher_with_codecs(
+        claim,
+        pool,
+        cancel,
+        options,
+        crate::store::DEFAULT_PAYLOAD_CODECS.clone(),
+    )
+}
+
+/// [`spawn_heartbeat_flusher_with`], encoding each checkpoint through
+/// `codecs` before it is written (issue #2043).
+///
+/// The flusher encodes, and not the activity. Then the shared
+/// [`crate::context::ActivityContext`] needs no codec, and an auto-heartbeat
+/// ping is covered too. A liveness ping holds no details and stays `null`.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn spawn_heartbeat_flusher_with_codecs(
+    claim: TaskClaim,
+    pool: Pool<AsyncPgConnection>,
+    cancel: CancellationToken,
+    options: HeartbeatFlushOptions,
+    codecs: PayloadCodecs,
+) -> HeartbeatSlot {
     // A fence stops this flusher too (issue #1823). The flusher outlives a
     // drain, so the worker token does not reach it.
     if crate::replication::FenceRegistry::is_enabled() {
@@ -273,6 +299,7 @@ pub fn spawn_heartbeat_flusher_with(
         Arc::clone(&latest),
         cancel,
         options,
+        codecs,
     ));
     HeartbeatSlot(latest)
 }
@@ -418,6 +445,7 @@ pub async fn flush_heartbeat(
             metrics: Arc::new(crate::telemetry::NoOpMetrics),
             shards: Arc::from([0]),
         },
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
         Duration::MAX,
     )
     .await
@@ -439,6 +467,25 @@ struct FlushFailure {
 struct Pending {
     payload: Value,
     sent_order: std::time::Instant,
+}
+
+/// The checkpoint as the column stores it (issue #2043).
+///
+/// A liveness ping holds no details, so it stays `null`. A checkpoint that
+/// does not encode is dropped and the ping is kept. The heartbeat time then
+/// still advances, and the timeout scanner does not kill a live activity.
+#[cfg(feature = "db")]
+fn stored_checkpoint(codecs: &PayloadCodecs, payload: &Value) -> Value {
+    if payload.is_null() {
+        return Value::Null;
+    }
+    codecs.encode_column(payload).unwrap_or_else(|error| {
+        tracing::warn!(
+            error_kind = crate::codec_rotation::sweep_error_kind(&error),
+            "heartbeat details could not be encoded; the flush drops them"
+        );
+        Value::Null
+    })
 }
 
 /// Write `beat`, or a newer heartbeat from `latest`, on one connection.
@@ -463,6 +510,7 @@ async fn flush(
     beat: &mut Pending,
     latest: &Latest,
     options: &HeartbeatFlushOptions,
+    codecs: &PayloadCodecs,
     interval: Duration,
 ) -> Result<ClaimWrite, FlushFailure> {
     let metrics = options.metrics.as_ref();
@@ -490,7 +538,7 @@ async fn flush(
         let written = crate::queue::record_heartbeat_sent_ago(
             &mut conn,
             claim,
-            beat.payload.clone(),
+            stored_checkpoint(codecs, &beat.payload),
             beat.sent_order.elapsed(),
         )
         .await;
@@ -523,6 +571,7 @@ async fn stamped_heartbeat_loop(
     latest: LatestHeartbeat,
     cancel: CancellationToken,
     options: HeartbeatFlushOptions,
+    codecs: PayloadCodecs,
 ) {
     let flush_interval = Duration::from_secs(1);
     let task_id = claim.task_id;
@@ -561,7 +610,16 @@ async fn stamped_heartbeat_loop(
         // If we got at least one heartbeat, flush to DB.
         if let Some(mut beat) = pending.take() {
             let started = tokio::time::Instant::now();
-            let outcome = flush(&pool, &claim, &mut beat, &latest, &options, flush_interval).await;
+            let outcome = flush(
+                &pool,
+                &claim,
+                &mut beat,
+                &latest,
+                &options,
+                &codecs,
+                flush_interval,
+            )
+            .await;
             // A write that blocked leaves the row with an old send time,
             // whether it then succeeds or fails. A newer heartbeat then goes
             // at once, so a timeout scanner does not see a live activity as

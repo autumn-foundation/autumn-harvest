@@ -145,20 +145,19 @@ impl CodecColumn {
 /// Every row of the table holds an encoded cell.
 const ALL_ROWS: &str = "TRUE";
 
-/// Only a workflow task's row is encoded. An activity task keeps its input
-/// and output in clear.
-const WORKFLOW_TASK_ROWS: &str = "t.task_type = 'workflow'";
-
-/// Every codec column the sweep converts and the census counts (issue #1979).
+/// Every codec column the sweep converts and the census counts (issue #1979,
+/// issue #2043).
 ///
 /// Most are written through [`PayloadCodecs::encode_column`].
 /// `harvest_execution_summaries.result` is a verbatim copy of
 /// `harvest_workflow_executions.output`, so it holds the same ciphertext.
-/// `harvest_task_queue` holds the workflow task's input and output, encoded
-/// the same way. An activity task row stays in clear. A clear activity
-/// argument can still have the shape of a valid envelope. So those entries
-/// select workflow rows only, and the sweep and the census never touch an
-/// activity row.
+/// A workflow task row and an activity task row both hold encoded cells. A
+/// completion-callback dead letter copies the stored delivery body, so it
+/// holds an envelope too.
+///
+/// A row written before issue #2043 can hold a clear value. A clear value
+/// that has the shape of an envelope reads as one. The security posture
+/// page names this residual risk.
 ///
 /// A column belongs here exactly when `docs/security-posture.md` marks it
 /// Covered, except `harvest_events.event_data`, which the event pass covers.
@@ -204,13 +203,49 @@ pub const CODEC_COLUMNS: &[CodecColumn] = &[
         table: "harvest_task_queue",
         id_column: "id",
         column: "input",
-        rows: WORKFLOW_TASK_ROWS,
+        rows: ALL_ROWS,
     },
     CodecColumn {
         table: "harvest_task_queue",
         id_column: "id",
         column: "output",
-        rows: WORKFLOW_TASK_ROWS,
+        rows: ALL_ROWS,
+    },
+    CodecColumn {
+        table: "harvest_task_queue",
+        id_column: "id",
+        column: "heartbeat_details",
+        rows: ALL_ROWS,
+    },
+    CodecColumn {
+        table: "harvest_completion_deliveries",
+        id_column: "id",
+        column: "payload",
+        rows: ALL_ROWS,
+    },
+    CodecColumn {
+        table: "harvest_debounce",
+        id_column: "id",
+        column: "last_input",
+        rows: ALL_ROWS,
+    },
+    CodecColumn {
+        table: "harvest_start_throttle",
+        id_column: "id",
+        column: "input",
+        rows: ALL_ROWS,
+    },
+    CodecColumn {
+        table: "harvest_completion_trigger_outbox",
+        id_column: "id",
+        column: "target_input",
+        rows: ALL_ROWS,
+    },
+    CodecColumn {
+        table: "harvest_batch_jobs",
+        id_column: "id",
+        column: "signal_payload",
+        rows: ALL_ROWS,
     },
 ];
 
@@ -346,7 +381,7 @@ fn active_key_would_decrypt(codecs: &PayloadCodecs) -> bool {
 const COMPLETED_CURSOR_REVALIDATION_SECS: f64 = 300.0;
 
 #[cfg(feature = "db")]
-const fn sweep_error_kind(error: &HarvestError) -> &'static str {
+pub(crate) const fn sweep_error_kind(error: &HarvestError) -> &'static str {
     match error {
         HarvestError::UnknownCodecKey { .. } => "unknown_key",
         HarvestError::UnknownPayloadCodec { .. } => "unknown_codec",

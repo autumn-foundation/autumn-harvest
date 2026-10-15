@@ -17311,7 +17311,10 @@ impl ActivityContext {
                 // Mark the task COMPLETED. The row lock above keeps the claim
                 // current, so a lost lease here is a bug, and the error rolls
                 // back.
-                crate::queue::complete_claimed_task(conn, &claim, output)
+                // The row stores the result in the column form (issue #2043).
+                let row_output =
+                    crate::queue::activity_row_output(&codecs, &output, stored.is_some())?;
+                crate::queue::complete_claimed_task(conn, &claim, row_output)
                     .await?
                     .require_applied(task_id)?;
 
