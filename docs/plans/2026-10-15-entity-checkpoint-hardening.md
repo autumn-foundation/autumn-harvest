@@ -2,7 +2,8 @@
 
 ## Problem
 
-Round 6 of the review of the keyed entity (issue #1975) left two findings.
+Issue #2049 records two findings from the review of the keyed entity
+(issue #1975).
 
 1. `Entity::run` records the checkpoint byte budget once for each run. A later
    attempt in the same run reuses it. A deploy can lower the input cap while a
@@ -22,8 +23,8 @@ Round 6 of the review of the keyed entity (issue #1975) left two findings.
   history. Replay of a recorded budget gives the recorded claim.
 - `continue_as_new` checks the live cap only when history holds no
   `WorkflowContinuedAsNew` event. It checks before it emits the command.
-- `record_failure` is the only writer of `last_error`.
-- The MSRV is 1.88. `str::floor_char_boundary` needs 1.91.
+- `record_failure` is the only writer of `last_error` during a run.
+- The MSRV lacks `str::floor_char_boundary`.
 - Release 0.7.0 shipped on 2026-10-05. The entity merged after it.
 
 ## Brainstorm
@@ -32,7 +33,7 @@ Finding 1:
 
 1. Record the budget at each checkpoint attempt. This is the issue proposal.
 2. Read the live cap each time and record nothing. Replay then reads another
-   cap and claims other ops than the run did.
+   cap and claims different ops from the live run.
 3. Catch `PayloadTooLarge` from `continue_as_new` and retry. Nothing records
    the failure, so a replay under another cap diverges.
 4. Put the budget in the decision side effect. This changes the recorded
@@ -53,31 +54,32 @@ Option 1 wins in both lists. It keeps the wire form and the event types.
 
 | Way to fail | Guard |
 |---|---|
-| The budget record sits far from the `continue_as_new` it sizes. | Record it just before `claim_waiting_ops`, with no `await` between them. |
-| The new attempt reuses a recorded budget. | Test: cut a history after a failed attempt, lower the cap, drive the next cycle. The input fits the new cap. |
-| The cut splits a multi-byte character and panics. | Test with a 3-byte character, so the cut falls inside it. |
+| The budget record sits far from the `continue_as_new` it sizes. | Record it before `claim_waiting_ops`, with no `await` between them. |
+| The new attempt reuses a recorded budget. | Test: cut a history after an attempt whose ops did not fit, lower the cap, drive the next cycle. The new attempt records the lowered budget and runs the next op. |
+| A replay sizes its claim from the live cap, not the recorded budget. | Test: replay a full history under a lowered cap. |
+| The loop records the budget for each op, not for each attempt. | Test: a run with no checkpoint records no budget. |
+| The cut splits a multi-byte character and panics. | Test 2-, 3- and 4-byte characters, so the cut falls inside one. |
 | The marker pushes the result over the bound. | Test the lengths around the bound. |
 | A short error changes. | Test an error of exactly the bound. It stays whole. |
-| The decode-error path stays unbounded. | Test a bad `kind` far above the bound. |
-| The kept buffer holds the memory of the huge error. | Build a new `String` for the cut text. |
+| The decode-error path stays unbounded. | Test a bad `kind` above the bound. |
+| The stored string keeps the memory of the long error. | Build a new `String` for the cut text. |
 | The `max_ops_per_run(1)` case still fails. | Test a 3 MiB error with `max_ops_per_run(1)`. |
+| A long `last_error` in the start input stays long. | Cut it at the start of `Entity::run`. Test a 3 MiB start-input error. |
 
 ## Six hats
 
 - **White.** See the facts above.
-- **Red.** An operator fears a deploy that wedges a live entity. A user does
-  not like to see an error cut.
+- **Red.** An operator fears a deploy that wedges a live entity. A user wants
+  the full error text.
 - **Black.** A history that retried a checkpoint under the old code does not
-  replay under the new code. A history that carried an error above the bound
-  does not replay either. No release holds the old code, so the cost is low.
-  The cut also loses detail of a long error.
+  replay under the new code. No release holds the old code, so the cost is
+  low. The cut also loses detail of a long error.
 - **Yellow.** The change is small: one removed variable and one helper. It
-  adds no event type and no migration. Each decision and its
-  `continue_as_new` now use one config.
-- **Green.** Export the bound as a constant, so a test can use it. Later, a
+  adds no event type and no migration. The budget and the `continue_as_new`
+  cap come from one config read.
+- **Green.** Export the bound as a constant, so a caller can read it. Later, a
   handler may return a typed error with a code and a short message.
-- **Blue.** Work in TDD order. Update ADR 0006, the changelog fragment, the
-  security notes and the module docs. Review from several angles.
+- **Blue.** Work in TDD order.
 
 ## Decisions
 
@@ -85,16 +87,19 @@ Option 1 wins in both lists. It keeps the wire form and the event types.
   cost more than they save.
 - The bound is 1024 bytes in total, marker included. The marker is
   `... [truncated]`.
-- No cut of a `last_error` that arrives in the start input. That input is
-  trusted, and the next failed op replaces the field.
+- Cut a `last_error` from the start input too. The first plan left it whole,
+  because the next failed op replaces it. That is false when no op fails.
+  Review found it, and the cut is one line.
 
 ## Steps
 
-1. RED: a test of the budget record for each attempt, a replay test under a
-   lowered cap, tests of the bound and a 3 MiB error with
-   `max_ops_per_run(1)`.
+1. RED:
+   - a test of the budget record for each attempt;
+   - a replay test under a lowered cap;
+   - tests of the bound;
+   - a 3 MiB error with `max_ops_per_run(1)`.
 2. GREEN: remove the cached budget and add the bound.
-3. REFACTOR: tidy the code and the docs.
+3. REFACTOR: tidy the code.
 4. Docs: ADR 0006, the changelog fragment, the security notes and the module
    docs.
 5. Review from several angles. Fix each confirmed finding.

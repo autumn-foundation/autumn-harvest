@@ -41,7 +41,7 @@
 //!   deterministic. The error text rides in the checkpoint input. The
 //!   checkpoint keeps at most
 //!   [`ENTITY_LAST_ERROR_MAX_BYTES`](crate::entity::ENTITY_LAST_ERROR_MAX_BYTES)
-//!   bytes of it.
+//!   bytes of the error text.
 //! - A handler panic fails the run, as in any workflow.
 //!
 //! # Example
@@ -104,20 +104,22 @@ pub const ENTITY_CHECKPOINT_SIDE_EFFECT: &str = "harvest.entity.checkpoint";
 /// The side-effect id that records the byte budget of a checkpoint input.
 ///
 /// The budget is the configured workflow input cap. Each checkpoint attempt
-/// records it. A config change between a run and its replay does not change
-/// what an earlier attempt carried. A later attempt uses the live config.
+/// records it. Replay of an earlier attempt reads the recorded budget, not
+/// the current cap. A later attempt reads the current cap.
 pub const ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT: &str = "harvest.entity.checkpoint_budget";
 
-/// The most bytes that [`EntityStats::last_error`] keeps, marker included.
+/// The maximum size in bytes of [`EntityStats::last_error`], marker included.
 ///
 /// A longer error is cut at a `char` boundary and ends with `... [truncated]`.
-/// The error rides in each checkpoint input, so a huge error would stop later
-/// checkpoints. A decode error can also quote part of a bad payload. A change
-/// to this bound changes replay.
+/// The error rides in each checkpoint input. Without a bound, a huge error
+/// stops later checkpoints. A decode error can also quote part of a bad
+/// payload. Change this bound as a versioned workflow change.
 pub const ENTITY_LAST_ERROR_MAX_BYTES: usize = 1024;
 
 /// The text that ends a cut error.
 const TRUNCATION_MARKER: &str = "... [truncated]";
+
+const _: () = assert!(ENTITY_LAST_ERROR_MAX_BYTES > TRUNCATION_MARKER.len());
 
 /// One message on the [`ENTITY_OP_SIGNAL`] signal.
 ///
@@ -313,6 +315,8 @@ where
             mut checkpoint,
             max_ops_per_run,
         } = self;
+        // The start input is trusted, but its error must obey the bound too.
+        checkpoint.stats.last_error = checkpoint.stats.last_error.take().map(bound_error);
         let mut waiting: VecDeque<Value> = std::mem::take(&mut checkpoint.pending).into();
         let published = Arc::new(Mutex::new(Published::of(&checkpoint)));
         register_queries(ctx, &published);
@@ -461,8 +465,8 @@ fn json_len<T: Serialize + ?Sized>(value: &T) -> HarvestResult<u64> {
 
 /// Cut `error` to [`ENTITY_LAST_ERROR_MAX_BYTES`], marker included.
 ///
-/// The cut lands on a `char` boundary. `str::floor_char_boundary` needs Rust
-/// 1.91, and the MSRV is 1.88.
+/// The cut lands on a `char` boundary. The loop below replaces
+/// `str::floor_char_boundary`, which the MSRV lacks.
 fn bound_error(error: String) -> String {
     if error.len() <= ENTITY_LAST_ERROR_MAX_BYTES {
         return error;
@@ -471,7 +475,7 @@ fn bound_error(error: String) -> String {
     while !error.is_char_boundary(end) {
         end -= 1;
     }
-    // A new string frees the buffer of the long error.
+    // `truncate` would keep the buffer of the long error. A new string drops it.
     let mut bounded = String::with_capacity(end + TRUNCATION_MARKER.len());
     bounded.push_str(&error[..end]);
     bounded.push_str(TRUNCATION_MARKER);
@@ -827,6 +831,10 @@ mod tests {
             vec![json!(false); 3],
             "the loop records one checkpoint decision for each op that does not end the run"
         );
+        assert!(
+            recorded(outcome.events(), ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT).is_empty(),
+            "a run with no checkpoint attempt records no budget"
+        );
         let report = outcome.replay_check(counter).await;
         assert!(
             matches!(report.status, ReplayStatus::ReplaySucceeded),
@@ -942,7 +950,7 @@ mod tests {
         assert_eq!(carried.stats.last_error.as_deref(), Some("op refused"));
     }
 
-    /// An error far above the input cap.
+    /// An error above the input cap.
     const HUGE_ERROR_BYTES: usize = 3 << 20;
 
     /// A counter entity that asks for a checkpoint after each op. Each op
@@ -958,8 +966,8 @@ mod tests {
         })
     }
 
-    /// The failed op counts and the entity goes on, even when the next
-    /// checkpoint is due at once.
+    /// A huge error does not block the checkpoint. The input fits the cap
+    /// and replay succeeds.
     #[tokio::test]
     async fn a_huge_error_does_not_block_the_checkpoint() {
         let outcome = env_with(&[op(1)]).run(huge_error_counter, json!({})).await;
@@ -987,7 +995,7 @@ mod tests {
         );
     }
 
-    /// A decode error can quote the payload. The bound limits what it keeps.
+    /// A decode error can quote the payload. The bound cuts the quote.
     #[tokio::test]
     async fn a_decode_error_that_quotes_the_payload_is_bounded() {
         let bad = json!({"kind": "z".repeat(64 * 1024)});
@@ -1004,6 +1012,28 @@ mod tests {
         );
     }
 
+    /// The start input is trusted, but its `last_error` obeys the bound too.
+    #[tokio::test]
+    async fn a_start_input_error_above_the_bound_is_cut() {
+        let input = json!({"stats": {"last_error": "x".repeat(HUGE_ERROR_BYTES)}});
+        let outcome = env_with(&[op(1)]).run(one_op_counter, input).await;
+        let checkpoint = outcome
+            .result
+            .clone()
+            .expect("the checkpoint fits the input cap");
+        let carried: EntityCheckpoint<i64> = serde_json::from_value(checkpoint).unwrap();
+        let error = carried.stats.last_error.expect("the start input set it");
+        assert!(
+            error.len() <= ENTITY_LAST_ERROR_MAX_BYTES,
+            "the error keeps {} bytes",
+            error.len()
+        );
+        assert!(
+            error.ends_with(TRUNCATION_MARKER),
+            "the cut leaves a marker"
+        );
+    }
+
     #[test]
     fn an_error_within_the_bound_stays_whole() {
         let exact = "e".repeat(ENTITY_LAST_ERROR_MAX_BYTES);
@@ -1012,19 +1042,44 @@ mod tests {
     }
 
     #[test]
+    fn the_bound_and_the_marker_are_wire_values() {
+        assert_eq!(ENTITY_LAST_ERROR_MAX_BYTES, 1024);
+        assert_eq!(TRUNCATION_MARKER, "... [truncated]");
+    }
+
+    /// The bound applies when the loop records the failure, so the stats
+    /// query and the checkpoint carry the same text.
+    #[test]
+    fn a_recorded_failure_is_counted_and_bounded() {
+        let mut stats = EntityStats::default();
+        record_failure(&mut stats, "x".repeat(HUGE_ERROR_BYTES));
+        assert_eq!(stats.failed, 1);
+        let error = stats.last_error.expect("the failure is recorded");
+        assert!(error.len() <= ENTITY_LAST_ERROR_MAX_BYTES);
+        assert!(error.ends_with(TRUNCATION_MARKER));
+    }
+
+    /// The cut keeps the head of the error and frees the long buffer.
+    #[test]
     fn a_longer_error_is_cut_to_the_bound_with_a_marker() {
         let kept = ENTITY_LAST_ERROR_MAX_BYTES - TRUNCATION_MARKER.len();
-        let expected = format!("{}{TRUNCATION_MARKER}", "e".repeat(kept));
+        let expected = format!("HEAD{}{TRUNCATION_MARKER}", "e".repeat(kept - 4));
         for len in [
             ENTITY_LAST_ERROR_MAX_BYTES + 1,
             ENTITY_LAST_ERROR_MAX_BYTES * 2,
             HUGE_ERROR_BYTES,
         ] {
-            assert_eq!(bound_error("e".repeat(len)), expected, "{len} bytes in");
+            let cut = bound_error(format!("HEAD{}TAIL", "e".repeat(len - 8)));
+            assert_eq!(cut, expected, "{len} bytes in");
+            assert!(
+                cut.capacity() <= 2 * ENTITY_LAST_ERROR_MAX_BYTES,
+                "the buffer of the long error is gone"
+            );
         }
     }
 
-    /// The cut index falls inside a character for each width and offset.
+    /// Characters of 2, 3 and 4 bytes at four offsets. Most cuts land inside
+    /// a character.
     #[test]
     fn the_cut_lands_on_a_char_boundary() {
         let kept = ENTITY_LAST_ERROR_MAX_BYTES - TRUNCATION_MARKER.len();
@@ -1264,7 +1319,8 @@ mod tests {
             .mock_activity("entity_step", |_| Ok(json!(1)))
             .run(activity_one_op_counter, json!({}))
             .await;
-        // End the history where the activity of the op that did not fit ends.
+        // End the history after the activity of the first op that follows the
+        // first attempt.
         let cut = outcome
             .events()
             .iter()
@@ -1272,7 +1328,7 @@ mod tests {
             .filter(|(_, e)| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
             .nth(1)
             .map(|(index, _)| index + 1)
-            .expect("the op that did not fit ran an activity");
+            .expect("the op after the first attempt ran an activity");
         let history = outcome.events()[..cut].to_vec();
         assert_eq!(
             recorded(&history, ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT).len(),
@@ -1280,14 +1336,12 @@ mod tests {
             "the first attempt is in the history"
         );
 
-        // Three ops of 600 KiB fit the old cap but not this one.
-        let lowered = 1024 * 1024;
-        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history).with_payload_caps(
-            crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
-            crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
-            crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
-            lowered,
-        );
+        // Three ops of 600 KiB fit the default cap but not half of it.
+        let lowered = crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES / 2;
+        let activity = crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES;
+        let signal = crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES;
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history)
+            .with_payload_caps(activity, activity, signal, lowered);
         let (cycle, ..) = drive_workflow(ctx, activity_one_op_counter, json!({}), None).await;
         let WorkflowOutcome::Suspended { commands } = cycle else {
             panic!("the run must go on, not fail: {cycle:?}");
@@ -1308,11 +1362,38 @@ mod tests {
             [&json!(lowered)],
             "the new attempt records the live budget"
         );
+        let next_op = commands.iter().any(|c| {
+            matches!(
+                c,
+                WorkflowCommand::ScheduleActivity { name, input, .. }
+                    if name == "entity_step" && *input == json!({"add": 4})
+            )
+        });
         assert!(
-            !commands
-                .iter()
-                .any(|c| matches!(c, WorkflowCommand::ContinueAsNew { .. })),
-            "the carried ops do not fit, so the run runs another op first"
+            next_op,
+            "the carried ops do not fit, so the loop runs the next op first"
+        );
+    }
+
+    /// Replay reads the recorded budgets. A full history from the default cap
+    /// replays under a lowered cap.
+    #[tokio::test]
+    async fn a_full_history_replays_under_a_lowered_cap() {
+        let outcome = env_with(&overflowing_ops())
+            .run(one_op_counter, json!({}))
+            .await;
+        let report = WorkflowReplayer::new()
+            .with_payload_caps(
+                crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+                crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+                crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES / 2,
+            )
+            .register_fn("one_op_counter", one_op_counter)
+            .replay_from_events(outcome.events().to_vec())
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
         );
     }
 

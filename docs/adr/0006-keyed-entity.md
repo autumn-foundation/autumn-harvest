@@ -73,10 +73,10 @@ adds no `WorkflowEvent` variant, no migration and no worker path.
 - The cost is one `SideEffectRecorded` event for each op. A run with an
   `execution_timeout` also records a deadline probe for each op. Each
   checkpoint attempt also records its byte budget.
-- The budget is the workflow input cap. The loop records it at each attempt,
-  just before it sizes the input. A cap that a deploy lowers while a handler
-  waits on an activity then applies to the next attempt. Replay of the
-  earlier attempt still reads the budget it recorded.
+- The budget is the workflow input cap, or no limit when payload offload
+  lifts it. The loop records it before it sizes the input. A deploy can lower
+  the cap while a handler waits on an activity. The next attempt then uses the
+  lowered cap. Replay of an earlier attempt reads the budget it recorded.
 - `max_ops_per_run` adds a fixed bound. It needs no event.
 - At a checkpoint, the loop claims the op signals that wait in history. It
   carries them in the checkpoint input while the input fits the workflow
@@ -111,15 +111,16 @@ A native primitive stays at rank 13, behind customer pull.
 - Continue-as-new works only in a root workflow, so an entity cannot be a
   child workflow.
 - These values are part of replay: `max_ops_per_run`, the
-  `execution_timeout`, the `EntityCheckpoint` wire form, and the error text
-  of a failed op (it rides in the checkpoint input). Change them as a
-  versioned workflow change. A new checkpoint field must skip serialization
-  at its default.
-- The checkpoint keeps at most 1 KiB of the error of a failed op
-  (`stats.last_error`). A longer error is cut at a `char` boundary and ends
-  with `... [truncated]`. A huge error then cannot stop a later checkpoint. A
-  decode error can quote the payload, so the cut also limits what the field
-  keeps. The bound is part of replay.
+  `execution_timeout`, the `EntityCheckpoint` wire form, the error text of a
+  failed op (it rides in the checkpoint input), and the bound on that text.
+  Change them as a versioned workflow change. A new checkpoint field must
+  skip serialization at its default.
+- `stats.last_error` keeps at most 1024 bytes, marker included
+  (`ENTITY_LAST_ERROR_MAX_BYTES`). `Entity::run` cuts a longer error at a
+  `char` boundary and ends it with `... [truncated]`. The cut covers the error
+  of a failed op and the trusted start input. A huge error then cannot stop a
+  later checkpoint. A decode error can quote the payload, so the cut also
+  limits that quote.
 - The deadline check runs only after an op. An idle entity with an
   `execution_timeout` times out. Do not set one on an entity.
 - The start input is trusted. A caller who may start the workflow may set
