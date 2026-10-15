@@ -621,7 +621,7 @@ impl FirecrackerLauncher {
                 ));
             }
             super::jailer::check_cgroup_parent(jailer)?;
-            super::jailer::check_limits(jailer)?;
+            super::jailer::check_limits(jailer, super::jailer::host_nr_open())?;
             super::jailer::check_extra_cgroups(jailer)?;
             super::jailer::check_cgroup_root(jailer, mounts)?;
             // `RunningVm::spawn` clears the environment, so only the
@@ -4334,6 +4334,34 @@ while True:
         }
         drop(new_launcher(with_limit(Some(super::super::jailer::MIN_NOFILE_LIMIT))).unwrap());
         drop(new_launcher(with_limit(None)).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_vmm_file_limit_above_the_host_ceiling_is_a_config_error() {
+        let dir = temp_dir();
+        let with_limit = |limit: u64| {
+            let mut config = jailed(&dir);
+            let Confinement::Jailer(jail) = &mut config.confinement else {
+                unreachable!("a jailed config");
+            };
+            jail.nofile_limit = Some(limit);
+            config
+        };
+        // Linux refuses an `RLIMIT_NOFILE` above `fs.nr_open`, even to root.
+        let nr_open: u64 = std::fs::read_to_string("/proc/sys/fs/nr_open")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        for limit in [nr_open + 1, u64::MAX] {
+            let err = new_launcher(with_limit(limit)).expect_err("over fs.nr_open");
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains("nr_open")),
+                "{limit}: {err:?}"
+            );
+        }
+        drop(new_launcher(with_limit(nr_open)).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

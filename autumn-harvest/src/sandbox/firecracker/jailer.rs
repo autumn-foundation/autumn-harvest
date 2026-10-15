@@ -76,7 +76,8 @@ pub struct JailerConfig {
     /// The `fsize` rlimit of the VMM, in bytes. It must hold a snapshot of
     /// the guest memory. The default is [`DEFAULT_FSIZE_LIMIT`].
     pub fsize_limit: Option<u64>,
-    /// The `no-file` rlimit of the VMM, at least [`MIN_NOFILE_LIMIT`].
+    /// The `no-file` rlimit of the VMM, at least [`MIN_NOFILE_LIMIT`] and at
+    /// most the `fs.nr_open` of the host.
     pub nofile_limit: Option<u64>,
 }
 
@@ -208,17 +209,37 @@ pub fn check_extra_cgroups(config: &JailerConfig) -> Result<(), SandboxError> {
 /// leaves room for 32 vCPUs.
 pub const MIN_NOFILE_LIMIT: u64 = 128;
 
-/// Check the rlimits of the VMM.
+/// The largest `fs.nr_open` of a 64-bit kernel: `INT_MAX`, rounded down to a
+/// multiple of 64. A host whose value cannot be read is checked against it.
+const NR_OPEN_MAX: u64 = 2_147_483_584;
+
+/// The `fs.nr_open` value of this host, or [`NR_OPEN_MAX`] when it cannot be
+/// read. No `RLIMIT_NOFILE` can pass it.
+#[must_use]
+pub fn host_nr_open() -> u64 {
+    std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(NR_OPEN_MAX)
+}
+
+/// Check the rlimits of the VMM on a host whose `fs.nr_open` is `nr_open`.
 ///
 /// # Errors
 ///
 /// [`SandboxError::Config`] for a `no-file` limit below
-/// [`MIN_NOFILE_LIMIT`]. Each launch would fail, and a retry cannot help.
-pub fn check_limits(config: &JailerConfig) -> Result<(), SandboxError> {
+/// [`MIN_NOFILE_LIMIT`] or above `nr_open`. The jailer sets the limit with
+/// `setrlimit`, which refuses a value above `nr_open`, even to root. Each
+/// launch would fail, and a retry cannot help.
+pub fn check_limits(config: &JailerConfig, nr_open: u64) -> Result<(), SandboxError> {
     match config.nofile_limit {
         Some(limit) if limit < MIN_NOFILE_LIMIT => Err(SandboxError::Config(format!(
             "the jailer no-file limit of {limit} is below the {MIN_NOFILE_LIMIT} files that \
              a VMM needs"
+        ))),
+        Some(limit) if limit > nr_open => Err(SandboxError::Config(format!(
+            "the jailer no-file limit of {limit} is above the fs.nr_open of {nr_open}, so \
+             setrlimit would refuse it at each launch"
         ))),
         _ => Ok(()),
     }

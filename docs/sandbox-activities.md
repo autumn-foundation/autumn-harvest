@@ -347,7 +347,8 @@ What each microVM gets:
   the whole guest memory to one file, so `create_golden_snapshot` refuses a
   limit below the guest memory;
 - a `no-file` limit of 1024 on the VMM, by default. The launcher refuses a
-  limit below 128 (`MIN_NOFILE_LIMIT`), because each launch would fail.
+  limit below 128 (`MIN_NOFILE_LIMIT`), because each launch would fail. It
+  also refuses a limit above the host `fs.nr_open`, which `setrlimit` refuses.
 
 `GuestImage::extra_boot_args` adds kernel arguments. The launcher refuses an
 extra argument that replaces one of its own, and a word that starts with `-`.
