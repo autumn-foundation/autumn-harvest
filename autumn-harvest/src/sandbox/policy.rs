@@ -412,10 +412,11 @@ impl SandboxPolicy {
         // Each kept stream byte can decode to three bytes of U+FFFD, and each
         // of those can escape to six bytes of JSON.
         let streams = self.max_limits.max_output_bytes.saturating_mul(2 * 3 * 6);
+        // The collector caps each read by the budget left, so the total
+        // bounds the file bytes. A larger cap for one file adds nothing.
         let files = self
             .sizes
-            .max_output_file_bytes
-            .max(self.sizes.max_output_files_total_bytes)
+            .max_output_files_total_bytes
             .div_ceil(3)
             .saturating_mul(4);
         // Each output appears once, returned or skipped, with an escaped
@@ -776,6 +777,20 @@ mod tests {
         let streams = 2 * 6 * policy.max_limits.max_output_bytes;
         let files = policy.sizes.max_output_files_total_bytes.div_ceil(3) * 4;
         assert!(policy.max_outcome_json_bytes() >= streams + files);
+    }
+
+    #[test]
+    fn the_outcome_bound_sizes_files_by_the_total_budget() {
+        // The collector never returns more file bytes than the total budget.
+        // A larger cap for one file does not make the outcome larger.
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_output_file_bytes = 1 << 40;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert_eq!(
+            policy.max_outcome_json_bytes(),
+            SandboxPolicy::default().max_outcome_json_bytes()
+        );
+        policy.validate().unwrap();
     }
 
     #[test]

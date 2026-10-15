@@ -88,6 +88,9 @@ The outcome is JSON too:
 - A read of an output stops at `max_output_file_bytes` or at the bytes left
   of `max_output_files_total_bytes`, whichever is less. A file that does not
   fit is skipped unread.
+- The policy sizes the outcome frame by `max_output_files_total_bytes`. A
+  larger `max_output_file_bytes` returns no more bytes, so the frame check
+  does not count it.
 - Each output list holds at most `MAX_OUTPUT_ENTRIES` (4096) entries. The
   host decoder stops there, so a guest cannot fill host memory with tiny
   entries. A policy may not allow more outputs.
