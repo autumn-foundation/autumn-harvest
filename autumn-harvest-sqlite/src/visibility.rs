@@ -560,17 +560,20 @@ fn search_attr_term(
         Value::Bool(true) => "type = 'true'".to_string(),
         Value::Bool(false) => "type = 'false'".to_string(),
         Value::Number(number) => {
-            // JSON1 reads an integer above `i64::MAX` as a float, which
-            // cannot tell neighbouring values apart. A filter on one would
-            // match the wrong runs, so it is refused.
-            let v = match (number.as_i64(), number.is_u64()) {
-                (Some(int), _) => Param::Integer(int),
-                (None, true) => {
-                    return Err(SqliteError::InvalidSearchAttribute(format!(
-                        "the filter on `{key}` is an integer above the 64-bit signed range"
-                    )));
-                }
-                (None, false) => Param::Real(number.as_f64().unwrap_or(f64::NAN)),
+            // JSON1 reads a stored integer outside the `i64` range as a float,
+            // which cannot tell neighbouring values apart. A filter at that
+            // size would match the wrong runs, whether it is an integer or a
+            // float. So a filter of magnitude 2^63 or more is refused.
+            let v = match number.as_i64() {
+                Some(int) => Param::Integer(int),
+                None => match number.as_f64() {
+                    Some(float) if float.abs() < I64_RANGE_EDGE => Param::Real(float),
+                    _ => {
+                        return Err(SqliteError::InvalidSearchAttribute(format!(
+                            "the filter on `{key}` is outside the 64-bit signed range"
+                        )));
+                    }
+                },
             };
             let p = bind(params, v);
             format!("type IN ('integer', 'real') AND atom = {p}")
@@ -591,6 +594,9 @@ fn search_attr_term(
          THEN {attrs} END) WHERE key = {k} AND {test})"
     ))
 }
+
+/// 2^63, the first magnitude outside the `i64` range. A float holds it exactly.
+const I64_RANGE_EDGE: f64 = 9_223_372_036_854_775_808.0;
 
 /// Push `value` and return its placeholder.
 fn bind(params: &mut Vec<Param>, value: Param) -> String {

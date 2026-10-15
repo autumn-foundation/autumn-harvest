@@ -757,9 +757,10 @@ let run = rt.describe(started.exec_id)?;
   seal does not move it.
 - **Search attributes.** A filter tests equality. Numbers compare as numbers,
   so `1` matches `1.0`. A filter value must be a JSON string, number, boolean
-  or `null`. Another value is `SqliteError::InvalidSearchAttribute`. So is an
-  integer above `i64::MAX`: JSON1 reads it as a float, which cannot tell
-  neighbouring values apart.
+  or `null`. Another value is `SqliteError::InvalidSearchAttribute`. So is a
+  number of magnitude 2^63 or more, integer or float. JSON1 reads a stored
+  integer of that size as a float, which cannot tell neighbouring values
+  apart.
 - **Pages.** A page holds `limit` rows: 100 by default, cut to the range 1 to
   1000. `next` is the cursor of the next page, or `None` at the end. The
   cursor is the table `rowid`. A `VACUUM` can renumber it, so do not keep a

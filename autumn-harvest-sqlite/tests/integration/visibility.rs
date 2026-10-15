@@ -975,8 +975,20 @@ fn a_filter_integer_above_the_i64_range_is_refused() {
         matches!(err, SqliteError::InvalidSearchAttribute(_)),
         "{err}"
     );
-    // The top of the range still compares exactly.
+    // A float in the same range aliases those integers too.
+    for big in [2.0_f64.powi(63), -1.0e19] {
+        let err = rt
+            .list_executions(&ExecutionFilter::new().search_attribute("n", json!(big)))
+            .unwrap_err();
+        assert!(
+            matches!(err, SqliteError::InvalidSearchAttribute(_)),
+            "{big}: {err}"
+        );
+    }
+    // The top of the range still compares exactly, and so does a float below it.
     rt.list_executions(&ExecutionFilter::new().search_attribute("n", json!(i64::MAX)))
+        .unwrap();
+    rt.list_executions(&ExecutionFilter::new().search_attribute("n", json!(1.5e18)))
         .unwrap();
 }
 

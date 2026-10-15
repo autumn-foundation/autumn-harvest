@@ -16,8 +16,8 @@ agent daemon read `harvest_executions` with its own SQL.
 - `ExecutionFilter` filters by workflow name, execution id, exact workflow
   id, workflow id prefix, states, a start-time range and search-attribute
   equality. The search-attribute filter uses JSON1. Numbers compare as
-  numbers. A filter integer above `i64::MAX` is refused, because JSON1 reads
-  it as a float. A filter holds at most 64 states and 64 search attributes.
+  numbers. A filter number of magnitude 2^63 or more is refused, because
+  JSON1 reads a stored integer of that size as a float. A filter holds at most 64 states and 64 search attributes.
 - One state filter seeks on the new `idx_harvest_executions_state` index.
 - Each field is a `Stored<T>`: `Value`, `Null` or `Unreadable`. One damaged
   row does not fail a page.

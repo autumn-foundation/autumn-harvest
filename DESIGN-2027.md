@@ -147,8 +147,8 @@ issue.
 - A row written before this change has no `started_at`. A time filter does
   not match it.
 - Search-attribute filters test equality only. Numbers compare as numbers,
-  so `1` matches `1.0`. A filter integer above `i64::MAX` is refused, because
-  JSON1 reads it as a float.
+  so `1` matches `1.0`. A filter number of magnitude 2^63 or more is refused,
+  because JSON1 reads a stored integer of that size as a float.
 - One state filter seeks on an index. Any other filter that matches few rows
   walks the table to fill a page, and reads past each large input.
 - Search attributes have no size cap of their own, as on Postgres.
