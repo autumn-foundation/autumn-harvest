@@ -120,6 +120,10 @@ pub fn check_version(version: Version) -> Result<(), SandboxError> {
 /// The wait before a version probe tries a busy binary again.
 const BUSY_RETRY: Duration = Duration::from_millis(10);
 
+/// The most bytes of `--version` output that a probe reads. The real output
+/// is one short line, and a flood would fill the memory of the worker.
+const MAX_VERSION_OUTPUT: u64 = 64 * 1024;
+
 /// Run `<binary> --version` with no environment and check the result.
 ///
 /// # Errors
@@ -133,22 +137,38 @@ pub async fn probe_version(
     // The launcher probes a copy that it just wrote. Another thread can fork
     // while the copy is open for writing, and the child holds it until its
     // exec. So a busy copy is tried again, within the time limit.
-    let output = tokio::time::timeout(VERSION_PROBE_TIMEOUT, async {
-        loop {
-            let output = tokio::process::Command::new(firecracker_bin)
+    let (status, stdout) = tokio::time::timeout(VERSION_PROBE_TIMEOUT, async {
+        use tokio::io::AsyncReadExt as _;
+        let mut child = loop {
+            let spawned = tokio::process::Command::new(firecracker_bin)
                 .arg("--version")
                 .env_clear()
                 .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
                 .kill_on_drop(true)
-                .output()
-                .await;
-            match output {
+                .spawn();
+            match spawned {
                 Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
                     tokio::time::sleep(BUSY_RETRY).await;
                 }
-                output => return output,
+                spawned => break spawned?,
             }
+        };
+        // The read stops one byte past the cap. A dropped child is killed.
+        let mut stdout = Vec::new();
+        if let Some(pipe) = child.stdout.take() {
+            pipe.take(MAX_VERSION_OUTPUT + 1)
+                .read_to_end(&mut stdout)
+                .await?;
         }
+        if u64::try_from(stdout.len()).unwrap_or(u64::MAX) > MAX_VERSION_OUTPUT {
+            return Err(std::io::Error::other(format!(
+                "it printed more than {MAX_VERSION_OUTPUT} bytes"
+            )));
+        }
+        let status = child.wait().await?;
+        Ok::<_, std::io::Error>((status, stdout))
     })
     .await
     .map_err(|_| SandboxError::Config("`firecracker --version` did not finish".into()))?
@@ -160,14 +180,13 @@ pub async fn probe_version(
     })?;
     // A wrapper can print a version and still fail. Such a binary fails
     // each launch too, so it is no valid version.
-    if !output.status.success() {
+    if !status.success() {
         return Err(SandboxError::Config(format!(
-            "{} --version did not exit cleanly: {}",
-            firecracker_bin.display(),
-            output.status
+            "{} --version did not exit cleanly: {status}",
+            firecracker_bin.display()
         )));
     }
-    let text = String::from_utf8_lossy(&output.stdout);
+    let text = String::from_utf8_lossy(&stdout);
     let version = parse_version(&text, binary).ok_or_else(|| {
         SandboxError::Config(format!(
             "{} --version printed no {} version",
@@ -502,6 +521,34 @@ mod tests {
             Err(SandboxError::Config(ref m)) if m.contains("Jailer")
         ));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_prints_too_much_is_a_config_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A broken wrapper floods its output before the version.
+        let noisy = dir.path().join("fc-noisy");
+        write_executable(
+            &noisy,
+            "#!/bin/sh\nhead -c 1048576 /dev/zero | tr '\\0' x\necho\necho 'Firecracker v1.17.0'\n",
+        );
+        let err = probe_version(&noisy, VmmBinary::Firecracker)
+            .await
+            .expect_err("the output passes the cap");
+        assert!(
+            matches!(&err, SandboxError::Config(m) if m.contains("more than")),
+            "{err:?}"
+        );
+        // A flood on stderr is not kept either.
+        let loud = dir.path().join("fc-loud");
+        write_executable(
+            &loud,
+            "#!/bin/sh\nhead -c 1048576 /dev/zero >&2\necho 'Firecracker v1.17.0'\n",
+        );
+        assert_eq!(
+            probe_version(&loud, VmmBinary::Firecracker).await.unwrap(),
+            (1, 17, 0)
+        );
     }
 
     /// The host checks of `root`, with the fake `/dev/kvm` of

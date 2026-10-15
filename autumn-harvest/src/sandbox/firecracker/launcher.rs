@@ -878,7 +878,11 @@ impl FirecrackerLauncher {
                         .into(),
                 ));
             }
-            super::jailer::check_limits(jailer, super::jailer::host_nr_open())?;
+            super::jailer::check_limits(
+                jailer,
+                super::jailer::host_nr_open(),
+                super::jailer::HardCeilings::of_worker(),
+            )?;
             super::jailer::check_cgroups(jailer, machine, mounts)?;
             // `RunningVm::spawn` clears the environment, so only the
             // arguments of the jailer count.
@@ -3986,6 +3990,41 @@ while True:
     }
 
     #[test]
+    fn a_vmm_file_limit_above_the_worker_hard_limit_is_a_config_error() {
+        let mut hard = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes a valid stack value.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut hard) },
+            0
+        );
+        let above = hard.rlim_max.saturating_add(1);
+        if crate::sandbox::exec::can_raise_hard_limits()
+            || above > super::super::jailer::host_nr_open()
+        {
+            eprintln!("skipped: this worker can give the jailer any no-file limit");
+            return;
+        }
+        // Without CAP_SYS_RESOURCE, the jailer cannot raise the hard limit
+        // that it inherits, so each launch would fail.
+        let dir = temp_dir();
+        let mut config = jailed(&dir);
+        if let Confinement::Jailer(jail) = &mut config.confinement {
+            jail.nofile_limit = Some(above);
+        }
+        let err = new_launcher(config)
+            .map(|_| ())
+            .expect_err("the jailer cannot raise its hard limit");
+        assert!(
+            matches!(&err, SandboxError::Config(m) if m.contains("no-file")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_sentinel_jail_identity_is_a_config_error() {
         // `u32::MAX` is `(uid_t)-1`, which setuid and setgid refuse.
         for (uid, gid) in [(u32::MAX, 12_345), (12_345, u32::MAX)] {
@@ -4801,7 +4840,12 @@ while True:
                 "{limit}: {err:?}"
             );
         }
-        drop(new_launcher(with_limit(nr_open)).unwrap());
+        // A worker without CAP_SYS_RESOURCE keeps the jailer below its own
+        // hard limit too.
+        let fits = super::super::jailer::HardCeilings::of_worker()
+            .nofile
+            .map_or(nr_open, |hard| hard.min(nr_open));
+        drop(new_launcher(with_limit(fits)).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

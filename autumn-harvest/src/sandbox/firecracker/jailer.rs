@@ -226,16 +226,54 @@ pub fn host_nr_open() -> u64 {
         .unwrap_or(NR_OPEN_MAX)
 }
 
-/// Check the rlimits of the VMM on a host whose `fs.nr_open` is `nr_open`.
+/// The `no-file` limit that the jailer sets when the config gives none.
+pub const JAILER_DEFAULT_NOFILE: u64 = 2048;
+
+/// The hard rlimits that a jailer of this worker cannot pass, or `None`
+/// where it can raise the limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HardCeilings {
+    /// The hard `RLIMIT_NOFILE`.
+    pub nofile: Option<u64>,
+    /// The hard `RLIMIT_FSIZE`.
+    pub fsize: Option<u64>,
+}
+
+impl HardCeilings {
+    /// The ceilings of this worker.
+    ///
+    /// The jailer inherits the hard limits of the worker. It can raise one
+    /// only with root and `CAP_SYS_RESOURCE` in the initial user namespace.
+    #[must_use]
+    pub fn of_worker() -> Self {
+        use crate::sandbox::exec::{can_raise_hard_limits, hard_limit};
+        if can_raise_hard_limits() {
+            return Self::default();
+        }
+        Self {
+            nofile: hard_limit(libc::RLIMIT_NOFILE),
+            fsize: hard_limit(libc::RLIMIT_FSIZE),
+        }
+    }
+}
+
+/// Check the rlimits of the VMM on a host whose `fs.nr_open` is `nr_open`,
+/// for a worker with the hard limits `hard`.
 ///
 /// # Errors
 ///
 /// [`SandboxError::Config`] for a `no-file` limit below
 /// [`MIN_NOFILE_LIMIT`] or above `nr_open`, or an `fsize` limit below
-/// [`MIN_FSIZE_LIMIT`]. The jailer sets each limit with `setrlimit`, which
-/// refuses a `no-file` value above `nr_open`, even to root. Each launch would
-/// fail, and a retry cannot help.
-pub fn check_limits(config: &JailerConfig, nr_open: u64) -> Result<(), SandboxError> {
+/// [`MIN_FSIZE_LIMIT`]. The same goes for a limit above a ceiling of `hard`,
+/// and a missing `no-file` limit counts as [`JAILER_DEFAULT_NOFILE`]. The
+/// jailer sets each limit with `setrlimit`, which refuses a `no-file` value
+/// above `nr_open`, even to root. Each launch would fail, and a retry cannot
+/// help.
+pub fn check_limits(
+    config: &JailerConfig,
+    nr_open: u64,
+    hard: HardCeilings,
+) -> Result<(), SandboxError> {
     match config.nofile_limit {
         Some(limit) if limit < MIN_NOFILE_LIMIT => Err(SandboxError::Config(format!(
             "the jailer no-file limit of {limit} is below the {MIN_NOFILE_LIMIT} files that \
@@ -252,7 +290,24 @@ pub fn check_limits(config: &JailerConfig, nr_open: u64) -> Result<(), SandboxEr
             ))),
             _ => Ok(()),
         },
+    }?;
+    let nofile = config.nofile_limit.unwrap_or(JAILER_DEFAULT_NOFILE);
+    for (name, limit, ceiling) in [
+        ("no-file", Some(nofile), hard.nofile),
+        ("fsize", config.fsize_limit, hard.fsize),
+    ] {
+        if let (Some(limit), Some(ceiling)) = (limit, ceiling)
+            && limit > ceiling
+        {
+            return Err(SandboxError::Config(format!(
+                "the jailer {name} limit of {limit} is above the hard limit of {ceiling} that \
+                 it inherits; without root and CAP_SYS_RESOURCE it cannot raise that, so \
+                 each launch would fail; raise the worker hard limit, such as with systemd \
+                 LimitNOFILE, or lower the jailer limit"
+            )));
+        }
     }
+    Ok(())
 }
 
 /// The smallest `fsize` rlimit of a VMM. The jailer writes its pid file
@@ -664,7 +719,8 @@ mod tests {
         for limit in [0, 4095] {
             let mut config = config();
             config.fsize_limit = Some(limit);
-            let err = check_limits(&config, 1 << 20).expect_err("too small");
+            let err =
+                check_limits(&config, 1 << 20, HardCeilings::default()).expect_err("too small");
             assert!(
                 matches!(err, SandboxError::Config(ref m) if m.contains("fsize")),
                 "{limit}: {err:?}"
@@ -672,7 +728,35 @@ mod tests {
         }
         let mut config = config();
         config.fsize_limit = Some(4096);
-        check_limits(&config, 1 << 20).unwrap();
+        check_limits(&config, 1 << 20, HardCeilings::default()).unwrap();
+    }
+
+    #[test]
+    fn the_jailer_limits_must_fit_the_worker_hard_limits() {
+        let tight = HardCeilings {
+            nofile: Some(1024),
+            fsize: Some(1 << 30),
+        };
+        let mut config = config();
+        config.nofile_limit = Some(1024);
+        config.fsize_limit = Some(1 << 30);
+        check_limits(&config, 1 << 20, tight).unwrap();
+        // The jailer sets 2048 files when the config gives no limit.
+        for (nofile, fsize, name) in [
+            (None, Some(1 << 30), "no-file"),
+            (Some(1025), Some(1 << 30), "no-file"),
+            (Some(1024), Some((1 << 30) + 1), "fsize"),
+        ] {
+            config.nofile_limit = nofile;
+            config.fsize_limit = fsize;
+            let err = check_limits(&config, 1 << 20, tight).expect_err(name);
+            assert!(
+                matches!(&err, SandboxError::Config(m) if m.contains(name) && m.contains("hard")),
+                "{err:?}"
+            );
+            // A worker that can raise its hard limits has no ceiling.
+            check_limits(&config, 1 << 20, HardCeilings::default()).unwrap();
+        }
     }
 
     #[test]

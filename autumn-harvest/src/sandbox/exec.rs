@@ -883,7 +883,7 @@ pub(crate) fn can_raise_hard_limits() -> bool {
 
 /// The hard limit of `resource` for this process, or `None` when it cannot
 /// be read.
-fn hard_limit(resource: Resource) -> Option<libc::rlim_t> {
+pub(crate) fn hard_limit(resource: Resource) -> Option<libc::rlim_t> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -990,9 +990,9 @@ pub fn spawn_exec_capacity() -> u64 {
 
 /// The rlimit resource type: glibc and musl declare it apart.
 #[cfg(target_env = "gnu")]
-type Resource = libc::__rlimit_resource_t;
+pub(crate) type Resource = libc::__rlimit_resource_t;
 #[cfg(not(target_env = "gnu"))]
-type Resource = libc::c_int;
+pub(crate) type Resource = libc::c_int;
 
 /// Set one rlimit.
 ///

@@ -215,7 +215,8 @@ runtime refuses a policy that allows the network on a backend without one.
   binary that passes into a directory of its own, and each launch runs the
   copies. So a deploy cannot swap a binary between the check and the launch.
   A deploy that replaced or changed either binary gives a new check and new
-  copies.
+  copies. The check reads at most 64 KiB of `--version` output, so a broken
+  wrapper cannot fill the memory of the worker.
 - A jail base, or an unjailed `work_root`, that lets the worker run programs.
   The copies run from there, so the launcher refuses a `noexec` mount. It
   also refuses a `nodev` jail base, because Firecracker cannot open
@@ -387,6 +388,10 @@ What each microVM gets:
 - a `no-file` limit of 1024 on the VMM, by default. The launcher refuses a
   limit below 128 (`MIN_NOFILE_LIMIT`), because each launch would fail. It
   also refuses a limit above the host `fs.nr_open`, which `setrlimit` refuses.
+  Without `CAP_SYS_RESOURCE`, the jailer cannot raise the hard limits that it
+  inherits from the worker. Then the launcher also refuses a `no-file` or
+  `fsize` limit above the worker hard limit. With no `no-file` limit, the
+  jailer sets 2048.
 
 `GuestImage::extra_boot_args` adds kernel arguments. The launcher refuses an
 extra argument that replaces one of its own, and a word that starts with `-`.
