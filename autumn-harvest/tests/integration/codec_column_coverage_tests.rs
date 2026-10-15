@@ -1414,9 +1414,10 @@ async fn an_activity_that_cannot_decode_its_input_fails_the_attempt_and_never_ru
     let codecs = aead_codecs(true);
     let mut conn = connect(&url).await;
     let exec_id = start(&mut conn, &codecs, "cc_guarded_wf", wf_queue, None).await;
+    let exec = exec_id.as_uuid().to_string();
 
-    // The first worker owns the workflow queue and holds the key. The second
-    // owns the activity queue and does not.
+    // The first worker owns the workflow queue. It schedules the activity on a
+    // queue that no worker polls yet.
     let pool = build_pool(&url);
     let owner = worker(
         wf_queue,
@@ -1426,23 +1427,52 @@ async fn an_activity_that_cannot_decode_its_input_fails_the_attempt_and_never_ru
             &codecs,
         ),
     );
-    let reader = worker(
+    let run_owner = owner.clone();
+    let owner_pool = pool.clone();
+    let owner_handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(40), run_owner.run(&owner_pool)).await;
+    });
+    let sql = "SELECT COUNT(*)::BIGINT AS n FROM harvest_task_queue \
+               WHERE task_type = 'activity' AND workflow_exec_id::TEXT = $1";
+    let mut scheduled = 0;
+    for _ in 0..600 {
+        scheduled = count_rows(&mut conn, sql, &exec).await;
+        if scheduled > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(scheduled, 1, "the workflow scheduled the activity");
+
+    // History still decodes. Only the task row names a key that no registry
+    // holds, as a corrupt cell would.
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET input = $2 \
+         WHERE task_type = 'activity' AND workflow_exec_id::TEXT = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&exec)
+    .bind::<diesel::sql_types::Jsonb, _>(&json!({
+        autumn_harvest::payload_codec::CODEC_ENVELOPE_KEY:
+            {"codec_id": "aes-256-gcm", "kid": "cc-gone", "data": "AAAA"}
+    }))
+    .execute(&mut conn)
+    .await
+    .expect("corrupt the task row");
+
+    let activity_worker = worker(
         act_queue,
         registry(
             Vec::new(),
             vec![activity_info("cc_guarded", act_queue, guarded_activity)],
-            &reader_without_the_key(),
+            &codecs,
         ),
     );
-    let handles: Vec<_> = [owner.clone(), reader.clone()]
-        .into_iter()
-        .map(|w| {
-            let run_pool = pool.clone();
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(40), w.run(&run_pool)).await;
-            })
-        })
-        .collect();
+    let run_activity = activity_worker.clone();
+    let activity_pool = pool.clone();
+    let activity_handle = tokio::spawn(async move {
+        let _ =
+            tokio::time::timeout(Duration::from_secs(40), run_activity.run(&activity_pool)).await;
+    });
 
     let mut failed = 0;
     for _ in 0..800 {
@@ -1451,7 +1481,7 @@ async fn an_activity_that_cannot_decode_its_input_fails_the_attempt_and_never_ru
             "SELECT COUNT(*)::BIGINT AS n FROM harvest_task_queue \
              WHERE task_type = 'activity' AND workflow_exec_id::TEXT = $1 \
                AND error LIKE '%PayloadDecodeFailed%'",
-            &exec_id.as_uuid().to_string(),
+            &exec,
         )
         .await;
         if failed > 0 {
@@ -1460,10 +1490,9 @@ async fn an_activity_that_cannot_decode_its_input_fails_the_attempt_and_never_ru
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     owner.shutdown();
-    reader.shutdown();
-    for handle in handles {
-        let _ = handle.await;
-    }
+    activity_worker.shutdown();
+    let _ = owner_handle.await;
+    let _ = activity_handle.await;
     assert!(failed > 0, "the attempt fails with PayloadDecodeFailed");
     assert_eq!(
         AtomicUsize::load(&GUARDED_RUNS, Ordering::SeqCst),
