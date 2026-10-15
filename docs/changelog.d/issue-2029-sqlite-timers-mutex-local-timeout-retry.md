@@ -31,6 +31,7 @@ its history replays on the core `WorkflowReplayer`.
   failure adds `LocalActivityExhausted`. The per-attempt budget is
   `start_to_close`, capped at 60 seconds. Under Tokio a body past it is
   dropped, as on Postgres. A closure body is checked after it returns.
+  The workflow deadline also bounds an attempt.
   A retry backoff parks the run in `local_retry_at`, and the drive does not
   sleep. A batch with a durable awaitable ends the run `FAILED`, as on
   Postgres (issue #950). This backend also rejects a second local activity

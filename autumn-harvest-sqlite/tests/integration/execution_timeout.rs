@@ -452,3 +452,48 @@ async fn a_body_that_ends_past_the_deadline_times_out() {
     );
     assert_replays(info.name, info.handler, history).await;
 }
+
+/// A local activity that never returns. Its budget is the 60-second cap.
+#[activity(local = true)]
+async fn hangs_locally(_ctx: &ActivityContext, _n: i64) -> Result<i64, String> {
+    std::future::pending::<()>().await;
+    Ok(0)
+}
+
+/// Awaits a hung local activity under a one-second timeout.
+#[workflow(execution_timeout = "1s")]
+async fn awaits_a_hung_local(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    ctx.execute_local_activity(&hangs_locally_info(), n)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// The workflow deadline bounds a local attempt, not only its own budget. The
+// drive ends the run `TIMED_OUT` at the deadline and records no result.
+#[tokio::test]
+async fn the_deadline_bounds_a_local_activity_attempt() {
+    let info = awaits_a_hung_local_info();
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&info);
+    rt.register_activity(&hangs_locally_info());
+    let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+
+    let state = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        rt.run_until_blocked(exec),
+    )
+    .await
+    .expect("the deadline must stop the attempt")
+    .unwrap();
+    assert!(matches!(state, RunState::TimedOut(_)), "got {state:?}");
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        !history.iter().any(|e| matches!(
+            e,
+            WorkflowEvent::LocalActivityFailed { .. }
+                | WorkflowEvent::LocalActivityCompleted { .. }
+        )),
+        "a late attempt records no result"
+    );
+    assert_replays(info.name, info.handler, history).await;
+}

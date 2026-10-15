@@ -1288,8 +1288,10 @@ pub async fn run_local_attempt(
     run: &LocalRun,
     attempt: u32,
     previous_failure: Option<String>,
+    deadline_left: Option<std::time::Duration>,
 ) -> Result<Value, String> {
-    let budget = run.budget();
+    // The workflow deadline bounds the attempt too (issue #2029).
+    let budget = deadline_left.map_or_else(|| run.budget(), |left| run.budget().min(left));
     let started = std::time::Instant::now();
     let result = match &spec.body {
         ActivityRunner::Closure(body) => {

@@ -502,7 +502,8 @@ attempt. Some limits apply:
 - The per-attempt budget is `start_to_close`, capped at 60 seconds. Under a
   Tokio runtime, an `#[activity]` body that runs past it is dropped, as on
   Postgres. A closure body cannot be stopped, so its budget is checked after
-  it returns.
+  it returns. The workflow deadline also bounds an attempt. An attempt that
+  ends past it records no result, and the run ends `TIMED_OUT`.
 - A backoff and a timeout round up to whole milliseconds.
 - A retry backoff ends the cycle. A drive before its end returns
   `RunState::WaitingTimer`. Postgres sleeps inline instead. A pending cancel

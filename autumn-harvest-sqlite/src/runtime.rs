@@ -2960,13 +2960,29 @@ impl SqliteRuntime {
         cancel_reason: Option<&str>,
     ) -> SqliteResult<Option<RunState>> {
         let mut previous_failure = run.last_error.clone();
+        let deadline = store::run_config(&self.conn, exec)?.deadline_at;
         for attempt in run.failed_attempts.saturating_add(1)..=run.max_attempts() {
             let spec = self
                 .activities
                 .get(&run.name)
                 .ok_or_else(|| SqliteError::unregistered(&run.name))?;
+            // Issue #2029: an attempt stops at the workflow deadline. A run
+            // past it ends `TIMED_OUT`, and the attempt records no result.
+            let left = match deadline {
+                Some(at) if failure_now() >= at => {
+                    return self.seal_timed_out(exec, at, failure_now()).map(Some);
+                }
+                Some(at) => Some(std::time::Duration::from_millis(
+                    at.saturating_sub(failure_now()).unsigned_abs(),
+                )),
+                None => None,
+            };
             let result =
-                worker::run_local_attempt(exec, owner, spec, &run, attempt, previous_failure).await;
+                worker::run_local_attempt(exec, owner, spec, &run, attempt, previous_failure, left)
+                    .await;
+            if let Some(at) = deadline.filter(|at| failure_now() >= *at) {
+                return self.seal_timed_out(exec, at, failure_now()).map(Some);
+            }
             let (events, backoff) = worker::local_attempt_events(exec, &run, attempt, result);
             // The next attempt sees the stored message, as on Postgres.
             previous_failure = events.iter().find_map(|event| match event {
