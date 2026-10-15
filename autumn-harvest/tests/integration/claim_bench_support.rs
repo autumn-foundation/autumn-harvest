@@ -126,6 +126,14 @@ pub enum ClaimGate {
     /// deployment with rate limiting and *no* breaker executes strictly more
     /// work than this scenario does.
     AllGates,
+    /// Rows carry a `fairness_key`, and the claim runs with fairness keys on
+    /// (issue #1976).
+    ///
+    /// The fair claim builds one map of the lags of keys in debt. It
+    /// also adds one sort term and one state upsert. This row measures that
+    /// cost against `baseline`. It is a claim mode, not a gate, so
+    /// `all_gates` does not include it.
+    FairnessKeys,
 }
 
 impl ClaimGate {
@@ -141,6 +149,7 @@ impl ClaimGate {
             Self::DoubleBacklog => "double_backlog",
             Self::PausedRows => "paused_rows",
             Self::AllGates => "all_gates",
+            Self::FairnessKeys => "fairness_keys",
         }
     }
 
@@ -148,7 +157,7 @@ impl ClaimGate {
     /// "baseline, then what each predicate adds". `DoubleBacklog` sits directly
     /// before `PausedRows` because it is that row's control.
     #[must_use]
-    pub const fn all() -> [Self; 8] {
+    pub const fn all() -> [Self; 9] {
         [
             Self::Baseline,
             Self::BuildPolicy,
@@ -158,7 +167,18 @@ impl ClaimGate {
             Self::DoubleBacklog,
             Self::PausedRows,
             Self::AllGates,
+            Self::FairnessKeys,
         ]
+    }
+
+    /// The claim's fairness mode for this scenario (issue #1976).
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub const fn claim_fairness(self) -> autumn_harvest::queue::ClaimFairness {
+        match self {
+            Self::FairnessKeys => autumn_harvest::queue::ClaimFairness::Keys,
+            _ => autumn_harvest::queue::ClaimFairness::Off,
+        }
     }
 
     /// Which gate a row's `vs` column should be measured against.
@@ -2929,6 +2949,12 @@ pub mod db {
     /// cost rather than degenerating into lock contention.
     const KEY_CARDINALITY: usize = 256;
 
+    /// Distinct fairness keys the `fairness_keys` scenario seeds (issue
+    /// #1976). The bench's fairness section sweeps it. Default 256, the same
+    /// as the other keyed gates.
+    pub static FAIRNESS_KEY_CARDINALITY: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(KEY_CARDINALITY);
+
     /// Concurrency cap high enough never to block, so the `COUNT(*)` subquery
     /// and advisory lock are exercised without throttling the measurement.
     const NON_BLOCKING_CAP: i64 = 1_000_000;
@@ -3627,7 +3653,8 @@ pub mod db {
             conn,
             "TRUNCATE harvest_task_queue, harvest_workflow_executions, \
              harvest_rate_limit_buckets, harvest_build_compat, harvest_build_policies, \
-             harvest_workers, harvest_queue_pauses, harvest_activity_pauses \
+             harvest_workers, harvest_queue_pauses, harvest_activity_pauses, \
+             harvest_fairness_state, harvest_fairness_weights \
              RESTART IDENTITY CASCADE",
         )
         .await;
@@ -3680,6 +3707,10 @@ pub mod db {
             gate,
             ClaimGate::RateLimited | ClaimGate::CircuitBreakerSet | ClaimGate::AllGates
         )
+    }
+
+    const fn wants_fairness_key(gate: ClaimGate) -> bool {
+        matches!(gate, ClaimGate::FairnessKeys)
     }
 
     const fn wants_paused_rows(gate: ClaimGate) -> bool {
@@ -3858,6 +3889,18 @@ pub mod db {
         } else {
             "NULL".to_string()
         };
+        // One tenant per key, spread over the same cardinality as the other
+        // keyed gates (issue #1976).
+        let fair_expr = if wants_fairness_key(gate) {
+            let keys = std::sync::atomic::AtomicUsize::load(
+                &FAIRNESS_KEY_CARDINALITY,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .max(1);
+            format!("'{BENCH_PREFIX}-fk-' || (i % {keys})")
+        } else {
+            "NULL".to_string()
+        };
 
         exec(
             conn,
@@ -3865,11 +3908,11 @@ pub mod db {
                 "INSERT INTO harvest_task_queue \
                    (queue_name, task_type, activity_name, activity_id, input, state, \
                     priority, max_attempts, scheduled_at, required_build_id, \
-                    concurrency_key, concurrency_cap, rate_limit_key) \
+                    concurrency_key, concurrency_cap, rate_limit_key, fairness_key) \
                  SELECT '{BENCH_PREFIX}-q-' || (i % {queues}), 'activity', '{BENCH_ACTIVITY}', \
                         gen_random_uuid(), '{{}}'::jsonb, 'PENDING', 0, 3, \
                         NOW() - INTERVAL '1 second', {build_expr}, \
-                        {conc_key_expr}, {conc_cap_expr}, {rl_expr} \
+                        {conc_key_expr}, {conc_cap_expr}, {rl_expr}, {fair_expr} \
                  FROM generate_series(0, {} ) AS s(i)",
                 backlog - 1
             ),
@@ -4094,6 +4137,7 @@ pub mod db {
         let queues = Arc::new(queue_names(scenario));
         let cb_set = Arc::new(circuit_breaker_set(scenario.gate));
         let build_id = worker_build_id(scenario.gate).to_string();
+        let fairness = scenario.gate.claim_fairness();
 
         let total_ops = measured_claims_for(scenario.backlog);
         let claimers = scenario.claimers.max(1);
@@ -4192,7 +4236,7 @@ pub mod db {
                     // computed from a partial run.
                     let claimed = tokio::time::timeout(
                         deadline - now,
-                        queue::claim_task(
+                        queue::claim_task_with_fairness(
                             &mut conn,
                             &queues,
                             &worker,
@@ -4200,6 +4244,9 @@ pub mod db {
                             None,
                             &cb_set,
                             &[],
+                            None,
+                            None,
+                            fairness,
                         ),
                     )
                     .await;
@@ -4324,6 +4371,7 @@ pub mod db {
             context_headers: None,
             session_id: None,
             new_start: false,
+            fairness_key: None,
         }
     }
 
@@ -4598,6 +4646,8 @@ pub mod db {
         pub with_concurrency_key: i64,
         /// Rows with `rate_limit_key` set (rate-limit gate, #332 / #699).
         pub with_rate_limit_key: i64,
+        /// Rows with `fairness_key` set (fair claim, #1976).
+        pub with_fairness_key: i64,
         /// Pending rows belonging to a PAUSED execution (pause skip, #383).
         pub paused_ballast: i64,
         /// `harvest_build_compat` declarations, without which a build-routed
@@ -4642,6 +4692,12 @@ pub mod db {
                 conn,
                 "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue \
                  WHERE state = 'PENDING' AND rate_limit_key IS NOT NULL",
+            )
+            .await,
+            with_fairness_key: count(
+                conn,
+                "SELECT COUNT(*)::bigint AS n FROM harvest_task_queue \
+                 WHERE state = 'PENDING' AND fairness_key IS NOT NULL",
             )
             .await,
             paused_ballast: count(

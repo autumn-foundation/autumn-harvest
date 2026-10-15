@@ -100,13 +100,16 @@ let built = HarvestBuilder::new()
 
 `workflows()` returns `agent_loop` and `agent_heartbeat`. `activities()`
 returns `agent_model_turn`, `agent_tool_call`, `agent_memory_snapshot`,
-`agent_deliver` and `agent_precheck`. The test
+`agent_deliver`, `agent_precheck` and `agent_discover_peers`. The test
 `the_engine_registration_builds` builds this exact registration.
 
 Start a run under the name `agent_loop` with an `AgentTask` as input. To
-decide on a gated call, send a signal to the run. Build the name with
-`approval::approval_signal(step, position, call_id)` from the recorded
-`ModelTurn`, and send a serialised `Approval` as the payload. A worker with
+decide on a gated call, send a signal to the run, with a serialised
+`Approval` as the payload. Read the signal name from the wait: the
+deadline timer of the wait is `__signal_timeout:<seq>:<signal name>`. On
+SQLite, `RunState::WaitingSignal` holds the name. For a run with no
+delegation, `approval::approval_signal(step, position, call_id)` also builds
+it from the recorded `ModelTurn`. A worker with
 no harness fails the call as `AgentHarnessMissing`, which is not retryable.
 
 A worker with a payload cap other than the default must say so. Set
@@ -155,7 +158,8 @@ A worker with a payload cap other than the default must say so. Set
 The names `memory` and `schedule_followup` belong to the built-in tools.
 When a built-in is active, it hides an app tool with the same name. With a
 memory store installed, `memory` is always reserved, even in a run that gets
-no memory tool.
+no memory tool. In a run with a mandate, `delegate` is reserved too. See
+[agent mesh](agent-mesh.md).
 
 A tool error is cut to fit the result cap too, so a huge error message
 cannot fail the run.
@@ -193,7 +197,9 @@ the model as the prompt.
 ## 5. Approvals
 
 A call that the policy answers with `RequireApproval` waits on one signal.
-The name is `tool_approval:<step>:<position>:<call_id>`.
+The name is `tool_approval:<round>:<position>:<call_id>`. `round` counts the
+tool rounds of the whole run tree. With no delegation, it is the step of the
+run.
 `approval::approval_call_id` reads the call id back from a name.
 
 | Decision | Effect |
@@ -337,7 +343,8 @@ and the run ends under `budget_exceeded`. Three limits apply:
 The adapter owns the payloads it records: `AgentTask`, `ModelTurnRequest`,
 `ModelTurn`, `ToolCallRequest`, `ToolOutcome`, `AgentReport`,
 `HeartbeatTask`, `HeartbeatReport`, `Report`, `ReportSource`,
-`MemoryScope`, `Followups` and `LoopGuard`. They hold only types this crate
+`MemoryScope`, `Followups`, `LoopGuard`, `Mandate`, `Peer` and
+`DelegationRecord`. They hold only types this crate
 defines, so the crate owns their serde shape. Replay reads these payloads
 back, so add a field only with `#[serde(default)]`. A new field of an
 activity input also needs `skip_serializing_if` at its default, because a
@@ -354,6 +361,8 @@ strict replay compares each recorded input as it was written.
 - **A follow-up chain shares one workflow history.** Each segment adds to
   it. Keep `max_chain` low, or start a new run from the report.
 - **The session entity is separate.** It is a sibling issue.
+- **All agents share the harness model.** A peer cannot choose its own
+  model. See [the agent mesh guide](agent-mesh.md).
 - **The cost ledger needs Postgres.** The SQLite path calls the model
   directly, with no activity context, so it writes no ledger rows.
 
@@ -657,10 +666,11 @@ change.
 | `agent_tool_call` | The recorded outcome of the same call, or an error stub. No tool runs. |
 | `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
 | `agent_deliver` | A stub. No report leaves the harness. |
+| `agent_discover_peers` | The recorded peers for the same names, or none. The candidate needs no roster. |
 | Any other activity, such as `agent_precheck` | No mock. The candidate run fails. |
 
-A tool or snapshot activity that failed the source fails the candidate at the
-same activity.
+A tool, snapshot or peer-lookup activity that failed the source fails the
+candidate at the same activity.
 
 The policy runs live, so use a policy with no side effects. It sees the
 recorded run id and the aligned call ids. A retryable model failure retries
@@ -670,7 +680,7 @@ with no payload store.
 
 A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn
-and position takes the recorded call id. Approval signal names hold the call
+and position, of the same agent, takes the recorded call id. Approval signal names hold the call
 id, so the recorded approvals stay valid. Any other call gets a new `eval_`
 id, so no recorded approval can release it. The harness sends again only an
 approval for a wait that the source opened, when it arrived before the
@@ -705,3 +715,10 @@ thinking blocks verbatim, which the provider-neutral `ChatMessage` cannot
 carry. It therefore keeps its own turn activity. It takes three parts from
 this crate: the approval signal names, the durable approval wait
 (`approval::await_decision`), and the payload-cap checks.
+
+## 14. Agent mesh
+
+A run can delegate a task to a peer agent. The peer runs as a sub-agent
+inside the same workflow, with its own prompt, tools and budget. A mandate
+bounds the delegation tree. Flow rules gate a dangerous sequence of tool
+calls across the tree. Read [`agent-mesh.md`](agent-mesh.md).

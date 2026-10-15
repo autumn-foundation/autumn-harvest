@@ -6,11 +6,14 @@
 //! Replay reads these payloads back. Add a field only with `#[serde(default)]`,
 //! so that a history written before the field still decodes.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
+use crate::flow::Released;
 use crate::followup::Followups;
 use crate::loop_guard::LoopGuard;
 use crate::memory::MemoryScope;
+use crate::mesh::{DelegationRecord, Mandate};
 use crate::message::ToolDefinition;
 use crate::message::{
     ChatMessage, ChatRole, ContentPart, SessionId, StopReason, TokenUsage, ToolCall,
@@ -104,6 +107,16 @@ pub struct AgentTask {
     /// the tenant LLM budgets (issue #1997).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// The authority of the root agent in a delegation tree. With a mandate
+    /// that names peers, the run gets the `delegate` tool. See
+    /// [`mesh`](crate::mesh).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mandate: Option<Mandate>,
+    /// The flow labels that earlier runs of this conversation exercised.
+    /// Pass [`AgentReport::flow_labels`] here when you pass the transcript as
+    /// the history. See [`flow`](crate::flow).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 /// Where the run id of a task comes from.
@@ -141,7 +154,28 @@ impl AgentTask {
             unattended_memory_writes: false,
             run_id_source: RunIdSource::ExecutionId,
             tenant: None,
+            mandate: None,
+            flow_labels: BTreeSet::new(),
         }
+    }
+
+    /// Start with the flow labels that earlier runs exercised. See
+    /// [`flow_labels`](Self::flow_labels).
+    #[must_use]
+    pub fn flow_labels<I, S>(mut self, labels: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.flow_labels = labels.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the mandate of the root agent. See [`mandate`](Self::mandate).
+    #[must_use]
+    pub fn mandate(mut self, mandate: Mandate) -> Self {
+        self.mandate = Some(mandate);
+        self
     }
 
     /// Set the tenant that scopes the response cache. See
@@ -316,6 +350,19 @@ pub struct ModelTurnRequest {
     /// Postgres, the verified tenant of the run wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// The agent that holds the mandate of this run, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The harness tools that this agent may call. `None` means every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<BTreeSet<String>>,
+    /// The flow labels that the run tree has exercised before this turn.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+    /// The flow rules that a person released in the run tree before this
+    /// turn. See [`Recheck::UntilApproved`](crate::Recheck::UntilApproved).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_released: Released,
 }
 
 /// The recorded result of one model-turn activity.
@@ -337,6 +384,14 @@ pub struct ModelTurn {
     /// so `usage` is zero.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cache_hit: bool,
+    /// The flow labels of each tool call, in order. Empty when the harness
+    /// has no flow rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<BTreeSet<String>>,
+    /// The flow rules that an approval of each tool call releases, in order.
+    /// Empty when no rule of the harness can be released.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub releases: Vec<Released>,
 }
 
 impl ModelTurn {
@@ -394,6 +449,14 @@ pub struct ToolCallRequest {
     /// decision says.
     #[serde(default, skip_serializing_if = "is_false")]
     pub read_only: bool,
+    /// The harness tools that this agent may call. `None` means every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<BTreeSet<String>>,
+    /// The flow labels that the decision recorded for the call. The tool-call
+    /// activity refuses a tool whose labels grew after the decision. `None`
+    /// when the decision had no flow rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeSet<String>>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -461,10 +524,12 @@ pub struct AgentReport {
     pub stop: AgentStop,
     /// The last text the model produced.
     pub text: String,
-    /// Tool rounds used in the whole run, follow-ups included.
+    /// Tool rounds used in the whole run, follow-ups and delegations
+    /// included. Each agent has its own step bound.
     pub steps_used: u32,
-    /// Tool calls answered in the whole run, whether they ran or not. A round
-    /// cut at the request cap answers its remaining calls with an error.
+    /// Tool calls answered in the whole run, delegations included, whether
+    /// they ran or not. A round cut at the request cap answers its remaining
+    /// calls with an error.
     pub tool_calls: u32,
     /// Provider-reported tokens for the whole run, follow-ups included.
     pub usage: TokenUsage,
@@ -478,6 +543,14 @@ pub struct AgentReport {
     /// than `completed`, so the follow-up did not run.
     #[serde(default)]
     pub followup_dropped: bool,
+    /// Each delegation of the run tree, refused ones too, in the order each
+    /// ended.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegations: Vec<DelegationRecord>,
+    /// The flow labels that the run tree exercised, with the labels of the
+    /// task. Pass them to the next run of this conversation.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 /// The transcript without system messages.
@@ -587,6 +660,8 @@ mod tests {
             usage: TokenUsage::default(),
             decisions: vec![ToolDecision::Allow],
             cache_hit: false,
+            labels: Vec::new(),
+            releases: Vec::new(),
         };
         assert_eq!(turn.text(), "ab");
         let calls = turn.calls();
@@ -607,7 +682,16 @@ mod tests {
         // The new fields are left out at their defaults, so a recorded input
         // from before them still matches on strict replay.
         let fields = encoded.as_object_mut().unwrap();
-        for key in ["read_only", "memory_scope", "extra_tools", "tenant"] {
+        for key in [
+            "read_only",
+            "memory_scope",
+            "extra_tools",
+            "tenant",
+            "agent",
+            "allowed_tools",
+            "flow_labels",
+            "flow_released",
+        ] {
             assert!(!fields.contains_key(key), "{key}");
         }
         let old_call = json!({
@@ -618,6 +702,56 @@ mod tests {
         let encoded = serde_json::to_value(&call).unwrap();
         assert!(encoded.get("read_only").is_none());
         assert!(encoded.get("memory_scope").is_none());
+        assert!(encoded.get("allowed_tools").is_none());
+        assert!(encoded.get("labels").is_none());
+    }
+
+    #[test]
+    fn a_task_and_a_report_with_no_mesh_keep_the_recorded_shape() {
+        let task = AgentTask::new("go");
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert!(encoded.get("mandate").is_none());
+        assert!(encoded.get("flow_labels").is_none());
+        let old = json!({"input": "go", "max_steps": 8, "approval_timeout_secs": 60});
+        let decoded: AgentTask = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.mandate, None);
+        assert_eq!(decoded.flow_labels, BTreeSet::new());
+        let with = AgentTask::new("go").mandate(Mandate::new("planner"));
+        let back: AgentTask = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        assert_eq!(back.mandate, Some(Mandate::new("planner")));
+
+        let report = json!({
+            "stop": "completed", "text": "hi", "steps_used": 0, "tool_calls": 0,
+            "usage": {"input_tokens": 0, "output_tokens": 0}, "messages": [],
+            "followups": 0, "followup_dropped": false,
+        });
+        let decoded: AgentReport = serde_json::from_value(report).unwrap();
+        assert_eq!(decoded.delegations, Vec::new());
+        assert_eq!(decoded.flow_labels, BTreeSet::new());
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert!(encoded.get("delegations").is_none());
+        assert!(encoded.get("flow_labels").is_none());
+
+        let turn = json!({
+            "content": [], "stop": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+            "decisions": [],
+        });
+        let decoded: ModelTurn = serde_json::from_value(turn).unwrap();
+        assert_eq!(decoded.labels, Vec::<BTreeSet<String>>::new());
+        assert_eq!(decoded.releases, Vec::<Released>::new());
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("releases")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("labels")
+                .is_none()
+        );
     }
 
     #[test]

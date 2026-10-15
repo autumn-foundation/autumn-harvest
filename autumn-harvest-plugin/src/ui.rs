@@ -15594,6 +15594,7 @@ mod tests {
             timed_out_claims: None,
             handler_started_at: None,
             new_start: false,
+            fairness_key: None,
         }
     }
 

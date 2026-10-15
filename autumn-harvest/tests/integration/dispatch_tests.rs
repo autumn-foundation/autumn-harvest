@@ -323,6 +323,7 @@ fn worker_config(queue: &str, shards: Vec<ShardId>) -> WorkerRuntimeConfig {
         max_workflow_history_events: None,
         slot_tuner: None,
         max_concurrent_sessions: 0,
+        fairness_keys: false,
     }
 }
 
@@ -412,6 +413,7 @@ async fn start_on(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -826,6 +828,121 @@ async fn retry_backoff_is_honoured_by_the_channel() {
     assert!(
         gap >= Duration::from_millis(450),
         "the retry ran {gap:?} after the failure; the 500 ms backoff was not honoured"
+    );
+}
+
+/// A channel whose acks take `ack_delay`, as a slow channel's do.
+#[derive(Debug)]
+struct SlowAckDispatch {
+    inner: Arc<MemoryDispatch>,
+    ack_delay: Duration,
+}
+
+#[async_trait::async_trait]
+impl TaskDispatch for SlowAckDispatch {
+    async fn publish(
+        &self,
+        hints: &[autumn_harvest::dispatch::DispatchHint],
+    ) -> autumn_harvest::HarvestResult<()> {
+        self.inner.publish(hints).await
+    }
+
+    async fn next(
+        &self,
+        queues: &[String],
+        consumer: &str,
+        max: usize,
+        wait: Duration,
+    ) -> autumn_harvest::HarvestResult<Vec<autumn_harvest::dispatch::DispatchLease>> {
+        self.inner.next(queues, consumer, max, wait).await
+    }
+
+    async fn ack(
+        &self,
+        lease: &autumn_harvest::dispatch::DispatchLease,
+    ) -> autumn_harvest::HarvestResult<()> {
+        tokio::time::sleep(self.ack_delay).await;
+        self.inner.ack(lease).await
+    }
+
+    async fn ack_many(
+        &self,
+        leases: &[autumn_harvest::dispatch::DispatchLease],
+    ) -> autumn_harvest::HarvestResult<()> {
+        tokio::time::sleep(self.ack_delay).await;
+        self.inner.ack_many(leases).await
+    }
+
+    async fn release(
+        &self,
+        lease: &autumn_harvest::dispatch::DispatchLease,
+        delay: Duration,
+    ) -> autumn_harvest::HarvestResult<()> {
+        self.inner.release(lease, delay).await
+    }
+
+    async fn maintain(
+        &self,
+        queues: &[String],
+    ) -> autumn_harvest::HarvestResult<autumn_harvest::dispatch::DispatchMaintenance> {
+        self.inner.maintain(queues).await
+    }
+}
+
+/// A task that puts its own row back to `PENDING` before the worker acks its
+/// reference keeps a reference for the row. A retry does this when the
+/// activity fails fast. The channel drops a publish for a reference it has
+/// leased out, so a body that ran before the ack lost the hint. The row then
+/// waited for the reconcile sweep.
+#[tokio::test]
+async fn a_row_put_back_before_the_ack_keeps_its_reference() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let inner = Arc::new(MemoryDispatch::new());
+    let channel = Arc::new(SlowAckDispatch {
+        inner: Arc::clone(&inner),
+        ack_delay: Duration::from_millis(500),
+    });
+    autumn_harvest::dispatch::install(
+        channel as Arc<dyn TaskDispatch>,
+        DispatchSettings {
+            poll_interval: Duration::from_millis(20),
+            reconcile_interval: Duration::from_secs(30),
+            reconcile_batch: 100,
+            release_backoff_cap: Duration::from_secs(30),
+        },
+    );
+    let _guard = InstalledGuard;
+
+    let log = Arc::new(ActivityLog::default());
+    let shared = shared_state_with(Arc::clone(&log));
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, "dispatch_retrying").await;
+
+    let pool = build_pool(&url);
+    let worker = Arc::new(make_worker(
+        vec![wf_info("dispatch_retrying", retrying_activity_workflow)],
+        vec![act_info(
+            "flaky",
+            fail_once_activity,
+            Some(RetryPolicy::fixed(3, Duration::from_millis(100)).with_jitter(JitterPolicy::None)),
+        )],
+        shared,
+    ));
+
+    let mut check = connect(&url).await;
+    let started = std::time::Instant::now();
+    with_worker(worker, pool, async {
+        wait_for_state(&mut check, exec_id, &["COMPLETED"], Duration::from_secs(40)).await;
+    })
+    .await;
+    let elapsed = started.elapsed();
+    assert_eq!(AtomicUsize::load(&log.runs, Ordering::SeqCst), 2);
+    // A few 500 ms acks and one 100 ms backoff. The 30 s reconcile sweep
+    // would take far longer.
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the retry waited for the reconcile sweep: {elapsed:?}"
     );
 }
 
@@ -1556,6 +1673,73 @@ async fn a_workflow_reference_waits_for_a_workflow_permit() {
         }
     })
     .await;
+}
+
+/// A reference for a full pool waits for a permit. The reader does not spin
+/// on it (issue #1429).
+///
+/// A worker gives such a reference straight back, so a peer with a permit can
+/// read it. While the other pool has a free permit, the read size is not
+/// zero. So the reader read the same reference again at once, and gave it
+/// back again. That loop made thousands of channel calls per second. With
+/// an in-memory channel it never yielded, so it starved the task that held
+/// the permit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reference_for_a_full_pool_does_not_spin_the_reader() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = unique_queue("f7_spin");
+    let _cleanup = SeededQueueGuard {
+        url: url.clone(),
+        queue: queue.clone(),
+    };
+
+    let mut conn = connect(&url).await;
+    let first = start_on(&mut conn, "dispatch_slow", &queue).await;
+    let second = start_on(&mut conn, "dispatch_slow", &queue).await;
+
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install(&channel);
+
+    let config = WorkerRuntimeConfig {
+        max_concurrent_workflows: 1,
+        max_concurrent_activities: 8,
+        ..worker_config(&queue, vec![ShardId::new(0)])
+    };
+    let worker = Arc::new(make_worker_with(
+        config,
+        vec![wf_info("dispatch_slow", slow_workflow)],
+        vec![ActivityInfo {
+            is_local: true,
+            default_queue: None,
+            ..act_info("slow_local", slow_local_activity, None)
+        }],
+        empty_shared_state(),
+    ));
+
+    let pool = build_pool(&url);
+    let mut check = connect(&url).await;
+    with_worker(worker, pool, async {
+        for exec in [first, second] {
+            wait_for_state(&mut check, exec, &["COMPLETED"], Duration::from_secs(30)).await;
+        }
+    })
+    .await;
+
+    // Each run holds the one workflow permit for at least 800 ms. A reader
+    // that waits up to 10 ms per read releases a reference about 80 times in
+    // that hold. A spinning reader released it about 65,000 times.
+    let released = channel.released_ids();
+    for exec in [first, second] {
+        for task in tasks_for(&mut check, exec).await {
+            let count = released.iter().filter(|id| **id == task.id).count();
+            assert!(
+                count <= 1_000,
+                "the reader released the reference of task {} {count} times",
+                task.id
+            );
+        }
+    }
 }
 
 /// A stale reference must not spend a claimable sibling's share of the same

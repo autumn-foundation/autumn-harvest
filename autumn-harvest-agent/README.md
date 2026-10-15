@@ -16,6 +16,11 @@ It also has the always-on primitives: heartbeats, follow-ups on a durable
 timer, delivery, a frozen memory snapshot, and a loop guard. An opt-in
 response cache serves an identical model call across runs, per tenant.
 
+A run can delegate a task to a peer agent. The peer runs as a sub-agent in
+the same workflow. A mandate bounds the delegation tree, and flow rules gate a
+dangerous sequence of tool calls. See
+[`docs/agent-mesh.md`](../docs/agent-mesh.md).
+
 A crash costs at most the one step that was in flight. The crate depends on
 the core engine only. It has no Autumn plugin and no `autumn-web` dependency.
 An app implements `AgentModel` for its provider.

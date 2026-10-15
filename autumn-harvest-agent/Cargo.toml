@@ -69,6 +69,10 @@ required-features = ["sqlite"]
 name = "eval"
 required-features = ["eval", "sqlite"]
 
+[[test]]
+name = "mesh"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 

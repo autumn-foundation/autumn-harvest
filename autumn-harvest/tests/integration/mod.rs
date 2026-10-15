@@ -161,6 +161,8 @@ mod executor_span_tests;
 #[cfg(feature = "testing")]
 mod external_completion_tests;
 mod external_outbox_scan_tests;
+mod fairness_key_tests;
+mod fairness_key_worker_tests;
 #[cfg(feature = "db")]
 mod fanout_result_writer_db_tests;
 mod fanout_tests;
@@ -222,6 +224,7 @@ mod nd_block_tests;
 #[cfg(feature = "db")]
 mod notify_post_commit_tests;
 mod otel_semconv_docs;
+mod otel_workflow_semconv_docs;
 mod panic_containment_tests;
 #[cfg(feature = "db")]
 mod parent_close_cascade_unfinished_handlers_perf;
