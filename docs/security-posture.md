@@ -1399,7 +1399,9 @@ A stored value that does not decode never starts work on ciphertext:
   applies.
 - The debounce, throttle and outbox scanners move the row back and log a
   warning that holds no payload text. A throttle row past its deadline is
-  still dropped. The row starts after an operator restores the key.
+  still dropped. The throttle claim has no floor on the move, so a throttle
+  row is written and logged once per 30-second window. The row starts after an
+  operator restores the key.
 - The batch executor leaves a signal job as it is and logs a warning. A cancel
   or terminate job never reads the payload, so a missing key does not block it.
 - The callback scanner counts the failure as a delivery attempt. The delivery

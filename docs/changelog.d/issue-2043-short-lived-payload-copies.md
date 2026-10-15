@@ -35,7 +35,7 @@ change encodes them.
     `PayloadDecodeFailed`, and the retry policy applies.
   - The debounce, throttle and outbox scanners move the row back and log a
     warning with no payload text. A throttle row past its deadline is still
-    dropped.
+    dropped. A throttle row is written and logged once per 30-second window.
   - The batch executor leaves a signal job as it is. A cancel or terminate job
     never reads the payload, so a missing key does not block it.
   - The callback scanner counts a failed attempt, so the delivery backs off.

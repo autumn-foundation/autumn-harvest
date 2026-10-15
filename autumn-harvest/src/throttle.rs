@@ -993,12 +993,18 @@ struct FireDueRow {
     expires_at: Option<DateTime<Utc>>,
     #[diesel(sql_type = diesel::sql_types::Integer)]
     shard_id: i32,
+    /// When the row was deferred. A backoff moves it into the future (issue
+    /// #2043).
+    #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+    deferred_at: DateTime<Utc>,
 }
 
 /// How far a row that does not decode moves its `deferred_at` (issue #2043).
 ///
-/// A long backoff keeps the warning rate low. The row keeps its
-/// `schedule_to_start` deadline.
+/// The claim has no `deferred_at` floor, so the move reorders the row behind
+/// its neighbours and does not hide it. The row is a candidate on every tick.
+/// The window limits the work instead: a row inside it is not written and not
+/// warned about again. The row keeps its `schedule_to_start` deadline.
 #[cfg(feature = "db")]
 const UNDECODABLE_REDEFER_BACKOFF: Duration = Duration::from_secs(30);
 
@@ -1006,11 +1012,12 @@ const UNDECODABLE_REDEFER_BACKOFF: Duration = Duration::from_secs(30);
 ///
 /// The row stores `input` in the column form. The quota ordering and the
 /// start both need the plain input. A row that does not decode logs a warning
-/// with no payload text. A row past its `schedule_to_start` deadline is
-/// dropped, as `fire_claimed_throttle_row` drops it, because that needs no
-/// payload. Any other row moves back and fires after an operator restores the
-/// key. The row thus cannot sit at the head of its key, and it cannot abort the
-/// claim of its neighbours.
+/// with no payload text, once per backoff window. A row past its
+/// `schedule_to_start` deadline is dropped, as `fire_claimed_throttle_row`
+/// drops it, because that needs no payload. Any other row moves back and fires
+/// after an operator restores the key. A row still inside its window is left as
+/// it is. The row thus cannot sit at the head of its key, and it cannot abort
+/// the claim of its neighbours.
 ///
 /// # Errors
 ///
@@ -1031,6 +1038,15 @@ async fn decode_due_rows(
             }
             Err(error) => {
                 let expired = row.expires_at.is_some_and(|at| at < now);
+                if !expired && row.deferred_at > now {
+                    // Inside the window of an earlier move. The row is already
+                    // behind its neighbours, so a write would add no order.
+                    tracing::debug!(
+                        throttle_id = %row.id,
+                        "throttle input still cannot be decoded; the row stays in its backoff window"
+                    );
+                    continue;
+                }
                 tracing::warn!(
                     throttle_id = %row.id,
                     expired,
@@ -1651,7 +1667,8 @@ async fn fire_due_on_conn(
                     ORDER BY rn ASC, deferred_at ASC LIMIT $2
                 )
                 SELECT t.id, t.workflow_name, t.throttle_key, t.bucket_key, t.workflow_id,
-                       t.queue_name, t.input, t.start_options, t.expires_at, t.shard_id
+                       t.queue_name, t.input, t.start_options, t.expires_at, t.shard_id,
+                       t.deferred_at
                 FROM harvest_start_throttle t
                 JOIN selected s ON s.id = t.id
                 ORDER BY t.deferred_at ASC
@@ -2127,6 +2144,7 @@ mod tests {
             start_options: serde_json::json!({ "tenant_id": "wrong" }),
             expires_at: None,
             shard_id: 0,
+            deferred_at: Utc::now(),
         };
         assert_eq!(row.workflow_name(), "wf_a");
         assert_eq!(row.quota_input()["tenant_id"], "t1");
@@ -2454,6 +2472,7 @@ mod tests {
                 start_options: serde_json::json!({}),
                 expires_at: None,
                 shard_id: 0,
+                deferred_at: Utc::now(),
             }
         }
 

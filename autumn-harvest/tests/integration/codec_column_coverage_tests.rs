@@ -1993,6 +1993,71 @@ async fn an_undecodable_buffer_row_moves_back_and_never_starts_a_run() {
     }
 }
 
+/// The throttle claim has no `deferred_at` floor, so a backed-off row is still
+/// a candidate on the next tick. The scan must not write or warn again inside
+/// the window.
+#[tokio::test]
+async fn an_undecodable_throttle_row_is_written_once_per_backoff_window() {
+    use autumn_harvest::throttle::fire_due_throttled_starts_with_codecs;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let reader = reader_without_the_key();
+    let mut conn = connect(&url).await;
+    let metrics = autumn_harvest::telemetry::NoOpMetrics;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let id = format!("cc-window-{}", Uuid::new_v4().simple());
+    defer_throttled(&mut conn, &key, &id, None, &codecs).await;
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets SET tokens = 5, last_refilled_at = NOW() \
+         WHERE key IN (SELECT bucket_key FROM harvest_start_throttle WHERE workflow_id = $1)",
+    )
+    .bind::<diesel::sql_types::Text, _>(&id)
+    .execute(&mut conn)
+    .await
+    .expect("refill the bucket");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    async fn deferred_at(conn: &mut AsyncPgConnection, id: &str) -> String {
+        let cell: JsonCell = diesel::sql_query(
+            "SELECT to_jsonb(deferred_at::text) AS value FROM harvest_start_throttle \
+             WHERE workflow_id = $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(id)
+        .get_result(conn)
+        .await
+        .expect("load deferred_at");
+        cell.value.as_str().expect("a text value").to_string()
+    }
+
+    autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+    fire_due_throttled_starts_with_codecs(&mut conn, &None, &[], &metrics, &reader)
+        .await
+        .expect("first scan");
+    let after_first = deferred_at(&mut conn, &id).await;
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_start_throttle \
+             WHERE workflow_id = $1 AND deferred_at > now() + interval '10 seconds'",
+            &id,
+        )
+        .await,
+        1,
+        "the first scan moves the row back"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+    fire_due_throttled_starts_with_codecs(&mut conn, &None, &[], &metrics, &reader)
+        .await
+        .expect("second scan");
+    assert_eq!(
+        deferred_at(&mut conn, &id).await,
+        after_first,
+        "a row inside its backoff window is not written again"
+    );
+}
+
 #[tokio::test]
 async fn an_undecodable_outbox_row_backs_off_and_never_starts_a_run() {
     use autumn_harvest::models::NewCompletionTriggerOutboxDb;
