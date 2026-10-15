@@ -180,6 +180,9 @@ Codex review ran on the pull request. The fixes:
   strings. A `concat!` or a line continuation no longer escapes it.
 - Documentation gaps and the load-bearing rationale that the daemon move
   had cut.
+- The merge with #2029 put a mutex release in the upsert, not in
+  `set_failed`. An upsert under a lock freed it, and a failed holder kept
+  it. Both moved back, and a test covers each case.
 
 ---
 

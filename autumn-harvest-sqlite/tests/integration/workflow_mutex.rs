@@ -71,6 +71,28 @@ async fn locks_beside_a_timer(ctx: &WorkflowContext, _n: i64) -> Result<String, 
     Ok(format!("{fired:?}"))
 }
 
+/// Takes the lock, upserts a search attribute, then holds the lock until the
+/// signal `release` arrives (issue #2027).
+#[workflow]
+async fn upserts_under_the_lock(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let guard = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+    ctx.upsert_search_attrs([("stage".to_string(), Some(json!("locked")))])
+        .map_err(|e| e.to_string())?;
+    let _: serde_json::Value = ctx
+        .wait_for_signal("release")
+        .await
+        .map_err(|e| e.to_string())?;
+    guard.release();
+    Ok(0)
+}
+
+/// Takes the lock and fails before it releases the lock.
+#[workflow]
+async fn fails_under_the_lock(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let _guard = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+    Err("broken".to_string())
+}
+
 fn runtime(infos: &[&WorkflowInfo]) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     for info in infos {
@@ -172,6 +194,43 @@ async fn a_terminated_holder_frees_its_lock() {
     rt.terminate(h, "stop").unwrap();
     let state = rt.run_until_blocked(w).await.unwrap();
     assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
+}
+
+// An upsert is not a release. The holder keeps the lock after it upserts
+// (issue #2027).
+#[tokio::test]
+async fn an_upsert_under_the_lock_keeps_the_lock() {
+    let holder = upserts_under_the_lock_info();
+    let waiter = locks_once_info();
+    let mut rt = runtime(&[&holder, &waiter]);
+
+    let h = rt.start_workflow(holder.name, json!(0)).unwrap();
+    let state = rt.run_until_blocked(h).await.unwrap();
+    assert!(matches!(state, RunState::WaitingSignal(_)), "got {state:?}");
+    let w = rt.start_workflow(waiter.name, json!(4)).unwrap();
+    let state = rt.run_until_blocked(w).await.unwrap();
+    assert!(
+        matches!(state, RunState::WaitingMutex(ref k) if k == "k"),
+        "got {state:?}"
+    );
+}
+
+// A holder that fails frees its lock, as a terminated holder does.
+#[tokio::test]
+async fn a_failed_holder_frees_its_lock() {
+    let holder = fails_under_the_lock_info();
+    let waiter = locks_once_info();
+    let mut rt = runtime(&[&holder, &waiter]);
+
+    let h = rt.start_workflow(holder.name, json!(0)).unwrap();
+    let state = rt.run_until_blocked(h).await.unwrap();
+    assert!(matches!(state, RunState::Failed(_)), "got {state:?}");
+    let w = rt.start_workflow(waiter.name, json!(5)).unwrap();
+    let state = rt.run_until_blocked(w).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if v == 5),
+        "got {state:?}"
+    );
 }
 
 // A held lock is durable. The holder keeps it across a reopen.

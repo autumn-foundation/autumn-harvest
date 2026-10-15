@@ -460,7 +460,7 @@ pub fn set_failed(conn: &Connection, exec_id: ExecutionId, error: &str) -> Sqlit
          WHERE exec_id = ?1",
         params![exec_id.to_string(), error, now_micros()],
     )?;
-    Ok(())
+    crate::mutex::release_all(conn, exec_id)
 }
 
 /// The wall clock in epoch microseconds. A terminal write stores it as
@@ -549,7 +549,7 @@ pub fn upsert_search_attrs(
         "UPDATE harvest_executions SET search_attrs = ?2 WHERE exec_id = ?1",
         params![exec_id.to_string(), serde_json::to_string(&merged)?],
     )?;
-    crate::mutex::release_all(conn, exec_id)
+    Ok(())
 }
 
 // ── Event log ────────────────────────────────────────────────────────────────
