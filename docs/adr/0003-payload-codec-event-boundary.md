@@ -210,5 +210,28 @@ caller could store an envelope-shaped value that an engine read unwraps.
 
 **Residual.** A row written before this release had no escape. If it holds
 an envelope-shaped value, an engine read now decodes it. This is the issue
-#1253 residual, now on the engine path. The remaining short-lived copies are
-follow-up work in issue #2043.
+#1253 residual, now on the engine path. Issue #2043 covers the short-lived
+copies. See the addendum below.
+
+## Addendum (issue #2043): the codec covers the short-lived copies
+
+**Decision.** The codec also encodes the activity task row (`input`, `output`
+and `heartbeat_details`), the completion-callback delivery and its dead letter,
+the debounce, throttle and outbox buffers, and the batch job signal payload.
+
+**Why now.** A finished activity task row stays until task retention removes
+it, and a callback dead letter stays for good. So these copies are not
+short-lived. Each held the same data as the column it copies.
+
+**One rule per reader.** A reader decodes the stored value before it uses it.
+A dead-letter writer takes the input as its source row stores it, and keeps one
+envelope layer. A value that does not decode never reaches a handler, a webhook
+or a start. An activity attempt fails with a retryable error. A scanner leaves
+the row pending.
+
+**What stays clear.** `harvest_event_batches.buffered_payloads`,
+`harvest_cross_shard_children.child_spec`, `harvest_schedules.workflow_input`
+and `context_headers` stay clear. SQL appends to and counts the batch array.
+Erasure rewrites a field inside the child spec. The schedule API edits the
+template, and the reconciler compares it by value. Many readers treat an
+unreadable header map as no headers. The coverage table gives each reason.

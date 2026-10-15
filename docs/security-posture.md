@@ -1383,6 +1383,22 @@ Any other caller sees the stored envelope. The list surfaces and the MCP
 status and watch tools always show the stored envelope. See
 [`docs/operations/read-path-decode.md`](operations/read-path-decode.md).
 
+**Task rows and short-lived copies (issue #2043).** An activity task row
+stores its input, result and checkpoint encoded. A finished activity row stays
+until task retention removes it, 7 days by default. So it is not short-lived.
+A completion-callback delivery and its dead letter store the webhook body
+encoded. The scanner decodes the body before it signs and sends it, so the
+receiver always gets plaintext. A debounce, throttle or outbox row stores its
+input encoded, and the fire path decodes it before the start. The batch
+executor decodes a job payload before it sends each signal.
+
+A stored value that does not decode never starts work on ciphertext. An
+activity attempt fails with `PayloadDecodeFailed`, and the retry policy
+applies. A scanner leaves the row pending and logs a warning that holds no
+payload text. The row fires after an operator restores the key. Upgrade every
+worker before you turn column encoding on. An older worker runs an activity on
+the envelope.
+
 **Behavior change for API clients.** Before column encoding, the output
 column was always plaintext, so every caller of `GET /workflows/{id}/result`
 got plaintext. With column encoding on, only an admin with
