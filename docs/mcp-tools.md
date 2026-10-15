@@ -90,9 +90,10 @@ checking your app's full route list for `start_*`/`*_status`/`signal_*`/
 | `foo_watch` | GET `{prefix}/workflows/foo/{handle}/watch` | `handle` | Streaming progress over MCP `notifications/progress`; terminates with the final state |
 
 `foo_update_bar` validates and admits the update. The worker runs the
-handler once, in its next decision cycle, and the tool returns the output. A
-handler that panics or runs longer than 5 s records a failure, and the tool
-returns that failure.
+handler in its next decision cycle, and the tool returns the output. A handler
+that panics or runs for more than 5 s records a failure, and the tool returns
+that failure. A workflow task that waits on a timer does not wake for the
+update, so the call times out.
 
 `{prefix}` defaults to `{api_path}/mcp` (`/api/harvest/mcp` when no management
 API is mounted); override with `mcp_tools_at`.

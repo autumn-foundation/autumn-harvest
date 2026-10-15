@@ -2293,6 +2293,10 @@ pub(crate) struct DriveResult {
     #[cfg_attr(not(any(feature = "db", feature = "testing")), allow(dead_code))]
     // Resident paths need the worker or the test harness.
     pub(crate) resident: crate::resident::Residency,
+    /// `true` when admitted updates remain after the dispatch window closed
+    /// (issue #2035). The worker wakes the task, so a later cycle runs them.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the worker reads it.
+    pub(crate) updates_deferred: bool,
 }
 
 impl DriveResult {
@@ -2423,9 +2427,10 @@ async fn drive_cycle(
     let keep = keep.filter(|_| matches!(cycle_result, HandlerCycleResult::Suspended));
     let future = keep.is_some().then_some(future);
     let (mut outcome, mut pending) = span_handle.in_scope(|| classify_cycle(&ctx, cycle_result));
-    crate::update::dispatch_pending_updates(&ctx, &mut outcome, &mut pending)
-        .instrument(span_handle.clone())
-        .await;
+    let updates_deferred =
+        crate::update::dispatch_pending_updates(&ctx, &mut outcome, &mut pending)
+            .instrument(span_handle.clone())
+            .await;
     let resident = match (future, keep) {
         (Some(future), Some(key)) => {
             match crate::resident::ResidentWorkflow::capture(&ctx, future, &mut outcome, key) {
@@ -2451,6 +2456,7 @@ async fn drive_cycle(
         span: span_handle,
         router,
         resident,
+        updates_deferred,
     }
 }
 

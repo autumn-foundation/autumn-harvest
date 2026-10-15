@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::context::{WorkflowCommand, WorkflowContext};
@@ -19,8 +20,9 @@ use crate::types::UpdateId;
 
 /// Longest time that one admitted update handler may run in a cycle (issue #2035).
 ///
-/// A handler that does not finish in this time records `UpdateFailed`.
-pub const UPDATE_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
+/// A handler that does not finish in this time records `UpdateFailed`. Keep
+/// `workflow_task_timeout` above this limit, or the cycle can end first.
+pub(crate) const UPDATE_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Pinned boxed async future returned by an update handler invocation.
 pub type UpdateHandlerFuture = Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;
@@ -116,7 +118,7 @@ impl UpdateRegistry {
     }
 }
 
-/// Runs each admitted update that has no result and adds its result to the
+/// Runs the admitted updates that have no result and adds their results to the
 /// cycle commands (issue #2035).
 ///
 /// The executor calls this after the body parks or returns. The handlers of
@@ -127,13 +129,21 @@ impl UpdateRegistry {
 /// A cycle whose commands the worker discards runs no handler. A repeat of
 /// that cycle would run the handler again. Those cycles are a divergence, a
 /// panic and a deadlock.
+///
+/// The cycle runs under the workflow-task budget. The dispatch therefore
+/// starts a handler only while a full [`UPDATE_HANDLER_TIMEOUT`] is left in
+/// half of the remaining budget. The first update always runs, so each cycle
+/// makes progress.
+///
+/// Returns `true` when updates remain. The caller must wake the task, so a
+/// later cycle runs them.
 pub(crate) async fn dispatch_pending_updates(
     ctx: &WorkflowContext,
     outcome: &mut WorkflowOutcome,
     pending: &mut Vec<WorkflowCommand>,
-) {
+) -> bool {
     if !ctx.dispatches_updates() {
-        return;
+        return false;
     }
     let commands = match outcome {
         WorkflowOutcome::Suspended { commands } => commands,
@@ -144,7 +154,7 @@ pub(crate) async fn dispatch_pending_updates(
             handler_panic: false,
             ..
         } => pending,
-        WorkflowOutcome::Failed { .. } | WorkflowOutcome::TaskFailed { .. } => return,
+        WorkflowOutcome::Failed { .. } | WorkflowOutcome::TaskFailed { .. } => return false,
     };
     // The body can run an update with `execute_admitted_update`. The batch
     // then holds its result, and the handler must not run twice.
@@ -155,16 +165,42 @@ pub(crate) async fn dispatch_pending_updates(
             _ => None,
         })
         .collect();
+    let window = window_end(ctx.update_cutoff());
+    let mut started = false;
     for (update_id, name, input) in ctx.pending_updates() {
         if recorded.contains(&update_id) {
             continue;
         }
+        if started && !window_allows(window) {
+            return true;
+        }
+        started = true;
         let result = run_bounded(ctx, &name, input).await;
         commands.push(WorkflowCommand::RecordUpdateResult { update_id, result });
     }
+    false
+}
+
+/// The end of the dispatch window, or `None` when the task has no budget.
+///
+/// The window is half of the budget that is left. The persist needs the rest.
+fn window_end(cutoff: Option<DateTime<Utc>>) -> Option<tokio::time::Instant> {
+    let left = (cutoff? - Utc::now()).to_std().unwrap_or(Duration::ZERO);
+    Some(tokio::time::Instant::now() + left / 2)
+}
+
+/// Whether a handler may start. It needs a full [`UPDATE_HANDLER_TIMEOUT`].
+fn window_allows(end: Option<tokio::time::Instant>) -> bool {
+    end.is_none_or(|end| {
+        end.saturating_duration_since(tokio::time::Instant::now()) >= UPDATE_HANDLER_TIMEOUT
+    })
 }
 
 /// Runs one handler. A panic or a timeout becomes an error result.
+///
+/// The error text is part of the history and the HTTP answer. A panic
+/// message can hold internal detail, so the text is fixed and the log keeps
+/// the detail.
 async fn run_bounded(ctx: &WorkflowContext, name: &str, input: Value) -> Result<Value, String> {
     use futures::FutureExt as _;
 
@@ -173,10 +209,14 @@ async fn run_bounded(ctx: &WorkflowContext, name: &str, input: Value) -> Result<
     let run = std::panic::AssertUnwindSafe(ctx.run_update_handler(name, input)).catch_unwind();
     match tokio::time::timeout(UPDATE_HANDLER_TIMEOUT, run).await {
         Ok(Ok(result)) => result,
-        Ok(Err(panic)) => Err(format!(
-            "update handler panicked: {}",
-            crate::error::panic_message(panic)
-        )),
+        Ok(Err(panic)) => {
+            tracing::error!(
+                update = name,
+                panic_message = %crate::error::panic_message(panic),
+                "update handler panicked"
+            );
+            Err("update handler panicked".to_string())
+        }
         Err(_elapsed) => Err(format!(
             "update handler timed out after {}s",
             UPDATE_HANDLER_TIMEOUT.as_secs()
@@ -336,19 +376,38 @@ mod tests {
             ctx.register_declarative_update_handler(handler);
         }
         if dispatch {
-            ctx.with_update_dispatch()
+            ctx.with_update_dispatch(None)
         } else {
             ctx
         }
+    }
+
+    /// A worker-style context whose task budget ends at `cutoff`.
+    fn context_with_cutoff(
+        history: Vec<WorkflowEvent>,
+        handlers: &[&UpdateHandlerInfo],
+        cutoff: DateTime<Utc>,
+    ) -> WorkflowContext {
+        let ctx = crate::executor::default_task_context(ExecutionId::new(), history);
+        for handler in handlers {
+            ctx.register_declarative_update_handler(handler);
+        }
+        ctx.with_update_dispatch(Some(cutoff))
+    }
+
+    async fn drive_full(
+        ctx: WorkflowContext,
+        body: crate::info::WorkflowHandlerFn,
+    ) -> crate::executor::DriveResult {
+        crate::executor::drive_workflow_keep(ctx, body, Value::Null, None, None).await
     }
 
     async fn drive(
         ctx: WorkflowContext,
         body: crate::info::WorkflowHandlerFn,
     ) -> (WorkflowOutcome, Vec<WorkflowCommand>) {
-        let (outcome, pending, _span, _router) =
-            crate::executor::drive_workflow(ctx, body, Value::Null, None).await;
-        (outcome, pending)
+        let drive = drive_full(ctx, body).await;
+        (drive.outcome, drive.pending)
     }
 
     /// Every `RecordUpdateResult` in the cycle batch, in order.
@@ -422,6 +481,7 @@ mod tests {
         ];
         let (outcome, pending) = drive(context(history, &[&handler], true), parked).await;
 
+        assert!(matches!(outcome, WorkflowOutcome::Suspended { .. }));
         assert!(results(&outcome, &pending).is_empty());
         assert_eq!(REPLAY_RUNS.load(Ordering::SeqCst), 0);
     }
@@ -440,6 +500,7 @@ mod tests {
         let history = vec![started(), admitted(id, "count", json!(1))];
         let (outcome, pending) = drive(context(history, &[&handler], false), parked).await;
 
+        assert!(matches!(outcome, WorkflowOutcome::Suspended { .. }));
         assert!(results(&outcome, &pending).is_empty());
         assert_eq!(OFF_RUNS.load(Ordering::SeqCst), 0);
     }
@@ -487,9 +548,10 @@ mod tests {
             let recorded = results(&outcome, &pending);
             assert_eq!(recorded.len(), 1, "{name}: one result");
             let error = recorded[0].1.clone().expect_err("a panic is a failure");
+            assert_eq!(error, "update handler panicked", "{name}");
             assert!(
-                error.contains("update handler panicked") && error.contains(needle),
-                "{name}: {error}"
+                !error.contains(needle),
+                "{name}: the panic text stays out of history"
             );
         }
     }
@@ -503,12 +565,15 @@ mod tests {
         let id = UpdateId::new();
         let handler = info("hang", never_finishes);
         let history = vec![started(), admitted(id, "hang", json!({}))];
+        let started = tokio::time::Instant::now();
         let (outcome, pending) = drive(context(history, &[&handler], true), parked).await;
 
-        let recorded = results(&outcome, &pending);
-        assert_eq!(recorded.len(), 1);
-        let error = recorded[0].1.clone().expect_err("a timeout is a failure");
-        assert!(error.contains("timed out"), "{error}");
+        assert!(matches!(outcome, WorkflowOutcome::Suspended { .. }));
+        assert_eq!(
+            results(&outcome, &pending),
+            vec![(id, Err("update handler timed out after 5s".to_string()))]
+        );
+        assert!(started.elapsed() >= UPDATE_HANDLER_TIMEOUT);
     }
 
     #[tokio::test]
@@ -739,5 +804,126 @@ mod tests {
 
         assert_eq!(results(&outcome, &pending), vec![(id, Ok(json!("hi")))]);
         assert_eq!(LATE_RUNS.load(Ordering::SeqCst), 1);
+    }
+
+    static NEXT_CYCLE_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_next_cycle(_ctx: Arc<WorkflowContext>, input: Value) -> UpdateHandlerFuture {
+        NEXT_CYCLE_RUNS.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(input) })
+    }
+
+    /// The events that the worker writes for the `RecordUpdateResult` commands.
+    fn result_events(recorded: &[(UpdateId, Result<Value, String>)]) -> Vec<WorkflowEvent> {
+        recorded
+            .iter()
+            .map(|(update_id, result)| match result {
+                Ok(output) => WorkflowEvent::UpdateCompleted {
+                    update_id: *update_id,
+                    output: output.clone(),
+                },
+                Err(error) => WorkflowEvent::UpdateFailed {
+                    update_id: *update_id,
+                    error: error.clone(),
+                },
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_results_of_one_cycle_stop_the_next_cycle_from_running_them() {
+        let ok = info("ok", count_next_cycle);
+        let pay = info("pay", reject);
+        let hang = info("hang", never_finishes);
+        let boom = info("boom", panic_in_future);
+        let handlers = [&ok, &pay, &hang, &boom];
+        let mut history = vec![started()];
+        for name in ["ok", "pay", "hang", "boom", "ghost"] {
+            history.push(admitted(UpdateId::new(), name, json!({})));
+        }
+
+        let first = drive_full(context(history.clone(), &handlers, true), parked).await;
+        let recorded = results(&first.outcome, &first.pending);
+        assert_eq!(recorded.len(), 5, "cycle one runs every update");
+        history.extend(result_events(&recorded));
+
+        let second = drive_full(context(history, &handlers, true), parked).await;
+        assert!(matches!(second.outcome, WorkflowOutcome::Suspended { .. }));
+        assert!(results(&second.outcome, &second.pending).is_empty());
+        assert!(!second.updates_deferred);
+        assert_eq!(NEXT_CYCLE_RUNS.load(Ordering::SeqCst), 1);
+    }
+
+    static CLOSED_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_closed(_ctx: Arc<WorkflowContext>, input: Value) -> UpdateHandlerFuture {
+        CLOSED_RUNS.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(input) })
+    }
+
+    #[tokio::test]
+    async fn a_closed_window_still_runs_the_first_update_and_defers_the_rest() {
+        let (first, second, third) = (UpdateId::new(), UpdateId::new(), UpdateId::new());
+        let handler = info("count", count_closed);
+        let history = vec![
+            started(),
+            admitted(first, "count", json!(1)),
+            admitted(second, "count", json!(2)),
+            admitted(third, "count", json!(3)),
+        ];
+        let cutoff = Utc::now() - chrono::Duration::seconds(1);
+        let drive = drive_full(context_with_cutoff(history, &[&handler], cutoff), parked).await;
+
+        assert_eq!(
+            results(&drive.outcome, &drive.pending),
+            vec![(first, Ok(json!(1)))]
+        );
+        assert!(drive.updates_deferred);
+        assert_eq!(CLOSED_RUNS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_open_window_runs_every_pending_update() {
+        let ids = [UpdateId::new(), UpdateId::new(), UpdateId::new()];
+        let handler = info("order", echo_order);
+        let mut history = vec![started()];
+        for (n, id) in ids.iter().enumerate() {
+            history.push(admitted(*id, "order", json!(n)));
+        }
+        let cutoff = Utc::now() + chrono::Duration::hours(1);
+        let drive = drive_full(context_with_cutoff(history, &[&handler], cutoff), parked).await;
+
+        assert_eq!(results(&drive.outcome, &drive.pending).len(), 3);
+        assert!(!drive.updates_deferred);
+    }
+
+    static WINDOW_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    fn four_seconds(_ctx: Arc<WorkflowContext>, input: Value) -> UpdateHandlerFuture {
+        WINDOW_RUNS.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Ok(input)
+        })
+    }
+
+    /// A 30 s budget gives a 15 s window. Handlers start at 0 s, 4 s and 8 s.
+    /// At 12 s only 3 s are left, which is less than one handler limit.
+    #[tokio::test(start_paused = true)]
+    async fn the_window_closes_when_less_than_one_handler_limit_is_left() {
+        let ids: Vec<UpdateId> = (0..5).map(|_| UpdateId::new()).collect();
+        let handler = info("slow", four_seconds);
+        let mut history = vec![started()];
+        for (n, id) in ids.iter().enumerate() {
+            history.push(admitted(*id, "slow", json!(n)));
+        }
+        let cutoff = Utc::now() + chrono::Duration::seconds(30);
+        let drive = drive_full(context_with_cutoff(history, &[&handler], cutoff), parked).await;
+
+        let recorded = results(&drive.outcome, &drive.pending);
+        let ran: Vec<UpdateId> = recorded.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ran, ids[..3].to_vec(), "the first three run, in order");
+        assert!(drive.updates_deferred);
+        assert_eq!(WINDOW_RUNS.load(Ordering::SeqCst), 3);
     }
 }

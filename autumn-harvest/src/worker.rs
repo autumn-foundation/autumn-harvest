@@ -25885,8 +25885,9 @@ async fn process_workflow_task(
                 registry.default_activity_start_to_close(),
             )
             // Issue #2035: a live decision runs the admitted updates. A replay
-            // gate does not, so it never runs a handler.
-            .with_update_dispatch();
+            // gate does not, so it never runs a handler. The cut-off keeps the
+            // dispatch inside the workflow-task budget.
+            .with_update_dispatch(workflow_task_deadline);
             crate::executor::drive_workflow_keep(
                 ctx,
                 workflow.handler,
@@ -25923,7 +25924,20 @@ async fn process_workflow_task(
             span: execute_span,
             router: resolved_router,
             resident: iter_resident,
+            updates_deferred,
         } = drive;
+        // Issue #2035: the dispatch window closed with updates left. This
+        // claimed row only records the wake. The park that ends the cycle then
+        // re-pends the task, and the next cycle runs the rest.
+        if updates_deferred
+            && let Err(error) = queue::wake_workflow_task(conn, prepared.exec_id).await
+        {
+            tracing::warn!(
+                exec_id = %prepared.exec_id,
+                %error,
+                "could not wake the task for deferred updates"
+            );
+        }
         // Issue #2007: one sample per decision, after its first drive.
         if let Some(outcome) = resident_outcome.take() {
             telemetry.metrics.record_workflow_resident(

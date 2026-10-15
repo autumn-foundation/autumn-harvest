@@ -768,17 +768,20 @@ Workflow Update Handlers allow external clients to interact with running workflo
 
 ### When an Update Handler Runs
 
-The worker runs each admitted update once, at the end of its next decision cycle. The workflow body runs first. The worker then runs the pending updates in history order. It records `UpdateCompleted` or `UpdateFailed` with the other events of that cycle.
+The worker runs each pending update at the end of its next decision cycle. The workflow body runs first. The worker then runs the pending updates in history order. It records `UpdateCompleted` or `UpdateFailed` with the other events of that cycle.
 
-Replay never runs the handler again. Replay returns the recorded result. Three rules follow:
+A cycle runs under the workflow-task budget. The worker starts a handler only while a full handler limit is left in half of the remaining budget. The first update of a cycle always runs. The worker wakes the task for the updates that remain, and the next cycle runs them.
 
-- Delivery is at least once. A crash after the handler and before the worker records the result runs the handler again. Write a handler that tolerates a repeat.
-- State that a handler writes to a captured variable does not return on replay. Do not let the workflow body depend on it.
-- A handler has 5 seconds to finish. A handler that panics or runs longer records `UpdateFailed`. A handler cannot await an activity or a timer.
+Replay never runs the handler again. Replay returns the recorded result. Four rules follow:
+
+- Delivery is at least once. Any path that discards the cycle after the handler ran runs the handler again. Examples are a crash, a deadlock retry, an event-id conflict, a pause and a lost claim. Write a handler that tolerates a repeat.
+- A value that a handler writes to a captured variable does not return on replay. Do not let the workflow body depend on it.
+- A handler has 5 seconds to finish. A handler that panics or runs for more than 5 seconds records `UpdateFailed`. A handler that awaits an activity or a timer never finishes, so it hits the same limit.
+- The error text of a panic is not stored. The worker logs it. The caller sees `update handler panicked`.
 
 ### Orphaned Update Handlers
 
-If a workflow ends (completes, fails, times out, is cancelled or is terminated) before the worker runs an admitted update, the update becomes **orphaned**. Orphaned updates will be terminated immediately, and their clients will receive a `409 Conflict` response with an `update_orphaned` error payload.
+If a workflow ends (completes, fails, times out, is cancelled or is terminated) before the worker runs an admitted update, the update becomes **orphaned**. The engine terminates an orphaned update at once. Its client gets a `409 Conflict` response with an `update_orphaned` error payload.
 
 ### Waiting for Update Handlers to Complete
 
@@ -790,3 +793,5 @@ ctx.await_condition(|| ctx.all_handlers_finished()).await;
 ```
 
 This ensures a clean exit and prevents unhandled update requests from being aborted.
+
+`all_handlers_finished()` reads history up to the replay position. The worker records a result at the end of a cycle. The helper sees that result once the body passes it, which can take one more cycle.
