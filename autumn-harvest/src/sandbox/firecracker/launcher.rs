@@ -354,15 +354,17 @@ impl FileStamp {
 
 /// An inotify watch for a write to the pinned image files.
 ///
-/// The watch is on each inode, so it sees a write through any hard link. A
-/// link, an unlink and a read are not writes, so launches do not trip it.
+/// The watch is on each inode, so it sees a write or a truncate through any
+/// hard link. A link, an unlink and a read are not writes, so launches do not
+/// trip it. A write through a shared memory map makes no event, but it moves
+/// the modification time that [`FileStamp`] checks.
 #[derive(Debug)]
 struct WriteWatch {
     fd: std::os::fd::OwnedFd,
     /// The watch descriptor of each watched file, in order.
     watches: Vec<libc::c_int>,
     /// Set at the first event, and never cleared.
-    written: std::sync::atomic::AtomicBool,
+    written: Mutex<bool>,
 }
 
 impl WriteWatch {
@@ -383,7 +385,7 @@ impl WriteWatch {
             // SAFETY: the descriptor is new, and nothing else owns it.
             fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
             watches: Vec::with_capacity(paths.len()),
-            written: std::sync::atomic::AtomicBool::new(false),
+            written: Mutex::new(false),
         };
         for path in paths {
             let descriptor = watch.add(path)?;
@@ -439,8 +441,11 @@ impl WriteWatch {
     /// failed read, so the check fails closed.
     fn written(&self) -> bool {
         use std::os::fd::AsRawFd as _;
-        use std::sync::atomic::Ordering;
-        if self.written.load(Ordering::SeqCst) {
+        // The read takes the events from the queue. So the read and the flag
+        // share one lock. Otherwise a second check could find the queue empty
+        // before the first check sets the flag.
+        let mut written = self.written.lock().unwrap_or_else(PoisonError::into_inner);
+        if *written {
             return true;
         }
         let mut events = [0u8; 4096];
@@ -465,7 +470,7 @@ impl WriteWatch {
                     _ => {}
                 }
             }
-            self.written.store(true, Ordering::SeqCst);
+            *written = true;
             return true;
         }
     }
@@ -864,44 +869,17 @@ impl FirecrackerLauncher {
         }
         check_launcher_paths(&config)?;
         if let Confinement::Jailer(jailer) = &config.confinement {
-            if jailer.uid == 0 || jailer.gid == 0 {
-                return Err(SandboxError::Config(
-                    "the jailer must drop to a non-root uid and gid, or an escaped VMM keeps root"
-                        .into(),
-                ));
-            }
-            // The jailer would fail to drop to it at each launch.
-            if jailer.uid == u32::MAX || jailer.gid == u32::MAX {
-                return Err(SandboxError::Config(
-                    "the jail uid and gid cannot be u32::MAX, which is (uid_t)-1 and which \
-                     setuid and setgid refuse"
-                        .into(),
-                ));
-            }
-            super::jailer::check_limits(
-                jailer,
-                super::jailer::host_nr_open(),
-                super::jailer::HardCeilings::of_worker(),
-            )?;
-            super::jailer::check_cgroups(jailer, machine, mounts)?;
-            // `RunningVm::spawn` clears the environment, so only the
-            // arguments of the jailer count.
-            super::jailer::check_jailer_exec(
-                jailer,
-                machine,
-                &config_file_args(),
-                crate::sandbox::exec::spawn_exec_capacity(),
-            )?;
-            if let Some(netns) = &jailer.netns {
-                netns_check(netns)?;
-            }
-            // The jailer makes the chroot and the cgroup, then drops to the
-            // jail uid. Each step needs root, so another uid fails each launch.
-            if euid != 0 {
-                return Err(SandboxError::Config(format!(
-                    "the jailer needs root, and this process runs as uid {euid}; run the worker \
-                     as root or use Confinement::Unjailed"
-                )));
+            check_jailed(jailer, machine, (euid, mounts), netns_check)?;
+        }
+        // Each version check copies the binaries. A missing binary is checked
+        // there too.
+        let mut binaries = vec![config.firecracker_bin.as_path()];
+        if let Confinement::Jailer(jailer) = &config.confinement {
+            binaries.push(&jailer.jailer_bin);
+        }
+        for path in binaries {
+            if let Ok(meta) = std::fs::metadata(path) {
+                check_vmm_size(path, meta.len())?;
             }
         }
         let exec_name = super::jailer::exec_name(&config.firecracker_bin)?;
@@ -1195,6 +1173,9 @@ impl FirecrackerLauncher {
             .iter()
             .map(|(_, path)| file_id(path))
             .collect::<Result<Vec<_>, _>>()?;
+        for ((_, path), id) in sources.iter().zip(&ids) {
+            check_vmm_size(path, id.size)?;
+        }
         let mut checked = self.versions_checked.lock().await;
         if let Some(vmm) = checked.as_ref()
             && vmm.sources == ids
@@ -1834,6 +1815,81 @@ impl Drop for CheckedVmm {
     }
 }
 
+/// Check the jailer settings of a launcher with `machine`, for a worker that
+/// runs as `euid` on a host with the mount table `mounts`.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Config`] for a setting that would fail each launch.
+fn check_jailed(
+    jailer: &JailerConfig,
+    machine: MachineSpec,
+    (euid, mounts): (u32, &str),
+    netns_check: fn(&Path) -> Result<(), SandboxError>,
+) -> Result<(), SandboxError> {
+    if jailer.uid == 0 || jailer.gid == 0 {
+        return Err(SandboxError::Config(
+            "the jailer must drop to a non-root uid and gid, or an escaped VMM keeps root".into(),
+        ));
+    }
+    // The jailer would fail to drop to it at each launch.
+    if jailer.uid == u32::MAX || jailer.gid == u32::MAX {
+        return Err(SandboxError::Config(
+            "the jail uid and gid cannot be u32::MAX, which is (uid_t)-1 and which \
+                 setuid and setgid refuse"
+                .into(),
+        ));
+    }
+    super::jailer::check_limits(
+        jailer,
+        super::jailer::host_nr_open(),
+        super::jailer::HardCeilings::of_worker(),
+    )?;
+    super::jailer::check_cgroups(jailer, machine, mounts)?;
+    // `RunningVm::spawn` clears the environment, so only the
+    // arguments of the jailer count.
+    super::jailer::check_jailer_exec(
+        jailer,
+        machine,
+        &config_file_args(),
+        crate::sandbox::exec::spawn_exec_capacity(),
+    )?;
+    if let Some(netns) = &jailer.netns {
+        netns_check(netns)?;
+    }
+    // The jailer makes the chroot and the cgroup, then drops to the
+    // jail uid. Each step needs root, so another uid fails each launch.
+    if euid != 0 {
+        return Err(SandboxError::Config(format!(
+            "the jailer needs root, and this process runs as uid {euid}; run the worker \
+                 as root or use Confinement::Unjailed"
+        )));
+    }
+    Ok(())
+}
+
+/// The largest Firecracker or jailer binary that the launcher copies. A
+/// release binary is a few MiB, and a debug build stays far below this.
+pub const MAX_VMM_BINARY_BYTES: u64 = 256 << 20;
+
+/// Refuse the VMM binary at `path` when its `size` is above
+/// [`MAX_VMM_BINARY_BYTES`].
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Config`]. The path names another file, and each
+/// version check would copy all of it.
+fn check_vmm_size(path: &Path, size: u64) -> Result<(), SandboxError> {
+    if size > MAX_VMM_BINARY_BYTES {
+        return Err(SandboxError::Config(format!(
+            "{} is {size} bytes, above the {MAX_VMM_BINARY_BYTES} bytes of a VMM binary; the \
+             path names another file, and each version check would copy all of it",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Copy each `(name, path)` of `sources` to `<dir>/<name>/<file name>`, with
 /// mode `0555`. Each source must still be its entry of `ids`, before and
 /// after its copy. Otherwise a deploy changed it during the check.
@@ -1890,7 +1946,15 @@ fn copy_binaries(
             .mode(0o555)
             .open(&to)
             .map_err(|e| fail(from, &e))?;
-        std::io::copy(&mut source, &mut copy).map_err(|e| fail(from, &e))?;
+        // A file that grows during the copy stops one byte past the bound.
+        let copied = std::io::copy(
+            &mut std::io::Read::take(&mut source, MAX_VMM_BINARY_BYTES + 1),
+            &mut copy,
+        )
+        .map_err(|e| fail(from, &e))?;
+        if copied > MAX_VMM_BINARY_BYTES {
+            return Err(fail(from, &"the file grew past the size of a VMM binary"));
+        }
         // The umask can narrow the mode of the open, so it is set again.
         copy.set_permissions(std::fs::Permissions::from_mode(0o555))
             .map_err(|e| fail(from, &e))?;
@@ -3989,6 +4053,27 @@ while True:
         }
     }
 
+    #[tokio::test]
+    async fn an_oversized_vmm_binary_is_a_config_error_and_is_not_copied() {
+        let dir = temp_dir();
+        // A path that names another large file, such as an image.
+        let big = dir.join("firecracker");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(MAX_VMM_BINARY_BYTES + 1).unwrap();
+        drop(file);
+        std::fs::set_permissions(&big, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let refused = |err: &SandboxError| matches!(err, SandboxError::Config(m) if m.contains("bytes") && m.contains("binary"));
+        match new_launcher(unjailed(&dir, big, BootMethod::ConfigFile)) {
+            Err(err) => assert!(refused(&err), "{err:?}"),
+            Ok(launcher) => {
+                let err = launcher.check_versions().await.map(|_| ()).unwrap_err();
+                assert!(refused(&err), "{err:?}");
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_vmm_file_limit_above_the_worker_hard_limit_is_a_config_error() {
         let mut hard = libc::rlimit {
@@ -5083,6 +5168,7 @@ while True:
         // `cp -p` of a new image with the same size and modification time,
         // as two images from the Nix store have.
         let old = std::fs::metadata(&rootfs).unwrap();
+        let stamp = FileStamp::of(&rootfs).unwrap();
         let bytes = vec![b'x'; usize::try_from(old.len()).unwrap()];
         std::fs::write(&rootfs, &bytes).unwrap();
         std::fs::File::options()
@@ -5091,18 +5177,49 @@ while True:
             .unwrap()
             .set_modified(old.modified().unwrap())
             .unwrap();
-        let id = new_vm_id(launcher.owner());
+        // The stamp check passes, so only the watch can refuse the launch.
+        assert_eq!(FileStamp::of(&rootfs).unwrap(), stamp);
         let vmm = launcher.check_versions().await.unwrap();
-        let err = launcher
-            .prepare(&id, &BootMethod::ConfigFile, &vmm)
-            .await
-            .map(|_| ())
-            .expect_err("the pinned root file system changed in place");
-        assert!(
-            matches!(&err, SandboxError::Config(m) if m.contains("in place")),
-            "{err:?}"
-        );
+        // The watch keeps the write, so each later launch fails too.
+        for _ in 0..2 {
+            let id = new_vm_id(launcher.owner());
+            let err = launcher
+                .prepare(&id, &BootMethod::ConfigFile, &vmm)
+                .await
+                .map(|_| ())
+                .expect_err("the pinned root file system changed in place");
+            assert!(
+                matches!(&err, SandboxError::Config(m) if m.contains("had a write in place")),
+                "{err:?}"
+            );
+        }
         drop((vmm, launcher));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_checks_after_a_write_both_see_it() {
+        let dir = temp_dir();
+        let file = dir.join("image");
+        std::fs::write(&file, b"image").unwrap();
+        // The read takes the event from the queue. A second check must not
+        // pass before the first one sets the flag. The race lost about one
+        // round in 30, and closing a watch takes a few milliseconds.
+        for _ in 0..300 {
+            let watch = WriteWatch::new(&[file.as_path()]).unwrap();
+            std::fs::write(&file, b"IMAGE").unwrap();
+            let barrier = std::sync::Barrier::new(2);
+            let check = || {
+                barrier.wait();
+                watch.written()
+            };
+            let (a, b) = std::thread::scope(|scope| {
+                let a = scope.spawn(check);
+                let b = scope.spawn(check);
+                (a.join().unwrap(), b.join().unwrap())
+            });
+            assert!(a && b, "a check passed after a write: {a} {b}");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5161,7 +5278,7 @@ while True:
         let dir = temp_dir();
         let launcher = new_launcher(jailed(&dir)).unwrap();
         let vmm = launcher.check_versions().await.unwrap();
-        // Each launch links the pinned files into its jail, and its drop
+        // Each launch links the pinned files into its jail, and its teardown
         // unlinks them. Neither counts as a write.
         for _ in 0..3 {
             let id = new_vm_id(launcher.owner());
@@ -5169,8 +5286,12 @@ while True:
                 .prepare(&id, &BootMethod::ConfigFile, &vmm)
                 .await
                 .unwrap();
+            let jail = prepared.vm_dir.clone();
             drop(prepared);
+            crate::sandbox::exec::remove_work_dir(&jail).unwrap();
+            assert!(!jail.exists(), "{}", jail.display());
         }
+        launcher.tenancy.pinned.as_ref().unwrap().check().unwrap();
         drop((vmm, launcher));
         std::fs::remove_dir_all(dir).unwrap();
     }

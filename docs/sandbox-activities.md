@@ -216,7 +216,8 @@ runtime refuses a policy that allows the network on a backend without one.
   copies. So a deploy cannot swap a binary between the check and the launch.
   A deploy that replaced or changed either binary gives a new check and new
   copies. The check reads at most 64 KiB of `--version` output, so a broken
-  wrapper cannot fill the memory of the worker.
+  wrapper cannot fill the memory of the worker. The launcher refuses a binary
+  above 256 MiB (`MAX_VMM_BINARY_BYTES`), because each check copies it.
 - A jail base, or an unjailed `work_root`, that lets the worker run programs.
   The copies run from there, so the launcher refuses a `noexec` mount. It
   also refuses a `nodev` jail base, because Firecracker cannot open
