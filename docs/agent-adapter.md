@@ -492,7 +492,9 @@ text, never the text itself.
   acknowledgement. Only the text of the last turn counts. A segment that
   ends on an empty turn sends nothing, even when an earlier turn wrote
   text beside a tool call. An empty `output_capped` turn sends only the
-  stop notice.
+  stop notice. A run recorded before this rule replays as it ran. The
+  workflow records the `agent_final_turn_rules` patch marker to tell them
+  apart. The follow-up length rule uses the same marker.
 - A segment that a bound ended early sends a notice, for example
   `The agent stopped early: loop_detected.`. An unattended run therefore
   does not fail in silence.

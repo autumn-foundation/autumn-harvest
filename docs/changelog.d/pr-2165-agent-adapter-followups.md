@@ -14,6 +14,10 @@ This fix closes four open items of #2046.
   sends the notice.
 - **Follow-up size.** The 2 000 character limit counts the untrimmed prompt.
 
+**Replay.** The final-turn rule and the raw follow-up length rule sit
+behind the `agent_final_turn_rules` patch marker. A history recorded before
+the marker replays under the old rules.
+
 **No migration. No new `WorkflowEvent` variant.** `HeartbeatTask` gains an
 optional field that is absent from JSON when unset.
 
