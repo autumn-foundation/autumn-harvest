@@ -3295,7 +3295,7 @@ fn validate_workflow_schedules(
             return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
         }
         // Reject a bad cron expression, a zero interval, a fractional interval
-        // (issue #1967) and an interval over the cap (issue #2048).
+        // (issue #1967) and an interval over `MAX_INTERVAL_PERIOD` (issue #2048).
         if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
@@ -5886,7 +5886,7 @@ mod tests {
 
     #[test]
     fn harvest_builder_rejects_workflow_schedule_over_the_interval_cap() {
-        // Issue #2048: the scheduler cannot add this period to a timestamp.
+        // Adding this period to a timestamp overflows chrono (issue #2048).
         let err = HarvestBuilder::new()
             .workflows(vec![fake_workflow_info()])
             .workflow_schedule(WorkflowSchedule::new(
@@ -5900,6 +5900,29 @@ mod tests {
                 err,
                 HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
                     if workflow_name == "test" && reason.contains("must not exceed")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn harvest_builder_rejects_dag_schedule_over_the_interval_cap() {
+        // The DAG path has its own validation call (issue #2048).
+        let dag = DagInfo {
+            schedule: Some(Schedule::Interval(Duration::from_secs(
+                9_000_000_000_000_000,
+            ))),
+            ..fake_dag_info()
+        };
+        let err = HarvestBuilder::new()
+            .dags(vec![dag])
+            .try_build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
+                    if workflow_name == "daily_etl" && reason.contains("must not exceed")
             ),
             "got: {err:?}"
         );

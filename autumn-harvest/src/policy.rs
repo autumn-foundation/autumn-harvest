@@ -1595,8 +1595,10 @@ impl WorkflowSchedule {
 
 /// Longest accepted [`Schedule::Interval`] period: 100 years of 365 days.
 ///
-/// A longer period can move the next fire time past the last date that
-/// `chrono` can hold (issue #2048). [`validate_schedule`] rejects it.
+/// A period of about 8.2e12 seconds or more pushes the next fire time past
+/// the last date that `chrono` holds (issue #2048). The cap sits far below
+/// that limit and far above any real cadence. [`validate_schedule`] rejects a
+/// longer period.
 pub const MAX_INTERVAL_PERIOD: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 /// Validate a [`Schedule`] value, returning an error string if it is invalid.
@@ -1644,10 +1646,11 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
         Schedule::Interval(period) if period.subsec_nanos() != 0 => Err(format!(
             "interval schedule period must be a whole number of seconds, got {period:?}"
         )),
-        // `next_run_after` adds the period to a timestamp. chrono panics past
-        // year 262143, so a huge period must not reach it (issue #2048).
+        // The scheduler adds the period to a timestamp. chrono cannot hold a
+        // date past year 262143. The cap keeps the sum in range (issue #2048).
         Schedule::Interval(period) if *period > MAX_INTERVAL_PERIOD => Err(format!(
-            "interval schedule period must not exceed {} seconds, got {} seconds",
+            "interval schedule period must not exceed {} seconds, got {} seconds. \
+             Use a manual schedule to stop automatic runs.",
             MAX_INTERVAL_PERIOD.as_secs(),
             period.as_secs()
         )),
@@ -2689,14 +2692,14 @@ mod tests {
                 "{interval:?} must be rejected: {err}"
             );
         }
-        assert!(validate_schedule(&Schedule::Interval(MAX_INTERVAL_PERIOD)).is_ok());
     }
 
     #[test]
     fn interval_schedule_over_the_cap_is_rejected() {
-        // `next_run_after` cannot add a huge period to a timestamp (issue #2048).
+        // Adding this period to a timestamp overflows chrono (issue #2048).
         for secs in [
             MAX_INTERVAL_PERIOD.as_secs() + 1,
+            8_000_000_000_000,
             8_300_000_000_000,
             9_000_000_000_000_000,
             u64::MAX,
@@ -2715,6 +2718,16 @@ mod tests {
         assert!(validate_schedule(&Schedule::Interval(MAX_INTERVAL_PERIOD)).is_ok());
         let one_below = MAX_INTERVAL_PERIOD - Duration::from_secs(1);
         assert!(validate_schedule(&Schedule::Interval(one_below)).is_ok());
+    }
+
+    #[test]
+    fn interval_schedule_cap_is_100_years() {
+        // The changelog fragment states this value (issue #2048). Change both together.
+        assert_eq!(MAX_INTERVAL_PERIOD.as_secs(), 3_153_600_000);
+        for secs in [1, 31_536_000] {
+            let schedule = Schedule::Interval(Duration::from_secs(secs));
+            assert!(validate_schedule(&schedule).is_ok(), "{secs} s");
+        }
     }
 
     #[test]

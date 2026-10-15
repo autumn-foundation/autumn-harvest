@@ -57109,7 +57109,7 @@ mod tests {
 
     #[test]
     fn parse_schedule_expr_with_tz_interval_over_the_cap_is_rejected() {
-        // The scheduler cannot add this period to a timestamp (issue #2048).
+        // Adding this period to a timestamp overflows chrono (issue #2048).
         let err = parse_schedule_expr_with_tz("interval:9000000000000000", "UTC")
             .expect_err("a period over the cap must be rejected");
         assert!(err.contains("must not exceed"), "{err}");

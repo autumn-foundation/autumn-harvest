@@ -195,7 +195,7 @@ impl std::fmt::Display for BackfillPlanError {
 /// - For `Cron` schedules the first occurrence at or after `from` is included; subsequent
 ///   occurrences are stepped through until they exceed `to`.
 /// - For `Interval` schedules `from` is treated as the first backfill timestamp and slots are
-///   spaced by the interval duration.
+///   spaced by the interval duration. The plan stops at the last date that `chrono` holds.
 /// - `Manual` schedules and `None` return an empty list (no automatic firing times).
 ///
 /// # Errors
@@ -250,7 +250,7 @@ pub fn plan_backfill_timestamps(
                     return Err(BackfillPlanError::LimitExceeded { limit: max_count });
                 }
                 timestamps.push(cursor);
-                // The next slot may pass the last date chrono holds (issue #2048).
+                // Stop when the next slot passes the last date that chrono holds (issue #2048).
                 let Some(next) = cursor.checked_add_signed(dur) else {
                     break;
                 };
@@ -3034,8 +3034,8 @@ fn merge_schedule_patch(
 /// # Errors
 ///
 /// Returns [`HarvestError::Config`] when the merged spec fails validation
-/// (invalid cron expression, unknown timezone, zero interval) and
-/// [`HarvestError::Database`] on connection/query failure. Row-state
+/// (invalid cron expression, unknown timezone, zero interval, interval over
+/// `MAX_INTERVAL_PERIOD`) and [`HarvestError::Database`] on connection/query failure. Row-state
 /// conditions (missing row, DAG row, live fire claim) are reported through
 /// [`ScheduleUpdateOutcome`], not errors.
 pub async fn update_workflow_schedule(
@@ -5221,8 +5221,8 @@ fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Opti
             // schedule simply never fires. (`validate_schedule` also rejects it at
             // registration time.)
             .filter(|duration| *duration > chrono::Duration::zero())
-            // A sum past the last date chrono holds is "no next occurrence"
-            // too, never a panic (issue #2048).
+            // A sum past the last date that chrono holds also means no next
+            // run (issue #2048).
             .and_then(|duration| reference.checked_add_signed(duration)),
         Some(Schedule::Manual) | None => None,
     }
@@ -8585,7 +8585,45 @@ mod tests {
     }
 
     #[test]
-    fn next_run_after_gives_a_next_run_for_every_valid_interval() {
+    fn next_run_after_sum_stops_exactly_at_the_last_date() {
+        // The sum is valid up to the last date that chrono holds, and no further.
+        let now = parse_utc("2026-01-01T00:00:00Z");
+        let span = u64::try_from((DateTime::<Utc>::MAX_UTC - now).num_seconds()).unwrap();
+        let fits = Schedule::Interval(Duration::from_secs(span));
+        let over = Schedule::Interval(Duration::from_secs(span + 1));
+        assert!(next_run_after(Some(&fits), now).is_some());
+        assert_eq!(next_run_after(Some(&over), now), None);
+
+        let one_second = Schedule::Interval(Duration::from_secs(1));
+        let last_second = DateTime::<Utc>::MAX_UTC - chrono::Duration::seconds(1);
+        assert_eq!(
+            next_run_after(Some(&one_second), last_second),
+            Some(DateTime::<Utc>::MAX_UTC)
+        );
+    }
+
+    #[test]
+    fn stored_huge_interval_walks_end() {
+        // A row stored before the cap can hold any period, and the parser does
+        // not validate. The catchup walks must end on their own (issue #2048).
+        let schedule = parse_schedule_from_expr("interval:9000000000000000")
+            .expect("a stored interval parses");
+        let first_due = parse_utc("2026-01-01T00:00:00Z");
+        let now = first_due + chrono::Duration::hours(1);
+
+        assert_eq!(next_run_after(Some(&schedule), first_due), None);
+        assert_eq!(
+            due_run_plan(Some(&schedule), first_due, now, true),
+            (vec![first_due], None)
+        );
+        let summary = eligible_slot_summary(Some(&schedule), first_due, now, None);
+        assert_eq!(summary.eligible_count, 1);
+        assert_eq!(summary.last_eligible, Some(first_due));
+        assert_eq!(summary.next_run_at, None);
+    }
+
+    #[test]
+    fn next_run_after_gives_a_next_run_up_to_the_interval_cap() {
         // Oracle (issue #2048): an interval that `validate_schedule` accepts
         // has a next run from a current reference.
         let now = parse_utc("2026-01-01T00:00:00Z");

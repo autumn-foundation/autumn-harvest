@@ -1027,6 +1027,15 @@ mod tests {
     }
 
     #[test]
+    fn a_huge_canary_interval_still_builds() {
+        // Issue #2048: an interval schedule has a longest period.
+        let cfg = CanaryConfig::new(Duration::from_secs(4_000_000_000));
+        assert_eq!(cfg.interval(), autumn_harvest::policy::MAX_INTERVAL_PERIOD);
+        let built = register_canary(HarvestBuilder::default(), &cfg).try_build();
+        assert!(built.is_ok(), "got: {:?}", built.err());
+    }
+
+    #[test]
     fn register_canary_single_queue() {
         let cfg = CanaryConfig::new(Duration::from_secs(30));
         let builder = register_canary(HarvestBuilder::default(), &cfg);
