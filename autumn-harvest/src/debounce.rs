@@ -466,8 +466,15 @@ pub async fn admit_debounced_start_with_codecs(
     ";
 
     // The row stores the input in the column form (issue #2043). The fire
-    // path decodes it before the start.
-    let last_input = codecs.encode_column(&params.last_input)?;
+    // path decodes it before the start. A gated admission rolls back, so its
+    // row never holds an input. It binds `null`. That needs no encode, so a
+    // failing codec cannot turn the gate result into an error. It also keeps
+    // the plain input out of the write-ahead log.
+    let last_input = if gate_active {
+        serde_json::Value::Null
+    } else {
+        codecs.encode_column(&params.last_input)?
+    };
     let workflow_name = params.workflow_name;
     let debounce_key = params.debounce_key;
     let workflow_id = params.workflow_id;

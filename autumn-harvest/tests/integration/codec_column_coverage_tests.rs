@@ -1462,6 +1462,56 @@ async fn an_outbox_target_input_is_read_as_plaintext_when_the_relay_starts_the_r
     assert_one_layer(&codecs, &started.input, &plain, "the relayed run input");
 }
 
+static GATE_FAILING: AtomicBool = AtomicBool::new(false);
+static GATE_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+#[tokio::test]
+async fn a_gated_debounce_admission_returns_the_gate_result_while_the_encoder_fails() {
+    use autumn_harvest::debounce::{AdmitDebounceParams, admit_debounced_start_with_codecs};
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = flaky_codecs(&GATE_FAILING, &GATE_FAILURES);
+    AtomicBool::store(&GATE_FAILING, true, Ordering::SeqCst);
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let workflow_id = format!("cc-gated-{}", Uuid::new_v4().simple());
+    let params = || AdmitDebounceParams {
+        workflow_name: "cc_gated_debounce_wf",
+        debounce_key: &key,
+        workflow_id: &workflow_id,
+        queue_name: "default",
+        last_input: json!({"ssn": INPUT_SECRET}),
+        start_options: Default::default(),
+        window: Duration::from_millis(1),
+        max_wait: Duration::from_secs(60),
+        shard_id: 0,
+    };
+
+    let gated = admit_debounced_start_with_codecs(&mut conn, params(), true, &codecs)
+        .await
+        .expect("a gated admission gives the gate result, not a codec error");
+    assert!(gated.is_none(), "the gate rejects the request");
+    assert_eq!(
+        AtomicUsize::load(&GATE_FAILURES, Ordering::SeqCst),
+        0,
+        "a rolled-back row needs no ciphertext"
+    );
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_debounce \
+             WHERE workflow_name = 'cc_gated_debounce_wf' AND debounce_key = $1",
+            &key,
+        )
+        .await,
+        0,
+        "a gated admission leaves no row"
+    );
+
+    admit_debounced_start_with_codecs(&mut conn, params(), false, &codecs)
+        .await
+        .expect_err("an admitted request still needs the encoder");
+}
+
 // ── batch jobs (issue #2043) ─────────────────────────────────────────────────
 
 #[tokio::test]
