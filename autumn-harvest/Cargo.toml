@@ -55,6 +55,11 @@ schema = ["dep:schemars"]
 # --workspace`, default features, never compiles wasmtime). See
 # docs/rnd/wasm-activities-spike.md.
 wasm-activities = ["dep:wasmtime", "dep:wat", "db", "dep:ed25519-dalek"]
+# Sandboxed code activities. An activity runs code that an agent wrote in a
+# Firecracker microVM, or in a Linux process sandbox for development. Off by
+# default. It needs no database. `libc` is already in the lockfile, so the
+# feature adds no new crate. See docs/sandbox-activities.md.
+sandbox-activities = ["dep:libc"]
 # Contention-adaptive atomicity R&D spike (issue #2012). Physical backout,
 # a saga or a hybrid per workflow, with a measurement harness. Off by
 # default. No production path calls it. It adds no dependency.
@@ -157,6 +162,9 @@ schemars = { version = "0.8", optional = true }
 # propagates to downstream consumers, only the manifest constraint does).
 wasmtime = { version = "48.0.6", optional = true }
 wat = { version = "1", optional = true }
+# Process limits, signals and namespaces for `sandbox-activities`. The
+# lockfile already holds this crate through tokio.
+libc = { version = "0.2", optional = true }
 # Publisher signatures on WASM modules (issue #1838). The lockfile already
 # holds this version through `jsonwebtoken`, so it adds no new crate.
 ed25519-dalek = { version = "3.0", optional = true }

@@ -2096,6 +2096,31 @@ impl HarvestBuilder {
         self
     }
 
+    /// Register a sandboxed code activity.
+    ///
+    /// The builder adds a normal activity and puts its runtime in the
+    /// [`SandboxActivities`](crate::sandbox::SandboxActivities) state. One
+    /// shared handler runs each request on the runtime of its activity name.
+    /// See [`crate::sandbox`].
+    #[cfg(feature = "sandbox-activities")]
+    #[must_use]
+    pub fn sandbox_activity(mut self, activity: crate::sandbox::SandboxActivity) -> Self {
+        // A later sandbox registration of the same name replaces the earlier
+        // one. Another kind of activity with the name stays, as for the
+        // other registrations: the worker keeps the later one.
+        self.activities
+            .retain(|info| info.module != "sandbox" || info.name != activity.name);
+        self.activities.push(activity.activity_info());
+        let registry = self
+            .state
+            .entry(TypeId::of::<crate::sandbox::SandboxActivities>())
+            .or_insert_with(|| Box::new(crate::sandbox::SandboxActivities::default()));
+        if let Some(registry) = registry.downcast_mut::<crate::sandbox::SandboxActivities>() {
+            registry.insert(activity);
+        }
+        self
+    }
+
     /// Trust WASM modules signed by this Ed25519 public key (issue #1838).
     ///
     /// Call it once per key. With one or more keys, every registered WASM

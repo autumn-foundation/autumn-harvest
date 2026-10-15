@@ -70,9 +70,10 @@ autumn-harvest/          <- workspace root
   autumn-harvest-sqlite/ <- optional SQLite storage backend
   autumn-harvest-agent/  <- durable agent loop: model and tool calls as activities (issue #1973)
   autumn-harvest-verify/ <- semantic (MIR-level) determinism analyzer (issue #962)
+  autumn-harvest-sandbox-guest/ <- guest agent: process 1 of each sandbox microVM
 ```
 
-Eight crates in the workspace. `autumn-harvest` is the public library and `autumn-harvest-macros` is a separate proc-macro crate consumed by `autumn-harvest` via `prelude.rs`. `autumn-harvest-plugin` is the Autumn integration. `autumn-harvest-cli`, `autumn-harvest-redis`, `autumn-harvest-sqlite`, `autumn-harvest-agent` and `autumn-harvest-verify` are optional. The list above omits `examples/`, whose members are illustrations rather than published crates.
+`autumn-harvest` is the public library and `autumn-harvest-macros` is a separate proc-macro crate consumed by `autumn-harvest` via `prelude.rs`. `autumn-harvest-plugin` is the Autumn integration. The other crates in the list are optional. The list above omits `examples/`, whose members are illustrations rather than published crates.
 
 ## Architecture
 
@@ -83,6 +84,8 @@ Eight crates in the workspace. `autumn-harvest` is the public library and `autum
 `autumn-harvest-redis` is an **optional** dependency of `autumn-harvest-plugin`, behind that crate's `redis` cargo feature (issue #1312). It implements the core `dispatch::TaskDispatch` seam over Redis Streams. The default build never compiles it, and the plugin rejects `[harvest.redis] url` on a build without the feature. `autumn-harvest-redis` depends on `autumn-harvest` with `default-features = false`, so the channel never pulls the `db` feature into a caller that does not want it. See [`docs/operations/redis-dispatch.md`](operations/redis-dispatch.md).
 
 `autumn-harvest-agent` is the durable agent loop (issue #1973). The agent loop is a workflow, and each model call and tool call is an activity. It owns its agent primitives (`AgentModel`, `Tool`, `ToolPolicy`, `Approval`), modelled on `autumn-plugin-agent` but with no dependency on it. It depends on `autumn-harvest` with `default-features = false` only, so it has no Postgres, no `autumn-web` and no Autumn plugin dependency. `scripts/check-agent-adapter-deps.sh` gates that in CI. Its `eval` feature (issue #2001) also turns on the engine's `testing` feature for replay-as-evaluation. Its `mesh` and `flow` modules add delegation to peer agents, mandates and flow rules. See [`docs/agent-adapter.md`](agent-adapter.md), [`docs/agent-mesh.md`](agent-mesh.md) and [ADR 0006](adr/0006-agent-adapter-framework.md).
+
+`autumn-harvest-sandbox-guest` builds `harvest-guest-agent`, a static binary that runs as process 1 in each microVM of the sandboxed code activities. Only the guest image uses it. It depends on `autumn-harvest` with `default-features = false` and the `sandbox-activities` feature, and it shares the wire protocol and the process executor with the host. See [`docs/sandbox-activities.md`](sandbox-activities.md).
 
 Macro-generated code must use `::autumn_harvest::` paths for everything. The proc-macro crate has no dependency on `serde_json` or `autumn-web` itself; it emits token streams that resolve via the `::autumn_harvest::` path. `lib.rs` re-exports `serde_json` at `::autumn_harvest::serde_json` and exposes its own local `task_duration()` parser at `::autumn_harvest::task_duration` for exactly this reason.
 

@@ -460,6 +460,16 @@ jobs:
       - name: Run the OTel workflow conventions proposal guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration otel_workflow_semconv_docs::"
 
+      # The sandboxed code activity guide and its design record live outside
+      # the crate sources, so a docs-only change skips the `test` matrix.
+      # These guards check the failure table, the Firecracker minimums, the
+      # kernel arguments, the test commands and the evidence of each criterion.
+      #
+      # Guarded by `sandbox_activities_docs::guards_run_on_docs_only_changes`.
+      # Quoted for the trailing-`::` YAML reason above.
+      - name: Run the sandboxed code activity docs guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration sandbox_activities_docs::"
+
       # Folio corpus harness: internal link check across all of docs/ (see
       # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
       # guards above — a broken link is exactly the change class a docs-only
@@ -981,7 +991,17 @@ jobs:
       # the `eval` suite.
       - name: Run autumn-harvest-agent tests (issues #1973, #2001)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 3
-        run: cargo test -p autumn-harvest-agent --features sqlite,eval
+        run: cargo test -p autumn-harvest-agent --features sqlite,eval,sandbox
+      # Sandboxed code activities. The tests need no KVM: a fake VMM, fake
+      # `firecracker` and `jailer` scripts and a fake API server stand in. The
+      # Linux backends compile on Linux only, so the other OSes run the
+      # portable protocol, policy and capture tests.
+      - name: Run sandboxed code activity tests
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 1
+        run: cargo test -p autumn-harvest --no-default-features --features sandbox-activities --lib sandbox
+      - name: Run sandbox guest agent tests
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        run: cargo test -p autumn-harvest-sandbox-guest
       # The agent-daemon example's suite is offline: a scripted stub model, no
       # API key, and no network. Linux only, because the daemon's control
       # surface is a Unix domain socket.
@@ -2084,6 +2104,12 @@ jobs:
         run: cargo clippy -p autumn-harvest-agent --all-targets --features eval --no-deps -- -D warnings
       - name: Clippy autumn-harvest-agent (sqlite and eval features, issue #2001)
         run: cargo clippy -p autumn-harvest-agent --all-targets --features sqlite,eval --no-deps -- -D warnings
+      - name: Clippy autumn-harvest-agent (sandbox feature)
+        run: cargo clippy -p autumn-harvest-agent --all-targets --features sandbox --no-deps -- -D warnings
+      # Same issue #962 rule: a new workspace member needs its own step.
+      # `--no-deps` for the reason of the redis step below.
+      - name: Clippy autumn-harvest-sandbox-guest
+        run: cargo clippy -p autumn-harvest-sandbox-guest --all-targets --no-deps -- -D warnings
       # Issue #1312: the Redis dispatch channel. Same issue #962 rule as the
       # verify crate below -- a workspace member gets NO clippy coverage
       # without its own step here.
