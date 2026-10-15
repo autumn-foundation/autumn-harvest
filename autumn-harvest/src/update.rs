@@ -994,6 +994,71 @@ mod tests {
         assert!(drive.updates_deferred);
     }
 
+    /// Consumes one signal, then waits on an activity. Such a wait can stay
+    /// resident, and a redundant wake resumes it warm.
+    fn signal_then_activity(ctx: &WorkflowContext, _input: Value) -> BodyFuture<'_> {
+        Box::pin(async move {
+            ctx.wait_for_signal("a")
+                .await
+                .map_err(|error| error.to_string())?;
+            ctx.execute_activity_raw("probe", Value::Null, "default")
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    /// A re-drive with a closed window defers and runs no update, so its batch
+    /// holds no `RecordUpdateResult`. Such a cycle can stay resident. A redundant
+    /// wake resumes an activity wait warm, and a warm cycle skips the dispatch,
+    /// so the update would wait for an unrelated event. The cycle must go cold.
+    #[tokio::test(start_paused = true)]
+    async fn a_cycle_that_defers_an_update_does_not_stay_resident() {
+        let id = UpdateId::new();
+        let handler = info("quick", echo_once);
+        let history = vec![
+            started(),
+            admitted(id, "quick", json!({})),
+            WorkflowEvent::SignalReceived {
+                signal_name: "a".to_string(),
+                payload: json!({}),
+            },
+        ];
+        // 4 s left: half of it is under one handler limit, so the window is closed.
+        let cutoff = Utc::now() + chrono::Duration::seconds(4);
+        let ctx = redrive_context(history, &[&handler], cutoff);
+        let key = crate::resident::ResidentKey::new(
+            signal_then_activity,
+            None,
+            &std::collections::HashMap::new(),
+        );
+        let drive = crate::executor::drive_workflow_keep(
+            ctx,
+            signal_then_activity,
+            Value::Null,
+            None,
+            Some(key),
+        )
+        .await;
+
+        assert!(
+            drive.updates_deferred,
+            "the closed window defers the update"
+        );
+        let ran: Vec<UpdateId> = results(&drive.outcome, &drive.pending)
+            .into_iter()
+            .map(|(update_id, _)| update_id)
+            .collect();
+        assert_eq!(
+            ran,
+            Vec::<UpdateId>::new(),
+            "the closed window runs no update"
+        );
+        assert!(
+            !drive.resident.is_parked(),
+            "a deferred update needs a cold cycle to run"
+        );
+    }
+
     static REDRIVE_RUNS: AtomicUsize = AtomicUsize::new(0);
 
     fn count_redrive(_ctx: Arc<WorkflowContext>, input: Value) -> UpdateHandlerFuture {

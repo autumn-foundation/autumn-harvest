@@ -482,3 +482,87 @@ async fn updates_left_by_a_closed_window_run_in_later_cycles() {
     let history = load_history_from_url(&database_url, exec_id).await;
     assert_eq!(result_ids(&history.events), admitted, "in admission order");
 }
+
+static STRAND_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+fn bump_in_strand(_ctx: Arc<WorkflowContext>, input: Value) -> UpdateFuture {
+    STRAND_RUNS.fetch_add(1, Ordering::SeqCst);
+    Box::pin(async move { Ok(input) })
+}
+
+/// Runs a local activity, then waits on an activity that no worker serves. A
+/// wait on an activity can stay resident, and a redundant wake resumes it warm.
+///
+/// No worker polls the queue, so the activity never starts. A running activity
+/// would append events, and a conflicting persist would replay a handler. That
+/// is the at-least-once limit, and this test must not depend on it.
+fn local_then_unserved_activity(ctx: &WorkflowContext, _input: Value) -> BodyFuture<'_> {
+    Box::pin(async move {
+        ctx.execute_local_activity_raw("local_probe", json!({}), None, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        ctx.execute_activity_raw("unserved_probe", json!({}), "unserved")
+            .await
+            .map_err(|error| error.to_string())
+    })
+}
+
+/// A registry with `body`, a local activity, an unserved activity and the updates.
+fn registry_with_unserved_activity(
+    body: WorkflowHandlerFn,
+    updates: Vec<UpdateHandlerInfo>,
+) -> Arc<HandlerRegistry> {
+    let unserved = ActivityInfo {
+        is_local: false,
+        ..local_activity("unserved_probe", local_probe)
+    };
+    Arc::new(
+        HandlerRegistry::new(
+            vec![workflow(body)],
+            vec![local_activity("local_probe", local_probe), unserved],
+        )
+        .with_handler_infos(vec![], updates, vec![]),
+    )
+}
+
+/// A local activity makes the worker re-drive the body in the same task. Under a
+/// tight budget, the first drive runs one update and the re-drive runs none. The
+/// re-drive waits on an activity, so it can stay resident. A redundant wake would
+/// resume it warm, and a warm cycle skips the dispatch. The cycle must go cold,
+/// so the later cycles run the rest while the workflow stays parked.
+#[tokio::test]
+async fn updates_deferred_by_a_redrive_run_while_the_workflow_waits_on_an_activity() {
+    let (database_url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect");
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, json!({ "test": true })).await;
+    let mut admitted = Vec::new();
+    for n in 0..3 {
+        admitted.push(admit(&mut conn, exec_id, "bump_in_strand", json!(n)).await);
+    }
+
+    // The effective budget is the larger of the two settings: 8 s. Half of what
+    // is left is under 5 s, so the window never holds a second handler.
+    let mut config = runtime_config("declarative-update-strand", 4, 4, Duration::from_secs(8));
+    config.max_local_activity_start_to_close = Duration::from_secs(1);
+    let updates = vec![update_info("bump_in_strand", bump_in_strand)];
+    let worker = Arc::new(
+        Worker::new(
+            config,
+            registry_with_unserved_activity(local_then_unserved_activity, updates),
+        )
+        .expect("worker should build"),
+    );
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&database_url));
+    for update_id in &admitted {
+        wait_for_update_event(&database_url, exec_id, *update_id).await;
+    }
+    worker.shutdown();
+    handle.await.expect("worker joins");
+
+    assert_eq!(runs(&STRAND_RUNS), 3, "each handler runs once");
+    let history = load_history_from_url(&database_url, exec_id).await;
+    assert_eq!(result_ids(&history.events), admitted, "in admission order");
+}
