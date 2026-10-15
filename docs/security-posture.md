@@ -1145,7 +1145,8 @@ route and no table.
   the continue-as-new chain, and it cannot act on a live entity. A delete
   operation erases nothing.
 - **`harvest.entity.stats` shows `last_error`.** A decode error can quote
-  part of the bad payload.
+  part of the bad payload. The field keeps at most 1 KiB. A cut error ends
+  with `... [truncated]`.
 
 ---
 

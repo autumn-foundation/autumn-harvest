@@ -3,7 +3,9 @@
 ## Status
 
 Accepted (issue #1975). The plan is
-[`2026-10-08-keyed-entity.md`](../plans/2026-10-08-keyed-entity.md).
+[`2026-10-08-keyed-entity.md`](../plans/2026-10-08-keyed-entity.md). The
+follow-up plan for the checkpoint budget and the error bound (issue #2049) is
+[`2026-10-15-entity-checkpoint-hardening.md`](../plans/2026-10-15-entity-checkpoint-hardening.md).
 
 ## Context
 
@@ -69,8 +71,12 @@ adds no `WorkflowEvent` variant, no migration and no worker path.
   Replay reads the recorded answer, so it takes the checkpoint at the same
   op.
 - The cost is one `SideEffectRecorded` event for each op. A run with an
-  `execution_timeout` also records a deadline probe for each op. A checkpoint
-  records its byte budget once.
+  `execution_timeout` also records a deadline probe for each op. Each
+  checkpoint attempt also records its byte budget.
+- The budget is the workflow input cap. The loop records it at each attempt,
+  just before it sizes the input. A cap that a deploy lowers while a handler
+  waits on an activity then applies to the next attempt. Replay of the
+  earlier attempt still reads the budget it recorded.
 - `max_ops_per_run` adds a fixed bound. It needs no event.
 - At a checkpoint, the loop claims the op signals that wait in history. It
   carries them in the checkpoint input while the input fits the workflow
@@ -109,6 +115,11 @@ A native primitive stays at rank 13, behind customer pull.
   of a failed op (it rides in the checkpoint input). Change them as a
   versioned workflow change. A new checkpoint field must skip serialization
   at its default.
+- The checkpoint keeps at most 1 KiB of the error of a failed op
+  (`stats.last_error`). A longer error is cut at a `char` boundary and ends
+  with `... [truncated]`. A huge error then cannot stop a later checkpoint. A
+  decode error can quote the payload, so the cut also limits what the field
+  keeps. The bound is part of replay.
 - The deadline check runs only after an op. An idle entity with an
   `execution_timeout` times out. Do not set one on an entity.
 - The start input is trusted. A caller who may start the workflow may set

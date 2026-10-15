@@ -38,7 +38,10 @@
 //!   [`EntityCheckpoint`](crate::entity::EntityCheckpoint) wire form are part of replay. Change them as a
 //!   versioned workflow change.
 //! - A handler must await all the work it starts, and its error text must be
-//!   deterministic. The error text rides in the checkpoint input.
+//!   deterministic. The error text rides in the checkpoint input. The
+//!   checkpoint keeps at most
+//!   [`ENTITY_LAST_ERROR_MAX_BYTES`](crate::entity::ENTITY_LAST_ERROR_MAX_BYTES)
+//!   bytes of it.
 //! - A handler panic fails the run, as in any workflow.
 //!
 //! # Example
@@ -100,11 +103,17 @@ pub const ENTITY_CHECKPOINT_SIDE_EFFECT: &str = "harvest.entity.checkpoint";
 
 /// The side-effect id that records the byte budget of a checkpoint input.
 ///
-/// The budget is the configured workflow input cap. A config change between
-/// a run and its replay does not change what the run carried.
+/// The budget is the configured workflow input cap. Each checkpoint attempt
+/// records it. A config change between a run and its replay does not change
+/// what an earlier attempt carried. A later attempt uses the live config.
 pub const ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT: &str = "harvest.entity.checkpoint_budget";
 
 /// The most bytes that [`EntityStats::last_error`] keeps, marker included.
+///
+/// A longer error is cut at a `char` boundary and ends with `... [truncated]`.
+/// The error rides in each checkpoint input, so a huge error would stop later
+/// checkpoints. A decode error can also quote part of a bad payload. A change
+/// to this bound changes replay.
 pub const ENTITY_LAST_ERROR_MAX_BYTES: usize = 1024;
 
 /// The text that ends a cut error.
@@ -157,6 +166,9 @@ pub struct EntityStats {
     /// Checkpoints taken with continue-as-new.
     pub checkpoints: u64,
     /// The error of the most recent failed operation.
+    ///
+    /// It keeps at most [`ENTITY_LAST_ERROR_MAX_BYTES`] bytes. A longer error
+    /// is cut and ends with `... [truncated]`.
     pub last_error: Option<String>,
 }
 
@@ -1018,7 +1030,8 @@ mod tests {
         let kept = ENTITY_LAST_ERROR_MAX_BYTES - TRUNCATION_MARKER.len();
         for ch in ['é', '€', '😀'] {
             for lead in 0..4 {
-                let error = format!("{}{}", "a".repeat(lead), ch.to_string().repeat(1024));
+                let wide = ch.to_string().repeat(ENTITY_LAST_ERROR_MAX_BYTES);
+                let error = format!("{}{wide}", "a".repeat(lead));
                 let cut = bound_error(error);
                 let body = cut.strip_suffix(TRUNCATION_MARKER).expect("a marker");
                 assert!(
