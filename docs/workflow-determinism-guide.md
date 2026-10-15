@@ -766,9 +766,19 @@ Each layer catches a different class of problem. All six together provide defenc
 
 Workflow Update Handlers allow external clients to interact with running workflows and receive synchronous results (issue #140). However, update handlers run asynchronously and their lifecycles are decoupled from the main workflow function.
 
+### When an Update Handler Runs
+
+The worker runs each admitted update once, at the end of its next decision cycle. The workflow body runs first. The worker then runs the pending updates in history order. It records `UpdateCompleted` or `UpdateFailed` with the other events of that cycle.
+
+Replay never runs the handler again. Replay returns the recorded result. Three rules follow:
+
+- Delivery is at least once. A crash after the handler and before the worker records the result runs the handler again. Write a handler that tolerates a repeat.
+- State that a handler writes to a captured variable does not return on replay. Do not let the workflow body depend on it.
+- A handler has 5 seconds to finish. A handler that panics or runs longer records `UpdateFailed`. A handler cannot await an activity or a timer.
+
 ### Orphaned Update Handlers
 
-If a workflow completes (or fails, times out, is cancelled/terminated) while update handlers are still in progress, these updates become **orphaned**. Orphaned updates will be terminated immediately, and their clients will receive a `409 Conflict` response with an `update_orphaned` error payload.
+If a workflow ends (completes, fails, times out, is cancelled or is terminated) before the worker runs an admitted update, the update becomes **orphaned**. Orphaned updates will be terminated immediately, and their clients will receive a `409 Conflict` response with an `update_orphaned` error payload.
 
 ### Waiting for Update Handlers to Complete
 

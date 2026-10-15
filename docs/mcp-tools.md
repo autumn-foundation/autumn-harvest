@@ -89,9 +89,10 @@ checking your app's full route list for `start_*`/`*_status`/`signal_*`/
 | `foo_update_bar` | POST `{prefix}/workflows/foo/{handle}/update/bar` | `handle`, `body` = update input | **Synchronous** request/response: validated, durably admitted, executed, result returned (default 30 s wait) |
 | `foo_watch` | GET `{prefix}/workflows/foo/{handle}/watch` | `handle` | Streaming progress over MCP `notifications/progress`; terminates with the final state |
 
-**Known limitation (issue #2035):** the engine admits a declarative update
-but does not run its handler yet. `foo_update_bar` validates and admits the
-update, and then returns 504 after the 30 s wait.
+`foo_update_bar` validates and admits the update. The worker runs the
+handler once, in its next decision cycle, and the tool returns the output. A
+handler that panics or runs longer than 5 s records a failure, and the tool
+returns that failure.
 
 `{prefix}` defaults to `{api_path}/mcp` (`/api/harvest/mcp` when no management
 API is mounted); override with `mcp_tools_at`.
@@ -355,7 +356,7 @@ while the chain still runs. After the run is deleted, `tasks/get` answers
   collision among the other `/mcp` tools does not drop a workflow here,
   because this route exposes only `start_{wf}`.
 - Only a signal wait is `input_required`. An update wait and an
-  `await_condition` park read as `working` (issue #2035).
+  `await_condition` park read as `working`, because no history marks them.
 - Harvest does not push `notifications/tasks`. Poll `tasks/get`.
 - A continue-as-new to a workflow that is not an MCP workflow leaves the
   catalog. `tasks/get` still reads the run, but `tasks/update` and

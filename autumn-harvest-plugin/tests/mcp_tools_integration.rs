@@ -9,8 +9,6 @@
 //! app is torn down and a second app on the same database finishes the run).
 //!
 //! Requires Docker. CI runs this suite from a `linux` manifest row (issue #1959).
-//! The tests that wait for an update handler stay ignored until a fix for
-//! issue #2035 lands. The engine admits a declarative update but never runs it.
 //! Each test uses a multi-thread runtime. `TestApp::plugin` blocks on plugin
 //! startup, and that deadlocks a current-thread runtime.
 
@@ -328,7 +326,7 @@ async fn post_sse(client: &TestClient, body: Value) -> TestResponse {
 /// An agent starts a multi-step workflow and sees >= 2 progress updates over
 /// streaming MCP. It sends a signal that unblocks a `wait_for_signal`, then
 /// reads a terminal status. `mcp_update_tools_run_the_handler_synchronously`
-/// covers the update step (issue #2035).
+/// covers the update step.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_drives_a_durable_workflow_via_mcp_tools() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -646,7 +644,6 @@ async fn signal_follows_the_continue_as_new_chain_to_the_live_successor() {
 /// must resolve a `ContinuedAsNew` chain to the live successor, as
 /// `signal_{wf}` does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "issue #2035: the engine never runs an admitted declarative update"]
 async fn update_follows_the_continue_as_new_chain_to_the_live_successor() {
     let _ = tracing_subscriber::fmt::try_init();
     let db = setup_db().await;
@@ -669,7 +666,6 @@ async fn update_follows_the_continue_as_new_chain_to_the_live_successor() {
 /// The mcp update tools run the handler and return its output in the same
 /// call. This is request/response, unlike the async signal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "issue #2035: the engine never runs an admitted declarative update"]
 async fn mcp_update_tools_run_the_handler_synchronously() {
     let _ = tracing_subscriber::fmt::try_init();
     let db = setup_db().await;
