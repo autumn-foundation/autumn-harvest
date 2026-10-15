@@ -890,6 +890,10 @@ impl SqliteRuntime {
         policy: WorkflowIdReusePolicy,
     ) -> SqliteResult<StartOutcome> {
         self.check_start(workflow_name, &input)?;
+        // An overdue prior ends first, so the reuse policy sees it terminal.
+        if let Some(id) = workflow_id.filter(|id| !id.trim().is_empty()) {
+            self.seal_key_if_overdue(workflow_name, id)?;
+        }
         let now = (self.now_fn)().timestamp_millis();
         let config = self.start_config(workflow_name, now)?;
         let tx = self.conn.transaction()?;
@@ -970,7 +974,9 @@ impl SqliteRuntime {
         name: &str,
         payload: Value,
     ) -> SqliteResult<()> {
-        self.send_signal_as_of(exec, name, payload, Utc::now())
+        let now = (self.now_fn)().timestamp_millis();
+        self.signal_execution(exec, name, &payload, None, Utc::now(), now)
+            .map(|_staged| ())
     }
 
     /// Like [`send_signal`](Self::send_signal) but with an injected arrival time
@@ -1000,7 +1006,8 @@ impl SqliteRuntime {
         payload: Value,
         received_at: DateTime<Utc>,
     ) -> SqliteResult<()> {
-        self.signal_execution(exec, name, &payload, None, received_at)
+        let at = received_at.timestamp_millis();
+        self.signal_execution(exec, name, &payload, None, received_at, at)
             .map(|_staged| ())
     }
 
@@ -1035,7 +1042,8 @@ impl SqliteRuntime {
         payload: Value,
         idempotency_key: Option<&str>,
     ) -> SqliteResult<bool> {
-        self.signal_execution(exec, name, &payload, idempotency_key, Utc::now())
+        let now = (self.now_fn)().timestamp_millis();
+        self.signal_execution(exec, name, &payload, idempotency_key, Utc::now(), now)
     }
 
     /// Signal the run that a `(workflow_name, workflow_id)` key names (issue
@@ -1197,9 +1205,11 @@ impl SqliteRuntime {
         payload: &Value,
         idempotency_key: Option<&str>,
         received_at: DateTime<Utc>,
+        deadline_clock: i64,
     ) -> SqliteResult<bool> {
-        // A missing run reports `NotFound` before the key rules.
-        self.seal_if_overdue(exec)?;
+        // A missing run reports `NotFound` before the key rules. The deadline
+        // check runs at `deadline_clock` (issue #2029).
+        self.seal_if_overdue_at(exec, deadline_clock)?;
         let key = signal_key(name, payload, idempotency_key)?;
         stage_keyed(&self.conn, exec, name, payload, key, received_at)
     }
@@ -1276,11 +1286,17 @@ impl SqliteRuntime {
     /// reports `WorkflowNotRunning`. A keyed signal retry stays a no-op, as on
     /// any other terminal run. An unknown `exec` reports `ExecutionNotFound`.
     fn seal_if_overdue(&mut self, exec: ExecutionId) -> SqliteResult<()> {
+        let now = (self.now_fn)().timestamp_millis();
+        self.seal_if_overdue_at(exec, now)
+    }
+
+    /// [`seal_if_overdue`](Self::seal_if_overdue) at the epoch-millisecond
+    /// instant `now`. An as-of signal passes its own time.
+    fn seal_if_overdue_at(&mut self, exec: ExecutionId, now: i64) -> SqliteResult<()> {
         let state = store::execution_state(&self.conn, exec)?;
         if autumn_harvest::erase::is_terminal_state(&state) {
             return Ok(());
         }
-        let now = (self.now_fn)().timestamp_millis();
         if let Some(deadline) = store::run_config(&self.conn, exec)?
             .deadline_at
             .filter(|at| now >= *at)
@@ -2551,7 +2567,8 @@ impl SqliteRuntime {
                 // untyped `Err(String)` decodes to `message = error` with all typed
                 // fields `None`, so its stored form is unchanged.
                 let decoded = autumn_harvest::failure::decode_workflow_failure(&error);
-                let retry = retry_plan(&config, &decoded, exec, now)?;
+                // The delay counts from the failure, after the body ran.
+                let retry = retry_plan(&config, &decoded, exec, failure_now())?;
                 let tx = self.conn.transaction()?;
                 ingest.apply(&tx, exec)?;
                 persist_terminal_pending_commands(&tx, exec, &pending)?;

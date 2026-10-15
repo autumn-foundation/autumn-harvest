@@ -347,3 +347,39 @@ async fn the_retry_starts_at_its_backoff() {
         started[0]
     );
 }
+
+/// The clock of `slow_failure`. Its body moves it, as a long compute would.
+static SLOW_CLOCK: AtomicI64 = AtomicI64::new(2_000_000);
+
+/// Spends 30 clock seconds, then fails. The retry waits 10 seconds.
+#[workflow(retry = no_jitter(2, 10))]
+async fn slow_failure(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let _ = ctx;
+    SLOW_CLOCK.fetch_add(30, Ordering::SeqCst);
+    Err("failed late".to_string())
+}
+
+// The retry delay counts from the failure, not from the start of the cycle.
+#[tokio::test]
+async fn the_retry_delay_counts_from_the_failure() {
+    let info = slow_failure_info();
+    let mut rt = runtime(&info);
+    rt.set_clock(|| {
+        Utc.timestamp_opt(SLOW_CLOCK.load(Ordering::SeqCst), 0)
+            .unwrap()
+    });
+    let first = rt.start_workflow(info.name, json!(0)).unwrap();
+    let start = SLOW_CLOCK.load(Ordering::SeqCst);
+    rt.run_until_blocked(first).await.unwrap();
+
+    let fire_at = rt
+        .load_history(first)
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEvent::WorkflowRetryScheduled { fire_at, .. } => Some(fire_at.timestamp()),
+            _ => None,
+        })
+        .expect("a retry");
+    assert_eq!(fire_at, start + 40, "the delay must start at the failure");
+}

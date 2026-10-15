@@ -363,3 +363,56 @@ async fn signal_with_start_replaces_an_overdue_run() {
     let state = rt.run_until_blocked(outcome.exec_id).await.unwrap();
     assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
 }
+
+// A plain start seals an overdue prior before the reuse policy acts. So a
+// TerminateIfRunning replace keeps the timeout, not a cancel.
+#[tokio::test]
+async fn a_replace_keeps_the_timeout_of_an_overdue_prior() {
+    let info = waits_forever_info();
+    let (mut rt, clock) = runtime(&info);
+    let old = rt
+        .start_workflow_with_id(info.name, "order-3", json!(1))
+        .unwrap();
+    rt.run_until_blocked(old).await.unwrap();
+
+    clock.set(31);
+    let fresh = rt
+        .start_workflow_with_reuse_policy(
+            info.name,
+            "order-3",
+            json!(2),
+            autumn_harvest::WorkflowIdReusePolicy::TerminateIfRunning,
+        )
+        .unwrap();
+    assert!(fresh.created);
+    let history = rt.load_history(old).unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowExecutionTimedOut { .. })),
+        "the overdue prior must record its timeout"
+    );
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowCancelled { .. })),
+        "a timed-out prior is not cancelled"
+    );
+    assert_replays(info.name, info.handler, history).await;
+}
+
+// An as-of signal checks the deadline at its own time, not the runtime clock.
+#[tokio::test]
+async fn an_as_of_signal_checks_the_deadline_at_its_own_time() {
+    let info = waits_forever_info();
+    let (mut rt, _clock) = runtime(&info);
+    let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+
+    // The runtime clock stays at the start. The signal is 31 seconds late.
+    let late = Utc.timestamp_opt(1_000_031, 0).unwrap();
+    assert!(matches!(
+        rt.send_signal_as_of(exec, "never", json!(1), late),
+        Err(SqliteError::WorkflowNotRunning { ref state, .. }) if state == "TIMED_OUT"
+    ));
+}
