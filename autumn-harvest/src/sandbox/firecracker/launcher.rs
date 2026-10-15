@@ -95,6 +95,11 @@ pub trait VmLauncher: Send + Sync + 'static {
     fn memory_capacity(&self) -> Option<u64> {
         None
     }
+
+    /// The bytes of the guest work directory. `None` by default.
+    fn work_capacity(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// The two snapshot files of a golden microVM.
@@ -1416,6 +1421,11 @@ impl VmLauncher for FirecrackerLauncher {
     /// The guest memory less the guest reserve.
     fn memory_capacity(&self) -> Option<u64> {
         Some(self.config.machine.run_memory_bytes())
+    }
+
+    /// The `/work` tmpfs that the guest mounts.
+    fn work_capacity(&self) -> Option<u64> {
+        Some(super::config::work_mib(&self.config.image).saturating_mul(1 << 20))
     }
 }
 
@@ -3482,6 +3492,30 @@ while True:
             guest_port: GUEST_AGENT_PORT,
             api_timeout: Duration::from_secs(5),
         }
+    }
+
+    #[test]
+    fn a_guest_work_size_below_the_policy_inputs_is_a_config_error() {
+        use crate::sandbox::firecracker::backend::{BackendSettings, FirecrackerBackend};
+        use crate::sandbox::policy::SandboxPolicy;
+        use crate::sandbox::runtime::SandboxRuntime;
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let mut config = unjailed(&dir, fc, BootMethod::ConfigFile);
+        // The default policy takes 1 MiB of input in up to 64 files.
+        config
+            .image
+            .extra_boot_args
+            .push("harvest.work_mib=1".into());
+        let launcher = Arc::new(new_launcher(config).unwrap());
+        let backend = FirecrackerBackend::new(launcher, BackendSettings::default()).unwrap();
+        let err = SandboxRuntime::new(Arc::new(backend), SandboxPolicy::default())
+            .expect_err("a 1 MiB work tmpfs");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("/work")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

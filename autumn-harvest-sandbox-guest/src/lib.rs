@@ -26,7 +26,7 @@ pub const DEFAULT_PORT: u32 = 52;
 pub const DEFAULT_RUN_AS: (u32, u32) = (1000, 1000);
 
 /// The default size of the `/work` tmpfs, in MiB.
-pub const DEFAULT_WORK_MIB: u64 = 256;
+pub const DEFAULT_WORK_MIB: u64 = autumn_harvest::sandbox::guest::DEFAULT_WORK_MIB;
 
 /// The time that the agent waits for the host to close the connection
 /// after a run, before it reboots. The wait lets the vsock device deliver
@@ -173,6 +173,23 @@ mod tests {
     fn root_is_never_the_uid_of_the_code() {
         let config = parse_cmdline("harvest.uid=0 harvest.gid=0");
         assert_eq!(config.run_as, DEFAULT_RUN_AS);
+    }
+
+    /// The runtime checks the policy against the size that the host reads.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_host_reads_the_work_size_that_the_guest_mounts() {
+        use autumn_harvest::sandbox::firecracker::config::{GuestImage, boot_args, work_mib};
+        for extra in [
+            &[][..],
+            &["harvest.work_mib=64"][..],
+            &["harvest.work_mib=64 nosmt", "harvest.work_mib=8"][..],
+        ] {
+            let mut image = GuestImage::new("/images/vmlinux", "/images/rootfs.ext4");
+            image.extra_boot_args = extra.iter().map(|arg| (*arg).to_owned()).collect();
+            let guest = parse_cmdline(&boot_args(&image, DEFAULT_PORT));
+            assert_eq!(guest.work_mib, work_mib(&image), "{extra:?}");
+        }
     }
 }
 

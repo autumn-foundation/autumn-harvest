@@ -155,6 +155,21 @@ pub struct SizeBounds {
     pub max_output_files_total_bytes: u64,
 }
 
+/// The most files in a request, the code file included.
+///
+/// The guest `/work` tmpfs holds [`WORK_MAX_INODES`] inodes. The root and the
+/// two work directories take three. Each file can take one inode for each
+/// path component, up to [`MAX_PATH_DEPTH`].
+///
+/// [`WORK_MAX_INODES`]: super::guest::WORK_MAX_INODES
+/// [`MAX_PATH_DEPTH`]: super::request::MAX_PATH_DEPTH
+pub const MAX_REQUEST_FILES: usize =
+    (super::guest::WORK_MAX_INODES as usize - 3) / super::request::MAX_PATH_DEPTH;
+
+/// The largest page of a Linux guest, in bytes. An `aarch64` kernel can use
+/// 64 KiB pages.
+pub const MAX_PAGE_BYTES: u64 = 64 * 1024;
+
 /// The default size bounds.
 pub const DEFAULT_SIZE_BOUNDS: SizeBounds = SizeBounds {
     max_files: 64,
@@ -352,22 +367,7 @@ impl SandboxPolicy {
                 )));
             }
         }
-        // The code file counts as one file. Without it, each request is a
-        // denial.
-        if self.sizes.max_files == 0 {
-            return Err(SandboxError::Config(
-                "the policy allows no file, and the code file counts as one".into(),
-            ));
-        }
-        // The outcome decoder stops at this cap, so a request may not ask for
-        // more outputs.
-        let cap = super::outcome::MAX_OUTPUT_ENTRIES;
-        if self.sizes.max_outputs > cap {
-            return Err(SandboxError::Config(format!(
-                "the policy allows {} outputs, over the {cap} that an outcome holds",
-                self.sizes.max_outputs
-            )));
-        }
+        self.check_entry_counts()?;
         // Each request and each outcome must fit one guest frame. Otherwise
         // an accepted request fails late, as a retryable fault.
         let frame = u64::try_from(super::protocol::MAX_FRAME_BYTES).unwrap_or(u64::MAX);
@@ -412,6 +412,47 @@ impl SandboxPolicy {
             .saturating_add(files)
             .saturating_add(outputs)
             .saturating_add(OUTCOME_ENVELOPE_BYTES)
+    }
+
+    /// Check the file and output counts of a request.
+    fn check_entry_counts(&self) -> Result<(), SandboxError> {
+        // The code file counts as one file. Without it, each request is a
+        // denial.
+        if self.sizes.max_files == 0 {
+            return Err(SandboxError::Config(
+                "the policy allows no file, and the code file counts as one".into(),
+            ));
+        }
+        // More files can use up the inodes of the guest work directory, and
+        // each run would fail with `ENOSPC`.
+        if self.sizes.max_files > MAX_REQUEST_FILES {
+            return Err(SandboxError::Config(format!(
+                "the policy allows {} files, but the guest work directory has inodes for at \
+                 most {MAX_REQUEST_FILES}",
+                self.sizes.max_files
+            )));
+        }
+        // The outcome decoder stops at this cap, so a request may not ask for
+        // more outputs.
+        let cap = super::outcome::MAX_OUTPUT_ENTRIES;
+        if self.sizes.max_outputs > cap {
+            return Err(SandboxError::Config(format!(
+                "the policy allows {} outputs, over the {cap} that an outcome holds",
+                self.sizes.max_outputs
+            )));
+        }
+        Ok(())
+    }
+
+    /// The most `/work` bytes that the input files of one run can take.
+    ///
+    /// The code, the files and stdin count as input bytes. A tmpfs gives each
+    /// file whole pages, so each file can add up to one page.
+    #[must_use]
+    pub fn max_work_input_bytes(&self) -> u64 {
+        count(self.sizes.max_files)
+            .saturating_mul(MAX_PAGE_BYTES)
+            .saturating_add(self.sizes.max_input_bytes)
     }
 
     /// The most bytes that one run of any runtime passes to exec.
@@ -874,6 +915,27 @@ mod tests {
         limits.max_open_files = MIN_OPEN_FILES;
         SandboxPolicy::default()
             .with_limits(limits, MAX_LIMITS)
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn a_policy_cannot_allow_more_files_than_the_guest_inodes_hold() {
+        // The root and the two work directories take three inodes. Each file
+        // can take one inode for each path component.
+        let inodes = crate::sandbox::guest::WORK_MAX_INODES as usize;
+        let cap = (inodes - 3) / crate::sandbox::request::MAX_PATH_DEPTH;
+        let mut sizes = DEFAULT_SIZE_BOUNDS;
+        sizes.max_files = cap + 1;
+        let policy = SandboxPolicy::default().with_sizes(sizes);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("files")),
+            "{:?}",
+            policy.validate()
+        );
+        sizes.max_files = cap;
+        SandboxPolicy::default()
+            .with_sizes(sizes)
             .validate()
             .unwrap();
     }

@@ -469,6 +469,10 @@ pub const MAX_GUEST_ERROR_BYTES: usize = 4096;
 /// that the guest takes to remove a work tree.
 pub const WORK_MAX_INODES: u32 = 65_536;
 
+/// The size of the guest `/work` tmpfs, in MiB, when the kernel command line
+/// sets no `harvest.work_mib`.
+pub const DEFAULT_WORK_MIB: u64 = 256;
+
 /// A guest error text for history: at most [`MAX_GUEST_ERROR_BYTES`], with
 /// each NUL as U+FFFD. Postgres `jsonb` rejects `\u0000`.
 fn clean(text: &str) -> String {

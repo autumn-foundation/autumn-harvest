@@ -91,6 +91,9 @@ The outcome is JSON too:
 - Each output list holds at most `MAX_OUTPUT_ENTRIES` (4096) entries. The
   host decoder stops there, so a guest cannot fill host memory with tiny
   entries. A policy may not allow more outputs.
+- A policy allows at most `MAX_REQUEST_FILES` (4095) files. The guest work
+  directory holds 65,536 inodes, and each file can take one for each of its
+  16 path components.
 - The host sets `isolation` and `image`. The guest cannot change them. The
   image name has at most 256 bytes and no control character. The host also
   caps `duration_ms` at the time that it measured.
@@ -323,7 +326,7 @@ let launcher = FirecrackerLauncher::new(LauncherConfig {
 launcher.verify_host(PosturePolicy::Enforce).await?;
 launcher.sweep_stale();
 let backend = FirecrackerBackend::new(Arc::new(launcher), BackendSettings::default())?
-    .with_warm_pool(4);
+    .with_warm_pool(4)?;
 let runtime = SandboxRuntime::new(Arc::new(backend), SandboxPolicy::default())?;
 ```
 
@@ -350,6 +353,11 @@ What each microVM gets:
 extra argument that replaces one of its own, and a word that starts with `-`.
 The kernel gives `--` and the words after it to init, so such a word could
 change the mode of the guest agent.
+`harvest.work_mib=<n>` sets the size of the guest `/work` tmpfs, which is
+256 MiB by default. The launcher refuses a value that is not a whole number
+from 1 to `MAX_WORK_MIB`, so the byte count fits 64 bits. The runtime refuses
+a policy whose largest input does not fit, with 64 KiB more for each file.
+
 The whole line may hold at most 1791 bytes (`MAX_BOOT_ARGS_BYTES`).
 Firecracker adds its own arguments and refuses a line over 2047 bytes at
 each boot. So the launcher refuses a longer line as a config error.
@@ -396,7 +404,7 @@ fit a path (4095 bytes).
 | Path | Time to a listening agent |
 |------|---------------------------|
 | Cold boot | About 125 ms in the Firecracker specification, plus guest init. |
-| Warm pool | None: the pool boots ahead. Set `with_warm_pool(n)`. |
+| Warm pool | None: the pool boots ahead. Set `with_warm_pool(n)`, with `n` at most 1024 (`MAX_WARM_POOL`). |
 | Snapshot | About 3 ms for the load call, then lazy page faults. |
 
 `BootMethod::Snapshot` loads a golden snapshot for each run. It needs the

@@ -96,6 +96,12 @@ pub trait SandboxBackend: Send + Sync + 'static {
         None
     }
 
+    /// The bytes of the work directory of one run, or `None` with no bound.
+    /// A runtime refuses a policy whose largest input does not fit it.
+    fn work_capacity(&self) -> Option<u64> {
+        None
+    }
+
     /// Run `job`. Stop and clean up when `cancel` fires.
     fn execute(
         &self,
@@ -139,7 +145,9 @@ impl SandboxRuntime {
     /// - the backend isolation is weaker than `policy.min_isolation`;
     /// - the policy allows the network on a backend without one;
     /// - the memory ceiling of the policy is above what one run of the
-    ///   backend can use.
+    ///   backend can use;
+    /// - the largest run passes more bytes to exec than the backend allows;
+    /// - the largest input does not fit the work directory of the backend.
     pub fn new(
         backend: Arc<dyn SandboxBackend>,
         policy: SandboxPolicy,
@@ -189,6 +197,17 @@ impl SandboxRuntime {
                  the backend allows"
             )));
         }
+        // Inputs that do not fit the work directory fail each run with
+        // `ENOSPC`, and a retry cannot help.
+        let inputs = policy.max_work_input_bytes();
+        if let Some(capacity) = backend.work_capacity()
+            && inputs > capacity
+        {
+            return Err(SandboxError::Config(format!(
+                "the inputs of the largest run can take {inputs} bytes of /work, above the \
+                 {capacity} bytes that the backend gives a run"
+            )));
+        }
         let overhead = DEFAULT_BACKEND_OVERHEAD.max(backend.overhead());
         Ok(Self {
             backend,
@@ -201,10 +220,11 @@ impl SandboxRuntime {
         })
     }
 
-    /// Bound the runs at one time. A value of 0 becomes 1.
+    /// Bound the runs at one time. A value of 0 becomes 1. A value above
+    /// [`Semaphore::MAX_PERMITS`] becomes that bound, which no host reaches.
     #[must_use]
     pub fn with_max_concurrent(mut self, max_concurrent: usize) -> Self {
-        let max_concurrent = max_concurrent.max(1);
+        let max_concurrent = max_concurrent.clamp(1, Semaphore::MAX_PERMITS);
         self.permits = Arc::new(Semaphore::new(max_concurrent));
         self.max_concurrent = max_concurrent;
         self
@@ -1011,5 +1031,13 @@ pub(crate) mod tests {
     fn a_zero_bound_becomes_one() {
         let (_, runtime) = runtime(FakeBackend::new(IsolationLevel::Process));
         assert_eq!(runtime.with_max_concurrent(0).max_concurrent(), 1);
+    }
+
+    #[test]
+    fn a_huge_bound_does_not_panic() {
+        // Tokio refuses more than `Semaphore::MAX_PERMITS` permits.
+        let (_, runtime) = runtime(FakeBackend::new(IsolationLevel::Process));
+        let runtime = runtime.with_max_concurrent(usize::MAX);
+        assert_eq!(runtime.max_concurrent(), Semaphore::MAX_PERMITS);
     }
 }

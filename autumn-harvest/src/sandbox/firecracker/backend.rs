@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::config::GUEST_AGENT_PORT;
 use super::launcher::{LaunchedVm, VmLauncher};
-use super::pool::WarmPool;
+use super::pool::{MAX_WARM_POOL, WarmPool};
 use super::vsock::connect_guest;
 use crate::sandbox::error::SandboxError;
 use crate::sandbox::guest::{read_outcome, send_run};
@@ -131,8 +131,16 @@ impl FirecrackerBackend {
     }
 
     /// Keep `size` booted microVMs ready. Call it inside a Tokio runtime.
-    #[must_use]
-    pub fn with_warm_pool(mut self, size: usize) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Config`] for a size above [`MAX_WARM_POOL`].
+    pub fn with_warm_pool(mut self, size: usize) -> Result<Self, SandboxError> {
+        if size > MAX_WARM_POOL {
+            return Err(SandboxError::Config(format!(
+                "a warm pool holds at most {MAX_WARM_POOL} microVMs, not {size}"
+            )));
+        }
         if size > 0 {
             self.pool = Some(WarmPool::start(
                 Arc::clone(&self.launcher),
@@ -141,7 +149,7 @@ impl FirecrackerBackend {
                 self.settings.boot_timeout,
             ));
         }
-        self
+        Ok(self)
     }
 
     /// The warm pool, when the backend has one.
@@ -257,6 +265,10 @@ impl SandboxBackend for FirecrackerBackend {
 
     fn memory_capacity(&self) -> Option<u64> {
         self.launcher.memory_capacity()
+    }
+
+    fn work_capacity(&self) -> Option<u64> {
+        self.launcher.work_capacity()
     }
 
     fn execute(
@@ -632,11 +644,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_warm_pool_too_large_is_a_config_error_not_a_panic() {
+        let fake = launcher(GuestMode::Serve);
+        for size in [MAX_WARM_POOL + 1, usize::MAX] {
+            let backend = FirecrackerBackend::new(fake.clone(), fast()).unwrap();
+            let err = backend.with_warm_pool(size).expect_err("too large");
+            assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+        }
+        assert_eq!(fake.launched(), 0);
+    }
+
+    #[tokio::test]
     async fn a_warm_pool_serves_a_booted_vm_and_refills() {
         let fake = launcher(GuestMode::Serve);
         let backend = FirecrackerBackend::new(fake.clone(), fast())
             .unwrap()
-            .with_warm_pool(2);
+            .with_warm_pool(2)
+            .unwrap();
         let pool = backend.warm_pool().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while pool.ready_len() < 2 {
@@ -662,7 +686,8 @@ mod tests {
         let fake = launcher(GuestMode::Serve);
         let backend = FirecrackerBackend::new(fake.clone(), fast())
             .unwrap()
-            .with_warm_pool(1);
+            .with_warm_pool(1)
+            .unwrap();
         let pool = backend.warm_pool().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while pool.ready_len() < 1 {
@@ -691,7 +716,8 @@ mod tests {
         let fake = Arc::new(fake);
         let backend = FirecrackerBackend::new(fake.clone(), fast())
             .unwrap()
-            .with_warm_pool(1);
+            .with_warm_pool(1)
+            .unwrap();
         let pool = backend.warm_pool().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while pool.ready_len() < 1 {

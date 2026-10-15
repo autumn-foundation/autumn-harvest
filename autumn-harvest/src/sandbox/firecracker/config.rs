@@ -239,6 +239,31 @@ pub fn boot_args(image: &GuestImage, port: u32) -> String {
     args.join(" ")
 }
 
+/// The kernel argument that sets the size of the guest `/work` tmpfs.
+const WORK_MIB_ARG: &str = "harvest.work_mib=";
+
+/// The largest `harvest.work_mib` value. A guest kernel shifts the value to
+/// bytes with no overflow check, so the byte count must fit 64 bits.
+pub const MAX_WORK_MIB: u64 = u64::MAX >> 20;
+
+/// The size of the guest `/work` tmpfs of `image`, in MiB.
+///
+/// The guest agent takes the last valid `harvest.work_mib` value, or else
+/// [`DEFAULT_WORK_MIB`]. This function takes the same value.
+///
+/// [`DEFAULT_WORK_MIB`]: crate::sandbox::guest::DEFAULT_WORK_MIB
+#[must_use]
+pub fn work_mib(image: &GuestImage) -> u64 {
+    image
+        .extra_boot_args
+        .iter()
+        .flat_map(|arg| arg.split_whitespace())
+        .filter_map(|word| word.strip_prefix(WORK_MIB_ARG))
+        .filter_map(|value| value.parse::<u64>().ok().filter(|&mib| mib > 0))
+        .next_back()
+        .unwrap_or(crate::sandbox::guest::DEFAULT_WORK_MIB)
+}
+
 /// The boot arguments that the launcher sets, before the extra ones.
 fn launcher_boot_args(image: &GuestImage, port: u32) -> Vec<String> {
     vec![
@@ -260,8 +285,9 @@ fn launcher_boot_args(image: &GuestImage, port: u32) -> Vec<String> {
 /// Check the boot arguments of `image` with the guest port `port`.
 ///
 /// The init path must be one kernel word. No extra boot argument may replace
-/// an argument of the launcher or reach the guest agent as an option. The
-/// whole line must fit Firecracker.
+/// an argument of the launcher or reach the guest agent as an option. A
+/// `harvest.work_mib` value must be a whole number from 1 to
+/// [`MAX_WORK_MIB`]. The whole line must fit Firecracker.
 ///
 /// # Errors
 ///
@@ -313,6 +339,17 @@ pub fn check_boot_args(image: &GuestImage, port: u32) -> Result<(), SandboxError
         if reserved.contains(&name) {
             return Err(SandboxError::Config(format!(
                 "the extra boot argument {arg:?} would replace the launcher argument {name:?}"
+            )));
+        }
+        // The agent skips a bad size and mounts the default, so the size
+        // that the operator set would be lost.
+        if let Some(value) = arg.strip_prefix(WORK_MIB_ARG)
+            && !value
+                .parse::<u64>()
+                .is_ok_and(|mib| (1..=MAX_WORK_MIB).contains(&mib))
+        {
+            return Err(SandboxError::Config(format!(
+                "the extra boot argument {arg:?} must set a work size from 1 to {MAX_WORK_MIB} MiB"
             )));
         }
     }
@@ -620,6 +657,36 @@ mod tests {
             check_boot_args(&image, GUEST_AGENT_PORT),
             Err(SandboxError::Config(_))
         ));
+    }
+
+    #[test]
+    fn the_work_size_follows_the_guest_rule() {
+        let mut image = image();
+        assert_eq!(work_mib(&image), crate::sandbox::guest::DEFAULT_WORK_MIB);
+        image.extra_boot_args.extend([
+            "harvest.work_mib=64".into(),
+            "nosmt harvest.work_mib=32".into(),
+        ]);
+        assert_eq!(work_mib(&image), 32);
+        check_boot_args(&image, GUEST_AGENT_PORT).unwrap();
+        // A guest kernel shifts the MiB value to bytes with no overflow check.
+        let wraps = format!("harvest.work_mib={}", (u64::MAX >> 20) + 1);
+        for bad in [
+            "harvest.work_mib=0",
+            "harvest.work_mib=",
+            "harvest.work_mib=1m",
+            wraps.as_str(),
+        ] {
+            let mut image = self::tests::image();
+            image.extra_boot_args.push(bad.into());
+            assert!(
+                matches!(
+                    check_boot_args(&image, GUEST_AGENT_PORT),
+                    Err(SandboxError::Config(_))
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

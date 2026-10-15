@@ -97,7 +97,7 @@ impl Harness {
         let mut backend =
             FirecrackerBackend::new(launcher.clone(), BackendSettings::default()).unwrap();
         if pool > 0 {
-            backend = backend.with_warm_pool(pool);
+            backend = backend.with_warm_pool(pool).unwrap();
         }
         let backend = Arc::new(backend);
         let runtime =

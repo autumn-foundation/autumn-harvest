@@ -45,19 +45,24 @@ impl std::fmt::Debug for WarmPool {
     }
 }
 
+/// The most microVMs that a warm pool of a backend keeps ready. Each one can
+/// hold its guest memory, so this many of the default machine can hold over
+/// 2 TiB.
+pub const MAX_WARM_POOL: usize = 1024;
+
 impl WarmPool {
     /// Start a pool that keeps `target` microVMs from `launcher` ready. Each
     /// microVM must answer a ping on `port` within `boot_timeout` to count
     /// as ready. Call it inside a Tokio runtime.
     #[must_use]
-    pub fn start(
+    pub(crate) fn start(
         launcher: Arc<dyn VmLauncher>,
         target: usize,
         port: u32,
         boot_timeout: Duration,
     ) -> Self {
         let inner = Arc::new(PoolInner {
-            ready: Mutex::new(VecDeque::with_capacity(target)),
+            ready: Mutex::new(VecDeque::new()),
             wake: Notify::new(),
             closed: AtomicBool::new(false),
             task: Mutex::new(None),
