@@ -29,9 +29,11 @@ to history. A body that already ran the same update with
 
 The cycle runs under the workflow-task budget. A handler starts only while a
 full handler limit is left in half of the remaining budget. The first update of
-a cycle always runs. When updates remain, `DriveResult::updates_deferred` is
-set, and the worker wakes the task so the next cycle runs them. A burst of slow
-updates therefore cannot cancel the cycle or cost poison-pill strikes.
+a decision always runs. A re-drive of the same decision runs no update past the
+window. Every handler stops at half of the budget that is left. When updates
+remain, `DriveResult::updates_deferred` is set, and the worker wakes the task so
+the next cycle runs them. A burst of slow updates therefore cannot cancel the
+cycle or cost poison-pill strikes.
 
 **Limits.** Delivery is at least once. Any path that discards the cycle after
 the handlers ran runs them again: a crash, a deadlock retry, an event-id

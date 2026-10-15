@@ -20,8 +20,8 @@ use crate::types::UpdateId;
 
 /// Longest time that one admitted update handler may run in a cycle (issue #2035).
 ///
-/// A handler that does not finish in this time records `UpdateFailed`. Keep
-/// `workflow_task_timeout` above this limit, or the cycle can end first.
+/// A handler that does not finish in this time records `UpdateFailed`. When
+/// less budget is left, the limit is half of what is left.
 pub(crate) const UPDATE_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How the executor dispatches admitted updates in one drive (issue #2035).
@@ -144,7 +144,8 @@ impl UpdateRegistry {
 /// The cycle runs under the workflow-task budget. The dispatch therefore
 /// starts a handler only while a full [`UPDATE_HANDLER_TIMEOUT`] is left in
 /// half of the remaining budget. The first update of a decision always runs,
-/// so each decision makes progress.
+/// so each decision makes progress. Every handler stops at half of the budget
+/// that is left, so the persist keeps the other half.
 ///
 /// Returns `true` when updates remain. The caller must wake the task, so a
 /// later cycle runs them.
@@ -186,7 +187,7 @@ pub(crate) async fn dispatch_pending_updates(
             return true;
         }
         started = true;
-        let result = run_bounded(ctx, &name, input).await;
+        let result = run_bounded(ctx, &name, input, handler_limit(dispatch.cutoff)).await;
         commands.push(WorkflowCommand::RecordUpdateResult { update_id, result });
     }
     false
@@ -198,6 +199,18 @@ pub(crate) async fn dispatch_pending_updates(
 fn window_end(cutoff: Option<DateTime<Utc>>) -> Option<tokio::time::Instant> {
     let left = (cutoff? - Utc::now()).to_std().unwrap_or(Duration::ZERO);
     Some(tokio::time::Instant::now() + left / 2)
+}
+
+/// The time that one handler may run.
+///
+/// It is [`UPDATE_HANDLER_TIMEOUT`], or half of what is left of the budget when
+/// that is less. A body that used most of the budget thus cannot push the cycle
+/// past its cut-off, and the persist keeps the other half.
+fn handler_limit(cutoff: Option<DateTime<Utc>>) -> Duration {
+    cutoff.map_or(UPDATE_HANDLER_TIMEOUT, |cutoff| {
+        let left = (cutoff - Utc::now()).to_std().unwrap_or(Duration::ZERO);
+        UPDATE_HANDLER_TIMEOUT.min(left / 2)
+    })
 }
 
 /// Whether a handler may start. It needs a full [`UPDATE_HANDLER_TIMEOUT`].
@@ -212,14 +225,19 @@ fn window_allows(end: Option<tokio::time::Instant>) -> bool {
 /// The error text is part of the history and the HTTP answer. A panic
 /// message can hold internal detail, so the text is fixed and the log keeps
 /// the detail.
-async fn run_bounded(ctx: &WorkflowContext, name: &str, input: Value) -> Result<Value, String> {
+async fn run_bounded(
+    ctx: &WorkflowContext,
+    name: &str,
+    input: Value,
+    limit: Duration,
+) -> Result<Value, String> {
     use futures::FutureExt as _;
 
     // The wrapped future builds the handler future on its first poll. One
     // `catch_unwind` call therefore covers a panic in the build and a panic in
     // the poll.
     let run = std::panic::AssertUnwindSafe(ctx.run_update_handler(name, input)).catch_unwind();
-    match tokio::time::timeout(UPDATE_HANDLER_TIMEOUT, run).await {
+    match tokio::time::timeout(limit, run).await {
         Ok(Ok(result)) => result,
         Ok(Err(panic)) => {
             tracing::error!(
@@ -230,8 +248,8 @@ async fn run_bounded(ctx: &WorkflowContext, name: &str, input: Value) -> Result<
             Err("update handler panicked".to_string())
         }
         Err(_elapsed) => Err(format!(
-            "update handler timed out after {}s",
-            UPDATE_HANDLER_TIMEOUT.as_secs()
+            "update handler timed out after {:?}",
+            Duration::from_millis(u64::try_from(limit.as_millis()).unwrap_or(u64::MAX))
         )),
     }
 }
@@ -914,6 +932,31 @@ mod tests {
         );
         assert!(drive.updates_deferred);
         assert_eq!(CLOSED_RUNS.load(Ordering::SeqCst), 1);
+    }
+
+    /// With 4 s of budget left and a closed window, the first update still runs.
+    /// Its limit is half of what is left, so it cannot pass the cut-off.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_update_is_bounded_by_the_budget_that_is_left() {
+        let id = UpdateId::new();
+        let handler = info("hang", never_finishes);
+        let history = vec![started(), admitted(id, "hang", json!({}))];
+        let cutoff = Utc::now() + chrono::Duration::seconds(4);
+        let began = tokio::time::Instant::now();
+        let drive = drive_full(context_with_cutoff(history, &[&handler], cutoff), parked).await;
+
+        let recorded = results(&drive.outcome, &drive.pending);
+        assert_eq!(recorded.len(), 1);
+        let error = recorded[0].1.clone().expect_err("a timeout is a failure");
+        assert!(
+            error.starts_with("update handler timed out after "),
+            "{error}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(3),
+            "the handler stops before the 5 s limit: {:?}",
+            began.elapsed()
+        );
     }
 
     static REDRIVE_RUNS: AtomicUsize = AtomicUsize::new(0);

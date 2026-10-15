@@ -54,6 +54,7 @@ persists `RecordUpdateResult` as `UpdateCompleted` or `UpdateFailed`.
 | B11 | Run every pending update in one cycle. | Rejected. Many slow handlers can exceed the task budget and cost poison-pill strikes. |
 | B12 | Cap the count per cycle. | Rejected. A count says nothing about time. |
 | B13 | Start a handler only while a full handler limit is left in half of the remaining budget. Wake the task for the rest. | **Adopted.** The cycle persists inside the budget. The first update always runs, so each cycle makes progress. |
+| B16 | Stop every handler at half of the budget that is left. | **Adopted.** A slow body cannot push the first update past the cut-off. The persist keeps the other half. |
 | B14 | Fail the updates that the window leaves. | Rejected. A slow handler would fail healthy updates. A later cycle can run them. |
 | B15 | Store the panic text in the result. | Rejected. History is plaintext and the caller reads it. The log keeps the text. |
 
@@ -74,7 +75,8 @@ persists `RecordUpdateResult` as `UpdateCompleted` or `UpdateFailed`.
 | R11 | A warm resume skips an update. | The resident path declines on `UpdateAdmitted`. |
 | R12 | The cycle is discarded after the handler ran. | Not preventable. Section 2 lists the paths. |
 | R13 | Many slow handlers exceed the task budget. The run gets poison-pill strikes and fails. | The dispatch window stops the batch. The worker wakes the task for the rest. Unit tests and a worker test cover it. |
-| R14 | The window never lets a handler start, and the wake repeats forever. | The first update of a cycle always runs. Each woken cycle resolves at least one update. |
+| R14 | The window never lets a handler start, and the wake repeats forever. | The first update of a decision always runs. Each woken decision resolves at least one update. |
+| R16 | A slow body leaves under 5 seconds, and the first handler passes the cut-off. | The handler limit is half of what is left. A late handler records `UpdateFailed`, and the run lives. |
 | R15 | A panic message with internal detail reaches history and the HTTP caller. | The result text is fixed. The log keeps the detail. |
 
 ### 0.4 Six thinking hats
@@ -126,7 +128,9 @@ history order**. This order is safe for replay:
    timeout becomes `UpdateFailed`. The panic text goes to the log only.
 5. The dispatch window is half of the budget that is left at the end of the
    body. A handler starts only while a full handler limit is left in the
-   window. The first update always runs.
+   window. The first update of a decision always runs. A re-drive of the same
+   decision runs no update past the window. Every handler stops at half of the
+   budget that is left.
 6. When updates remain, `DriveResult::updates_deferred` is `true`. The worker
    then calls `wake_workflow_task`. The claimed row records the wake, and the
    park that ends the cycle re-pends the task.
@@ -146,8 +150,9 @@ history order**. This order is safe for replay:
   captured variable does not return in the body.
 - A handler cannot await a durable command, such as an activity or a timer.
   It times out and records `UpdateFailed`.
-- Keep `workflow_task_timeout` above the handler limit of 5 seconds. A budget
-  below it can end the cycle during the first handler.
+- A handler stops at half of the budget that is left. A slow body can leave
+  less than 5 seconds. The handler then records `UpdateFailed`, and the run
+  lives.
 - A terminal cycle that the window cuts short leaves updates pending. The
   workflow ends, so those updates are orphaned.
 - A missing handler records `UpdateFailed` for good. This happens on a worker
