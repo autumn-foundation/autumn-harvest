@@ -44,7 +44,9 @@ change encodes them.
   encode keeps the stored checkpoint, and the flush refreshes the heartbeat
   time only. The flusher then encodes it again on each tick until a newer
   heartbeat replaces it. An unchanged checkpoint reuses its last envelope, so a
-  repeat does not spend a new random nonce.
+  repeat does not spend a new random nonce. A change of the column encoding
+  switch or of the active key makes the flusher encode again. A rollback that
+  turns the switch off thus stores the plain checkpoint.
 - **One envelope layer.** A dead letter and a requeued task keep one layer for
   every task type. The dead-letter writer takes the input as its source row
   stores it.

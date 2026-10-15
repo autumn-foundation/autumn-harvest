@@ -490,10 +490,15 @@ struct Pending {
 /// a new random AES-GCM nonce. The auto-heartbeat ticker sends the same
 /// checkpoint on every tick. Reuse is not nonce reuse. The same bytes go to
 /// the same cell.
+///
+/// The entry also records the column encoding switch it was made under. A
+/// switch change then makes the flusher encode again. A rollback that turns the
+/// switch off thus stores the plain checkpoint for an older worker.
 #[cfg(feature = "db")]
 struct EncodedCheckpoint {
     plain: Value,
     stored: Value,
+    column_encoding: bool,
 }
 
 /// The checkpoint as the column stores it (issue #2043).
@@ -514,15 +519,17 @@ fn stored_checkpoint(
     }
     if let Some(hit) = cache
         .as_ref()
-        .filter(|hit| hit.plain == *payload && cached_form_is_current(codecs, &hit.stored))
+        .filter(|hit| hit.plain == *payload && cached_form_is_current(codecs, hit))
     {
         return Some(hit.stored.clone());
     }
+    let column_encoding = codecs.column_encoding();
     match codecs.encode_column(payload) {
         Ok(stored) => {
             *cache = Some(EncodedCheckpoint {
                 plain: payload.clone(),
                 stored: stored.clone(),
+                column_encoding,
             });
             Some(stored)
         }
@@ -538,14 +545,17 @@ fn stored_checkpoint(
 
 /// Whether a cached stored form still matches the registry (issue #2043).
 ///
-/// With column encoding off, the form is plain, so it always matches. With it
-/// on, the form must be an envelope under the active key. A switch change or
-/// a key rotation then makes the flusher encode again.
+/// The entry must come from the present column encoding switch. With the
+/// switch off, the form is plain, so it then matches. With the switch on, the
+/// form must also be an envelope under the active key. A switch change or a
+/// key rotation then makes the flusher encode again.
 #[cfg(feature = "db")]
-fn cached_form_is_current(codecs: &PayloadCodecs, stored: &Value) -> bool {
-    !codecs.column_encoding()
-        || crate::payload_codec::codec_envelope_key_id(stored)
-            .is_some_and(|key_id| key_id == codecs.active_key_id())
+fn cached_form_is_current(codecs: &PayloadCodecs, hit: &EncodedCheckpoint) -> bool {
+    let column_encoding = codecs.column_encoding();
+    hit.column_encoding == column_encoding
+        && (!column_encoding
+            || crate::payload_codec::codec_envelope_key_id(&hit.stored)
+                .is_some_and(|key_id| key_id == codecs.active_key_id()))
 }
 
 /// Write `beat`, or a newer heartbeat from `latest`, on one connection.
@@ -878,6 +888,90 @@ mod tests {
             drain_latest(&mut rx).is_none(),
             "empty channel should produce no payload"
         );
+    }
+
+    // -- Issue #2043: the cache of the encoded checkpoint -------------------
+
+    #[cfg(feature = "db")]
+    mod encoded_checkpoint {
+        use super::*;
+        use crate::payload_codec::{CodecError, PayloadCodec, is_codec_envelope};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// A codec that counts its encodes.
+        struct CountingCodec(AtomicUsize);
+
+        impl PayloadCodec for CountingCodec {
+            fn codec_id(&self) -> &'static str {
+                "counting"
+            }
+
+            fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(raw.iter().rev().copied().collect())
+            }
+
+            fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+                Ok(encoded.iter().rev().copied().collect())
+            }
+        }
+
+        /// A registry that encodes columns, and the encode counter.
+        fn encoding_registry() -> (PayloadCodecs, Arc<CountingCodec>) {
+            let codecs = PayloadCodecs::default();
+            let counter = Arc::new(CountingCodec(AtomicUsize::new(0)));
+            codecs
+                .register_key("k1", counter.clone())
+                .expect("register the codec");
+            codecs.set_column_encoding(true);
+            (codecs, counter)
+        }
+
+        #[test]
+        fn an_unchanged_checkpoint_reuses_its_envelope() {
+            let (codecs, counter) = encoding_registry();
+            let payload = serde_json::json!({"cursor": 7});
+            let mut cache = None;
+
+            let first = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
+            let second = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
+
+            assert!(is_codec_envelope(&first), "the checkpoint is encoded");
+            assert_eq!(first, second, "an unchanged checkpoint keeps its envelope");
+            assert_eq!(counter.0.load(Ordering::SeqCst), 1, "one encode, not two");
+        }
+
+        #[test]
+        fn turning_column_encoding_off_drops_the_cached_envelope() {
+            let (codecs, _counter) = encoding_registry();
+            let payload = serde_json::json!({"cursor": 7});
+            let mut cache = None;
+            let on = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
+            assert!(is_codec_envelope(&on), "the checkpoint is encoded");
+
+            codecs.set_column_encoding(false);
+            let off = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
+
+            assert_eq!(
+                off, payload,
+                "a rollback must store the plain checkpoint for an older worker"
+            );
+        }
+
+        #[test]
+        fn turning_column_encoding_on_again_encodes_the_checkpoint() {
+            let (codecs, _counter) = encoding_registry();
+            let payload = serde_json::json!({"cursor": 7});
+            let mut cache = None;
+            codecs.set_column_encoding(false);
+            let off = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
+            assert_eq!(off, payload, "the plain checkpoint is stored while off");
+
+            codecs.set_column_encoding(true);
+            let on = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
+
+            assert!(is_codec_envelope(&on), "the checkpoint is encoded again");
+        }
     }
 
     // -- Issue #1788: the stamped flusher that the worker uses -------------
