@@ -96,6 +96,7 @@ pub fn report_text(source: ReportSource, stop: AgentStop, text: &str) -> Option<
         | AgentStop::StepsExhausted
         | AgentStop::TokensExhausted
         | AgentStop::TranscriptFull
+        | AgentStop::ReplyTooLarge
         | AgentStop::BudgetExceeded
         | AgentStop::LoopDetected => {
             let notice = format!("The agent stopped early: {}.", stop_name(stop));
@@ -190,6 +191,9 @@ mod tests {
         // A spent LLM budget also ends the run early (issue #1997).
         let text = report_text(ReportSource::Heartbeat, AgentStop::BudgetExceeded, "").unwrap();
         assert_eq!(text, "The agent stopped early: budget_exceeded.");
+        // A reply too large to record ends the run early too (issue #2040).
+        let text = report_text(ReportSource::Run, AgentStop::ReplyTooLarge, "").unwrap();
+        assert_eq!(text, "The agent stopped early: reply_too_large.");
     }
 
     #[test]

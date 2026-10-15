@@ -392,6 +392,13 @@ pub struct ModelTurn {
     /// Empty when no rule of the harness can be released.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub releases: Vec<Released>,
+    /// `true` when the reply did not fit the result cap, even with its
+    /// decision reasons cut. The activity then drops the reply: `content`,
+    /// `decisions`, `labels` and `releases` are empty, and `usage` stays, so
+    /// the paid call is still counted. The loop ends under
+    /// [`AgentStop::ReplyTooLarge`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub oversized: bool,
 }
 
 impl ModelTurn {
@@ -510,6 +517,10 @@ pub enum AgentStop {
     TokensExhausted,
     /// The next request was too large to record. It was not sent.
     TranscriptFull,
+    /// The model reply was too large to record, even with its decision
+    /// reasons cut. The reply is dropped. The call is still counted in the
+    /// usage.
+    ReplyTooLarge,
     /// A run or tenant LLM budget refuses the next model call (issue
     /// #1997). The adapter does not send the call.
     BudgetExceeded,
@@ -619,6 +630,30 @@ mod tests {
     fn stop_names_are_stable_in_history() {
         assert_eq!(json!(AgentStop::TranscriptFull), json!("transcript_full"));
         assert_eq!(json!(AgentStop::BudgetExceeded), json!("budget_exceeded"));
+        assert_eq!(json!(AgentStop::ReplyTooLarge), json!("reply_too_large"));
+    }
+
+    #[test]
+    fn the_oversized_flag_is_recorded_only_when_set() {
+        let turn = json!({
+            "content": [], "stop": "end_turn",
+            "usage": {
+                "input_tokens": 1, "output_tokens": 2,
+                "cache_read_tokens": 0, "cache_write_tokens": 0,
+            },
+            "decisions": [],
+        });
+        let decoded: ModelTurn = serde_json::from_value(turn.clone()).unwrap();
+        assert!(!decoded.oversized);
+        // A recorded turn from before the flag encodes as it was written.
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), turn);
+        let dropped = ModelTurn {
+            oversized: true,
+            ..decoded
+        };
+        let value = serde_json::to_value(&dropped).unwrap();
+        assert_eq!(value["oversized"], true);
+        assert_eq!(serde_json::from_value::<ModelTurn>(value).unwrap(), dropped);
     }
 
     #[test]
@@ -662,6 +697,7 @@ mod tests {
             cache_hit: false,
             labels: Vec::new(),
             releases: Vec::new(),
+            oversized: false,
         };
         assert_eq!(turn.text(), "ab");
         let calls = turn.calls();

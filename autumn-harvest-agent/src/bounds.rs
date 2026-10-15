@@ -30,6 +30,34 @@ pub fn exceeds_bytes<T: Serialize + ?Sized>(value: &T, cap: u64) -> bool {
     json_len(value) > cap
 }
 
+/// The bytes that one tool round may still add to the next request.
+///
+/// SKELETON: it admits everything until the budget logic lands.
+#[derive(Debug, Clone, Copy)]
+pub struct RoundBudget;
+
+impl RoundBudget {
+    /// A budget for a request of `floor` bytes under `cap`, where each open
+    /// call holds a placeholder of `minimal` bytes. A `cap` of zero is no cap.
+    #[must_use]
+    pub const fn new(_cap: u64, _floor: u64, _minimal: u64) -> Self {
+        Self
+    }
+
+    /// Can the round run a call? Only when every call can still get at least
+    /// a minimal answer.
+    #[must_use]
+    pub const fn can_run(&self) -> bool {
+        true
+    }
+
+    /// Charge a result of `size` bytes. Returns `false`, and charges
+    /// nothing, when the result does not fit.
+    pub const fn admit(&mut self, _size: u64) -> bool {
+        true
+    }
+}
+
 /// Is `value` too large to send as one activity input under the default cap?
 ///
 /// It refuses only what the engine is certain to refuse, and never a value
@@ -63,5 +91,50 @@ mod tests {
     fn a_small_value_fits() {
         assert_eq!(json_len(&serde_json::json!({"a": 1})), 7);
         assert!(!exceeds_activity_input(&"small"));
+    }
+
+    #[test]
+    fn a_zero_cap_is_no_cap() {
+        // The engine reads a cap of zero as no cap.
+        assert!(!exceeds_bytes(&"abc", 0));
+        assert!(!exceeds_bytes(
+            &string_of(DEFAULT_MAX_ACTIVITY_INPUT_BYTES * 2),
+            0
+        ));
+    }
+
+    #[test]
+    fn a_round_that_cannot_hold_minimal_answers_cannot_run() {
+        assert!(RoundBudget::new(100, 100, 10).can_run());
+        assert!(!RoundBudget::new(100, 101, 10).can_run());
+    }
+
+    #[test]
+    fn a_result_is_charged_over_its_placeholder() {
+        // The floor already holds 10 bytes for this call.
+        let mut budget = RoundBudget::new(100, 90, 10);
+        assert!(budget.admit(20), "90 + (20 - 10) = 100 fits exactly");
+        assert!(budget.can_run());
+        assert!(
+            budget.admit(10),
+            "a result as long as the placeholder is free"
+        );
+        assert!(!budget.admit(11), "one byte over");
+        assert!(budget.admit(10), "a refused result charged nothing");
+    }
+
+    #[test]
+    fn a_short_result_frees_room_for_the_next() {
+        let mut budget = RoundBudget::new(100, 100, 10);
+        assert!(budget.admit(4), "6 bytes freed");
+        assert!(budget.admit(16), "uses the 6 freed bytes");
+        assert!(!budget.admit(11));
+    }
+
+    #[test]
+    fn a_zero_budget_cap_admits_everything() {
+        let mut budget = RoundBudget::new(0, u64::MAX, 10);
+        assert!(budget.can_run());
+        assert!(budget.admit(u64::MAX));
     }
 }

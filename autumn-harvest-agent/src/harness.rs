@@ -475,6 +475,7 @@ impl AgentHarness {
                 cache_hit,
                 labels: Vec::new(),
                 releases: Vec::new(),
+                oversized: false,
             };
             let info = RunInfo {
                 run_id: RunId::new(request.run_id.clone()),
@@ -1055,6 +1056,14 @@ fn cut_bytes(text: String, max: usize) -> String {
     format!("{}{TRUNCATED}", &text[..end])
 }
 
+/// The most bytes that one decision reason keeps when a turn is over the cap.
+const REASON_CUT_BYTES: usize = 256;
+
+/// SKELETON: it leaves the turn as it is until the fitting logic lands.
+fn fit_turn(turn: ModelTurn, _cap: u64) -> ModelTurn {
+    turn
+}
+
 /// Cut `text` to `limit` characters and mark the cut.
 pub(crate) fn truncate(text: &str, limit: usize) -> String {
     match text.char_indices().nth(limit) {
@@ -1102,6 +1111,124 @@ mod tests {
         }
         assert_eq!(fit_result("short".into(), cap), "short");
         assert!(fit_result("x".repeat(100), 300).ends_with(TRUNCATED));
+    }
+
+    #[test]
+    fn a_zero_result_cap_is_no_cap() {
+        // The engine reads a result cap of zero as no cap.
+        assert_eq!(max_tool_result_bytes(0), usize::MAX);
+        let text = "x".repeat(10_000);
+        assert_eq!(fit_result(text.clone(), 0), text);
+    }
+
+    #[test]
+    fn a_zero_result_cap_keeps_a_whole_error() {
+        let harness = AgentHarness::new(Arc::new(NoModel)).max_result_bytes(0);
+        let message = "m".repeat(5_000);
+        let outcome = harness.error_outcome(&message);
+        assert!(outcome.is_error);
+        assert!(!outcome.content.contains(TRUNCATED), "{}", outcome.content);
+        assert!(outcome.content.contains(&message));
+    }
+
+    /// A turn with `content`, one decision per entry of `decisions`, and
+    /// usage that a test can check.
+    fn turn_of(content: Vec<ContentPart>, decisions: Vec<ToolDecision>) -> ModelTurn {
+        ModelTurn {
+            content,
+            stop: crate::message::StopReason::EndTurn,
+            usage: TokenUsage::new(7, 3),
+            decisions,
+            cache_hit: false,
+            labels: Vec::new(),
+            releases: Vec::new(),
+            oversized: false,
+        }
+    }
+
+    fn call(id: &str) -> ContentPart {
+        ContentPart::ToolCall {
+            id: id.to_owned(),
+            name: "t".to_owned(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    fn deny(reason: &str) -> ToolDecision {
+        ToolDecision::Deny {
+            reason: reason.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_turn_that_fits_is_left_alone() {
+        let turn = turn_of(vec![call("c")], vec![deny("no")]);
+        assert_eq!(fit_turn(turn.clone(), 10_000), turn);
+    }
+
+    #[test]
+    fn a_zero_turn_cap_is_no_cap() {
+        let turn = turn_of(vec![ContentPart::Text("y".repeat(10_000))], Vec::new());
+        assert_eq!(fit_turn(turn.clone(), 0), turn);
+    }
+
+    #[test]
+    fn long_reasons_are_cut_before_the_reply_is_dropped() {
+        let approval = ToolDecision::RequireApproval {
+            reason: "q".repeat(50_000),
+        };
+        let turn = turn_of(
+            vec![call("a"), call("b")],
+            vec![deny(&"r".repeat(50_000)), approval],
+        );
+        let fitted = fit_turn(turn.clone(), 4_096);
+
+        assert!(!fitted.oversized);
+        assert!(json_len(&fitted) <= 4_096, "{}", json_len(&fitted));
+        assert_eq!(fitted.content, turn.content, "the calls stay as they were");
+        assert_eq!(fitted.usage, turn.usage);
+        let [first, second] = fitted.decisions.as_slice() else {
+            panic!("one decision for each call: {:?}", fitted.decisions);
+        };
+        assert!(matches!(first, ToolDecision::Deny { .. }));
+        assert!(matches!(second, ToolDecision::RequireApproval { .. }));
+        for decision in [first, second] {
+            let (ToolDecision::Deny { reason } | ToolDecision::RequireApproval { reason }) =
+                decision
+            else {
+                panic!("a decision with a reason: {decision:?}");
+            };
+            assert!(reason.ends_with(TRUNCATED), "{reason}");
+            assert!(reason.len() <= REASON_CUT_BYTES, "{}", reason.len());
+        }
+    }
+
+    #[test]
+    fn a_reason_is_cut_on_a_char_boundary() {
+        let turn = turn_of(vec![call("a")], vec![deny(&"é".repeat(5_000))]);
+        let fitted = fit_turn(turn, 2_048);
+        let [ToolDecision::Deny { reason }] = fitted.decisions.as_slice() else {
+            panic!("one cut reason: {:?}", fitted.decisions);
+        };
+        assert!(reason.ends_with(TRUNCATED));
+        assert!(reason.len() <= REASON_CUT_BYTES);
+    }
+
+    #[test]
+    fn a_reply_that_still_does_not_fit_becomes_a_typed_outcome() {
+        let turn = turn_of(
+            vec![ContentPart::Text("y".repeat(10_000)), call("c")],
+            vec![deny("no")],
+        );
+        let fitted = fit_turn(turn.clone(), 1_024);
+
+        assert!(fitted.oversized);
+        assert!(fitted.content.is_empty());
+        assert!(fitted.decisions.is_empty());
+        assert!(fitted.labels.is_empty() && fitted.releases.is_empty());
+        assert_eq!(fitted.usage, turn.usage, "the paid call is still counted");
+        assert_eq!(fitted.stop, turn.stop);
+        assert!(json_len(&fitted) <= 1_024);
     }
 
     #[test]
