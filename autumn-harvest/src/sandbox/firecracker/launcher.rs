@@ -440,14 +440,18 @@ impl WriteWatch {
     /// Each event counts: a write, a lost watch or an overflow. So does a
     /// failed read, so the check fails closed.
     fn written(&self) -> bool {
-        use std::os::fd::AsRawFd as _;
         // The read takes the events from the queue. So the read and the flag
         // share one lock. Otherwise a second check could find the queue empty
         // before the first check sets the flag.
         let mut written = self.written.lock().unwrap_or_else(PoisonError::into_inner);
-        if *written {
-            return true;
-        }
+        *written = *written || self.take_event();
+        *written
+    }
+
+    /// Whether a read takes at least one event from the queue. A failed read
+    /// counts as one, so the check fails closed.
+    fn take_event(&self) -> bool {
+        use std::os::fd::AsRawFd as _;
         let mut events = [0u8; 4096];
         loop {
             // SAFETY: the buffer is valid for its length, and the descriptor
@@ -459,19 +463,17 @@ impl WriteWatch {
                     events.len(),
                 )
             };
+            if n > 0 {
+                return true;
+            }
             if n == 0 {
                 return false;
             }
-            if n < 0 {
-                let e = std::io::Error::last_os_error();
-                match e.kind() {
-                    std::io::ErrorKind::Interrupted => continue,
-                    std::io::ErrorKind::WouldBlock => return false,
-                    _ => {}
-                }
+            match std::io::Error::last_os_error().kind() {
+                std::io::ErrorKind::Interrupted => {}
+                std::io::ErrorKind::WouldBlock => return false,
+                _ => return true,
             }
-            *written = true;
-            return true;
         }
     }
 }
@@ -1947,12 +1949,12 @@ fn copy_binaries(
             .open(&to)
             .map_err(|e| fail(from, &e))?;
         // A file that grows during the copy stops one byte past the bound.
-        let copied = std::io::copy(
+        let bytes = std::io::copy(
             &mut std::io::Read::take(&mut source, MAX_VMM_BINARY_BYTES + 1),
             &mut copy,
         )
         .map_err(|e| fail(from, &e))?;
-        if copied > MAX_VMM_BINARY_BYTES {
+        if bytes > MAX_VMM_BINARY_BYTES {
             return Err(fail(from, &"the file grew past the size of a VMM binary"));
         }
         // The umask can narrow the mode of the open, so it is set again.
