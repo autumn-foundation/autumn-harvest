@@ -8589,11 +8589,20 @@ mod tests {
         // Oracle (issue #2048): an interval that `validate_schedule` accepts
         // has a next run from a current reference.
         let now = parse_utc("2026-01-01T00:00:00Z");
-        for secs in [1, 3_600, 31_536_000, crate::policy::MAX_INTERVAL_PERIOD.as_secs()] {
+        for secs in [
+            1,
+            3_600,
+            31_536_000,
+            crate::policy::MAX_INTERVAL_PERIOD.as_secs(),
+        ] {
             let schedule = Schedule::Interval(Duration::from_secs(secs));
             assert!(crate::policy::validate_schedule(&schedule).is_ok());
             let expected = now + chrono::Duration::seconds(i64::try_from(secs).unwrap());
-            assert_eq!(next_run_after(Some(&schedule), now), Some(expected), "{secs} s");
+            assert_eq!(
+                next_run_after(Some(&schedule), now),
+                Some(expected),
+                "{secs} s"
+            );
         }
     }
 

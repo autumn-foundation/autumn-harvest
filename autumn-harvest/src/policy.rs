@@ -747,7 +747,8 @@ pub enum Schedule {
     Cron(String),
     /// Fixed interval from the end of the previous run.
     ///
-    /// The period must be a whole number of seconds greater than zero.
+    /// The period must be a whole number of seconds. It must be greater than
+    /// zero and at most [`MAX_INTERVAL_PERIOD`].
     Interval(Duration),
     /// Only runs when triggered manually via API.
     Manual,
@@ -1595,20 +1596,21 @@ impl WorkflowSchedule {
 /// Longest accepted [`Schedule::Interval`] period: 100 years of 365 days.
 ///
 /// A longer period can move the next fire time past the last date that
-/// `chrono` can hold (issue #2048).
+/// `chrono` can hold (issue #2048). [`validate_schedule`] rejects it.
 pub const MAX_INTERVAL_PERIOD: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 /// Validate a [`Schedule`] value, returning an error string if it is invalid.
 ///
 /// For [`Schedule::Cron`] expressions this parses the expression using
 /// `croner` (5-field or 6-field with seconds). A [`Schedule::Interval`] period
-/// must be a whole number of seconds greater than zero.
+/// must be a whole number of seconds. It must be greater than zero and at most
+/// [`MAX_INTERVAL_PERIOD`].
 ///
 /// # Errors
 ///
 /// Returns a human-readable error string if the cron expression is
-/// syntactically invalid. Also returns one if the interval is zero or has a
-/// fractional second.
+/// syntactically invalid. Also returns one if the interval is zero, has a
+/// fractional second, or is longer than [`MAX_INTERVAL_PERIOD`].
 pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     match schedule {
         Schedule::Cron(expr) => Cron::new(expr)

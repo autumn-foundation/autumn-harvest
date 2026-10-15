@@ -3294,8 +3294,8 @@ fn validate_workflow_schedules(
         {
             return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
         }
-        // Reject a bad cron expression, a zero interval and a fractional interval
-        // (issue #1967).
+        // Reject a bad cron expression, a zero interval, a fractional interval
+        // (issue #1967) and an interval over the cap (issue #2048).
         if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
@@ -5879,6 +5879,27 @@ mod tests {
                 err,
                 HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
                     if workflow_name == "test" && reason.contains("whole number of seconds")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn harvest_builder_rejects_workflow_schedule_over_the_interval_cap() {
+        // Issue #2048: the scheduler cannot add this period to a timestamp.
+        let err = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "test",
+                Schedule::Interval(Duration::from_secs(9_000_000_000_000_000)),
+            ))
+            .try_build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
+                    if workflow_name == "test" && reason.contains("must not exceed")
             ),
             "got: {err:?}"
         );
