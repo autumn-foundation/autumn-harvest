@@ -137,6 +137,32 @@ fn persists_the_corpus(job: &serde_yaml::Value) -> bool {
         && fuzz.is_some_and(|f| r < f && f < sv)
 }
 
+/// True when a failed corpus download does not fail the run.
+///
+/// The corpus is a cache. A download can fail for a reason outside the
+/// code, such as an artifact quota. Then the run fuzzes from the seeds,
+/// and it does not save that corpus. Otherwise the next run would restore
+/// the small corpus and lose the grown one.
+fn tolerates_a_lost_corpus(job: &serde_yaml::Value) -> bool {
+    let steps = steps(job);
+    let restore = steps
+        .iter()
+        .find(|s| str_at(s, &["run"]).contains("gh run download"));
+    let save = steps.iter().find(|s| {
+        str_at(s, &["uses"]).starts_with("actions/upload-artifact@")
+            && str_at(s, &["with", "name"]) == CORPUS_ARTIFACT
+    });
+    let (Some(restore), Some(save)) = (restore, save) else {
+        return false;
+    };
+    let run = str_at(restore, &["run"]);
+    str_at(restore, &["id"]) == "restore"
+        && run.contains("if ! gh run download")
+        && run.contains("lost=true")
+        && run.contains("$GITHUB_OUTPUT")
+        && str_at(save, &["if"]).contains("steps.restore.outputs.lost != 'true'")
+}
+
 /// The draft-skip condition that `ci.yml` uses. A schedule always runs.
 const DRAFT_SKIP: &str =
     "github.event_name != 'pull_request' || github.event.pull_request.draft == false";
@@ -236,6 +262,11 @@ fn fuzz_nightly_runs_on_a_cron_with_a_persisted_corpus() {
     assert!(
         alerts_on_scheduled_failure(&doc["jobs"]["alert"], "fuzz"),
         "the `alert` job must open an issue when a scheduled `fuzz` run fails"
+    );
+    assert!(
+        tolerates_a_lost_corpus(fuzz),
+        "a failed corpus download must not fail the `fuzz` job, and that run \
+         must not save its corpus"
     );
 }
 

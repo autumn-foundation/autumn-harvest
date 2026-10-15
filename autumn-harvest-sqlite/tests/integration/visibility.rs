@@ -9,6 +9,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use autumn_harvest::WorkflowIdReusePolicy;
+use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{
     ExecutionFilter, ExecutionOutcome, ListCursor, MAX_FILTER_TERMS, MAX_LIST_LIMIT, RunState,
@@ -86,6 +87,19 @@ async fn chained(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     Ok(n)
 }
 
+/// Fails once with no backoff, so one retry runs.
+#[workflow(retry = RetryPolicy {
+    max_attempts: 2,
+    initial_interval: Duration::ZERO,
+    backoff_coefficient: 1.0,
+    max_interval: Duration::ZERO,
+    non_retryable_errors: Vec::new(),
+    jitter: JitterPolicy::None,
+})]
+async fn retried(_ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    Err("broken".to_string())
+}
+
 fn runtime() -> SqliteRuntime {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     for info in [
@@ -95,6 +109,7 @@ fn runtime() -> SqliteRuntime {
         staged_info(),
         upserts_then_spawns_info(),
         chained_info(),
+        retried_info(),
     ] {
         rt.register_workflow(&info);
     }
@@ -683,6 +698,40 @@ async fn continue_as_new_copies_the_memo_and_the_search_attributes() {
                 .state("COMPLETED")
         ),
         vec![last]
+    );
+}
+
+/// A retry is the same logical run. It keeps the memo and the search
+/// attributes, as on Postgres.
+#[tokio::test]
+async fn a_retry_copies_the_memo_and_the_search_attributes() {
+    let mut rt = runtime();
+    let first = rt
+        .start_workflow_with_options(
+            "retried",
+            json!(0),
+            StartOptions::new()
+                .memo(json!("keep me"))
+                .search_attribute("tenant", json!("acme")),
+        )
+        .unwrap()
+        .exec_id;
+    rt.run_until_idle().await.unwrap();
+    let second = rt.successor(first).unwrap().expect("one retry");
+    for exec in [first, second] {
+        let summary = rt.describe(exec).unwrap().summary;
+        assert_eq!(summary.memo, Stored::Value(json!("keep me")));
+        assert_eq!(
+            summary.search_attributes,
+            Stored::Value(attrs(&[("tenant", json!("acme"))]))
+        );
+    }
+    assert_eq!(
+        ids(
+            &rt,
+            &ExecutionFilter::new().search_attribute("tenant", json!("acme"))
+        ),
+        vec![second, first]
     );
 }
 

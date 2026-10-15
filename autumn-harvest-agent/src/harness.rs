@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use tracing::Instrument;
 
+use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
 use crate::flow::{FlowRules, Released, call_labels};
@@ -168,6 +169,15 @@ impl AgentHarness {
 
     /// Set the activity-result cap of the workers, in bytes. Set it when the
     /// workers use a cap other than the engine default.
+    ///
+    /// A larger tool result is cut to fit. A model reply that does not fit
+    /// ends the run as `reply_too_large`. A cap of zero is no cap, as in the
+    /// engine. A cap under 256 bytes cannot hold the `oversized` turn, so the
+    /// activity can still fail.
+    ///
+    /// A worker with a payload store offloads a large result, and the engine
+    /// skips its cap for it. The harness cannot see the store, so set zero for
+    /// such a worker.
     #[must_use]
     pub const fn max_result_bytes(mut self, bytes: u64) -> Self {
         self.max_result_bytes = bytes;
@@ -339,6 +349,10 @@ impl AgentHarness {
     /// Postgres. A hit skips the model call. The policy still decides each
     /// tool call.
     ///
+    /// A turn that exceeds the result cap does not fail. The method cuts each
+    /// decision reason. When the turn still does not fit, the method returns a
+    /// turn with [`ModelTurn::oversized`] set.
+    ///
     /// # Errors
     ///
     /// Returns an activity error payload. A failure that a retry can fix is
@@ -475,6 +489,7 @@ impl AgentHarness {
                 cache_hit,
                 labels: Vec::new(),
                 releases: Vec::new(),
+                oversized: false,
             };
             let info = RunInfo {
                 run_id: RunId::new(request.run_id.clone()),
@@ -496,8 +511,10 @@ impl AgentHarness {
                 &mut policy_budget,
             )
             .await;
-            // A turn over the result cap fails. The cache serves and keeps
-            // only a turn that fits, so no identical request fails from it.
+            // The cache serves and keeps only an answer whose whole turn fits.
+            // The check uses the turn before the cut below. A cached turn that
+            // exceeds the cap would end every identical run as
+            // `reply_too_large`.
             let fits = self.fits_result_cap(&turn);
             if cache_hit && !fits {
                 tracing::warn!("a cached answer does not fit the result cap; calling the model");
@@ -508,7 +525,7 @@ impl AgentHarness {
             {
                 self.cache_store(key, &response).await;
             }
-            return Ok((turn, latency));
+            return Ok((fit_turn(turn, self.max_result_bytes), latency));
         }
     }
 
@@ -710,7 +727,7 @@ impl AgentHarness {
             cache_hit: true,
             ..turn.clone()
         };
-        self.max_result_bytes == 0 || !crate::bounds::exceeds_bytes(&hit, self.max_result_bytes)
+        !exceeds_bytes(&hit, self.max_result_bytes)
     }
 
     /// Store a fresh answer. A fault or a slow cache is only a warning.
@@ -798,8 +815,7 @@ impl AgentHarness {
     /// a twelfth of the cap.
     fn error_outcome(&self, message: &str) -> ToolOutcome {
         let message = truncate(message, self.tool_output_limit);
-        let cap = self.max_result_bytes.saturating_sub(OUTCOME_ENVELOPE_BYTES);
-        let max = usize::try_from(cap / 12).unwrap_or(usize::MAX);
+        let max = max_error_bytes(self.max_result_bytes);
         ToolOutcome::error(&cut_bytes(message, max))
     }
 
@@ -1032,10 +1048,27 @@ fn model_failure(err: &AgentError) -> String {
 /// The most bytes of tool output one result keeps under `cap`.
 ///
 /// JSON escapes one byte into at most six (`\u0000`). A sixth of the cap,
-/// less the outcome envelope, therefore always fits.
+/// less the outcome envelope, therefore always fits. A cap of zero is no cap,
+/// so the whole output stays.
 #[must_use]
 pub fn max_tool_result_bytes(cap: u64) -> usize {
-    usize::try_from(cap.saturating_sub(OUTCOME_ENVELOPE_BYTES) / 6).unwrap_or(usize::MAX)
+    share_of(cap, 6)
+}
+
+/// The most bytes of error text one result keeps under `cap`.
+///
+/// The text is escaped twice, so a byte can grow to twelve.
+fn max_error_bytes(cap: u64) -> usize {
+    share_of(cap, 12)
+}
+
+/// The share of `cap` for one result: (`cap` - envelope) / `divisor`. A cap
+/// of zero is no cap, as in the engine.
+fn share_of(cap: u64, divisor: u64) -> usize {
+    if cap == 0 {
+        return usize::MAX;
+    }
+    usize::try_from(cap.saturating_sub(OUTCOME_ENVELOPE_BYTES) / divisor).unwrap_or(usize::MAX)
 }
 
 /// Cut `text` so that its recorded outcome fits the result cap.
@@ -1053,6 +1086,44 @@ fn cut_bytes(text: String, max: usize) -> String {
         end -= 1;
     }
     format!("{}{TRUNCATED}", &text[..end])
+}
+
+/// The most bytes that one decision reason keeps when a turn exceeds the cap.
+///
+/// A policy writes a reason as free text. 256 bytes still tell the reviewer or
+/// the model why. A turn with many calls then stays small.
+const REASON_CUT_BYTES: usize = 256;
+
+/// Make `turn` fit the result cap, or replace it with a typed outcome.
+///
+/// A turn that exceeds the cap would fail the activity with a `PayloadTooLarge`
+/// that is not retryable, after the model call was paid for. So the decision
+/// reasons are cut first, because a policy writes them as free text. A turn
+/// that still does not fit becomes [`ModelTurn::into_oversized`]. The loop
+/// then ends the run under [`AgentStop::ReplyTooLarge`](crate::AgentStop). A
+/// cap of zero is no cap.
+///
+/// The activity does not fail, so no failed-workflow alert fires. A warning
+/// with the sizes marks the drop. It holds no text of the reply.
+pub(crate) fn fit_turn(mut turn: ModelTurn, cap: u64) -> ModelTurn {
+    if !exceeds_bytes(&turn, cap) {
+        return turn;
+    }
+    for decision in &mut turn.decisions {
+        if let ToolDecision::Deny { reason } | ToolDecision::RequireApproval { reason } = decision {
+            *reason = cut_bytes(std::mem::take(reason), REASON_CUT_BYTES);
+        }
+    }
+    let size = json_len(&turn);
+    if size > cap {
+        tracing::warn!(
+            observed_bytes = size,
+            cap_bytes = cap,
+            "the model reply exceeds the result cap; the run ends as reply_too_large"
+        );
+        return turn.into_oversized();
+    }
+    turn
 }
 
 /// Cut `text` to `limit` characters and mark the cut.
@@ -1102,6 +1173,192 @@ mod tests {
         }
         assert_eq!(fit_result("short".into(), cap), "short");
         assert!(fit_result("x".repeat(100), 300).ends_with(TRUNCATED));
+    }
+
+    #[test]
+    fn a_zero_result_cap_is_no_cap() {
+        // The engine reads a result cap of zero as no cap.
+        assert_eq!(max_tool_result_bytes(0), usize::MAX);
+        let text = "x".repeat(10_000);
+        assert_eq!(fit_result(text.clone(), 0), text);
+    }
+
+    #[test]
+    fn a_zero_result_cap_keeps_a_whole_error() {
+        let harness = AgentHarness::new(Arc::new(NoModel)).max_result_bytes(0);
+        let message = "m".repeat(5_000);
+        let outcome = harness.error_outcome(&message);
+        assert!(outcome.is_error);
+        assert!(!outcome.content.contains(TRUNCATED), "{}", outcome.content);
+        assert!(outcome.content.contains(&message));
+    }
+
+    /// A turn with `content` and `decisions`, and fixed usage for checks.
+    fn turn_of(content: Vec<ContentPart>, decisions: Vec<ToolDecision>) -> ModelTurn {
+        ModelTurn {
+            content,
+            stop: crate::message::StopReason::EndTurn,
+            usage: TokenUsage::new(7, 3),
+            decisions,
+            cache_hit: false,
+            labels: Vec::new(),
+            releases: Vec::new(),
+            oversized: false,
+        }
+    }
+
+    fn call(id: &str) -> ContentPart {
+        ContentPart::ToolCall {
+            id: id.to_owned(),
+            name: "t".to_owned(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    fn deny(reason: &str) -> ToolDecision {
+        ToolDecision::Deny {
+            reason: reason.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_turn_that_fits_is_left_alone() {
+        let turn = turn_of(vec![call("c")], vec![deny("no")]);
+        assert_eq!(fit_turn(turn.clone(), 10_000), turn);
+    }
+
+    #[test]
+    fn a_long_reason_under_a_roomy_cap_stays_whole() {
+        let turn = turn_of(vec![call("a")], vec![deny(&"r".repeat(5_000))]);
+        assert_eq!(fit_turn(turn.clone(), 1_000_000), turn);
+    }
+
+    #[test]
+    fn an_error_of_any_content_fits_the_result_cap() {
+        // A NUL grows to seven bytes: six in the error JSON, and one more for
+        // the backslash when the outcome escapes the text again.
+        let cap = DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
+        let harness = AgentHarness::new(Arc::new(NoModel)).tool_output_limit(usize::MAX);
+        for unit in ["\u{0}", "\"", "é"] {
+            let message = unit.repeat(usize::try_from(cap).unwrap());
+            let outcome = harness.error_outcome(&message);
+            assert!(
+                json_len(&outcome) <= cap,
+                "{unit:?}: {}",
+                json_len(&outcome)
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_turn_cap_is_no_cap() {
+        let turn = turn_of(vec![ContentPart::Text("y".repeat(10_000))], Vec::new());
+        assert_eq!(fit_turn(turn.clone(), 0), turn);
+    }
+
+    #[test]
+    fn long_reasons_are_cut_before_the_reply_is_dropped() {
+        let approval = ToolDecision::RequireApproval {
+            reason: "q".repeat(50_000),
+        };
+        let turn = turn_of(
+            vec![call("a"), call("b")],
+            vec![deny(&"r".repeat(50_000)), approval],
+        );
+        let fitted = fit_turn(turn.clone(), 4_096);
+
+        assert!(!fitted.oversized);
+        assert!(json_len(&fitted) <= 4_096, "{}", json_len(&fitted));
+        assert_eq!(fitted.content, turn.content, "the calls stay as they were");
+        assert_eq!(fitted.usage, turn.usage);
+        let [first, second] = fitted.decisions.as_slice() else {
+            panic!("one decision for each call: {:?}", fitted.decisions);
+        };
+        assert!(matches!(first, ToolDecision::Deny { .. }));
+        assert!(matches!(second, ToolDecision::RequireApproval { .. }));
+        for decision in [first, second] {
+            let (ToolDecision::Deny { reason } | ToolDecision::RequireApproval { reason }) =
+                decision
+            else {
+                panic!("a decision with a reason: {decision:?}");
+            };
+            assert!(reason.ends_with(TRUNCATED), "{reason}");
+            // The documented limit, not the constant: a change must show here.
+            assert!(reason.len() <= 256, "{}", reason.len());
+        }
+    }
+
+    #[test]
+    fn a_reason_is_cut_on_a_char_boundary() {
+        // Three bytes per char. 256 less the marker is 242, which is not a
+        // multiple of three, so the cut must step back to a boundary.
+        let turn = turn_of(vec![call("a")], vec![deny(&"€".repeat(5_000))]);
+        let fitted = fit_turn(turn, 2_048);
+        let [ToolDecision::Deny { reason }] = fitted.decisions.as_slice() else {
+            panic!("one cut reason: {:?}", fitted.decisions);
+        };
+        assert!(reason.ends_with(TRUNCATED));
+        assert!(reason.len() <= 256, "{}", reason.len());
+        assert!(reason.len() > 200, "the cut keeps most of the limit");
+    }
+
+    #[test]
+    fn a_reply_that_still_does_not_fit_becomes_a_typed_outcome() {
+        let turn = turn_of(
+            vec![ContentPart::Text("y".repeat(10_000)), call("c")],
+            vec![deny("no")],
+        );
+        let fitted = fit_turn(turn.clone(), 1_024);
+
+        assert!(fitted.oversized);
+        assert_eq!(fitted.content, Vec::new());
+        assert_eq!(fitted.decisions, Vec::new());
+        assert!(fitted.labels.is_empty() && fitted.releases.is_empty());
+        assert_eq!(fitted.usage, turn.usage, "the paid call is still counted");
+        assert_eq!(fitted.stop, turn.stop);
+        assert!(json_len(&fitted) <= 1_024);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_fitted_turn_fits_or_is_the_typed_outcome(
+            text in "(\\PC|[\\x00-\\x1f]){0,2000}",
+            reasons in proptest::collection::vec("(\\PC|[\\x00-\\x1f]){0,2000}", 0..4),
+            cap in 300_u64..6_000,
+        ) {
+            let content = std::iter::once(ContentPart::Text(text))
+                .chain((0..reasons.len()).map(|index| call(&format!("c{index}"))))
+                .collect();
+            let decisions = reasons.iter().map(|reason| deny(reason)).collect();
+            let turn = turn_of(content, decisions);
+
+            proptest::prop_assert_eq!(&fit_turn(turn.clone(), 0), &turn);
+            let fitted = fit_turn(turn.clone(), cap);
+            if fitted.oversized {
+                proptest::prop_assert_eq!(&fitted.content, &Vec::<ContentPart>::new());
+                proptest::prop_assert_eq!(&fitted.decisions, &Vec::<ToolDecision>::new());
+                proptest::prop_assert_eq!(fitted.usage, turn.usage);
+            } else {
+                proptest::prop_assert!(json_len(&fitted) <= cap);
+                proptest::prop_assert_eq!(&fitted.content, &turn.content);
+                proptest::prop_assert_eq!(fitted.decisions.len(), turn.decisions.len());
+            }
+            proptest::prop_assert_eq!(fit_turn(fitted.clone(), cap), fitted);
+        }
+    }
+
+    #[test]
+    fn the_typed_outcome_fits_a_small_cap() {
+        // The builder docs say a cap of 256 bytes or more holds the outcome.
+        // Check it with the widest usage numbers.
+        let mut turn = turn_of(vec![call("c")], vec![deny("no")]);
+        turn.usage = TokenUsage {
+            input_tokens: u32::MAX,
+            output_tokens: u32::MAX,
+            cache_read_tokens: u32::MAX,
+            cache_write_tokens: u32::MAX,
+        };
+        assert!(json_len(&turn.into_oversized()) <= 256);
     }
 
     #[test]

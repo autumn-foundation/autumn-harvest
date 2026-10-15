@@ -58,7 +58,8 @@ pub struct AgentTask {
     pub approval_timeout_secs: u64,
     /// The activity-input cap of the workers, in bytes. Set it when the
     /// workers use a cap other than the engine default. The loop stops with
-    /// `TranscriptFull` before it sends a request over this size.
+    /// `TranscriptFull` before it sends a request over this size. A cap of
+    /// zero is no cap, as in the engine.
     #[serde(default)]
     pub max_request_bytes: Option<u64>,
     /// Send the final answer to the harness delivery.
@@ -98,6 +99,12 @@ pub struct AgentTask {
     /// started before the change replays as it ran.
     #[serde(default)]
     pub run_id_source: RunIdSource,
+    /// Measure a tool round against the whole next request (issue #2040).
+    /// [`AgentTask::new`] turns it on. A recorded task with no field measures
+    /// the results alone and reads a zero request cap as a limit of zero
+    /// bytes. A run started before the change then replays as it ran.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub whole_request_budget: bool,
     /// The tenant that scopes the response cache.
     ///
     /// On Postgres, the verified tenant of the run wins over this field. Set
@@ -153,6 +160,7 @@ impl AgentTask {
             unattended: false,
             unattended_memory_writes: false,
             run_id_source: RunIdSource::ExecutionId,
+            whole_request_budget: true,
             tenant: None,
             mandate: None,
             flow_labels: BTreeSet::new(),
@@ -303,7 +311,11 @@ impl AgentTask {
         timeout.as_secs().saturating_add(partial)
     }
 
-    /// Set the activity-input cap of the workers, in bytes.
+    /// Set the activity-input cap of the workers, in bytes. Zero is no cap.
+    ///
+    /// A worker with a payload store offloads a large input, and the engine
+    /// skips its cap for it. The loop cannot see the store, so set zero for
+    /// such a worker.
     #[must_use]
     pub const fn max_request_bytes(mut self, bytes: u64) -> Self {
         self.max_request_bytes = Some(bytes);
@@ -392,9 +404,34 @@ pub struct ModelTurn {
     /// Empty when no rule of the harness can be released.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub releases: Vec<Released>,
+    /// `true` when the reply did not fit the result cap, even with its
+    /// decision reasons cut. The activity then drops the reply: `content`,
+    /// `decisions`, `labels` and `releases` are empty, and `usage` stays, so
+    /// the paid call is still counted. The loop ends under
+    /// [`AgentStop::ReplyTooLarge`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub oversized: bool,
 }
 
 impl ModelTurn {
+    /// The typed outcome for a reply that is too large to record.
+    ///
+    /// It keeps the usage, the stop reason and `cache_hit`, so the paid call
+    /// stays counted. Everything else is dropped.
+    #[must_use]
+    pub(crate) fn into_oversized(self) -> Self {
+        Self {
+            content: Vec::new(),
+            stop: self.stop,
+            usage: self.usage,
+            decisions: Vec::new(),
+            cache_hit: self.cache_hit,
+            labels: Vec::new(),
+            releases: Vec::new(),
+            oversized: true,
+        }
+    }
+
     /// The tool calls of the turn, in order.
     #[must_use]
     pub fn calls(&self) -> Vec<ToolCall> {
@@ -460,7 +497,7 @@ pub struct ToolCallRequest {
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
-const fn is_false(value: &bool) -> bool {
+pub(crate) const fn is_false(value: &bool) -> bool {
     !*value
 }
 
@@ -510,6 +547,10 @@ pub enum AgentStop {
     TokensExhausted,
     /// The next request was too large to record. It was not sent.
     TranscriptFull,
+    /// The model reply was too large to record, even with its decision
+    /// reasons cut. The reply is dropped. The call is still counted in the
+    /// usage.
+    ReplyTooLarge,
     /// A run or tenant LLM budget refuses the next model call (issue
     /// #1997). The adapter does not send the call.
     BudgetExceeded,
@@ -619,6 +660,30 @@ mod tests {
     fn stop_names_are_stable_in_history() {
         assert_eq!(json!(AgentStop::TranscriptFull), json!("transcript_full"));
         assert_eq!(json!(AgentStop::BudgetExceeded), json!("budget_exceeded"));
+        assert_eq!(json!(AgentStop::ReplyTooLarge), json!("reply_too_large"));
+    }
+
+    #[test]
+    fn the_oversized_flag_is_recorded_only_when_set() {
+        let turn = json!({
+            "content": [], "stop": "end_turn",
+            "usage": {
+                "input_tokens": 1, "output_tokens": 2,
+                "cache_read_tokens": 0, "cache_write_tokens": 0,
+            },
+            "decisions": [],
+        });
+        let decoded: ModelTurn = serde_json::from_value(turn.clone()).unwrap();
+        assert!(!decoded.oversized);
+        // A recorded turn from before the flag encodes as it was written.
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), turn);
+        let dropped = ModelTurn {
+            oversized: true,
+            ..decoded
+        };
+        let value = serde_json::to_value(&dropped).unwrap();
+        assert_eq!(value["oversized"], true);
+        assert_eq!(serde_json::from_value::<ModelTurn>(value).unwrap(), dropped);
     }
 
     #[test]
@@ -662,6 +727,7 @@ mod tests {
             cache_hit: false,
             labels: Vec::new(),
             releases: Vec::new(),
+            oversized: false,
         };
         assert_eq!(turn.text(), "ab");
         let calls = turn.calls();
@@ -801,6 +867,17 @@ mod tests {
         let task: AgentTask = serde_json::from_value(old).unwrap();
         assert_eq!(task.loop_guard, LoopGuard::disabled());
         assert_eq!(AgentTask::new("go").loop_guard, LoopGuard::default());
+    }
+
+    #[test]
+    fn a_task_from_before_the_whole_request_budget_measures_results_only() {
+        let old = json!({"input": "go", "max_steps": 8, "approval_timeout_secs": 60});
+        let task: AgentTask = serde_json::from_value(old).unwrap();
+        assert!(!task.whole_request_budget);
+        // A task that leaves the flag off encodes as it was recorded.
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert!(encoded.get("whole_request_budget").is_none());
+        assert!(AgentTask::new("go").whole_request_budget);
     }
 
     #[test]

@@ -17,15 +17,16 @@ agent daemon read `harvest_executions` with its own SQL.
   id, workflow id prefix, states, a start-time range and search-attribute
   equality. The search-attribute filter uses JSON1. Numbers compare as
   numbers. A filter number of magnitude 2^63 or more is refused, because
-  JSON1 reads a stored integer of that size as a float. A filter holds at most 64 states and 64 search attributes.
+  JSON1 reads a stored integer of that size as a float. A filter holds at
+  most 64 states and 64 search attributes.
 - One state filter seeks on the new `idx_harvest_executions_state` index.
 - Each field is a `Stored<T>`: `Value`, `Null` or `Unreadable`. One damaged
   row does not fail a page.
 - `ctx.upsert_search_attrs` merges its patch in the cycle transaction, on the
   suspend path and on the terminal path, as on Postgres. It is not progress.
 - `start_workflow_with_options` takes a workflow id, a reuse policy, a memo
-  and search attributes. A continue-as-new copies the memo and the search
-  attributes.
+  and search attributes. A continue-as-new and a workflow retry copy the
+  memo and the search attributes.
 - New errors: `SqliteError::InvalidSearchAttribute` and
   `SqliteError::InvalidFilter`.
 - `StartOptions` has builder methods, as `ExecutionFilter` has.

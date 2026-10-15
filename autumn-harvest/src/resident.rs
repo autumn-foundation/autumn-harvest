@@ -1482,6 +1482,16 @@ mod tests {
         }
     }
 
+    /// An update that the edge admitted while the workflow was parked (issue #2035).
+    fn admitted_update() -> WorkflowEvent {
+        WorkflowEvent::UpdateAdmitted {
+            update_id: crate::types::UpdateId::new(),
+            name: "bump".into(),
+            input: Value::Null,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
     /// Builds a delta from the own events and the id of the parked activity.
     type DeltaBuilder = Box<dyn Fn(&[WorkflowEvent], ActivityExecId) -> Vec<WorkflowEvent>>;
 
@@ -1560,6 +1570,16 @@ mod tests {
                     ]
                     .concat()
                 }),
+            ),
+            (
+                "an update admitted before the result",
+                ResumeDeclined::UnexpectedEvent("UpdateAdmitted"),
+                Box::new(|own, id| [own.to_vec(), vec![admitted_update(), completed(id)]].concat()),
+            ),
+            (
+                "an update admitted after the result",
+                ResumeDeclined::ExtraEvents,
+                Box::new(|own, id| [own.to_vec(), vec![completed(id), admitted_update()]].concat()),
             ),
             (
                 "a timer fire for another timer",

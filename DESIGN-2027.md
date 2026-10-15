@@ -64,7 +64,7 @@ memo. The daemon then reads executions through the backend.
 | R3 | An upsert counts as progress, so the drive loop spins. | The write is not progress, as for an update result. A test drives a body that upserts and then waits. |
 | R4 | A rolled-back cycle keeps its upsert. | The write is in the cycle transaction. The rollback drops it. |
 | R5 | The terminal path drops the upsert, or seals the run `FAILED`. | The terminal drain applies the patch before the terminal event. |
-| R6 | A continue-as-new loses the memo or the search attributes. | The successor copies both. A test checks it. |
+| R6 | A continue-as-new or a retry loses the memo or the search attributes. | The successor copies both. A test checks each path. |
 | R7 | The reader writes to the file, or takes the writer lock. | It opens the file `READ_ONLY`. A test opens a reader beside a live runtime. |
 | R8 | A filter value with SQL in it changes the query. | Every value is a bound parameter. |
 | R9 | A search attribute that is an object breaks the filter. | Start rejects a value that is not a primitive. The core rejects it in a patch. A filter value that is not a primitive is an error. |
@@ -130,7 +130,8 @@ Each stored field is a `Stored<T>`: `Value`, `Null` or `Unreadable`.
   startup read then does not walk the finished sessions.
 - `start_workflow_with_options` takes a workflow id, a reuse policy, a memo
   and search attributes.
-- A continue-as-new copies the memo and the search attributes.
+- A continue-as-new and a workflow retry (issue #2029) copy the memo and
+  the search attributes, as on Postgres.
 - The first terminal write sets `closed_at`. A later reuse-policy seal keeps
   it.
 

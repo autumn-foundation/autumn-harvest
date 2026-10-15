@@ -34,11 +34,12 @@
 use std::collections::HashMap;
 use std::task::Poll;
 
-use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
+use autumn_harvest::builder::{DEFAULT_MAX_ACTIVITY_RESULT_BYTES, DEFAULT_RETRY_AFTER_CEILING};
 use autumn_harvest::context::{ActivityIdentity, empty_shared_state};
+use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::{
-    ActivityContext, ActivityHandlerFn, ExecutionId, TimeoutType, TimerId, WorkflowCommand,
-    WorkflowEvent, WorkflowHistoryPolicy,
+    ActivityContext, ActivityExecId, ActivityHandlerFn, ExecutionId, TimeoutType, TimerId,
+    WorkflowCommand, WorkflowEvent, WorkflowHistoryPolicy,
 };
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -1228,6 +1229,240 @@ pub fn finalize_timeout_within_tx(
     )?;
     queue::finish_task(conn, &task.task_id)?;
     Ok(())
+}
+
+/// The per-attempt budget cap of a local activity (issue #2029). It matches
+/// the default `max_local_activity_start_to_close` of the Postgres worker.
+pub const LOCAL_ACTIVITY_START_TO_CLOSE_CAP: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// One `RunLocalActivity` command that the drive runs after the cycle commits
+/// (issue #2029).
+pub struct LocalRun {
+    /// The id of the `LocalActivityScheduled` event.
+    pub activity_id: ActivityExecId,
+    /// The registered activity name.
+    pub name: String,
+    /// The activity input.
+    pub input: Value,
+    /// The per-attempt budget of the call. The cap above bounds it.
+    pub start_to_close: Option<std::time::Duration>,
+    /// The retry policy of the call. `None` = one attempt.
+    pub retry_policy: Option<RetryPolicy>,
+    /// The failed attempts that history already records.
+    pub failed_attempts: u32,
+    /// The error of the last recorded failed attempt.
+    pub last_error: Option<String>,
+}
+
+impl LocalRun {
+    /// The attempt cap: the policy's `max_attempts`, or 1.
+    pub fn max_attempts(&self) -> u32 {
+        self.retry_policy
+            .as_ref()
+            .map_or(1, |p| p.max_attempts.max(1))
+    }
+
+    /// The per-attempt budget: the declared one, capped at
+    /// [`LOCAL_ACTIVITY_START_TO_CLOSE_CAP`].
+    fn budget(&self) -> std::time::Duration {
+        self.start_to_close
+            .map_or(LOCAL_ACTIVITY_START_TO_CLOSE_CAP, |d| {
+                d.min(LOCAL_ACTIVITY_START_TO_CLOSE_CAP)
+            })
+    }
+}
+
+/// Run attempt `attempt` of a local activity, inline (issue #2029).
+///
+/// A closure body gets no context. An `#[activity]` body gets the local
+/// context that the Postgres worker builds. A panic becomes the retryable
+/// `HandlerPanic` failure. An `#[activity]` body that runs past its budget is
+/// dropped under a Tokio runtime. A closure body cannot be stopped, so its
+/// budget is checked after it returns. As on Postgres, the result has no
+/// size cap here. The history byte cap still bounds it.
+pub async fn run_local_attempt(
+    exec_id: ExecutionId,
+    owner: &RunOwner<'_>,
+    spec: &ActivitySpec,
+    run: &LocalRun,
+    attempt: u32,
+    previous_failure: Option<String>,
+    deadline_left: Option<std::time::Duration>,
+) -> Result<Value, String> {
+    // The workflow deadline bounds the attempt too (issue #2029).
+    let budget = deadline_left.map_or_else(|| run.budget(), |left| run.budget().min(left));
+    let started = std::time::Instant::now();
+    let result = match &spec.body {
+        ActivityRunner::Closure(body) => {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(run.input.clone())))
+                .unwrap_or_else(|payload| {
+                    Err(handler_panic_activity_envelope(
+                        autumn_harvest::error::panic_message(payload),
+                    ))
+                })
+        }
+        ActivityRunner::Handler(handler) => {
+            let identity = ActivityIdentity::new(
+                exec_id,
+                owner.workflow_id,
+                owner.workflow_type,
+                run.name.clone(),
+                run.activity_id,
+            );
+            let deadline = chrono::Duration::from_std(budget)
+                .ok()
+                .and_then(|span| Utc::now().checked_add_signed(span));
+            let ctx = ActivityContext::new_embedded_local(empty_shared_state(), identity)
+                .with_attempt(attempt)
+                .with_max_attempts(run.max_attempts())
+                .with_deadline(deadline)
+                .with_previous_failure(previous_failure);
+            let body = run_local_handler(*handler, &ctx, run.input.clone());
+            match within_budget(body, budget).await {
+                Some(result) => result,
+                None => return Err(local_timeout_error(run, budget)),
+            }
+        }
+    };
+    if started.elapsed() > budget {
+        return Err(local_timeout_error(run, budget));
+    }
+    result
+}
+
+/// The Postgres error text of a local attempt that ran past `budget`.
+fn local_timeout_error(run: &LocalRun, budget: std::time::Duration) -> String {
+    format!("local activity '{}' timed out after {budget:?}", run.name)
+}
+
+/// Await `body` for at most `budget`. Returns `None` at the budget, and the
+/// body is dropped, as on Postgres (issue #2029).
+///
+/// The timer is Tokio's. The drive may run on another runtime, or on a Tokio
+/// runtime with no timer. The body then runs to its end, and the caller
+/// checks the budget after it returns.
+pub async fn within_budget<F>(body: F, budget: std::time::Duration) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    let sleep = tokio::runtime::Handle::try_current()
+        .ok()
+        .and_then(|_| std::panic::catch_unwind(|| tokio::time::sleep(budget)).ok());
+    let Some(sleep) = sleep else {
+        return Some(body.await);
+    };
+    let mut body = std::pin::pin!(body);
+    let mut sleep = std::pin::pin!(sleep);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(output) = body.as_mut().poll(cx) {
+            return Poll::Ready(Some(output));
+        }
+        sleep.as_mut().poll(cx).map(|()| None)
+    })
+    .await
+}
+
+/// Await one local `#[activity]` handler, and contain a panic in the call
+/// or in a poll (issue #2029).
+async fn run_local_handler(
+    handler: ActivityHandlerFn,
+    ctx: &ActivityContext,
+    input: Value,
+) -> Result<Value, String> {
+    let panicked = |payload| {
+        Err(handler_panic_activity_envelope(
+            autumn_harvest::error::panic_message(payload),
+        ))
+    };
+    let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(ctx, input)));
+    let mut body = match call {
+        Ok(body) => body,
+        Err(payload) => return panicked(payload),
+    };
+    std::future::poll_fn(move |cx| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.as_mut().poll(cx)))
+            .unwrap_or_else(|payload| Poll::Ready(panicked(payload)))
+    })
+    .await
+}
+
+/// The events of one local attempt, and the backoff before the next one
+/// (issue #2029). `None` means the activity is done.
+///
+/// A failure appends `LocalActivityFailed`. A terminal failure also appends
+/// `LocalActivityExhausted`, the marker that ends the activity on replay.
+/// The stored error is the typed message, or the raw string, as on Postgres.
+pub fn local_attempt_events(
+    exec_id: ExecutionId,
+    run: &LocalRun,
+    attempt: u32,
+    result: Result<Value, String>,
+) -> (Vec<WorkflowEvent>, Option<std::time::Duration>) {
+    let activity_id = run.activity_id;
+    let error = match result {
+        Ok(output) => {
+            return (
+                vec![WorkflowEvent::LocalActivityCompleted {
+                    activity_id,
+                    output,
+                }],
+                None,
+            );
+        }
+        Err(error) => error,
+    };
+    let typed = autumn_harvest::failure::parse_typed_payload(&error);
+    let non_retryable = typed.as_ref().is_some_and(|f| f.non_retryable)
+        || run.retry_policy.as_ref().is_some_and(|p| {
+            p.is_non_retryable(typed.as_ref().map(|f| f.error_type.as_str()), &error)
+        });
+    // A positive `retry_after` hint wins over the policy, within the Postgres
+    // ceiling.
+    let hint = autumn_harvest::policy::resolve_retry_after_hint(
+        typed.as_ref().and_then(|f| f.retry_after),
+        DEFAULT_RETRY_AFTER_CEILING,
+    );
+    let message = typed.map_or(error, |f| f.message);
+    let failed = WorkflowEvent::LocalActivityFailed {
+        activity_id,
+        error: message.clone(),
+        attempt,
+    };
+    if non_retryable || attempt >= run.max_attempts() {
+        let exhausted = WorkflowEvent::LocalActivityExhausted {
+            activity_id,
+            error: message,
+            attempt,
+        };
+        return (vec![failed, exhausted], None);
+    }
+    let seed = local_retry_seed(exec_id, activity_id);
+    let delay = hint
+        .or_else(|| {
+            run.retry_policy
+                .as_ref()
+                .and_then(|p| p.next_delay_with_seed(attempt, seed))
+        })
+        .unwrap_or_default();
+    (vec![failed], Some(delay))
+}
+
+/// The jitter seed of a local retry. It differs per activity of one run.
+///
+/// It is the FNV-1a mix of the Postgres worker, so both backends pick the
+/// same backoff.
+fn local_retry_seed(exec_id: ExecutionId, activity_id: ActivityExecId) -> u64 {
+    const PRIME: u64 = 0x1000_0000_01b3;
+    let mut seed = 0xcbf2_9ce4_8422_2325_u64;
+    for id in [exec_id.as_uuid().as_u128(), activity_id.as_uuid().as_u128()] {
+        let raw = id.to_le_bytes();
+        for half in [&raw[..8], &raw[8..]] {
+            seed ^= u64::from_le_bytes(half.try_into().unwrap_or([0; 8]));
+            seed = seed.wrapping_mul(PRIME);
+        }
+    }
+    seed
 }
 
 /// Fire one due timer atomically: append `TimerFired` and mark the timer row

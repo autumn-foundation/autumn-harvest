@@ -137,6 +137,13 @@ A complete, runnable version is in
   history caps apply with the Postgres defaults: 50,000 events and 50 MiB per
   run. A run that reaches a cap fails. Its error is `HistoryCapReason` JSON. Change
   the caps with `set_history_event_hard_cap` and `set_history_byte_hard_cap`.
+- **Timers, mutex, local activities, timeout and retry (issue #2029).**
+  `ctx.start_timer` and `TimerHandle` arm, cancel and reset durable timers.
+  `ctx.mutex(key).acquire()` grants a key in FIFO order, and a waiting run
+  returns `RunState::WaitingMutex(key)`. `#[activity(local = true)]` runs
+  inline after its decision commits. `#[workflow(execution_timeout = ..)]` ends a
+  late run `TIMED_OUT`. `#[workflow(retry = ..)]` starts a retry run, which
+  `successor(exec)` returns. Each records the Postgres events.
 
 ## v0.1 non-goals
 
@@ -145,8 +152,8 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
 - Schedules, the management API, DAGs, worker sessions, retention, sharding.
-- Child workflows, external signals/cancels, local activities, and a
-  continue-as-new to a different workflow type
+- Child workflows, external signals/cancels, and a continue-as-new to a
+  different workflow type
   (`continue_as_new_as_type`) — a workflow reaching one of these is
   rejected **loudly, by name**, never silently dropped. The run then ends
   `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).

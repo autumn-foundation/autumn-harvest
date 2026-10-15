@@ -533,7 +533,7 @@ mod db {
         CodecKeyActivationBlocker, CodecKeyShardRemainder, HarvestError, HarvestResult,
         database_error,
     };
-    use crate::payload_codec::PayloadCodecs;
+    use crate::payload_codec::{ColumnCursor, PayloadCodecs};
     use crate::payload_store::PAYLOAD_FIELD_KEYS;
     use crate::telemetry::MetricsRecorder;
 
@@ -1267,77 +1267,22 @@ mod db {
         pending: bool,
     }
 
-    /// Where one shard's column cycle stopped (issue #1979).
-    ///
-    /// It lives in this process only. A restart or a second worker starts a
-    /// cycle from the first column, which is safe: the census, not this
-    /// cursor, decides completion.
-    #[derive(Debug, Clone, Default)]
-    struct ColumnCursor {
-        /// The key id this cycle converts onto.
-        active_key_id: String,
-        /// Index into [`CODEC_COLUMNS`].
-        column: usize,
-        /// The last primary key examined in that column.
-        after: Option<uuid::Uuid>,
-        /// Cells this cycle could not convert so far.
-        unresolved: i64,
-    }
-
-    /// Column cursors by database identity, schema and shard id.
-    ///
-    /// One process can host several runtimes on different databases, so the
-    /// shard id alone is not a unique scope. Runtimes on one database can
-    /// also select different schemas through `search_path`, so the scope
-    /// names the schema where the codec tables resolve.
-    static COLUMN_CURSORS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, ColumnCursor>>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
-
-    #[derive(diesel::QueryableByName)]
-    struct CursorScope {
-        #[diesel(sql_type = Text)]
-        scope: String,
-    }
-
-    /// The cursor key for this connection's database, schema and `shard_id`.
-    async fn column_cursor_scope(
-        conn: &mut AsyncPgConnection,
+    fn load_column_cursor(
+        codecs: &PayloadCodecs,
         shard_id: i32,
-    ) -> HarvestResult<String> {
-        let row: CursorScope = diesel::sql_query(
-            "SELECT current_database() || '@' \
-                 || COALESCE(host(inet_server_addr()), 'local') || ':' \
-                 || COALESCE(inet_server_port()::TEXT, '') || '/' \
-                 || COALESCE(( \
-                     SELECT relnamespace::regnamespace::TEXT FROM pg_class \
-                     WHERE oid = to_regclass('harvest_workflow_executions') \
-                 ), '') AS scope",
-        )
-        .get_result(conn)
-        .await
-        .map_err(database_error)?;
-        Ok(format!("{}/{shard_id}", row.scope))
-    }
-
-    fn load_column_cursor(scope: &str, active_key_id: &str) -> ColumnCursor {
-        let cursors = COLUMN_CURSORS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cursors
-            .get(scope)
+        active_key_id: &str,
+    ) -> ColumnCursor {
+        codecs
+            .column_cursor(shard_id)
             .filter(|cursor| cursor.active_key_id == active_key_id)
-            .cloned()
             .unwrap_or_else(|| ColumnCursor {
                 active_key_id: active_key_id.to_string(),
                 ..ColumnCursor::default()
             })
     }
 
-    fn store_column_cursor(scope: String, cursor: ColumnCursor) {
-        COLUMN_CURSORS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(scope, cursor);
+    fn store_column_cursor(codecs: &PayloadCodecs, shard_id: i32, cursor: ColumnCursor) {
+        codecs.set_column_cursor(shard_id, cursor);
     }
 
     /// Re-encrypt the codec columns onto `active_key_id` (issue #1979).
@@ -1355,8 +1300,7 @@ mod db {
         active_key_id: &str,
         batch_limit: i64,
     ) -> HarvestResult<ColumnPass> {
-        let scope = column_cursor_scope(conn, shard.as_i32()).await?;
-        let mut cursor = load_column_cursor(&scope, active_key_id);
+        let mut cursor = load_column_cursor(codecs, shard.as_i32(), active_key_id);
         let budget = usize::try_from(batch_limit).unwrap_or(usize::MAX);
         let key_id = key_id_expr("$1");
         let mut examined = 0usize;
@@ -1411,7 +1355,8 @@ mod db {
         let pass = if cursor.column >= CODEC_COLUMNS.len() {
             let unresolved = cursor.unresolved;
             store_column_cursor(
-                scope,
+                codecs,
+                shard.as_i32(),
                 ColumnCursor {
                     active_key_id: active_key_id.to_string(),
                     ..ColumnCursor::default()
@@ -1423,7 +1368,7 @@ mod db {
                 pending: false,
             }
         } else {
-            store_column_cursor(scope, cursor);
+            store_column_cursor(codecs, shard.as_i32(), cursor);
             ColumnPass {
                 rewritten,
                 unresolved: 0,
@@ -2869,6 +2814,51 @@ mod db {
                 tracing::warn!(error = %e, key_id, "codec key state refresh: local flip failed");
                 Ok(false)
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod column_cursor_tests {
+        use super::{ColumnCursor, load_column_cursor, store_column_cursor};
+        use crate::payload_codec::PayloadCodecs;
+
+        fn mid_cycle(key: &str) -> ColumnCursor {
+            ColumnCursor {
+                active_key_id: key.to_string(),
+                column: 2,
+                after: Some(uuid::Uuid::from_u128(7)),
+                unresolved: 3,
+            }
+        }
+
+        /// Issue #2054: two runtimes in one process must not share a cursor.
+        #[test]
+        fn a_column_cursor_belongs_to_its_codecs() {
+            let first = PayloadCodecs::default();
+            let second = PayloadCodecs::default();
+            store_column_cursor(&first, 0, mid_cycle("k1"));
+
+            assert_eq!(load_column_cursor(&first, 0, "k1").column, 2);
+            assert_eq!(load_column_cursor(&second, 0, "k1").column, 0);
+        }
+
+        #[test]
+        fn clones_of_one_codecs_share_the_cursor() {
+            let codecs = PayloadCodecs::default();
+            let clone = codecs.clone();
+            store_column_cursor(&clone, 0, mid_cycle("k1"));
+
+            assert_eq!(load_column_cursor(&codecs, 0, "k1").unresolved, 3);
+            assert_eq!(load_column_cursor(&clone, 0, "k1").unresolved, 3);
+        }
+
+        #[test]
+        fn a_column_cursor_is_per_shard_and_per_key() {
+            let codecs = PayloadCodecs::default();
+            store_column_cursor(&codecs, 0, mid_cycle("k1"));
+
+            assert_eq!(load_column_cursor(&codecs, 1, "k1").column, 0);
+            assert_eq!(load_column_cursor(&codecs, 0, "k2").column, 0);
         }
     }
 }
