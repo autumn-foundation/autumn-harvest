@@ -1008,6 +1008,22 @@ macro_rules! expired_run_gate_sql {
     };
 }
 
+/// The override-expiry-aware available-tokens formula, as SQL text, for the
+/// `b` alias (issue #945).
+///
+/// This must render exactly what [`effective_available_tokens_expr`] computes
+/// at runtime. `claim_task_query` and `oldest_pending_ages_query` need the
+/// formula as compile-time SQL text: one is built by `concat!`-only macros,
+/// and the other is a `pub const fn` body. Neither can call a runtime
+/// helper. This macro gives both the one formula instead of a hand-typed
+/// copy at each site. `rate_limit_available_sql_matches_the_effective_available_tokens_expr`
+/// pins it to the helper.
+macro_rules! rate_limit_available_sql {
+    () => {
+        "LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate)"
+    };
+}
+
 /// The run-deadline re-check after the bucket lock, for the single-row
 /// claim (issue #1824).
 ///
@@ -1229,7 +1245,9 @@ macro_rules! claim_candidate_gates_sql {
                    OR EXISTS ( \
                        SELECT 1 FROM harvest_rate_limit_buckets b \
                        WHERE b.key = harvest_task_queue.rate_limit_key \
-                         AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
+                         AND ",
+            rate_limit_available_sql!(),
+            " >= 1.0 \
                    ) \
                ) ",
         )
@@ -1360,13 +1378,17 @@ macro_rules! claim_trailing_ctes_sql {
             ", \
         rate_limit_debit AS ( \
             UPDATE harvest_rate_limit_buckets b \
-            SET tokens = LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) - 1.0, \
+            SET tokens = ",
+            rate_limit_available_sql!(),
+            " - 1.0, \
                 last_refilled_at = NOW() \
             FROM candidate \
             WHERE b.key = candidate.rate_limit_key \
               AND NOT (candidate.activity_name = ANY($5)) \
               AND NOT (SELECT expired FROM run_expired_now) \
-              AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
+              AND ",
+            rate_limit_available_sql!(),
+            " >= 1.0 \
             RETURNING b.key AS debited_key \
         ), \
         claimed AS ( \
@@ -4939,7 +4961,8 @@ pub async fn queue_depths(
 /// Binds: `$1` queue names, `$2` circuit-breaker-tracked activities.
 #[must_use]
 pub const fn oldest_pending_ages_query() -> &'static str {
-    "SELECT queue_name, \
+    concat!(
+        "SELECT queue_name, \
                 GREATEST( \
                     EXTRACT(EPOCH FROM (NOW() - MIN(GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))))), \
                     0 \
@@ -4983,10 +5006,13 @@ pub const fn oldest_pending_ages_query() -> &'static str {
                OR EXISTS ( \
                    SELECT 1 FROM harvest_rate_limit_buckets b \
                    WHERE b.key = harvest_task_queue.rate_limit_key \
-                     AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
+                     AND ",
+        rate_limit_available_sql!(),
+        " >= 1.0 \
                ) \
            ) \
          GROUP BY queue_name"
+    )
 }
 
 /// Returns the age in seconds of the oldest currently-*claimable* eligible task
@@ -11754,11 +11780,28 @@ mod tests {
 
     // ── TTL'd rate-limit override drift locks (issue #945) ──────────────────
     //
-    // These sites are hand-copied literal SQL (2 of the 3 live inside
-    // `pub const fn` bodies, which cannot call runtime helpers), so nothing
-    // stops them drifting from `effective_available_tokens_expr` except a
-    // test asserting textual containment -- mirroring the queue-pause /
-    // activity-pause drift locks immediately above.
+    // `claim_task_query` and `oldest_pending_ages_query` need the formula as
+    // compile-time SQL text. 2 of the 3 sites below live inside a
+    // `concat!`-only macro or a `pub const fn` body. Neither can call the
+    // runtime helper. Both now render `rate_limit_available_sql!()`, one
+    // macro, instead of a hand-typed copy at each site --
+    // `rate_limit_available_sql_matches_the_effective_available_tokens_expr`
+    // pins that macro to the helper. These tests stay. They mirror the
+    // queue-pause / activity-pause drift locks immediately above. A correct
+    // macro expansion is still worth asserting at its actual call sites, not
+    // only at its own definition.
+
+    #[test]
+    fn rate_limit_available_sql_matches_the_effective_available_tokens_expr() {
+        assert_eq!(
+            rate_limit_available_sql!(),
+            effective_available_tokens_expr("b"),
+            "rate_limit_available_sql! must render exactly what \
+             effective_available_tokens_expr(\"b\") computes at runtime, or \
+             the sites that cannot call that helper directly silently diverge \
+             from it"
+        );
+    }
 
     #[test]
     fn claim_task_query_honors_the_effective_rate_limit_override() {
