@@ -740,7 +740,7 @@ fn heartbeat_activity(ctx: &autumn_harvest::ActivityContext, _input: Value) -> B
             tokio::time::sleep(Duration::from_millis(2500)).await;
             return Err("retry after a checkpoint".to_string());
         }
-        while !HEARTBEAT_RELEASE.load(Ordering::SeqCst) {
+        while !AtomicBool::load(&HEARTBEAT_RELEASE, Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let seen: Option<Value> = ctx.heartbeat_details().map_err(|e| e.to_string())?;
@@ -910,7 +910,10 @@ impl autumn_harvest::completion_callback::CompletionCallbackDeliverer for Captur
                 .unwrap()
                 .push((body.to_vec(), headers.to_vec()));
             autumn_harvest::completion_callback::DeliveryAttempt {
-                status: Some(self.status.load(Ordering::SeqCst)),
+                status: Some(std::sync::atomic::AtomicU16::load(
+                    &self.status,
+                    Ordering::SeqCst,
+                )),
                 transport_error: None,
                 retry_after: None,
             }
