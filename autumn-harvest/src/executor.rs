@@ -2427,9 +2427,12 @@ async fn drive_cycle(
     let keep = keep.filter(|_| matches!(cycle_result, HandlerCycleResult::Suspended));
     let future = keep.is_some().then_some(future);
     let (mut outcome, mut pending) = span_handle.in_scope(|| classify_cycle(&ctx, cycle_result));
-    // A warm cycle replays nothing. The resident path declines a delta that
-    // holds `UpdateAdmitted`, so a warm cycle has no pending update. Skipping
-    // it also saves a history scan on each warm decision.
+    // A warm cycle replays nothing, so it has no pending update. The resident
+    // path declines a delta that holds `UpdateAdmitted`. A cycle that ran an
+    // update is never kept resident, because `RecordUpdateResult` is not a
+    // resident command. A cycle that deferred an update is never kept resident
+    // either (below). Skipping the dispatch also saves a history scan on each
+    // warm decision.
     let warm = replay == Some(false);
     let updates_deferred = if warm {
         false
@@ -2439,6 +2442,12 @@ async fn drive_cycle(
             .await
     };
     let resident = match (future, keep) {
+        // A redundant wake resumes an activity wait warm, and a warm cycle
+        // skips the dispatch. A deferred update therefore needs a cold cycle
+        // to run (issue #2035).
+        (Some(_), Some(_)) if updates_deferred => {
+            crate::resident::Residency::Missed(crate::telemetry::ResidentOutcome::Blocked)
+        }
         (Some(future), Some(key)) => {
             match crate::resident::ResidentWorkflow::capture(&ctx, future, &mut outcome, key) {
                 Ok(workflow) => crate::resident::Residency::Parked(workflow),

@@ -28,7 +28,8 @@ persists `RecordUpdateResult` as `UpdateCompleted` or `UpdateFailed`.
   event can sit anywhere in history and never causes a divergence.
 - A handler runs on its own context. It cannot read a body local variable.
 - A resident resume declines when its delta holds `UpdateAdmitted`. A cycle
-  with a `RecordUpdateResult` never stays resident.
+  with a `RecordUpdateResult` never stays resident. A cycle that defers an
+  update never stays resident either.
 - The replay gates share `drive_cycle` with the worker.
 - The determinism guide says an update that the engine has not run when the
   run ends is orphaned. The caller gets `409 update_orphaned`.
@@ -74,6 +75,7 @@ persists `RecordUpdateResult` as `UpdateCompleted` or `UpdateFailed`.
 | R9 | An unknown update name loops. | The dispatch records the "not found" failure once. |
 | R10 | `continue_as_new` reorders the batch. | The dispatch adds results after the cycle outcome. A test covers it. |
 | R11 | A warm resume skips an update. | The resident path declines on `UpdateAdmitted`. |
+| R17 | A re-drive defers an update and runs none, so its batch has no `RecordUpdateResult`. It stays resident on an activity wait, and a redundant wake resumes it warm. The warm cycle skips the dispatch. | A cycle that defers an update is not kept resident. The next cycle replays cold and runs the rest. A wait on a lone signal hid this case, because a redundant wake on it is declined. |
 | R12 | The cycle is discarded after the handler ran. | Not preventable. Section 2 lists the paths. |
 | R13 | Many slow handlers exceed the task budget. The run gets poison-pill strikes and fails. | The dispatch window stops the batch. The worker wakes the task for the rest. Unit tests and a worker test cover it. |
 | R14 | The window never lets a handler start, and the wake repeats forever. | The first update of a decision always runs. Each woken decision resolves at least one update. |
