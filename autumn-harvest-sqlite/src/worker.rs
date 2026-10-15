@@ -1342,7 +1342,7 @@ fn local_timeout_error(run: &LocalRun, budget: std::time::Duration) -> String {
 /// The timer is Tokio's. The drive may run on another runtime, or on a Tokio
 /// runtime with no timer. The body then runs to its end, and the caller
 /// checks the budget after it returns.
-async fn within_budget<F>(body: F, budget: std::time::Duration) -> Option<F::Output>
+pub async fn within_budget<F>(body: F, budget: std::time::Duration) -> Option<F::Output>
 where
     F: std::future::Future,
 {

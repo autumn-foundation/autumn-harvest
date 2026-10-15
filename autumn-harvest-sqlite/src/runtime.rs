@@ -1306,6 +1306,13 @@ impl SqliteRuntime {
         Ok(())
     }
 
+    /// Seal `exec` if it is overdue at `now`, then refuse it unless it is
+    /// still running (issue #2029).
+    fn refuse_past_deadline(&mut self, exec: ExecutionId, now: i64) -> SqliteResult<()> {
+        self.seal_if_overdue_at(exec, now)?;
+        refuse_unless_running(&self.conn, exec)
+    }
+
     /// Seal the run that `(workflow_name, workflow_id)` names, if it is
     /// overdue. A key with no run is left to the caller.
     fn seal_key_if_overdue(&mut self, workflow_name: &str, workflow_id: &str) -> SqliteResult<()> {
@@ -1492,6 +1499,9 @@ impl SqliteRuntime {
         };
 
         let now = (self.now_fn)();
+        // Issue #2029: the handler can end past the deadline. The update then
+        // does not commit, and the run ends `TIMED_OUT`.
+        self.refuse_past_deadline(exec, now.timestamp_millis())?;
         let admitted = WorkflowEvent::UpdateAdmitted {
             update_id,
             name: name.to_string(),
@@ -2694,7 +2704,8 @@ impl SqliteRuntime {
             }
         };
         let settle_after_first_terminal = worker::activity_race_in_flight(history, commands);
-        let drained = worker::drain_ready(
+        let deadline = store::run_config(&self.conn, exec)?.deadline_at;
+        let drain = worker::drain_ready(
             &mut self.conn,
             exec,
             owner,
@@ -2702,8 +2713,22 @@ impl SqliteRuntime {
             failure_now,
             &self.activities,
             settle_after_first_terminal,
-        )
-        .await?;
+        );
+        // Issue #2029: the workflow deadline bounds the drain. A body past it
+        // is dropped, as a dropped drive drops it (issue #2024). The seal then
+        // removes its `RUNNING` task.
+        let drained = match deadline {
+            Some(at) => {
+                let left = at.saturating_sub(failure_now()).unsigned_abs();
+                let finished =
+                    worker::within_budget(drain, std::time::Duration::from_millis(left)).await;
+                match finished {
+                    Some(drained) => drained?,
+                    None => return self.seal_timed_out(exec, at, failure_now().max(at)),
+                }
+            }
+            None => drain.await?,
+        };
         if applied || drained {
             return Ok(RunState::InProgress);
         }

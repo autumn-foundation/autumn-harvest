@@ -37,7 +37,8 @@ its history replays on the core `WorkflowReplayer`.
   Postgres (issue #950). This backend also rejects a second local activity
   in one batch. A typed `retry_after` hint wins over the policy backoff.
 - **Execution timeout (#243).** A start stores `execution_timeout_ms` and
-  `deadline_at`. Each cycle checks the deadline first, and again after the body runs. A late run gets
+  `deadline_at`. Each cycle checks the deadline first, and again after the body runs.
+  The deadline also bounds the activity drain and an update. A late run gets
   `WorkflowExecutionTimedOut`, ends `TIMED_OUT` with the Postgres error text,
   and loses its open rows and locks. The drive returns the new
   `RunState::TimedOut(error)`. `ctx.deadline()` reports the same deadline,

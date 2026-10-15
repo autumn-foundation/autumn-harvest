@@ -497,3 +497,88 @@ async fn the_deadline_bounds_a_local_activity_attempt() {
     );
     assert_replays(info.name, info.handler, history).await;
 }
+
+/// A regular activity that never returns and signals nothing.
+#[activity]
+async fn hangs_quietly(_ctx: &ActivityContext, _n: i64) -> Result<i64, String> {
+    std::future::pending::<()>().await;
+    Ok(0)
+}
+
+/// Awaits a regular activity that never returns, under a one-second timeout.
+#[workflow(execution_timeout = "1s")]
+async fn awaits_a_hung_remote(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    ctx.execute_activity(&hangs_quietly_info(), n)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// The workflow deadline bounds the activity drain too. A hung activity does
+// not hold the drive past it.
+#[tokio::test]
+async fn the_deadline_bounds_a_regular_activity() {
+    let info = awaits_a_hung_remote_info();
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&info);
+    rt.register_activity(&hangs_quietly_info());
+    let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+
+    let state = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        rt.run_until_blocked(exec),
+    )
+    .await
+    .expect("the deadline must stop the drain")
+    .unwrap();
+    assert!(matches!(state, RunState::TimedOut(_)), "got {state:?}");
+    assert_replays(info.name, info.handler, rt.load_history(exec).unwrap()).await;
+}
+
+/// The clock of `slow_update`. The handler moves it, as a long compute would.
+static UPDATE_CLOCK: AtomicI64 = AtomicI64::new(4_000_000);
+
+/// Waits for a signal under a 30-second timeout. `slow_update` serves it.
+#[workflow(execution_timeout = "30s")]
+async fn late_updatable(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let _: serde_json::Value = ctx
+        .wait_for_signal("never")
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(0)
+}
+
+/// Spends 40 clock seconds, then returns.
+#[update(workflow = "late_updatable")]
+async fn slow_update(_ctx: &WorkflowContext, name: String) -> Result<String, String> {
+    UPDATE_CLOCK.fetch_add(40, Ordering::SeqCst);
+    Ok(name)
+}
+
+// An update that ends past the deadline does not commit. The run ends
+// `TIMED_OUT`, and the caller gets `WorkflowNotRunning`.
+#[tokio::test]
+async fn an_update_that_ends_past_the_deadline_is_refused() {
+    let info = late_updatable_info();
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&info);
+    rt.register_update(&slow_update_info());
+    rt.set_clock(|| {
+        Utc.timestamp_opt(UPDATE_CLOCK.load(Ordering::SeqCst), 0)
+            .unwrap()
+    });
+    let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+
+    assert!(matches!(
+        rt.update(exec, "slow_update", json!("a")).await,
+        Err(SqliteError::WorkflowNotRunning { ref state, .. }) if state == "TIMED_OUT"
+    ));
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::UpdateAdmitted { .. })),
+        "a late update must not commit"
+    );
+    assert_replays(info.name, info.handler, history).await;
+}
