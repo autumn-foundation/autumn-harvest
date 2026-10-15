@@ -25700,6 +25700,9 @@ async fn process_workflow_task(
         }
     });
     let mut warm_resident = warm_residency.into_workflow();
+    // Issue #2035: set after the first drive of this decision. Only that drive
+    // may run an update past the dispatch window.
+    let mut drove_before = false;
     // The resident state of the final cycle, kept for the next decision.
     let mut final_resident: crate::resident::Residency;
     // A module-hosted workflow binds its module around one drive only, so
@@ -25835,6 +25838,7 @@ async fn process_workflow_task(
             registry.payload_codecs(),
         )
         .await?;
+        let run_first = !std::mem::replace(&mut drove_before, true);
         let workflow_drive = async {
             if let Some(resident) = warm_resident.take() {
                 match resident
@@ -25883,7 +25887,14 @@ async fn process_workflow_task(
                 // consumed by the LOCAL activity path in `execute_local_activity_with_opts`.
                 registry.default_activity_retry_policy(),
                 registry.default_activity_start_to_close(),
-            );
+            )
+            // Issue #2035: a live decision runs the admitted updates. A replay
+            // gate does not, so it never runs a handler. The cut-off keeps the
+            // dispatch inside the workflow-task budget.
+            .with_update_dispatch(crate::update::UpdateDispatch {
+                cutoff: workflow_task_deadline,
+                run_first,
+            });
             crate::executor::drive_workflow_keep(
                 ctx,
                 workflow.handler,
@@ -25920,7 +25931,16 @@ async fn process_workflow_task(
             span: execute_span,
             router: resolved_router,
             resident: iter_resident,
+            updates_deferred,
         } = drive;
+        // Issue #2035: the dispatch window closed with updates left. This
+        // claimed row only records the wake. The park that ends the cycle then
+        // re-pends the task, and the next cycle runs the rest. A failed wake
+        // fails the cycle, so the retry runs the rest. A parked task with no
+        // wake would leave those updates waiting.
+        if updates_deferred {
+            queue::wake_workflow_task(conn, prepared.exec_id).await?;
+        }
         // Issue #2007: one sample per decision, after its first drive.
         if let Some(outcome) = resident_outcome.take() {
             telemetry.metrics.record_workflow_resident(
