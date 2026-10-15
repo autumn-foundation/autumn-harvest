@@ -126,9 +126,9 @@ impl UpdateRegistry {
 /// keeps the results in its commands. A terminal cycle keeps them in
 /// `pending`, and the worker records them before the final event.
 ///
-/// A cycle whose commands the worker discards runs no handler. A repeat of
-/// that cycle would run the handler again. Those cycles are a divergence, a
-/// panic and a deadlock.
+/// A cycle whose commands the worker discards runs no handler. A dispatch in
+/// such a cycle loses its result, and the repeat of the cycle runs the handler
+/// again. Those cycles are a divergence, a panic and a deadlock.
 ///
 /// The cycle runs under the workflow-task budget. The dispatch therefore
 /// starts a handler only while a full [`UPDATE_HANDLER_TIMEOUT`] is left in
@@ -158,7 +158,7 @@ pub(crate) async fn dispatch_pending_updates(
     };
     // The body can run an update with `execute_admitted_update`. The batch
     // then holds its result, and the handler must not run twice.
-    let recorded: HashSet<UpdateId> = commands
+    let mut recorded: HashSet<UpdateId> = commands
         .iter()
         .filter_map(|command| match command {
             WorkflowCommand::RecordUpdateResult { update_id, .. } => Some(*update_id),
@@ -168,7 +168,7 @@ pub(crate) async fn dispatch_pending_updates(
     let window = window_end(ctx.update_cutoff());
     let mut started = false;
     for (update_id, name, input) in ctx.pending_updates() {
-        if recorded.contains(&update_id) {
+        if !recorded.insert(update_id) {
             continue;
         }
         if started && !window_allows(window) {
@@ -204,8 +204,9 @@ fn window_allows(end: Option<tokio::time::Instant>) -> bool {
 async fn run_bounded(ctx: &WorkflowContext, name: &str, input: Value) -> Result<Value, String> {
     use futures::FutureExt as _;
 
-    // The wrapped future builds the handler future on its first poll. A panic
-    // in the build is therefore caught with a panic in the poll.
+    // The wrapped future builds the handler future on its first poll. One
+    // `catch_unwind` call therefore covers a panic in the build and a panic in
+    // the poll.
     let run = std::panic::AssertUnwindSafe(ctx.run_update_handler(name, input)).catch_unwind();
     match tokio::time::timeout(UPDATE_HANDLER_TIMEOUT, run).await {
         Ok(Ok(result)) => result,
@@ -895,6 +896,28 @@ mod tests {
 
         assert_eq!(results(&drive.outcome, &drive.pending).len(), 3);
         assert!(!drive.updates_deferred);
+    }
+
+    static REPEAT_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_repeat(_ctx: Arc<WorkflowContext>, input: Value) -> UpdateHandlerFuture {
+        REPEAT_RUNS.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(input) })
+    }
+
+    #[tokio::test]
+    async fn an_update_id_that_history_repeats_runs_once() {
+        let id = UpdateId::new();
+        let handler = info("count", count_repeat);
+        let history = vec![
+            started(),
+            admitted(id, "count", json!(1)),
+            admitted(id, "count", json!(1)),
+        ];
+        let (outcome, pending) = drive(context(history, &[&handler], true), parked).await;
+
+        assert_eq!(results(&outcome, &pending), vec![(id, Ok(json!(1)))]);
+        assert_eq!(REPEAT_RUNS.load(Ordering::SeqCst), 1);
     }
 
     static WINDOW_RUNS: AtomicUsize = AtomicUsize::new(0);

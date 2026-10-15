@@ -25928,15 +25928,11 @@ async fn process_workflow_task(
         } = drive;
         // Issue #2035: the dispatch window closed with updates left. This
         // claimed row only records the wake. The park that ends the cycle then
-        // re-pends the task, and the next cycle runs the rest.
-        if updates_deferred
-            && let Err(error) = queue::wake_workflow_task(conn, prepared.exec_id).await
-        {
-            tracing::warn!(
-                exec_id = %prepared.exec_id,
-                %error,
-                "could not wake the task for deferred updates"
-            );
+        // re-pends the task, and the next cycle runs the rest. A failed wake
+        // fails the cycle, so the retry runs the rest. A parked task with no
+        // wake would leave those updates waiting.
+        if updates_deferred {
+            queue::wake_workflow_task(conn, prepared.exec_id).await?;
         }
         // Issue #2007: one sample per decision, after its first drive.
         if let Some(outcome) = resident_outcome.take() {

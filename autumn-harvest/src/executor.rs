@@ -2427,10 +2427,17 @@ async fn drive_cycle(
     let keep = keep.filter(|_| matches!(cycle_result, HandlerCycleResult::Suspended));
     let future = keep.is_some().then_some(future);
     let (mut outcome, mut pending) = span_handle.in_scope(|| classify_cycle(&ctx, cycle_result));
-    let updates_deferred =
+    // A warm cycle replays nothing. The resident path declines a delta that
+    // holds `UpdateAdmitted`, so a warm cycle has no pending update. Skipping
+    // it also saves a history scan on each warm decision.
+    let warm = replay == Some(false);
+    let updates_deferred = if warm {
+        false
+    } else {
         crate::update::dispatch_pending_updates(&ctx, &mut outcome, &mut pending)
             .instrument(span_handle.clone())
-            .await;
+            .await
+    };
     let resident = match (future, keep) {
         (Some(future), Some(key)) => {
             match crate::resident::ResidentWorkflow::capture(&ctx, future, &mut outcome, key) {
