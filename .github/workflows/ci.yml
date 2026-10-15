@@ -451,6 +451,15 @@ jobs:
       - name: Run the agent-code journal report guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration agent_code_journal_docs::"
 
+      # Issue #2015: the OTel workflow conventions draft lives under `docs/`,
+      # so a docs-only change skips the `test` matrix. These guards run here.
+      # They check the draft against ADR 0001 and the Weaver model shape.
+      #
+      # Guarded by `otel_workflow_semconv_docs::guards_run_on_docs_only_changes`.
+      # Quoted for the trailing-`::` YAML reason above.
+      - name: Run the OTel workflow conventions proposal guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration otel_workflow_semconv_docs::"
+
       # Folio corpus harness: internal link check across all of docs/ (see
       # docs/audits/corpus-link-check.py). Same reasoning as the docs-only
       # guards above — a broken link is exactly the change class a docs-only
