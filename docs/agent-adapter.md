@@ -114,7 +114,13 @@ no harness fails the call as `AgentHarnessMissing`, which is not retryable.
 
 A worker with a payload cap other than the default must say so. Set
 `AgentTask::max_request_bytes` to its activity-input cap, and
-`AgentHarness::max_result_bytes` to its activity-result cap.
+`AgentHarness::max_result_bytes` to its activity-result cap. A cap of zero
+means no cap, as in the engine.
+
+A worker with a payload store offloads an input or a result over the store
+threshold. The engine then skips its cap for that value. The adapter does not
+see the store, so it still applies its own caps. Set both caps to zero for such
+a worker. Otherwise the adapter ends a run that the store could carry.
 
 ## 4. Build the harness
 
@@ -131,7 +137,9 @@ A worker with a payload cap other than the default must say so. Set
 - `tool_output_limit(chars)` — the cap on one tool result. The default is
   8 000 characters.
 - `max_result_bytes(bytes)` — the activity-result cap of the workers. A
-  larger tool result is cut to fit it. The default is the engine default.
+  larger tool result is cut to fit it. A model reply that does not fit ends
+  the run as `reply_too_large`. The default is the engine default. Zero is
+  no cap.
 - `model_timeout(d)` — the time budget of one model call. The default is
   13 minutes. With the policy, cache and ledger budgets, it stays below the
   15-minute `start_to_close`. A call over it is a
@@ -185,7 +193,8 @@ ledger row.
 `AgentTask` sets the run. Its bounds are `max_steps` (default 8, per
 segment), `max_total_tokens` (per run), `max_output_tokens`,
 `approval_timeout` (default one hour, rounded up to whole seconds) and
-`max_request_bytes` (default: the engine default). Its content is `input`,
+`max_request_bytes` (the default is the engine default; zero is no cap). Its
+content is `input`,
 `system`, `history` and `session`. `tenant` scopes the response cache.
 Section 10 explains the always-on settings: `deliver`, `memory`,
 `followups`, `loop_guard`, `read_only`, `unattended` and
@@ -253,14 +262,16 @@ A bound is a normal end, not an error. `AgentReport.stop` names it:
 | `output_capped` | The last turn hit the output cap. Its tool calls do not run. |
 | `steps_exhausted` | The model asked for tools after `max_steps` rounds. |
 | `tokens_exhausted` | The run spent more than `max_total_tokens`, follow-ups included. |
-| `transcript_full` | The next request, or the results of one round, could not fit the request cap. The request was not sent. |
+| `transcript_full` | The next request would exceed the request cap. The request is not sent. |
+| `reply_too_large` | The model reply exceeds the result cap, even with its decision reasons cut. The activity drops the reply. |
 | `budget_exceeded` | A run or tenant LLM budget refused the next model call. The call was not sent. See [LLM budgets](#llm-budgets-issue-1997). |
 | `loop_detected` | The loop guard saw the same call, with the same result, too many times. |
 
 A turn that ends the run before its tool calls run is left out of
-`AgentReport.messages`. Its text is not the answer either. A round whose
-results pass the request cap stays in the transcript: each call that did not
-fit gets an error result, so the transcript shows what ran.
+`AgentReport.messages`. Its text is not the answer either. A round that ends
+the run as `transcript_full` stays in the transcript. Each call that did not
+run, or whose result did not fit, gets an error result, so the transcript
+shows what ran. The text of that turn is not the answer either.
 
 A `transcript_full` transcript is too large for one request. Do not pass it
 whole as the `history` of a new run. Summarise it, or keep its last turns.
@@ -274,6 +285,47 @@ reads.
 
 The run fails when a model call fails for good: a non-retryable kind, for
 example a rejected API key, or four failed attempts.
+
+### Payload caps (issue #2040)
+
+A tool round measures the whole next request before it runs a call. The
+request holds the transcript, the assistant turn and an answer for each call.
+The round reserves a placeholder answer for each call. It replaces the
+placeholder with the real result.
+
+- When the placeholders exceed the request cap, no call runs. No result can
+  reach the model, so no call with a side effect runs. The run ends as
+  `transcript_full`.
+- The round drops a result that exceeds the cap. The call ran. The calls
+  after it do not run. The run ends as `transcript_full`.
+
+The measure covers the result text and the flow state that this turn can
+add. A delegation adds the labels and usage of its child, which the round
+cannot know in advance. The loop measures the next request again before it
+sends it. It ends the run as `transcript_full` if that request exceeds the
+cap.
+
+A task recorded before this rule measures the results alone, so a run in
+flight replays as it ran. Such a task also reads a zero request cap as a limit
+of zero bytes, as it did. `AgentTask::new` and `HeartbeatTask::new` turn the
+new rule on. A recorded tick keeps the flag in `HeartbeatTask`.
+
+The model-turn activity fits its reply to the result cap:
+
+1. It cuts each decision reason to 256 bytes. It does this only when the
+   turn exceeds the cap.
+2. When the reply still exceeds the cap, the activity returns a turn with
+   `oversized` set and no content. The run ends as `reply_too_large`. The
+   activity logs a warning with the sizes.
+
+The report keeps the usage of the paid call. The reply is not in
+`AgentReport.messages`. A result cap of 256 bytes or more always holds the
+`oversized` turn. A smaller cap can still fail the activity with
+`PayloadTooLarge`.
+
+A cap of zero is no cap, as in the engine. This holds for
+`AgentTask::max_request_bytes` and `AgentHarness::max_result_bytes`, in every
+check above.
 
 ### LLM budgets (issue #1997)
 
@@ -423,9 +475,10 @@ A tick is one short workflow:
    `HEARTBEAT_OK` with no other letter or digit.
 
 A tick never books a follow-up. `HeartbeatTask` takes its own budget:
-`max_steps`, `max_total_tokens`, `max_output_tokens` and
-`approval_timeout`. The approval wait defaults to 15 minutes, because the
-schedule starts no new tick while one runs.
+`max_steps`, `max_total_tokens`, `max_output_tokens`, `max_request_bytes`
+and `approval_timeout`. Set `max_request_bytes` to the activity-input cap
+of the workers, as for `AgentTask`. The approval wait defaults to 15
+minutes, because the schedule starts no new tick while one runs.
 
 On Postgres, register the schedule that `heartbeat::schedule` builds:
 
@@ -465,6 +518,8 @@ a fixed user message that the app controls, which tells the model to act on
 that call.
 
 - The workflow refuses a second follow-up in one segment.
+- The prompt is at most 2 000 characters. The count includes white space,
+  because the transcript keeps the prompt as the model wrote it.
 - The delay is at most the `max_delay` of `Followups::new`. The shortest
   delay is one minute.
 - A chain cap (`Followups::max_chain`, 10 by default) stops an agent that
@@ -486,7 +541,12 @@ the harness. The default `LogDelivery` logs the run id and the size of the
 text, never the text itself.
 
 - A `completed` answer goes out, unless it is empty or a silent heartbeat
-  acknowledgement.
+  acknowledgement. Only the text of the last turn counts. A segment that
+  ends on an empty turn sends nothing, even when an earlier turn wrote
+  text beside a tool call. An empty `output_capped` turn sends only the
+  stop notice. A run recorded before this rule replays as it ran. The
+  workflow records the `agent_final_turn_rules` patch marker to tell them
+  apart. The follow-up length rule uses the same marker.
 - A segment that a bound ended early sends a notice, for example
   `The agent stopped early: loop_detected.`. An unattended run therefore
   does not fail in silence.
@@ -520,9 +580,12 @@ entries are its own notes, not instructions from the user.
 
 Each edit carries an `EditKey`: the run, the step and the call. A store
 applies each key once, so a call that runs again after a crash changes
-nothing, even when another run edited the scope in between. A durable store
-must save the key with the edit, in one transaction. An `add` of an entry
-that already exists changes nothing either.
+nothing, even when another run edited the scope in between. A store keeps
+the first result of a key, an error included, and returns it on a retry. A
+failed `remove` therefore cannot remove a newer entry after a crash. A
+durable store must save the key and its result with the edit, in one
+transaction. An `add` of an entry that already exists changes nothing
+either.
 
 ### Loop guard
 
@@ -615,9 +678,10 @@ one map between workers:
 miss with a warning. An out-of-date entry is a quiet miss. The cache never
 fails a turn. Each cache call, the tenant read included, has the
 `cache_timeout` budget: 5 seconds by default. One turn makes at most three
-cache calls. A turn over `AgentHarness::max_result_bytes` fails, so the
-cache neither stores nor serves one. A hit over the cap is a miss, and the
-harness asks the model. A codec error is logged with fixed text,
+cache calls. The cache neither stores nor serves a turn over
+`AgentHarness::max_result_bytes`, because a cached turn over the cap would end
+every identical run as `reply_too_large`. A hit over the cap is a miss, and
+the harness asks the model. A codec error is logged with fixed text,
 because a custom codec can quote the answer.
 
 **Limits.**
@@ -675,8 +739,8 @@ candidate at the same activity.
 The policy runs live, so use a policy with no side effects. It sees the
 recorded run id and the aligned call ids. A retryable model failure retries
 under the retry policy of `agent_model_turn`, as on a worker. A turn over the
-harness result cap (`AgentHarness::max_result_bytes`) fails, as on a worker
-with no payload store.
+harness result cap (`AgentHarness::max_result_bytes`) is cut or dropped, as on
+a worker with no payload store. A dropped reply reads as a `stop` divergence.
 
 A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn

@@ -169,6 +169,11 @@ Two attribution details:
   layer first, then applies the walk below. So a decoded column shows the
   same value with the switch off or on, and the same value as a row written
   before issue #1979.
+- The walk runs twice on a column: once for the column layer, once for the
+  value inside. A business value that is itself an envelope therefore decodes
+  on an admin read (issue #2054). The strict engine read returns it as
+  written. The difference is intended. A row from before issue #1979 has no
+  column layer, and its nested envelopes must still decode.
 - Because the walk is envelope-driven, business data stored as plaintext that
   happens to be byte-for-byte a codec envelope — at any nesting depth — is
   transformed on the decoded view: decoded when its `codec_id` is registered,

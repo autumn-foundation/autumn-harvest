@@ -120,8 +120,32 @@ pub const ERROR_TYPE_WORKFLOW_TASK_TIMED_OUT: &str = "WorkflowTaskTimedOut";
 /// import naming them is unsatisfied). Instantiation fails deterministically,
 /// so the outcome is **non-retryable**: a denied capability cannot succeed on a
 /// later attempt without a policy change.
-#[cfg(feature = "wasm-activities")]
+///
+/// A sandboxed code activity uses the same type for a request that breaks its
+/// policy, and for a worker configuration that is not valid. See the
+/// `sandbox` module.
+#[cfg(any(feature = "wasm-activities", feature = "sandbox-activities"))]
 pub const ERROR_TYPE_SANDBOX_DENIED: &str = "SandboxDenied";
+
+/// Stable error-type name for a sandbox backend that could not run the code.
+///
+/// The backend could not start, boot or reach the sandbox. **Retryable**:
+/// another attempt, or another worker, can succeed.
+#[cfg(feature = "sandbox-activities")]
+pub const ERROR_TYPE_SANDBOX_UNAVAILABLE: &str = "SandboxUnavailable";
+
+/// Stable error-type name for a sandbox guest that broke the wire protocol.
+///
+/// **Non-retryable**: the guest runs untrusted code, so a retry could repeat
+/// an attack on the host parser.
+#[cfg(feature = "sandbox-activities")]
+pub const ERROR_TYPE_SANDBOX_PROTOCOL_VIOLATION: &str = "SandboxProtocolViolation";
+
+/// Stable error-type name for a sandbox run that its activity cancelled.
+///
+/// **Retryable**: the worker cancellation path decides what happens next.
+#[cfg(feature = "sandbox-activities")]
+pub const ERROR_TYPE_SANDBOX_CANCELLED: &str = "SandboxCancelled";
 
 /// Stable error-type name for a WASM activity that exhausted a resource budget
 /// (issue #965).
@@ -389,7 +413,7 @@ impl ActivityFailure {
     /// is non-retryable: a denied capability cannot be granted by a retry, so
     /// the in-flight attempt terminates immediately and the workflow's own
     /// failure/compensation path takes over.
-    #[cfg(feature = "wasm-activities")]
+    #[cfg(any(feature = "wasm-activities", feature = "sandbox-activities"))]
     #[must_use]
     pub fn sandbox_denied(detail: impl Into<String>) -> Self {
         Self::non_retryable(ERROR_TYPE_SANDBOX_DENIED, detail)

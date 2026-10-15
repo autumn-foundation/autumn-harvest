@@ -137,6 +137,7 @@ mod debugger_tests;
 mod decision_boundary_db_tests;
 #[cfg(feature = "testing")]
 mod decision_boundary_replay_tests;
+mod declarative_update_tests;
 #[cfg(feature = "db")]
 mod deep_backlog_fixture_tests;
 #[cfg(feature = "db")]
@@ -301,6 +302,7 @@ mod retry_clock_skew_tests;
 mod retry_now_tests;
 mod safety_report_docs;
 mod saga_tests;
+mod sandbox_activities_docs;
 mod scanner_lease_tests;
 mod scanner_liveness_tests;
 mod scanner_tick_db_tests;
@@ -351,6 +353,8 @@ mod standalone_activity_docs;
 #[cfg(feature = "db")]
 mod standalone_activity_overhead_perf;
 mod standalone_activity_support;
+#[cfg(feature = "db")]
+mod start_duplicate_codec_failure_tests;
 #[cfg(feature = "db")]
 mod start_idempotency_tests;
 #[cfg(feature = "db")]

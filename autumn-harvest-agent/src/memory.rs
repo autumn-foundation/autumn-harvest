@@ -12,7 +12,7 @@
 //! A tool call that was in flight at a crash runs again. Each edit therefore
 //! carries an [`EditKey`], and a store applies a key once.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -293,8 +293,8 @@ fn escape(text: &str) -> String {
 
 /// The key of one memory edit: the run, the step and the tool call.
 ///
-/// A store applies each key once. A retried call then changes nothing, even
-/// when another run edited the scope in between.
+/// A store applies each key once, and keeps a failure as well. A retried call
+/// then changes nothing, even when another run edited the scope in between.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EditKey(String);
@@ -339,8 +339,12 @@ pub trait MemoryStore: Send + Sync + std::fmt::Debug {
     /// Apply one edit and store it. Returns the block after the edit.
     ///
     /// Call [`apply_op`] so the rules are the same in every store. Store
-    /// `key` with the edit, in the same transaction. When `key` is stored
-    /// already, change nothing and return the block as it is.
+    /// `key` with the first result, an [`apply_op`] error included, in the
+    /// same transaction. When `key` is stored already, change nothing. Return
+    /// the stored error, or the block as it is.
+    ///
+    /// A failed edit keeps its key. A retry then cannot succeed after
+    /// another run adds the entry that the first call missed.
     ///
     /// # Errors
     ///
@@ -367,7 +371,7 @@ pub struct InMemoryMemoryStore {
 #[derive(Default)]
 struct State {
     scopes: HashMap<MemoryScope, Vec<MemoryBlock>>,
-    applied: HashSet<(MemoryScope, EditKey)>,
+    applied: HashMap<(MemoryScope, EditKey), Option<AgentError>>,
 }
 
 impl std::fmt::Debug for InMemoryMemoryStore {
@@ -430,14 +434,14 @@ impl MemoryStore for InMemoryMemoryStore {
             .entry(scope.clone())
             .or_insert_with(|| self.template.clone());
         let done = (scope.clone(), key.clone());
-        let result = if applied.contains(&done) {
-            current(blocks, &op)
-        } else {
-            let result = apply_to(blocks, &op);
-            if result.is_ok() {
-                applied.insert(done);
+        let result = match applied.get(&done) {
+            Some(Some(error)) => Err(error.clone()),
+            Some(None) => current(blocks, &op),
+            None => {
+                let result = apply_to(blocks, &op);
+                applied.insert(done, result.as_ref().err().cloned());
+                result
             }
-            result
         };
         drop(state);
         Box::pin(std::future::ready(result))
@@ -721,6 +725,28 @@ mod tests {
             .unwrap();
         // The retry of the first remove must not delete the newer entry.
         store.apply(&scope, remove, &first).await.unwrap();
+        let blocks = store.load(&scope).await.unwrap();
+        assert_eq!(blocks[0].entries, vec!["tea".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_retried_failed_edit_returns_its_first_error() {
+        let store = InMemoryMemoryStore::new();
+        let scope = MemoryScope::new("u");
+        let remove = MemoryOp::Remove {
+            block: "memory".into(),
+            old: "tea".into(),
+        };
+        let key = EditKey::new("run:0:a");
+        // No entry matches, so the first call fails.
+        let first = store.apply(&scope, remove.clone(), &key).await.unwrap_err();
+        // Another run adds a matching entry before the retry arrives.
+        store
+            .apply(&scope, add("tea"), &EditKey::new("other:0:b"))
+            .await
+            .unwrap();
+        let retry = store.apply(&scope, remove, &key).await.unwrap_err();
+        assert_eq!(retry, first);
         let blocks = store.load(&scope).await.unwrap();
         assert_eq!(blocks[0].entries, vec!["tea".to_owned()]);
     }
