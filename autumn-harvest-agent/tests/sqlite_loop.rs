@@ -771,6 +771,121 @@ async fn a_huge_decision_reason_is_cut_and_the_run_goes_on() {
     assert!(results[0].len() < 1_024, "{}", results[0].len());
 }
 
+/// A read-only tool with a long flow label. A harness with flow rules
+/// records the label with the call, and the label joins the next request.
+fn labelled_tool(label: &str, runs: &Arc<AtomicUsize>) -> Arc<dyn autumn_harvest_agent::Tool> {
+    let runs = Arc::clone(runs);
+    autumn_harvest_agent::FnTool::new(
+        "read",
+        "Reads a record.",
+        json!({"type": "object"}),
+        move |_input| {
+            let runs = Arc::clone(&runs);
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("ok"))
+            }
+        },
+    )
+    .effect(ToolEffect::ReadOnly)
+    .label(label)
+    .shared()
+}
+
+/// A tool that runs adds its labels to the next request. The round must
+/// measure that request with the labels (issue #2040).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_labels_a_call_adds_count_toward_the_next_request() {
+    let (_dir, db) = fresh_db();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let model = ScriptedModel::new(vec![
+        calls(&[("r1", "read", json!({}))], 1),
+        answer("unreachable", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(labelled_tool(&"L".repeat(3_000), &runs))
+        .flow_rules(
+            autumn_harvest_agent::FlowRules::new().forbid(["a", "b"], Rule::Deny("no".into())),
+        );
+    let mut rt = runtime(&db, harness);
+
+    let task = AgentTask::new("go").max_request_bytes(2_048);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::TranscriptFull);
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        0,
+        "the label makes the next request too large, so the call must not run"
+    );
+}
+
+/// A task recorded before the whole-request budget measures the results
+/// alone. A run in flight must replay as it ran, so the call runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_from_before_the_whole_request_budget_still_runs_its_calls() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"data": "x".repeat(4_096)}))], 1),
+        answer("unreachable", 1),
+    ]);
+    let harness =
+        AgentHarness::new(model.clone()).tool(recorded_tool("write", ToolEffect::Write, &recorder));
+    let mut rt = runtime(&db, harness);
+
+    let old: AgentTask = serde_json::from_value(json!({
+        "input": "go",
+        "max_steps": 8,
+        "approval_timeout_secs": 60,
+        "max_request_bytes": 2_048,
+    }))
+    .unwrap();
+    let exec = sqlite::start(&mut rt, &old).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::TranscriptFull);
+    assert_eq!(recorder.runs().len(), 1, "the old rule ran the call");
+}
+
+/// A round that runs no call must not make the model's narration the answer.
+/// The text claims work that never ran.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_round_does_not_make_its_narration_the_answer() {
+    use autumn_harvest_agent::{ChatResponse, ContentPart, StopReason, TokenUsage};
+
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let narrated = Ok(ChatResponse {
+        content: vec![
+            ContentPart::Text("Done. I wiped the table.".to_owned()),
+            ContentPart::ToolCall {
+                id: "w1".to_owned(),
+                name: "write".to_owned(),
+                arguments: json!({"data": "x".repeat(4_096)}),
+            },
+        ],
+        stop_reason: StopReason::ToolUse,
+        usage: TokenUsage::new(1, 0),
+    });
+    let model = ScriptedModel::new(vec![narrated, answer("unreachable", 1)]);
+    let harness =
+        AgentHarness::new(model.clone()).tool(recorded_tool("write", ToolEffect::Write, &recorder));
+    let mut rt = runtime(&db, harness);
+
+    let task = AgentTask::new("go").max_request_bytes(2_048);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::TranscriptFull);
+    assert!(recorder.runs().is_empty());
+    assert_eq!(
+        report.text, "",
+        "no call ran, so the narration is no answer"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_system_message_in_the_history_never_reaches_the_model() {
     let (_dir, db) = fresh_db();

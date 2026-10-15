@@ -99,6 +99,12 @@ pub struct AgentTask {
     /// started before the change replays as it ran.
     #[serde(default)]
     pub run_id_source: RunIdSource,
+    /// Measure a tool round against the whole next request (issue #2040).
+    /// [`AgentTask::new`] turns it on. A recorded task with no field measures
+    /// the results alone, as the first version did, so a run started before
+    /// the change replays as it ran.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub whole_request_budget: bool,
     /// The tenant that scopes the response cache.
     ///
     /// On Postgres, the verified tenant of the run wins over this field. Set
@@ -154,6 +160,7 @@ impl AgentTask {
             unattended: false,
             unattended_memory_writes: false,
             run_id_source: RunIdSource::ExecutionId,
+            whole_request_budget: true,
             tenant: None,
             mandate: None,
             flow_labels: BTreeSet::new(),
@@ -856,6 +863,17 @@ mod tests {
         let task: AgentTask = serde_json::from_value(old).unwrap();
         assert_eq!(task.loop_guard, LoopGuard::disabled());
         assert_eq!(AgentTask::new("go").loop_guard, LoopGuard::default());
+    }
+
+    #[test]
+    fn a_task_from_before_the_whole_request_budget_measures_results_only() {
+        let old = json!({"input": "go", "max_steps": 8, "approval_timeout_secs": 60});
+        let task: AgentTask = serde_json::from_value(old).unwrap();
+        assert!(!task.whole_request_budget);
+        // A task that leaves the flag off encodes as it was recorded.
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert!(encoded.get("whole_request_budget").is_none());
+        assert!(AgentTask::new("go").whole_request_budget);
     }
 
     #[test]

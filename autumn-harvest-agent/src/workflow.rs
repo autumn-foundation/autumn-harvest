@@ -704,6 +704,11 @@ async fn run_round(
     })
 }
 
+/// SKELETON: it returns the answer of a call that did not run.
+fn placeholder() -> String {
+    ToolOutcome::error(NOT_RUN_FULL).content
+}
+
 /// The answer to a call whose result would pass the request cap.
 const DROPPED_FULL: &str =
     "the call ran, but its result was dropped: the next request would pass the request cap";
@@ -937,6 +942,7 @@ async fn delegate(
         unattended: task.unattended,
         unattended_memory_writes: false,
         run_id_source: task.run_id_source,
+        whole_request_budget: task.whole_request_budget,
         tenant: task.tenant.clone(),
         mandate: Some(mandate),
         // The tree holds the labels, so the child task carries none.
@@ -1265,6 +1271,17 @@ pub fn activities() -> Vec<ActivityInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_placeholder_is_as_long_as_every_fixed_answer() {
+        // The round reserves one placeholder per call. Any fixed answer that
+        // replaces it must not grow the next request.
+        let reserved = json_len(&placeholder());
+        for message in [DROPPED_FULL, NOT_RUN_FULL, NOT_RUN_LOOP, NOT_RUN_STALE] {
+            let answer = ToolOutcome::error(message).content;
+            assert!(json_len(&answer) <= reserved, "{message}");
+        }
+    }
 
     #[test]
     fn the_verified_tenant_wins_over_the_task_field() {
