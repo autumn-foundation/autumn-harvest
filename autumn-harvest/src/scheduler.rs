@@ -250,7 +250,11 @@ pub fn plan_backfill_timestamps(
                     return Err(BackfillPlanError::LimitExceeded { limit: max_count });
                 }
                 timestamps.push(cursor);
-                cursor += dur;
+                // The next slot may pass the last date chrono holds (issue #2048).
+                let Some(next) = cursor.checked_add_signed(dur) else {
+                    break;
+                };
+                cursor = next;
             }
             Ok(timestamps)
         }
@@ -5217,7 +5221,9 @@ fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Opti
             // schedule simply never fires. (`validate_schedule` also rejects it at
             // registration time.)
             .filter(|duration| *duration > chrono::Duration::zero())
-            .map(|duration| reference + duration),
+            // A sum past the last date chrono holds is "no next occurrence"
+            // too, never a panic (issue #2048).
+            .and_then(|duration| reference.checked_add_signed(duration)),
         Some(Schedule::Manual) | None => None,
     }
 }

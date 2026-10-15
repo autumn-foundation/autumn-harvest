@@ -1642,6 +1642,13 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
         Schedule::Interval(period) if period.subsec_nanos() != 0 => Err(format!(
             "interval schedule period must be a whole number of seconds, got {period:?}"
         )),
+        // `next_run_after` adds the period to a timestamp. chrono panics past
+        // year 262143, so a huge period must not reach it (issue #2048).
+        Schedule::Interval(period) if *period > MAX_INTERVAL_PERIOD => Err(format!(
+            "interval schedule period must not exceed {} seconds, got {} seconds",
+            MAX_INTERVAL_PERIOD.as_secs(),
+            period.as_secs()
+        )),
         Schedule::Interval(_) | Schedule::Manual => Ok(()),
     }
 }
