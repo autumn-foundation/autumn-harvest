@@ -8332,6 +8332,33 @@ mod tests {
         assert_eq!(timestamps.len(), 169); // 0h..168h inclusive = 169 slots
     }
 
+    #[test]
+    fn plan_backfill_timestamps_huge_interval_returns_only_the_first_slot() {
+        // The second slot is past the last date chrono holds (issue #2048).
+        let from = parse_utc("2026-04-01T00:00:00Z");
+        let to = parse_utc("2026-04-08T00:00:00Z");
+        for secs in [9_000_000_000_000_000, u64::MAX] {
+            let schedule = Schedule::Interval(Duration::from_secs(secs));
+
+            let timestamps = plan_backfill_timestamps(Some(&schedule), from, to, 100)
+                .expect("a huge interval must not fail the plan");
+
+            assert_eq!(timestamps, vec![from], "{secs} s");
+        }
+    }
+
+    #[test]
+    fn plan_backfill_timestamps_interval_stops_at_the_end_of_time() {
+        let schedule = Schedule::Interval(Duration::from_secs(60));
+        let from = DateTime::<Utc>::MAX_UTC - chrono::Duration::seconds(30);
+
+        let timestamps =
+            plan_backfill_timestamps(Some(&schedule), from, DateTime::<Utc>::MAX_UTC, 100)
+                .expect("the end of time must not fail the plan");
+
+        assert_eq!(timestamps, vec![from]);
+    }
+
     // ── apply_overlap_policy ──────────────────────────────────────────────────
 
     #[test]
@@ -8533,6 +8560,38 @@ mod tests {
     }
 
     #[test]
+    fn next_run_after_huge_interval_is_none_not_a_panic() {
+        // chrono panics on `reference + duration` past year 262143 (issue #2048).
+        let now = parse_utc("2026-01-01T00:00:00Z");
+        for secs in [8_300_000_000_000, 9_000_000_000_000_000, u64::MAX] {
+            let schedule = Schedule::Interval(Duration::from_secs(secs));
+            assert_eq!(next_run_after(Some(&schedule), now), None, "{secs} s");
+        }
+    }
+
+    #[test]
+    fn next_run_after_interval_at_the_end_of_time_is_none() {
+        let schedule = Schedule::Interval(Duration::from_secs(1));
+        assert_eq!(
+            next_run_after(Some(&schedule), DateTime::<Utc>::MAX_UTC),
+            None
+        );
+    }
+
+    #[test]
+    fn next_run_after_gives_a_next_run_for_every_valid_interval() {
+        // Oracle (issue #2048): an interval that `validate_schedule` accepts
+        // has a next run from a current reference.
+        let now = parse_utc("2026-01-01T00:00:00Z");
+        for secs in [1, 3_600, 31_536_000, crate::policy::MAX_INTERVAL_PERIOD.as_secs()] {
+            let schedule = Schedule::Interval(Duration::from_secs(secs));
+            assert!(crate::policy::validate_schedule(&schedule).is_ok());
+            let expected = now + chrono::Duration::seconds(i64::try_from(secs).unwrap());
+            assert_eq!(next_run_after(Some(&schedule), now), Some(expected), "{secs} s");
+        }
+    }
+
+    #[test]
     fn schedule_expr_and_parse_round_trip_cron_in_timezone() {
         let schedule = Schedule::CronInTimezone {
             expr: "0 9 * * 1-5".to_string(),
@@ -8553,7 +8612,7 @@ mod tests {
         for interval in [
             Duration::from_secs(1),
             Duration::from_secs(60),
-            Duration::from_secs(u64::MAX),
+            crate::policy::MAX_INTERVAL_PERIOD,
             Duration::from_nanos(1),
             Duration::from_millis(500),
             Duration::from_millis(1_500),

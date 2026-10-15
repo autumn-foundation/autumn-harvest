@@ -1592,6 +1592,12 @@ impl WorkflowSchedule {
     }
 }
 
+/// Longest accepted [`Schedule::Interval`] period: 100 years of 365 days.
+///
+/// A longer period can move the next fire time past the last date that
+/// `chrono` can hold (issue #2048).
+pub const MAX_INTERVAL_PERIOD: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
 /// Validate a [`Schedule`] value, returning an error string if it is invalid.
 ///
 /// For [`Schedule::Cron`] expressions this parses the expression using
@@ -2674,7 +2680,32 @@ mod tests {
                 "{interval:?} must be rejected: {err}"
             );
         }
-        assert!(validate_schedule(&Schedule::Interval(Duration::from_secs(u64::MAX))).is_ok());
+        assert!(validate_schedule(&Schedule::Interval(MAX_INTERVAL_PERIOD)).is_ok());
+    }
+
+    #[test]
+    fn interval_schedule_over_the_cap_is_rejected() {
+        // `next_run_after` cannot add a huge period to a timestamp (issue #2048).
+        for secs in [
+            MAX_INTERVAL_PERIOD.as_secs() + 1,
+            8_300_000_000_000,
+            9_000_000_000_000_000,
+            u64::MAX,
+        ] {
+            let err =
+                validate_schedule(&Schedule::Interval(Duration::from_secs(secs))).unwrap_err();
+            assert!(
+                err.contains("must not exceed"),
+                "{secs} s must be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn interval_schedule_at_the_cap_is_accepted() {
+        assert!(validate_schedule(&Schedule::Interval(MAX_INTERVAL_PERIOD)).is_ok());
+        let one_below = MAX_INTERVAL_PERIOD - Duration::from_secs(1);
+        assert!(validate_schedule(&Schedule::Interval(one_below)).is_ok());
     }
 
     #[test]

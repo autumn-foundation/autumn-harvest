@@ -57108,6 +57108,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_schedule_expr_with_tz_interval_over_the_cap_is_rejected() {
+        // The scheduler cannot add this period to a timestamp (issue #2048).
+        let err = parse_schedule_expr_with_tz("interval:9000000000000000", "UTC")
+            .expect_err("a period over the cap must be rejected");
+        assert!(err.contains("must not exceed"), "{err}");
+        let cap = autumn_harvest::policy::MAX_INTERVAL_PERIOD.as_secs();
+        let at_cap = parse_schedule_expr_with_tz(&format!("interval:{cap}"), "UTC");
+        assert!(at_cap.is_ok(), "the cap itself must parse: {at_cap:?}");
+    }
+
+    #[test]
     fn create_workflow_schedule_request_timezone_defaults_to_utc() {
         let json = r#"{"workflow_name":"my_wf","schedule_expr":"0 9 * * *"}"#;
         let req: CreateWorkflowScheduleRequest =
