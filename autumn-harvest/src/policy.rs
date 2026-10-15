@@ -2716,7 +2716,7 @@ mod tests {
     #[test]
     fn interval_schedule_at_the_cap_is_accepted() {
         assert!(validate_schedule(&Schedule::Interval(MAX_INTERVAL_PERIOD)).is_ok());
-        let one_below = MAX_INTERVAL_PERIOD - Duration::from_secs(1);
+        let one_below = Duration::from_secs(MAX_INTERVAL_PERIOD.as_secs() - 1);
         assert!(validate_schedule(&Schedule::Interval(one_below)).is_ok());
     }
 
