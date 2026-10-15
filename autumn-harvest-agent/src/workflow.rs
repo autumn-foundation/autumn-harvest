@@ -67,9 +67,9 @@ struct Progress {
     /// Tool calls of every agent under this one.
     delegated_tool_calls: u32,
     last_text: String,
-    /// The segment ended on a turn with no tool calls, so `last_text` is its
-    /// answer.
-    answered: bool,
+    /// The text of the turn that ended the segment with no tool calls. It is
+    /// `None` when the segment ended any other way.
+    answer: Option<String>,
     /// The loop guard history of the whole run.
     tracker: LoopTracker,
     /// The follow-up that this segment booked.
@@ -91,7 +91,7 @@ impl Progress {
             delegated_steps: 0,
             delegated_tool_calls: 0,
             last_text: String::new(),
-            answered: false,
+            answer: None,
             tracker: LoopTracker::default(),
             followup: None,
             chain: 0,
@@ -285,11 +285,7 @@ pub(crate) async fn drive(
             } else {
                 source
             };
-            let answer = if progress.answered {
-                report.text.as_str()
-            } else {
-                ""
-            };
+            let answer = progress.answer.as_deref().unwrap_or("");
             if let Some(text) = report_text(source, stop, answer) {
                 let sent = Report {
                     source,
@@ -323,7 +319,7 @@ pub(crate) async fn drive(
         progress.steps = 0;
         progress.messages = report.messages;
         progress.last_text.clear();
-        progress.answered = false;
+        progress.answer = None;
         input = followup::WAKE_MESSAGE;
     }
 }
@@ -444,7 +440,7 @@ async fn run_segment(
 
         if calls.is_empty() {
             progress.push_assistant(&turn);
-            progress.answered = true;
+            progress.answer = Some(turn.text());
             return Ok(if over_budget {
                 AgentStop::TokensExhausted
             } else if turn.stop == StopReason::MaxTokens {

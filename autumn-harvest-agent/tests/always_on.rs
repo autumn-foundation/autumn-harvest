@@ -984,3 +984,25 @@ async fn an_app_tool_cannot_take_the_memory_name_when_writes_are_off() {
         "the app tool never runs"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_final_turn_does_not_deliver_an_earlier_aside() {
+    let (_dir, db) = fresh_db();
+    let inbox = Arc::new(Inbox::default());
+    let recorder = Arc::new(Recorder::default());
+    let mut aside = calls(&[("a", "lookup", json!({}))], 1).unwrap();
+    aside.content.insert(
+        0,
+        autumn_harvest_agent::ContentPart::Text("Let me check...".into()),
+    );
+    let model = ScriptedModel::new(vec![Ok(aside), answer("", 1)]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder))
+        .delivery(inbox.clone());
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &AgentTask::new("go").deliver()).unwrap();
+    let _ = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(inbox.reports(), Vec::<Report>::new());
+}

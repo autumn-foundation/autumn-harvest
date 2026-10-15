@@ -134,9 +134,9 @@ pub(crate) fn plan(
     let prompt = arguments
         .get("prompt")
         .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|prompt| !prompt.is_empty())
+        .filter(|prompt| !prompt.trim().is_empty())
         .ok_or("give a `prompt` for the follow-up")?;
+    // The untrimmed arguments stay in the transcript, so measure those.
     if prompt.chars().count() > MAX_PROMPT_CHARS {
         return Err(format!(
             "the follow-up prompt must be at most {MAX_PROMPT_CHARS} characters"
@@ -206,6 +206,13 @@ mod tests {
         );
         let long = "x".repeat(MAX_PROMPT_CHARS + 1);
         assert!(plan(&json!({"prompt": long, "delay_minutes": 1}), &s, 0, false).is_err());
+    }
+
+    #[test]
+    fn padding_counts_toward_the_prompt_limit() {
+        let padded = format!("p{}", " ".repeat(MAX_PROMPT_CHARS));
+        let call = json!({"prompt": padded, "delay_minutes": 1});
+        assert!(plan(&call, &settings(), 0, false).is_err());
     }
 
     #[test]
