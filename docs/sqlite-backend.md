@@ -776,6 +776,108 @@ The handler can await any future, within a 5 second limit. It cannot await a
 durable command, such as an activity or a timer. Such a handler returns
 `SqliteError::UpdateTimedOut` and writes no event.
 
+### List, describe and search attributes (issue #2027)
+
+List the runs in a file, newest first, one page at a time:
+
+```rust
+use autumn_harvest_sqlite::{ExecutionFilter, StartOptions};
+use serde_json::json;
+
+// Start a run with a memo and a first search attribute.
+let mut first = serde_json::Map::new();
+first.insert("tenant".into(), json!("acme"));
+let started = rt.start_workflow_with_options(
+    "order",
+    json!({ "id": 7 }),
+    StartOptions {
+        workflow_id: Some("order-7".into()),
+        memo: Some(json!({ "owner": "ops" })),
+        search_attributes: first,
+        ..StartOptions::default()
+    },
+)?;
+
+// Inside a workflow, merge more attributes in:
+// ctx.upsert_search_attrs([("stage".to_string(), Some(json!("paid")))])?;
+
+let mut filter = ExecutionFilter::new()
+    .workflow_name("order")
+    .state("RUNNING")
+    .search_attribute("tenant", json!("acme"))
+    .limit(50);
+loop {
+    let page = rt.list_executions(&filter)?;
+    for run in &page.executions {
+        println!("{:?} {:?}", run.exec_id, run.state);
+    }
+    match page.next {
+        Some(cursor) => filter = filter.before(cursor),
+        None => break,
+    }
+}
+
+// One run, with its input, output and error:
+let run = rt.describe(started.exec_id)?;
+```
+
+- **Filters.** `workflow_name`, `exec_id`, `workflow_id` (exact),
+  `workflow_id_prefix`, `state` (repeat it for several states),
+  `started_after` (inclusive), `started_before` (exclusive) and
+  `search_attribute`. Set filters combine with AND. A filter holds at most
+  64 states and 64 search attributes. A larger one is
+  `SqliteError::InvalidFilter`.
+- **Times.** `started_at` is the `WorkflowStarted` time, to the microsecond.
+  `closed_at` is the time of the first terminal write. A later reuse-policy
+  seal does not move it.
+- **Search attributes.** A filter tests equality. Numbers compare as numbers,
+  so `1` matches `1.0`. A filter value must be a JSON string, number, boolean
+  or `null`. Another value is `SqliteError::InvalidSearchAttribute`. So is a
+  number of magnitude 2^63 or more, integer or float. JSON1 reads a stored
+  integer of that size as a float, which cannot tell neighbouring values
+  apart.
+- **Pages.** A page holds `limit` rows: 100 by default, cut to the range 1 to
+  1000. `next` is the cursor of the next page, or `None` at the end. The
+  cursor is the table `rowid`. A `VACUUM` can renumber it, so do not keep a
+  cursor across one.
+- **No payloads in a list.** `list_executions` returns no input, output or
+  error. `visit_executions(&filter, |run| ...)` passes the same rows with
+  their payloads, one row at a time. The visit holds one read snapshot until
+  it returns, so keep the closure short. A long one stops the WAL file from
+  shrinking.
+- **Damaged rows.** Each field is a `Stored` value: `Value`, `Null` or
+  `Unreadable`. A value in the wrong storage class or text that is not
+  UTF-8 is `Unreadable`. So is a memo or search-attribute value that does
+  not parse, and search attributes that are not an object. One bad row does
+  not fail the page.
+- **A reader beside the writer.** `SqliteReader::open(path)` opens the file
+  `READ_ONLY` and takes no writer lock. It has the same three reads. It
+  reads a file that an older version wrote. A column that the file does not
+  have reads as `Null`.
+- **Upserts.** `ctx.upsert_search_attrs` merges its patch in the cycle
+  transaction, on the suspend path and on the terminal path, as on
+  Postgres. `None` removes a key. A cycle that rolls back keeps no patch.
+- **Memo.** The start sets it. No command changes it later. A start that
+  returns an existing run leaves its memo and its search attributes as they
+  are.
+- **Continue-as-new and retry.** The successor keeps the memo and the
+  search attributes, as on Postgres.
+
+Limits:
+
+- A run written before issue #2027 has no `started_at`. A time filter does
+  not match it.
+- Search-attribute filters test equality only. There is no comparison,
+  `IN` or `EXISTS` predicate.
+- One state filter seeks on an index. Every other filter walks the table
+  from the newest row. A filter that matches few rows in a large file walks
+  far to fill a page. A run's later columns sit after its input, so the walk
+  also reads past each large input.
+- A start does not check search-attribute keys against the
+  `upsert_search_attrs` rules, as on Postgres. Search attributes have no
+  size cap of their own.
+- The memo is stored as plain JSON. This backend has no payload codec.
+
 ---
 
 ## 9. Durability and crash recovery
@@ -872,14 +974,16 @@ specific command/feature. The run then ends `FAILED` (see below):
 - **External signals / cancels** (`signal_external_workflow`,
   `request_cancel_external_workflow`).
 - **External / task-token activities**.
-- **Search attributes** (`upsert_search_attributes`) and a **continue-as-new
-  to a different type** (`continue_as_new_as_type`). The token is
-  `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
-  supported (see [§7](#7-the-drive-model)).
+- A **continue-as-new to a different type** (`continue_as_new_as_type`).
+  The token is `ContinueAsNew.new_workflow_type`. A same-type
+  `continue_as_new` is supported (see [§7](#7-the-drive-model)).
 - **Worker sessions** (`create_session`).
 - **A batch that breaks a solo rule**: a mutex acquire beside another
   awaitable, or a local activity beside a durable awaitable or a second
   local activity. The token is `AcquireMutex` or `RunLocalActivity`.
+
+Search attributes are supported since issue #2027. See
+[§8](#list-describe-and-search-attributes-issue-2027).
 
 A rejected execution ends `FAILED` (issue #1834). The drive that meets the
 feature rolls back the whole cycle. It then seals the run in a new

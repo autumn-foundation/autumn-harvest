@@ -27,7 +27,8 @@ use crate::error::{SqliteError, SqliteResult};
 use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::lock::WriterLock;
 use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
-use crate::{lock, mutex, queue, schema, store, update, worker};
+use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
+use crate::{lock, mutex, queue, schema, store, update, visibility, worker};
 
 /// A synchronous activity body, keyed by name.
 ///
@@ -205,6 +206,56 @@ pub struct StartOutcome {
     /// `true` for a fresh insert (a new `WorkflowStarted` was appended); `false`
     /// when the policy returned an existing execution without starting a new run.
     pub created: bool,
+}
+
+/// Options for [`SqliteRuntime::start_workflow_with_options`] (issue #2027).
+#[derive(Debug, Clone, Default)]
+pub struct StartOptions {
+    /// The business workflow id. `None` or a blank id gives a fresh run.
+    pub workflow_id: Option<String>,
+    /// What to do when a run with this workflow id exists.
+    pub reuse_policy: WorkflowIdReusePolicy,
+    /// A JSON value stored with the run. No command changes it later.
+    pub memo: Option<Value>,
+    /// The search attributes at start. Each value is a JSON primitive.
+    pub search_attributes: serde_json::Map<String, Value>,
+}
+
+impl StartOptions {
+    /// Options with no workflow id, the default reuse policy, no memo and no
+    /// search attributes.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the business workflow id.
+    #[must_use]
+    pub fn workflow_id(mut self, id: impl Into<String>) -> Self {
+        self.workflow_id = Some(id.into());
+        self
+    }
+
+    /// Set the reuse policy.
+    #[must_use]
+    pub const fn reuse_policy(mut self, policy: WorkflowIdReusePolicy) -> Self {
+        self.reuse_policy = policy;
+        self
+    }
+
+    /// Set the memo.
+    #[must_use]
+    pub fn memo(mut self, memo: Value) -> Self {
+        self.memo = Some(memo);
+        self
+    }
+
+    /// Set the search attribute `key` to `value`.
+    #[must_use]
+    pub fn search_attribute(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.search_attributes.insert(key.into(), value);
+        self
+    }
 }
 
 /// The result of [`SqliteRuntime::send_signal_by_workflow_id`] (issue #2028).
@@ -749,6 +800,7 @@ impl SqliteRuntime {
                 None,
                 input,
                 WorkflowIdReusePolicy::AllowDuplicate,
+                RunFields::default(),
             )?
             .exec_id)
     }
@@ -811,8 +863,73 @@ impl SqliteRuntime {
                 Some(workflow_id),
                 input,
                 WorkflowIdReusePolicy::AllowDuplicate,
+                RunFields::default(),
             )?
             .exec_id)
+    }
+
+    /// Start (or reuse) a workflow with a memo and search attributes
+    /// (issue #2027).
+    ///
+    /// The id and the reuse policy act as in
+    /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy).
+    /// A start that returns an existing run does not change its memo or its
+    /// search attributes. The keys are not checked against the
+    /// `upsert_search_attrs` rules, as on Postgres.
+    ///
+    /// # Errors
+    ///
+    /// The errors of
+    /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy).
+    /// Returns [`SqliteError::InvalidSearchAttribute`] for a search attribute
+    /// that is not a JSON primitive. Returns [`SqliteError::PayloadTooLarge`]
+    /// for a memo over the workflow-input cap.
+    pub fn start_workflow_with_options(
+        &mut self,
+        workflow_name: &str,
+        input: Value,
+        options: StartOptions,
+    ) -> SqliteResult<StartOutcome> {
+        // An unknown workflow is the first error, as on every other start path.
+        if !self.workflows.contains_key(workflow_name) {
+            return Err(SqliteError::UnknownWorkflow(workflow_name.to_string()));
+        }
+        let StartOptions {
+            workflow_id,
+            reuse_policy,
+            memo,
+            search_attributes,
+        } = options;
+        for (key, value) in &search_attributes {
+            if value.is_object() || value.is_array() {
+                return Err(SqliteError::InvalidSearchAttribute(format!(
+                    "`{key}` must be a JSON string, number, boolean or null"
+                )));
+            }
+        }
+        // The memo shares the workflow-input cap. Postgres stores it in the
+        // same row, beside the input.
+        if let Some(memo) = &memo {
+            let observed = serde_json::to_string(memo)?.len() as u64;
+            if DEFAULT_MAX_WORKFLOW_INPUT_BYTES > 0 && observed > DEFAULT_MAX_WORKFLOW_INPUT_BYTES {
+                return Err(SqliteError::PayloadTooLarge {
+                    kind: "memo",
+                    observed_bytes: observed,
+                    cap_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+                });
+            }
+        }
+        let fields = RunFields {
+            memo: memo.as_ref(),
+            search_attrs: (!search_attributes.is_empty()).then_some(&search_attributes),
+        };
+        self.start_workflow_with_policy_inner(
+            workflow_name,
+            workflow_id.as_deref(),
+            input,
+            reuse_policy,
+            fields,
+        )
     }
 
     /// Start (or reuse) a workflow under an explicit
@@ -869,7 +986,13 @@ impl SqliteRuntime {
         input: Value,
         policy: WorkflowIdReusePolicy,
     ) -> SqliteResult<StartOutcome> {
-        self.start_workflow_with_policy_inner(workflow_name, Some(workflow_id), input, policy)
+        self.start_workflow_with_policy_inner(
+            workflow_name,
+            Some(workflow_id),
+            input,
+            policy,
+            RunFields::default(),
+        )
     }
 
     /// Shared start path applying the `(workflow_name, workflow_id)` reuse matrix
@@ -888,6 +1011,7 @@ impl SqliteRuntime {
         workflow_id: Option<&str>,
         input: Value,
         policy: WorkflowIdReusePolicy,
+        fields: RunFields<'_>,
     ) -> SqliteResult<StartOutcome> {
         self.check_start(workflow_name, &input)?;
         // An overdue prior ends first, so the reuse policy sees it terminal.
@@ -907,6 +1031,7 @@ impl SqliteRuntime {
             FreshRun {
                 config: &config,
                 started_at: now,
+                fields,
             },
         )?;
         tx.commit()?;
@@ -1179,6 +1304,7 @@ impl SqliteRuntime {
             FreshRun {
                 config: &config,
                 started_at: now,
+                fields: RunFields::default(),
             },
         )?;
         let signal_delivered = stage_keyed(
@@ -1696,6 +1822,45 @@ impl SqliteRuntime {
             }
             _ => Ok(ExecutionOutcome::Running),
         }
+    }
+
+    /// One page of executions, newest first, with no payloads (issue #2027).
+    ///
+    /// [`SqliteReader`](crate::SqliteReader) has the same read without the
+    /// writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::InvalidSearchAttribute`] for a filter value that
+    /// is not a JSON primitive. Returns [`SqliteError::Sqlite`] if the query
+    /// fails.
+    pub fn list_executions(&self, filter: &ExecutionFilter) -> SqliteResult<ExecutionPage> {
+        visibility::list(&self.conn, filter)
+    }
+
+    /// Call `visit` once for each row of one page, newest first, with its
+    /// payloads (issue #2027). Only one row is in memory at a time. Returns
+    /// the cursor of the next page.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`list_executions`](Self::list_executions).
+    pub fn visit_executions(
+        &self,
+        filter: &ExecutionFilter,
+        visit: impl FnMut(ExecutionDescription),
+    ) -> SqliteResult<Option<ListCursor>> {
+        visibility::visit_rows(&self.conn, filter, visit)
+    }
+
+    /// One execution with its payloads (issue #2027).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails.
+    pub fn describe(&self, exec: ExecutionId) -> SqliteResult<ExecutionDescription> {
+        visibility::describe(&self.conn, exec)
     }
 
     /// Run the query `name` on `exec` with `args`, and return its answer
@@ -2258,9 +2423,13 @@ impl SqliteRuntime {
             workflow_name,
             workflow_id,
             input,
-            &config,
-            now,
+            FreshRun {
+                config: &config,
+                started_at: now,
+                fields: RunFields::default(),
+            },
         )?;
+        store::copy_memo_and_search_attrs(&tx, exec, successor)?;
         queue::move_undelivered_signals(&tx, exec, successor)?;
         tx.commit()?;
         Ok(RunState::ContinuedAsNew(successor))
@@ -2770,14 +2939,7 @@ impl SqliteRuntime {
         check_batch_shape(commands)?;
         let tx = self.conn.transaction()?;
         // A body that no longer awaits a key gives up its queue place.
-        let acquiring: Vec<&str> = commands
-            .iter()
-            .filter_map(|cmd| match cmd {
-                WorkflowCommand::AcquireMutex { key, .. } => Some(key.as_str()),
-                _ => None,
-            })
-            .collect();
-        mutex::drop_stale_waits(&tx, exec, &acquiring)?;
+        mutex::drop_stale_waits(&tx, exec, &acquired_keys(commands))?;
         // The planned signals come first. Replay read them ahead of this
         // cycle's commands (issue #2020).
         let mut produced = ingest.apply(&tx, exec)?;
@@ -2908,6 +3070,13 @@ impl SqliteRuntime {
                 WorkflowCommand::RecordUpdateResult { update_id, result } => {
                     store::append_event(&tx, exec, &update::result_event(*update_id, result))?;
                 }
+                // A search-attribute patch (issue #2027). It writes the row in
+                // this cycle's transaction, as the Postgres worker does. It is
+                // not progress: the core drops it on replay, so a body that
+                // upserts and then waits sends it again on each drive.
+                WorkflowCommand::UpsertSearchAttributes { patch } => {
+                    store::upsert_search_attrs(&tx, exec, patch)?;
+                }
                 // Race-loser teardown (issue #476/#600). Emitted when a resolved
                 // `ctx.race()` / `wait_for_signal_timeout` picks a winner and rides
                 // in the SAME suspending batch when the workflow blocks again
@@ -2946,8 +3115,8 @@ impl SqliteRuntime {
                 }
                 // Reject every OTHER unsupported command BY NAME via
                 // `command_name`. Examples are child workflows, external
-                // activities, external signals and cancels, search attributes
-                // and detached children. No current variant is an
+                // activities, external signals and cancels, and detached
+                // children. No current variant is an
                 // opaque `"Unknown"` (Codex #1069 P2, `runtime.rs:840`). Dropping
                 // the uncommitted `tx` rolls back the whole batch. So an
                 // unsupported command after a supported one persists NEITHER the
@@ -3436,15 +3605,19 @@ impl StartMatrix {
         if self == Self::SignalWithStart {
             check_input_cap(&input)?;
         }
-        insert_fresh_execution(
-            conn,
-            workflow_name,
-            workflow_id,
-            input,
-            fresh.config,
-            fresh.started_at,
-        )
+        insert_fresh_execution(conn, workflow_name, workflow_id, input, fresh)
     }
+}
+
+/// The mutex keys that `commands` acquire (issue #2029).
+fn acquired_keys(commands: &[WorkflowCommand]) -> Vec<&str> {
+    commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::AcquireMutex { key, .. } => Some(key.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The settings of a run that a start creates (issue #2029).
@@ -3454,6 +3627,8 @@ struct FreshRun<'a> {
     config: &'a store::RunConfig,
     /// The epoch-millisecond start that `WorkflowStarted` carries.
     started_at: i64,
+    /// The memo and the search attributes (issue #2027).
+    fields: RunFields<'a>,
 }
 
 /// Apply the `(workflow_name, workflow_id)` reuse matrix inside the caller's
@@ -3800,24 +3975,23 @@ fn insert_fresh_execution(
     workflow_name: &str,
     business_id: Option<&str>,
     input: Value,
-    config: &store::RunConfig,
-    started_at: i64,
+    fresh: FreshRun<'_>,
 ) -> SqliteResult<StartOutcome> {
     let exec = ExecutionId::new();
     let workflow_id = business_id.map_or_else(|| exec.to_string(), str::to_string);
-    insert_run(
-        conn,
-        exec,
-        workflow_name,
-        &workflow_id,
-        input,
-        config,
-        started_at,
-    )?;
+    insert_run(conn, exec, workflow_name, &workflow_id, input, fresh)?;
     Ok(StartOutcome {
         exec_id: exec,
         created: true,
     })
+}
+
+/// The memo and the search attributes that a new run starts with (issue
+/// #2027).
+#[derive(Debug, Clone, Copy, Default)]
+struct RunFields<'a> {
+    memo: Option<&'a Value>,
+    search_attrs: Option<&'a serde_json::Map<String, Value>>,
 }
 
 /// Insert a `RUNNING` row for `exec` and its `WorkflowStarted` event. A
@@ -3826,17 +4000,33 @@ fn insert_fresh_execution(
 /// `started_at` is the epoch-millisecond start of the run. `WorkflowStarted`
 /// carries it, as Postgres stamps its target start time. `ctx.deadline()`
 /// counts from it, so it matches the stored deadline (issue #2029).
+///
+/// The row stores the event time as `started_at` in microseconds (issue
+/// #2027), so a time filter and the history agree.
 fn insert_run(
     conn: &Connection,
     exec: ExecutionId,
     workflow_name: &str,
     workflow_id: &str,
     input: Value,
-    config: &store::RunConfig,
-    started_at: i64,
+    fresh: FreshRun<'_>,
 ) -> SqliteResult<()> {
-    store::insert_execution_with_config(conn, exec, workflow_name, workflow_id, &input, config)?;
-    let started_at = DateTime::from_timestamp_millis(started_at).unwrap_or_else(Utc::now);
+    store::insert_execution_with_config(
+        conn,
+        exec,
+        workflow_name,
+        workflow_id,
+        &input,
+        fresh.config,
+    )?;
+    let started_at = DateTime::from_timestamp_millis(fresh.started_at).unwrap_or_else(Utc::now);
+    store::set_start_fields(
+        conn,
+        exec,
+        started_at.timestamp_micros(),
+        fresh.fields.memo,
+        fresh.fields.search_attrs,
+    )?;
     store::append_event(
         conn,
         exec,
@@ -3950,9 +4140,15 @@ fn start_retry(
         workflow_name,
         &successor.to_string(),
         input,
-        &config,
-        plan.start_at,
+        FreshRun {
+            config: &config,
+            started_at: plan.start_at,
+            fields: RunFields::default(),
+        },
     )?;
+    // A retry is the same logical run, so it keeps the memo and the search
+    // attributes, as on Postgres (issue #2027).
+    store::copy_memo_and_search_attrs(conn, exec, successor)?;
     queue::move_all_signals_to_retry(conn, exec, successor)?;
     store::append_event(
         conn,
@@ -4373,6 +4569,11 @@ fn persist_terminal_pending_commands<'c>(
             // terminal event, as on Postgres.
             WorkflowCommand::RecordUpdateResult { update_id, result } => {
                 store::append_event(conn, exec, &update::result_event(*update_id, result))?;
+            }
+            // A search-attribute patch in the terminal cycle (issue #2027).
+            // It lands before the terminal write, as on Postgres.
+            WorkflowCommand::UpsertSearchAttributes { patch } => {
+                store::upsert_search_attrs(conn, exec, patch)?;
             }
             // Race-loser teardown (issue #476/#600) drained in the SAME cycle the
             // workflow completes/fails — the canonical `wait_for_signal_timeout(...)`

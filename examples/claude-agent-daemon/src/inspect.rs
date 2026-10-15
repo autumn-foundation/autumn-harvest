@@ -1,18 +1,23 @@
 //! Read-only inspection of the workflow database.
 //!
-//! The runtime exposes per-execution reads, not a listing, so the daemon opens
-//! a second connection in READ-ONLY mode to enumerate sessions. The backend
-//! opens the file in WAL mode with a busy timeout for exactly this case: one
-//! writer, plus the occasional reader. Never open a second WRITE handle.
+//! The daemon reads beside the runtime, so a read does not wait for a drive.
+//! The backend opens the file in WAL mode with a busy timeout for exactly
+//! this case: one writer, plus the occasional reader. Never open a second
+//! WRITE handle.
+//!
+//! The daemon reads executions through the backend's `SqliteReader` (issue
+//! #2027). Events, timers, signals and tasks have no backend listing yet, so a
+//! read-only connection reads those tables.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
 use autumn_harvest::WorkflowEvent;
+use autumn_harvest_sqlite::{ExecutionDescription, ExecutionFilter, SqliteReader, Stored};
 use rusqlite::{Connection, OpenFlags};
 
-use crate::session::{self, ApprovalDecision, SessionTask};
+use crate::session::{self, ApprovalDecision, SessionReport, SessionTask};
 
 /// How many events one `history` command prints.
 ///
@@ -93,7 +98,7 @@ pub struct RecordedTask {
     pub has_goal: bool,
 }
 
-/// One row of `harvest_executions`.
+/// One session, read whole for the single status.
 pub struct ExecutionRow {
     pub exec_id: String,
     pub state: String,
@@ -104,9 +109,15 @@ pub struct ExecutionRow {
 
 /// One session as a LISTING shows it, with every field already bounded.
 ///
-/// A listing names many sessions, so it carries no whole payload. The single
-/// status of one session still reads its row entire, because that is the one
-/// session the operator asked about.
+/// A listing names many sessions, so it holds no whole payload. The backend
+/// passes one row at a time (issue #2027). The daemon decodes each document
+/// whole, with the decode that the single status runs, and then cuts it.
+/// Memory holds one row's payloads at a time.
+///
+/// The listing and `status` therefore cannot disagree about a document. A
+/// projection of one field cannot prove that the whole document reads. A
+/// repeated key, an unpaired surrogate escape or a count outside its Rust
+/// type all pass a field projection, and `status` refuses each of them.
 #[derive(Debug)]
 pub struct SessionSummary {
     /// The session's id, or `None` when the row does not hold one this
@@ -114,11 +125,11 @@ pub struct SessionSummary {
     /// row without one can be SEEN and cannot be acted on.
     pub exec_id: Option<String>,
     pub state: Option<String>,
-    /// `None` when the recorded task cannot be read.
+    /// The goal, or `None` when the recorded task holds no goal text.
     pub goal: Option<String>,
     pub stop: Option<String>,
-    /// The recorded turn count, or `None` when no report this daemon can read
-    /// is stored. The type is the range: see [`COUNTER_CEILING`].
+    /// The recorded turn count, or `None` when the report holds no count in
+    /// the range of the `u32` that `SessionReport` declares.
     pub turns: Option<u32>,
     pub tool_calls: Option<u32>,
     pub answer: Option<String>,
@@ -133,100 +144,31 @@ pub struct SessionSummary {
     /// session with a damaged reason would otherwise look like one that
     /// recorded no reason, and `status` calls the same row unreadable.
     pub error_is_damaged: bool,
-    /// Is the recorded report a document this daemon cannot read as a whole?
+    /// Is a report present that does not deserialise as a `SessionReport`?
     ///
-    /// The test is the whole declared shape, as
-    /// [`SessionSummary::task_is_damaged`] is. Every field `SessionReport`
-    /// declares must be present once, and of the type and range that field
-    /// reads as. A document that answers no projection at all is the reason
-    /// the test must be the whole shape.
+    /// The fields beside it are projected from the document on their own.
+    /// Some of them can read when the whole document does not. The caller
+    /// therefore names the row unreadable from this flag, and not from the
+    /// fields.
     ///
-    /// Each field is projected on its own, so a PARTIAL failure shows itself.
-    /// The caller reads some fields and not others. It then names the row
-    /// unreadable. Two shapes escape that. A document that repeats a key
-    /// answers every projection and still fails to deserialise as a whole.
-    /// `json_type` reports the FIRST value of a repeated key, so even a
-    /// repeat of another type passes the type guards.
-    ///
-    /// The other shape is a document that answers NO projection. Four shapes
-    /// reached that state. The object is empty. The object holds none of the
-    /// four keys. Every declared key holds the wrong type. The column holds
-    /// text that is not JSON. Every projection answered nothing, which is what a
-    /// session with NO report answers. The caller then showed a COMPLETED
-    /// session with no result, and the report it could not read was never
-    /// named. Invalid JSON is therefore reported here, and not left to the
-    /// projections.
-    ///
-    /// A projection is also a PREFIX. The listing cuts a long field in the
-    /// database, and the caller decodes what it is given. Text that holds no
-    /// character beyond that cut therefore reached neither end. An `answer` of
-    /// 2100 letters and then a broken escape decoded cleanly here, and failed
-    /// to deserialise in `status`.
-    ///
-    /// The surrogate test below answers for the WHOLE value, and the database
-    /// answers it. See [`SessionSummary::task_is_damaged`], which states how.
-    ///
-    /// The listing then showed a genuine report for a document the single
-    /// status refuses. The two must agree, so the repeat is reported and the
-    /// caller names the row unreadable.
-    ///
-    /// Only the DECLARED keys are tested. A repeated key the report does not
-    /// declare is measured to deserialise, because the whole document reads
-    /// and the field is ignored. So is a broken escape inside one. Testing
-    /// every key would refuse a report that `status` shows.
-    ///
-    /// The count is filtered rather than made distinct. A `count(DISTINCT)`
-    /// sorts in a temporary B-tree, which the plan guard refuses for this
-    /// query.
+    /// A document that answers NO projection must still be named. An empty
+    /// object, text that is not JSON and a value in the wrong storage class
+    /// all reach that state. A silence would read as a session with no
+    /// report yet.
     pub report_is_damaged: bool,
-    /// Is the recorded task a document this daemon cannot read as a whole?
+    /// Is the recorded task a document that does not deserialise as a
+    /// `SessionTask`?
     ///
-    /// The goal beside it is projected on its own, so a document the single
-    /// status refuses can still answer that projection with a plausible goal.
-    /// The listing then attributed a task to a session whose task nothing can
-    /// read, and `status` called the same row unreadable.
-    ///
-    /// Five shapes reach that state, and each one is measured. A declared key
-    /// is repeated. A declared key is absent. A declared key holds the wrong
-    /// type. A count sits outside the range of the Rust field. A declared text
-    /// field holds no character.
-    ///
-    /// The test is therefore the whole declared shape, and not the goal
-    /// alone. Every field `SessionTask` declares must be present once, and of
-    /// the type and range that field reads as.
-    ///
-    /// # Text that holds no character
-    ///
-    /// `json_valid` accepts an unpaired surrogate escape, and `json_type`
-    /// calls the field text. The database DECODES one into bytes no character
-    /// has, which is what the Rust reader refuses.
-    ///
-    /// The test is a `GLOB` over the decoded value, for a code point between
-    /// `U+D800` and `U+DFFF`. It runs in the database, so it answers for the
-    /// whole field and not for the prefix the listing cuts. A field of 2100
-    /// letters and then a broken escape is caught by it.
-    ///
-    /// The test is EXACT, and not a pattern over the recorded text. A
-    /// well-formed pair decodes to one astral character and is not matched.
-    /// `U+D7FF` encodes with the same lead byte and is not matched either.
-    /// Both were measured, and `status` accepts both.
-    ///
-    /// Only the DECLARED keys are tested, as with
-    /// [`SessionSummary::report_is_damaged`]. An undeclared key is measured to
-    /// deserialise, and its value is never decoded. A broken escape inside one
-    /// therefore does not stop the whole document from reading.
-    ///
-    /// One limit stands. `approval_timeout_secs` is a `u64`, and `SQLite`
-    /// holds integers as `i64`. The top of that range is compared as a float,
-    /// which does not separate the last few values exactly.
+    /// The goal is projected on its own, so a document the single status
+    /// refuses can still answer that projection with a plausible goal. The
+    /// caller hides the goal when this is set, so the two views agree.
     pub task_is_damaged: bool,
     /// Where this row sits in the table, which is the cursor that reads the
     /// rows BEFORE it. The listing is capped, so an old session waiting for a
     /// decision would otherwise become unreachable once enough newer ones
     /// arrive.
     ///
-    /// This is the `rowid`, because `harvest_executions` carries no time and
-    /// no sequence of its own. The rows are ordered by it, and a rowid is
+    /// This is the backend's `ListCursor`, which is the `rowid`. A rowid is
     /// assigned in insert order, so the order is the order sessions started.
     ///
     /// A `VACUUM` may renumber a rowid, unlike the event `seq` the history
@@ -237,36 +179,13 @@ pub struct SessionSummary {
     pub row: i64,
 }
 
-/// The top of the range `SessionTask::approval_timeout_secs` reads as.
-///
-/// The field is a `u64`, and `SQLite` holds an integer as an `i64`. A recorded
-/// value above that range extracts as a float. The bound is therefore a float
-/// too, so that the two compare.
-///
-/// The value is two to the power of 64, which a float holds exactly. It is
-/// the first float ABOVE `u64::MAX`, because no float separates the two. A
-/// recorded count in that gap therefore passes this bound and fails to
-/// deserialise. The gap is the last few values of the range, and a float
-/// cannot be made to divide it.
-pub const TIMEOUT_CEILING: f64 = 18_446_744_073_709_551_616.0;
-
-/// How many characters of one listed field are read.
+/// How many characters of one listed field are printed.
 ///
 /// A goal, an answer and an error are all written by somebody else: the
 /// operator, the model, or the engine. None of them is bounded at the source.
 pub const MAX_LISTED_CHARS: u32 = 500;
 
-/// The BYTES of one listed field the database is asked for.
-///
-/// The cut is on bytes, because `substr` on TEXT counts to the first NUL and
-/// stops. A goal of `"\u0000do it"` is a goal `submit` accepts, and the
-/// listing showed nothing for it while the single status showed all of it.
-///
-/// Four bytes is the longest UTF-8 character, so this budget always carries
-/// at least [`LISTED_READ_CHARS`] characters. The caller cuts the characters.
-pub const MAX_LISTED_BYTES: u32 = LISTED_READ_CHARS * 4;
-
-/// How many characters of one listed field are READ.
+/// How many characters of one listed field are KEPT.
 ///
 /// One character past the printed cap, so a reader can tell a field that was
 /// CUT from one that ended by itself. The renderer marks the cut. This is the
@@ -274,30 +193,41 @@ pub const MAX_LISTED_BYTES: u32 = LISTED_READ_CHARS * 4;
 ///
 /// Without the extra character the listing showed a 4000-character answer as
 /// a complete one. An operator then had no reason to open the single status.
-const LISTED_READ_CHARS: u32 = MAX_LISTED_CHARS + 1;
+const LISTED_READ_CHARS: usize = MAX_LISTED_CHARS as usize + 1;
 
-/// The largest counter a recorded report can carry.
+/// The inspector's read-only handles on the database.
 ///
-/// `SessionReport` declares both counts as `u32`, so a recorded `-1` or
-/// `4294967296` is a report `status` refuses to read. Both are still
-/// `integer` to `json_type` AND to `typeof`, so neither of those guards sees
-/// the range, and the listing showed `[end_turn after -1 turns, ...]`.
-///
-/// The bound is the Rust type's own maximum, and it is PASSED to the query.
-/// The SQL and the field it protects therefore cannot drift apart.
-pub const COUNTER_CEILING: i64 = u32::MAX as i64;
+/// The backend reader lists and describes executions. The connection reads
+/// the event, timer, signal and task tables. The reader derefs to that
+/// connection, so a read of those tables takes the reader as it is.
+pub struct Reader {
+    /// Lists and describes executions (issue #2027).
+    pub executions: SqliteReader,
+    tables: Connection,
+}
 
-/// Open the inspector connection.
+impl std::ops::Deref for Reader {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.tables
+    }
+}
+
+/// Open the inspector's read-only handles.
 ///
 /// # Errors
 ///
 /// Returns an error if the database cannot be opened for reading.
-pub fn open(db: &Path) -> Result<Connection, String> {
-    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+pub fn open(db: &Path) -> Result<Reader, String> {
+    let tables = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("cannot open {} for reading: {e}", db.display()))?;
-    conn.busy_timeout(BUSY_TIMEOUT)
+    tables
+        .busy_timeout(BUSY_TIMEOUT)
         .map_err(|e| format!("cannot set the busy timeout: {e}"))?;
-    Ok(conn)
+    let executions = SqliteReader::open(db)
+        .map_err(|e| format!("cannot open {} for reading: {e}", db.display()))?;
+    Ok(Reader { executions, tables })
 }
 
 /// Is this execution id a session of the agent workflow?
@@ -306,26 +236,30 @@ pub fn open(db: &Path) -> Result<Connection, String> {
 /// exist returns no rows, which looks the same as a session that has recorded
 /// nothing yet.
 ///
+/// The backend matches the workflow name by its BYTES. A `BLOB` holding the
+/// same letters never compares equal to a `TEXT` value, and such a row read
+/// as a typo. The listing carries no payload, so the check reads none.
+///
 /// # Errors
 ///
 /// Returns an error if the query fails.
-pub fn is_session(conn: &Connection, workflow_name: &str, exec_id: &str) -> Result<bool, String> {
-    // The name is matched by its BYTES. A `BLOB` holding the same letters
-    // never compares equal to a `TEXT` parameter. This answer is what
-    // `history` uses to tell a typo from a session, and such a row read as a
-    // typo. The lookup still seeks on `exec_id`, which is the primary key,
-    // so the cast costs nothing here.
-    conn.query_row(
-        "SELECT 1 FROM harvest_executions \
-         WHERE cast(workflow_name as blob) = cast(?1 as blob) AND exec_id = ?2",
-        [workflow_name, exec_id],
-        |_| Ok(true),
-    )
-    .or_else(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => Ok(false),
-        other => Err(format!("cannot look up the session: {other}")),
-    })
+pub fn is_session(reader: &Reader, workflow_name: &str, exec_id: &str) -> Result<bool, String> {
+    let filter = ExecutionFilter::new()
+        .workflow_name(workflow_name)
+        .exec_id(exec_id)
+        .limit(1);
+    reader
+        .executions
+        .list_executions(&filter)
+        .map(|page| !page.executions.is_empty())
+        .map_err(|e| format!("cannot look up the session: {e}"))
 }
+
+/// How many RUNNING sessions one page of the startup read carries.
+///
+/// The read pages through every RUNNING session. The page only bounds how
+/// many rows the backend reads in one statement.
+const RUNNING_PAGE: u32 = 500;
 
 /// Every RUNNING session, oldest first, with the task it started from.
 ///
@@ -336,61 +270,78 @@ pub fn is_session(conn: &Connection, workflow_name: &str, exec_id: &str) -> Resu
 ///
 /// # Errors
 ///
-/// Returns an error if the query fails.
-pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSession>, String> {
+/// Returns an error if the query fails, or if a RUNNING row holds an id this
+/// daemon cannot read.
+pub fn running(reader: &Reader, workflow_name: &str) -> Result<Vec<RunningSession>, String> {
     // The task is read the way the RUNTIME reads it, and not projected field
-    // by field in SQL. `SQLite` and `serde_json` do not agree about what a
-    // document says, so no projection can prove a row is readable.
-    // `json_valid` accepts a goal of `"\uD800"` and gives it a type and a
-    // length, while `serde_json` refuses the unpaired surrogate. A row the
-    // projection called readable would be sealed FAILED by the runtime on
-    // its first drive, where no later daemon could resume it.
+    // by field. `SQLite` and `serde_json` do not agree about what a document
+    // says, so no projection can prove a row is readable. `json_valid`
+    // accepts a goal of `"\uD800"`, while `serde_json` refuses the unpaired
+    // surrogate. A row the projection called readable would be sealed FAILED
+    // by the runtime on its first drive, where no later daemon could resume
+    // it.
     //
-    // `recorded` runs the runtime's own three steps, so a row that answers
-    // here deserialises on the first drive by construction.
+    // The backend matches the name and the state by their BYTES. A column of
+    // TEXT affinity still keeps a stored BLOB as a BLOB. A damaged row can
+    // therefore hold the right bytes in the wrong class. The engine reads
+    // these columns into a `String`, and refuses a BLOB there. The filter
+    // matches such a row, and its field reads as `Unreadable`. The caller then
+    // names the row damaged. Without that, the drive fails on every tick, and
+    // nothing seals the session.
     //
-    // The document is read as BLOB bytes. A field can hold bytes that are
-    // not valid UTF-8. Reading one of those as text fails the WHOLE query,
-    // which would name no row at all. The bytes name their own row.
+    // The cost is ONE document at a time. The backend passes the rows one by
+    // one, and each task is cut down before the next row. The returned set
+    // holds no goal. A single control request already costs the daemon that
+    // memory. The state filter seeks on the backend's state index, so the
+    // read does not grow with the finished sessions.
     //
-    // The STORAGE CLASS is checked first, because the cast hides it. The
-    // engine reads this column straight into a `String`, and `rusqlite`
-    // refuses a BLOB value there. A column of TEXT affinity still keeps a
-    // stored BLOB as a BLOB. A damaged row can therefore hold the right
-    // bytes in the wrong class. The cast alone would accept it, and the
-    // drive would fail on every tick over a session nothing ever seals.
-    //
-    // The cost is ONE document at a time. The rows are read as a stream, and
-    // the task is cut down before the next row, so the returned set holds no
-    // goal. A single control request already costs the daemon that memory.
-    let mut statement = conn
-        .prepare(
-            "SELECT exec_id, \
-                    CASE WHEN typeof(input_json) = 'text' \
-                         THEN cast(input_json as blob) END, \
-                    typeof(state) <> 'text', \
-                    typeof(workflow_name) <> 'text' \
-             FROM harvest_executions \
-             WHERE cast(workflow_name as blob) = cast(?1 as blob) \
-             AND cast(state as blob) = cast('RUNNING' as blob) ORDER BY rowid",
-        )
-        .map_err(|e| format!("cannot prepare the running-session query: {e}"))?;
-    let rows = statement
-        .query_map([workflow_name], |row| {
-            Ok(RunningSession {
-                exec_id: row.get(0)?,
-                task: row
-                    .get::<_, Option<Vec<u8>>>(1)?
-                    .as_deref()
-                    .and_then(recorded),
-                state_is_damaged: row.get(2)?,
-                name_is_damaged: row.get(3)?,
+    // Each page is its own statement, so its own read snapshot. This read
+    // runs at startup, before any drive, and the file lock keeps out a second
+    // daemon. No write can land between two pages. A read while sessions are
+    // driven would need one snapshot over all pages.
+    let mut filter = ExecutionFilter::new()
+        .workflow_name(workflow_name)
+        .state("RUNNING")
+        .limit(RUNNING_PAGE);
+    let mut sessions = Vec::new();
+    let mut unreadable_id = false;
+    loop {
+        let next = reader
+            .executions
+            .visit_executions(&filter, |row| match running_session(row) {
+                Some(session) => sessions.push(session),
+                None => unreadable_id = true,
             })
-        })
-        .map_err(|e| format!("cannot read the running sessions: {e}"))?;
+            .map_err(|e| format!("cannot read the running sessions: {e}"))?;
+        // An id is what names the session to every later command. A row
+        // without one cannot be driven or refused by name, so the whole read
+        // fails rather than skip it.
+        if unreadable_id {
+            return Err(
+                "cannot read the running sessions: a RUNNING row holds an id that cannot be read"
+                    .to_string(),
+            );
+        }
+        match next {
+            Some(cursor) => filter = filter.before(cursor),
+            None => break,
+        }
+    }
+    // The backend reads newest first, and the drive order is the submit order.
+    sessions.reverse();
+    Ok(sessions)
+}
 
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("cannot read the running sessions: {e}"))
+/// Cut one RUNNING row down to what a startup check reads. `None` when the
+/// row holds no id this daemon can read.
+fn running_session(row: ExecutionDescription) -> Option<RunningSession> {
+    let exec_id = row.summary.exec_id.into_value()?;
+    Some(RunningSession {
+        exec_id,
+        task: row.input_json.value().and_then(|text| recorded(text)),
+        state_is_damaged: row.summary.state.is_unreadable(),
+        name_is_damaged: row.summary.workflow_name.is_unreadable(),
+    })
 }
 
 /// Read one recorded task, keeping only what a startup check needs.
@@ -398,17 +349,15 @@ pub fn running(conn: &Connection, workflow_name: &str) -> Result<Vec<RunningSess
 /// `None` when the document is not a task this daemon can read. The goal is
 /// measured here and dropped, so it never leaves this function.
 ///
-/// The three steps are the runtime's own, in its order. The backend reads
+/// The steps are the runtime's own, in its order. The backend reads
 /// `input_json` as TEXT, parses the WHOLE document into a `Value`, and the
-/// workflow takes its task from that value. The caller has already refused a
-/// value of another storage class. That is the first half of the TEXT read,
-/// and the UTF-8 test here is the second. Each step refuses something the
-/// next one never sees. The middle step is why a fault in a field no check
-/// reads still answers `None`. Parsing a document unescapes every string in
-/// it, including one this daemon ignores.
-fn recorded(document: &[u8]) -> Option<RecordedTask> {
-    let text = std::str::from_utf8(document).ok()?;
-    let whole = serde_json::from_str::<serde_json::Value>(text).ok()?;
+/// workflow takes its task from that value. The backend reader has already
+/// refused a value of another storage class or bytes that are not UTF-8.
+/// The parse is why a fault in a field no check reads still answers `None`.
+/// Parsing a document unescapes every string in it, including one this
+/// daemon ignores.
+fn recorded(document: &str) -> Option<RecordedTask> {
+    let whole = serde_json::from_str::<serde_json::Value>(document).ok()?;
     let task = serde_json::from_value::<SessionTask>(whole).ok()?;
     Some(RecordedTask {
         has_goal: !task.goal.trim().is_empty(),
@@ -703,10 +652,11 @@ pub const MAX_EVENT_DETAIL_CHARS: u32 = 240;
 
 /// The BYTES of one event field the database is asked for.
 ///
-/// The cut is on bytes for the reason [`MAX_LISTED_BYTES`] gives: `substr` on
-/// TEXT counts to the first NUL and stops. The budget carries one character
-/// past the printed cap, so a caller can still tell a cut line from a whole
-/// one. The caller cuts the characters.
+/// The cut is on bytes, because `substr` on TEXT counts to the first NUL and
+/// stops. A field of `"\u0000do it"` would then show nothing. Four bytes is the
+/// longest UTF-8 character, so the budget always carries the characters. It
+/// carries one character past the printed cap, so a caller can still tell a
+/// cut line from a whole one. The caller cuts the characters.
 const MAX_EVENT_DETAIL_BYTES: u32 = (MAX_EVENT_DETAIL_CHARS + 1) * 4;
 
 /// Read one page of the TOOL CALLS a session's model replies asked for.
@@ -830,42 +780,55 @@ impl ReplyCalls {
 
 /// One session, by id.
 ///
-/// `status` names one session, so it reads one row. The listing would select
-/// and allocate the input and the output of every session that ever ran. The
-/// daemon serves its commands one at a time, so that cost blocks every one.
+/// `status` names one session, so it reads one row. The listing would read
+/// the input and the output of every session it names. The daemon serves
+/// its commands one at a time, so that cost blocks every one.
 ///
-/// The workflow name is matched by its BYTES. A `BLOB` holding the same
-/// letters never compares equal to a `TEXT` parameter, so `status` reported
+/// The backend matches the workflow name by its BYTES. A `BLOB` holding the
+/// same letters never compares equal to a `TEXT` value, so `status` reported
 /// that such a session does not exist. The seek is still on `exec_id`, the
-/// primary key, so the cast costs this read nothing.
+/// primary key.
 ///
 /// # Errors
 ///
-/// Returns an error if the query fails.
+/// Returns an error if the query fails, or if a field of the row cannot be
+/// read.
 pub fn execution(
-    conn: &Connection,
+    reader: &Reader,
     workflow_name: &str,
     exec_id: &str,
 ) -> Result<Option<ExecutionRow>, String> {
-    conn.query_row(
-        "SELECT exec_id, state, input_json, output_json, error FROM harvest_executions \
-         WHERE cast(workflow_name as blob) = cast(?1 as blob) AND exec_id = ?2",
-        [workflow_name, exec_id],
-        |row| {
-            Ok(ExecutionRow {
-                exec_id: row.get(0)?,
-                state: row.get(1)?,
-                input_json: row.get(2)?,
-                output_json: row.get(3)?,
-                error: row.get(4)?,
-            })
-        },
-    )
-    .map(Some)
-    .or_else(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => Ok(None),
-        other => Err(format!("cannot read session {exec_id}: {other}")),
-    })
+    let filter = ExecutionFilter::new()
+        .workflow_name(workflow_name)
+        .exec_id(exec_id)
+        .limit(1);
+    let mut found = None;
+    reader
+        .executions
+        .visit_executions(&filter, |row| found = Some(row))
+        .map_err(|e| format!("cannot read session {exec_id}: {e}"))?;
+    let Some(row) = found else {
+        return Ok(None);
+    };
+    // A status shows the row whole, so every field must read. A field that
+    // does not read refuses the status. A partial view would pass for the
+    // session's whole record.
+    let refused =
+        |column: &str| format!("cannot read session {exec_id}: the {column} column cannot be read");
+    let required =
+        |field: Stored<String>, column: &str| field.into_value().ok_or_else(|| refused(column));
+    let optional = |field: Stored<String>, column: &str| match field {
+        Stored::Value(text) => Ok(Some(text)),
+        Stored::Null => Ok(None),
+        Stored::Unreadable => Err(refused(column)),
+    };
+    Ok(Some(ExecutionRow {
+        exec_id: required(row.summary.exec_id, "exec_id")?,
+        state: required(row.summary.state, "state")?,
+        input_json: required(row.input_json, "input_json")?,
+        output_json: optional(row.output_json, "output_json")?,
+        error: optional(row.error, "error")?,
+    }))
 }
 
 /// When the deadline of one awaited signal expires, in epoch milliseconds.
@@ -1387,7 +1350,7 @@ fn races_signal(timer_id: &str, signal: &str) -> bool {
 /// operator would read a character nobody wrote.
 ///
 /// The characters are cut here, because the database was asked for a budget
-/// of bytes. See [`MAX_LISTED_BYTES`] and [`MAX_EVENT_DETAIL_BYTES`].
+/// of bytes. See [`MAX_EVENT_DETAIL_BYTES`].
 ///
 /// `None` means the field CANNOT BE READ, and it never means empty. An empty
 /// answer is a real outcome: a session can end with the model writing no
@@ -1432,226 +1395,139 @@ fn cut_text(bytes: Option<Vec<u8>>, chars: u32, source_len: Option<i64>) -> Opti
     Some(whole.chars().take(chars as usize).collect())
 }
 
-/// One page of the sessions a listing names, newest first. See [`no_cursor`].
-pub const SESSIONS_QUERY: &str = "SELECT \
-                    CASE WHEN typeof(exec_id) = 'text' \
-                         THEN coalesce(substr(cast(exec_id as blob), 1, ?3), \
-                                       zeroblob(0)) END, \
-                    CASE WHEN typeof(state) = 'text' \
-                         THEN coalesce(substr(cast(state as blob), 1, ?3), \
-                                       zeroblob(0)) END, \
-                    CASE WHEN typeof(input_json) = 'text' AND json_valid(input_json) \
-                          AND json_type(input_json, '$.goal') = 'text' \
-                         THEN coalesce(substr(cast(json_extract(input_json, '$.goal') \
-                                                   as blob), 1, ?3), zeroblob(0)) END, \
-                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
-                          AND json_type(output_json, '$.stop') = 'text' \
-                         THEN coalesce(substr(cast(json_extract(output_json, '$.stop') \
-                                                   as blob), 1, ?3), zeroblob(0)) END, \
-                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
-                          AND json_type(output_json, '$.turns') = 'integer' \
-                          AND typeof(json_extract(output_json, '$.turns')) = 'integer' \
-                          AND json_extract(output_json, '$.turns') BETWEEN 0 AND ?5 \
-                         THEN json_extract(output_json, '$.turns') END, \
-                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
-                          AND json_type(output_json, '$.tool_calls') = 'integer' \
-                          AND typeof(json_extract(output_json, '$.tool_calls')) \
-                              = 'integer' \
-                          AND json_extract(output_json, '$.tool_calls') \
-                              BETWEEN 0 AND ?5 \
-                         THEN json_extract(output_json, '$.tool_calls') END, \
-                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
-                          AND json_type(output_json, '$.answer') = 'text' \
-                         THEN coalesce(substr(cast(json_extract(output_json, '$.answer') \
-                                                   as blob), 1, ?3), zeroblob(0)) END, \
-                    CASE WHEN typeof(error) = 'text' \
-                         THEN coalesce(substr(cast(error as blob), 1, ?3), \
-                                       zeroblob(0)) END, \
-                    error IS NOT NULL AND typeof(error) <> 'text', \
-                    CASE WHEN typeof(output_json) = 'null' THEN 0 \
-                         WHEN typeof(output_json) <> 'text' THEN 1 \
-                         WHEN NOT json_valid(output_json) THEN 1 \
-                         ELSE NOT coalesce(( \
-                                  json_type(output_json, '$.stop') = 'text' \
-                              AND json_type(output_json, '$.answer') = 'text' \
-                              AND json_type(output_json, '$.turns') = 'integer' \
-                              AND typeof(json_extract(output_json, '$.turns')) \
-                                  = 'integer' \
-                              AND json_extract(output_json, '$.turns') \
-                                  BETWEEN 0 AND ?5 \
-                              AND json_type(output_json, '$.tool_calls') = 'integer' \
-                              AND typeof(json_extract(output_json, '$.tool_calls')) \
-                                  = 'integer' \
-                              AND json_extract(output_json, '$.tool_calls') \
-                                  BETWEEN 0 AND ?5 \
-                              AND (SELECT count(*) FROM json_each(output_json) \
-                                   WHERE key IN ('answer', 'turns', \
-                                                 'tool_calls', 'stop')) = 4 \
-                              AND (SELECT count(*) FROM json_each(output_json) \
-                                   WHERE key IN ('answer', 'stop') \
-                                     AND value GLOB '*[' || char(55296) \
-                                                 || '-' || char(57343) \
-                                                 || ']*') = 0), 0) END, \
-                    CASE WHEN typeof(input_json) = 'text' \
-                         THEN CASE WHEN json_valid(input_json) \
-                                   THEN NOT coalesce(( \
-                                        json_type(input_json, '$.goal') = 'text' \
-                                    AND json_type(input_json, '$.workspace') = 'text' \
-                                    AND json_type(input_json, '$.model') = 'text' \
-                                    AND json_type(input_json, '$.max_turns') = 'integer' \
-                                    AND json_extract(input_json, '$.max_turns') \
-                                        BETWEEN 0 AND ?6 \
-                                    AND json_type(input_json, \
-                                                  '$.approval_timeout_secs') = 'integer' \
-                                    AND json_extract(input_json, \
-                                                     '$.approval_timeout_secs') \
-                                        BETWEEN 0 AND ?7 \
-                                    AND (SELECT count(*) FROM json_each(input_json) \
-                                         WHERE key IN ('goal', 'max_turns', \
-                                                       'approval_timeout_secs', \
-                                                       'workspace', 'model')) = 5 \
-                                    AND (SELECT count(*) FROM json_each(input_json) \
-                                         WHERE key IN ('goal', 'workspace', 'model') \
-                                           AND value GLOB '*[' || char(55296) \
-                                                       || '-' || char(57343) \
-                                                       || ']*') = 0), 0) \
-                                   ELSE 1 END \
-                         ELSE 1 END, \
-                    rowid, \
-                    CASE WHEN typeof(exec_id) = 'text' \
-                         THEN length(cast(exec_id as blob)) END, \
-                    CASE WHEN typeof(state) = 'text' \
-                         THEN length(cast(state as blob)) END, \
-                    CASE WHEN typeof(input_json) = 'text' AND json_valid(input_json) \
-                          AND json_type(input_json, '$.goal') = 'text' \
-                         THEN length(cast(json_extract(input_json, '$.goal') \
-                                          as blob)) END, \
-                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
-                          AND json_type(output_json, '$.stop') = 'text' \
-                         THEN length(cast(json_extract(output_json, '$.stop') \
-                                          as blob)) END, \
-                    CASE WHEN typeof(output_json) = 'text' AND json_valid(output_json) \
-                          AND json_type(output_json, '$.answer') = 'text' \
-                         THEN length(cast(json_extract(output_json, '$.answer') \
-                                          as blob)) END, \
-                    CASE WHEN typeof(error) = 'text' \
-                         THEN length(cast(error as blob)) END \
-             FROM harvest_executions \
-             WHERE cast(workflow_name as blob) = cast(?1 as blob) \
-             AND rowid < ?4 \
-             ORDER BY rowid DESC LIMIT ?2";
-
 /// One page of the agent workflow's executions, oldest first.
 ///
 /// `before` reads the page before a row this listing named. The cap is on one
-/// page and not on the table, so every session stays reachable.
+/// page and not on the table, so every session stays reachable. The page
+/// holds one row past the cap, so the caller can say there are more without
+/// a second query.
 ///
 /// # Errors
 ///
 /// Returns an error if the query fails.
 pub fn executions(
-    conn: &Connection,
+    reader: &Reader,
     workflow_name: &str,
     before: Option<i64>,
 ) -> Result<Vec<SessionSummary>, String> {
-    // The rows are walked by ROWID, and the workflow name is tested against
-    // each one. Matching the name by its BYTES is what asks for that now. A
-    // cast takes the name out of the planner's index choice, so the `+` that
-    // used to do it is no longer needed.
+    // The backend walks the rowid backwards, which is the order the listing
+    // wants, so it stops at the cap. An index lookup on the name would sort
+    // every match first. Measured on 20000 sessions, the first page took
+    // 11.7ms through the index and 0.1ms by the walk. The walk loses only
+    // where this workflow is a small minority of the file. This daemon owns
+    // its file and starts one workflow in it, so that case does not arise. It matches the name by its BYTES. A
+    // session recorded as a `BLOB` was once missing from the listing. Then
+    // `status` and `history` reported that it does not exist.
     //
-    // The bytes are what the name must be matched by. A `BLOB` holding the
-    // same letters never compares equal to a `TEXT` parameter. A session
-    // recorded that way was missing from the listing, and `status` and
-    // `history` both reported that it does not exist. A terminal session
-    // simply disappeared. The startup read matches by bytes for the same
-    // reason. See [`RunningSession::name_is_damaged`].
-    //
-    // The index on the name cannot answer `ORDER BY rowid`, so a lookup
-    // through it sorts every matching row in a temporary B-tree before the
-    // LIMIT applies. The cap then bounds what comes BACK and not what is
-    // read, which is the opposite of what this query is for. Walking the
-    // rowid index backwards is already the order the listing wants, so it
-    // stops at the cap. Measured on 20000 sessions, the first page took
-    // 11.7ms through the index and 0.1ms by this walk.
-    //
-    // The trade is real, and the other way in one case. A file where this
-    // workflow is a small minority costs a walk past the rest: 2.9ms against
-    // 0.09ms at 50 rows in 20000. This daemon owns its file and starts one
-    // workflow in it, so the majority case is the only one it has.
-    //
-    // The FIELDS are selected, and not the rows. A recorded task and a
-    // recorded report can each approach the backend's payload cap. A listing
-    // that read them whole would hold hundreds of megabytes for a capped
-    // number of sessions. It would then copy that to build the views, and
-    // once more to serialise the answer. Each field is cut in the database,
-    // where the bytes already are.
-    //
-    // `json_valid` guards every extraction. `json_extract` on a document
-    // that is not JSON raises `malformed JSON`, and that aborts the WHOLE
-    // statement. One damaged row would hide every session in the file,
-    // including one waiting for a decision. The guard leaves that row's
-    // fields NULL, which the caller already shows as an unreadable task.
-    //
-    // The TYPE is guarded as well, because valid JSON can still say the
-    // wrong thing. A report of `{"stop":1}` is valid, and `json_extract`
-    // returns the integer 1, which fails to read as the text this row
-    // expects. That failure aborts the whole statement exactly as a damaged
-    // document does.
-    //
-    // `typeof` guards the two integers beside `json_type`, and the two catch
-    // different faults. A number too large for a signed 64-bit integer is
-    // still an `integer` to `json_type`, while `json_extract` returns a real.
-    //
-    // Every TEXT field is read as bytes, and none of them as a string. A JSON
-    // string can hold an unpaired surrogate, which `SQLite` accepts and calls
-    // text. `json_extract` then yields bytes that are not UTF-8, and reading
-    // those into a `String` fails the whole statement. The bytes are decoded
-    // by the caller, which keeps what is readable.
-    let mut statement = conn
-        .prepare(SESSIONS_QUERY)
-        .map_err(|e| format!("cannot prepare the session query: {e}"))?;
-    let rows = statement
-        .query_map(
-            rusqlite::params![
-                workflow_name,
-                MAX_LISTED_SESSIONS + 1,
-                MAX_LISTED_BYTES,
-                no_cursor(before),
-                COUNTER_CEILING,
-                i64::from(u32::MAX),
-                TIMEOUT_CEILING
-            ],
-            |row| {
-                // A TEXT column can still hold bytes no character has. The
-                // class test alone called such a row sound, while the single
-                // status refused the same field. The read itself is the
-                // evidence: the column held something and nothing came back.
-                let error_bytes: Option<Vec<u8>> = row.get(7)?;
-                let error = cut_text(error_bytes.clone(), LISTED_READ_CHARS, row.get(17)?);
-                let error_is_damaged: bool =
-                    row.get(8)? || (error_bytes.is_some() && error.is_none());
-                Ok(SessionSummary {
-                    exec_id: cut_text(row.get(0)?, LISTED_READ_CHARS, row.get(12)?),
-                    state: cut_text(row.get(1)?, LISTED_READ_CHARS, row.get(13)?),
-                    goal: cut_text(row.get(2)?, LISTED_READ_CHARS, row.get(14)?),
-                    stop: cut_text(row.get(3)?, LISTED_READ_CHARS, row.get(15)?),
-                    turns: row.get(4)?,
-                    tool_calls: row.get(5)?,
-                    answer: cut_text(row.get(6)?, LISTED_READ_CHARS, row.get(16)?),
-                    error,
-                    error_is_damaged,
-                    report_is_damaged: row.get(9)?,
-                    task_is_damaged: row.get(10)?,
-                    row: row.get(11)?,
-                })
-            },
-        )
-        .map_err(|e| format!("cannot read the sessions: {e}"))?;
-
-    let mut listed = rows
-        .collect::<Result<Vec<_>, _>>()
+    // Each row arrives with its payloads, one row at a time. It is cut to a
+    // bounded summary before the next row, so the page never holds a whole
+    // task or a whole report. A damaged field reads as `Unreadable`, and one
+    // damaged row never hides the rest of the listing.
+    let mut filter = ExecutionFilter::new()
+        .workflow_name(workflow_name)
+        .limit(MAX_LISTED_SESSIONS + 1);
+    if let Some(row) = before {
+        filter = filter.before(autumn_harvest_sqlite::ListCursor::from_raw(row));
+    }
+    let mut listed = Vec::new();
+    reader
+        .executions
+        .visit_executions(&filter, |row| listed.push(summarise(&row)))
         .map_err(|e| format!("cannot read the sessions: {e}"))?;
     // The newest are read first, so the listing reads oldest first again.
     listed.reverse();
     Ok(listed)
+}
+
+/// Keep the first [`LISTED_READ_CHARS`] characters of one listed field.
+fn kept(text: &str) -> String {
+    text.chars().take(LISTED_READ_CHARS).collect()
+}
+
+/// Cut one whole row down to a listed summary.
+///
+/// The verdict on each document is the decode `status` runs. The fields are
+/// then projected one by one with [`field`], so a fault in one field leaves
+/// the others readable. A field that holds the wrong type reads as nothing.
+/// So does a count outside the `u32` the report declares.
+fn summarise(row: &ExecutionDescription) -> SessionSummary {
+    let task = row.input_json.value().map(String::as_str);
+    let task_is_damaged =
+        task.is_none_or(|text| serde_json::from_str::<SessionTask>(text).is_err());
+    let report = row.output_json.value().map(String::as_str);
+    let report_is_damaged = match &row.output_json {
+        Stored::Value(text) => serde_json::from_str::<SessionReport>(text).is_err(),
+        Stored::Null => false,
+        Stored::Unreadable => true,
+    };
+    let text_at = |document: Option<&str>, key: &str| {
+        document
+            .and_then(|text| field(text, key))
+            .and_then(|value| value.as_str().map(kept))
+    };
+    let count_at = |key: &str| {
+        report
+            .and_then(|text| field(text, key))
+            .and_then(|value| value.as_u64())
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    SessionSummary {
+        exec_id: row.summary.exec_id.value().map(|id| kept(id)),
+        state: row.summary.state.value().map(|state| kept(state)),
+        goal: text_at(task, "goal"),
+        stop: text_at(report, "stop"),
+        turns: count_at("turns"),
+        tool_calls: count_at("tool_calls"),
+        answer: text_at(report, "answer"),
+        error: row.error.value().map(|error| kept(error)),
+        error_is_damaged: row.error.is_unreadable(),
+        report_is_damaged,
+        task_is_damaged,
+        row: row.summary.cursor.raw(),
+    }
+}
+
+/// The value of the top-level `key` of a JSON object, read on its own.
+///
+/// Every other key is skipped and not decoded, as serde skips a key that a
+/// struct does not declare. A broken escape in another field therefore does
+/// not hide this one. A repeated key answers its FIRST value. `None` when the
+/// document is not an object, holds no such key, or the value does not decode.
+fn field(document: &str, key: &str) -> Option<serde_json::Value> {
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+
+    struct Field<'k>(&'k str);
+
+    impl<'de> Visitor<'de> for Field<'_> {
+        type Value = Option<serde_json::Value>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut found = None;
+            while let Some(name) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if found.is_none() && name == self.0 {
+                    found = Some(map.next_value::<serde_json::Value>()?);
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(found)
+        }
+    }
+
+    impl<'de> DeserializeSeed<'de> for Field<'_> {
+        type Value = Option<serde_json::Value>;
+
+        fn deserialize<D: serde::Deserializer<'de>>(self, de: D) -> Result<Self::Value, D::Error> {
+            de.deserialize_map(self)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_str(document);
+    let value = Field(key).deserialize(&mut de).ok()?;
+    de.end().ok()?;
+    value
 }

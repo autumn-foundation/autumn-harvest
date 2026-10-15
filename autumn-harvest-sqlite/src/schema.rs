@@ -75,6 +75,17 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
     cancel_from_seq INTEGER,               -- the history length when `cancel` stored
                                            -- the request (issue #2021). It bounds the
                                            -- events that a cleanup can add.
+    started_at    INTEGER,                 -- the `WorkflowStarted` time in epoch
+                                           -- microseconds (issue #2027). NULL on a row
+                                           -- written before that issue.
+    closed_at     INTEGER,                 -- the time of the first terminal write in
+                                           -- epoch microseconds (issue #2027). NULL while the
+                                           -- run is open.
+    search_attrs  TEXT,                    -- the search attributes as a JSON object
+                                           -- (issue #2027). NULL until a start or an
+                                           -- upsert sets one.
+    memo          TEXT,                    -- the start memo as JSON (issue #2027). No
+                                           -- command changes it after the start.
     execution_timeout_ms INTEGER,          -- the declared execution_timeout (issue
                                            -- #2029). NULL = no timeout. A successor
                                            -- re-anchors its deadline with it.
@@ -105,6 +116,15 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
 -- needing no separate additive migration.
 CREATE INDEX IF NOT EXISTS idx_harvest_executions_key
     ON harvest_executions (workflow_name, workflow_id);
+
+-- The state filter of a listing (issue #2027). It indexes the same expression
+-- the filter tests, so the planner can use it. The filter compares bytes, so a
+-- value in the wrong storage class still matches. Without the index, a filter
+-- on `state` reads past `input_json` on every row, which is slow when the
+-- inputs are large. The index is non-unique and idempotent, so it builds on
+-- every open of an older file.
+CREATE INDEX IF NOT EXISTS idx_harvest_executions_state
+    ON harvest_executions (cast(state as blob));
 
 CREATE TABLE IF NOT EXISTS harvest_events (
     exec_id    TEXT NOT NULL,
@@ -313,6 +333,9 @@ use crate::error::SqliteResult;
 /// - **issue #2021** — `harvest_executions.cancel_reason`, the stored cooperative
 ///   cancel request, and `cancel_from_seq`, the history length at the request.
 ///   Both are nullable, so an old row has no pending cancel.
+/// - **issue #2027** — `harvest_executions.started_at`, `closed_at`,
+///   `search_attrs` and `memo`. All four are nullable. An old row has no start
+///   time, no close time, no search attributes and no memo.
 /// - **issue #2028** — `harvest_signals.idempotency_key` and its partial unique
 ///   index on `(exec_id, idempotency_key)`. The index is built here, because the
 ///   base [`SCHEMA`] runs before an old table has the column. When the column is
@@ -369,6 +392,27 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "cancel_from_seq",
         "ALTER TABLE harvest_executions ADD COLUMN cancel_from_seq INTEGER",
     )?;
+    // issue #2027: the columns that list and describe read.
+    for (column, sql) in [
+        (
+            "started_at",
+            "ALTER TABLE harvest_executions ADD COLUMN started_at INTEGER",
+        ),
+        (
+            "closed_at",
+            "ALTER TABLE harvest_executions ADD COLUMN closed_at INTEGER",
+        ),
+        (
+            "search_attrs",
+            "ALTER TABLE harvest_executions ADD COLUMN search_attrs TEXT",
+        ),
+        (
+            "memo",
+            "ALTER TABLE harvest_executions ADD COLUMN memo TEXT",
+        ),
+    ] {
+        add_column_if_absent(conn, "harvest_executions", column, sql)?;
+    }
     // issue #2029: the execution timeout and the workflow retry.
     for (column, ddl) in [
         ("execution_timeout_ms", "INTEGER"),
@@ -665,6 +709,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, (None, None, None, 1, None, None));
+    }
+
+    // Issue #2027: an old `harvest_executions` gains the four visibility
+    // columns. The old row keeps its data, and each new column reads NULL.
+    #[test]
+    fn migrate_adds_the_visibility_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_HARVEST_EXECUTIONS_DDL).unwrap();
+        conn.execute_batch(OLD_HARVEST_TASKS_DDL).unwrap();
+        conn.execute_batch(OLD_HARVEST_SIGNALS_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO harvest_executions (exec_id, workflow_name, input_json, state) \
+             VALUES ('e1', 'wf', '{}', 'RUNNING')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let row: (
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT state, started_at, closed_at, search_attrs, memo \
+                 FROM harvest_executions WHERE exec_id = 'e1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("RUNNING".to_string(), None, None, None, None));
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh.execute_batch(SCHEMA).unwrap();
+        for column in ["started_at", "closed_at", "search_attrs", "memo"] {
+            assert!(column_exists(&fresh, "harvest_executions", column).unwrap());
+        }
     }
 
     // An old-schema `harvest_tasks` (missing the freeze columns) is brought up to

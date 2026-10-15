@@ -260,6 +260,16 @@ pub enum SqliteError {
     #[error("invalid signal: {0}")]
     InvalidSignal(String),
 
+    /// A search attribute at start, or in a list filter, is not a JSON
+    /// primitive (issue #2027).
+    #[error("invalid search attribute: {0}")]
+    InvalidSearchAttribute(String),
+
+    /// A list filter has more terms than
+    /// [`MAX_FILTER_TERMS`](crate::MAX_FILTER_TERMS) allows (issue #2027).
+    #[error("invalid filter: {0}")]
+    InvalidFilter(String),
+
     /// A value stored in `SQLite` could not be parsed back into its Rust type.
     #[error("corrupt stored value: {0}")]
     Corrupt(String),

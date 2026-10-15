@@ -94,6 +94,12 @@ A complete, runnable version is in
   handler that `ctx.register_query` registered. It replays the stored history
   to the run's frontier and writes nothing. A terminal run answers with the
   state at its recorded end.
+- **List and describe (issue #2027).** `list_executions(&filter)` pages runs
+  newest first. It filters by workflow name, workflow id prefix, state, start
+  time and search attributes. `describe(exec)` reads one run with its
+  payloads. `SqliteReader::open(path)` gives the same reads without the
+  writer. `ctx.upsert_search_attrs` and the memo of
+  `start_workflow_with_options` are stored on the run.
 - **Durability & crash recovery.** All state is in the database. Dropping the
   runtime and re-`open`-ing the same file is a faithful restart: any task left
   `RUNNING` by a crash is reclaimed and the workflow resumes purely by
@@ -146,8 +152,8 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
 - Schedules, the management API, DAGs, worker sessions, retention, sharding.
-- Child workflows, external signals/cancels, search
-  attributes, and a continue-as-new to a different workflow type
+- Child workflows, external signals/cancels, and a continue-as-new to a
+  different workflow type
   (`continue_as_new_as_type`) — a workflow reaching one of these is
   rejected **loudly, by name**, never silently dropped. The run then ends
   `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).

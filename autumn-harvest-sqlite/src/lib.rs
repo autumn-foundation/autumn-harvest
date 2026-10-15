@@ -278,8 +278,6 @@
 //!   (`SignalExternalWorkflow`), `ctx.request_cancel_external_workflow(...)`
 //!   (`RequestCancelExternalWorkflow`).
 //! - **External activities** — task-token activities (`ScheduleExternalActivity`).
-//! - **Search attributes** — `ctx.upsert_search_attributes(...)`
-//!   (`UpsertSearchAttributes`).
 //! - **A cross-type continue-as-new** — `ctx.continue_as_new_as_type(...)`
 //!   (`ContinueAsNew.new_workflow_type`). A same-type `continue_as_new` is
 //!   supported (issue #2023): see [Long-lived runs](#long-lived-runs-issue-2023).
@@ -632,6 +630,26 @@
 //! at its frontier. A terminal run answers with the state at its recorded
 //! end. One process holds the run, so a query needs no routing to a worker.
 //!
+//! # List, describe and search attributes (issue #2027)
+//!
+//! [`SqliteRuntime::list_executions`] returns one page of runs, newest first.
+//! [`ExecutionFilter`] filters by workflow name, execution id, workflow id
+//! prefix, state, start time and search-attribute equality. A page carries no
+//! payload. [`SqliteRuntime::visit_executions`] passes the same rows with
+//! their payloads, one row at a time. [`SqliteRuntime::describe`] reads one
+//! run.
+//!
+//! [`SqliteReader`] has the same three reads. It opens the file `READ_ONLY`
+//! and takes no writer lock, so it reads beside a live runtime.
+//!
+//! Each field is a [`Stored`] value. A damaged value is
+//! [`Stored::Unreadable`], so one bad row does not fail a page.
+//!
+//! `ctx.upsert_search_attrs` merges its patch into the row, in the cycle
+//! transaction, as on Postgres. [`SqliteRuntime::start_workflow_with_options`]
+//! sets the first search attributes and a memo. A continue-as-new and a
+//! workflow retry copy both to the successor.
+//!
 //! # Deterministic side effects
 //!
 //! `ctx.system_now()`, `ctx.new_uuid()`, `ctx.random_*()`, and `ctx.side_effect()`
@@ -657,6 +675,7 @@ mod runtime;
 mod schema;
 mod store;
 mod update;
+mod visibility;
 mod worker;
 
 pub use autumn_harvest::{ExecutionId, WorkflowEvent};
@@ -666,6 +685,11 @@ pub use crate::history_cap::HistoryCapReason;
 pub use crate::query::DEFAULT_QUERY_TIMEOUT;
 pub use crate::runtime::{
     ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SignalDelivery, SignalWithStart,
-    SignalWithStartOutcome, SqliteRuntime, StartOutcome, UNSUPPORTED_FEATURE_ERROR_TYPE,
+    SignalWithStartOutcome, SqliteRuntime, StartOptions, StartOutcome,
+    UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
 pub use crate::store::ActivityAttempt;
+pub use crate::visibility::{
+    DEFAULT_LIST_LIMIT, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,
+    ListCursor, MAX_FILTER_TERMS, MAX_LIST_LIMIT, SqliteReader, Stored,
+};
