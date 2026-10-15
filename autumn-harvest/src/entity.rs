@@ -306,7 +306,6 @@ where
         register_queries(ctx, &published);
 
         let mut run = RunCounters::default();
-        let mut budget: Option<Option<u64>> = None;
         loop {
             let raw = match waiting.pop_front() {
                 Some(raw) => raw,
@@ -337,14 +336,11 @@ where
             *lock(&published) = Published::of(&checkpoint);
 
             if checkpoint_due(ctx, &mut run, max_ops_per_run)? {
-                let limit = match budget {
-                    Some(limit) => limit,
-                    None => *budget.insert(
-                        ctx.side_effect(ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT, || {
-                            ctx.continue_as_new_input_budget()
-                        })?,
-                    ),
-                };
+                // Record the budget at each attempt. A cap that changes while a
+                // handler waits then applies to the next attempt.
+                let limit = ctx.side_effect(ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT, || {
+                    ctx.continue_as_new_input_budget()
+                })?;
                 if !claim_waiting_ops(ctx, &checkpoint, &mut waiting, limit)? {
                     // An op does not fit. Run it in this run, then try again.
                     continue;
@@ -451,9 +447,23 @@ fn json_len<T: Serialize + ?Sized>(value: &T) -> HarvestResult<u64> {
     Ok(serde_json::to_string(value)?.len() as u64)
 }
 
-/// RED stub: returns `error` as is.
+/// Cut `error` to [`ENTITY_LAST_ERROR_MAX_BYTES`], marker included.
+///
+/// The cut lands on a `char` boundary. `str::floor_char_boundary` needs Rust
+/// 1.91, and the MSRV is 1.88.
 fn bound_error(error: String) -> String {
-    error
+    if error.len() <= ENTITY_LAST_ERROR_MAX_BYTES {
+        return error;
+    }
+    let mut end = ENTITY_LAST_ERROR_MAX_BYTES - TRUNCATION_MARKER.len();
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    // A new string frees the buffer of the long error.
+    let mut bounded = String::with_capacity(end + TRUNCATION_MARKER.len());
+    bounded.push_str(&error[..end]);
+    bounded.push_str(TRUNCATION_MARKER);
+    bounded
 }
 
 fn record_failure(stats: &mut EntityStats, error: String) {
