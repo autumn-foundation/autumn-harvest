@@ -155,6 +155,11 @@ The process executor gives each run:
   A policy also refuses more than `u32::MAX` CPU seconds, and more than 1 PiB
   of memory or file size (`MAX_LIMIT_BYTES`). A larger value could reach
   `RLIM_INFINITY`, which removes the limit with no error.
+  A child cannot raise a hard limit above the one of the worker without root
+  and `CAP_SYS_RESOURCE`. A non-root child enters a user namespace first, and
+  a container often drops that capability. So the process backend refuses a
+  policy limit above a hard limit of the worker, as a config error. Raise the
+  worker limit, such as with systemd `LimitNOFILE`, or lower the policy.
   The data rlimit is the memory limit plus 1 GiB, because V8 in Node 24
   reserves about 600 MiB of address space at start. The CPU rlimit applies
   to each process;
@@ -303,7 +308,8 @@ Publish a new image by rename, never by a write in place. A hard link shares
 its inode, so `cp` onto `rootfs.ext4` also changes the pinned file. The pin
 records the inode, the size and the modification time of each file. It also
 holds an inotify watch for a write to each file. So it sees a `cp -p` that
-keeps the size and the time. Each launch checks both, and a changed file
+keeps the size and the time. The watch starts before the stamps and the
+checks, and each link must be a watched file. Each launch checks both, and a changed file
 fails the launch as a config error until the worker restarts. A write during
 a running microVM still reaches it. The watch needs one inotify instance per
 launcher. A full `fs.inotify` limit fails the launcher start as a config error.

@@ -12,7 +12,8 @@ use tokio_util::sync::CancellationToken;
 use super::error::SandboxError;
 use super::outcome::SandboxOutcome;
 use super::policy::{
-    IsolationLevel, MAX_ENGINE_ENV_BYTES, MAX_ENGINE_ENV_VARS, NetworkPolicy, SandboxPolicy,
+    IsolationLevel, MAX_ENGINE_ENV_BYTES, MAX_ENGINE_ENV_VARS, NetworkPolicy, SandboxLimits,
+    SandboxPolicy,
 };
 use super::request::{ExecPlan, RESERVED_ENV_PREFIX, SandboxRequest};
 
@@ -100,6 +101,16 @@ pub trait SandboxBackend: Send + Sync + 'static {
     /// A runtime refuses a policy whose largest input does not fit it.
     fn work_capacity(&self) -> Option<u64> {
         None
+    }
+
+    /// Check that the backend can set the limits of `max` on a run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Config`] for a limit that the backend cannot
+    /// set. Each run with it would fail, and a retry cannot help.
+    fn check_limits(&self, _max: &SandboxLimits) -> Result<(), SandboxError> {
+        Ok(())
     }
 
     /// Run `job`. Stop and clean up when `cancel` fires.
@@ -208,6 +219,7 @@ impl SandboxRuntime {
                  {capacity} bytes that the backend gives a run"
             )));
         }
+        backend.check_limits(&policy.max_limits)?;
         let overhead = super::bounded(DEFAULT_BACKEND_OVERHEAD.max(backend.overhead()));
         Ok(Self {
             backend,

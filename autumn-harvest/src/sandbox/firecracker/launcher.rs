@@ -359,6 +359,8 @@ impl FileStamp {
 #[derive(Debug)]
 struct WriteWatch {
     fd: std::os::fd::OwnedFd,
+    /// The watch descriptor of each watched file, in order.
+    watches: Vec<libc::c_int>,
     /// Set at the first event, and never cleared.
     written: std::sync::atomic::AtomicBool,
 }
@@ -370,30 +372,65 @@ impl WriteWatch {
     ///
     /// Returns the error of `inotify_init1` or `inotify_add_watch`, such as
     /// a full `fs.inotify` limit.
-    fn new(paths: &[PathBuf]) -> std::io::Result<Self> {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
-        use std::os::unix::ffi::OsStrExt as _;
+    fn new(paths: &[&Path]) -> std::io::Result<Self> {
+        use std::os::fd::FromRawFd as _;
         // SAFETY: inotify_init1 reads no memory.
         let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // SAFETY: the descriptor is new, and nothing else owns it.
-        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let mut watch = Self {
+            // SAFETY: the descriptor is new, and nothing else owns it.
+            fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+            watches: Vec::with_capacity(paths.len()),
+            written: std::sync::atomic::AtomicBool::new(false),
+        };
         for path in paths {
-            let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-            // SAFETY: the path is a NUL-terminated string that outlives the
-            // call, and the descriptor is open.
-            let watch =
-                unsafe { libc::inotify_add_watch(fd.as_raw_fd(), path.as_ptr(), libc::IN_MODIFY) };
-            if watch < 0 {
-                return Err(std::io::Error::last_os_error());
+            let descriptor = watch.add(path)?;
+            watch.watches.push(descriptor);
+        }
+        Ok(watch)
+    }
+
+    /// Watch `path` for a write, and return the watch descriptor.
+    ///
+    /// A hard link does not follow a symbolic link, so neither does the
+    /// watch.
+    fn add(&self, path: &Path) -> std::io::Result<libc::c_int> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: the path is a NUL-terminated string that outlives the call,
+        // and the descriptor is open.
+        let descriptor = unsafe {
+            libc::inotify_add_watch(
+                self.fd.as_raw_fd(),
+                path.as_ptr(),
+                libc::IN_MODIFY | libc::IN_DONT_FOLLOW,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(descriptor)
+    }
+
+    /// Whether each of `paths` is the file that the watch of the same index
+    /// watches.
+    ///
+    /// One inotify instance gives one descriptor to each inode. A second
+    /// watch on a watched inode returns the first descriptor, through any of
+    /// its hard links.
+    fn watches(&self, paths: &[&Path]) -> std::io::Result<bool> {
+        if paths.len() != self.watches.len() {
+            return Ok(false);
+        }
+        for (path, watched) in paths.iter().zip(&self.watches) {
+            if self.add(path)? != *watched {
+                return Ok(false);
             }
         }
-        Ok(Self {
-            fd,
-            written: std::sync::atomic::AtomicBool::new(false),
-        })
+        Ok(true)
     }
 
     /// Whether a watched file had a write since the watch started.
@@ -487,6 +524,17 @@ impl PinnedImage {
     ///
     /// Returns [`SandboxError::Config`] when a link fails. Nothing is left.
     fn pin(config: &LauncherConfig, vm_root: &Path, owner: &str) -> Result<Self, SandboxError> {
+        Self::pin_with(config, vm_root, owner, || {})
+    }
+
+    /// [`Self::pin`], with `after_stamps` run once the stamps are taken, so
+    /// a test can write in the window.
+    fn pin_with(
+        config: &LauncherConfig,
+        vm_root: &Path,
+        owner: &str,
+        after_stamps: impl FnOnce(),
+    ) -> Result<Self, SandboxError> {
         use std::os::unix::fs::DirBuilderExt as _;
         let dir = vm_root.join(format!("{VM_ID_PREFIX}{owner}{PINNED_IMAGE_SUFFIX}"));
         let fail = |what: &Path, e: &std::io::Error| {
@@ -507,12 +555,20 @@ impl PinnedImage {
                 "cannot lock the image directories for the pin: {e}; a publish can hold them"
             ))
         })?;
-        // The lock keeps out a rename, but not a write in place. The stamps
-        // come before the checks, so the pin refuses a write after them.
+        // The lock keeps out a rename, but not a write in place. The watch
+        // comes first, so it sees each write after the stamps.
+        let watch = WriteWatch::new(&files).map_err(|e| {
+            SandboxError::Config(format!(
+                "cannot watch the image files for writes: {e}; check the fs.inotify limits"
+            ))
+        })?;
+        // The stamps come before the checks, so the pin refuses a write after
+        // them.
         let stamps = files
             .iter()
             .map(|file| FileStamp::of(file).map_err(|e| fail(file, &e)))
             .collect::<Result<Vec<_>, _>>()?;
+        after_stamps();
         // The manifest lands with the pair, so the lock covers it too.
         let meta = match &config.boot {
             BootMethod::Snapshot(snapshot) => Some(SnapshotMeta::check(config, snapshot)?),
@@ -543,13 +599,16 @@ impl PinnedImage {
                 .chain(snapshot.iter().flat_map(|s| [&s.state, &s.memory]))
                 .cloned()
                 .collect();
-            let watch = WriteWatch::new(&links).map_err(|e| {
-                SandboxError::Config(format!(
-                    "cannot watch the pinned image in {} for writes: {e}; check the \
-                     fs.inotify limits",
+            // Each link must be the file that the watch watches. A rename
+            // outside the lock could swap a file after the watch.
+            let linked: Vec<&Path> = links.iter().map(PathBuf::as_path).collect();
+            if !watch.watches(&linked).map_err(|e| fail(&dir, &e))? {
+                return Err(SandboxError::Config(format!(
+                    "an image file was replaced during the pin of {}; publish an image under \
+                     the lock of its directory",
                     dir.display()
-                ))
-            })?;
+                )));
+            }
             let pinned = Self {
                 dir: dir.clone(),
                 kernel,
@@ -559,7 +618,6 @@ impl PinnedImage {
                 stamps: links.into_iter().zip(stamps).collect(),
                 watch,
             };
-            // The watch came after the links. The stamps cover a write before it.
             pinned.check()?;
             Ok(pinned)
         })();
@@ -5001,6 +5059,56 @@ while True:
             "{err:?}"
         );
         drop((vmm, launcher));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_watch_knows_a_hard_link_of_a_watched_file_from_another_file() {
+        let dir = temp_dir();
+        let (file, link, other) = (dir.join("a"), dir.join("b"), dir.join("c"));
+        std::fs::write(&file, b"image").unwrap();
+        std::fs::hard_link(&file, &link).unwrap();
+        std::fs::write(&other, b"image").unwrap();
+        let watch = WriteWatch::new(&[file.as_path()]).unwrap();
+        assert!(watch.watches(&[link.as_path()]).unwrap());
+        assert!(!watch.watches(&[other.as_path()]).unwrap());
+        assert!(!watch.watches(&[]).unwrap());
+        assert!(!watch.written());
+        std::fs::write(&link, b"IMAGE").unwrap();
+        assert!(watch.written());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_during_the_pin_that_keeps_the_stamp_fails_the_pin() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        let rootfs = config.image.rootfs.clone();
+        let vm_root = dir.join("pins");
+        std::fs::create_dir(&vm_root).unwrap();
+        // The write lands after the stamps, while the pin checks and links.
+        let err = PinnedImage::pin_with(&config, &vm_root, "owner", || {
+            let old = std::fs::metadata(&rootfs).unwrap();
+            let bytes = vec![b'x'; usize::try_from(old.len()).unwrap()];
+            std::fs::write(&rootfs, &bytes).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&rootfs)
+                .unwrap()
+                .set_modified(old.modified().unwrap())
+                .unwrap();
+        })
+        .map(|_| ())
+        .expect_err("the write keeps the stamp, but the watch sees it");
+        assert!(
+            matches!(&err, SandboxError::Config(m) if m.contains("in place")),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&vm_root).unwrap().count(),
+            0,
+            "the pin left files"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

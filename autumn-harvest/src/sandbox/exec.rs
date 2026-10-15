@@ -46,7 +46,7 @@ use super::capture::StreamCapture;
 use super::error::SandboxError;
 use super::guest::PlanExecutor;
 use super::outcome::{MAX_SKIP_REASON_BYTES, OutputFile, RunStatus, SandboxOutcome, SkippedOutput};
-use super::policy::{IsolationLevel, NetworkPolicy};
+use super::policy::{IsolationLevel, NetworkPolicy, SandboxLimits};
 use super::request::ExecPlan;
 use super::runtime::BoxFuture;
 
@@ -852,6 +852,117 @@ fn stack_limit() -> Option<libc::rlimit> {
     (unsafe { libc::getrlimit(libc::RLIMIT_STACK, &raw mut limit) } == 0).then_some(limit)
 }
 
+/// The bit of `CAP_SYS_RESOURCE` in a capability set.
+const CAP_SYS_RESOURCE_BIT: u64 = 1 << 24;
+
+/// Whether a child of this process can raise a hard rlimit.
+///
+/// That needs root with `CAP_SYS_RESOURCE` in the initial user namespace. A
+/// non-root child enters a new user namespace first, so it never can. A
+/// container often drops the capability, even for root. A value that cannot
+/// be read counts as no.
+#[must_use]
+pub(crate) fn can_raise_hard_limits() -> bool {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return false;
+    }
+    // The initial user namespace maps each uid to itself.
+    let initial = std::fs::read_to_string("/proc/self/uid_map")
+        .is_ok_and(|map| map.split_whitespace().eq(["0", "0", "4294967295"]));
+    let caps = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:"))
+                .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        });
+    initial && caps.is_some_and(|caps| caps & CAP_SYS_RESOURCE_BIT != 0)
+}
+
+/// The hard limit of `resource` for this process, or `None` when it cannot
+/// be read.
+fn hard_limit(resource: Resource) -> Option<libc::rlim_t> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes a valid stack value.
+    (unsafe { libc::getrlimit(resource, &raw mut limit) } == 0).then_some(limit.rlim_max)
+}
+
+/// Check that each child can set the rlimits that `max` allows.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Config`] for `max_open_files` above `fs.nr_open`.
+/// It does the same for a limit above the hard limit of this worker, when a
+/// child cannot raise it. Each run with such a limit would fail at
+/// `setrlimit`, and a retry cannot help.
+pub fn check_limits(max: &SandboxLimits) -> Result<(), SandboxError> {
+    check_limits_with(
+        max,
+        can_raise_hard_limits(),
+        crate::sandbox::firecracker::jailer::host_nr_open(),
+        hard_limit,
+    )
+}
+
+/// [`check_limits`] with the facts of a worker, so a test can set them.
+fn check_limits_with(
+    max: &SandboxLimits,
+    raise: bool,
+    nr_open: u64,
+    hard: impl Fn(Resource) -> Option<libc::rlim_t>,
+) -> Result<(), SandboxError> {
+    let open_files = u64::from(max.max_open_files);
+    if open_files > nr_open {
+        return Err(SandboxError::Config(format!(
+            "limit max_open_files is {open_files}, above the fs.nr_open of {nr_open} on this \
+             host, so setrlimit would fail each run"
+        )));
+    }
+    if raise {
+        return Ok(());
+    }
+    // The hard values that `ChildSetup` sets.
+    for (field, resource, value) in [
+        (
+            "cpu_seconds",
+            libc::RLIMIT_CPU,
+            max.cpu_seconds.saturating_add(1),
+        ),
+        (
+            "memory_bytes",
+            libc::RLIMIT_DATA,
+            max.memory_bytes.saturating_add(DATA_HEADROOM_BYTES),
+        ),
+        ("max_file_bytes", libc::RLIMIT_FSIZE, max.max_file_bytes),
+        ("max_open_files", libc::RLIMIT_NOFILE, open_files),
+        (
+            "max_processes",
+            libc::RLIMIT_NPROC,
+            u64::from(max.max_processes),
+        ),
+    ] {
+        // getrlimit does not fail for these resources. A failure leaves the
+        // check to the spawn.
+        let Some(ceiling) = hard(resource) else {
+            continue;
+        };
+        if value > ceiling {
+            return Err(SandboxError::Config(format!(
+                "limit {field} needs a hard rlimit of {value}, above the {ceiling} of this \
+                 worker; a child cannot raise a hard limit without root and CAP_SYS_RESOURCE, \
+                 so each run would fail; raise the hard limit of the worker, such as with \
+                 systemd LimitNOFILE, or lower the policy"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The hard stack limit of this process, or `None` when it cannot be read.
 fn stack_hard_limit() -> Option<libc::rlim_t> {
     stack_limit().map(|limit| limit.rlim_max)
@@ -1641,6 +1752,48 @@ mod tests {
         std::fs::write(&path, b"").unwrap();
         write_control(&path, b"0").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"0");
+    }
+
+    #[test]
+    fn each_limit_must_fit_the_hard_limit_of_the_worker() {
+        let max = SandboxPolicy::default().max_limits;
+        let roomy = |_: Resource| Some(libc::RLIM_INFINITY);
+        check_limits_with(&max, false, 1 << 20, roomy).unwrap();
+        // Each hard value that the child sets, one over the worker limit.
+        for (resource, field, hard) in [
+            (libc::RLIMIT_CPU, "cpu_seconds", max.cpu_seconds + 1),
+            (
+                libc::RLIMIT_DATA,
+                "memory_bytes",
+                max.memory_bytes + DATA_HEADROOM_BYTES,
+            ),
+            (libc::RLIMIT_FSIZE, "max_file_bytes", max.max_file_bytes),
+            (
+                libc::RLIMIT_NOFILE,
+                "max_open_files",
+                u64::from(max.max_open_files),
+            ),
+            (
+                libc::RLIMIT_NPROC,
+                "max_processes",
+                u64::from(max.max_processes),
+            ),
+        ] {
+            let tight = |r: Resource| Some(if r == resource { hard - 1 } else { u64::MAX });
+            let err = check_limits_with(&max, false, 1 << 20, tight).expect_err(field);
+            assert!(
+                matches!(&err, SandboxError::Config(m) if m.contains(field)),
+                "{err:?}"
+            );
+            // Root with CAP_SYS_RESOURCE raises the hard limit.
+            check_limits_with(&max, true, 1 << 20, tight).unwrap();
+            let exact = |r: Resource| Some(if r == resource { hard } else { u64::MAX });
+            check_limits_with(&max, false, 1 << 20, exact).unwrap();
+        }
+        // No one can pass fs.nr_open.
+        let nr_open = u64::from(max.max_open_files) - 1;
+        let err = check_limits_with(&max, true, nr_open, roomy).expect_err("nr_open");
+        assert!(matches!(&err, SandboxError::Config(m) if m.contains("nr_open")));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use super::error::SandboxError;
 use super::exec::{ExecOptions, execute_plan};
 use super::outcome::SandboxOutcome;
-use super::policy::IsolationLevel;
+use super::policy::{IsolationLevel, SandboxLimits};
 use super::runtime::{BoxFuture, SandboxBackend, SandboxJob};
 
 /// A backend that runs each plan with the Linux process executor.
@@ -45,6 +45,12 @@ impl SandboxBackend for ProcessBackend {
     /// The allowance follows the stack limit of the worker.
     fn exec_capacity(&self) -> Option<u64> {
         Some(super::exec::exec_capacity())
+    }
+
+    /// A child cannot raise a hard rlimit above the one of the worker
+    /// without root and `CAP_SYS_RESOURCE`.
+    fn check_limits(&self, max: &SandboxLimits) -> Result<(), SandboxError> {
+        super::exec::check_limits(max)
     }
 
     fn execute(
@@ -148,5 +154,46 @@ mod tests {
             .unwrap();
         assert_eq!(out.status, RunStatus::Exited { code: 1 });
         assert!(out.stderr.contains("ZeroDivisionError"), "{}", out.stderr);
+    }
+
+    #[test]
+    fn a_limit_above_the_worker_hard_limit_is_a_config_error() {
+        let mut hard = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit writes a valid stack value.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut hard) },
+            0
+        );
+        let above = hard.rlim_max.saturating_add(1);
+        let Ok(above) = u32::try_from(above) else {
+            eprintln!("skipped: the hard open-file limit has no room above it");
+            return;
+        };
+        if above > crate::sandbox::policy::MAX_OPEN_FILES {
+            eprintln!("skipped: the hard open-file limit is at the policy ceiling");
+            return;
+        }
+        // A worker without CAP_SYS_RESOURCE, or a non-root one, cannot give
+        // a child more than its own hard limit. Each such run would fail.
+        let policy = SandboxPolicy::for_development();
+        let mut max = policy.max_limits;
+        max.max_open_files = above;
+        let defaults = policy.default_limits;
+        let policy = policy.with_limits(defaults, max);
+        let result = SandboxRuntime::new(Arc::new(ProcessBackend::default()), policy);
+        if crate::sandbox::exec::can_raise_hard_limits() {
+            result.unwrap();
+        } else {
+            let err = result
+                .map(|_| ())
+                .expect_err("each run would fail at setrlimit");
+            assert!(
+                matches!(&err, SandboxError::Config(m) if m.contains("max_open_files")),
+                "{err:?}"
+            );
+        }
     }
 }
