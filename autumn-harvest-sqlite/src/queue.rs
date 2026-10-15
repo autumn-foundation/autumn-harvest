@@ -735,21 +735,25 @@ pub fn delete_unfired_timers_for_execution(
     )?)
 }
 
-/// Delete every undelivered staged signal row for an execution — companion to
+/// Delete every unkeyed, undelivered staged signal row for an execution — companion to
 /// [`delete_pending_tasks_for_execution`] / [`delete_unfired_timers_for_execution`]
 /// for the `TerminateIfRunning` seal. A signal staged against a sealed prior can
 /// never be delivered, because the prior is never driven again. This backend has
 /// no retention/GC pass to reclaim it otherwise. Returns the number of rows deleted.
 /// Delivered rows are left untouched (inert audit history).
+///
+/// A row with an idempotency key also stays (issue #2028). It is the record
+/// that dedupes a retry of its key after the seal.
 pub fn delete_undelivered_signals_for_execution(
     conn: &Connection,
     exec_id: ExecutionId,
 ) -> SqliteResult<usize> {
-    Ok(conn.execute(
-        "DELETE FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
-        params![exec_id.to_string()],
-    )?)
+    Ok(conn.execute(DELETE_UNDELIVERED_SIGNALS_SQL, params![exec_id.to_string()])?)
 }
+
+/// The statement of [`delete_undelivered_signals_for_execution`].
+const DELETE_UNDELIVERED_SIGNALS_SQL: &str = "DELETE FROM harvest_signals \
+     WHERE exec_id = ?1 AND delivered = 0 AND idempotency_key IS NULL";
 
 /// Move every undelivered signal of `from` to `to` (issue #2023).
 ///
@@ -774,8 +778,8 @@ mod tests {
     use autumn_harvest::ExecutionId;
 
     use super::{
-        delete_undelivered_signals_for_execution, due_timers, due_timers_with_deadlines,
-        enqueue_timer,
+        DELETE_UNDELIVERED_SIGNALS_SQL, delete_undelivered_signals_for_execution, due_timers,
+        due_timers_with_deadlines, enqueue_timer,
     };
     use crate::schema;
 
@@ -789,7 +793,7 @@ mod tests {
 
         let plan: String = conn
             .query_row(
-                "EXPLAIN QUERY PLAN DELETE FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
+                &format!("EXPLAIN QUERY PLAN {DELETE_UNDELIVERED_SIGNALS_SQL}"),
                 params![exec.to_string()],
                 |row| row.get::<_, String>(3),
             )
@@ -802,6 +806,35 @@ mod tests {
             !plan.contains("SCAN"),
             "expected no full-table scan, got plan: {plan}"
         );
+    }
+
+    // Issue #2028: a seal deletes the unkeyed undelivered rows. A keyed row
+    // stays, so a retry of its key still dedupes. Delivered rows stay too.
+    #[test]
+    fn a_seal_keeps_keyed_and_delivered_signal_rows() {
+        let conn = open();
+        schema::migrate(&conn).unwrap();
+        let exec = ExecutionId::new();
+        conn.execute(
+            "INSERT INTO harvest_signals (exec_id, name, payload_json, delivered, idempotency_key) \
+             VALUES (?1, 'a', '1', 0, NULL), (?1, 'b', '1', 0, 'k'), (?1, 'c', '1', 1, NULL)",
+            params![exec.to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            delete_undelivered_signals_for_execution(&conn, exec).unwrap(),
+            1
+        );
+        let mut stmt = conn
+            .prepare("SELECT name FROM harvest_signals ORDER BY name")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(names, ["b", "c"]);
     }
 
     // Issue #2020: the bounded signal read must stream rows in arrival order.

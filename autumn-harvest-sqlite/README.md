@@ -111,6 +111,12 @@ A complete, runnable version is in
   starting a second one. The new call's input is discarded. Use
   `start_workflow_with_reuse_policy` for the full `WorkflowIdReusePolicy`
   matrix — reject, replace-if-failed, or terminate-and-restart.
+- **Keyed signals and signal-with-start (issue #2028).**
+  `send_signal_idempotent(exec, name, payload, key)` stages a signal once per
+  key, so a retried webhook is safe. `send_signal_by_workflow_id` signals the
+  running run of a `(workflow_name, workflow_id)` key and refuses a terminal
+  one. `signal_with_start` starts a run and signals it, or signals the run
+  that exists, in one transaction.
 - **Cancel and terminate (issue #2021).** `cancel(exec, reason)` is
   cooperative. The next drive replays the body with
   `ctx.cancellation_reason()` set, so the body can run cleanup activities. The
