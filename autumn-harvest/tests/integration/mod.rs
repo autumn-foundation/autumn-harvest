@@ -224,6 +224,7 @@ mod nd_block_tests;
 #[cfg(feature = "db")]
 mod notify_post_commit_tests;
 mod otel_semconv_docs;
+mod otel_workflow_semconv_docs;
 mod panic_containment_tests;
 #[cfg(feature = "db")]
 mod parent_close_cascade_unfinished_handlers_perf;
