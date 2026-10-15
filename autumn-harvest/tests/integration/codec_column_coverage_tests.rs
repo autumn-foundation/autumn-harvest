@@ -145,12 +145,26 @@ fn registry(
     activities: Vec<ActivityInfo>,
     codecs: &PayloadCodecs,
 ) -> Arc<HandlerRegistry> {
+    registry_with_telemetry(
+        workflows,
+        activities,
+        codecs,
+        Arc::new(TelemetryConfig::default()),
+    )
+}
+
+fn registry_with_telemetry(
+    workflows: Vec<WorkflowInfo>,
+    activities: Vec<ActivityInfo>,
+    codecs: &PayloadCodecs,
+    telemetry: Arc<TelemetryConfig>,
+) -> Arc<HandlerRegistry> {
     Arc::new(
         HandlerRegistry::with_state_and_telemetry(
             workflows,
             activities,
             autumn_harvest::context::empty_shared_state(),
-            Arc::new(TelemetryConfig::default()),
+            telemetry,
         )
         .with_payload_codecs(codecs.clone()),
     )
@@ -1615,15 +1629,57 @@ fn wf_guarded(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
     })
 }
 
-#[tokio::test]
-async fn an_activity_that_cannot_decode_its_input_fails_the_attempt_and_never_runs() {
+/// Runs the activity on a queue that another worker owns, with a policy that
+/// skips `PayloadDecodeFailed`.
+fn wf_guarded_non_retryable(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let queue = format!("{}-act", ctx.queue_name());
+        let policy = RetryPolicy {
+            max_attempts: 3,
+            initial_interval: Duration::from_millis(10),
+            backoff_coefficient: 1.0,
+            max_interval: Duration::from_millis(10),
+            non_retryable_errors: vec!["PayloadDecodeFailed".to_string()],
+            jitter: JitterPolicy::None,
+        };
+        ctx.execute_activity_raw_with_opts("cc_guarded", input, &queue, Some(policy), None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// The `(error_type, non_retryable)` labels of the failed activity attempts.
+#[derive(Default)]
+struct FailureLabels(std::sync::Mutex<Vec<(String, bool)>>);
+
+impl autumn_harvest::telemetry::MetricsRecorder for FailureLabels {
+    fn record_activity_failed(
+        &self,
+        _activity_name: &str,
+        _workflow_type: &str,
+        error_type: &str,
+        non_retryable: bool,
+    ) {
+        self.0
+            .lock()
+            .unwrap()
+            .push((error_type.to_string(), non_retryable));
+    }
+}
+
+/// Corrupts the activity task row of a run, then lets a second worker claim
+/// it. Returns the failure labels that worker recorded.
+async fn fail_a_corrupt_activity_row(
+    workflow_name: &'static str,
+    handler: autumn_harvest::info::WorkflowHandlerFn,
+) -> Vec<(String, bool)> {
     let (url, _c) = setup_test_database_url_or_env().await;
     let wf_queue: &'static str =
         Box::leak(format!("cc-{}", Uuid::new_v4().simple()).into_boxed_str());
     let act_queue: &'static str = Box::leak(format!("{wf_queue}-act").into_boxed_str());
     let codecs = aead_codecs(true);
     let mut conn = connect(&url).await;
-    let exec_id = start(&mut conn, &codecs, "cc_guarded_wf", wf_queue, None).await;
+    let exec_id = start(&mut conn, &codecs, workflow_name, wf_queue, None).await;
     let exec = exec_id.as_uuid().to_string();
 
     // The first worker owns the workflow queue. It schedules the activity on a
@@ -1632,7 +1688,7 @@ async fn an_activity_that_cannot_decode_its_input_fails_the_attempt_and_never_ru
     let owner = worker(
         wf_queue,
         registry(
-            vec![wf_info("cc_guarded_wf", wf_guarded, None)],
+            vec![wf_info(workflow_name, handler, None)],
             vec![activity_info("cc_guarded", act_queue, guarded_activity)],
             &codecs,
         ),
@@ -1669,12 +1725,15 @@ async fn an_activity_that_cannot_decode_its_input_fails_the_attempt_and_never_ru
     .await
     .expect("corrupt the task row");
 
+    let labels = Arc::new(FailureLabels::default());
+    let telemetry = Arc::new(TelemetryConfig::builder().metrics(labels.clone()).build());
     let activity_worker = worker(
         act_queue,
-        registry(
+        registry_with_telemetry(
             Vec::new(),
             vec![activity_info("cc_guarded", act_queue, guarded_activity)],
             &codecs,
+            telemetry,
         ),
     );
     let run_activity = activity_worker.clone();
@@ -1708,6 +1767,31 @@ async fn an_activity_that_cannot_decode_its_input_fails_the_attempt_and_never_ru
         AtomicUsize::load(&GUARDED_RUNS, Ordering::SeqCst),
         0,
         "the handler never runs on ciphertext"
+    );
+    labels.0.lock().unwrap().clone()
+}
+
+#[tokio::test]
+async fn an_activity_that_cannot_decode_its_input_fails_the_attempt_and_never_runs() {
+    let labels = fail_a_corrupt_activity_row("cc_guarded_wf", wf_guarded).await;
+    assert!(!labels.is_empty(), "the failed attempt is counted");
+    assert!(
+        labels.iter().all(
+            |(error_type, non_retryable)| error_type == "PayloadDecodeFailed" && !non_retryable
+        ),
+        "the default policy retries a decode failure: {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_decode_failure_the_policy_skips_is_counted_as_non_retryable() {
+    let labels = fail_a_corrupt_activity_row("cc_guarded_nr_wf", wf_guarded_non_retryable).await;
+    assert!(!labels.is_empty(), "the failed attempt is counted");
+    assert!(
+        labels.iter().all(
+            |(error_type, non_retryable)| error_type == "PayloadDecodeFailed" && *non_retryable
+        ),
+        "the policy lists PayloadDecodeFailed, so the metric says non-retryable: {labels:?}"
     );
 }
 

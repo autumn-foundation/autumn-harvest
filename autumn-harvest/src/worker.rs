@@ -18732,6 +18732,16 @@ async fn fail_attempt_before_handler(
         ActivityStatus::Failed,
         Some(error_type),
     );
+    // The label follows the retry decision, as for a handler failure. It
+    // honours the typed flag and the policy's `non_retryable_errors` list. A
+    // policy that does not load leaves the typed flag.
+    let retry_policy =
+        retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await;
+    let non_retryable = non_retryable
+        || failure_is_non_retryable(
+            &payload,
+            retry_policy.as_ref().ok().and_then(Option::as_ref),
+        );
     telemetry
         .metrics
         .record_activity_failed(activity_name, "", error_type, non_retryable);
@@ -18741,19 +18751,19 @@ async fn fail_attempt_before_handler(
         build_label,
         ActivityStatus::Failed,
     );
-    let finalized = async {
-        let retry_policy =
-            retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await?;
-        write_activity_result(
-            pool,
-            registry,
-            attempt,
-            retry_policy.as_ref(),
-            &Err(payload),
-        )
-        .await
-    }
-    .await;
+    let finalized = match retry_policy {
+        Ok(retry_policy) => {
+            write_activity_result(
+                pool,
+                registry,
+                attempt,
+                retry_policy.as_ref(),
+                &Err(payload),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
     let write = finalize_write_for_outcome(&finalized);
     if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write, false) {
         record_activity_outcome(
