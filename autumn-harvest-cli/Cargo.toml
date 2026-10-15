@@ -39,7 +39,8 @@ diesel-async = { workspace = true }
 futures = { workspace = true }
 tokio-postgres = "0.7.18"
 tokio-postgres-rustls = "0.14"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# 0.23.46 is the first release with the RUSTSEC-2026-0346 to 0349 fixes.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 url = "2"
 crossterm = "0.29.0"
