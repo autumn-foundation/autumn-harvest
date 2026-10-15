@@ -33,8 +33,9 @@ uuid = { workspace = true }
 # TLS support (issue #1834). The `redis` client builds its rustls config
 # with `ClientConfig::builder()`, which needs a process crypto provider. This
 # crate installs `ring` when none is set. `rustls::pki_types` also checks
-# caller-supplied PEM before any network I/O.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# caller-supplied PEM before any network I/O. 0.23.46 is the first release
+# with the RUSTSEC-2026-0346 to 0349 fixes.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 
