@@ -24,6 +24,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
+use autumn_harvest::policy::MAX_INTERVAL_PERIOD;
 use autumn_harvest::prelude::*;
 use autumn_harvest::worker::DbPool;
 use chrono::{DateTime, Utc};
@@ -114,6 +115,8 @@ impl CanaryConfig {
     /// `per_probe_timeout` at or below the probe's own minimum runtime and
     /// false-fail a healthy pipeline (issue #796, AC6). **30s is recommended.**
     /// A fractional `interval` rounds up to the next whole second (issue #1967).
+    /// An `interval` above [`MAX_INTERVAL_PERIOD`] is **clamped down** (with a
+    /// warning), so the interval schedule validates (issue #2048).
     #[must_use]
     pub fn new(interval: Duration) -> Self {
         // An interval schedule takes whole seconds only (issue #1967). Round a
@@ -131,6 +134,17 @@ impl CanaryConfig {
                  healthy probe cannot false-fail its per-probe timeout (issue #796)"
             );
             MIN_CANARY_INTERVAL
+        } else {
+            interval
+        };
+        let interval = if interval > MAX_INTERVAL_PERIOD {
+            tracing::warn!(
+                requested_secs = interval.as_secs(),
+                max_secs = MAX_INTERVAL_PERIOD.as_secs(),
+                "synthetic liveness canary interval above the maximum; clamping down so the \
+                 interval schedule validates (issue #2048)"
+            );
+            MAX_INTERVAL_PERIOD
         } else {
             interval
         };

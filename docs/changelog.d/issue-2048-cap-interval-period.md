@@ -39,6 +39,9 @@ Design decisions:
   `checked_add_signed` and returns `None` on overflow, as for a zero
   interval. `plan_backfill_timestamps` stops its walk. Every caller
   terminates.
+- `CanaryConfig::new` clamps an interval over the cap down, with a warning.
+  Issue #1967 rounded a fraction up for the same reason: a canary must
+  always build.
 - The stored form, the API shape and the CLI do not change.
 
 No migration. No new `WorkflowEvent` variant.
@@ -56,5 +59,6 @@ These tests cover the cap boundary and each path that calls
 `stored_huge_interval_walks_end`,
 `harvest_builder_rejects_workflow_schedule_over_the_interval_cap`,
 `harvest_builder_rejects_dag_schedule_over_the_interval_cap`,
+`a_huge_canary_interval_still_builds`,
 `invalid_merged_schedule_writes_nothing` and
 `parse_schedule_expr_with_tz_interval_over_the_cap_is_rejected`.
