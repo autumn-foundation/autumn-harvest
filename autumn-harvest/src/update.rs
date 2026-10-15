@@ -483,7 +483,7 @@ mod tests {
         let (outcome, pending) = drive(context(history, &[&handler], true), parked).await;
 
         assert!(matches!(outcome, WorkflowOutcome::Suspended { .. }));
-        assert!(results(&outcome, &pending).is_empty());
+        assert_eq!(results(&outcome, &pending), Vec::new());
         assert_eq!(REPLAY_RUNS.load(Ordering::SeqCst), 0);
     }
 
@@ -502,7 +502,7 @@ mod tests {
         let (outcome, pending) = drive(context(history, &[&handler], false), parked).await;
 
         assert!(matches!(outcome, WorkflowOutcome::Suspended { .. }));
-        assert!(results(&outcome, &pending).is_empty());
+        assert_eq!(results(&outcome, &pending), Vec::new());
         assert_eq!(OFF_RUNS.load(Ordering::SeqCst), 0);
     }
 
@@ -711,7 +711,7 @@ mod tests {
             ),
             "{outcome:?}"
         );
-        assert!(results(&outcome, &pending).is_empty());
+        assert_eq!(results(&outcome, &pending), Vec::new());
         assert_eq!(DIVERGE_RUNS.load(Ordering::SeqCst), 0);
     }
 
@@ -743,7 +743,7 @@ mod tests {
             ),
             "{outcome:?}"
         );
-        assert!(results(&outcome, &pending).is_empty());
+        assert_eq!(results(&outcome, &pending), Vec::new());
         assert_eq!(PANIC_BODY_RUNS.load(Ordering::SeqCst), 0);
     }
 
@@ -850,7 +850,7 @@ mod tests {
 
         let second = drive_full(context(history, &handlers, true), parked).await;
         assert!(matches!(second.outcome, WorkflowOutcome::Suspended { .. }));
-        assert!(results(&second.outcome, &second.pending).is_empty());
+        assert_eq!(results(&second.outcome, &second.pending), Vec::new());
         assert!(!second.updates_deferred);
         assert_eq!(NEXT_CYCLE_RUNS.load(Ordering::SeqCst), 1);
     }

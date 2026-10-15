@@ -66,7 +66,7 @@ fn local_then_park(ctx: &WorkflowContext, _input: Value) -> BodyFuture<'_> {
     })
 }
 
-fn local_probe<'a>(_ctx: &'a ActivityContext, _input: Value) -> BodyFuture<'a> {
+fn local_probe(_ctx: &ActivityContext, _input: Value) -> BodyFuture<'_> {
     Box::pin(async move { Ok(json!("probed")) })
 }
 
