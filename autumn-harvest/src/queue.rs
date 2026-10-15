@@ -4249,6 +4249,25 @@ pub(crate) async fn claim_handler_started(
     Ok(row.is_some_and(|(held, started)| held == Some(true) && started == Some(claim.attempt)))
 }
 
+/// An activity result as its task row stores it (issue #2043).
+///
+/// The row holds the result in the column form. A stored-result reference
+/// holds no payload, only a pointer to the blob, so it stays as it is.
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError`] when the codec fails to encode.
+pub fn activity_row_output(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    output: &serde_json::Value,
+    is_stored_reference: bool,
+) -> crate::error::HarvestResult<serde_json::Value> {
+    if is_stored_reference {
+        return Ok(output.clone());
+    }
+    codecs.encode_column(output)
+}
+
 /// Complete the task that `claim` holds. A stale claim changes nothing.
 ///
 /// Returns [`ClaimWrite::LeaseLost`] for a stale claim. [`complete_task`] is
@@ -5112,6 +5131,34 @@ pub async fn record_heartbeat_sent_ago(
     details: serde_json::Value,
     age: std::time::Duration,
 ) -> HarvestResult<ClaimWrite> {
+    record_heartbeat_inner(conn, claim, Some(details), age).await
+}
+
+/// [`record_heartbeat_sent_ago`] for a heartbeat that holds no details
+/// (issue #2043).
+///
+/// It refreshes `last_heartbeat_at` and leaves the stored checkpoint as it
+/// is. The heartbeat flusher uses it when a checkpoint does not encode, so the
+/// previous checkpoint survives.
+///
+/// # Errors
+///
+/// As [`record_heartbeat_sent_ago`].
+pub async fn record_heartbeat_liveness_sent_ago(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    age: std::time::Duration,
+) -> HarvestResult<ClaimWrite> {
+    record_heartbeat_inner(conn, claim, None, age).await
+}
+
+/// The shared body of the two heartbeat writes. `None` keeps the checkpoint.
+async fn record_heartbeat_inner(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    details: Option<serde_json::Value>,
+    age: std::time::Duration,
+) -> HarvestResult<ClaimWrite> {
     use diesel_async::AsyncConnection as _;
     if !crate::replication::FenceRegistry::is_enabled() {
         return write_heartbeat(conn, claim, details, age).await;
@@ -5129,7 +5176,7 @@ pub async fn record_heartbeat_sent_ago(
 async fn write_heartbeat(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    details: serde_json::Value,
+    details: Option<serde_json::Value>,
     age: std::time::Duration,
 ) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
@@ -5139,16 +5186,20 @@ async fn write_heartbeat(
     )
     .bind::<diesel::sql_types::Double, _>(age.as_secs_f64())
     .sql(")");
-    let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id))
-        .set((
-            dsl::last_heartbeat_at.eq(stamp),
-            dsl::heartbeat_details.eq(Some(details)),
-        ))
-        .into_boxed();
-    let updated = fence(update, Some(claim))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let target = diesel::update(dsl::harvest_task_queue.find(claim.task_id));
+    let updated = if let Some(details) = details {
+        let update = target
+            .set((
+                dsl::last_heartbeat_at.eq(stamp),
+                dsl::heartbeat_details.eq(Some(details)),
+            ))
+            .into_boxed();
+        fence(update, Some(claim)).execute(conn).await
+    } else {
+        let update = target.set(dsl::last_heartbeat_at.eq(stamp)).into_boxed();
+        fence(update, Some(claim)).execute(conn).await
+    }
+    .map_err(crate::error::database_error)?;
     Ok(claim_write(updated > 0))
 }
 
@@ -10031,6 +10082,38 @@ pub async fn claim_task_batched_on_shard(
 mod tests {
     use super::*;
     use crate::error::CapabilityMissPhase;
+
+    /// An activity result is stored in the column form (issue #2043). A
+    /// stored-result reference holds no payload, so it stays as it is.
+    #[test]
+    fn an_activity_row_output_follows_the_column_switch() {
+        let codecs = crate::payload_codec::PayloadCodecs::default();
+        let key = crate::aead_codec::DataKey::from_bytes(&[0x31; 32]).expect("key");
+        crate::aead_codec::AeadCodec::new("k1", &key)
+            .expect("codec")
+            .register_with(&codecs)
+            .expect("register");
+        let result = serde_json::json!({"card": "4111"});
+
+        codecs.set_column_encoding(false);
+        assert_eq!(
+            activity_row_output(&codecs, &result, false).expect("off"),
+            result,
+            "with the switch off, the result stays as it is"
+        );
+
+        codecs.set_column_encoding(true);
+        let stored = activity_row_output(&codecs, &result, false).expect("on");
+        assert!(crate::payload_codec::is_codec_envelope(&stored));
+        assert_eq!(codecs.decode_column(&stored).expect("decode"), result);
+
+        let reference = serde_json::json!({"blob": "key"});
+        assert_eq!(
+            activity_row_output(&codecs, &reference, true).expect("reference"),
+            reference,
+            "a stored-result reference stays clear"
+        );
+    }
 
     /// `EnqueueParams` shares its input with the caller (issue #1733).
     #[test]

@@ -65,6 +65,7 @@ allos        autumn-harvest         integration                      testing,met
 allos        autumn-harvest         property                         db                         -
 allos        autumn-harvest-plugin  api_rate_limit                   -                          -
 allos        autumn-harvest-plugin  archived_history_api_tests       -                          -
+allos        autumn-harvest-plugin  codec_column_writers_guard       -                          -
 allos        autumn-harvest-plugin  connector_dependency_graph       -                          -
 allos        autumn-harvest-plugin  connector_example_budget         -                          -
 allos        autumn-harvest-plugin  contract_regression              -                          -

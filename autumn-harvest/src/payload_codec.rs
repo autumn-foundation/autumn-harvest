@@ -1698,10 +1698,10 @@ impl PayloadCodecs {
 
     /// Turn encoding of the codec columns on or off (issue #1979).
     ///
-    /// The codec columns are `harvest_workflow_executions.input`, `.output`
-    /// and `.memo`, `harvest_signals.payload`, `harvest_dead_letters.input`,
-    /// and the workflow task's `harvest_task_queue.input` and `.output`. The
-    /// default is off.
+    /// The codec columns are the entries of `codec_rotation::CODEC_COLUMNS`
+    /// (issue #1979, issue #2043). The coverage table in
+    /// `docs/security-posture.md` gives a reason for each column that stays
+    /// clear. The default is off.
     ///
     /// Readers always decode these columns, whatever this switch says. So
     /// turn it on only after every process in the fleet runs a release that

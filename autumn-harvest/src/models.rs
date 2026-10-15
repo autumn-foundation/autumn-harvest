@@ -1619,7 +1619,8 @@ pub struct CompletionDelivery {
     pub target_url: String,
     pub event_filter: serde_json::Value,
     pub terminal_state: String,
-    /// Frozen `CompletionEnvelope` JSON, signed and `POSTed` verbatim on every
+    /// Frozen `CompletionEnvelope` JSON in the column form (issue #2043). The
+    /// scanner decodes it, then signs and `POST`s the plain body on every
     /// attempt, including redeliveries.
     pub payload: serde_json::Value,
     /// `PENDING` | `INFLIGHT` | `DELIVERED` | `FAILED`.

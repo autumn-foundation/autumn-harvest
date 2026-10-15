@@ -11325,11 +11325,19 @@ fn build_activity_enqueue_plan(
             scheduled.queue.clone()
         };
 
-        let mut params = queue::EnqueueParams::new(
-            queue_name.clone(),
-            TaskType::Activity,
-            scheduled.input.clone(),
-        );
+        // A reserved session activity carries a session id, not payload. Its
+        // row keeps the id as it is, so a missing key cannot fail the run.
+        let is_reserved = crate::context::is_reserved_session_activity_name(&scheduled.name);
+        // Any other row stores the input as the column form (issue #2043).
+        // The `ActivityScheduled` event below keeps the plain input, and the
+        // event codec encodes it.
+        let row_input = if is_reserved {
+            scheduled.input.clone()
+        } else {
+            registry.payload_codecs().encode_column(&scheduled.input)?
+        };
+        let mut params =
+            queue::EnqueueParams::new(queue_name.clone(), TaskType::Activity, row_input);
         params.workflow_exec_id = Some(exec_id.as_uuid());
         params.activity_name = Some(scheduled.name.clone());
         params.activity_id = Some(scheduled.activity_id.as_uuid());
@@ -11360,7 +11368,6 @@ fn build_activity_enqueue_plan(
         // floor. They must NOT inherit the builder-level default — fall back to
         // the pre-feature resolution (call-site override → activity default) for
         // them so an operator's floor never governs session acquire/release.
-        let is_reserved = crate::context::is_reserved_session_activity_name(&scheduled.name);
         let builder_retry_default = if is_reserved {
             None
         } else {
@@ -14842,6 +14849,15 @@ async fn finalize_activity_completion_write(
         return Ok(queue::ClaimWrite::LeaseLost);
     };
 
+    // The row stores the result in the column form (issue #2043). Encode it
+    // before the transaction, so the execution lock and the claim lock are not
+    // held across the encode. A stored-result reference stays as it is.
+    let encoded_row_output = if stored.is_some() {
+        None
+    } else {
+        Some(queue::activity_row_output(codecs, &output, false)?)
+    };
+
     let result = Box::pin(
         conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
             let mut output = output.clone();
@@ -14894,7 +14910,8 @@ async fn finalize_activity_completion_write(
                 llm_calls,
             )
             .await?;
-            queue::complete_claimed_task(conn, &claim_of_task(task)?, output)
+            let row_output = encoded_row_output.clone().unwrap_or_else(|| output.clone());
+            queue::complete_claimed_task(conn, &claim_of_task(task)?, row_output)
                 .await?
                 .require_applied(task.id)?;
             // Worker sessions (issue #606): a session member activity's
@@ -17929,6 +17946,72 @@ async fn record_session_acquire_schedule_to_start_timeout(
     crate::dispatch::settle_scope(result).await
 }
 
+/// The session id in a session task's input (issue #2043).
+///
+/// A new row keeps the id as it is. The decode only serves a row that holds a
+/// column form. An input that does not decode is not a valid session id.
+fn session_id_of_input(
+    input: &serde_json::Value,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> Option<crate::types::SessionId> {
+    codecs
+        .decode_column(input)
+        .ok()?
+        .as_str()?
+        .parse::<crate::types::SessionId>()
+        .ok()
+}
+
+#[cfg(test)]
+mod session_input_tests {
+    use super::session_id_of_input;
+    use crate::aead_codec::{AeadCodec, DataKey};
+    use crate::payload_codec::PayloadCodecs;
+    use crate::types::SessionId;
+    use serde_json::json;
+
+    fn aead_codecs() -> PayloadCodecs {
+        let codecs = PayloadCodecs::default();
+        let key = DataKey::from_bytes(&[0x21; 32]).expect("key");
+        AeadCodec::new("k1", &key)
+            .expect("codec")
+            .register_with(&codecs)
+            .expect("register");
+        codecs.set_column_encoding(true);
+        codecs
+    }
+
+    #[test]
+    fn a_clear_session_id_reads_back() {
+        let id = SessionId::new();
+        let input = json!(id.as_uuid().to_string());
+        assert_eq!(session_id_of_input(&input, &aead_codecs()), Some(id));
+    }
+
+    #[test]
+    fn an_encoded_session_id_reads_back() {
+        let codecs = aead_codecs();
+        let id = SessionId::new();
+        let stored = codecs
+            .encode_column(&json!(id.as_uuid().to_string()))
+            .expect("encode");
+        assert_eq!(session_id_of_input(&stored, &codecs), Some(id));
+    }
+
+    #[test]
+    fn an_input_that_does_not_decode_is_not_a_session_id() {
+        let id = SessionId::new();
+        let stored = aead_codecs()
+            .encode_column(&json!(id.as_uuid().to_string()))
+            .expect("encode");
+        assert_eq!(
+            session_id_of_input(&stored, &PayloadCodecs::default()),
+            None
+        );
+        assert_eq!(session_id_of_input(&json!(7), &aead_codecs()), None);
+    }
+}
+
 /// Handle the internal session-acquire activity (issue #606) -- see the
 /// interception in [`process_activity_task`].
 ///
@@ -17976,11 +18059,7 @@ async fn handle_session_acquire(
     };
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
 
-    let Some(session_id) = task
-        .input
-        .as_str()
-        .and_then(|s| s.parse::<crate::types::SessionId>().ok())
-    else {
+    let Some(session_id) = session_id_of_input(&task.input, codecs) else {
         let error = "session-acquire task input is not a valid SessionId".to_string();
         fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
@@ -18206,11 +18285,7 @@ async fn handle_session_release(
     };
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
 
-    let Some(session_id) = task
-        .input
-        .as_str()
-        .and_then(|s| s.parse::<crate::types::SessionId>().ok())
-    else {
+    let Some(session_id) = session_id_of_input(&task.input, codecs) else {
         let error = "session-release task input is not a valid SessionId".to_string();
         fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
@@ -18612,6 +18687,107 @@ pub async fn handle_session_acquire_for_test(
     )
     .await
     .map(|_| ())
+}
+
+/// Why an attempt ends before its handler runs.
+struct PreHandlerFailure {
+    /// The metric label.
+    error_type: &'static str,
+    /// Whether the retry policy skips this failure.
+    non_retryable: bool,
+    /// The failure text that the result carries.
+    payload: String,
+}
+
+/// Where a failed attempt reports its outcome (issue #1815).
+struct ActivityOutcomeSinks<'a> {
+    task_outcomes: &'a crate::worker_outlier::TaskOutcomeWindow,
+    deferred_failure: &'a DeferredActivityFailure,
+    outlier_clock: std::time::Instant,
+}
+
+/// End an attempt that fails before its handler runs.
+///
+/// The circuit breaker and a bad stored payload both use it. It records the
+/// failure metrics, writes the result, and reports the outcome.
+///
+/// `ActivityStarted` is already committed, and a start is not idempotent.
+/// So the write uses the same retries as a handler result (issue #1788). A
+/// released claim would append a second start. A rejection whose claim a later
+/// owner took is skipped, as for any attempt.
+async fn fail_attempt_before_handler(
+    pool: &DbPool,
+    registry: &HandlerRegistry,
+    attempt: &ActivityAttempt<'_>,
+    build_id: &str,
+    failure: PreHandlerFailure,
+    sinks: &ActivityOutcomeSinks<'_>,
+) -> HarvestResult<()> {
+    let PreHandlerFailure {
+        error_type,
+        non_retryable,
+        payload,
+    } = failure;
+    let ActivityAttempt {
+        task,
+        worker_id,
+        activity_name,
+        ..
+    } = *attempt;
+    let telemetry = registry.telemetry().clone();
+    let build_label = crate::telemetry::build_id_label(build_id);
+    let build_label = build_label.as_ref();
+    telemetry.metrics.record_activity_completed_for_build(
+        activity_name,
+        &task.queue_name,
+        build_label,
+        0.0,
+        ActivityStatus::Failed,
+        Some(error_type),
+    );
+    // The label follows the retry decision, as for a handler failure. It
+    // honours the typed flag and the policy's `non_retryable_errors` list. A
+    // policy that does not load leaves the typed flag.
+    let retry_policy =
+        retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await;
+    let non_retryable = non_retryable
+        || failure_is_non_retryable(
+            &payload,
+            retry_policy.as_ref().ok().and_then(Option::as_ref),
+        );
+    telemetry
+        .metrics
+        .record_activity_failed(activity_name, "", error_type, non_retryable);
+    telemetry.metrics.record_activity_attempt_for_build(
+        activity_name,
+        &task.queue_name,
+        build_label,
+        ActivityStatus::Failed,
+    );
+    let finalized = match retry_policy {
+        Ok(retry_policy) => {
+            write_activity_result(
+                pool,
+                registry,
+                attempt,
+                retry_policy.as_ref(),
+                &Err(payload),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    let write = finalize_write_for_outcome(&finalized);
+    if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write, false) {
+        record_activity_outcome(
+            sinks.task_outcomes,
+            sinks.deferred_failure,
+            sinks.outlier_clock,
+            failed,
+            finalized.as_ref().err(),
+        );
+    }
+    finalized.map(|_| ())
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -19082,6 +19258,14 @@ async fn process_activity_task(
         ) + dispatched_at.elapsed().as_secs_f64(),
     );
 
+    let attempt = ActivityAttempt {
+        task,
+        exec_id,
+        activity_id,
+        worker_id,
+        activity_name,
+        llm_calls: &[],
+    };
     if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
         opened_at,
         retry_after,
@@ -19091,70 +19275,70 @@ async fn process_activity_task(
         let payload =
             crate::failure::ActivityFailure::circuit_open(activity_name, opened_at, retry_after)
                 .into_error_payload();
-        let telemetry = registry.telemetry().clone();
-        let build_label = crate::telemetry::build_id_label(build_id);
-        let build_label = build_label.as_ref();
-        telemetry.metrics.record_activity_completed_for_build(
-            activity_name,
-            &task.queue_name,
-            build_label,
-            0.0,
-            ActivityStatus::Failed,
-            Some(crate::failure::ERROR_TYPE_CIRCUIT_OPEN),
-        );
-        telemetry.metrics.record_activity_failed(
-            activity_name,
-            "",
-            crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
-            true,
-        );
-        telemetry.metrics.record_activity_attempt_for_build(
-            activity_name,
-            &task.queue_name,
-            build_label,
-            ActivityStatus::Failed,
-        );
-        // `ActivityStarted` is already committed, and a start is not
-        // idempotent. So this write uses the same retries as a handler result
-        // (issue #1788). A released claim would append a second start.
-        let finalized = async {
-            let retry_policy =
-                retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await?;
-            let attempt = ActivityAttempt {
-                task,
-                exec_id,
-                activity_id,
-                worker_id,
-                activity_name,
-                llm_calls: &[],
-            };
-            write_activity_result(
-                pool,
-                registry,
-                &attempt,
-                retry_policy.as_ref(),
-                &Err(payload),
-            )
-            .await
-        }
-        .await;
-        // Issue #1815: a breaker is per worker, so a rejected attempt counts as
-        // a failure. Otherwise the ratio would improve while the worker rejects
-        // work. A rejection whose claim a later owner took is skipped, as for
-        // any attempt.
-        let write = finalize_write_for_outcome(&finalized);
-        if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write, false)
-        {
-            record_activity_outcome(
+        // Issue #1815: a breaker is per worker, so a rejected attempt counts
+        // as a failure. Otherwise the ratio would improve while the worker
+        // rejects work.
+        return fail_attempt_before_handler(
+            pool,
+            registry,
+            &attempt,
+            build_id,
+            PreHandlerFailure {
+                error_type: crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
+                non_retryable: true,
+                payload,
+            },
+            &ActivityOutcomeSinks {
                 task_outcomes,
                 deferred_failure,
                 outlier_clock,
-                failed,
-                finalized.as_ref().err(),
-            );
-        }
-        return finalized.map(|_| ());
+            },
+        )
+        .await;
     }
+
+    // The row stores the input and the last checkpoint as the column form
+    // (issue #2043). The handler gets the plain values. A value that does not
+    // decode fails the attempt. The retry policy then applies, and an
+    // operator can restore the key.
+    let codecs = registry.payload_codecs();
+    let decoded = codecs.decode_column(&task.input).and_then(|input| {
+        let checkpoint = codecs.decode_column_opt(task.heartbeat_details.as_ref())?;
+        Ok((input, checkpoint))
+    });
+    let (handler_input, previous_checkpoint) = match decoded {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            use crate::failure::IntoActivityErrorString as _;
+            tracing::warn!(
+                task_id = %task.id,
+                error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                "activity payload could not be decoded"
+            );
+            let payload = crate::failure::ActivityFailure::retryable(
+                crate::failure::ERROR_TYPE_PAYLOAD_DECODE_FAILED,
+                "the stored activity input or checkpoint could not be decoded",
+            )
+            .into_error_payload();
+            return fail_attempt_before_handler(
+                pool,
+                registry,
+                &attempt,
+                build_id,
+                PreHandlerFailure {
+                    error_type: crate::failure::ERROR_TYPE_PAYLOAD_DECODE_FAILED,
+                    non_retryable: false,
+                    payload,
+                },
+                &ActivityOutcomeSinks {
+                    task_outcomes,
+                    deferred_failure,
+                    outlier_clock,
+                },
+            )
+            .await;
+        }
+    };
 
     // The context token is a child of the flusher token. A lost lease
     // cancels both. A drain cancels the context alone, so a handler that
@@ -19162,7 +19346,7 @@ async fn process_activity_task(
     let heartbeat_stop = CancellationToken::new();
     let cancel = heartbeat_stop.child_token();
     let activity_claim = claim_of_task(task)?;
-    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher_with(
+    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher_with_codecs(
         activity_claim.clone(),
         pool.clone(),
         heartbeat_stop.clone(),
@@ -19171,6 +19355,7 @@ async fn process_activity_task(
             metrics: Arc::clone(&registry.telemetry().metrics),
             shards: Arc::clone(pool_labels),
         },
+        codecs.clone(),
     );
     let trace_carrier = task
         .trace_context
@@ -19204,7 +19389,7 @@ async fn process_activity_task(
     let ctx = ActivityContext::new_with_cancellation_check(
         registry.shared_state(),
         Some(heartbeat_tx.into()),
-        task.heartbeat_details.clone(),
+        previous_checkpoint,
         cancel.clone(),
         activity_claim.clone(),
         pool.clone(),
@@ -19466,7 +19651,7 @@ async fn process_activity_task(
                 activity_interceptors,
                 &invocation,
                 &ctx,
-                task.input.clone(),
+                handler_input,
                 // `move` captures the resolved dispatch; it does NOT borrow
                 // `&ctx`, so it composes with the chain's own `&ctx` borrow. The
                 // explicit return type unifies the two `Box::pin` arms.
@@ -19506,7 +19691,7 @@ async fn process_activity_task(
                 activity_interceptors,
                 &invocation,
                 &ctx,
-                task.input.clone(),
+                handler_input,
                 |input| (activity_handler)(&ctx, input),
             )
         }),
@@ -19519,7 +19704,7 @@ async fn process_activity_task(
                 activity_interceptors,
                 &invocation,
                 &ctx,
-                task.input.clone(),
+                handler_input,
                 |input| (activity_handler)(&ctx, input),
             )
         })

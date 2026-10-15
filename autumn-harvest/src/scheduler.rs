@@ -4791,7 +4791,7 @@ async fn tick_one_workflow_schedule(
                     start_source_ref: Some(schedule.id.to_string()),
                     started_by: None,
                 };
-                match crate::throttle::reserve_or_defer(
+                match crate::throttle::reserve_or_defer_with_codecs(
                     conn,
                     crate::throttle::AdmitThrottleParams {
                         workflow_name: wf_name,
@@ -4805,6 +4805,7 @@ async fn tick_one_workflow_schedule(
                         schedule_to_start: throttle_policy.schedule_to_start,
                         shard_id: current_shard.as_i32(),
                     },
+                    registry.payload_codecs(),
                 )
                 .await
                 {
@@ -6844,7 +6845,7 @@ async fn drain_claimed_buffered_schedule(
                     start_source_ref: Some(schedule.id.to_string()),
                     started_by: None,
                 };
-                match crate::throttle::reserve_or_defer(
+                match crate::throttle::reserve_or_defer_with_codecs(
                     conn,
                     crate::throttle::AdmitThrottleParams {
                         workflow_name: wf_name,
@@ -6858,6 +6859,7 @@ async fn drain_claimed_buffered_schedule(
                         schedule_to_start: throttle_policy.schedule_to_start,
                         shard_id: current_shard.as_i32(),
                     },
+                    registry.payload_codecs(),
                 )
                 .await
                 {
