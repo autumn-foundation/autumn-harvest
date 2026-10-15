@@ -3319,8 +3319,8 @@ fn validate_workflow_schedules(
         {
             return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
         }
-        // Reject a bad cron expression, a zero interval and a fractional interval
-        // (issue #1967).
+        // Reject a bad cron expression, a zero interval, a fractional interval
+        // (issue #1967) and an interval over `MAX_INTERVAL_PERIOD` (issue #2048).
         if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
@@ -5904,6 +5904,50 @@ mod tests {
                 err,
                 HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
                     if workflow_name == "test" && reason.contains("whole number of seconds")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn harvest_builder_rejects_workflow_schedule_over_the_interval_cap() {
+        // Adding this period to a timestamp overflows chrono (issue #2048).
+        let err = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "test",
+                Schedule::Interval(Duration::from_secs(9_000_000_000_000_000)),
+            ))
+            .try_build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
+                    if workflow_name == "test" && reason.contains("must not exceed")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn harvest_builder_rejects_dag_schedule_over_the_interval_cap() {
+        // The DAG path has its own validation call (issue #2048).
+        let dag = DagInfo {
+            schedule: Some(Schedule::Interval(Duration::from_secs(
+                9_000_000_000_000_000,
+            ))),
+            ..fake_dag_info()
+        };
+        let err = HarvestBuilder::new()
+            .dags(vec![dag])
+            .try_build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
+                    if workflow_name == "daily_etl" && reason.contains("must not exceed")
             ),
             "got: {err:?}"
         );
