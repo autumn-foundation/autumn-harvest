@@ -2422,7 +2422,10 @@ async fn drive_cycle(
     // after the cycle, as before issue #1798.
     let keep = keep.filter(|_| matches!(cycle_result, HandlerCycleResult::Suspended));
     let future = keep.is_some().then_some(future);
-    let (mut outcome, pending) = span_handle.in_scope(|| classify_cycle(&ctx, cycle_result));
+    let (mut outcome, mut pending) = span_handle.in_scope(|| classify_cycle(&ctx, cycle_result));
+    crate::update::dispatch_pending_updates(&ctx, &mut outcome, &mut pending)
+        .instrument(span_handle.clone())
+        .await;
     let resident = match (future, keep) {
         (Some(future), Some(key)) => {
             match crate::resident::ResidentWorkflow::capture(&ctx, future, &mut outcome, key) {

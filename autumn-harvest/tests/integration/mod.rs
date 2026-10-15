@@ -131,6 +131,7 @@ mod dag_signal_gate_tests;
 mod dag_unified_tests;
 mod dashboard_pack_docs;
 mod debounce_tests;
+mod declarative_update_tests;
 #[cfg(feature = "debugger")]
 mod debugger_tests;
 #[cfg(all(feature = "db", feature = "testing"))]
