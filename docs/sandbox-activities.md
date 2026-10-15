@@ -149,6 +149,9 @@ The process executor gives each run:
 - rlimits for CPU time, data memory, file size, open files and core dumps.
   A policy allows 64 to 1,048,576 open files (`MIN_OPEN_FILES`,
   `MAX_OPEN_FILES`). `setrlimit` refuses more than the default `fs.nr_open`.
+  A policy also refuses more than `u32::MAX` CPU seconds, and more than 1 PiB
+  of memory or file size (`MAX_LIMIT_BYTES`). A larger value could reach
+  `RLIM_INFINITY`, which removes the limit with no error.
   The data rlimit is the memory limit plus 1 GiB, because V8 in Node 24
   reserves about 600 MiB of address space at start. The CPU rlimit applies
   to each process;

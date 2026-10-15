@@ -87,6 +87,17 @@ impl SandboxLimits {
 /// to start, so 64 leaves room for each built-in runtime.
 pub const MIN_OPEN_FILES: u32 = 64;
 
+/// The largest byte limit of a policy: 1 PiB.
+///
+/// A larger memory or file size limit could reach `u64::MAX`, which is
+/// `RLIM_INFINITY` and removes the limit. A file size limit above `i64::MAX`
+/// also reads as negative in the kernel, which fails each write.
+pub const MAX_LIMIT_BYTES: u64 = 1 << 50;
+
+/// The largest CPU limit of a policy, in seconds. The hard CPU rlimit is one
+/// second more, so a larger value could reach `RLIM_INFINITY`.
+pub const MAX_CPU_SECONDS: u64 = u32::MAX as u64;
+
 /// The most open files that a policy can allow: the Linux default of
 /// `fs.nr_open`. `setrlimit` refuses more, even to root, and the host cannot
 /// read the value of a guest kernel.
@@ -423,6 +434,20 @@ impl SandboxPolicy {
     /// Check that no limit passes what the kernel or the engine can hold.
     fn check_limit_ceilings(&self) -> Result<(), SandboxError> {
         // The default is at most the ceiling, so the ceiling bounds both.
+        // An rlimit of `RLIM_INFINITY` would remove the limit with no error.
+        let max = &self.max_limits;
+        for (field, value, ceiling) in [
+            ("cpu_seconds", max.cpu_seconds, MAX_CPU_SECONDS),
+            ("memory_bytes", max.memory_bytes, MAX_LIMIT_BYTES),
+            ("max_file_bytes", max.max_file_bytes, MAX_LIMIT_BYTES),
+        ] {
+            if value > ceiling {
+                return Err(SandboxError::Config(format!(
+                    "limit {field} is {value}, above its ceiling of {ceiling}, near the \
+                     RLIM_INFINITY that would remove the limit"
+                )));
+            }
+        }
         if self.max_limits.max_open_files > MAX_OPEN_FILES {
             return Err(SandboxError::Config(format!(
                 "limit max_open_files is {}, above the {MAX_OPEN_FILES} of the default \
@@ -949,6 +974,28 @@ mod tests {
             "{:?}",
             policy.validate()
         );
+    }
+
+    #[test]
+    fn a_limit_that_reaches_rlim_infinity_is_a_config_error() {
+        // `u64::MAX` is `RLIM_INFINITY`, which removes the limit. The data
+        // rlimit adds headroom, so a smaller memory size can reach it too.
+        type Set = fn(&mut SandboxLimits);
+        let cases: [(&str, Set); 3] = [
+            ("cpu_seconds", |l| l.cpu_seconds = u64::MAX),
+            ("memory_bytes", |l| l.memory_bytes = u64::MAX - 1),
+            ("max_file_bytes", |l| l.max_file_bytes = u64::MAX),
+        ];
+        for (field, set) in cases {
+            let mut limits = MAX_LIMITS;
+            set(&mut limits);
+            let policy = SandboxPolicy::default().with_limits(DEFAULT_LIMITS, limits);
+            assert!(
+                matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains(field)),
+                "{field}: {:?}",
+                policy.validate()
+            );
+        }
     }
 
     #[test]
