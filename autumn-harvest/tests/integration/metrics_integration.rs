@@ -20,7 +20,7 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 use autumn_harvest::dlq::{self, NewDeadLetterEntry};
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
+use autumn_harvest::info::{ActivityInfo, UpdateHandlerInfo, WorkflowInfo};
 use autumn_harvest::models::{
     HarvestMutexWaiter, NewHarvestMutexLock, NewWorkflowExecution, WorkflowExecution,
 };
@@ -504,6 +504,22 @@ async fn wait_for_timer_started(database_url: &str, exec_id: ExecutionId, timer_
 }
 
 fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> {
+    build_worker_with_budget(
+        worker_id,
+        registry,
+        Duration::from_secs(10),
+        Duration::from_secs(60),
+    )
+}
+
+/// Like [`build_worker`], with an explicit task budget and local-activity cap.
+/// The effective budget is the larger of the two.
+fn build_worker_with_budget(
+    worker_id: &str,
+    registry: Arc<HandlerRegistry>,
+    workflow_task_timeout: Duration,
+    max_local_activity_start_to_close: Duration,
+) -> Arc<Worker> {
     Arc::new(
         Worker::new(
             WorkerRuntimeConfig {
@@ -520,7 +536,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),
                 sticky_timeout: Duration::from_secs(5),
-                max_local_activity_start_to_close: Duration::from_secs(60),
+                max_local_activity_start_to_close,
                 shard_assignments: vec![ShardId::new(0)],
                 worker_heartbeat_interval: Duration::from_secs(30),
                 build_id: String::new(),
@@ -532,7 +548,7 @@ fn build_worker(worker_id: &str, registry: Arc<HandlerRegistry>) -> Arc<Worker> 
                 poison_pill_threshold: 3,
                 capability_miss_max_redeliveries: 5,
 
-                workflow_task_timeout: std::time::Duration::from_secs(10),
+                workflow_task_timeout,
                 workflow_panic_max_attempts: 3,
                 labels: std::collections::HashMap::new(),
                 queue_weights: std::collections::HashMap::new(),
@@ -570,6 +586,15 @@ fn unfinished_updates_test_workflow<'a>(
     _input: serde_json::Value,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>> {
     Box::pin(async move { Ok(serde_json::json!({"completed": true})) })
+}
+
+/// An update handler that returns at once. The test needs one resolved update
+/// next to an unresolved one.
+fn unfinished_updates_probe_update(
+    _ctx: Arc<WorkflowContext>,
+    input: serde_json::Value,
+) -> Pin<Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>> {
+    Box::pin(async move { Ok(input) })
 }
 
 /// Fixed update id shared between `update_then_suspend_workflow` and its test so
@@ -4984,6 +5009,14 @@ async fn oldest_pending_age_excludes_saturated_concurrency_cap() {
     );
 }
 
+/// Issues #684 and #2035: a workflow that completes with an admitted update
+/// still unresolved emits `harvest.workflow.unfinished_handlers`.
+///
+/// The worker runs every admitted update before the workflow closes, and an
+/// update with no handler records `UpdateFailed`. The unresolved update here
+/// therefore comes from the task budget. A budget of 8 s leaves less than the
+/// 5 s handler limit once the first handler has run. The second update waits,
+/// and the body finishes in the same cycle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)]
 async fn workflow_completed_with_unfinished_updates_emits_metric() {
@@ -5039,8 +5072,9 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
         .await
         .expect("failed to insert workflow execution row");
 
-    // Append WorkflowStarted AND UpdateAdmitted to history.
-    let update_id = UpdateId::new();
+    // Append WorkflowStarted and two admitted updates to history.
+    let first_update = UpdateId::new();
+    let second_update = UpdateId::new();
     store::append_events(
         &mut conn,
         exec_id,
@@ -5053,8 +5087,14 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
                 scheduled_time: None,
             },
             WorkflowEvent::UpdateAdmitted {
-                update_id,
-                name: "unresolved_update".to_string(),
+                update_id: first_update,
+                name: "unfinished_probe".to_string(),
+                input: serde_json::json!({}),
+                timestamp: Utc::now(),
+            },
+            WorkflowEvent::UpdateAdmitted {
+                update_id: second_update,
+                name: "unfinished_probe".to_string(),
                 input: serde_json::json!({}),
                 timestamp: Utc::now(),
             },
@@ -5079,38 +5119,63 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
             .build(),
     );
 
-    let registry = Arc::new(HandlerRegistry::with_state_and_telemetry(
-        vec![WorkflowInfo {
-            quota: None,
-            declared_activities: None,
-            declared_children: None,
-            mcp: false,
-            name: "unfinished_updates_test_workflow",
-            module: "metrics_integration",
-            handler: unfinished_updates_test_workflow,
-            execution_timeout: None,
-            chain_execution_timeout: None,
-            sla: None,
-            concurrency: None,
-            debounce: None,
-            batch: None,
-            throttle: None,
-            max_input_bytes: None,
-            owner: None,
-            runbook_url: None,
-            severity: None,
-            description: None,
-            input_schema: None,
-            output_schema: None,
-            error_schema: None,
-            retry_policy: None,
-        }],
-        vec![],
-        autumn_harvest::context::empty_shared_state(),
-        telemetry,
-    ));
+    let probe_update = UpdateHandlerInfo {
+        name: "unfinished_probe",
+        workflow: "unfinished_updates_test_workflow",
+        module: "metrics_integration",
+        input_type_hint: "",
+        output_type_hint: "",
+        has_validator: false,
+        handler: unfinished_updates_probe_update,
+        validator: None,
+        mcp: false,
+        description: None,
+        arg_schema: None,
+        response_schema: None,
+    };
 
-    let worker = build_worker("metrics-worker-unfinished", registry);
+    let registry = Arc::new(
+        HandlerRegistry::with_state_and_telemetry(
+            vec![WorkflowInfo {
+                quota: None,
+                declared_activities: None,
+                declared_children: None,
+                mcp: false,
+                name: "unfinished_updates_test_workflow",
+                module: "metrics_integration",
+                handler: unfinished_updates_test_workflow,
+                execution_timeout: None,
+                chain_execution_timeout: None,
+                sla: None,
+                concurrency: None,
+                debounce: None,
+                batch: None,
+                throttle: None,
+                max_input_bytes: None,
+                owner: None,
+                runbook_url: None,
+                severity: None,
+                description: None,
+                input_schema: None,
+                output_schema: None,
+                error_schema: None,
+                retry_policy: None,
+            }],
+            vec![],
+            autumn_harvest::context::empty_shared_state(),
+            telemetry,
+        )
+        .with_handler_infos(vec![], vec![probe_update], vec![]),
+    );
+
+    // The effective budget is the larger of the two settings: 8 s. Half of what
+    // is left after the first handler is under the 5 s handler limit.
+    let worker = build_worker_with_budget(
+        "metrics-worker-unfinished",
+        registry,
+        Duration::from_secs(8),
+        Duration::from_secs(1),
+    );
     let pool = build_test_pool(&database_url);
 
     let runner = Arc::clone(&worker);
@@ -5128,6 +5193,14 @@ async fn workflow_completed_with_unfinished_updates_emits_metric() {
     assert!(
         names.contains(&METRIC_WORKFLOW_UNFINISHED_HANDLERS),
         "harvest.workflow.unfinished_handlers must be emitted; got: {names:?}"
+    );
+    let completed = names
+        .iter()
+        .filter(|name| **name == METRIC_UPDATE_COMPLETED)
+        .count();
+    assert_eq!(
+        completed, 1,
+        "only the first update runs before the window closes; got: {names:?}"
     );
 }
 
