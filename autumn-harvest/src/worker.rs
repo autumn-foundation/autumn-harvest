@@ -25700,6 +25700,9 @@ async fn process_workflow_task(
         }
     });
     let mut warm_resident = warm_residency.into_workflow();
+    // Issue #2035: set after the first drive of this decision. Only that drive
+    // may run an update past the dispatch window.
+    let mut drove_before = false;
     // The resident state of the final cycle, kept for the next decision.
     let mut final_resident: crate::resident::Residency;
     // A module-hosted workflow binds its module around one drive only, so
@@ -25835,6 +25838,7 @@ async fn process_workflow_task(
             registry.payload_codecs(),
         )
         .await?;
+        let run_first = !std::mem::replace(&mut drove_before, true);
         let workflow_drive = async {
             if let Some(resident) = warm_resident.take() {
                 match resident
@@ -25887,7 +25891,10 @@ async fn process_workflow_task(
             // Issue #2035: a live decision runs the admitted updates. A replay
             // gate does not, so it never runs a handler. The cut-off keeps the
             // dispatch inside the workflow-task budget.
-            .with_update_dispatch(workflow_task_deadline);
+            .with_update_dispatch(crate::update::UpdateDispatch {
+                cutoff: workflow_task_deadline,
+                run_first,
+            });
             crate::executor::drive_workflow_keep(
                 ctx,
                 workflow.handler,

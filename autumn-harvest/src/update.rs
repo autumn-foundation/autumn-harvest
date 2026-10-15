@@ -24,6 +24,17 @@ use crate::types::UpdateId;
 /// `workflow_task_timeout` above this limit, or the cycle can end first.
 pub(crate) const UPDATE_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How the executor dispatches admitted updates in one drive (issue #2035).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UpdateDispatch {
+    /// The end of the workflow-task budget, or `None` when the budget is off.
+    pub(crate) cutoff: Option<DateTime<Utc>>,
+    /// Whether the first update may run after the window closes. Only the first
+    /// drive of a decision sets it. A re-drive of the same decision shares the
+    /// budget, so it must not run another update past the window.
+    pub(crate) run_first: bool,
+}
+
 /// Pinned boxed async future returned by an update handler invocation.
 pub type UpdateHandlerFuture = Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;
 
@@ -132,8 +143,8 @@ impl UpdateRegistry {
 ///
 /// The cycle runs under the workflow-task budget. The dispatch therefore
 /// starts a handler only while a full [`UPDATE_HANDLER_TIMEOUT`] is left in
-/// half of the remaining budget. The first update always runs, so each cycle
-/// makes progress.
+/// half of the remaining budget. The first update of a decision always runs,
+/// so each decision makes progress.
 ///
 /// Returns `true` when updates remain. The caller must wake the task, so a
 /// later cycle runs them.
@@ -142,9 +153,9 @@ pub(crate) async fn dispatch_pending_updates(
     outcome: &mut WorkflowOutcome,
     pending: &mut Vec<WorkflowCommand>,
 ) -> bool {
-    if !ctx.dispatches_updates() {
+    let Some(dispatch) = ctx.update_dispatch() else {
         return false;
-    }
+    };
     let commands = match outcome {
         WorkflowOutcome::Suspended { commands } => commands,
         WorkflowOutcome::Completed { .. }
@@ -165,8 +176,8 @@ pub(crate) async fn dispatch_pending_updates(
             _ => None,
         })
         .collect();
-    let window = window_end(ctx.update_cutoff());
-    let mut started = false;
+    let window = window_end(dispatch.cutoff);
+    let mut started = !dispatch.run_first;
     for (update_id, name, input) in ctx.pending_updates() {
         if !recorded.insert(update_id) {
             continue;
@@ -377,7 +388,10 @@ mod tests {
             ctx.register_declarative_update_handler(handler);
         }
         if dispatch {
-            ctx.with_update_dispatch(None)
+            ctx.with_update_dispatch(UpdateDispatch {
+                cutoff: None,
+                run_first: true,
+            })
         } else {
             ctx
         }
@@ -393,7 +407,26 @@ mod tests {
         for handler in handlers {
             ctx.register_declarative_update_handler(handler);
         }
-        ctx.with_update_dispatch(Some(cutoff))
+        ctx.with_update_dispatch(UpdateDispatch {
+            cutoff: Some(cutoff),
+            run_first: true,
+        })
+    }
+
+    /// A context for a re-drive of a decision that already ran an update.
+    fn redrive_context(
+        history: Vec<WorkflowEvent>,
+        handlers: &[&UpdateHandlerInfo],
+        cutoff: DateTime<Utc>,
+    ) -> WorkflowContext {
+        let ctx = crate::executor::default_task_context(ExecutionId::new(), history);
+        for handler in handlers {
+            ctx.register_declarative_update_handler(handler);
+        }
+        ctx.with_update_dispatch(UpdateDispatch {
+            cutoff: Some(cutoff),
+            run_first: false,
+        })
     }
 
     async fn drive_full(
@@ -881,6 +914,26 @@ mod tests {
         );
         assert!(drive.updates_deferred);
         assert_eq!(CLOSED_RUNS.load(Ordering::SeqCst), 1);
+    }
+
+    static REDRIVE_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_redrive(_ctx: Arc<WorkflowContext>, input: Value) -> UpdateHandlerFuture {
+        REDRIVE_RUNS.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(input) })
+    }
+
+    #[tokio::test]
+    async fn a_redrive_with_a_closed_window_runs_no_update() {
+        let id = UpdateId::new();
+        let handler = info("count", count_redrive);
+        let history = vec![started(), admitted(id, "count", json!(1))];
+        let cutoff = Utc::now() - chrono::Duration::seconds(1);
+        let drive = drive_full(redrive_context(history, &[&handler], cutoff), parked).await;
+
+        assert_eq!(results(&drive.outcome, &drive.pending), Vec::new());
+        assert!(drive.updates_deferred);
+        assert_eq!(REDRIVE_RUNS.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

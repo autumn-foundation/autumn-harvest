@@ -3137,13 +3137,10 @@ pub struct WorkflowContext {
     /// canary, allowing it to suspend at the end of its history without throwing
     /// non-determinism errors.
     canary_mode: bool,
-    /// When `true`, the executor runs each admitted update that has no result
-    /// at the end of the cycle (issue #2035). Only the worker sets it. A replay
-    /// gate leaves it off, so a gate never runs a handler.
-    dispatch_updates: bool,
-    /// The absolute cut-off of the workflow-task budget, for the update
-    /// dispatch (issue #2035). `None` when the budget is off.
-    update_cutoff: Option<DateTime<Utc>>,
+    /// When set, the executor runs each admitted update that has no result at
+    /// the end of the cycle (issue #2035). Only the worker sets it. A replay
+    /// gate leaves it `None`, so a gate never runs a handler.
+    update_dispatch: Option<crate::update::UpdateDispatch>,
     // ── Payload size caps (issue #252) ────────────────────────────────
     /// Logical workflow type name for use in `PayloadTooLarge` errors.
     /// Empty string when not known (legacy contexts, update handlers).
@@ -3732,8 +3729,7 @@ impl WorkflowContext {
             cancellation_reason,
             strict_replay: false,
             canary_mode: false,
-            dispatch_updates: false,
-            update_cutoff: None,
+            update_dispatch: None,
             workflow_name: String::new(),
             queue_name: String::new(),
             workflow_id: String::new(),
@@ -3921,8 +3917,7 @@ impl WorkflowContext {
             cancellation_reason,
             strict_replay: false,
             canary_mode: false,
-            dispatch_updates: false,
-            update_cutoff: None,
+            update_dispatch: None,
             workflow_name: String::new(),
             queue_name: String::new(),
             workflow_id: String::new(),
@@ -4000,8 +3995,7 @@ impl WorkflowContext {
             cancellation_reason: None,
             strict_replay: false,
             canary_mode: false,
-            dispatch_updates: false,
-            update_cutoff: None,
+            update_dispatch: None,
             workflow_name: String::new(),
             queue_name: String::new(),
             workflow_id: String::new(),
@@ -4312,24 +4306,21 @@ impl WorkflowContext {
     /// (issue #2035).
     ///
     /// The worker calls this for a live decision. A replay gate does not.
-    /// `cutoff` is the absolute end of the workflow-task budget. The dispatch
+    /// `dispatch` holds the end of the workflow-task budget. The dispatch
     /// stops early, so the cycle persists before the budget ends.
     #[must_use]
     #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the worker dispatches updates.
-    pub(crate) const fn with_update_dispatch(mut self, cutoff: Option<DateTime<Utc>>) -> Self {
-        self.dispatch_updates = true;
-        self.update_cutoff = cutoff;
+    pub(crate) const fn with_update_dispatch(
+        mut self,
+        dispatch: crate::update::UpdateDispatch,
+    ) -> Self {
+        self.update_dispatch = Some(dispatch);
         self
     }
 
-    /// Whether the executor runs admitted updates for this context.
-    pub(crate) const fn dispatches_updates(&self) -> bool {
-        self.dispatch_updates
-    }
-
-    /// The end of the workflow-task budget, if the dispatch has one.
-    pub(crate) const fn update_cutoff(&self) -> Option<DateTime<Utc>> {
-        self.update_cutoff
+    /// How the executor dispatches admitted updates, or `None` when it does not.
+    pub(crate) const fn update_dispatch(&self) -> Option<crate::update::UpdateDispatch> {
+        self.update_dispatch
     }
 
     /// Set the shard the parent row lives on right now (issue #1405).
