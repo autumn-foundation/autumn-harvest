@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use tracing::Instrument;
 
-use crate::bounds::exceeds_bytes;
+use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
 use crate::flow::{FlowRules, Released, call_labels};
@@ -172,7 +172,8 @@ impl AgentHarness {
     ///
     /// A larger tool result is cut to fit. A model reply that does not fit
     /// ends the run as `reply_too_large`. A cap of zero is no cap, as in the
-    /// engine.
+    /// engine. A cap under 256 bytes cannot hold the `oversized` turn, so the
+    /// activity can still fail.
     #[must_use]
     pub const fn max_result_bytes(mut self, bytes: u64) -> Self {
         self.max_result_bytes = bytes;
@@ -344,9 +345,9 @@ impl AgentHarness {
     /// Postgres. A hit skips the model call. The policy still decides each
     /// tool call.
     ///
-    /// A turn over the result cap does not fail. The method cuts the decision
-    /// reasons, then returns a typed outcome with
-    /// [`ModelTurn::oversized`] set.
+    /// A turn that exceeds the result cap does not fail. The method cuts each
+    /// decision reason. When the turn still does not fit, the method returns a
+    /// turn with [`ModelTurn::oversized`] set.
     ///
     /// # Errors
     ///
@@ -507,7 +508,9 @@ impl AgentHarness {
             )
             .await;
             // The cache serves and keeps only an answer whose whole turn fits.
-            // A fresh turn that does not fit is cut below, never recorded as is.
+            // The check uses the turn before the cut below. A cached turn that
+            // exceeds the cap would end every identical run as
+            // `reply_too_large`.
             let fits = self.fits_result_cap(&turn);
             if cache_hit && !fits {
                 tracing::warn!("a cached answer does not fit the result cap; calling the model");
@@ -1055,8 +1058,8 @@ fn max_error_bytes(cap: u64) -> usize {
     share_of(cap, 12)
 }
 
-/// A `divisor`th of `cap`, less the outcome envelope. A cap of zero is no
-/// cap, as in the engine.
+/// The share of `cap` for one result: (`cap` - envelope) / `divisor`. A cap
+/// of zero is no cap, as in the engine.
 fn share_of(cap: u64, divisor: u64) -> usize {
     if cap == 0 {
         return usize::MAX;
@@ -1081,17 +1084,23 @@ fn cut_bytes(text: String, max: usize) -> String {
     format!("{}{TRUNCATED}", &text[..end])
 }
 
-/// The most bytes that one decision reason keeps when a turn is over the cap.
+/// The most bytes that one decision reason keeps when a turn exceeds the cap.
+///
+/// A policy writes a reason as free text. 256 bytes still tell the reviewer or
+/// the model why. A turn with many calls then stays small.
 const REASON_CUT_BYTES: usize = 256;
 
 /// Make `turn` fit the result cap, or replace it with a typed outcome.
 ///
-/// A turn over the cap would fail the activity with a `PayloadTooLarge` that
-/// is not retryable, after the model call was paid for. So the decision
+/// A turn that exceeds the cap would fail the activity with a `PayloadTooLarge`
+/// that is not retryable, after the model call was paid for. So the decision
 /// reasons are cut first, because a policy writes them as free text. A turn
-/// that still does not fit becomes [`ModelTurn::into_oversized`], and the
-/// loop ends it under [`AgentStop::ReplyTooLarge`](crate::AgentStop). A cap
-/// of zero is no cap.
+/// that still does not fit becomes [`ModelTurn::into_oversized`]. The loop
+/// then ends the run under [`AgentStop::ReplyTooLarge`](crate::AgentStop). A
+/// cap of zero is no cap.
+///
+/// The activity does not fail, so no failed-workflow alert fires. A warning
+/// with the sizes marks the drop. It holds no text of the reply.
 pub(crate) fn fit_turn(mut turn: ModelTurn, cap: u64) -> ModelTurn {
     if !exceeds_bytes(&turn, cap) {
         return turn;
@@ -1101,7 +1110,13 @@ pub(crate) fn fit_turn(mut turn: ModelTurn, cap: u64) -> ModelTurn {
             *reason = cut_bytes(std::mem::take(reason), REASON_CUT_BYTES);
         }
     }
-    if exceeds_bytes(&turn, cap) {
+    let size = json_len(&turn);
+    if size > cap {
+        tracing::warn!(
+            observed_bytes = size,
+            cap_bytes = cap,
+            "the model reply exceeds the result cap; the run ends as reply_too_large"
+        );
         return turn.into_oversized();
     }
     turn
@@ -1174,8 +1189,7 @@ mod tests {
         assert!(outcome.content.contains(&message));
     }
 
-    /// A turn with `content`, one decision per entry of `decisions`, and
-    /// usage that a test can check.
+    /// A turn with `content` and `decisions`, and fixed usage for checks.
     fn turn_of(content: Vec<ContentPart>, decisions: Vec<ToolDecision>) -> ModelTurn {
         ModelTurn {
             content,
@@ -1276,8 +1290,8 @@ mod tests {
 
     #[test]
     fn the_typed_outcome_fits_a_small_cap() {
-        // The documented floor: a cap of 256 bytes still records the outcome,
-        // even with the widest usage numbers.
+        // The builder docs say a cap of 256 bytes or more holds the outcome.
+        // Check it with the widest usage numbers.
         let mut turn = turn_of(vec![call("c")], vec![deny("no")]);
         turn.usage = TokenUsage {
             input_tokens: u32::MAX,

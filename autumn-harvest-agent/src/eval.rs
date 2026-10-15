@@ -990,8 +990,8 @@ fn live_turn(
     (recorded, taken, index): (&[ToolCall], &HashSet<String>, usize),
     retry: &RetryPolicy,
 ) -> Result<ModelTurn, String> {
-    // The cap applies below, to the turn as a worker records it. So the
-    // harness itself must not cut the turn with the aligned ids.
+    // The cap applies after the call, to the turn as a worker records it. So
+    // the harness must not cut the turn with the aligned ids.
     let result_cap = harness.result_cap();
     let harness = &harness.clone().max_result_bytes(0);
     let mut attempt = 1;

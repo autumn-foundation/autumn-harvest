@@ -188,7 +188,7 @@ ledger row.
 `AgentTask` sets the run. Its bounds are `max_steps` (default 8, per
 segment), `max_total_tokens` (per run), `max_output_tokens`,
 `approval_timeout` (default one hour, rounded up to whole seconds) and
-`max_request_bytes` (default: the engine default, zero is no cap). Its
+`max_request_bytes` (the default is the engine default; zero is no cap). Its
 content is `input`,
 `system`, `history` and `session`. `tenant` scopes the response cache.
 Section 10 explains the always-on settings: `deliver`, `memory`,
@@ -257,42 +257,19 @@ A bound is a normal end, not an error. `AgentReport.stop` names it:
 | `output_capped` | The last turn hit the output cap. Its tool calls do not run. |
 | `steps_exhausted` | The model asked for tools after `max_steps` rounds. |
 | `tokens_exhausted` | The run spent more than `max_total_tokens`, follow-ups included. |
-| `transcript_full` | The next request could not fit the request cap. The request was not sent. |
-| `reply_too_large` | The model reply could not fit the result cap, even with its decision reasons cut. The reply is dropped. |
+| `transcript_full` | The next request would exceed the request cap. The request is not sent. |
+| `reply_too_large` | The model reply exceeds the result cap, even with its decision reasons cut. The activity drops the reply. |
 | `budget_exceeded` | A run or tenant LLM budget refused the next model call. The call was not sent. See [LLM budgets](#llm-budgets-issue-1997). |
 | `loop_detected` | The loop guard saw the same call, with the same result, too many times. |
 
 A turn that ends the run before its tool calls run is left out of
-`AgentReport.messages`. Its text is not the answer either. A round whose
-results pass the request cap stays in the transcript: each call that did not
-fit gets an error result, so the transcript shows what ran.
+`AgentReport.messages`. Its text is not the answer either. A round that ends
+the run as `transcript_full` stays in the transcript. Each call that did not
+run, or whose result did not fit, gets an error result, so the transcript
+shows what ran. The text of that turn is not the answer either.
 
 A `transcript_full` transcript is too large for one request. Do not pass it
 whole as the `history` of a new run. Summarise it, or keep its last turns.
-
-### Payload caps (issue #2040)
-
-A tool round counts the whole next request: the transcript, the assistant
-turn and every answer. It checks this before it runs a call.
-
-- When even a minimal answer for each call cannot fit, no call runs. The
-  model could not read a result, so a call with a side effect must not run.
-- A result that does not fit is dropped, and the calls after it do not run.
-  Each call still gets an answer, so the transcript shows what ran.
-
-The model-turn activity fits its reply to the result cap:
-
-1. It cuts each decision reason to 256 bytes.
-2. When the reply still does not fit, the activity returns a turn with
-   `oversized` set, and no content. The run ends as `reply_too_large`.
-
-The report keeps the usage of the paid call. The reply is not in
-`AgentReport.messages`. A cap under 256 bytes cannot record the `oversized`
-turn, and the activity then fails.
-
-A cap of zero is no cap, as in the engine. This holds for
-`AgentTask::max_request_bytes` and `AgentHarness::max_result_bytes`, and for
-every check above.
 
 Retries follow `ErrorKind::is_retryable`. `RateLimited`, `Transport` and
 `Unavailable` retry with backoff, up to four attempts. So does a model call
@@ -303,6 +280,45 @@ reads.
 
 The run fails when a model call fails for good: a non-retryable kind, for
 example a rejected API key, or four failed attempts.
+
+### Payload caps (issue #2040)
+
+A tool round measures the whole next request before it runs a call. The
+request holds the transcript, the assistant turn and an answer for each call.
+The round reserves a placeholder answer for each call. It replaces the
+placeholder with the real result.
+
+- When the placeholders exceed the request cap, no call runs. No result can
+  reach the model, so no call with a side effect runs. The run ends as
+  `transcript_full`.
+- The round drops a result that exceeds the cap. The call ran. The calls
+  after it do not run. The run ends as `transcript_full`.
+
+The measure covers the result text and the flow state that this turn can
+add. A delegation adds the labels and usage of its child, which the round
+cannot know in advance. The loop measures the next request again before it
+sends it. It ends the run as `transcript_full` if that request exceeds the
+cap.
+
+A task recorded before this rule measures the results alone, so a run in
+flight replays as it ran. `AgentTask::new` turns the new rule on.
+
+The model-turn activity fits its reply to the result cap:
+
+1. It cuts each decision reason to 256 bytes. It does this only when the
+   turn exceeds the cap.
+2. When the reply still exceeds the cap, the activity returns a turn with
+   `oversized` set and no content. The run ends as `reply_too_large`. The
+   activity logs a warning with the sizes.
+
+The report keeps the usage of the paid call. The reply is not in
+`AgentReport.messages`. A result cap of 256 bytes or more always holds the
+`oversized` turn. A smaller cap can still fail the activity with
+`PayloadTooLarge`.
+
+A cap of zero is no cap, as in the engine. This holds for
+`AgentTask::max_request_bytes` and `AgentHarness::max_result_bytes`, in every
+check above.
 
 ### LLM budgets (issue #1997)
 
@@ -645,8 +661,9 @@ miss with a warning. An out-of-date entry is a quiet miss. The cache never
 fails a turn. Each cache call, the tenant read included, has the
 `cache_timeout` budget: 5 seconds by default. One turn makes at most three
 cache calls. The cache neither stores nor serves a turn over
-`AgentHarness::max_result_bytes`. A hit over the cap is a miss, and the
-harness asks the model. A codec error is logged with fixed text,
+`AgentHarness::max_result_bytes`, because a cached turn over the cap would end
+every identical run as `reply_too_large`. A hit over the cap is a miss, and
+the harness asks the model. A codec error is logged with fixed text,
 because a custom codec can quote the answer.
 
 **Limits.**

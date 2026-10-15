@@ -6,31 +6,61 @@ more cases. Items 4 and 6 of the issue shipped earlier, in the always-on PR.
 **What shipped.**
 
 - **Round budget (item 1).** A tool round measures the whole next request: the
-  transcript, the assistant turn and every answer. It builds that request once,
-  with a placeholder for each answer. A result replaces its placeholder, so the
-  sum stays exact. When even minimal answers cannot fit, no call runs.
+  transcript, the assistant turn and an answer for each call. It builds that
+  request once, with a placeholder for each answer. A result replaces its
+  placeholder. The placeholder is the longest fixed answer, so any fixed answer
+  fits in its place. The request also holds the labels and releases that this
+  turn can add. When the placeholders exceed the cap, no call runs.
 - **Model reply cap (item 2).** The model-turn activity fits its reply to the
   result cap. It cuts each decision reason to 256 bytes first. A reply that
-  still does not fit becomes a turn with `oversized` set. The loop ends it
-  under the new stop `reply_too_large`. The run no longer fails with a
-  `PayloadTooLarge` that is not retryable, after the model call was paid for.
+  still exceeds the cap becomes a turn with `oversized` set. The loop ends the
+  run under the new stop `reply_too_large`. The activity no longer fails with a
+  non-retryable `PayloadTooLarge` after the paid call. It logs a warning with
+  the sizes.
 - **Zero cap (items 3 and 5).** A cap of zero is no cap, as in the engine.
   `exceeds_bytes`, `max_tool_result_bytes` and the error result follow the
   rule. `AgentTask::max_request_bytes(0)` no longer ends a run before its
   first model call.
+- **Narration.** A round that ends the run as `transcript_full` no longer
+  makes the model text the report answer. The text can claim work that did not
+  run.
+
+**Limits.** The round budget is exact for the result text and for the flow
+state that the turn records. A delegation adds the labels and usage of its
+child, which the round cannot know in advance. The loop measures the next
+request again before it sends it, and ends the run as `transcript_full` if it
+exceeds the cap. A result that does not fit is still dropped after its call
+ran.
+
+**Replay.** The round budget changes which tool calls a round schedules near
+the cap. `AgentTask::whole_request_budget` gates it. `AgentTask::new` turns it
+on. A task recorded before this change has no field, so it keeps the
+results-only measure and replays as it ran. A heartbeat tick builds its task
+at run time, so a tick in flight at deploy near the cap can fail replay.
 
 **Invariants.** No new `WorkflowEvent` variant. No migration. No route change.
-`ModelTurn::oversized` is left out at its default, so a recorded turn encodes
-as before and strict replay still matches. `AgentStop` is `#[non_exhaustive]`,
-so the new stop is not a break. `ModelTurn` gains a field. A struct literal of
-it needs the new field.
+`ModelTurn::oversized` and `AgentTask::whole_request_budget` are left out at
+their defaults, so a recorded value encodes as before. The text of the
+fixed "did not run" and "dropped" answers changed. They reach only the report
+of a run that has ended.
 
-**Eval.** `eval::evaluate` follows a worker. A turn over the result cap is cut
-or dropped, and the candidate run ends under `reply_too_large`. It no longer
-fails.
+**Breaking changes.** `ModelTurn` and `AgentTask` gain a public field. A struct
+literal of either needs the new field. `AgentStop` is `#[non_exhaustive]`, so
+the new stop is not a break. A reader built before this change cannot decode
+`reply_too_large` in a recorded report. `exceeds_bytes(_, 0)` now returns
+`false`, and `max_tool_result_bytes(0)` returns `usize::MAX`.
 
-**Tests.** Each case has a test that failed first: `bounds`, `harness` and
-`types` unit tests, `engine_activities` for the activity, and `sqlite_loop`
-for the loop. They cover a round that cannot fit, a round charged against a
-large history, a reply over the cap, a huge policy reason, and a zero cap in
-the request check, the round and the tool results.
+**Eval.** `eval::evaluate` follows a worker. A turn that exceeds the result cap
+is cut or dropped. A dropped reply ends the candidate run under
+`reply_too_large`. The run no longer fails. The per-turn verdict of a dropped
+reply can read as reworded. The run-level `end_diverged` flag shows the stop.
+
+**Tests.** Each behaviour change has a test that failed first. The `types`
+guards and one zero-cap budget test passed at red, because the stubs held the
+shape. The tests cover:
+
+- a round that cannot fit, and a round charged against a large history;
+- a label that a call adds to the next request;
+- a reply over the cap, and a huge policy reason;
+- a zero cap in the request check, the round and the tool results;
+- a task recorded before the change.

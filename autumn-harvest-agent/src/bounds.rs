@@ -36,48 +36,54 @@ pub fn exceeds_bytes<T: Serialize + ?Sized>(value: &T, cap: u64) -> bool {
 /// The room that one tool round has in the next request.
 ///
 /// The round answers every call in one tool message. That message joins the
-/// transcript, so the whole next request must fit the cap. The budget starts
-/// from the size of that request with a placeholder for each call. A result
-/// replaces its placeholder, so it adds only the difference. A JSON string is
-/// measured on its own, so the sum is exact.
+/// transcript, so the whole next request must fit the cap.
+///
+/// The budget starts from the size of that request with one placeholder
+/// answer for each call. A result replaces its placeholder, so it adds only
+/// the difference in length. The sum is exact for the result text. It does
+/// not cover state that a call changes while it runs, such as the labels of a
+/// delegated child. The loop checks the next request again before it sends
+/// it, and ends the run if that request exceeds the cap.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RoundBudget {
     cap: u64,
     projected: u64,
-    minimal: u64,
+    placeholder: u64,
 }
 
 impl RoundBudget {
-    /// A budget for a next request of `floor` bytes under `cap`. Each call
-    /// holds a placeholder of `minimal` bytes in `floor`. A `cap` of zero is
-    /// no cap.
-    pub(crate) const fn new(cap: u64, floor: u64, minimal: u64) -> Self {
+    /// A budget for a next request of `floor` bytes under `cap`. The floor
+    /// holds one placeholder of `placeholder` bytes for each call. A `cap` of
+    /// zero is no cap.
+    pub(crate) const fn new(cap: u64, floor: u64, placeholder: u64) -> Self {
         Self {
             cap,
             projected: floor,
-            minimal,
+            placeholder,
         }
     }
 
-    /// A budget with no cap.
-    pub(crate) const fn unbounded() -> Self {
-        Self::new(0, 0, 0)
+    /// A budget that measures the results alone, as the first version did.
+    /// A task recorded before the whole-request budget uses it, so a run in
+    /// flight replays as it ran.
+    pub(crate) const fn results_only(cap: u64) -> Self {
+        Self::new(cap, 0, 0)
     }
 
-    /// Can the round run a call? Only when every call can still get its
-    /// minimal answer. A call that runs has a result that no request can
-    /// carry otherwise.
+    /// Can the round run a call? Only when a placeholder for each call fits
+    /// the next request. A call that runs when no answer fits has a result
+    /// that the model can never read.
     pub(crate) const fn can_run(&self) -> bool {
         self.cap == 0 || self.projected <= self.cap
     }
 
-    /// Charge a result of `size` bytes. Returns `false`, and charges
-    /// nothing, when the next request would pass the cap.
+    /// Add a result of `size` bytes in place of its placeholder. Returns
+    /// `false`, and adds nothing, when the next request would exceed the cap.
     pub(crate) const fn admit(&mut self, size: u64) -> bool {
         let next = self
             .projected
             .saturating_add(size)
-            .saturating_sub(self.minimal);
+            .saturating_sub(self.placeholder);
         if self.cap != 0 && next > self.cap {
             return false;
         }
@@ -157,6 +163,17 @@ mod tests {
         assert!(budget.admit(4), "6 bytes freed");
         assert!(budget.admit(16), "uses the 6 freed bytes");
         assert!(!budget.admit(11));
+    }
+
+    #[test]
+    fn a_results_only_budget_adds_each_result_in_full() {
+        let mut budget = RoundBudget::results_only(100);
+        assert!(budget.can_run());
+        assert!(budget.admit(60));
+        assert!(!budget.admit(41), "60 + 41 exceeds the cap");
+        assert!(budget.admit(40));
+        let mut open = RoundBudget::results_only(0);
+        assert!(open.admit(u64::MAX), "a zero cap is no cap");
     }
 
     #[test]

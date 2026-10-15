@@ -183,7 +183,8 @@ impl Run<'_> {
         self.agent.and_then(|agent| agent.mandate.tools.clone())
     }
 
-    /// The tools that the workflow runs itself, and the model must see.
+    /// The tools that the workflow runs itself. The model sees them with the
+    /// harness tools.
     fn extra_tools(&self) -> Vec<ToolDefinition> {
         self.task
             .followups
@@ -197,7 +198,7 @@ impl Run<'_> {
 /// The request for the next model turn over `messages`.
 ///
 /// The loop sends it, and a tool round measures it before it runs a call.
-/// One builder keeps the two measures equal.
+/// One builder makes the loop and the round measure the same fields.
 fn next_request(
     run: Run<'_>,
     progress: &Progress,
@@ -459,8 +460,8 @@ async fn run_segment(
         };
 
         progress.usage = progress.usage.saturating_add(turn.usage);
-        // The activity dropped a reply that did not fit the result cap. The
-        // turn holds no text and no calls, so the segment ends here.
+        // The activity drops a reply that does not fit the result cap. The
+        // turn then holds no text and no calls, so the segment ends here.
         if turn.oversized {
             return Ok(AgentStop::ReplyTooLarge);
         }
@@ -504,11 +505,17 @@ async fn run_segment(
         };
         progress.steps = progress.steps.saturating_add(1);
         tree.rounds = tree.rounds.saturating_add(1);
+        let narration = progress.last_text.clone();
         progress.push_assistant(&turn);
 
         match Box::pin(run_round(ctx, run, progress, tree, slot, &turn, calls)).await? {
             RoundEnd::Continue => {}
-            RoundEnd::Full => return Ok(AgentStop::TranscriptFull),
+            RoundEnd::Full => {
+                // Not every call ran, so the text of the turn is no answer.
+                // It can claim work that never ran.
+                progress.last_text = narration;
+                return Ok(AgentStop::TranscriptFull);
+            }
             RoundEnd::Loop => return Ok(AgentStop::LoopDetected),
         }
     }
@@ -537,7 +544,7 @@ async fn system_prompt(ctx: &WorkflowContext, task: &AgentTask) -> Result<Option
 enum RoundEnd {
     /// Every call has an answer. Ask the model again.
     Continue,
-    /// The next request would pass the request cap.
+    /// The next request would exceed the request cap.
     Full,
     /// The loop guard stopped the run.
     Loop,
@@ -579,18 +586,30 @@ impl Slot<'_> {
     }
 }
 
-/// The budget of one tool round: the whole next request, with a minimal
-/// answer in place of each result.
+/// The budget of one tool round: the whole next request, with a placeholder
+/// answer for each call.
 ///
 /// The request holds the transcript, the assistant turn and every answer. A
 /// round that measured the results alone would run a call whose result no
 /// request can carry (issue #2040).
-fn round_budget(run: Run<'_>, progress: &Progress, tree: &Tree, calls: &[ToolCall]) -> RoundBudget {
+///
+/// The request also holds the flow state. A call that runs adds its labels,
+/// and an approval adds its releases. The recorded turn names both, so the
+/// budget adds them for every call that can run.
+fn round_budget(
+    run: Run<'_>,
+    progress: &Progress,
+    tree: &Tree,
+    turn: &ModelTurn,
+    calls: &[ToolCall],
+) -> RoundBudget {
     let cap = run.task.request_cap();
-    if cap == 0 {
-        return RoundBudget::unbounded();
+    // A task recorded before the whole-request budget measured the results
+    // alone. A run in flight must replay as it ran. A zero cap is no cap.
+    if !run.task.whole_request_budget || cap == 0 {
+        return RoundBudget::results_only(cap);
     }
-    let placeholder = ToolOutcome::error(NOT_RUN_FULL).content;
+    let placeholder = placeholder();
     let answers = calls
         .iter()
         .map(|call| ContentPart::ToolResult {
@@ -603,17 +622,39 @@ fn round_budget(run: Run<'_>, progress: &Progress, tree: &Tree, calls: &[ToolCal
         role: ChatRole::Tool,
         content: answers,
     });
-    let request = next_request(run, progress, tree, &run.extra_tools(), messages);
+    let mut request = next_request(run, progress, tree, &run.extra_tools(), messages);
+    (request.flow_labels, request.flow_released) = flow_after(tree, turn);
     RoundBudget::new(cap, json_len(&request), json_len(&placeholder))
+}
+
+/// The flow state after every call of `turn` that can run.
+///
+/// It adds the labels of each call that the decision does not deny. It adds
+/// the releases of each call that waits for an approval.
+fn flow_after(tree: &Tree, turn: &ModelTurn) -> (BTreeSet<String>, Released) {
+    let mut exercised = tree.exercised.clone();
+    let mut released = tree.released.clone();
+    for (position, decision) in turn.decisions.iter().enumerate() {
+        if matches!(decision, ToolDecision::Deny { .. }) {
+            continue;
+        }
+        exercised.extend(turn.labels.get(position).into_iter().flatten().cloned());
+        if matches!(decision, ToolDecision::RequireApproval { .. }) {
+            released.extend(turn.releases.get(position).into_iter().flatten().cloned());
+        }
+    }
+    (exercised, released)
 }
 
 /// Answer every call of one round in ONE tool message.
 ///
-/// The next request must fit the request cap. When even a minimal answer for
-/// each call cannot fit, no call runs. When a result does not fit, it is
-/// dropped, and no more calls run. No more calls run after the loop guard
-/// stops the run either. Each call still gets an answer, so the transcript
-/// stays valid and shows what ran.
+/// The next request must fit the request cap. When a placeholder answer for
+/// each call does not fit, no call runs. The model could not read a result.
+///
+/// The round drops a result that does not fit, and runs no more calls. The
+/// run then ends, so the model never reads a later result. No more calls run
+/// after the loop guard stops the run either. Each call still gets an answer,
+/// so the transcript stays valid and shows what ran.
 async fn run_round(
     ctx: &WorkflowContext,
     run: Run<'_>,
@@ -624,7 +665,7 @@ async fn run_round(
     calls: Vec<ToolCall>,
 ) -> Result<RoundEnd, String> {
     let task = run.task;
-    let mut budget = round_budget(run, progress, tree, &calls);
+    let mut budget = round_budget(run, progress, tree, turn, &calls);
     let mut results = Vec::with_capacity(calls.len());
     let mut full = false;
     let mut looped = false;
@@ -639,8 +680,8 @@ async fn run_round(
         } else if stale {
             ToolOutcome::error(NOT_RUN_STALE).content
         } else if !budget.can_run() {
-            // Even a minimal answer for each call passes the cap. No result
-            // could reach the model, so no call runs.
+            // A placeholder for each call exceeds the cap. No result could
+            // reach the model, so no call runs.
             full = true;
             ToolOutcome::error(NOT_RUN_FULL).content
         } else {
@@ -704,18 +745,25 @@ async fn run_round(
     })
 }
 
-/// SKELETON: it returns the answer of a call that did not run.
+/// The longest answer that the round writes for a call with no result.
+///
+/// The round budget reserves it for every call, so any fixed answer fits the
+/// next request in its place.
 fn placeholder() -> String {
-    ToolOutcome::error(NOT_RUN_FULL).content
+    [DROPPED_FULL, NOT_RUN_FULL, NOT_RUN_LOOP, NOT_RUN_STALE]
+        .into_iter()
+        .map(|message| ToolOutcome::error(message).content)
+        .max_by_key(json_len)
+        .unwrap_or_default()
 }
 
-/// The answer to a call whose result would pass the request cap.
+/// The answer to a call whose result would exceed the request cap.
 const DROPPED_FULL: &str =
-    "the call ran, but its result was dropped: the next request would pass the request cap";
+    "the call ran, but its result was dropped: the next request would exceed the request cap";
 
-/// The answer to a call that did not run because the next request would pass
-/// the request cap. It is also the placeholder that the round budget uses.
-const NOT_RUN_FULL: &str = "the call did not run: the next request would pass the request cap";
+/// The answer to a call that did not run because the next request would
+/// exceed the request cap.
+const NOT_RUN_FULL: &str = "the call did not run: the next request would exceed the request cap";
 
 /// The answer to a call that did not run because the loop guard stopped the
 /// run.
@@ -922,32 +970,8 @@ async fn delegate(
     } = child;
     tree.delegations = tree.delegations.saturating_add(1);
     let run_id = format!("{}:d{}", tree.root, tree.delegations);
-    let read_only = task.read_only || mandate.read_only;
     let child_agent = discover(ctx, &mandate).await?;
-    let child_task = AgentTask {
-        input: child_input,
-        system: peer.system.clone(),
-        history: Vec::new(),
-        session_id: task.session_id.clone(),
-        max_steps: peer.max_steps,
-        max_total_tokens,
-        max_output_tokens: task.max_output_tokens,
-        approval_timeout_secs: task.approval_timeout_secs,
-        max_request_bytes: task.max_request_bytes,
-        deliver: false,
-        memory_scope: None,
-        followups: None,
-        loop_guard: task.loop_guard,
-        read_only,
-        unattended: task.unattended,
-        unattended_memory_writes: false,
-        run_id_source: task.run_id_source,
-        whole_request_budget: task.whole_request_budget,
-        tenant: task.tenant.clone(),
-        mandate: Some(mandate),
-        // The tree holds the labels, so the child task carries none.
-        flow_labels: BTreeSet::new(),
-    };
+    let child_task = child_task(task, peer, child_input, mandate, max_total_tokens);
     let mut child = Progress::new(run_id.clone(), Vec::new());
     let child_run = Run {
         task: &child_task,
@@ -986,6 +1010,43 @@ async fn delegate(
         content: outcome,
         is_error: stop != AgentStop::Completed,
     })
+}
+
+/// The task of a delegated child. It keeps the bounds of the parent task and
+/// takes the prompt and the limits of the peer.
+///
+/// Every field is named, so a new field of [`AgentTask`] must be placed here.
+fn child_task(
+    task: &AgentTask,
+    peer: &Peer,
+    input: String,
+    mandate: Mandate,
+    max_total_tokens: Option<u32>,
+) -> AgentTask {
+    AgentTask {
+        input,
+        system: peer.system.clone(),
+        history: Vec::new(),
+        session_id: task.session_id.clone(),
+        max_steps: peer.max_steps,
+        max_total_tokens,
+        max_output_tokens: task.max_output_tokens,
+        approval_timeout_secs: task.approval_timeout_secs,
+        max_request_bytes: task.max_request_bytes,
+        deliver: false,
+        memory_scope: None,
+        followups: None,
+        loop_guard: task.loop_guard,
+        read_only: task.read_only || mandate.read_only,
+        unattended: task.unattended,
+        unattended_memory_writes: false,
+        run_id_source: task.run_id_source,
+        whole_request_budget: task.whole_request_budget,
+        tenant: task.tenant.clone(),
+        mandate: Some(mandate),
+        // The tree holds the labels, so the child task carries none.
+        flow_labels: BTreeSet::new(),
+    }
 }
 
 /// A delegation that passed every check.
@@ -1271,6 +1332,46 @@ pub fn activities() -> Vec<ActivityInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_flow_state_after_a_turn_skips_denied_calls() {
+        let labels = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        // A released rule is a set of labels.
+        let rule = |names: &[&str]| -> Released { std::iter::once(labels(names)).collect() };
+        let tree = Tree {
+            root: "r".into(),
+            rounds: 0,
+            delegations: 0,
+            exercised: labels(&["old"]),
+            released: Released::new(),
+            records: Vec::new(),
+        };
+        let ask = ToolDecision::RequireApproval {
+            reason: "ask".into(),
+        };
+        let deny = ToolDecision::Deny {
+            reason: "no".into(),
+        };
+        let turn = ModelTurn {
+            content: Vec::new(),
+            stop: StopReason::ToolUse,
+            usage: TokenUsage::default(),
+            decisions: vec![ToolDecision::Allow, deny, ask],
+            cache_hit: false,
+            labels: vec![labels(&["a"]), labels(&["denied"]), labels(&["c"])],
+            releases: vec![rule(&["x"]), rule(&["denied"]), rule(&["y"])],
+            oversized: false,
+        };
+        let (exercised, released) = flow_after(&tree, &turn);
+        assert_eq!(
+            exercised,
+            labels(&["old", "a", "c"]),
+            "a denied call adds none"
+        );
+        assert_eq!(released, rule(&["y"]), "only a call that asks can release");
+    }
 
     #[test]
     fn the_placeholder_is_as_long_as_every_fixed_answer() {

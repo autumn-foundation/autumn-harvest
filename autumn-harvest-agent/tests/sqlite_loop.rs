@@ -686,8 +686,8 @@ async fn a_round_that_cannot_fit_a_minimal_answer_runs_no_tool() {
     assert!(results[0].contains("did not run"), "{}", results[0]);
 }
 
-/// The history leaves room for one result, not two. The old budget counted
-/// the results alone, so all three calls ran (issue #2040).
+/// The history leaves room for one result, not two. A budget that adds up
+/// the results alone would run all three calls (issue #2040).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_round_is_charged_against_the_whole_next_request() {
     let (_dir, db) = fresh_db();
@@ -720,8 +720,8 @@ async fn a_round_is_charged_against_the_whole_next_request() {
     assert_eq!(runs.load(Ordering::SeqCst), 2, "the third call never ran");
 }
 
-/// A reply over the result cap used to fail the activity after the model call
-/// was paid for. It now ends the run under a named stop (issue #2040).
+/// A reply over the result cap ends the run under a named stop. It does not
+/// fail the activity after the model call is paid for (issue #2040).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reply_over_the_result_cap_ends_the_run_under_a_named_stop() {
     let (_dir, db) = fresh_db();
@@ -879,7 +879,7 @@ async fn a_refused_round_does_not_make_its_narration_the_answer() {
     let report = report(rt.run_until_blocked(exec).await.unwrap());
 
     assert_eq!(report.stop, AgentStop::TranscriptFull);
-    assert!(recorder.runs().is_empty());
+    assert_eq!(recorder.runs(), Vec::<serde_json::Value>::new());
     assert_eq!(
         report.text, "",
         "no call ran, so the narration is no answer"

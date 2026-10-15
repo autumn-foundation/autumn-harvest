@@ -644,8 +644,8 @@ async fn a_refused_cost_still_records_the_turn_as_unpriced() {
     assert_eq!(ledger[0].cost_usd_micros(), None, "the bad cost is dropped");
 }
 
-/// A reply over the result cap used to fail the activity with a
-/// non-retryable `PayloadTooLarge`, after the model call was paid for
+/// A reply over the result cap must not fail the activity with a
+/// non-retryable `PayloadTooLarge`, because the model call is paid for
 /// (issue #2040).
 #[tokio::test]
 async fn a_reply_over_the_result_cap_is_a_typed_outcome_not_a_failed_activity() {
