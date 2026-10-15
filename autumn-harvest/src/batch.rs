@@ -871,22 +871,28 @@ mod db {
             }
         };
 
-        // The row stores the payload in the column form (issue #2043). A
-        // payload that does not decode leaves the job as it is. The job runs
-        // after an operator restores the key.
-        let signal_payload = match config
-            .payload_codecs
-            .decode_column_opt(job.signal_payload.as_ref())
-        {
-            Ok(payload) => payload,
-            Err(error) => {
-                tracing::warn!(
-                    job_id = %job.id,
-                    error_kind = crate::codec_rotation::sweep_error_kind(&error),
-                    "batch signal payload could not be decoded; the job stays as it is"
-                );
-                return Ok(());
+        // The row stores the payload in the column form (issue #2043). Only a
+        // signal job reads it. A cancel or terminate job ignores the payload,
+        // so a missing key must not block it. A signal payload that does not
+        // decode leaves the job as it is. The job runs after an operator
+        // restores the key.
+        let signal_payload = if action == BatchAction::Signal {
+            match config
+                .payload_codecs
+                .decode_column_opt(job.signal_payload.as_ref())
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                        "batch signal payload could not be decoded; the job stays as it is"
+                    );
+                    return Ok(());
+                }
             }
+        } else {
+            None
         };
 
         // Walk every shard, collect targets, dispatch with bounded fan-out.

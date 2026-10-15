@@ -26,7 +26,9 @@ use autumn_harvest::dlq::{self, NewDeadLetterEntry};
 use autumn_harvest::handle::WorkflowHandleClient;
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
 use autumn_harvest::models::WorkflowExecution;
-use autumn_harvest::payload_codec::{PayloadCodecs, codec_envelope_key_id, is_codec_envelope};
+use autumn_harvest::payload_codec::{
+    CodecError, PayloadCodec, PayloadCodecs, codec_envelope_key_id, is_codec_envelope,
+};
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
 use autumn_harvest::telemetry::TelemetryConfig;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
@@ -779,22 +781,25 @@ fn wf_heartbeat(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
     })
 }
 
+/// The stored checkpoint of the run's activity task row now, if any.
+async fn peek_heartbeat(conn: &mut AsyncPgConnection, exec_id: Uuid) -> Option<Value> {
+    use autumn_harvest::schema::harvest_task_queue;
+    let stored: Option<Option<Value>> = harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id)))
+        .filter(harvest_task_queue::task_type.eq("activity"))
+        .select(harvest_task_queue::heartbeat_details)
+        .first(conn)
+        .await
+        .optional()
+        .expect("load heartbeat");
+    stored.flatten().filter(|value| !value.is_null())
+}
+
 /// The stored checkpoint of the run's activity task row, once the flusher
 /// has written one.
 async fn stored_heartbeat(conn: &mut AsyncPgConnection, exec_id: Uuid) -> Option<Value> {
-    use autumn_harvest::schema::harvest_task_queue;
     for _ in 0..600 {
-        let stored: Option<Option<Value>> = harvest_task_queue::table
-            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id)))
-            .filter(harvest_task_queue::task_type.eq("activity"))
-            .select(harvest_task_queue::heartbeat_details)
-            .first(conn)
-            .await
-            .optional()
-            .expect("load heartbeat");
-        if let Some(Some(value)) = stored
-            && !value.is_null()
-        {
+        if let Some(value) = peek_heartbeat(conn, exec_id).await {
             return Some(value);
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -845,6 +850,138 @@ async fn a_heartbeat_checkpoint_is_ciphertext_and_the_retry_reads_plaintext() {
         json!({"seen": {"cursor": HEARTBEAT_SECRET}}),
         "the retry reads the plaintext checkpoint"
     );
+}
+
+// ── a checkpoint that fails to encode (issue #2043) ──────────────────────────
+
+static FLAKY_FAILING: AtomicBool = AtomicBool::new(false);
+static FLAKY_FAILURES: AtomicUsize = AtomicUsize::new(0);
+static FLAKY_DONE: AtomicBool = AtomicBool::new(false);
+
+/// An AES-256-GCM codec that fails to encode while `FLAKY_FAILING` is set.
+struct FlakyAead(AeadCodec);
+
+impl PayloadCodec for FlakyAead {
+    fn codec_id(&self) -> &'static str {
+        self.0.codec_id()
+    }
+
+    fn bound_key_id(&self) -> Option<&str> {
+        self.0.bound_key_id()
+    }
+
+    fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+        if AtomicBool::load(&FLAKY_FAILING, Ordering::SeqCst) {
+            FLAKY_FAILURES.fetch_add(1, Ordering::SeqCst);
+            return Err(CodecError("simulated encode failure".to_string()));
+        }
+        self.0.encode(raw)
+    }
+
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+        self.0.decode(encoded)
+    }
+}
+
+/// Sends one checkpoint while the codec fails, then waits for the test.
+fn flaky_heartbeat_activity(ctx: &autumn_harvest::ActivityContext, _input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        AtomicBool::store(&FLAKY_FAILING, true, Ordering::SeqCst);
+        ctx.heartbeat(json!({"cursor": HEARTBEAT_SECRET}))
+            .await
+            .map_err(|e| e.to_string())?;
+        for _ in 0..1200 {
+            if AtomicBool::load(&FLAKY_DONE, Ordering::SeqCst) {
+                return Ok(json!({"done": true}));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Err("the test never read the stored checkpoint".to_string())
+    })
+}
+
+fn wf_flaky_heartbeat(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        ctx.execute_activity_raw("cc_flaky_heartbeat", input, &queue)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tokio::test]
+async fn a_checkpoint_that_fails_to_encode_is_retried_on_the_next_flush() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue: &'static str = Box::leak(format!("cc-{}", Uuid::new_v4().simple()).into_boxed_str());
+    let codecs = PayloadCodecs::default();
+    let key = DataKey::from_bytes(&[0x5a; 32]).expect("data key");
+    codecs
+        .register_key(
+            "cc-k1",
+            Arc::new(FlakyAead(
+                AeadCodec::new("cc-k1", &key).expect("aead codec"),
+            )),
+        )
+        .expect("register");
+    codecs.set_column_encoding(true);
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, &codecs, "cc_flaky_heartbeat_wf", queue, None).await;
+
+    let pool = build_pool(&url);
+    let worker = worker(
+        queue,
+        registry(
+            vec![wf_info("cc_flaky_heartbeat_wf", wf_flaky_heartbeat, None)],
+            vec![activity_info(
+                "cc_flaky_heartbeat",
+                queue,
+                flaky_heartbeat_activity,
+            )],
+            &codecs,
+        ),
+    );
+    let run = worker.clone();
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(60), run.run(&run_pool)).await;
+    });
+
+    for _ in 0..600 {
+        if AtomicUsize::load(&FLAKY_FAILURES, Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        AtomicUsize::load(&FLAKY_FAILURES, Ordering::SeqCst) > 0,
+        "the flusher must try to encode the checkpoint"
+    );
+    assert!(
+        peek_heartbeat(&mut conn, exec_id.as_uuid()).await.is_none(),
+        "a checkpoint that does not encode is not stored in clear"
+    );
+
+    // The activity sends no later heartbeat. Only a retry can store it.
+    AtomicBool::store(&FLAKY_FAILING, false, Ordering::SeqCst);
+    let stored = stored_heartbeat(&mut conn, exec_id.as_uuid())
+        .await
+        .expect("the flusher retries the checkpoint once the codec works");
+    assert_ciphertext(&stored, HEARTBEAT_SECRET, "task_queue.heartbeat_details");
+    assert_eq!(
+        codecs.decode_column(&stored).expect("decode"),
+        json!({"cursor": HEARTBEAT_SECRET}),
+        "the retry stores the checkpoint the activity sent"
+    );
+
+    AtomicBool::store(&FLAKY_DONE, true, Ordering::SeqCst);
+    let client = WorkflowHandleClient::single(pool, url.clone()).with_codecs(codecs.clone());
+    client
+        .handle(exec_id)
+        .result_raw_with_timeout(Duration::from_secs(30))
+        .await
+        .expect("the workflow completes");
+    worker.shutdown();
+    let _ = handle.await;
 }
 
 // ── helpers for the short-lived copies (issue #2043) ─────────────────────────
@@ -1822,6 +1959,62 @@ async fn an_undecodable_batch_job_stays_pending_and_sends_no_signal() {
             .await
             .is_empty(),
         "no signal is sent"
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_batch_job_runs_without_the_key_for_its_unused_payload() {
+    use autumn_harvest::batch::{
+        BatchAction, BatchExecutorConfig, BatchFilter, BatchSubmission, run_executor_once,
+        submit_batch_job_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let workflow_name: &'static str =
+        Box::leak(format!("cc_batch_{}", Uuid::new_v4().simple()).into_boxed_str());
+    start(&mut conn, &codecs, workflow_name, &queue, None).await;
+    let job_id = submit_batch_job_with_codecs(
+        &mut conn,
+        BatchSubmission {
+            action: BatchAction::Cancel,
+            filter: BatchFilter {
+                states: vec!["RUNNING".to_string()],
+                workflow_name: Some(workflow_name.to_string()),
+                search_attrs: Vec::new(),
+            },
+            signal_name: None,
+            signal_payload: Some(json!({"pin": SIGNAL_SECRET})),
+            idempotency_key: None,
+            created_by: None,
+        },
+        &codecs,
+    )
+    .await
+    .expect("submit");
+
+    let pool = autumn_harvest::shard::ShardedDbPool::single(build_pool(&url));
+    run_executor_once(
+        &pool,
+        &BatchExecutorConfig {
+            payload_codecs: reader_without_the_key(),
+            ..BatchExecutorConfig::default()
+        },
+    )
+    .await
+    .expect("run the executor");
+
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_batch_jobs \
+             WHERE id::TEXT = $1 AND status = 'Completed'",
+            &job_id.to_string(),
+        )
+        .await,
+        1,
+        "a cancel job never reads the payload, so a missing key must not block it"
     );
 }
 

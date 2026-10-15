@@ -5187,20 +5187,17 @@ async fn write_heartbeat(
     .bind::<diesel::sql_types::Double, _>(age.as_secs_f64())
     .sql(")");
     let target = diesel::update(dsl::harvest_task_queue.find(claim.task_id));
-    let updated = match details {
-        Some(details) => {
-            let update = target
-                .set((
-                    dsl::last_heartbeat_at.eq(stamp),
-                    dsl::heartbeat_details.eq(Some(details)),
-                ))
-                .into_boxed();
-            fence(update, Some(claim)).execute(conn).await
-        }
-        None => {
-            let update = target.set(dsl::last_heartbeat_at.eq(stamp)).into_boxed();
-            fence(update, Some(claim)).execute(conn).await
-        }
+    let updated = if let Some(details) = details {
+        let update = target
+            .set((
+                dsl::last_heartbeat_at.eq(stamp),
+                dsl::heartbeat_details.eq(Some(details)),
+            ))
+            .into_boxed();
+        fence(update, Some(claim)).execute(conn).await
+    } else {
+        let update = target.set(dsl::last_heartbeat_at.eq(stamp)).into_boxed();
+        fence(update, Some(claim)).execute(conn).await
     }
     .map_err(crate::error::database_error)?;
     Ok(claim_write(updated > 0))

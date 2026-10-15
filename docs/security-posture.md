@@ -1400,7 +1400,8 @@ A stored value that does not decode never starts work on ciphertext:
 - The debounce, throttle and outbox scanners move the row back and log a
   warning that holds no payload text. A throttle row past its deadline is
   still dropped. The row starts after an operator restores the key.
-- The batch executor leaves the job as it is and logs a warning.
+- The batch executor leaves a signal job as it is and logs a warning. A cancel
+  or terminate job never reads the payload, so a missing key does not block it.
 - The callback scanner counts the failure as a delivery attempt. The delivery
   backs off. After its last attempt, it moves to the dead-letter queue with the
   stored body. A redrive sends the body after an operator restores the key.

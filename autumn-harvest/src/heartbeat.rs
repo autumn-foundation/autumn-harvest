@@ -453,6 +453,7 @@ pub async fn flush_heartbeat(
         Duration::MAX,
     )
     .await
+    .map(|flushed| flushed.write)
     .map_err(|failure| *failure.error)
 }
 
@@ -464,6 +465,15 @@ pub async fn flush_heartbeat(
 struct FlushFailure {
     reason: &'static str,
     error: Box<HarvestError>,
+}
+
+/// A written flush (issue #2043).
+#[cfg(feature = "db")]
+struct Flushed {
+    write: ClaimWrite,
+    /// The checkpoint did not encode. The write refreshed the heartbeat time
+    /// only, so the row still holds the previous checkpoint.
+    checkpoint_kept: bool,
 }
 
 /// A heartbeat not yet written, with the time the activity sent it.
@@ -491,7 +501,8 @@ struct EncodedCheckpoint {
 /// A liveness ping holds no details, so it stays `null`. A checkpoint that
 /// does not encode gives `None`. The flush then refreshes the heartbeat time
 /// only, and the previous checkpoint survives. The timeout scanner still sees a
-/// live activity.
+/// live activity. The flush loop keeps the heartbeat and encodes it again on
+/// the next tick.
 #[cfg(feature = "db")]
 fn stored_checkpoint(
     codecs: &PayloadCodecs,
@@ -553,6 +564,7 @@ fn cached_form_is_current(codecs: &PayloadCodecs, stored: &Value) -> bool {
 ///
 /// `beat` holds the last heartbeat written or tried.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn flush(
     pool: &Pool<AsyncPgConnection>,
     claim: &TaskClaim,
@@ -562,7 +574,7 @@ async fn flush(
     codecs: &PayloadCodecs,
     cache: &mut Option<EncodedCheckpoint>,
     interval: Duration,
-) -> Result<ClaimWrite, FlushFailure> {
+) -> Result<Flushed, FlushFailure> {
     let metrics = options.metrics.as_ref();
     let shards = &options.shards;
     let mut started = tokio::time::Instant::now();
@@ -586,7 +598,9 @@ async fn flush(
         }
         let write_started = std::time::Instant::now();
         let age = beat.sent_order.elapsed();
-        let written = match stored_checkpoint(codecs, &beat.payload, cache) {
+        let details = stored_checkpoint(codecs, &beat.payload, cache);
+        let checkpoint_kept = details.is_none();
+        let written = match details {
             Some(details) => {
                 crate::queue::record_heartbeat_sent_ago(&mut conn, claim, details, age).await
             }
@@ -601,10 +615,15 @@ async fn flush(
             Err(error) => crate::pool::is_session_timeout(error),
         };
         if !connection_works || !write_blocked(started.elapsed(), interval) || !latest.is_full() {
-            return written.map_err(|error| FlushFailure {
-                reason: "write_error",
-                error: Box::new(error),
-            });
+            return written
+                .map(|write| Flushed {
+                    write,
+                    checkpoint_kept,
+                })
+                .map_err(|error| FlushFailure {
+                    reason: "write_error",
+                    error: Box::new(error),
+                });
         }
         if written.is_err() {
             metrics.record_heartbeat_flush_failed("write_error");
@@ -679,10 +698,24 @@ async fn stamped_heartbeat_loop(
             // stale (issue #1788).
             let blocked = write_blocked(started.elapsed(), flush_interval);
             match outcome {
-                Ok(ClaimWrite::Applied) => after_blocked_write = blocked,
+                Ok(Flushed {
+                    write: ClaimWrite::Applied,
+                    checkpoint_kept,
+                }) => {
+                    after_blocked_write = blocked;
+                    // A checkpoint that did not encode is not lost
+                    // (issue #2043). A later heartbeat replaces it. Without
+                    // one, the next tick encodes it again.
+                    if checkpoint_kept {
+                        pending = Some(beat);
+                    }
+                }
                 // The claim is no longer current (issue #1789). Stop the
                 // activity, so this stale attempt does no more work.
-                Ok(ClaimWrite::LeaseLost) => {
+                Ok(Flushed {
+                    write: ClaimWrite::LeaseLost,
+                    ..
+                }) => {
                     tracing::warn!(
                         task_id = %task_id,
                         worker_id = %claim.worker_id,
