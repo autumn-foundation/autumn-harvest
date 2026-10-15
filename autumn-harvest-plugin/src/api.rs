@@ -9915,7 +9915,7 @@ async fn submit_batch_operation(
     // Persist the row on the default shard. The executor will fan out across
     // every configured shard at run time via iter_shards().
     let mut conn = acquire_conn(pool.default_pool()).await?;
-    let submit_result = batch::submit_batch_job(
+    let submit_result = batch::submit_batch_job_with_codecs(
         &mut conn,
         BatchSubmission {
             action,
@@ -9925,6 +9925,7 @@ async fn submit_batch_operation(
             idempotency_key: request.idempotency_key,
             created_by: request.created_by,
         },
+        &api_state.payload_codecs(),
     )
     .await;
 
@@ -18871,10 +18872,11 @@ pub(crate) async fn start_workflow(
             // Gate already enforced before the connection was acquired (above), so
             // pass gate_active = false here: the upsert always proceeds. `Ok(None)`
             // (the gate-rollback signal) is therefore unreachable on this path.
-            match autumn_harvest::debounce::admit_debounced_start(
+            match autumn_harvest::debounce::admit_debounced_start_with_codecs(
                 &mut debounce_conn,
                 admit_params,
                 false,
+                runtime.registry.payload_codecs(),
             )
             .await
             {
@@ -19647,7 +19649,7 @@ pub(crate) async fn start_workflow(
             started_by: None,
         };
 
-        match autumn_harvest::throttle::reserve_or_defer_or_shed(
+        match autumn_harvest::throttle::reserve_or_defer_or_shed_with_codecs(
             &mut conn,
             autumn_harvest::throttle::AdmitThrottleParams {
                 workflow_name: &workflow_name,
@@ -19661,6 +19663,7 @@ pub(crate) async fn start_workflow(
                 schedule_to_start: throttle_policy.schedule_to_start,
                 shard_id: shard.as_i32(),
             },
+            runtime.registry.payload_codecs(),
         )
         .await
         {
@@ -21186,7 +21189,7 @@ async fn batch_start_workflows(
                     start_source_ref: None,
                     started_by: Some(actor.clone()),
                 };
-                match autumn_harvest::throttle::reserve_or_defer_or_shed(
+                match autumn_harvest::throttle::reserve_or_defer_or_shed_with_codecs(
                     &mut conn,
                     autumn_harvest::throttle::AdmitThrottleParams {
                         workflow_name: &item.workflow_name,
@@ -21200,6 +21203,7 @@ async fn batch_start_workflows(
                         schedule_to_start: throttle_policy.schedule_to_start,
                         shard_id: shard.as_i32(),
                     },
+                    runtime.registry.payload_codecs(),
                 )
                 .await
                 {
@@ -30539,7 +30543,7 @@ async fn trigger_schedule_now(
             start_source_ref: Some(schedule_id.to_string()),
             started_by: Some(actor.clone()),
         };
-        match autumn_harvest::throttle::reserve_or_defer(
+        match autumn_harvest::throttle::reserve_or_defer_with_codecs(
             &mut exec_conn,
             autumn_harvest::throttle::AdmitThrottleParams {
                 workflow_name: &workflow_name,
@@ -30553,6 +30557,7 @@ async fn trigger_schedule_now(
                 schedule_to_start: throttle_policy.schedule_to_start,
                 shard_id: trigger_exec_shard.as_i32(),
             },
+            runtime.registry.payload_codecs(),
         )
         .await
         {
@@ -32028,7 +32033,7 @@ pub(crate) async fn schedule_backfill_inner(
                         start_source_ref: Some(schedule_id.to_string()),
                         started_by: Some(actor.clone()),
                     };
-                    match autumn_harvest::throttle::reserve_or_defer(
+                    match autumn_harvest::throttle::reserve_or_defer_with_codecs(
                         &mut conn,
                         autumn_harvest::throttle::AdmitThrottleParams {
                             workflow_name: &wf_name,
@@ -32042,6 +32047,7 @@ pub(crate) async fn schedule_backfill_inner(
                             schedule_to_start: throttle_policy.schedule_to_start,
                             shard_id: runtime.router.default_shard().as_i32(),
                         },
+                        runtime.registry.payload_codecs(),
                     )
                     .await
                     {

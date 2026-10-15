@@ -3540,12 +3540,15 @@ mod tests {
             "dlq::dead_letter(",
             "evaluate_triggers_for_execution(",
             "evaluate_triggers_for_execution_collecting(",
+            "fire_due_completion_deliveries(",
+            "admit_debounced_start(",
+            "reserve_or_defer(",
+            "reserve_or_defer_or_shed(",
+            "submit_batch_job(",
         ];
-        // A completion-callback dead letter copies the delivery body, which
-        // stays in clear (see `docs/security-posture.md`). The count is pinned
-        // so it can only go down.
-        const KNOWN_PLAIN_WRITES: &[(&str, &str, usize)] =
-            &[("completion_callback.rs", "dlq::dead_letter(", 1)];
+        // No engine call may use a plain variant (issue #2043). A pinned
+        // count here could only go down.
+        const KNOWN_PLAIN_WRITES: &[(&str, &str, usize)] = &[];
         let engine_sources: &[(&str, &str)] = &[
             ("worker.rs", include_str!("worker.rs")),
             ("timeout.rs", include_str!("timeout.rs")),
@@ -3562,6 +3565,7 @@ mod tests {
             ),
             ("reset.rs", include_str!("reset.rs")),
             ("cross_shard_child.rs", include_str!("cross_shard_child.rs")),
+            ("scheduler.rs", include_str!("scheduler.rs")),
         ];
         for (name, src) in engine_sources {
             for call in PLAIN_WRITES {

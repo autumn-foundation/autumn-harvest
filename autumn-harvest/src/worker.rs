@@ -18669,7 +18669,14 @@ async fn fail_attempt_before_handler(
     let finalized = async {
         let retry_policy =
             retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await?;
-        write_activity_result(pool, registry, attempt, retry_policy.as_ref(), &Err(payload)).await
+        write_activity_result(
+            pool,
+            registry,
+            attempt,
+            retry_policy.as_ref(),
+            &Err(payload),
+        )
+        .await
     }
     .await;
     let write = finalize_write_for_outcome(&finalized);

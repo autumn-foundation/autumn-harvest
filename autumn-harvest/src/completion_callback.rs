@@ -2649,6 +2649,9 @@ pub async fn enqueue_completion_deliveries(
                 "failed to serialize completion-callback envelope: {e}"
             ))
         })?;
+        // The row stores the body in the column form (issue #2043). The
+        // scanner decodes it before it signs and sends the body.
+        let payload = codecs.encode_column(&payload)?;
         let event_filter_json = serde_json::to_value(&target.filter).map_err(|e| {
             crate::error::HarvestError::Config(format!(
                 "failed to serialize completion-callback event filter: {e}"
@@ -3006,6 +3009,7 @@ async fn apply_outcome(
     conn: &mut diesel_async::AsyncPgConnection,
     row: &ClaimedDeliveryRow,
     action: OutcomeAction,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<()> {
     use diesel::prelude::*;
     use diesel_async::AsyncConnection;
@@ -3091,7 +3095,9 @@ async fn apply_outcome(
                     // A stale/superseded attempt must not dead-letter a row a
                     // newer attempt already resolved differently.
                     if updated > 0 {
-                        crate::dlq::dead_letter(conn, &entry).await?;
+                        // The entry holds the stored body. The writer keeps
+                        // one envelope layer (issue #2043).
+                        crate::dlq::dead_letter_with_codecs(conn, &entry, codecs).await?;
                     }
                     Ok(())
                 }),
@@ -3139,6 +3145,7 @@ async fn fire_due_on_conn(
     conn: &mut diesel_async::AsyncPgConnection,
     config: &CallbackRuntimeConfig,
     shard_id: Option<i32>,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
     if !completion_deliveries_table_exists(conn).await? {
         return Ok(0);
@@ -3208,13 +3215,29 @@ async fn fire_due_on_conn(
                     "target URL rejected by current SSRF policy: {rejection}"
                 )),
             };
-            apply_outcome(conn, &row, action).await?;
+            apply_outcome(conn, &row, action, codecs).await?;
             processed += 1;
             continue;
         }
 
-        let payload = fresh_payloads.get(&row.id).unwrap_or(&row.payload);
-        let body = match serde_json::to_vec(payload) {
+        let stored = fresh_payloads.get(&row.id).unwrap_or(&row.payload);
+        // The row stores the body in the column form (issue #2043). Sign and
+        // send the plain body. A body that does not decode is not sent. It
+        // counts as a failed attempt, so the delivery backs off and a dead
+        // letter keeps the stored body. A restored key lets a redrive send it.
+        let payload = match codecs.decode_column(stored) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(
+                    delivery_id = %row.id,
+                    error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                    "completion-callback body could not be decoded; the attempt fails"
+                );
+                dispatchable.push((row, None));
+                continue;
+            }
+        };
+        let body = match serde_json::to_vec(&payload) {
             Ok(bytes) => bytes,
             Err(e) => {
                 tracing::error!(
@@ -3226,13 +3249,13 @@ async fn fire_due_on_conn(
                     last_status: None,
                     last_error: Some(format!("payload serialization failed: {e}")),
                 };
-                apply_outcome(conn, &row, action).await?;
+                apply_outcome(conn, &row, action, codecs).await?;
                 processed += 1;
                 continue;
             }
         };
         let headers = delivery_headers(&config.secret, &body, row.id, now);
-        dispatchable.push((row, body, headers));
+        dispatchable.push((row, Some((body, headers))));
     }
 
     // Dispatch every claimed delivery's HTTP POST concurrently rather than
@@ -3245,9 +3268,19 @@ async fn fire_due_on_conn(
     // call is concurrent; outcome recording below still runs sequentially
     // against the single connection this function was handed (mirroring
     // every other scanner in this codebase).
-    let delivery_futures = dispatchable
-        .iter()
-        .map(|(row, body, headers)| config.deliverer.deliver(&row.target_url, body, headers));
+    let delivery_futures = dispatchable.iter().map(|(row, prepared)| async move {
+        match prepared {
+            Some((body, headers)) => {
+                config
+                    .deliverer
+                    .deliver(&row.target_url, body, headers)
+                    .await
+            }
+            None => {
+                DeliveryAttempt::transport_error("the stored body could not be decoded".to_string())
+            }
+        }
+    });
     let attempt_outcomes = futures::future::join_all(delivery_futures).await;
 
     // A fresh timestamp for backoff scheduling (issue #921 review, Codex
@@ -3279,8 +3312,7 @@ async fn fire_due_on_conn(
     let mut backoff_rows: Vec<BackoffOutcomeRow> = Vec::new();
     let mut dead_letter_rows: Vec<(ClaimedDeliveryRow, OutcomeAction)> = Vec::new();
 
-    for ((row, _body, _headers), attempt_outcome) in dispatchable.into_iter().zip(attempt_outcomes)
-    {
+    for ((row, _prepared), attempt_outcome) in dispatchable.into_iter().zip(attempt_outcomes) {
         let retry_policy: crate::policy::RetryPolicy = match serde_json::from_value(
             row.retry_policy.clone(),
         ) {
@@ -3334,7 +3366,7 @@ async fn fire_due_on_conn(
     apply_delivered_outcomes_batch(conn, &delivered_rows, backoff_now).await?;
     apply_backoff_outcomes_batch(conn, &backoff_rows, backoff_now).await?;
     for (row, action) in dead_letter_rows {
-        apply_outcome(conn, &row, action).await?;
+        apply_outcome(conn, &row, action, codecs).await?;
     }
 
     Ok(processed)
@@ -3362,17 +3394,20 @@ pub async fn fire_due_completion_deliveries(
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
 ) -> crate::error::HarvestResult<usize> {
-    fire_due_completion_deliveries_on_conn_shard(
+    fire_due_completion_deliveries_with_codecs(
         conn,
-        None,
-        sharded_pool.as_ref(),
+        sharded_pool,
         shard_assignments,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
     )
     .await
 }
 
 /// [`fire_due_completion_deliveries`], decoding each stored body through
 /// `codecs` before it is signed and sent (issue #2043).
+///
+/// A body that does not decode is not sent. The attempt fails, so the
+/// delivery backs off, and a dead letter keeps the stored body.
 ///
 /// # Errors
 ///
@@ -3382,9 +3417,16 @@ pub async fn fire_due_completion_deliveries_with_codecs(
     conn: &mut diesel_async::AsyncPgConnection,
     sharded_pool: &Option<crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
-    _codecs: &crate::payload_codec::PayloadCodecs,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
-    fire_due_completion_deliveries(conn, sharded_pool, shard_assignments).await
+    fire_due_completion_deliveries_on_conn_shard(
+        conn,
+        None,
+        sharded_pool.as_ref(),
+        shard_assignments,
+        codecs,
+    )
+    .await
 }
 
 /// [`fire_due_completion_deliveries`] for a caller that knows `conn`'s shard.
@@ -3395,6 +3437,7 @@ pub(crate) async fn fire_due_completion_deliveries_on_conn_shard(
     conn_shard: Option<crate::types::ShardId>,
     sharded_pool: Option<&crate::shard::ShardedDbPool>,
     shard_assignments: &[crate::types::ShardId],
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<usize> {
     let Some(config) = read_global_callback_config() else {
         return Ok(0);
@@ -3419,11 +3462,12 @@ pub(crate) async fn fire_due_completion_deliveries_on_conn_shard(
                 else {
                     continue;
                 };
-                total += fire_due_on_conn(&mut shard_conn, &config, Some(shard.as_i32())).await?;
+                total += fire_due_on_conn(&mut shard_conn, &config, Some(shard.as_i32()), codecs)
+                    .await?;
             }
         }
         _ => {
-            total += fire_due_on_conn(conn, &config, None).await?;
+            total += fire_due_on_conn(conn, &config, None, codecs).await?;
         }
     }
 

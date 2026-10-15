@@ -1107,7 +1107,8 @@ async fn a_callback_dead_letter_is_ciphertext_and_a_redrive_posts_plaintext() {
 #[tokio::test]
 async fn a_debounced_input_is_ciphertext_and_the_fire_starts_on_plaintext() {
     use autumn_harvest::debounce::{
-        AdmitDebounceParams, admit_debounced_start_with_codecs, fire_due_debounced_starts_with_codecs,
+        AdmitDebounceParams, admit_debounced_start_with_codecs,
+        fire_due_debounced_starts_with_codecs,
     };
     let (url, _c) = setup_test_database_url_or_env().await;
     let codecs = aead_codecs(true);
@@ -1268,11 +1269,15 @@ async fn an_outbox_target_input_is_read_as_plaintext_when_the_relay_starts_the_r
         .await
         .expect("insert the outbox row");
 
+    // The relay needs the pool of the target shard.
+    let sharded = Some(autumn_harvest::shard::ShardedDbPool::single(build_pool(
+        &url,
+    )));
     autumn_harvest::completion_trigger::enforce_completion_triggers_outbox_with_codecs(
         &mut conn,
         &autumn_harvest::telemetry::NoOpMetrics,
-        &None,
-        &[],
+        &sharded,
+        &[ShardId::new(0)],
         &codecs,
     )
     .await
@@ -1314,13 +1319,12 @@ async fn a_batch_signal_payload_is_ciphertext_and_each_delivery_is_plaintext() {
     .await
     .expect("submit");
 
-    let stored: JsonCell = diesel::sql_query(
-        "SELECT signal_payload AS value FROM harvest_batch_jobs WHERE id = $1",
-    )
-    .bind::<diesel::sql_types::Uuid, _>(job_id)
-    .get_result(&mut conn)
-    .await
-    .expect("load the batch job");
+    let stored: JsonCell =
+        diesel::sql_query("SELECT signal_payload AS value FROM harvest_batch_jobs WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(job_id)
+            .get_result(&mut conn)
+            .await
+            .expect("load the batch job");
     assert_ciphertext(&stored.value, SIGNAL_SECRET, "batch_jobs.signal_payload");
 
     let pool = autumn_harvest::shard::ShardedDbPool::single(build_pool(&url));

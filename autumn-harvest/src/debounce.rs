@@ -283,6 +283,29 @@ pub struct PendingDebounceRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+/// [`admit_debounced_start_with_codecs`], with the identity registry.
+///
+/// The row then stores the input as the identity codec writes it. Engine code
+/// calls the `_with_codecs` variant.
+///
+/// # Errors
+///
+/// As [`admit_debounced_start_with_codecs`].
+#[cfg(feature = "db")]
+pub async fn admit_debounced_start(
+    conn: &mut diesel_async::AsyncPgConnection,
+    params: AdmitDebounceParams<'_>,
+    gate_active: bool,
+) -> crate::error::HarvestResult<Option<DebounceAdmitOutcome>> {
+    admit_debounced_start_with_codecs(
+        conn,
+        params,
+        gate_active,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
 /// Upsert a pending debounce record for the given key.
 ///
 /// On the **first qualifying request** for a key, inserts a new row with
@@ -321,10 +344,11 @@ pub struct PendingDebounceRecord {
 /// into the gated scope. `Ok(Some(outcome))` is returned when admitted.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
-pub async fn admit_debounced_start(
+pub async fn admit_debounced_start_with_codecs(
     conn: &mut diesel_async::AsyncPgConnection,
     params: AdmitDebounceParams<'_>,
     gate_active: bool,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Option<DebounceAdmitOutcome>> {
     // Sentinel error used to roll the transaction back when the gate is active
     // (an Ok return would commit). Distinguished from a real DB error below.
@@ -441,7 +465,9 @@ pub async fn admit_debounced_start(
             (xmax = 0) AS is_new_record
     ";
 
-    let last_input = params.last_input;
+    // The row stores the input in the column form (issue #2043). The fire
+    // path decodes it before the start.
+    let last_input = codecs.encode_column(&params.last_input)?;
     let workflow_name = params.workflow_name;
     let debounce_key = params.debounce_key;
     let workflow_id = params.workflow_id;
@@ -538,6 +564,36 @@ impl crate::quota_lock_order::QuotaLockRow for FireDueRow {
     fn quota_input(&self) -> &serde_json::Value {
         &self.last_input
     }
+}
+
+/// Decode the stored input of each claimed row (issue #2043).
+///
+/// The row stores `last_input` in the column form. The quota ordering and the
+/// start both need the plain input. A row that does not decode stays pending,
+/// and the pass logs a warning with no payload text. It fires after an
+/// operator restores the key. A bad row thus cannot abort the claim of its
+/// neighbours.
+#[cfg(feature = "db")]
+fn decode_due_rows(
+    rows: Vec<FireDueRow>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> Vec<FireDueRow> {
+    rows.into_iter()
+        .filter_map(|mut row| match codecs.decode_column(&row.last_input) {
+            Ok(plain) => {
+                row.last_input = plain;
+                Some(row)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    debounce_id = %row.id,
+                    error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                    "debounce input could not be decoded; the row stays pending"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// Fire all pending debounce records whose `effective_fire_at` has elapsed.
@@ -646,6 +702,7 @@ async fn fire_due_on_conn(
                             .await
                             .map_err(crate::error::database_error)?;
 
+                        let due_rows = decode_due_rows(due_rows, codecs);
                         let due_rows =
                             crate::quota_lock_order::order_due_rows_for_deadlock_free_firing(
                                 conn, due_rows,
@@ -669,22 +726,6 @@ async fn fire_due_on_conn(
     .await?;
 
     Ok(fired)
-}
-
-/// [`admit_debounced_start`], storing `last_input` through `codecs`
-/// (issue #2043).
-///
-/// # Errors
-///
-/// Same as [`admit_debounced_start`].
-#[cfg(feature = "db")]
-pub async fn admit_debounced_start_with_codecs(
-    conn: &mut diesel_async::AsyncPgConnection,
-    params: AdmitDebounceParams<'_>,
-    gate_active: bool,
-    _codecs: &crate::payload_codec::PayloadCodecs,
-) -> crate::error::HarvestResult<Option<DebounceAdmitOutcome>> {
-    admit_debounced_start(conn, params, gate_active).await
 }
 
 /// Fire all due debounced starts across every assigned shard.
