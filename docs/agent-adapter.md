@@ -114,7 +114,8 @@ no harness fails the call as `AgentHarnessMissing`, which is not retryable.
 
 A worker with a payload cap other than the default must say so. Set
 `AgentTask::max_request_bytes` to its activity-input cap, and
-`AgentHarness::max_result_bytes` to its activity-result cap.
+`AgentHarness::max_result_bytes` to its activity-result cap. A cap of zero
+means no cap, as in the engine.
 
 ## 4. Build the harness
 
@@ -131,7 +132,9 @@ A worker with a payload cap other than the default must say so. Set
 - `tool_output_limit(chars)` — the cap on one tool result. The default is
   8 000 characters.
 - `max_result_bytes(bytes)` — the activity-result cap of the workers. A
-  larger tool result is cut to fit it. The default is the engine default.
+  larger tool result is cut to fit it. A model reply that does not fit ends
+  the run as `reply_too_large`. The default is the engine default. Zero is
+  no cap.
 - `model_timeout(d)` — the time budget of one model call. The default is
   13 minutes. With the policy, cache and ledger budgets, it stays below the
   15-minute `start_to_close`. A call over it is a
@@ -185,7 +188,8 @@ ledger row.
 `AgentTask` sets the run. Its bounds are `max_steps` (default 8, per
 segment), `max_total_tokens` (per run), `max_output_tokens`,
 `approval_timeout` (default one hour, rounded up to whole seconds) and
-`max_request_bytes` (default: the engine default). Its content is `input`,
+`max_request_bytes` (default: the engine default, zero is no cap). Its
+content is `input`,
 `system`, `history` and `session`. `tenant` scopes the response cache.
 Section 10 explains the always-on settings: `deliver`, `memory`,
 `followups`, `loop_guard`, `read_only`, `unattended` and
@@ -253,7 +257,8 @@ A bound is a normal end, not an error. `AgentReport.stop` names it:
 | `output_capped` | The last turn hit the output cap. Its tool calls do not run. |
 | `steps_exhausted` | The model asked for tools after `max_steps` rounds. |
 | `tokens_exhausted` | The run spent more than `max_total_tokens`, follow-ups included. |
-| `transcript_full` | The next request, or the results of one round, could not fit the request cap. The request was not sent. |
+| `transcript_full` | The next request could not fit the request cap. The request was not sent. |
+| `reply_too_large` | The model reply could not fit the result cap, even with its decision reasons cut. The reply is dropped. |
 | `budget_exceeded` | A run or tenant LLM budget refused the next model call. The call was not sent. See [LLM budgets](#llm-budgets-issue-1997). |
 | `loop_detected` | The loop guard saw the same call, with the same result, too many times. |
 
@@ -264,6 +269,30 @@ fit gets an error result, so the transcript shows what ran.
 
 A `transcript_full` transcript is too large for one request. Do not pass it
 whole as the `history` of a new run. Summarise it, or keep its last turns.
+
+### Payload caps (issue #2040)
+
+A tool round counts the whole next request: the transcript, the assistant
+turn and every answer. It checks this before it runs a call.
+
+- When even a minimal answer for each call cannot fit, no call runs. The
+  model could not read a result, so a call with a side effect must not run.
+- A result that does not fit is dropped, and the calls after it do not run.
+  Each call still gets an answer, so the transcript shows what ran.
+
+The model-turn activity fits its reply to the result cap:
+
+1. It cuts each decision reason to 256 bytes.
+2. When the reply still does not fit, the activity returns a turn with
+   `oversized` set, and no content. The run ends as `reply_too_large`.
+
+The report keeps the usage of the paid call. The reply is not in
+`AgentReport.messages`. A cap under 256 bytes cannot record the `oversized`
+turn, and the activity then fails.
+
+A cap of zero is no cap, as in the engine. This holds for
+`AgentTask::max_request_bytes` and `AgentHarness::max_result_bytes`, and for
+every check above.
 
 Retries follow `ErrorKind::is_retryable`. `RateLimited`, `Transport` and
 `Unavailable` retry with backoff, up to four attempts. So does a model call
@@ -615,8 +644,8 @@ one map between workers:
 miss with a warning. An out-of-date entry is a quiet miss. The cache never
 fails a turn. Each cache call, the tenant read included, has the
 `cache_timeout` budget: 5 seconds by default. One turn makes at most three
-cache calls. A turn over `AgentHarness::max_result_bytes` fails, so the
-cache neither stores nor serves one. A hit over the cap is a miss, and the
+cache calls. The cache neither stores nor serves a turn over
+`AgentHarness::max_result_bytes`. A hit over the cap is a miss, and the
 harness asks the model. A codec error is logged with fixed text,
 because a custom codec can quote the answer.
 
@@ -675,8 +704,8 @@ candidate at the same activity.
 The policy runs live, so use a policy with no side effects. It sees the
 recorded run id and the aligned call ids. A retryable model failure retries
 under the retry policy of `agent_model_turn`, as on a worker. A turn over the
-harness result cap (`AgentHarness::max_result_bytes`) fails, as on a worker
-with no payload store.
+harness result cap (`AgentHarness::max_result_bytes`) is cut or dropped, as on
+a worker with no payload store.
 
 A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn

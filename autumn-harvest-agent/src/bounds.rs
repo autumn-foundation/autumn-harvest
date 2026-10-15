@@ -59,6 +59,11 @@ impl RoundBudget {
         }
     }
 
+    /// A budget with no cap.
+    pub(crate) const fn unbounded() -> Self {
+        Self::new(0, 0, 0)
+    }
+
     /// Can the round run a call? Only when every call can still get its
     /// minimal answer. A call that runs has a result that no request can
     /// carry otherwise.

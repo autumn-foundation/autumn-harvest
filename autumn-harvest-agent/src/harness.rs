@@ -169,6 +169,10 @@ impl AgentHarness {
 
     /// Set the activity-result cap of the workers, in bytes. Set it when the
     /// workers use a cap other than the engine default.
+    ///
+    /// A larger tool result is cut to fit. A model reply that does not fit
+    /// ends the run as `reply_too_large`. A cap of zero is no cap, as in the
+    /// engine.
     #[must_use]
     pub const fn max_result_bytes(mut self, bytes: u64) -> Self {
         self.max_result_bytes = bytes;
@@ -339,6 +343,10 @@ impl AgentHarness {
     /// activity does, so register [`activities`](crate::activities) on
     /// Postgres. A hit skips the model call. The policy still decides each
     /// tool call.
+    ///
+    /// A turn over the result cap does not fail. The method cuts the decision
+    /// reasons, then returns a typed outcome with
+    /// [`ModelTurn::oversized`] set.
     ///
     /// # Errors
     ///
@@ -1037,21 +1045,23 @@ fn model_failure(err: &AgentError) -> String {
 /// so the whole output stays.
 #[must_use]
 pub fn max_tool_result_bytes(cap: u64) -> usize {
-    if cap == 0 {
-        return usize::MAX;
-    }
-    usize::try_from(cap.saturating_sub(OUTCOME_ENVELOPE_BYTES) / 6).unwrap_or(usize::MAX)
+    share_of(cap, 6)
 }
 
 /// The most bytes of error text one result keeps under `cap`.
 ///
-/// The text is escaped twice, so a byte can grow to twelve. A cap of zero is
-/// no cap.
+/// The text is escaped twice, so a byte can grow to twelve.
 fn max_error_bytes(cap: u64) -> usize {
+    share_of(cap, 12)
+}
+
+/// A `divisor`th of `cap`, less the outcome envelope. A cap of zero is no
+/// cap, as in the engine.
+fn share_of(cap: u64, divisor: u64) -> usize {
     if cap == 0 {
         return usize::MAX;
     }
-    usize::try_from(cap.saturating_sub(OUTCOME_ENVELOPE_BYTES) / 12).unwrap_or(usize::MAX)
+    usize::try_from(cap.saturating_sub(OUTCOME_ENVELOPE_BYTES) / divisor).unwrap_or(usize::MAX)
 }
 
 /// Cut `text` so that its recorded outcome fits the result cap.
@@ -1262,6 +1272,20 @@ mod tests {
         assert_eq!(fitted.usage, turn.usage, "the paid call is still counted");
         assert_eq!(fitted.stop, turn.stop);
         assert!(json_len(&fitted) <= 1_024);
+    }
+
+    #[test]
+    fn the_typed_outcome_fits_a_small_cap() {
+        // The documented floor: a cap of 256 bytes still records the outcome,
+        // even with the widest usage numbers.
+        let mut turn = turn_of(vec![call("c")], vec![deny("no")]);
+        turn.usage = TokenUsage {
+            input_tokens: u32::MAX,
+            output_tokens: u32::MAX,
+            cache_read_tokens: u32::MAX,
+            cache_write_tokens: u32::MAX,
+        };
+        assert!(json_len(&turn.into_oversized()) <= 256);
     }
 
     #[test]

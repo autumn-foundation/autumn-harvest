@@ -537,7 +537,7 @@ async fn system_prompt(ctx: &WorkflowContext, task: &AgentTask) -> Result<Option
 enum RoundEnd {
     /// Every call has an answer. Ask the model again.
     Continue,
-    /// The results passed the request cap.
+    /// The next request would pass the request cap.
     Full,
     /// The loop guard stopped the run.
     Loop,
@@ -588,7 +588,7 @@ impl Slot<'_> {
 fn round_budget(run: Run<'_>, progress: &Progress, tree: &Tree, calls: &[ToolCall]) -> RoundBudget {
     let cap = run.task.request_cap();
     if cap == 0 {
-        return RoundBudget::new(0, 0, 0);
+        return RoundBudget::unbounded();
     }
     let placeholder = ToolOutcome::error(NOT_RUN_FULL).content;
     let answers = calls
@@ -1065,6 +1065,10 @@ fn harness(ctx: &ActivityContext) -> Result<&AgentHarness, String> {
 /// (issue #1996). `AgentModel::model_id` names the model, and
 /// `AgentModel::cost_usd_micros` prices the call. A response cache hit calls
 /// no model and spends no tokens, so it records no call.
+///
+/// A reply over the result cap does not fail the activity. The activity cuts
+/// the decision reasons. When the reply still does not fit, it returns a turn
+/// with `oversized` set, and the loop ends under `reply_too_large`.
 ///
 /// # Errors
 ///

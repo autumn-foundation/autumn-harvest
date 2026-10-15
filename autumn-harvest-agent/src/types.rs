@@ -58,7 +58,8 @@ pub struct AgentTask {
     pub approval_timeout_secs: u64,
     /// The activity-input cap of the workers, in bytes. Set it when the
     /// workers use a cap other than the engine default. The loop stops with
-    /// `TranscriptFull` before it sends a request over this size.
+    /// `TranscriptFull` before it sends a request over this size. A cap of
+    /// zero is no cap, as in the engine.
     #[serde(default)]
     pub max_request_bytes: Option<u64>,
     /// Send the final answer to the harness delivery.
@@ -303,7 +304,7 @@ impl AgentTask {
         timeout.as_secs().saturating_add(partial)
     }
 
-    /// Set the activity-input cap of the workers, in bytes.
+    /// Set the activity-input cap of the workers, in bytes. Zero is no cap.
     #[must_use]
     pub const fn max_request_bytes(mut self, bytes: u64) -> Self {
         self.max_request_bytes = Some(bytes);
