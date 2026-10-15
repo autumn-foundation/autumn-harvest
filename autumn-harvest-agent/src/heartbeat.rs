@@ -257,6 +257,7 @@ impl HeartbeatTask {
         task.unattended_memory_writes = self.allow_memory_writes;
         task.tenant.clone_from(&self.tenant);
         task.flow_labels.clone_from(&self.flow_labels);
+        task.whole_request_budget = self.whole_request_budget;
         task
     }
 }
@@ -409,7 +410,13 @@ mod tests {
     #[test]
     fn an_empty_task_decodes_to_the_defaults() {
         let task: HeartbeatTask = serde_json::from_str("{}").unwrap();
-        assert_eq!(task, HeartbeatTask::new());
+        // The one difference is the compatibility flag. A recorded tick has
+        // none, so it keeps the old measure.
+        let expected = HeartbeatTask {
+            whole_request_budget: false,
+            ..HeartbeatTask::new()
+        };
+        assert_eq!(task, expected);
     }
 
     #[test]

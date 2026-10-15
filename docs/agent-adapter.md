@@ -301,7 +301,9 @@ sends it. It ends the run as `transcript_full` if that request exceeds the
 cap.
 
 A task recorded before this rule measures the results alone, so a run in
-flight replays as it ran. `AgentTask::new` turns the new rule on.
+flight replays as it ran. Such a task also reads a zero request cap as a limit
+of zero bytes, as it did. `AgentTask::new` and `HeartbeatTask::new` turn the
+new rule on. A recorded tick keeps the flag in `HeartbeatTask`.
 
 The model-turn activity fits its reply to the result cap:
 

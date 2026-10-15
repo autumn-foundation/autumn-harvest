@@ -101,8 +101,8 @@ pub struct AgentTask {
     pub run_id_source: RunIdSource,
     /// Measure a tool round against the whole next request (issue #2040).
     /// [`AgentTask::new`] turns it on. A recorded task with no field measures
-    /// the results alone. A run started before the change then replays as it
-    /// ran.
+    /// the results alone and reads a zero request cap as a limit of zero
+    /// bytes. A run started before the change then replays as it ran.
     #[serde(default, skip_serializing_if = "is_false")]
     pub whole_request_budget: bool,
     /// The tenant that scopes the response cache.

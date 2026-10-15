@@ -444,7 +444,12 @@ async fn run_segment(
         let request = next_request(run, progress, tree, &extra_tools, progress.messages.clone());
         // A request the engine would refuse is not sent. The refusal is not
         // retryable, so it would fail the run after earlier work was paid for.
-        if exceeds_bytes(&request, task.request_cap()) {
+        //
+        // A task recorded before the whole-request budget read a zero cap as a
+        // limit of zero bytes. Its run ended here, so a replay must end here.
+        let cap = task.request_cap();
+        let legacy_zero_cap = cap == 0 && !task.whole_request_budget;
+        if legacy_zero_cap || exceeds_bytes(&request, cap) {
             return Ok(AgentStop::TranscriptFull);
         }
         let turn: ModelTurn = match ctx

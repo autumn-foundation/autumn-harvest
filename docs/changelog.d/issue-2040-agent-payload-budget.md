@@ -33,10 +33,12 @@ exceeds the cap. A result that does not fit is still dropped after its call
 ran.
 
 **Replay.** The round budget changes which tool calls a round schedules near
-the cap. `AgentTask::whole_request_budget` gates it. `AgentTask::new` turns it
-on. A task recorded before this change has no field, so it keeps the
-results-only measure and replays as it ran. A heartbeat tick builds its task
-at run time, so a tick in flight at deploy near the cap can fail replay.
+the cap. The zero-cap rule changes whether a run sends its first request.
+`AgentTask::whole_request_budget` gates both. `AgentTask::new` turns it on. A
+task recorded before this change has no field. It keeps the results-only
+measure, reads a zero cap as a limit of zero bytes, and replays as it ran. A
+heartbeat tick builds its task at run time, so `HeartbeatTask` records the
+same flag, and `HeartbeatTask::new` turns it on.
 
 **Invariants.** No new `WorkflowEvent` variant. No migration. No route change.
 `ModelTurn::oversized` and `AgentTask::whole_request_budget` are left out at
@@ -44,8 +46,9 @@ their defaults, so a recorded value encodes as before. The text of the
 fixed "did not run" and "dropped" answers changed. They reach only the report
 of a run that has ended.
 
-**Breaking changes.** `ModelTurn`, `AgentTask` and `eval::TurnDecision` gain a
-public field. A struct literal of one of them needs the new field. `AgentStop` is `#[non_exhaustive]`, so
+**Breaking changes.** `ModelTurn`, `AgentTask`, `HeartbeatTask` and
+`eval::TurnDecision` gain a public field. A struct literal of one of them
+needs the new field. `AgentStop` is `#[non_exhaustive]`, so
 the new stop is not a break. A reader built before this change cannot decode
 `reply_too_large` in a recorded report. `exceeds_bytes(_, 0)` now returns
 `false`, and `max_tool_result_bytes(0)` returns `usize::MAX`.
@@ -65,5 +68,5 @@ that they fail when the code is wrong. The tests cover:
 - a label that a call adds to the next request;
 - a reply over the cap, a huge policy reason, and a child that drops its reply;
 - a zero cap in the request check, the round and the tool results;
-- a task recorded before the change;
+- a task and a heartbeat tick recorded before the change, with a zero cap;
 - the eval cap, which measures the ids that the provider gave.
