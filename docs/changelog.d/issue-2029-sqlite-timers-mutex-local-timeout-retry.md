@@ -42,7 +42,8 @@ its history replays on the core `WorkflowReplayer`.
   `RunState::TimedOut(error)`. `ctx.deadline()` reports the same deadline,
   because `WorkflowStarted` carries the run's start instant. A signal, an
   update, a cancel or a terminate after the deadline seals the run first and
-  gets `WorkflowNotRunning`.
+  gets `WorkflowNotRunning`. A signal by workflow id does the same. A
+  signal-with-start replaces the overdue run with a new one.
 - **Workflow retry (#523).** A start freezes the policy and
   `workflow_attempt = 1`. An author failure that the policy allows starts a
   retry in the failure transaction. The retry gets the same input, the next

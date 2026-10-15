@@ -647,37 +647,107 @@ pub fn load_attempts(
 /// [`send_signal`](crate::SqliteRuntime::send_signal) uses the wall clock, as
 /// the wall-clock drivers do. The `*_as_of` seam injects a test epoch, as the
 /// `*_as_of` drivers do. Mirrors the Postgres `harvest_signals.received_at`.
+///
+/// `idempotency_key` is stored as given (issue #2028). The unique index rejects
+/// a second row with the same key for `exec_id`.
 pub fn stage_signal(
     conn: &Connection,
     exec_id: ExecutionId,
     name: &str,
     payload: &Value,
     received_at: i64,
+    idempotency_key: Option<&str>,
 ) -> SqliteResult<()> {
     conn.execute(
-        "INSERT INTO harvest_signals (exec_id, name, payload_json, delivered, received_at) \
-         VALUES (?1, ?2, ?3, 0, ?4)",
+        "INSERT INTO harvest_signals \
+         (exec_id, name, payload_json, delivered, received_at, idempotency_key) \
+         VALUES (?1, ?2, ?3, 0, ?4, ?5)",
         params![
             exec_id.to_string(),
             name,
             serde_json::to_string(payload)?,
-            received_at
+            received_at,
+            idempotency_key
         ],
     )?;
     Ok(())
 }
 
-/// Whether `exec_id` has a staged signal named `name`, delivered or not.
+/// Whether `exec_id` has a signal row with this key, delivered or not (issue
+/// #2028). The unique index serves the probe.
 ///
 /// # Errors
 ///
 /// Returns a persistence error if the query fails.
-pub fn has_signal(conn: &Connection, exec_id: ExecutionId, name: &str) -> SqliteResult<bool> {
+pub fn has_signal_key(conn: &Connection, exec_id: ExecutionId, key: &str) -> SqliteResult<bool> {
     Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM harvest_signals WHERE exec_id = ?1 AND name = ?2)",
-        params![exec_id.to_string(), name],
+        "SELECT EXISTS (SELECT 1 FROM harvest_signals \
+         WHERE exec_id = ?1 AND idempotency_key = ?2)",
+        params![exec_id.to_string(), key],
         |r| r.get(0),
     )?)
+}
+
+/// The newest run of a `(workflow_name, workflow_id)` chain that holds a
+/// signal with this key, in any state (issue #2028).
+///
+/// A continue-as-new successor and a reuse-policy replacement share the
+/// `workflow_id`. So the probe finds a key that an earlier run of the chain
+/// holds. It mirrors the Postgres `lookup_idempotent_signal_dedupe`.
+///
+/// # Errors
+///
+/// Returns a persistence error if the query fails, or
+/// [`SqliteError::Corrupt`] for a bad stored id.
+pub fn find_signal_key_in_chain(
+    conn: &Connection,
+    workflow_name: &str,
+    workflow_id: &str,
+    key: &str,
+) -> SqliteResult<Option<ExecutionId>> {
+    conn.query_row(
+        "SELECT s.exec_id FROM harvest_executions AS e \
+         JOIN harvest_signals AS s ON s.exec_id = e.exec_id \
+         WHERE e.workflow_name = ?1 AND e.workflow_id = ?2 AND s.idempotency_key = ?3 \
+         ORDER BY s.signal_seq DESC LIMIT 1",
+        params![workflow_name, workflow_id, key],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()?
+    .map(|id| id.parse().map_err(|_| SqliteError::corrupt("exec_id")))
+    .transpose()
+}
+
+/// The run that a `(workflow_name, workflow_id)` key names, with its state
+/// (issue #2028). The `RUNNING` run wins. Otherwise the newest run wins.
+///
+/// It mirrors the Postgres `resolve_execution_id_by_workflow_id`: active
+/// first, else the newest terminal run.
+///
+/// # Errors
+///
+/// Returns a persistence error if the query fails, or
+/// [`SqliteError::Corrupt`] for a bad stored id.
+pub fn resolve_run_by_key(
+    conn: &Connection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> SqliteResult<Option<(ExecutionId, String)>> {
+    let row = conn
+        .query_row(
+            "SELECT exec_id, state FROM harvest_executions \
+             WHERE workflow_name = ?1 AND workflow_id = ?2 \
+             ORDER BY state = 'RUNNING' DESC, rowid DESC LIMIT 1",
+            params![workflow_name, workflow_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    row.map(|(id, state)| {
+        id.parse()
+            .map(|exec| (exec, state))
+            .map_err(|_| SqliteError::corrupt("exec_id"))
+    })
+    .transpose()
 }
 
 /// A staged signal awaiting delivery.

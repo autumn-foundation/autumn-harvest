@@ -306,3 +306,60 @@ async fn a_late_input_seal_deletes_a_running_task() {
         .unwrap();
     assert_eq!(open, 0, "the seal must not strand a RUNNING task");
 }
+
+// A signal by workflow id after the deadline seals the run first (issue #2028).
+#[tokio::test]
+async fn a_late_signal_by_workflow_id_is_refused() {
+    let info = waits_forever_info();
+    let (mut rt, clock) = runtime(&info);
+    let exec = rt
+        .start_workflow_with_id(info.name, "order-1", json!(1))
+        .unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+
+    clock.set(31);
+    assert!(matches!(
+        rt.send_signal_by_workflow_id(info.name, "order-1", "never", json!(1), None),
+        Err(SqliteError::WorkflowNotRunning { ref state, .. }) if state == "TIMED_OUT"
+    ));
+    assert_replays(info.name, info.handler, rt.load_history(exec).unwrap()).await;
+}
+
+// Signal-with-start after the deadline ends the overdue run and starts a new
+// one, so the signal lands on a live run.
+#[tokio::test]
+async fn signal_with_start_replaces_an_overdue_run() {
+    let info = waits_forever_info();
+    let (mut rt, clock) = runtime(&info);
+    let old = rt
+        .start_workflow_with_id(info.name, "order-2", json!(1))
+        .unwrap();
+    rt.run_until_blocked(old).await.unwrap();
+
+    clock.set(31);
+    let outcome = rt
+        .signal_with_start(autumn_harvest_sqlite::SignalWithStart {
+            workflow_name: info.name,
+            workflow_id: "order-2",
+            input: json!(2),
+            reuse_policy: autumn_harvest::WorkflowIdReusePolicy::AllowDuplicate,
+            signal_name: "never",
+            signal_payload: json!(7),
+            idempotency_key: None,
+        })
+        .unwrap();
+    assert_ne!(outcome.exec_id, old);
+    assert!(outcome.started_fresh && outcome.signal_delivered);
+    // The old run timed out before the replace sealed it.
+    let history = rt.load_history(old).unwrap();
+    assert!(
+        history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowExecutionTimedOut { .. })),
+        "the overdue run must record its timeout"
+    );
+    assert_replays(info.name, info.handler, history).await;
+    // The new run counts its deadline from its own start.
+    let state = rt.run_until_blocked(outcome.exec_id).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "got {state:?}");
+}

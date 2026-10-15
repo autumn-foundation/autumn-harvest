@@ -1945,7 +1945,7 @@ mod tests {
         .unwrap();
 
         // Signal arrives at t=100.
-        store::stage_signal(&conn, exec, "go", &serde_json::json!("v"), 100).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!("v"), 100, None).unwrap();
         // The raced deadline timer of THIS wait, expired at t=60 (<= 100).
         queue::enqueue_timer(&conn, exec, "__signal_timeout:0:go", 60).unwrap();
         // An UNRELATED durable timer, also due at t=50 (<= 100) — must NOT fire
@@ -2025,9 +2025,9 @@ mod tests {
             &serde_json::json!(null),
         )
         .unwrap();
-        store::stage_signal(&conn, exec, "go", &serde_json::json!("on_time"), 10).unwrap();
-        store::stage_signal(&conn, exec, "go", &serde_json::json!("late"), 90).unwrap();
-        store::stage_signal(&conn, exec, "go", &serde_json::json!("later"), 100).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!("on_time"), 10, None).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!("late"), 90, None).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!("later"), 100, None).unwrap();
         queue::enqueue_timer(&conn, exec, "__signal_timeout:0:go", 60).unwrap();
 
         let ingest = SignalIngest::plan(&conn, exec, 120, IngestBudget::default()).unwrap();
@@ -2058,7 +2058,7 @@ mod tests {
         )
         .unwrap();
         for i in 0..5 {
-            store::stage_signal(&conn, exec, "go", &serde_json::json!(i), i).unwrap();
+            store::stage_signal(&conn, exec, "go", &serde_json::json!(i), i, None).unwrap();
         }
         let policy = autumn_harvest::WorkflowHistoryPolicy::default().with_event_hard_cap(3);
 
@@ -2085,7 +2085,7 @@ mod tests {
         for seq in 0..3 {
             queue::enqueue_timer(&conn, exec, &format!("__signal_timeout:{seq}:go"), 10).unwrap();
         }
-        store::stage_signal(&conn, exec, "go", &serde_json::json!(1), 50).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!(1), 50, None).unwrap();
         let policy = autumn_harvest::WorkflowHistoryPolicy::default().with_event_hard_cap(3);
 
         let ingest =
@@ -2107,7 +2107,7 @@ mod tests {
             &serde_json::json!(null),
         )
         .unwrap();
-        store::stage_signal(&conn, exec, "go", &serde_json::json!(1), 100).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!(1), 100, None).unwrap();
         queue::enqueue_timer(&conn, exec, "__signal_timeout:0:go", 60).unwrap();
 
         let ingest = SignalIngest::plan(&conn, exec, 200, IngestBudget::default()).unwrap();
