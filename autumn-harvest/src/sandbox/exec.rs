@@ -475,13 +475,16 @@ impl RunCgroup {
         // The data rlimit leaves room for JIT reservations. This bounds the
         // memory in use, with no swap. A kernel without swap accounting has
         // no swap file.
-        let bounded = std::fs::write(cgroup.dir.join("memory.max"), memory_bytes.to_string())
-            .and_then(
-                |()| match std::fs::write(cgroup.dir.join("memory.swap.max"), b"0") {
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                    other => other,
-                },
-            );
+        let bounded = write_control(
+            &cgroup.dir.join("memory.max"),
+            memory_bytes.to_string().as_bytes(),
+        )
+        .and_then(
+            |()| match write_control(&cgroup.dir.join("memory.swap.max"), b"0") {
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        );
         if let Err(e) = bounded {
             return Err(SandboxError::Unavailable(format!(
                 "the run cgroup {} cannot bound the memory: {e}; the cgroup root must give \
@@ -578,6 +581,18 @@ fn effective_run_as(options: &ExecOptions) -> Result<Option<(u32, u32)>, Sandbox
 ///
 /// Returns [`SandboxError::Config`] for uid 0 or gid 0, for the `u32::MAX`
 /// sentinel, and for `run_as` on a non-root executor.
+/// Write `value` to the cgroup control file at `path`. The open never
+/// creates the file. On kernfs, an `O_CREAT` open of a missing file fails
+/// with `EACCES`. That would hide the `NotFound` of a missing control.
+fn write_control(path: &Path, value: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_CLOEXEC)
+        .open(path)?
+        .write_all(value)
+}
+
 fn run_as_for(options: &ExecOptions, root: bool) -> Result<Option<(u32, u32)>, SandboxError> {
     // A non-root executor runs the code in a user namespace with no uid
     // map. There, setuid and setgid fail, so a run_as fails on every run.
@@ -1612,6 +1627,20 @@ mod tests {
             Err(SandboxError::Unavailable(m)) if m.contains("user namespace") => {}
             Err(e) => panic!("{e:?}"),
         }
+    }
+
+    #[test]
+    fn a_control_file_write_never_creates_the_file() {
+        // A cgroup directory cannot hold a new file, and kernfs answers an
+        // `O_CREAT` open of a missing file with `EACCES`, not `ENOENT`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.swap.max");
+        let err = write_control(&path, b"0").expect_err("a missing file");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(!path.exists());
+        std::fs::write(&path, b"").unwrap();
+        write_control(&path, b"0").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"0");
     }
 
     #[test]

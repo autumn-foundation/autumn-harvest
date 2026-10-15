@@ -194,6 +194,9 @@ pub fn check_extra_cgroups(config: &JailerConfig) -> Result<(), SandboxError> {
             "would replace a launcher limit"
         } else if value.chars().any(char::is_control) {
             "has a control character in its value"
+        } else if value.is_empty() || value.contains('=') {
+            // The jailer splits `key=value` at each `=` and wants a value.
+            "has an empty value or an `=` in its value, which the jailer cannot parse"
         } else {
             continue;
         };
@@ -228,9 +231,10 @@ pub fn host_nr_open() -> u64 {
 /// # Errors
 ///
 /// [`SandboxError::Config`] for a `no-file` limit below
-/// [`MIN_NOFILE_LIMIT`] or above `nr_open`. The jailer sets the limit with
-/// `setrlimit`, which refuses a value above `nr_open`, even to root. Each
-/// launch would fail, and a retry cannot help.
+/// [`MIN_NOFILE_LIMIT`] or above `nr_open`, or an `fsize` limit below
+/// [`MIN_FSIZE_LIMIT`]. The jailer sets each limit with `setrlimit`, which
+/// refuses a `no-file` value above `nr_open`, even to root. Each launch would
+/// fail, and a retry cannot help.
 pub fn check_limits(config: &JailerConfig, nr_open: u64) -> Result<(), SandboxError> {
     match config.nofile_limit {
         Some(limit) if limit < MIN_NOFILE_LIMIT => Err(SandboxError::Config(format!(
@@ -241,8 +245,65 @@ pub fn check_limits(config: &JailerConfig, nr_open: u64) -> Result<(), SandboxEr
             "the jailer no-file limit of {limit} is above the fs.nr_open of {nr_open}, so \
              setrlimit would refuse it at each launch"
         ))),
-        _ => Ok(()),
+        _ => match config.fsize_limit {
+            Some(limit) if limit < MIN_FSIZE_LIMIT => Err(SandboxError::Config(format!(
+                "the jailer fsize limit of {limit} is below the {MIN_FSIZE_LIMIT} bytes that \
+                 the jailer needs to write its pid file before it runs Firecracker"
+            ))),
+            _ => Ok(()),
+        },
     }
+}
+
+/// The smallest `fsize` rlimit of a VMM. The jailer writes its pid file
+/// under the limit, and a smaller one kills it with `SIGXFSZ`.
+pub const MIN_FSIZE_LIMIT: u64 = 4096;
+
+/// Check the cgroup settings of `config` on a host with the mount table
+/// `mounts`: the parent, the extra values, the root and its controllers.
+///
+/// # Errors
+///
+/// [`SandboxError::Config`] from the first check that fails.
+pub fn check_cgroups(
+    config: &JailerConfig,
+    machine: MachineSpec,
+    mounts: &str,
+) -> Result<(), SandboxError> {
+    check_cgroup_parent(config)?;
+    check_extra_cgroups(config)?;
+    check_cgroup_root(config, mounts)?;
+    let controllers = config.cgroup_root.join("cgroup.controllers");
+    let listed = std::fs::read_to_string(&controllers)
+        .map_err(|e| SandboxError::Config(format!("cannot read {}: {e}", controllers.display())))?;
+    check_cgroup_controllers(config, machine, &listed)
+}
+
+/// Check that the cgroup root lists the controller of each cgroup value.
+///
+/// The jailer reads `cgroup.controllers` of the root and refuses a value
+/// whose controller is not in it. `listed` is the text of that file.
+///
+/// # Errors
+///
+/// [`SandboxError::Config`] that names the first missing controller.
+pub fn check_cgroup_controllers(
+    config: &JailerConfig,
+    machine: MachineSpec,
+    listed: &str,
+) -> Result<(), SandboxError> {
+    let listed: Vec<&str> = listed.split_whitespace().collect();
+    for (key, _) in cgroup_values(config, machine) {
+        let controller = key.split('.').next().unwrap_or_default();
+        if !listed.contains(&controller) {
+            return Err(SandboxError::Config(format!(
+                "the cgroup root {} does not list the controller {controller:?} of {key:?}, so \
+                 the jailer would refuse each launch",
+                config.cgroup_root.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Check that `cgroup_parent` names a cgroup below `cgroup_root` that the
@@ -594,6 +655,35 @@ mod tests {
                 ("memory.swap.max".to_owned(), "0".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn a_file_size_limit_too_small_for_the_jailer_is_a_config_error() {
+        // The jailer writes its pid file under this limit before it runs
+        // Firecracker.
+        for limit in [0, 4095] {
+            let mut config = config();
+            config.fsize_limit = Some(limit);
+            let err = check_limits(&config, 1 << 20).expect_err("too small");
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains("fsize")),
+                "{limit}: {err:?}"
+            );
+        }
+        let mut config = config();
+        config.fsize_limit = Some(4096);
+        check_limits(&config, 1 << 20).unwrap();
+    }
+
+    #[test]
+    fn an_extra_cgroup_value_must_be_one_the_jailer_parses() {
+        // The jailer splits `key=value` at each `=` and wants a value.
+        for (key, value) in [("io.max", "8:0 rbps=1048576"), ("cpuset.cpus", "")] {
+            let mut config = config();
+            config.extra_cgroups.push((key.into(), value.into()));
+            let err = check_extra_cgroups(&config).expect_err(key);
+            assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+        }
     }
 
     #[test]

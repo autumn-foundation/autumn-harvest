@@ -87,6 +87,11 @@ impl SandboxLimits {
 /// to start, so 64 leaves room for each built-in runtime.
 pub const MIN_OPEN_FILES: u32 = 64;
 
+/// The most open files that a policy can allow: the Linux default of
+/// `fs.nr_open`. `setrlimit` refuses more, even to root, and the host cannot
+/// read the value of a guest kernel.
+pub const MAX_OPEN_FILES: u32 = 1 << 20;
+
 /// The limits that a request gets when it asks for none.
 pub const DEFAULT_LIMITS: SandboxLimits = SandboxLimits {
     wall_clock_ms: 30_000,
@@ -340,6 +345,7 @@ impl SandboxPolicy {
                 )));
             }
         }
+        self.check_limit_ceilings()?;
         // Each run gets the default, because a request cannot set this limit.
         // Fewer descriptors fail each run before the code starts.
         if self.default_limits.max_open_files < MIN_OPEN_FILES {
@@ -412,6 +418,27 @@ impl SandboxPolicy {
             .saturating_add(files)
             .saturating_add(outputs)
             .saturating_add(OUTCOME_ENVELOPE_BYTES)
+    }
+
+    /// Check that no limit passes what the kernel or the engine can hold.
+    fn check_limit_ceilings(&self) -> Result<(), SandboxError> {
+        // The default is at most the ceiling, so the ceiling bounds both.
+        if self.max_limits.max_open_files > MAX_OPEN_FILES {
+            return Err(SandboxError::Config(format!(
+                "limit max_open_files is {}, above the {MAX_OPEN_FILES} of the default \
+                 fs.nr_open, so setrlimit would fail each run",
+                self.max_limits.max_open_files
+            )));
+        }
+        // The engine adds the attempt time to the current time.
+        if self.max_limits.wall_clock() > super::MAX_TIMEOUT {
+            return Err(SandboxError::Config(format!(
+                "limit wall_clock_ms is {}, above the {} ms of MAX_TIMEOUT",
+                self.max_limits.wall_clock_ms,
+                super::MAX_TIMEOUT.as_millis()
+            )));
+        }
+        Ok(())
     }
 
     /// Check the file and output counts of a request.
@@ -897,6 +924,28 @@ mod tests {
         let policy = SandboxPolicy::default().with_sizes(sizes);
         assert!(
             matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("outputs")),
+            "{:?}",
+            policy.validate()
+        );
+    }
+
+    #[test]
+    fn a_policy_limit_past_the_kernel_or_the_engine_is_a_config_error() {
+        // `setrlimit` refuses more files than `fs.nr_open`, 1 << 20 by default.
+        let mut limits = MAX_LIMITS;
+        limits.max_open_files = (1 << 20) + 1;
+        let policy = SandboxPolicy::default().with_limits(DEFAULT_LIMITS, limits);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("nr_open")),
+            "{:?}",
+            policy.validate()
+        );
+        // A wall clock of decades is no bound, and the attempt must fit.
+        let mut limits = MAX_LIMITS;
+        limits.wall_clock_ms = 1_000_000_000_000;
+        let policy = SandboxPolicy::default().with_limits(DEFAULT_LIMITS, limits);
+        assert!(
+            matches!(policy.validate(), Err(SandboxError::Config(ref m)) if m.contains("wall_clock_ms")),
             "{:?}",
             policy.validate()
         );

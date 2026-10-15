@@ -582,7 +582,7 @@ impl FirecrackerLauncher {
     /// [`Self::new`] for a process with the uid `euid` and the mount table
     /// `mounts`. `netns_check` checks the network namespace of a jailer.
     fn new_on_host(
-        config: LauncherConfig,
+        mut config: LauncherConfig,
         euid: u32,
         mounts: &str,
         netns_check: fn(&Path) -> Result<(), SandboxError>,
@@ -593,13 +593,19 @@ impl FirecrackerLauncher {
         // The guest kernel and agent keep some memory, so a run needs more.
         if !(1..=MAX_VCPUS).contains(&machine.vcpu_count)
             || machine.mem_size_mib <= GUEST_MEMORY_RESERVE_MIB
+            || machine.mem_size_mib > super::config::MAX_GUEST_MEMORY_MIB
         {
             return Err(SandboxError::Config(format!(
                 "a microVM needs 1 to {MAX_VCPUS} vCPUs and more than \
-                 {GUEST_MEMORY_RESERVE_MIB} MiB, not {} vCPUs and {} MiB",
-                machine.vcpu_count, machine.mem_size_mib
+                 {GUEST_MEMORY_RESERVE_MIB} MiB up to {} MiB, not {} vCPUs and {} MiB",
+                super::config::MAX_GUEST_MEMORY_MIB,
+                machine.vcpu_count,
+                machine.mem_size_mib
             )));
         }
+        // A longer API timeout means no bound, and the launch budget must
+        // still fit the engine clock.
+        config.api_timeout = crate::sandbox::bounded(config.api_timeout);
         super::config::check_boot_args(&config.image, config.guest_port)?;
         // The guest would listen on a port of its own choice.
         if config.guest_port == super::vsock::VMADDR_PORT_ANY {
@@ -630,10 +636,8 @@ impl FirecrackerLauncher {
                         .into(),
                 ));
             }
-            super::jailer::check_cgroup_parent(jailer)?;
             super::jailer::check_limits(jailer, super::jailer::host_nr_open())?;
-            super::jailer::check_extra_cgroups(jailer)?;
-            super::jailer::check_cgroup_root(jailer, mounts)?;
+            super::jailer::check_cgroups(jailer, machine, mounts)?;
             // `RunningVm::spawn` clears the environment, so only the
             // arguments of the jailer count.
             super::jailer::check_jailer_exec(
@@ -675,6 +679,8 @@ impl FirecrackerLauncher {
             .map_err(|e| {
                 SandboxError::Config(format!("cannot create {}: {e}", vm_root.display()))
             })?;
+        let jailed = matches!(config.confinement, Confinement::Jailer(_));
+        check_mount_flags(&vm_root, mount_flags(&vm_root)?, jailed)?;
         if let Confinement::Jailer(jailer) = &config.confinement {
             check_trusted_files(&config, jailer, &vm_root)?;
         }
@@ -1445,6 +1451,45 @@ impl VmLauncher for FirecrackerLauncher {
     fn work_capacity(&self) -> Option<u64> {
         Some(super::config::work_mib(&self.config.image).saturating_mul(1 << 20))
     }
+}
+
+/// The `statvfs` mount flags of the file system that holds `path`.
+fn mount_flags(path: &Path) -> Result<libc::c_ulong, SandboxError> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let fail = |e: &dyn std::fmt::Display| {
+        SandboxError::Config(format!("cannot read the mount of {}: {e}", path.display()))
+    };
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| fail(&e))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: a NUL-terminated path and a buffer of the right size.
+    if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(fail(&std::io::Error::last_os_error()));
+    }
+    // SAFETY: statvfs filled the buffer.
+    Ok(unsafe { stat.assume_init() }.f_flag)
+}
+
+/// Check the mount flags `flags` of the VM root `root`.
+///
+/// The VMM copies run from the root, so `noexec` stops each launch. The
+/// jailer makes `dev/kvm` in each jail below the root, and Firecracker cannot
+/// open a device node on a `nodev` mount.
+///
+/// # Errors
+///
+/// [`SandboxError::Config`] for a `noexec` root, or a `nodev` jailed root.
+fn check_mount_flags(root: &Path, flags: libc::c_ulong, jailed: bool) -> Result<(), SandboxError> {
+    let problem = if flags & libc::ST_NOEXEC != 0 {
+        "noexec, so the VMM copies there cannot run"
+    } else if jailed && flags & libc::ST_NODEV != 0 {
+        "nodev, so Firecracker cannot open /dev/kvm in a jail there"
+    } else {
+        return Ok(());
+    };
+    Err(SandboxError::Config(format!(
+        "the VM root {} is on a mount with {problem}",
+        root.display()
+    )))
 }
 
 /// The API socket of an unjailed VM, in its directory.
@@ -3502,6 +3547,12 @@ while True:
         // The jailer of a test uses the cgroup root of its config.
         let mounts = match &config.confinement {
             Confinement::Jailer(jail) => {
+                // The root lists the controllers that a host has.
+                let controllers = jail.cgroup_root.join("cgroup.controllers");
+                if !controllers.exists() {
+                    std::fs::create_dir_all(&jail.cgroup_root).unwrap();
+                    std::fs::write(&controllers, "cpuset cpu io memory hugetlb pids\n").unwrap();
+                }
                 format!("cgroup2 {} cgroup2 rw 0 0\n", jail.cgroup_root.display())
             }
             Confinement::Unjailed { .. } => String::new(),
@@ -3514,6 +3565,13 @@ while True:
         let mut jail = JailerConfig::new(script(dir, "jailer", "exec sleep 60"), 12_345, 12_345);
         jail.chroot_base = dir.join("jail");
         jail.cgroup_root = dir.join("cgroup");
+        // The root lists the controllers that a host has.
+        std::fs::create_dir_all(&jail.cgroup_root).unwrap();
+        std::fs::write(
+            jail.cgroup_root.join("cgroup.controllers"),
+            "cpuset cpu io memory hugetlb pids\n",
+        )
+        .unwrap();
         LauncherConfig {
             firecracker_bin: script(dir, "firecracker", "exit 0"),
             image: image(dir),
@@ -3547,6 +3605,63 @@ while True:
             "{err:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_cgroup_root_without_the_launcher_controllers_is_a_config_error() {
+        // The jailer refuses a key whose controller the root does not list.
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        std::fs::create_dir_all(dir.join("cgroup")).unwrap();
+        std::fs::write(dir.join("cgroup/cgroup.controllers"), "hugetlb\n").unwrap();
+        let err = new_launcher(config).expect_err("no cpu, memory or pids");
+        assert!(
+            matches!(err, SandboxError::Config(ref m) if m.contains("controller")),
+            "{err:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_guest_memory_that_firecracker_cannot_map_is_a_config_error() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let mut config = unjailed(&dir, fc, BootMethod::ConfigFile);
+        config.machine.mem_size_mib = u32::MAX;
+        let err = new_launcher(config).expect_err("4 PiB of guest memory");
+        assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_api_timeout_with_no_bound_keeps_a_finite_launch_budget() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "exit 0");
+        let mut config = unjailed(&dir, fc, BootMethod::Api);
+        config.api_timeout = Duration::MAX;
+        let launcher = new_launcher(config).unwrap();
+        assert!(
+            launcher.launch_budget() <= 2 * crate::sandbox::MAX_TIMEOUT,
+            "{:?}",
+            launcher.launch_budget()
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_jail_base_on_a_nodev_or_noexec_mount_is_a_config_error() {
+        let base = Path::new("/srv/jail");
+        for flags in [libc::ST_NODEV, libc::ST_NOEXEC] {
+            assert!(matches!(
+                check_mount_flags(base, flags, true),
+                Err(SandboxError::Config(_))
+            ));
+        }
+        // An unjailed launcher runs no device node from its root.
+        check_mount_flags(base, libc::ST_NODEV, false).unwrap();
+        assert!(check_mount_flags(base, libc::ST_NOEXEC, false).is_err());
+        check_mount_flags(base, libc::ST_NOSUID, true).unwrap();
     }
 
     #[test]

@@ -147,6 +147,8 @@ The process executor gives each run:
   neither works, the run fails closed;
 - `PR_SET_NO_NEW_PRIVS`;
 - rlimits for CPU time, data memory, file size, open files and core dumps.
+  A policy allows 64 to 1,048,576 open files (`MIN_OPEN_FILES`,
+  `MAX_OPEN_FILES`). `setrlimit` refuses more than the default `fs.nr_open`.
   The data rlimit is the memory limit plus 1 GiB, because V8 in Node 24
   reserves about 600 MiB of address space at start. The CPU rlimit applies
   to each process;
@@ -204,7 +206,9 @@ runtime refuses a policy that allows the network on a backend without one.
   A deploy that replaced or changed either binary gives a new check and new
   copies.
 - A jail base, or an unjailed `work_root`, that lets the worker run programs.
-  The copies run from there, so a `noexec` mount fails each check.
+  The copies run from there, so the launcher refuses a `noexec` mount. It
+  also refuses a `nodev` jail base, because Firecracker cannot open
+  `/dev/kvm` in a jail there.
 - KSM off, nested KVM off, and each CPU vulnerability `Not affected` or
   mitigated. Any other CPU status, such as `Vulnerable` or `Unknown`, is
   critical. A KSM, nested KVM or CPU vulnerability state that cannot be read,
@@ -240,7 +244,12 @@ runtime refuses a policy that allows the network on a backend without one.
   the limits itself. The jailer gets each value as an argument. So the
   launcher also refuses values that do not fit the exec limits. A key over
   255 bytes (`NAME_MAX`) is a config error too, because the jailer cannot
-  open that file.
+  open that file. So is an empty value or a value with `=`, which the jailer
+  cannot parse.
+- A cgroup root whose `cgroup.controllers` lists `cpu`, `memory`, `pids` and
+  the controller of each extra key. The jailer refuses each launch without
+  them. The jailer also writes `memory.swap.max`, so the host needs swap
+  accounting.
 
 Call `verify_host` before the first run. It checks the versions and the host,
 including cgroup v2 at `JailerConfig::cgroup_root`. Under
@@ -344,13 +353,16 @@ What each microVM gets:
   ceiling of the default policy plus a 128 MiB guest reserve
   (`GUEST_MEMORY_RESERVE_MIB`). Firecracker maps guest memory on first use,
   so the unused part costs no host memory. The runtime refuses a policy
-  whose memory ceiling is above the microVM size less the reserve;
+  whose memory ceiling is above the microVM size less the reserve. The
+  launcher refuses more than 1022 GiB (`MAX_GUEST_MEMORY_MIB`), which
+  Firecracker cannot map;
 - a read-only root drive, a vsock device and a virtio-rng device;
 - no network device, no metadata service and no serial console;
 - the kernel arguments `reboot=k panic=1 8250.nr_uarts=0`;
 - an 8 GiB `fsize` limit on the VMM, by default. A golden snapshot writes
   the whole guest memory to one file, so `create_golden_snapshot` refuses a
-  limit below the guest memory;
+  limit below the guest memory. The launcher refuses a limit below 4096
+  bytes (`MIN_FSIZE_LIMIT`), because the jailer writes its pid file first;
 - a `no-file` limit of 1024 on the VMM, by default. The launcher refuses a
   limit below 128 (`MIN_NOFILE_LIMIT`), because each launch would fail. It
   also refuses a limit above the host `fs.nr_open`, which `setrlimit` refuses.
@@ -468,8 +480,10 @@ not fit is only counted.
 
 - The registration sets `start_to_close` to `max_attempt_time`. That is the
   queue wait, the wall-clock ceiling, the backend overhead and the cleanup
-  grace together. A queue wait, boot timeout or attempt time of
-  `Duration::MAX` counts as no bound. The backend overhead is at least what the backend needs:
+  grace together. Each timeout counts up to `MAX_TIMEOUT`, one year, so a
+  longer one, such as `Duration::MAX`, means no bound. A policy wall clock
+  above it is a config error. The attempt time then fits the engine clock.
+  The backend overhead is at least what the backend needs:
   for Firecracker, the boot timeout, the request transfer, the response grace
   and the teardown.
 - The Firecracker backend starts the response grace after the guest takes

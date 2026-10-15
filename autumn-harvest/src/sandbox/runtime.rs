@@ -208,7 +208,7 @@ impl SandboxRuntime {
                  {capacity} bytes that the backend gives a run"
             )));
         }
-        let overhead = DEFAULT_BACKEND_OVERHEAD.max(backend.overhead());
+        let overhead = super::bounded(DEFAULT_BACKEND_OVERHEAD.max(backend.overhead()));
         Ok(Self {
             backend,
             policy: Arc::new(policy),
@@ -231,18 +231,20 @@ impl SandboxRuntime {
     }
 
     /// Set the time that the backend gets on top of the wall-clock limit.
-    /// It is never less than [`SandboxBackend::overhead`].
+    /// It is never less than [`SandboxBackend::overhead`], and never more
+    /// than [`MAX_TIMEOUT`](super::MAX_TIMEOUT).
     #[must_use]
     pub fn with_backend_overhead(mut self, overhead: Duration) -> Self {
-        self.overhead = overhead.max(self.backend.overhead());
+        self.overhead = super::bounded(overhead.max(self.backend.overhead()));
         self
     }
 
     /// Set the time that a run waits for a free slot. After it, the run is
     /// [`SandboxError::Unavailable`], and the activity retries later.
+    /// A wait above [`MAX_TIMEOUT`](super::MAX_TIMEOUT) counts as that bound.
     #[must_use]
-    pub const fn with_queue_wait(mut self, queue_wait: Duration) -> Self {
-        self.queue_wait = queue_wait;
+    pub fn with_queue_wait(mut self, queue_wait: Duration) -> Self {
+        self.queue_wait = super::bounded(queue_wait);
         self
     }
 
@@ -1049,6 +1051,30 @@ pub(crate) mod tests {
         let request = SandboxRequest::new("sh", "true");
         runtime
             .run_with(&request, options, &CancellationToken::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_bound_settings_keep_a_finite_attempt_that_runs() {
+        // `Duration::MAX` means no bound. The attempt time must still fit
+        // the engine, and an attempt of that length must still run.
+        let (_, runtime) = runtime(FakeBackend::new(IsolationLevel::Process));
+        let runtime = runtime
+            .with_queue_wait(Duration::MAX)
+            .with_backend_overhead(Duration::MAX);
+        let attempt = runtime.max_attempt_time();
+        assert!(attempt <= 4 * crate::sandbox::MAX_TIMEOUT, "{attempt:?}");
+        let options = RunOptions {
+            time_left: Some(attempt),
+            ..RunOptions::default()
+        };
+        runtime
+            .run_with(
+                &SandboxRequest::new("sh", "true"),
+                options,
+                &CancellationToken::new(),
+            )
             .await
             .unwrap();
     }

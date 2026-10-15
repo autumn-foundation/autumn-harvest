@@ -49,6 +49,11 @@ pub const FIRECRACKER_CMDLINE_RESERVE: usize = 256;
 /// The longest boot argument line that the launcher gives to Firecracker.
 pub const MAX_BOOT_ARGS_BYTES: usize = FIRECRACKER_CMDLINE_SIZE - 1 - FIRECRACKER_CMDLINE_RESERVE;
 
+/// The most guest memory of a microVM: 1022 GiB, the largest guest memory of
+/// Firecracker on `aarch64`. Firecracker maps all of it at boot, so a larger
+/// size can pass the address space or the KVM slot limit.
+pub const MAX_GUEST_MEMORY_MIB: u32 = 1022 * 1024;
+
 /// The prefix of each VM id that this crate creates.
 pub const VM_ID_PREFIX: &str = "hsbx-";
 

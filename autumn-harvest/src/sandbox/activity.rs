@@ -157,12 +157,14 @@ impl SandboxActivity {
             module: "sandbox",
             default_retry_policy: Some(self.retry.clone()),
             default_start_to_close: Some(self.start_to_close()),
-            default_heartbeat_timeout: self.heartbeat_timeout,
-            default_schedule_to_start: self.schedule_to_start,
+            // The engine adds each to the current time, so none may pass
+            // what its clock holds. A longer one means no bound.
+            default_heartbeat_timeout: self.heartbeat_timeout.map(super::bounded),
+            default_schedule_to_start: self.schedule_to_start.map(super::bounded),
             default_queue: queue,
             max_concurrent: self.max_concurrent,
             concurrency_key: None,
-            default_schedule_to_close: self.schedule_to_close,
+            default_schedule_to_close: self.schedule_to_close.map(super::bounded),
             is_local: false,
             max_input_bytes: Some(policy.max_request_json_bytes()),
             max_result_bytes: Some(policy.max_outcome_json_bytes()),
@@ -326,6 +328,21 @@ mod tests {
         let runtime =
             SandboxRuntime::new(backend.clone(), SandboxPolicy::for_development()).unwrap();
         (backend, SandboxActivity::new("run_code", Arc::new(runtime)))
+    }
+
+    #[test]
+    fn no_bound_timeouts_reach_the_engine_as_a_time_it_can_hold() {
+        // The engine adds each to the current time.
+        let (_, activity) = activity(FakeBackend::new(IsolationLevel::Process));
+        let info = activity
+            .with_schedule_to_close(Some(Duration::MAX))
+            .with_heartbeat_timeout(Duration::MAX)
+            .with_schedule_to_start(Some(Duration::MAX))
+            .activity_info();
+        let bound = Some(crate::sandbox::MAX_TIMEOUT);
+        assert_eq!(info.default_schedule_to_close, bound);
+        assert_eq!(info.default_heartbeat_timeout, bound);
+        assert_eq!(info.default_schedule_to_start, bound);
     }
 
     fn state_with(activity: SandboxActivity) -> crate::context::SharedState {

@@ -99,8 +99,12 @@ impl FirecrackerBackend {
     /// port. The port is the port of the launcher, or else of the settings.
     pub fn new(
         launcher: Arc<dyn VmLauncher>,
-        settings: BackendSettings,
+        mut settings: BackendSettings,
     ) -> Result<Self, SandboxError> {
+        // A longer timeout means no bound, and the overhead must still fit
+        // the engine clock.
+        settings.boot_timeout = crate::sandbox::bounded(settings.boot_timeout);
+        settings.response_grace = crate::sandbox::bounded(settings.response_grace);
         // Ask the launcher once, so the pool and each run use one port.
         let port = launcher.guest_port().unwrap_or(settings.guest_port);
         if port == super::vsock::VMADDR_PORT_ANY {
@@ -652,6 +656,12 @@ mod tests {
             ..fast()
         };
         let backend = FirecrackerBackend::new(fake.clone(), settings).unwrap();
+        // The overhead stays a time that the engine can schedule.
+        assert!(
+            backend.overhead() <= 4 * crate::sandbox::MAX_TIMEOUT,
+            "{:?}",
+            backend.overhead()
+        );
         let out = backend
             .execute(job("echo cold", 5_000), CancellationToken::new())
             .await

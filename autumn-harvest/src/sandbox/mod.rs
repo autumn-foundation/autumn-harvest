@@ -62,6 +62,15 @@ pub use policy::{
 pub use request::{ExecPlan, PlanFile, RequestedLimits, SandboxFile, SandboxRequest};
 pub use runtime::{RunOptions, SandboxBackend, SandboxJob, SandboxRuntime};
 
+/// The longest timeout that the sandbox keeps: one year. A longer one means
+/// no bound. The sum of a few such timeouts still fits the engine clock.
+pub const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
+
+/// `timeout`, at most [`MAX_TIMEOUT`].
+pub(crate) fn bounded(timeout: std::time::Duration) -> std::time::Duration {
+    timeout.min(MAX_TIMEOUT)
+}
+
 /// The latest deadline that the sandbox sets: 30 years ahead, as Tokio sets
 /// for a deadline that never comes. A longer wait means no bound.
 const FAR_FUTURE: std::time::Duration = std::time::Duration::from_secs(30 * 365 * 24 * 60 * 60);
