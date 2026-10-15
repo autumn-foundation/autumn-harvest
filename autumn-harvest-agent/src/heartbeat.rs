@@ -96,6 +96,10 @@ pub struct HeartbeatTask {
     /// untrusted data, and a note shows in every later run of the scope.
     #[serde(default)]
     pub allow_memory_writes: bool,
+    /// The activity-input cap of the workers, in bytes. See
+    /// [`AgentTask::max_request_bytes`](crate::AgentTask::max_request_bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_bytes: Option<u64>,
     /// The tenant that scopes the response cache. See
     /// [`AgentTask::tenant`](crate::AgentTask::tenant).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,6 +145,7 @@ impl HeartbeatTask {
             max_output_tokens: None,
             approval_timeout_secs: DEFAULT_HEARTBEAT_APPROVAL_TIMEOUT_SECS,
             allow_memory_writes: false,
+            max_request_bytes: None,
             tenant: None,
             flow_labels: BTreeSet::new(),
         }
@@ -226,6 +231,13 @@ impl HeartbeatTask {
         self
     }
 
+    /// Set the activity-input cap of the workers, in bytes.
+    #[must_use]
+    pub const fn max_request_bytes(mut self, bytes: u64) -> Self {
+        self.max_request_bytes = Some(bytes);
+        self
+    }
+
     /// Set the tenant that scopes the response cache.
     #[must_use]
     pub fn tenant(mut self, tenant: impl Into<String>) -> Self {
@@ -245,6 +257,7 @@ impl HeartbeatTask {
         task.max_total_tokens = self.max_total_tokens;
         task.max_output_tokens = self.max_output_tokens;
         task.approval_timeout_secs = self.approval_timeout_secs;
+        task.max_request_bytes = self.max_request_bytes;
         task.read_only = !self.allow_actions;
         task.unattended = true;
         task.unattended_memory_writes = self.allow_memory_writes;
@@ -397,5 +410,20 @@ mod tests {
         let schedule = schedule(Schedule::Manual, &task).unwrap();
         assert_eq!(schedule.workflow_name, HEARTBEAT_WORKFLOW_NAME);
         assert_eq!(schedule.input, serde_json::to_value(&task).unwrap());
+    }
+
+    #[test]
+    fn a_tick_carries_the_worker_input_cap() {
+        assert_eq!(HeartbeatTask::new().agent_task().max_request_bytes, None);
+        let task = HeartbeatTask::new().max_request_bytes(1_000).agent_task();
+        assert_eq!(task.max_request_bytes, Some(1_000));
+        let old = serde_json::json!({"prompt": "tick"});
+        let decoded: HeartbeatTask = serde_json::from_value(old).unwrap();
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("max_request_bytes")
+                .is_none()
+        );
     }
 }

@@ -423,9 +423,10 @@ A tick is one short workflow:
    `HEARTBEAT_OK` with no other letter or digit.
 
 A tick never books a follow-up. `HeartbeatTask` takes its own budget:
-`max_steps`, `max_total_tokens`, `max_output_tokens` and
-`approval_timeout`. The approval wait defaults to 15 minutes, because the
-schedule starts no new tick while one runs.
+`max_steps`, `max_total_tokens`, `max_output_tokens`, `max_request_bytes`
+and `approval_timeout`. Set `max_request_bytes` to the activity-input cap
+of the workers, as for `AgentTask`. The approval wait defaults to 15
+minutes, because the schedule starts no new tick while one runs.
 
 On Postgres, register the schedule that `heartbeat::schedule` builds:
 
@@ -465,6 +466,8 @@ a fixed user message that the app controls, which tells the model to act on
 that call.
 
 - The workflow refuses a second follow-up in one segment.
+- The prompt is at most 2 000 characters. The count includes white space,
+  because the transcript keeps the prompt as the model wrote it.
 - The delay is at most the `max_delay` of `Followups::new`. The shortest
   delay is one minute.
 - A chain cap (`Followups::max_chain`, 10 by default) stops an agent that
@@ -486,7 +489,12 @@ the harness. The default `LogDelivery` logs the run id and the size of the
 text, never the text itself.
 
 - A `completed` answer goes out, unless it is empty or a silent heartbeat
-  acknowledgement.
+  acknowledgement. Only the text of the last turn counts. A segment that
+  ends on an empty turn sends nothing, even when an earlier turn wrote
+  text beside a tool call. An empty `output_capped` turn sends only the
+  stop notice. A run recorded before this rule replays as it ran. The
+  workflow records the `agent_final_turn_rules` patch marker to tell them
+  apart. The follow-up length rule uses the same marker.
 - A segment that a bound ended early sends a notice, for example
   `The agent stopped early: loop_detected.`. An unattended run therefore
   does not fail in silence.
@@ -520,9 +528,12 @@ entries are its own notes, not instructions from the user.
 
 Each edit carries an `EditKey`: the run, the step and the call. A store
 applies each key once, so a call that runs again after a crash changes
-nothing, even when another run edited the scope in between. A durable store
-must save the key with the edit, in one transaction. An `add` of an entry
-that already exists changes nothing either.
+nothing, even when another run edited the scope in between. A store keeps
+the first result of a key, an error included, and returns it on a retry. A
+failed `remove` therefore cannot remove a newer entry after a crash. A
+durable store must save the key and its result with the edit, in one
+transaction. An `add` of an entry that already exists changes nothing
+either.
 
 ### Loop guard
 

@@ -44,6 +44,9 @@ use crate::types::{
     ToolOutcome, without_system,
 };
 
+/// The replay gate of the final-turn delivery and the raw follow-up length.
+const FINAL_TURN_PATCH: &str = "agent_final_turn_rules";
+
 /// The registered workflow name.
 pub const WORKFLOW_NAME: &str = "agent_loop";
 
@@ -67,15 +70,18 @@ struct Progress {
     /// Tool calls of every agent under this one.
     delegated_tool_calls: u32,
     last_text: String,
-    /// The segment ended on a turn with no tool calls, so `last_text` is its
-    /// answer.
-    answered: bool,
+    /// The text of the turn that ended the segment with no tool calls. It is
+    /// `None` when the segment ended any other way.
+    answer: Option<String>,
     /// The loop guard history of the whole run.
     tracker: LoopTracker,
     /// The follow-up that this segment booked.
     followup: Option<Planned>,
     /// Follow-ups that ran before this segment.
     chain: u32,
+    /// The run records the final-turn marker. An older history does not, and
+    /// replays under the rules it ran with.
+    final_turn_rules: bool,
 }
 
 impl Progress {
@@ -91,10 +97,11 @@ impl Progress {
             delegated_steps: 0,
             delegated_tool_calls: 0,
             last_text: String::new(),
-            answered: false,
+            answer: None,
             tracker: LoopTracker::default(),
             followup: None,
             chain: 0,
+            final_turn_rules: false,
         }
     }
 
@@ -108,6 +115,16 @@ impl Progress {
             role: ChatRole::Assistant,
             content: turn.content.clone(),
         });
+    }
+
+    /// The text of a segment to deliver. `last` is the last non-empty text.
+    fn delivered_text<'a>(&'a self, last: &'a str) -> &'a str {
+        match self.answer.as_deref() {
+            Some(text) if self.final_turn_rules => text,
+            // A history before the rules sent the last non-empty text.
+            Some(_) => last,
+            None => "",
+        }
     }
 
     fn report(&self, stop: AgentStop, tree: &Tree) -> AgentReport {
@@ -230,6 +247,8 @@ pub(crate) async fn drive(
     // A system message inside the history is dropped. Only `task.system`
     // reaches the model as the system prompt.
     let mut progress = Progress::new(run_id, without_system(&task.history));
+    // Gate the final-turn rules. A run recorded before them replays as it ran.
+    progress.final_turn_rules = ctx.patched(FINAL_TURN_PATCH);
     let mut tree = Tree {
         root: progress.run_id.clone(),
         rounds: 0,
@@ -285,11 +304,7 @@ pub(crate) async fn drive(
             } else {
                 source
             };
-            let answer = if progress.answered {
-                report.text.as_str()
-            } else {
-                ""
-            };
+            let answer = progress.delivered_text(&report.text);
             if let Some(text) = report_text(source, stop, answer) {
                 let sent = Report {
                     source,
@@ -323,7 +338,7 @@ pub(crate) async fn drive(
         progress.steps = 0;
         progress.messages = report.messages;
         progress.last_text.clear();
-        progress.answered = false;
+        progress.answer = None;
         input = followup::WAKE_MESSAGE;
     }
 }
@@ -444,7 +459,7 @@ async fn run_segment(
 
         if calls.is_empty() {
             progress.push_assistant(&turn);
-            progress.answered = true;
+            progress.answer = Some(turn.text());
             return Ok(if over_budget {
                 AgentStop::TokensExhausted
             } else if turn.stop == StopReason::MaxTokens {
@@ -754,6 +769,7 @@ async fn run_tool(
             &settings,
             progress.chain,
             progress.followup.is_some(),
+            progress.final_turn_rules,
         );
         return Ok(match planned {
             Ok(planned) => {

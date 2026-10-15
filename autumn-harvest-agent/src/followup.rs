@@ -115,12 +115,15 @@ pub(crate) const WAKE_MESSAGE: &str = "[Scheduled follow-up] The follow-up you b
 /// Check one follow-up call.
 ///
 /// `chain` counts the follow-ups that already ran. `pending` is `true` when
-/// this segment already booked one.
+/// this segment already booked one. `raw_length` measures the prompt as the
+/// model wrote it. A history recorded before that rule needs `false`, so
+/// replay gives the same answer.
 pub(crate) fn plan(
     arguments: &serde_json::Value,
     settings: &Followups,
     chain: u32,
     pending: bool,
+    raw_length: bool,
 ) -> Result<Planned, String> {
     if pending {
         return Err("a follow-up is already scheduled in this turn".to_owned());
@@ -134,10 +137,11 @@ pub(crate) fn plan(
     let prompt = arguments
         .get("prompt")
         .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|prompt| !prompt.is_empty())
+        .filter(|prompt| !prompt.trim().is_empty())
         .ok_or("give a `prompt` for the follow-up")?;
-    if prompt.chars().count() > MAX_PROMPT_CHARS {
+    // The untrimmed arguments stay in the transcript, so measure those.
+    let measured = if raw_length { prompt } else { prompt.trim() };
+    if measured.chars().count() > MAX_PROMPT_CHARS {
         return Err(format!(
             "the follow-up prompt must be at most {MAX_PROMPT_CHARS} characters"
         ));
@@ -173,6 +177,7 @@ mod tests {
             &settings(),
             0,
             false,
+            true,
         )
         .unwrap();
         assert_eq!(planned.delay_secs, 300);
@@ -183,29 +188,86 @@ mod tests {
         let s = settings();
         let ok = json!({"prompt": "p", "delay_minutes": 5});
         assert!(
-            plan(&ok, &s, 0, true)
+            plan(&ok, &s, 0, true, true)
                 .unwrap_err()
                 .contains("already scheduled")
         );
-        assert!(plan(&ok, &s, 2, false).unwrap_err().contains("cap of 2"));
         assert!(
-            plan(&json!({"delay_minutes": 5}), &s, 0, false)
+            plan(&ok, &s, 2, false, true)
+                .unwrap_err()
+                .contains("cap of 2")
+        );
+        assert!(
+            plan(&json!({"delay_minutes": 5}), &s, 0, false, true)
                 .unwrap_err()
                 .contains("prompt")
         );
         assert!(
-            plan(&json!({"prompt": "p"}), &s, 0, false)
+            plan(&json!({"prompt": "p"}), &s, 0, false, true)
                 .unwrap_err()
                 .contains("delay_minutes")
         );
-        assert!(plan(&json!({"prompt": "p", "delay_minutes": 0}), &s, 0, false).is_err());
         assert!(
-            plan(&json!({"prompt": "p", "delay_minutes": 61}), &s, 0, false)
-                .unwrap_err()
-                .contains("at most 60 minutes")
+            plan(
+                &json!({"prompt": "p", "delay_minutes": 0}),
+                &s,
+                0,
+                false,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            plan(
+                &json!({"prompt": "p", "delay_minutes": 61}),
+                &s,
+                0,
+                false,
+                true
+            )
+            .unwrap_err()
+            .contains("at most 60 minutes")
         );
         let long = "x".repeat(MAX_PROMPT_CHARS + 1);
-        assert!(plan(&json!({"prompt": long, "delay_minutes": 1}), &s, 0, false).is_err());
+        assert!(
+            plan(
+                &json!({"prompt": long, "delay_minutes": 1}),
+                &s,
+                0,
+                false,
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn padding_counts_toward_the_prompt_limit() {
+        let padded = format!("p{}", " ".repeat(MAX_PROMPT_CHARS));
+        let call = json!({"prompt": padded, "delay_minutes": 1});
+        let error = plan(&call, &settings(), 0, false, true).unwrap_err();
+        assert!(error.contains("characters"), "{error}");
+    }
+
+    #[test]
+    fn a_history_before_the_raw_rule_measures_the_trimmed_prompt() {
+        let padded = format!("p{}", " ".repeat(MAX_PROMPT_CHARS));
+        let call = json!({"prompt": padded, "delay_minutes": 1});
+        assert!(plan(&call, &settings(), 0, false, false).is_ok());
+    }
+
+    #[test]
+    fn padding_up_to_the_limit_is_accepted() {
+        let at_limit = format!("p{}", " ".repeat(MAX_PROMPT_CHARS - 1));
+        let call = json!({"prompt": at_limit, "delay_minutes": 1});
+        assert!(plan(&call, &settings(), 0, false, true).is_ok());
+    }
+
+    #[test]
+    fn a_blank_prompt_is_refused() {
+        let call = json!({"prompt": " \n\t ", "delay_minutes": 1});
+        let error = plan(&call, &settings(), 0, false, true).unwrap_err();
+        assert!(error.contains("prompt"), "{error}");
     }
 
     #[test]
