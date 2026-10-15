@@ -356,8 +356,9 @@ impl FileStamp {
 ///
 /// The watch is on each inode, so it sees a write or a truncate through any
 /// hard link. A link, an unlink and a read are not writes, so launches do not
-/// trip it. A write through a shared memory map makes no event, but it moves
-/// the modification time that [`FileStamp`] checks.
+/// trip it. A write through a shared memory map makes no event. It moves the
+/// modification time that [`FileStamp`] checks only when it dirties a clean
+/// page.
 #[derive(Debug)]
 struct WriteWatch {
     fd: std::os::fd::OwnedFd,
@@ -822,17 +823,20 @@ impl FirecrackerLauncher {
     ///   network namespace of a jailed launch;
     /// - the lease cannot be taken.
     pub fn new(config: LauncherConfig) -> Result<Self, SandboxError> {
-        // SAFETY: geteuid has no preconditions.
-        let euid = unsafe { libc::geteuid() };
+        let worker = Worker {
+            // SAFETY: geteuid has no preconditions.
+            euid: unsafe { libc::geteuid() },
+            hard: super::jailer::HardCeilings::of_worker(),
+        };
         let mounts = std::fs::read_to_string("/proc/self/mounts").unwrap_or_default();
-        Self::new_on_host(config, euid, &mounts, check_netns)
+        Self::new_on_host(config, worker, &mounts, check_netns)
     }
 
-    /// [`Self::new`] for a process with the uid `euid` and the mount table
-    /// `mounts`. `netns_check` checks the network namespace of a jailer.
+    /// [`Self::new`] for `worker` on a host with the mount table `mounts`.
+    /// `netns_check` checks the network namespace of a jailer.
     fn new_on_host(
         mut config: LauncherConfig,
-        euid: u32,
+        worker: Worker,
         mounts: &str,
         netns_check: fn(&Path) -> Result<(), SandboxError>,
     ) -> Result<Self, SandboxError> {
@@ -871,7 +875,7 @@ impl FirecrackerLauncher {
         }
         check_launcher_paths(&config)?;
         if let Confinement::Jailer(jailer) = &config.confinement {
-            check_jailed(jailer, machine, (euid, mounts), netns_check)?;
+            check_jailed(jailer, machine, (worker, mounts), netns_check)?;
         }
         // Each version check copies the binaries. A missing binary is checked
         // there too.
@@ -1817,8 +1821,17 @@ impl Drop for CheckedVmm {
     }
 }
 
-/// Check the jailer settings of a launcher with `machine`, for a worker that
-/// runs as `euid` on a host with the mount table `mounts`.
+/// What a launcher reads of the worker process, so a test can set it.
+#[derive(Debug, Clone, Copy)]
+struct Worker {
+    /// The effective uid.
+    euid: u32,
+    /// The hard rlimits that a jailer of the worker cannot pass.
+    hard: super::jailer::HardCeilings,
+}
+
+/// Check the jailer settings of a launcher with `machine`, for `worker` on a
+/// host with the mount table `mounts`.
 ///
 /// # Errors
 ///
@@ -1826,9 +1839,10 @@ impl Drop for CheckedVmm {
 fn check_jailed(
     jailer: &JailerConfig,
     machine: MachineSpec,
-    (euid, mounts): (u32, &str),
+    (worker, mounts): (Worker, &str),
     netns_check: fn(&Path) -> Result<(), SandboxError>,
 ) -> Result<(), SandboxError> {
+    let euid = worker.euid;
     if jailer.uid == 0 || jailer.gid == 0 {
         return Err(SandboxError::Config(
             "the jailer must drop to a non-root uid and gid, or an escaped VMM keeps root".into(),
@@ -1842,11 +1856,14 @@ fn check_jailed(
                 .into(),
         ));
     }
-    super::jailer::check_limits(
-        jailer,
-        super::jailer::host_nr_open(),
-        super::jailer::HardCeilings::of_worker(),
-    )?;
+    // A non-root worker fails below with its own error. Its hard limits
+    // would point the operator at the wrong remedy.
+    let hard = if euid == 0 {
+        worker.hard
+    } else {
+        super::jailer::HardCeilings::default()
+    };
+    super::jailer::check_limits(jailer, super::jailer::host_nr_open(), hard)?;
     super::jailer::check_cgroups(jailer, machine, mounts)?;
     // `RunningVm::spawn` clears the environment, so only the
     // arguments of the jailer count.
@@ -3884,7 +3901,19 @@ while True:
             Confinement::Unjailed { .. } => String::new(),
         };
         // A test cannot make a namespace handle without root.
-        FirecrackerLauncher::new_on_host(config, 0, &mounts, |_| Ok(()))
+        FirecrackerLauncher::new_on_host(config, as_root(), &mounts, |_| Ok(()))
+    }
+
+    /// A root worker with no hard rlimit ceiling, so a test does not depend
+    /// on the limits of the test process.
+    const fn as_root() -> Worker {
+        Worker {
+            euid: 0,
+            hard: super::super::jailer::HardCeilings {
+                nofile: None,
+                fsize: None,
+            },
+        }
     }
 
     fn jailed(dir: &Path) -> LauncherConfig {
@@ -4076,38 +4105,57 @@ while True:
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[tokio::test]
+    async fn a_vmm_binary_that_grows_past_the_bound_is_refused_at_the_check() {
+        let dir = temp_dir();
+        let fc = script(&dir, "firecracker", "echo 'Firecracker v1.17.0'");
+        let launcher = new_launcher(unjailed(&dir, fc.clone(), BootMethod::ConfigFile)).unwrap();
+        // A deploy puts a large file at the path after the launcher starts.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fc)
+            .unwrap()
+            .set_len(MAX_VMM_BINARY_BYTES + 1)
+            .unwrap();
+        let err = launcher.check_versions().await.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(&err, SandboxError::Config(m) if m.contains("bytes") && m.contains("binary")),
+            "{err:?}"
+        );
+        drop(launcher);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn a_vmm_file_limit_above_the_worker_hard_limit_is_a_config_error() {
-        let mut hard = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes a valid stack value.
-        assert_eq!(
-            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut hard) },
-            0
-        );
-        let above = hard.rlim_max.saturating_add(1);
-        if crate::sandbox::exec::can_raise_hard_limits()
-            || above > super::super::jailer::host_nr_open()
-        {
-            eprintln!("skipped: this worker can give the jailer any no-file limit");
-            return;
-        }
         // Without CAP_SYS_RESOURCE, the jailer cannot raise the hard limit
         // that it inherits, so each launch would fail.
         let dir = temp_dir();
-        let mut config = jailed(&dir);
-        if let Confinement::Jailer(jail) = &mut config.confinement {
-            jail.nofile_limit = Some(above);
+        let worker = Worker {
+            euid: 0,
+            hard: super::super::jailer::HardCeilings {
+                nofile: Some(1024),
+                fsize: None,
+            },
+        };
+        // The jailer sets 2048 files when the config gives no limit.
+        for limit in [Some(1025), None] {
+            let mut config = jailed(&dir);
+            let mounts = match &mut config.confinement {
+                Confinement::Jailer(jail) => {
+                    jail.nofile_limit = limit;
+                    format!("cgroup2 {} cgroup2 rw 0 0\n", jail.cgroup_root.display())
+                }
+                Confinement::Unjailed { .. } => unreachable!(),
+            };
+            let err = FirecrackerLauncher::new_on_host(config, worker, &mounts, |_| Ok(()))
+                .map(|_| ())
+                .expect_err("the jailer cannot raise its hard limit");
+            assert!(
+                matches!(&err, SandboxError::Config(m) if m.contains("no-file") && m.contains("hard")),
+                "{limit:?}: {err:?}"
+            );
         }
-        let err = new_launcher(config)
-            .map(|_| ())
-            .expect_err("the jailer cannot raise its hard limit");
-        assert!(
-            matches!(&err, SandboxError::Config(m) if m.contains("no-file")),
-            "{err:?}"
-        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4401,7 +4449,7 @@ while True:
         let dir = temp_dir();
         let err = FirecrackerLauncher::new_on_host(
             jailed(&dir),
-            0,
+            as_root(),
             "cgroup2 /sys/fs/cgroup cgroup2 rw 0 0\n",
             |_| Ok(()),
         )
@@ -4448,7 +4496,7 @@ while True:
             Confinement::Unjailed { .. } => unreachable!(),
         };
         // The jailer joins it with setns, so a plain file fails each launch.
-        let err = FirecrackerLauncher::new_on_host(config, 0, &mounts, check_netns)
+        let err = FirecrackerLauncher::new_on_host(config, as_root(), &mounts, check_netns)
             .expect_err("a plain file");
         assert!(
             matches!(err, SandboxError::Config(ref m) if m.contains("network namespace")),
@@ -4547,17 +4595,27 @@ while True:
     #[test]
     fn a_jailed_launcher_needs_root() {
         let dir = temp_dir();
-        let config = jailed(&dir);
-        let mounts = match &config.confinement {
+        let mut config = jailed(&dir);
+        let mounts = match &mut config.confinement {
             Confinement::Jailer(jail) => {
+                // A limit above the hard limit of a non-root worker does not
+                // hide the real cause.
+                jail.nofile_limit = Some(4096);
                 format!("cgroup2 {} cgroup2 rw 0 0\n", jail.cgroup_root.display())
             }
             Confinement::Unjailed { .. } => unreachable!(),
         };
-        let err = FirecrackerLauncher::new_on_host(config, 1000, &mounts, |_| Ok(()))
+        let worker = Worker {
+            euid: 1000,
+            hard: super::super::jailer::HardCeilings {
+                nofile: Some(1024),
+                fsize: None,
+            },
+        };
+        let err = FirecrackerLauncher::new_on_host(config, worker, &mounts, |_| Ok(()))
             .expect_err("the jailer needs root");
         assert!(
-            matches!(err, SandboxError::Config(ref m) if m.contains("root")),
+            matches!(err, SandboxError::Config(ref m) if m.contains("needs root")),
             "{err:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();
@@ -4927,12 +4985,7 @@ while True:
                 "{limit}: {err:?}"
             );
         }
-        // A worker without CAP_SYS_RESOURCE keeps the jailer below its own
-        // hard limit too.
-        let fits = super::super::jailer::HardCeilings::of_worker()
-            .nofile
-            .map_or(nr_open, |hard| hard.min(nr_open));
-        drop(new_launcher(with_limit(fits)).unwrap());
+        drop(new_launcher(with_limit(nr_open)).unwrap());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -292,9 +292,9 @@ pub fn check_limits(
         },
     }?;
     let nofile = config.nofile_limit.unwrap_or(JAILER_DEFAULT_NOFILE);
-    for (name, limit, ceiling) in [
-        ("no-file", Some(nofile), hard.nofile),
-        ("fsize", config.fsize_limit, hard.fsize),
+    for (name, limit, ceiling, systemd) in [
+        ("no-file", Some(nofile), hard.nofile, "LimitNOFILE"),
+        ("fsize", config.fsize_limit, hard.fsize, "LimitFSIZE"),
     ] {
         if let (Some(limit), Some(ceiling)) = (limit, ceiling)
             && limit > ceiling
@@ -303,7 +303,7 @@ pub fn check_limits(
                 "the jailer {name} limit of {limit} is above the hard limit of {ceiling} that \
                  it inherits; without root and CAP_SYS_RESOURCE it cannot raise that, so \
                  each launch would fail; raise the worker hard limit, such as with systemd \
-                 LimitNOFILE, or lower the jailer limit"
+                 {systemd}, or lower the jailer limit"
             )));
         }
     }
