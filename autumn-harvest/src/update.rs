@@ -27,13 +27,22 @@ pub(crate) const UPDATE_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
 /// How the executor dispatches admitted updates in one drive (issue #2035).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpdateDispatch {
-    /// The end of the workflow-task budget, or `None` when the budget is off.
+    /// The end of the workflow-task budget. With `None`, the budget is off and
+    /// the window is a fixed 30 seconds.
     pub(crate) cutoff: Option<DateTime<Utc>>,
     /// Whether the first update may run after the window closes. Only the first
     /// drive of a decision sets it. A re-drive of the same decision shares the
     /// budget, so it must not run another update past the window.
     pub(crate) run_first: bool,
 }
+
+/// The dispatch window when the task has no budget (issue #2035).
+///
+/// An operator can turn the workflow-task timeout off. A burst of slow
+/// handlers could then hold the task for a long time before any result is
+/// persisted. This window ends the batch, and the worker wakes the task for
+/// the rest.
+const UNBUDGETED_WINDOW: Duration = Duration::from_secs(30);
 
 /// Pinned boxed async future returned by an update handler invocation.
 pub type UpdateHandlerFuture = Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>;
@@ -193,12 +202,15 @@ pub(crate) async fn dispatch_pending_updates(
     false
 }
 
-/// The end of the dispatch window, or `None` when the task has no budget.
+/// The end of the dispatch window.
 ///
 /// The window is half of the budget that is left. The persist needs the rest.
-fn window_end(cutoff: Option<DateTime<Utc>>) -> Option<tokio::time::Instant> {
-    let left = (cutoff? - Utc::now()).to_std().unwrap_or(Duration::ZERO);
-    Some(tokio::time::Instant::now() + left / 2)
+/// A task with no budget gets a fixed [`UNBUDGETED_WINDOW`].
+fn window_end(cutoff: Option<DateTime<Utc>>) -> tokio::time::Instant {
+    let window = cutoff.map_or(UNBUDGETED_WINDOW, |cutoff| {
+        (cutoff - Utc::now()).to_std().unwrap_or(Duration::ZERO) / 2
+    });
+    tokio::time::Instant::now() + window
 }
 
 /// The time that one handler may run.
@@ -214,10 +226,8 @@ fn handler_limit(cutoff: Option<DateTime<Utc>>) -> Duration {
 }
 
 /// Whether a handler may start. It needs a full [`UPDATE_HANDLER_TIMEOUT`].
-fn window_allows(end: Option<tokio::time::Instant>) -> bool {
-    end.is_none_or(|end| {
-        end.saturating_duration_since(tokio::time::Instant::now()) >= UPDATE_HANDLER_TIMEOUT
-    })
+fn window_allows(end: tokio::time::Instant) -> bool {
+    end.saturating_duration_since(tokio::time::Instant::now()) >= UPDATE_HANDLER_TIMEOUT
 }
 
 /// Runs one handler. A panic or a timeout becomes an error result.
@@ -957,6 +967,31 @@ mod tests {
             "the handler stops before the 5 s limit: {:?}",
             began.elapsed()
         );
+    }
+
+    fn four_seconds_uncounted(_ctx: Arc<WorkflowContext>, input: Value) -> UpdateHandlerFuture {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Ok(input)
+        })
+    }
+
+    /// With no task budget the window is 30 s. Handlers start at 0 s, 4 s and
+    /// so on up to 24 s, when 6 s are left. At 28 s only 2 s are left.
+    #[tokio::test(start_paused = true)]
+    async fn a_task_without_a_budget_still_stops_a_burst_at_the_fallback_window() {
+        let ids: Vec<UpdateId> = (0..10).map(|_| UpdateId::new()).collect();
+        let handler = info("slow", four_seconds_uncounted);
+        let mut history = vec![started()];
+        for (n, id) in ids.iter().enumerate() {
+            history.push(admitted(*id, "slow", json!(n)));
+        }
+        let drive = drive_full(context(history, &[&handler], true), parked).await;
+
+        let recorded = results(&drive.outcome, &drive.pending);
+        let ran: Vec<UpdateId> = recorded.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ran, ids[..7].to_vec(), "seven run, in order");
+        assert!(drive.updates_deferred);
     }
 
     static REDRIVE_RUNS: AtomicUsize = AtomicUsize::new(0);

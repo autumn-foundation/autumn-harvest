@@ -770,7 +770,7 @@ Workflow Update Handlers allow external clients to interact with running workflo
 
 The worker runs each pending update at the end of its next decision cycle. The workflow body runs first. The worker then runs the pending updates in history order. It records `UpdateCompleted` or `UpdateFailed` with the other events of that cycle.
 
-A cycle runs under the workflow-task budget. The worker starts a handler only while a full handler limit is left in half of the remaining budget. The first update of a decision always runs. The worker wakes the task for the updates that remain, and the next cycle runs them. A handler also stops at half of the budget that is left.
+A cycle runs under the workflow-task budget. The worker starts a handler only while a full handler limit is left in half of the remaining budget. The first update of a decision always runs. The worker wakes the task for the updates that remain, and the next cycle runs them. A handler also stops at half of the budget that is left. A task with no budget gets a fixed 30 second window.
 
 Replay never runs the handler again. Replay returns the recorded result. Four rules follow:
 

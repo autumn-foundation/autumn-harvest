@@ -30,7 +30,8 @@ to history. A body that already ran the same update with
 The cycle runs under the workflow-task budget. A handler starts only while a
 full handler limit is left in half of the remaining budget. The first update of
 a decision always runs. A re-drive of the same decision runs no update past the
-window. Every handler stops at half of the budget that is left. When updates
+window. Every handler stops at half of the budget that is left. A task with no
+budget gets a fixed 30 second window. When updates
 remain, `DriveResult::updates_deferred` is set, and the worker wakes the task so
 the next cycle runs them. A burst of slow updates therefore cannot cancel the
 cycle or cost poison-pill strikes.

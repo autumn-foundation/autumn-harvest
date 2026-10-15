@@ -55,6 +55,7 @@ persists `RecordUpdateResult` as `UpdateCompleted` or `UpdateFailed`.
 | B12 | Cap the count per cycle. | Rejected. A count says nothing about time. |
 | B13 | Start a handler only while a full handler limit is left in half of the remaining budget. Wake the task for the rest. | **Adopted.** The cycle persists inside the budget. The first update always runs, so each cycle makes progress. |
 | B16 | Stop every handler at half of the budget that is left. | **Adopted.** A slow body cannot push the first update past the cut-off. The persist keeps the other half. |
+| B17 | Run every update when the task timeout is off. | Rejected. A burst of slow handlers could hold the task and a connection for a long time. A fixed 30 second window ends the batch. |
 | B14 | Fail the updates that the window leaves. | Rejected. A slow handler would fail healthy updates. A later cycle can run them. |
 | B15 | Store the panic text in the result. | Rejected. History is plaintext and the caller reads it. The log keeps the text. |
 
@@ -130,7 +131,7 @@ history order**. This order is safe for replay:
    body. A handler starts only while a full handler limit is left in the
    window. The first update of a decision always runs. A re-drive of the same
    decision runs no update past the window. Every handler stops at half of the
-   budget that is left.
+   budget that is left. A task with no budget gets a fixed 30 second window.
 6. When updates remain, `DriveResult::updates_deferred` is `true`. The worker
    then calls `wake_workflow_task`. The claimed row records the wake, and the
    park that ends the cycle re-pends the task.
