@@ -312,6 +312,10 @@ impl AgentTask {
     }
 
     /// Set the activity-input cap of the workers, in bytes. Zero is no cap.
+    ///
+    /// A worker with a payload store offloads a large input, and the engine
+    /// skips its cap for it. The loop cannot see the store, so set zero for
+    /// such a worker.
     #[must_use]
     pub const fn max_request_bytes(mut self, bytes: u64) -> Self {
         self.max_request_bytes = Some(bytes);

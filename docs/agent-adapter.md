@@ -117,6 +117,11 @@ A worker with a payload cap other than the default must say so. Set
 `AgentHarness::max_result_bytes` to its activity-result cap. A cap of zero
 means no cap, as in the engine.
 
+A worker with a payload store offloads an input or a result over the store
+threshold. The engine then skips its cap for that value. The adapter does not
+see the store, so it still applies its own caps. Set both caps to zero for such
+a worker. Otherwise the adapter ends a run that the store could carry.
+
 ## 4. Build the harness
 
 `AgentHarness` holds the parts that do real work:

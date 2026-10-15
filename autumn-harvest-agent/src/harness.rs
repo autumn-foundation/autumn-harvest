@@ -174,6 +174,10 @@ impl AgentHarness {
     /// ends the run as `reply_too_large`. A cap of zero is no cap, as in the
     /// engine. A cap under 256 bytes cannot hold the `oversized` turn, so the
     /// activity can still fail.
+    ///
+    /// A worker with a payload store offloads a large result, and the engine
+    /// skips its cap for it. The harness cannot see the store, so set zero for
+    /// such a worker.
     #[must_use]
     pub const fn max_result_bytes(mut self, bytes: u64) -> Self {
         self.max_result_bytes = bytes;

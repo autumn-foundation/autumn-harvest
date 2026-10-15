@@ -25,6 +25,11 @@ more cases. Items 4 and 6 of the issue shipped earlier, in the always-on PR.
   makes the model text the report answer. The text can claim work that did not
   run.
 
+**Payload store.** A worker with a payload store offloads a value over the
+store threshold, and the engine skips its cap for it. The adapter cannot see
+the store. Set `AgentTask::max_request_bytes` and `AgentHarness::max_result_bytes`
+to zero for such a worker. Before this change, a zero cap broke both limits.
+
 **Limits.** The round budget is exact for the result text and for the flow
 state that the turn records. A delegation adds the labels and usage of its
 child, which the round cannot know in advance. The loop measures the next
