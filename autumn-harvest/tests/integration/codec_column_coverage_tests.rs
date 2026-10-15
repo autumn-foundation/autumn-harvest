@@ -1098,6 +1098,15 @@ impl Drop for CallbackConfigGuard {
 }
 
 fn install_callbacks(deliverer: Arc<CapturingDeliverer>, max_attempts: u32) -> CallbackConfigGuard {
+    install_callbacks_with_backoff(deliverer, max_attempts, Duration::from_millis(10))
+}
+
+/// As [`install_callbacks`], with the first retry delay set to `initial`.
+fn install_callbacks_with_backoff(
+    deliverer: Arc<CapturingDeliverer>,
+    max_attempts: u32,
+    initial: Duration,
+) -> CallbackConfigGuard {
     use autumn_harvest::completion_callback::{
         CallbackRuntimeConfig, CallbackSecret, GLOBAL_CALLBACK_CONFIG, HostAllowlist, SsrfPolicy,
     };
@@ -1106,7 +1115,7 @@ fn install_callbacks(deliverer: Arc<CapturingDeliverer>, max_attempts: u32) -> C
         secret: CallbackSecret::new(CALLBACK_HMAC_KEY.to_vec()),
         ssrf_policy: SsrfPolicy::new(HostAllowlist::new().with_pattern("api.example.com")),
         default_targets: Vec::new(),
-        retry_policy: RetryPolicy::exponential(max_attempts, Duration::from_millis(10)),
+        retry_policy: RetryPolicy::exponential(max_attempts, initial),
     }));
     CallbackConfigGuard
 }
@@ -1658,7 +1667,9 @@ async fn a_callback_body_that_cannot_decode_is_not_posted_and_backs_off() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let codecs = aead_codecs(true);
     let deliverer = CapturingDeliverer::new(200);
-    let _config = install_callbacks(deliverer.clone(), 3);
+    // A long first delay makes the `delayed` check below exact. A short one
+    // can expire before the check runs.
+    let _config = install_callbacks_with_backoff(deliverer.clone(), 3, Duration::from_secs(600));
     let mut conn = connect(&url).await;
     let exec_id = completed_run_with_callback(&mut conn, &codecs).await;
     evaluate_callbacks(&mut conn, exec_id, &codecs).await;
@@ -1976,12 +1987,15 @@ async fn an_undecodable_batch_job_stays_pending_and_sends_no_signal() {
     );
 }
 
+/// A cancel job that an older writer stored with a payload. The executor
+/// ignores the payload for a cancel, so a missing key must not block the job.
 #[tokio::test]
 async fn a_cancel_batch_job_runs_without_the_key_for_its_unused_payload() {
     use autumn_harvest::batch::{
-        BatchAction, BatchExecutorConfig, BatchFilter, BatchSubmission, run_executor_once,
-        submit_batch_job_with_codecs,
+        BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, run_executor_once,
     };
+    use autumn_harvest::models::NewBatchJob;
+    use autumn_harvest::schema::harvest_batch_jobs;
     let (url, _c) = setup_test_database_url_or_env().await;
     let queue = format!("cc-{}", Uuid::new_v4().simple());
     let codecs = aead_codecs(true);
@@ -1989,24 +2003,30 @@ async fn a_cancel_batch_job_runs_without_the_key_for_its_unused_payload() {
     let workflow_name: &'static str =
         Box::leak(format!("cc_batch_{}", Uuid::new_v4().simple()).into_boxed_str());
     start(&mut conn, &codecs, workflow_name, &queue, None).await;
-    let job_id = submit_batch_job_with_codecs(
-        &mut conn,
-        BatchSubmission {
-            action: BatchAction::Cancel,
-            filter: BatchFilter {
-                states: vec!["RUNNING".to_string()],
-                workflow_name: Some(workflow_name.to_string()),
-                search_attrs: Vec::new(),
-            },
+    let job_id = Uuid::new_v4();
+    let filter = BatchFilter {
+        states: vec!["RUNNING".to_string()],
+        workflow_name: Some(workflow_name.to_string()),
+        search_attrs: Vec::new(),
+    };
+    diesel::insert_into(harvest_batch_jobs::table)
+        .values(&NewBatchJob {
+            id: job_id,
+            action: BatchAction::Cancel.as_str(),
+            filter: serde_json::to_value(&filter).expect("filter"),
             signal_name: None,
-            signal_payload: Some(json!({"pin": SIGNAL_SECRET})),
+            signal_payload: Some(
+                codecs
+                    .encode_column(&json!({"pin": SIGNAL_SECRET}))
+                    .expect("encode"),
+            ),
+            status: BatchJobStatus::Pending.as_str(),
             idempotency_key: None,
             created_by: None,
-        },
-        &codecs,
-    )
-    .await
-    .expect("submit");
+        })
+        .execute(&mut conn)
+        .await
+        .expect("insert the job");
 
     let pool = autumn_harvest::shard::ShardedDbPool::single(build_pool(&url));
     run_executor_once(
@@ -2029,6 +2049,52 @@ async fn a_cancel_batch_job_runs_without_the_key_for_its_unused_payload() {
         .await,
         1,
         "a cancel job never reads the payload, so a missing key must not block it"
+    );
+}
+
+static CANCEL_FAILING: AtomicBool = AtomicBool::new(false);
+static CANCEL_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+#[tokio::test]
+async fn a_cancel_batch_submission_stores_no_payload_and_needs_no_encoder() {
+    use autumn_harvest::batch::{
+        BatchAction, BatchFilter, BatchSubmission, get_batch_job, submit_batch_job_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = flaky_codecs(&CANCEL_FAILING, &CANCEL_FAILURES);
+    AtomicBool::store(&CANCEL_FAILING, true, Ordering::SeqCst);
+    let mut conn = connect(&url).await;
+    let job_id = submit_batch_job_with_codecs(
+        &mut conn,
+        BatchSubmission {
+            action: BatchAction::Cancel,
+            filter: BatchFilter {
+                states: vec!["RUNNING".to_string()],
+                workflow_name: Some(format!("cc_batch_{}", Uuid::new_v4().simple())),
+                search_attrs: Vec::new(),
+            },
+            signal_name: None,
+            signal_payload: Some(json!({"pin": SIGNAL_SECRET})),
+            idempotency_key: None,
+            created_by: None,
+        },
+        &codecs,
+    )
+    .await
+    .expect("a cancel does not depend on the encoder");
+
+    let job = get_batch_job(&mut conn, job_id)
+        .await
+        .expect("load the job")
+        .expect("the job exists");
+    assert_eq!(
+        job.signal_payload, None,
+        "a cancel never reads the payload, so the row stores none"
+    );
+    assert_eq!(
+        AtomicUsize::load(&CANCEL_FAILURES, Ordering::SeqCst),
+        0,
+        "the encoder is not called for a cancel"
     );
 }
 

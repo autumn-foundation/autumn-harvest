@@ -1474,7 +1474,7 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_workers.labels` | Clear | Worker capabilities, not payload. |
 | `harvest_build_policies.ramp_aborted` | Clear | Rollout state, not payload. |
 | `harvest_batch_jobs.filter` | Clear | An operator filter, not payload. |
-| `harvest_batch_jobs.signal_payload` | Covered | The operator-supplied batch payload. The executor decodes it before it sends each signal. |
+| `harvest_batch_jobs.signal_payload` | Covered | The operator-supplied batch payload. Only a signal job stores it, and the executor decodes it before it sends each signal. A cancel or terminate job stores none. |
 | `harvest_batch_jobs.errors` | Clear | Failure text (issue #1920). |
 | `harvest_batch_jobs.processed_ids` | Clear | Ids only. |
 | `harvest_schedule_decisions.detail` | Clear | A scheduler decision record, not payload. |

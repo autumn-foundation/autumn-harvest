@@ -12,7 +12,8 @@ change encodes them.
     copies it.
   - `harvest_debounce.last_input`, `harvest_start_throttle.input` and
     `harvest_completion_trigger_outbox.target_input`.
-  - `harvest_batch_jobs.signal_payload`.
+  - `harvest_batch_jobs.signal_payload`. Only a signal job stores a payload. A
+    cancel or terminate job stores none.
 - **Columns that stay clear.** The coverage table in
   `docs/security-posture.md` gives a reason for each:
   `harvest_event_batches.buffered_payloads`,

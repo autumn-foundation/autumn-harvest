@@ -226,8 +226,9 @@ mod db {
     /// (issue #2043).
     ///
     /// The row stores the payload in the column form. The executor decodes it
-    /// before it sends each signal. A retry with a known idempotency key
-    /// returns the existing job and encodes nothing.
+    /// before it sends each signal. A cancel or terminate job stores no
+    /// payload. A retry with a known idempotency key returns the existing job
+    /// and encodes nothing.
     ///
     /// # Errors
     ///
@@ -257,6 +258,14 @@ mod db {
             return Ok(existing);
         }
 
+        // Only a signal job reads the payload. A cancel or terminate job
+        // stores none, so it never depends on the encoder.
+        let signal_payload = if request.action == BatchAction::Signal {
+            codecs.encode_column_opt(request.signal_payload.as_ref())?
+        } else {
+            None
+        };
+
         let id = Uuid::new_v4();
         let filter_value = serde_json::to_value(&request.filter).map_err(HarvestError::from)?;
         let new_row = NewBatchJob {
@@ -264,7 +273,7 @@ mod db {
             action: request.action.as_str(),
             filter: filter_value,
             signal_name: request.signal_name.as_deref(),
-            signal_payload: codecs.encode_column_opt(request.signal_payload.as_ref())?,
+            signal_payload,
             status: BatchJobStatus::Pending.as_str(),
             idempotency_key: request.idempotency_key.as_deref(),
             created_by: request.created_by.as_deref(),
