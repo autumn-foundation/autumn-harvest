@@ -1,0 +1,279 @@
+groups:
+  - id: span.workflow.schedule_workflow.producer
+    type: span
+    span_kind: producer
+    stability: development
+    brief: This span describes a caller that schedules a workflow run.
+    note: |
+      The span name SHOULD be `schedule_workflow {workflow.name}`.
+
+      The engine SHOULD store the trace context of this span with the
+      scheduled work. The worker then uses it as the parent of the
+      `execute_workflow` span.
+
+      The span starts when the caller sends the start request. It ends
+      when the engine durably accepts or refuses the run, or the request
+      fails.
+      If the operation ends in an error, the span status SHOULD be `Error`.
+    attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.operation.name
+        requirement_level: required
+        sampling_relevant: true
+        note: The value MUST be `schedule_workflow`.
+      - ref: workflow.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.run.id
+        requirement_level:
+          conditionally_required: If the run id is available before the span ends.
+      - ref: workflow.queue.name
+        requirement_level: recommended
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the operation ends in an error.
+
+  - id: span.workflow.execute_workflow.consumer
+    type: span
+    span_kind: consumer
+    stability: development
+    brief: This span describes one decision cycle of a workflow run.
+    note: |
+      The span name SHOULD be `execute_workflow {workflow.name}`.
+
+      A live cycle uses the stored context of the scheduling span as its
+      parent. A replay cycle follows the replay rule of this proposal.
+
+      The span starts when a worker begins a decision cycle. It ends
+      when the cycle commits its result or fails.
+      If the operation ends in an error, the span status SHOULD be `Error`.
+    attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.operation.name
+        requirement_level: required
+        sampling_relevant: true
+        note: The value MUST be `execute_workflow`.
+      - ref: workflow.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.run.id
+        requirement_level: required
+      - ref: workflow.replay
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.queue.name
+        requirement_level: recommended
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the operation ends in an error.
+
+  - id: span.workflow.start_child_workflow.producer
+    type: span
+    span_kind: producer
+    stability: development
+    brief: This span describes a workflow run that schedules a child run.
+    note: |
+      The span name SHOULD be `start_child_workflow {workflow.name}`.
+
+      The `workflow.name` and `workflow.run.id` attributes describe the
+      child run.
+
+      The span starts when the parent issues the child start command. It
+      ends when the engine durably records or refuses the command, or
+      the write fails.
+      If the operation ends in an error, the span status SHOULD be `Error`.
+    attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.operation.name
+        requirement_level: required
+        sampling_relevant: true
+        note: The value MUST be `start_child_workflow`.
+      - ref: workflow.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.run.id
+        requirement_level:
+          conditionally_required: If the run id is available before the span ends.
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the operation ends in an error.
+
+  - id: span.workflow.schedule_activity.producer
+    type: span
+    span_kind: producer
+    stability: development
+    brief: This span describes a workflow run that schedules an activity.
+    note: |
+      The span name SHOULD be `schedule_activity {workflow.activity.name}`.
+
+      The span starts when the workflow issues the activity command. It
+      ends when the engine durably records or refuses the command, or
+      the write fails.
+      If the operation ends in an error, the span status SHOULD be `Error`.
+    attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.operation.name
+        requirement_level: required
+        sampling_relevant: true
+        note: The value MUST be `schedule_activity`.
+      - ref: workflow.activity.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.run.id
+        requirement_level: required
+      - ref: workflow.queue.name
+        requirement_level: recommended
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the operation ends in an error.
+
+  - id: span.workflow.execute_activity.consumer
+    type: span
+    span_kind: consumer
+    stability: development
+    brief: This span describes one attempt of an activity.
+    note: |
+      The span name SHOULD be `execute_activity {workflow.activity.name}`.
+
+      Each attempt gets its own span. A retry is a new span with a higher
+      `workflow.activity.attempt`.
+
+      The span starts when a worker begins the attempt. It ends when the
+      attempt returns a result or fails.
+      If the operation ends in an error, the span status SHOULD be `Error`.
+    attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.operation.name
+        requirement_level: required
+        sampling_relevant: true
+        note: The value MUST be `execute_activity`.
+      - ref: workflow.activity.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.run.id
+        requirement_level: required
+      - ref: workflow.activity.attempt
+        requirement_level: required
+      - ref: workflow.queue.name
+        requirement_level: recommended
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the operation ends in an error.
+
+  - id: span.workflow.send_signal.producer
+    type: span
+    span_kind: producer
+    stability: development
+    brief: This span describes a caller that sends a signal to a workflow run.
+    note: |
+      The span name SHOULD be `send_signal {workflow.name}`. If the name of
+      the target workflow is not available, the span name SHOULD be
+      `send_signal`.
+
+      The `workflow.name` and `workflow.run.id` attributes describe the
+      target run.
+
+      The span starts when the caller sends the signal. It ends when the
+      engine durably accepts or refuses the signal, or the request
+      fails.
+      If the operation ends in an error, the span status SHOULD be `Error`.
+    attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.operation.name
+        requirement_level: required
+        sampling_relevant: true
+        note: The value MUST be `send_signal`.
+      - ref: workflow.run.id
+        requirement_level:
+          conditionally_required: If the run id is available before the span ends.
+      - ref: workflow.name
+        requirement_level: recommended
+      - ref: workflow.signal.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.signal.id
+        requirement_level: opt_in
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the operation ends in an error.
+
+  - id: span.workflow.deliver_signal.consumer
+    type: span
+    span_kind: consumer
+    stability: development
+    brief: This span describes a workflow run that receives a signal.
+    note: |
+      The span name SHOULD be `deliver_signal {workflow.name}`.
+
+      The span SHOULD be a child of the `execute_workflow` span that
+      observes the signal. It SHOULD link to the `send_signal` span when
+      the engine stores that context.
+
+      The span starts when the `execute_workflow` cycle takes the signal
+      from the engine. It ends when the workflow code has received the
+      signal, or the delivery fails.
+      If the operation ends in an error, the span status SHOULD be `Error`.
+    attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.operation.name
+        requirement_level: required
+        sampling_relevant: true
+        note: The value MUST be `deliver_signal`.
+      - ref: workflow.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.run.id
+        requirement_level: required
+      - ref: workflow.signal.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.signal.id
+        requirement_level: opt_in
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the operation ends in an error.
+
+  - id: span.workflow.fire_timer.internal
+    type: span
+    span_kind: internal
+    stability: development
+    brief: This span describes a durable timer that fires.
+    note: |
+      The span name SHOULD be `fire_timer`.
+
+      The span SHOULD be a child of the `execute_workflow` span that
+      observes the timer.
+
+      The span starts when the `execute_workflow` cycle applies the
+      fired timer. It ends when the workflow code has received the timer
+      result, or the delivery fails. A scheduler that finds a due timer
+      earlier emits no span for that step.
+      If the operation ends in an error, the span status SHOULD be `Error`.
+    attributes:
+      - ref: workflow.system.name
+        requirement_level: required
+        sampling_relevant: true
+      - ref: workflow.operation.name
+        requirement_level: required
+        sampling_relevant: true
+        note: The value MUST be `fire_timer`.
+      - ref: workflow.run.id
+        requirement_level: required
+      - ref: error.type
+        requirement_level:
+          conditionally_required: If the operation ends in an error.
+
