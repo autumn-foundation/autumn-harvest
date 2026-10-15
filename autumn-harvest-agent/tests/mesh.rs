@@ -94,6 +94,40 @@ fn researcher() -> Peer {
     Peer::new("researcher", "Finds facts on the web.").system("You research.")
 }
 
+/// A child whose reply exceeds the result cap ends under `reply_too_large`.
+/// The parent reads the verdict as an error result and goes on, and the child
+/// usage stays counted (issue #2040).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_reply_over_the_result_cap_ends_the_child_only() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        delegate("d1", "researcher", "find the ferry times", 5),
+        answer(&"y".repeat(10_000), 7),
+        answer("No answer from the researcher.", 3),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .peer(researcher())
+        .max_result_bytes(4_096);
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &planner(&["researcher"])).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::Completed);
+    assert_eq!(report.delegations.len(), 1);
+    assert_eq!(report.delegations[0].stop, Some(AgentStop::ReplyTooLarge));
+    assert_eq!(
+        report.usage.input_tokens, 15,
+        "the child call stays counted"
+    );
+    let results = last_tool_results(&report.messages[..report.messages.len() - 1]);
+    assert!(
+        results[0].contains(r#""stop":"reply_too_large""#),
+        "{}",
+        results[0]
+    );
+}
+
 // AC1, AC2, AC3, AC14
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delegation_runs_the_peer_and_returns_only_its_answer() {

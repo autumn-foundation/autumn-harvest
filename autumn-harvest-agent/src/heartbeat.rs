@@ -109,6 +109,12 @@ pub struct HeartbeatTask {
     /// [`AgentTask::flow_labels`](crate::AgentTask::flow_labels).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
+    /// Measure a tool round against the whole next request. See
+    /// [`AgentTask::whole_request_budget`](crate::AgentTask::whole_request_budget).
+    /// [`HeartbeatTask::new`] turns it on. A recorded tick with no field keeps
+    /// the old measure, so a tick in flight replays as it ran.
+    #[serde(default, skip_serializing_if = "crate::types::is_false")]
+    pub whole_request_budget: bool,
 }
 
 fn default_prompt() -> String {
@@ -148,6 +154,7 @@ impl HeartbeatTask {
             max_request_bytes: None,
             tenant: None,
             flow_labels: BTreeSet::new(),
+            whole_request_budget: true,
         }
     }
 
@@ -263,6 +270,7 @@ impl HeartbeatTask {
         task.unattended_memory_writes = self.allow_memory_writes;
         task.tenant.clone_from(&self.tenant);
         task.flow_labels.clone_from(&self.flow_labels);
+        task.whole_request_budget = self.whole_request_budget;
         task
     }
 }
@@ -342,6 +350,20 @@ mod tests {
     use crate::delivery::HEARTBEAT_OK;
 
     #[test]
+    fn a_tick_from_before_the_whole_request_budget_keeps_the_old_measure() {
+        let old: HeartbeatTask = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!old.whole_request_budget);
+        assert!(!old.agent_task().whole_request_budget);
+        // A tick that leaves the flag off encodes as it was recorded.
+        let encoded = serde_json::to_value(&old).unwrap();
+        assert!(encoded.get("whole_request_budget").is_none());
+
+        let new = HeartbeatTask::new();
+        assert!(new.whole_request_budget);
+        assert!(new.agent_task().whole_request_budget);
+    }
+
+    #[test]
     fn the_default_prompt_names_the_silent_answer() {
         assert!(DEFAULT_HEARTBEAT_PROMPT.contains(HEARTBEAT_OK));
     }
@@ -401,7 +423,13 @@ mod tests {
     #[test]
     fn an_empty_task_decodes_to_the_defaults() {
         let task: HeartbeatTask = serde_json::from_str("{}").unwrap();
-        assert_eq!(task, HeartbeatTask::new());
+        // The one difference is the compatibility flag. A recorded tick has
+        // none, so it keeps the old measure.
+        let expected = HeartbeatTask {
+            whole_request_budget: false,
+            ..HeartbeatTask::new()
+        };
+        assert_eq!(task, expected);
     }
 
     #[test]

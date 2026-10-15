@@ -25,7 +25,7 @@ use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 
 use crate::approval::{Approval, Decision, approval_signal, await_decision};
-use crate::bounds::{exceeds_bytes, json_len};
+use crate::bounds::{RoundBudget, exceeds_bytes, json_len};
 use crate::delivery::{Report, ReportSource, report_text};
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
@@ -37,7 +37,9 @@ use crate::mesh::{
     DELEGATE_TOOL, DelegateArgs, DelegationRecord, INVALID_NAME, Mandate, Peer, Refusal,
     delegate_definition, valid_name,
 };
-use crate::message::{ChatMessage, ChatRole, ContentPart, RunId, StopReason, TokenUsage, ToolCall};
+use crate::message::{
+    ChatMessage, ChatRole, ContentPart, RunId, StopReason, TokenUsage, ToolCall, ToolDefinition,
+};
 use crate::policy::ToolDecision;
 use crate::types::{
     AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, RunIdSource, ToolCallRequest,
@@ -196,6 +198,48 @@ impl Run<'_> {
     /// The harness tools that the mandate permits. `None` means every tool.
     fn allowed_tools(&self) -> Option<BTreeSet<String>> {
         self.agent.and_then(|agent| agent.mandate.tools.clone())
+    }
+
+    /// The tools that the workflow runs itself. The model sees them with the
+    /// harness tools.
+    fn extra_tools(&self) -> Vec<ToolDefinition> {
+        self.task
+            .followups
+            .map(|_| followup::definition())
+            .into_iter()
+            .chain(self.agent.and_then(Agent::delegate_tool))
+            .collect()
+    }
+}
+
+/// The request for the next model turn over `messages`.
+///
+/// The loop sends it, and a tool round measures it before it runs a call.
+/// One builder makes the loop and the round measure the same fields.
+fn next_request(
+    run: Run<'_>,
+    progress: &Progress,
+    tree: &Tree,
+    extra_tools: &[ToolDefinition],
+    messages: Vec<ChatMessage>,
+) -> ModelTurnRequest {
+    let task = run.task;
+    ModelTurnRequest {
+        run_id: progress.run_id.clone(),
+        session_id: task.session_id.clone(),
+        steps_used: progress.steps,
+        max_steps: task.max_steps,
+        usage: progress.usage,
+        messages,
+        max_output_tokens: task.max_output_tokens,
+        read_only: task.read_only,
+        memory_scope: task.memory_tool_scope(),
+        extra_tools: extra_tools.to_vec(),
+        tenant: task.tenant.clone(),
+        agent: run.agent.map(|agent| agent.mandate.holder().to_owned()),
+        allowed_tools: run.allowed_tools(),
+        flow_labels: tree.exercised.clone(),
+        flow_released: tree.released.clone(),
     }
 }
 
@@ -400,12 +444,7 @@ async fn run_segment(
     messages.append(&mut progress.messages);
     messages.push(ChatMessage::text(ChatRole::User, input));
     progress.messages = messages;
-    let extra_tools: Vec<_> = task
-        .followups
-        .map(|_| followup::definition())
-        .into_iter()
-        .chain(run.agent.and_then(Agent::delegate_tool))
-        .collect();
+    let extra_tools = run.extra_tools();
 
     loop {
         // A delegation adds the child usage after a turn. A tree over its cap
@@ -417,26 +456,15 @@ async fn run_segment(
         {
             return Ok(AgentStop::TokensExhausted);
         }
-        let request = ModelTurnRequest {
-            run_id: progress.run_id.clone(),
-            session_id: task.session_id.clone(),
-            steps_used: progress.steps,
-            max_steps: task.max_steps,
-            usage: progress.usage,
-            messages: progress.messages.clone(),
-            max_output_tokens: task.max_output_tokens,
-            read_only: task.read_only,
-            memory_scope: task.memory_tool_scope(),
-            extra_tools: extra_tools.clone(),
-            tenant: task.tenant.clone(),
-            agent: run.agent.map(|agent| agent.mandate.holder().to_owned()),
-            allowed_tools: run.allowed_tools(),
-            flow_labels: tree.exercised.clone(),
-            flow_released: tree.released.clone(),
-        };
+        let request = next_request(run, progress, tree, &extra_tools, progress.messages.clone());
         // A request the engine would refuse is not sent. The refusal is not
         // retryable, so it would fail the run after earlier work was paid for.
-        if exceeds_bytes(&request, task.request_cap()) {
+        //
+        // A task recorded before the whole-request budget read a zero cap as a
+        // limit of zero bytes. Its run ended here, so a replay must end here.
+        let cap = task.request_cap();
+        let legacy_zero_cap = cap == 0 && !task.whole_request_budget;
+        if legacy_zero_cap || exceeds_bytes(&request, cap) {
             return Ok(AgentStop::TranscriptFull);
         }
         let turn: ModelTurn = match ctx
@@ -452,6 +480,11 @@ async fn run_segment(
         };
 
         progress.usage = progress.usage.saturating_add(turn.usage);
+        // The activity drops a reply that does not fit the result cap. The
+        // turn then holds no text and no calls, so the segment ends here.
+        if turn.oversized {
+            return Ok(AgentStop::ReplyTooLarge);
+        }
         let over_budget = task
             .max_total_tokens
             .is_some_and(|max| progress.usage.total() > max);
@@ -492,11 +525,17 @@ async fn run_segment(
         };
         progress.steps = progress.steps.saturating_add(1);
         tree.rounds = tree.rounds.saturating_add(1);
+        let narration = progress.last_text.clone();
         progress.push_assistant(&turn);
 
         match Box::pin(run_round(ctx, run, progress, tree, slot, &turn, calls)).await? {
             RoundEnd::Continue => {}
-            RoundEnd::Full => return Ok(AgentStop::TranscriptFull),
+            RoundEnd::Full => {
+                // Not every call ran, so the text of the turn is no answer.
+                // It can claim work that never ran.
+                progress.last_text = narration;
+                return Ok(AgentStop::TranscriptFull);
+            }
             RoundEnd::Loop => return Ok(AgentStop::LoopDetected),
         }
     }
@@ -525,7 +564,7 @@ async fn system_prompt(ctx: &WorkflowContext, task: &AgentTask) -> Result<Option
 enum RoundEnd {
     /// Every call has an answer. Ask the model again.
     Continue,
-    /// The results passed the request cap.
+    /// The next request would exceed the request cap.
     Full,
     /// The loop guard stopped the run.
     Loop,
@@ -567,12 +606,75 @@ impl Slot<'_> {
     }
 }
 
+/// The budget of one tool round: the whole next request, with a placeholder
+/// answer for each call.
+///
+/// The request holds the transcript, the assistant turn and every answer. A
+/// round that measured the results alone would run a call whose result no
+/// request can carry (issue #2040).
+///
+/// The request also holds the flow state. A call that runs adds its labels,
+/// and an approval adds its releases. The recorded turn names both, so the
+/// budget adds them for every call that can run.
+fn round_budget(
+    run: Run<'_>,
+    progress: &Progress,
+    tree: &Tree,
+    turn: &ModelTurn,
+    calls: &[ToolCall],
+) -> RoundBudget {
+    let cap = run.task.request_cap();
+    // A task recorded before the whole-request budget measured the results
+    // alone. A run in flight must replay as it ran. A zero cap is no cap.
+    if !run.task.whole_request_budget || cap == 0 {
+        return RoundBudget::results_only(cap);
+    }
+    let placeholder = placeholder();
+    let answers = calls
+        .iter()
+        .map(|call| ContentPart::ToolResult {
+            tool_call_id: call.id.clone(),
+            content: placeholder.clone(),
+        })
+        .collect();
+    let mut messages = progress.messages.clone();
+    messages.push(ChatMessage {
+        role: ChatRole::Tool,
+        content: answers,
+    });
+    let mut request = next_request(run, progress, tree, &run.extra_tools(), messages);
+    (request.flow_labels, request.flow_released) = flow_after(tree, turn);
+    RoundBudget::new(cap, json_len(&request), json_len(&placeholder))
+}
+
+/// The flow state after every call of `turn` that can run.
+///
+/// It adds the labels of each call that the decision does not deny. It adds
+/// the releases of each call that waits for an approval.
+fn flow_after(tree: &Tree, turn: &ModelTurn) -> (BTreeSet<String>, Released) {
+    let mut exercised = tree.exercised.clone();
+    let mut released = tree.released.clone();
+    for (position, decision) in turn.decisions.iter().enumerate() {
+        if matches!(decision, ToolDecision::Deny { .. }) {
+            continue;
+        }
+        exercised.extend(turn.labels.get(position).into_iter().flatten().cloned());
+        if matches!(decision, ToolDecision::RequireApproval { .. }) {
+            released.extend(turn.releases.get(position).into_iter().flatten().cloned());
+        }
+    }
+    (exercised, released)
+}
+
 /// Answer every call of one round in ONE tool message.
 ///
-/// The results can pass the request cap. No more calls run then, because the
-/// results cannot fit any request. No more calls run after the loop guard
-/// stops the run either. Each call still gets an answer, so the transcript
-/// stays valid and shows what ran.
+/// The next request must fit the request cap. When a placeholder answer for
+/// each call does not fit, no call runs. The model could not read a result.
+///
+/// The round drops a result that does not fit, and runs no more calls. The
+/// run then ends, so the model never reads a later result. No more calls run
+/// after the loop guard stops the run either. Each call still gets an answer,
+/// so the transcript stays valid and shows what ran.
 async fn run_round(
     ctx: &WorkflowContext,
     run: Run<'_>,
@@ -583,9 +685,8 @@ async fn run_round(
     calls: Vec<ToolCall>,
 ) -> Result<RoundEnd, String> {
     let task = run.task;
-    let cap = task.request_cap();
+    let mut budget = round_budget(run, progress, tree, turn, &calls);
     let mut results = Vec::with_capacity(calls.len());
-    let mut spent = 0_u64;
     let mut full = false;
     let mut looped = false;
     let mut stale = false;
@@ -598,6 +699,11 @@ async fn run_round(
             ToolOutcome::error(NOT_RUN_LOOP).content
         } else if stale {
             ToolOutcome::error(NOT_RUN_STALE).content
+        } else if !budget.can_run() {
+            // A placeholder for each call exceeds the cap. No result could
+            // reach the model, so no call runs.
+            full = true;
+            ToolOutcome::error(NOT_RUN_FULL).content
         } else {
             // A recorded turn always holds one decision per call. A missing
             // one denies the call rather than guess.
@@ -634,13 +740,11 @@ async fn run_round(
                 LoopVerdict::Warn(repeats) => content.push_str(&warning_note(&name, repeats)),
                 LoopVerdict::Stop(_) => looped = true,
             }
-            let size = json_len(&content);
-            if spent.saturating_add(size) > cap {
+            if budget.admit(json_len(&content)) {
+                content
+            } else {
                 full = true;
                 ToolOutcome::error(DROPPED_FULL).content
-            } else {
-                spent = spent.saturating_add(size);
-                content
             }
         };
         results.push(ContentPart::ToolResult {
@@ -661,12 +765,25 @@ async fn run_round(
     })
 }
 
-/// The answer to a call whose result passed the request cap.
-const DROPPED_FULL: &str =
-    "the call ran, but its result was dropped: the results passed the request cap";
+/// The longest answer that the round writes for a call with no result.
+///
+/// The round budget reserves it for every call, so any fixed answer fits the
+/// next request in its place.
+fn placeholder() -> String {
+    [DROPPED_FULL, NOT_RUN_FULL, NOT_RUN_LOOP, NOT_RUN_STALE]
+        .into_iter()
+        .map(|message| ToolOutcome::error(message).content)
+        .max_by_key(json_len)
+        .unwrap_or_default()
+}
 
-/// The answer to a call that did not run because the round was full.
-const NOT_RUN_FULL: &str = "the call did not run: the results passed the request cap";
+/// The answer to a call whose result would exceed the request cap.
+const DROPPED_FULL: &str =
+    "the call ran, but its result was dropped: the next request would exceed the request cap";
+
+/// The answer to a call that did not run because the next request would
+/// exceed the request cap.
+const NOT_RUN_FULL: &str = "the call did not run: the next request would exceed the request cap";
 
 /// The answer to a call that did not run because the loop guard stopped the
 /// run.
@@ -874,31 +991,8 @@ async fn delegate(
     } = child;
     tree.delegations = tree.delegations.saturating_add(1);
     let run_id = format!("{}:d{}", tree.root, tree.delegations);
-    let read_only = task.read_only || mandate.read_only;
     let child_agent = discover(ctx, &mandate).await?;
-    let child_task = AgentTask {
-        input: child_input,
-        system: peer.system.clone(),
-        history: Vec::new(),
-        session_id: task.session_id.clone(),
-        max_steps: peer.max_steps,
-        max_total_tokens,
-        max_output_tokens: task.max_output_tokens,
-        approval_timeout_secs: task.approval_timeout_secs,
-        max_request_bytes: task.max_request_bytes,
-        deliver: false,
-        memory_scope: None,
-        followups: None,
-        loop_guard: task.loop_guard,
-        read_only,
-        unattended: task.unattended,
-        unattended_memory_writes: false,
-        run_id_source: task.run_id_source,
-        tenant: task.tenant.clone(),
-        mandate: Some(mandate),
-        // The tree holds the labels, so the child task carries none.
-        flow_labels: BTreeSet::new(),
-    };
+    let child_task = child_task(task, peer, child_input, mandate, max_total_tokens);
     let mut child = Progress::new(run_id.clone(), Vec::new());
     let child_run = Run {
         task: &child_task,
@@ -937,6 +1031,43 @@ async fn delegate(
         content: outcome,
         is_error: stop != AgentStop::Completed,
     })
+}
+
+/// The task of a delegated child. It keeps the bounds of the parent task and
+/// takes the prompt and the limits of the peer.
+///
+/// Every field is named, so a new field of [`AgentTask`] must be placed here.
+fn child_task(
+    task: &AgentTask,
+    peer: &Peer,
+    input: String,
+    mandate: Mandate,
+    max_total_tokens: Option<u32>,
+) -> AgentTask {
+    AgentTask {
+        input,
+        system: peer.system.clone(),
+        history: Vec::new(),
+        session_id: task.session_id.clone(),
+        max_steps: peer.max_steps,
+        max_total_tokens,
+        max_output_tokens: task.max_output_tokens,
+        approval_timeout_secs: task.approval_timeout_secs,
+        max_request_bytes: task.max_request_bytes,
+        deliver: false,
+        memory_scope: None,
+        followups: None,
+        loop_guard: task.loop_guard,
+        read_only: task.read_only || mandate.read_only,
+        unattended: task.unattended,
+        unattended_memory_writes: false,
+        run_id_source: task.run_id_source,
+        whole_request_budget: task.whole_request_budget,
+        tenant: task.tenant.clone(),
+        mandate: Some(mandate),
+        // The tree holds the labels, so the child task carries none.
+        flow_labels: BTreeSet::new(),
+    }
 }
 
 /// A delegation that passed every check.
@@ -1022,6 +1153,10 @@ fn harness(ctx: &ActivityContext) -> Result<&AgentHarness, String> {
 /// (issue #1996). `AgentModel::model_id` names the model, and
 /// `AgentModel::cost_usd_micros` prices the call. A response cache hit calls
 /// no model and spends no tokens, so it records no call.
+///
+/// A reply over the result cap does not fail the activity. The activity cuts
+/// the decision reasons. When the reply still does not fit, it returns a turn
+/// with `oversized` set, and the loop ends under `reply_too_large`.
 ///
 /// # Errors
 ///
@@ -1218,6 +1353,57 @@ pub fn activities() -> Vec<ActivityInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_flow_state_after_a_turn_skips_denied_calls() {
+        let labels = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        // A released rule is a set of labels.
+        let rule = |names: &[&str]| -> Released { std::iter::once(labels(names)).collect() };
+        let tree = Tree {
+            root: "r".into(),
+            rounds: 0,
+            delegations: 0,
+            exercised: labels(&["old"]),
+            released: Released::new(),
+            records: Vec::new(),
+        };
+        let ask = ToolDecision::RequireApproval {
+            reason: "ask".into(),
+        };
+        let deny = ToolDecision::Deny {
+            reason: "no".into(),
+        };
+        let turn = ModelTurn {
+            content: Vec::new(),
+            stop: StopReason::ToolUse,
+            usage: TokenUsage::default(),
+            decisions: vec![ToolDecision::Allow, deny, ask],
+            cache_hit: false,
+            labels: vec![labels(&["a"]), labels(&["denied"]), labels(&["c"])],
+            releases: vec![rule(&["x"]), rule(&["denied"]), rule(&["y"])],
+            oversized: false,
+        };
+        let (exercised, released) = flow_after(&tree, &turn);
+        assert_eq!(
+            exercised,
+            labels(&["old", "a", "c"]),
+            "a denied call adds none"
+        );
+        assert_eq!(released, rule(&["y"]), "only a call that asks can release");
+    }
+
+    #[test]
+    fn the_placeholder_is_as_long_as_every_fixed_answer() {
+        // The round reserves one placeholder per call. Any fixed answer that
+        // replaces it must not grow the next request.
+        let reserved = json_len(&placeholder());
+        for message in [DROPPED_FULL, NOT_RUN_FULL, NOT_RUN_LOOP, NOT_RUN_STALE] {
+            let answer = ToolOutcome::error(message).content;
+            assert!(json_len(&answer) <= reserved, "{message}");
+        }
+    }
 
     #[test]
     fn the_verified_tenant_wins_over_the_task_field() {

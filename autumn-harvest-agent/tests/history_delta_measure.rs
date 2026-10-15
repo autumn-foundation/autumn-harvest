@@ -123,6 +123,7 @@ fn agent_loop_history(filler: Filler) -> Vec<WorkflowEvent> {
             cache_hit: false,
             labels: Vec::new(),
             releases: Vec::new(),
+            oversized: false,
         };
         events.push(WorkflowEvent::ActivityCompleted {
             activity_id: model_id,
