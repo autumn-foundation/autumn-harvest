@@ -1000,7 +1000,7 @@ mod tests {
     async fn a_decode_error_that_quotes_the_payload_is_bounded() {
         let bad = json!({"kind": "z".repeat(64 * 1024)});
         let outcome = env_with(&[bad]).run(one_op_counter, json!({})).await;
-        let input = outcome.result.clone().expect("checkpoint");
+        let input = outcome.result.expect("checkpoint");
         let carried: EntityCheckpoint<i64> = serde_json::from_value(input).unwrap();
         let error = carried.stats.last_error.expect("the failure is recorded");
         assert!(error.starts_with("entity message does not decode: "));
@@ -1017,10 +1017,7 @@ mod tests {
     async fn a_start_input_error_above_the_bound_is_cut() {
         let input = json!({"stats": {"last_error": "x".repeat(HUGE_ERROR_BYTES)}});
         let outcome = env_with(&[op(1)]).run(one_op_counter, input).await;
-        let checkpoint = outcome
-            .result
-            .clone()
-            .expect("the checkpoint fits the input cap");
+        let checkpoint = outcome.result.expect("the checkpoint fits the input cap");
         let carried: EntityCheckpoint<i64> = serde_json::from_value(checkpoint).unwrap();
         let error = carried.stats.last_error.expect("the start input set it");
         assert!(
