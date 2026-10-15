@@ -1,6 +1,6 @@
 ## Fix — Agent adapter: failed-edit keys, tick input cap, final-turn delivery, follow-up size (issue #2050)
 
-Four items of the review rounds on autumn-foundation/autumn-harvest#2046.
+This fix closes four open items of #2046.
 
 - **Failed memory edit.** `InMemoryMemoryStore::apply` now keeps the first
   result of an `EditKey`, an error included. A retry returns that error. It
@@ -19,6 +19,7 @@ optional field that is absent from JSON when unset.
 
 **Tests.** `a_retried_failed_edit_returns_its_first_error`,
 `a_tick_carries_the_worker_input_cap`,
-`an_empty_final_turn_does_not_deliver_an_earlier_aside` and
+`an_empty_final_turn_does_not_deliver_an_earlier_aside`,
+`an_empty_capped_final_turn_sends_the_notice_only` and
 `padding_counts_toward_the_prompt_limit`. Each failed before its fix.
 Items 1 and 5 of the issue shipped in #2046.

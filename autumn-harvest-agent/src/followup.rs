@@ -212,7 +212,22 @@ mod tests {
     fn padding_counts_toward_the_prompt_limit() {
         let padded = format!("p{}", " ".repeat(MAX_PROMPT_CHARS));
         let call = json!({"prompt": padded, "delay_minutes": 1});
-        assert!(plan(&call, &settings(), 0, false).is_err());
+        let error = plan(&call, &settings(), 0, false).unwrap_err();
+        assert!(error.contains("characters"), "{error}");
+    }
+
+    #[test]
+    fn padding_up_to_the_limit_is_accepted() {
+        let at_limit = format!("p{}", " ".repeat(MAX_PROMPT_CHARS - 1));
+        let call = json!({"prompt": at_limit, "delay_minutes": 1});
+        assert!(plan(&call, &settings(), 0, false).is_ok());
+    }
+
+    #[test]
+    fn a_blank_prompt_is_refused() {
+        let call = json!({"prompt": " \n\t ", "delay_minutes": 1});
+        let error = plan(&call, &settings(), 0, false).unwrap_err();
+        assert!(error.contains("prompt"), "{error}");
     }
 
     #[test]

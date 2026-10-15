@@ -1006,3 +1006,62 @@ async fn an_empty_final_turn_does_not_deliver_an_earlier_aside() {
 
     assert_eq!(inbox.reports(), Vec::<Report>::new());
 }
+
+fn aside_turn() -> autumn_harvest_agent::ChatResponse {
+    let mut aside = calls(&[("a", "lookup", json!({}))], 1).unwrap();
+    aside.content.insert(
+        0,
+        autumn_harvest_agent::ContentPart::Text("Let me check...".into()),
+    );
+    aside
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_the_final_turn_text_is_delivered() {
+    let (_dir, db) = fresh_db();
+    let inbox = Arc::new(Inbox::default());
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![Ok(aside_turn()), answer("Done.", 1)]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder))
+        .delivery(inbox.clone());
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &AgentTask::new("go").deliver()).unwrap();
+    let _ = report(rt.run_until_blocked(exec).await.unwrap());
+
+    let reports = inbox.reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].text, "Done.");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_capped_final_turn_sends_the_notice_only() {
+    let (_dir, db) = fresh_db();
+    let inbox = Arc::new(Inbox::default());
+    let recorder = Arc::new(Recorder::default());
+    let mut capped = answer("", 1).unwrap();
+    capped.stop_reason = autumn_harvest_agent::StopReason::MaxTokens;
+    let model = ScriptedModel::new(vec![Ok(aside_turn()), Ok(capped)]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder))
+        .delivery(inbox.clone());
+    let mut rt = runtime(&db, harness);
+
+    let exec = sqlite::start(&mut rt, &AgentTask::new("go").deliver()).unwrap();
+    let _ = report(rt.run_until_blocked(exec).await.unwrap());
+
+    let reports = inbox.reports();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].stop, AgentStop::OutputCapped);
+    assert!(
+        reports[0].text.contains("output_capped"),
+        "{:?}",
+        reports[0]
+    );
+    assert!(
+        !reports[0].text.contains("Let me check"),
+        "{:?}",
+        reports[0]
+    );
+}
