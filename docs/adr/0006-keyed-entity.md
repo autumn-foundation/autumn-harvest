@@ -119,8 +119,9 @@ A native primitive stays at rank 13, behind customer pull.
   (`ENTITY_LAST_ERROR_MAX_BYTES`). `Entity::run` cuts a longer error at a
   `char` boundary and ends it with `... [truncated]`. The cut covers the error
   of a failed op and the trusted start input. A huge error then cannot stop a
-  later checkpoint. A decode error can quote the payload, so the cut also
-  limits that quote.
+  later checkpoint. The bound counts UTF-8 bytes, and JSON escapes can grow it
+  to about 6 KiB in the checkpoint input. A decode error can quote the
+  payload, so the cut also limits that quote.
 - The deadline check runs only after an op. An idle entity with an
   `execution_timeout` times out. Do not set one on an entity.
 - The start input is trusted. A caller who may start the workflow may set
