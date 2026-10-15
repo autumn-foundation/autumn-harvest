@@ -212,8 +212,9 @@ mod db {
     /// Insert a new batch job row, or return the existing id when an
     /// idempotent retry collides with a prior submission.
     ///
-    /// The row stores the signal payload as the identity codec writes it.
-    /// Engine code calls [`submit_batch_job_with_codecs`].
+    /// The row stores the signal payload in clear. An envelope-shaped payload
+    /// gets an identity escape. Engine code calls
+    /// [`submit_batch_job_with_codecs`].
     pub async fn submit_batch_job(
         conn: &mut AsyncPgConnection,
         request: BatchSubmission,
@@ -871,7 +872,7 @@ mod db {
         };
 
         // The row stores the payload in the column form (issue #2043). A
-        // payload that does not decode leaves the job pending. The job runs
+        // payload that does not decode leaves the job as it is. The job runs
         // after an operator restores the key.
         let signal_payload = match config
             .payload_codecs
@@ -882,7 +883,7 @@ mod db {
                 tracing::warn!(
                     job_id = %job.id,
                     error_kind = crate::codec_rotation::sweep_error_kind(&error),
-                    "batch signal payload could not be decoded; the job stays pending"
+                    "batch signal payload could not be decoded; the job stays as it is"
                 );
                 return Ok(());
             }

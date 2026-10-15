@@ -1044,7 +1044,8 @@ diesel::table! {
         target_url       -> Text,
         event_filter     -> Jsonb,
         terminal_state   -> Text,
-        /// Frozen `CompletionEnvelope` JSON, signed and `POSTed` verbatim on
+        /// Frozen `CompletionEnvelope` JSON in the column form (issue #2043).
+        /// The scanner decodes it, then signs and `POST`s the plain body on
         /// every attempt (including redeliveries).
         payload          -> Jsonb,
         /// PENDING | INFLIGHT | DELIVERED | FAILED

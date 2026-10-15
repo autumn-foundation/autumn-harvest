@@ -2515,6 +2515,22 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
 
     let mut processed_count = 0;
     for task in pending_tasks {
+        // The row stores the input in the column form (issue #2043). A row
+        // that does not decode stays pending and backs off. It starts after
+        // an operator restores the key.
+        let target_input = match codecs.decode_column(&task.target_input) {
+            Ok(input) => input,
+            Err(error) => {
+                tracing::warn!(
+                    outbox_id = %task.id,
+                    error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                    "outbox input could not be decoded; the row stays pending"
+                );
+                stamp_outbox_relay_backoff(conn, task.id).await;
+                continue;
+            }
+        };
+
         let target_shard = crate::types::ShardId::new(task.target_shard);
         let Some(target_pool) = sharded_pool
             .as_ref()
@@ -2553,22 +2569,6 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
         };
 
         let priority: Priority = serde_json::from_value(task.priority).unwrap_or_default();
-
-        // The row stores the input in the column form (issue #2043). A row
-        // that does not decode stays pending and backs off. It starts after
-        // an operator restores the key.
-        let target_input = match codecs.decode_column(&task.target_input) {
-            Ok(input) => input,
-            Err(error) => {
-                tracing::warn!(
-                    outbox_id = %task.id,
-                    error_kind = crate::codec_rotation::sweep_error_kind(&error),
-                    "outbox input could not be decoded; the row stays pending"
-                );
-                stamp_outbox_relay_backoff(conn, task.id).await;
-                continue;
-            }
-        };
 
         let (target_owner, target_runbook_url, target_severity, target_sla, target_retry_policy) = {
             let lock = GLOBAL_WORKFLOW_METADATA.read().ok();

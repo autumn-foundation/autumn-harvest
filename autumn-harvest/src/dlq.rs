@@ -657,6 +657,11 @@ fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult
 /// Mirrors [`NewDeadLetter`] but owns its strings, making it easier to
 /// construct from runtime data without lifetime gymnastics.
 ///
+/// `input` is the input as the source row stores it (issue #2043). That is
+/// the column form for a workflow task, an activity task and a callback
+/// delivery. The writer decodes it once and then encodes it, so the dead
+/// letter keeps one envelope layer.
+///
 /// ## Examples
 ///
 /// ```rust
@@ -2550,19 +2555,20 @@ mod tests {
     }
 
     /// A task row stores its input as an envelope (issue #2043). The dead
-    /// letter takes that stored form and keeps one envelope layer, for every
-    /// task type.
+    /// letter takes that stored form and keeps one envelope layer. A clear
+    /// input gets one layer too.
     #[test]
-    fn a_stored_input_keeps_one_envelope_layer_for_every_task_type() {
+    fn a_stored_input_keeps_one_envelope_layer() {
         let codecs = aead_codecs();
         let plain = serde_json::json!({"ssn": "123-45-6789"});
         let stored = codecs.encode_column(&plain).expect("encode");
-        for task_type in ["workflow", "ACTIVITY", "activity", "CALLBACK"] {
-            let kept = dead_letter_input(&codecs, &stored).expect("input");
+        for input in [&stored, &plain] {
+            let kept = dead_letter_input(&codecs, input).expect("input");
+            assert!(crate::payload_codec::is_codec_envelope(&kept), "{kept}");
             assert_eq!(
                 codecs.decode_column(&kept).expect("decode"),
                 plain,
-                "{task_type} must decode once to the plaintext"
+                "the input must decode once to the plaintext"
             );
         }
     }

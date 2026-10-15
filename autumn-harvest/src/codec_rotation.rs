@@ -3522,12 +3522,12 @@ mod tests {
         }
     }
 
-    /// An engine signal or dead-letter write without the registry stores the
-    /// payload in clear (issue #1979). The sweep never encrypts plaintext, so
-    /// that leak is permanent. An external-await read without the registry
-    /// cannot decode the target output, so the await stays pending. A trigger
-    /// evaluation without the registry starts its target in clear. This
-    /// guard keeps every engine call on the codec-aware variant.
+    /// An engine write without the registry stores the payload in clear
+    /// (issue #1979, issue #2043). The sweep never encrypts plaintext, so that
+    /// leak is permanent. A read without the registry cannot decode a stored
+    /// value, so a scanner leaves the row pending. A trigger evaluation
+    /// without the registry starts its target in clear. This guard keeps every
+    /// engine call on the codec-aware variant.
     #[test]
     fn engine_signal_and_dead_letter_writes_pass_the_registry() {
         const PLAIN_WRITES: &[&str] = &[
@@ -3545,6 +3545,9 @@ mod tests {
             "reserve_or_defer(",
             "reserve_or_defer_or_shed(",
             "submit_batch_job(",
+            "fire_due_debounced_starts(",
+            "fire_due_throttled_starts(",
+            "enforce_completion_triggers_outbox(",
         ];
         // No engine call may use a plain variant (issue #2043). A pinned
         // count here could only go down.

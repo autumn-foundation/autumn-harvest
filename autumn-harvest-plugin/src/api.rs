@@ -9915,6 +9915,12 @@ async fn submit_batch_operation(
     // Persist the row on the default shard. The executor will fan out across
     // every configured shard at run time via iter_shards().
     let mut conn = acquire_conn(pool.default_pool()).await?;
+    // The registry holds the write codec (issue #2043). The API mirror serves
+    // the read path, and it defaults to the identity registry.
+    let write_codecs = api_state.runtime().map_or_else(
+        |_| api_state.payload_codecs(),
+        |rt| rt.registry.payload_codecs().clone(),
+    );
     let submit_result = batch::submit_batch_job_with_codecs(
         &mut conn,
         BatchSubmission {
@@ -9925,7 +9931,7 @@ async fn submit_batch_operation(
             idempotency_key: request.idempotency_key,
             created_by: request.created_by,
         },
-        &api_state.payload_codecs(),
+        &write_codecs,
     )
     .await;
 

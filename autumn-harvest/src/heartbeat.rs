@@ -14,9 +14,10 @@
 //! Shuttle models in `tests/shuttle_models.rs` drive the same loop with a
 //! recording sink (issue #1800).
 //!
-//! The worker uses [`spawn_heartbeat_flusher_with`] instead (issue #1788). Its
-//! payloads carry the time the activity sent them, and a failed flush keeps
-//! its payload for the next tick. Both need the `db` feature.
+//! The worker uses [`spawn_heartbeat_flusher_with_codecs`] instead (issue
+//! #1788, issue #2043). Its payloads carry the time the activity sent them, a
+//! failed flush keeps its payload for the next tick, and it encodes each
+//! checkpoint. Both need the `db` feature.
 
 use std::future::Future;
 use std::time::Duration;
@@ -142,7 +143,8 @@ fn drain_latest(rx: &mut mpsc::Receiver<Value>) -> Option<Value> {
 ///
 /// [`crate::pool::acquire_bound`] limits each pool acquire (issue #1788). The
 /// write stamps the time of the flush, and a failed flush drops its payload.
-/// The worker uses [`spawn_heartbeat_flusher_with`], which keeps both.
+/// The worker uses [`spawn_heartbeat_flusher_with_codecs`], which keeps both.
+/// This flusher stores each checkpoint in clear.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn spawn_heartbeat_flusher(
@@ -246,7 +248,8 @@ pub struct HeartbeatFlushOptions {
 
 /// A heartbeat flusher for payloads that their sender stamps (issue #1788).
 ///
-/// The worker uses it. It takes an explicit acquire bound and a metrics sink.
+/// It takes an explicit acquire bound and a metrics sink. It stores each
+/// checkpoint in clear. The worker uses [`spawn_heartbeat_flusher_with_codecs`].
 ///
 /// A failed flush keeps its payload. The next tick sends it again, unless a
 /// newer payload replaces it. A lost claim cancels `cancel` and stops the
@@ -446,6 +449,7 @@ pub async fn flush_heartbeat(
             shards: Arc::from([0]),
         },
         &crate::store::DEFAULT_PAYLOAD_CODECS,
+        &mut None,
         Duration::MAX,
     )
     .await
@@ -469,23 +473,68 @@ struct Pending {
     sent_order: std::time::Instant,
 }
 
+/// The last checkpoint the flusher encoded, with its stored form (issue
+/// #2043).
+///
+/// An unchanged checkpoint reuses its stored form, so a repeat does not spend
+/// a new random AES-GCM nonce. The auto-heartbeat ticker sends the same
+/// checkpoint on every tick. Reuse is not nonce reuse. The same bytes go to
+/// the same cell.
+#[cfg(feature = "db")]
+struct EncodedCheckpoint {
+    plain: Value,
+    stored: Value,
+}
+
 /// The checkpoint as the column stores it (issue #2043).
 ///
 /// A liveness ping holds no details, so it stays `null`. A checkpoint that
-/// does not encode is dropped and the ping is kept. The heartbeat time then
-/// still advances, and the timeout scanner does not kill a live activity.
+/// does not encode gives `None`. The flush then refreshes the heartbeat time
+/// only, and the previous checkpoint survives. The timeout scanner still sees a
+/// live activity.
 #[cfg(feature = "db")]
-fn stored_checkpoint(codecs: &PayloadCodecs, payload: &Value) -> Value {
+fn stored_checkpoint(
+    codecs: &PayloadCodecs,
+    payload: &Value,
+    cache: &mut Option<EncodedCheckpoint>,
+) -> Option<Value> {
     if payload.is_null() {
-        return Value::Null;
+        return Some(Value::Null);
     }
-    codecs.encode_column(payload).unwrap_or_else(|error| {
-        tracing::warn!(
-            error_kind = crate::codec_rotation::sweep_error_kind(&error),
-            "heartbeat details could not be encoded; the flush drops them"
-        );
-        Value::Null
-    })
+    if let Some(hit) = cache
+        .as_ref()
+        .filter(|hit| hit.plain == *payload && cached_form_is_current(codecs, &hit.stored))
+    {
+        return Some(hit.stored.clone());
+    }
+    match codecs.encode_column(payload) {
+        Ok(stored) => {
+            *cache = Some(EncodedCheckpoint {
+                plain: payload.clone(),
+                stored: stored.clone(),
+            });
+            Some(stored)
+        }
+        Err(error) => {
+            tracing::warn!(
+                error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                "heartbeat details could not be encoded; the flush keeps the stored checkpoint"
+            );
+            None
+        }
+    }
+}
+
+/// Whether a cached stored form still matches the registry (issue #2043).
+///
+/// With column encoding off, the form is plain, so it always matches. With it
+/// on, the form must be an envelope under the active key. A switch change or
+/// a key rotation then makes the flusher encode again.
+#[cfg(feature = "db")]
+fn cached_form_is_current(codecs: &PayloadCodecs, stored: &Value) -> bool {
+    !codecs.column_encoding()
+        || crate::payload_codec::codec_envelope_key_id(stored)
+            .is_some_and(|key_id| key_id == codecs.active_key_id())
 }
 
 /// Write `beat`, or a newer heartbeat from `latest`, on one connection.
@@ -511,6 +560,7 @@ async fn flush(
     latest: &Latest,
     options: &HeartbeatFlushOptions,
     codecs: &PayloadCodecs,
+    cache: &mut Option<EncodedCheckpoint>,
     interval: Duration,
 ) -> Result<ClaimWrite, FlushFailure> {
     let metrics = options.metrics.as_ref();
@@ -535,13 +585,13 @@ async fn flush(
             *beat = newer;
         }
         let write_started = std::time::Instant::now();
-        let written = crate::queue::record_heartbeat_sent_ago(
-            &mut conn,
-            claim,
-            stored_checkpoint(codecs, &beat.payload),
-            beat.sent_order.elapsed(),
-        )
-        .await;
+        let age = beat.sent_order.elapsed();
+        let written = match stored_checkpoint(codecs, &beat.payload, cache) {
+            Some(details) => {
+                crate::queue::record_heartbeat_sent_ago(&mut conn, claim, details, age).await
+            }
+            None => crate::queue::record_heartbeat_liveness_sent_ago(&mut conn, claim, age).await,
+        };
         let latency = write_started.elapsed().as_secs_f64();
         for shard in shards.iter() {
             metrics.record_db_query_duration(crate::telemetry::DbOp::Heartbeat, *shard, latency);
@@ -578,6 +628,8 @@ async fn stamped_heartbeat_loop(
     // The newest payload not yet written, with its send time. A failed flush
     // puts it back here. A retry writes that time, not the retry time.
     let mut pending: Option<Pending> = None;
+    // The last checkpoint this flusher encoded (issue #2043).
+    let mut encoded: Option<EncodedCheckpoint> = None;
     // Set when a write that blocked for an interval or more succeeds. The
     // next wait then ends as soon as a newer heartbeat is in the slot.
     let mut after_blocked_write = false;
@@ -617,6 +669,7 @@ async fn stamped_heartbeat_loop(
                 &latest,
                 &options,
                 &codecs,
+                &mut encoded,
                 flush_interval,
             )
             .await;

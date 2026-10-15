@@ -821,8 +821,8 @@ pub async fn reserve_or_defer_with_codecs(
 /// here. A bypass and a reserved token continue to the start primitive, which
 /// sheds a fresh create itself.
 ///
-/// Scheduler and backfill fires keep [`reserve_or_defer`]. They cannot act on
-/// `Retry-After`, so load shedding exempts them.
+/// Scheduler and backfill fires keep [`reserve_or_defer_with_codecs`]. They
+/// cannot act on `Retry-After`, so load shedding exempts them.
 ///
 /// # Errors
 /// As [`reserve_or_defer`], plus [`crate::error::HarvestError::LoadShed`]
@@ -995,33 +995,57 @@ struct FireDueRow {
     shard_id: i32,
 }
 
+/// How far a row that does not decode moves its `deferred_at` (issue #2043).
+///
+/// A long backoff keeps the warning rate low. The row keeps its
+/// `schedule_to_start` deadline.
+#[cfg(feature = "db")]
+const UNDECODABLE_REDEFER_BACKOFF: Duration = Duration::from_secs(30);
+
 /// Decode the stored input of each claimed row (issue #2043).
 ///
-/// The row stores `input` in the column form. The quota ordering and the start
-/// both need the plain input. A row that does not decode stays pending, and
-/// the pass logs a warning with no payload text. It fires after an operator
-/// restores the key. A bad row thus cannot abort the claim of its neighbours.
+/// The row stores `input` in the column form. The quota ordering and the
+/// start both need the plain input. A row that does not decode logs a warning
+/// with no payload text. A row past its `schedule_to_start` deadline is
+/// dropped, as `fire_claimed_throttle_row` drops it, because that needs no
+/// payload. Any other row moves back and fires after an operator restores the
+/// key. The row thus cannot sit at the head of its key, and it cannot abort the
+/// claim of its neighbours.
+///
+/// # Errors
+///
+/// Database failures while the row moves back or is dropped.
 #[cfg(feature = "db")]
-fn decode_due_rows(
+async fn decode_due_rows(
+    conn: &mut diesel_async::AsyncPgConnection,
     rows: Vec<FireDueRow>,
     codecs: &crate::payload_codec::PayloadCodecs,
-) -> Vec<FireDueRow> {
-    rows.into_iter()
-        .filter_map(|mut row| match codecs.decode_column(&row.input) {
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<Vec<FireDueRow>> {
+    let mut decodable = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        match codecs.decode_column(&row.input) {
             Ok(plain) => {
                 row.input = plain;
-                Some(row)
+                decodable.push(row);
             }
             Err(error) => {
+                let expired = row.expires_at.is_some_and(|at| at < now);
                 tracing::warn!(
                     throttle_id = %row.id,
+                    expired,
                     error_kind = crate::codec_rotation::sweep_error_kind(&error),
-                    "throttle input could not be decoded; the row stays pending"
+                    "throttle input could not be decoded"
                 );
-                None
+                if expired {
+                    delete_throttle_row(conn, row.id).await?;
+                } else {
+                    redefer_throttle_row(conn, row.id, now + UNDECODABLE_REDEFER_BACKOFF).await?;
+                }
             }
-        })
-        .collect()
+        }
+    }
+    Ok(decodable)
 }
 
 #[cfg(feature = "db")]
@@ -1641,7 +1665,7 @@ async fn fire_due_on_conn(
                             .await
                             .map_err(crate::error::database_error)?;
 
-                        let due_rows = decode_due_rows(due_rows, codecs);
+                        let due_rows = decode_due_rows(conn, due_rows, codecs, now).await?;
                         pre_lock_rate_limit_buckets_for_claimed_batch(conn, &due_rows).await?;
                         // The sort uses the quota key, not `bucket_key`. A bucket that
                         // mixes quota keys can fire a newer row before an older one in

@@ -11325,14 +11325,19 @@ fn build_activity_enqueue_plan(
             scheduled.queue.clone()
         };
 
-        // The row stores the input as the column form (issue #2043). The
-        // `ActivityScheduled` event below keeps the plain input, and the
+        // A reserved session activity carries a session id, not payload. Its
+        // row keeps the id as it is, so a missing key cannot fail the run.
+        let is_reserved = crate::context::is_reserved_session_activity_name(&scheduled.name);
+        // Any other row stores the input as the column form (issue #2043).
+        // The `ActivityScheduled` event below keeps the plain input, and the
         // event codec encodes it.
-        let mut params = queue::EnqueueParams::new(
-            queue_name.clone(),
-            TaskType::Activity,
-            registry.payload_codecs().encode_column(&scheduled.input)?,
-        );
+        let row_input = if is_reserved {
+            scheduled.input.clone()
+        } else {
+            registry.payload_codecs().encode_column(&scheduled.input)?
+        };
+        let mut params =
+            queue::EnqueueParams::new(queue_name.clone(), TaskType::Activity, row_input);
         params.workflow_exec_id = Some(exec_id.as_uuid());
         params.activity_name = Some(scheduled.name.clone());
         params.activity_id = Some(scheduled.activity_id.as_uuid());
@@ -11363,7 +11368,6 @@ fn build_activity_enqueue_plan(
         // floor. They must NOT inherit the builder-level default — fall back to
         // the pre-feature resolution (call-site override → activity default) for
         // them so an operator's floor never governs session acquire/release.
-        let is_reserved = crate::context::is_reserved_session_activity_name(&scheduled.name);
         let builder_retry_default = if is_reserved {
             None
         } else {
@@ -14845,6 +14849,15 @@ async fn finalize_activity_completion_write(
         return Ok(queue::ClaimWrite::LeaseLost);
     };
 
+    // The row stores the result in the column form (issue #2043). Encode it
+    // before the transaction, so the execution lock and the claim lock are not
+    // held across the encode. A stored-result reference stays as it is.
+    let encoded_row_output = if stored.is_some() {
+        None
+    } else {
+        Some(queue::activity_row_output(codecs, &output, false)?)
+    };
+
     let result = Box::pin(
         conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
             let mut output = output.clone();
@@ -14897,8 +14910,7 @@ async fn finalize_activity_completion_write(
                 llm_calls,
             )
             .await?;
-            // The row stores the result in the column form (issue #2043).
-            let row_output = queue::activity_row_output(codecs, &output, stored.is_some())?;
+            let row_output = encoded_row_output.clone().unwrap_or_else(|| output.clone());
             queue::complete_claimed_task(conn, &claim_of_task(task)?, row_output)
                 .await?
                 .require_applied(task.id)?;
@@ -17923,18 +17935,68 @@ async fn record_session_acquire_schedule_to_start_timeout(
 
 /// The session id in a session task's input (issue #2043).
 ///
-/// The row stores the input as the column form, so decode it first. An input
-/// that does not decode is not a valid session id.
-fn session_id_of_task(
-    task: &TaskQueueItem,
+/// A new row keeps the id as it is. The decode only serves a row that holds a
+/// column form. An input that does not decode is not a valid session id.
+fn session_id_of_input(
+    input: &serde_json::Value,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> Option<crate::types::SessionId> {
     codecs
-        .decode_column(&task.input)
+        .decode_column(input)
         .ok()?
         .as_str()?
         .parse::<crate::types::SessionId>()
         .ok()
+}
+
+#[cfg(test)]
+mod session_input_tests {
+    use super::session_id_of_input;
+    use crate::aead_codec::{AeadCodec, DataKey};
+    use crate::payload_codec::PayloadCodecs;
+    use crate::types::SessionId;
+    use serde_json::json;
+
+    fn aead_codecs() -> PayloadCodecs {
+        let codecs = PayloadCodecs::default();
+        let key = DataKey::from_bytes(&[0x21; 32]).expect("key");
+        AeadCodec::new("k1", &key)
+            .expect("codec")
+            .register_with(&codecs)
+            .expect("register");
+        codecs.set_column_encoding(true);
+        codecs
+    }
+
+    #[test]
+    fn a_clear_session_id_reads_back() {
+        let id = SessionId::new();
+        let input = json!(id.as_uuid().to_string());
+        assert_eq!(session_id_of_input(&input, &aead_codecs()), Some(id));
+    }
+
+    #[test]
+    fn an_encoded_session_id_reads_back() {
+        let codecs = aead_codecs();
+        let id = SessionId::new();
+        let stored = codecs
+            .encode_column(&json!(id.as_uuid().to_string()))
+            .expect("encode");
+        assert_eq!(session_id_of_input(&stored, &codecs), Some(id));
+    }
+
+    #[test]
+    fn an_input_that_does_not_decode_is_not_a_session_id() {
+        let id = SessionId::new();
+        let stored = aead_codecs()
+            .encode_column(&json!(id.as_uuid().to_string()))
+            .expect("encode");
+        assert_eq!(
+            session_id_of_input(&stored, &PayloadCodecs::default()),
+            None
+        );
+        assert_eq!(session_id_of_input(&json!(7), &aead_codecs()), None);
+    }
 }
 
 /// Handle the internal session-acquire activity (issue #606) -- see the
@@ -17984,7 +18046,7 @@ async fn handle_session_acquire(
     };
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
 
-    let Some(session_id) = session_id_of_task(task, codecs) else {
+    let Some(session_id) = session_id_of_input(&task.input, codecs) else {
         let error = "session-acquire task input is not a valid SessionId".to_string();
         fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
@@ -18210,7 +18272,7 @@ async fn handle_session_release(
     };
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
 
-    let Some(session_id) = session_id_of_task(task, codecs) else {
+    let Some(session_id) = session_id_of_input(&task.input, codecs) else {
         let error = "session-release task input is not a valid SessionId".to_string();
         fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
@@ -18614,6 +18676,16 @@ pub async fn handle_session_acquire_for_test(
     .map(|_| ())
 }
 
+/// Why an attempt ends before its handler runs.
+struct PreHandlerFailure {
+    /// The metric label.
+    error_type: &'static str,
+    /// Whether the retry policy skips this failure.
+    non_retryable: bool,
+    /// The failure text that the result carries.
+    payload: String,
+}
+
 /// Where a failed attempt reports its outcome (issue #1815).
 struct ActivityOutcomeSinks<'a> {
     task_outcomes: &'a crate::worker_outlier::TaskOutcomeWindow,
@@ -18624,9 +18696,7 @@ struct ActivityOutcomeSinks<'a> {
 /// End an attempt that fails before its handler runs.
 ///
 /// The circuit breaker and a bad stored payload both use it. It records the
-/// failure metrics, writes the result, and reports the outcome. `error_type`
-/// is the metric label, and `payload` is the failure text that the result
-/// carries.
+/// failure metrics, writes the result, and reports the outcome.
 ///
 /// `ActivityStarted` is already committed, and a start is not idempotent.
 /// So the write uses the same retries as a handler result (issue #1788). A
@@ -18637,9 +18707,14 @@ async fn fail_attempt_before_handler(
     registry: &HandlerRegistry,
     attempt: &ActivityAttempt<'_>,
     build_id: &str,
-    (error_type, payload): (&'static str, String),
+    failure: PreHandlerFailure,
     sinks: &ActivityOutcomeSinks<'_>,
 ) -> HarvestResult<()> {
+    let PreHandlerFailure {
+        error_type,
+        non_retryable,
+        payload,
+    } = failure;
     let ActivityAttempt {
         task,
         worker_id,
@@ -18659,7 +18734,7 @@ async fn fail_attempt_before_handler(
     );
     telemetry
         .metrics
-        .record_activity_failed(activity_name, "", error_type, true);
+        .record_activity_failed(activity_name, "", error_type, non_retryable);
     telemetry.metrics.record_activity_attempt_for_build(
         activity_name,
         &task.queue_name,
@@ -19185,7 +19260,11 @@ async fn process_activity_task(
             registry,
             &attempt,
             build_id,
-            (crate::failure::ERROR_TYPE_CIRCUIT_OPEN, payload),
+            PreHandlerFailure {
+                error_type: crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
+                non_retryable: true,
+                payload,
+            },
             &ActivityOutcomeSinks {
                 task_outcomes,
                 deferred_failure,
@@ -19223,7 +19302,11 @@ async fn process_activity_task(
                 registry,
                 &attempt,
                 build_id,
-                (crate::failure::ERROR_TYPE_PAYLOAD_DECODE_FAILED, payload),
+                PreHandlerFailure {
+                    error_type: crate::failure::ERROR_TYPE_PAYLOAD_DECODE_FAILED,
+                    non_retryable: false,
+                    payload,
+                },
                 &ActivityOutcomeSinks {
                     task_outcomes,
                     deferred_failure,
@@ -19545,7 +19628,7 @@ async fn process_activity_task(
                 activity_interceptors,
                 &invocation,
                 &ctx,
-                handler_input.clone(),
+                handler_input,
                 // `move` captures the resolved dispatch; it does NOT borrow
                 // `&ctx`, so it composes with the chain's own `&ctx` borrow. The
                 // explicit return type unifies the two `Box::pin` arms.
@@ -19585,7 +19668,7 @@ async fn process_activity_task(
                 activity_interceptors,
                 &invocation,
                 &ctx,
-                handler_input.clone(),
+                handler_input,
                 |input| (activity_handler)(&ctx, input),
             )
         }),
@@ -19598,7 +19681,7 @@ async fn process_activity_task(
                 activity_interceptors,
                 &invocation,
                 &ctx,
-                handler_input.clone(),
+                handler_input,
                 |input| (activity_handler)(&ctx, input),
             )
         })

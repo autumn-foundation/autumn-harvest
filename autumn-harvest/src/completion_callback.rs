@@ -3174,18 +3174,19 @@ async fn fire_due_on_conn(
     let claimed_ids: Vec<Uuid> = claimed.iter().map(|row| row.id).collect();
     let fresh_payloads = reread_claimed_payloads(conn, &claimed_ids).await?;
 
-    // Sign and send the payload bytes exactly as read back above — a
-    // Postgres JSONB round-trip may reorder object keys relative to the
-    // bytes originally inserted, but that never threatens the "signature
-    // covers exactly what was posted" invariant: whatever bytes we derive
-    // here are the ones we sign *and* the ones we send, on every attempt
-    // including the first. A row that fails to serialize is dead-lettered
-    // immediately rather than merely skipped (issue #921 review): a `continue`
-    // here would leave the row's just-claimed `INFLIGHT` state and
-    // `next_attempt_at = lease_until` untouched, so — since serialization
-    // failure is deterministic for a given payload — the very next scanner
-    // tick (30s later) would reclaim and fail to serialize it again,
-    // forever, spamming logs and never actually resolving the delivery.
+    // Sign and send the payload bytes exactly as decoded below.
+    // A Postgres JSONB round-trip may reorder object keys relative to the
+    // bytes originally inserted. That never threatens the "signature covers
+    // exactly what was posted" invariant. The bytes that the code derives
+    // here are the ones it signs and the ones it sends, on every attempt
+    // including the first.
+    //
+    // A row that fails to serialize is dead-lettered immediately, not merely
+    // skipped (issue #921 review). A `continue` here would leave the row's
+    // just-claimed `INFLIGHT` state and `next_attempt_at = lease_until`
+    // untouched. Serialization failure is deterministic for a given payload.
+    // So the next scanner tick (30s later) would reclaim the row and fail
+    // again, forever. That would spam logs and never resolve the delivery.
     let mut dispatchable = Vec::with_capacity(claimed.len());
     for row in claimed {
         // Re-validate the target URL against the *live* SSRF policy before

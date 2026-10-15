@@ -256,7 +256,7 @@ pub struct DebounceAdmitOutcome {
     /// The stable `workflow_id` the eventual run will be created with. This is
     /// the **first** request's id for the key (kept across retriggers), which
     /// the caller should echo instead of its own generated id. See
-    /// [`admit_debounced_start`]'s doc comment for the legacy-empty-id healing
+    /// [`admit_debounced_start_with_codecs`]'s doc comment for the legacy-empty-id healing
     /// exception (issue #1430).
     pub workflow_id: String,
     /// Current fire deadline after this admission.
@@ -285,8 +285,8 @@ pub struct PendingDebounceRecord {
 
 /// [`admit_debounced_start_with_codecs`], with the identity registry.
 ///
-/// The row then stores the input as the identity codec writes it. Engine code
-/// calls the `_with_codecs` variant.
+/// The row then stores the input in clear. An envelope-shaped input gets an
+/// identity escape. Engine code calls the `_with_codecs` variant.
 ///
 /// # Errors
 ///
@@ -566,34 +566,51 @@ impl crate::quota_lock_order::QuotaLockRow for FireDueRow {
     }
 }
 
+/// How far a row that does not decode moves its fire time (issue #2043).
+///
+/// A long backoff keeps the warning rate low. The row still keeps its
+/// `max_fire_at` bound.
+#[cfg(feature = "db")]
+const UNDECODABLE_REDEFER_BACKOFF: Duration = Duration::from_secs(30);
+
 /// Decode the stored input of each claimed row (issue #2043).
 ///
 /// The row stores `last_input` in the column form. The quota ordering and the
-/// start both need the plain input. A row that does not decode stays pending,
-/// and the pass logs a warning with no payload text. It fires after an
-/// operator restores the key. A bad row thus cannot abort the claim of its
-/// neighbours.
+/// start both need the plain input. A row that does not decode moves its fire
+/// time back and logs a warning with no payload text. It fires after an
+/// operator restores the key. The row thus cannot sit at the head of the claim
+/// window, and it cannot abort the claim of its neighbours.
+///
+/// # Errors
+///
+/// Database failures while the row moves back.
 #[cfg(feature = "db")]
-fn decode_due_rows(
+async fn decode_due_rows(
+    conn: &mut diesel_async::AsyncPgConnection,
     rows: Vec<FireDueRow>,
     codecs: &crate::payload_codec::PayloadCodecs,
-) -> Vec<FireDueRow> {
-    rows.into_iter()
-        .filter_map(|mut row| match codecs.decode_column(&row.last_input) {
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<Vec<FireDueRow>> {
+    let mut decodable = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        match codecs.decode_column(&row.last_input) {
             Ok(plain) => {
                 row.last_input = plain;
-                Some(row)
+                decodable.push(row);
             }
             Err(error) => {
                 tracing::warn!(
                     debounce_id = %row.id,
                     error_kind = crate::codec_rotation::sweep_error_kind(&error),
-                    "debounce input could not be decoded; the row stays pending"
+                    "debounce input could not be decoded; the row moves back"
                 );
-                None
+                let target =
+                    redefer_target(now, row.max_fire_at, now + UNDECODABLE_REDEFER_BACKOFF);
+                redefer_debounce_row(conn, row.id, target).await?;
             }
-        })
-        .collect()
+        }
+    }
+    Ok(decodable)
 }
 
 /// Fire all pending debounce records whose `effective_fire_at` has elapsed.
@@ -702,7 +719,7 @@ async fn fire_due_on_conn(
                             .await
                             .map_err(crate::error::database_error)?;
 
-                        let due_rows = decode_due_rows(due_rows, codecs);
+                        let due_rows = decode_due_rows(conn, due_rows, codecs, now).await?;
                         let due_rows =
                             crate::quota_lock_order::order_due_rows_for_deadlock_free_firing(
                                 conn, due_rows,

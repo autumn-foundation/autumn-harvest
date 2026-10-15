@@ -1383,28 +1383,56 @@ Any other caller sees the stored envelope. The list surfaces and the MCP
 status and watch tools always show the stored envelope. See
 [`docs/operations/read-path-decode.md`](operations/read-path-decode.md).
 
-**Task rows and short-lived copies (issue #2043).** An activity task row
-stores its input, result and checkpoint encoded. A finished activity row stays
-until task retention removes it, 7 days by default. So it is not short-lived.
-A completion-callback delivery and its dead letter store the webhook body
-encoded. The scanner decodes the body before it signs and sends it, so the
-receiver always gets plaintext. A debounce, throttle or outbox row stores its
-input encoded, and the fire path decodes it before the start. The batch
-executor decodes a job payload before it sends each signal.
+**Task rows and short-lived copies (issue #2043).** With column encoding on,
+an activity task row stores its input, result and checkpoint encoded. A
+finished activity row stays until task retention removes it. So it is not
+short-lived. A completion-callback delivery and its dead letter store the
+webhook body encoded. The scanner decodes the body before it signs and sends
+it, so the receiver always gets plaintext. A debounce, throttle or outbox row
+stores its input encoded, and the fire path decodes it before the start. The
+batch executor decodes a job payload before it sends each signal. A session
+task keeps its session id in clear, because the id is not payload.
 
-A stored value that does not decode never starts work on ciphertext. An
-activity attempt fails with `PayloadDecodeFailed`, and the retry policy
-applies. A scanner leaves the row pending and logs a warning that holds no
-payload text. The row fires after an operator restores the key. Upgrade every
-worker before you turn column encoding on. An older worker runs an activity on
-the envelope.
+A stored value that does not decode never starts work on ciphertext:
+
+- An activity attempt fails with `PayloadDecodeFailed`. The retry policy
+  applies.
+- The debounce, throttle and outbox scanners move the row back and log a
+  warning that holds no payload text. A throttle row past its deadline is
+  still dropped. The row starts after an operator restores the key.
+- The batch executor leaves the job as it is and logs a warning.
+- The callback scanner counts the failure as a delivery attempt. The delivery
+  backs off. After its last attempt, it moves to the dead-letter queue with the
+  stored body. A redrive sends the body after an operator restores the key.
+
+Every worker needs every key that can read a row. A worker without the key
+fails an attempt that a peer could run.
+
+**Upgrade order for these columns.** Upgrade every worker and every API
+process before you turn column encoding on. If it is on already, turn it off,
+finish the roll, and turn it on again. An older worker runs an activity on the
+envelope. An older scanner sends the envelope to a receiver, starts a run on
+it, or sends it as a signal.
+
+**Rows from before the upgrade.** A row written before issue #2043 holds clear
+values. A clear value that has the shape of an envelope reads as an envelope.
+The census counts it, and the sweep converts it. A retired codec id makes that
+cell unresolved, and an activity attempt on it fails with
+`PayloadDecodeFailed`. Drain the activity queues before you turn column
+encoding on. Wait for task retention, or run terminal task GC, before you
+retire a key.
+
+**Erasure.** Erasure (issue #495) does not reach the task rows or the outbox.
+They stay until task retention or the relay removes them. Their ciphertext is
+not readable without the key.
 
 **Behavior change for API clients.** Before column encoding, the output
 column was always plaintext, so every caller of `GET /workflows/{id}/result`
 got plaintext. With column encoding on, only an admin with
 `decode_payloads_on_read` on gets plaintext. Turn on `decode_payloads_on_read`,
 and give result readers admin access, before you turn on column encoding. The
-Rust `WorkflowHandle` decodes with its own registry, so it is not affected.
+Rust `WorkflowHandle` decodes with its own registry, so it is not affected. The
+same holds for the checkpoints that `GET /workflows/{id}/stack` returns.
 
 **Residual risk.** With the switch on or off, a new write escapes a value
 shaped like a codec envelope, as the event codec does (issue #1253). A row
@@ -1423,23 +1451,23 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_workflow_executions.output` | Covered | The workflow result. |
 | `harvest_workflow_executions.memo` | Covered | Operator notes can hold PII. No query reads into them. |
 | `harvest_workflow_executions.search_attrs` | Clear | Visibility queries filter on it. Do not put PII in it. |
-| `harvest_workflow_executions.context_headers` | Clear | Many engine paths read the headers as a string map, and an unreadable value means no headers. The archive and the history export read them with no codec. Do not put PII in a header. |
+| `harvest_workflow_executions.context_headers` | Clear | The worker, the replay export, the archive and the history export read the headers as a string map with no codec. An unreadable value means no headers. Do not put PII in a header. |
 | `harvest_workflow_executions.workflow_retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_workflow_executions.completion_callbacks` | Clear | Callback targets, not payload. |
 | `harvest_workflow_executions.migrated_from_shards` | Clear | Shard bookkeeping, not payload. |
 | `harvest_task_queue.input` | Covered | A workflow task and an activity task both store the input encoded. A finished activity row stays until task retention removes it. |
-| `harvest_task_queue.output` | Covered | The workflow task stores the same form as `harvest_workflow_executions.output`. An activity task stores its result encoded. |
+| `harvest_task_queue.output` | Covered | The workflow task stores the same form as `harvest_workflow_executions.output`. An activity task stores its result encoded. A stored-result reference holds no payload and stays as it is. |
 | `harvest_task_queue.heartbeat_details` | Covered | The activity checkpoint. The heartbeat flusher encodes it, and a retry decodes it. |
 | `harvest_task_queue.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_task_queue.trace_context` | Clear | Trace ids, not payload. |
 | `harvest_task_queue.required_capabilities` | Clear | Routing labels, not payload. |
-| `harvest_task_queue.context_headers` | Clear | A copy of the execution headers. The same readers apply. |
+| `harvest_task_queue.context_headers` | Clear | A copy of the execution headers. The worker reads them as a string map. |
 | `harvest_schedules.workflow_input` | Clear | An operator template that the schedule API lists and edits. The reconciler compares it by value on each tick, and each encode makes a new nonce. |
 | `harvest_schedules.buffered_runs` | Clear | Fire times only. |
 | `harvest_schedules.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_signals.payload` | Covered | The signal payload. Signal ingest decodes it before it records `SignalReceived`. |
 | `harvest_stream_chunks.chunk` | Clear | Durable output chunks (#1974). The stream route sends them as stored. PII erasure deletes them. Do not put secrets in a chunk. |
-| `harvest_dead_letters.input` | Covered | The failed task input. A completion-callback entry copies the stored webhook body, so it is encoded too. |
+| `harvest_dead_letters.input` | Covered | The failed task input. A completion-callback entry carries the webhook body in the stored form, so it is encoded too. |
 | `harvest_workers.queues` | Clear | Worker registration, not payload. |
 | `harvest_workers.shard_assignments` | Clear | Worker registration, not payload. |
 | `harvest_workers.labels` | Clear | Worker capabilities, not payload. |
@@ -1454,12 +1482,12 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_completion_triggers.condition` | Clear | Trigger configuration, not payload. |
 | `harvest_completion_trigger_outbox.target_input` | Covered | The input of a deferred trigger start. The relay decodes it before the target start. |
 | `harvest_completion_trigger_outbox.priority` | Clear | Scheduling, not payload. |
-| `harvest_cross_shard_children.child_spec` | Clear | Erasure rewrites the `input` field inside the spec, and the sweep reads one envelope at the cell root. The target start encodes the input it writes. |
+| `harvest_cross_shard_children.child_spec` | Clear | Erasure rewrites the `input` field inside the spec, and the sweep reads one envelope at the cell root. The spec holds the child input in clear until erasure or retirement. |
 | `harvest_debounce.last_input` | Covered | The buffered start input. The fire path decodes it before the start. |
 | `harvest_debounce.start_options` | Clear | Start configuration, not payload. |
 | `harvest_start_throttle.input` | Covered | The deferred start input. The fire path decodes it before the start. |
 | `harvest_start_throttle.start_options` | Clear | Start configuration, not payload. |
-| `harvest_event_batches.buffered_payloads` | Clear | SQL appends to the array and counts its elements, and the sweep reads one envelope at the cell root. |
+| `harvest_event_batches.buffered_payloads` | Clear | SQL appends to the array and counts its elements, and the sweep reads one envelope at the cell root. The array holds each buffered input in clear until the batch fires. |
 | `harvest_event_batches.start_options` | Clear | Start configuration, not payload. |
 | `harvest_completion_deliveries.event_filter` | Clear | Callback configuration, not payload. |
 | `harvest_completion_deliveries.payload` | Covered | The webhook body. The scanner decodes it before it signs and sends the body. |

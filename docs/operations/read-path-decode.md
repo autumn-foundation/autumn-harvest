@@ -159,8 +159,9 @@ Two attribution details:
   the stored (possibly ciphertext) error first-line. Counts and ids remain
   correct; signatures on an encrypted deployment group by ciphertext shape.
 - With column encoding on (issue #1979, issue #2043), the engine writes
-  envelopes into the execution `input`/`output`/`memo` columns, signal
-  payloads, dead-letter inputs, task rows and the other covered columns. The surfaces above decode them under the same rules. A
+  envelopes into the covered columns. These include the execution
+  `input`, `output` and `memo`, signal payloads, dead-letter inputs and task
+  rows. The surfaces above decode them under the same rules. A
   non-admin caller, and the undecoded list surfaces, see the envelopes. See
   the column coverage table in `docs/security-posture.md`.
 - A column write can wrap the whole value in one envelope: the column codec,
