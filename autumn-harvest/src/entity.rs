@@ -104,6 +104,12 @@ pub const ENTITY_CHECKPOINT_SIDE_EFFECT: &str = "harvest.entity.checkpoint";
 /// a run and its replay does not change what the run carried.
 pub const ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT: &str = "harvest.entity.checkpoint_budget";
 
+/// The most bytes that [`EntityStats::last_error`] keeps, marker included.
+pub const ENTITY_LAST_ERROR_MAX_BYTES: usize = 1024;
+
+/// The text that ends a cut error.
+const TRUNCATION_MARKER: &str = "... [truncated]";
+
 /// One message on the [`ENTITY_OP_SIGNAL`] signal.
 ///
 /// The wire form is `{"kind":"op","op":<op>}` or `{"kind":"delete"}`.
@@ -445,9 +451,14 @@ fn json_len<T: Serialize + ?Sized>(value: &T) -> HarvestResult<u64> {
     Ok(serde_json::to_string(value)?.len() as u64)
 }
 
+/// RED stub: returns `error` as is.
+fn bound_error(error: String) -> String {
+    error
+}
+
 fn record_failure(stats: &mut EntityStats, error: String) {
     stats.failed += 1;
-    stats.last_error = Some(error);
+    stats.last_error = Some(bound_error(error));
 }
 
 /// Decide if the run takes a checkpoint after this op.
@@ -530,8 +541,9 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::context::WorkflowHistoryPolicy;
+    use crate::context::{WorkflowCommand, WorkflowHistoryPolicy};
     use crate::event::{SideEffectKind, WorkflowEvent};
+    use crate::executor::{WorkflowOutcome, drive_workflow};
     use crate::testing::{ReplayStatus, WorkflowReplayer, WorkflowTestEnv};
     use crate::types::ExecutionId;
 
@@ -656,18 +668,23 @@ mod tests {
         })
     }
 
-    fn checkpoint_side_effects(events: &[WorkflowEvent]) -> Vec<Value> {
+    /// The values of the side effects recorded under `id`.
+    fn recorded(events: &[WorkflowEvent], id: &str) -> Vec<Value> {
         events
             .iter()
             .filter_map(|e| match e {
                 WorkflowEvent::SideEffectRecorded { name, value, .. }
-                    if name.as_deref() == Some(ENTITY_CHECKPOINT_SIDE_EFFECT) =>
+                    if name.as_deref() == Some(id) =>
                 {
                     Some(value.clone())
                 }
                 _ => None,
             })
             .collect()
+    }
+
+    fn checkpoint_side_effects(events: &[WorkflowEvent]) -> Vec<Value> {
+        recorded(events, ENTITY_CHECKPOINT_SIDE_EFFECT)
     }
 
     #[test]
@@ -903,6 +920,110 @@ mod tests {
         assert_eq!(carried.stats.last_error.as_deref(), Some("op refused"));
     }
 
+    /// An error far above the input cap.
+    const HUGE_ERROR_BYTES: usize = 3 << 20;
+
+    /// A counter entity that asks for a checkpoint after each op. Each op
+    /// fails with a huge error.
+    fn huge_error_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .max_ops_per_run(1)
+                .run(|_: i64, _: CounterOp| async move { Err("x".repeat(HUGE_ERROR_BYTES)) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// The failed op counts and the entity goes on, even when the next
+    /// checkpoint is due at once.
+    #[tokio::test]
+    async fn a_huge_error_does_not_block_the_checkpoint() {
+        let outcome = env_with(&[op(1)]).run(huge_error_counter, json!({})).await;
+        let input = outcome
+            .result
+            .clone()
+            .expect("the checkpoint fits the input cap");
+        let carried: EntityCheckpoint<i64> = serde_json::from_value(input).unwrap();
+        assert_eq!(carried.stats.failed, 1);
+        let error = carried.stats.last_error.expect("the failure is recorded");
+        assert!(
+            error.len() <= ENTITY_LAST_ERROR_MAX_BYTES,
+            "the error keeps {} bytes",
+            error.len()
+        );
+        assert!(
+            error.ends_with(TRUNCATION_MARKER),
+            "the cut leaves a marker"
+        );
+
+        let report = outcome.replay_check(huge_error_counter).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    /// A decode error can quote the payload. The bound limits what it keeps.
+    #[tokio::test]
+    async fn a_decode_error_that_quotes_the_payload_is_bounded() {
+        let bad = json!({"kind": "z".repeat(64 * 1024)});
+        let outcome = env_with(&[bad]).run(one_op_counter, json!({})).await;
+        let input = outcome.result.clone().expect("checkpoint");
+        let carried: EntityCheckpoint<i64> = serde_json::from_value(input).unwrap();
+        let error = carried.stats.last_error.expect("the failure is recorded");
+        assert!(error.starts_with("entity message does not decode: "));
+        assert!(error.contains("zzz"), "the error quotes the payload");
+        assert!(
+            error.len() <= ENTITY_LAST_ERROR_MAX_BYTES,
+            "the error keeps {} bytes",
+            error.len()
+        );
+    }
+
+    #[test]
+    fn an_error_within_the_bound_stays_whole() {
+        let exact = "e".repeat(ENTITY_LAST_ERROR_MAX_BYTES);
+        assert_eq!(bound_error(exact.clone()), exact);
+        assert_eq!(bound_error(String::new()), "");
+    }
+
+    #[test]
+    fn a_longer_error_is_cut_to_the_bound_with_a_marker() {
+        let kept = ENTITY_LAST_ERROR_MAX_BYTES - TRUNCATION_MARKER.len();
+        let expected = format!("{}{TRUNCATION_MARKER}", "e".repeat(kept));
+        for len in [
+            ENTITY_LAST_ERROR_MAX_BYTES + 1,
+            ENTITY_LAST_ERROR_MAX_BYTES * 2,
+            HUGE_ERROR_BYTES,
+        ] {
+            assert_eq!(bound_error("e".repeat(len)), expected, "{len} bytes in");
+        }
+    }
+
+    /// The cut index falls inside a character for each width and offset.
+    #[test]
+    fn the_cut_lands_on_a_char_boundary() {
+        let kept = ENTITY_LAST_ERROR_MAX_BYTES - TRUNCATION_MARKER.len();
+        for ch in ['é', '€', '😀'] {
+            for lead in 0..4 {
+                let error = format!("{}{}", "a".repeat(lead), ch.to_string().repeat(1024));
+                let cut = bound_error(error);
+                let body = cut.strip_suffix(TRUNCATION_MARKER).expect("a marker");
+                assert!(
+                    body.chars().skip(lead).all(|c| c == ch),
+                    "{ch} after {lead}"
+                );
+                assert!(cut.len() <= ENTITY_LAST_ERROR_MAX_BYTES);
+                assert!(
+                    kept - body.len() < ch.len_utf8(),
+                    "the cut gives up less than one {ch}"
+                );
+            }
+        }
+    }
+
     /// A recorded `true` decision replays to the same checkpoint, with the
     /// waiting ops in its input.
     #[tokio::test]
@@ -1027,20 +1148,26 @@ mod tests {
         json!({"kind": "op", "op": {"add": n}, "pad": "x".repeat(pad_bytes)})
     }
 
-    /// Waiting ops that overflow the input cap run in this run. The
-    /// checkpoint carries only what fits.
-    #[tokio::test]
-    async fn a_checkpoint_carries_only_what_fits_the_input_cap() {
+    /// One small op, then four ops of 600 KiB. The first checkpoint cannot
+    /// carry all four under the default 2 MiB input cap.
+    fn overflowing_ops() -> Vec<Value> {
         let big = 600 * 1024;
-        let outcome = env_with(&[
+        vec![
             op(1),
             padded(2, big),
             padded(4, big),
             padded(8, big),
             padded(16, big),
-        ])
-        .run(one_op_counter, json!({}))
-        .await;
+        ]
+    }
+
+    /// Waiting ops that overflow the input cap run in this run. The
+    /// checkpoint carries only what fits.
+    #[tokio::test]
+    async fn a_checkpoint_carries_only_what_fits_the_input_cap() {
+        let outcome = env_with(&overflowing_ops())
+            .run(one_op_counter, json!({}))
+            .await;
         let input = outcome.result.clone().expect("checkpoint");
         let size = serde_json::to_string(&input).unwrap().len() as u64;
         assert!(
@@ -1069,6 +1196,101 @@ mod tests {
                 .map_err(|e| e.to_string())?;
             Ok(json!(state))
         })
+    }
+
+    /// A counter entity that asks for a checkpoint after each op. Its
+    /// handler awaits one activity.
+    fn activity_one_op_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .max_ops_per_run(1)
+                .run(|count, op: CounterOp| async move {
+                    ctx.execute_activity_raw("entity_step", json!(op), "default")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(count + 1)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// Each attempt records its budget. The first attempt here does not fit,
+    /// so the run makes a second one.
+    #[tokio::test]
+    async fn each_checkpoint_attempt_records_its_budget() {
+        let outcome = env_with(&overflowing_ops())
+            .run(one_op_counter, json!({}))
+            .await;
+        assert!(outcome.result.is_ok(), "{:?}", outcome.result);
+        let cap = json!(crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES);
+        assert_eq!(
+            recorded(outcome.events(), ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT),
+            vec![cap.clone(), cap],
+            "one record for each attempt"
+        );
+    }
+
+    /// A deploy lowers the input cap while a handler waits on an activity.
+    /// Replay restores the budget of the first attempt. The next attempt must
+    /// size its input under the live cap, not under that budget.
+    #[tokio::test]
+    async fn a_lowered_cap_applies_to_the_next_attempt() {
+        let outcome = env_with(&overflowing_ops())
+            .mock_activity("entity_step", |_| Ok(json!(1)))
+            .run(activity_one_op_counter, json!({}))
+            .await;
+        // End the history where the activity of the op that did not fit ends.
+        let cut = outcome
+            .events()
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| matches!(e, WorkflowEvent::ActivityCompleted { .. }))
+            .nth(1)
+            .map(|(index, _)| index + 1)
+            .expect("the op that did not fit ran an activity");
+        let history = outcome.events()[..cut].to_vec();
+        assert_eq!(
+            recorded(&history, ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT).len(),
+            1,
+            "the first attempt is in the history"
+        );
+
+        // Three ops of 600 KiB fit the old cap but not this one.
+        let lowered = 1024 * 1024;
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history).with_payload_caps(
+            crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+            crate::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES,
+            crate::builder::DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            lowered,
+        );
+        let (cycle, ..) = drive_workflow(ctx, activity_one_op_counter, json!({}), None).await;
+        let WorkflowOutcome::Suspended { commands } = cycle else {
+            panic!("the run must go on, not fail: {cycle:?}");
+        };
+        let budgets: Vec<&Value> = commands
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::RecordSideEffect { name, value, .. }
+                    if name.as_deref() == Some(ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT) =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            budgets,
+            [&json!(lowered)],
+            "the new attempt records the live budget"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::ContinueAsNew { .. })),
+            "the carried ops do not fit, so the run runs another op first"
+        );
     }
 
     #[tokio::test]
