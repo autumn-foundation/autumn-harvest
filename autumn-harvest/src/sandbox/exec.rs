@@ -576,8 +576,8 @@ fn effective_run_as(options: &ExecOptions) -> Result<Option<(u32, u32)>, Sandbox
 ///
 /// # Errors
 ///
-/// Returns [`SandboxError::Config`] for uid 0 or gid 0, and for `run_as` on
-/// a non-root executor.
+/// Returns [`SandboxError::Config`] for uid 0 or gid 0, for the `u32::MAX`
+/// sentinel, and for `run_as` on a non-root executor.
 fn run_as_for(options: &ExecOptions, root: bool) -> Result<Option<(u32, u32)>, SandboxError> {
     // A non-root executor runs the code in a user namespace with no uid
     // map. There, setuid and setgid fail, so a run_as fails on every run.
@@ -591,6 +591,14 @@ fn run_as_for(options: &ExecOptions, root: bool) -> Result<Option<(u32, u32)>, S
     if run_as.is_some_and(|(uid, gid)| uid == 0 || gid == 0) {
         return Err(SandboxError::Config(
             "the code must not run as uid 0 or gid 0".into(),
+        ));
+    }
+    // Each run would fail at the identity switch.
+    if run_as.is_some_and(|(uid, gid)| uid == u32::MAX || gid == u32::MAX) {
+        return Err(SandboxError::Config(
+            "the code cannot run as u32::MAX, which is (uid_t)-1 and which setuid and setgid \
+             refuse"
+                .into(),
         ));
     }
     Ok(run_as)
@@ -1603,6 +1611,24 @@ mod tests {
             }
             Err(SandboxError::Unavailable(m)) if m.contains("user namespace") => {}
             Err(e) => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn the_sentinel_identity_is_a_config_error() {
+        // `u32::MAX` is `(uid_t)-1`: setuid and setgid refuse it on each run.
+        for run_as in [(u32::MAX, 54_321), (54_321, u32::MAX)] {
+            let options = ExecOptions {
+                run_as: Some(run_as),
+                ..ExecOptions::default()
+            };
+            assert!(
+                matches!(
+                    run_as_for(&options, true),
+                    Err(SandboxError::Config(ref m)) if m.contains("u32::MAX")
+                ),
+                "{run_as:?}"
+            );
         }
     }
 

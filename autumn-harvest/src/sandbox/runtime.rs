@@ -328,7 +328,7 @@ impl SandboxRuntime {
     ) -> Result<SandboxOutcome, SandboxError> {
         let deadline = options
             .time_left
-            .map(|left| tokio::time::Instant::now() + left.saturating_sub(CLEANUP_GRACE));
+            .map(|left| super::tokio_deadline_after(left.saturating_sub(CLEANUP_GRACE)));
         let mut plan = self.policy.plan(request)?;
         // The request check does not see these variables, so they have
         // bounds of their own. The request frame bound keeps room for them.
@@ -405,7 +405,7 @@ impl SandboxRuntime {
         deadline: Option<tokio::time::Instant>,
         cancel: &CancellationToken,
     ) -> Result<tokio::sync::OwnedSemaphorePermit, SandboxError> {
-        let mut wait_until = tokio::time::Instant::now() + self.queue_wait;
+        let mut wait_until = super::tokio_deadline_after(self.queue_wait);
         if let Some(deadline) = deadline {
             wait_until = wait_until.min(deadline);
         }
@@ -1031,6 +1031,26 @@ pub(crate) mod tests {
     fn a_zero_bound_becomes_one() {
         let (_, runtime) = runtime(FakeBackend::new(IsolationLevel::Process));
         assert_eq!(runtime.with_max_concurrent(0).max_concurrent(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_queue_wait_with_no_bound_does_not_panic() {
+        // `Duration::MAX` means no bound. `Instant::now()` plus it overflows.
+        let (_, runtime) = runtime(FakeBackend::new(IsolationLevel::Process));
+        let runtime = runtime.with_queue_wait(Duration::MAX);
+        let permit = runtime.acquire_slot(None, &CancellationToken::new()).await;
+        assert!(permit.is_ok(), "{permit:?}");
+        drop(permit);
+        // An attempt with no time bound reads the same way.
+        let options = RunOptions {
+            time_left: Some(Duration::MAX),
+            ..RunOptions::default()
+        };
+        let request = SandboxRequest::new("sh", "true");
+        runtime
+            .run_with(&request, options, &CancellationToken::new())
+            .await
+            .unwrap();
     }
 
     #[test]

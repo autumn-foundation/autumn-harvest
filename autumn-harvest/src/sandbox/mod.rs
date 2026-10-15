@@ -62,6 +62,21 @@ pub use policy::{
 pub use request::{ExecPlan, PlanFile, RequestedLimits, SandboxFile, SandboxRequest};
 pub use runtime::{RunOptions, SandboxBackend, SandboxJob, SandboxRuntime};
 
+/// The latest deadline that the sandbox sets: 30 years ahead, as Tokio sets
+/// for a deadline that never comes. A longer wait means no bound.
+const FAR_FUTURE: std::time::Duration = std::time::Duration::from_secs(30 * 365 * 24 * 60 * 60);
+
+/// The instant `wait` after now. A wait past [`FAR_FUTURE`] counts as no
+/// bound, so a configured `Duration::MAX` cannot overflow the `Instant`.
+pub(crate) fn deadline_after(wait: std::time::Duration) -> std::time::Instant {
+    std::time::Instant::now() + wait.min(FAR_FUTURE)
+}
+
+/// [`deadline_after`] on the Tokio clock.
+pub(crate) fn tokio_deadline_after(wait: std::time::Duration) -> tokio::time::Instant {
+    tokio::time::Instant::now() + wait.min(FAR_FUTURE)
+}
+
 /// Serde helpers that write bytes as standard base64 text.
 pub(crate) mod b64 {
     use base64::Engine as _;

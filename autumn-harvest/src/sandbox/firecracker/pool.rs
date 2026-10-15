@@ -9,7 +9,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -213,7 +213,7 @@ async fn launch_ready(
 ) -> Result<Box<dyn LaunchedVm>, SandboxError> {
     let mut vm = launcher.launch().await?;
     let path = vm.vsock_path().to_path_buf();
-    let deadline = Instant::now() + boot_timeout;
+    let deadline = crate::sandbox::deadline_after(boot_timeout);
     let ready = async {
         let mut stream = connect_guest(&path, port, deadline, &mut || vm.exit_status()).await?;
         // The guest kernel can finish the handshake while the agent hangs,

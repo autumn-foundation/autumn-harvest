@@ -620,6 +620,14 @@ impl FirecrackerLauncher {
                         .into(),
                 ));
             }
+            // The jailer would fail to drop to it at each launch.
+            if jailer.uid == u32::MAX || jailer.gid == u32::MAX {
+                return Err(SandboxError::Config(
+                    "the jail uid and gid cannot be u32::MAX, which is (uid_t)-1 and which \
+                     setuid and setgid refuse"
+                        .into(),
+                ));
+            }
             super::jailer::check_cgroup_parent(jailer)?;
             super::jailer::check_limits(jailer, super::jailer::host_nr_open())?;
             super::jailer::check_extra_cgroups(jailer)?;
@@ -1079,7 +1087,7 @@ impl FirecrackerLauncher {
             SandboxError::Unavailable("the golden microVM has no API socket".into())
         })?;
         self.boot_through_api(vm, &socket, &BootMethod::Api).await?;
-        let deadline = std::time::Instant::now() + boot_timeout;
+        let deadline = crate::sandbox::deadline_after(boot_timeout);
         let vsock = vm.vsock.clone();
         let mut exited = || vm.exit_status();
         let mut stream =
@@ -1334,7 +1342,7 @@ impl FirecrackerLauncher {
         socket: &Path,
         boot: &BootMethod,
     ) -> Result<(), SandboxError> {
-        let deadline = std::time::Instant::now() + self.config.api_timeout;
+        let deadline = crate::sandbox::deadline_after(self.config.api_timeout);
         loop {
             if let Some(status) = vm.exit_status() {
                 return Err(SandboxError::Unavailable(format!(
@@ -1747,7 +1755,7 @@ fn lock_dirs(
 ) -> std::io::Result<Vec<std::fs::File>> {
     use std::os::fd::AsRawFd as _;
     let dirs: std::collections::BTreeSet<&Path> = files.iter().filter_map(|f| f.parent()).collect();
-    let deadline = std::time::Instant::now() + wait;
+    let deadline = crate::sandbox::deadline_after(wait);
     let mut locks = Vec::with_capacity(dirs.len());
     for dir in dirs {
         let file = std::fs::File::open(dir)?;
@@ -3562,6 +3570,25 @@ while True:
             assert!(matches!(err, SandboxError::Config(_)), "{err:?}");
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_sentinel_jail_identity_is_a_config_error() {
+        // `u32::MAX` is `(uid_t)-1`, which setuid and setgid refuse.
+        for (uid, gid) in [(u32::MAX, 12_345), (12_345, u32::MAX)] {
+            let dir = temp_dir();
+            let mut config = jailed(&dir);
+            if let Confinement::Jailer(jail) = &mut config.confinement {
+                jail.uid = uid;
+                jail.gid = gid;
+            }
+            let err = new_launcher(config).expect_err("sentinel jail identity");
+            assert!(
+                matches!(err, SandboxError::Config(ref m) if m.contains("u32::MAX")),
+                "{err:?}"
+            );
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

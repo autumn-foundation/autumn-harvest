@@ -1,7 +1,7 @@
 //! The Firecracker backend: one single-use microVM per run.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
@@ -186,7 +186,7 @@ impl FirecrackerBackend {
         cancel: &CancellationToken,
     ) -> Result<SandboxOutcome, SandboxError> {
         let path = vm.vsock_path().to_path_buf();
-        let deadline = Instant::now() + self.settings.boot_timeout;
+        let deadline = crate::sandbox::deadline_after(self.settings.boot_timeout);
         let mut exited = || vm.exit_status();
         let mut stream = tokio::select! {
             biased;
@@ -641,6 +641,30 @@ mod tests {
             .await
             .expect_err("launch failed");
         assert!(matches!(err, SandboxError::Unavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn a_boot_timeout_with_no_bound_does_not_panic() {
+        // `Instant::now()` plus `Duration::MAX` overflows.
+        let fake = launcher(GuestMode::Serve);
+        let settings = BackendSettings {
+            boot_timeout: Duration::MAX,
+            ..fast()
+        };
+        let backend = FirecrackerBackend::new(fake.clone(), settings).unwrap();
+        let out = backend
+            .execute(job("echo cold", 5_000), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "cold\n");
+        let backend = backend.with_warm_pool(1).unwrap();
+        let pool = backend.warm_pool().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.ready_len() < 1 {
+            assert!(Instant::now() < deadline, "the pool never filled");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        backend.shutdown().await;
     }
 
     #[tokio::test]

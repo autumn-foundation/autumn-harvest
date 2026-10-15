@@ -28,7 +28,7 @@ pub fn kill(dir: &Path, wait: Duration) {
     if std::fs::write(dir.join("cgroup.freeze"), b"1").is_err() {
         return;
     }
-    let deadline = Instant::now() + wait;
+    let deadline = super::deadline_after(wait);
     while !is_frozen(dir) {
         if Instant::now() >= deadline {
             return;
@@ -73,7 +73,7 @@ pub fn is_gone(dir: &Path) -> bool {
 /// Kill every process in the cgroup at `dir`, wait up to `wait` for it to
 /// empty, and remove it. The removal fails while a process is left.
 pub fn kill_and_remove(dir: &Path, wait: Duration) {
-    let deadline = Instant::now() + wait;
+    let deadline = super::deadline_after(wait);
     kill(dir, wait);
     while !is_empty(dir) && Instant::now() < deadline {
         std::thread::sleep(POLL);

@@ -242,6 +242,9 @@ pub fn boot_args(image: &GuestImage, port: u32) -> String {
 /// The kernel argument that sets the size of the guest `/work` tmpfs.
 const WORK_MIB_ARG: &str = "harvest.work_mib=";
 
+/// The kernel arguments that set the uid and the gid of the guest code.
+const ID_ARGS: [&str; 2] = ["harvest.uid=", "harvest.gid="];
+
 /// The largest `harvest.work_mib` value. A guest kernel shifts the value to
 /// bytes with no overflow check, so the byte count must fit 64 bits.
 pub const MAX_WORK_MIB: u64 = u64::MAX >> 20;
@@ -287,7 +290,8 @@ fn launcher_boot_args(image: &GuestImage, port: u32) -> Vec<String> {
 /// The init path must be one kernel word. No extra boot argument may replace
 /// an argument of the launcher or reach the guest agent as an option. A
 /// `harvest.work_mib` value must be a whole number from 1 to
-/// [`MAX_WORK_MIB`]. The whole line must fit Firecracker.
+/// [`MAX_WORK_MIB`], and a `harvest.uid` or `harvest.gid` value an id that
+/// the guest uses. The whole line must fit Firecracker.
 ///
 /// # Errors
 ///
@@ -339,6 +343,18 @@ pub fn check_boot_args(image: &GuestImage, port: u32) -> Result<(), SandboxError
         if reserved.contains(&name) {
             return Err(SandboxError::Config(format!(
                 "the extra boot argument {arg:?} would replace the launcher argument {name:?}"
+            )));
+        }
+        // The agent skips an id that it cannot use and keeps the default, so
+        // the id that the operator set would be lost.
+        if let Some(value) = ID_ARGS.iter().find_map(|key| arg.strip_prefix(key))
+            && !value
+                .parse::<u32>()
+                .is_ok_and(|id| id != 0 && id != u32::MAX)
+        {
+            return Err(SandboxError::Config(format!(
+                "the extra boot argument {arg:?} must set an id from 1 to {}",
+                u32::MAX - 1
             )));
         }
         // The agent skips a bad size and mounts the default, so the size
@@ -657,6 +673,33 @@ mod tests {
             check_boot_args(&image, GUEST_AGENT_PORT),
             Err(SandboxError::Config(_))
         ));
+    }
+
+    #[test]
+    fn an_extra_code_identity_must_be_one_the_guest_uses() {
+        for bad in [
+            "harvest.uid=0",
+            "harvest.gid=0",
+            "harvest.uid=4294967295",
+            "harvest.gid=4294967295",
+            "harvest.uid=nobody",
+            "harvest.gid=",
+        ] {
+            let mut image = image();
+            image.extra_boot_args.push(bad.into());
+            assert!(
+                matches!(
+                    check_boot_args(&image, GUEST_AGENT_PORT),
+                    Err(SandboxError::Config(_))
+                ),
+                "{bad}"
+            );
+        }
+        let mut image = image();
+        image
+            .extra_boot_args
+            .push("harvest.uid=2000 harvest.gid=3000".into());
+        check_boot_args(&image, GUEST_AGENT_PORT).unwrap();
     }
 
     #[test]

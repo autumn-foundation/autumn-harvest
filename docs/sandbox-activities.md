@@ -162,7 +162,9 @@ The process executor gives each run:
   processes of that run alone. That needs Linux 5.14 or later and user
   namespaces. Without them, the run fails closed;
 - uid and gid `65534` when the worker runs as root. The executor refuses
-  uid 0 and gid 0 for the code.
+  uid 0 and gid 0 for the code. It also refuses `u32::MAX`, which is
+  `(uid_t)-1` and which `setuid` and `setgid` refuse. The launcher refuses
+  the same ids for the jail, and for `harvest.uid` and `harvest.gid`.
 
 The process backend has these limits. Inside a microVM, none of them
 matters, because the microVM ends after one run.
@@ -463,7 +465,8 @@ not fit is only counted.
 
 - The registration sets `start_to_close` to `max_attempt_time`. That is the
   queue wait, the wall-clock ceiling, the backend overhead and the cleanup
-  grace together. The backend overhead is at least what the backend needs:
+  grace together. A queue wait, boot timeout or attempt time of
+  `Duration::MAX` counts as no bound. The backend overhead is at least what the backend needs:
   for Firecracker, the boot timeout, the request transfer, the response grace
   and the teardown.
 - The Firecracker backend starts the response grace after the guest takes

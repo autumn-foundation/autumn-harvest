@@ -72,10 +72,12 @@ pub fn parse_cmdline(cmdline: &str) -> GuestConfig {
                     config.port = port;
                 }
             }
-            // Root is never the uid or the gid of the code.
+            // Root is never the uid or the gid of the code. `u32::MAX` is
+            // `(uid_t)-1`, which setuid and setgid refuse.
             "harvest.uid" => {
                 if let Ok(uid) = value.parse::<u32>()
                     && uid != 0
+                    && uid != u32::MAX
                 {
                     config.run_as.0 = uid;
                 }
@@ -83,6 +85,7 @@ pub fn parse_cmdline(cmdline: &str) -> GuestConfig {
             "harvest.gid" => {
                 if let Ok(gid) = value.parse::<u32>()
                     && gid != 0
+                    && gid != u32::MAX
                 {
                     config.run_as.1 = gid;
                 }
@@ -172,6 +175,13 @@ mod tests {
     #[test]
     fn root_is_never_the_uid_of_the_code() {
         let config = parse_cmdline("harvest.uid=0 harvest.gid=0");
+        assert_eq!(config.run_as, DEFAULT_RUN_AS);
+    }
+
+    #[test]
+    fn the_sentinel_id_is_never_the_uid_of_the_code() {
+        // `u32::MAX` is `(uid_t)-1`, which setuid and setgid refuse.
+        let config = parse_cmdline("harvest.uid=4294967295 harvest.gid=4294967295");
         assert_eq!(config.run_as, DEFAULT_RUN_AS);
     }
 
