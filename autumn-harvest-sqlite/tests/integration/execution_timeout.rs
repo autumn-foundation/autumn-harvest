@@ -416,3 +416,39 @@ async fn an_as_of_signal_checks_the_deadline_at_its_own_time() {
         Err(SqliteError::WorkflowNotRunning { ref state, .. }) if state == "TIMED_OUT"
     ));
 }
+
+/// The clock of `finishes_late`. Its body moves it, as a long compute would.
+static LATE_CLOCK: AtomicI64 = AtomicI64::new(3_000_000);
+
+/// Spends 40 clock seconds, then returns. The deadline is 30 seconds.
+#[workflow(execution_timeout = "30s")]
+async fn finishes_late(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let _ = ctx;
+    LATE_CLOCK.fetch_add(40, Ordering::SeqCst);
+    Ok(1)
+}
+
+// A cycle that starts in time but ends past the deadline does not commit its
+// outcome. The run ends `TIMED_OUT`, and the history replays.
+#[tokio::test]
+async fn a_body_that_ends_past_the_deadline_times_out() {
+    let info = finishes_late_info();
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&info);
+    rt.set_clock(|| {
+        Utc.timestamp_opt(LATE_CLOCK.load(Ordering::SeqCst), 0)
+            .unwrap()
+    });
+    let exec = rt.start_workflow(info.name, json!(1)).unwrap();
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::TimedOut(_)), "got {state:?}");
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        !history
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowCompleted { .. })),
+        "a late outcome must not commit"
+    );
+    assert_replays(info.name, info.handler, history).await;
+}

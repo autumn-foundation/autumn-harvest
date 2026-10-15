@@ -515,7 +515,7 @@ attempt. Some limits apply:
   in one batch. Such a batch ends the run `FAILED`.
 
 **Execution timeout.** `#[workflow(execution_timeout = "30s")]` stores a
-deadline at start, from the runtime clock. Each cycle checks it first. A run
+deadline at start, from the runtime clock. Each cycle checks it first, and again after the body runs. A run
 past it gets `WorkflowExecutionTimedOut`, ends `TIMED_OUT` with the error
 `timeout: WorkflowExecution for <name>`, and loses its open rows and locks.
 The drive returns `RunState::TimedOut(error)`. `ctx.deadline()` reports the

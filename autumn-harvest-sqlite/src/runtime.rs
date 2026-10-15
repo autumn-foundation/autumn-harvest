@@ -2437,6 +2437,16 @@ impl SqliteRuntime {
             )
             .await;
 
+        // Issue #2029: the body can run past the deadline. Its outcome then
+        // does not commit, and the run ends `TIMED_OUT`. The as-of drive keeps
+        // `failure_now() == now`, so this check changes nothing there.
+        if let Some(deadline) = config.deadline_at {
+            let after = failure_now();
+            if after >= deadline {
+                return self.seal_timed_out(exec, deadline, after);
+            }
+        }
+
         // Contained workflow-handler panic gate (issue #782 analog), BEFORE any
         // terminal side effect and beside the non-determinism gate below. A
         // `#[workflow]` body that `panic!()`s (rather than returning `Err`) is
