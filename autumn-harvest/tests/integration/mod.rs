@@ -351,6 +351,8 @@ mod standalone_activity_docs;
 mod standalone_activity_overhead_perf;
 mod standalone_activity_support;
 #[cfg(feature = "db")]
+mod start_duplicate_codec_failure_tests;
+#[cfg(feature = "db")]
 mod start_idempotency_tests;
 #[cfg(feature = "db")]
 mod start_source_tests;

@@ -1534,6 +1534,18 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         .inherited_chain_deadline_at
         .or_else(|| effective_chain_timeout.and_then(|d| target_start_time.checked_add_signed(d)));
 
+    // Encode `input` and `memo` now, but hold a failure (issue #2054). A
+    // duplicate start writes nothing, so a broken codec must not change its
+    // result. Each branch that writes a run raises the held error first.
+    let (encoded_input, encoded_memo, encode_failure) = match codecs
+        .encode_shared_column(&request.input)
+        .and_then(|input| Ok((input, codecs.encode_column_opt(request.memo.as_ref())?)))
+    {
+        Ok((input, memo)) => (input, memo, None),
+        // The placeholder is never stored: every write path checks the held error.
+        Err(error) => (serde_json::Value::Null.into(), None, Some(error)),
+    };
+
     let row = NewWorkflowExecution {
         continued_from_exec_id: None,
         first_exec_id: None,
@@ -1544,14 +1556,14 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         workflow_id: request.workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: shard_id_value,
-        input: codecs.encode_shared_column(&request.input)?,
+        input: encoded_input,
         parent_id: request.parent_id,
         queue_name: request.queue_name,
         execution_timeout: effective_timeout,
         deadline_at,
         sla: effective_sla,
         sla_deadline_at,
-        memo: codecs.encode_column_opt(request.memo.as_ref())?,
+        memo: encoded_memo,
         search_attrs: request.search_attrs.clone(),
         assigned_build_id: assigned_build.clone(),
         parent_close_policy: None, // root or awaited child; detached uses worker path
@@ -1615,6 +1627,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     ), HarvestError, _>(async |conn| {
         let row = row;
         let enqueue = enqueue;
+        let mut encode_failure = encode_failure;
         let quota_key = quota_key.clone();
         // `gate`, `metrics`, `shard_id_value`, `quota_policy`, and
         // `quota_enforcement_policy` (issue #946) are all `Copy`, so the
@@ -1828,14 +1841,31 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // `TERMINATED`). A previously sealed continue-as-new chain or reset
         // source therefore does not block reusing the same
         // (workflow_name, workflow_id).
-        let inserted = diesel::insert_into(harvest_workflow_executions::table)
-            .values(&row)
-            .on_conflict_do_nothing()
-            .returning(WorkflowExecution::as_returning())
-            .get_result(conn)
-            .await
-            .optional()
-            .map_err(database_error)?;
+        let inserted = if encode_failure.is_some() {
+            // The row holds a placeholder, so probe instead of insert. The
+            // probe sees what the unique index would reject. With no
+            // occupant this start needs a new run, so raise the codec error.
+            if try_load_active_execution_for_update(
+                conn,
+                request.workflow_name,
+                request.workflow_id,
+            )
+            .await?
+            .is_none()
+            {
+                refuse_unencoded(&mut encode_failure)?;
+            }
+            None
+        } else {
+            diesel::insert_into(harvest_workflow_executions::table)
+                .values(&row)
+                .on_conflict_do_nothing()
+                .returning(WorkflowExecution::as_returning())
+                .get_result(conn)
+                .await
+                .optional()
+                .map_err(database_error)?
+        };
 
         if let Some(execution) = inserted {
             // Atomic debounce gate: this INSERT is a fresh start. For a
@@ -2160,6 +2190,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                             ),
                         });
                     }
+                    refuse_unencoded(&mut encode_failure)?;
                     let mut tx_cancel_metrics = vec![StartCancelledRun::terminated(
                         existing.workflow_name.clone(),
                         existing.queue_name.clone(),
@@ -2240,6 +2271,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                                 });
                             }
                             // Only these two explicitly abnormal states start fresh.
+                            refuse_unencoded(&mut encode_failure)?;
                             let (started_wf, mut deferred, credited_ids) = replace_execution(
                                 conn,
                                 existing,
@@ -2297,6 +2329,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                             workflow_id: request.workflow_id.to_string(),
                         });
                     }
+                    refuse_unencoded(&mut encode_failure)?;
                     let (started_wf, mut extra_deferred, credited_ids) = replace_execution(
                         conn,
                         existing,
@@ -2374,6 +2407,13 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             Err(e)
         }
     }
+}
+
+/// Raise the encode error a start held back (issue #2054).
+///
+/// Call it before any write of the start's payload columns.
+fn refuse_unencoded(held: &mut Option<HarvestError>) -> HarvestResult<()> {
+    held.take().map_or(Ok(()), Err)
 }
 
 /// Start a workflow execution or load the existing one, applying the caller's
