@@ -101,6 +101,16 @@ async fn run_count(conn: &mut AsyncPgConnection, workflow_id: &str) -> i64 {
         .expect("count")
 }
 
+async fn state_of(conn: &mut AsyncPgConnection, exec_id: Uuid) -> String {
+    use autumn_harvest::schema::harvest_workflow_executions as t;
+    t::table
+        .find(exec_id)
+        .select(t::state)
+        .get_result(conn)
+        .await
+        .expect("state")
+}
+
 /// Starts one run with a working codec, then breaks the codec.
 async fn seeded(
     conn: &mut AsyncPgConnection,
@@ -178,6 +188,7 @@ async fn failed_only_attaches_to_a_running_run_while_the_codec_fails() {
     .expect("a duplicate start must attach, not fail on the codec");
 
     assert_eq!(again.exec_id, first.exec_id);
+    assert!(!again.created);
 }
 
 #[tokio::test]
@@ -259,12 +270,58 @@ async fn a_replacing_start_still_reports_the_codec_error_and_keeps_the_prior_run
 
     assert!(matches!(err, HarvestError::Config(_)), "{err:?}");
     assert_eq!(run_count(&mut conn, &workflow_id).await, 1);
-    use autumn_harvest::schema::harvest_workflow_executions as t;
-    let state: String = t::table
-        .find(first.exec_id.as_uuid())
-        .select(t::state)
-        .get_result(&mut conn)
-        .await
-        .expect("state");
+    let state = state_of(&mut conn, first.exec_id.as_uuid()).await;
     assert_eq!(state, "FAILED", "the failed replace must roll back");
+}
+
+/// A terminating start needs a new run, so it needs the codec. The prior
+/// run must stay as it was, not cancelled with no successor.
+async fn assert_terminate_refused(
+    prior_state: &str,
+    reuse: WorkflowIdReusePolicy,
+    conflict: WorkflowIdConflictPolicy,
+) {
+    let (mut conn, _db) = connect().await;
+    let (codecs, workflow_id, first) = seeded(&mut conn, prior_state).await;
+
+    let err = start(&mut conn, &codecs, &workflow_id, reuse, conflict)
+        .await
+        .expect_err("a terminating start needs the codec");
+
+    assert!(matches!(err, HarvestError::Config(_)), "{err:?}");
+    assert_eq!(run_count(&mut conn, &workflow_id).await, 1);
+    assert_eq!(
+        state_of(&mut conn, first.exec_id.as_uuid()).await,
+        prior_state
+    );
+}
+
+#[tokio::test]
+async fn terminate_if_running_keeps_a_running_prior_while_the_codec_fails() {
+    assert_terminate_refused(
+        "RUNNING",
+        WorkflowIdReusePolicy::TerminateIfRunning,
+        WorkflowIdConflictPolicy::Unspecified,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminate_if_running_keeps_a_completed_prior_while_the_codec_fails() {
+    assert_terminate_refused(
+        "COMPLETED",
+        WorkflowIdReusePolicy::TerminateIfRunning,
+        WorkflowIdConflictPolicy::Unspecified,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn terminate_existing_keeps_a_running_prior_while_the_codec_fails() {
+    assert_terminate_refused(
+        "RUNNING",
+        WorkflowIdReusePolicy::AllowDuplicate,
+        WorkflowIdConflictPolicy::TerminateExisting,
+    )
+    .await;
 }

@@ -2845,9 +2845,11 @@ mod db {
         #[test]
         fn clones_of_one_codecs_share_the_cursor() {
             let codecs = PayloadCodecs::default();
-            store_column_cursor(&codecs.clone(), 0, mid_cycle("k1"));
+            let clone = codecs.clone();
+            store_column_cursor(&clone, 0, mid_cycle("k1"));
 
             assert_eq!(load_column_cursor(&codecs, 0, "k1").unresolved, 3);
+            assert_eq!(load_column_cursor(&clone, 0, "k1").unresolved, 3);
         }
 
         #[test]

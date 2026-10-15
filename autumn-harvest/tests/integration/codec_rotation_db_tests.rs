@@ -4280,22 +4280,25 @@ async fn two_databases_in_one_process_keep_separate_column_cursors() {
     let (url_b, _b) = setup_isolated_db().await;
     let mut conn_a = connect(&url_a).await;
     let mut conn_b = connect(&url_b).await;
-    let codecs = two_key_registry();
-    for conn in [&mut conn_a, &mut conn_b] {
-        seed_codec_columns(conn, &codecs, "k1").await;
-        seed_codec_columns(conn, &codecs, "k1").await;
+    // Each runtime owns its registry, so each owns its cursor (issue #2054).
+    let codecs_a = two_key_registry();
+    let codecs_b = two_key_registry();
+    for (conn, codecs) in [(&mut conn_a, &codecs_a), (&mut conn_b, &codecs_b)] {
+        seed_codec_columns(conn, codecs, "k1").await;
+        seed_codec_columns(conn, codecs, "k1").await;
     }
-    codecs.set_active_key("k2").expect("flip");
+    codecs_a.set_active_key("k2").expect("flip a");
+    codecs_b.set_active_key("k2").expect("flip b");
 
     // Alternate the two shard-0 sweeps, as two runtimes in one process do.
     // Each converts its 16 cells at 3 per tick, so 6 ticks each suffice
     // when neither reuses the other's cursor.
     let (mut total_a, mut total_b) = (0, 0);
     for _ in 0..6 {
-        total_a += sweep_codec_reencryption_once(&mut conn_a, 0, &codecs, 3, &NoOpMetrics)
+        total_a += sweep_codec_reencryption_once(&mut conn_a, 0, &codecs_a, 3, &NoOpMetrics)
             .await
             .expect("sweep a");
-        total_b += sweep_codec_reencryption_once(&mut conn_b, 0, &codecs, 3, &NoOpMetrics)
+        total_b += sweep_codec_reencryption_once(&mut conn_b, 0, &codecs_b, 3, &NoOpMetrics)
             .await
             .expect("sweep b");
     }
@@ -4320,21 +4323,24 @@ async fn two_schemas_in_one_database_keep_separate_column_cursors() {
     let url_b = format!("{url}{sep}options=-c%20search_path%3Dtenant_b");
     let mut conn_a = connect(&url).await;
     let mut conn_b = connect(&url_b).await;
-    let codecs = two_key_registry();
-    for conn in [&mut conn_a, &mut conn_b] {
-        seed_codec_columns(conn, &codecs, "k1").await;
-        seed_codec_columns(conn, &codecs, "k1").await;
+    // Each runtime owns its registry, so each owns its cursor (issue #2054).
+    let codecs_a = two_key_registry();
+    let codecs_b = two_key_registry();
+    for (conn, codecs) in [(&mut conn_a, &codecs_a), (&mut conn_b, &codecs_b)] {
+        seed_codec_columns(conn, codecs, "k1").await;
+        seed_codec_columns(conn, codecs, "k1").await;
     }
-    codecs.set_active_key("k2").expect("flip");
+    codecs_a.set_active_key("k2").expect("flip a");
+    codecs_b.set_active_key("k2").expect("flip b");
 
     // Each schema holds 16 cells. At 3 per tick, 6 ticks each convert them
     // all when neither sweep reuses the cursor of the other.
     let (mut total_a, mut total_b) = (0, 0);
     for _ in 0..6 {
-        total_a += sweep_codec_reencryption_once(&mut conn_a, 0, &codecs, 3, &NoOpMetrics)
+        total_a += sweep_codec_reencryption_once(&mut conn_a, 0, &codecs_a, 3, &NoOpMetrics)
             .await
             .expect("sweep a");
-        total_b += sweep_codec_reencryption_once(&mut conn_b, 0, &codecs, 3, &NoOpMetrics)
+        total_b += sweep_codec_reencryption_once(&mut conn_b, 0, &codecs_b, 3, &NoOpMetrics)
             .await
             .expect("sweep b");
     }

@@ -1452,8 +1452,24 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // hold a lock across the gap to the later authoritative check. A
     // non-quota-governed request (`quota_key.is_none()`, the common case)
     // keeps the pre-check-cancel shortcut byte-for-byte unchanged.
+
+    // Encode `input` and `memo` now, but hold a failure (issue #2054). A
+    // duplicate start writes nothing, so a broken codec must not change its
+    // result. Each branch that writes a run raises the held error first.
+    let (encoded_input, encoded_memo, encode_failure) = match codecs
+        .encode_shared_column(&request.input)
+        .and_then(|input| Ok((input, codecs.encode_column_opt(request.memo.as_ref())?)))
+    {
+        Ok((input, memo)) => (input, memo, None),
+        // The placeholder is never stored: every write path checks the held error.
+        Err(error) => (serde_json::Value::Null.into(), None, Some(error)),
+    };
+
     if terminate_via_pre_check
         && quota_key.is_none()
+        // The pre-check cancel is durable. Skip it when this start cannot
+        // write a replacement; the locked branch below then refuses first.
+        && encode_failure.is_none()
         // Skip the pre-check cancellation when we're going to reject this fresh
         // start for a debounced workflow — otherwise we'd cancel the prior run
         // (Transaction 1) and then reject, leaving it cancelled with no successor.
@@ -1533,18 +1549,6 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     let chain_deadline_at = request
         .inherited_chain_deadline_at
         .or_else(|| effective_chain_timeout.and_then(|d| target_start_time.checked_add_signed(d)));
-
-    // Encode `input` and `memo` now, but hold a failure (issue #2054). A
-    // duplicate start writes nothing, so a broken codec must not change its
-    // result. Each branch that writes a run raises the held error first.
-    let (encoded_input, encoded_memo, encode_failure) = match codecs
-        .encode_shared_column(&request.input)
-        .and_then(|input| Ok((input, codecs.encode_column_opt(request.memo.as_ref())?)))
-    {
-        Ok((input, memo)) => (input, memo, None),
-        // The placeholder is never stored: every write path checks the held error.
-        Err(error) => (serde_json::Value::Null.into(), None, Some(error)),
-    };
 
     let row = NewWorkflowExecution {
         continued_from_exec_id: None,

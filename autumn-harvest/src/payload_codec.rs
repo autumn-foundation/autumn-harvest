@@ -724,8 +724,9 @@ pub struct PayloadCodecs {
     columns: Arc<AtomicBool>,
     /// Where each shard's column sweep stopped (issue #2054).
     ///
-    /// Shared across clones, so one runtime has one cursor per shard. Two
-    /// runtimes build two registries, so they never share a cursor.
+    /// Shared across clones: one cursor for each registry and shard id. Give
+    /// each runtime its own registry. Do not share one registry, or its
+    /// clones, across databases or schemas.
     #[cfg(feature = "db")]
     column_cursors: Arc<std::sync::Mutex<BTreeMap<i32, ColumnCursor>>>,
 }
