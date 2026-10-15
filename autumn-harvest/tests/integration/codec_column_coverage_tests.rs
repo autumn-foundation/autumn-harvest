@@ -858,29 +858,53 @@ static FLAKY_FAILING: AtomicBool = AtomicBool::new(false);
 static FLAKY_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static FLAKY_DONE: AtomicBool = AtomicBool::new(false);
 
-/// An AES-256-GCM codec that fails to encode while `FLAKY_FAILING` is set.
-struct FlakyAead(AeadCodec);
+/// An AES-256-GCM codec that fails to encode while `failing` is set. Each
+/// failure adds one to `failures`.
+struct FlakyAead {
+    inner: AeadCodec,
+    failing: &'static AtomicBool,
+    failures: &'static AtomicUsize,
+}
 
 impl PayloadCodec for FlakyAead {
     fn codec_id(&self) -> &'static str {
-        self.0.codec_id()
+        self.inner.codec_id()
     }
 
     fn bound_key_id(&self) -> Option<&str> {
-        self.0.bound_key_id()
+        self.inner.bound_key_id()
     }
 
     fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
-        if AtomicBool::load(&FLAKY_FAILING, Ordering::SeqCst) {
-            FLAKY_FAILURES.fetch_add(1, Ordering::SeqCst);
+        if AtomicBool::load(self.failing, Ordering::SeqCst) {
+            self.failures.fetch_add(1, Ordering::SeqCst);
             return Err(CodecError("simulated encode failure".to_string()));
         }
-        self.0.encode(raw)
+        self.inner.encode(raw)
     }
 
     fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
-        self.0.decode(encoded)
+        self.inner.decode(encoded)
     }
+}
+
+/// A registry whose codec fails to encode while `failing` is set. Column
+/// encoding is on.
+fn flaky_codecs(failing: &'static AtomicBool, failures: &'static AtomicUsize) -> PayloadCodecs {
+    let codecs = PayloadCodecs::default();
+    let key = DataKey::from_bytes(&[0x5a; 32]).expect("data key");
+    codecs
+        .register_key(
+            "cc-k1",
+            Arc::new(FlakyAead {
+                inner: AeadCodec::new("cc-k1", &key).expect("aead codec"),
+                failing,
+                failures,
+            }),
+        )
+        .expect("register");
+    codecs.set_column_encoding(true);
+    codecs
 }
 
 /// Sends one checkpoint while the codec fails, then waits for the test.
@@ -913,17 +937,7 @@ fn wf_flaky_heartbeat(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
 async fn a_checkpoint_that_fails_to_encode_is_retried_on_the_next_flush() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let queue: &'static str = Box::leak(format!("cc-{}", Uuid::new_v4().simple()).into_boxed_str());
-    let codecs = PayloadCodecs::default();
-    let key = DataKey::from_bytes(&[0x5a; 32]).expect("data key");
-    codecs
-        .register_key(
-            "cc-k1",
-            Arc::new(FlakyAead(
-                AeadCodec::new("cc-k1", &key).expect("aead codec"),
-            )),
-        )
-        .expect("register");
-    codecs.set_column_encoding(true);
+    let codecs = flaky_codecs(&FLAKY_FAILING, &FLAKY_FAILURES);
     let mut conn = connect(&url).await;
     let exec_id = start(&mut conn, &codecs, "cc_flaky_heartbeat_wf", queue, None).await;
 
@@ -2015,6 +2029,47 @@ async fn a_cancel_batch_job_runs_without_the_key_for_its_unused_payload() {
         .await,
         1,
         "a cancel job never reads the payload, so a missing key must not block it"
+    );
+}
+
+static BATCH_FAILING: AtomicBool = AtomicBool::new(false);
+static BATCH_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+#[tokio::test]
+async fn a_retry_of_an_accepted_batch_submission_resolves_while_the_encoder_fails() {
+    use autumn_harvest::batch::{
+        BatchAction, BatchFilter, BatchSubmission, submit_batch_job_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = flaky_codecs(&BATCH_FAILING, &BATCH_FAILURES);
+    let mut conn = connect(&url).await;
+    let workflow_name = format!("cc_batch_{}", Uuid::new_v4().simple());
+    let submission = BatchSubmission {
+        action: BatchAction::Signal,
+        filter: BatchFilter {
+            states: vec!["RUNNING".to_string()],
+            workflow_name: Some(workflow_name),
+            search_attrs: Vec::new(),
+        },
+        signal_name: Some("go".to_string()),
+        signal_payload: Some(json!({"pin": SIGNAL_SECRET})),
+        idempotency_key: Some(format!("cc-idem-{}", Uuid::new_v4().simple())),
+        created_by: None,
+    };
+    let accepted = submit_batch_job_with_codecs(&mut conn, submission.clone(), &codecs)
+        .await
+        .expect("the first submission is accepted");
+
+    AtomicBool::store(&BATCH_FAILING, true, Ordering::SeqCst);
+    let retry = submit_batch_job_with_codecs(&mut conn, submission, &codecs)
+        .await
+        .expect("a retry of an accepted submission resolves to its job");
+
+    assert_eq!(retry, accepted, "the retry returns the existing job id");
+    assert_eq!(
+        AtomicUsize::load(&BATCH_FAILURES, Ordering::SeqCst),
+        0,
+        "an existing job needs no new ciphertext"
     );
 }
 

@@ -226,7 +226,8 @@ mod db {
     /// (issue #2043).
     ///
     /// The row stores the payload in the column form. The executor decodes it
-    /// before it sends each signal.
+    /// before it sends each signal. A retry with a known idempotency key
+    /// returns the existing job and encodes nothing.
     ///
     /// # Errors
     ///
@@ -245,6 +246,15 @@ mod db {
             return Err(HarvestError::Config(
                 super::BATCH_EMPTY_FILTER_ERR.to_string(),
             ));
+        }
+
+        // A retry of an accepted submission needs no new ciphertext. Resolve
+        // it first, so a failing encoder cannot turn it into an error. The
+        // conflict handler below still covers a concurrent submission.
+        if let Some(key) = request.idempotency_key.as_deref()
+            && let Some(existing) = find_job_by_key(conn, key).await?
+        {
+            return Ok(existing);
         }
 
         let id = Uuid::new_v4();
@@ -272,18 +282,26 @@ mod db {
             )) => {
                 // A concurrent submission with the same idempotency_key raced
                 // ahead of our insert. Return the id of the row that won.
-                harvest_batch_jobs::table
-                    .filter(
-                        harvest_batch_jobs::idempotency_key
-                            .eq(request.idempotency_key.as_deref().unwrap_or("")),
-                    )
-                    .select(harvest_batch_jobs::id)
-                    .first::<Uuid>(conn)
-                    .await
-                    .map_err(database_error)
+                find_job_by_key(conn, request.idempotency_key.as_deref().unwrap_or(""))
+                    .await?
+                    .ok_or_else(|| database_error(diesel::result::Error::NotFound))
             }
             Err(e) => Err(database_error(e)),
         }
+    }
+
+    /// The id of the job that holds `idempotency_key`, if any.
+    async fn find_job_by_key(
+        conn: &mut AsyncPgConnection,
+        idempotency_key: &str,
+    ) -> HarvestResult<Option<Uuid>> {
+        harvest_batch_jobs::table
+            .filter(harvest_batch_jobs::idempotency_key.eq(idempotency_key))
+            .select(harvest_batch_jobs::id)
+            .first::<Uuid>(conn)
+            .await
+            .optional()
+            .map_err(database_error)
     }
 
     /// Filters accepted by the management list endpoint.
