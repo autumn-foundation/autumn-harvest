@@ -76,6 +76,8 @@ pub struct FakeLauncher {
     pub launch_budget: std::time::Duration,
     /// The time that the shutdown of a crashed VM takes.
     pub crash_teardown: std::time::Duration,
+    /// Whether `check_image` reports a changed image.
+    pub image_changed: std::sync::atomic::AtomicBool,
 }
 
 impl FakeLauncher {
@@ -97,6 +99,7 @@ impl FakeLauncher {
             port_queries: AtomicUsize::new(0),
             launch_budget: std::time::Duration::ZERO,
             crash_teardown: std::time::Duration::ZERO,
+            image_changed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -154,6 +157,15 @@ impl VmLauncher for FakeLauncher {
 
     fn launch_budget(&self) -> std::time::Duration {
         self.launch_budget
+    }
+
+    fn check_image(&self) -> Result<(), SandboxError> {
+        if self.image_changed.load(Ordering::SeqCst) {
+            return Err(SandboxError::Config(
+                "a pinned image file had a write in place".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

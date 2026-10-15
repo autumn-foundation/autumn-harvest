@@ -313,7 +313,9 @@ holds an inotify watch for a write to each file. So it sees a `cp -p` that
 keeps the size and the time. The watch starts before the stamps and the
 checks, and each link must be a watched file. Each launch checks both, and a changed file
 fails the launch as a config error until the worker restarts. A write during
-a running microVM still reaches it. The watch needs one inotify instance per
+a running microVM still reaches it, because the microVM reads its image while
+it runs. So the backend checks the image again after each run. After a write,
+the run returns a config error and no outcome. The watch needs one inotify instance per
 launcher. A full `fs.inotify` limit fails the launcher start as a config error.
 
 The pin holds a shared `flock` on each image directory while it links. The

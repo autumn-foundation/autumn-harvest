@@ -100,6 +100,17 @@ pub trait VmLauncher: Send + Sync + 'static {
     fn work_capacity(&self) -> Option<u64> {
         None
     }
+
+    /// Check that the image of the launches is still the one they booted.
+    /// The backend calls it after each run, so an outcome never comes from
+    /// changed bytes. `Ok` by default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SandboxError::Config`] when an image file changed.
+    fn check_image(&self) -> Result<(), SandboxError> {
+        Ok(())
+    }
 }
 
 /// The two snapshot files of a golden microVM.
@@ -1674,6 +1685,16 @@ impl VmLauncher for FirecrackerLauncher {
 
     fn guest_port(&self) -> Option<u32> {
         Some(self.config.guest_port)
+    }
+
+    /// A microVM reads its root file system and snapshot memory while it
+    /// runs. A write in place during a run reaches it, so the run is
+    /// checked again at its end.
+    fn check_image(&self) -> Result<(), SandboxError> {
+        self.tenancy
+            .pinned
+            .as_ref()
+            .map_or(Ok(()), PinnedImage::check)
     }
 
     /// The two version probes of the first launch, the API boot, and

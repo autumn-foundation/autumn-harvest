@@ -307,7 +307,13 @@ impl SandboxBackend for FirecrackerBackend {
                 None => Err(SandboxError::Unavailable("the microVM is gone".into())),
             };
             guard.shutdown().await;
-            result
+            // The microVM read its image until the end. A write in place in
+            // that time could change the outcome, so the outcome goes.
+            match (result, self.launcher.check_image()) {
+                (Err(SandboxError::Cancelled), _) => Err(SandboxError::Cancelled),
+                (_, Err(changed)) => Err(changed),
+                (result, Ok(())) => result,
+            }
         })
     }
 }
@@ -509,6 +515,24 @@ mod tests {
             .unwrap();
         assert_eq!(out.status, RunStatus::Exited { code: 7 });
         assert_eq!(out.stdout, "in the vm\n");
+        assert_eq!(fake.launched(), 1);
+        assert_eq!(fake.live(), 0, "the VM must be torn down");
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_image_changed_returns_no_outcome() {
+        let fake = launcher(GuestMode::Serve);
+        let backend = FirecrackerBackend::new(fake.clone(), fast()).unwrap();
+        // A write in place reaches the microVM while it runs.
+        fake.image_changed.store(true, Ordering::SeqCst);
+        let err = backend
+            .execute(job("echo in the vm", 5_000), CancellationToken::new())
+            .await
+            .expect_err("the outcome may come from changed bytes");
+        assert!(
+            matches!(&err, SandboxError::Config(m) if m.contains("in place")),
+            "{err:?}"
+        );
         assert_eq!(fake.launched(), 1);
         assert_eq!(fake.live(), 0, "the VM must be torn down");
     }
