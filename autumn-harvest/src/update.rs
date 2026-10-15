@@ -5,17 +5,17 @@
 //! name is a no-op, making it safe to call at the top of every `#[workflow]`
 //! function on each replay cycle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-
 use std::time::Duration;
 
 use serde_json::Value;
 
 use crate::context::{WorkflowCommand, WorkflowContext};
 use crate::executor::WorkflowOutcome;
+use crate::types::UpdateId;
 
 /// Longest time that one admitted update handler may run in a cycle (issue #2035).
 ///
@@ -118,11 +118,70 @@ impl UpdateRegistry {
 
 /// Runs each admitted update that has no result and adds its result to the
 /// cycle commands (issue #2035).
+///
+/// The executor calls this after the body parks or returns. The handlers of
+/// the body then exist, and the cycle commands are known. A suspended cycle
+/// keeps the results in its commands. A terminal cycle keeps them in
+/// `pending`, and the worker records them before the final event.
+///
+/// A cycle whose commands the worker discards runs no handler. A repeat of
+/// that cycle would run the handler again. Those cycles are a divergence, a
+/// panic and a deadlock.
 pub(crate) async fn dispatch_pending_updates(
-    _ctx: &WorkflowContext,
-    _outcome: &mut WorkflowOutcome,
-    _pending: &mut Vec<WorkflowCommand>,
+    ctx: &WorkflowContext,
+    outcome: &mut WorkflowOutcome,
+    pending: &mut Vec<WorkflowCommand>,
 ) {
+    if !ctx.dispatches_updates() {
+        return;
+    }
+    let commands = match outcome {
+        WorkflowOutcome::Suspended { commands } => commands,
+        WorkflowOutcome::Completed { .. }
+        | WorkflowOutcome::ContinuedAsNew { .. }
+        | WorkflowOutcome::Failed {
+            non_deterministic_details: None,
+            handler_panic: false,
+            ..
+        } => pending,
+        WorkflowOutcome::Failed { .. } | WorkflowOutcome::TaskFailed { .. } => return,
+    };
+    // The body can run an update with `execute_admitted_update`. The batch
+    // then holds its result, and the handler must not run twice.
+    let recorded: HashSet<UpdateId> = commands
+        .iter()
+        .filter_map(|command| match command {
+            WorkflowCommand::RecordUpdateResult { update_id, .. } => Some(*update_id),
+            _ => None,
+        })
+        .collect();
+    for (update_id, name, input) in ctx.pending_updates() {
+        if recorded.contains(&update_id) {
+            continue;
+        }
+        let result = run_bounded(ctx, &name, input).await;
+        commands.push(WorkflowCommand::RecordUpdateResult { update_id, result });
+    }
+}
+
+/// Runs one handler. A panic or a timeout becomes an error result.
+async fn run_bounded(ctx: &WorkflowContext, name: &str, input: Value) -> Result<Value, String> {
+    use futures::FutureExt as _;
+
+    // The wrapped future builds the handler future on its first poll. A panic
+    // in the build is therefore caught with a panic in the poll.
+    let run = std::panic::AssertUnwindSafe(ctx.run_update_handler(name, input)).catch_unwind();
+    match tokio::time::timeout(UPDATE_HANDLER_TIMEOUT, run).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(panic)) => Err(format!(
+            "update handler panicked: {}",
+            crate::error::panic_message(panic)
+        )),
+        Err(_elapsed) => Err(format!(
+            "update handler timed out after {}s",
+            UPDATE_HANDLER_TIMEOUT.as_secs()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -227,7 +286,8 @@ mod tests {
     use crate::info::UpdateHandlerInfo;
     use crate::types::{ActivityExecId, ExecutionId, UpdateId};
 
-    type BodyFuture<'a> = Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
+    type BodyFuture<'a> =
+        Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
 
     fn started() -> WorkflowEvent {
         WorkflowEvent::WorkflowStarted {
@@ -412,14 +472,17 @@ mod tests {
     #[tokio::test]
     async fn a_handler_panic_is_recorded_as_a_failure() {
         for (name, handler, needle) in [
-            ("future", panic_in_future as crate::info::UpdateHandlerFn, "boom in future"),
+            (
+                "future",
+                panic_in_future as crate::info::UpdateHandlerFn,
+                "boom in future",
+            ),
             ("build", panic_in_construction, "boom in construction"),
         ] {
             let id = UpdateId::new();
             let registered = info(name, handler);
             let history = vec![started(), admitted(id, name, json!({}))];
-            let (outcome, pending) =
-                drive(context(history, &[&registered], true), parked).await;
+            let (outcome, pending) = drive(context(history, &[&registered], true), parked).await;
 
             let recorded = results(&outcome, &pending);
             assert_eq!(recorded.len(), 1, "{name}: one result");
@@ -602,8 +665,7 @@ mod tests {
         let id = UpdateId::new();
         let handler = info("count", count_panic_body);
         let history = vec![started(), admitted(id, "count", json!(1))];
-        let (outcome, pending) =
-            drive(context(history, &[&handler], true), panicking_body).await;
+        let (outcome, pending) = drive(context(history, &[&handler], true), panicking_body).await;
 
         assert!(
             matches!(
@@ -619,7 +681,8 @@ mod tests {
         assert_eq!(PANIC_BODY_RUNS.load(Ordering::SeqCst), 0);
     }
 
-    const BODY_DRIVEN_ID: uuid::Uuid = uuid::Uuid::from_u128(0x2035_0000_0000_7000_8000_0000_0000_0001);
+    const BODY_DRIVEN_ID: uuid::Uuid =
+        uuid::Uuid::from_u128(0x2035_0000_0000_7000_8000_0000_0000_0001);
     static BODY_DRIVEN_RUNS: AtomicUsize = AtomicUsize::new(0);
 
     fn count_body_driven(_ctx: Arc<WorkflowContext>, input: Value) -> UpdateHandlerFuture {

@@ -14340,18 +14340,7 @@ impl WorkflowContext {
         }
 
         // Live path: invoke the registered handler.
-        let handler_opt = {
-            let registry = self
-                .update_registry
-                .lock()
-                .expect("update_registry lock poisoned");
-            registry.get_handler(name)
-        };
-
-        let result = match handler_opt {
-            Some(handler) => handler(input).await,
-            None => Err(format!("update handler '{name}' not found")),
-        };
+        let result = self.run_update_handler(name, input).await;
 
         // Durably record the terminal result so the worker can append
         // UpdateCompleted/UpdateFailed before persisting other side effects.
@@ -14361,6 +14350,45 @@ impl WorkflowContext {
         });
 
         result
+    }
+
+    /// Run the registered handler for `name`. This call does not read history.
+    ///
+    /// Returns `Err("update handler 'name' not found")` if no handler has the
+    /// name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal update registry mutex is poisoned.
+    pub(crate) async fn run_update_handler(
+        &self,
+        name: &str,
+        input: Value,
+    ) -> Result<Value, String> {
+        let handler = self
+            .update_registry
+            .lock()
+            .expect("update_registry lock poisoned")
+            .get_handler(name);
+        match handler {
+            Some(handler) => handler(input).await,
+            None => Err(format!("update handler '{name}' not found")),
+        }
+    }
+
+    /// List the admitted updates that have no result in the loaded history,
+    /// in history order (issue #2035).
+    ///
+    /// This read does not move the replay position.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
+    pub(crate) fn pending_updates(&self) -> Vec<(UpdateId, String, Value)> {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .drain_admitted_updates()
     }
 
     // ── Signal handlers (issue #546) ────────────────────────────────────

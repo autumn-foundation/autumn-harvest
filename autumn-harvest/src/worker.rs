@@ -25883,7 +25883,10 @@ async fn process_workflow_task(
                 // consumed by the LOCAL activity path in `execute_local_activity_with_opts`.
                 registry.default_activity_retry_policy(),
                 registry.default_activity_start_to_close(),
-            );
+            )
+            // Issue #2035: a live decision runs the admitted updates. A replay
+            // gate does not, so it never runs a handler.
+            .with_update_dispatch();
             crate::executor::drive_workflow_keep(
                 ctx,
                 workflow.handler,

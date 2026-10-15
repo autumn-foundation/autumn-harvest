@@ -57,7 +57,10 @@ fn bump_before_finish(_ctx: Arc<WorkflowContext>, input: Value) -> UpdateFuture 
     Box::pin(async move { Ok(json!({ "bumped": input })) })
 }
 
-fn registry(name: &'static str, handler: autumn_harvest::info::UpdateHandlerFn) -> Arc<HandlerRegistry> {
+fn registry(
+    name: &'static str,
+    handler: autumn_harvest::info::UpdateHandlerFn,
+) -> Arc<HandlerRegistry> {
     let update = UpdateHandlerInfo {
         name,
         workflow: "e2e_test_workflow",
@@ -73,8 +76,11 @@ fn registry(name: &'static str, handler: autumn_harvest::info::UpdateHandlerFn) 
         response_schema: None,
     };
     Arc::new(
-        HandlerRegistry::new(vec![workflow(park_then_finish)], vec![])
-            .with_handler_infos(vec![], vec![update], vec![]),
+        HandlerRegistry::new(vec![workflow(park_then_finish)], vec![]).with_handler_infos(
+            vec![],
+            vec![update],
+            vec![],
+        ),
     )
 }
 
@@ -159,7 +165,12 @@ async fn wait_for_update_event(
 }
 
 /// The edge path: append `UpdateAdmitted`, then wake the parked task.
-async fn admit(conn: &mut AsyncPgConnection, exec_id: ExecutionId, name: &str, input: Value) -> UpdateId {
+async fn admit(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    name: &str,
+    input: Value,
+) -> UpdateId {
     let update_id = UpdateId::new();
     store::admit_update_event(conn, exec_id, update_id, name.to_string(), input, None)
         .await
@@ -251,7 +262,10 @@ async fn a_finishing_cycle_records_the_update_before_the_final_event() {
         .expect("the update result is in history");
     let end = position(|event| matches!(event, WorkflowEvent::WorkflowCompleted { .. }))
         .expect("the workflow completed");
-    assert!(result < end, "result at {result} must precede the end at {end}");
+    assert!(
+        result < end,
+        "result at {result} must precede the end at {end}"
+    );
     let recorded = wait_for_update_event(&database_url, exec_id, update_id).await;
     assert!(
         matches!(&recorded, WorkflowEvent::UpdateCompleted { output, .. } if output == &json!({ "bumped": 7 })),
