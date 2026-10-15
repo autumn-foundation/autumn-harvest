@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use autumn_harvest::aead_codec::{AeadCodec, DataKey};
@@ -37,6 +37,7 @@ const INPUT_SECRET: &str = "cc-input-ssn-123-45-6789";
 const MEMO_SECRET: &str = "cc-memo-account-0042";
 const SIGNAL_SECRET: &str = "cc-signal-pin-4321";
 const DLQ_SECRET: &str = "cc-dlq-email-alice";
+const HEARTBEAT_SECRET: &str = "cc-heartbeat-cursor-77";
 
 type BoxFut<'a> = Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
 
@@ -398,24 +399,23 @@ async fn covered_columns_hold_ciphertext_and_the_engine_reads_plaintext() {
     );
     execution.decode_columns(&codecs).expect("decode columns");
 
-    // The workflow task row holds envelopes. The short-lived activity task
-    // row stays in clear (see the coverage table).
+    // Every task row holds envelopes, activity rows included (issue #2043).
     let rows = task_rows(&mut conn, exec_id.as_uuid()).await;
     assert!(
         rows.iter().any(|(task_type, _, _)| task_type == "workflow"),
         "the run has a workflow task row"
     );
+    assert!(
+        rows.iter().any(|(task_type, _, _)| task_type == "activity"),
+        "the run has an activity task row"
+    );
     for (task_type, input, output) in rows {
-        if task_type == "workflow" {
-            assert_ciphertext(&input, INPUT_SECRET, "workflow task input");
-            assert_ciphertext(
-                output.as_ref().expect("workflow task output"),
-                INPUT_SECRET,
-                "workflow task output",
-            );
-        } else {
-            assert_eq!(input, json!({"ssn": INPUT_SECRET}), "activity task input");
-        }
+        assert_ciphertext(&input, INPUT_SECRET, &format!("{task_type} task input"));
+        assert_ciphertext(
+            output.as_ref().expect("task output"),
+            INPUT_SECRET,
+            &format!("{task_type} task output"),
+        );
     }
     assert_eq!(execution.input, json!({"ssn": INPUT_SECRET}));
     assert_eq!(execution.memo, Some(json!({"account": MEMO_SECRET})));
@@ -530,10 +530,11 @@ async fn a_dead_letter_input_is_ciphertext_and_replay_requeues_plaintext() {
             .await
             .expect("load task")
     };
+    assert_ciphertext(&requeued, DLQ_SECRET, "the requeued activity input");
     assert_eq!(
-        requeued,
+        codecs.decode_column(&requeued).expect("decode"),
         json!({"email": DLQ_SECRET}),
-        "the task queue holds the plaintext the worker runs on"
+        "the requeued row decodes to the plaintext the worker runs on"
     );
 }
 
@@ -679,19 +680,22 @@ async fn an_envelope_shaped_activity_input_survives_a_dead_letter_round_trip() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let codecs = aead_codecs(true);
     let mut conn = connect(&url).await;
-    // A clear activity argument that only looks like an identity envelope.
+    // An activity argument that only looks like an identity envelope. The task
+    // row stores it as the enqueue writes it, and the dead letter takes that
+    // stored form.
     let shaped = json!({
         autumn_harvest::payload_codec::CODEC_ENVELOPE_KEY: 1,
         "codec_id": "identity",
         "data": "e30=",
     });
+    let stored = codecs.encode_column(&shaped).expect("encode");
     let entry = NewDeadLetterEntry {
         original_task_id: Uuid::new_v4(),
         queue_name: format!("cc-{}", Uuid::new_v4().simple()),
         task_type: "ACTIVITY".to_string(),
         workflow_exec_id: None,
         activity_name: Some("cc_echo".to_string()),
-        input: shaped.clone(),
+        input: stored,
         error: "boom".to_string(),
         attempts: 1,
         owner: None,
@@ -714,7 +718,624 @@ async fn an_envelope_shaped_activity_input_survives_a_dead_letter_round_trip() {
             .expect("load task")
     };
     assert_eq!(
-        requeued, shaped,
+        codecs.decode_column(&requeued).expect("decode"),
+        shaped,
         "the activity argument is replayed exactly as it was, never unwrapped"
+    );
+}
+
+// ── activity heartbeat checkpoint (issue #2043) ──────────────────────────────
+
+static HEARTBEAT_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+static HEARTBEAT_RELEASE: AtomicBool = AtomicBool::new(false);
+
+/// The first attempt sends a checkpoint, waits for the flusher, and fails.
+/// The retry waits for the test, then returns the checkpoint it reads.
+fn heartbeat_activity(ctx: &autumn_harvest::ActivityContext, _input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        if HEARTBEAT_ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
+            ctx.heartbeat(json!({"cursor": HEARTBEAT_SECRET}))
+                .await
+                .map_err(|e| e.to_string())?;
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            return Err("retry after a checkpoint".to_string());
+        }
+        while !HEARTBEAT_RELEASE.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let seen: Option<Value> = ctx.heartbeat_details().map_err(|e| e.to_string())?;
+        Ok(json!({"seen": seen}))
+    })
+}
+
+fn wf_heartbeat(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let queue = ctx.queue_name().to_string();
+        let policy = RetryPolicy {
+            max_attempts: 2,
+            initial_interval: Duration::from_millis(10),
+            backoff_coefficient: 1.0,
+            max_interval: Duration::from_millis(10),
+            non_retryable_errors: vec![],
+            jitter: JitterPolicy::None,
+        };
+        ctx.execute_activity_raw_with_opts("cc_heartbeat", input, &queue, Some(policy), None)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// The stored checkpoint of the run's activity task row, once the flusher
+/// has written one.
+async fn stored_heartbeat(conn: &mut AsyncPgConnection, exec_id: Uuid) -> Option<Value> {
+    use autumn_harvest::schema::harvest_task_queue;
+    for _ in 0..600 {
+        let stored: Option<Option<Value>> = harvest_task_queue::table
+            .filter(harvest_task_queue::workflow_exec_id.eq(Some(exec_id)))
+            .filter(harvest_task_queue::task_type.eq("activity"))
+            .select(harvest_task_queue::heartbeat_details)
+            .first(conn)
+            .await
+            .optional()
+            .expect("load heartbeat");
+        if let Some(Some(value)) = stored
+            && !value.is_null()
+        {
+            return Some(value);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    None
+}
+
+#[tokio::test]
+async fn a_heartbeat_checkpoint_is_ciphertext_and_the_retry_reads_plaintext() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let queue: &'static str = Box::leak(queue.into_boxed_str());
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, &codecs, "cc_heartbeat_wf", queue, None).await;
+
+    let pool = build_pool(&url);
+    let worker = worker(
+        queue,
+        registry(
+            vec![wf_info("cc_heartbeat_wf", wf_heartbeat, None)],
+            vec![activity_info("cc_heartbeat", queue, heartbeat_activity)],
+            &codecs,
+        ),
+    );
+    let run = worker.clone();
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(40), run.run(&run_pool)).await;
+    });
+
+    let stored = stored_heartbeat(&mut conn, exec_id.as_uuid())
+        .await
+        .expect("the flusher writes the checkpoint");
+    assert_ciphertext(&stored, HEARTBEAT_SECRET, "task_queue.heartbeat_details");
+    HEARTBEAT_RELEASE.store(true, Ordering::SeqCst);
+
+    let client = WorkflowHandleClient::single(pool, url.clone()).with_codecs(codecs.clone());
+    let result = client
+        .handle(exec_id)
+        .result_raw_with_timeout(Duration::from_secs(30))
+        .await
+        .expect("the retry completes");
+    worker.shutdown();
+    let _ = handle.await;
+    assert_eq!(
+        result,
+        json!({"seen": {"cursor": HEARTBEAT_SECRET}}),
+        "the retry reads the plaintext checkpoint"
+    );
+}
+
+// ── helpers for the short-lived copies (issue #2043) ─────────────────────────
+
+#[derive(diesel::QueryableByName)]
+struct JsonCell {
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    value: Value,
+}
+
+/// The execution a start created for `workflow_name` and `workflow_id`.
+async fn started_execution(
+    conn: &mut AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+) -> WorkflowExecution {
+    use autumn_harvest::schema::harvest_workflow_executions;
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(workflow_name))
+        .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+        .select(WorkflowExecution::as_select())
+        .first(conn)
+        .await
+        .expect("the start created an execution")
+}
+
+/// Assert that a started run holds its input as one envelope layer.
+fn assert_one_layer(codecs: &PayloadCodecs, stored: &Value, expected: &Value, what: &str) {
+    assert_ciphertext(stored, INPUT_SECRET, what);
+    assert_eq!(
+        &codecs.decode_column(stored).expect("decode"),
+        expected,
+        "{what} must decode once to the plaintext"
+    );
+}
+
+// ── completion callbacks (issue #2043) ───────────────────────────────────────
+
+const CALLBACK_SECRET: &str = "cc-callback-refund-9911";
+const CALLBACK_HMAC_KEY: &[u8] = b"cc-callback-hmac-key";
+
+type CapturedPost = (Vec<u8>, Vec<(&'static str, String)>);
+
+/// A deliverer that records each POST and answers with a settable status.
+struct CapturingDeliverer {
+    status: std::sync::atomic::AtomicU16,
+    posts: std::sync::Mutex<Vec<CapturedPost>>,
+}
+
+impl CapturingDeliverer {
+    fn new(status: u16) -> Arc<Self> {
+        Arc::new(Self {
+            status: std::sync::atomic::AtomicU16::new(status),
+            posts: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    fn answer_with(&self, status: u16) {
+        self.status.store(status, Ordering::SeqCst);
+    }
+
+    fn posts(&self) -> Vec<CapturedPost> {
+        self.posts.lock().unwrap().clone()
+    }
+}
+
+impl autumn_harvest::completion_callback::CompletionCallbackDeliverer for CapturingDeliverer {
+    fn deliver<'a>(
+        &'a self,
+        _target_url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'static str, String)],
+    ) -> autumn_harvest::completion_callback::DeliverFuture<'a> {
+        Box::pin(async move {
+            self.posts
+                .lock()
+                .unwrap()
+                .push((body.to_vec(), headers.to_vec()));
+            autumn_harvest::completion_callback::DeliveryAttempt {
+                status: Some(self.status.load(Ordering::SeqCst)),
+                transport_error: None,
+                retry_after: None,
+            }
+        })
+    }
+}
+
+/// Clears the process-wide callback config when a test ends.
+struct CallbackConfigGuard;
+
+impl Drop for CallbackConfigGuard {
+    fn drop(&mut self) {
+        *autumn_harvest::completion_callback::GLOBAL_CALLBACK_CONFIG
+            .write()
+            .unwrap() = None;
+    }
+}
+
+fn install_callbacks(deliverer: Arc<CapturingDeliverer>, max_attempts: u32) -> CallbackConfigGuard {
+    use autumn_harvest::completion_callback::{
+        CallbackRuntimeConfig, CallbackSecret, GLOBAL_CALLBACK_CONFIG, HostAllowlist, SsrfPolicy,
+    };
+    *GLOBAL_CALLBACK_CONFIG.write().unwrap() = Some(Arc::new(CallbackRuntimeConfig {
+        deliverer,
+        secret: CallbackSecret::new(CALLBACK_HMAC_KEY.to_vec()),
+        ssrf_policy: SsrfPolicy::new(HostAllowlist::new().with_pattern("api.example.com")),
+        default_targets: Vec::new(),
+        retry_policy: RetryPolicy::exponential(max_attempts, Duration::from_millis(10)),
+    }));
+    CallbackConfigGuard
+}
+
+/// A completed run with one callback target. Its stored result is an
+/// envelope, as the engine writes it.
+async fn completed_run_with_callback(conn: &mut AsyncPgConnection, codecs: &PayloadCodecs) -> Uuid {
+    diesel::sql_query("DELETE FROM harvest_dead_letters WHERE task_type = 'CALLBACK'")
+        .execute(conn)
+        .await
+        .expect("clear callback dead letters");
+    diesel::sql_query("DELETE FROM harvest_completion_deliveries")
+        .execute(conn)
+        .await
+        .expect("clear deliveries");
+    let exec_id = Uuid::new_v4();
+    let output = codecs
+        .encode_column(&json!({"refund": CALLBACK_SECRET}))
+        .expect("encode output");
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+         (id, workflow_name, workflow_id, shard_id, input, state, output, completed_at, \
+          completion_callbacks) \
+         VALUES ($1, 'cc_callback_wf', $2, 0, 'null'::jsonb, 'COMPLETED', $3, now(), $4)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .bind::<diesel::sql_types::Text, _>(Uuid::new_v4().to_string())
+    .bind::<diesel::sql_types::Jsonb, _>(&output)
+    .bind::<diesel::sql_types::Jsonb, _>(
+        &json!([{"url": "https://api.example.com/hook", "filter": {"type": "AnyTerminal"}}]),
+    )
+    .execute(conn)
+    .await
+    .expect("insert the completed run");
+    exec_id
+}
+
+async fn delivery_cells(conn: &mut AsyncPgConnection, exec_id: Uuid) -> (Uuid, Value) {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        payload: Value,
+    }
+    let row: Row = diesel::sql_query(
+        "SELECT id, payload FROM harvest_completion_deliveries WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .get_result(conn)
+    .await
+    .expect("the run has one delivery row");
+    (row.id, row.payload)
+}
+
+async fn callback_dead_letter_input(conn: &mut AsyncPgConnection, exec_id: Uuid) -> Value {
+    let cell: JsonCell = diesel::sql_query(
+        "SELECT input AS value FROM harvest_dead_letters \
+         WHERE task_type = 'CALLBACK' AND workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id)
+    .get_result(conn)
+    .await
+    .expect("the run has one callback dead letter");
+    cell.value
+}
+
+async fn evaluate_callbacks(conn: &mut AsyncPgConnection, exec_id: Uuid, codecs: &PayloadCodecs) {
+    autumn_harvest::completion_trigger::evaluate_triggers_for_execution_with_codecs(
+        conn,
+        ExecutionId::from_uuid(exec_id),
+        autumn_harvest::completion_trigger::TerminalState::Completed,
+        None,
+        codecs,
+    )
+    .await
+    .expect("evaluate triggers");
+}
+
+#[tokio::test]
+async fn a_callback_payload_is_ciphertext_and_the_post_body_is_plaintext() {
+    use autumn_harvest::completion_callback::{
+        CallbackSecret, SIGNATURE_HEADER, fire_due_completion_deliveries_with_codecs, sign,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let deliverer = CapturingDeliverer::new(200);
+    let _config = install_callbacks(deliverer.clone(), 3);
+    let mut conn = connect(&url).await;
+    let exec_id = completed_run_with_callback(&mut conn, &codecs).await;
+    evaluate_callbacks(&mut conn, exec_id, &codecs).await;
+
+    let (_, stored) = delivery_cells(&mut conn, exec_id).await;
+    assert_ciphertext(&stored, CALLBACK_SECRET, "completion_deliveries.payload");
+
+    let fired = fire_due_completion_deliveries_with_codecs(&mut conn, &None, &[], &codecs)
+        .await
+        .expect("fire");
+    assert_eq!(fired, 1, "one delivery was due");
+    let posts = deliverer.posts();
+    assert_eq!(posts.len(), 1, "one POST");
+    let (body, headers) = &posts[0];
+    let sent: Value = serde_json::from_slice(body).expect("the body is JSON");
+    assert!(
+        !is_codec_envelope(&sent) && sent.to_string().contains(CALLBACK_SECRET),
+        "the receiver gets the plaintext body: {sent}"
+    );
+    let signature = headers
+        .iter()
+        .find(|(name, _)| *name == SIGNATURE_HEADER)
+        .map(|(_, value)| value.clone())
+        .expect("a signature header");
+    assert_eq!(
+        signature,
+        sign(&CallbackSecret::new(CALLBACK_HMAC_KEY.to_vec()), body),
+        "the signature covers the bytes that were sent"
+    );
+}
+
+#[tokio::test]
+async fn a_callback_dead_letter_is_ciphertext_and_a_redrive_posts_plaintext() {
+    use autumn_harvest::completion_callback::{
+        fire_due_completion_deliveries_with_codecs, redrive_delivery,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let deliverer = CapturingDeliverer::new(500);
+    let _config = install_callbacks(deliverer.clone(), 1);
+    let mut conn = connect(&url).await;
+    let exec_id = completed_run_with_callback(&mut conn, &codecs).await;
+    evaluate_callbacks(&mut conn, exec_id, &codecs).await;
+    fire_due_completion_deliveries_with_codecs(&mut conn, &None, &[], &codecs)
+        .await
+        .expect("fire");
+
+    let stored = callback_dead_letter_input(&mut conn, exec_id).await;
+    assert_ciphertext(&stored, CALLBACK_SECRET, "dead_letters.input (CALLBACK)");
+    let decoded = codecs.decode_column(&stored).expect("decode once");
+    assert!(
+        !is_codec_envelope(&decoded) && decoded.to_string().contains(CALLBACK_SECRET),
+        "the dead letter holds one envelope layer: {decoded}"
+    );
+
+    let (delivery_id, _) = delivery_cells(&mut conn, exec_id).await;
+    redrive_delivery(&mut conn, ExecutionId::from_uuid(exec_id), delivery_id)
+        .await
+        .expect("redrive");
+    deliverer.answer_with(200);
+    fire_due_completion_deliveries_with_codecs(&mut conn, &None, &[], &codecs)
+        .await
+        .expect("fire again");
+    let posts = deliverer.posts();
+    let (body, _) = posts.last().expect("a POST after the redrive");
+    let sent: Value = serde_json::from_slice(body).expect("the body is JSON");
+    assert!(
+        !is_codec_envelope(&sent) && sent.to_string().contains(CALLBACK_SECRET),
+        "the redrive posts the plaintext body: {sent}"
+    );
+}
+
+// ── start buffers and the trigger outbox (issue #2043) ───────────────────────
+
+#[tokio::test]
+async fn a_debounced_input_is_ciphertext_and_the_fire_starts_on_plaintext() {
+    use autumn_harvest::debounce::{
+        AdmitDebounceParams, admit_debounced_start_with_codecs, fire_due_debounced_starts_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let workflow_id = format!("cc-debounce-{}", Uuid::new_v4().simple());
+    let plain = json!({"ssn": INPUT_SECRET});
+    admit_debounced_start_with_codecs(
+        &mut conn,
+        AdmitDebounceParams {
+            workflow_name: "cc_debounce_wf",
+            debounce_key: &key,
+            workflow_id: &workflow_id,
+            queue_name: "default",
+            last_input: plain.clone(),
+            start_options: Default::default(),
+            window: Duration::from_millis(1),
+            max_wait: Duration::from_secs(60),
+            shard_id: 0,
+        },
+        false,
+        &codecs,
+    )
+    .await
+    .expect("admit")
+    .expect("the gate is off, so the request is admitted");
+
+    let stored: JsonCell = diesel::sql_query(
+        "SELECT last_input AS value FROM harvest_debounce \
+         WHERE workflow_name = 'cc_debounce_wf' AND debounce_key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&key)
+    .get_result(&mut conn)
+    .await
+    .expect("load the debounce row");
+    assert_ciphertext(&stored.value, INPUT_SECRET, "debounce.last_input");
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let fired = fire_due_debounced_starts_with_codecs(
+        &mut conn,
+        &None,
+        &[],
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &codecs,
+    )
+    .await
+    .expect("fire");
+    assert!(fired >= 1, "the due row fired");
+    let started = started_execution(&mut conn, "cc_debounce_wf", &workflow_id).await;
+    assert_one_layer(&codecs, &started.input, &plain, "the debounced run input");
+}
+
+#[tokio::test]
+async fn a_throttled_input_is_ciphertext_and_the_fire_starts_on_plaintext() {
+    use autumn_harvest::throttle::{
+        AdmitThrottleParams, ThrottleAdmission, fire_due_throttled_starts_with_codecs,
+        reserve_or_defer_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let plain = json!({"ssn": INPUT_SECRET});
+    let mut defer = async |workflow_id: &str| {
+        reserve_or_defer_with_codecs(
+            &mut conn,
+            AdmitThrottleParams {
+                workflow_name: "cc_throttle_wf",
+                throttle_key: &key,
+                workflow_id,
+                queue_name: "default",
+                input: plain.clone(),
+                start_options: Default::default(),
+                refill_per_sec: 0.001,
+                burst: 1.0,
+                schedule_to_start: None,
+                shard_id: 0,
+            },
+            &codecs,
+        )
+        .await
+        .expect("admit")
+    };
+    // The first request takes the only token. The second is deferred.
+    assert!(matches!(
+        defer("cc-throttle-first").await,
+        ThrottleAdmission::Reserved { .. }
+    ));
+    let workflow_id = format!("cc-throttle-{}", Uuid::new_v4().simple());
+    assert!(matches!(
+        defer(&workflow_id).await,
+        ThrottleAdmission::Deferred(_)
+    ));
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        input: Value,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        bucket_key: String,
+    }
+    let row: Row = diesel::sql_query(
+        "SELECT input, bucket_key FROM harvest_start_throttle WHERE workflow_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&workflow_id)
+    .get_result(&mut conn)
+    .await
+    .expect("load the throttle row");
+    assert_ciphertext(&row.input, INPUT_SECRET, "start_throttle.input");
+
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets SET tokens = 5, last_refilled_at = NOW() WHERE key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&row.bucket_key)
+    .execute(&mut conn)
+    .await
+    .expect("refill the bucket");
+    autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+    let fired = fire_due_throttled_starts_with_codecs(
+        &mut conn,
+        &None,
+        &[],
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &codecs,
+    )
+    .await
+    .expect("fire");
+    assert!(fired >= 1, "the deferred row fired");
+    let started = started_execution(&mut conn, "cc_throttle_wf", &workflow_id).await;
+    assert_one_layer(&codecs, &started.input, &plain, "the throttled run input");
+}
+
+#[tokio::test]
+async fn an_outbox_target_input_is_read_as_plaintext_when_the_relay_starts_the_run() {
+    use autumn_harvest::models::NewCompletionTriggerOutboxDb;
+    use autumn_harvest::schema::harvest_completion_trigger_outbox;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let plain = json!({"ssn": INPUT_SECRET});
+    let workflow_id = format!("cc-outbox-{}", Uuid::new_v4().simple());
+    diesel::insert_into(harvest_completion_trigger_outbox::table)
+        .values(&NewCompletionTriggerOutboxDb {
+            source_exec_id: Uuid::new_v4(),
+            trigger_id: Uuid::new_v4(),
+            target_shard: 0,
+            target_workflow_name: "cc_outbox_wf".to_string(),
+            target_workflow_id: workflow_id.clone(),
+            target_input: codecs.encode_column(&plain).expect("encode"),
+            queue_name: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            priority: serde_json::to_value(autumn_harvest::types::Priority::default()).unwrap(),
+            max_workflow_input_bytes: 1_000_000,
+            tenant: None,
+        })
+        .execute(&mut conn)
+        .await
+        .expect("insert the outbox row");
+
+    autumn_harvest::completion_trigger::enforce_completion_triggers_outbox_with_codecs(
+        &mut conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &None,
+        &[],
+        &codecs,
+    )
+    .await
+    .expect("relay");
+    let started = started_execution(&mut conn, "cc_outbox_wf", &workflow_id).await;
+    assert_one_layer(&codecs, &started.input, &plain, "the relayed run input");
+}
+
+// ── batch jobs (issue #2043) ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_batch_signal_payload_is_ciphertext_and_each_delivery_is_plaintext() {
+    use autumn_harvest::batch::{
+        BatchAction, BatchExecutorConfig, BatchFilter, BatchSubmission, run_executor_once,
+        submit_batch_job_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, &codecs, "cc_batch_target", &queue, None).await;
+    let plain = json!({"pin": SIGNAL_SECRET});
+    let job_id = submit_batch_job_with_codecs(
+        &mut conn,
+        BatchSubmission {
+            action: BatchAction::Signal,
+            filter: BatchFilter {
+                states: vec!["RUNNING".to_string()],
+                workflow_name: Some("cc_batch_target".to_string()),
+                search_attrs: Vec::new(),
+            },
+            signal_name: Some("go".to_string()),
+            signal_payload: Some(plain.clone()),
+            idempotency_key: None,
+            created_by: None,
+        },
+        &codecs,
+    )
+    .await
+    .expect("submit");
+
+    let stored: JsonCell = diesel::sql_query(
+        "SELECT signal_payload AS value FROM harvest_batch_jobs WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(job_id)
+    .get_result(&mut conn)
+    .await
+    .expect("load the batch job");
+    assert_ciphertext(&stored.value, SIGNAL_SECRET, "batch_jobs.signal_payload");
+
+    let pool = autumn_harvest::shard::ShardedDbPool::single(build_pool(&url));
+    run_executor_once(
+        &pool,
+        &BatchExecutorConfig {
+            payload_codecs: codecs.clone(),
+            ..BatchExecutorConfig::default()
+        },
+    )
+    .await
+    .expect("run the executor");
+    let payloads = signal_payloads(&mut conn, exec_id.as_uuid()).await;
+    assert_eq!(payloads.len(), 1, "one signal row");
+    assert_ciphertext(&payloads[0], SIGNAL_SECRET, "signals.payload");
+    assert_eq!(
+        codecs.decode_column(&payloads[0]).expect("decode"),
+        plain,
+        "the signal holds one envelope layer, and it decodes to the batch payload"
     );
 }

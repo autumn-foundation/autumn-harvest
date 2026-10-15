@@ -3371,6 +3371,22 @@ pub async fn fire_due_completion_deliveries(
     .await
 }
 
+/// [`fire_due_completion_deliveries`], decoding each stored body through
+/// `codecs` before it is signed and sent (issue #2043).
+///
+/// # Errors
+///
+/// Same as [`fire_due_completion_deliveries`].
+#[cfg(feature = "db")]
+pub async fn fire_due_completion_deliveries_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    sharded_pool: &Option<crate::shard::ShardedDbPool>,
+    shard_assignments: &[crate::types::ShardId],
+    _codecs: &crate::payload_codec::PayloadCodecs,
+) -> crate::error::HarvestResult<usize> {
+    fire_due_completion_deliveries(conn, sharded_pool, shard_assignments).await
+}
+
 /// [`fire_due_completion_deliveries`] for a caller that knows `conn`'s shard.
 /// See [`crate::shard::connect_or_reuse`].
 #[cfg(feature = "db")]

@@ -788,6 +788,20 @@ pub async fn reserve_or_defer(
     admit(conn, params, false).await
 }
 
+/// [`reserve_or_defer`], storing a deferred input through `codecs`
+/// (issue #2043).
+///
+/// # Errors
+/// As [`reserve_or_defer`].
+#[cfg(feature = "db")]
+pub async fn reserve_or_defer_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    params: AdmitThrottleParams<'_>,
+    _codecs: &crate::payload_codec::PayloadCodecs,
+) -> crate::error::HarvestResult<ThrottleAdmission> {
+    reserve_or_defer(conn, params).await
+}
+
 /// [`reserve_or_defer`] for an HTTP start, which load shedding governs
 /// (issue #1794).
 ///

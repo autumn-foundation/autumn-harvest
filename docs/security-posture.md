@@ -1398,7 +1398,7 @@ strict read. It never guesses.
 
 The sweep and the census cover each column marked Covered. The list is
 `codec_rotation::CODEC_COLUMNS`. A unit test parses `schema.rs` and fails when
-a `JSONB` column has no row here. Gaps marked #2043 are follow-up work.
+a `JSONB` column has no row here. Each clear column has a reason.
 
 | Column | Codec | Reason |
 |---|---|---|
@@ -1407,46 +1407,46 @@ a `JSONB` column has no row here. Gaps marked #2043 are follow-up work.
 | `harvest_workflow_executions.output` | Covered | The workflow result. |
 | `harvest_workflow_executions.memo` | Covered | Operator notes can hold PII. No query reads into them. |
 | `harvest_workflow_executions.search_attrs` | Clear | Visibility queries filter on it. Do not put PII in it. |
-| `harvest_workflow_executions.context_headers` | Clear | The engine copies the headers to every task. The API never returns them. Follow-up #2043. |
+| `harvest_workflow_executions.context_headers` | Clear | Many engine paths read the headers as a string map, and an unreadable value means no headers. The archive and the history export read them with no codec. Do not put PII in a header. |
 | `harvest_workflow_executions.workflow_retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_workflow_executions.completion_callbacks` | Clear | Callback targets, not payload. |
 | `harvest_workflow_executions.migrated_from_shards` | Clear | Shard bookkeeping, not payload. |
-| `harvest_task_queue.input` | Covered (workflow tasks) | A workflow task row lives as long as its run. An activity task row stays in clear. It is short-lived, and its `ActivityScheduled` event holds an encrypted copy. Follow-up #2043. |
-| `harvest_task_queue.output` | Covered (workflow tasks) | The workflow task stores the same form as `harvest_workflow_executions.output`. An activity result stays in clear for the reason above. |
-| `harvest_task_queue.heartbeat_details` | Clear | A short-lived activity checkpoint. Follow-up #2043. |
+| `harvest_task_queue.input` | Covered | A workflow task and an activity task both store the input encoded. A finished activity row stays until task retention removes it. |
+| `harvest_task_queue.output` | Covered | The workflow task stores the same form as `harvest_workflow_executions.output`. An activity task stores its result encoded. |
+| `harvest_task_queue.heartbeat_details` | Covered | The activity checkpoint. The heartbeat flusher encodes it, and a retry decodes it. |
 | `harvest_task_queue.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_task_queue.trace_context` | Clear | Trace ids, not payload. |
 | `harvest_task_queue.required_capabilities` | Clear | Routing labels, not payload. |
-| `harvest_task_queue.context_headers` | Clear | As for the execution row. Follow-up #2043. |
-| `harvest_schedules.workflow_input` | Clear | An operator template that the schedule API lists and edits. Follow-up #2043. |
+| `harvest_task_queue.context_headers` | Clear | A copy of the execution headers. The same readers apply. |
+| `harvest_schedules.workflow_input` | Clear | An operator template that the schedule API lists and edits. The reconciler compares it by value on each tick, and each encode makes a new nonce. |
 | `harvest_schedules.buffered_runs` | Clear | Fire times only. |
 | `harvest_schedules.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_signals.payload` | Covered | The signal payload. Signal ingest decodes it before it records `SignalReceived`. |
 | `harvest_stream_chunks.chunk` | Clear | Durable output chunks (#1974). The stream route sends them as stored. PII erasure deletes them. Do not put secrets in a chunk. |
-| `harvest_dead_letters.input` | Covered | The failed task input. A completion-callback entry copies the clear webhook body, so it stays in clear. Follow-up #2043. |
+| `harvest_dead_letters.input` | Covered | The failed task input. A completion-callback entry copies the stored webhook body, so it is encoded too. |
 | `harvest_workers.queues` | Clear | Worker registration, not payload. |
 | `harvest_workers.shard_assignments` | Clear | Worker registration, not payload. |
 | `harvest_workers.labels` | Clear | Worker capabilities, not payload. |
 | `harvest_build_policies.ramp_aborted` | Clear | Rollout state, not payload. |
 | `harvest_batch_jobs.filter` | Clear | An operator filter, not payload. |
-| `harvest_batch_jobs.signal_payload` | Clear | The operator-supplied batch payload. Each delivered signal row is covered. Follow-up #2043. |
+| `harvest_batch_jobs.signal_payload` | Covered | The operator-supplied batch payload. The executor decodes it before it sends each signal. |
 | `harvest_batch_jobs.errors` | Clear | Failure text (issue #1920). |
 | `harvest_batch_jobs.processed_ids` | Clear | Ids only. |
 | `harvest_schedule_decisions.detail` | Clear | A scheduler decision record, not payload. |
 | `harvest_completion_triggers.terminal_states` | Clear | Trigger configuration, not payload. |
 | `harvest_completion_triggers.input_mapping` | Clear | Trigger configuration, not payload. |
 | `harvest_completion_triggers.condition` | Clear | Trigger configuration, not payload. |
-| `harvest_completion_trigger_outbox.target_input` | Clear | A short-lived outbox row. The target start encodes the input it writes. Follow-up #2043. |
+| `harvest_completion_trigger_outbox.target_input` | Covered | The input of a deferred trigger start. The relay decodes it before the target start. |
 | `harvest_completion_trigger_outbox.priority` | Clear | Scheduling, not payload. |
-| `harvest_cross_shard_children.child_spec` | Clear | A short-lived relay row that holds the child input. The target start encodes it. Follow-up #2043. |
-| `harvest_debounce.last_input` | Clear | A short-lived start buffer. Follow-up #2043. |
+| `harvest_cross_shard_children.child_spec` | Clear | Erasure rewrites the `input` field inside the spec, and the sweep reads one envelope at the cell root. The target start encodes the input it writes. |
+| `harvest_debounce.last_input` | Covered | The buffered start input. The fire path decodes it before the start. |
 | `harvest_debounce.start_options` | Clear | Start configuration, not payload. |
-| `harvest_start_throttle.input` | Clear | A short-lived start buffer. Follow-up #2043. |
+| `harvest_start_throttle.input` | Covered | The deferred start input. The fire path decodes it before the start. |
 | `harvest_start_throttle.start_options` | Clear | Start configuration, not payload. |
-| `harvest_event_batches.buffered_payloads` | Clear | A short-lived start buffer. Follow-up #2043. |
+| `harvest_event_batches.buffered_payloads` | Clear | SQL appends to the array and counts its elements, and the sweep reads one envelope at the cell root. |
 | `harvest_event_batches.start_options` | Clear | Start configuration, not payload. |
 | `harvest_completion_deliveries.event_filter` | Clear | Callback configuration, not payload. |
-| `harvest_completion_deliveries.payload` | Clear | The webhook body. It holds the decoded result. Follow-up #2043. |
+| `harvest_completion_deliveries.payload` | Covered | The webhook body. The scanner decodes it before it signs and sends the body. |
 | `harvest_completion_deliveries.retry_policy` | Clear | Callback configuration, not payload. |
 | `harvest_execution_summaries.search_attrs` | Clear | As for the execution row. |
 | `harvest_execution_summaries.result` | Covered | A verbatim copy of `harvest_workflow_executions.output`, so it holds the same envelope. |

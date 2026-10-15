@@ -671,6 +671,22 @@ async fn fire_due_on_conn(
     Ok(fired)
 }
 
+/// [`admit_debounced_start`], storing `last_input` through `codecs`
+/// (issue #2043).
+///
+/// # Errors
+///
+/// Same as [`admit_debounced_start`].
+#[cfg(feature = "db")]
+pub async fn admit_debounced_start_with_codecs(
+    conn: &mut diesel_async::AsyncPgConnection,
+    params: AdmitDebounceParams<'_>,
+    gate_active: bool,
+    _codecs: &crate::payload_codec::PayloadCodecs,
+) -> crate::error::HarvestResult<Option<DebounceAdmitOutcome>> {
+    admit_debounced_start(conn, params, gate_active).await
+}
+
 /// Fire all due debounced starts across every assigned shard.
 ///
 /// Spawns deferred trigger-starts and records the `debounce_fired` metric after

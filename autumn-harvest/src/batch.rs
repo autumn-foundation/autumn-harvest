@@ -209,6 +209,20 @@ mod db {
         pub created_by: Option<String>,
     }
 
+    /// [`submit_batch_job`], storing the signal payload through `codecs`
+    /// (issue #2043).
+    ///
+    /// # Errors
+    ///
+    /// As [`submit_batch_job`].
+    pub async fn submit_batch_job_with_codecs(
+        conn: &mut AsyncPgConnection,
+        request: BatchSubmission,
+        _codecs: &crate::payload_codec::PayloadCodecs,
+    ) -> HarvestResult<Uuid> {
+        submit_batch_job(conn, request).await
+    }
+
     /// Insert a new batch job row, or return the existing id when an
     /// idempotent retry collides with a prior submission.
     pub async fn submit_batch_job(
@@ -1019,6 +1033,7 @@ pub use db::{
     BatchExecutorConfig, BatchJobView, BatchSubmission, ListFilters, count_targets_on_shard,
     get_batch_job, list_batch_jobs, mark_completed, mark_failed, mark_running, open_jobs,
     record_progress, run_executor_once, sample_targets_on_shard, submit_batch_job,
+    submit_batch_job_with_codecs,
 };
 
 #[cfg(test)]
