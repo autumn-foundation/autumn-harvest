@@ -318,6 +318,58 @@ struct PinnedImage {
     snapshot: Option<SnapshotFiles>,
     /// The manifest of the snapshot, checked at the pin.
     meta: Option<SnapshotMeta>,
+    /// Each pinned file, with its stamp from before the pin checks it.
+    stamps: Vec<(PathBuf, FileStamp)>,
+}
+
+/// What a pin records of an image file.
+///
+/// A hard link shares its inode, so a write in place reaches the pin. Such a
+/// write keeps the inode, but it changes the modification time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+}
+
+impl FileStamp {
+    /// The stamp of the file at `path`.
+    fn of(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(path)?;
+        Ok(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+        })
+    }
+}
+
+/// Check that each file of `stamps` keeps its stamp.
+///
+/// # Errors
+///
+/// Returns [`SandboxError::Config`] when a file changed or cannot be read.
+/// A launch would boot bytes that the pin did not check, and a retry cannot
+/// help until the worker restarts.
+fn check_stamps(stamps: &[(PathBuf, FileStamp)]) -> Result<(), SandboxError> {
+    for (path, stamp) in stamps {
+        let found = FileStamp::of(path);
+        if found.as_ref().is_ok_and(|found| found == stamp) {
+            continue;
+        }
+        let found = found.map_or_else(|e| e.to_string(), |found| format!("{found:?}"));
+        return Err(SandboxError::Config(format!(
+            "the pinned image file {} changed after the pin: it had {stamp:?}, and it has \
+             {found}; a hard link shares its inode, so a write in place reaches the pin; \
+             publish an image by rename and restart the worker",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 impl PinnedImage {
@@ -349,6 +401,12 @@ impl PinnedImage {
                 "cannot lock the image directories for the pin: {e}; a publish can hold them"
             ))
         })?;
+        // The lock keeps out a rename, but not a write in place. The stamps
+        // come before the checks, so the pin refuses a write after them.
+        let stamps = files
+            .iter()
+            .map(|file| FileStamp::of(file).map_err(|e| fail(file, &e)))
+            .collect::<Result<Vec<_>, _>>()?;
         // The manifest lands with the pair, so the lock covers it too.
         let meta = match &config.boot {
             BootMethod::Snapshot(snapshot) => Some(SnapshotMeta::check(config, snapshot)?),
@@ -371,13 +429,23 @@ impl PinnedImage {
                 }),
                 BootMethod::ConfigFile | BootMethod::Api => None,
             };
-            Ok(Self {
+            let mut pinned = Self {
                 dir: dir.clone(),
                 kernel: link(&config.image.kernel, KERNEL_FILE)?,
                 rootfs: link(&config.image.rootfs, ROOTFS_FILE)?,
                 snapshot,
                 meta,
-            })
+                stamps: Vec::new(),
+            };
+            // The links come in the order of `files`.
+            pinned.stamps = [&pinned.kernel, &pinned.rootfs]
+                .into_iter()
+                .chain(pinned.snapshot.iter().flat_map(|s| [&s.state, &s.memory]))
+                .cloned()
+                .zip(stamps)
+                .collect();
+            check_stamps(&pinned.stamps)?;
+            Ok(pinned)
         })();
         if pinned.is_err() {
             let _ = crate::sandbox::exec::remove_work_dir(&dir);
@@ -1144,8 +1212,18 @@ impl FirecrackerLauncher {
         let config = self.config.clone();
         let meta_path = SnapshotMeta::path(&files.state);
         let out = out_dir.to_path_buf();
+        let stamps = self
+            .tenancy
+            .pinned
+            .as_ref()
+            .map(|pinned| pinned.stamps.clone());
         tokio::task::spawn_blocking(move || {
             let meta = SnapshotMeta::of(&config, (&kernel, &rootfs), firecracker)?;
+            // The digests must come from the bytes that the golden microVM
+            // booted.
+            if let Some(stamps) = &stamps {
+                check_stamps(stamps).map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
             let meta = serde_json::to_vec(&meta).map_err(std::io::Error::other)?;
             std::fs::create_dir_all(&out)?;
             // The manifest replaces the old one with the pair, as one set.
@@ -1172,6 +1250,11 @@ impl FirecrackerLauncher {
     ) -> Result<Prepared, SandboxError> {
         use std::os::unix::fs::DirBuilderExt as _;
         let config = &self.config;
+        // The image that this launcher pinned at its start.
+        let pinned = self.tenancy.pinned.as_ref();
+        if let Some(pinned) = pinned {
+            check_stamps(&pinned.stamps)?;
+        }
         let jail = super::jailer::jail_dir(jailer, &self.exec_name, id);
         let root = jail.join("root");
         std::fs::DirBuilder::new()
@@ -1183,8 +1266,6 @@ impl FirecrackerLauncher {
         // nothing.
         let guard = JailGuard::new(jail.clone(), Arc::clone(&self.tenancy));
         let fail = |what: &str, e: &std::io::Error| prepare_error(id, what, e);
-        // The image that this launcher pinned at its start.
-        let pinned = self.tenancy.pinned.as_ref();
         let kernel = pinned.map_or(&config.image.kernel, |pinned| &pinned.kernel);
         let rootfs = pinned.map_or(&config.image.rootfs, |pinned| &pinned.rootfs);
         let mut links = vec![
@@ -4738,6 +4819,39 @@ while True:
         drop(vmm);
         drop(launcher);
         assert!(!pinned.exists(), "the launcher left its pinned image");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_write_in_place_after_the_pin_fails_each_launch() {
+        let dir = temp_dir();
+        let config = jailed(&dir);
+        let kernel = config.image.kernel.clone();
+        // The image is old, as at a worker start.
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&kernel)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let size = std::fs::metadata(&kernel).unwrap().len();
+        let launcher = new_launcher(config).unwrap();
+        // `cp` onto the kernel writes the pinned inode, with the same size.
+        let bytes = vec![b'x'; usize::try_from(size).unwrap()];
+        std::fs::write(&kernel, &bytes).unwrap();
+        let id = new_vm_id(launcher.owner());
+        let vmm = launcher.check_versions().await.unwrap();
+        let err = launcher
+            .prepare(&id, &BootMethod::ConfigFile, &vmm)
+            .await
+            .map(|_| ())
+            .expect_err("the pinned kernel changed in place");
+        assert!(
+            matches!(&err, SandboxError::Config(m) if m.contains("in place")),
+            "{err:?}"
+        );
+        drop((vmm, launcher));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

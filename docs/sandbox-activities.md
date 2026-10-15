@@ -299,6 +299,12 @@ root, and each launch links from there. So an image that lands one file at a
 time never gives a launch a mixed pair. A new image takes effect at the next
 worker start. An unjailed launcher reads the configured paths at each launch.
 
+Publish a new image by rename, never by a write in place. A hard link shares
+its inode, so `cp` onto `rootfs.ext4` also changes the pinned file. The pin
+records the inode, the size and the modification time of each file. Each
+launch checks them, and a changed file fails the launch as a config error
+until the worker restarts. A write during a running microVM still reaches it.
+
 The pin holds a shared `flock` on each image directory while it links. The
 script holds an exclusive `flock` on the output directory while it renames,
 and so does a snapshot publish. So a launcher never pins half a publish. A
