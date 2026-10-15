@@ -606,8 +606,9 @@ async fn a_zero_request_cap_is_no_cap() {
 async fn a_zero_request_cap_never_ends_a_round_full() {
     let (_dir, db) = fresh_db();
     let model = ScriptedModel::new(vec![big_calls(8), answer("done", 1)]);
+    // The engine keeps its own input cap, so the results stay under it.
     let harness = AgentHarness::new(model.clone())
-        .tool(big_tool(3 * 1024 * 1024))
+        .tool(big_tool(100 * 1024))
         .tool_output_limit(usize::MAX);
     let mut rt = runtime(&db, harness);
 

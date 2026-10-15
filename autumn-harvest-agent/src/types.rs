@@ -402,6 +402,24 @@ pub struct ModelTurn {
 }
 
 impl ModelTurn {
+    /// The typed outcome for a reply that is too large to record.
+    ///
+    /// It keeps the usage, the stop reason and `cache_hit`, so the paid call
+    /// stays counted. Everything else is dropped.
+    #[must_use]
+    pub(crate) fn into_oversized(self) -> Self {
+        Self {
+            content: Vec::new(),
+            stop: self.stop,
+            usage: self.usage,
+            decisions: Vec::new(),
+            cache_hit: self.cache_hit,
+            labels: Vec::new(),
+            releases: Vec::new(),
+            oversized: true,
+        }
+    }
+
     /// The tool calls of the turn, in order.
     #[must_use]
     pub fn calls(&self) -> Vec<ToolCall> {

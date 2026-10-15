@@ -511,7 +511,7 @@ async fn a_recorded_tool_failure_fails_the_candidate_at_the_same_call() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_turn_over_the_worker_result_cap_fails_as_in_production() {
+async fn a_turn_over_the_worker_result_cap_ends_as_in_production() {
     let source = one_lookup().await;
     let long = "x".repeat(2_000);
     let model = ScriptedModel::new(vec![
@@ -524,15 +524,16 @@ async fn a_turn_over_the_worker_result_cap_fails_as_in_production() {
         .await
         .unwrap();
 
-    let RunEnd::Failed(error) = &evaluation.candidate else {
-        panic!("the oversized turn fails: {:?}", evaluation.candidate);
+    // A worker drops the reply and ends the run under a named stop (issue
+    // #2040). It does not fail the activity.
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!(
+            "the oversized turn ends the run: {:?}",
+            evaluation.candidate
+        );
     };
-    assert!(error.contains("PayloadTooLarge"), "{error}");
+    assert_eq!(report.stop, AgentStop::ReplyTooLarge);
     assert!(evaluation.end_diverged);
-    assert_eq!(
-        evaluation.turns[1].verdict,
-        Verdict::Diverged(Divergence::Missing(Side::Candidate))
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

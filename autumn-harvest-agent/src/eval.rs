@@ -11,8 +11,8 @@
 //! - `agent_model_turn` asks the candidate model, then the candidate policy.
 //!   These are the only live calls. A retryable failure retries under the
 //!   retry policy of the activity, as on a worker. A turn over the worker
-//!   result cap fails, as on a worker with no payload store. The response
-//!   cache is skipped, so every turn asks the candidate.
+//!   result cap is cut or dropped, as on a worker with no payload store. The
+//!   response cache is skipped, so every turn asks the candidate.
 //! - `agent_tool_call` returns the recorded outcome of the same call. A call
 //!   with no recorded outcome gets an error stub. No tool runs.
 //! - `agent_memory_snapshot` returns the recorded snapshot, or an empty one.
@@ -90,7 +90,7 @@ use std::time::Duration;
 
 use autumn_harvest::erase::is_erasure_tombstone;
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString, parse_typed_payload};
+use autumn_harvest::failure::parse_typed_payload;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::testing::WorkflowTestEnv;
 use autumn_harvest::types::ActivityExecId;
@@ -98,8 +98,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::bounds::exceeds_bytes;
-use crate::harness::AgentHarness;
+use crate::harness::{AgentHarness, fit_turn};
 use crate::mesh::Peer;
 use crate::message::{ContentPart, StopReason, ToolCall};
 use crate::policy::ToolDecision;
@@ -991,6 +990,10 @@ fn live_turn(
     (recorded, taken, index): (&[ToolCall], &HashSet<String>, usize),
     retry: &RetryPolicy,
 ) -> Result<ModelTurn, String> {
+    // The cap applies below, to the turn as a worker records it. So the
+    // harness itself must not cut the turn with the aligned ids.
+    let result_cap = harness.result_cap();
+    let harness = &harness.clone().max_result_bytes(0);
     let mut attempt = 1;
     loop {
         // The provider ids, before the alignment changes them.
@@ -1003,7 +1006,7 @@ fn live_turn(
             handle.block_on(harness.model_turn_with(request.clone(), align))
         });
         let payload = match result {
-            Ok(turn) => return fit_result_cap(turn, &provider_ids, harness.result_cap()),
+            Ok(turn) => return Ok(fit_result_cap(turn, &provider_ids, result_cap)),
             Err(payload) => payload,
         };
         let delay = retry_delay(&payload, retry, attempt).ok_or(payload)?;
@@ -1023,16 +1026,12 @@ fn call_ids(content: &[ContentPart]) -> Vec<String> {
         .collect()
 }
 
-/// Refuse a turn over the worker result cap, as a worker with no payload
-/// store does.
+/// Fit a turn to the worker result cap, as a worker with no payload store
+/// does: cut the decision reasons, or drop the reply.
 ///
-/// A worker records the turn with the provider ids. So the check measures
-/// the turn with `provider_ids`, not with the aligned ids.
-///
-/// # Errors
-///
-/// Returns a non-retryable `PayloadTooLarge` failure payload.
-fn fit_result_cap(turn: ModelTurn, provider_ids: &[String], cap: u64) -> Result<ModelTurn, String> {
+/// A worker records the turn with the provider ids. So the fit measures the
+/// turn with `provider_ids`, not with the aligned ids.
+fn fit_result_cap(turn: ModelTurn, provider_ids: &[String], cap: u64) -> ModelTurn {
     let mut as_recorded = turn.clone();
     let parts = as_recorded
         .content
@@ -1044,15 +1043,14 @@ fn fit_result_cap(turn: ModelTurn, provider_ids: &[String], cap: u64) -> Result<
     for (id, provider_id) in parts.zip(provider_ids) {
         id.clone_from(provider_id);
     }
-    // A worker reads a zero cap as no cap.
-    if cap > 0 && exceeds_bytes(&as_recorded, cap) {
-        return Err(ActivityFailure::non_retryable(
-            "PayloadTooLarge",
-            format!("the model turn is larger than the result cap of {cap} bytes"),
-        )
-        .into_error_payload());
+    let fitted = fit_turn(as_recorded, cap);
+    if fitted.oversized {
+        return turn.into_oversized();
     }
-    Ok(turn)
+    ModelTurn {
+        decisions: fitted.decisions,
+        ..turn
+    }
 }
 
 /// The wait before attempt `attempt + 1` of a failed model turn, or `None`
@@ -1411,10 +1409,13 @@ mod tests {
         let fits = crate::bounds::json_len(&turn);
         align_call_ids(&mut turn.content, &[], &HashSet::new(), 0);
         let original = vec!["c1".to_owned()];
-        assert!(fit_result_cap(turn.clone(), &original, fits).is_ok());
-        assert!(fit_result_cap(turn.clone(), &original, fits - 1).is_err());
+        // The aligned ids are longer, so only the provider form fits.
+        let fitted = fit_result_cap(turn.clone(), &original, fits);
+        assert!(!fitted.oversized);
+        assert_eq!(fitted.content, turn.content, "the aligned ids stay");
+        assert!(fit_result_cap(turn.clone(), &original, fits - 1).oversized);
         assert!(
-            fit_result_cap(turn, &original, 0).is_ok(),
+            !fit_result_cap(turn, &original, 0).oversized,
             "a zero cap is no cap"
         );
     }

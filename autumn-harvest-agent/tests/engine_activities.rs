@@ -660,7 +660,7 @@ async fn a_reply_over_the_result_cap_is_a_typed_outcome_not_a_failed_activity() 
     assert!(raw.to_string().len() <= 2_048, "{}", raw.to_string().len());
     let turn: ModelTurn = serde_json::from_value(raw).unwrap();
     assert!(turn.oversized);
-    assert!(turn.content.is_empty());
+    assert_eq!(turn.content, Vec::new());
     assert_eq!(turn.usage.input_tokens, 5, "the paid call stays counted");
     assert_eq!(ctx.llm_calls().len(), 1, "the ledger still has the call");
 }

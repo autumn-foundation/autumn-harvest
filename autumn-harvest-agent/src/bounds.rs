@@ -10,7 +10,8 @@
 //! comes from recorded input or from a constant of the build.
 //!
 //! The engine cap is configurable. A worker with a cap other than the default
-//! must pass it in, for example as `AgentTask::max_request_bytes`.
+//! must pass it in, for example as `AgentTask::max_request_bytes`. A cap of
+//! zero means no cap, as in the engine.
 
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_INPUT_BYTES;
 use serde::Serialize;
@@ -25,35 +26,57 @@ pub fn json_len<T: Serialize + ?Sized>(value: &T) -> u64 {
 }
 
 /// Is `value` larger than `cap` bytes once serialised?
+///
+/// A `cap` of zero is no cap, as it is in the engine.
 #[must_use]
 pub fn exceeds_bytes<T: Serialize + ?Sized>(value: &T, cap: u64) -> bool {
-    json_len(value) > cap
+    cap > 0 && json_len(value) > cap
 }
 
-/// The bytes that one tool round may still add to the next request.
+/// The room that one tool round has in the next request.
 ///
-/// SKELETON: it admits everything until the budget logic lands.
+/// The round answers every call in one tool message. That message joins the
+/// transcript, so the whole next request must fit the cap. The budget starts
+/// from the size of that request with a placeholder for each call. A result
+/// replaces its placeholder, so it adds only the difference. A JSON string is
+/// measured on its own, so the sum is exact.
 #[derive(Debug, Clone, Copy)]
-pub struct RoundBudget;
+pub(crate) struct RoundBudget {
+    cap: u64,
+    projected: u64,
+    minimal: u64,
+}
 
 impl RoundBudget {
-    /// A budget for a request of `floor` bytes under `cap`, where each open
-    /// call holds a placeholder of `minimal` bytes. A `cap` of zero is no cap.
-    #[must_use]
-    pub const fn new(_cap: u64, _floor: u64, _minimal: u64) -> Self {
-        Self
+    /// A budget for a next request of `floor` bytes under `cap`. Each call
+    /// holds a placeholder of `minimal` bytes in `floor`. A `cap` of zero is
+    /// no cap.
+    pub(crate) const fn new(cap: u64, floor: u64, minimal: u64) -> Self {
+        Self {
+            cap,
+            projected: floor,
+            minimal,
+        }
     }
 
-    /// Can the round run a call? Only when every call can still get at least
-    /// a minimal answer.
-    #[must_use]
-    pub const fn can_run(&self) -> bool {
-        true
+    /// Can the round run a call? Only when every call can still get its
+    /// minimal answer. A call that runs has a result that no request can
+    /// carry otherwise.
+    pub(crate) const fn can_run(&self) -> bool {
+        self.cap == 0 || self.projected <= self.cap
     }
 
     /// Charge a result of `size` bytes. Returns `false`, and charges
-    /// nothing, when the result does not fit.
-    pub const fn admit(&mut self, _size: u64) -> bool {
+    /// nothing, when the next request would pass the cap.
+    pub(crate) const fn admit(&mut self, size: u64) -> bool {
+        let next = self
+            .projected
+            .saturating_add(size)
+            .saturating_sub(self.minimal);
+        if self.cap != 0 && next > self.cap {
+            return false;
+        }
+        self.projected = next;
         true
     }
 }
