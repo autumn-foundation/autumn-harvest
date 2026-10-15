@@ -908,6 +908,29 @@ async fn the_labels_a_call_adds_count_toward_the_next_request() {
     );
 }
 
+/// A task recorded before the change read a zero request cap as a limit of
+/// zero bytes. Its run ended before the first model call, and a replay of it
+/// must end the same way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_task_from_before_the_whole_request_budget_reads_a_zero_cap_as_a_limit() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![answer("never", 1)]);
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()));
+
+    let old: AgentTask = serde_json::from_value(json!({
+        "input": "go",
+        "max_steps": 8,
+        "approval_timeout_secs": 60,
+        "max_request_bytes": 0,
+    }))
+    .unwrap();
+    let exec = sqlite::start(&mut rt, &old).unwrap();
+    let report = report(rt.run_until_blocked(exec).await.unwrap());
+
+    assert_eq!(report.stop, AgentStop::TranscriptFull);
+    assert_eq!(model.calls(), 0, "the old rule never sent the request");
+}
+
 /// A task recorded before the whole-request budget measures the results
 /// alone. A run in flight must replay as it ran, so the call runs.
 #[tokio::test(flavor = "multi_thread")]
