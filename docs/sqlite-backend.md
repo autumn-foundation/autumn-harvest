@@ -580,10 +580,12 @@ loop {
 - `pause_schedule` stops the fires. `resume_schedule` counts the next slot
   from now, so the missed slots do not fire. `delete_schedule` removes the
   row, and the runs keep running. `list_schedules` reads every row.
-- A schedule that cannot fire logs a warning and keeps its slot due. It
-  does not fail the pass. An unregistered workflow is one such case: its
-  slot fires once the app registers it. Register each workflow before you
-  poll, or call `delete_schedule` when you remove one.
+- A schedule that cannot fire keeps its slot due. An unregistered workflow
+  or a damaged row only logs a warning, so it cannot stop the fleet. The
+  slot of an unregistered workflow fires once the app registers it.
+  Register each workflow before you poll, or call `delete_schedule` when
+  you remove one. Any other fire error, such as a failed write, is
+  returned after the pass, as a run's error is.
 - `jitter` is ignored. Jitter spreads the fires of a fleet, and one writer
   has no fleet.
 - Each other field this backend cannot honor is rejected with

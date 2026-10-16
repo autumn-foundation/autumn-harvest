@@ -2155,8 +2155,10 @@ impl SqliteRuntime {
     /// starve the rest.
     ///
     /// The pass first fires each due schedule (issue #2031). A fire that
-    /// starts a run is progress. A schedule that cannot fire logs a warning
-    /// and keeps its slot due. It does not fail the pass.
+    /// starts a run is progress. A schedule that cannot fire keeps its slot
+    /// due. An unregistered workflow or a damaged row only logs a warning.
+    /// Any other fire error, such as a failed write, is returned like a
+    /// run's error, after the pass drives the fleet.
     ///
     /// # Errors
     ///
@@ -2209,7 +2211,7 @@ impl SqliteRuntime {
         let failure_now = move || now_fn().timestamp_millis();
         let mut first_error = None;
         let now = (self.now_fn)().timestamp_millis();
-        let mut progress = fire && self.fire_due_schedules(now)?;
+        let mut progress = fire && self.fire_due_schedules(now, &mut first_error)?;
         for exec in store::running_executions(&self.conn)? {
             if skip.contains(&exec) {
                 continue;
@@ -2245,7 +2247,7 @@ impl SqliteRuntime {
         // `_as_of` simulation: `failure_now() == now` (deterministic, sleep-free).
         let failure_now = move || now;
         let mut first_error = None;
-        let mut progress = self.fire_due_schedules(now)?;
+        let mut progress = self.fire_due_schedules(now, &mut first_error)?;
         for exec in store::running_executions(&self.conn)? {
             match self.drive_one_cycle(exec, now, &failure_now).await {
                 Ok(
@@ -2310,17 +2312,33 @@ impl SqliteRuntime {
     /// Fire each schedule due at `now` (issue #2031). Returns `true` when a
     /// fire started a run.
     ///
-    /// A schedule that cannot fire logs a warning and keeps its slot due. An
-    /// unregistered workflow and a damaged row are such cases. The pass does
-    /// not fail, so one stale schedule cannot stop the fleet. The slot of an
-    /// unregistered workflow fires once the app registers it.
-    fn fire_due_schedules(&mut self, now: i64) -> SqliteResult<bool> {
+    /// One schedule's error does not stop the others. Its slot stays due.
+    ///
+    /// - An unregistered workflow or a damaged row only logs a warning. It
+    ///   does not fail the pass, so one stale schedule cannot stop the
+    ///   fleet. The slot of an unregistered workflow fires once the app
+    ///   registers it.
+    /// - Any other error, such as a failed write, goes to `first_error`, as
+    ///   a run's error does. So the caller sees that a due slot did not fire.
+    fn fire_due_schedules(
+        &mut self,
+        now: i64,
+        first_error: &mut Option<SqliteError>,
+    ) -> SqliteResult<bool> {
         let mut started = false;
         for name in schedule::due_names(&self.conn, now)? {
             match self.fire_schedule(&name, now) {
                 Ok(fired) => started |= fired,
                 Err(err) => {
                     tracing::warn!(schedule = %name, error = %err, "a due schedule did not fire");
+                    if !matches!(
+                        err,
+                        SqliteError::UnknownWorkflow(_)
+                            | SqliteError::Corrupt(_)
+                            | SqliteError::Json(_)
+                    ) {
+                        first_error.get_or_insert(err);
+                    }
                 }
             }
         }

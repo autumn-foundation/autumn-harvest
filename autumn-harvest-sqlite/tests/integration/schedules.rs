@@ -709,3 +709,33 @@ async fn a_cron_in_a_time_zone_fires_at_its_local_slot() {
         Schedule::CronInTimezone { tz, .. } if tz == "America/New_York"
     ));
 }
+
+// A failed write is not a stale schedule. The pass still fires the other
+// schedules, then returns the error, so the caller sees the lost fire.
+#[tokio::test]
+async fn a_failed_fire_write_is_returned() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write.db");
+    let clock = Arc::new(AtomicI64::new(T0));
+    let mut rt = runtime_at(&path, &clock);
+    rt.upsert_schedule(&every_minute("tick")).unwrap();
+    rt.upsert_schedule(&every_minute("hold")).unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER fail_tick BEFORE INSERT ON harvest_executions \
+             WHEN NEW.workflow_name = 'tick' \
+             BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+        )
+        .unwrap();
+
+    clock.store(T0 + MINUTE, Ordering::SeqCst);
+    let err = rt.poll_once().await.expect_err("the failed write returns");
+    assert!(matches!(err, SqliteError::Sqlite(_)), "{err}");
+    assert_eq!(runs(&rt, "hold").len(), 1, "the other schedule still fires");
+    assert_eq!(
+        next_run_at(&rt, "tick"),
+        Some(T0 + MINUTE),
+        "the slot stays due"
+    );
+}

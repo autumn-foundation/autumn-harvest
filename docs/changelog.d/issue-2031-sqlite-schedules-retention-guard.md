@@ -11,7 +11,8 @@ table had no append-only guard.
   slot and its pause, so an app can upsert on every open.
 - `poll_once`, `poll_once_as_of` and `run_until_idle` fire each due schedule
   before they drive the fleet. `run_until_idle` fires on its first pass only.
-  A schedule that cannot fire logs a warning and keeps its slot due. One transaction checks the overlap, starts the
+  A schedule that cannot fire keeps its slot due. An unregistered workflow
+  or a damaged row only logs a warning. A failed write is returned. One transaction checks the overlap, starts the
   run and moves the slot. The run of a slot has the `workflow_id`
   `sched:<workflow>:<slot seconds>`.
 - Catch-up is off: after a gap, a schedule fires one run and realigns. The
@@ -46,7 +47,7 @@ Additive, applied on open: the `harvest_schedules` table, the
 
 **Test evidence**
 
-- `schedules.rs` (24 tests): a reopen keeps every slot and the next run
+- `schedules.rs` (25 tests): a reopen keeps every slot and the next run
   starts on time; a late fire keeps the cadence; a gap fires once; cron and
   cron-in-zone slots; `Skip`, `AllowAll` and `max_active_runs`; successors,
   overdue and cancelled runs; pause, resume and delete; a slot that has its

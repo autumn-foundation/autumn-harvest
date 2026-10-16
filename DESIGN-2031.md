@@ -72,7 +72,7 @@ two triggers and four indexes. Each change is additive.
 | R6 | A long downtime fires a burst of runs. | Catch-up off fires one run, then realigns. Catch-up on is rejected. A test covers it. |
 | R7 | A schedule fires while its last run still runs. | `Skip` counts `RUNNING` rows of the schedule, successors included. A run past its deadline or with a pending cancel does not count. Tests cover each case. |
 | R8 | A silently ignored field changes the run. | Each field this backend cannot honor is rejected by name. A test covers each. |
-| R9 | A schedule for an unregistered workflow loses its slot, or stops the fleet. | The slot stays due and the fire logs a warning. The pass does not fail. |
+| R9 | A schedule for an unregistered workflow loses its slot, or stops the fleet. | The slot stays due and the fire logs a warning. The pass does not fail. A failed write still returns. |
 | R9a | `run_until_idle` never quiesces, because each pass meets a new slot. | It fires on its first pass only. |
 | R10 | A purge removes a live run. | Only a known terminal state with a `closed_at` before the cutoff is a candidate. |
 | R11 | A purge breaks the signal dedupe of a live chain. | Accepted, as on Postgres. Only the close time counts. The window bounds the risk. Section 2 records it. |
@@ -148,7 +148,8 @@ API on `SqliteRuntime`: `upsert_schedule`, `delete_schedule`,
 `poll_once`, `poll_once_as_of` and `run_until_idle` fire each due schedule
 before they drive the fleet. `run_until_idle` fires on its first pass only.
 `run_until_blocked` drives one run and fires nothing. A schedule that
-cannot fire logs a warning and keeps its slot due.
+cannot fire keeps its slot due. A stale or damaged row only logs a
+warning. A failed write is returned after the pass.
 
 A fire starts one run for the due slot, with `workflow_id`
 `sched:<workflow_name>:<slot seconds>`. Under `skip`, a schedule at its
@@ -188,8 +189,10 @@ A Codex review found nothing. The fixes:
   Postgres has already ended both. The count now skips them.
 - `run_until_idle` met a new slot on each pass of a slow clock and ended
   `Runaway`. It now fires on its first pass only.
-- A schedule for a removed workflow failed every `poll_once`. A fire error
-  now logs a warning and keeps the slot due.
+- A schedule for a removed workflow failed every `poll_once`. Such an
+  error now logs a warning and keeps the slot due. A Codex review then
+  noted that this hid a failed write. A persistence error is returned
+  again, after the pass.
 - A slot that already had its run did not become `last_run_at`. It now does.
 - The live-key rule of retention differed from Postgres. It let a long
   chain grow for ever, and its probe was quadratic. It is gone.
