@@ -1426,6 +1426,20 @@ cell unresolved, and an activity attempt on it fails with
 encoding on. Wait for task retention, or run terminal task GC, before you
 retire a key.
 
+**Copies into a new row.** A workflow retry, a continue-as-new successor and
+a reset fork are new writes (issue #2065). Each decodes the stored `input` and
+`memo`, then encodes them under the active key, as the switch says. A fork or
+successor of a clear row is therefore encoded, even though the sweep never
+encodes clear values. With the switch off, the copy is clear. A registry that
+cannot decode a value copies the stored bytes, so no value is lost or guessed.
+A shard move still copies the stored bytes.
+
+**Codec failures during a signal.** A codec failure is `HarvestError::Codec`.
+`HarvestError::is_codec_failure` is true for it and for the unknown-codec
+errors. A failed encode never fails an external signal for good. The outbox and
+inline delivery leave the request pending, and the next outbox sweep tries
+again.
+
 **Erasure.** Erasure (issue #495) does not reach the task rows or the outbox.
 They stay until task retention or the relay removes them. Their ciphertext is
 not readable without the key.

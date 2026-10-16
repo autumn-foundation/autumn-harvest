@@ -402,6 +402,14 @@ pub enum HarvestError {
         codec_id: String,
     },
 
+    /// A payload codec failed to encode or decode a value (issue #2065).
+    ///
+    /// Use [`HarvestError::is_codec_failure`] to test for this error and for
+    /// the unknown-codec errors. A codec failure says nothing about the target
+    /// of an operation, so a caller must not treat it as a terminal state.
+    #[error("payload codec failure: {0}")]
+    Codec(String),
+
     /// Retiring a codec key was refused because stored rows still reference it
     /// (issue #948).
     ///
@@ -1453,6 +1461,16 @@ impl HarvestError {
     #[must_use]
     pub const fn is_shard_unavailable(&self) -> bool {
         matches!(self, Self::ShardUnavailable { .. })
+    }
+
+    /// Did a payload codec fail to encode or decode a value (issue #2065)?
+    ///
+    /// True for [`HarvestError::Codec`], [`HarvestError::UnknownCodecKey`] and
+    /// [`HarvestError::UnknownPayloadCodec`]. A key outage or a missing key can
+    /// end, so the operation is retryable and not a verdict on its target.
+    #[must_use]
+    pub const fn is_codec_failure(&self) -> bool {
+        false
     }
 
     /// Is this a [`HarvestError::PoolAcquireTimeout`]?
