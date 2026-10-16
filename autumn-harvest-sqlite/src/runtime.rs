@@ -2903,8 +2903,11 @@ impl SqliteRuntime {
         if applied || drained {
             return Ok(RunState::InProgress);
         }
+        // Issue #1984: an open non-cancellable block defers the seal, as it
+        // defers a cancel on Postgres. The block may wait on a signal or a timer.
         if let Some(reason) = cancel_reason
             && !queue::has_pending_activity(&self.conn, exec)?
+            && autumn_harvest::cancellation_scope::open_non_cancellable_blocks(history) == 0
         {
             return self.seal_cancelled(exec, reason, None);
         }

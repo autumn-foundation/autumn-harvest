@@ -44,6 +44,26 @@ pub(crate) const SHIELD_OPEN_MARKER_PREFIX: &str = "non_cancellable_open:";
 /// Name prefix of the marker that closes a non-cancellable block.
 pub(crate) const SHIELD_CLOSE_MARKER_PREFIX: &str = "non_cancellable_close:";
 
+/// The number of non-cancellable blocks that `history` leaves open (issue #1984).
+///
+/// A block records an open marker when it starts and a close marker when it
+/// ends. A runtime with a cooperative cancel uses this count to defer its
+/// seal while a block is open, as the Postgres engine defers its cancel.
+#[must_use]
+pub fn open_non_cancellable_blocks(history: &[WorkflowEvent]) -> usize {
+    let mut open = std::collections::HashSet::new();
+    for event in history {
+        if let WorkflowEvent::MarkerRecorded { name, .. } = event {
+            if let Some(seq) = name.strip_prefix(SHIELD_OPEN_MARKER_PREFIX) {
+                open.insert(seq);
+            } else if let Some(seq) = name.strip_prefix(SHIELD_CLOSE_MARKER_PREFIX) {
+                open.remove(seq);
+            }
+        }
+    }
+    open.len()
+}
+
 /// The operations that a scope cancels.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ScopeMembers {

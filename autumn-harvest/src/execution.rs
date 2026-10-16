@@ -578,18 +578,9 @@ pub(crate) struct DeferredCancelState {
 
 impl DeferredCancelState {
     pub(crate) fn of(events: &[WorkflowEvent]) -> Self {
-        use crate::cancellation_scope::{SHIELD_CLOSE_MARKER_PREFIX, SHIELD_OPEN_MARKER_PREFIX};
-        let mut open = std::collections::HashSet::new();
         let mut requested = None;
         for event in events {
             match event {
-                WorkflowEvent::MarkerRecorded { name, .. } => {
-                    if let Some(seq) = name.strip_prefix(SHIELD_OPEN_MARKER_PREFIX) {
-                        open.insert(seq);
-                    } else if let Some(seq) = name.strip_prefix(SHIELD_CLOSE_MARKER_PREFIX) {
-                        open.remove(seq);
-                    }
-                }
                 WorkflowEvent::WorkflowCancelRequested { reason } if requested.is_none() => {
                     requested = Some(reason.clone());
                 }
@@ -600,7 +591,7 @@ impl DeferredCancelState {
             }
         }
         Self {
-            open_blocks: open.len(),
+            open_blocks: crate::cancellation_scope::open_non_cancellable_blocks(events),
             requested,
         }
     }
