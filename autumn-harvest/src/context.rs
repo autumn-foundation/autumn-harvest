@@ -4842,9 +4842,8 @@ impl WorkflowContext {
     /// The deadline check consults the replay-safe recorded clock via a
     /// **tolerant** read ([`deadline_clock_read`](Self::deadline_clock_read)),
     /// so its answer is deterministic across replays and workers. A workflow
-    /// with **no** `execution_timeout` records no deadline side-effect
-    /// (AC4). The two triggers are combined without
-    /// short-circuiting the deadline check, so a timeout-bearing workflow reads
+    /// with **no** `execution_timeout` records no deadline side-effect (AC4).
+    /// The two triggers are combined without short-circuiting the deadline check, so a timeout-bearing workflow reads
     /// the deadline clock regardless of the event-count branch — keeping the
     /// recorded side-effect stream a pure function of the recorded history at
     /// the cursor, not of the (task-varying) event count.
@@ -18501,9 +18500,9 @@ mod tests {
         );
     }
 
-    /// A context at the live frontier: `extra` events precede it, and the
-    /// threshold is `threshold`.
-    fn frontier_ctx(extra: usize, threshold: u64) -> WorkflowContext {
+    /// A replay context with `extra` marker events after the start event.
+    /// The cursor starts at the first event.
+    fn ctx_with_extra_events(extra: usize, threshold: u64) -> WorkflowContext {
         let mut events = vec![WorkflowEvent::WorkflowStarted {
             input: Value::Null,
             timestamp: Utc::now(),
@@ -18541,7 +18540,7 @@ mod tests {
 
     #[test]
     fn should_continue_as_new_records_a_live_true_decision() {
-        let ctx = frontier_ctx(0, 0);
+        let ctx = ctx_with_extra_events(0, 0);
         assert_eq!(ctx.history_event_count(), 1);
         assert!(ctx.should_continue_as_new());
         let cmds = ctx.drain_commands();
@@ -18560,10 +18559,59 @@ mod tests {
     }
 
     #[test]
+    fn should_continue_as_new_reads_a_legacy_checkpoint_after_the_deadline_probe() {
+        // A history from before #2080 with an execution timeout holds the
+        // deadline clock read, then the checkpoint.
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let ctx = deadline_ctx(
+            t0,
+            vec![
+                recorded_now(t0),
+                WorkflowEvent::WorkflowContinuedAsNew {
+                    new_exec_id: ExecutionId::new(),
+                    input: Value::Null,
+                    new_workflow_type: None,
+                },
+            ],
+            Some(chrono::Duration::seconds(30)),
+        );
+        assert!(ctx.should_continue_as_new());
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn should_continue_as_new_replays_the_decision_before_the_deadline_probe() {
+        let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let ctx = deadline_ctx(
+            t0,
+            vec![
+                continue_decision(true),
+                recorded_now(t0),
+                next_side_effect(),
+            ],
+            Some(chrono::Duration::seconds(30)),
+        );
+        assert!(ctx.should_continue_as_new());
+        assert!(ctx.drain_commands().is_empty());
+        assert_eq!(ctx.side_effect("next", || 0).unwrap(), 7);
+    }
+
+    #[test]
+    fn should_continue_as_new_reads_a_recorded_false_as_false() {
+        let ctx = deadline_ctx_with_policy(
+            Utc::now(),
+            vec![continue_decision(false), next_side_effect()],
+            None,
+            WorkflowHistoryPolicy::default(),
+        );
+        assert!(!ctx.should_continue_as_new());
+    }
+
+    #[test]
     fn should_continue_as_new_ignores_history_that_grows_after_the_call() {
         // Three events are loaded and the threshold is two. The cursor is
         // still inside the history, so the live answer was false (issue #2080).
-        let ctx = frontier_ctx(2, 2);
+        let ctx = ctx_with_extra_events(2, 2);
         assert_eq!(ctx.history_event_count(), 3);
         assert!(!ctx.should_continue_as_new());
         assert!(ctx.drain_commands().is_empty());
@@ -19047,7 +19095,7 @@ mod tests {
     fn should_continue_as_new_still_trips_on_history_count() {
         // The event-count trigger fires at the frontier, independent of the
         // deadline path (no execution_timeout here).
-        assert!(frontier_ctx(0, 0).should_continue_as_new());
+        assert!(ctx_with_extra_events(0, 0).should_continue_as_new());
     }
 
     #[test]

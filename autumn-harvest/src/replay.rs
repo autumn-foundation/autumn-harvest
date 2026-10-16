@@ -5882,7 +5882,8 @@ impl HistoryMatcher {
     ///
     /// - A recorded `true` decision is consumed.
     /// - A `WorkflowContinuedAsNew` event is a checkpoint from a history that
-    ///   predates the record. It is left in place and reads as `true`.
+    ///   predates the record. It is left in place and reads as `true`. A
+    ///   deadline probe clock read before it does not change that.
     /// - Any other event reads as `false`, with the cursor untouched.
     /// - A cursor past the end is the live frontier.
     #[must_use]
@@ -5901,8 +5902,31 @@ impl HistoryMatcher {
                 ContinueAsNewMatch::True
             }
             WorkflowEvent::WorkflowContinuedAsNew { .. } => ContinueAsNewMatch::True,
+            // A legacy run with an execution timeout reads its deadline clock
+            // before the checkpoint. Look past that one event.
+            probe if Self::is_deadline_probe_event(probe) => {
+                let mut next = self.cursor + 1;
+                while self.is_consumed(next) {
+                    next += 1;
+                }
+                match self.events.get(next) {
+                    Some(WorkflowEvent::WorkflowContinuedAsNew { .. }) => ContinueAsNewMatch::True,
+                    _ => ContinueAsNewMatch::False,
+                }
+            }
             _ => ContinueAsNewMatch::False,
         }
+    }
+
+    fn is_deadline_probe_event(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Now,
+                name: Some(name),
+                ..
+            } if name == DEADLINE_PROBE_SIDE_EFFECT_NAME
+        )
     }
 
     /// Match a local activity command against history.

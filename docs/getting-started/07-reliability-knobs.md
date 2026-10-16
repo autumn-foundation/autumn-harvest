@@ -315,7 +315,8 @@ what keeps the internal live-deadline read replay-safe.
 **Call `should_continue_as_new()` once per decision cycle.** When the workflow
 declares an `execution_timeout`, each `should_continue_as_new()` call reads the
 deadline clock and records **one** `SideEffectRecorded{Now}` event on the live
-frontier (a no-timeout workflow records nothing). Call it once at the top of a
+frontier. A `true` answer from the history-size trigger also records one
+`__harvest_continue_as_new` event. A `false` answer records nothing. Call it once at the top of a
 decision cycle — not in a tight inner loop that fires it dozens of times per
 cycle — or the history grows a `Now` event per call.
 

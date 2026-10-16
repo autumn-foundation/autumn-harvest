@@ -10162,10 +10162,9 @@ fn history_policy_branch_workflow<'a>(
     })
 }
 
-/// A 4-event history recorded by the `checkpoint` branch (event count 4 > the
-/// tuned threshold of 2): `WorkflowStarted`, `ActivityScheduled(checkpoint)`,
-/// `ActivityCompleted`, `WorkflowCompleted`. Under the DEFAULT policy (large
-/// threshold) `should_continue_as_new()` never trips for this small history.
+/// A history recorded by the `checkpoint` branch: `WorkflowStarted`, the
+/// recorded `true` decision, `ActivityScheduled(checkpoint)`,
+/// `ActivityCompleted`, `WorkflowCompleted`.
 fn history_policy_checkpoint_fixture() -> Vec<WorkflowEvent> {
     let activity_id = ActivityExecId::new();
     vec![
@@ -10175,6 +10174,11 @@ fn history_policy_checkpoint_fixture() -> Vec<WorkflowEvent> {
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::event::SideEffectKind::Custom,
+            name: Some(autumn_harvest::CONTINUE_AS_NEW_SIDE_EFFECT_NAME.to_string()),
+            value: serde_json::json!(true),
         },
         WorkflowEvent::ActivityScheduled {
             activity_id,
@@ -10193,50 +10197,25 @@ fn history_policy_checkpoint_fixture() -> Vec<WorkflowEvent> {
 }
 
 #[tokio::test]
-async fn strict_replay_default_policy_diverges_from_low_threshold_history() {
-    // Negative control: under the DEFAULT history policy (large threshold) the
-    // 4-event history never trips `should_continue_as_new()`, so the workflow
-    // schedules `keep_going` and diverges from the recorded `checkpoint`. Proves
-    // the fixture is discriminating (and that the strict-path default is
-    // unchanged for callers that never set a policy).
-    let report = WorkflowReplayer::new()
-        .register_fn("history_policy_branch", history_policy_branch_workflow)
-        .replay_from_events(history_policy_checkpoint_fixture())
-        .await;
-
-    assert!(
-        matches!(
-            report.status,
-            ReplayStatus::NonDeterminismDetected {
-                kind: NonDeterminismKind::ActivityScheduleMismatch,
-                ..
-            }
-        ),
-        "default policy must diverge (keep_going vs recorded checkpoint):\n{report}"
-    );
-}
-
-#[tokio::test]
-async fn strict_replay_honors_with_history_policy() {
-    // Issue #614 (PR #1107 Codex review): the STRICT `replay_from_events` path
-    // must honor `with_history_policy`. With threshold = 2 the 4-event history
-    // trips `should_continue_as_new()`, so the workflow schedules `checkpoint`,
-    // matching the recorded history → ReplaySucceeded. BEFORE the fix the strict
-    // path hardcoded the default policy, ignored this setter, scheduled
-    // `keep_going`, and reported NonDeterminismDetected (identical to the negative
-    // control above) — so this test is the fix's regression guard.
-    let policy =
+async fn strict_replay_follows_the_recorded_decision_under_any_policy() {
+    // Issue #2080: a replay reads the recorded `true` decision, not the loaded
+    // event count. The threshold changes nothing for a recorded position.
+    let low =
         autumn_harvest::context::WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
-    let report = WorkflowReplayer::new()
-        .with_history_policy(policy)
-        .register_fn("history_policy_branch", history_policy_branch_workflow)
-        .replay_from_events(history_policy_checkpoint_fixture())
-        .await;
-
-    assert!(
-        matches!(report.status, ReplayStatus::ReplaySucceeded),
-        "strict replay must honor with_history_policy(threshold=2) and replay clean:\n{report}"
-    );
+    for policy in [
+        autumn_harvest::context::WorkflowHistoryPolicy::default(),
+        low,
+    ] {
+        let report = WorkflowReplayer::new()
+            .with_history_policy(policy)
+            .register_fn("history_policy_branch", history_policy_branch_workflow)
+            .replay_from_events(history_policy_checkpoint_fixture())
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "a recorded decision must replay clean:\n{report}"
+        );
+    }
 }
 
 // ===========================================================================

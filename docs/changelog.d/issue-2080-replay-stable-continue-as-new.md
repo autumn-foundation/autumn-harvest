@@ -11,8 +11,16 @@ reads that event back. Where history continues with no such event, the replay
 answers `false`. A `false` answer records nothing.
 
 Older histories have no record. A `WorkflowContinuedAsNew` event at the cursor
-reads as `true`. Any other event reads as `false`. No migration is needed, and
-no `WorkflowEvent` variant is new.
+reads as `true`, also after a deadline probe clock read. Any other event reads
+as `false`. No migration is needed, and no `WorkflowEvent` variant is new.
+
+Known limits. An older run that answered `true` and then ran other commands
+before `continue_as_new` replays as `false`. A `false` answer followed directly
+by `continue_as_new` replays as `true`. Code that ignores a `true` answer
+records one event per call.
+
+Tests that built a history with no record for a `true` branch now include the
+record. A recorded position no longer depends on the history policy.
 
 The entity loop keeps its own checkpoint side effect. Its test
 `the_checkpoint_decision_is_stable_when_history_grows` now asserts that a naive
