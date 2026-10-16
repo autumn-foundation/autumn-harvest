@@ -1271,6 +1271,21 @@ pub fn hints_wanted() -> bool {
         .unwrap_or_else(|_| is_installed())
 }
 
+/// True when a hint raised now has a channel to publish to (issue #2066).
+///
+/// [`hints_wanted`] is true for a per-shard install. That install leaves the
+/// global slot empty, so an unbound caller still has no channel. A caller that
+/// would load rows only to build hints checks this call first.
+// The caller needs the `db` feature.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+#[must_use]
+pub(crate) fn hints_deliverable() -> bool {
+    match publish_target() {
+        PublishTarget::Bound(channel) => channel.is_some(),
+        PublishTarget::Live => installed().is_some(),
+    }
+}
+
 /// Publish `hints` on the bound channel, or else on the installed one, now.
 ///
 /// Errors are logged and dropped. The reconcile sweep in the worker is the

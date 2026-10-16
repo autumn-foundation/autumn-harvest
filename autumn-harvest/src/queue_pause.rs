@@ -1489,6 +1489,9 @@ pub async fn resume_queue(
         // Trading a rare scale problem for a deterministic, silent,
         // config-dependent break of the feature's core operation is the
         // wrong trade. The memory cost is tracked as a follow-up.
+        // A per-shard install passes `hints_wanted` but gives an unbound caller
+        // no channel. Build the id set only when a publish can land.
+        let publish_hints = crate::dispatch::hints_deliverable();
         let shifted: Vec<ShiftedTaskId> = diesel::sql_query(resume_shift_scheduled_at_query())
             .bind::<diesel::sql_types::Text, _>(&queue_owned)
             .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
@@ -1499,7 +1502,7 @@ pub async fn resume_queue(
         // Only a deployment with a channel needs the thawed ids. Without one
         // the collector stays empty, so a resume of a large backlog does not
         // hold a second copy of every id it shifted.
-        if crate::dispatch::hints_wanted() {
+        if publish_hints {
             collector
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1518,7 +1521,7 @@ pub async fn resume_queue(
         // to separate.
         // Load the ids only when a channel will publish them. The late pass can
         // cover the whole backlog created during a long pause (issue #2066).
-        let late = if crate::dispatch::hints_wanted() {
+        let late = if publish_hints {
             let late_shifted: Vec<ShiftedTaskId> =
                 diesel::sql_query(resume_shift_late_arrivals_query())
                     .bind::<diesel::sql_types::Text, _>(&queue_owned)
