@@ -1867,6 +1867,47 @@ mod tests {
     }
 
     #[test]
+    fn caller_input_sources_are_the_client_reachable_ones() {
+        for src in [
+            StartSource::Api,
+            StartSource::Schedule,
+            StartSource::Backfill,
+            StartSource::SignalWithStart,
+            StartSource::UpdateWithStart,
+            StartSource::CompletionTrigger,
+            StartSource::Webhook,
+            StartSource::Broker,
+            StartSource::Child,
+            StartSource::Batch,
+            StartSource::Outbox,
+            StartSource::Transactional,
+        ] {
+            assert!(src.carries_caller_input(), "{src:?}");
+        }
+        for src in [
+            StartSource::ContinueAsNew,
+            StartSource::Reset,
+            StartSource::Rerun,
+            StartSource::Unknown,
+        ] {
+            assert!(!src.carries_caller_input(), "{src:?}");
+        }
+    }
+
+    #[test]
+    fn start_provenance_reads_the_row_columns() {
+        let pred = uuid::Uuid::new_v4();
+        let p = StartProvenance::from_row(Some("continue_as_new"), Some(pred));
+        assert_eq!(p.source, StartSource::ContinueAsNew);
+        assert_eq!(p.continued_from, Some(ExecutionId::from_uuid(pred)));
+        assert_eq!(
+            StartProvenance::from_row(None, None),
+            StartProvenance::default()
+        );
+        assert_eq!(StartProvenance::default().source, StartSource::Unknown);
+    }
+
+    #[test]
     fn start_source_default_is_unknown() {
         assert_eq!(StartSource::default(), StartSource::Unknown);
     }

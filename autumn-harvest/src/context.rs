@@ -31101,6 +31101,29 @@ mod tests {
         assert_eq!(orphan.parent_execution_id(), None);
     }
 
+    /// Issue #2082: the default start provenance is unknown and has no predecessor.
+    #[test]
+    fn info_start_provenance_defaults_to_unknown() {
+        let info = WorkflowContext::new_test().info();
+        assert_eq!(info.start_source, StartSource::Unknown);
+        assert_eq!(info.continued_from, None);
+    }
+
+    /// Issue #2082: a threaded provenance shows in `info()` and the accessors.
+    /// Two rebuilds of the same fixture agree, so the value is replay-stable.
+    #[test]
+    fn info_reports_configured_start_provenance() {
+        let predecessor = ExecutionId::new();
+        let provenance = StartProvenance::continued_from(predecessor);
+        let build = || WorkflowContext::new_test().with_start_provenance(provenance);
+        let ctx = build();
+        assert_eq!(ctx.info().start_source, StartSource::ContinueAsNew);
+        assert_eq!(ctx.info().continued_from, Some(predecessor));
+        assert_eq!(ctx.start_source(), StartSource::ContinueAsNew);
+        assert_eq!(ctx.continued_from(), Some(predecessor));
+        assert_eq!(build().info(), ctx.info());
+    }
+
     /// AC5/AC6 (zero footprint): calling `info()` emits no commands and leaves
     /// the event history unchanged — the same leave-no-trace property as queries.
     #[test]
