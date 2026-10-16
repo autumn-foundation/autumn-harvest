@@ -1818,7 +1818,8 @@ const HIDDEN: &str = "<hidden>";
 
 /// Returns `token` when it is a plain word, else [`HIDDEN`].
 ///
-/// A mistyped URL has `:`, `/` or `@`. Those never pass, so an error line cannot echo it.
+/// A mistyped URL holds `:`, `/` or `@`. These characters fail the check, so an error line never shows the URL.
+/// A secret that is a plain word still shows. Callers pass tokens that are names, not secrets.
 #[cfg(feature = "db")]
 fn plain(token: &str) -> &str {
     let word = !token.is_empty()
@@ -1826,6 +1827,19 @@ fn plain(token: &str) -> &str {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
     if word { token } else { HIDDEN }
+}
+
+/// Refuses a URL where a file or name belongs.
+///
+/// Later errors and reports echo these values. A mistyped database URL would reach them.
+#[cfg(feature = "db")]
+fn not_a_url(flag: &str, value: String) -> Result<String, UpgradeCheckError> {
+    if value.contains("://") {
+        return Err(UpgradeCheckError::Usage(format!(
+            "{flag} takes a name or file, not a URL"
+        )));
+    }
+    Ok(value)
 }
 
 #[cfg(feature = "db")]
@@ -1859,10 +1873,10 @@ impl CommandArgs {
                     })?;
                     out.database_urls.push(url);
                 }
-                "--baseline-structure" => out.baseline = Some(value()?.into()),
-                "--candidate-structure" => out.candidate = Some(value()?.into()),
-                "--workflow-name" => out.workflow_name = Some(value()?),
-                "--baseline-build" => out.baseline_build = Some(value()?),
+                "--baseline-structure" => out.baseline = Some(not_a_url(&flag, value()?)?.into()),
+                "--candidate-structure" => out.candidate = Some(not_a_url(&flag, value()?)?.into()),
+                "--workflow-name" => out.workflow_name = Some(not_a_url(&flag, value()?)?),
+                "--baseline-build" => out.baseline_build = Some(not_a_url(&flag, value()?)?),
                 "--limit" => {
                     let raw = value()?;
                     out.limit = Some(raw.parse().map_err(|_| {
@@ -2076,7 +2090,9 @@ mod tests {
     const SECRET_URL: &str = "postgres://u:SECRETPW@h/db";
 
     fn assert_no_secret(args: &[&str]) {
-        let err = parse(args).expect_err("usage error");
+        let Err(err) = parse(args) else {
+            panic!("expected a usage error for {args:?}");
+        };
         assert!(!err.to_string().contains("SECRETPW"), "{err}");
     }
 
@@ -2092,6 +2108,19 @@ mod tests {
         assert_no_secret(&["--database-url-env", SECRET_URL]);
         assert_no_secret(&["--limit", SECRET_URL]);
         assert_no_secret(&["--format", SECRET_URL]);
+    }
+
+    #[test]
+    fn a_url_given_to_a_name_or_file_flag_is_refused() {
+        for flag in [
+            "--baseline-structure",
+            "--candidate-structure",
+            "--baseline-build",
+            "--workflow-name",
+        ] {
+            assert_no_secret(&[flag, SECRET_URL]);
+            assert_no_secret(&[&format!("{flag}={SECRET_URL}")]);
+        }
     }
 
     #[test]

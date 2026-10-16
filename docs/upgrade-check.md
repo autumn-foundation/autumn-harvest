@@ -128,6 +128,10 @@ $ my-upgrade-check \
 A flag also takes its value as `--flag=value`. The report goes to stdout,
 and an error goes to stderr.
 
+A usage error names a plain flag or variable name only. Any other argument
+shows as `<hidden>`, so a mistyped URL never reaches stderr. A file or name
+flag refuses a value that holds `://`.
+
 The check reads `RUNNING` and `PAUSED` runs. It reads inside read-only
 transactions and writes nothing.
 
