@@ -852,6 +852,40 @@ pub(crate) fn bad_tenant() -> Response {
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 
+/// Buffer the body when a shard or a key comes from it.
+///
+/// The body is read under the app's own limit, then put back for the handler.
+/// Shards found go into `shards`. `Err` is the body-limit rejection.
+#[allow(clippy::result_large_err)]
+async fn buffer_body(
+    api_state: &HarvestApiState,
+    request: Request,
+    source: Option<ShardSource>,
+    key_input: Option<StartInput>,
+    shards: &mut Vec<ShardId>,
+) -> Result<(Request, BodyKey), Response> {
+    let reads_body = key_input.is_some()
+        || matches!(
+            source,
+            Some(ShardSource::StartBody | ShardSource::Body { .. })
+        );
+    if !reads_body {
+        return Ok((request, BodyKey::default()));
+    }
+    let is_form = is_form_urlencoded(request.headers());
+    let (parts, body) = request.into_parts();
+    let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), &())
+        .await
+        .map_err(IntoResponse::into_response)?;
+    shards.extend(match source {
+        Some(ShardSource::StartBody) => start_body_shard(api_state, &bytes),
+        Some(ShardSource::Body { field, form }) => body_field_shard(field, form, is_form, &bytes),
+        _ => None,
+    });
+    let body_key = key_input.map_or_else(BodyKey::default, |input| read_body_key(input, &bytes));
+    Ok((Request::from_parts(parts, Body::from(bytes)), body_key))
+}
+
 /// The authorizer layer (issue #1803).
 ///
 /// Installed only by `with_authorizer`. It runs after the token layer, so it
@@ -881,35 +915,11 @@ pub(crate) async fn enforce_authorizer(
     if let Some(ShardSource::Query(keys)) = source {
         shards.extend(query_shards(request.uri().query(), keys));
     }
-    let reads_body = key_input.is_some()
-        || matches!(
-            source,
-            Some(ShardSource::StartBody | ShardSource::Body { .. })
-        );
-    let mut body_key = BodyKey::default();
-    let request = if reads_body {
-        // Buffer the body under the app's own limit, read the shard and the
-        // key, then put the body back for the handler.
-        let is_form = is_form_urlencoded(request.headers());
-        let (parts, body) = request.into_parts();
-        let bytes = match Bytes::from_request(Request::from_parts(parts.clone(), body), &()).await {
-            Ok(bytes) => bytes,
-            Err(rejection) => return rejection.into_response(),
+    let (request, body_key) =
+        match buffer_body(&api_state, request, source, key_input, &mut shards).await {
+            Ok(read) => read,
+            Err(response) => return response,
         };
-        shards.extend(match source {
-            Some(ShardSource::StartBody) => start_body_shard(&api_state, &bytes),
-            Some(ShardSource::Body { field, form }) => {
-                body_field_shard(field, form, is_form, &bytes)
-            }
-            _ => None,
-        });
-        if let Some(input) = key_input {
-            body_key = read_body_key(input, &bytes);
-        }
-        Request::from_parts(parts, Body::from(bytes))
-    } else {
-        request
-    };
     shards.sort_unstable_by_key(|s| s.as_i32());
     shards.dedup();
 
