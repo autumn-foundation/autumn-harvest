@@ -1129,3 +1129,34 @@ async fn a_generated_id_inside_a_payload_does_not_break_the_payload_check() {
         .await
         .unwrap_or_else(|failure| panic!("{failure}"));
 }
+
+#[tokio::test]
+async fn no_signal_lands_between_a_local_activity_and_the_next_drive() {
+    // The worker runs a local activity inline and drives the body again in
+    // the same decision. No ingest runs between, so no signal can land.
+    fn wf(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
+        Box::pin(async move {
+            ctx.execute_local_activity_raw("stamp", json!(null), None, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            let early = ctx
+                .try_receive_signal::<Value>("go")
+                .map_err(|e| e.to_string())?;
+            Ok(json!(early))
+        })
+    }
+    let env = WorkflowTestEnv::new().mock_activity("stamp", Ok);
+    let report = env
+        .simulation()
+        .signal("go", json!(true))
+        .seeds(SEEDS)
+        .sweep(wf, json!(null), |outcome| {
+            always!(
+                outcome.result() == &Ok(json!(null)),
+                "no signal lands after the local activity"
+            );
+        })
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    assert!(report.seeds > 0);
+}

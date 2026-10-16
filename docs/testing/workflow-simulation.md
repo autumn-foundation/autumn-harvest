@@ -257,7 +257,7 @@ explore new seeds without a code change.
 - **External workflows.** External signals, cancels and awaits resolve in
   their own task, as in the default env.
 - **Local activities.** They resolve in the task that runs them, as in
-  production.
+  production. The body then runs again at once, with no delivery between.
 - **Shared state.** A crash does not reset `with_state` values.
 - **Timer id collation.** The model sorts tied timer ids by bytes. Postgres
   sorts them by collation. Keep tied ids to plain ASCII letters and digits.

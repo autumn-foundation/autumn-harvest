@@ -1247,6 +1247,21 @@ struct HeldTimer {
     piggyback: bool,
 }
 
+/// What the worker does after it persists a suspension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Next {
+    /// A local activity ran inline. The worker drives the body again in the
+    /// same decision, with no ingest between.
+    Redrive,
+    /// A command resolved in this task, such as a mutex grant or an external
+    /// operation. A batch of bookkeeping only also requeues. A new task runs
+    /// even when no delivery lands.
+    Requeue,
+    /// The batch waits. It parks even when it appended a marker or a side
+    /// effect. With no delivery, the run is blocked.
+    Park,
+}
+
 /// What a task boundary delivered.
 enum Delivery {
     /// This many events landed.
@@ -1414,10 +1429,15 @@ impl<'a, 'env> SimRun<'a, 'env> {
             let WorkflowOutcome::Suspended { commands } = outcome else {
                 return self.finish_terminal(outcome, &pending_cmds);
             };
-            let rerun = match self.process(commands) {
-                Ok(rerun) => rerun,
+            let next = match self.process(commands) {
+                Ok(next) => next,
                 Err(error) => return self.finish(SimStatus::HarnessError, Err(error)),
             };
+            // The worker runs the body again in the same decision. No ingest
+            // runs between the two drives.
+            if next == Next::Redrive {
+                continue;
+            }
             let mut delivery = self.deliver();
             while matches!(delivery, Delivery::Quiet) {
                 delivery = self.deliver();
@@ -1428,7 +1448,7 @@ impl<'a, 'env> SimRun<'a, 'env> {
                     let reason = self.cancel.take().unwrap_or_default();
                     return self.finish(SimStatus::Cancelled, Err(reason));
                 }
-                Delivery::Events(0) if !rerun => {
+                Delivery::Events(0) if next == Next::Park => {
                     let error = "the workflow is blocked: no held result, timer, \
                                  signal or cancel can unblock it"
                         .to_string();
@@ -1455,15 +1475,12 @@ impl<'a, 'env> SimRun<'a, 'env> {
     /// another delivery wakes the task. The latest batch decides this for
     /// every held timer.
     ///
-    /// It returns whether the task runs again with no delivery. That is so
-    /// when a command resolves in this task, such as a local activity, a
-    /// mutex grant or an external operation. It is also so for a batch of
-    /// bookkeeping only, which the worker requeues. A batch that waits parks
-    /// instead, even when it appended a marker or a side effect.
-    fn process(&mut self, commands: Vec<WorkflowCommand>) -> Result<bool, String> {
+    /// It returns what the worker does next, as [`Next`] tells.
+    fn process(&mut self, commands: Vec<WorkflowCommand>) -> Result<Next, String> {
         let batch = BatchFlags::of(&commands);
         let before = self.history.len();
-        let mut rerun = false;
+        let mut redrive = false;
+        let mut requeue = false;
         let piggyback = parks_without_deadline(&commands);
         // The sim orders timers by deadline itself, so it holds every awaited
         // fire, not only the earliest.
@@ -1496,10 +1513,10 @@ impl<'a, 'env> SimRun<'a, 'env> {
                 deferred.push(Deferred::new(DeliveryKey::Activity(activity_id), events));
                 continue;
             }
+            let inline = matches!(cmd, WorkflowCommand::RunLocalActivity { .. });
             let resolves_now = matches!(
                 cmd,
-                WorkflowCommand::RunLocalActivity { .. }
-                    | WorkflowCommand::AcquireMutex { .. }
+                WorkflowCommand::AcquireMutex { .. }
                     | WorkflowCommand::SignalExternalWorkflow { .. }
                     | WorkflowCommand::RequestCancelExternalWorkflow { .. }
                     | WorkflowCommand::AwaitExternalWorkflow { .. }
@@ -1511,7 +1528,8 @@ impl<'a, 'env> SimRun<'a, 'env> {
                 &mut deferred,
                 &mut self.mocks,
             )?;
-            rerun |= resolves_now && progress;
+            redrive |= inline && progress;
+            requeue |= resolves_now && progress;
         }
         for held in &mut self.held {
             held.piggyback = piggyback && matches!(held.key, DeliveryKey::Timer(_));
@@ -1539,9 +1557,15 @@ impl<'a, 'env> SimRun<'a, 'env> {
                 }
             }
         }
-        rerun |= !batch.competing_suspension && self.history.len() != before;
+        requeue |= !batch.competing_suspension && self.history.len() != before;
         self.tag(self.task);
-        Ok(rerun)
+        Ok(if redrive {
+            Next::Redrive
+        } else if requeue {
+            Next::Requeue
+        } else {
+            Next::Park
+        })
     }
 
     /// Drop the held results and fires that `cmd` cancels.
@@ -1959,40 +1983,61 @@ fn render_trace(events: &[WorkflowEvent], tasks: &[usize]) -> Vec<String> {
 /// A digest of each event with its payloads.
 ///
 /// The trace holds no payload, so these digests catch a value that changes
-/// on the same path. The harness and the context mint random ids, such as
-/// activity ids, child ids and the successor of a continue-as-new. The body
-/// can also pass such an id on, for example in an activity input. So each
-/// `*_id` field of an event names a generated id, and each place that id
-/// appears becomes its ordinal by first use. Other payload values count.
+/// on the same path. The harness and the context mint random UUIDs, such as
+/// child ids and the successor of a continue-as-new. The body can pass such
+/// an id on, for example in an activity input.
+///
+/// So each `*_id` field of an event that holds a UUID names a generated id.
+/// Each JSON string equal to that id becomes its ordinal by first use. A
+/// stable id, such as a timer id, is not a UUID and stays as it is. A string
+/// that only contains an id also stays, so no other payload text changes.
 fn payload_digests(events: &[WorkflowEvent]) -> Vec<u64> {
-    let values: Vec<Value> = events
+    let mut values: Vec<Value> = events
         .iter()
         .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
         .collect();
-    let mut ordinals: Vec<(String, String)> = Vec::new();
+    let mut generated: Vec<String> = Vec::new();
     for value in &values {
         if let Some(Value::Object(fields)) = value.get("data") {
             for (key, field) in fields {
                 if let (true, Value::String(id)) = (key.ends_with("_id"), field)
-                    && !id.is_empty()
-                    && !ordinals.iter().any(|(known, _)| known == id)
+                    && uuid::Uuid::parse_str(id).is_ok()
+                    && !generated.contains(id)
                 {
-                    let ordinal = format!("id{}", ordinals.len() + 1);
-                    ordinals.push((id.clone(), ordinal));
+                    generated.push(id.clone());
                 }
             }
         }
     }
     values
-        .iter()
+        .iter_mut()
         .map(|value| {
-            let mut text = value.to_string();
-            for (id, ordinal) in &ordinals {
-                text = text.replace(id.as_str(), ordinal);
-            }
-            fnv1a(text.as_bytes())
+            normalize_ids(value, &generated);
+            fnv1a(value.to_string().as_bytes())
         })
         .collect()
+}
+
+/// Replace each string equal to a generated id with its ordinal.
+fn normalize_ids(value: &mut Value, generated: &[String]) {
+    match value {
+        Value::String(text) => {
+            if let Some(index) = generated.iter().position(|id| id == text) {
+                *text = format!("<generated-id-{}>", index + 1);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_ids(item, generated);
+            }
+        }
+        Value::Object(fields) => {
+            for field in fields.values_mut() {
+                normalize_ids(field, generated);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn render_event(event: &WorkflowEvent, ids: &mut Ordinals) -> String {
@@ -2065,6 +2110,44 @@ mod tests {
                 other => other.type_name().to_string(),
             })
             .collect()
+    }
+
+    #[test]
+    fn the_payload_digest_normalizes_generated_uuids_only() {
+        let events = |payload: Value| {
+            vec![
+                WorkflowEvent::TimerFired {
+                    timer_id: timer("a"),
+                },
+                WorkflowEvent::SignalReceived {
+                    signal_name: "go".to_string(),
+                    payload,
+                },
+            ]
+        };
+        // A timer id is stable, so payload text that matches it still counts.
+        // A substring rewrite made "a" equal to the ordinal "id1".
+        assert_ne!(
+            payload_digests(&events(json!("a"))),
+            payload_digests(&events(json!("id1")))
+        );
+        assert_ne!(
+            payload_digests(&events(json!("abc"))),
+            payload_digests(&events(json!("xbc")))
+        );
+
+        // A generated UUID becomes its ordinal wherever a value equals it.
+        let child = |id: &str| WorkflowEvent::ChildWorkflowStarted {
+            child_id: id.parse().unwrap(),
+            workflow_name: "audit".to_string(),
+            input: json!({"nested": [id]}),
+        };
+        let first = "0190b6a0-0000-7000-8000-000000000001";
+        let second = "0190b6a0-0000-7000-8000-000000000002";
+        assert_eq!(
+            payload_digests(&[child(first)]),
+            payload_digests(&[child(second)])
+        );
     }
 
     #[test]
