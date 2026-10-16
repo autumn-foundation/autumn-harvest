@@ -68,10 +68,10 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
 
-/// One id returned by [`resume_shift_scheduled_at_query`], so the second pass
-/// can exclude exactly the rows the first pass shifted rather than re-deriving
-/// that set from a `created_at` predicate that cannot see commit order
-/// (issue #619 round-19 review).
+/// One id returned by a resume shift pass.
+///
+/// The second pass excludes the ids of the first pass. The resume publishes a
+/// dispatch hint for the ids of both passes after commit (issue #2066).
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName)]
 struct ShiftedTaskId {
@@ -919,6 +919,9 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
 /// paying to recover a sub-millisecond credit — so the residual is documented
 /// rather than eliminated.
 ///
+/// The statement returns the ids it shifts. The resume publishes a dispatch
+/// hint for each one after commit (issue #2066).
+///
 /// Binds: `$1` = queue name, `$2` = the hold's `paused_at`, `$3` = the ids the
 /// primary pass reported shifting.
 #[must_use]
@@ -935,7 +938,8 @@ pub const fn resume_shift_late_arrivals_query() -> &'static str {
        AND NOT EXISTS ( \
              SELECT 1 FROM unnest($3::uuid[]) AS already(id) \
              WHERE already.id = harvest_task_queue.id \
-           )"
+           ) \
+     RETURNING id"
 }
 
 /// The `GET /admin/queues/paused` read, and the Vantage Workers banner's source.
@@ -1489,12 +1493,22 @@ pub async fn resume_queue(
         // (the counts sum exactly, no row is shifted twice) for any commit
         // order rather than only for the ones a `created_at` test happens
         // to separate.
-        let late = diesel::sql_query(resume_shift_late_arrivals_query())
-            .bind::<diesel::sql_types::Text, _>(&queue_owned)
-            .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
-            .execute(conn)
-            .await?;
+        let late_shifted: Vec<ShiftedTaskId> =
+            diesel::sql_query(resume_shift_late_arrivals_query())
+                .bind::<diesel::sql_types::Text, _>(&queue_owned)
+                .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
+                .load(conn)
+                .await?;
+        let late = late_shifted.len();
+        // The late rows need a hint too. Their reference may sit in release
+        // backoff (issue #2066).
+        if crate::dispatch::hints_wanted() {
+            collector
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(late_shifted.into_iter().map(|r| r.id));
+        }
 
         // Wake sleeping listeners (issue #619 round-17 review).
         //
@@ -2039,6 +2053,17 @@ mod tests {
                 "got:\n{sql}"
             );
         }
+    }
+
+    /// Pass 2 must report the ids it shifts, so the resume can publish a
+    /// dispatch hint for them after commit (issue #2066).
+    #[test]
+    fn the_late_resume_pass_returns_the_ids_it_shifts() {
+        let late = resume_shift_late_arrivals_query();
+        assert!(
+            late.trim_end().ends_with("RETURNING id"),
+            "pass 2 must return the shifted ids; got:\n{late}"
+        );
     }
 
     /// The partition must be **total**, and `created_at` is nullable (a

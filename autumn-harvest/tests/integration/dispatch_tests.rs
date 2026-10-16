@@ -715,6 +715,50 @@ async fn gated_row_is_released_with_backoff() {
     .await;
 }
 
+/// A task created during the pause is shifted by the late resume pass. The
+/// resume must republish its hint (issue #2066).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_republishes_hints_for_tasks_created_during_the_pause() {
+    let _serial = DISPATCH_SERIAL.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let channel = Arc::new(MemoryDispatch::new());
+    let _guard = install(&channel);
+
+    let mut conn = connect(&url).await;
+    autumn_harvest::queue_pause::pause_queue(&mut conn, "default", "test", "operator", None)
+        .await
+        .expect("pause");
+    let _resume = PausedQueueGuard {
+        url: url.clone(),
+        queue: "default",
+    };
+    let exec_id = start(&mut conn, "dispatch_trivial").await;
+    let task_id = tasks_for(&mut conn, exec_id)
+        .await
+        .into_iter()
+        .next()
+        .expect("task row")
+        .id;
+
+    // Drop the start's reference, as a parked or lost reference would be.
+    channel.drop_all();
+    assert!(channel.is_drained());
+
+    autumn_harvest::queue_pause::resume_queue(&mut conn, "default", "operator")
+        .await
+        .expect("resume");
+
+    // The background publisher sends the hint, so poll for it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while channel.is_drained() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the resume must republish task {task_id}, which the late pass shifted"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The reconcile sweep republishes a row whose reference the channel lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reconcile_republishes_after_channel_loss() {
