@@ -715,7 +715,17 @@ fn start_body_shard(api_state: &HarvestApiState, body: &[u8]) -> Option<ShardId>
 ///
 /// The second value is the body field that holds the start input. Each
 /// template must be in [`autumn_harvest::audit::CLASSIFIED_ROUTES`].
-pub(crate) const WORKFLOW_ID_ROUTES: &[(&str, StartInput)] = &[];
+pub(crate) const WORKFLOW_ID_ROUTES: &[(&str, StartInput)] = &[
+    ("POST /workflows/{workflow_name}/start", StartInput::Input),
+    (
+        "POST /workflows/{workflow_name}/signal-with-start",
+        StartInput::StartInput,
+    ),
+    (
+        "POST /workflows/{workflow_name}/update-with-start",
+        StartInput::StartInput,
+    ),
+];
 
 /// Which body field holds the start input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -727,8 +737,24 @@ pub(crate) enum StartInput {
 }
 
 /// The start input field of `method` and `path`, if the route has a key.
-fn workflow_id_route(_method: &Method, _path: &str) -> Option<StartInput> {
-    None
+fn workflow_id_route(method: &Method, path: &str) -> Option<StartInput> {
+    static MATCHERS: std::sync::OnceLock<RouteMatchers<StartInput>> = std::sync::OnceLock::new();
+    let matchers = MATCHERS.get_or_init(|| {
+        build_route_matchers("WORKFLOW_ID_ROUTES", WORKFLOW_ID_ROUTES.iter().copied())
+    });
+    match_route(matchers, method, path).map(|m| *m.value)
+}
+
+/// The body fields the hook reads. The handlers read the same names, so a
+/// body they reject names no key here.
+#[derive(serde::Deserialize)]
+struct BodyKeyFields {
+    #[serde(default)]
+    workflow_id: Option<String>,
+    #[serde(default)]
+    input: Option<serde_json::Value>,
+    #[serde(default)]
+    start_input: Option<serde_json::Value>,
 }
 
 /// The business key and start-input presence read from a start-family body.
@@ -739,8 +765,21 @@ struct BodyKey {
 }
 
 /// Read the business key from `body`.
-fn read_body_key(_input: StartInput, _body: &[u8]) -> BodyKey {
-    BodyKey::default()
+///
+/// A body that does not parse names no key. The handler rejects it. A repeated
+/// key fails the parse, as it does in the handler.
+fn read_body_key(input: StartInput, body: &[u8]) -> BodyKey {
+    let Ok(fields) = serde_json::from_slice::<BodyKeyFields>(body) else {
+        return BodyKey::default();
+    };
+    let input = match input {
+        StartInput::Input => fields.input,
+        StartInput::StartInput => fields.start_input,
+    };
+    BodyKey {
+        workflow_id: fields.workflow_id,
+        start_input_present: input.is_some(),
+    }
 }
 
 /// The shard one body `field` names, from a JSON or a form body.
@@ -838,29 +877,38 @@ pub(crate) async fn enforce_authorizer(
     };
 
     let source = shard_source(&method, &path);
-    let request = match source {
-        None | Some(ShardSource::FanOut) => request,
-        Some(ShardSource::Query(keys)) => {
-            shards.extend(query_shards(request.uri().query(), keys));
-            request
+    let key_input = workflow_id_route(&method, &path);
+    if let Some(ShardSource::Query(keys)) = source {
+        shards.extend(query_shards(request.uri().query(), keys));
+    }
+    let reads_body = key_input.is_some()
+        || matches!(
+            source,
+            Some(ShardSource::StartBody | ShardSource::Body { .. })
+        );
+    let mut body_key = BodyKey::default();
+    let request = if reads_body {
+        // Buffer the body under the app's own limit, read the shard and the
+        // key, then put the body back for the handler.
+        let is_form = is_form_urlencoded(request.headers());
+        let (parts, body) = request.into_parts();
+        let bytes = match Bytes::from_request(Request::from_parts(parts.clone(), body), &()).await {
+            Ok(bytes) => bytes,
+            Err(rejection) => return rejection.into_response(),
+        };
+        shards.extend(match source {
+            Some(ShardSource::StartBody) => start_body_shard(&api_state, &bytes),
+            Some(ShardSource::Body { field, form }) => {
+                body_field_shard(field, form, is_form, &bytes)
+            }
+            _ => None,
+        });
+        if let Some(input) = key_input {
+            body_key = read_body_key(input, &bytes);
         }
-        Some(source) => {
-            // Buffer the body under the app's own limit, read the shard, then
-            // put the body back for the handler.
-            let is_form = is_form_urlencoded(request.headers());
-            let (parts, body) = request.into_parts();
-            let bytes =
-                match Bytes::from_request(Request::from_parts(parts.clone(), body), &()).await {
-                    Ok(bytes) => bytes,
-                    Err(rejection) => return rejection.into_response(),
-                };
-            shards.extend(match source {
-                ShardSource::StartBody => start_body_shard(&api_state, &bytes),
-                ShardSource::Body { field, form } => body_field_shard(field, form, is_form, &bytes),
-                ShardSource::Query(_) | ShardSource::FanOut => None,
-            });
-            Request::from_parts(parts, Body::from(bytes))
-        }
+        Request::from_parts(parts, Body::from(bytes))
+    } else {
+        request
     };
     shards.sort_unstable_by_key(|s| s.as_i32());
     shards.dedup();
@@ -888,7 +936,9 @@ pub(crate) async fn enforce_authorizer(
     for shard in candidates {
         let authz = AuthzRequest::new(principal, route_class, &method, &path, request.extensions())
             .with_tenant(tenant.as_deref(), tenant_verified)
-            .with_shard(shard);
+            .with_shard(shard)
+            .with_workflow_id(body_key.workflow_id.as_deref())
+            .with_start_input_present(body_key.start_input_present);
         let AuthzDecision::Deny(reason) = authorizer.0.authorize(&authz).await else {
             continue;
         };

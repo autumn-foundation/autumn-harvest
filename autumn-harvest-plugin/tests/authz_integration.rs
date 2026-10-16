@@ -1425,7 +1425,11 @@ async fn other_routes_carry_no_workflow_id() {
     let by_path = |path: &str| seen.iter().find(|(p, _, _)| p == path).cloned().unwrap();
     assert_eq!(
         by_path("/workflows/by-id/ent/acme%2F1/signal/op"),
-        ("/workflows/by-id/ent/acme%2F1/signal/op".into(), None, false)
+        (
+            "/workflows/by-id/ent/acme%2F1/signal/op".into(),
+            None,
+            false
+        )
     );
     assert_eq!(by_path("/workflows").1, None);
     // A null start input counts as absent.
