@@ -3753,12 +3753,14 @@ const COLUMN_DEBOUNCE: &str = "column-debounce";
 const COLUMN_THROTTLE: &str = "column-throttle";
 const COLUMN_OUTBOX: &str = "column-outbox";
 const COLUMN_BATCH: &str = "column-batch";
+const COLUMN_BATCH_BUFFER: &str = "column-batch-buffer";
 
 /// The cells one [`seed_codec_columns`] call writes. A workflow task row and
 /// an activity task row each hold an input and an output. The activity row
-/// also holds a heartbeat. Every other swept column holds one cell.
+/// also holds a heartbeat. The event batch buffer holds one element, and the
+/// census counts its row once. Every other swept column holds one cell.
 /// `the_seed_covers_every_codec_column` pins this to `CODEC_COLUMNS`.
-const CELLS_PER_SEED: usize = 16;
+const CELLS_PER_SEED: usize = 17;
 
 /// Write one envelope under `key_id` into every swept codec column.
 async fn seed_codec_columns(
@@ -3922,6 +3924,26 @@ async fn seed_short_lived_columns(
     .execute(conn)
     .await
     .expect("insert batch job");
+
+    insert_batch_buffer(conn, &[cell(COLUMN_BATCH_BUFFER)]).await;
+}
+
+/// Insert one event batch row that buffers `elements` (issue #2043).
+async fn insert_batch_buffer(conn: &mut AsyncPgConnection, elements: &[Value]) {
+    use diesel::sql_types::{Jsonb, Text, Uuid as SqlUuid};
+    diesel::sql_query(
+        "INSERT INTO harvest_event_batches \
+         (id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, \
+          start_options, fire_at, max_size, shard_id, created_at, updated_at) \
+         VALUES ($1, 'column_rotation', $2, 'wf', 'default', $3, '{}'::jsonb, \
+                 now() + interval '1 day', 100, 0, now(), now())",
+    )
+    .bind::<SqlUuid, _>(Uuid::new_v4())
+    .bind::<Text, _>(Uuid::new_v4().to_string())
+    .bind::<Jsonb, _>(Value::Array(elements.to_vec()))
+    .execute(conn)
+    .await
+    .expect("insert batch buffer");
 }
 
 /// Every swept codec cell on the shard, as `(column, stored value)`, in
@@ -3958,6 +3980,9 @@ async fn codec_cells(conn: &mut AsyncPgConnection) -> Vec<(String, Value)> {
              FROM harvest_completion_trigger_outbox \
            UNION ALL SELECT 14, id::TEXT, 'batch', signal_payload FROM harvest_batch_jobs \
              WHERE signal_payload IS NOT NULL \
+           UNION ALL SELECT 15, b.id::TEXT, 'batch_buffer', e.value \
+             FROM harvest_event_batches b \
+             CROSS JOIN LATERAL jsonb_array_elements(b.buffered_payloads) e(value) \
          ) c ORDER BY ord, row_id",
     )
     .load(conn)
@@ -4273,6 +4298,85 @@ async fn the_column_sweep_converts_activity_task_rows() {
 
 /// The seed must reach every swept column. A new `CODEC_COLUMNS` entry then
 /// fails here until the seed, and so the sweep tests, cover it.
+/// One batch row holds several elements, each under its own key. The census
+/// counts the row once per key, and the sweep converts every envelope element
+/// in one swap. A clear element stays clear (issue #2043).
+#[tokio::test]
+async fn the_sweep_re_encrypts_each_element_of_a_batch_buffer() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_aead_key_registry();
+    let elements = vec![
+        encode_under(&codecs, "k1", &json!("buffer-a")),
+        encode_under(&codecs, "k1", &json!("buffer-b")),
+        json!("buffer-clear"),
+    ];
+    insert_batch_buffer(&mut conn, &elements).await;
+
+    let by_key = autumn_harvest::codec_rotation::count_rows_by_key_id(&mut conn)
+        .await
+        .expect("census");
+    assert_eq!(by_key.get("k1").copied(), Some(1), "one row, counted once");
+
+    codecs.set_active_key("k2").expect("flip");
+    let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("sweep");
+    assert_eq!(rewritten, 1, "one swap converts the whole buffer");
+
+    let cells = codec_cells(&mut conn).await;
+    assert_eq!(cells.len(), 2, "two envelope elements, one clear");
+    for (column, value) in &cells {
+        assert_eq!(column, "batch_buffer");
+        assert_eq!(
+            autumn_harvest::payload_codec::codec_envelope_key_id(value),
+            Some("k2"),
+            "each envelope element is on the active key"
+        );
+    }
+    let decoded: Vec<Value> = cells
+        .iter()
+        .map(|(_, value)| codecs.decode_column(value).expect("decode"))
+        .collect();
+    assert_eq!(decoded, vec![json!("buffer-a"), json!("buffer-b")]);
+    let by_key = autumn_harvest::codec_rotation::count_rows_by_key_id(&mut conn)
+        .await
+        .expect("census");
+    assert_eq!(by_key.get("k1").copied().unwrap_or(0), 0);
+    assert_eq!(by_key.get("k2").copied(), Some(1));
+}
+
+/// An element under a key this registry never held blocks completion. The
+/// other elements of that buffer stay as they were (issue #2043).
+#[tokio::test]
+async fn an_undecodable_batch_element_blocks_completion() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_aead_key_registry();
+    let orphan = json!({
+        CODEC_ENVELOPE_KEY: {"codec_id": "xor", "kid": "gone", "data": "AAAA"}
+    });
+    insert_batch_buffer(
+        &mut conn,
+        &[encode_under(&codecs, "k1", &json!("buffer-a")), orphan],
+    )
+    .await;
+    codecs.set_active_key("k2").expect("flip");
+
+    let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("a per-cell failure is not an error");
+    assert_eq!(rewritten, 0, "the buffer is left whole");
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert_eq!(progress.rows_by_key_id.get("gone").copied(), Some(1));
+    assert!(
+        progress.cursor.and_then(|c| c.completed_at).is_none(),
+        "the pass must not complete over an unconverted element"
+    );
+}
+
 #[tokio::test]
 async fn the_seed_covers_every_codec_column() {
     #[derive(diesel::QueryableByName)]
