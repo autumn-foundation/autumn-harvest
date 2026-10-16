@@ -68,10 +68,34 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
 
-/// One id returned by [`resume_shift_scheduled_at_query`], so the second pass
-/// can exclude exactly the rows the first pass shifted rather than re-deriving
-/// that set from a `created_at` predicate that cannot see commit order
-/// (issue #619 round-19 review).
+/// Build the late-pass statement. `$tail` is the optional `RETURNING` clause.
+///
+/// One body feeds both variants, so they cannot drift apart.
+macro_rules! late_arrivals_sql {
+    ($tail:literal) => {
+        concat!(
+            "UPDATE harvest_task_queue \
+             SET scheduled_at = CASE \
+                   WHEN created_at IS NULL OR created_at < $2 \
+                     THEN scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2)) \
+                   ELSE clock_timestamp() \
+                 END \
+             WHERE queue_name = $1 \
+               AND state = 'PENDING' \
+               AND scheduled_at <= clock_timestamp() \
+               AND NOT EXISTS ( \
+                     SELECT 1 FROM unnest($3::uuid[]) AS already(id) \
+                     WHERE already.id = harvest_task_queue.id \
+                   )",
+            $tail
+        )
+    };
+}
+
+/// One id returned by a resume shift pass.
+///
+/// The second pass excludes the ids of the first pass. The resume publishes a
+/// dispatch hint for the ids of both passes after commit (issue #2066).
 #[cfg(feature = "db")]
 #[derive(diesel::QueryableByName)]
 struct ShiftedTaskId {
@@ -919,23 +943,26 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
 /// paying to recover a sub-millisecond credit — so the residual is documented
 /// rather than eliminated.
 ///
+/// The statement returns the ids it shifts. The resume publishes a dispatch
+/// hint for each one after commit (issue #2066). A resume with no dispatch
+/// channel runs [`resume_shift_late_arrivals_count_query`] instead.
+///
 /// Binds: `$1` = queue name, `$2` = the hold's `paused_at`, `$3` = the ids the
 /// primary pass reported shifting.
 #[must_use]
 pub const fn resume_shift_late_arrivals_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET scheduled_at = CASE \
-           WHEN created_at IS NULL OR created_at < $2 \
-             THEN scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2)) \
-           ELSE clock_timestamp() \
-         END \
-     WHERE queue_name = $1 \
-       AND state = 'PENDING' \
-       AND scheduled_at <= clock_timestamp() \
-       AND NOT EXISTS ( \
-             SELECT 1 FROM unnest($3::uuid[]) AS already(id) \
-             WHERE already.id = harvest_task_queue.id \
-           )"
+    late_arrivals_sql!(" RETURNING id")
+}
+
+/// The same statement as [`resume_shift_late_arrivals_query`], without the
+/// `RETURNING` clause.
+///
+/// The late pass covers every due task created during the pause. After a long
+/// pause that set can be the whole backlog. A resume with no dispatch channel
+/// needs only the row count, so it must not load the ids (issue #2066).
+#[must_use]
+pub const fn resume_shift_late_arrivals_count_query() -> &'static str {
+    late_arrivals_sql!("")
 }
 
 /// The `GET /admin/queues/paused` read, and the Vantage Workers banner's source.
@@ -1400,7 +1427,7 @@ pub async fn resume_queue(
     // emits the level on the `BEGIN`, so it travels with the query. This
     // mirrors `queue::claim_task`, which pins the same level for the same
     // fresh-snapshot reason.
-    // Ids the shift below thawed, collected so the dispatch hints for them are
+    // Ids both shift passes below thawed, collected so the dispatch hints for them are
     // published **after** this transaction commits (issue #1312). Publishing
     // from inside would name rows a channel reader still sees as held.
     let thawed: std::sync::Arc<std::sync::Mutex<Vec<uuid::Uuid>>> =
@@ -1462,6 +1489,9 @@ pub async fn resume_queue(
         // Trading a rare scale problem for a deterministic, silent,
         // config-dependent break of the feature's core operation is the
         // wrong trade. The memory cost is tracked as a follow-up.
+        // A per-shard install passes `hints_wanted` but gives an unbound caller
+        // no channel. Build the id set only when a publish can land.
+        let publish_hints = crate::dispatch::hints_deliverable();
         let shifted: Vec<ShiftedTaskId> = diesel::sql_query(resume_shift_scheduled_at_query())
             .bind::<diesel::sql_types::Text, _>(&queue_owned)
             .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
@@ -1472,7 +1502,7 @@ pub async fn resume_queue(
         // Only a deployment with a channel needs the thawed ids. Without one
         // the collector stays empty, so a resume of a large backlog does not
         // hold a second copy of every id it shifted.
-        if crate::dispatch::hints_wanted() {
+        if publish_hints {
             collector
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1489,12 +1519,32 @@ pub async fn resume_queue(
         // (the counts sum exactly, no row is shifted twice) for any commit
         // order rather than only for the ones a `created_at` test happens
         // to separate.
-        let late = diesel::sql_query(resume_shift_late_arrivals_query())
-            .bind::<diesel::sql_types::Text, _>(&queue_owned)
-            .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
-            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
-            .execute(conn)
-            .await?;
+        // Load the ids only when a channel will publish them. The late pass can
+        // cover the whole backlog created during a long pause (issue #2066).
+        let late = if publish_hints {
+            let late_shifted: Vec<ShiftedTaskId> =
+                diesel::sql_query(resume_shift_late_arrivals_query())
+                    .bind::<diesel::sql_types::Text, _>(&queue_owned)
+                    .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
+                    .load(conn)
+                    .await?;
+            let count = late_shifted.len();
+            // The late rows need a hint too. Their reference may sit in
+            // release backoff.
+            collector
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(late_shifted.into_iter().map(|r| r.id));
+            count
+        } else {
+            diesel::sql_query(resume_shift_late_arrivals_count_query())
+                .bind::<diesel::sql_types::Text, _>(&queue_owned)
+                .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
+                .execute(conn)
+                .await?
+        };
 
         // Wake sleeping listeners (issue #619 round-17 review).
         //
@@ -2039,6 +2089,34 @@ mod tests {
                 "got:\n{sql}"
             );
         }
+    }
+
+    /// Pass 2 must report the ids it shifts, so the resume can publish a
+    /// dispatch hint for them after commit (issue #2066).
+    #[test]
+    fn the_late_resume_pass_returns_the_ids_it_shifts() {
+        let late = resume_shift_late_arrivals_query();
+        assert!(
+            late.starts_with("UPDATE harvest_task_queue") && late.contains("RETURNING id"),
+            "pass 2 must return the shifted ids; got:\n{late}"
+        );
+    }
+
+    /// A resume with no dispatch channel must not load the late ids. The pass
+    /// can cover the whole backlog created during a long pause (issue #2066).
+    #[test]
+    fn the_count_only_late_pass_returns_no_rows_and_shares_the_id_pass_body() {
+        let with_ids = resume_shift_late_arrivals_query();
+        let count_only = resume_shift_late_arrivals_count_query();
+        assert!(
+            !count_only.contains("RETURNING"),
+            "the count-only pass must not return rows; got:\n{count_only}"
+        );
+        assert_eq!(
+            with_ids.strip_suffix(" RETURNING id"),
+            Some(count_only),
+            "the two passes must differ only in the RETURNING clause"
+        );
     }
 
     /// The partition must be **total**, and `created_at` is nullable (a
