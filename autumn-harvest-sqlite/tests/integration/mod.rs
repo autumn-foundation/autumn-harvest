@@ -24,6 +24,7 @@ mod freeze_activity_defaults;
 mod history_caps;
 mod local_activities;
 mod payload_caps;
+mod payload_depth;
 mod portable_activity;
 mod portable_fixture;
 mod race_activities;

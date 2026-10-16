@@ -849,9 +849,10 @@ impl SqliteRuntime {
     /// # Errors
     ///
     /// Returns [`SqliteError::UnknownWorkflow`] if `workflow_name` has no
-    /// registered handler, [`SqliteError::PayloadTooLarge`] if `input` exceeds the
-    /// workflow-input cap, or [`SqliteError::Sqlite`]/[`SqliteError::Json`] on a
-    /// persistence failure. (Under `AllowDuplicate` it never returns
+    /// registered handler. Returns [`SqliteError::PayloadTooLarge`] if `input`
+    /// exceeds the workflow-input cap. Returns [`SqliteError::PayloadTooDeep`] if
+    /// it nests past [`MAX_PAYLOAD_DEPTH`]. Returns [`SqliteError::Sqlite`] or
+    /// [`SqliteError::Json`] on a persistence failure. (Under `AllowDuplicate` it never returns
     /// [`SqliteError::AlreadyExists`] — that is only for
     /// [`RejectDuplicate`](WorkflowIdReusePolicy::RejectDuplicate).)
     pub fn start_workflow_with_id(
@@ -886,7 +887,8 @@ impl SqliteRuntime {
     /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy).
     /// Returns [`SqliteError::InvalidSearchAttribute`] for a search attribute
     /// that is not a JSON primitive. Returns [`SqliteError::PayloadTooLarge`]
-    /// for a memo over the workflow-input cap.
+    /// for a memo over the workflow-input cap, and
+    /// [`SqliteError::PayloadTooDeep`] for a memo nested past [`MAX_PAYLOAD_DEPTH`].
     pub fn start_workflow_with_options(
         &mut self,
         workflow_name: &str,
@@ -913,6 +915,7 @@ impl SqliteRuntime {
         // The memo shares the workflow-input cap. Postgres stores it in the
         // same row, beside the input.
         if let Some(memo) = &memo {
+            check_depth("memo", memo)?;
             let observed = serde_json::to_string(memo)?.len() as u64;
             if DEFAULT_MAX_WORKFLOW_INPUT_BYTES > 0 && observed > DEFAULT_MAX_WORKFLOW_INPUT_BYTES {
                 return Err(SqliteError::PayloadTooLarge {
@@ -979,9 +982,11 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::AlreadyExists`] when `policy` is
     /// [`RejectDuplicate`](WorkflowIdReusePolicy::RejectDuplicate) and a non-sealed
-    /// prior exists; [`SqliteError::UnknownWorkflow`] for an unregistered workflow;
-    /// [`SqliteError::PayloadTooLarge`] for an oversized `input`; or
-    /// [`SqliteError::Sqlite`]/[`SqliteError::Json`] on a persistence failure.
+    /// prior exists. Returns [`SqliteError::UnknownWorkflow`] for an unregistered
+    /// workflow. Returns [`SqliteError::PayloadTooLarge`] for an oversized `input`
+    /// and [`SqliteError::PayloadTooDeep`] for one nested past
+    /// [`MAX_PAYLOAD_DEPTH`]. Returns [`SqliteError::Sqlite`] or
+    /// [`SqliteError::Json`] on a persistence failure.
     pub fn start_workflow_with_reuse_policy(
         &mut self,
         workflow_name: &str,
@@ -1088,7 +1093,9 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id and
     /// [`SqliteError::WorkflowNotRunning`] for a terminal execution. Returns
-    /// [`SqliteError::PayloadTooLarge`] for an oversized payload. Returns a
+    /// [`SqliteError::PayloadTooLarge`] for an oversized payload and
+    /// [`SqliteError::PayloadTooDeep`] for one nested past [`MAX_PAYLOAD_DEPTH`].
+    /// Returns a
     /// persistence error if the signal row cannot be written.
     // Owned-value ingress API: callers hand over a `serde_json::Value` payload
     // that is serialized into durable storage; `store::stage_signal` only borrows
@@ -1263,6 +1270,7 @@ impl SqliteRuntime {
     /// - [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
     /// - [`SqliteError::AlreadyExists`] for a `RejectDuplicate` collision.
     /// - [`SqliteError::PayloadTooLarge`] for an oversized input or payload.
+    /// - [`SqliteError::PayloadTooDeep`] for an input or payload nested too deep.
     /// - [`SqliteError::InvalidSignal`] for a broken key rule.
     /// - A persistence error.
     pub fn signal_with_start(
@@ -3952,8 +3960,39 @@ fn start_in_tx(
     }
 }
 
+/// The deepest nesting that ingress accepts in a payload (issue #2157).
+///
+/// `serde_json` reads at most 128 levels. Event storage wraps a payload in a
+/// few more levels. The cap leaves room for that wrapping.
+pub const MAX_PAYLOAD_DEPTH: usize = 100;
+
+/// Returns `Ok` only when `value` nests no deeper than [`MAX_PAYLOAD_DEPTH`].
+///
+/// The walk uses a heap stack. A recursive walk would overflow the call
+/// stack on the input it must refuse. The walk stops at the first level past the
+/// cap, so a very deep value costs little to refuse.
+fn check_depth(kind: &'static str, value: &Value) -> SqliteResult<()> {
+    let mut stack = vec![(value, 0_usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > MAX_PAYLOAD_DEPTH {
+            return Err(SqliteError::PayloadTooDeep {
+                kind,
+                observed_depth: depth,
+                cap_depth: MAX_PAYLOAD_DEPTH,
+            });
+        }
+        match node {
+            Value::Array(items) => stack.extend(items.iter().map(|v| (v, depth + 1))),
+            Value::Object(map) => stack.extend(map.values().map(|v| (v, depth + 1))),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Returns `Ok` only when `input` fits the workflow-input cap.
 fn check_input_cap(input: &Value) -> SqliteResult<()> {
+    check_depth("workflow_input", input)?;
     // Enforce the workflow-input cap BEFORE any write (issue #252). The Postgres
     // start path rejects an oversized input with `PayloadTooLarge` before it
     // persists anything. Without this check, this backend stores and replays an
@@ -4056,6 +4095,7 @@ fn stage_keyed(
     // an oversized signal to a terminal run differs only in its error kind.
     // Both backends refuse it and stage no row. The size is the
     // serialized-JSON byte length, as in the core.
+    check_depth("signal_payload", payload)?;
     if DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES > 0 {
         let observed = serde_json::to_string(payload).map_or(0, |s| s.len() as u64);
         if observed > DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES {
