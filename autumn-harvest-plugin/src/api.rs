@@ -25832,7 +25832,11 @@ async fn fork_workflow(
     };
     let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
         Ok(conn) => conn,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            let failure = e.to_string();
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return e.into_response();
+        }
     };
     if request.effects == ForkEffects::Live
         && let Some(response) =

@@ -490,3 +490,56 @@ async fn fork_route_audits_on_the_source_shard() {
         "no audit on the default shard"
     );
 }
+
+/// A fork whose source shard cannot give a connection is still audited. The
+/// row lands on the default shard, as for the other refusals before the
+/// source shard resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_with_no_source_shard_connection_is_audited() {
+    let (url, _container) = setup_database().await;
+    let (url_a, _url_b) = two_shard_urls(&url).await;
+    let mut pools = std::collections::BTreeMap::new();
+    pools.insert(ShardId::new(0), build_pool(&url_a));
+    // Nothing listens on port 1, so every checkout from shard 1 fails.
+    pools.insert(
+        ShardId::new(1),
+        build_pool("postgres://postgres:postgres@127.0.0.1:1/postgres"),
+    );
+    let storage = HarvestDbPool::sharded(autumn_harvest::shard::ShardedDbPool::from_map(
+        pools,
+        ShardId::new(0),
+    ));
+    let api_state = HarvestApiState::new();
+    api_state.set_admin_auth_boundary(true);
+    api_state.install_storage_pool(storage);
+    api_state.install(HarvestApiRuntime::new(
+        Arc::new(fork_registry()),
+        Arc::new(DagCatalog::default()),
+        Arc::new(Vec::new()),
+        Some("fork-shard-test".to_string()),
+        vec!["default".to_string()],
+        SchedulerMonitor::offline(),
+        HarvestRetentionRuntime::disabled(autumn_harvest::RetentionConfig::default()),
+        ShardRouter::new(
+            vec![ShardId::new(0), ShardId::new(1)],
+            vec![ShardId::new(0), ShardId::new(1)],
+            ShardId::new(0),
+        ),
+    ));
+    let app = harvest_api_router(api_state);
+
+    let source = ExecutionId::new_for_shard(ShardId::new(1)).to_string();
+    let (status, body) = post_fork(&app, &source, json!({ "reason": "what-if" }), true).await;
+    assert!(status.is_server_error(), "{status}: {body}");
+
+    let mut conn = AsyncPgConnection::establish(&url_a).await.expect("connect");
+    let failed: i64 = autumn_harvest::schema::harvest_audit_log::table
+        .filter(autumn_harvest::schema::harvest_audit_log::operation.eq("workflow.fork"))
+        .filter(autumn_harvest::schema::harvest_audit_log::target_id.eq(&source))
+        .filter(autumn_harvest::schema::harvest_audit_log::status.eq("failed"))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("count failed audit rows");
+    assert_eq!(failed, 1, "one failed audit row on the default shard");
+}
