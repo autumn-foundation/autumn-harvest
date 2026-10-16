@@ -4303,19 +4303,30 @@ while True:
                 .filter(|path| !path.to_string_lossy().ends_with(VMM_COPIES_SUFFIX))
                 .collect()
         };
-        let mut launch = launcher.launch();
         // Poll once at a time. The link step is the first wait after the
-        // jail exists, so the launch stops there.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while jails().is_empty() {
-            assert!(Instant::now() < deadline, "the launch never made a jail");
-            let polled = std::future::poll_fn(|cx| {
-                std::task::Poll::Ready(launch.as_mut().poll(cx).is_pending())
-            })
-            .await;
-            assert!(polled, "the launch ended before it made a jail");
-            tokio::time::sleep(Duration::from_millis(1)).await;
+        // jail exists, so the launch usually stops there. The link task can
+        // end before its first poll, and then one poll runs the whole
+        // launch. That attempt leaves no jail, and the test tries again.
+        let mut caught = None;
+        for _ in 0..20 {
+            let mut launch = launcher.launch();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut pending = true;
+            while pending && jails().is_empty() {
+                assert!(Instant::now() < deadline, "the launch never made a jail");
+                pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(launch.as_mut().poll(cx).is_pending())
+                })
+                .await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            if pending {
+                caught = Some(launch);
+                break;
+            }
+            assert!(jails().is_empty(), "an ended launch left {:?}", jails());
         }
+        let launch = caught.expect("each launch ended before it made a jail");
         drop(launch);
         // The link task can still run after the drop.
         let deadline = Instant::now() + Duration::from_secs(5);

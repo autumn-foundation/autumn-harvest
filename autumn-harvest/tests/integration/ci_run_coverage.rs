@@ -1705,10 +1705,77 @@ pub const SHELL_OPERATORS: &[&str] = &[";", "&", "|", "\n", "`", "$("];
 /// An `if` can skip the step on the nightly. A `continue-on-error` makes a
 /// failed suite look green to the watchdog, which counts successful runs.
 pub fn ungated(node: &serde_yaml::Value) -> bool {
-    let soft = node
-        .get("continue-on-error")
-        .is_some_and(|v| v.as_bool() != Some(false));
-    node.get("if").is_none() && !soft
+    node.get("if").is_none() && !soft(node)
+}
+
+/// The draft-skip condition that `ci.yml` uses. A schedule always runs.
+pub const DRAFT_SKIP: &str =
+    "github.event_name != 'pull_request' || github.event.pull_request.draft == false";
+
+/// True when a job has no `continue-on-error` and no `if` but [`DRAFT_SKIP`].
+pub fn runs_on_every_schedule(job: &serde_yaml::Value) -> bool {
+    !soft(job)
+        && matches!(
+            job.get("if").map(serde_yaml::Value::as_str),
+            None | Some(Some(DRAFT_SKIP))
+        )
+}
+
+/// True when a job or step sets `continue-on-error` to anything but `false`.
+pub fn soft(node: &serde_yaml::Value) -> bool {
+    node.get("continue-on-error")
+        .is_some_and(|v| v.as_bool() != Some(false))
+}
+
+/// The steps of a parsed workflow job.
+pub fn steps(job: &serde_yaml::Value) -> Vec<&serde_yaml::Value> {
+    job.get("steps")
+        .and_then(serde_yaml::Value::as_sequence)
+        .map(|s| s.iter().collect())
+        .unwrap_or_default()
+}
+
+/// The string at `path` under `node`, or `""` when a key is missing.
+pub fn str_at<'a>(node: &'a serde_yaml::Value, path: &[&str]) -> &'a str {
+    let mut cur = node;
+    for key in path {
+        match cur.get(key) {
+            Some(next) => cur = next,
+            None => return "",
+        }
+    }
+    cur.as_str().unwrap_or("")
+}
+
+/// The names in a job's `needs`, a string or a list.
+pub fn job_needs(job: &serde_yaml::Value) -> BTreeSet<&str> {
+    match job.get("needs") {
+        Some(serde_yaml::Value::String(s)) => BTreeSet::from([s.as_str()]),
+        Some(serde_yaml::Value::Sequence(s)) => s.iter().filter_map(|n| n.as_str()).collect(),
+        _ => BTreeSet::new(),
+    }
+}
+
+/// True when `pin` is a dated nightly, such as `nightly-2026-08-14`.
+///
+/// A newer nightly can fail to compile the crate, so a pin must be a date.
+pub fn dated_nightly(pin: &str) -> bool {
+    pin.strip_prefix("nightly-")
+        .is_some_and(|d| d.len() == 10 && d.chars().all(|c| c.is_ascii_digit() || c == '-'))
+}
+
+/// True when a job needs each of `needs` and opens an issue after a failed
+/// scheduled run. GitHub tells only the last editor of a cron about a failure.
+pub fn alerts_on_scheduled_failure(job: &serde_yaml::Value, needs: &[&str]) -> bool {
+    let condition = str_at(job, &["if"]);
+    let listed = job_needs(job);
+    needs.iter().all(|n| listed.contains(n))
+        && condition.contains("failure()")
+        && condition.contains("'schedule'")
+        && str_at(job, &["permissions", "issues"]) == "write"
+        && steps(job)
+            .iter()
+            .any(|s| str_at(s, &["run"]).contains("gh issue create"))
 }
 
 /// True when an ungated step in an ungated job runs the whole `chaos_tests`
