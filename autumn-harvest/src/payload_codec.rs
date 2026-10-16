@@ -1816,20 +1816,27 @@ impl PayloadCodecs {
     /// [`PayloadCodecs::encode_column`] does. A clear legacy value is encoded,
     /// and ciphertext moves to the active key. With column encoding off, the
     /// copy keeps the stored bytes, so it never turns ciphertext into clear.
-    /// A value this registry cannot decode also keeps its stored bytes, so the
-    /// copy never loses or guesses a value.
+    /// A value this registry cannot decode, or that decodes to bytes which are
+    /// not JSON, also keeps its stored bytes. The copy never loses or guesses a
+    /// value.
     ///
     /// # Errors
     ///
     /// [`HarvestError`] when the codec fails to encode the decoded value.
     #[cfg(feature = "db")]
     pub(crate) fn recode_column_for_copy(&self, stored: &Value) -> HarvestResult<Value> {
+        // Read the switch once. A concurrent flip must not leave a decoded
+        // value to be stored in clear.
         if !self.column_encoding() {
             return Ok(stored.clone());
         }
         match self.decode_column(stored) {
-            Ok(plain) => self.encode_column(&plain),
-            Err(error) if error.is_codec_failure() => Ok(stored.clone()),
+            Ok(plain) => self.encode_payload(&plain),
+            Err(error)
+                if error.is_codec_failure() || matches!(error, HarvestError::Serialization(_)) =>
+            {
+                Ok(stored.clone())
+            }
             Err(error) => Err(error),
         }
     }
@@ -4092,6 +4099,18 @@ mod tests {
             codecs.recode_column_for_copy(&corrupt).expect("recode"),
             corrupt,
             "an unreadable value is copied as stored"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_keeps_the_stored_bytes_when_the_decoded_bytes_are_not_json() {
+        let codecs = keyed_codecs(true);
+        let bytes = XorCodec(1).encode(b"not json").expect("encode");
+        let stored = PayloadCodecs::envelope("xor", "k1", &bytes, false);
+        assert_eq!(
+            codecs.recode_column_for_copy(&stored).expect("recode"),
+            stored
         );
     }
 
