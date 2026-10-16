@@ -25979,9 +25979,8 @@ async fn process_workflow_task(
             // execution row so a child workflow can read it via `ctx.info()` /
             // `ctx.parent_execution_id()`. `None` for a top-level run.
             parent_execution_id: prepared.execution.parent_id.map(ExecutionId::from_uuid),
-            // Issue #2082: thread how the run started and its predecessor from
-            // the execution row, so a keyed entity can tell a client start
-            // from a continue-as-new checkpoint.
+            // Issue #2082: read the start source and predecessor from the row.
+            // A keyed entity uses them to tell a client start from a checkpoint.
             start_provenance: crate::types::StartProvenance::from_row(
                 prepared.execution.start_source.as_deref(),
                 prepared.execution.continued_from_exec_id,

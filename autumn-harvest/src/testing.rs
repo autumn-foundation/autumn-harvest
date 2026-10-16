@@ -605,6 +605,9 @@ struct SampledExecution {
     // replay so a workflow that branches on `ctx.queue_name()` does not
     // false-report non-determinism.
     queue_name: String,
+    // Issue #2082: the sampled row's start source and predecessor, so a canary
+    // replay of a keyed entity takes the same branch as the live run.
+    start_provenance: crate::types::StartProvenance,
 }
 
 impl WorkflowReplayer {
@@ -694,7 +697,10 @@ impl WorkflowReplayer {
     /// `ctx.info().start_source` needs it to replay like the live run. The
     /// default is an unknown source with no predecessor.
     #[must_use]
-    pub const fn with_start_provenance(mut self, provenance: crate::types::StartProvenance) -> Self {
+    pub const fn with_start_provenance(
+        mut self,
+        provenance: crate::types::StartProvenance,
+    ) -> Self {
         self.start_provenance = provenance;
         self
     }
@@ -1151,6 +1157,7 @@ impl WorkflowReplayer {
             parent_execution_id,
             workflow_id,
             queue_name,
+            self.start_provenance,
         )
         .await
     }
@@ -1173,6 +1180,7 @@ impl WorkflowReplayer {
         // Issue #798: the execution's task queue, so a workflow branching on
         // `ctx.queue_name()` does not replay under `""`.
         queue_name: Option<String>,
+        start_provenance: crate::types::StartProvenance,
     ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
@@ -1192,7 +1200,8 @@ impl WorkflowReplayer {
 
         // Issue #798 (Codex round 21): borrow the candidate's declarative
         // handlers for the duration of the executor call.
-        let declarative = self.declarative_handlers();
+        let mut declarative = self.declarative_handlers();
+        declarative.start_provenance = start_provenance;
         let exec_id = snapshot.execution_id;
         // Issue #698: the workflow type name (mechanism 1 — the handler-lookup key)
         // applied to the replayed context via `.with_workflow_name(...)`.
@@ -1231,6 +1240,7 @@ impl WorkflowReplayer {
                     parent_execution_id,
                     workflow_id,
                     queue_name,
+                    start_provenance,
                 )
                 .await;
         }
@@ -1347,6 +1357,7 @@ impl WorkflowReplayer {
             parent_execution_id,
             workflow_id,
             queue_name,
+            self.start_provenance,
         )
         .await
     }
@@ -1362,6 +1373,7 @@ impl WorkflowReplayer {
         parent_execution_id: Option<ExecutionId>,
         workflow_id: Option<String>,
         queue_name: Option<String>,
+        start_provenance: crate::types::StartProvenance,
     ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
@@ -1381,7 +1393,8 @@ impl WorkflowReplayer {
 
         // Issue #798 (Codex round 21): borrow the candidate's declarative
         // handlers for the duration of the executor call.
-        let declarative = self.declarative_handlers();
+        let mut declarative = self.declarative_handlers();
+        declarative.start_provenance = start_provenance;
         let exec_id = snapshot.execution_id;
         // Issue #698: the workflow type name (mechanism 1 — the handler-lookup key).
         let workflow_name = snapshot.workflow_name.clone();
@@ -1730,6 +1743,7 @@ impl WorkflowReplayer {
                 meta.parent_execution_id,
                 workflow_id,
                 queue_name,
+                meta.start_provenance,
             )
             .await)
     }
@@ -1793,6 +1807,7 @@ impl WorkflowReplayer {
                 meta.parent_execution_id,
                 workflow_id,
                 queue_name,
+                meta.start_provenance,
             )
             .await)
     }
@@ -1870,8 +1885,19 @@ impl WorkflowReplayer {
 
         let mut all_executions = Vec::new();
         for (shard_id, executions) in query_results {
-            for (id, name, created, headers, exec_timeout, deadline_at, parent_id, wf_id, queue) in
-                executions
+            for (
+                id,
+                name,
+                created,
+                headers,
+                exec_timeout,
+                deadline_at,
+                parent_id,
+                wf_id,
+                queue,
+                start_source,
+                continued_from,
+            ) in executions
             {
                 all_executions.push(SampledExecution {
                     shard_id,
@@ -1888,6 +1914,11 @@ impl WorkflowReplayer {
                     workflow_id: wf_id,
                     // Issue #798: the sampled row's task queue.
                     queue_name: queue,
+                    // Issue #2082: the sampled row's start source and predecessor.
+                    start_provenance: crate::types::StartProvenance::from_row(
+                        start_source.as_deref(),
+                        continued_from,
+                    ),
                 });
             }
         }
@@ -1959,6 +1990,7 @@ impl WorkflowReplayer {
                                     exec.parent_execution_id,
                                     Some(exec.workflow_id.clone()),
                                     Some(exec.queue_name.clone()),
+                                    exec.start_provenance,
                                 )
                                 .await;
                             Ok::<_, crate::error::HarvestError>(report)
@@ -2090,11 +2122,14 @@ async fn query_running_executions(
         Option<uuid::Uuid>,
         String,
         String,
+        Option<String>,
+        Option<uuid::Uuid>,
     )>,
 > {
     use crate::schema::harvest_workflow_executions::dsl::{
-        context_headers, created_at, deadline_at, execution_timeout, harvest_workflow_executions,
-        id, parent_id, queue_name, state, workflow_id, workflow_name,
+        context_headers, continued_from_exec_id, created_at, deadline_at, execution_timeout,
+        harvest_workflow_executions, id, parent_id, queue_name, start_source, state, workflow_id,
+        workflow_name,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -2126,6 +2161,9 @@ async fn query_running_executions(
             // Issue #798: thread the execution's task queue, so a canary replay of
             // a workflow branching on `ctx.queue_name()` does not run under "".
             queue_name,
+            // Issue #2082: thread the start source and predecessor.
+            start_source,
+            continued_from_exec_id,
         ))
         .order((created_at.desc(), id.desc()))
         .limit(i64::try_from(options.sample_size).unwrap_or(i64::MAX))
@@ -2139,6 +2177,8 @@ async fn query_running_executions(
             Option<uuid::Uuid>,
             String,
             String,
+            Option<String>,
+            Option<uuid::Uuid>,
         )>(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -2260,6 +2300,8 @@ struct DbReplayMeta {
     // Issue #798: the row's `queue_name` column, so `replay_from_db` reports the
     // real `ctx.queue_name()` instead of "".
     queue_name: String,
+    // Issue #2082: the row's start source and predecessor.
+    start_provenance: crate::types::StartProvenance,
 }
 
 #[cfg(feature = "db")]
@@ -2273,17 +2315,28 @@ async fn load_workflow_name_and_headers(
 ) -> crate::error::HarvestResult<DbReplayMeta> {
     use crate::error::{HarvestError, database_error};
     use crate::schema::harvest_workflow_executions::dsl::{
-        context_headers as context_headers_col, deadline_at as deadline_at_col,
-        execution_timeout as execution_timeout_col, harvest_workflow_executions, id as id_col,
-        parent_id as parent_id_col, queue_name as queue_name_col, workflow_id as workflow_id_col,
-        workflow_name,
+        context_headers as context_headers_col, continued_from_exec_id as continued_from_col,
+        deadline_at as deadline_at_col, execution_timeout as execution_timeout_col,
+        harvest_workflow_executions, id as id_col, parent_id as parent_id_col,
+        queue_name as queue_name_col, start_source as start_source_col,
+        workflow_id as workflow_id_col, workflow_name,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
     let exec_uuid = exec_id.as_uuid();
 
-    let (name, raw_headers, execution_timeout, deadline_at, parent_uuid, workflow_id, queue_name): (
+    let (
+        name,
+        raw_headers,
+        execution_timeout,
+        deadline_at,
+        parent_uuid,
+        workflow_id,
+        queue_name,
+        start_source,
+        continued_from,
+    ): (
         String,
         Option<serde_json::Value>,
         Option<chrono::Duration>,
@@ -2291,6 +2344,8 @@ async fn load_workflow_name_and_headers(
         Option<uuid::Uuid>,
         String,
         String,
+        Option<String>,
+        Option<uuid::Uuid>,
     ) = harvest_workflow_executions
         .filter(id_col.eq(exec_uuid))
         .select((
@@ -2302,6 +2357,9 @@ async fn load_workflow_name_and_headers(
             workflow_id_col,
             // Issue #798: the row's task queue.
             queue_name_col,
+            // Issue #2082: the row's start source and predecessor.
+            start_source_col,
+            continued_from_col,
         ))
         .first(conn)
         .await
@@ -2332,6 +2390,11 @@ async fn load_workflow_name_and_headers(
         workflow_id,
         // Issue #798: the row's task queue.
         queue_name,
+        // Issue #2082: the row's start source and predecessor.
+        start_provenance: crate::types::StartProvenance::from_row(
+            start_source.as_deref(),
+            continued_from,
+        ),
     })
 }
 
@@ -6490,7 +6553,10 @@ impl WorkflowTestEnv {
     /// `replay_check` replays under the same value. The default is an unknown
     /// source with no predecessor.
     #[must_use]
-    pub const fn with_start_provenance(mut self, provenance: crate::types::StartProvenance) -> Self {
+    pub const fn with_start_provenance(
+        mut self,
+        provenance: crate::types::StartProvenance,
+    ) -> Self {
         self.start_provenance = provenance;
         self
     }

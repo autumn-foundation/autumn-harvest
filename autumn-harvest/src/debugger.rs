@@ -1672,6 +1672,8 @@ impl ReplayDebugger {
                 queries: &queries,
                 updates: &updates,
                 router: None,
+                // A snapshot holds no row, so the debugger replays with an unknown source.
+                start_provenance: crate::types::StartProvenance::default(),
             },
         );
 

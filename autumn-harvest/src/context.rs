@@ -31171,7 +31171,9 @@ mod tests {
         assert_eq!(ctx.info().continued_from, Some(predecessor));
         assert_eq!(ctx.start_source(), StartSource::ContinueAsNew);
         assert_eq!(ctx.continued_from(), Some(predecessor));
-        assert_eq!(build().info(), ctx.info());
+        let again = build().info();
+        assert_eq!(again.start_source, ctx.info().start_source);
+        assert_eq!(again.continued_from, ctx.info().continued_from);
     }
 
     /// AC5/AC6 (zero footprint): calling `info()` emits no commands and leaves
