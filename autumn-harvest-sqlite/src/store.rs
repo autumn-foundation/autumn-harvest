@@ -102,28 +102,25 @@ pub fn insert_execution_with_config(
 
 /// Insert a child run with its parent link (issue #2026).
 ///
-/// `parent_close_policy` is `None` for an awaited child. A detached child
-/// stores its policy, as the Postgres `parent_close_policy` column does.
+/// `parent` is the parent run and the close policy. The policy is `None` for
+/// an awaited child. A detached child stores its policy, as the Postgres
+/// `parent_close_policy` column does. `config` holds the timeout and retry
+/// settings of the child's type (issue #2029).
 pub fn insert_child_execution(
     conn: &Connection,
     exec_id: ExecutionId,
     workflow_name: &str,
     input: &Value,
-    parent: ExecutionId,
-    parent_close_policy: Option<&str>,
+    parent: (ExecutionId, Option<&str>),
+    config: &RunConfig,
 ) -> SqliteResult<()> {
     // A child's business id is its own execution id, as on Postgres.
+    let workflow_id = exec_id.to_string();
+    insert_execution_with_config(conn, exec_id, workflow_name, &workflow_id, input, config)?;
     conn.execute(
-        "INSERT INTO harvest_executions \
-         (exec_id, workflow_name, workflow_id, input_json, state, parent_exec_id, parent_close_policy) \
-         VALUES (?1, ?2, ?1, ?3, 'RUNNING', ?4, ?5)",
-        params![
-            exec_id.to_string(),
-            workflow_name,
-            serde_json::to_string(input)?,
-            parent.to_string(),
-            parent_close_policy
-        ],
+        "UPDATE harvest_executions SET parent_exec_id = ?2, parent_close_policy = ?3 \
+         WHERE exec_id = ?1",
+        params![exec_id.to_string(), parent.0.to_string(), parent.1],
     )?;
     Ok(())
 }
@@ -528,13 +525,17 @@ pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) ->
 }
 
 /// Move a run to `CANCELLED` and store the reason in `error` (issue #2026).
+///
+/// It records the close time and releases the run's mutex locks and waits,
+/// as every terminal setter does (issues #2027 and #2029).
 pub fn set_cancelled(conn: &Connection, exec_id: ExecutionId, reason: &str) -> SqliteResult<()> {
     conn.execute(
-        "UPDATE harvest_executions SET state = 'CANCELLED', output_json = NULL, error = ?2 \
+        "UPDATE harvest_executions SET state = 'CANCELLED', output_json = NULL, error = ?2, \
+           closed_at = ?3 \
          WHERE exec_id = ?1",
-        params![exec_id.to_string(), reason],
+        params![exec_id.to_string(), reason, now_micros()],
     )?;
-    Ok(())
+    crate::mutex::release_all(conn, exec_id)
 }
 
 pub fn set_failed(conn: &Connection, exec_id: ExecutionId, error: &str) -> SqliteResult<()> {

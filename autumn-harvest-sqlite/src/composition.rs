@@ -23,10 +23,11 @@ use autumn_harvest::types::{
     ExternalAwaitId, ExternalCancelId, ExternalSignalId, ExternalTarget, ParentClosePolicy,
 };
 use autumn_harvest::{ExecutionId, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::error::{SqliteError, SqliteResult};
+use crate::runtime::WorkflowPolicy;
 use crate::{queue, store, worker};
 use rusqlite::Connection;
 
@@ -46,6 +47,14 @@ const PARENT_CLOSED_TERMINATE: &str = "ParentClosed";
 /// mirrors the core `CHILD_TIMEOUT_TIMER_PREFIX`, which is not public.
 const CHILD_TIMEOUT_TIMER_PREFIX: &str = "__child_timeout:";
 
+/// What a child start reads from the runtime's registry (issue #2026).
+pub struct Registry<'a> {
+    /// The registered workflow handlers. A child's type must be one of them.
+    pub workflows: &'a HashMap<String, WorkflowHandlerFn>,
+    /// The timeout and the retry policy of each type (issue #2029).
+    pub policies: &'a HashMap<String, WorkflowPolicy>,
+}
+
 /// Apply one composition command of a suspending cycle (issue #2026).
 ///
 /// The command is one of `StartChildWorkflow`, `SpawnDetachedChildWorkflow`,
@@ -60,7 +69,7 @@ const CHILD_TIMEOUT_TIMER_PREFIX: &str = "__child_timeout:";
 /// persistence error. The caller then drops its transaction.
 pub fn apply_command(
     conn: &Connection,
-    workflows: &HashMap<String, WorkflowHandlerFn>,
+    registry: &Registry<'_>,
     exec: ExecutionId,
     history: &[WorkflowEvent],
     cmd: &WorkflowCommand,
@@ -74,13 +83,14 @@ pub fn apply_command(
             ..
         } => start_child(
             conn,
-            workflows,
+            registry,
             exec,
             history,
             *child_id,
             workflow_name,
             input,
             None,
+            now,
         ),
         WorkflowCommand::SpawnDetachedChildWorkflow {
             child_id,
@@ -89,13 +99,14 @@ pub fn apply_command(
             parent_close_policy,
         } => start_child(
             conn,
-            workflows,
+            registry,
             exec,
             history,
             *child_id,
             workflow_name,
             input,
             Some(*parent_close_policy),
+            now,
         ),
         WorkflowCommand::SignalExternalWorkflow {
             signal_id,
@@ -144,7 +155,8 @@ pub fn apply_command(
 ///
 /// `policy` is `None` for an awaited child and `Some` for a detached child.
 /// The parent records `ChildWorkflowStarted` or `ChildWorkflowSpawnedDetached`.
-/// The child gets its row and its `WorkflowStarted` event.
+/// The child gets its row and its `WorkflowStarted` event. It starts at `now`,
+/// the cycle clock in epoch milliseconds, so its deadline counts from there.
 ///
 /// A re-drive of an in-progress child re-emits its command with the recorded
 /// id. That id is in `history` or has a row, so the call writes nothing.
@@ -158,18 +170,19 @@ pub fn apply_command(
 #[allow(clippy::too_many_arguments)]
 pub fn start_child(
     conn: &Connection,
-    workflows: &HashMap<String, WorkflowHandlerFn>,
+    registry: &Registry<'_>,
     parent: ExecutionId,
     history: &[WorkflowEvent],
     child_id: ExecutionId,
     workflow_name: &str,
     input: &Value,
     policy: Option<ParentClosePolicy>,
+    now: i64,
 ) -> SqliteResult<bool> {
     if child_recorded(history, child_id) || store::execution_exists(conn, child_id)? {
         return Ok(false);
     }
-    if !workflows.contains_key(workflow_name) {
+    if !registry.workflows.contains_key(workflow_name) {
         return Err(SqliteError::UnknownWorkflow(workflow_name.to_string()));
     }
     let parent_event = policy.map_or_else(
@@ -186,16 +199,24 @@ pub fn start_child(
         },
     );
     store::append_event(conn, parent, &parent_event)?;
+    // A child keeps the timeout and the retry policy of its type (issue
+    // #2029). An awaited child never retries, as on Postgres, so only a
+    // detached child stores the retry policy.
+    let mut config = crate::runtime::fresh_run_config(registry.policies.get(workflow_name), now)?;
+    if policy.is_none() {
+        config.retry_policy_json = None;
+    }
     store::insert_child_execution(
         conn,
         child_id,
         workflow_name,
         input,
-        parent,
-        policy.map(ParentClosePolicy::as_str),
+        (parent, policy.map(ParentClosePolicy::as_str)),
+        &config,
     )?;
-    // List and describe read the start time from the row (issue #2027).
-    let started_at = Utc::now();
+    // List and describe read the start time from the row (issue #2027). The
+    // deadline counts from it.
+    let started_at = DateTime::from_timestamp_millis(now).unwrap_or_else(Utc::now);
     store::set_start_fields(conn, child_id, started_at.timestamp_micros(), None, None)?;
     store::append_event(
         conn,

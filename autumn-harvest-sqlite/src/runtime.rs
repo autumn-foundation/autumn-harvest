@@ -130,11 +130,36 @@ impl ActivitySpec {
 }
 
 /// The timeout and retry declarations of a registered workflow (issue #2029).
-struct WorkflowPolicy {
+pub struct WorkflowPolicy {
     /// `#[workflow(execution_timeout = ..)]`.
     execution_timeout: Option<std::time::Duration>,
     /// `#[workflow(retry = ..)]`.
     retry_policy: Option<autumn_harvest::policy::RetryPolicy>,
+}
+
+/// The [`store::RunConfig`] of a fresh run that starts at `now`, from its
+/// type's `policy` (issue #2029). A start and a child start share it.
+pub fn fresh_run_config(
+    policy: Option<&WorkflowPolicy>,
+    now: i64,
+) -> SqliteResult<store::RunConfig> {
+    // Round up, so a sub-millisecond timeout never fires at once.
+    let timeout_ms = policy
+        .and_then(|p| p.execution_timeout)
+        .map(duration_to_millis_ceil);
+    let retry_policy_json = policy
+        .and_then(|p| p.retry_policy.as_ref())
+        .map(serde_json::to_string)
+        .transpose()?;
+    Ok(store::RunConfig {
+        execution_timeout_ms: timeout_ms,
+        deadline_at: timeout_ms.map(|ms| now.saturating_add(ms)),
+        start_at: None,
+        attempt: 1,
+        retry_policy_json,
+        retry_of: None,
+        local_retry_at: None,
+    })
 }
 
 /// The status of an execution after a driver step.
@@ -1059,24 +1084,7 @@ impl SqliteRuntime {
     /// The [`store::RunConfig`] of a fresh run of `workflow_name` that starts
     /// at `now` (issue #2029).
     fn start_config(&self, workflow_name: &str, now: i64) -> SqliteResult<store::RunConfig> {
-        let policy = self.workflow_policies.get(workflow_name);
-        // Round up, so a sub-millisecond timeout never fires at once.
-        let timeout_ms = policy
-            .and_then(|p| p.execution_timeout)
-            .map(duration_to_millis_ceil);
-        let retry_policy_json = policy
-            .and_then(|p| p.retry_policy.as_ref())
-            .map(serde_json::to_string)
-            .transpose()?;
-        Ok(store::RunConfig {
-            execution_timeout_ms: timeout_ms,
-            deadline_at: timeout_ms.map(|ms| now.saturating_add(ms)),
-            start_at: None,
-            attempt: 1,
-            retry_policy_json,
-            retry_of: None,
-            local_retry_at: None,
-        })
+        fresh_run_config(self.workflow_policies.get(workflow_name), now)
     }
 
     /// The checks of a plain start, before any write: a registered workflow
@@ -1497,7 +1505,10 @@ impl SqliteRuntime {
             batch.ingest.apply(&tx, exec)?;
             let history = store::load_history(&tx, exec)?;
             let drain = TerminalDrain {
-                workflows: &self.workflows,
+                registry: composition::Registry {
+                    workflows: &self.workflows,
+                    policies: &self.workflow_policies,
+                },
                 history: &history,
                 cycle: TerminalCycle::Completing,
                 now,
@@ -2395,7 +2406,10 @@ impl SqliteRuntime {
         let tx = self.conn.transaction()?;
         failure.ingest.apply(&tx, exec)?;
         let drain = TerminalDrain {
-            workflows: &self.workflows,
+            registry: composition::Registry {
+                workflows: &self.workflows,
+                policies: &self.workflow_policies,
+            },
             history: failure.history,
             cycle: TerminalCycle::Failing,
             now: clock.decided_at,
@@ -2657,7 +2671,10 @@ impl SqliteRuntime {
         ingest.apply(&tx, exec)?;
         let history = store::load_history(&tx, exec)?;
         let drain = TerminalDrain {
-            workflows: &self.workflows,
+            registry: composition::Registry {
+                workflows: &self.workflows,
+                policies: &self.workflow_policies,
+            },
             history: &history,
             cycle: TerminalCycle::Completing,
             now,
@@ -2972,7 +2989,10 @@ impl SqliteRuntime {
                 // terminal event, in command order, inside the SAME transaction —
                 // mirroring the Postgres `persist_terminal_outcome_commands`.
                 let drain = TerminalDrain {
-                    workflows: &self.workflows,
+                    registry: composition::Registry {
+                        workflows: &self.workflows,
+                        policies: &self.workflow_policies,
+                    },
                     history: &history,
                     cycle: TerminalCycle::Completing,
                     now: decided_at,
@@ -3410,7 +3430,11 @@ impl SqliteRuntime {
                 | WorkflowCommand::RequestCancelExternalWorkflow { .. }
                 | WorkflowCommand::AwaitExternalWorkflow { .. }) => {
                     let at = clock.decided_at;
-                    if composition::apply_command(&tx, &self.workflows, exec, history, cmd, at)? {
+                    let registry = composition::Registry {
+                        workflows: &self.workflows,
+                        policies: &self.workflow_policies,
+                    };
+                    if composition::apply_command(&tx, &registry, exec, history, cmd, at)? {
                         produced = true;
                     }
                     // A cancel can reach this run through a parent-close cascade.
@@ -4920,8 +4944,8 @@ enum TerminalCycle {
 /// The context that a terminal drain needs to start or record a child (issue
 /// #2026).
 struct TerminalDrain<'a> {
-    /// The registered workflow handlers. A detached spawn checks its type here.
-    workflows: &'a HashMap<String, WorkflowHandlerFn>,
+    /// The registered workflows. A detached spawn reads its type here.
+    registry: composition::Registry<'a>,
     /// The history that the cycle replayed.
     history: &'a [WorkflowEvent],
     /// How the cycle ends.
@@ -4966,13 +4990,14 @@ fn persist_terminal_pending_commands<'c>(
             } => {
                 composition::start_child(
                     conn,
-                    drain.workflows,
+                    &drain.registry,
                     exec,
                     drain.history,
                     *child_id,
                     workflow_name,
                     input,
                     Some(*parent_close_policy),
+                    drain.now,
                 )?;
             }
             // A failing cycle that dropped a fresh child dispatch records it as

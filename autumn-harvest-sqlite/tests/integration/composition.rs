@@ -634,6 +634,61 @@ async fn spawns_then_times_out(ctx: &WorkflowContext, _n: i64) -> Result<Value, 
         .map_err(|e| e.to_string())
 }
 
+/// Waits past its 30 s execution timeout.
+#[workflow(execution_timeout = "30s")]
+async fn timed_child(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.wait_for_signal("never")
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Counts the runs of `retried_child`. Only one test starts it.
+static RETRIED_CHILD_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Fails on every run. Its type declares two attempts with no backoff.
+#[workflow(retry = autumn_harvest::policy::RetryPolicy::fixed(2, std::time::Duration::ZERO))]
+async fn retried_child(_ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    RETRIED_CHILD_RUNS.fetch_add(1, Ordering::SeqCst);
+    Err("always".to_string())
+}
+
+/// Counts the runs of `retry_declared_child`. Only one test starts it.
+static RETRY_DECLARED_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Like `retried_child`, for the awaited case.
+#[workflow(retry = autumn_harvest::policy::RetryPolicy::fixed(2, std::time::Duration::ZERO))]
+async fn retry_declared_child(_ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    RETRY_DECLARED_RUNS.fetch_add(1, Ordering::SeqCst);
+    Err("always".to_string())
+}
+
+/// Spawns `retried_child` detached under `abandon`, then waits.
+#[workflow]
+async fn spawns_retried_child(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.spawn_child_workflow_detached_raw("retried_child", json!(0), ParentClosePolicy::Abandon)
+        .map_err(|e| e.to_string())?;
+    ctx.wait_for_signal("never")
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Holds the `k` mutex until a signal that never comes.
+#[workflow]
+async fn holds_the_lock(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let _guard = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+    ctx.wait_for_signal("never")
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Takes the `k` mutex, releases it, and completes.
+#[workflow]
+async fn takes_the_lock(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+    let guard = ctx.mutex("k").acquire().await.map_err(|e| e.to_string())?;
+    guard.release();
+    Ok(1)
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn runtime() -> SqliteRuntime {
@@ -705,6 +760,12 @@ fn fixtures() -> Vec<WorkflowInfo> {
         spawns_then_waits_on_missing_info(),
         mints_then_continues_info(),
         spawns_then_times_out_info(),
+        timed_child_info(),
+        retried_child_info(),
+        retry_declared_child_info(),
+        spawns_retried_child_info(),
+        holds_the_lock_info(),
+        takes_the_lock_info(),
     ]
 }
 
@@ -2377,4 +2438,98 @@ async fn a_timed_out_parent_applies_its_close_policy() {
         .position(|e| matches!(e, WorkflowEvent::ChildWorkflowCascadeApplied { .. }))
         .expect("the cascade is recorded");
     assert!(timed_out < cascade, "{history:#?}");
+}
+
+/// A child keeps the execution timeout of its type, as on Postgres. An
+/// awaiting parent records the timeout.
+#[tokio::test]
+async fn an_awaited_child_times_out_by_its_declared_timeout() {
+    let mut rt = runtime();
+    let clock = Arc::new(AtomicI64::new(1_767_225_600_000));
+    let read = Arc::clone(&clock);
+    rt.set_clock(move || {
+        chrono::DateTime::from_timestamp_millis(read.load(Ordering::SeqCst)).unwrap()
+    });
+    let parent = rt
+        .start_workflow("parent_reports_child_failure", json!("timed_child"))
+        .unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    let child = children_of(&rt, parent)[0];
+
+    clock.fetch_add(31_000, Ordering::SeqCst);
+    let state = rt.run_until_blocked(parent).await.unwrap();
+
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    assert!(matches!(
+        rt.run_until_blocked(child).await.unwrap(),
+        RunState::TimedOut(_)
+    ));
+    let out = completed(&rt, parent);
+    assert_eq!(
+        out["reason"],
+        json!("timeout: WorkflowExecution for timed_child"),
+        "{out}"
+    );
+    assert_replays(&rt, parent, "parent_reports_child_failure").await;
+}
+
+/// A detached child keeps the retry policy of its type, as on Postgres.
+#[tokio::test]
+async fn a_detached_child_retries_by_its_declared_policy() {
+    let mut rt = runtime();
+    let parent = rt.start_workflow("spawns_retried_child", json!(0)).unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    let child = children_of(&rt, parent)[0];
+
+    rt.run_until_idle().await.ok();
+
+    assert_eq!(RETRIED_CHILD_RUNS.load(Ordering::SeqCst), 2);
+    assert!(
+        rt.load_history(child)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::WorkflowRetryScheduled { .. })),
+        "the first attempt schedules a retry"
+    );
+}
+
+/// An awaited child never retries, as on Postgres. Its parent sees the
+/// first failure.
+#[tokio::test]
+async fn an_awaited_child_does_not_retry() {
+    let mut rt = runtime();
+    let parent = rt
+        .start_workflow(
+            "parent_reports_child_failure",
+            json!("retry_declared_child"),
+        )
+        .unwrap();
+
+    let state = rt.run_until_blocked(parent).await.unwrap();
+
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    assert_eq!(RETRY_DECLARED_RUNS.load(Ordering::SeqCst), 1);
+    assert_eq!(completed(&rt, parent)["reason"], json!("always"));
+}
+
+/// A run that another run cancels gives up its mutex and records its close
+/// time, as every terminal path does.
+#[tokio::test]
+async fn a_hard_cancelled_holder_releases_its_mutex() {
+    let mut rt = runtime();
+    let holder = rt.start_workflow("holds_the_lock", json!(0)).unwrap();
+    rt.run_until_blocked(holder).await.unwrap();
+    let waiter = rt.start_workflow("takes_the_lock", json!(0)).unwrap();
+    assert!(matches!(
+        rt.run_until_blocked(waiter).await.unwrap(),
+        RunState::WaitingMutex(_)
+    ));
+
+    let canceller = rt.start_workflow("cancel_reports", json!(holder)).unwrap();
+    rt.run_until_blocked(canceller).await.unwrap();
+    let state = rt.run_until_blocked(waiter).await.unwrap();
+
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let row = rt.describe(holder).unwrap();
+    assert!(row.summary.closed_at.value().is_some(), "{row:?}");
 }

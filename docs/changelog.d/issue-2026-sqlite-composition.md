@@ -77,7 +77,12 @@ which issue #2028 added, and dedups through the same helpers as
 any terminal run. Its detached children get their policy, and an awaiting
 parent records a `ChildWorkflowFailed` with the timeout text, as on Postgres.
 A failed run that retries does not close: its successor starts in the same
-transaction, and its detached children keep running, as on Postgres.
+transaction, and its detached children keep running, as on Postgres. A child
+keeps the `execution_timeout` of its type. A detached child also keeps the
+retry policy of its type. An awaited child never retries, as on Postgres. A
+cancel from another run, a race-loser cancel and a `request_cancel` cascade
+record the close time and release the run's mutex, as every terminal path
+does.
 
 **Known limits.**
 
@@ -89,11 +94,8 @@ transaction, and its detached children keep running, as on Postgres.
 - This backend writes a mixed batch in command order. Postgres writes the
   external events first. Each event is the same, and replay accepts both
   orders.
-- A child run starts with no `execution_timeout` and no workflow retry policy.
-  An awaited child never retries on Postgres either. A detached child does on
-  Postgres, when its type declares a policy.
 
-**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 58
+**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 62
 tests. Each test replays every history it asserts on the core
 `WorkflowReplayer`, with the run's ids. They cover:
 
@@ -116,7 +118,9 @@ tests. Each test replays every history it asserts on the core
   cascade events, and an update and
   a query on a child that read its parent;
 - a parent that passes its `execution_timeout` and cascades to its detached
-  child.
+  child, a child that times out by its declared timeout, a detached child
+  that retries, an awaited child that does not, and a cancelled mutex holder
+  that releases the lock.
 
 Unit tests cover the schema step, a race loser with no row, and the panic
 strikes of runs that another run seals: by a cancel, a terminate cascade, an
