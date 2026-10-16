@@ -1829,12 +1829,13 @@ fn plain(token: &str) -> &str {
     if word { token } else { HIDDEN }
 }
 
-/// Refuses a database URL or key-value DSN where a file or name belongs.
+/// Refuses a database address where a file or name belongs.
 ///
-/// Later errors and reports echo these values. A mistyped database address would reach them.
+/// Later errors and reports echo these values. A database address is a URL or has `key=value`
+/// pairs. So a value with `://` or `=` never passes, whatever the spacing around the `=`.
 #[cfg(feature = "db")]
 fn not_a_url(flag: &str, value: String) -> Result<String, UpgradeCheckError> {
-    if value.contains("://") || value.to_ascii_lowercase().contains("password=") {
+    if value.contains("://") || value.contains('=') {
         return Err(UpgradeCheckError::Usage(format!(
             "{flag} takes a name or file, not a database address"
         )));
@@ -2129,6 +2130,8 @@ mod tests {
             refused(&[flag, SECRET_URL]);
             refused(&[&format!("{flag}={SECRET_URL}")]);
             refused(&[flag, "host=h user=u PassWord=SECRETPW"]);
+            refused(&[flag, "host=h user=u password = SECRETPW"]);
+            refused(&[flag, "host=h user=u password\t=\tSECRETPW"]);
             refused(&[&format!("{flag}=password=SECRETPW")]);
         }
     }
