@@ -63,8 +63,9 @@ def _line_counts(segments):
 
     This is the rule of `LineCoverageStats` in LLVM. A line is mapped when a
     counted region starts on it, or when a counted segment wraps into it. A
-    line that starts a skipped region is not mapped. A gap region does not
-    count as a start. The count is the largest count that applies.
+    line that starts a skipped region is not mapped, unless a counted region
+    entry also starts on it. A gap region does not count as a start. The
+    count is the largest count that applies.
     """
     out = {}
     if not segments:
@@ -79,9 +80,12 @@ def _line_counts(segments):
             index += 1
         starts = [s[2] for s in current if s[3] and s[4] and not s[5]]
         skipped = bool(current) and not current[0][3] and current[0][4]
-        if skipped or not (starts or (wrapped and wrapped[3])):
+        mapped = not skipped and bool(starts or (wrapped and wrapped[3]))
+        # Any counted region entry maps the line, a gap entry too.
+        mapped = mapped or any(s[3] and s[4] for s in current)
+        if not mapped:
             continue
-        out[line] = max(starts + ([wrapped[2]] if wrapped else []))
+        out[line] = max(starts + [wrapped[2] if wrapped else 0])
     return out
 
 
@@ -110,15 +114,20 @@ def from_export(doc, root):
                 _add_branch(into, branch[0], str(branch[1]), branch)
             # A branch inside a macro expansion counts at the line of the
             # call, as in the LCOV exporter. Its key also holds the call
-            # column, its source file and its own place, so two branches
-            # stay apart.
+            # column, its source file and its own place.
             for expansion in item.get("expansions", []):
                 line, column = expansion["source_region"][:2]
                 names = expansion.get("filenames", [])
+                seen = {}
                 for branch in expansion.get("branches", []):
                     file_id = branch[6]
                     source = _relative(names[file_id], root) if file_id < len(names) else file_id
                     block = f"{column}@{source}:{branch[0]}:{branch[1]}"
+                    # Two nested calls can expand one branch place. The
+                    # occurrence keeps them apart.
+                    seen[block] = seen.get(block, -1) + 1
+                    if seen[block]:
+                        block = f"{block}#{seen[block]}"
                     _add_branch(into, line, block, branch)
     return records
 
@@ -425,15 +434,22 @@ EXPORT = {
             [5, 1, 0, True, True, False], [6, 3, 0, False, False, False],
             [8, 1, 0, False, True, False],
             [10, 1, 4, True, True, True], [10, 20, 3, True, True, False],
+            [12, 1, 0, False, True, False], [12, 8, 6, True, True, False],
+            [14, 1, 0, False, False, False],
+            [16, 1, 5, True, True, True],
         ],
         "branches": [[3, 5, 3, 8, 2, 0, 0, 0, 4], [3, 5, 3, 8, 1, 1, 0, 0, 4]],
         # A macro call on line 6, column 3. Its branch is at line 40 of the
         # macro definition.
-        # A second branch sits at the same place in another file.
+        # A second branch sits at the same place in another file. A third
+        # is a second nested call of the first.
         "expansions": [{
             "source_region": [6, 3, 6, 20, 1, 0, 1, 1],
             "filenames": ["/w/r/autumn-harvest/src/timeout.rs", "/w/r/m.rs", "/w/r/n.rs"],
-            "branches": [[40, 9, 40, 14, 1, 0, 1, 0, 4], [40, 9, 40, 14, 0, 2, 2, 0, 4]],
+            "branches": [
+                [40, 9, 40, 14, 1, 0, 1, 0, 4], [40, 9, 40, 14, 0, 2, 2, 0, 4],
+                [40, 9, 40, 14, 4, 0, 1, 0, 4],
+            ],
         }],
     }]}],
 }
@@ -444,14 +460,21 @@ def self_test():
     # Lines 2 and 4 follow a segment with no count. Line 6 follows a counted
     # region. Line 8 starts a skipped region. Line 10 starts with a gap, so
     # only its second region counts.
-    assert timeout["lines"] == {1: 5, 3: 7, 5: 0, 6: 0, 10: 3}, timeout
+    # Line 11 follows the counted region of line 10. Line 12 starts a
+    # skipped region, but a counted region starts later on it, so it is
+    # mapped. Lines 13 and 14 follow that region. Line 16 holds
+    # only a counted gap entry after a segment with no count, so it is
+    # mapped with no hits.
+    assert timeout["lines"] == {1: 5, 3: 7, 5: 0, 6: 0, 10: 3, 11: 3, 12: 6, 13: 6, 14: 6, 16: 0}, timeout
     # Two instantiations of one branch add up. A branch inside a macro
     # expansion counts at the line of the call, as the LCOV exporter does.
-    # Its key names its source file, so two files stay apart.
+    # Its key names its source file, so two files stay apart, and the
+    # occurrence, so two nested calls stay apart.
     assert timeout["branches"] == {
         (3, "5", "0"): 3, (3, "5", "1"): 1,
         (6, "3@m.rs:40:9", "0"): 1, (6, "3@m.rs:40:9", "1"): 0,
         (6, "3@n.rs:40:9", "0"): 0, (6, "3@n.rs:40:9", "1"): 2,
+        (6, "3@m.rs:40:9#1", "0"): 4, (6, "3@m.rs:40:9#1", "1"): 0,
     }, timeout
     try:
         from_export({"type": "other"}, "")
