@@ -701,6 +701,43 @@ async fn a_fork_lineage_past_the_scan_bound_is_refused() {
     );
 }
 
+/// A malformed fork row at the scan bound is refused. The walk loads exactly
+/// the bound of ancestors and ends on a fork row that names no source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_ancestor_at_the_scan_bound_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("deep-malformed");
+    let mut conn = connect(&url).await;
+    // The root says that it is a fork, but it names no source.
+    let root = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    diesel::update(harvest_workflow_executions::table.find(root.as_uuid()))
+        .set(harvest_workflow_executions::start_source.eq(Some("fork")))
+        .execute(&mut conn)
+        .await
+        .expect("mark the root");
+    // 64 forks above it, so the walk loads the root as its last ancestor.
+    let mut parent = root;
+    for _ in 0..64 {
+        let child = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+        diesel::update(harvest_workflow_executions::table.find(child.as_uuid()))
+            .set((
+                harvest_workflow_executions::start_source.eq(Some("fork")),
+                harvest_workflow_executions::start_source_ref.eq(Some(parent.to_string())),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("link the chain");
+        parent = child;
+    }
+    let error = fork_workflow_execution(&mut conn, parent, request(ForkEffects::Recorded), None)
+        .await
+        .expect_err("a malformed ancestor at the bound is refused");
+    assert!(
+        matches!(error, WorkflowForkError::LineageMalformed { exec_id } if exec_id == root),
+        "unexpected error: {error}"
+    );
+}
+
 /// A fork at a later point carries the completed charge and takes the
 /// receipt from the record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

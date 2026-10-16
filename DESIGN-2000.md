@@ -194,6 +194,7 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A named blob that no run references any more was copied without a reference, although retention can delete it. | The copy is refused with `HistoryUnavailable` (`410`). The new input of a fork has its own references. |
 | A padded caller `workflow_id` was trimmed, so the fork took a different business key. | A nonblank id is kept verbatim, as for a start or a rerun. A blank id is refused. |
 | The record served a stored result whose blob no run references, so the fork completed an activity whose result can be gone. | That activity fails closed with `ForkEffectUnavailable`, as one with no record does. The error names the blob. |
+| After exactly the bound of ancestor loads, a last ancestor that is a fork with no source passed as a clean lineage. | That case is `LineageMalformed`, as it is inside the walk. |
 
 ## 2. Tests
 

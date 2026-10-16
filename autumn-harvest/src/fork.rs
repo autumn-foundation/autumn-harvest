@@ -805,7 +805,9 @@ pub(crate) async fn erased_fork_ancestor(
         (true, Some(_)) => Err(WorkflowForkError::LineageTooDeep {
             depth: MAX_FORK_LINEAGE,
         }),
-        _ => Ok(None),
+        // The last ancestor is a fork that names no source, as above.
+        (true, None) => Err(WorkflowForkError::LineageMalformed { exec_id: child }),
+        (false, _) => Ok(None),
     }
 }
 
