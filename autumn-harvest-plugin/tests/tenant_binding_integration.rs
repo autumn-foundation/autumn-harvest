@@ -1173,10 +1173,12 @@ async fn a_raw_mount_binds_the_verified_tenant() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{resp:?}");
     assert!(resp.get("execution_id").is_none(), "{resp:?}");
+    let summaries = deny_summaries(&mut conn).await;
+    assert_eq!(summaries.len(), 5, "one row per refusal: {summaries:?}");
 }
 
-/// A full mount runs the owner lookup and the audit write once per refusal
-/// (issue #2076). The inner copy of the layer must skip.
+/// A full mount writes one audit row per refusal (issue #2076). The unit test
+/// `the_inner_binding_skips_only_after_the_outer_copy` covers the skip.
 #[tokio::test]
 async fn a_full_mount_audits_a_refusal_once() {
     let (url, _c) = setup_database().await;

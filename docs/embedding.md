@@ -552,5 +552,6 @@ explain why. Use `HarvestEmbedding` unless you need a different order.
 `harvest_api_router` binds a tenant itself. If your middleware sets
 `VerifiedTenant`, the router refuses a request for another tenant's run. It
 also refuses the list and admin routes. The answers are the same as those of
-`HarvestEmbedding`. The `/ui` router that you nest outside it gets no binding,
-so do not mount Vantage for a tenant-bound caller.
+`HarvestEmbedding`. The `/ui` router that you nest next to it gets no binding,
+so do not mount Vantage for a tenant-bound caller. A raw mount has no rate
+limiter, so add your own.

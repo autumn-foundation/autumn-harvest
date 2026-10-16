@@ -328,6 +328,9 @@ struct BindingApplied;
 /// A mount through [`apply_admin_auth_layers`](crate::api) already ran the
 /// outer copy, so this copy skips. A raw mount has no outer copy, so this one
 /// does the work.
+///
+/// The skip assumes that no layer between the two copies sets `VerifiedTenant`
+/// or `TokenPrincipal`. Keep it so.
 pub(crate) async fn enforce_tenant_binding_once(
     State(api_state): State<HarvestApiState>,
     request: Request,
@@ -646,6 +649,42 @@ mod tests {
         );
         assert!(verified_tenant(&request_with(Some("acme"), Some("globex"))).is_err());
         assert!(verified_tenant(&request_with(Some("a b"), None)).is_err());
+    }
+
+    /// The inner copy skips after the outer copy ran (issue #2076). The route
+    /// is not tenant-scoped, so a copy that does not skip answers `403`.
+    #[tokio::test]
+    async fn the_inner_binding_skips_only_after_the_outer_copy() {
+        use tower::ServiceExt as _;
+        let api_state = HarvestApiState::new();
+        let app = |marked: bool| {
+            axum::Router::new()
+                .route("/workflows", axum::routing::get(|| async { "ran" }))
+                .layer(axum::middleware::from_fn_with_state(
+                    api_state.clone(),
+                    enforce_tenant_binding_once,
+                ))
+                .layer(axum::middleware::from_fn(
+                    move |mut request: Request, next: Next| async move {
+                        request
+                            .extensions_mut()
+                            .insert(VerifiedTenant::new("acme").unwrap());
+                        if marked {
+                            request.extensions_mut().insert(BindingApplied);
+                        }
+                        next.run(request).await
+                    },
+                ))
+        };
+        let call = |marked: bool| {
+            let request = Request::builder()
+                .uri("/workflows")
+                .body(Body::empty())
+                .unwrap();
+            app(marked).oneshot(request)
+        };
+        assert_eq!(call(true).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(call(false).await.unwrap().status(), StatusCode::FORBIDDEN);
     }
 
     #[cfg(feature = "mcp")]
