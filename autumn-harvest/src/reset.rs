@@ -851,7 +851,16 @@ pub async fn reset_workflow_execution(
                 ),
             )
             .await?;
-            let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
+            let fork = insert_fork_execution(
+                conn,
+                &source,
+                new_exec_id,
+                registry.map_or(
+                    &crate::store::DEFAULT_PAYLOAD_CODECS,
+                    HandlerRegistry::payload_codecs,
+                ),
+            )
+            .await?;
             copy_carried_events(conn, new_exec_id, &rows, reset_event_id).await?;
             append_fork_marker(conn, new_exec_id, exec_id, &request, &plan).await?;
 
@@ -1373,7 +1382,11 @@ async fn insert_fork_execution(
     conn: &mut AsyncPgConnection,
     source: &WorkflowExecution,
     new_exec_id: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> Result<WorkflowExecution, WorkflowResetError> {
+    // The fork is a new write: encode a clear legacy `input` and `memo` (issue #2065).
+    let fork_input = codecs.recode_column_for_copy(&source.input)?;
+    let fork_memo = codecs.recode_column_opt_for_copy(source.memo.as_ref())?;
     // Re-compute deadline_at from the source execution's timeout so the fork
     // gets a fresh deadline anchored to its own start time (issue #243).
     let deadline_at = source.execution_timeout.map(|d| chrono::Utc::now() + d);
@@ -1419,14 +1432,14 @@ async fn insert_fork_execution(
         workflow_id: &source.workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: source.shard_id,
-        input: source.input.clone().into(),
+        input: fork_input.into(),
         parent_id: None,
         queue_name: &source.queue_name,
         execution_timeout: source.execution_timeout,
         deadline_at,
         sla: source.sla,
         sla_deadline_at,
-        memo: source.memo.clone(),
+        memo: fork_memo,
         search_attrs: fork_search_attrs,
         assigned_build_id: source.assigned_build_id.clone(),
         parent_close_policy: None, // reset fork is a fresh root execution
