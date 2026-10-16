@@ -2607,6 +2607,38 @@ mod tests {
         assert_eq!(declined.err(), Some(ResumeDeclined::KeyChanged));
     }
 
+    #[test]
+    fn keys_differ_when_only_the_start_provenance_differs() {
+        let meta = |provenance| crate::executor::WorkflowExecuteSpanMeta {
+            workflow_name: "wf".into(),
+            workflow_id: String::new(),
+            shard_id: 0,
+            queue_name: String::new(),
+            is_replay: false,
+            link_traceparent: None,
+            build_id: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            start_provenance: provenance,
+            cancellation_reason: None,
+        };
+        let key = |m: &crate::executor::WorkflowExecuteSpanMeta| {
+            ResidentKey::new(pair_then_c_workflow, Some(m), &HashMap::new())
+        };
+        let api = meta(crate::types::StartProvenance::fresh(
+            crate::types::StartSource::Api,
+        ));
+        let again = meta(crate::types::StartProvenance::fresh(
+            crate::types::StartSource::Api,
+        ));
+        let can = meta(crate::types::StartProvenance::continued_from(
+            ExecutionId::new(),
+        ));
+        assert!(key(&api) == key(&again));
+        assert!(key(&api) != key(&can));
+    }
+
     #[tokio::test]
     async fn a_sibling_left_parked_by_a_failed_branch_declines() {
         let (outcome, resident) = start(

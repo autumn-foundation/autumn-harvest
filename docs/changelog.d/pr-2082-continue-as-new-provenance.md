@@ -18,3 +18,13 @@ run. [ADR 0006](../adr/0006-keyed-entity.md) and
 
 **Tests.** Unit tests cover the source classifier, the row mapping, the
 `ctx.info()` fields and the entity gate, including `replay_check`.
+
+**API.** `WorkflowExecutionInfo`, `WorkflowExecuteSpanMeta` and
+`ReplayDeclarativeHandlers` gain a field. An external struct literal of these
+types stops compiling.
+
+**Upgrade note.** Runs that a caller seeded before the upgrade replay from
+`S::default()`. Drain them, or call `Entity::trust_start_input` first. An
+older worker still trusts the input until the whole fleet rolls. A reset or a
+re-run copies the stored input, so it keeps a forged one. The SQLite backend
+records no start source.

@@ -696,6 +696,10 @@ impl WorkflowReplayer {
     /// no `WorkflowEvent` does. A workflow that branches on
     /// `ctx.info().start_source` needs it to replay like the live run. The
     /// default is an unknown source with no predecessor.
+    ///
+    /// A [`HistorySnapshot`] holds no provenance. The verifier, the debugger and
+    /// a fixture replay therefore use this value, and `replay_from_db` and the
+    /// canary read the row.
     #[must_use]
     pub const fn with_start_provenance(
         mut self,

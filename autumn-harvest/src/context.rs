@@ -3341,6 +3341,7 @@ pub struct WorkflowExecutionInfo {
     pub start_source: StartSource,
     /// The run that continued as new into this one, or `None` (issue #2082).
     /// It is `Some` for a continue-as-new or cross-type continuation successor.
+    /// A workflow retry of a successor reports `None`.
     pub continued_from: Option<ExecutionId>,
 }
 
@@ -18916,6 +18917,44 @@ mod tests {
         );
     }
 
+    /// Issue #2082: a declarative update handler sees the start source of its run.
+    #[tokio::test]
+    async fn update_handler_inherits_start_provenance() {
+        #[allow(clippy::needless_pass_by_value)]
+        fn source_probe_handler(
+            ctx: std::sync::Arc<WorkflowContext>,
+            _input: Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>
+        {
+            let source = ctx.info().start_source.as_str();
+            Box::pin(async move { Ok(serde_json::json!(source)) })
+        }
+
+        let info = crate::info::UpdateHandlerInfo {
+            name: "source_probe",
+            workflow: "wf",
+            module: "test",
+            input_type_hint: "",
+            output_type_hint: "string",
+            has_validator: false,
+            handler: source_probe_handler,
+            validator: None,
+            mcp: false,
+            description: None,
+            arg_schema: None,
+            response_schema: None,
+        };
+
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), vec![started_event()])
+            .with_start_provenance(StartProvenance::fresh(StartSource::SignalWithStart));
+        ctx.register_declarative_update_handler(&info);
+        let result = ctx
+            .invoke_update("source_probe", Value::Null)
+            .expect("handler registered")
+            .await;
+        assert_eq!(result, Ok(serde_json::json!("signal_with_start")));
+    }
+
     #[test]
     fn time_until_deadline_uses_recorded_clock() {
         let t0 = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
@@ -31160,7 +31199,7 @@ mod tests {
     }
 
     /// Issue #2082: a threaded provenance shows in `info()` and the accessors.
-    /// Two rebuilds of the same fixture agree, so the value is replay-stable.
+    /// Two contexts built from the same input report the same provenance.
     #[test]
     fn info_reports_configured_start_provenance() {
         let predecessor = ExecutionId::new();

@@ -1579,6 +1579,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_re_run_keeps_its_checkpoint() {
+        let outcome = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::Rerun))
+            .run(counter, forged())
+            .await;
+        assert_eq!(outcome.result, Ok(json!(57)));
+    }
+
+    #[tokio::test]
+    async fn the_initial_state_is_ignored_when_the_input_is_kept() {
+        let unknown = env_with(&[delete()]).run(seeded_counter, forged()).await;
+        assert_eq!(unknown.result, Ok(json!(57)), "unknown source keeps input");
+        let trusted = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(trusting_seeded_counter, forged())
+            .await;
+        assert_eq!(trusted.result, Ok(json!(57)), "trusted input wins");
+    }
+
+    /// A counter entity with both an initial state and a trusted start input.
+    fn trusting_seeded_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .initial_state(100)
+                .trust_start_input()
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    #[tokio::test]
     async fn the_fresh_start_gate_replays() {
         let outcome = env_with(&[op(1), delete()])
             .with_start_provenance(fresh(StartSource::Api))

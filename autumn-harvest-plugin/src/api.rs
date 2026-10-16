@@ -14059,6 +14059,11 @@ pub(crate) async fn build_awaitables_report(
             .with_execution_timeout(execution.execution_timeout)
             .with_deadline(execution.deadline_at)
             .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))
+            // Issue #2082: the replay needs the row's start source.
+            .with_start_provenance(autumn_harvest::types::StartProvenance::from_row(
+                execution.start_source.as_deref(),
+                execution.continued_from_exec_id,
+            ))
             .with_workflow_name(execution.workflow_name.clone())
             .with_workflow_id(execution.workflow_id.clone())
             .with_context_headers(context_headers);
@@ -26837,6 +26842,11 @@ async fn hydrate_ctx_for_query(
     // execution row, absent from history, so this context (which sources those
     // from the row) must source parent from the row too.
     .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))
+    // Issue #2082: the query replays the body, so it needs the row's start source.
+    .with_start_provenance(autumn_harvest::types::StartProvenance::from_row(
+        execution.start_source.as_deref(),
+        execution.continued_from_exec_id,
+    ))
     // Issue #698: thread the execution row's workflow type name and business
     // `workflow_id` so a query replayed on this run reports the real values via
     // `ctx.info().workflow_type` / `ctx.info().workflow_id`. Both live on the
