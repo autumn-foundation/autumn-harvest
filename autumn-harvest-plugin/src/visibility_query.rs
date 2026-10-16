@@ -10,7 +10,11 @@
 use diesel::pg::Pg;
 use diesel::query_builder::{AstPass, QueryFragment, QueryId};
 use diesel::result::QueryResult;
+use diesel::serialize::{self, IsNull, Output, ToSql};
+use diesel::sql_types::Jsonb;
 use serde_json::Value;
+use std::fmt;
+use std::io::Write as _;
 
 use crate::api::{CmpOp, SearchAttrPredicate};
 
@@ -644,32 +648,82 @@ impl Parser {
 }
 
 impl Literal {
-    fn into_json(self) -> Value {
+    fn into_json(self) -> JsonText {
         match self {
-            Self::Str(text) => Value::String(text),
-            // The lexer checks each number, so `Null` does not occur.
-            Self::Num(text) => number_json(&text).unwrap_or(Value::Null),
-            Self::Bool(flag) => Value::Bool(flag),
+            Self::Str(text) => Value::String(text).into(),
+            // The lexer checks each number, so `null` does not occur.
+            Self::Num(text) => number_json(&text).unwrap_or_else(|| Value::Null.into()),
+            Self::Bool(flag) => Value::Bool(flag).into(),
         }
     }
 }
 
-/// Converts number text to a JSON number. Returns `None` when JSON or
-/// Postgres `numeric` cannot hold the value, for example `1e400`, or
-/// `1e-400`, which `f64` reads as zero.
-fn number_json(text: &str) -> Option<Value> {
-    if let Ok(n) = text.parse::<i64>() {
-        return Some(Value::Number(n.into()));
+/// A JSON scalar kept as text, so a number keeps every digit.
+///
+/// A `serde_json::Value` holds a number as `i64`, `u64` or `f64`. It would
+/// round a longer literal, and two different literals could bind one value.
+/// Postgres `jsonb` stores the exact number, so the text goes to it as is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonText(String);
+
+impl From<Value> for JsonText {
+    fn from(value: Value) -> Self {
+        Self(value.to_string())
     }
-    if let Ok(n) = text.parse::<u64>() {
-        return Some(Value::Number(n.into()));
+}
+
+/// Lets a test compare a bound scalar with a `json!` value.
+#[cfg(test)]
+impl PartialEq<Value> for JsonText {
+    fn eq(&self, other: &Value) -> bool {
+        serde_json::from_str::<Value>(&self.0).is_ok_and(|v| v == *other)
     }
+}
+
+impl fmt::Display for JsonText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl ToSql<Jsonb, Pg> for JsonText {
+    fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
+        // The `jsonb` binary format starts with a version byte.
+        out.write_all(&[1])?;
+        out.write_all(self.0.as_bytes())?;
+        Ok(IsNull::No)
+    }
+}
+
+/// Converts number text to a JSON number. Returns `None` when `f64` cannot
+/// hold the value, for example `1e400`, or `1e-400`, which `f64` reads as
+/// zero. The range check keeps the filter inside what Postgres `numeric`
+/// reads without error. The digits that remain are not rounded.
+pub fn number_json(text: &str) -> Option<JsonText> {
     let n = text.parse::<f64>().ok().filter(|n| n.is_finite())?;
-    let mantissa = text.split(['e', 'E']).next().unwrap_or(text);
-    if n == 0.0 && mantissa.bytes().any(|b| matches!(b, b'1'..=b'9')) {
+    let (sign, unsigned) = text.strip_prefix('-').map_or(("", text), |t| ("-", t));
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((m, e)) => (m, Some(e)),
+        None => (unsigned, None),
+    };
+    let nonzero = mantissa.bytes().any(|b| matches!(b, b'1'..=b'9'));
+    if n == 0.0 && nonzero {
         return None;
     }
-    serde_json::Number::from_f64(n).map(Value::Number)
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    // JSON allows no leading zero, no bare `.5` and no trailing `.`.
+    let int = int.trim_start_matches('0');
+    let mut out = format!("{sign}{}", if int.is_empty() { "0" } else { int });
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
+    }
+    // A zero ignores its exponent, which could be out of range.
+    if let Some(exponent) = exponent.filter(|_| nonzero) {
+        out.push('e');
+        out.push_str(exponent);
+    }
+    Some(JsonText(out))
 }
 
 /// Returns the one child, or a node of the children.
@@ -681,14 +735,19 @@ fn flatten(mut children: Vec<Expr>, node: fn(Vec<Expr>) -> Expr) -> Expr {
     }
 }
 
+/// Builds the `{key: value}` object that `@>` tests against.
+fn attr_object(key: &str, value: &JsonText) -> JsonText {
+    JsonText(format!("{{{}:{value}}}", Value::String(key.to_owned())))
+}
+
 /// One part of a compiled filter.
 #[derive(Debug, Clone)]
 enum Part {
     Sql(&'static str),
     Text(String),
     TextArray(Vec<String>),
-    Jsonb(Value),
-    JsonbArray(Vec<Value>),
+    Jsonb(JsonText),
+    JsonbArray(Vec<JsonText>),
     Timestamptz(chrono::DateTime<chrono::Utc>),
 }
 
@@ -716,7 +775,7 @@ impl SqlFilter {
     /// Compiles one `search_attr=key:value` containment object.
     pub fn contains(object: Value) -> Self {
         Self {
-            parts: vec![Part::Sql(SEARCH_ATTRS_CONTAINS), Part::Jsonb(object)],
+            parts: vec![Part::Sql(SEARCH_ATTRS_CONTAINS), Part::Jsonb(object.into())],
         }
     }
 
@@ -745,17 +804,13 @@ impl SqlFilter {
         match predicate {
             SearchAttrPredicate::Eq { key, value } => {
                 self.sql(SEARCH_ATTRS_CONTAINS);
-                self.parts.push(Part::Jsonb(
-                    serde_json::json!({ key.clone(): value.clone() }),
-                ));
+                self.parts.push(Part::Jsonb(attr_object(key, value)));
             }
             SearchAttrPredicate::Ne { key, value } => {
                 self.sql("(harvest_workflow_executions.search_attrs ? ");
                 self.parts.push(Part::Text(key.clone()));
                 self.sql(" AND NOT (harvest_workflow_executions.search_attrs @> ");
-                self.parts.push(Part::Jsonb(
-                    serde_json::json!({ key.clone(): value.clone() }),
-                ));
+                self.parts.push(Part::Jsonb(attr_object(key, value)));
                 self.sql("))");
             }
             SearchAttrPredicate::Cmp { key, op, value } => {
@@ -849,7 +904,7 @@ impl QueryId for SqlFilter {
 
 impl QueryFragment<Pg> for SqlFilter {
     fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Pg>) -> QueryResult<()> {
-        use diesel::sql_types::{Array, Jsonb, Text, Timestamptz};
+        use diesel::sql_types::{Array, Text, Timestamptz};
 
         // The SQL text changes with the filter shape. A cached statement for
         // each shape only fills the cache.
@@ -1112,13 +1167,12 @@ mod tests {
             "1.00000000000000000001",
             "-9007199254740993.5",
         ] {
-            for template in [
-                "attrs.a = N",
-                "attrs.a != N",
-                "attrs.a IN (N, 2)",
-            ] {
-                let bound = sql(&template.replace('N', literal));
-                assert!(bound.contains(literal), "{template} lost {literal}: {bound}");
+            for template in ["attrs.a = @", "attrs.a != @", "attrs.a IN (@, 2)"] {
+                let bound = sql(&template.replace('@', literal));
+                assert!(
+                    bound.contains(literal),
+                    "{template} lost {literal}: {bound}"
+                );
             }
         }
         assert_ne!(
@@ -1180,7 +1234,7 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("Object {\"a\": Number(1)}"), "{text}");
+        assert!(text.contains("JsonText(\"{\\\"a\\\":1}\")"), "{text}");
         assert!(text.contains("\"RUNNING\""), "{text}");
     }
 

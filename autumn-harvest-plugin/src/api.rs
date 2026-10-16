@@ -29,6 +29,8 @@ use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::visibility_query::{JsonText, number_json};
+
 use autumn_harvest::admission_gate::db as admission_gate_db;
 use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::{
@@ -3227,9 +3229,9 @@ pub(crate) enum CmpOp {
 #[derive(Debug, Clone)]
 pub(crate) enum SearchAttrPredicate {
     /// `key:eq:value` — typed equality (numeric/bool/string coercion).
-    Eq { key: String, value: Value },
+    Eq { key: String, value: JsonText },
     /// `key:ne:value` — key present and typed value differs.
-    Ne { key: String, value: Value },
+    Ne { key: String, value: JsonText },
     /// `key:{gt,gte,lt,lte}:value` — numeric comparison. `value` is the
     /// validated, trimmed numeric *text* (not an f64): it is bound and cast
     /// `::numeric` in SQL so the comparison stays exact even for integers
@@ -3240,7 +3242,7 @@ pub(crate) enum SearchAttrPredicate {
         value: String,
     },
     /// `key:in:v1,v2,…` — membership in a typed set.
-    In { key: String, values: Vec<Value> },
+    In { key: String, values: Vec<JsonText> },
     /// `key:exists` — key is present with any value.
     Exists { key: String },
 }
@@ -10811,30 +10813,22 @@ fn schema_validation_response(
 
 /// Coerce a raw predicate token to a typed JSON scalar (issue #506).
 ///
-/// A token that parses as a JSON number becomes a `Number`; the exact literals
-/// `true`/`false` become a `Bool`; everything else stays a `String`. This is the
-/// documented typed-coercion rule that lets `eq`/`ne`/`in` compare against the
-/// stored JSONB value by type (so `amount:eq:100` matches numeric `100`, not the
-/// string `"100"`).
-pub(crate) fn coerce_scalar(raw: &str) -> Value {
-    if let Ok(n) = raw.parse::<i64>() {
-        return Value::Number(n.into());
-    }
-    if let Ok(n) = raw.parse::<u64>() {
-        return Value::Number(n.into());
-    }
-    if let Some(num) = raw
-        .parse::<f64>()
-        .ok()
-        .and_then(serde_json::Number::from_f64)
-    {
-        return Value::Number(num);
+/// A token that parses as a number becomes a number with all its digits. The
+/// exact literals `true`/`false` become a `Bool`. Everything else stays a
+/// `String`. This is the documented typed-coercion rule that lets
+/// `eq`/`ne`/`in` compare against the stored JSONB value by type (so
+/// `amount:eq:100` matches numeric `100`, not the string `"100"`).
+pub(crate) fn coerce_scalar(raw: &str) -> JsonText {
+    // A number keeps every digit. Text such as `+5` or `.5` is a number too.
+    if let Some(number) = number_json(raw.strip_prefix('+').unwrap_or(raw)) {
+        return number;
     }
     match raw {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),
         other => Value::String(other.to_string()),
     }
+    .into()
 }
 
 /// Parse a single `search_attr_filter=key:op:value` query value into a typed
@@ -10921,7 +10915,7 @@ pub(crate) fn parse_search_attr_filter(raw: &str) -> Result<SearchAttrPredicate,
         "lte" => cmp("lte", CmpOp::Lte),
         "in" => {
             let v = require_value(raw, "in")?;
-            let values: Vec<Value> = v
+            let values: Vec<JsonText> = v
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -54552,6 +54546,20 @@ mod tests {
     }
 
     // ── Issue #506: typed comparison & set predicates ───────────────────────
+
+    #[test]
+    fn coerce_scalar_keeps_every_digit_of_a_number() {
+        for raw in [
+            "12345678901234567890123",
+            "18446744073709551616",
+            "1.00000000000000000001",
+        ] {
+            assert_eq!(coerce_scalar(raw).to_string(), raw);
+        }
+        assert_eq!(coerce_scalar("+5").to_string(), "5");
+        assert_eq!(coerce_scalar(".5").to_string(), "0.5");
+        assert_eq!(coerce_scalar("inf"), serde_json::json!("inf"));
+    }
 
     #[test]
     fn coerce_scalar_infers_number_bool_and_string() {
