@@ -2403,6 +2403,11 @@ async fn activity_rows_stay_clear_while_column_encoding_is_off() {
 
 // ── event batch buffers (issue #2043) ────────────────────────────────────────
 
+/// The batch scanner claims every due row in the database. Two tests that
+/// fire with different registries would take each other's rows, so they run
+/// one at a time.
+static BATCH_FIRE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const BATCH_SECRET_A: &str = "cc-batch-a-ssn-111";
 const BATCH_SECRET_B: &str = "cc-batch-b-ssn-222";
 
@@ -2439,6 +2444,7 @@ async fn batch_cells(conn: &mut AsyncPgConnection, key: &str) -> Vec<Value> {
 
 #[tokio::test]
 async fn a_buffered_batch_payload_is_ciphertext_and_the_fire_starts_on_plaintext() {
+    let _serial = BATCH_FIRE_LOCK.lock().await;
     use autumn_harvest::event_batch::{
         admit_batched_start_with_codecs, fire_due_event_batches_with_codecs,
     };
@@ -2548,6 +2554,7 @@ async fn batch_payloads_stay_in_clear_while_column_encoding_is_off() {
 
 #[tokio::test]
 async fn an_undecodable_batch_row_moves_back_and_is_never_dropped_or_started() {
+    let _serial = BATCH_FIRE_LOCK.lock().await;
     use autumn_harvest::event_batch::{
         admit_batched_start_with_codecs, fire_due_event_batches_with_codecs,
     };
@@ -2557,10 +2564,11 @@ async fn an_undecodable_batch_row_moves_back_and_is_never_dropped_or_started() {
     let mut conn = connect(&url).await;
     let key = format!("k-{}", Uuid::new_v4().simple());
     let workflow_id = format!("cc-stuck-batch-{}", Uuid::new_v4().simple());
+    let name = format!("cc_batch_stuck_{}", Uuid::new_v4().simple());
     admit_batched_start_with_codecs(
         &mut conn,
         batch_params(
-            "cc_batch_stuck_wf",
+            &name,
             &key,
             &workflow_id,
             json!({"ssn": BATCH_SECRET_A}),
@@ -2600,7 +2608,7 @@ async fn an_undecodable_batch_row_moves_back_and_is_never_dropped_or_started() {
             &mut conn,
             "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
              WHERE workflow_name = $1",
-            "cc_batch_stuck_wf",
+            &name,
         )
         .await,
         0,

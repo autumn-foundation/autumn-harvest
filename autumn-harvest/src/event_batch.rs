@@ -231,7 +231,8 @@ pub async fn admit_batched_start_with_codecs(
     let workflow_id = params.workflow_id;
     let queue_name = params.queue_name;
     let shard_id = params.shard_id;
-    let payload = params.payload;
+    // Encode one element. The SQL appends it to the array (issue #2043).
+    let payload = codecs.encode_column(&params.payload)?;
     let max_size = params.max_size;
 
     let (outcome, deferred_starts, deferred_checks, cancel_metrics) =
@@ -306,8 +307,12 @@ pub async fn admit_batched_start_with_codecs(
                     // mirrors `harvest_event_batches`' own
                     // first-admission-wins rule for every other captured
                     // start option.
-                    let quota_key_input_override: Option<serde_json::Value> = row
+                    let buffered_payloads = row
                         .buffered_payloads
+                        .as_ref()
+                        .map(|stored| decode_buffered_payloads(codecs, stored))
+                        .transpose()?;
+                    let quota_key_input_override: Option<serde_json::Value> = buffered_payloads
                         .as_ref()
                         .and_then(|v| v.as_array())
                         .and_then(|items| items.iter().next())
@@ -345,7 +350,7 @@ pub async fn admit_batched_start_with_codecs(
                             &row.workflow_name,
                             &row.workflow_id,
                             exec_id,
-                            row.buffered_payloads
+                            buffered_payloads
                                 .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
                             &row.queue_name,
                         )
@@ -437,6 +442,38 @@ const fn is_transient_error(e: &HarvestError) -> bool {
 /// three staying numerically equal.
 #[cfg(feature = "db")]
 const QUOTA_REDEFER_BACKOFF: Duration = Duration::from_secs(5);
+
+/// How far a batch row moves back when a buffered payload does not decode
+/// (issue #2043).
+///
+/// A long backoff keeps the warning rate low. The row stays, so an operator
+/// can restore the key and the batch then starts.
+#[cfg(feature = "db")]
+const UNDECODABLE_REDEFER_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Decode each element of a stored `buffered_payloads` array (issue #2043).
+///
+/// Each admission stores one envelope per element, so the SQL append and
+/// the element count keep working. A row from before the change holds clear
+/// elements, and those pass through unchanged.
+///
+/// # Errors
+///
+/// [`HarvestError`] when an element does not decode. Never a guess.
+#[cfg(feature = "db")]
+fn decode_buffered_payloads(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    stored: &serde_json::Value,
+) -> HarvestResult<serde_json::Value> {
+    let Some(items) = stored.as_array() else {
+        return Ok(stored.clone());
+    };
+    items
+        .iter()
+        .map(|item| codecs.decode_column(item))
+        .collect::<HarvestResult<Vec<_>>>()
+        .map(serde_json::Value::Array)
+}
 
 /// Push a quota-blocked event-batch row's `fire_at` forward by
 /// [`QUOTA_REDEFER_BACKOFF`] (issue #946, Task #7 hardening) so it is
@@ -601,6 +638,21 @@ async fn fire_claimed_batch_row(
 > {
     use diesel_async::RunQueryDsl;
 
+    // A payload that does not decode never starts a run (issue #2043). The
+    // row moves back and stays, so a restored key lets it start.
+    let buffered_payloads = match decode_buffered_payloads(codecs, &row.buffered_payloads) {
+        Ok(plain) => plain,
+        Err(error) => {
+            tracing::warn!(
+                batch_id = %row.id,
+                error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                "batch payload could not be decoded; the row moves back"
+            );
+            redefer_event_batch_row(conn, row.id, Utc::now() + UNDECODABLE_REDEFER_BACKOFF).await?;
+            return Ok(None);
+        }
+    };
+
     let opts: DebounceStartOptions = serde_json::from_value(row.start_options).unwrap_or_default();
 
     let shard = crate::types::ShardId::new(row.shard_id);
@@ -633,8 +685,7 @@ async fn fire_claimed_batch_row(
     // Issue #1230 Finding 1: see the identical capture in
     // `admit_batched_start` above for the full rationale. `row.buffered_payloads`
     // here is the merged array; the first element is the quota-key override.
-    let quota_key_input_override: Option<serde_json::Value> = row
-        .buffered_payloads
+    let quota_key_input_override: Option<serde_json::Value> = buffered_payloads
         .as_array()
         .and_then(|items| items.iter().next())
         .cloned();
@@ -670,7 +721,7 @@ async fn fire_claimed_batch_row(
             &workflow_name,
             &workflow_id,
             exec_id,
-            row.buffered_payloads,
+            buffered_payloads,
             &queue_name,
         )
     };
