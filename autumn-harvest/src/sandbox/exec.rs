@@ -2208,7 +2208,16 @@ mod tests {
     async fn a_background_process_is_killed_when_the_main_process_exits() {
         let out = run(sh("sleep 300 & echo $!")).await;
         let pid: i32 = out.stdout.trim().parse().unwrap();
-        assert!(process_is_gone(pid), "pid {pid} must not outlive the run");
+        // `kill` returns before the process dies, so the check waits a
+        // little. A process that the run did not kill sleeps for 300 s.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_is_gone(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "pid {pid} must not outlive the run"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

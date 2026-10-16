@@ -91,6 +91,7 @@ def from_export(doc, root):
     The LCOV exporter of LLVM 23 crashes on this crate, so the jobs export
     JSON. A branch key is its line, its column and its side. Two
     instantiations of one generic branch share a key, so their hits add up.
+    The branches of each macro expansion count too.
 
     The JSON does not mark a folded branch side. LLVM drops a folded side
     from its own totals, and this script counts it as not taken. So a branch
@@ -106,10 +107,21 @@ def from_export(doc, root):
             for number, hits in _line_counts(item["segments"]).items():
                 into["lines"][number] = into["lines"].get(number, 0) + hits
             for branch in item["branches"]:
-                for side, hits in (("0", branch[4]), ("1", branch[5])):
-                    key = (branch[0], str(branch[1]), side)
-                    into["branches"][key] = into["branches"].get(key, 0) + hits
+                _add_branch(into, branch[0], str(branch[1]), branch)
+            # A branch inside a macro expansion counts at the line of the
+            # call, as in the LCOV exporter. Its key also holds the call
+            # column and its own place, so two branches stay apart.
+            for expansion in item.get("expansions", []):
+                line, column = expansion["source_region"][:2]
+                for branch in expansion.get("branches", []):
+                    _add_branch(into, line, f"{column}@{branch[0]}:{branch[1]}", branch)
     return records
+
+
+def _add_branch(into, line, block, branch):
+    for side, hits in (("0", branch[4]), ("1", branch[5])):
+        key = (line, block, side)
+        into["branches"][key] = into["branches"].get(key, 0) + hits
 
 
 def merge(records):
@@ -410,6 +422,12 @@ EXPORT = {
             [10, 1, 4, True, True, True], [10, 20, 3, True, True, False],
         ],
         "branches": [[3, 5, 3, 8, 2, 0, 0, 0, 4], [3, 5, 3, 8, 1, 1, 0, 0, 4]],
+        # A macro call on line 6, column 3. Its branch is at line 40 of the
+        # macro definition.
+        "expansions": [{
+            "source_region": [6, 3, 6, 20, 1, 0, 1, 1],
+            "branches": [[40, 9, 40, 14, 1, 0, 1, 0, 4]],
+        }],
     }]}],
 }
 
@@ -420,8 +438,12 @@ def self_test():
     # region. Line 8 starts a skipped region. Line 10 starts with a gap, so
     # only its second region counts.
     assert timeout["lines"] == {1: 5, 3: 7, 5: 0, 6: 0, 10: 3}, timeout
-    # Two instantiations of one branch add up.
-    assert timeout["branches"] == {(3, "5", "0"): 3, (3, "5", "1"): 1}, timeout
+    # Two instantiations of one branch add up. A branch inside a macro
+    # expansion counts at the line of the call, as the LCOV exporter does.
+    assert timeout["branches"] == {
+        (3, "5", "0"): 3, (3, "5", "1"): 1,
+        (6, "3@40:9", "0"): 1, (6, "3@40:9", "1"): 0,
+    }, timeout
     try:
         from_export({"type": "other"}, "")
         raise AssertionError("a non-export file must fail")
