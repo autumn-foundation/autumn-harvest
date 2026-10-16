@@ -161,3 +161,67 @@ code, guard quality, and style. The fixes:
 |----|----------|
 | A draft proposal exists in `docs/` | `docs/otel-workflow-semconv/README.md` and its Weaver model, pinned by `otel_workflow_semconv_docs`. |
 | Submitted upstream, or a recorded decision not to | The `**Submission status:**` line of the page, checked by `the_submission_status_is_recorded`. |
+
+---
+
+## 3. Follow-up: the upstream Weaver check
+
+### 3.1 Facts found before the plan
+
+- Issue #2015 stays open after PR #2158. The status is `pending`.
+- Section 10 of the page says that the guards do not run Weaver. Upstream
+  runs `make check-policies` on each pull request.
+- The `make check-policies` recipe on upstream `main` pins the Weaver
+  image by digest. It also pins the policy package commit.
+- The recipe downloads its baseline archive inside the container. A
+  proxied sandbox cannot do that. It also floats to the latest release.
+- A local run of the same checks passed. It used Weaver 0.28.0, upstream
+  `main` at `331541c`, and the `v1.44.0` baseline. The model added no
+  warning.
+- An unresolved `ref` in a copy of the model fails the same run.
+
+### 3.2 Brainstorm — how can the check be done?
+
+| # | Idea | Verdict |
+|---|------|---------|
+| F1 | Run upstream `make check-policies` as it is. | Rejected. It needs network in the container, and its baseline floats. |
+| F2 | A script that mirrors the recipe with local mounts. It pins an upstream commit and reads the image and package pins from that tree. | **Adopted.** |
+| F3 | Add the script to the required `lint` job. | Rejected. Each PR then pulls an image and clones three trees. |
+| F4 | A separate workflow that runs when the model or the script changes. | **Adopted.** The `sandbox-kvm.yml` workflow uses the same pattern. |
+| F5 | Record the result on the page and in the issue text. | **Adopted.** Reviewers upstream see that the model passes. |
+| F6 | Fill the `<commit>` placeholder now. | Rejected. This change edits the draft, so its merge commit is the one to cite. |
+| F7 | File the upstream issue from this session. | Rejected. Filing is a maintainer action. This session has no access to upstream. |
+| F8 | Run the full upstream `make check`. | Rejected. The generated Markdown belongs to the upstream pull request. |
+| F9 | Run a broken copy of the model, and expect a failure. | **Adopted.** It proves that the check reads the model. |
+
+### 3.3 Reverse brainstorm — how can the check do harm?
+
+| # | How to make it harmful | Mitigation |
+|---|------------------------|------------|
+| H1 | The script checks the upstream tree without the model, and passes. | F9. The broken copy must fail on its own defect. |
+| H2 | Upstream `main` moves and breaks the check. | The script pins a full commit SHA. |
+| H3 | The page names one commit and the script checks another. | A guard compares the two. |
+| H4 | The page claims a check that no workflow runs. | A guard reads the workflow, its triggers and its step. |
+| H5 | The image is not pinned. | The script refuses an image with no `@sha256:` digest. |
+| H6 | A failed command does not fail the script. | `set -euo pipefail`. A guard checks it. |
+| H7 | The pin gets old, and the result misleads. | Section 10 says to move the pin and run the check before a maintainer files the issue. |
+| H8 | The issue text claims more than the check proves. | The text names the checks, not upstream acceptance. |
+
+### 3.4 Six thinking hats
+
+| Hat | Notes |
+|-----|-------|
+| White | The model passes the upstream checks at a pinned commit. The page says the guards do not run Weaver. |
+| Red | A proposal that passes upstream checks reads as serious work. |
+| Black | Upstream can change its policies. The check then needs a new pin. Three clones make the job slow. |
+| Yellow | The check finds a format defect before upstream review does. It costs one small workflow. |
+| Green | The negative control makes a vacuous pass impossible. |
+| Blue | Add the script, the workflow and the page record. Keep the status `pending`. Ask the maintainer to file. |
+
+### 3.5 TDD map
+
+| Phase | Test | Proves |
+|-------|------|--------|
+| Red → green | `the_weaver_check_script_mirrors_upstream` | F2, F9, H1, H2, H5, H6. |
+| Red → green | `the_weaver_check_runs_when_the_model_changes` | F4, H4. |
+| Red → green | `the_page_records_the_weaver_check` | F5, H3, H7, H8. |
