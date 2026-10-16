@@ -468,8 +468,8 @@ runs and sets `workflow_id`. It never gives the body to the hook.
   with-start routes. A `null` value counts as absent.
 - A `start` with an idempotency key replays the first run for that key. The
   replay ignores the body `workflow_id`, so the hook cannot see the id of the
-  run it returns. The engine still refuses a replay across tenants. Treat an
-  idempotency key as a secret within one tenant. Signal-with-start and
+  run it returns. A tenant-bound caller cannot replay another tenant's run. Treat
+  an idempotency key as a secret within one tenant. Signal-with-start and
   update-with-start do not have this path.
 - The hook runs on the management API only. A webhook or connector binding
   calls the handler directly, so the hook does not see it.
@@ -1168,8 +1168,8 @@ route and no table.
   full state. It is a read route like `GET /workflows/{id}`, and it is not
   audited. Outside the `dev` profile, mount the API behind your own auth, for
   example `api_with_auth`. A key is guessable.
-- **The authorizer hook sees the key on every route.** It reads the key from
-  the path on the by-id query and signal routes. On signal-with-start and
+- **The authorizer hook sees the key on the keyed-entity routes.** It reads
+  the key from the path on the by-id query and signal routes. On signal-with-start and
   update-with-start, it reads `AuthzRequest::workflow_id` from the body (see
   [Body key](#body-key-issue-2081)). Check the key there, and deny `None`.
   `start_input_present` shows whether a caller sets the first state.

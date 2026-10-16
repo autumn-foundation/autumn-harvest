@@ -1,4 +1,4 @@
-## Phase X.Y — Authorizer hook sees the body `workflow_id` (issue #2081)
+## Security — Authorizer hook sees the body `workflow_id` (issue #2081)
 
 `AuthzRequest` has two new fields: `workflow_id` and `start_input_present`.
 Harvest reads them from the body of `start`, `signal-with-start` and
