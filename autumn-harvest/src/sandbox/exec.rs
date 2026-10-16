@@ -2208,7 +2208,10 @@ mod tests {
     async fn a_background_process_is_killed_when_the_main_process_exits() {
         let out = run(sh("sleep 300 & echo $!")).await;
         let pid: i32 = out.stdout.trim().parse().unwrap();
-        assert!(process_is_gone(pid), "pid {pid} must not outlive the run");
+        assert!(
+            process_is_gone_within(pid, Duration::from_secs(10)).await,
+            "pid {pid} must not outlive the run"
+        );
     }
 
     #[tokio::test]
@@ -2844,6 +2847,23 @@ mod tests {
         .unwrap();
         remove_work_dir(&root).unwrap();
         assert!(!root.exists());
+    }
+
+    /// Whether `pid` is gone within `bound`. `SIGKILL` is queued at once, but
+    /// the process dies only when the kernel next runs it. A loaded runner
+    /// can show it alive for a moment. A process that the run never killed
+    /// stays alive past the bound, so the check still fails for a missed kill.
+    async fn process_is_gone_within(pid: i32, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        loop {
+            if process_is_gone(pid) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     fn process_is_gone(pid: i32) -> bool {
