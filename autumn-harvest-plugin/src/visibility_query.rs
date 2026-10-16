@@ -695,11 +695,18 @@ impl ToSql<Jsonb, Pg> for JsonText {
     }
 }
 
+/// The longest number text that a filter accepts, in bytes.
+pub const MAX_NUMBER_LEN: usize = 1024;
+
 /// Converts number text to a JSON number. Returns `None` when `f64` cannot
 /// hold the value, for example `1e400`, or `1e-400`, which `f64` reads as
 /// zero. The range check keeps the filter inside what Postgres `numeric`
-/// reads without error. The digits that remain are not rounded.
+/// reads without error. The length cap bounds the work. The digits that
+/// remain are not rounded.
 pub fn number_json(text: &str) -> Option<JsonText> {
+    if text.len() > MAX_NUMBER_LEN {
+        return None;
+    }
     let n = text.parse::<f64>().ok().filter(|n| n.is_finite())?;
     let (sign, unsigned) = text.strip_prefix('-').map_or(("", text), |t| ("-", t));
     let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
@@ -711,6 +718,11 @@ pub fn number_json(text: &str) -> Option<JsonText> {
         return None;
     }
     let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    // `f64` also reads a `+`, which JSON does not allow.
+    let digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if !digits(int) || !digits(frac) {
+        return None;
+    }
     // JSON allows no leading zero, no bare `.5` and no trailing `.`.
     let int = int.trim_start_matches('0');
     let mut out = format!("{sign}{}", if int.is_empty() { "0" } else { int });
@@ -1185,13 +1197,54 @@ mod tests {
         );
     }
 
+    /// The JSON text of each `jsonb` value that a filter binds.
+    fn json_binds(raw: &str) -> Vec<String> {
+        SqlFilter::from_expr(&parse(raw).unwrap())
+            .parts
+            .iter()
+            .flat_map(|part| match part {
+                Part::Jsonb(v) => vec![v.to_string()],
+                Part::JsonbArray(vs) => vs.iter().map(ToString::to_string).collect(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
     #[test]
     fn number_literals_bind_as_valid_json() {
-        // A leading zero is not valid JSON, and Postgres would reject it.
-        let bound = sql("attrs.a = 007.50");
-        assert!(bound.contains("7.50") && !bound.contains("007"), "{bound}");
-        let bound = sql("attrs.a = -0.5e+3");
-        assert!(bound.contains("-0.5e+3"), "{bound}");
+        for (literal, json) in [
+            ("007.50", "7.50"),
+            ("-0.5e+3", "-0.5e+3"),
+            ("1E5", "1e5"),
+            ("2e-3", "2e-3"),
+            ("-0", "-0"),
+            ("0e999999999", "0"),
+            ("0.0e-99999", "0.0"),
+        ] {
+            let bound = json_binds(&format!("attrs.a = {literal}"));
+            assert_eq!(bound, [format!("{{\"a\":{json}}}")], "{literal}");
+            serde_json::from_str::<Value>(&bound[0]).unwrap();
+        }
+        assert_eq!(json_binds("attrs.a IN (1.50, 007)"), ["1.50", "7"]);
+    }
+
+    #[test]
+    fn number_json_accepts_only_json_digits() {
+        let text = |s: &str| number_json(s).map(|n| n.to_string());
+        assert_eq!(text(".5").as_deref(), Some("0.5"));
+        assert_eq!(text("-.5").as_deref(), Some("-0.5"));
+        assert_eq!(text("5.").as_deref(), Some("5"));
+        for bad in [
+            "+5", "++5", "-+5", "inf", "NaN", "1e400", "1e-400", "", "-", ".",
+        ] {
+            assert_eq!(text(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_number_text_that_is_too_long_fails_early() {
+        let long = format!("0.{}", "1".repeat(MAX_NUMBER_LEN));
+        assert!(rejected(&format!("attrs.a = {long}")).contains("out of range"));
     }
 
     #[test]

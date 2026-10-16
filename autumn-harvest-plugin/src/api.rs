@@ -29,8 +29,6 @@ use diesel_async::RunQueryDsl;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::visibility_query::{JsonText, number_json};
-
 use autumn_harvest::admission_gate::db as admission_gate_db;
 use autumn_harvest::admission_gate::{AdmissionGateView, GateScope};
 use autumn_harvest::audit::{
@@ -150,6 +148,7 @@ use crate::state::HarvestDbPool;
 use crate::usage::{self, UsageParams, UsageResponse};
 use crate::version_gate_retirement::{RetirementCheckQuery, build_retirement_check_report};
 use crate::version_usage::{VersionUsageQuery, build_version_usage_report};
+use crate::visibility_query::{JsonText, number_json};
 use crate::workflow_count::{self, WorkflowCountParams, WorkflowCountResponse};
 use crate::workflow_reachability::{WorkflowReachabilityQuery, build_workflow_reachability_report};
 
@@ -54559,6 +54558,36 @@ mod tests {
         assert_eq!(coerce_scalar("+5").to_string(), "5");
         assert_eq!(coerce_scalar(".5").to_string(), "0.5");
         assert_eq!(coerce_scalar("inf"), serde_json::json!("inf"));
+    }
+
+    #[test]
+    fn legacy_search_attr_filter_keeps_every_digit() {
+        let big = "12345678901234567890123";
+        match parse_search_attr_filter(&format!("a:eq:{big}")).unwrap() {
+            SearchAttrPredicate::Eq { value, .. } => assert_eq!(value.to_string(), big),
+            other => panic!("expected eq, got {other:?}"),
+        }
+        match parse_search_attr_filter(&format!("a:ne:{big}")).unwrap() {
+            SearchAttrPredicate::Ne { value, .. } => assert_eq!(value.to_string(), big),
+            other => panic!("expected ne, got {other:?}"),
+        }
+        match parse_search_attr_filter(&format!("a:in:{big},2,x")).unwrap() {
+            SearchAttrPredicate::In { values, .. } => {
+                let texts: Vec<String> = values.iter().map(ToString::to_string).collect();
+                assert_eq!(texts, [big, "2", "\"x\""]);
+            }
+            other => panic!("expected in, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coerce_scalar_never_builds_invalid_json() {
+        // A second `+` is not a number, so the token stays a string.
+        assert_eq!(coerce_scalar("++5"), serde_json::json!("++5"));
+        assert_eq!(coerce_scalar("+-5"), serde_json::json!(-5));
+        // A very long number stays a string and costs no more memory.
+        let long = "1".repeat(2000);
+        assert_eq!(coerce_scalar(&long), serde_json::json!(long));
     }
 
     #[test]

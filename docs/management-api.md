@@ -659,9 +659,10 @@ value     = quoted-string | number | "true" | "false"
 
 **Types.** Quotes decide the type. `attrs.n = 100` matches the number `100`.
 `attrs.n = '100'` matches the string `"100"`. A number keeps all its digits,
-so `attrs.n = 12345678901234567890123` matches only that number. A string takes single or double
-quotes. A backslash escapes the next character. `attrs."my key"` names a key
-that is not a plain word.
+so `attrs.n = 12345678901234567890123` matches only that number. A number is
+1024 bytes or fewer. A string takes single or double quotes. A backslash
+escapes the next character. `attrs."my key"` names a key that is not a plain
+word.
 
 **Semantics.** Attribute predicates have the same meaning as the
 [typed predicates](#typed-search-attribute-predicates-get-workflows). `!=`
