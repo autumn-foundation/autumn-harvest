@@ -211,9 +211,32 @@ mod db {
 
     /// Insert a new batch job row, or return the existing id when an
     /// idempotent retry collides with a prior submission.
+    ///
+    /// The row stores the signal payload in clear. An envelope-shaped payload
+    /// gets an identity escape. Engine code calls
+    /// [`submit_batch_job_with_codecs`].
     pub async fn submit_batch_job(
         conn: &mut AsyncPgConnection,
         request: BatchSubmission,
+    ) -> HarvestResult<Uuid> {
+        submit_batch_job_with_codecs(conn, request, &crate::store::DEFAULT_PAYLOAD_CODECS).await
+    }
+
+    /// [`submit_batch_job`], storing the signal payload through `codecs`
+    /// (issue #2043).
+    ///
+    /// The row stores the payload in the column form. The executor decodes it
+    /// before it sends each signal. A cancel or terminate job stores no
+    /// payload. A retry with a known idempotency key returns the existing job
+    /// and encodes nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`submit_batch_job`].
+    pub async fn submit_batch_job_with_codecs(
+        conn: &mut AsyncPgConnection,
+        request: BatchSubmission,
+        codecs: &crate::payload_codec::PayloadCodecs,
     ) -> HarvestResult<Uuid> {
         if request.action == BatchAction::Signal && request.signal_name.is_none() {
             return Err(HarvestError::Config(
@@ -226,6 +249,23 @@ mod db {
             ));
         }
 
+        // A retry of an accepted submission needs no new ciphertext. Resolve
+        // it first, so a failing encoder cannot turn it into an error. The
+        // conflict handler below still covers a concurrent submission.
+        if let Some(key) = request.idempotency_key.as_deref()
+            && let Some(existing) = find_job_by_key(conn, key).await?
+        {
+            return Ok(existing);
+        }
+
+        // Only a signal job reads the payload. A cancel or terminate job
+        // stores none, so it never depends on the encoder.
+        let signal_payload = if request.action == BatchAction::Signal {
+            codecs.encode_column_opt(request.signal_payload.as_ref())?
+        } else {
+            None
+        };
+
         let id = Uuid::new_v4();
         let filter_value = serde_json::to_value(&request.filter).map_err(HarvestError::from)?;
         let new_row = NewBatchJob {
@@ -233,7 +273,7 @@ mod db {
             action: request.action.as_str(),
             filter: filter_value,
             signal_name: request.signal_name.as_deref(),
-            signal_payload: request.signal_payload.clone(),
+            signal_payload,
             status: BatchJobStatus::Pending.as_str(),
             idempotency_key: request.idempotency_key.as_deref(),
             created_by: request.created_by.as_deref(),
@@ -251,18 +291,26 @@ mod db {
             )) => {
                 // A concurrent submission with the same idempotency_key raced
                 // ahead of our insert. Return the id of the row that won.
-                harvest_batch_jobs::table
-                    .filter(
-                        harvest_batch_jobs::idempotency_key
-                            .eq(request.idempotency_key.as_deref().unwrap_or("")),
-                    )
-                    .select(harvest_batch_jobs::id)
-                    .first::<Uuid>(conn)
-                    .await
-                    .map_err(database_error)
+                find_job_by_key(conn, request.idempotency_key.as_deref().unwrap_or(""))
+                    .await?
+                    .ok_or_else(|| database_error(diesel::result::Error::NotFound))
             }
             Err(e) => Err(database_error(e)),
         }
+    }
+
+    /// The id of the job that holds `idempotency_key`, if any.
+    async fn find_job_by_key(
+        conn: &mut AsyncPgConnection,
+        idempotency_key: &str,
+    ) -> HarvestResult<Option<Uuid>> {
+        harvest_batch_jobs::table
+            .filter(harvest_batch_jobs::idempotency_key.eq(idempotency_key))
+            .select(harvest_batch_jobs::id)
+            .first::<Uuid>(conn)
+            .await
+            .optional()
+            .map_err(database_error)
     }
 
     /// Filters accepted by the management list endpoint.
@@ -850,6 +898,30 @@ mod db {
             }
         };
 
+        // The row stores the payload in the column form (issue #2043). Only a
+        // signal job reads it. A cancel or terminate job ignores the payload,
+        // so a missing key must not block it. A signal payload that does not
+        // decode leaves the job as it is. The job runs after an operator
+        // restores the key.
+        let signal_payload = if action == BatchAction::Signal {
+            match config
+                .payload_codecs
+                .decode_column_opt(job.signal_payload.as_ref())
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job.id,
+                        error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                        "batch signal payload could not be decoded; the job stays as it is"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
+
         // Walk every shard, collect targets, dispatch with bounded fan-out.
         // Bolt: Pre-calculate total shards to hint the initial capacity of `all_targets`.
         // While we don't know exactly how many executions exist on each shard,
@@ -906,7 +978,6 @@ mod db {
             .collect();
 
         let signal_name = job.signal_name.clone();
-        let signal_payload = job.signal_payload.clone();
         let concurrency = usize::try_from(config.concurrency.max(1)).unwrap_or(1);
         let metrics = Arc::clone(&config.metrics);
         let codecs = &config.payload_codecs;
@@ -1019,6 +1090,7 @@ pub use db::{
     BatchExecutorConfig, BatchJobView, BatchSubmission, ListFilters, count_targets_on_shard,
     get_batch_job, list_batch_jobs, mark_completed, mark_failed, mark_running, open_jobs,
     record_progress, run_executor_once, sample_targets_on_shard, submit_batch_job,
+    submit_batch_job_with_codecs,
 };
 
 #[cfg(test)]

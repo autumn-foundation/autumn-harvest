@@ -348,6 +348,9 @@ pub mod external_target_location;
 #[cfg(feature = "db")]
 pub mod external_task;
 pub mod failure;
+/// Runtime weight overrides and state upkeep for fairness keys (issue #1976).
+#[cfg(feature = "db")]
+pub mod fairness_keys;
 pub mod fan_out;
 /// Replay fuzz harness (issue #1835). Not a stable API.
 #[cfg(feature = "fuzzing")]
@@ -574,6 +577,8 @@ pub mod notify;
 pub mod queue;
 /// Metric-gated automatic abort of a build ramp (issue #1814).
 pub mod ramp_guard;
+#[cfg(feature = "sandbox-activities")]
+pub mod sandbox;
 #[cfg(feature = "db")]
 pub mod schedule_decision;
 #[cfg(feature = "db")]

@@ -13,6 +13,10 @@
 //! model call across runs. The `eval` feature adds the `eval` module.
 //! That module re-drives a recorded run with a candidate model or prompt.
 //!
+//! The [`mesh`] module lets a run delegate a task to a [`Peer`]. A
+//! [`Mandate`] bounds the delegation tree. The [`flow`] module gates a
+//! dangerous sequence of tool calls with [`FlowRules`].
+//!
 //! The crate depends on the core engine only, with no default features. It
 //! has no Autumn plugin dependency.
 //! An app implements [`AgentModel`] for its provider, or bridges a framework
@@ -65,15 +69,19 @@ pub mod delivery;
 pub mod error;
 #[cfg(feature = "eval")]
 pub mod eval;
+pub mod flow;
 pub mod followup;
 pub mod harness;
 pub mod heartbeat;
 pub mod loop_guard;
 pub mod memory;
+pub mod mesh;
 pub mod message;
 pub mod model;
 pub mod policy;
 pub mod response_cache;
+#[cfg(feature = "sandbox")]
+pub mod sandbox;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod tool;
@@ -83,6 +91,7 @@ pub mod workflow;
 pub use approval::Approval;
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
 pub use error::{AgentError, ErrorKind};
+pub use flow::{FlowRule, FlowRules, Recheck, Released};
 pub use followup::Followups;
 pub use harness::AgentHarness;
 pub use heartbeat::{
@@ -91,6 +100,7 @@ pub use heartbeat::{
 };
 pub use loop_guard::LoopGuard;
 pub use memory::{EditKey, InMemoryMemoryStore, MemoryBlock, MemoryScope, MemoryStore};
+pub use mesh::{DelegationRecord, MANDATE_META_KEY, Mandate, Peer, Refusal};
 pub use message::{
     ChatMessage, ChatRole, ContentPart, RunId, SessionId, StopReason, TokenUsage, ToolCall,
     ToolDefinition,
@@ -106,7 +116,8 @@ pub use types::{
     ToolOutcome,
 };
 pub use workflow::{
-    WORKFLOW_NAME, activities, agent_deliver, agent_deliver_info, agent_loop, agent_loop_info,
-    agent_memory_snapshot, agent_memory_snapshot_info, agent_model_turn, agent_model_turn_info,
-    agent_precheck, agent_precheck_info, agent_tool_call, agent_tool_call_info, workflows,
+    WORKFLOW_NAME, activities, agent_deliver, agent_deliver_info, agent_discover_peers,
+    agent_discover_peers_info, agent_loop, agent_loop_info, agent_memory_snapshot,
+    agent_memory_snapshot_info, agent_model_turn, agent_model_turn_info, agent_precheck,
+    agent_precheck_info, agent_tool_call, agent_tool_call_info, workflows,
 };

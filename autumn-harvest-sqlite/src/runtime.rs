@@ -29,7 +29,8 @@ use crate::error::{SqliteError, SqliteResult};
 use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::lock::WriterLock;
 use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
-use crate::{lock, queue, schema, store, update, worker};
+use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
+use crate::{lock, mutex, queue, schema, store, update, visibility, worker};
 
 /// A synchronous activity body, keyed by name.
 ///
@@ -130,6 +131,14 @@ impl ActivitySpec {
     }
 }
 
+/// The timeout and retry declarations of a registered workflow (issue #2029).
+struct WorkflowPolicy {
+    /// `#[workflow(execution_timeout = ..)]`.
+    execution_timeout: Option<std::time::Duration>,
+    /// `#[workflow(retry = ..)]`.
+    retry_policy: Option<autumn_harvest::policy::RetryPolicy>,
+}
+
 /// The status of an execution after a driver step.
 #[derive(Debug)]
 pub enum RunState {
@@ -143,6 +152,13 @@ pub enum RunState {
     WaitingSignal(String),
     /// Blocked awaiting a durable timer that has not yet fired.
     WaitingTimer,
+    /// Blocked awaiting the named workflow mutex (issue #2029). Another run
+    /// holds the key, or is ahead in its queue. A drive after the release
+    /// grants it.
+    WaitingMutex(String),
+    /// The run passed its `execution_timeout` and ended `TIMED_OUT` (issue
+    /// #2029). The payload is the stored error.
+    TimedOut(String),
     /// The run ended `CANCELLED` (issue #2021). The payload is the reason.
     Cancelled(String),
     /// The run ended `TERMINATED` (issue #2021). The payload is the reason, not
@@ -194,6 +210,97 @@ pub struct StartOutcome {
     pub created: bool,
 }
 
+/// Options for [`SqliteRuntime::start_workflow_with_options`] (issue #2027).
+#[derive(Debug, Clone, Default)]
+pub struct StartOptions {
+    /// The business workflow id. `None` or a blank id gives a fresh run.
+    pub workflow_id: Option<String>,
+    /// What to do when a run with this workflow id exists.
+    pub reuse_policy: WorkflowIdReusePolicy,
+    /// A JSON value stored with the run. No command changes it later.
+    pub memo: Option<Value>,
+    /// The search attributes at start. Each value is a JSON primitive.
+    pub search_attributes: serde_json::Map<String, Value>,
+}
+
+impl StartOptions {
+    /// Options with no workflow id, the default reuse policy, no memo and no
+    /// search attributes.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the business workflow id.
+    #[must_use]
+    pub fn workflow_id(mut self, id: impl Into<String>) -> Self {
+        self.workflow_id = Some(id.into());
+        self
+    }
+
+    /// Set the reuse policy.
+    #[must_use]
+    pub const fn reuse_policy(mut self, policy: WorkflowIdReusePolicy) -> Self {
+        self.reuse_policy = policy;
+        self
+    }
+
+    /// Set the memo.
+    #[must_use]
+    pub fn memo(mut self, memo: Value) -> Self {
+        self.memo = Some(memo);
+        self
+    }
+
+    /// Set the search attribute `key` to `value`.
+    #[must_use]
+    pub fn search_attribute(mut self, key: impl Into<String>, value: Value) -> Self {
+        self.search_attributes.insert(key.into(), value);
+        self
+    }
+}
+
+/// The result of [`SqliteRuntime::send_signal_by_workflow_id`] (issue #2028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalDelivery {
+    /// The run that holds the signal.
+    pub exec_id: ExecutionId,
+    /// `true` when this call staged the signal. `false` when the idempotency
+    /// key was already staged in the `(workflow_name, workflow_id)` chain.
+    pub delivered: bool,
+}
+
+/// The request of [`SqliteRuntime::signal_with_start`] (issue #2028).
+#[derive(Debug, Clone)]
+pub struct SignalWithStart<'a> {
+    /// The registered workflow type.
+    pub workflow_name: &'a str,
+    /// The business id. It must not be blank.
+    pub workflow_id: &'a str,
+    /// The input of a fresh run. An attach ignores it.
+    pub input: Value,
+    /// The reuse policy for a prior run of the key.
+    pub reuse_policy: WorkflowIdReusePolicy,
+    /// The signal name.
+    pub signal_name: &'a str,
+    /// The signal payload.
+    pub signal_payload: Value,
+    /// An optional idempotency key. An empty key is no key.
+    pub idempotency_key: Option<&'a str>,
+}
+
+/// The result of [`SqliteRuntime::signal_with_start`] (issue #2028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalWithStartOutcome {
+    /// The run that holds the signal.
+    pub exec_id: ExecutionId,
+    /// `true` when this call started the run.
+    pub started_fresh: bool,
+    /// `true` when this call staged the signal. `false` when the idempotency
+    /// key was already staged.
+    pub signal_delivered: bool,
+}
+
 /// The `error_type` of the `WorkflowFailed` event that seals an execution
 /// which reached an unsupported feature (issue #1834).
 pub const UNSUPPORTED_FEATURE_ERROR_TYPE: &str = "UnsupportedFeature";
@@ -228,6 +335,9 @@ const WORKFLOW_PANIC_MAX_ATTEMPTS: u32 = 3;
 pub struct SqliteRuntime {
     conn: Connection,
     workflows: HashMap<String, WorkflowHandlerFn>,
+    /// The `execution_timeout` and retry policy of each workflow (issue
+    /// #2029). A start freezes them on the run row.
+    workflow_policies: HashMap<String, WorkflowPolicy>,
     activities: HashMap<String, ActivitySpec>,
     /// Declarative `#[update]` handlers, keyed by workflow name (issue #2025).
     update_handlers: HashMap<String, Vec<UpdateHandlerInfo>>,
@@ -356,6 +466,7 @@ impl SqliteRuntime {
         Ok(Self {
             conn,
             workflows: HashMap::new(),
+            workflow_policies: HashMap::new(),
             activities: HashMap::new(),
             update_handlers: HashMap::new(),
             update_timeout: UPDATE_TIMEOUT,
@@ -440,7 +551,9 @@ impl SqliteRuntime {
     /// Register a workflow handler (by name) from its macro-generated
     /// [`WorkflowInfo`].
     ///
-    /// Only `name` + `handler` are retained; every other `WorkflowInfo` field is
+    /// The runtime keeps `name`, `handler`, `execution_timeout` and the
+    /// workflow-level `retry_policy` (issue #2029). A start freezes the last two
+    /// on the run. Every other `WorkflowInfo` field is
     /// either pure metadata / observability (accepted and inert) or an
     /// execution/admission-affecting feature this v0.1 backend does not implement.
     /// The latter are **rejected LOUDLY at registration** rather than silently
@@ -451,25 +564,30 @@ impl SqliteRuntime {
     ///
     /// Panics (setup-time, mirroring the Postgres `HarvestPlugin::build()` panic on
     /// registration misconfiguration) if `info` declares an unsupported execution- or
-    /// admission-affecting feature. That includes `execution_timeout`, a
-    /// workflow-level `retry_policy` (`#[workflow(retry(...))]`), `concurrency`,
+    /// admission-affecting feature. That includes `concurrency`,
     /// `debounce`, `batch`, `throttle`, `quota`, or a raised `max_input_bytes`. The
     /// panic message names the specific feature and points at the supported
     /// alternative. Running the workflow with the feature silently missing would
-    /// diverge from the declared `#[workflow(...)]` contract (Codex #1069 P2,
-    /// `runtime.rs:602`/`:686`).
+    /// diverge from the declared `#[workflow(...)]` contract (Codex #1069 P2).
     pub fn register_workflow(&mut self, info: &WorkflowInfo) {
         if let Some((feature, hint)) = unsupported_workflow_feature(info) {
             panic!(
                 "autumn-harvest-sqlite (v0.1): workflow `{}` declares the unsupported \
-                 `{feature}` feature. This embedded single-writer backend retains only \
-                 the handler at registration, so honoring it is a v0.1 non-goal (issue \
+                 `{feature}` feature. This embedded single-writer backend does not \
+                 implement it, so honoring it is a v0.1 non-goal (issue \
                  #1068 follow-ups) — registering it anyway would silently drop the \
                  setting and diverge from the #[workflow(...)] contract. {hint}",
                 info.name,
             );
         }
         self.workflows.insert(info.name.to_string(), info.handler);
+        self.workflow_policies.insert(
+            info.name.to_string(),
+            WorkflowPolicy {
+                execution_timeout: info.execution_timeout,
+                retry_policy: info.retry_policy.clone(),
+            },
+        );
     }
 
     /// Register an activity from its macro-generated [`ActivityInfo`]. The
@@ -532,8 +650,9 @@ impl SqliteRuntime {
     /// - **REJECTED** at registration (setup-time panic, mirroring
     ///   [`register_workflow`]): `default_heartbeat_timeout`,
     ///   `default_schedule_to_start`, `circuit_breaker`, `rate_limit_*`,
-    ///   `max_concurrent`, `requires`, `is_local`, and a raised
-    ///   `max_input_bytes` / `max_result_bytes`.
+    ///   `max_concurrent`, `requires`, a raised `max_input_bytes` /
+    ///   `max_result_bytes`, and `schedule_to_close` on a local activity.
+    ///   `is_local` itself is honored (issue #2029).
     /// - **ACCEPTED, inert**: `name` (registration key), `module` (diagnostics),
     ///   and a lone `concurrency_key` (groups a cap that is not set).
     ///
@@ -683,6 +802,7 @@ impl SqliteRuntime {
                 None,
                 input,
                 WorkflowIdReusePolicy::AllowDuplicate,
+                RunFields::default(),
             )?
             .exec_id)
     }
@@ -745,8 +865,73 @@ impl SqliteRuntime {
                 Some(workflow_id),
                 input,
                 WorkflowIdReusePolicy::AllowDuplicate,
+                RunFields::default(),
             )?
             .exec_id)
+    }
+
+    /// Start (or reuse) a workflow with a memo and search attributes
+    /// (issue #2027).
+    ///
+    /// The id and the reuse policy act as in
+    /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy).
+    /// A start that returns an existing run does not change its memo or its
+    /// search attributes. The keys are not checked against the
+    /// `upsert_search_attrs` rules, as on Postgres.
+    ///
+    /// # Errors
+    ///
+    /// The errors of
+    /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy).
+    /// Returns [`SqliteError::InvalidSearchAttribute`] for a search attribute
+    /// that is not a JSON primitive. Returns [`SqliteError::PayloadTooLarge`]
+    /// for a memo over the workflow-input cap.
+    pub fn start_workflow_with_options(
+        &mut self,
+        workflow_name: &str,
+        input: Value,
+        options: StartOptions,
+    ) -> SqliteResult<StartOutcome> {
+        // An unknown workflow is the first error, as on every other start path.
+        if !self.workflows.contains_key(workflow_name) {
+            return Err(SqliteError::UnknownWorkflow(workflow_name.to_string()));
+        }
+        let StartOptions {
+            workflow_id,
+            reuse_policy,
+            memo,
+            search_attributes,
+        } = options;
+        for (key, value) in &search_attributes {
+            if value.is_object() || value.is_array() {
+                return Err(SqliteError::InvalidSearchAttribute(format!(
+                    "`{key}` must be a JSON string, number, boolean or null"
+                )));
+            }
+        }
+        // The memo shares the workflow-input cap. Postgres stores it in the
+        // same row, beside the input.
+        if let Some(memo) = &memo {
+            let observed = serde_json::to_string(memo)?.len() as u64;
+            if DEFAULT_MAX_WORKFLOW_INPUT_BYTES > 0 && observed > DEFAULT_MAX_WORKFLOW_INPUT_BYTES {
+                return Err(SqliteError::PayloadTooLarge {
+                    kind: "memo",
+                    observed_bytes: observed,
+                    cap_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+                });
+            }
+        }
+        let fields = RunFields {
+            memo: memo.as_ref(),
+            search_attrs: (!search_attributes.is_empty()).then_some(&search_attributes),
+        };
+        self.start_workflow_with_policy_inner(
+            workflow_name,
+            workflow_id.as_deref(),
+            input,
+            reuse_policy,
+            fields,
+        )
     }
 
     /// Start (or reuse) a workflow under an explicit
@@ -803,7 +988,13 @@ impl SqliteRuntime {
         input: Value,
         policy: WorkflowIdReusePolicy,
     ) -> SqliteResult<StartOutcome> {
-        self.start_workflow_with_policy_inner(workflow_name, Some(workflow_id), input, policy)
+        self.start_workflow_with_policy_inner(
+            workflow_name,
+            Some(workflow_id),
+            input,
+            policy,
+            RunFields::default(),
+        )
     }
 
     /// Shared start path applying the `(workflow_name, workflow_id)` reuse matrix
@@ -822,111 +1013,75 @@ impl SqliteRuntime {
         workflow_id: Option<&str>,
         input: Value,
         policy: WorkflowIdReusePolicy,
+        fields: RunFields<'_>,
     ) -> SqliteResult<StartOutcome> {
-        if !self.workflows.contains_key(workflow_name) {
-            return Err(SqliteError::UnknownWorkflow(workflow_name.to_string()));
+        self.check_start(workflow_name, &input)?;
+        // An overdue prior ends first, so the reuse policy sees it terminal.
+        if let Some(id) = workflow_id.filter(|id| !id.trim().is_empty()) {
+            self.seal_key_if_overdue(workflow_name, id)?;
         }
-        // Enforce the workflow-input cap BEFORE any write (issue #252, Codex #1069
-        // `runtime.rs:264`). The Postgres start path rejects an oversized input with
-        // `PayloadTooLarge` before persisting anything; without this the SQLite
-        // backend would store/replay an unbounded input and accept a start other
-        // backends reject. Measured as the serialized-JSON byte length, exactly as
-        // the core does. A zero cap means uncapped (the core convention); the default
-        // `DEFAULT_MAX_WORKFLOW_INPUT_BYTES` (2 MiB) is > 0, so the check is active.
-        if DEFAULT_MAX_WORKFLOW_INPUT_BYTES > 0 {
-            let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-            if observed > DEFAULT_MAX_WORKFLOW_INPUT_BYTES {
-                return Err(SqliteError::PayloadTooLarge {
-                    kind: "workflow_input",
-                    observed_bytes: observed,
-                    cap_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
-                });
-            }
-        }
-
-        // A non-blank caller-supplied id is the reuse key; a blank/None id has no
-        // reuse key (it defaults to the fresh exec-id string form, unique per run),
-        // so it always creates a distinct execution regardless of `policy`.
-        let business_id = workflow_id.filter(|id| !id.trim().is_empty());
-
+        let now = (self.now_fn)().timestamp_millis();
+        let config = self.start_config(workflow_name, now)?;
         let tx = self.conn.transaction()?;
-        let outcome = match business_id {
-            // No reuse key → always fresh; `workflow_id` defaults to the exec-id
-            // string form so `ctx.info().workflow_id` is never empty and is
-            // distinct per run (issue #698).
-            None => insert_fresh_execution(&tx, workflow_name, None, input)?,
-            Some(id) => {
-                let prior = store::find_active_execution_by_key(&tx, workflow_name, id)?;
-                match (policy, prior) {
-                    // No active prior → create fresh under every policy.
-                    (_, None) => insert_fresh_execution(&tx, workflow_name, Some(id), input)?,
-
-                    // Return the existing execution unchanged.
-                    (WorkflowIdReusePolicy::AllowDuplicate, Some((prior_exec, _))) => {
-                        StartOutcome {
-                            exec_id: prior_exec,
-                            created: false,
-                        }
-                    }
-
-                    // Refuse the duplicate — drop the (uncommitted) transaction so no
-                    // fresh row is written, and surface the collision.
-                    (
-                        WorkflowIdReusePolicy::RejectDuplicate,
-                        Some((existing_exec_id, existing_state)),
-                    ) => {
-                        return Err(SqliteError::AlreadyExists {
-                            existing_exec_id,
-                            existing_state,
-                        });
-                    }
-
-                    // Replace a FAILED or CANCELLED prior, as on Postgres.
-                    // Otherwise return the existing run.
-                    (
-                        WorkflowIdReusePolicy::AllowDuplicateFailedOnly,
-                        Some((prior_exec, prior_state)),
-                    ) => {
-                        if prior_state == "FAILED" || prior_state == CANCELLED_STATE {
-                            cancel_and_seal_prior(&tx, prior_exec, &prior_state)?;
-                            insert_fresh_execution(&tx, workflow_name, Some(id), input)?
-                        } else {
-                            StartOutcome {
-                                exec_id: prior_exec,
-                                created: false,
-                            }
-                        }
-                    }
-
-                    // Cancel + seal EVERY active prior for the key, then start fresh.
-                    // A pre-#1068 database may already hold MULTIPLE RUNNING rows for
-                    // one key (the old always-fresh behavior), so sealing only the
-                    // newest (`Some(_)` here) would leave older RUNNING duplicates
-                    // active and still driven by `run_until_idle` — defeating the
-                    // terminate-and-restart guarantee (Codex #1080 P2). Re-query the
-                    // FULL active set and reconcile every row: a still-RUNNING prior
-                    // records a `WorkflowCancelled` event and has its PENDING tasks /
-                    // unfired timers cleaned up; an already-terminal prior is sealed
-                    // without a cancellation event. All happen in this one start
-                    // transaction, so the result is exactly one active row (the fresh
-                    // run) with no orphaned RUNNING prior. (When there is no active
-                    // prior at all the `(_, None)` arm above already handles it.)
-                    (WorkflowIdReusePolicy::TerminateIfRunning, Some(_)) => {
-                        for (prior_exec, prior_state) in
-                            store::find_active_executions_by_key(&tx, workflow_name, id)?
-                        {
-                            cancel_and_seal_prior(&tx, prior_exec, &prior_state)?;
-                        }
-                        insert_fresh_execution(&tx, workflow_name, Some(id), input)?
-                    }
-                }
-            }
-        };
+        let outcome = start_in_tx(
+            &tx,
+            workflow_name,
+            workflow_id,
+            input,
+            policy,
+            StartMatrix::Plain,
+            FreshRun {
+                config: &config,
+                started_at: now,
+                fields,
+            },
+        )?;
         tx.commit()?;
         Ok(outcome)
     }
 
+    /// The [`store::RunConfig`] of a fresh run of `workflow_name` that starts
+    /// at `now` (issue #2029).
+    fn start_config(&self, workflow_name: &str, now: i64) -> SqliteResult<store::RunConfig> {
+        let policy = self.workflow_policies.get(workflow_name);
+        // Round up, so a sub-millisecond timeout never fires at once.
+        let timeout_ms = policy
+            .and_then(|p| p.execution_timeout)
+            .map(duration_to_millis_ceil);
+        let retry_policy_json = policy
+            .and_then(|p| p.retry_policy.as_ref())
+            .map(serde_json::to_string)
+            .transpose()?;
+        Ok(store::RunConfig {
+            execution_timeout_ms: timeout_ms,
+            deadline_at: timeout_ms.map(|ms| now.saturating_add(ms)),
+            start_at: None,
+            attempt: 1,
+            retry_policy_json,
+            retry_of: None,
+            local_retry_at: None,
+        })
+    }
+
+    /// The checks of a plain start, before any write: a registered workflow
+    /// and the input cap.
+    fn check_start(&self, workflow_name: &str, input: &Value) -> SqliteResult<()> {
+        self.check_registered(workflow_name)?;
+        check_input_cap(input)
+    }
+
+    /// Returns `Ok` only when `workflow_name` has a registered handler.
+    fn check_registered(&self, workflow_name: &str) -> SqliteResult<()> {
+        if self.workflows.contains_key(workflow_name) {
+            return Ok(());
+        }
+        Err(SqliteError::UnknownWorkflow(workflow_name.to_string()))
+    }
+
     /// Deliver an inbound signal. The next drive appends it to history.
+    ///
+    /// It is [`send_signal_idempotent`](Self::send_signal_idempotent) with no
+    /// key, so every call stages a row.
     ///
     /// # Errors
     ///
@@ -946,7 +1101,9 @@ impl SqliteRuntime {
         name: &str,
         payload: Value,
     ) -> SqliteResult<()> {
-        self.send_signal_as_of(exec, name, payload, Utc::now())
+        let now = (self.now_fn)().timestamp_millis();
+        self.signal_execution(exec, name, &payload, None, Utc::now(), now)
+            .map(|_staged| ())
     }
 
     /// Like [`send_signal`](Self::send_signal) but with an injected arrival time
@@ -976,67 +1133,213 @@ impl SqliteRuntime {
         payload: Value,
         received_at: DateTime<Utc>,
     ) -> SqliteResult<()> {
-        // Validate the target BEFORE staging (Codex #1069 P2). `harvest_signals`
-        // has no FK or state check. An unconditional stage returns `Ok(())` for
-        // a typoed id or a sealed run. No drive will ever consume that row, so
-        // the wakeup is silently lost. Mirror the Postgres `send_signal`
-        // rejections. `store::execution_state` returns `ExecutionNotFound` for an
-        // unknown id. A terminal execution is `WorkflowNotRunning`. A RUNNING
-        // (non-terminal) execution stages as before.
-        //
-        // The single-writer runtime holds `SQLite`'s only write handle, so the
-        // state read and the stage cannot race a concurrent transition: no other
-        // writer exists to seal the execution between the check and the insert.
+        let at = received_at.timestamp_millis();
+        self.signal_execution(exec, name, &payload, None, received_at, at)
+            .map(|_staged| ())
+    }
 
-        // Issue #1985: a promise signal must carry a settlement, and a promise
-        // settles once. The Postgres path drops a second settlement through its
-        // idempotency key. This backend has no key, so it skips the stage. The
-        // check runs before the terminal check, so a retry after the run ends
-        // is a no-op here too, as on Postgres.
-        if name.starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX) {
-            // A missing run reports `NotFound` before the payload check.
-            store::execution_state(&self.conn, exec)?;
-            autumn_harvest::durable_promise::settlement_idempotency_key(name, &payload, None)
-                .map_err(|e| SqliteError::InvalidSignal(e.to_string()))?;
-            if store::has_signal(&self.conn, exec, name)? {
-                return Ok(());
-            }
+    /// Deliver a signal at most once per idempotency key (issue #2028).
+    ///
+    /// Returns `Ok(true)` when the call stages the signal. Returns `Ok(false)`
+    /// when `exec` already holds a signal with this key. The probe runs before
+    /// the state check, so a retry after the run ends is also `Ok(false)`, as on
+    /// Postgres. A partial unique index on `(exec_id, idempotency_key)`
+    /// enforces the key.
+    ///
+    /// An empty key is no key, so the call always stages. A key is scoped to
+    /// the run that holds the row. A continue-as-new moves an undelivered row
+    /// to the successor, so a retry to the old `exec` is `WorkflowNotRunning`.
+    /// For a key scoped to the whole `(workflow_name, workflow_id)` chain, use
+    /// [`send_signal_by_workflow_id`](Self::send_signal_by_workflow_id).
+    ///
+    /// A `harvest.promise:` signal always uses its name as its key, so a
+    /// promise settles once (issue #1985).
+    ///
+    /// # Errors
+    ///
+    /// As [`send_signal`](Self::send_signal). Also
+    /// [`SqliteError::InvalidSignal`] when a normal signal uses a
+    /// `harvest.promise:` key, or a promise signal has a bad payload or a
+    /// different key.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn send_signal_idempotent(
+        &mut self,
+        exec: ExecutionId,
+        name: &str,
+        payload: Value,
+        idempotency_key: Option<&str>,
+    ) -> SqliteResult<bool> {
+        let now = (self.now_fn)().timestamp_millis();
+        self.signal_execution(exec, name, &payload, idempotency_key, Utc::now(), now)
+    }
+
+    /// Signal the run that a `(workflow_name, workflow_id)` key names (issue
+    /// #2028).
+    ///
+    /// The call resolves the `RUNNING` run of the key. A continue-as-new
+    /// successor keeps the key, so the call reaches it. With no running run,
+    /// the newest run of the key is terminal, and the call refuses it.
+    ///
+    /// A key that a run of the chain already holds returns
+    /// [`SignalDelivery`] with `delivered: false` for that run, in any state.
+    /// So a retry after a continue-as-new or after the run ends stages
+    /// nothing. A promise key is scoped to its run only, as on Postgres. Each
+    /// call is one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::BlankWorkflowId`] for a blank id,
+    /// [`SqliteError::WorkflowIdNotFound`] when the key has no run, and
+    /// [`SqliteError::WorkflowNotRunning`] when its newest run is terminal.
+    /// Otherwise as [`send_signal_idempotent`](Self::send_signal_idempotent).
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn send_signal_by_workflow_id(
+        &mut self,
+        workflow_name: &str,
+        workflow_id: &str,
+        name: &str,
+        payload: Value,
+        idempotency_key: Option<&str>,
+    ) -> SqliteResult<SignalDelivery> {
+        if workflow_id.trim().is_empty() {
+            return Err(SqliteError::BlankWorkflowId);
         }
-        self.refuse_unless_running(exec)?;
-        // Enforce the signal-payload cap at INGRESS (issue #252, Codex #1069
-        // `runtime.rs:346`), before the `harvest_signals` row is staged.
-        // Otherwise the next drive records an oversized `SignalReceived` event.
-        // That bloats history and accepts a payload that Postgres rejects at its
-        // boundary. Checked AFTER the not-found / terminal rejections above: the
-        // target's existence/state is a precondition for accepting ANY signal, so a
-        // typoed or sealed target reports that (the more actionable error) rather
-        // than a size complaint — the prompt's chosen order. (The Postgres HTTP
-        // boundary happens to check the cap *before* `send_signal`'s state check;
-        // both reject and neither stages the row, so the only observable difference
-        // is the error KIND for the pathological "oversized payload to an
-        // unknown/terminal target" case — a caller bug either way.) Measured as the
-        // serialized-JSON byte length, matching the core (`serde_json::to_string`).
-        if DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES > 0 {
-            let observed = serde_json::to_string(&payload).map_or(0, |s| s.len() as u64);
-            if observed > DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES {
-                return Err(SqliteError::PayloadTooLarge {
-                    kind: "signal_payload",
-                    observed_bytes: observed,
-                    cap_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
-                });
-            }
+        let key = signal_key(name, &payload, idempotency_key)?;
+        self.seal_key_if_overdue(workflow_name, workflow_id)?;
+        let tx = self.conn.transaction()?;
+        if let Some(holder) = key_in_chain(&tx, workflow_name, workflow_id, name, key)? {
+            return Ok(SignalDelivery {
+                exec_id: holder,
+                delivered: false,
+            });
         }
-        // Millisecond precision (issue #1069 P2): `received_at` is compared against
-        // a deadline timer's `fire_at` (both epoch-MILLISECOND) by the wake-event
-        // ingest, so a whole-second floor could flip an on-time signal past its
-        // deadline near a second boundary.
-        store::stage_signal(
-            &self.conn,
-            exec,
-            name,
-            &payload,
-            received_at.timestamp_millis(),
-        )
+        let (exec, _state) = store::resolve_run_by_key(&tx, workflow_name, workflow_id)?
+            .ok_or_else(|| SqliteError::WorkflowIdNotFound {
+                workflow_name: workflow_name.to_string(),
+                workflow_id: workflow_id.to_string(),
+            })?;
+        let delivered = stage_keyed(&tx, exec, name, &payload, key, Utc::now())?;
+        tx.commit()?;
+        Ok(SignalDelivery {
+            exec_id: exec,
+            delivered,
+        })
+    }
+
+    /// Start a run of the key and signal it, or signal the run that exists
+    /// (issue #2028).
+    ///
+    /// One transaction holds the key probe, the start decision, any start or
+    /// replace, and the signal stage. An error rolls back all of them. The next
+    /// drive appends the signal before the body runs (issue #2020).
+    ///
+    /// | Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
+    /// |---|---|---|---|---|
+    /// | none | start + signal | start + signal | start + signal | start + signal |
+    /// | `RUNNING` | signal | `AlreadyExists` | signal | cancel + start + signal |
+    /// | `COMPLETED` / `FAILED` / `CANCELLED` | start + signal | `AlreadyExists` | start + signal | start + signal |
+    /// | `TERMINATED` / `CONTINUED_AS_NEW` | start + signal | start + signal | start + signal | start + signal |
+    ///
+    /// A terminal prior is the difference from
+    /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy).
+    /// A signal to a terminal run cannot land, so this call starts a fresh run,
+    /// as on Postgres. A start over a prior seals the prior `CONTINUED_AS_NEW`,
+    /// as the plain-start replace does.
+    ///
+    /// A key that a run of the chain already holds returns `started_fresh:
+    /// false` and `signal_delivered: false` for that run, before the matrix
+    /// runs. So a retry after the first run ends starts nothing.
+    ///
+    /// A `RUNNING` prior with a pending cooperative cancel counts as
+    /// `CANCELLED`, because the next drive ends it. A replace seals every
+    /// active run of the key. The input cap applies only when the call starts
+    /// a run, because an attach ignores the input. A cancelled `RUNNING` prior gets the Postgres
+    /// reason `"terminated by signal-with-start"`.
+    ///
+    /// # Errors
+    ///
+    /// - [`SqliteError::BlankWorkflowId`] for a blank id.
+    /// - [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
+    /// - [`SqliteError::AlreadyExists`] for a `RejectDuplicate` collision.
+    /// - [`SqliteError::PayloadTooLarge`] for an oversized input or payload.
+    /// - [`SqliteError::InvalidSignal`] for a broken key rule.
+    /// - A persistence error.
+    pub fn signal_with_start(
+        &mut self,
+        request: SignalWithStart<'_>,
+    ) -> SqliteResult<SignalWithStartOutcome> {
+        let SignalWithStart {
+            workflow_name,
+            workflow_id,
+            input,
+            reuse_policy,
+            signal_name,
+            signal_payload,
+            idempotency_key,
+        } = request;
+        if workflow_id.trim().is_empty() {
+            return Err(SqliteError::BlankWorkflowId);
+        }
+        // The input cap applies only when the call creates a run. An attach
+        // ignores the input, as on Postgres (issue #918).
+        self.check_registered(workflow_name)?;
+        let key = signal_key(signal_name, &signal_payload, idempotency_key)?;
+        // An overdue prior ends first, so the call replaces it.
+        self.seal_key_if_overdue(workflow_name, workflow_id)?;
+        let now = (self.now_fn)().timestamp_millis();
+        let config = self.start_config(workflow_name, now)?;
+        let tx = self.conn.transaction()?;
+        if let Some(holder) = key_in_chain(&tx, workflow_name, workflow_id, signal_name, key)? {
+            return Ok(SignalWithStartOutcome {
+                exec_id: holder,
+                started_fresh: false,
+                signal_delivered: false,
+            });
+        }
+        let started = start_in_tx(
+            &tx,
+            workflow_name,
+            Some(workflow_id),
+            input,
+            reuse_policy,
+            StartMatrix::SignalWithStart,
+            FreshRun {
+                config: &config,
+                started_at: now,
+                fields: RunFields::default(),
+            },
+        )?;
+        let signal_delivered = stage_keyed(
+            &tx,
+            started.exec_id,
+            signal_name,
+            &signal_payload,
+            key,
+            Utc::now(),
+        )?;
+        tx.commit()?;
+        Ok(SignalWithStartOutcome {
+            exec_id: started.exec_id,
+            started_fresh: started.created,
+            signal_delivered,
+        })
+    }
+
+    /// Stage a signal on `exec`. Returns `true` when it staged a row.
+    fn signal_execution(
+        &mut self,
+        exec: ExecutionId,
+        name: &str,
+        payload: &Value,
+        idempotency_key: Option<&str>,
+        received_at: DateTime<Utc>,
+        deadline_clock: i64,
+    ) -> SqliteResult<bool> {
+        // A missing run reports `NotFound` before the key rules. The deadline
+        // check runs at `deadline_clock` (issue #2029).
+        self.seal_if_overdue_at(exec, deadline_clock)?;
+        let key = signal_key(name, payload, idempotency_key)?;
+        stage_keyed(&self.conn, exec, name, payload, key, received_at)
     }
 
     /// Request a cooperative cancel of `exec` (issue #2021).
@@ -1060,8 +1363,8 @@ impl SqliteRuntime {
     ///   unregistered activity or workflow, or a stuck cycle.
     ///
     /// The run then gets `WorkflowCancelled` as its last event, and its pending
-    /// tasks, unfired timers and staged signals are deleted. The drive that ends
-    /// the run returns [`RunState::Cancelled`].
+    /// tasks, unfired timers and unkeyed staged signals are deleted. The drive
+    /// that ends the run returns [`RunState::Cancelled`].
     ///
     /// A repeat call on a run with a pending request keeps the first reason.
     /// Use [`terminate`](Self::terminate) to stop a run at once.
@@ -1073,7 +1376,8 @@ impl SqliteRuntime {
     /// treats a cancel of a `CANCELLED` run as a no-op, but this backend refuses
     /// it. Returns a persistence error if the request cannot be written.
     pub fn cancel(&mut self, exec: ExecutionId, reason: &str) -> SqliteResult<()> {
-        self.refuse_unless_running(exec)?;
+        self.seal_if_overdue(exec)?;
+        refuse_unless_running(&self.conn, exec)?;
         let reason = reason_or(reason, DEFAULT_CANCEL_REASON);
         store::request_cancel(&self.conn, exec, &reason)
     }
@@ -1081,8 +1385,8 @@ impl SqliteRuntime {
     /// Terminate `exec` at once (issue #2021).
     ///
     /// One transaction appends `WorkflowCancelled { reason }`, ends the run
-    /// `TERMINATED`, and deletes its pending tasks, unfired timers and staged
-    /// signals. The body does not run again, and `terminate` drops a pending
+    /// `TERMINATED`, and deletes its pending tasks, unfired timers and unkeyed
+    /// staged signals. The body does not run again, and `terminate` drops a pending
     /// cancel request. A later drive returns [`RunState::Terminated`]. A blank
     /// `reason` becomes `"workflow termination requested"`, as on Postgres.
     ///
@@ -1093,7 +1397,8 @@ impl SqliteRuntime {
     /// treats a terminate of a terminal run as a no-op, but this backend refuses
     /// it. Returns a persistence error if the seal cannot be written.
     pub fn terminate(&mut self, exec: ExecutionId, reason: &str) -> SqliteResult<()> {
-        self.refuse_unless_running(exec)?;
+        self.seal_if_overdue(exec)?;
+        refuse_unless_running(&self.conn, exec)?;
         let reason = reason_or(reason, DEFAULT_TERMINATE_REASON);
         let tx = self.conn.transaction()?;
         seal_with_cancel_event(&tx, exec, TERMINATED_STATE, &reason)?;
@@ -1102,19 +1407,47 @@ impl SqliteRuntime {
         Ok(())
     }
 
-    /// Returns `Ok` only when `exec` is a stored, non-terminal execution.
+    /// End `exec` `TIMED_OUT` when its deadline has passed (issue #2029).
     ///
-    /// The single writer holds the only write handle, so no transition can
-    /// happen between this check and the caller's write.
-    fn refuse_unless_running(&self, exec: ExecutionId) -> SqliteResult<()> {
+    /// Each call that writes to a run calls this first. A late signal, update,
+    /// cancel or terminate then finds the run sealed, and the state check
+    /// reports `WorkflowNotRunning`. A keyed signal retry stays a no-op, as on
+    /// any other terminal run. An unknown `exec` reports `ExecutionNotFound`.
+    fn seal_if_overdue(&mut self, exec: ExecutionId) -> SqliteResult<()> {
+        let now = (self.now_fn)().timestamp_millis();
+        self.seal_if_overdue_at(exec, now)
+    }
+
+    /// [`seal_if_overdue`](Self::seal_if_overdue) at the epoch-millisecond
+    /// instant `now`. An as-of signal passes its own time.
+    fn seal_if_overdue_at(&mut self, exec: ExecutionId, now: i64) -> SqliteResult<()> {
         let state = store::execution_state(&self.conn, exec)?;
         if autumn_harvest::erase::is_terminal_state(&state) {
-            return Err(SqliteError::WorkflowNotRunning {
-                execution_id: exec,
-                state,
-            });
+            return Ok(());
+        }
+        if let Some(deadline) = store::run_config(&self.conn, exec)?
+            .deadline_at
+            .filter(|at| now >= *at)
+        {
+            self.seal_timed_out(exec, deadline, now)?;
         }
         Ok(())
+    }
+
+    /// Seal `exec` if it is overdue at `now`, then refuse it unless it is
+    /// still running (issue #2029).
+    fn refuse_past_deadline(&mut self, exec: ExecutionId, now: i64) -> SqliteResult<()> {
+        self.seal_if_overdue_at(exec, now)?;
+        refuse_unless_running(&self.conn, exec)
+    }
+
+    /// Seal the run that `(workflow_name, workflow_id)` names, if it is
+    /// overdue. A key with no run is left to the caller.
+    fn seal_key_if_overdue(&mut self, workflow_name: &str, workflow_id: &str) -> SqliteResult<()> {
+        match store::resolve_run_by_key(&self.conn, workflow_name, workflow_id)? {
+            Some((exec, _state)) => self.seal_if_overdue(exec),
+            None => Ok(()),
+        }
     }
 
     /// End a cancel-requested `exec` `CANCELLED` (issue #2021).
@@ -1230,7 +1563,8 @@ impl SqliteRuntime {
         name: &str,
         input: Value,
     ) -> SqliteResult<Value> {
-        self.refuse_unless_running(exec)?;
+        self.seal_if_overdue(exec)?;
+        refuse_unless_running(&self.conn, exec)?;
         let workflow_name = store::workflow_name_of(&self.conn, exec)?;
         let handler = *self
             .workflows
@@ -1293,6 +1627,9 @@ impl SqliteRuntime {
         };
 
         let now = (self.now_fn)();
+        // Issue #2029: the handler can end past the deadline. The update then
+        // does not commit, and the run ends `TIMED_OUT`.
+        self.refuse_past_deadline(exec, now.timestamp_millis())?;
         let admitted = WorkflowEvent::UpdateAdmitted {
             update_id,
             name: name.to_string(),
@@ -1367,6 +1704,9 @@ impl SqliteRuntime {
         // The body sees a pending cancel here, as on the next drive (issue
         // #2021).
         let cancel_reason = store::cancel_request(&self.conn, exec)?.map(|(reason, _)| reason);
+        // The drive's deadline, so `ctx.deadline()` replays the same branch
+        // (issue #2029).
+        let (timeout, deadline) = store::run_config(&self.conn, exec)?.context_deadline();
         // The same policy as the drive, so `should_continue_as_new` replays the
         // same branch (issue #2023).
         let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
@@ -1377,28 +1717,32 @@ impl SqliteRuntime {
         )
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id)
-        .with_pending_cancellation(cancel_reason);
+        .with_pending_cancellation(cancel_reason)
+        .with_execution_timeout(timeout)
+        .with_deadline(deadline);
         for info in declarative {
             ctx.register_declarative_update_handler(info);
         }
         Ok((ctx, input, history_bytes))
     }
 
-    /// The run that `exec` continued as, if any (issue #2023).
+    /// The run that `exec` continued as, or the retry that it started, if
+    /// any (issues #2023 and #2029).
     ///
-    /// `Some` only for a run that `continue_as_new` sealed. A reuse-policy seal
-    /// shares the `CONTINUED_AS_NEW` state but has no successor.
+    /// `Some` for a run that `continue_as_new` sealed, and for a `FAILED` run
+    /// that started a workflow retry. A reuse-policy seal shares the
+    /// `CONTINUED_AS_NEW` state but has no successor.
     ///
     /// # Errors
     ///
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns a
     /// persistence error if the history cannot be read.
     pub fn successor(&self, exec: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
-        let state = store::execution_state(&self.conn, exec)?;
-        if state != SEALED_STATE {
-            return Ok(None);
+        match store::execution_state(&self.conn, exec)?.as_str() {
+            SEALED_STATE => store::successor_of(&self.conn, exec),
+            "FAILED" => store::retry_of(&self.conn, exec),
+            _ => Ok(None),
         }
-        store::successor_of(&self.conn, exec)
     }
 
     /// The full ordered event history — the canonical, replayable log.
@@ -1480,6 +1824,45 @@ impl SqliteRuntime {
             }
             _ => Ok(ExecutionOutcome::Running),
         }
+    }
+
+    /// One page of executions, newest first, with no payloads (issue #2027).
+    ///
+    /// [`SqliteReader`](crate::SqliteReader) has the same read without the
+    /// writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::InvalidSearchAttribute`] for a filter value that
+    /// is not a JSON primitive. Returns [`SqliteError::Sqlite`] if the query
+    /// fails.
+    pub fn list_executions(&self, filter: &ExecutionFilter) -> SqliteResult<ExecutionPage> {
+        visibility::list(&self.conn, filter)
+    }
+
+    /// Call `visit` once for each row of one page, newest first, with its
+    /// payloads (issue #2027). Only one row is in memory at a time. Returns
+    /// the cursor of the next page.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`list_executions`](Self::list_executions).
+    pub fn visit_executions(
+        &self,
+        filter: &ExecutionFilter,
+        visit: impl FnMut(ExecutionDescription),
+    ) -> SqliteResult<Option<ListCursor>> {
+        visibility::visit_rows(&self.conn, filter, visit)
+    }
+
+    /// One execution with its payloads (issue #2027).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
+    /// [`SqliteError::Sqlite`] if the query fails.
+    pub fn describe(&self, exec: ExecutionId) -> SqliteResult<ExecutionDescription> {
+        visibility::describe(&self.conn, exec)
     }
 
     /// Run the query `name` on `exec` with `args`, and return its answer
@@ -1707,7 +2090,9 @@ impl SqliteRuntime {
             }
             let now = (self.now_fn)().timestamp_millis();
             match self.drive_one_cycle(exec, now, &failure_now).await {
-                Ok(RunState::WaitingSignal(_) | RunState::WaitingTimer) => {}
+                Ok(
+                    RunState::WaitingSignal(_) | RunState::WaitingTimer | RunState::WaitingMutex(_),
+                ) => {}
                 Ok(_) => progress = true,
                 Err(err) => {
                     skip.insert(exec);
@@ -1737,7 +2122,9 @@ impl SqliteRuntime {
         let mut first_error = None;
         for exec in store::running_executions(&self.conn)? {
             match self.drive_one_cycle(exec, now, &failure_now).await {
-                Ok(RunState::WaitingSignal(_) | RunState::WaitingTimer) => {}
+                Ok(
+                    RunState::WaitingSignal(_) | RunState::WaitingTimer | RunState::WaitingMutex(_),
+                ) => {}
                 Ok(_) => progress = true,
                 Err(err) => record_fleet_error(exec, err, &mut first_error),
             }
@@ -1844,7 +2231,7 @@ impl SqliteRuntime {
     }
 
     /// Seal `exec` `FAILED` with the typed unsupported-feature reason, and
-    /// remove its pending tasks, unfired timers and staged signals.
+    /// remove its pending tasks, unfired timers and unkeyed staged signals.
     ///
     /// The `WorkflowFailed` event carries [`UNSUPPORTED_FEATURE_ERROR_TYPE`]
     /// and `non_retryable = true`. A retry would meet the same feature again.
@@ -1869,6 +2256,46 @@ impl SqliteRuntime {
             non_retryable: Some(true),
         };
         self.seal_failed(exec, &event, &message, now)
+    }
+
+    /// End `exec` `TIMED_OUT` at its `deadline` (issue #2029).
+    ///
+    /// One transaction appends `WorkflowExecutionTimedOut`, sets the state and
+    /// the Postgres error text, and deletes the open rows. A `RUNNING` task
+    /// is one of them. The terminal setter
+    /// also releases the run's mutex locks. The event is the Postgres one, so
+    /// the history replays on any backend.
+    fn seal_timed_out(
+        &mut self,
+        exec: ExecutionId,
+        deadline: i64,
+        now: i64,
+    ) -> SqliteResult<RunState> {
+        let workflow_name = store::workflow_name_of(&self.conn, exec)?;
+        let error = autumn_harvest::HarvestError::Timeout {
+            timeout_type: autumn_harvest::TimeoutType::WorkflowExecution,
+            task_name: workflow_name,
+        }
+        .to_string();
+        let at = |ms: i64| DateTime::from_timestamp_millis(ms).unwrap_or_default();
+        let tx = self.conn.transaction()?;
+        store::append_event(
+            &tx,
+            exec,
+            &WorkflowEvent::WorkflowExecutionTimedOut {
+                deadline: at(deadline),
+                timed_out_at: at(now),
+            },
+        )?;
+        store::set_terminal_with_reason(&tx, exec, TIMED_OUT_STATE, &error)?;
+        // A late signal or update seals without a drive, so no reclaim ran.
+        // A drive dropped mid-body can leave a `RUNNING` row with no owner.
+        queue::reclaim_running_for_execution(&tx, exec)?;
+        delete_open_rows(&tx, exec)?;
+        tx.commit()?;
+        self.workflow_panic_strikes.remove(&exec);
+        tracing::warn!(%exec, %error, "workflow passed its execution_timeout");
+        Ok(RunState::TimedOut(error))
     }
 
     /// Fail `exec` at a history cap (issue #2023).
@@ -1904,7 +2331,7 @@ impl SqliteRuntime {
     }
 
     /// Append `event`, set `exec` `FAILED` with `error`, and remove its pending
-    /// tasks, unfired timers and staged signals, in one transaction.
+    /// tasks, unfired timers and unkeyed staged signals, in one transaction.
     fn seal_failed(
         &mut self,
         exec: ExecutionId,
@@ -1948,6 +2375,10 @@ impl SqliteRuntime {
     /// a dispatch, as the Postgres worker does: the old run never resumes, so
     /// no one can await the result. Pending tasks and unfired timers of `exec`
     /// are deleted for the same reason.
+    ///
+    /// The successor keeps the timeout and the retry policy (issue #2029). Its
+    /// deadline counts from `now`, and its retry attempt is 1, as on Postgres.
+    #[allow(clippy::too_many_arguments)]
     fn continue_as_new(
         &mut self,
         exec: ExecutionId,
@@ -1956,6 +2387,7 @@ impl SqliteRuntime {
         ingest: &worker::SignalIngest,
         pending: &[WorkflowCommand],
         input: Value,
+        now: i64,
     ) -> SqliteResult<RunState> {
         let dropped = pending.iter().filter(|cmd| is_dispatch(cmd)).count();
         if dropped > 0 {
@@ -1985,8 +2417,21 @@ impl SqliteRuntime {
         )?;
         queue::delete_pending_tasks_for_execution(&tx, exec)?;
         queue::delete_unfired_timers_for_execution(&tx, exec)?;
+        let config = successor_config(store::run_config(&tx, exec)?, now, None, 1, None);
         store::seal_execution(&tx, exec, SEALED_STATE)?;
-        insert_run(&tx, successor, workflow_name, workflow_id, input)?;
+        insert_run(
+            &tx,
+            successor,
+            workflow_name,
+            workflow_id,
+            input,
+            FreshRun {
+                config: &config,
+                started_at: now,
+                fields: RunFields::default(),
+            },
+        )?;
+        store::copy_memo_and_search_attrs(&tx, exec, successor)?;
         queue::move_undelivered_signals(&tx, exec, successor)?;
         tx.commit()?;
         Ok(RunState::ContinuedAsNew(successor))
@@ -2035,14 +2480,17 @@ impl SqliteRuntime {
                 TERMINATED_STATE => Ok(RunState::Terminated(
                     store::execution_error(&self.conn, exec)?.unwrap_or_default(),
                 )),
+                TIMED_OUT_STATE => Ok(RunState::TimedOut(
+                    store::execution_error(&self.conn, exec)?.unwrap_or_default(),
+                )),
                 // A continued run names its successor again (issue #2023). It
                 // starts no second successor.
                 SEALED_STATE => Ok(store::successor_of(&self.conn, exec)?.map_or_else(
                     || RunState::Failed(format!("execution is terminal ({state}); not resumable")),
                     RunState::ContinuedAsNew,
                 )),
-                // Any other terminal state (`TIMED_OUT`) is inert. Surface a
-                // terminal `Failed` that names it.
+                // Any other terminal state is inert. Surface a terminal
+                // `Failed` that names it.
                 other => Ok(RunState::Failed(format!(
                     "execution is terminal ({other}); not resumable"
                 ))),
@@ -2050,8 +2498,33 @@ impl SqliteRuntime {
         }
 
         // A drive dropped mid-body leaves its task `RUNNING` (issue #2024).
-        // Nothing else owns it now, so hand it back to the claim.
+        // Nothing else owns it now, so hand it back to the claim. A seal below
+        // then deletes it as a pending task.
         queue::reclaim_running_for_execution(&self.conn, exec)?;
+
+        // Issue #2029: a retry waits for its backoff, and a run past its
+        // deadline ends `TIMED_OUT` before it runs again.
+        let config = store::run_config(&self.conn, exec)?;
+        if config.start_at.is_some_and(|at| now < at) {
+            // A retry that has not started yet has no work to clean up, so a
+            // pending cancel ends it at once.
+            if let Some((reason, _)) = store::cancel_request(&self.conn, exec)? {
+                return self.seal_cancelled(exec, &reason, None);
+            }
+            return Ok(RunState::WaitingTimer);
+        }
+        if let Some(deadline) = config.deadline_at.filter(|at| now >= *at) {
+            return self.seal_timed_out(exec, deadline, now);
+        }
+        // A local activity waits for its retry backoff here. A pending cancel
+        // skips the wait: the next attempt runs now, so the activity resolves
+        // and the body sees the cancel.
+        if config.local_retry_at.is_some_and(|at| now < at)
+            && store::cancel_request(&self.conn, exec)?.is_none()
+        {
+            return Ok(RunState::WaitingTimer);
+        }
+
         // Plan every staged signal before replay (issue #2020). Replay reads
         // the planned events in memory. Each persisting transaction below
         // applies the plan first, so a discarded cycle consumes no signal.
@@ -2107,7 +2580,9 @@ impl SqliteRuntime {
         // dedicated parameter on this entry point — the core reads it ONLY from
         // `span_meta.workflow_id`, so build a minimal meta carrying it (see
         // [`drive_span_meta`]).
-        let span_meta = drive_span_meta(&workflow_name, &workflow_id, cancel_reason.clone());
+        let mut span_meta = drive_span_meta(&workflow_name, &workflow_id, cancel_reason.clone());
+        // Issue #2029: `ctx.deadline()` reports the stored deadline.
+        (span_meta.execution_timeout, span_meta.deadline_at) = config.context_deadline();
         let declarative = self.declarative_updates(&workflow_name);
         let declarative: Vec<&UpdateHandlerInfo> = declarative.iter().collect();
         let (outcome, pending, _span, _resolved_router) =
@@ -2142,6 +2617,16 @@ impl SqliteRuntime {
                 None,
             )
             .await;
+
+        // Issue #2029: the body can run past the deadline. Its outcome then
+        // does not commit, and the run ends `TIMED_OUT`. The as-of drive keeps
+        // `failure_now() == now`, so this check changes nothing there.
+        if let Some(deadline) = config.deadline_at {
+            let after = failure_now();
+            if after >= deadline {
+                return self.seal_timed_out(exec, deadline, after);
+            }
+        }
 
         // Contained workflow-handler panic gate (issue #782 analog), BEFORE any
         // terminal side effect and beside the non-determinism gate below. A
@@ -2273,6 +2758,8 @@ impl SqliteRuntime {
                 // untyped `Err(String)` decodes to `message = error` with all typed
                 // fields `None`, so its stored form is unchanged.
                 let decoded = autumn_harvest::failure::decode_workflow_failure(&error);
+                // The delay counts from the failure, after the body ran.
+                let retry = retry_plan(&config, &decoded, exec, failure_now())?;
                 let tx = self.conn.transaction()?;
                 ingest.apply(&tx, exec)?;
                 persist_terminal_pending_commands(&tx, exec, &pending)?;
@@ -2282,6 +2769,10 @@ impl SqliteRuntime {
                 }
                 store::append_event(&tx, exec, &WorkflowEvent::workflow_failed_typed(&decoded))?;
                 store::set_failed(&tx, exec, &decoded.message)?;
+                // Issue #2029: the retry starts in the same transaction.
+                if let Some(plan) = retry {
+                    start_retry(&tx, exec, &workflow_name, config, &plan)?;
+                }
                 tx.commit()?;
                 Ok(RunState::Failed(decoded.message))
             }
@@ -2290,7 +2781,15 @@ impl SqliteRuntime {
             WorkflowOutcome::ContinuedAsNew {
                 input,
                 new_workflow_type: None,
-            } => self.continue_as_new(exec, &workflow_name, &workflow_id, &ingest, &pending, input),
+            } => self.continue_as_new(
+                exec,
+                &workflow_name,
+                &workflow_id,
+                &ingest,
+                &pending,
+                input,
+                now,
+            ),
             // A cross-type successor needs its own type's defaults. This backend
             // does not resolve them, so it rejects the command by name.
             WorkflowOutcome::ContinuedAsNew {
@@ -2356,7 +2855,16 @@ impl SqliteRuntime {
         cancel_reason: Option<&str>,
     ) -> SqliteResult<RunState> {
         let applied = match self.apply_commands(exec, ingest, history, commands, caps, now)? {
-            Applied::Committed { produced } => produced,
+            // Issue #2029: run the local activity now, then replay again.
+            Applied::Committed {
+                local: Some(run), ..
+            } => {
+                let terminal = self
+                    .run_local_activity(exec, owner, run, caps, now, failure_now, cancel_reason)
+                    .await?;
+                return Ok(terminal.unwrap_or(RunState::InProgress));
+            }
+            Applied::Committed { produced, .. } => produced,
             Applied::CapReached(reason) => {
                 // Issue #2021: a pending cancel wins over a cap that its
                 // cleanup reaches. The seal adds only `WorkflowCancelled`.
@@ -2367,7 +2875,8 @@ impl SqliteRuntime {
             }
         };
         let settle_after_first_terminal = worker::activity_race_in_flight(history, commands);
-        let drained = worker::drain_ready(
+        let deadline = store::run_config(&self.conn, exec)?.deadline_at;
+        let drain = worker::drain_ready(
             &mut self.conn,
             exec,
             owner,
@@ -2375,8 +2884,22 @@ impl SqliteRuntime {
             failure_now,
             &self.activities,
             settle_after_first_terminal,
-        )
-        .await?;
+        );
+        // Issue #2029: the workflow deadline bounds the drain. A body past it
+        // is dropped, as a dropped drive drops it (issue #2024). The seal then
+        // removes its `RUNNING` task.
+        let drained = match deadline {
+            Some(at) => {
+                let left = at.saturating_sub(failure_now()).unsigned_abs();
+                let finished =
+                    worker::within_budget(drain, std::time::Duration::from_millis(left)).await;
+                match finished {
+                    Some(drained) => drained?,
+                    None => return self.seal_timed_out(exec, at, failure_now().max(at)),
+                }
+            }
+            None => drain.await?,
+        };
         if applied || drained {
             return Ok(RunState::InProgress);
         }
@@ -2415,10 +2938,14 @@ impl SqliteRuntime {
         caps: &CapCheck<'_>,
         now: i64,
     ) -> SqliteResult<Applied> {
+        check_batch_shape(commands)?;
         let tx = self.conn.transaction()?;
+        // A body that no longer awaits a key gives up its queue place.
+        mutex::drop_stale_waits(&tx, exec, &acquired_keys(commands))?;
         // The planned signals come first. Replay read them ahead of this
         // cycle's commands (issue #2020).
         let mut produced = ingest.apply(&tx, exec)?;
+        let mut local = None;
         // Timer ids armed within THIS batch, so a (pathological) duplicate
         // `StartTimer` for the same id in one cycle can't double-append.
         let mut armed_this_batch: std::collections::HashSet<String> =
@@ -2472,11 +2999,7 @@ impl SqliteRuntime {
                         // step is checked (mul then add): a pathological duration
                         // saturates to an effectively-infinite deadline instead of
                         // panicking or overflowing.
-                        let fire_at = i64::try_from(*duration_secs)
-                            .ok()
-                            .and_then(|secs| secs.checked_mul(1000))
-                            .and_then(|ms| now.checked_add(ms))
-                            .unwrap_or(i64::MAX);
+                        let fire_at = fire_at(now, *duration_secs);
                         persist_started_timer(&tx, exec, timer_id, *duration_secs, fire_at)?;
                         produced = true;
                     }
@@ -2549,6 +3072,13 @@ impl SqliteRuntime {
                 WorkflowCommand::RecordUpdateResult { update_id, result } => {
                     store::append_event(&tx, exec, &update::result_event(*update_id, result))?;
                 }
+                // A search-attribute patch (issue #2027). It writes the row in
+                // this cycle's transaction, as the Postgres worker does. It is
+                // not progress: the core drops it on replay, so a body that
+                // upserts and then waits sends it again on each drive.
+                WorkflowCommand::UpsertSearchAttributes { patch } => {
+                    store::upsert_search_attrs(&tx, exec, patch)?;
+                }
                 // Race-loser teardown (issue #476/#600). Emitted when a resolved
                 // `ctx.race()` / `wait_for_signal_timeout` picks a winner and rides
                 // in the SAME suspending batch when the workflow blocks again
@@ -2568,19 +3098,28 @@ impl SqliteRuntime {
                         produced = true;
                     }
                 }
-                // Cancellable durable timers (issue #768) — a v0.1 non-goal.
-                // Reject LOUDLY and by NAME with an actionable message pointing at
-                // the supported fire-once `ctx.timer(...)`, rather than letting them
-                // fall through to the generic catch-all (Codex #1069 P2,
-                // `runtime.rs:840`). `?`-dropping the uncommitted `tx` rolls the
-                // whole batch back.
+                // Cancellable timers (issue #2029, #768), in command order.
                 cmd @ (WorkflowCommand::ArmTimer { .. } | WorkflowCommand::CancelTimer { .. }) => {
-                    return Err(cancellable_timer_unsupported(cmd));
+                    if apply_timer_command(&tx, exec, cmd, Some(now))? {
+                        produced = true;
+                    }
+                }
+                // The workflow mutex (issue #2029, #691).
+                cmd @ (WorkflowCommand::AcquireMutex { .. }
+                | WorkflowCommand::ReleaseMutex { .. }) => {
+                    if apply_mutex_command(&tx, exec, cmd, now)? {
+                        produced = true;
+                    }
+                }
+                // A local activity (issue #2029). Its body runs after the commit.
+                cmd @ WorkflowCommand::RunLocalActivity { .. } => {
+                    local = schedule_local_activity(&tx, &self.activities, exec, cmd)?;
+                    produced = true;
                 }
                 // Reject every OTHER unsupported command BY NAME via
                 // `command_name`. Examples are child workflows, external
-                // activities, signals and cancels, local activities, search
-                // attributes and detached children. No current variant is an
+                // activities, external signals and cancels, and detached
+                // children. No current variant is an
                 // opaque `"Unknown"` (Codex #1069 P2, `runtime.rs:840`). Dropping
                 // the uncommitted `tx` rolls back the whole batch. So an
                 // unsupported command after a supported one persists NEITHER the
@@ -2592,7 +3131,94 @@ impl SqliteRuntime {
             return Ok(Applied::CapReached(reason));
         }
         tx.commit()?;
-        Ok(Applied::Committed { produced })
+        Ok(Applied::Committed { produced, local })
+    }
+
+    /// Run the attempts of one local activity after its cycle commits (issue
+    /// #2029). Returns the run state if the run ended.
+    ///
+    /// The attempts start after the failures that history records, so a
+    /// crash resumes at the next attempt. Each result commits in its own
+    /// transaction, within the history caps. The context sees the result on
+    /// the next replay, as on Postgres.
+    ///
+    /// A retry with a backoff stores `local_retry_at` and ends the cycle. The
+    /// drive then returns `WaitingTimer` until that time. Postgres sleeps
+    /// inline instead.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_local_activity(
+        &mut self,
+        exec: ExecutionId,
+        owner: &worker::RunOwner<'_>,
+        run: worker::LocalRun,
+        caps: &CapCheck<'_>,
+        now: i64,
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+        cancel_reason: Option<&str>,
+    ) -> SqliteResult<Option<RunState>> {
+        let mut previous_failure = run.last_error.clone();
+        let deadline = store::run_config(&self.conn, exec)?.deadline_at;
+        for attempt in run.failed_attempts.saturating_add(1)..=run.max_attempts() {
+            let spec = self
+                .activities
+                .get(&run.name)
+                .ok_or_else(|| SqliteError::unregistered(&run.name))?;
+            // Issue #2029: an attempt stops at the workflow deadline. A run
+            // past it ends `TIMED_OUT`, and the attempt records no result.
+            let left = match deadline {
+                Some(at) if failure_now() >= at => {
+                    return self.seal_timed_out(exec, at, failure_now()).map(Some);
+                }
+                Some(at) => Some(std::time::Duration::from_millis(
+                    at.saturating_sub(failure_now()).unsigned_abs(),
+                )),
+                None => None,
+            };
+            let result =
+                worker::run_local_attempt(exec, owner, spec, &run, attempt, previous_failure, left)
+                    .await;
+            if let Some(at) = deadline.filter(|at| failure_now() >= *at) {
+                return self.seal_timed_out(exec, at, failure_now()).map(Some);
+            }
+            let (events, backoff) = worker::local_attempt_events(exec, &run, attempt, result);
+            // The next attempt sees the stored message, as on Postgres.
+            previous_failure = events.iter().find_map(|event| match event {
+                WorkflowEvent::LocalActivityFailed { error, .. } => Some(error.clone()),
+                _ => None,
+            });
+            // A backoff parks the run until `retry_at`. The drive does not
+            // sleep, so it never blocks the caller's async runtime.
+            let retry_at = backoff
+                .filter(|delay| !delay.is_zero())
+                .map(|delay| failure_now().saturating_add(duration_to_millis_ceil(delay)));
+            let tx = self.conn.transaction()?;
+            for event in &events {
+                store::append_event(&tx, exec, event)?;
+            }
+            if let Some(at) = retry_at {
+                store::set_local_retry_at(&tx, exec, at)?;
+            }
+            if let Some(reason) = caps.reached(&tx, exec)? {
+                drop(tx);
+                // As on Postgres, the attempt's first event stays, so the side
+                // effect that ran has a recorded result. The run then ends at
+                // the cap. A pending cancel wins over a cap, as on the drive.
+                if let Some(first) = events.first() {
+                    let tx = self.conn.transaction()?;
+                    store::append_event(&tx, exec, first)?;
+                    tx.commit()?;
+                }
+                return match cancel_reason {
+                    Some(cancel) => self.seal_cancelled(exec, cancel, None).map(Some),
+                    None => self.fail_for_history_cap(exec, &reason, now).map(Some),
+                };
+            }
+            tx.commit()?;
+            if backoff.is_none() || retry_at.is_some() {
+                break;
+            }
+        }
+        Ok(None)
     }
 
     /// Classify why a no-progress cycle is blocked.
@@ -2613,8 +3239,15 @@ impl SqliteRuntime {
         commands: &[WorkflowCommand],
     ) -> SqliteResult<RunState> {
         for cmd in commands {
-            if let WorkflowCommand::WaitForSignal { signal_name, .. } = cmd {
-                return Ok(RunState::WaitingSignal(signal_name.clone()));
+            match cmd {
+                WorkflowCommand::WaitForSignal { signal_name, .. } => {
+                    return Ok(RunState::WaitingSignal(signal_name.clone()));
+                }
+                // Issue #2029: the acquire is the only awaitable in its batch.
+                WorkflowCommand::AcquireMutex { key, .. } => {
+                    return Ok(RunState::WaitingMutex(key.clone()));
+                }
+                _ => {}
             }
         }
         if queue::has_unfired_timer(&self.conn, exec)? {
@@ -2905,8 +3538,8 @@ const SEALED_STATE: &str = "CONTINUED_AS_NEW";
 /// no orphan can be claimed / fire against a run that is never driven again). An
 /// already-terminal prior (`COMPLETED`, `FAILED` or `CANCELLED`) is sealed WITHOUT a cancellation
 /// event and has no PENDING tasks or unfired timers left to clean up. Every prior
-/// being sealed — RUNNING or already-terminal — also has its undelivered staged
-/// signals deleted. A signal can be staged while the prior is RUNNING. It can then
+/// being sealed — RUNNING or already-terminal — also has its unkeyed undelivered
+/// staged signals deleted. A keyed row stays (issue #2028). A signal can be staged while the prior is RUNNING. It can then
 /// outlive the prior even if the prior reaches COMPLETED/FAILED on its own (the
 /// workflow never awaited that signal name). The row is then just as unreachable,
 /// regardless of which state sealed it. This backend has no retention/GC pass, so
@@ -2920,13 +3553,14 @@ fn cancel_and_seal_prior(
     conn: &Connection,
     prior_exec: ExecutionId,
     prior_state: &str,
+    reason: &str,
 ) -> SqliteResult<()> {
     if prior_state == "RUNNING" {
         store::append_event(
             conn,
             prior_exec,
             &WorkflowEvent::WorkflowCancelled {
-                reason: "superseded by a TerminateIfRunning start (#1068)".to_string(),
+                reason: reason.to_string(),
             },
         )?;
         queue::delete_pending_tasks_for_execution(conn, prior_exec)?;
@@ -2937,6 +3571,282 @@ fn cancel_and_seal_prior(
     queue::delete_undelivered_signals_for_execution(conn, prior_exec)?;
     store::seal_execution(conn, prior_exec, SEALED_STATE)?;
     Ok(())
+}
+
+/// Which start matrix applies (issue #2028).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartMatrix {
+    /// A plain start returns a terminal prior under `AllowDuplicate` and
+    /// `AllowDuplicateFailedOnly`.
+    Plain,
+    /// Signal-with-start replaces a terminal prior instead, so the signal can
+    /// land.
+    SignalWithStart,
+}
+
+impl StartMatrix {
+    /// The `WorkflowCancelled` reason of a `RUNNING` prior that a replace
+    /// cancels. Signal-with-start uses the Postgres text.
+    const fn cancel_reason(self) -> &'static str {
+        match self {
+            Self::Plain => "superseded by a TerminateIfRunning start (#1068)",
+            Self::SignalWithStart => "terminated by signal-with-start",
+        }
+    }
+
+    /// Insert a fresh run of the key. Signal-with-start checks the input cap
+    /// here, because an attach ignores the input. A plain start checks it
+    /// before its transaction.
+    fn insert_fresh(
+        self,
+        conn: &Connection,
+        workflow_name: &str,
+        workflow_id: Option<&str>,
+        input: Value,
+        fresh: FreshRun<'_>,
+    ) -> SqliteResult<StartOutcome> {
+        if self == Self::SignalWithStart {
+            check_input_cap(&input)?;
+        }
+        insert_fresh_execution(conn, workflow_name, workflow_id, input, fresh)
+    }
+}
+
+/// The mutex keys that `commands` acquire (issue #2029).
+fn acquired_keys(commands: &[WorkflowCommand]) -> Vec<&str> {
+    commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            WorkflowCommand::AcquireMutex { key, .. } => Some(key.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The settings of a run that a start creates (issue #2029).
+#[derive(Debug, Clone, Copy)]
+struct FreshRun<'a> {
+    /// The timeout and retry policy, frozen at start.
+    config: &'a store::RunConfig,
+    /// The epoch-millisecond start that `WorkflowStarted` carries.
+    started_at: i64,
+    /// The memo and the search attributes (issue #2027).
+    fields: RunFields<'a>,
+}
+
+/// Apply the `(workflow_name, workflow_id)` reuse matrix inside the caller's
+/// transaction (issues #1068 and #2028). The callers document the two
+/// matrices.
+fn start_in_tx(
+    conn: &Connection,
+    workflow_name: &str,
+    workflow_id: Option<&str>,
+    input: Value,
+    policy: WorkflowIdReusePolicy,
+    matrix: StartMatrix,
+    fresh: FreshRun<'_>,
+) -> SqliteResult<StartOutcome> {
+    // A non-blank id is the reuse key. A blank or `None` id has no reuse key.
+    // It defaults to the fresh exec-id string, so each call creates a new run.
+    let Some(id) = workflow_id.filter(|id| !id.trim().is_empty()) else {
+        // `ctx.info().workflow_id` is then never empty and is distinct per run
+        // (issue #698).
+        return matrix.insert_fresh(conn, workflow_name, None, input, fresh);
+    };
+    let Some((prior_exec, prior_state)) =
+        store::find_active_execution_by_key(conn, workflow_name, id)?
+    else {
+        // No active prior → create fresh under every policy.
+        return matrix.insert_fresh(conn, workflow_name, Some(id), input, fresh);
+    };
+    let existing = StartOutcome {
+        exec_id: prior_exec,
+        created: false,
+    };
+    // Signal-with-start cannot usefully signal a terminal prior, so it
+    // replaces it. A RUNNING prior with a pending cooperative cancel counts as
+    // terminal too (issue #2021). The next drive ends it CANCELLED, so the
+    // signal would never act. Postgres sets CANCELLED at once, so its matrix
+    // replaces such a run.
+    let replace_terminal = matrix == StartMatrix::SignalWithStart
+        && (autumn_harvest::erase::is_terminal_state(&prior_state)
+            || store::cancel_request(conn, prior_exec)?.is_some());
+    match policy {
+        WorkflowIdReusePolicy::AllowDuplicate if !replace_terminal => Ok(existing),
+        // Refuse the duplicate — drop the (uncommitted) transaction so no
+        // fresh row is written, and surface the collision.
+        WorkflowIdReusePolicy::RejectDuplicate => Err(SqliteError::AlreadyExists {
+            existing_exec_id: prior_exec,
+            existing_state: prior_state,
+        }),
+        // Replace a FAILED or CANCELLED prior, as on Postgres. Otherwise return
+        // the existing run.
+        WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+            if !replace_terminal && prior_state != "FAILED" && prior_state != CANCELLED_STATE =>
+        {
+            Ok(existing)
+        }
+        // A plain start replaces only the newest prior. It never cancels an
+        // older RUNNING duplicate that a FAILED-only replace leaves alone.
+        WorkflowIdReusePolicy::AllowDuplicate | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+            if !replace_terminal =>
+        {
+            cancel_and_seal_prior(conn, prior_exec, &prior_state, matrix.cancel_reason())?;
+            matrix.insert_fresh(conn, workflow_name, Some(id), input, fresh)
+        }
+        // Cancel and seal EVERY active prior for the key, then start fresh.
+        // A pre-#1068 database can hold MULTIPLE RUNNING rows for one key,
+        // from the old always-fresh start. A seal of only the newest row
+        // leaves the older rows active. `run_until_idle` then still drives
+        // them, which breaks the terminate-and-restart guarantee (issue
+        // #1080). So read the FULL active set and reconcile every row. A
+        // RUNNING prior records `WorkflowCancelled` and loses its PENDING tasks
+        // and unfired timers. The call seals a terminal prior with no cancel
+        // event. One start transaction does all of it. The result is exactly
+        // one active row, the fresh run.
+        //
+        // A signal-with-start replace does the same, as Postgres upgrades it
+        // to `TerminateIfRunning`.
+        WorkflowIdReusePolicy::AllowDuplicate
+        | WorkflowIdReusePolicy::AllowDuplicateFailedOnly
+        | WorkflowIdReusePolicy::TerminateIfRunning => {
+            for (prior_exec, prior_state) in
+                store::find_active_executions_by_key(conn, workflow_name, id)?
+            {
+                cancel_and_seal_prior(conn, prior_exec, &prior_state, matrix.cancel_reason())?;
+            }
+            matrix.insert_fresh(conn, workflow_name, Some(id), input, fresh)
+        }
+    }
+}
+
+/// Returns `Ok` only when `input` fits the workflow-input cap.
+fn check_input_cap(input: &Value) -> SqliteResult<()> {
+    // Enforce the workflow-input cap BEFORE any write (issue #252). The Postgres
+    // start path rejects an oversized input with `PayloadTooLarge` before it
+    // persists anything. Without this check, this backend stores and replays an
+    // unbounded input that other backends reject. The size is the serialized-JSON
+    // byte length, as in the core. A zero cap means no cap. The default (2 MiB)
+    // is above zero, so the check is active.
+    if DEFAULT_MAX_WORKFLOW_INPUT_BYTES > 0 {
+        let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
+        if observed > DEFAULT_MAX_WORKFLOW_INPUT_BYTES {
+            return Err(SqliteError::PayloadTooLarge {
+                kind: "workflow_input",
+                observed_bytes: observed,
+                cap_bytes: DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Returns `Ok` only when `exec` is a stored, non-terminal execution.
+///
+/// The single writer holds the only write handle, so no transition can
+/// happen between this check and the caller's write.
+fn refuse_unless_running(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> {
+    let state = store::execution_state(conn, exec)?;
+    if autumn_harvest::erase::is_terminal_state(&state) {
+        return Err(SqliteError::WorkflowNotRunning {
+            execution_id: exec,
+            state,
+        });
+    }
+    Ok(())
+}
+
+/// Apply the key rules to a signal (issues #1985 and #2028).
+///
+/// An empty key is no key. A promise signal uses its name as its key. A
+/// normal signal cannot use a promise key. Returns the key to store.
+fn signal_key<'a>(
+    name: &'a str,
+    payload: &Value,
+    idempotency_key: Option<&'a str>,
+) -> SqliteResult<Option<&'a str>> {
+    let key = idempotency_key.filter(|key| !key.is_empty());
+    autumn_harvest::durable_promise::settlement_idempotency_key(name, payload, key)
+        .map_err(|e| SqliteError::InvalidSignal(e.to_string()))
+}
+
+/// The run of the `(workflow_name, workflow_id)` chain that already holds
+/// `key`, if any (issue #2028). A promise key is scoped to its run, so it
+/// skips this probe, as on Postgres.
+fn key_in_chain(
+    conn: &Connection,
+    workflow_name: &str,
+    workflow_id: &str,
+    name: &str,
+    key: Option<&str>,
+) -> SqliteResult<Option<ExecutionId>> {
+    match key {
+        Some(key) if !name.starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX) => {
+            store::find_signal_key_in_chain(conn, workflow_name, workflow_id, key)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Stage one signal on `exec` inside the caller's transaction (issue #2028).
+///
+/// Returns `Ok(false)` when `exec` already holds `key`. The probe runs before
+/// the state check, so a keyed retry after the run ends is a no-op, as on
+/// Postgres. Returns `Ok(true)` when it stages the row.
+fn stage_keyed(
+    conn: &Connection,
+    exec: ExecutionId,
+    name: &str,
+    payload: &Value,
+    key: Option<&str>,
+    received_at: DateTime<Utc>,
+) -> SqliteResult<bool> {
+    if let Some(key) = key
+        && store::has_signal_key(conn, exec, key)?
+    {
+        return Ok(false);
+    }
+    // Validate the target BEFORE staging (issue #1069). `harvest_signals`
+    // has no FK or state check. No drive consumes a row staged for a sealed
+    // run, so the wakeup would be lost silently. A terminal execution is
+    // `WorkflowNotRunning`, as on Postgres. The single writer holds the only
+    // write handle, so no transition can happen between this check and the
+    // insert.
+    refuse_unless_running(conn, exec)?;
+    // Enforce the signal-payload cap at INGRESS (issues #252 and #1069),
+    // before the `harvest_signals` row is staged.
+    // Otherwise the next drive records an oversized `SignalReceived` event.
+    // That bloats history and accepts a payload that Postgres rejects at its
+    // boundary. The check runs AFTER the not-found and terminal checks. A
+    // valid, running target is a precondition for ANY signal. So a typoed or
+    // sealed target reports that, the more actionable error, and not the
+    // size. The Postgres HTTP boundary checks the cap before the state. So
+    // an oversized signal to a terminal run differs only in its error kind.
+    // Both backends refuse it and stage no row. The size is the
+    // serialized-JSON byte length, as in the core.
+    if DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES > 0 {
+        let observed = serde_json::to_string(payload).map_or(0, |s| s.len() as u64);
+        if observed > DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES {
+            return Err(SqliteError::PayloadTooLarge {
+                kind: "signal_payload",
+                observed_bytes: observed,
+                cap_bytes: DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES,
+            });
+        }
+    }
+    // Millisecond precision (issue #1069). The wake-event ingest compares
+    // `received_at` with a deadline timer's `fire_at`. Both are epoch
+    // milliseconds. A whole-second floor can move an on-time signal past its
+    // deadline.
+    store::stage_signal(
+        conn,
+        exec,
+        name,
+        payload,
+        received_at.timestamp_millis(),
+        key,
+    )?;
+    Ok(true)
 }
 
 /// The events of the cycle that ends a cancelled run, and the limits they
@@ -2968,6 +3878,9 @@ const CANCELLED_STATE: &str = "CANCELLED";
 
 /// The state `terminate` seals (issue #2021).
 const TERMINATED_STATE: &str = "TERMINATED";
+
+/// The state an execution timeout seals (issue #2029).
+const TIMED_OUT_STATE: &str = "TIMED_OUT";
 
 /// The Postgres default reason for a blank cancel reason.
 const DEFAULT_CANCEL_REASON: &str = "workflow cancellation requested";
@@ -3044,7 +3957,8 @@ fn seal_with_cancel_event(
 
 /// Delete the pending tasks, unfired timers and staged signals of a sealed
 /// `exec`, inside the caller's transaction. No drive uses them again, and
-/// this backend has no retention pass.
+/// this backend has no retention pass. A keyed signal stays, so a retry of its
+/// key still dedupes (issue #2028).
 fn delete_open_rows(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> {
     queue::delete_pending_tasks_for_execution(conn, exec)?;
     queue::delete_unfired_timers_for_execution(conn, exec)?;
@@ -3064,37 +3978,200 @@ fn insert_fresh_execution(
     workflow_name: &str,
     business_id: Option<&str>,
     input: Value,
+    fresh: FreshRun<'_>,
 ) -> SqliteResult<StartOutcome> {
     let exec = ExecutionId::new();
     let workflow_id = business_id.map_or_else(|| exec.to_string(), str::to_string);
-    insert_run(conn, exec, workflow_name, &workflow_id, input)?;
+    insert_run(conn, exec, workflow_name, &workflow_id, input, fresh)?;
     Ok(StartOutcome {
         exec_id: exec,
         created: true,
     })
 }
 
+/// The memo and the search attributes that a new run starts with (issue
+/// #2027).
+#[derive(Debug, Clone, Copy, Default)]
+struct RunFields<'a> {
+    memo: Option<&'a Value>,
+    search_attrs: Option<&'a serde_json::Map<String, Value>>,
+}
+
 /// Insert a `RUNNING` row for `exec` and its `WorkflowStarted` event. A
-/// start and a continue-as-new successor share it.
+/// start, a continue-as-new successor and a retry successor share it.
+///
+/// `started_at` is the epoch-millisecond start of the run. `WorkflowStarted`
+/// carries it, as Postgres stamps its target start time. `ctx.deadline()`
+/// counts from it, so it matches the stored deadline (issue #2029).
+///
+/// The row stores the event time as `started_at` in microseconds (issue
+/// #2027), so a time filter and the history agree.
 fn insert_run(
     conn: &Connection,
     exec: ExecutionId,
     workflow_name: &str,
     workflow_id: &str,
     input: Value,
+    fresh: FreshRun<'_>,
 ) -> SqliteResult<()> {
-    store::insert_execution(conn, exec, workflow_name, workflow_id, &input)?;
+    store::insert_execution_with_config(
+        conn,
+        exec,
+        workflow_name,
+        workflow_id,
+        &input,
+        fresh.config,
+    )?;
+    let started_at = DateTime::from_timestamp_millis(fresh.started_at).unwrap_or_else(Utc::now);
+    store::set_start_fields(
+        conn,
+        exec,
+        started_at.timestamp_micros(),
+        fresh.fields.memo,
+        fresh.fields.search_attrs,
+    )?;
     store::append_event(
         conn,
         exec,
-        &WorkflowEvent::workflow_started(input, Utc::now()),
+        &WorkflowEvent::workflow_started(input, started_at),
+    )
+}
+
+/// The [`store::RunConfig`] of a successor of a run with `config` (issue
+/// #2029).
+///
+/// The successor keeps the timeout and the retry policy. Its deadline counts
+/// from `anchor`, its own start. A continue-as-new starts at attempt 1. A
+/// retry passes the next attempt and the failed run.
+fn successor_config(
+    config: store::RunConfig,
+    anchor: i64,
+    start_at: Option<i64>,
+    attempt: u32,
+    retry_of: Option<ExecutionId>,
+) -> store::RunConfig {
+    let deadline_at = config
+        .execution_timeout_ms
+        .map(|ms| anchor.saturating_add(ms));
+    store::RunConfig {
+        execution_timeout_ms: config.execution_timeout_ms,
+        deadline_at,
+        start_at,
+        attempt,
+        retry_policy_json: config.retry_policy_json,
+        retry_of,
+        local_retry_at: None,
+    }
+}
+
+/// A workflow retry that a failed run starts (issue #2029).
+struct RetryPlan {
+    /// The attempt number of the successor.
+    attempt: u32,
+    /// The epoch-millisecond start of the successor, after its backoff.
+    start_at: i64,
+}
+
+/// The retry of a run that failed with `failure`, if its frozen policy allows
+/// one (issue #2029).
+///
+/// The rules are the Postgres ones. A run retries while its attempt is below
+/// `max_attempts`. A `HandlerPanic` never retries. A typed failure retries
+/// unless the policy lists its type. A legacy failure retries unless the
+/// policy lists its message. The backoff uses the policy and a seed from the
+/// failed exec id. This arm sees only an author failure, so non-determinism,
+/// a cap, an unsupported feature and a timeout never retry.
+fn retry_plan(
+    config: &store::RunConfig,
+    failure: &autumn_harvest::failure::DecodedWorkflowFailure,
+    exec: ExecutionId,
+    now: i64,
+) -> SqliteResult<Option<RetryPlan>> {
+    let Some(json) = &config.retry_policy_json else {
+        return Ok(None);
+    };
+    let policy: autumn_harvest::policy::RetryPolicy = serde_json::from_str(json)?;
+    let error_type = failure.error_type.as_deref();
+    if config.attempt >= policy.max_attempts
+        || error_type == Some(autumn_harvest::failure::ERROR_TYPE_HANDLER_PANIC)
+    {
+        return Ok(None);
+    }
+    let non_retryable = error_type.map_or_else(
+        || policy.is_non_retryable(None, &failure.message),
+        |kind| policy.is_non_retryable(Some(kind), ""),
+    );
+    if non_retryable {
+        return Ok(None);
+    }
+    // The seed is the one the Postgres worker uses, so the jitter matches.
+    let seed = u64::from_le_bytes(exec.as_uuid().as_bytes()[..8].try_into().unwrap_or([0; 8]));
+    let delay =
+        autumn_harvest::policy::compute_retry_delay_with_seed(&policy, config.attempt, seed);
+    Ok(Some(RetryPlan {
+        attempt: config.attempt.saturating_add(1),
+        start_at: now.saturating_add(duration_to_millis_ceil(delay)),
+    }))
+}
+
+/// Start the retry of the failed `exec`, inside its failure transaction
+/// (issue #2029).
+///
+/// The successor gets the same input, timeout and policy, and the next
+/// attempt. Its `workflow_id` is its own exec id, as on Postgres. Every signal
+/// row of `exec` moves to it, undelivered. The failed run then gets
+/// `WorkflowRetryScheduled` after its `WorkflowFailed`.
+fn start_retry(
+    conn: &Connection,
+    exec: ExecutionId,
+    workflow_name: &str,
+    config: store::RunConfig,
+    plan: &RetryPlan,
+) -> SqliteResult<()> {
+    let successor = ExecutionId::new();
+    let input = store::execution_input(conn, exec)?;
+    let config = successor_config(
+        config,
+        plan.start_at,
+        Some(plan.start_at),
+        plan.attempt,
+        Some(exec),
+    );
+    insert_run(
+        conn,
+        successor,
+        workflow_name,
+        &successor.to_string(),
+        input,
+        FreshRun {
+            config: &config,
+            started_at: plan.start_at,
+            fields: RunFields::default(),
+        },
+    )?;
+    // A retry is the same logical run, so it keeps the memo and the search
+    // attributes, as on Postgres (issue #2027).
+    store::copy_memo_and_search_attrs(conn, exec, successor)?;
+    queue::move_all_signals_to_retry(conn, exec, successor)?;
+    store::append_event(
+        conn,
+        exec,
+        &WorkflowEvent::WorkflowRetryScheduled {
+            retry_exec_id: successor,
+            attempt: plan.attempt,
+            fire_at: DateTime::from_timestamp_millis(plan.start_at).unwrap_or_default(),
+        },
     )
 }
 
 /// The result of [`SqliteRuntime::apply_commands`].
 enum Applied {
     /// The batch committed. `produced` is `true` when a durable row changed.
-    Committed { produced: bool },
+    /// `local` is a local activity to run after the commit (issue #2029).
+    Committed {
+        produced: bool,
+        local: Option<worker::LocalRun>,
+    },
     /// The batch reached a history cap and rolled back (issue #2023).
     CapReached(HistoryCapReason),
 }
@@ -3150,6 +4227,243 @@ pub fn persist_scheduled_activity(
         defaults_frozen,
     )?;
     Ok(())
+}
+
+/// The absolute deadline of a timer of `duration_secs` armed at `now`, in
+/// epoch milliseconds. A pathological duration saturates to an
+/// effectively infinite deadline instead of overflowing.
+fn fire_at(now: i64, duration_secs: u64) -> i64 {
+    i64::try_from(duration_secs)
+        .ok()
+        .and_then(|secs| secs.checked_mul(1000))
+        .and_then(|ms| now.checked_add(ms))
+        .unwrap_or(i64::MAX)
+}
+
+/// Apply one cancellable-timer command inside the caller's transaction
+/// (issue #2029, #768). Returns `true` if a durable row or event changed.
+///
+/// - A fresh `ArmTimer` appends `TimerStarted` and inserts no row, so an
+///   armed timer never fires while the body waits on something else.
+/// - An await `ArmTimer` inserts the row at `now + duration`. A terminal
+///   batch passes `now = None`, because the run ends.
+/// - `CancelTimer` deletes the unfired row and appends `TimerCancelled`.
+///
+/// This is the Postgres order and event set.
+fn apply_timer_command(
+    conn: &Connection,
+    exec: ExecutionId,
+    cmd: &WorkflowCommand,
+    now: Option<i64>,
+) -> SqliteResult<bool> {
+    match cmd {
+        WorkflowCommand::ArmTimer {
+            timer_id,
+            duration_secs,
+            for_await: false,
+        } => {
+            store::append_event(
+                conn,
+                exec,
+                &WorkflowEvent::TimerStarted {
+                    timer_id: timer_id.clone(),
+                    duration_secs: *duration_secs,
+                },
+            )?;
+            Ok(true)
+        }
+        WorkflowCommand::ArmTimer {
+            timer_id,
+            duration_secs,
+            for_await: true,
+        } => now.map_or(Ok(false), |now| {
+            queue::arm_awaited_timer(
+                conn,
+                exec,
+                &timer_id.to_string(),
+                fire_at(now, *duration_secs),
+            )
+        }),
+        WorkflowCommand::CancelTimer { timer_id } => {
+            queue::delete_pending_timer(conn, exec, &timer_id.to_string())?;
+            store::append_event(
+                conn,
+                exec,
+                &WorkflowEvent::TimerCancelled {
+                    timer_id: timer_id.clone(),
+                },
+            )?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Apply one mutex command inside the caller's transaction (issue #2029,
+/// #691). Returns `true` if it changed a durable row.
+///
+/// - A grant appends `MutexGranted`, and the next replay resumes the body. A
+///   queued acquire writes no event, so it is not progress.
+/// - A release that frees a lock is progress. The fleet poll then makes one
+///   more pass, and a waiter gets the lock. A replayed release of an old
+///   grant frees nothing.
+fn apply_mutex_command(
+    conn: &Connection,
+    exec: ExecutionId,
+    cmd: &WorkflowCommand,
+    now: i64,
+) -> SqliteResult<bool> {
+    match cmd {
+        WorkflowCommand::AcquireMutex { key, .. } => {
+            let Some(lock_seq) = mutex::acquire(conn, exec, key)? else {
+                return Ok(false);
+            };
+            let acquired_at = DateTime::from_timestamp_millis(now).unwrap_or_default();
+            store::append_event(
+                conn,
+                exec,
+                &WorkflowEvent::MutexGranted {
+                    key: key.clone(),
+                    lock_seq,
+                    acquired_at,
+                },
+            )?;
+            Ok(true)
+        }
+        WorkflowCommand::ReleaseMutex { key, lock_seq } => {
+            mutex::release(conn, exec, key, *lock_seq)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Record one `RunLocalActivity` inside the caller's transaction, and return
+/// the run that the drive starts after the commit (issue #2029).
+///
+/// The `LocalActivityScheduled` event takes the command's place in history,
+/// unless the context reports it as already recorded. An unregistered
+/// activity rolls the cycle back, as for a regular activity.
+fn schedule_local_activity(
+    conn: &Connection,
+    activities: &HashMap<String, ActivitySpec>,
+    exec: ExecutionId,
+    cmd: &WorkflowCommand,
+) -> SqliteResult<Option<worker::LocalRun>> {
+    let WorkflowCommand::RunLocalActivity {
+        activity_id,
+        name,
+        input,
+        start_to_close,
+        retry_policy,
+        already_scheduled,
+        failed_attempts,
+        last_error,
+        ..
+    } = cmd
+    else {
+        return Ok(None);
+    };
+    if !activities.contains_key(name) {
+        return Err(SqliteError::unregistered(name));
+    }
+    if !*already_scheduled {
+        store::append_event(
+            conn,
+            exec,
+            &WorkflowEvent::LocalActivityScheduled {
+                activity_id: *activity_id,
+                name: name.clone(),
+                input: input.clone(),
+                resolved: true,
+                retry_policy: retry_policy.clone(),
+                start_to_close_nanos: start_to_close
+                    .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
+            },
+        )?;
+    }
+    Ok(Some(worker::LocalRun {
+        activity_id: *activity_id,
+        name: name.clone(),
+        input: input.clone(),
+        start_to_close: *start_to_close,
+        retry_policy: retry_policy.clone(),
+        failed_attempts: *failed_attempts,
+        last_error: last_error.clone(),
+    }))
+}
+
+/// Reject a batch that mixes a solo awaitable with others (issue #2029).
+///
+/// The rules are the Postgres ones:
+///
+/// - `AcquireMutex` must be the only awaitable in its batch, so that its
+///   `MutexGranted` lands at a clean replay cursor (issue #691).
+/// - `RunLocalActivity` resolves within the cycle, so it cannot share a
+///   batch with a durable awaitable (issue #950). This backend runs one
+///   local activity per batch.
+///
+/// The error names the offending commands and seals the run `FAILED`.
+fn check_batch_shape(commands: &[WorkflowCommand]) -> SqliteResult<()> {
+    let count = |want: fn(&WorkflowCommand) -> bool| commands.iter().filter(|c| want(c)).count();
+    let acquires = count(|c| matches!(c, WorkflowCommand::AcquireMutex { .. }));
+    let locals = count(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. }));
+    if acquires == 0 && locals == 0 {
+        return Ok(());
+    }
+    // Postgres accepts a timer await beside an acquire. This backend does
+    // not: the timer can fire first, and its `TimerFired` then sits where
+    // the positional grant matcher expects `MutexGranted`, so replay
+    // diverges.
+    let mut found: Vec<&'static str> = commands
+        .iter()
+        .filter(|c| awaits_durably(c))
+        .map(command_name)
+        .collect();
+    found.sort_unstable();
+    found.dedup();
+    if acquires > 1 || (acquires > 0 && locals > 0) {
+        found.push("AcquireMutex");
+    }
+    if locals > 1 || (acquires > 0 && locals > 0) {
+        found.push("RunLocalActivity");
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    let message = if acquires > 0 {
+        format!(
+            "AcquireMutex — a mutex acquire must be the only awaitable in its batch; \
+             found {} (issue #691). Await the acquire on its own.",
+            found.join(", ")
+        )
+    } else {
+        format!(
+            "RunLocalActivity — a local activity cannot share a suspension batch with \
+             durable awaitables ({}) (issue #950). Await the local activity before or \
+             after the concurrent block.",
+            found.join(", ")
+        )
+    };
+    Err(SqliteError::Unsupported(message))
+}
+
+/// True for a command that parks the body on durable work (issue #2029).
+/// The Postgres batch rules of issue #950 list the same commands.
+const fn awaits_durably(cmd: &WorkflowCommand) -> bool {
+    matches!(
+        cmd,
+        WorkflowCommand::ScheduleActivity { .. }
+            | WorkflowCommand::WaitForActivity { .. }
+            | WorkflowCommand::StartTimer { .. }
+            | WorkflowCommand::StartChildWorkflow { .. }
+            | WorkflowCommand::WaitForSignal { .. }
+            | WorkflowCommand::ScheduleExternalActivity { .. }
+            | WorkflowCommand::AwaitExternalWorkflow { .. }
+            | WorkflowCommand::ArmTimer {
+                for_await: true,
+                ..
+            }
+    )
 }
 
 /// Atomic dispatch pair (AC6): append `TimerStarted` **and** insert the
@@ -3259,6 +4573,11 @@ fn persist_terminal_pending_commands<'c>(
             WorkflowCommand::RecordUpdateResult { update_id, result } => {
                 store::append_event(conn, exec, &update::result_event(*update_id, result))?;
             }
+            // A search-attribute patch in the terminal cycle (issue #2027).
+            // It lands before the terminal write, as on Postgres.
+            WorkflowCommand::UpsertSearchAttributes { patch } => {
+                store::upsert_search_attrs(conn, exec, patch)?;
+            }
             // Race-loser teardown (issue #476/#600) drained in the SAME cycle the
             // workflow completes/fails — the canonical `wait_for_signal_timeout(...)`
             // signal-win shape: `let s = ctx.wait_for_signal_timeout(..).await?;
@@ -3285,14 +4604,19 @@ fn persist_terminal_pending_commands<'c>(
             | WorkflowCommand::PublishDurableProgress { .. }
             // Durable workflow logs (issue #790) — Postgres-only sink; a benign
             // NO-OP here for the same reason as `PublishProgress`.
-            | WorkflowCommand::RecordLog { .. } => {}
-            // Cancellable durable timers (issue #768) — a v0.1 non-goal — can also
-            // be drained in the terminal cycle (e.g. `ctx.start_timer(...)` right
-            // before `Ok(..)`). Reject by NAME with the same actionable message as
-            // the suspend path (Codex #1069 P2, `runtime.rs:840`); `?` drops the
-            // caller's uncommitted terminal transaction.
+            | WorkflowCommand::RecordLog { .. }
+            // Issue #2029: the terminal state setter releases every lock and
+            // queue place of the run, which covers each release. An acquire
+            // that the body did not await granted nothing. A local activity
+            // that the body did not await records nothing, as on Postgres.
+            | WorkflowCommand::ReleaseMutex { .. }
+            | WorkflowCommand::AcquireMutex { .. }
+            | WorkflowCommand::RunLocalActivity { .. } => {}
+            // Issue #2029: a fresh arm records `TimerStarted`, and a cancel
+            // records `TimerCancelled`. An await arm needs no row, because the
+            // run ends. This is the Postgres terminal policy.
             cmd @ (WorkflowCommand::ArmTimer { .. } | WorkflowCommand::CancelTimer { .. }) => {
-                return Err(cancellable_timer_unsupported(cmd));
+                apply_timer_command(conn, exec, cmd, None)?;
             }
             // Any OTHER out-of-subset command in a terminal drain is rejected BY
             // NAME via `command_name` — no opaque `"Unknown"` for any current
@@ -3379,6 +4703,14 @@ fn apply_cancel_race_losers(
 /// `schedule_to_close` deadline at claim time (Codex #1069 P2, `runtime.rs:944`).
 pub fn duration_to_millis_saturating(d: std::time::Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Convert a positive `d` to whole milliseconds, rounded up (issue #2029).
+///
+/// A timeout or a backoff then never ends before its declared duration. A
+/// pathologically large value saturates to [`i64::MAX`].
+fn duration_to_millis_ceil(d: std::time::Duration) -> i64 {
+    i64::try_from(d.as_nanos().div_ceil(1_000_000)).unwrap_or(i64::MAX)
 }
 
 /// Human name for a command (for error messages). EVERY current
@@ -3475,71 +4807,39 @@ const fn command_name(cmd: &WorkflowCommand) -> &'static str {
     }
 }
 
-/// The clear, actionable [`SqliteError::Unsupported`] message for a cancellable
-/// durable-timer command (issue #768) — `WorkflowCommand::ArmTimer` /
-/// `CancelTimer`, emitted by `ctx.start_timer(...)` and
-/// `TimerHandle::await_fire`/`cancel`/`reset`. These are a v0.1 non-goal for this
-/// single-writer backend (only fire-once `ctx.timer(...)` durable timers are
-/// supported), so name the command AND point at the supported alternative rather
-/// than letting it surface as an opaque error (Codex #1069 P2, `runtime.rs:840`).
-fn cancellable_timer_unsupported(cmd: &WorkflowCommand) -> SqliteError {
-    SqliteError::Unsupported(format!(
-        "{} — cancellable timers (ctx.start_timer / TimerHandle await_fire·cancel·reset, \
-         issue #768) are a v0.1 non-goal for the sqlite backend; use ctx.timer(...) for \
-         fire-once durable timers",
-        command_name(cmd),
-    ))
-}
-
 /// Audit a [`WorkflowInfo`] at [`register_workflow`](SqliteRuntime::register_workflow)
 /// for a declared feature this v0.1 backend does not implement — returning the first
 /// such `(feature, hint)` found, or `None` if the workflow is registrable.
 ///
-/// [`register_workflow`](SqliteRuntime::register_workflow) retains ONLY `name` +
-/// `handler`, so every other `WorkflowInfo` field would otherwise be silently
-/// dropped. This closes the "silently-dropped `WorkflowInfo`-level feature" class
-/// (Codex #1069 P2, `runtime.rs:602` `execution_timeout`, `:686` `retry_policy`) at the
-/// single registration choke point: an execution- or admission-affecting field that
-/// is `Some(_)` (or a raised cap) is REJECTED so it can never take silently-wrong
-/// effect, mirroring how the command layer already rejects out-of-subset
-/// `WorkflowCommand`s ([`cancellable_timer_unsupported`]) and `ScheduleActivity`
-/// fields ([`apply_schedule_activity`]).
+/// [`register_workflow`](SqliteRuntime::register_workflow) keeps `name`,
+/// `handler`, `execution_timeout` and `retry_policy` (issue #2029). Every other
+/// `WorkflowInfo` field would otherwise be dropped silently. This audit is the
+/// single registration choke point for that class (Codex #1069 P2). It rejects
+/// an execution- or admission-affecting field that is `Some(_)`, or a raised
+/// cap. Such a field can then never take silently wrong effect. The command
+/// layer rejects out-of-subset `WorkflowCommand`s ([`command_name`]) and
+/// `ScheduleActivity` fields ([`apply_schedule_activity`]) in the same way.
 ///
 /// The partition (see the crate-level "Unsupported `WorkflowInfo`-level features"
 /// section for the full audit):
 ///
-/// - **REJECTED** — changes lifecycle, admission, or retry semantics if ignored:
-///   `execution_timeout` (#243), workflow-level `retry_policy` (#523), `concurrency`
-///   (#247), `debounce` (#499), `batch` (#518), and `throttle` (#607). Also `quota`
-///   (#946). A raised `max_input_bytes` (#252) lowers the effective input cap versus
-///   the declared contract if dropped.
+/// - **REJECTED** — changes lifecycle or admission semantics if ignored:
+///   `concurrency` (#247), `debounce` (#499), `batch` (#518), and `throttle`
+///   (#607). Also `quota` (#946). A raised `max_input_bytes` (#252) lowers the
+///   effective input cap versus the declared contract if dropped.
 /// - **ACCEPTED, inert** — pure metadata / observability, harmless to ignore because
 ///   execution never consults them here: `sla` (#487 — no scanner, so no
 ///   `sla_breached` metric; NO wrong execution), `owner` / `runbook_url` / `severity`
 ///   (#372), `description` + `input_schema` / `output_schema` / `error_schema` (#373 —
 ///   HTTP-edge discovery/validation, and this backend has no HTTP edge), `mcp` (#597 —
 ///   HTTP-edge tool exposure), and `module` (diagnostics).
-/// - **HONORED**: `name` (registration key) and `handler` (dispatch fn).
+/// - **HONORED**: `name` (registration key), `handler` (dispatch fn),
+///   `execution_timeout` (#243) and the workflow-level `retry_policy` (#523).
+///   Issue #2029 added the last two.
 const fn unsupported_workflow_feature(info: &WorkflowInfo) -> Option<(&'static str, &'static str)> {
     // Ordered most-impactful first; the first match is reported. Each hint points at
     // the supported alternative (or states none exists) so an author gets an
     // actionable failure at setup, not a silent runtime divergence.
-    if info.execution_timeout.is_some() {
-        return Some((
-            "execution_timeout",
-            "There is no execution-timeout scanner on this single-writer backend, so a \
-             declared hard deadline would never fire. Enforce a deadline inside the \
-             workflow body with a `ctx.timer(...)` branch (or `ctx.sleep_until`) instead.",
-        ));
-    }
-    if info.retry_policy.is_some() {
-        return Some((
-            "retry_policy (#[workflow(retry(...))])",
-            "Workflow-level auto-retry (a fresh retry successor after an author failure) \
-             is not orchestrated here. Use per-activity retry (`#[activity(retry = ...)]`, \
-             which this backend honors in full) or handle the failure in the workflow body.",
-        ));
-    }
     if info.concurrency.is_some() {
         return Some((
             "concurrency",
@@ -3605,13 +4905,15 @@ const fn unsupported_workflow_feature(info: &WorkflowInfo) -> Option<(&'static s
 /// honored nor rejected. The partition (see the crate-level "Unsupported
 /// `ActivityInfo`-level features" section):
 ///
-/// - **HONORED** (handled by [`register_activity`], NOT reported here):
-///   `default_schedule_to_close` (persisted + enforced as terminal
-///   `ActivityTimedOut { ScheduleToClose }`), `default_retry_policy` (the whole
-///   policy — backoff + `non_retryable_errors` — via the command on the TYPED path
-///   and a claim-time registry fallback on the RAW path, `runtime.rs:331`),
-///   `default_start_to_close` (via the command on the TYPED path and the same
-///   claim-time fallback on the RAW path), `default_queue` (recorded).
+/// - **HONORED** by [`register_activity`], so not reported here:
+///   - `default_schedule_to_close`: persisted, and enforced as a terminal
+///     `ActivityTimedOut { ScheduleToClose }`.
+///   - `default_retry_policy`: the whole policy, backoff and
+///     `non_retryable_errors` included. The TYPED path carries it on the
+///     command. The RAW path reads the registry at claim time.
+///   - `default_start_to_close`: the same two paths.
+///   - `default_queue`: recorded.
+///   - `is_local`: `RunLocalActivity` runs the body inline (issue #2029).
 /// - **REJECTED** (reported here): each is a dispatch-admission or cross-worker
 ///   semantic with no single-writer analog, or a cap raiser. A cap raiser would
 ///   otherwise silently apply the STRICTER global cap.
@@ -3620,8 +4922,7 @@ const fn unsupported_workflow_feature(info: &WorkflowInfo) -> Option<(&'static s
 ///   - `default_schedule_to_start`: no queue-wait scanner.
 ///   - `circuit_breaker` (#369), `rate_limit_*` (#332), `max_concurrent` (#247).
 ///   - `requires`: capability routing.
-///   - `is_local`: local-activity `RunLocalActivity` dispatch is a command-layer
-///     non-goal.
+///   - `default_schedule_to_close` on a local activity, as on Postgres.
 ///   - A raised `max_input_bytes` / `max_result_bytes` (#252).
 /// - **ACCEPTED, inert**: `name`, `module`, and a lone `concurrency_key` (groups a
 ///   cap that is not set). Also `input_schema` and `output_schema`: only the
@@ -3631,12 +4932,11 @@ const fn unsupported_workflow_feature(info: &WorkflowInfo) -> Option<(&'static s
 /// `ActivityInfo` should extend this audit rather than silently pass through.
 const fn unsupported_activity_feature(info: &ActivityInfo) -> Option<(&'static str, &'static str)> {
     // Ordered most-impactful first; the first match is reported.
-    if info.is_local {
+    if info.is_local && info.default_schedule_to_close.is_some() {
         return Some((
-            "local = true",
-            "Local activities dispatch via the RunLocalActivity command, which this \
-             single-writer backend rejects at the command layer. Register a regular \
-             activity instead — this backend already runs every activity body inline.",
+            "schedule_to_close on a local activity",
+            "A local activity runs inline in the decision cycle, so no task tracks a \
+             cross-retry deadline. Postgres rejects it too. Use start_to_close.",
         ));
     }
     if info.default_schedule_to_start.is_some() {
@@ -3715,10 +5015,9 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        cancellable_timer_unsupported, command_name, persist_scheduled_activity,
-        persist_started_timer, unsupported_activity_feature,
+        command_name, persist_scheduled_activity, persist_started_timer,
+        unsupported_activity_feature,
     };
-    use crate::error::SqliteError;
     use crate::{queue, schema, store};
 
     fn open() -> Connection {
@@ -3770,6 +5069,14 @@ mod tests {
         #[test]
         fn honored_and_inert_fields_do_not_reject() {
             // HONORED (handled by register_activity, not reported by the audit):
+            // Issue #2029: a local activity runs inline.
+            assert_eq!(
+                rejected_feature(&ActivityInfo {
+                    is_local: true,
+                    ..base_info()
+                }),
+                None,
+            );
             assert_eq!(
                 rejected_feature(&ActivityInfo {
                     default_schedule_to_close: Some(Duration::from_secs(5)),
@@ -3820,9 +5127,10 @@ mod tests {
             assert_eq!(
                 rejected_feature(&ActivityInfo {
                     is_local: true,
+                    default_schedule_to_close: Some(Duration::from_secs(10)),
                     ..base_info()
                 }),
-                Some("local = true"),
+                Some("schedule_to_close on a local activity"),
             );
             assert_eq!(
                 rejected_feature(&ActivityInfo {
@@ -3904,15 +5212,23 @@ mod tests {
         }
     }
 
-    // FIX B / AUDIT (Codex #1069 P2, runtime.rs:840): the previously-"Unknown"
-    // cancellable-timer commands are named by `command_name`, and
-    // `cancellable_timer_unsupported` produces a CLEAR, actionable message that
-    // names the command AND points at the supported fire-once `ctx.timer(...)`. The
-    // `command_name` match is EXHAUSTIVE (no `_ => "Unknown"` arm), so every other
-    // current variant is likewise named by construction — a future core variant is
-    // a compile error here rather than a silent "Unknown".
+    // Issue #2029: a positive delay or timeout never rounds down to zero.
     #[test]
-    fn cancellable_timer_commands_are_named_and_rejected_actionably() {
+    fn duration_to_millis_ceil_rounds_a_fraction_up() {
+        use std::time::Duration;
+
+        use super::duration_to_millis_ceil;
+        assert_eq!(duration_to_millis_ceil(Duration::ZERO), 0);
+        assert_eq!(duration_to_millis_ceil(Duration::from_micros(1)), 1);
+        assert_eq!(duration_to_millis_ceil(Duration::from_micros(1_500)), 2);
+        assert_eq!(duration_to_millis_ceil(Duration::from_millis(7)), 7);
+        assert_eq!(duration_to_millis_ceil(Duration::MAX), i64::MAX);
+    }
+
+    // `command_name` is EXHAUSTIVE (no `_ => "Unknown"` arm). A future core
+    // variant is a compile error here, not a silent "Unknown" (Codex #1069 P2).
+    #[test]
+    fn timer_commands_are_named() {
         let arm = WorkflowCommand::ArmTimer {
             timer_id: TimerId::new("t".to_string()),
             duration_secs: 1,
@@ -3923,29 +5239,6 @@ mod tests {
         };
         assert_eq!(command_name(&arm), "ArmTimer");
         assert_eq!(command_name(&cancel), "CancelTimer");
-        assert_ne!(command_name(&arm), "Unknown");
-
-        for cmd in [&arm, &cancel] {
-            let SqliteError::Unsupported(msg) = cancellable_timer_unsupported(cmd) else {
-                panic!("must be Unsupported");
-            };
-            assert!(
-                msg.contains(command_name(cmd)),
-                "must name the command: {msg}"
-            );
-            assert!(
-                !msg.contains("Unknown"),
-                "must not be the opaque Unknown: {msg}"
-            );
-            assert!(
-                msg.contains("ctx.timer"),
-                "must point at the supported fire-once alternative: {msg}"
-            );
-            assert!(
-                msg.contains("#768"),
-                "must reference the primitive's issue: {msg}"
-            );
-        }
     }
 
     fn scheduled_count(conn: &Connection, exec: ExecutionId) -> usize {
@@ -4118,14 +5411,6 @@ mod feature_gate_tests {
     #[test]
     fn every_execution_affecting_field_is_rejected() {
         let mut info = base_wf_info();
-        info.execution_timeout = Some(Duration::from_secs(30));
-        rejected("execution_timeout", &info);
-
-        let mut info = base_wf_info();
-        info.retry_policy = Some(RetryPolicy::fixed(2, Duration::from_secs(1)));
-        rejected("retry_policy", &info);
-
-        let mut info = base_wf_info();
         info.concurrency = Some(ConcurrencyPolicy::new("input.tenant_id", 10));
         rejected("concurrency", &info);
 
@@ -4198,15 +5483,13 @@ mod feature_gate_tests {
         );
     }
 
+    // Issue #2029: the timeout and the workflow retry are honored.
     #[test]
-    fn execution_timeout_is_reported_before_retry_policy() {
-        // Deterministic first-match ordering: when several are set, the most
-        // impactful (execution_timeout) is surfaced first.
+    fn execution_timeout_and_retry_policy_are_accepted() {
         let mut info = base_wf_info();
         info.execution_timeout = Some(Duration::from_secs(30));
         info.retry_policy = Some(RetryPolicy::fixed(2, Duration::from_secs(1)));
-        let (feature, _) = unsupported_workflow_feature(&info).expect("rejected");
-        assert!(feature.contains("execution_timeout"), "got `{feature}`");
+        assert!(unsupported_workflow_feature(&info).is_none());
     }
 
     // ── Payload caps: direct "nothing persisted" proofs (issue #252) ───────────

@@ -588,25 +588,27 @@ fn requeue_params(
     params.workflow_exec_id = entry.workflow_exec_id;
     params.activity_name = entry.activity_name;
     params.max_attempts = entry.attempts.max(1);
+    // The dead letter keeps the run's quota key. A valid quota key is the
+    // redriven task's fairness key (issue #1976).
+    params.fairness_key = crate::queue_fairness::fairness_key_for(None, entry.quota_key.as_deref());
     if let Some(at) = not_before {
         params.scheduled_at = at;
     }
     (params, decoded)
 }
 
-/// Encode a requeued workflow task's input as the start path does (issue
-/// #1979).
+/// Encode a requeued task's input as the enqueue does (issue #1979, issue
+/// #2043).
 ///
-/// A workflow task row lives as long as its run, so it follows the column
-/// switch. An activity task row is short-lived and stays in clear. Input that
-/// was not decoded is already the stored form, so it stays as it is.
+/// A task row stores its input in the column form, an activity row too. So
+/// the requeued input follows the column switch. Input that was not decoded
+/// is already the stored form, so it stays as it is.
 fn seal_requeued_input(
     params: &mut EnqueueParams,
-    task_type: TaskType,
     decoded: bool,
     codecs: &PayloadCodecs,
 ) -> HarvestResult<()> {
-    if decoded && task_type == TaskType::Workflow {
+    if decoded {
         params.input = codecs.encode_shared_column(&params.input)?;
     }
     Ok(())
@@ -621,25 +623,18 @@ fn replay_codecs(registry: Option<&HandlerRegistry>) -> &PayloadCodecs {
     })
 }
 
-/// The input as a dead-letter row stores it (issue #1979).
+/// The input as a dead-letter row stores it (issue #1979, issue #2043).
 ///
-/// Only a workflow task row stores its input encoded. So only a workflow
-/// input is decoded once before it is encoded, which keeps the row to one
-/// envelope layer. An input this registry cannot decode is already
-/// ciphertext, so it is kept as it is. A quarantine must not fail on a
-/// missing key.
-///
-/// An activity or callback input is clear by design. It is encoded as it
-/// is, so an argument that only looks like an envelope is escaped, never
-/// unwrapped.
+/// Every caller passes the input as its source row stores it. That is the
+/// column form, for a workflow task, an activity task and a callback
+/// delivery. So the input is decoded once before it is encoded, which keeps
+/// the row to one envelope layer. An input this registry cannot decode is
+/// already ciphertext, so it is kept as it is. A quarantine must not fail on
+/// a missing key.
 fn dead_letter_input(
     codecs: &PayloadCodecs,
-    task_type: &str,
     input: &serde_json::Value,
 ) -> HarvestResult<serde_json::Value> {
-    if !task_type.eq_ignore_ascii_case("workflow") {
-        return codecs.encode_column(input);
-    }
     codecs
         .decode_column(input)
         .map_or_else(|_| Ok(input.clone()), |plain| codecs.encode_column(&plain))
@@ -661,6 +656,11 @@ fn dead_letter_task_type(dead_letter_id: Uuid, task_type: &str) -> HarvestResult
 ///
 /// Mirrors [`NewDeadLetter`] but owns its strings, making it easier to
 /// construct from runtime data without lifetime gymnastics.
+///
+/// `input` is the input as the source row stores it (issue #2043). That is
+/// the column form for a workflow task, an activity task and a callback
+/// delivery. The writer decodes it once and then encodes it, so the dead
+/// letter keeps one envelope layer.
 ///
 /// ## Examples
 ///
@@ -758,7 +758,7 @@ pub async fn dead_letter_with_codecs(
         task_type: &entry.task_type,
         workflow_exec_id: entry.workflow_exec_id,
         activity_name: entry.activity_name.as_deref(),
-        input: dead_letter_input(codecs, &entry.task_type, &entry.input)?,
+        input: dead_letter_input(codecs, &entry.input)?,
         error: &entry.error,
         attempts: entry.attempts,
         owner: entry.owner.as_deref(),
@@ -955,7 +955,7 @@ pub async fn replay_dead_letter_at(
                 }
             }
 
-            seal_requeued_input(&mut params, task_type, decoded, codecs)?;
+            seal_requeued_input(&mut params, decoded, codecs)?;
             let task_id = crate::queue::enqueue(conn, &params).await?;
             let deleted = diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
                 .execute(conn)
@@ -1596,7 +1596,7 @@ pub async fn redrive_dead_letter_at(
                 }
             }
 
-            seal_requeued_input(&mut params, task_type, decoded, codecs)?;
+            seal_requeued_input(&mut params, decoded, codecs)?;
             let task_id = crate::queue::enqueue(conn, &params).await?;
             diesel::delete(dsl::harvest_dead_letters.find(dead_letter_id))
                 .execute(conn)
@@ -2542,6 +2542,90 @@ async fn load_workflow_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn aead_codecs() -> PayloadCodecs {
+        let codecs = PayloadCodecs::default();
+        let key = crate::aead_codec::DataKey::from_bytes(&[0x11; 32]).expect("key");
+        crate::aead_codec::AeadCodec::new("k1", &key)
+            .expect("codec")
+            .register_with(&codecs)
+            .expect("register");
+        codecs.set_column_encoding(true);
+        codecs
+    }
+
+    /// A task row stores its input as an envelope (issue #2043). The dead
+    /// letter takes that stored form and keeps one envelope layer. A clear
+    /// input gets one layer too.
+    #[test]
+    fn a_stored_input_keeps_one_envelope_layer() {
+        let codecs = aead_codecs();
+        let plain = serde_json::json!({"ssn": "123-45-6789"});
+        let stored = codecs.encode_column(&plain).expect("encode");
+        for input in [&stored, &plain] {
+            let kept = dead_letter_input(&codecs, input).expect("input");
+            assert!(crate::payload_codec::is_codec_envelope(&kept), "{kept}");
+            assert_eq!(
+                codecs.decode_column(&kept).expect("decode"),
+                plain,
+                "the input must decode once to the plaintext"
+            );
+        }
+    }
+
+    /// An input that this registry cannot decode is already ciphertext. A
+    /// quarantine keeps it and does not fail.
+    #[test]
+    fn an_undecodable_stored_input_is_kept_as_it_is() {
+        let writer = aead_codecs();
+        let stored = writer
+            .encode_column(&serde_json::json!({"ssn": "123-45-6789"}))
+            .expect("encode");
+        let reader = PayloadCodecs::default();
+        let kept = dead_letter_input(&reader, &stored).expect("input");
+        assert_eq!(kept, stored);
+    }
+
+    fn dead_letter_with_quota_key(quota_key: Option<&str>) -> DeadLetter {
+        DeadLetter {
+            id: Uuid::nil(),
+            original_task_id: Uuid::nil(),
+            queue_name: "q".into(),
+            task_type: "workflow".into(),
+            workflow_exec_id: None,
+            activity_name: None,
+            input: serde_json::json!({}),
+            error: String::new(),
+            attempts: 1,
+            failed_at: Utc::now(),
+            owner: None,
+            severity: None,
+            workflow_name: None,
+            quota_key: quota_key.map(str::to_owned),
+        }
+    }
+
+    /// A redrive takes a valid quota key as its fairness key. An invalid
+    /// quota key gives the default key, which the weight API can address
+    /// (issue #1976).
+    #[test]
+    fn redrive_uses_only_a_valid_quota_key_as_its_fairness_key() {
+        let codecs = PayloadCodecs::default();
+        let key_of = |quota_key: Option<&str>| {
+            let (params, _) = requeue_params(
+                dead_letter_with_quota_key(quota_key),
+                TaskType::Workflow,
+                None,
+                &codecs,
+            );
+            params.fairness_key
+        };
+        assert_eq!(key_of(Some("tenant-a")).as_deref(), Some("tenant-a"));
+        for bad in ["", " x", "..", "a\u{7}b"] {
+            assert_eq!(key_of(Some(bad)), None, "quota key {bad:?}");
+        }
+        assert_eq!(key_of(None), None);
+    }
 
     // ── Redrive filter unit tests (issue #510) ───────────────────────────────
 

@@ -30,6 +30,15 @@ a new entity.
   this run's own ops, so a backlog in one task still checkpoints. A byte
   estimate (loaded history plus op bytes) trips at half the history byte
   cap. `max_ops_per_run(n)` adds a fixed bound with no event.
+- The loop sizes a checkpoint input under the live cap (issue #2049). It
+  records the input byte budget at each checkpoint attempt. A cap that a
+  deploy lowers while a handler waits on an activity then applies to the next
+  attempt.
+- The error text is bounded (issue #2049). `stats.last_error` keeps at most
+  1024 bytes, marker included. The loop cuts a longer error at a `char`
+  boundary and ends it with `... [truncated]`. The cut covers a failed op and
+  the start input. A huge error cannot stop a checkpoint. A decode error that
+  quotes a payload fits the same bound.
 - A delete completes the run only when no operation waits in history.
 
 **Limits.** See the ADR consequences: the delete race, the state size cap,
@@ -38,15 +47,17 @@ trusted start input.
 
 **Invariants.** No new `WorkflowEvent` variant, no migration and no new
 route. Each operation adds one `SideEffectRecorded` event, or two with an
-`execution_timeout`. Crate-private `WorkflowContext` accessors feed the
-checkpoint decision.
+`execution_timeout`. Each checkpoint attempt adds one `SideEffectRecorded`
+event for the budget. A `trunk-dev` history from before issue #2049 that
+retried a checkpoint does not replay. No release holds such a history.
+Crate-private `WorkflowContext` accessors feed the checkpoint decision.
 
 **Tests.**
 
-- `entity::tests` (23): serialization, rollback, decode errors, delete,
-  checkpoint carry, the input-cap budget and its offload rule, the byte
-  trigger, recorded-decision replay, replay stability against a naive
-  loop, the deadline probe, cancellation, bad input and queries.
+- `entity::tests`: serialization, rollback, decode errors, delete,
+  checkpoint carry, the input-cap budget, the budget record at each attempt,
+  the `last_error` bound, the byte trigger, replay, the deadline probe,
+  cancellation, bad input and queries.
 - `tests/integration/entity_tests.rs` (Postgres): a worker crash in the
   middle of an op, with a later op held back; two clients racing on a new
   key; thirty ops across live history checkpoints, with a duplicate key.

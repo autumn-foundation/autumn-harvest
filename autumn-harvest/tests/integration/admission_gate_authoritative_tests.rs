@@ -270,6 +270,7 @@ async fn start_source_completed_on(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -2711,6 +2712,7 @@ async fn scanner_delivers_a_stale_row_whose_target_already_exists() {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                fairness_key: None,
                 tenant: None,
             },
             None,
@@ -2945,6 +2947,7 @@ async fn run_stale_sealed_delivered_case(
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                fairness_key: None,
                 tenant: None,
             },
             None,
@@ -3215,6 +3218,7 @@ async fn start_webhook_delivery(conn: &mut AsyncPgConnection, workflow_id: &str)
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -3268,6 +3272,7 @@ fn webhook_replacement_params(workflow_id: &'static str) -> StartWorkflowParams<
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     }
 }
@@ -3483,6 +3488,7 @@ fn ag_target_params(
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     }
 }

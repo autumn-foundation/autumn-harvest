@@ -1140,6 +1140,8 @@ impl WorkflowReplayer {
     /// with the global timeout, no live deadline, and the resolved parent;
     /// [`replay_from_db`](Self::replay_from_db) passes the loaded execution row's
     /// own values.
+    // One linear setup per replay mode. A split would only move the lines.
+    #[allow(clippy::too_many_lines)]
     async fn replay_from_snapshot_effective(
         &self,
         snapshot: HistorySnapshot,
@@ -1193,6 +1195,24 @@ impl WorkflowReplayer {
                 };
             }
         };
+        // Issue #2029: a run sealed TIMED_OUT replays up to its seal. The
+        // events are inflated first, as on the strict path.
+        if let Some(seal) = timed_out_seal_start(&events) {
+            let prefix = HistorySnapshot {
+                events: events[..seal].to_vec(),
+                ..snapshot
+            };
+            return self
+                .replay_canary_snapshot_effective(
+                    prefix,
+                    execution_timeout,
+                    deadline_at,
+                    parent_execution_id,
+                    workflow_id,
+                    queue_name,
+                )
+                .await;
+        }
         let total_events = events.len();
         // Issue #952: computed before `events` is moved into the runner.
         let failing_tail = history_ends_in_terminal_failure(&events);
@@ -1428,6 +1448,8 @@ impl WorkflowReplayer {
     /// Panics if the internal `HashMap::iter().next().unwrap()` is reached on
     /// an empty map — this is unreachable because the empty-map case returns
     /// early with `WorkflowFailed` before that line.
+    // One linear setup per replay mode. A split would only move the lines.
+    #[allow(clippy::too_many_lines)]
     pub async fn replay_from_events(&self, events: Vec<WorkflowEvent>) -> ReplayReport {
         if self.handlers.len() != 1 {
             let exec_id = self.execution_id.unwrap_or_default();
@@ -1489,6 +1511,18 @@ impl WorkflowReplayer {
                 };
             }
         };
+        // Issue #2029: a run sealed TIMED_OUT replays up to its seal.
+        if let Some(seal) = timed_out_seal_start(&events) {
+            let prefix = timed_out_prefix(
+                workflow_name,
+                exec_id,
+                events,
+                seal,
+                workflow_id,
+                queue_name,
+            );
+            return self.replay_canary_snapshot(prefix).await;
+        }
         let total_events = events.len();
         // Issue #952: computed before `events` is moved into the runner.
         let failing_tail = history_ends_in_terminal_failure(&events);
@@ -2304,6 +2338,55 @@ fn extract_input(events: &[WorkflowEvent]) -> Value {
 /// mapping below can never disagree with what the replay actually did.
 fn history_ends_in_terminal_failure(events: &[WorkflowEvent]) -> bool {
     crate::replay::HistoryMatcher::terminal_failure_tail_start(events).is_some()
+}
+
+/// Index of the `WorkflowExecutionTimedOut` seal that ends `events`, if any
+/// (issue #2029).
+///
+/// The engine seals a run past its `execution_timeout` while the body is
+/// parked, so no command follows the last recorded event. The replayer
+/// therefore replays the events before the seal as an in-flight run, as the
+/// deploy canary does. A divergence before the seal still reports.
+///
+/// Only trailing decision boundaries and cascade records may follow the
+/// seal. A seal at index 0 is a truncated export, not a timed-out run, so it
+/// keeps strict treatment. The canary path has no advancing timer clock, so
+/// this replay ignores `with_advancing_timer_clock`.
+fn timed_out_seal_start(events: &[WorkflowEvent]) -> Option<usize> {
+    let seal = events.iter().rposition(|event| {
+        !event.is_decision_boundary()
+            && !matches!(event, WorkflowEvent::ChildWorkflowCascadeApplied { .. })
+    })?;
+    (seal > 0
+        && matches!(
+            events[seal],
+            WorkflowEvent::WorkflowExecutionTimedOut { .. }
+        ))
+    .then_some(seal)
+}
+
+/// The events before the timeout seal at `seal`, as a canary snapshot
+/// (issue #2029).
+fn timed_out_prefix(
+    workflow_name: String,
+    execution_id: ExecutionId,
+    mut events: Vec<WorkflowEvent>,
+    seal: usize,
+    workflow_id: Option<String>,
+    queue_name: Option<String>,
+) -> HistorySnapshot {
+    events.truncate(seal);
+    HistorySnapshot {
+        workflow_name,
+        execution_id,
+        events,
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: None,
+        workflow_id,
+        queue_name,
+    }
 }
 
 fn outcome_to_report(
@@ -7790,6 +7873,79 @@ mod tests {
         let replayer = WorkflowReplayer::new().register_fn("simple", simple_workflow);
         let report = replayer.replay_from_events(events).await;
         assert!(matches!(report.status, ReplayStatus::ReplaySucceeded));
+    }
+
+    fn timed_out(events: &mut Vec<WorkflowEvent>) {
+        events.push(WorkflowEvent::WorkflowExecutionTimedOut {
+            deadline: Utc::now(),
+            timed_out_at: Utc::now(),
+        });
+    }
+
+    // Issue #2029: a run sealed TIMED_OUT while its body waits on an
+    // activity replays clean.
+    #[tokio::test]
+    async fn a_run_timed_out_while_parked_replays() {
+        let (_exec_id, mut events) = activity_events();
+        events.pop();
+        timed_out(&mut events);
+        let replayer = WorkflowReplayer::new().register_fn("activity", activity_workflow);
+        let report = replayer.replay_from_events(events).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    // Issue #2029: the snapshot and JSON paths apply the same rule.
+    #[tokio::test]
+    async fn a_timed_out_snapshot_replays() {
+        let (exec_id, mut events) = activity_events();
+        events.pop();
+        timed_out(&mut events);
+        let snapshot = HistorySnapshot {
+            workflow_name: "activity".into(),
+            execution_id: exec_id,
+            events,
+            context_headers: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            workflow_id: None,
+            queue_name: None,
+        };
+        let replayer = WorkflowReplayer::new().register_fn("activity", activity_workflow);
+        let report = replayer.replay_from_snapshot(snapshot).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    // Issue #2029: a divergence before the seal still reports.
+    #[tokio::test]
+    async fn a_timed_out_run_that_diverged_still_reports() {
+        let (_exec_id, mut events) = activity_events();
+        events.pop();
+        if let WorkflowEvent::ActivityScheduled { name, .. } = &mut events[1] {
+            *name = "renamed".into();
+        }
+        timed_out(&mut events);
+        let replayer = WorkflowReplayer::new().register_fn("activity", activity_workflow);
+        let report = replayer.replay_from_events(events).await;
+        assert!(
+            matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn timed_out_seal_start_needs_a_run_before_the_seal() {
+        let (_exec_id, mut events) = activity_events();
+        timed_out(&mut events);
+        assert_eq!(timed_out_seal_start(&events), Some(3));
+        assert_eq!(timed_out_seal_start(&events[3..]), None);
+        assert_eq!(timed_out_seal_start(&events[..3]), None);
     }
 
     #[tokio::test]
