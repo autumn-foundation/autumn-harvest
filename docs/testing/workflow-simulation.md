@@ -120,7 +120,8 @@ error, such as a missing mock, fails the sweep at once.
 
 `always!` and `sometimes!` work in the workflow body and in the check
 closure. They are in every build, so a workflow body can keep them. Outside a
-simulation run, they only evaluate the condition.
+simulation run, they only evaluate the condition. A run evaluates the label
+only when it records it.
 
 ## What the simulation delivers
 

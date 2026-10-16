@@ -321,8 +321,10 @@ fn with_probe(f: impl FnOnce(&mut Probe)) {
 }
 
 /// Record a false `always!` label in the current run, if any.
-pub(crate) fn note_always(label: &str) {
+pub(crate) fn note_always<L: AsRef<str>>(label: impl FnOnce() -> L) {
     with_probe(|probe| {
+        let label = label();
+        let label = label.as_ref();
         if probe.failed.insert(label.to_string()) {
             let place = probe.task.map_or_else(
                 || "in the check".to_string(),
@@ -336,9 +338,10 @@ pub(crate) fn note_always(label: &str) {
 }
 
 /// Record a `sometimes!` label in the current run, if any.
-pub(crate) fn note_sometimes(cond: bool, label: &str) {
+pub(crate) fn note_sometimes<L: AsRef<str>>(cond: bool, label: impl FnOnce() -> L) {
     with_probe(|probe| {
-        *probe.sometimes.entry(label.to_string()).or_insert(false) |= cond;
+        let label = label().as_ref().to_string();
+        *probe.sometimes.entry(label).or_insert(false) |= cond;
     });
 }
 
@@ -2290,6 +2293,32 @@ mod tests {
     fn the_macros_do_nothing_outside_a_run() {
         assert!(!crate::always!(false, "outside"));
         assert!(crate::sometimes!(true, "outside"));
+    }
+
+    #[test]
+    fn a_label_is_evaluated_only_when_a_run_records_it() {
+        let calls = std::cell::Cell::new(0);
+        let label = || {
+            calls.set(calls.get() + 1);
+            "counted"
+        };
+        crate::always!(false, label());
+        crate::sometimes!(true, label());
+        assert_eq!(calls.get(), 0, "no run records outside a probe scope");
+
+        let probe = Arc::new(Mutex::new(Probe::default()));
+        PROBE.sync_scope(probe, || {
+            crate::always!(true, label());
+            assert_eq!(calls.get(), 0, "a true always! records nothing");
+            crate::always!(false, label());
+            crate::sometimes!(false, label());
+        });
+        assert_eq!(calls.get(), 2);
+
+        // The label borrows its value, so a `String` label stays usable.
+        let owned = String::from("owned");
+        crate::always!(true, owned);
+        assert_eq!(owned, "owned");
     }
 
     #[test]
