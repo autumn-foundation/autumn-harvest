@@ -472,9 +472,13 @@ fn seal_failed(conn: &Connection, exec: ExecutionId, error: &str) -> SqliteResul
     Ok(event)
 }
 
-/// Remove the pending tasks, unfired timers and staged signals of a run that
+/// Remove the open tasks, unfired timers and staged signals of a run that
 /// will never be driven again. This backend has no retention pass.
+///
+/// A dropped drive can leave a task `RUNNING` with no owner (issue #2024).
+/// No drive reclaims it after this seal, so it goes with the pending ones.
 pub fn release_open_work(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> {
+    queue::reclaim_running_for_execution(conn, exec)?;
     queue::delete_pending_tasks_for_execution(conn, exec)?;
     queue::delete_unfired_timers_for_execution(conn, exec)?;
     queue::delete_undelivered_signals_for_execution(conn, exec)?;

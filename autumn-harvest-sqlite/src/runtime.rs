@@ -5537,6 +5537,41 @@ mod tests {
         assert!(store::load_history(&conn, parent).unwrap().is_empty());
     }
 
+    // Issue #2026: a dropped drive can leave an activity task `RUNNING`. A
+    // hard cancel from another run ends the run, so no drive reclaims that
+    // row later. The seal removes it with the pending ones.
+    #[test]
+    fn a_hard_cancel_removes_a_stranded_running_task() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &exec.to_string(), &serde_json::json!(0))
+            .unwrap();
+        queue::enqueue_activity(
+            &conn,
+            exec,
+            ActivityExecId::new(),
+            "work",
+            &serde_json::json!(0),
+            "default",
+            0,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        conn.execute("UPDATE harvest_tasks SET state = 'RUNNING'", [])
+            .unwrap();
+
+        crate::composition::cancel_execution(&conn, exec, "ops", 0).unwrap();
+
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM harvest_tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "the stranded task row must go");
+    }
+
     // ── unsupported_activity_feature audit (Codex #1069 P2, runtime.rs:39) ────────
     //
     // The THIRD author-declared-feature ingress surface: dispatch-time `ActivityInfo`
