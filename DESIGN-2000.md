@@ -193,6 +193,7 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A reset from before this change copied envelopes without references. A fork or a reset of it found no reference on its direct source, so it took none. | A key that the source does not reference takes the reference of any run on the shard, locked `FOR SHARE` until the copy commits. |
 | A named blob that no run references any more was copied without a reference, although retention can delete it. | The copy is refused with `HistoryUnavailable` (`410`). The new input of a fork has its own references. |
 | A padded caller `workflow_id` was trimmed, so the fork took a different business key. | A nonblank id is kept verbatim, as for a start or a rerun. A blank id is refused. |
+| The record served a stored result whose blob no run references, so the fork completed an activity whose result can be gone. | That activity fails closed with `ForkEffectUnavailable`, as one with no record does. The error names the blob. |
 
 ## 2. Tests
 

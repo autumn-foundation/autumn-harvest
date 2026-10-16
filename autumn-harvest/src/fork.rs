@@ -1985,6 +1985,21 @@ fn unavailable(activity_id: ActivityExecId, name: &str, occurrence: u32) -> Work
     }
 }
 
+/// The failure of a recorded stored result whose blob no run references.
+fn blob_unavailable(activity_id: ActivityExecId, key: &str) -> WorkflowEvent {
+    WorkflowEvent::ActivityFailed {
+        activity_id,
+        error: format!(
+            "fork record names payload blob {key}, which no run references any more; set an \
+             activity override, or fork with effects = live to run it"
+        ),
+        attempt: 1,
+        error_type: ERROR_TYPE_FORK_EFFECT_UNAVAILABLE.to_string(),
+        non_retryable: true,
+        details: None,
+    }
+}
+
 /// Whether the record source exists and is not erased.
 ///
 /// It reads the row `FOR SHARE`, as a fork does. So an erasure of the source
@@ -2093,7 +2108,19 @@ pub(crate) async fn serve_recorded_activities(
         let Some(outcome) = outcome.filter(|_| cancelled > 0) else {
             continue;
         };
-        let stored_key = stored_result_key(&outcome);
+        // A served stored result names a source blob. The offloader records
+        // only the blobs that it uploads, so the fork takes its own reference.
+        // A blob that no run references can already be gone, so the record
+        // cannot serve it.
+        let mut refs = Vec::new();
+        let mut outcome = outcome;
+        if let (Some(key), Some(source_id)) = (stored_result_key(&outcome), record_source) {
+            let named = std::collections::HashSet::from([key.clone()]);
+            refs = refs_for_keys(conn, source_id, &named).await?;
+            if refs.is_empty() {
+                outcome = blob_unavailable(activity_id, &key);
+            }
+        }
         crate::store::append_events_offloaded_with_codecs(
             conn,
             exec_id,
@@ -2103,13 +2130,7 @@ pub(crate) async fn serve_recorded_activities(
             codecs,
         )
         .await?;
-        // A served stored result names a source blob. The offloader records
-        // only the blobs that it uploads, so the fork takes its own reference.
-        if let (Some(key), Some(source_id)) = (stored_key, record_source) {
-            let named = std::collections::HashSet::from([key]);
-            let refs = refs_for_keys(conn, source_id, &named).await?;
-            crate::store::insert_payload_refs(conn, exec_id, &refs).await?;
-        }
+        crate::store::insert_payload_refs(conn, exec_id, &refs).await?;
         *next_event_id = next_event_id.saturating_add(1);
         settlement.served = true;
     }

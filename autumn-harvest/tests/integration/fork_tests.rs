@@ -1373,6 +1373,57 @@ async fn a_served_stored_result_keeps_its_blob() {
     assert!(shared, "the fork references the served stored-result blob");
 }
 
+/// A recorded stored result whose blob no run references can already be gone.
+/// The record cannot serve it, so the activity fails closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_result_with_no_reference_fails_closed() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("stored-gone");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1 });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let key = format!("result-{}", Uuid::new_v4().simple());
+    let stored = autumn_harvest::fan_out::StoredResult::new("mem", key.clone(), 1, "c");
+    let charge = autumn_harvest::ActivityExecId::new();
+    // No run references the blob, so retention can delete it.
+    store::append_events(
+        &mut conn,
+        source,
+        &[
+            WorkflowEvent::ActivityScheduled {
+                activity_id: charge,
+                name: "fork_charge".to_string(),
+                input: input.clone(),
+                queue: queue.clone(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: charge,
+                output: stored.to_recorded_value(),
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("record the stored result");
+
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, forked, "FAILED").await;
+    running.stop().await;
+
+    assert_eq!(charges(&queue), 0, "the record settles the activity");
+    let error = row.error.unwrap_or_default();
+    assert!(
+        error.contains(&key),
+        "the failure names the missing blob: {error}"
+    );
+    let refs = store::load_payload_refs(&mut conn, forked)
+        .await
+        .expect("refs");
+    assert!(refs.is_empty(), "the fork takes no reference: {refs:?}");
+}
+
 /// A fork at point 0 carries no decision to replay, so it takes the build of
 /// a fresh start under the current policy. A fork with a carried prefix keeps
 /// the source build, which can replay that prefix.
