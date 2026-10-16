@@ -1812,6 +1812,22 @@ Name one database per shard, in shard order. --database-url-env reads the URL
 from an environment variable, so the URL stays out of the process list.
 Exit codes: 0 every run migrates, 1 a run needs review or pin, 2 incomplete or bad input.";
 
+/// Stands in for a token that might hold a password.
+#[cfg(feature = "db")]
+const HIDDEN: &str = "<hidden>";
+
+/// Returns `token` when it is a plain word, else [`HIDDEN`].
+///
+/// A mistyped URL has `:`, `/` or `@`. Those never pass, so an error line cannot echo it.
+#[cfg(feature = "db")]
+fn plain(token: &str) -> &str {
+    let word = !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if word { token } else { HIDDEN }
+}
+
 #[cfg(feature = "db")]
 impl CommandArgs {
     fn parse(args: Vec<String>) -> Result<Self, UpgradeCheckError> {
@@ -1837,7 +1853,8 @@ impl CommandArgs {
                     let name = value()?;
                     let url = std::env::var(&name).map_err(|_| {
                         UpgradeCheckError::Usage(format!(
-                            "environment variable `{name}` is not set"
+                            "environment variable `{}` is not set",
+                            plain(&name)
                         ))
                     })?;
                     out.database_urls.push(url);
@@ -1849,7 +1866,10 @@ impl CommandArgs {
                 "--limit" => {
                     let raw = value()?;
                     out.limit = Some(raw.parse().map_err(|_| {
-                        UpgradeCheckError::Usage(format!("--limit `{raw}` is not a number"))
+                        UpgradeCheckError::Usage(format!(
+                            "--limit `{}` is not a number",
+                            plain(&raw)
+                        ))
                     })?);
                 }
                 "--format" => match value()?.as_str() {
@@ -1857,13 +1877,21 @@ impl CommandArgs {
                     "json" => out.json = true,
                     other => {
                         return Err(UpgradeCheckError::Usage(format!(
-                            "--format `{other}` is not text or json"
+                            "--format `{}` is not text or json",
+                            plain(other)
                         )));
                     }
                 },
-                // The flag name only: a value can hold a password.
+                // Name a flag only. Any other argument can be a URL with a password.
                 other => {
-                    return Err(UpgradeCheckError::Usage(format!("unknown flag `{other}`")));
+                    let shown = if other.starts_with("--") {
+                        plain(other)
+                    } else {
+                        HIDDEN
+                    };
+                    return Err(UpgradeCheckError::Usage(format!(
+                        "unknown argument `{shown}`"
+                    )));
                 }
             }
         }
@@ -2043,6 +2071,35 @@ mod tests {
         let err = parse(&["--database-url", "x", "--db=postgres://u:secret@h"])
             .expect_err("unknown flag");
         assert!(!err.to_string().contains("secret"), "{err}");
+    }
+
+    const SECRET_URL: &str = "postgres://u:SECRETPW@h/db";
+
+    fn assert_no_secret(args: &[&str]) {
+        let err = parse(args).expect_err("usage error");
+        assert!(!err.to_string().contains("SECRETPW"), "{err}");
+    }
+
+    #[test]
+    fn a_bare_url_error_does_not_echo_the_url() {
+        assert_no_secret(&[SECRET_URL]);
+        assert_no_secret(&["user=SECRETPW"]);
+        assert_no_secret(&["--postgres://u:SECRETPW@h/db"]);
+    }
+
+    #[test]
+    fn a_url_given_to_another_flag_is_not_echoed() {
+        assert_no_secret(&["--database-url-env", SECRET_URL]);
+        assert_no_secret(&["--limit", SECRET_URL]);
+        assert_no_secret(&["--format", SECRET_URL]);
+    }
+
+    #[test]
+    fn a_plain_unknown_flag_and_env_name_stay_in_the_error() {
+        let err = parse(&["--bogus"]).expect_err("unknown flag");
+        assert!(err.to_string().contains("--bogus"), "{err}");
+        let err = parse(&["--database-url-env", "NO_SUCH_VAR_2119"]).expect_err("unset");
+        assert!(err.to_string().contains("NO_SUCH_VAR_2119"), "{err}");
     }
 
     #[test]
