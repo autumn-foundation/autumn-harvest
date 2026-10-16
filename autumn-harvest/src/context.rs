@@ -6585,9 +6585,12 @@ impl WorkflowContext {
                         .map_or(global, |ov| global.max(ov))
                 };
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+                // Issue #1984: a scope that replays its cancel holds this
+                // dispatch. The cap applied when the cancelling cycle made it.
                 if effective_cap > 0
                     && observed > effective_cap
                     && !self.offload_will_apply(observed)
+                    && !self.replays_a_scope_cancel()
                 {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
@@ -6907,7 +6910,9 @@ impl WorkflowContext {
                 // Local activities are written with plain store::append_events (no
                 // offloader), so the offload bypass must NOT apply here even when a
                 // PayloadStore is configured. Always enforce the cap.
-                if effective_cap > 0 && observed > effective_cap {
+                // Issue #1984: a scope that replays its cancel holds this
+                // dispatch. The cap applied when the cancelling cycle made it.
+                if effective_cap > 0 && observed > effective_cap && !self.replays_a_scope_cancel() {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
                         observed_bytes: observed,
@@ -8739,8 +8744,12 @@ impl WorkflowContext {
                 // Enforce child-workflow input payload cap before scheduling.
                 // ChildWorkflowStarted is written to the parent's history via
                 // append_single_event (plain), so the offload bypass must NOT apply here.
+                // Issue #1984: a scope that replays its cancel holds this
+                // dispatch. The cap applied when the cancelling cycle made it.
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
+                if self.payload_max_workflow_input > 0
+                    && observed > self.payload_max_workflow_input
+                    && !self.replays_a_scope_cancel()
                 {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ChildWorkflowInput,

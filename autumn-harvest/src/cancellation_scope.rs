@@ -2444,6 +2444,42 @@ mod tests {
         assert!(nd.is_none(), "{nd:?}");
     }
 
+    /// A deploy lowers the input caps after a cancel. Replay holds the
+    /// cancelling cycle's dispatches, so it does not check them against
+    /// the new caps.
+    #[tokio::test]
+    async fn a_lowered_cap_does_not_fail_a_replayed_dispatch() {
+        async fn dispatch(ctx: &WorkflowContext, kind: usize) {
+            let input = json!("x".repeat(64));
+            let _ = match kind {
+                0 => ctx.execute_activity_raw("big", input, "default").await,
+                1 => {
+                    ctx.execute_local_activity_raw("big", input, None, None)
+                        .await
+                }
+                _ => ctx.spawn_child_workflow_raw("big", input).await,
+            };
+        }
+        for kind in 0..3 {
+            let live = WorkflowContext::new_test();
+            let result = bounded(run_then_cancel(&live, dispatch(&live, kind))).await;
+            assert!(
+                matches!(result, Err(HarvestError::Cancelled(_))),
+                "kind={kind}: {result:?}"
+            );
+            let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+            let replay = replay_of(details).with_payload_caps(8, 0, 0, 8);
+            let result = bounded(run_then_cancel(&replay, dispatch(&replay, kind))).await;
+            assert!(
+                matches!(result, Err(HarvestError::Cancelled(_))),
+                "kind={kind}: {result:?}"
+            );
+            let nd = replay.take_nd_details();
+            assert!(nd.is_none(), "kind={kind}: {nd:?}");
+        }
+    }
+
     /// Phase two of a patch replaces `patched` with `deprecate_patch`. The
     /// captured `patch:` marker is dropped, whether the deprecation runs
     /// before the scope or inside its body.
