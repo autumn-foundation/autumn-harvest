@@ -1414,11 +1414,10 @@ impl<'a, 'env> SimRun<'a, 'env> {
             let WorkflowOutcome::Suspended { commands } = outcome else {
                 return self.finish_terminal(outcome, &pending_cmds);
             };
-            let before = self.history.len();
-            if let Err(error) = self.process(commands) {
-                return self.finish(SimStatus::HarnessError, Err(error));
-            }
-            let changed = self.history.len() != before;
+            let rerun = match self.process(commands) {
+                Ok(rerun) => rerun,
+                Err(error) => return self.finish(SimStatus::HarnessError, Err(error)),
+            };
             let mut delivery = self.deliver();
             while matches!(delivery, Delivery::Quiet) {
                 delivery = self.deliver();
@@ -1429,7 +1428,7 @@ impl<'a, 'env> SimRun<'a, 'env> {
                     let reason = self.cancel.take().unwrap_or_default();
                     return self.finish(SimStatus::Cancelled, Err(reason));
                 }
-                Delivery::Events(0) if !changed => {
+                Delivery::Events(0) if !rerun => {
                     let error = "the workflow is blocked: no held result, timer, \
                                  signal or cancel can unblock it"
                         .to_string();
@@ -1455,8 +1454,16 @@ impl<'a, 'env> SimRun<'a, 'env> {
     /// the batches that set no wake-up time. Their timers fire only when
     /// another delivery wakes the task. The latest batch decides this for
     /// every held timer.
-    fn process(&mut self, commands: Vec<WorkflowCommand>) -> Result<(), String> {
+    ///
+    /// It returns whether the task runs again with no delivery. That is so
+    /// when a command resolves in this task, such as a local activity, a
+    /// mutex grant or an external operation. It is also so for a batch of
+    /// bookkeeping only, which the worker requeues. A batch that waits parks
+    /// instead, even when it appended a marker or a side effect.
+    fn process(&mut self, commands: Vec<WorkflowCommand>) -> Result<bool, String> {
         let batch = BatchFlags::of(&commands);
+        let before = self.history.len();
+        let mut rerun = false;
         let piggyback = parks_without_deadline(&commands);
         // The sim orders timers by deadline itself, so it holds every awaited
         // fire, not only the earliest.
@@ -1489,13 +1496,22 @@ impl<'a, 'env> SimRun<'a, 'env> {
                 deferred.push(Deferred::new(DeliveryKey::Activity(activity_id), events));
                 continue;
             }
-            self.env.process_command(
+            let resolves_now = matches!(
+                cmd,
+                WorkflowCommand::RunLocalActivity { .. }
+                    | WorkflowCommand::AcquireMutex { .. }
+                    | WorkflowCommand::SignalExternalWorkflow { .. }
+                    | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+                    | WorkflowCommand::AwaitExternalWorkflow { .. }
+            );
+            let progress = self.env.process_command(
                 cmd,
                 &flags,
                 &mut self.history,
                 &mut deferred,
                 &mut self.mocks,
             )?;
+            rerun |= resolves_now && progress;
         }
         for held in &mut self.held {
             held.piggyback = piggyback && matches!(held.key, DeliveryKey::Timer(_));
@@ -1523,8 +1539,9 @@ impl<'a, 'env> SimRun<'a, 'env> {
                 }
             }
         }
+        rerun |= !batch.competing_suspension && self.history.len() != before;
         self.tag(self.task);
-        Ok(())
+        Ok(rerun)
     }
 
     /// Drop the held results and fires that `cmd` cancels.

@@ -1032,3 +1032,26 @@ async fn a_seeded_local_activity_mock_sees_the_sim_clock() {
     // Monday 2024-01-01 00:00 UTC, the fixed start of a run.
     assert_eq!(outcome.result(), &Ok(json!(1_704_067_200)));
 }
+
+#[tokio::test]
+async fn a_marker_before_a_wait_does_not_run_the_body_again() {
+    // The worker persists the side effect with the wait and parks the task.
+    // No delivery can wake it, so the body runs once and the run blocks.
+    fn wf(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
+        Box::pin(async move {
+            let _ = ctx.random_u64();
+            ctx.wait_for_signal("never")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+    let env = WorkflowTestEnv::new();
+    let outcome = env.simulation().run(1, wf, json!(null)).await;
+    assert_eq!(
+        outcome.status(),
+        SimStatus::Blocked,
+        "{:?}",
+        outcome.result()
+    );
+    assert_eq!(outcome.tasks(), 1, "the body ran once");
+}
