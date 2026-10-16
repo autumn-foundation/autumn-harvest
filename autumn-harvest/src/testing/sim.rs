@@ -1960,25 +1960,37 @@ fn render_trace(events: &[WorkflowEvent], tasks: &[usize]) -> Vec<String> {
 ///
 /// The trace holds no payload, so these digests catch a value that changes
 /// on the same path. The harness and the context mint random ids, such as
-/// activity ids, child ids and the successor of a continue-as-new. So each
-/// `*_id` field of an event becomes an ordinal by first use. A payload keeps
-/// its own fields, so a user value still counts.
+/// activity ids, child ids and the successor of a continue-as-new. The body
+/// can also pass such an id on, for example in an activity input. So each
+/// `*_id` field of an event names a generated id, and each place that id
+/// appears becomes its ordinal by first use. Other payload values count.
 fn payload_digests(events: &[WorkflowEvent]) -> Vec<u64> {
-    let mut ordinals: HashMap<String, usize> = HashMap::new();
-    events
+    let values: Vec<Value> = events
         .iter()
-        .map(|event| {
-            let mut value = serde_json::to_value(event).unwrap_or(Value::Null);
-            if let Some(Value::Object(fields)) = value.get_mut("data") {
-                for (key, field) in fields.iter_mut() {
-                    if let (true, Value::String(id)) = (key.ends_with("_id"), &*field) {
-                        let next = ordinals.len() + 1;
-                        let ordinal = *ordinals.entry(id.clone()).or_insert(next);
-                        *field = Value::String(format!("id{ordinal}"));
-                    }
+        .map(|event| serde_json::to_value(event).unwrap_or(Value::Null))
+        .collect();
+    let mut ordinals: Vec<(String, String)> = Vec::new();
+    for value in &values {
+        if let Some(Value::Object(fields)) = value.get("data") {
+            for (key, field) in fields {
+                if let (true, Value::String(id)) = (key.ends_with("_id"), field)
+                    && !id.is_empty()
+                    && !ordinals.iter().any(|(known, _)| known == id)
+                {
+                    let ordinal = format!("id{}", ordinals.len() + 1);
+                    ordinals.push((id.clone(), ordinal));
                 }
             }
-            fnv1a(value.to_string().as_bytes())
+        }
+    }
+    values
+        .iter()
+        .map(|value| {
+            let mut text = value.to_string();
+            for (id, ordinal) in &ordinals {
+                text = text.replace(id.as_str(), ordinal);
+            }
+            fnv1a(text.as_bytes())
         })
         .collect()
 }

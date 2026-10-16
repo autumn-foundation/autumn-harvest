@@ -1098,3 +1098,34 @@ async fn a_queued_signal_that_wins_a_race_leaves_no_loser_terminal() {
     assert!(failure.reason.contains("does not replay"), "{failure}");
     assert!(!failure.reason.contains("illegal"), "{failure}");
 }
+
+#[tokio::test]
+async fn a_generated_id_inside_a_payload_does_not_break_the_payload_check() {
+    // The detached child id is random on each run. The body passes it to an
+    // activity and returns it, so it sits inside two payloads.
+    fn wf(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
+        Box::pin(async move {
+            let child = ctx
+                .spawn_child_workflow_detached_raw(
+                    "audit",
+                    json!(1),
+                    autumn_harvest::types::ParentClosePolicy::Abandon,
+                )
+                .map_err(|e| e.to_string())?;
+            ctx.execute_activity_raw("book", json!({"child": child.to_string()}), "q")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+    quotes_env()
+        .simulation()
+        .seeds(SeedPlan { first: 0, count: 8 })
+        .sweep(wf, json!(null), |outcome| {
+            always!(
+                outcome.status() == SimStatus::Completed,
+                "the run completes"
+            );
+        })
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+}
