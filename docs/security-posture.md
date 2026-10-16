@@ -970,7 +970,7 @@ credential is *tenant-bound*. Harvest then confines it without an authorizer.
 - **The embedder's own principal.** In the auth middleware that wraps the
   Harvest router, insert
   `autumn_harvest_plugin::tenant::VerifiedTenant::new(tenant)?` as a request
-  extension.
+  extension. A raw `harvest_api_router` mount needs no other step.
 
 A request with a token tenant and an embedder tenant that differ gets `403`.
 

@@ -317,12 +317,35 @@ fn declared_tenant(request: &Request) -> Result<Option<String>, ()> {
     Ok(Some(value.to_string()))
 }
 
+/// Marks a request that the outer binding layer has already handled.
+///
+/// Only this crate can build it, so an embedder cannot forge it.
+#[derive(Clone, Copy)]
+struct BindingApplied;
+
+/// The binding layer that `harvest_api_router` installs (issue #2076).
+///
+/// A mount through [`apply_admin_auth_layers`](crate::api) already ran the
+/// outer copy, so this copy skips. A raw mount has no outer copy, so this one
+/// does the work.
+pub(crate) async fn enforce_tenant_binding_once(
+    State(api_state): State<HarvestApiState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.extensions().get::<BindingApplied>().is_some() {
+        return next.run(request).await;
+    }
+    enforce_tenant_binding(State(api_state), request, next).await
+}
+
 /// The tenant binding layer (issue #1977). See the module docs.
 pub(crate) async fn enforce_tenant_binding(
     State(api_state): State<HarvestApiState>,
     mut request: Request,
     next: Next,
 ) -> Response {
+    request.extensions_mut().insert(BindingApplied);
     if *request.method() == Method::OPTIONS {
         return next.run(request).await;
     }
