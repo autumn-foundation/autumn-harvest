@@ -169,12 +169,13 @@ code, guard quality, and style. The fixes:
 ### 3.1 Facts found before the plan
 
 - Issue #2015 stays open after PR #2158. The status is `pending`.
-- Section 10 of the page says that the guards do not run Weaver. Upstream
+- Section 10 of the page said that the guards did not run Weaver. Upstream
   runs `make check-policies` on each pull request.
 - The `make check-policies` recipe on upstream `main` pins the Weaver
   image by digest. It also pins the policy package commit.
 - The recipe downloads its baseline archive inside the container. A
-  proxied sandbox cannot do that. It also floats to the latest release.
+  proxied sandbox cannot do that. Its baseline also floats to the latest
+  release.
 - A local run of the same checks passed. It used Weaver 0.28.0, upstream
   `main` at `331541c`, and the `v1.44.0` baseline. The model added no
   warning.
@@ -192,13 +193,13 @@ code, guard quality, and style. The fixes:
 | F6 | Fill the `<commit>` placeholder now. | Rejected. This change edits the draft, so its merge commit is the one to cite. |
 | F7 | File the upstream issue from this session. | Rejected. Filing is a maintainer action. This session has no access to upstream. |
 | F8 | Run the full upstream `make check`. | Rejected. The generated Markdown belongs to the upstream pull request. |
-| F9 | Run a broken copy of the model, and expect a failure. | **Adopted.** It proves that the check reads the model. |
+| F9 | Run a broken copy of the model, and expect a failure. | **Adopted.** It proves that the check reads the model and runs the policies. |
 
 ### 3.3 Reverse brainstorm — how can the check do harm?
 
 | # | How to make it harmful | Mitigation |
 |---|------------------------|------------|
-| H1 | The script checks the upstream tree without the model, and passes. | F9. The broken copy must fail on its own defect. |
+| H1 | The script checks the upstream tree without the model, and passes. | F9. The broken copy must fail on the upstream naming policy. |
 | H2 | Upstream `main` moves and breaks the check. | The script pins a full commit SHA. |
 | H3 | The page names one commit and the script checks another. | A guard compares the two. |
 | H4 | The page claims a check that no workflow runs. | A guard reads the workflow, its triggers and its step. |
@@ -215,7 +216,7 @@ code, guard quality, and style. The fixes:
 | Red | A proposal that passes upstream checks reads as serious work. |
 | Black | Upstream can change its policies. The check then needs a new pin. Three clones make the job slow. |
 | Yellow | The check finds a format defect before upstream review does. It costs one small workflow. |
-| Green | The negative control makes a vacuous pass impossible. |
+| Green | The negative control proves that run 1 reads the model. |
 | Blue | Add the script, the workflow and the page record. Keep the status `pending`. Ask the maintainer to file. |
 
 ### 3.5 TDD map
@@ -225,3 +226,28 @@ code, guard quality, and style. The fixes:
 | Red → green | `the_weaver_check_script_mirrors_upstream` | F2, F9, H1, H2, H5, H6. |
 | Red → green | `the_weaver_check_runs_when_the_model_changes` | F4, H4. |
 | Red → green | `the_page_records_the_weaver_check` | F5, H3, H7, H8. |
+
+### 3.6 Review record
+
+Four review agents read the change: the script, the guards and CI, the
+docs, and fidelity to upstream. Codex also reviewed the pull request. The
+fixes:
+
+- The workflow runs when a draft becomes ready. Codex and two agents found
+  this gap.
+- The negative control is a namespace collision, not an unresolved `ref`.
+  An unresolved `ref` fails before the policies run.
+- Run 1 fails on a Weaver warning for the model. The page claim is now
+  checked.
+- The script requires a full SHA for the policy packages and checks for
+  Docker first.
+- A weekly `latest` job runs the script against upstream `main`. It finds
+  a stale pin before a maintainer moves it.
+- The guards read code lines, not comments. They read each pin from the
+  start of a line. They check the job gating, the baseline and the step
+  order.
+- The enum `workflow.operation.name` has no `examples`. Upstream renders
+  them in each span table, where they contradicted the span value.
+- Section 8 gains the operation attribute and the system values that an
+  upstream reviewer can raise. Section 10 lists the files that the upstream
+  pull request needs.

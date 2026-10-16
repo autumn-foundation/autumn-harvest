@@ -66,21 +66,50 @@ const ISSUE_TEXT_SECTION: &str = "## 9. Upstream issue text";
 const SUBMISSION_SECTION: &str = "## 10. Submission";
 const STATUS_PREFIX: &str = "**Submission status:**";
 
-/// Text that the Weaver script must hold, each with the reason.
-const WEAVER_SCRIPT_PARTS: &[(&str, &str)] = &[
+/// Code lines of the Weaver script that must appear exactly, with the reason.
+const WEAVER_SCRIPT_LINES: &[(&str, &str)] = &[
     ("set -euo pipefail", "a failed command must fail the script"),
+    (
+        r#"*@sha256:*) image="${registry}/${image}" ;;"#,
+        "the script must refuse an image with no digest",
+    ),
+    (r#"place "${model}""#, "run 1 must check this model"),
+    (r#"place "${broken}""#, "run 2 must check the broken copy"),
+    (
+        r#"if run_weaver >"${work}/broken.log" 2>&1; then"#,
+        "the broken copy must fail, so a pass is not vacuous",
+    ),
+];
+
+/// Text that some code line of the Weaver script must hold, with the reason.
+const WEAVER_SCRIPT_PARTS: &[(&str, &str)] = &[
+    (
+        r#"clone_at "${semconv_repo}" "${semconv_commit}""#,
+        "the script must check the pinned upstream commit",
+    ),
+    (
+        r#"clone_at "${semconv_repo}" "refs/tags/${baseline_tag}""#,
+        "the baseline must be the pinned release",
+    ),
     (
         "dependencies.Dockerfile",
         "the Weaver image comes from the upstream pin",
     ),
-    ("@sha256:", "the script must refuse an image with no digest"),
     (
-        "WEAVER_PACKAGES_REPO",
+        "^WEAVER_PACKAGES_REPO=",
         "the policy packages come from the upstream pin",
     ),
-    ("--v2", "the flags must match `make check-policies`"),
     (
-        "--baseline-registry",
+        "=~ ^[0-9a-f]{40}$",
+        "the policy packages must be pinned to a commit",
+    ),
+    ("--network none", "the container must use local mounts only"),
+    (
+        "registry check --v2",
+        "the flags must match `make check-policies`",
+    ),
+    (
+        "--baseline-registry=/home/weaver/baseline",
         "the flags must match `make check-policies`",
     ),
     ("policies/check/naming_conventions", "upstream checks names"),
@@ -94,15 +123,26 @@ const WEAVER_SCRIPT_PARTS: &[(&str, &str)] = &[
         "upstream checks compatibility",
     ),
     (
-        "docs/otel-workflow-semconv/model/workflow",
+        r#"model="${root}/docs/otel-workflow-semconv/model/workflow""#,
         "the script must check this model",
     ),
-    ("model/workflow", "the model must sit at its upstream path"),
     (
-        "if check \"${broken}\"",
-        "a broken copy must fail, so a pass is not vacuous",
+        r#"cp -R "$1" "${semconv}/model/workflow""#,
+        "the model must sit at its upstream path",
+    ),
+    (
+        "weaver/source/workflow/",
+        "run 1 must fail on a warning for the model",
+    ),
+    (
+        "grep -qF 'naming_convention_attribute_namespace_collision'",
+        "the broken copy must fail on a package policy, not another error",
     ),
 ];
+
+/// The job `if` that skips a draft pull request, and nothing else.
+const DRAFT_SKIP: &str =
+    "github.event_name != 'pull_request' || github.event.pull_request.draft == false";
 
 /// The replay rules that section 6 must state. Each rule is a set of
 /// phrases that one numbered item must hold.
@@ -381,15 +421,33 @@ fn is_upstream_item(text: &str) -> bool {
         })
 }
 
+/// The value of the shell assignment `name="value"` at the start of a line.
+fn pin<'a>(script: &'a str, name: &str) -> Option<&'a str> {
+    script.lines().find_map(|line| {
+        line.strip_prefix(name)?
+            .strip_prefix("=\"")?
+            .split('"')
+            .next()
+    })
+}
+
 /// The full upstream commit SHA that the Weaver script pins.
 fn pinned_commit(script: &str) -> Option<&str> {
-    let start = script.find("semconv_commit=\"")? + "semconv_commit=\"".len();
-    let sha = script[start..].split('"').next()?;
-    (sha.len() == 40
-        && sha
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-    .then_some(sha)
+    pin(script, "semconv_commit").filter(|sha| {
+        sha.len() == 40
+            && sha
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// The trimmed lines of a shell script that are not comments.
+fn code_lines(script: &str) -> Vec<&str> {
+    script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect()
 }
 
 /// The string items under `key` of `value`.
@@ -618,7 +676,13 @@ fn the_model_has_the_weaver_shape() {
             "`{id}` needs a brief"
         );
         match type_name(&attribute) {
-            "boolean" | "enum" => {}
+            "boolean" => {}
+            // Each span table repeats an enum example, so it can contradict
+            // the operation value that the span pins.
+            "enum" => assert!(
+                attribute.get("examples").is_none(),
+                "`{id}` must have no `examples`. Its members are the values"
+            ),
             "string" | "int" => assert!(
                 attribute.get("examples").is_some(),
                 "`{id}` needs `examples`"
@@ -831,16 +895,34 @@ fn the_weaver_check_script_mirrors_upstream() {
         pinned_commit(&script).is_some(),
         "{WEAVER_SCRIPT} must pin `semconv_commit=\"<40-hex SHA>\"`, not a branch"
     );
-    let missing: Vec<String> = WEAVER_SCRIPT_PARTS
+    assert!(
+        pin(&script, "baseline_tag").is_some_and(|tag| tag.starts_with('v')),
+        "{WEAVER_SCRIPT} must pin `baseline_tag=\"v<release>\"`"
+    );
+    let code = code_lines(&script);
+    let missing: Vec<String> = WEAVER_SCRIPT_LINES
         .iter()
-        .filter(|(part, _)| !script.contains(part))
-        .map(|(part, reason)| format!("`{part}`: {reason}"))
+        .filter(|(line, _)| !code.contains(line))
+        .chain(
+            WEAVER_SCRIPT_PARTS
+                .iter()
+                .filter(|(part, _)| !code.iter().any(|line| line.contains(part))),
+        )
+        .map(|(text, reason)| format!("`{text}`: {reason}"))
         .collect();
     assert!(
         missing.is_empty(),
-        "{WEAVER_SCRIPT} lacks:\n{}",
+        "{WEAVER_SCRIPT} lacks these code lines:\n{}",
         missing.join("\n")
     );
+}
+
+/// The steps of `job` that run the Weaver script.
+fn script_steps(job: &Value) -> Vec<Value> {
+    sequence(job, "steps")
+        .into_iter()
+        .filter(|step| str_field(step, "run").is_some_and(|run| run.trim() == WEAVER_SCRIPT))
+        .collect()
 }
 
 #[test]
@@ -862,21 +944,55 @@ fn the_weaver_check_runs_when_the_model_changes() {
         }
     }
     assert!(
-        on.get("workflow_dispatch").is_some(),
-        "{WEAVER_WORKFLOW} must allow a manual run"
+        strings(&on["pull_request"], "types").contains(&"ready_for_review".to_owned()),
+        "{WEAVER_WORKFLOW} must run when a draft becomes ready"
     );
-    let jobs = workflow
-        .get("jobs")
-        .and_then(Value::as_mapping)
-        .unwrap_or_else(|| panic!("{WEAVER_WORKFLOW} must have `jobs`"));
-    let runs = jobs
-        .values()
-        .flat_map(|job| sequence(job, "steps"))
-        .filter_map(|step| str_field(&step, "run").map(str::to_owned))
-        .any(|run| run.trim() == WEAVER_SCRIPT);
     assert!(
-        runs,
-        "a step of {WEAVER_WORKFLOW} must run `{WEAVER_SCRIPT}`"
+        strings(&on["push"], "branches").contains(&"trunk-dev".to_owned()),
+        "{WEAVER_WORKFLOW} must run on a push to `trunk-dev`"
+    );
+    for event in ["workflow_dispatch", "schedule"] {
+        assert!(
+            on.get(event).is_some(),
+            "{WEAVER_WORKFLOW} must run on `{event}`"
+        );
+    }
+
+    let jobs = &workflow["jobs"];
+    let pinned = jobs
+        .get("pinned")
+        .unwrap_or_else(|| panic!("{WEAVER_WORKFLOW} must have a `pinned` job"));
+    assert_eq!(
+        str_field(pinned, "if"),
+        Some(DRAFT_SKIP),
+        "the `pinned` job may skip a draft and nothing else"
+    );
+    let steps = script_steps(pinned);
+    assert!(
+        !steps.is_empty(),
+        "the `pinned` job must run `{WEAVER_SCRIPT}`"
+    );
+    assert!(
+        pinned.get("continue-on-error").is_none(),
+        "the `pinned` job must fail when the script fails"
+    );
+    for step in &steps {
+        for key in ["if", "continue-on-error", "env"] {
+            assert!(
+                step.get(key).is_none(),
+                "the `pinned` step that runs the script must have no `{key}`"
+            );
+        }
+    }
+
+    let latest = jobs
+        .get("latest")
+        .unwrap_or_else(|| panic!("{WEAVER_WORKFLOW} must have a `latest` job"));
+    assert!(
+        script_steps(latest)
+            .iter()
+            .any(|step| step["env"]["SEMCONV_LATEST"].as_str() == Some("1")),
+        "the `latest` job must run `{WEAVER_SCRIPT}` with `SEMCONV_LATEST: \"1\"`"
     );
 }
 
@@ -885,31 +1001,33 @@ fn the_page_records_the_weaver_check() {
     let page = read(PAGE);
     let script = read(WEAVER_SCRIPT);
     let sha = pinned_commit(&script).unwrap_or_else(|| panic!("{WEAVER_SCRIPT} must pin a commit"));
+    let short = format!("`{}`", &sha[..7]);
+    let baseline = pin(&script, "baseline_tag")
+        .unwrap_or_else(|| panic!("{WEAVER_SCRIPT} must pin a baseline"));
     let submission = page_section(&page, SUBMISSION_SECTION);
     let link = format!("../../{WEAVER_SCRIPT}");
+    for (text, what) in [
+        (link.as_str(), "the script link"),
+        (short.as_str(), "the pinned commit"),
+        (&format!("`{baseline}`"), "the pinned baseline"),
+    ] {
+        assert!(
+            submission.contains(text),
+            "{SUBMISSION_SECTION} must name {what}, {text}"
+        );
+    }
+    let steps = numbered_items(submission);
+    let step = |needle: &str| steps.iter().position(|step| step.contains(needle));
+    let check = step("check-otel-workflow-semconv.sh");
+    let filing = step("file the text");
     assert!(
-        submission.contains(&link),
-        "{SUBMISSION_SECTION} must link `{link}`"
-    );
-    assert!(
-        submission.contains(&format!("`{}`", &sha[..7])),
-        "{SUBMISSION_SECTION} must name the pinned commit `{}`",
-        &sha[..7]
-    );
-    assert!(
-        numbered_items(submission)
-            .iter()
-            .any(|step| step.contains("check-otel-workflow-semconv.sh")),
-        "a submission step must run the Weaver check before the filing"
-    );
-    assert!(
-        !page.contains("does not run Weaver"),
-        "{PAGE} must not say that nothing runs Weaver"
+        check.is_some() && filing.is_some() && check < filing,
+        "a submission step must run the Weaver check before the step that files the text"
     );
     let issue = markdown_fence(page_section(&page, ISSUE_TEXT_SECTION)).unwrap_or_default();
     assert!(
-        issue.contains("`make check-policies`"),
-        "the issue text must say that the model passes `make check-policies`"
+        issue.contains("`make check-policies`") && issue.contains(&short),
+        "the issue text must say that the model passes `make check-policies` at {short}"
     );
 }
 
@@ -1041,6 +1159,22 @@ fn helpers_parse_their_inputs() {
         None
     );
     assert_eq!(pinned_commit("no pin"), None);
+    assert_eq!(
+        pinned_commit(&format!(
+            "# semconv_commit=\"{sha}\"\nsemconv_commit=\"main\"\n"
+        )),
+        None
+    );
+    assert_eq!(
+        pin("a=\"1\"\nbaseline_tag=\"v1.2.0\"\n", "baseline_tag"),
+        Some("v1.2.0")
+    );
+    assert_eq!(
+        code_lines("#!/bin/sh\n  # note\n\n  run x  \n"),
+        vec!["run x"]
+    );
+    let doc: Value = serde_yaml::from_str("p: [a, 1, b]").expect("valid YAML");
+    assert_eq!(strings(&doc, "p"), vec!["a".to_owned(), "b".to_owned()]);
     assert!(is_requirement_level(&Value::from("opt_in")));
     assert!(!is_requirement_level(&Value::from("optional")));
 }
