@@ -226,12 +226,10 @@ pub enum SqliteError {
     /// payload is refused before it is stored, so a later drive never fails on
     /// a value it cannot read back. `kind` names the boundary
     /// (`"workflow_input"`, `"memo"` or `"signal_payload"`).
-    #[error("payload too deep: {kind} nests {observed_depth} levels, over the cap of {cap_depth}")]
+    #[error("payload too deep: {kind} nests more than {cap_depth} levels")]
     PayloadTooDeep {
         /// The ingress boundary that was violated.
         kind: &'static str,
-        /// The first level found past the cap.
-        observed_depth: usize,
         /// The deepest nesting that ingress accepts.
         cap_depth: usize,
     },

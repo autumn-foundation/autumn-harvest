@@ -13,3 +13,7 @@ call stack. No migration. No new `WorkflowEvent` variant.
 
 Tests: `tests/integration/payload_depth.rs` covers each ingress at and over the
 cap, `signal_with_start`, and a 10,000-level value.
+
+Breaking: ingress now refuses nesting from 101 to 127 levels too. Those
+values worked before when the wrapper stayed under 128. The cap is stricter
+than Postgres, which has no depth cap. The error enum gains one variant.

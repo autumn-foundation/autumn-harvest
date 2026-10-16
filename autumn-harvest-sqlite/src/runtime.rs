@@ -852,8 +852,8 @@ impl SqliteRuntime {
     /// registered handler. Returns [`SqliteError::PayloadTooLarge`] if `input`
     /// exceeds the workflow-input cap. Returns [`SqliteError::PayloadTooDeep`] if
     /// it nests past [`MAX_PAYLOAD_DEPTH`]. Returns [`SqliteError::Sqlite`] or
-    /// [`SqliteError::Json`] on a persistence failure. (Under `AllowDuplicate` it never returns
-    /// [`SqliteError::AlreadyExists`] — that is only for
+    /// [`SqliteError::Json`] on a persistence failure. (Under `AllowDuplicate`
+    /// it never returns [`SqliteError::AlreadyExists`] — that is only for
     /// [`RejectDuplicate`](WorkflowIdReusePolicy::RejectDuplicate).)
     pub fn start_workflow_with_id(
         &mut self,
@@ -1095,8 +1095,7 @@ impl SqliteRuntime {
     /// [`SqliteError::WorkflowNotRunning`] for a terminal execution. Returns
     /// [`SqliteError::PayloadTooLarge`] for an oversized payload and
     /// [`SqliteError::PayloadTooDeep`] for one nested past [`MAX_PAYLOAD_DEPTH`].
-    /// Returns a
-    /// persistence error if the signal row cannot be written.
+    /// Returns a persistence error if the signal row cannot be written.
     // Owned-value ingress API: callers hand over a `serde_json::Value` payload
     // that is serialized into durable storage; `store::stage_signal` only borrows
     // it at the leaf, so taking it by value keeps the call site ergonomic
@@ -3966,25 +3965,53 @@ fn start_in_tx(
 /// few more levels. The cap leaves room for that wrapping.
 pub const MAX_PAYLOAD_DEPTH: usize = 100;
 
-/// Returns `Ok` only when `value` nests no deeper than [`MAX_PAYLOAD_DEPTH`].
-///
-/// The walk uses a heap stack. A recursive walk would overflow the call
-/// stack on the input it must refuse. The walk stops at the first level past the
-/// cap, so a very deep value costs little to refuse.
-fn check_depth(kind: &'static str, value: &Value) -> SqliteResult<()> {
-    let mut stack = vec![(value, 0_usize)];
-    while let Some((node, depth)) = stack.pop() {
-        if depth > MAX_PAYLOAD_DEPTH {
-            return Err(SqliteError::PayloadTooDeep {
-                kind,
-                observed_depth: depth,
-                cap_depth: MAX_PAYLOAD_DEPTH,
-            });
+/// The children of a JSON container, as one iterator type.
+enum Children<'a> {
+    Array(std::slice::Iter<'a, Value>),
+    Object(serde_json::map::Values<'a>),
+}
+
+impl<'a> Iterator for Children<'a> {
+    type Item = &'a Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Array(items) => items.next(),
+            Self::Object(values) => values.next(),
         }
-        match node {
-            Value::Array(items) => stack.extend(items.iter().map(|v| (v, depth + 1))),
-            Value::Object(map) => stack.extend(map.values().map(|v| (v, depth + 1))),
-            _ => {}
+    }
+}
+
+/// The children of `value`, or `None` for a scalar.
+fn children(value: &Value) -> Option<Children<'_>> {
+    match value {
+        Value::Array(items) => Some(Children::Array(items.iter())),
+        Value::Object(map) => Some(Children::Object(map.values())),
+        _ => None,
+    }
+}
+
+/// Returns `Ok` only when `value` has at most [`MAX_PAYLOAD_DEPTH`] open
+/// arrays and objects on any path.
+///
+/// The walk keeps one iterator per open container. A recursive walk would
+/// overflow the call stack on the input it must refuse. Memory use is bound
+/// by the cap, not by the width of the value.
+fn check_depth(kind: &'static str, value: &Value) -> SqliteResult<()> {
+    let mut open: Vec<Children<'_>> = children(value).into_iter().collect();
+    while let Some(top) = open.last_mut() {
+        let Some(child) = top.next() else {
+            open.pop();
+            continue;
+        };
+        if let Some(inner) = children(child) {
+            if open.len() >= MAX_PAYLOAD_DEPTH {
+                return Err(SqliteError::PayloadTooDeep {
+                    kind,
+                    cap_depth: MAX_PAYLOAD_DEPTH,
+                });
+            }
+            open.push(inner);
         }
     }
     Ok(())
@@ -4037,6 +4064,10 @@ fn signal_key<'a>(
     idempotency_key: Option<&'a str>,
 ) -> SqliteResult<Option<&'a str>> {
     let key = idempotency_key.filter(|key| !key.is_empty());
+    // The settlement decoder below recurses. Check the depth first.
+    if name.starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX) {
+        check_depth("signal_payload", payload)?;
+    }
     autumn_harvest::durable_promise::settlement_idempotency_key(name, payload, key)
         .map_err(|e| SqliteError::InvalidSignal(e.to_string()))
 }
