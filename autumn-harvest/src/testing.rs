@@ -58,6 +58,8 @@ use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy, WorkerId};
 
 pub mod sim;
 
+use sim::MockCall;
+
 // ---------------------------------------------------------------------------
 // NonDeterminismKind
 // ---------------------------------------------------------------------------
@@ -5395,6 +5397,12 @@ impl TestRunOutcome {
     /// deadline-disabled context, leave that probe unconsumed, and report a
     /// FALSE non-determinism.
     pub async fn replay_check(&self, handler: WorkflowHandlerFn) -> ReplayReport {
+        let (replayer, snapshot) = self.replay_parts(handler);
+        replayer.replay_from_snapshot(snapshot).await
+    }
+
+    /// The replayer and the snapshot that [`replay_check`](Self::replay_check) uses.
+    fn replay_parts(&self, handler: WorkflowHandlerFn) -> (WorkflowReplayer, HistorySnapshot) {
         let snapshot = crate::testing::HistorySnapshot {
             // Issue #698 (Codex P2): use the producing env's configured workflow
             // type name for BOTH the snapshot `workflow_name` (so the replay
@@ -5461,7 +5469,7 @@ impl TestRunOutcome {
         replayer = replayer
             .queries(self.declarative_queries.clone())
             .updates(self.declarative_updates.clone());
-        replayer.replay_from_snapshot(snapshot).await
+        (replayer, snapshot)
     }
 }
 
@@ -5540,10 +5548,9 @@ pub struct WorkflowTestRun<'env> {
     exec_id: ExecutionId,
     start_time: DateTime<Utc>,
     history: Vec<WorkflowEvent>,
-    call_counts: HashMap<String, u32>,
     /// Signals not yet in history. The next cycle ingests them at task-prep.
     pending_signals: Vec<(String, Value)>,
-    retry_sequences: HashMap<String, std::collections::VecDeque<Vec<Result<Value, String>>>>,
+    mocks: RunMocks,
     side_output: RecordedSideOutput,
     /// History length at the last `Blocked`. A drive with no new event and
     /// no pending signal returns `Blocked` again without running the body.
@@ -5630,12 +5637,10 @@ impl WorkflowTestRun<'_> {
 
             match outcome {
                 WorkflowOutcome::Suspended { commands } => {
-                    match self.env.process_suspension(
-                        commands,
-                        &mut self.history,
-                        &mut self.call_counts,
-                        &mut self.retry_sequences,
-                    ) {
+                    match self
+                        .env
+                        .process_suspension(commands, &mut self.history, &mut self.mocks)
+                    {
                         Ok(true) => {}
                         Ok(false) => {
                             self.blocked_at = Some(self.history.len());
@@ -5951,11 +5956,16 @@ pub struct WorkflowTestEnv {
     /// and each result is emitted as a separate `ActivityFailed` (with
     /// incrementing `attempt` numbers) or a terminal `ActivityCompleted`.
     retry_sequences: HashMap<String, std::collections::VecDeque<Vec<Result<Value, String>>>>,
+    /// Mocks that get a seeded generator and the virtual clock (issue #2033).
+    seeded_mocks: HashMap<String, sim::SeededMockFn>,
     /// Child-workflow stubs: workflow name → closure(input) → result.
     child_mocks: HashMap<String, MockFn>,
     /// Simulated wall-clock time.  Used as the `WorkflowStarted` timestamp so
     /// `ctx.now()` inside the workflow function is deterministic.
     simulated_now: DateTime<Utc>,
+    /// Whether [`with_frozen_anchor`](Self::with_frozen_anchor) set the
+    /// clock. A simulation run otherwise starts at a fixed time (issue #2033).
+    anchor_frozen: bool,
     /// Signals pre-queued for delivery when the workflow calls `wait_for_signal`.
     queued_signals: Vec<(String, Value)>,
     /// If `Some`, a `WorkflowCancelled` event is prepended to the history so
@@ -6054,8 +6064,10 @@ impl WorkflowTestEnv {
             activity_mocks: HashMap::new(),
             attempt_results: HashMap::new(),
             retry_sequences: HashMap::new(),
+            seeded_mocks: HashMap::new(),
             child_mocks: HashMap::new(),
             simulated_now: Utc::now(),
+            anchor_frozen: false,
             queued_signals: Vec::new(),
             build_id: None,
             cancellation_reason: None,
@@ -6094,7 +6106,9 @@ impl WorkflowTestEnv {
     where
         F: Fn(Value) -> Result<Value, String> + Send + Sync + 'static,
     {
-        self.activity_mocks.insert(name.into(), Arc::new(mock));
+        let name = name.into();
+        self.seeded_mocks.remove(&name);
+        self.activity_mocks.insert(name, Arc::new(mock));
         self
     }
 
@@ -6326,6 +6340,7 @@ impl WorkflowTestEnv {
     #[must_use]
     pub const fn with_frozen_anchor(mut self, anchor: DateTime<Utc>) -> Self {
         self.simulated_now = anchor;
+        self.anchor_frozen = true;
         self
     }
 
@@ -6581,9 +6596,8 @@ impl WorkflowTestEnv {
             exec_id: ExecutionId::new(),
             start_time: self.simulated_now,
             history,
-            call_counts: HashMap::new(),
             pending_signals: self.queued_signals.clone(),
-            retry_sequences: self.retry_sequences.clone(),
+            mocks: self.run_mocks(0),
             // Issue #790: the durable log lines this run would have persisted,
             // accumulated across every decision cycle and de-duplicated by `seq`
             // exactly the way the store's unique index does.
@@ -6932,12 +6946,76 @@ impl WorkflowTestEnv {
         &self,
         commands: Vec<WorkflowCommand>,
         history: &mut Vec<WorkflowEvent>,
-        call_counts: &mut HashMap<String, u32>,
-        retry_sequences: &mut HashMap<
-            String,
-            std::collections::VecDeque<Vec<Result<Value, String>>>,
-        >,
+        mocks: &mut RunMocks,
     ) -> Result<bool, String> {
+        let flags = BatchFlags::of(&commands);
+        let mut made_progress = false;
+        let mut deferred = Vec::new();
+        for cmd in commands {
+            made_progress |= self.process_command(cmd, &flags, history, &mut deferred, mocks)?;
+        }
+        history.extend(deferred.into_iter().flat_map(|d| d.events));
+        Ok(made_progress)
+    }
+
+    /// The fresh mock state of one run (issue #2033).
+    pub(crate) fn run_mocks(&self, seed: u64) -> RunMocks {
+        RunMocks {
+            call_counts: HashMap::new(),
+            retry_sequences: self.retry_sequences.clone(),
+            seed,
+        }
+    }
+}
+
+/// Mock state that lasts for one run (issue #2033).
+pub(crate) struct RunMocks {
+    /// Activity name to the number of calls so far.
+    pub(crate) call_counts: HashMap<String, u32>,
+    /// The retry sequences that no call has used yet.
+    pub(crate) retry_sequences:
+        HashMap<String, std::collections::VecDeque<Vec<Result<Value, String>>>>,
+    /// The seed that a seeded mock derives its generator from.
+    pub(crate) seed: u64,
+}
+
+/// What a deferred delivery resolves (issue #2033).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeliveryKey {
+    /// The terminal of an activity, with its attempts.
+    Activity(ActivityExecId),
+    /// The terminal of a child workflow.
+    Child(ExecutionId),
+    /// The fire of a timer.
+    Timer(crate::types::TimerId),
+    /// Events that land in the same task, such as a race loser's terminal.
+    Now,
+}
+
+/// The events that one command defers to the end of its batch.
+pub(crate) struct Deferred {
+    pub(crate) key: DeliveryKey,
+    pub(crate) events: Vec<WorkflowEvent>,
+}
+
+impl Deferred {
+    const fn new(key: DeliveryKey, events: Vec<WorkflowEvent>) -> Self {
+        Self { key, events }
+    }
+}
+
+/// Facts about a whole suspension batch that steer its commands.
+pub(crate) struct BatchFlags {
+    /// The batch also waits on an activity, a signal, a child or a classic timer.
+    pub(crate) competing_suspension: bool,
+    /// The batch is a child-versus-deadline race (issue #779).
+    pub(crate) child_timeout_race: bool,
+    /// The smallest deadline of the awaited cancellable timers in the batch.
+    pub(crate) min_await_deadline_secs: Option<u64>,
+}
+
+impl BatchFlags {
+    pub(crate) fn of(commands: &[WorkflowCommand]) -> Self {
         // Whether this batch also carries a genuine non-timer suspension
         // (activity/signal/child-workflow/classic timer). In production the
         // worker records an `ArmTimer` and leaves the workflow parked on that
@@ -6947,7 +7025,9 @@ impl WorkflowTestEnv {
         // synthesise impossible history such as
         // `[TimerStarted, ActivityScheduled, TimerFired, ActivityCompleted]`
         // (Codex P2, issue #768).
-        let batch_has_competing_suspension = commands.iter().any(Self::is_competing_suspension);
+        let batch_has_competing_suspension = commands
+            .iter()
+            .any(WorkflowTestEnv::is_competing_suspension);
 
         // Deadline-ordered firing for concurrent awaited cancellable timers
         // (issue #768, Codex P2 round 15). Production inserts every
@@ -6988,24 +7068,15 @@ impl WorkflowTestEnv {
             )
         });
 
-        let mut made_progress = false;
-        let mut deferred_events = Vec::new();
-        for cmd in commands {
-            made_progress |= self.process_command(
-                cmd,
-                batch_has_competing_suspension,
-                batch_is_child_timeout_race,
-                min_await_deadline_secs,
-                history,
-                &mut deferred_events,
-                call_counts,
-                retry_sequences,
-            )?;
+        Self {
+            competing_suspension: batch_has_competing_suspension,
+            child_timeout_race: batch_is_child_timeout_race,
+            min_await_deadline_secs,
         }
-        history.extend(deferred_events);
-        Ok(made_progress)
     }
+}
 
+impl WorkflowTestEnv {
     /// Whether a command is a genuine non-timer suspension that would keep the
     /// workflow parked on an external event (activity result, signal, child
     /// result, or a classic `ctx.timer` fire) — as opposed to author-controlled
@@ -7030,20 +7101,14 @@ impl WorkflowTestEnv {
     /// Returns `Ok(true)` when a command produced progress, `Ok(false)` when
     /// the command was a no-op, or `Err(msg)` when a mock/stub lookup failed
     /// (harness configuration error — the test must be fixed, not the workflow).
-    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-    fn process_command(
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn process_command(
         &self,
         cmd: WorkflowCommand,
-        batch_has_competing_suspension: bool,
-        batch_is_child_timeout_race: bool,
-        min_await_deadline_secs: Option<u64>,
+        flags: &BatchFlags,
         history: &mut Vec<WorkflowEvent>,
-        deferred_events: &mut Vec<WorkflowEvent>,
-        call_counts: &mut HashMap<String, u32>,
-        retry_sequences: &mut HashMap<
-            String,
-            std::collections::VecDeque<Vec<Result<Value, String>>>,
-        >,
+        deferred: &mut Vec<Deferred>,
+        mocks: &mut RunMocks,
     ) -> Result<bool, String> {
         match cmd {
             WorkflowCommand::ScheduleActivity {
@@ -7063,15 +7128,19 @@ impl WorkflowTestEnv {
                 // Increment the per-name call counter regardless so that any
                 // subsequent workflow-level calls for the same activity name see
                 // the correct call number when resolved against per-call mocks.
-                let call_num = Self::next_call_count(call_counts, &name);
-                if let Some(seq) = retry_sequences.get_mut(&name)
+                let call_num = Self::next_call_count(&mut mocks.call_counts, &name);
+                let mut events = Vec::new();
+                if let Some(seq) = mocks.retry_sequences.get_mut(&name)
                     && let Some(attempts) = seq.pop_front()
                 {
-                    Self::push_activity_retry_sequence(deferred_events, activity_id, attempts);
-                    return Ok(true);
+                    Self::push_activity_retry_sequence(&mut events, activity_id, attempts);
+                } else {
+                    let now = virtual_now(self.simulated_now, history);
+                    let mock = MockCall::new(&name, call_num, 1, now, mocks.seed);
+                    let result = self.resolve_activity(&mock, act_input)?;
+                    Self::push_activity_terminal(&mut events, activity_id, result);
                 }
-                let result = self.resolve_activity(&name, act_input, call_num)?;
-                Self::push_activity_terminal(deferred_events, activity_id, result);
+                deferred.push(Deferred::new(DeliveryKey::Activity(activity_id), events));
                 Ok(true)
             }
 
@@ -7083,8 +7152,10 @@ impl WorkflowTestEnv {
                 start_to_close,
                 ..
             } => {
-                let call_num = Self::next_call_count(call_counts, &name);
-                let result = self.resolve_activity(&name, act_input.clone(), call_num)?;
+                let call_num = Self::next_call_count(&mut mocks.call_counts, &name);
+                let now = virtual_now(self.simulated_now, history);
+                let mock = MockCall::new(&name, call_num, 1, now, mocks.seed);
+                let result = self.resolve_activity(&mock, act_input.clone())?;
                 history.push(WorkflowEvent::LocalActivityScheduled {
                     activity_id,
                     name: name.clone(),
@@ -7099,7 +7170,9 @@ impl WorkflowTestEnv {
                     start_to_close_nanos: start_to_close
                         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
                 });
-                Self::push_local_activity_terminal(deferred_events, activity_id, result);
+                let mut events = Vec::new();
+                Self::push_local_activity_terminal(&mut events, activity_id, result);
+                deferred.push(Deferred::new(DeliveryKey::Now, events));
                 Ok(true)
             }
 
@@ -7114,11 +7187,20 @@ impl WorkflowTestEnv {
                 // #775 Codex P2), so a signal that should win the race already
                 // resolved the select synchronously without ever suspending. When
                 // the timer genuinely suspends, it fires (timer wins).
+                //
+                // A timer that is still running emits `StartTimer` again on
+                // each replay. The worker dedups it by id. The harness does the same.
+                if Self::timer_is_active_in_history(history, &timer_id) {
+                    return Ok(false);
+                }
                 history.push(WorkflowEvent::TimerStarted {
                     timer_id: timer_id.clone(),
                     duration_secs,
                 });
-                deferred_events.push(WorkflowEvent::TimerFired { timer_id });
+                deferred.push(Deferred::new(
+                    DeliveryKey::Timer(timer_id.clone()),
+                    vec![WorkflowEvent::TimerFired { timer_id }],
+                ));
                 Ok(true)
             }
 
@@ -7143,6 +7225,13 @@ impl WorkflowTestEnv {
                 input: child_input,
                 ..
             } => {
+                // A running child emits `StartChildWorkflow` again on each
+                // replay. The worker dedups it by id. The harness does the same.
+                if history.iter().any(|e| {
+                    matches!(e, WorkflowEvent::ChildWorkflowStarted { child_id: id, .. } if *id == child_id)
+                }) {
+                    return Ok(false);
+                }
                 let result = match self.resolve_child(&workflow_name, child_input.clone()) {
                     Ok(result) => result,
                     // A child-timeout race (issue #779) with no registered mock:
@@ -7151,7 +7240,7 @@ impl WorkflowTestEnv {
                     // to the timeout branch instead of failing on the missing
                     // mock. The `StartTimer` in the same batch supplies progress.
                     Err(harness_err) => {
-                        if batch_is_child_timeout_race {
+                        if flags.child_timeout_race {
                             history.push(WorkflowEvent::ChildWorkflowStarted {
                                 child_id,
                                 workflow_name,
@@ -7167,11 +7256,8 @@ impl WorkflowTestEnv {
                     workflow_name,
                     input: child_input,
                 });
-                match result {
-                    Ok(output) => {
-                        deferred_events
-                            .push(WorkflowEvent::ChildWorkflowCompleted { child_id, output });
-                    }
+                let terminal = match result {
+                    Ok(output) => WorkflowEvent::ChildWorkflowCompleted { child_id, output },
                     Err(error) => {
                         // Decode the child mock's error so a typed
                         // `WorkflowFailure` envelope surfaces the child's
@@ -7180,11 +7266,10 @@ impl WorkflowTestEnv {
                         // `wake_parent_for_child_failure`. A plain string decodes
                         // to all-None typed fields (unchanged legacy behaviour).
                         let decoded = crate::failure::decode_workflow_failure(&error);
-                        deferred_events.push(WorkflowEvent::child_workflow_failed_typed(
-                            child_id, &decoded,
-                        ));
+                        WorkflowEvent::child_workflow_failed_typed(child_id, &decoded)
                     }
-                }
+                };
+                deferred.push(Deferred::new(DeliveryKey::Child(child_id), vec![terminal]));
                 Ok(true)
             }
 
@@ -7315,8 +7400,9 @@ impl WorkflowTestEnv {
                 // A timer-only cancel appends no event. The child-timeout race
                 // emits one on every replay, so it is not progress (issue #1991).
                 let made_progress = !activities.is_empty() || !children.is_empty();
+                let mut events = Vec::new();
                 for activity_id in activities {
-                    deferred_events.push(WorkflowEvent::ActivityFailed {
+                    events.push(WorkflowEvent::ActivityFailed {
                         activity_id,
                         error: "lost race to a sibling branch".to_string(),
                         attempt: 1,
@@ -7326,11 +7412,12 @@ impl WorkflowTestEnv {
                     });
                 }
                 for child_id in children {
-                    deferred_events.push(WorkflowEvent::child_workflow_failed(
+                    events.push(WorkflowEvent::child_workflow_failed(
                         child_id,
                         "lost race to a sibling branch".to_string(),
                     ));
                 }
+                deferred.push(Deferred::new(DeliveryKey::Now, events));
                 Ok(made_progress)
             }
 
@@ -7356,15 +7443,14 @@ impl WorkflowTestEnv {
                 for_await,
             } => {
                 if for_await {
-                    let fire_already_deferred = deferred_events.iter().any(|e| {
-                        matches!(e, WorkflowEvent::TimerFired { timer_id: id } if *id == timer_id)
-                    });
+                    let key = DeliveryKey::Timer(timer_id.clone());
+                    let fire_already_deferred = deferred.iter().any(|d| d.key == key);
                     if fire_already_deferred {
                         // Another `await_fire` re-arm for this id already deferred
                         // the fire this batch — idempotent no-op.
                         return Ok(false);
                     }
-                    if batch_has_competing_suspension {
+                    if flags.competing_suspension {
                         // Awaited alongside a genuine non-timer suspension: parked,
                         // fires on a later bookkeeping-only cycle.
                         return Ok(false);
@@ -7375,10 +7461,16 @@ impl WorkflowTestEnv {
                     // bookkeeping-only cycle re-arms it against the (now smaller) set
                     // of remaining awaits — matching production's min-`fires_at`
                     // reschedule + deadline-ordered ingest.
-                    if min_await_deadline_secs.is_some_and(|min| duration_secs > min) {
+                    if flags
+                        .min_await_deadline_secs
+                        .is_some_and(|min| duration_secs > min)
+                    {
                         return Ok(false);
                     }
-                    deferred_events.push(WorkflowEvent::TimerFired { timer_id });
+                    deferred.push(Deferred::new(
+                        key,
+                        vec![WorkflowEvent::TimerFired { timer_id }],
+                    ));
                     return Ok(true);
                 }
                 // Fresh arm: record TimerStarted (dedup by active-in-history), never
@@ -7397,9 +7489,8 @@ impl WorkflowTestEnv {
             // TimerCancelled and drop the deferred TimerFired for this id so the
             // timer never fires — the cancelled branch is taken deterministically.
             WorkflowCommand::CancelTimer { timer_id } => {
-                deferred_events.retain(
-                    |e| !matches!(e, WorkflowEvent::TimerFired { timer_id: id } if *id == timer_id),
-                );
+                let key = DeliveryKey::Timer(timer_id.clone());
+                deferred.retain(|d| d.key != key);
                 history.push(WorkflowEvent::TimerCancelled { timer_id });
                 Ok(true)
             }
@@ -7500,17 +7591,20 @@ impl WorkflowTestEnv {
     /// is the mock's success/failure value), or `Err(harness_error)` when no
     /// mock is registered — a harness configuration problem that must be fixed
     /// in the test, not handled as a workflow-level failure.
-    fn resolve_activity(
+    pub(crate) fn resolve_activity(
         &self,
-        name: &str,
+        call: &MockCall<'_>,
         input: Value,
-        call_num: u32,
     ) -> Result<Result<Value, String>, String> {
+        let (name, call_num) = (call.name, call.call);
         if let Some(result) = self.attempt_results.get(&(name.to_string(), call_num)) {
             return Ok(result.clone());
         }
         if let Some(mock) = self.activity_mocks.get(name) {
             return Ok(mock(input));
+        }
+        if let Some(mock) = self.seeded_mocks.get(name) {
+            return Ok(mock(input, &mut call.context()));
         }
         // Worker sessions (issue #606): the internal acquire/release
         // activities have no registered handler in production either -- the

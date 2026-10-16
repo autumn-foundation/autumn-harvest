@@ -120,10 +120,11 @@ sim run, and external signal, cancel and await orders.
 At each task boundary the sim holds a pending set. It picks a seeded subset:
 
 1. **Results.** Any subset of held activity and child results, in any order.
-   A result exists only after its scheduling event is in history.
+   A result exists only after its scheduling event is in history. Each
+   attempt's `ActivityStarted` is its own step before the terminal.
 2. **Clock.** Optionally advance to the next timer deadline. Every timer with
    a deadline at or before the new clock is then due. All due timers fire in
-   this task, ordered by `(deadline, timer_id)`.
+   this task, ordered by `(deadline, arm task, timer_id)`.
 3. **Signals.** Zero or more of the next scripted signals arrive, in script
    order. Each is received before or at the new deadline.
 4. **Ingest order.** The task appends the results first. It then appends the
@@ -133,8 +134,47 @@ At each task boundary the sim holds a pending set. It picks a seeded subset:
 6. **Losers.** `CancelRaceLosers` drops each loser's held result and appends
    the synthetic terminal at once. `CancelTimer` drops a held fire.
 
-An awaited cancellable timer is held only on a bookkeeping-only batch, as in
-the default env. A local activity resolves in its own task.
+Every awaited cancellable timer is held, because the worker stores its row.
+A batch that parks on an activity, a signal or a child with no classic timer
+sets no wake-up time. Its timers fire only with another delivery. A local
+activity resolves in its own task.
+
+### 2.1 Review record
+
+A three-angle review (model, tests, API and docs) found these defects. Each
+one is fixed and has a test:
+
+- An awaited timer beside another wait was never held. Production fires it
+  first. `an_awaited_timer_fires_by_its_deadline_beside_a_classic_timer`.
+- Built-in side effects and the start time were not seeded.
+  `built_in_side_effects_and_the_clock_are_seeded`.
+- `with_cancellation` failed every sweep.
+  `a_cancellation_from_the_env_works_in_a_sweep`.
+- `ActivityStarted` never landed alone.
+  `an_activity_start_can_land_before_its_result`.
+- A label that no run evaluates passed silently.
+  `a_required_label_that_no_run_evaluates_fails_the_sweep`.
+
+A second review of the fixes found these defects. Each one is fixed:
+
+- A re-held timer kept a stale wake flag, so a run could block.
+  `a_timer_held_beside_a_signal_wait_still_fires_after_it`.
+- A lone `ActivityStarted` counted as a wake.
+  `an_activity_start_alone_does_not_wake_a_parked_task`.
+- Mixed batches counted as parks with no deadline. The worker reschedules
+  them, so only single-kind batches count now.
+- A seeded `new_uuid` was a v4 UUID, and a seeded clock read used the summed
+  timer clock. Both now use the sim's virtual time.
+- A base seed variable reset the seed count of an explicit plan.
+
+The sim also surfaced two engine behaviours outside this change. The guide
+records both:
+
+- A canary replay of a running activity reports its trailing
+  `ActivityStarted` as unconsumed.
+- A cancellable timer await stops its scan at an in-flight
+  `ActivityStarted`, so `join!(activity, timer.await_fire())` can report a
+  false non-determinism.
 
 ---
 
@@ -143,11 +183,11 @@ the default env. A local activity resolves in its own task.
 | AC | Evidence |
 |----|----------|
 | Seeded, legal delivery across tasks | `workflow_sim_tests`: activities, children, timers, signals and cancel each land in more than one order over a sweep. Each explored history passes the legality check. |
-| Rules match the worker | `worker::tests::sim_wake_order_matches_merge_wake_events` (pure, differential). `signal_tests::sim_wake_order_matches_the_real_ingest` (Postgres). |
+| Rules match the worker | `worker::tests::sim_wake_order_matches_merge_wake_events` (pure, differential). `workflow_sim_ingest_tests::sim_wake_order_matches_the_real_ingest` (Postgres). |
 | Worked example | `workflow_sim_tests::the_sim_finds_the_race_bug_the_default_env_misses`. |
 | Run-twice and replay command | A tampered runner fails run-twice. A failure message holds `HARVEST_SIM_SEED=`. |
 | Replay check | Each sweep seed passes `WorkflowReplayer`. A nondeterministic body fails the sweep. |
 | `always!`, `sometimes!`, sweep | An unsatisfied `sometimes!` fails a sweep. A false `always!` fails it. |
 | Crash and resume | Each sweep seed also runs with a crash. The outcome must match. A body that depends on its run count fails. |
 | Guide | `docs/testing/workflow-simulation.md`. |
-| Changelog | `docs/changelog.d/pr-2033-workflow-sim.md`. |
+| Changelog | `docs/changelog.d/issue-2033-workflow-simulation.md`. |

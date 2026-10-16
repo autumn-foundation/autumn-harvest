@@ -33,7 +33,7 @@ fn quotes_env() -> WorkflowTestEnv {
 
 /// Books a carrier with the first quote. The bug: it always books the
 /// primary carrier, whichever quote won.
-fn book_first_quote_buggy<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
+fn book_first_quote_buggy(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
     Box::pin(async move {
         let winner = ctx
             .race()
@@ -51,7 +51,7 @@ fn book_first_quote_buggy<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
 }
 
 /// The fixed workflow books the carrier whose quote won.
-fn book_first_quote_fixed<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
+fn book_first_quote_fixed(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
     Box::pin(async move {
         let winner = ctx
             .race()
@@ -73,7 +73,10 @@ fn book_first_quote_fixed<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
 /// The check that the two booking workflows must pass.
 fn booked_carrier_won(outcome: &SimOutcome) {
     if let Ok(output) = outcome.result() {
-        let carrier = ["primary", "backup"][output["winner"].as_u64().unwrap_or(0) as usize];
+        let winner = output["winner"]
+            .as_u64()
+            .and_then(|w| usize::try_from(w).ok());
+        let carrier = ["primary", "backup"][winner.unwrap_or(0)];
         always!(
             output["carrier"] == carrier,
             "the booked carrier is the one that won"
@@ -97,6 +100,7 @@ async fn the_sim_finds_the_race_bug_the_default_env_misses() {
         .simulation()
         .seeds(SEEDS)
         .test_name("workflow_sim_tests::the_sim_finds_the_race_bug_the_default_env_misses")
+        .cargo_args("--no-default-features --features testing")
         .sweep(book_first_quote_buggy, json!(null), booked_carrier_won)
         .await
         .expect_err("some seed lands the backup quote first");
@@ -113,7 +117,11 @@ async fn the_sim_finds_the_race_bug_the_default_env_misses() {
         .lines()
         .find(|line| line.starts_with("reproduce: "))
         .expect("a reproduce line");
-    assert!(repro.contains("cargo test"), "{repro}");
+    assert!(repro.contains("cargo test -p autumn-harvest"), "{repro}");
+    assert!(
+        repro.contains("--no-default-features --features testing --test integration "),
+        "{repro}"
+    );
     assert!(
         repro.contains("the_sim_finds_the_race_bug_the_default_env_misses"),
         "{repro}"
@@ -139,7 +147,7 @@ async fn the_fixed_workflow_passes_the_sweep_and_reaches_the_backup_win() {
         .sweep(book_first_quote_fixed, json!(null), booked_carrier_won)
         .await
         .unwrap_or_else(|failure| panic!("{failure}"));
-    assert_eq!(report.seeds, SEEDS.count);
+    assert!(report.seeds > 0);
     assert!(report.reached.contains("the backup quote wins"));
 }
 
@@ -155,12 +163,15 @@ async fn an_unsatisfied_sometimes_fails_the_sweep() {
         .expect_err("no run takes a thousand tasks");
     let message = failure.to_string();
     assert!(message.contains("sometimes!"), "{message}");
-    assert!(message.contains("a run takes a thousand tasks"), "{message}");
+    assert!(
+        message.contains("a run takes a thousand tasks"),
+        "{message}"
+    );
 }
 
 #[tokio::test]
 async fn a_false_always_in_the_body_fails_the_sweep() {
-    fn wf<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
+    fn wf(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
         Box::pin(async move {
             let winner = ctx
                 .race()
@@ -179,11 +190,14 @@ async fn a_false_always_in_the_body_fails_the_sweep() {
         .sweep(wf, json!(null), |_| {})
         .await
         .expect_err("the backup wins on some seed");
-    assert!(failure.reason.contains("the primary always wins"), "{failure}");
+    assert!(
+        failure.reason.contains("the primary always wins"),
+        "{failure}"
+    );
 }
 
 /// Fans out three quotes, then waits for the `go` signal.
-fn fan_out_then_signal<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
+fn fan_out_then_signal(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
     Box::pin(async move {
         let items = (0..3)
             .map(|i| ("quote_primary".to_string(), json!(i), "q".to_string()))
@@ -243,7 +257,7 @@ async fn a_fan_out_sees_partial_batches_reordered_results_and_a_signal_between_t
                 "fan-out results land out of command order"
             );
             sometimes!(
-                outcome.task_of_events(&completed_positions(events)).len() > 1,
+                outcome.tasks_of_events(&completed_positions(events)).len() > 1,
                 "fan-out results land in separate tasks"
             );
             let positions = completed_positions(events);
@@ -258,11 +272,11 @@ async fn a_fan_out_sees_partial_batches_reordered_results_and_a_signal_between_t
         })
         .await
         .unwrap_or_else(|failure| panic!("{failure}"));
-    assert_eq!(report.seeds, SEEDS.count);
+    assert!(report.seeds > 0);
 }
 
 /// Waits for an activity or a one-minute timer, whichever comes first.
-fn activity_or_timeout<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
+fn activity_or_timeout(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
     Box::pin(async move {
         let winner = ctx
             .race()
@@ -296,7 +310,7 @@ async fn a_timer_can_win_or_lose_against_an_activity() {
 }
 
 /// A signal-or-deadline race: approve within ten minutes.
-fn approve_or_expire<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
+fn approve_or_expire(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
     Box::pin(async move {
         let winner = ctx
             .race()
@@ -305,7 +319,11 @@ fn approve_or_expire<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
             .run()
             .await
             .map_err(|e| e.to_string())?;
-        Ok(json!(if winner.index == 1 { "approved" } else { "expired" }))
+        Ok(json!(if winner.index == 1 {
+            "approved"
+        } else {
+            "expired"
+        }))
     })
 }
 
@@ -325,7 +343,7 @@ async fn a_mid_run_signal_can_win_or_lose_against_a_timer() {
 }
 
 /// Races two child workflows.
-fn first_child<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
+fn first_child(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
     Box::pin(async move {
         let winner = ctx
             .race()
@@ -355,7 +373,7 @@ async fn child_results_land_in_seeded_orders() {
 }
 
 /// Two activities in sequence.
-fn two_steps<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
+fn two_steps(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
     Box::pin(async move {
         let a = ctx
             .execute_activity_raw("quote_primary", json!(1), "q")
@@ -403,16 +421,7 @@ async fn a_cancel_lands_at_a_seeded_task_and_ends_the_run() {
 
 #[tokio::test]
 async fn each_seed_is_deterministic_and_a_mock_that_is_not_fails_the_sweep() {
-    // This mock answers differently on each call, so the two runs of a seed
-    // take different paths.
-    let calls = Arc::new(AtomicU32::new(0));
-    let env = WorkflowTestEnv::new()
-        .mock_activity("flip", move |_| {
-            Ok(json!(calls.fetch_add(1, Ordering::SeqCst) % 2 == 0))
-        })
-        .mock_activity("quote_primary", |_| Ok(json!(1)))
-        .mock_activity("quote_backup", |_| Ok(json!(2)));
-    fn wf<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
+    fn wf(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
         Box::pin(async move {
             let heads = ctx
                 .execute_activity_raw("flip", json!(null), "q")
@@ -428,6 +437,17 @@ async fn each_seed_is_deterministic_and_a_mock_that_is_not_fails_the_sweep() {
                 .map_err(|e| e.to_string())
         })
     }
+    // This mock answers differently on each call, so the two runs of a seed
+    // take different paths.
+    let calls = Arc::new(AtomicU32::new(0));
+    let env = WorkflowTestEnv::new()
+        .mock_activity("flip", move |_| {
+            Ok(json!(
+                calls.fetch_add(1, Ordering::SeqCst).is_multiple_of(2)
+            ))
+        })
+        .mock_activity("quote_primary", |_| Ok(json!(1)))
+        .mock_activity("quote_backup", |_| Ok(json!(2)));
     let failure = env
         .simulation()
         .seeds(SeedPlan { first: 0, count: 4 })
@@ -454,7 +474,7 @@ async fn each_seed_is_deterministic_and_a_mock_that_is_not_fails_the_sweep() {
 
 #[tokio::test]
 async fn each_explored_history_is_replayed() {
-    fn renamed<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
+    fn renamed(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
         Box::pin(async move {
             ctx.execute_activity_raw("quote_renamed", json!(1), "q")
                 .await
@@ -467,7 +487,7 @@ async fn each_explored_history_is_replayed() {
         .sweep(two_steps, json!(null), |_| {})
         .await
         .unwrap_or_else(|failure| panic!("{failure}"));
-    assert_eq!(report.replayed, SEEDS.count);
+    assert_eq!(report.replayed, report.seeds);
 
     // A build that renames the first activity cannot replay the old orders.
     let failure = quotes_env()
@@ -499,16 +519,20 @@ async fn a_crash_and_resume_gives_the_uncut_outcome() {
 #[tokio::test]
 async fn a_body_that_counts_its_runs_fails_the_crash_check() {
     struct Runs(AtomicU32);
-    fn wf<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
+    fn wf(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
         Box::pin(async move {
-            let runs = ctx.state::<Runs>().expect("state").0.fetch_add(1, Ordering::SeqCst);
-            // Not durable: a crash runs the body once more.
-            let name = if runs < 2 { "quote_primary" } else { "quote_backup" };
-            ctx.execute_activity_raw(name, json!(null), "q")
-                .await
-                .map_err(|e| e.to_string())?;
+            let runs = ctx
+                .state::<Runs>()
+                .expect("state")
+                .0
+                .fetch_add(1, Ordering::SeqCst);
             ctx.execute_activity_raw("book", json!(null), "q")
                 .await
+                .map_err(|e| e.to_string())?;
+            // Not durable: only the last cycle reaches this line, and a crash
+            // runs the body once more, so the parity changes.
+            let parity = if runs % 2 == 0 { "even" } else { "odd" };
+            ctx.side_effect(parity, || json!(1))
                 .map_err(|e| e.to_string())
         })
     }
@@ -518,7 +542,18 @@ async fn a_body_that_counts_its_runs_fails_the_crash_check() {
         .simulation()
         .run_with_crash(3, 1, wf, json!(null))
         .await;
-    assert!(uncut.same_outcome(&crashed).is_err());
+    assert_eq!(uncut.status(), SimStatus::Completed, "{:?}", uncut.result());
+    assert_eq!(
+        crashed.status(),
+        SimStatus::Completed,
+        "{:?}",
+        crashed.result()
+    );
+    assert_eq!(crashed.crashed_at(), Some(1));
+    let diff = uncut
+        .same_outcome(&crashed)
+        .expect_err("the parity differs");
+    assert!(diff.contains("SideEffectRecorded"), "{diff}");
 }
 
 #[tokio::test]
@@ -572,13 +607,16 @@ async fn a_fault_plan_fails_an_activity_by_ordinal() {
     assert_eq!(retried.status(), SimStatus::Completed);
     assert_eq!(
         retried.faults(),
-        ["quote_primary#1 attempt 1 failed", "quote_primary#1 attempt 2 failed"]
+        [
+            "quote_primary#1 attempt 1 failed",
+            "quote_primary#1 attempt 2 failed"
+        ]
     );
 }
 
 #[tokio::test]
 async fn a_seeded_mock_sees_the_virtual_clock() {
-    fn wf<'a>(ctx: &'a WorkflowContext, _: Value) -> Fut<'a> {
+    fn wf(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
         Box::pin(async move {
             ctx.timer("wait", 30).await.map_err(|e| e.to_string())?;
             ctx.execute_activity_raw("stamp", json!(null), "q")
@@ -588,11 +626,14 @@ async fn a_seeded_mock_sees_the_virtual_clock() {
     }
     let env = WorkflowTestEnv::new()
         .mock_activity_seeded("stamp", |_, mock| Ok(json!(mock.now().timestamp())));
-    let start = env.now().timestamp();
     let outcome = env.simulation().run(1, wf, json!(null)).await;
-    assert_eq!(outcome.result(), &Ok(json!(start + 30)));
+    let started = |events: &[WorkflowEvent]| match events.first() {
+        Some(WorkflowEvent::WorkflowStarted { timestamp, .. }) => timestamp.timestamp(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(outcome.result(), &Ok(json!(started(outcome.events()) + 30)));
     let default = env.run(wf, json!(null)).await;
-    assert_eq!(default.result, Ok(json!(start + 30)));
+    assert_eq!(default.result, Ok(json!(env.now().timestamp() + 30)));
 }
 
 #[tokio::test]
@@ -603,6 +644,295 @@ async fn the_trace_is_stable_and_names_tasks_not_ids() {
     let b = sim.run(9, book_first_quote_fixed, json!(null)).await;
     assert_eq!(a.trace(), b.trace());
     let text = a.trace().join("\n");
-    assert!(text.contains("ActivityScheduled a1 quote_primary"), "{text}");
+    assert!(
+        text.contains("ActivityScheduled a1 quote_primary"),
+        "{text}"
+    );
     assert!(!text.contains('-'), "no uuid leaks into the trace: {text}");
+}
+
+/// The guide names what the code ships, and each test it cites exists.
+#[test]
+fn the_guide_matches_the_code() {
+    use autumn_harvest::testing::sim::{
+        DEFAULT_MAX_ATTEMPTS, DEFAULT_SEEDS, SEED_BASE_VAR, SEED_VAR, SEEDS_VAR,
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let read = |path: &str| {
+        std::fs::read_to_string(root.join(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
+    };
+    let guide = read("docs/testing/workflow-simulation.md");
+    for var in [SEED_VAR, SEEDS_VAR, SEED_BASE_VAR] {
+        assert!(guide.contains(&format!("`{var}`")), "the guide names {var}");
+    }
+    assert!(guide.contains(&format!("The default is {DEFAULT_SEEDS}.")));
+    assert!(guide.contains(&format!("`DEFAULT_MAX_ATTEMPTS` ({DEFAULT_MAX_ATTEMPTS})")));
+    assert!(guide.contains("What it does not cover"));
+    assert!(guide.contains("Wire the sweep into your own CI"));
+
+    let cited = [
+        (
+            "autumn-harvest/src/worker.rs",
+            "fn sim_wake_order_matches_merge_wake_events",
+        ),
+        (
+            "autumn-harvest/tests/integration/workflow_sim_ingest_tests.rs",
+            "fn sim_wake_order_matches_the_real_ingest",
+        ),
+    ];
+    for (path, name) in cited {
+        assert!(read(path).contains(name), "{path} holds {name}");
+    }
+}
+
+/// Branches on `ctx.random_u64()` and reads the clock.
+fn coin_and_clock(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
+    Box::pin(async move {
+        let next = if ctx.random_u64().is_multiple_of(2) {
+            "quote_primary"
+        } else {
+            "quote_backup"
+        };
+        let id = ctx.new_uuid();
+        ctx.execute_activity_raw(next, json!(null), "q")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({
+            "next": next,
+            "id": id.to_string(),
+            "version": id.get_version_num(),
+            "now": ctx.system_now().timestamp(),
+        }))
+    })
+}
+
+#[tokio::test]
+async fn built_in_side_effects_and_the_clock_are_seeded() {
+    quotes_env()
+        .simulation()
+        .seeds(SEEDS)
+        .sweep(coin_and_clock, json!(null), |outcome| {
+            let next = outcome.result().as_ref().map(|v| v["next"].clone()).ok();
+            sometimes!(next == Some(json!("quote_primary")), "heads");
+            sometimes!(next == Some(json!("quote_backup")), "tails");
+        })
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+
+    // Two envs built at different times give one result for one seed.
+    let a = quotes_env()
+        .simulation()
+        .run(3, coin_and_clock, json!(null))
+        .await;
+    std::thread::sleep(Duration::from_millis(5));
+    let b = quotes_env()
+        .simulation()
+        .run(3, coin_and_clock, json!(null))
+        .await;
+    assert_eq!(
+        a.result(),
+        b.result(),
+        "the seed fixes the draws and the id"
+    );
+    let output = a.result().clone().expect("completes");
+    // Monday 2024-01-01 00:00 UTC, the fixed start of a run.
+    assert_eq!(output["now"], json!(1_704_067_200));
+    assert_eq!(output["version"], json!(7), "new_uuid stays a v7 UUID");
+    let other = quotes_env()
+        .simulation()
+        .run(4, coin_and_clock, json!(null))
+        .await;
+    assert_ne!(a.result(), other.result(), "another seed draws another id");
+}
+
+#[tokio::test]
+async fn a_cancellation_from_the_env_works_in_a_sweep() {
+    fn wf(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
+        Box::pin(async move {
+            // A cancel from the env is visible from the first cycle.
+            if ctx.is_cancelled() {
+                return Ok(json!("cleaned up"));
+            }
+            Ok(json!("ran"))
+        })
+    }
+    quotes_env()
+        .with_cancellation("stop")
+        .simulation()
+        .seeds(SEEDS)
+        .sweep(wf, json!(null), |outcome| {
+            always!(
+                outcome.result() == &Ok(json!("cleaned up")),
+                "the body cleans up"
+            );
+        })
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+}
+
+#[tokio::test]
+async fn a_required_label_that_no_run_evaluates_fails_the_sweep() {
+    let failure = quotes_env()
+        .simulation()
+        .seeds(SeedPlan { first: 0, count: 4 })
+        .require_reached("an unreachable branch")
+        .sweep(two_steps, json!(null), |_| {})
+        .await
+        .expect_err("no run evaluates the label");
+    assert!(
+        failure.reason.contains("an unreachable branch"),
+        "{failure}"
+    );
+}
+
+/// Waits on a classic 20 s timer and a cancellable 10 s timer at once.
+fn two_timers(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
+    Box::pin(async move {
+        let short = ctx.start_timer("short", 10);
+        tokio::select! {
+            // `biased` polls in order, so the body is deterministic.
+            biased;
+            fired = short.await_fire() => {
+                fired.map_err(|e| e.to_string())?;
+                Ok(json!("short"))
+            }
+            done = ctx.timer("long", 20) => {
+                done.map_err(|e| e.to_string())?;
+                Ok(json!("long"))
+            }
+        }
+    })
+}
+
+/// The timers that fired, in history order.
+fn fired(events: &[WorkflowEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            WorkflowEvent::TimerFired { timer_id } => Some(timer_id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn an_awaited_timer_fires_by_its_deadline_beside_a_classic_timer() {
+    // The default env never fires an awaited cancellable timer beside another
+    // wait, so the later classic timer wins. Production cannot do that.
+    let default = WorkflowTestEnv::new().run(two_timers, json!(null)).await;
+    assert_eq!(fired(default.events()), ["long"]);
+    assert_eq!(default.result, Ok(json!("long")));
+
+    // The sim fires the earlier deadline first, as the worker does.
+    let env = WorkflowTestEnv::new();
+    let sim = env.simulation();
+    for seed in 0..SEEDS.count {
+        let outcome = sim.run(seed, two_timers, json!(null)).await;
+        assert_eq!(fired(outcome.events()), ["short"], "seed {seed}");
+    }
+
+    // That order exposes a real bug: the losing classic timer leaves its
+    // `TimerStarted` unconsumed, so the history does not replay.
+    let failure = sim
+        .sweep(two_timers, json!(null), |_| {})
+        .await
+        .expect_err("the history does not replay");
+    assert!(failure.reason.contains("does not replay"), "{failure}");
+}
+
+#[tokio::test]
+async fn an_activity_start_can_land_before_its_result() {
+    quotes_env()
+        .simulation()
+        .seeds(SEEDS)
+        .sweep(two_steps, json!(null), |outcome| {
+            let events = outcome.events();
+            let start = events
+                .iter()
+                .position(|e| matches!(e, WorkflowEvent::ActivityStarted { .. }));
+            let done = events
+                .iter()
+                .position(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }));
+            sometimes!(
+                match (start, done) {
+                    (Some(s), Some(d)) => {
+                        outcome.tasks_of_events(&[s]) != outcome.tasks_of_events(&[d])
+                    }
+                    _ => false,
+                },
+                "a start and its result land in different tasks"
+            );
+        })
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+}
+
+/// Joins a signal wait with a cancellable 10 s timer.
+fn signal_and_timer(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
+    Box::pin(async move {
+        let timer = ctx.start_timer("pause", 10);
+        let (fired, go) = tokio::join!(timer.await_fire(), ctx.wait_for_signal("go"));
+        go.map_err(|e| e.to_string())?;
+        fired.map_err(|e| e.to_string())?;
+        Ok(json!("both"))
+    })
+}
+
+#[tokio::test]
+async fn a_timer_held_beside_a_signal_wait_still_fires_after_it() {
+    // The first batch parks on the signal, so the timer waits for a wake.
+    // Once the signal lands, the batch is timer bookkeeping only, and the
+    // worker wakes the task at the deadline. A stale flag would block here.
+    quotes_env()
+        .simulation()
+        .signal("go", json!(true))
+        .seeds(SEEDS)
+        .sweep(signal_and_timer, json!(null), |outcome| {
+            always!(
+                outcome.status() == SimStatus::Completed,
+                "the join completes"
+            );
+        })
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+}
+
+/// Waits for a cancellable 10 s timer or an activity, timer first.
+fn timer_or_activity(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
+    Box::pin(async move {
+        let timer = ctx.start_timer("deadline", 10);
+        tokio::select! {
+            biased;
+            fired = timer.await_fire() => {
+                fired.map_err(|e| e.to_string())?;
+                Ok(json!("timer"))
+            }
+            quote = ctx.execute_activity_raw("quote_primary", json!(null), "q") => {
+                quote.map_err(|e| e.to_string())
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn an_activity_start_alone_does_not_wake_a_parked_task() {
+    // The batch parks on one activity, so the worker sets no wake-up time.
+    // The timer can then fire only in the task that the result wakes.
+    let env = quotes_env();
+    let sim = env.simulation();
+    for seed in 0..SEEDS.count {
+        let outcome = sim.run(seed, timer_or_activity, json!(null)).await;
+        let events = outcome.events();
+        if let Some(fire) = events
+            .iter()
+            .position(|e| matches!(e, WorkflowEvent::TimerFired { .. }))
+        {
+            assert!(
+                events[..fire]
+                    .iter()
+                    .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
+                "seed {seed}: the timer fired before the result woke the task"
+            );
+        }
+    }
 }

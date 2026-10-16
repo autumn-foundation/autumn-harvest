@@ -36,6 +36,9 @@ async fn connect() -> (
     (conn, container)
 }
 
+/// Timer ids with deadline offsets, and signal arrival offsets.
+type Case = (Vec<(&'static str, u64)>, Vec<u64>);
+
 /// Inserts one `RUNNING` execution with an empty history.
 async fn insert_running_execution(conn: &mut diesel_async::AsyncPgConnection) -> ExecutionId {
     let exec_id = ExecutionId::new();
@@ -76,7 +79,7 @@ async fn sim_wake_order_matches_the_real_ingest() {
     let anchor = now - chrono::Duration::seconds(100);
     let at = |secs: u64| anchor + chrono::Duration::seconds(i64::try_from(secs).unwrap());
 
-    let mut cases: Vec<(Vec<(&str, u64)>, Vec<u64>)> = vec![
+    let mut cases: Vec<Case> = vec![
         (vec![("t", 60)], vec![59]),
         (vec![("t", 60)], vec![60]),
         (vec![("b", 30), ("a", 30), ("late", 150)], vec![10, 30, 70]),
@@ -88,7 +91,11 @@ async fn sim_wake_order_matches_the_real_ingest() {
         let timers = (0..rng.below(4))
             .map(|i| {
                 let id = ids[usize::try_from(i).unwrap()];
-                let offset = if rng.chance(25) { 150 + rng.below(50) } else { rng.below(4) * 25 };
+                let offset = if rng.chance(25) {
+                    150 + rng.below(50)
+                } else {
+                    rng.below(4) * 25
+                };
                 (id, offset)
             })
             .collect();

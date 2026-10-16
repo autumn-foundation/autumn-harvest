@@ -42812,7 +42812,7 @@ mod tests {
     ///
     /// The worker side loads due timers as the SQL does: `fires_at <= NOW()`,
     /// ordered by `(fires_at, timer_id)`. Signals arrive in `received_at`
-    /// order. `signal_tests` checks the same rule against the real ingest.
+    /// order. `workflow_sim_ingest_tests` checks the rule on the real ingest.
     #[test]
     fn sim_wake_order_matches_merge_wake_events() {
         let base = chrono::Utc::now();
@@ -42821,7 +42821,12 @@ mod tests {
             let mut rng = crate::dst::SplitMix64::new(seed);
             let clock = rng.below(8);
             let timers: Vec<(TimerId, u64)> = (0..rng.below(4))
-                .map(|i| (TimerId::new(format!("t{}", rng.below(3) * 10 + i)), rng.below(10)))
+                .map(|i| {
+                    (
+                        TimerId::new(format!("t{}", rng.below(3) * 10 + i)),
+                        rng.below(10),
+                    )
+                })
                 .collect();
             let mut received: Vec<u64> = (0..rng.below(4)).map(|_| rng.below(10)).collect();
             received.sort_unstable();
