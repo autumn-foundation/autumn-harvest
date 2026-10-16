@@ -24462,6 +24462,17 @@ async fn run_deferred_schedule_counter(
     }
 }
 
+/// How a terminal cycle with commands ends its run.
+#[derive(Clone, Copy)]
+enum TerminalSeal<'a> {
+    /// Persist the outcome that the workflow returned.
+    Outcome,
+    /// A deferred cancel takes the cycle over (issue #1984). The cycle's
+    /// commands persist as for its outcome. The run then ends cancelled
+    /// with this reason, and the outcome is dropped.
+    DeferredCancel(&'a str),
+}
+
 /// Persist a terminal (or continue-as-new) outcome that also carries pending
 /// pre-suspension commands (update results, search-attr patches, detached
 /// children, fan-out markers).
@@ -24493,6 +24504,7 @@ async fn persist_terminal_outcome_commands(
     // `persist_workflow_outcome` — see either's identical parameter doc
     // (issue #1263 items 11/15/17).
     resolved_router: Option<&crate::shard::ShardRouter>,
+    seal: TerminalSeal<'_>,
 ) -> HarvestResult<(
     bool,
     Vec<(ExecutionId, Option<String>)>,
@@ -24560,8 +24572,13 @@ async fn persist_terminal_outcome_commands(
     // keyed `workflow_id = child_id.to_string()`. That is an opaque id
     // minted fresh for that spawn, never the predecessor's own
     // `workflow_id`, so it can never collide with the successor's slot.
-    let continue_as_new_verdict =
-        resolve_continue_as_new_verdict_for_outcome(conn, registry, execution, &outcome).await?;
+    // A deferred cancel ends the run, so it starts no successor.
+    let continue_as_new_verdict = match seal {
+        TerminalSeal::Outcome => {
+            resolve_continue_as_new_verdict_for_outcome(conn, registry, execution, &outcome).await?
+        }
+        TerminalSeal::DeferredCancel(_) => None,
+    };
     let will_redirect_to_failure = matches!(
         continue_as_new_verdict,
         Some(ContinueAsNewVerdict::Redirect(_))
@@ -24612,7 +24629,7 @@ async fn persist_terminal_outcome_commands(
     // function in. The returned starts are NOT spawned here — the caller
     // must only spawn them after that outer transaction commits (see
     // `apply_race_loser_cancellations`'s doc comment).
-    let (race_deferred_triggers, _race_loser_events) = apply_race_loser_cancellations(
+    let (mut race_deferred_triggers, _race_loser_events) = apply_race_loser_cancellations(
         conn,
         persistence.exec_id,
         pending_cmds,
@@ -24631,6 +24648,23 @@ async fn persist_terminal_outcome_commands(
         resolved_router,
     )
     .await?;
+
+    if let TerminalSeal::DeferredCancel(reason) = seal {
+        let (_, starts, checks, terminal_metric) =
+            crate::execution::cancel_workflow_execution_collect_now(
+                conn,
+                persistence.exec_id,
+                reason,
+                Some(registry.telemetry().metrics.as_ref()),
+            )
+            .await?;
+        pending_cancel_metrics.extend(terminal_metric.map(|(workflow_name, queue_name)| {
+            crate::execution::StartCancelledRun::terminated(workflow_name, queue_name)
+        }));
+        race_deferred_triggers.extend(starts);
+        let checks = checks.into_iter().map(|(id, name)| (id, Some(name)));
+        return Ok((false, checks.collect(), race_deferred_triggers));
+    }
 
     // `persist_search_attrs_from_commands` above wrote the UpsertSearchAttributes
     // patch to the DB, but `execution` is the row loaded before that update. A
@@ -27923,52 +27957,31 @@ async fn process_workflow_task(
 
                 let mut pending_cancel_metrics = Vec::new();
                 if let Some(reason) = &deferred_cancel_ends_run {
-                    // An admitted update that finished this cycle keeps its
-                    // terminal event. The cancel then reads the next event id.
-                    let mut update_event_id =
-                        store::next_event_id_for(conn, prepared.exec_id).await?;
-                    persist_update_result_commands(
-                        conn,
-                        prepared.exec_id,
-                        &pending_cmds,
-                        &mut update_event_id,
-                        registry.payload_codecs(),
-                    )
-                    .await?;
-                    // A race that resolved this cycle tears its losers down.
-                    // The run cancel does not reach an awaited loser child.
-                    let (mut race_starts, _) = apply_race_loser_cancellations(
-                        conn,
-                        prepared.exec_id,
-                        &pending_cmds,
-                        &mut update_event_id,
-                        registry,
-                    )
-                    .await?;
-                    let (_, starts, checks, terminal_metric) =
-                        crate::execution::cancel_workflow_execution_collect_now(
+                    // The cycle's commands persist as for a terminal cycle:
+                    // update results, race-loser teardown, detached children,
+                    // search attributes, details, logs and progress. The run
+                    // then ends cancelled instead of with its outcome.
+                    let mut redirected = false;
+                    let (_, deferred_checks, race_deferred_triggers) =
+                        persist_terminal_outcome_commands(
                             conn,
-                            prepared.exec_id,
-                            reason,
-                            Some(telemetry.metrics.as_ref()),
+                            registry,
+                            execution_ref,
+                            persistence,
+                            outcome,
+                            &pending_cmds,
+                            &recorded_dispatches,
+                            &execute_span,
+                            &mut pending_cancel_metrics,
+                            &mut redirected,
+                            resolved_router.as_ref(),
+                            TerminalSeal::DeferredCancel(reason),
                         )
                         .await?;
-                    pending_cancel_metrics.extend(terminal_metric.map(
-                        |(workflow_name, queue_name)| {
-                            crate::execution::StartCancelledRun::terminated(
-                                workflow_name,
-                                queue_name,
-                            )
-                        },
-                    ));
-                    race_starts.extend(starts);
                     return Ok(WorkflowPersistFlow::Persisted {
                         retry_scheduled: false,
-                        deferred_checks: checks
-                            .into_iter()
-                            .map(|(id, name)| (id, Some(name)))
-                            .collect(),
-                        race_deferred_triggers: race_starts,
+                        deferred_checks,
+                        race_deferred_triggers,
                         pending_cancel_metrics,
                         continue_as_new_redirected_to_failure: false,
                         deferred_cancel_ended_run: true,
@@ -27992,6 +28005,7 @@ async fn process_workflow_task(
                             &mut pending_cancel_metrics,
                             &mut continue_as_new_redirected_to_failure,
                             resolved_router.as_ref(),
+                            TerminalSeal::Outcome,
                         )
                         .await?
                     } else {

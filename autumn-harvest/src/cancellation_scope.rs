@@ -148,6 +148,16 @@ pub(crate) enum CapturedRecord {
 }
 
 impl CapturedRecord {
+    /// The gate id of a `patch:` or `version:` marker record.
+    fn gate_id(&self) -> Option<&str> {
+        match self {
+            Self::Marker { name, .. } => name
+                .strip_prefix("patch:")
+                .or_else(|| name.strip_prefix("version:")),
+            Self::SideEffect { .. } => None,
+        }
+    }
+
     const fn order(&self) -> u64 {
         match self {
             Self::SideEffect { order, .. } | Self::Marker { order, .. } => *order,
@@ -307,6 +317,22 @@ pub(crate) fn rewind_armed_timer(
             None => {
                 inner.armed_timers.remove(at);
             }
+        }
+    }
+}
+
+/// Drop the captured markers of the deprecated gate `patch_id`.
+///
+/// `deprecate_patch` makes the gate's markers transparent wherever they are.
+/// Each scope that replays a cancel drops them from its records, so they
+/// are not left over as drift.
+pub(crate) fn drop_captured_gate(live: &[std::sync::Weak<ScopeShared>], patch_id: &str) {
+    for shared in live.iter().filter_map(std::sync::Weak::upgrade) {
+        let mut inner = shared.lock();
+        if inner.holding {
+            inner
+                .records
+                .retain(|record| record.gate_id() != Some(patch_id));
         }
     }
 }
@@ -702,10 +728,22 @@ impl<F: Future> ScopeRun<'_, F> {
         let name = cancel_marker_name(self.shared.seq);
         if let Some(details) = self.ctx.peek_marker_details(&name) {
             let marker = parse_cancel_marker(self.ctx, &name, details)?;
+            // A deprecated gate is transparent to replay, as its history
+            // markers are. Its captured markers are left out.
+            let records = marker
+                .records
+                .iter()
+                .filter(|record| {
+                    record
+                        .gate_id()
+                        .is_none_or(|id| !self.ctx.patch_is_deprecated(id))
+                })
+                .cloned()
+                .collect();
             {
                 let mut inner = self.shared.lock();
                 inner.holding = true;
-                inner.records = marker.records.iter().cloned().collect();
+                inner.records = records;
             }
             self.replay = Some(marker);
         }
@@ -2383,6 +2421,56 @@ mod tests {
         assert_eq!(*replayed.lock().expect("replayed lock"), Some(json!(true)));
         let nd = replay.take_nd_details();
         assert!(nd.is_none(), "{nd:?}");
+    }
+
+    /// A deploy raises `min` past the version that a cancel captured. Replay
+    /// returns the captured version, as it does for a marker in history.
+    #[tokio::test]
+    async fn a_captured_version_outside_the_new_range_replays() {
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| json!(ctx.version("rollout", 1, 2))).await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&replay, &replayed, |ctx| {
+            json!(ctx.version("rollout", 3, 4))
+        })
+        .await;
+
+        assert_eq!(*replayed.lock().expect("replayed lock"), Some(json!(2)));
+        let nd = replay.take_nd_details();
+        assert!(nd.is_none(), "{nd:?}");
+    }
+
+    /// Phase two of a patch replaces `patched` with `deprecate_patch`. The
+    /// captured `patch:` marker is dropped, whether the deprecation runs
+    /// before the scope or inside its body.
+    #[tokio::test]
+    async fn a_deprecated_patch_drops_its_captured_marker() {
+        for inside in [false, true] {
+            let live = WorkflowContext::new_test();
+            let seen = std::sync::Mutex::new(None);
+            record_then_cancel(&live, &seen, |ctx| json!(ctx.patched("rollout"))).await;
+            let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+            let replay = replay_of(details);
+            if !inside {
+                replay.deprecate_patch("rollout");
+            }
+            let replayed = std::sync::Mutex::new(None);
+            record_then_cancel(&replay, &replayed, |ctx| {
+                if inside {
+                    ctx.deprecate_patch("rollout");
+                }
+                Value::Null
+            })
+            .await;
+
+            let nd = replay.take_nd_details();
+            assert!(nd.is_none(), "inside={inside}: {nd:?}");
+        }
     }
 
     /// A pending cancel request (the SQLite cooperative cancel) is hidden

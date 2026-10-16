@@ -183,6 +183,32 @@ fn shield_race_then_fail_wf(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_
     })
 }
 
+/// The detached child that `shield_cleanup_then_fail_wf` spawns.
+static DETACHED_CHILD: std::sync::Mutex<Option<ExecutionId>> = std::sync::Mutex::new(None);
+
+/// Cleanup in a block whose last poll also sets a search attribute and
+/// spawns a detached child. The run then fails.
+fn shield_cleanup_then_fail_wf(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        ctx.non_cancellable(async {
+            ctx.execute_activity_raw("gated_cleanup", Value::Null, "default")
+                .await?;
+            ctx.upsert_search_attrs([("cleanup".to_string(), Some(json!("done")))])?;
+            let child = ctx.spawn_child_workflow_detached_raw(
+                "parked_child",
+                Value::Null,
+                autumn_harvest::ParentClosePolicy::Abandon,
+            )?;
+            *DETACHED_CHILD.lock().expect("child lock") = Some(child);
+            Ok::<_, HarvestError>(())
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        Err("the run fails after its cleanup".to_string())
+    })
+}
+
 /// A child that parks on a long timer.
 fn parked_child(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
     Box::pin(async move {
@@ -701,6 +727,65 @@ async fn deferred_cancel_tears_down_a_race_loser_of_the_failing_cycle() {
     assert_eq!(execution.error.as_deref(), Some("operator abort"));
     assert_eq!(children.len(), 1, "{children:?}");
     assert_ne!(children[0].state, "RUNNING", "the loser child is torn down");
+}
+
+/// A run that fails in the cycle that closes its block is cancelled instead.
+/// The commands of the block's last poll persist: its search attribute and
+/// its detached child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_cancel_keeps_the_cleanup_commands_of_the_failing_cycle() {
+    CLEANUP_GATE.store(false, Ordering::SeqCst);
+    *DETACHED_CHILD.lock().expect("child lock") = None;
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect");
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
+    let reg = Arc::new(HandlerRegistry::new(
+        vec![
+            wf_info("e2e_test_workflow", shield_cleanup_then_fail_wf),
+            wf_info("parked_child", parked_child),
+        ],
+        vec![act_info("gated_cleanup", gated_cleanup)],
+    ));
+    let worker = build_runtime_worker("worker-1984-shield-cleanup", 4, 2, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&database_url));
+
+    wait_for_event(&database_url, exec_id, "the cleanup start", |e| {
+        matches!(e, WorkflowEvent::ActivityStarted { .. })
+    })
+    .await;
+    let cancelled = cancel_workflow_execution(&mut conn, exec_id, "operator abort", &NoOpMetrics)
+        .await
+        .expect("cancel");
+    assert!(cancelled.deferred, "an open block defers the cancel");
+
+    CLEANUP_GATE.store(true, Ordering::SeqCst);
+    let execution = wait_for_execution_state_with_timeout(
+        &database_url,
+        exec_id,
+        "CANCELLED",
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    let child = DETACHED_CHILD
+        .lock()
+        .expect("child lock")
+        .expect("the block spawns its child");
+    let child_rows: Vec<String> = harvest_workflow_executions::table
+        .find(child.as_uuid())
+        .select(harvest_workflow_executions::state)
+        .load(&mut conn)
+        .await
+        .expect("load the child");
+    worker.shutdown();
+    handle.await.expect("join");
+
+    assert_eq!(execution.error.as_deref(), Some("operator abort"));
+    let attrs = execution.search_attrs.unwrap_or_default();
+    assert_eq!(attrs.get("cleanup"), Some(&json!("done")), "{attrs}");
+    assert_eq!(child_rows.len(), 1, "the detached child exists");
 }
 
 /// A paused run cannot close its block, so its cancel is not deferred.

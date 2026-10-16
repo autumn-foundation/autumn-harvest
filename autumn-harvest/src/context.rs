@@ -6018,7 +6018,8 @@ impl WorkflowContext {
         });
 
         // Issue #1984: a scope cancel withdrew the gate's marker. Replay keeps
-        // the version that the live cycle chose, even after a deploy raises max.
+        // the version that the live cycle chose, even after a deploy moves the
+        // range. `match_version` returns a recorded marker the same way.
         // A gate that matched its marker in history takes no captured record.
         if live
             && let Some(captured) = self
@@ -6026,14 +6027,11 @@ impl WorkflowContext {
                     self.captured_scope_marker(&crate::replay::version_marker_name(change_id)),
                 )
                 .and_then(|details| {
-                    let version = details
-                        .as_u64()
-                        .and_then(|v| u32::try_from(v).ok())
-                        .filter(|v| (min..=max).contains(v));
+                    let version = details.as_u64().and_then(|v| u32::try_from(v).ok());
                     if version.is_none() {
                         self.record_deferred_nd(format!(
                             "version gate '{change_id}': the version that a scope cancel \
-                             recorded is outside {min}..={max}"
+                             recorded is not a version number"
                         ));
                     }
                     version
@@ -6244,6 +6242,17 @@ impl WorkflowContext {
         self.match_history(|m| {
             m.deprecate_patch(patch_id);
         });
+        // Issue #1984: a scope that replays a cancel holds the gate markers of
+        // that cycle as captured records. The deprecation drops them there too.
+        crate::cancellation_scope::drop_captured_gate(
+            &self.live_scopes.lock().expect("live scopes lock poisoned"),
+            patch_id,
+        );
+    }
+
+    /// Whether this replay cycle deprecated the gate `patch_id` (issue #1984).
+    pub(crate) fn patch_is_deprecated(&self, patch_id: &str) -> bool {
+        self.match_history_unpumped(|m| m.patch_is_deprecated(patch_id))
     }
 
     // ── Saga compensation observability (issue #801) ──────────────────

@@ -6167,6 +6167,11 @@ impl HistoryMatcher {
     /// execution (empty history) the memo is `false`, so a residual
     /// `patched(id)` treats post-deprecation runs as unpatched — the
     /// documented footgun whose fix is deleting the residual call.
+    /// Whether this replay cycle deprecated the gate `patch_id` (issue #1984).
+    pub(crate) fn patch_is_deprecated(&self, patch_id: &str) -> bool {
+        self.deprecated_patches.contains_key(patch_id)
+    }
+
     pub fn deprecate_patch(&mut self, patch_id: &str) -> bool {
         if let Some(&present) = self.deprecated_patches.get(patch_id) {
             return present;
