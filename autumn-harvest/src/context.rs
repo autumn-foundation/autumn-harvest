@@ -2905,6 +2905,18 @@ struct BufferedCommand {
     scopes: Vec<u32>,
 }
 
+/// How a pending cancel request shows to the workflow body (issue #1984).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCancel {
+    /// No pending request. A cancellation reason, if any, is recorded.
+    None,
+    /// A pending request. A non-cancellable block hides it from its body.
+    Pending,
+    /// A pending request while the history holds an open block. The body
+    /// does not see it, so a check before the block replays as it ran.
+    BehindOpenBlock,
+}
+
 /// Context passed to every workflow function.
 ///
 /// In **replay mode** (resuming from Postgres history): commands are matched
@@ -3205,12 +3217,9 @@ pub struct WorkflowContext {
     /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
     /// expected to consult these at strategic points to run cleanup logic.
     cancellation_reason: Option<String>,
-    /// `true` when `cancellation_reason` is a pending request, not a recorded
-    /// `WorkflowCancelled` (issue #1984). A non-cancellable block hides it.
-    cancellation_pending: bool,
-    /// `true` when the history holds an open non-cancellable block at a
-    /// pending request (issue #1984). The body does not see the request then.
-    pending_behind_open_block: bool,
+    /// Whether `cancellation_reason` is a pending request, not a recorded
+    /// `WorkflowCancelled`, and where the body sees it (issue #1984).
+    cancellation_pending: PendingCancel,
     /// When `true`, activity and local-activity dispatch compares the input
     /// payload against what was recorded in history, in addition to the name.
     /// Set by the `WorkflowReplayer` to detect non-deterministic input changes.
@@ -3822,8 +3831,7 @@ impl WorkflowContext {
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
-            cancellation_pending: false,
-            pending_behind_open_block: false,
+            cancellation_pending: PendingCancel::None,
             strict_replay: false,
             canary_mode: false,
             update_dispatch: None,
@@ -4019,8 +4027,7 @@ impl WorkflowContext {
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
-            cancellation_pending: false,
-            pending_behind_open_block: false,
+            cancellation_pending: PendingCancel::None,
             strict_replay: false,
             canary_mode: false,
             update_dispatch: None,
@@ -4106,8 +4113,7 @@ impl WorkflowContext {
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason: None,
-            cancellation_pending: false,
-            pending_behind_open_block: false,
+            cancellation_pending: PendingCancel::None,
             strict_replay: false,
             canary_mode: false,
             update_dispatch: None,
@@ -4420,15 +4426,20 @@ impl WorkflowContext {
     #[must_use]
     pub fn with_pending_cancellation(mut self, reason: Option<String>) -> Self {
         if self.cancellation_reason.is_none() {
-            self.cancellation_pending = reason.is_some();
+            self.cancellation_pending = if reason.is_none() {
+                PendingCancel::None
+            } else if self
+                .matcher
+                .lock()
+                .expect("matcher lock poisoned")
+                .open_non_cancellable_blocks()
+                > 0
+            {
+                PendingCancel::BehindOpenBlock
+            } else {
+                PendingCancel::Pending
+            };
             self.cancellation_reason = reason;
-            self.pending_behind_open_block = self.cancellation_pending
-                && self
-                    .matcher
-                    .lock()
-                    .expect("matcher lock poisoned")
-                    .open_non_cancellable_blocks()
-                    > 0;
         }
         self
     }
@@ -5373,10 +5384,10 @@ impl WorkflowContext {
 
     /// The cancellation reason that the workflow body sees (issue #1984).
     fn visible_cancellation_reason(&self) -> Option<&str> {
-        if self.pending_behind_open_block {
+        if self.cancellation_pending == PendingCancel::BehindOpenBlock {
             return None;
         }
-        if self.cancellation_pending
+        if self.cancellation_pending == PendingCancel::Pending
             && self
                 .scope_stack
                 .lock()
