@@ -1280,7 +1280,7 @@ All six lower onto the single append-only `WorkflowEvent::SideEffectRecorded { k
 
 ### Run metadata — `ctx.info()` (issue #698)
 
-`ctx.info()` is the replay-safe, zero-footprint accessor for a workflow run's own **system** metadata — the identifiers operators and traces already key on, which author code previously could not see. It returns a `WorkflowExecutionInfo` bundling seven fields: `execution_id`, `workflow_id`, `workflow_type`, `start_time`, `history_event_count`, `is_replaying`, and `parent_execution_id`.
+`ctx.info()` is the replay-safe, zero-footprint accessor for a workflow run's own **system** metadata — the identifiers operators and traces already key on, which author code previously could not see. It returns a `WorkflowExecutionInfo` bundling nine fields: `execution_id`, `workflow_id`, `workflow_type`, `start_time`, `history_event_count`, `is_replaying`, `parent_execution_id`, `start_source` and `continued_from`. The last two come from the row columns `start_source` and `continued_from_exec_id` (issue #2082). `start_source` is `Unknown` for a run from before the engine recorded it. `continued_from` is the predecessor of a continue-as-new run.
 
 ```rust
 #[workflow]

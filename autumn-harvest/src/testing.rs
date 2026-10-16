@@ -436,6 +436,11 @@ pub struct WorkflowReplayer {
     /// A [`HistorySnapshot`] that carries its own `parent_execution_id` overrides
     /// this global. `None` (the default) models a top-level run.
     parent_execution_id: Option<ExecutionId>,
+    /// How the replayed run started (issue #2082). It lives in the execution
+    /// row, not in a `WorkflowEvent`. Set it with
+    /// [`with_start_provenance`](Self::with_start_provenance) so a workflow that
+    /// branches on `ctx.info().start_source` replays like the live run.
+    start_provenance: crate::types::StartProvenance,
     /// Effective business-level `workflow_id` threaded into the replayed
     /// `WorkflowContext` (issue #698). `workflow_id` lives in no `WorkflowEvent`, so
     /// a raw-events fixture cannot recover it; set it with
@@ -555,6 +560,7 @@ struct DeclarativeHandlerRefs<'a> {
     queries: Vec<&'a crate::info::QueryHandlerInfo>,
     updates: Vec<&'a crate::info::UpdateHandlerInfo>,
     router: Option<&'a crate::shard::ShardRouter>,
+    start_provenance: crate::types::StartProvenance,
 }
 
 impl<'a> DeclarativeHandlerRefs<'a> {
@@ -564,6 +570,7 @@ impl<'a> DeclarativeHandlerRefs<'a> {
             queries: &self.queries,
             updates: &self.updates,
             router: self.router,
+            start_provenance: self.start_provenance,
         }
     }
 }
@@ -613,6 +620,7 @@ impl WorkflowReplayer {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             execution_timeout: None,
             parent_execution_id: None,
+            start_provenance: crate::types::StartProvenance::default(),
             workflow_id: None,
             queue_name: None,
             build_id: None,
@@ -676,6 +684,18 @@ impl WorkflowReplayer {
     #[must_use]
     pub const fn with_parent_execution_id(mut self, parent: Option<ExecutionId>) -> Self {
         self.parent_execution_id = parent;
+        self
+    }
+
+    /// Set how the replayed run started (issue #2082).
+    ///
+    /// The `start_source` and `continued_from_exec_id` row columns hold it, and
+    /// no `WorkflowEvent` does. A workflow that branches on
+    /// `ctx.info().start_source` needs it to replay like the live run. The
+    /// default is an unknown source with no predecessor.
+    #[must_use]
+    pub const fn with_start_provenance(mut self, provenance: crate::types::StartProvenance) -> Self {
+        self.start_provenance = provenance;
         self
     }
 
@@ -827,6 +847,7 @@ impl WorkflowReplayer {
             queries: self.declarative_queries.iter().collect(),
             updates: self.declarative_updates.iter().collect(),
             router: self.shard_router.as_ref(),
+            start_provenance: self.start_provenance,
         }
     }
 
@@ -4847,6 +4868,8 @@ fn fixture_replayer(
         // still wins, so a deadline-aware fixture is validated either way.
         execution_timeout: defaults.execution_timeout,
         parent_execution_id: defaults.parent_execution_id,
+        // A fixture holds no row, so the verifier replays with an unknown source.
+        start_provenance: crate::types::StartProvenance::default(),
         workflow_id: defaults.workflow_id.clone(),
         // Issue #798 fallback: a snapshot carrying its own `queue_name` still
         // wins, so an exported fixture is validated against its real queue.
@@ -5189,6 +5212,8 @@ pub struct TestRunOutcome {
     /// reported as a FALSE non-determinism. `None` (the default) models a
     /// top-level run.
     parent_execution_id: Option<ExecutionId>,
+    /// How the producing run started (issue #2082). `replay_check` re-applies it.
+    start_provenance: crate::types::StartProvenance,
     /// The logical workflow type name carried from the producing `WorkflowTestEnv`
     /// (issue #698, Codex P2). `replay_check` uses it for BOTH the replay
     /// snapshot's `workflow_name` AND the handler-registration key — otherwise the
@@ -5445,6 +5470,8 @@ impl TestRunOutcome {
         if let Some(execution_timeout) = self.execution_timeout {
             replayer = replayer.with_execution_timeout(execution_timeout);
         }
+        // Issue #2082: the live run saw this provenance via span_meta.
+        replayer = replayer.with_start_provenance(self.start_provenance);
         // Issue #798: carry the producing env's build id. Unlike `workflow_id` /
         // `queue_name` above this rides the *replayer*, not the snapshot, because
         // `HistorySnapshot` deliberately carries no build id (a fixture-sourced
@@ -6003,6 +6030,9 @@ pub struct WorkflowTestEnv {
     /// (issue #698) so a no-DB test can prove `ctx.info().parent_execution_id` /
     /// `ctx.parent_execution_id()`. `None` (the default) models a top-level run.
     parent_execution_id: Option<ExecutionId>,
+    /// How the run under test started (issue #2082). The default is an unknown
+    /// source with no predecessor.
+    start_provenance: crate::types::StartProvenance,
     /// Canned `await_external_workflow` outcomes (issue #757): target → the
     /// target's `COMPLETED` output. An awaited target present here resolves to
     /// `Ok(output)`.
@@ -6068,6 +6098,7 @@ impl WorkflowTestEnv {
             execution_timeout: None,
             workflow_log_policy: None,
             parent_execution_id: None,
+            start_provenance: crate::types::StartProvenance::default(),
             external_await_results: HashMap::new(),
             external_await_failures: HashMap::new(),
             mutex_contended: HashSet::new(),
@@ -6453,6 +6484,17 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Set how the run under test started (issue #2082).
+    ///
+    /// Threaded into `ctx.info().start_source` and `ctx.info().continued_from`.
+    /// `replay_check` replays under the same value. The default is an unknown
+    /// source with no predecessor.
+    #[must_use]
+    pub const fn with_start_provenance(mut self, provenance: crate::types::StartProvenance) -> Self {
+        self.start_provenance = provenance;
+        self
+    }
+
     /// Set the effective `execution_timeout` budget for the contexts this env
     /// builds (issue #772), so `ctx.deadline()` /
     /// `ctx.should_continue_as_new()` can reason about deadline-aware
@@ -6602,6 +6644,7 @@ impl WorkflowTestEnv {
             && self.queue_name.is_empty()
             && self.execution_timeout.is_none()
             && self.parent_execution_id.is_none()
+            && self.start_provenance == crate::types::StartProvenance::default()
             // Issue #798: without this a `with_build_id`-only env falls into the
             // `None` arm and the configured build never reaches the live context,
             // so `ctx.build_id()` reports `None` on both sides — self-consistent,
@@ -6633,6 +6676,7 @@ impl WorkflowTestEnv {
             // Issue #698: thread the configured parent so `ctx.info()` /
             // `ctx.parent_execution_id()` report it inside the test run.
             parent_execution_id: self.parent_execution_id,
+            start_provenance: self.start_provenance,
             // `with_cancellation` records the cancel as an event.
             cancellation_reason: None,
         })
@@ -6706,6 +6750,7 @@ impl WorkflowTestEnv {
             execution_timeout: self.execution_timeout,
             // Issue #698: carry the spawning-parent id for replay_check.
             parent_execution_id: self.parent_execution_id,
+            start_provenance: self.start_provenance,
             // Issue #698: carry the configured workflow type and business id
             // for replay_check.
             workflow_name: self.workflow_name.clone(),

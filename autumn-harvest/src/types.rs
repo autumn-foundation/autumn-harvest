@@ -1068,6 +1068,20 @@ impl StartSource {
         }
     }
 
+    /// Whether a caller of this start path chooses the run input.
+    ///
+    /// A keyed entity treats such an input as untrusted. The engine builds the
+    /// input of a continue-as-new run. An operator sets the input of a reset or
+    /// a re-run. [`Self::Unknown`] is a run from before the source was
+    /// recorded, so it counts as trusted.
+    #[must_use]
+    pub const fn carries_caller_input(&self) -> bool {
+        !matches!(
+            self,
+            Self::ContinueAsNew | Self::Reset | Self::Rerun | Self::Unknown
+        )
+    }
+
     /// Parse a stored/source string into a [`StartSource`].
     ///
     /// Unrecognized input maps to [`StartSource::Unknown`] and never errors, so
@@ -1092,6 +1106,53 @@ impl StartSource {
             "outbox" => Self::Outbox,
             "transactional" => Self::Transactional,
             _ => Self::Unknown,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StartProvenance
+// ---------------------------------------------------------------------------
+
+/// Where a run came from (issue #2082).
+///
+/// Workflow code reads it through `ctx.info()`. It comes from the execution
+/// row, which never changes after the insert, so a replay sees the same value.
+/// The default is an unknown source with no predecessor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StartProvenance {
+    /// How the run started.
+    pub source: StartSource,
+    /// The run that continued as new into this one. `None` for any other start.
+    pub continued_from: Option<ExecutionId>,
+}
+
+impl StartProvenance {
+    /// A start from `source` with no predecessor.
+    #[must_use]
+    pub const fn fresh(source: StartSource) -> Self {
+        Self {
+            source,
+            continued_from: None,
+        }
+    }
+
+    /// A continue-as-new successor of `predecessor`.
+    #[must_use]
+    pub const fn continued_from(predecessor: ExecutionId) -> Self {
+        Self {
+            source: StartSource::ContinueAsNew,
+            continued_from: Some(predecessor),
+        }
+    }
+
+    /// Read the provenance from the `start_source` and `continued_from_exec_id`
+    /// columns. A missing or unknown source maps to [`StartSource::Unknown`].
+    #[must_use]
+    pub fn from_row(start_source: Option<&str>, continued_from: Option<Uuid>) -> Self {
+        Self {
+            source: start_source.map_or(StartSource::Unknown, StartSource::from_str),
+            continued_from: continued_from.map(ExecutionId::from_uuid),
         }
     }
 }

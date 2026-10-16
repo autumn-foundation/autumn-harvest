@@ -1120,10 +1120,12 @@ route and no table.
   one of them for an entity type may create an entity under any key. That
   caller may also send any operation to it, a delete included. Cancel,
   terminate and reset end or rewind an entity like any workflow.
-- **The start input is trusted.** Signal-with-start passes `start_input` to a
-  new run as its checkpoint. A caller can set the first state and pending
-  operations that way. Validate state in the handler if callers are not
-  trusted.
+- **A client cannot set the first state.** `Entity::run` drops the input of a
+  start that a caller chose, such as signal-with-start or the start route. It
+  keeps the checkpoint only for a continue-as-new, reset or re-run. A run with
+  no recorded start source keeps its input. `Entity::trust_start_input` turns
+  the drop off. Do it only when every caller that can start the entity is
+  trusted (issue #2082).
 - **Reads are not admin-gated.** The by-id query route
   `GET /workflows/by-id/{name}/{key}/query/harvest.entity.state` returns the
   full state. It is a read route like `GET /workflows/{id}`, and it is not

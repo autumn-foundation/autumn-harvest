@@ -29,7 +29,8 @@ use crate::replay::{
 use crate::signal_handler::{BoxSignalHandler, SignalHandlerRegistry, invoke_signal_handler};
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
-    ExternalSignalId, ExternalTarget, IdempotencyKey, SessionId, TimerId, UpdateId,
+    ExternalSignalId, ExternalTarget, IdempotencyKey, SessionId, StartProvenance, StartSource,
+    TimerId, UpdateId,
 };
 use crate::update::{BoxUpdateHandler, BoxUpdateValidator, UpdateRegistry};
 
@@ -3235,6 +3236,12 @@ pub struct WorkflowContext {
     /// query/update throwaway (`new_for_handler`), replayer, and test contexts
     /// that never went through the worker.
     parent_execution_id: Option<ExecutionId>,
+    /// How this run started and which run it continued from (issue #2082).
+    /// Threaded from the execution row's `start_source` and
+    /// `continued_from_exec_id` columns. The row never changes after the insert,
+    /// so the value is replay-stable. Unknown for contexts that never went
+    /// through the worker.
+    start_provenance: StartProvenance,
 }
 
 /// A read-only, replay-safe snapshot of a workflow run's system metadata
@@ -3274,6 +3281,8 @@ pub struct WorkflowContext {
 /// - `is_replaying` → **(c)** observability-only — the replay indicator itself
 ///   (carved out of the branch-safe guarantee below).
 /// - `parent_execution_id` → **(a)** threaded — the row `parent_id` column.
+/// - `start_source`, `continued_from` → **(a)** threaded — the row `start_source`
+///   and `continued_from_exec_id` columns (issue #2082).
 ///
 /// ```rust,ignore
 /// #[workflow]
@@ -3326,6 +3335,13 @@ pub struct WorkflowExecutionInfo {
     /// The execution id of the parent workflow that spawned this run, or `None`
     /// for a top-level run ("no parent").
     pub parent_execution_id: Option<ExecutionId>,
+    /// How this run started (issue #2082). [`StartSource::Unknown`] when the
+    /// source is not recorded, as for a run from before the column existed.
+    /// A continue-as-new successor reports [`StartSource::ContinueAsNew`].
+    pub start_source: StartSource,
+    /// The run that continued as new into this one, or `None` (issue #2082).
+    /// It is `Some` for a continue-as-new or cross-type continuation successor.
+    pub continued_from: Option<ExecutionId>,
 }
 
 /// RAII guard returned by `WorkflowContext::hold_signal_pump` (issue #1252).
@@ -3753,6 +3769,7 @@ impl WorkflowContext {
             timer_clock_elapsed_secs: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
+            start_provenance: StartProvenance::default(),
         }
     }
 
@@ -3941,6 +3958,7 @@ impl WorkflowContext {
             timer_clock_elapsed_secs: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
+            start_provenance: StartProvenance::default(),
         })
     }
 
@@ -4019,6 +4037,7 @@ impl WorkflowContext {
             timer_clock_elapsed_secs: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
+            start_provenance: StartProvenance::default(),
         }
     }
 
@@ -4246,6 +4265,20 @@ impl WorkflowContext {
     #[must_use]
     pub const fn with_parent_execution_id(mut self, parent: Option<ExecutionId>) -> Self {
         self.parent_execution_id = parent;
+        self
+    }
+
+    /// Set how this run started and which run it continued from (issue #2082).
+    ///
+    /// Threaded by the executor from
+    /// [`WorkflowExecuteSpanMeta::start_provenance`](crate::executor::WorkflowExecuteSpanMeta),
+    /// which the worker reads from the execution row. The default is an unknown
+    /// source with no predecessor. Surfaced through [`info()`](Self::info),
+    /// [`start_source()`](Self::start_source) and
+    /// [`continued_from()`](Self::continued_from).
+    #[must_use]
+    pub const fn with_start_provenance(mut self, provenance: StartProvenance) -> Self {
+        self.start_provenance = provenance;
         self
     }
 
@@ -4555,6 +4588,18 @@ impl WorkflowContext {
         self.parent_execution_id
     }
 
+    /// How this run started (issue #2082).
+    #[must_use]
+    pub const fn start_source(&self) -> StartSource {
+        self.start_provenance.source
+    }
+
+    /// The run that continued as new into this one, or `None` (issue #2082).
+    #[must_use]
+    pub const fn continued_from(&self) -> Option<ExecutionId> {
+        self.start_provenance.continued_from
+    }
+
     /// A read-only, replay-safe snapshot of this run's system metadata
     /// (issue #698).
     ///
@@ -4623,6 +4668,8 @@ impl WorkflowContext {
             history_event_count,
             is_replaying,
             parent_execution_id: self.parent_execution_id(),
+            start_source: self.start_source(),
+            continued_from: self.continued_from(),
         }
     }
 
@@ -14091,6 +14138,7 @@ impl WorkflowContext {
         // `new_for_handler` inits it to `None`; without this the update-handler
         // path (unlike the workflow body) would never see the parent.
         let parent_execution_id = self.parent_execution_id;
+        let start_provenance = self.start_provenance;
         // Issue #1991: the test harness clock. The handler reads it when it
         // runs, so its `ctx.now()` matches the workflow body.
         #[cfg(any(test, feature = "testing"))]
@@ -14122,6 +14170,7 @@ impl WorkflowContext {
                 inner.current_shard_id = current_shard_id;
                 // Issue #698: inherit the spawning parent's execution id.
                 inner.parent_execution_id = parent_execution_id;
+                inner.start_provenance = start_provenance;
                 #[cfg(any(test, feature = "testing"))]
                 {
                     inner.timer_clock_elapsed_secs = timer_clock.as_ref().map(snapshot_timer_clock);
@@ -14204,6 +14253,7 @@ impl WorkflowContext {
                 // Issue #698: inherit the spawning parent's execution id so
                 // `ctx.info().parent_execution_id` is visible inside the handler.
                 inner.parent_execution_id = self.parent_execution_id;
+                inner.start_provenance = self.start_provenance;
                 #[cfg(any(test, feature = "testing"))]
                 {
                     inner.timer_clock_elapsed_secs = self

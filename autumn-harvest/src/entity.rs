@@ -179,8 +179,10 @@ pub struct EntityStats {
 /// A new entity starts from `{}` or `null`. A checkpoint writes the state,
 /// the operations that still wait, and the counters.
 ///
-/// The start input is trusted. A caller who may start the workflow may set
-/// the first state and pending operations. Send `{}` from clients.
+/// [`Entity::run`] drops the input of a start that a caller chose, such as a
+/// start route or a signal-with-start (issue #2082). Only a continue-as-new run
+/// keeps its checkpoint. A run with no recorded source also keeps it. Use
+/// [`Entity::initial_state`] to seed a fresh entity from code.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(bound(serialize = "S: Serialize"))]
 pub struct EntityCheckpoint<S> {
@@ -250,6 +252,8 @@ pub struct Entity<'a, S> {
     ctx: &'a WorkflowContext,
     checkpoint: EntityCheckpoint<S>,
     max_ops_per_run: Option<u64>,
+    initial_state: Option<S>,
+    trust_start_input: bool,
 }
 
 impl<'a, S> Entity<'a, S>
@@ -263,7 +267,31 @@ where
             ctx,
             checkpoint,
             max_ops_per_run: None,
+            initial_state: None,
+            trust_start_input: false,
         }
+    }
+
+    /// Start a fresh entity from `state`, not from `S::default()`.
+    ///
+    /// The code sets this state, so it is trusted. A continue-as-new run
+    /// ignores it and keeps the state of its checkpoint. A change to `state`
+    /// changes replay, so version it.
+    #[must_use]
+    pub fn initial_state(mut self, state: S) -> Self {
+        self.initial_state = Some(state);
+        self
+    }
+
+    /// Keep the input of a fresh start as the checkpoint.
+    ///
+    /// By default a run that a caller started drops that input and starts from
+    /// [`initial_state`](Self::initial_state) or `S::default()`. Use this
+    /// only when every caller that can start the entity is trusted.
+    #[must_use]
+    pub const fn trust_start_input(mut self) -> Self {
+        self.trust_start_input = true;
+        self
     }
 
     /// Take a checkpoint after `n` operations in one run.
@@ -314,8 +342,16 @@ where
             ctx,
             mut checkpoint,
             max_ops_per_run,
+            initial_state,
+            trust_start_input,
         } = self;
-        // The start input is trusted, but its error must obey the bound too.
+        // A caller chose the input of a fresh start, so drop it (issue #2082).
+        // A run with no recorded source keeps its input: it can be an entity
+        // that started before the engine recorded the source.
+        if !trust_start_input && ctx.start_source().carries_caller_input() {
+            checkpoint = EntityCheckpoint::with_state(initial_state.unwrap_or_default());
+        }
+        // A kept input is trusted, but its error must obey the bound too.
         checkpoint.stats.last_error = checkpoint.stats.last_error.take().map(bound_error);
         let mut waiting: VecDeque<Value> = std::mem::take(&mut checkpoint.pending).into();
         let published = Arc::new(Mutex::new(Published::of(&checkpoint)));
