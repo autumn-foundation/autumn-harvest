@@ -1143,6 +1143,31 @@ async fn a_copy_of_a_legacy_reset_references_its_blobs() {
         );
         assert_eq!(keys, source_keys, "{copy} references the blob");
     }
+
+    // Once no run references the blob, retention can delete it. A copy would
+    // name a blob that may be gone, so the fork is refused.
+    diesel::delete(
+        harvest_payload_refs::table.filter(harvest_payload_refs::blob_key.eq(&source_keys[0])),
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop every reference");
+    let refused = fork_workflow_execution(
+        &mut conn,
+        legacy,
+        request(ForkEffects::Live),
+        Some(&offloading),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::HistoryUnavailable { .. }
+            ))
+        ),
+        "a fork that names an unreferenced blob is refused: {refused:?}"
+    );
 }
 
 /// An input override keeps an offloaded carryover as an envelope. The fork

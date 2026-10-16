@@ -79,8 +79,8 @@ impl WorkflowForkRequest {
     fn normalized(mut self) -> Self {
         self.reason = non_empty_or(&self.reason, "workflow fork requested");
         self.operator_id = non_empty_or(&self.operator_id, "unknown");
-        // An explicit empty id stays empty, so the fork refuses it.
-        self.workflow_id = self.workflow_id.map(|id| id.trim().to_string());
+        // A caller-chosen id stays verbatim, as for a start or a rerun. A
+        // blank id is refused later.
         self
     }
 }
@@ -609,7 +609,8 @@ async fn check_shards(
 /// The fork shares the blobs of the source. Its own references keep them
 /// alive after retention deletes the source. Only the rows that the fork
 /// stores count, so a replaced input releases its blob. The blobs of a new
-/// input, `input_refs`, are recorded in the same insert.
+/// input, `input_refs`, are recorded in the same insert. A named blob that no
+/// run references refuses the copy with `HistoryUnavailable`.
 pub(crate) async fn share_payload_refs(
     conn: &mut AsyncPgConnection,
     (source_id, new_exec_id): (ExecutionId, ExecutionId),
@@ -621,6 +622,18 @@ pub(crate) async fn share_payload_refs(
     let keys = shared_keys(copied, kept_input, prefix);
     let mut shared = refs_for_keys(conn, source_id, &keys).await?;
     shared.extend_from_slice(input_refs);
+    // The new input has its own references. Any other key that no run
+    // references can already be gone. The copy would then name a blob that
+    // replay cannot read, so it is refused.
+    if let Some(key) = keys
+        .iter()
+        .find(|key| !shared.iter().any(|blob| &blob.blob_key == *key))
+    {
+        return Err(HarvestError::HistoryUnavailable {
+            exec_id: source_id,
+            reason: format!("no run references payload blob {key}, so retention can delete it"),
+        });
+    }
     crate::store::insert_payload_refs(conn, new_exec_id, &shared).await
 }
 
@@ -1072,12 +1085,13 @@ fn derived_workflow_id(
     workflow_id
 }
 
-/// Refuse an explicit empty workflow id.
+/// Refuse an explicit blank workflow id.
 ///
-/// The start and rerun routes refuse it too (issue #1353). The by-id routes
-/// cannot address an empty id. An omitted id still derives a new one.
+/// The start and rerun routes refuse an empty id too (issue #1353). The by-id
+/// routes cannot address an empty id. A nonblank id is kept verbatim. An
+/// omitted id still derives a new one.
 fn check_workflow_id(workflow_id: Option<&str>) -> Result<(), WorkflowForkError> {
-    if workflow_id.is_some_and(str::is_empty) {
+    if workflow_id.is_some_and(|id| id.trim().is_empty()) {
         return Err(WorkflowForkError::InvalidOverride {
             message: "workflow_id must not be empty; omit it to derive one".to_string(),
         });
@@ -3018,6 +3032,17 @@ mod tests {
         // With no router, the id is derived once, as before.
         let id = derived_workflow_id("orders", "order-7", ShardId::new(0), None);
         assert!(id.starts_with("order-7-fork-"), "{id}");
+    }
+
+    #[test]
+    fn a_padded_workflow_id_is_kept_verbatim() {
+        let request = WorkflowForkRequest {
+            workflow_id: Some(" customer-1 ".to_string()),
+            ..WorkflowForkRequest::default()
+        }
+        .normalized();
+        assert_eq!(request.workflow_id.as_deref(), Some(" customer-1 "));
+        assert!(check_workflow_id(request.workflow_id.as_deref()).is_ok());
     }
 
     #[test]

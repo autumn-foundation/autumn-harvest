@@ -191,6 +191,8 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A fork whose source shard gives no connection returns before any audit row. | The route writes a failed `workflow.fork` row on the default shard, as for the other refusals before the source shard resolves. |
 | A source shard that the router reads but this node has no pool for falls back to the default shard, which answers a false `404`. | The route resolves the source with `db_conn_for_execution_exact`, so that case is a retryable `503`. |
 | A reset from before this change copied envelopes without references. A fork or a reset of it found no reference on its direct source, so it took none. | A key that the source does not reference takes the reference of any run on the shard, locked `FOR SHARE` until the copy commits. |
+| A named blob that no run references any more was copied without a reference, although retention can delete it. | The copy is refused with `HistoryUnavailable` (`410`). The new input of a fork has its own references. |
+| A padded caller `workflow_id` was trimmed, so the fork took a different business key. | A nonblank id is kept verbatim, as for a start or a rerun. A blank id is refused. |
 
 ## 2. Tests
 
