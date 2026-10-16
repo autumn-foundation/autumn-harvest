@@ -429,6 +429,15 @@ fn baseline_lists_the_critical_modules_with_recorded_floors() {
                 "{BASELINE} must record a `{key}` floor in [0, 100] for {name}; found {value:?}"
             );
         }
+        // A module tolerance is for a small module, where one branch is
+        // worth more than the global tolerance. It must stay bounded too.
+        if let Some(own) = module.get("tolerance") {
+            let own = own.as_f64().unwrap_or(-1.0);
+            assert!(
+                own > 0.0 && own <= 2.0,
+                "{BASELINE} `tolerance` of {name} must be in (0, 2] points; found {own}"
+            );
+        }
     }
 }
 

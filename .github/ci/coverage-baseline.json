@@ -1,12 +1,35 @@
 {
   "tolerance": 0.5,
   "modules": {
-    "autumn-harvest/src/codec_rotation.rs": {"lines": null, "branches": null},
-    "autumn-harvest/src/erase.rs": {"lines": null, "branches": null},
-    "autumn-harvest/src/poison_pill.rs": {"lines": null, "branches": null},
-    "autumn-harvest/src/queue.rs": {"lines": null, "branches": null},
-    "autumn-harvest/src/scheduler.rs": {"lines": null, "branches": null},
-    "autumn-harvest/src/timeout.rs": {"lines": null, "branches": null},
-    "autumn-harvest/src/worker.rs": {"lines": null, "branches": null}
+    "autumn-harvest/src/codec_rotation.rs": {
+      "lines": 89.65,
+      "branches": 85.79
+    },
+    "autumn-harvest/src/erase.rs": {
+      "lines": 89.82,
+      "branches": 65.71,
+      "tolerance": 1.5
+    },
+    "autumn-harvest/src/poison_pill.rs": {
+      "lines": 93.08,
+      "branches": 67.71,
+      "tolerance": 1.5
+    },
+    "autumn-harvest/src/queue.rs": {
+      "lines": 98.11,
+      "branches": 77.74
+    },
+    "autumn-harvest/src/scheduler.rs": {
+      "lines": 90.66,
+      "branches": 73.25
+    },
+    "autumn-harvest/src/timeout.rs": {
+      "lines": 93.15,
+      "branches": 79.49
+    },
+    "autumn-harvest/src/worker.rs": {
+      "lines": 92.02,
+      "branches": 75.53
+    }
   }
 }

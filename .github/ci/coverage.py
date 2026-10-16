@@ -176,14 +176,15 @@ def check(baseline, summary):
     """Return one message for each critical module below its floor.
 
     A module fails when its coverage is lower than its floor minus the
-    tolerance. A module with no data fails too. Otherwise a moved or renamed
+    tolerance. A module `tolerance` overrides the global one. A small
+    module needs it, because one branch there is worth more than a point. A module with no data fails too. Otherwise a moved or renamed
     module would leave the gate in silence. A `null` floor is not recorded
     yet, so it passes. The guard forbids a `null` floor in the committed
     baseline.
     """
-    tolerance = baseline["tolerance"]
     found = []
     for path, floors in _module_floors(baseline):
+        tolerance = floors.get("tolerance", baseline["tolerance"])
         row = summary["files"].get(path)
         if not row or not row["lines_total"]:
             found.append(f"{path}: no coverage data")
@@ -264,7 +265,7 @@ def ratchet_markdown(baseline, summary, found, partial=False):
     summary shows no verdict and suggests no new floor.
     """
     out = ["## Critical modules (issue #1818)", ""]
-    out.append(f"Tolerance: {baseline['tolerance']} points.")
+    out.append(f"Tolerance: {baseline['tolerance']} points, unless a module sets its own.")
     out += ["", "| Module | Lines | Floor | Branches | Floor |", "|---|---:|---:|---:|---:|"]
     for path, floors in _module_floors(baseline):
         row = summary["files"].get(path) or {}
@@ -276,7 +277,8 @@ def ratchet_markdown(baseline, summary, found, partial=False):
     if partial:
         out += ["Ratchet skipped: a test job failed, so the coverage of this run is partial.", ""]
         return "\n".join(out)
-    if all(v is None for _, floors in _module_floors(baseline) for v in floors.values()):
+    floors_set = [f.get(k) for _, f in _module_floors(baseline) for k in ("lines", "branches")]
+    if all(v is None for v in floors_set):
         out += ["No floor is recorded yet. The ratchet checks only that each module has data.", ""]
     out += [f"- FAIL: {m}" for m in found] or ["No critical module is below its floor."]
     if raised(baseline, summary) != baseline:
@@ -485,6 +487,14 @@ def self_test():
     assert "| `autumn-harvest` | 50.00% | 100.00% |" in text, text
     assert "| `autumn-harvest/src/erase.rs` | 0.00% (0/1) | n/a (0/0) |" in text, text
     assert "| `.` |" in files_markdown({"src/lib.rs": erase}), "a root crate"
+
+    # A module tolerance overrides the global one, and `raised` keeps it.
+    small = base({"autumn-harvest/src/queue.rs": {"lines": 66.67, "branches": 100.0}})
+    one_branch = {"files": {"autumn-harvest/src/queue.rs": dict(files["autumn-harvest/src/queue.rs"], branches_pct=98.6)}}
+    assert len(check(small, one_branch)) == 1
+    small["modules"]["autumn-harvest/src/queue.rs"]["tolerance"] = 1.5
+    assert check(small, one_branch) == []
+    assert raised(small, summary)["modules"]["autumn-harvest/src/queue.rs"]["tolerance"] == 1.5
 
     # Float error must not move a floor or the tolerance edge.
     assert _round_down(37.8) == 37.8 and _round_down(19.49) == 19.49

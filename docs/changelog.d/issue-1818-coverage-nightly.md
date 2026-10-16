@@ -30,7 +30,9 @@ module drops more than the tolerance below its floor, or has no data. The
 ratchet runs only when every test job passed, because a failed test cuts
 coverage short. The summary of such a run shows "Ratchet skipped".
 `coverage.py ratchet --update` raises the floors and never lowers one. The
-first floors are the lowest value of each module over the PR runs.
+first floors come from the first complete PR run. The global tolerance is
+0.5 points. `erase.rs` and `poison_pill.rs` set 1.5, because one branch
+there is worth more than one point.
 
 **Tests.** `coverage_nightly_wiring.rs` checks the cron, the toolchain, the
 shards, the artifacts, the ratchet step, the alert job and the baseline.

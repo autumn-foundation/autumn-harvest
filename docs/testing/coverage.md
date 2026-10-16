@@ -73,9 +73,12 @@ fails every night therefore turns the gate off. Fix that shard first.
 A failed scheduled run opens the issue "Coverage nightly: a scheduled run
 failed", or comments on it. The comment names the result of each job.
 
-The first floors are the lowest value of each module over the runs of the
-PR that added the nightly. The tolerance covers the jitter between those
-runs.
+The global `tolerance` is 0.5 points. A module can set its own
+`tolerance`, up to 2 points. `erase.rs` and `poison_pill.rs` use 1.5,
+because one branch there is worth more than one point.
+
+The first floors come from the first complete run of the PR that added the
+nightly. The later runs of that PR check them against the tolerance.
 
 ### Raise a floor
 

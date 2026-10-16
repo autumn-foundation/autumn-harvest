@@ -115,8 +115,9 @@ Stdlib only. Subcommands:
 ### 1.3 Baseline `.github/ci/coverage-baseline.json`
 
 Each critical module has a line floor and a branch floor, in percent. The
-`tolerance` field sets the allowed jitter in points. A drop below
-`floor - tolerance` fails. A module with no data fails.
+`tolerance` field sets the allowed jitter in points. A module can set its
+own `tolerance`. A drop below `floor - tolerance` fails. A module with no
+data fails.
 
 ### 1.4 Guard `autumn-harvest/tests/integration/coverage_nightly_wiring.rs`
 
@@ -128,8 +129,15 @@ rejects the softened forms that review found.
 ### 1.5 Baseline period
 
 The issue asks for a baseline period before the gate. The PR runs of this
-change are that period. Each floor is the lowest value of its module over
-those runs. The tolerance covers the jitter between them.
+change are that period. The floors come from the first complete run. Each
+later run checks them, and a floor drops to the lower value if jitter
+breaks it.
+
+One branch of `erase.rs` is 1.43 points, and one of `poison_pill.rs` is
+1.04 points. A global 0.5-point tolerance fails those modules on one
+flipped branch. A global 1.5 lets about 39 branches of `worker.rs` drop in
+silence. So the baseline keeps 0.5 and gives those two modules their own
+`tolerance` of 1.5.
 
 ## 2. Out of scope
 
