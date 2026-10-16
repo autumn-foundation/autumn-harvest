@@ -689,6 +689,20 @@ async fn takes_the_lock(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
     Ok(1)
 }
 
+/// Spawns a detached child under `request_cancel`, waits for `go`, then
+/// panics on every run.
+#[workflow]
+async fn spawns_then_panics(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.spawn_child_workflow_detached_raw(
+        "waits_for_go",
+        json!(0),
+        ParentClosePolicy::RequestCancel,
+    )
+    .map_err(|e| e.to_string())?;
+    let _: Value = ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+    panic!("kaboom")
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn runtime() -> SqliteRuntime {
@@ -766,6 +780,7 @@ fn fixtures() -> Vec<WorkflowInfo> {
         spawns_retried_child_info(),
         holds_the_lock_info(),
         takes_the_lock_info(),
+        spawns_then_panics_info(),
     ]
 }
 
@@ -2532,4 +2547,29 @@ async fn a_hard_cancelled_holder_releases_its_mutex() {
     assert!(matches!(state, RunState::Completed(_)), "{state:?}");
     let row = rt.describe(holder).unwrap();
     assert!(row.summary.closed_at.value().is_some(), "{row:?}");
+}
+
+/// The final panic strike counts the cascade events of its close, as the
+/// failure arm does. A parent that would pass the cap fails at the cap.
+#[tokio::test]
+async fn the_final_panic_strike_counts_cascade_events() {
+    let mut rt = runtime();
+    // `WorkflowStarted`, `ChildWorkflowSpawnedDetached` and `SignalReceived`
+    // come first. The cascade event then reaches the cap.
+    rt.set_history_event_hard_cap(Some(4));
+    let parent = rt.start_workflow("spawns_then_panics", json!(0)).unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    rt.send_signal(parent, "go", json!(1)).unwrap();
+
+    let state = loop {
+        match rt.run_until_blocked(parent).await {
+            Err(SqliteError::WorkflowPanicked { .. }) => {}
+            other => break other.unwrap(),
+        }
+    };
+
+    assert!(
+        matches!(state, RunState::Failed(ref m) if m.contains("HistoryCapExceeded")),
+        "{state:?}"
+    );
 }

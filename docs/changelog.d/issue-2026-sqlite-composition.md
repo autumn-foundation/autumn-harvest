@@ -95,7 +95,7 @@ does.
   external events first. Each event is the same, and replay accepts both
   orders.
 
-**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 62
+**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 63
 tests. Each test replays every history it asserts on the core
 `WorkflowReplayer`, with the run's ids. They cover:
 
@@ -114,8 +114,8 @@ tests. Each test replays every history it asserts on the core
 - `join!` of an await and a child in both orders;
 - an operator cancel and a terminate of a child, a terminated await target, a
   child that continues as new, and an await across a continue-as-new;
-- the terminal, cancel and fallback cancel cap checks with and without
-  cascade events, and an update and
+- the terminal, cancel, fallback cancel and final panic cap checks with and
+  without cascade events, and an update and
   a query on a child that read its parent;
 - a parent that passes its `execution_timeout` and cascades to its detached
   child, a child that times out by its declared timeout, a detached child

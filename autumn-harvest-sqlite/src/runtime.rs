@@ -2914,6 +2914,17 @@ impl SqliteRuntime {
             }
         }
 
+        // Issue #2023: the #1804 caps. Each arm that writes checks them inside
+        // its transaction, before its terminal event. The final panic strike
+        // checks them too. Issue #2021: under a pending cancel the cleanup
+        // budget is one more event cap. A suspending batch and a final batch
+        // both stop at it.
+        let caps = CapCheck {
+            policy: self.cancel_policy(budget_end),
+            start_bytes: history_bytes.saturating_add(ingest.bytes()),
+            workflow_type: &workflow_name,
+        };
+
         // Contained workflow-handler panic gate (issue #782 analog), BEFORE any
         // terminal side effect and beside the non-determinism gate below. A
         // `#[workflow]` body that `panic!()`s (rather than returning `Err`) is
@@ -2935,19 +2946,10 @@ impl SqliteRuntime {
             ..
         } = &outcome
         {
-            return self.contain_workflow_panic(exec, &ingest, error, decided_at);
+            let clock = CycleClock { now, decided_at };
+            return self.contain_workflow_panic(exec, &ingest, error, &caps, clock);
         }
         self.workflow_panic_strikes.remove(&exec);
-
-        // Issue #2023: the #1804 caps. Each arm that writes checks them inside
-        // its transaction, before its terminal event. Issue #2021: under a
-        // pending cancel the cleanup budget is one more event cap. A
-        // suspending batch and a final batch both stop at it.
-        let caps = CapCheck {
-            policy: self.cancel_policy(budget_end),
-            start_bytes: history_bytes.saturating_add(ingest.bytes()),
-            workflow_type: &workflow_name,
-        };
 
         // Issue #2021: a pending cancel request ends the run here.
         // - A body that returns `Ok` or `Err` has done its cleanup. Its
@@ -3647,7 +3649,8 @@ impl SqliteRuntime {
         exec: ExecutionId,
         ingest: &worker::SignalIngest,
         error: &str,
-        now: i64,
+        caps: &CapCheck<'_>,
+        clock: CycleClock,
     ) -> SqliteResult<RunState> {
         let strikes = {
             let count = self.workflow_panic_strikes.entry(exec).or_insert(0);
@@ -3670,13 +3673,20 @@ impl SqliteRuntime {
             // The sealing strike replayed the planned signals. Record them, so
             // the terminal history holds the input that caused the panic.
             ingest.apply(&tx, exec)?;
+            // The close writes one cascade event per detached child. The check
+            // counts them, as the failure arm does (issue #2026).
+            let cascade = composition::cascade_event_count(&tx, exec)?;
+            if let Some(reason) = caps.reached_with(&tx, exec, cascade)? {
+                drop(tx);
+                return self.fail_for_history_cap(exec, &reason, clock.now, clock.decided_at);
+            }
             let event = WorkflowEvent::workflow_failed_typed(&decoded);
             store::append_event(&tx, exec, &event)?;
             store::set_failed(&tx, exec, &decoded.message)?;
             // The plan can stop at the cap room. No drive reads the rest, so
             // remove it, as `seal_failed` does.
             queue::delete_undelivered_signals_for_execution(&tx, exec)?;
-            composition::close_execution(&tx, exec, &event, now)?;
+            composition::close_execution(&tx, exec, &event, clock.decided_at)?;
             tx.commit()?;
             Ok(RunState::Failed(decoded.message))
         } else {
