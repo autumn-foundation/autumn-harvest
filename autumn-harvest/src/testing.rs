@@ -56,6 +56,8 @@ use crate::executor::{
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
 use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy, WorkerId};
 
+pub mod sim;
+
 // ---------------------------------------------------------------------------
 // NonDeterminismKind
 // ---------------------------------------------------------------------------
