@@ -1055,3 +1055,46 @@ async fn a_marker_before_a_wait_does_not_run_the_body_again() {
     );
     assert_eq!(outcome.tasks(), 1, "the body ran once");
 }
+
+#[tokio::test]
+async fn a_queued_signal_that_wins_a_race_leaves_no_loser_terminal() {
+    // The signal is in history before the first task, so the race resolves
+    // at once and never dispatches the activity branch. As in the worker,
+    // the harness records no loser terminal for that branch.
+    fn wf(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
+        Box::pin(async move {
+            let winner = ctx
+                .race()
+                .signal("go")
+                .activity_raw("quote_primary", json!({}), "q")
+                .run()
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(winner.index))
+        })
+    }
+    let env = quotes_env().queue_signal("go", json!(true));
+    let default = env.run(wf, json!(null)).await;
+    assert_eq!(default.result, Ok(json!(0)));
+    autumn_harvest::testing::sim::check_legal(default.events())
+        .unwrap_or_else(|rule| panic!("{rule}: {:?}", default.events()));
+    assert!(
+        !default
+            .events()
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::ActivityFailed { .. })),
+        "no terminal for an undispatched loser"
+    );
+
+    // The history is legal, but strict replay of this race shape diverges,
+    // in the default env too. That is engine behaviour, and the guide
+    // records it. The sweep reports it as a replay failure.
+    let failure = env
+        .simulation()
+        .seeds(SeedPlan { first: 0, count: 4 })
+        .sweep(wf, json!(null), |_| {})
+        .await
+        .expect_err("strict replay of this race shape diverges");
+    assert!(failure.reason.contains("does not replay"), "{failure}");
+    assert!(!failure.reason.contains("illegal"), "{failure}");
+}

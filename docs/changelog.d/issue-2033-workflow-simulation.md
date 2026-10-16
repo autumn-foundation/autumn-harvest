@@ -46,10 +46,14 @@ take a `SeedVars`, so both harnesses share one seed parser. `always!` and
 default env now dedups a re-emitted `StartTimer` and `StartChildWorkflow` by
 id, as the worker does. Its order is unchanged.
 
-**Engine findings.** The sim surfaced two engine behaviours that this change
-does not alter. A canary replay of a running activity reports its trailing
-`ActivityStarted` as unconsumed. A cancellable timer await stops its scan at
-an in-flight `ActivityStarted`. The guide lists both.
+**Engine findings.** The sim surfaced three engine behaviours that this
+change does not alter. A canary replay of a running activity reports its
+trailing `ActivityStarted` as unconsumed. A cancellable timer await stops its
+scan at an in-flight `ActivityStarted`. A strict replay of a race that a
+queued signal wins at once diverges. The guide lists all three.
+
+The harness now records a race loser's terminal only for a branch that
+started, as `worker::apply_race_loser_cancellations` does.
 
 The guide is `docs/testing/workflow-simulation.md`.
 

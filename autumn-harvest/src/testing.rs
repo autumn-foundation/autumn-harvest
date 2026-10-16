@@ -6884,7 +6884,12 @@ impl WorkflowTestEnv {
                     children,
                     timers: _,
                 } => {
+                    // A loser that never started needs no terminal, as in
+                    // `worker::apply_race_loser_cancellations`.
                     for activity_id in activities {
+                        if !Self::activity_is_open(history, *activity_id) {
+                            continue;
+                        }
                         history.push(WorkflowEvent::ActivityFailed {
                             activity_id: *activity_id,
                             error: "lost race to a sibling branch".to_string(),
@@ -6895,6 +6900,9 @@ impl WorkflowTestEnv {
                         });
                     }
                     for child_id in children {
+                        if !Self::child_is_open(history, *child_id) {
+                            continue;
+                        }
                         history.push(WorkflowEvent::child_workflow_failed(
                             *child_id,
                             "lost race to a sibling branch".to_string(),
@@ -7402,6 +7410,16 @@ impl WorkflowTestEnv {
             } => {
                 // A timer-only cancel appends no event. The child-timeout race
                 // emits one on every replay, so it is not progress (issue #1991).
+                // A loser that never started needs no terminal, as in
+                // `worker::apply_race_loser_cancellations`.
+                let activities: Vec<_> = activities
+                    .into_iter()
+                    .filter(|id| Self::activity_is_open(history, *id))
+                    .collect();
+                let children: Vec<_> = children
+                    .into_iter()
+                    .filter(|id| Self::child_is_open(history, *id))
+                    .collect();
                 let made_progress = !activities.is_empty() || !children.is_empty();
                 let mut events = Vec::new();
                 for activity_id in activities {
@@ -7552,6 +7570,53 @@ impl WorkflowTestEnv {
                 Ok(true)
             }
         }
+    }
+
+    /// Whether `history` scheduled the activity and holds no terminal for it.
+    fn activity_is_open(history: &[WorkflowEvent], activity_id: ActivityExecId) -> bool {
+        let mut open = false;
+        for event in history {
+            match event {
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: id, ..
+                } if *id == activity_id => {
+                    open = true;
+                }
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityFailed {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityTimedOut {
+                    activity_id: id, ..
+                } if *id == activity_id => {
+                    open = false;
+                }
+                _ => {}
+            }
+        }
+        open
+    }
+
+    /// Whether `history` started the child and holds no terminal for it.
+    fn child_is_open(history: &[WorkflowEvent], child_id: ExecutionId) -> bool {
+        let mut open = false;
+        for event in history {
+            match event {
+                WorkflowEvent::ChildWorkflowStarted { child_id: id, .. } if *id == child_id => {
+                    open = true;
+                }
+                WorkflowEvent::ChildWorkflowCompleted { child_id: id, .. }
+                | WorkflowEvent::ChildWorkflowFailed { child_id: id, .. }
+                    if *id == child_id =>
+                {
+                    open = false;
+                }
+                _ => {}
+            }
+        }
+        open
     }
 
     /// Whether `timer_id` has an active (unfired, uncancelled) `TimerStarted`
