@@ -2477,10 +2477,25 @@ mod tests {
                     ctx.execute_local_activity_raw("big", input, None, None)
                         .await
                 }
-                _ => ctx.spawn_child_workflow_raw("big", input).await,
+                2 => ctx.spawn_child_workflow_raw("big", input).await,
+                3 => ctx
+                    .spawn_child_workflow_timeout("big", input, Duration::from_secs(60))
+                    .await
+                    .map(|_| Value::Null),
+                4 => ctx
+                    .spawn_child_workflow_fan_out_raw(vec![("big".to_string(), input)])
+                    .await
+                    .map(|_| Value::Null),
+                _ => ctx
+                    .race()
+                    .activity_raw("big", input.clone(), "default")
+                    .child_workflow_raw("big", input)
+                    .run()
+                    .await
+                    .map(|_| Value::Null),
             };
         }
-        for kind in 0..3 {
+        for kind in 0..6 {
             let live = WorkflowContext::new_test();
             let result = bounded(run_then_cancel(&live, dispatch(&live, kind))).await;
             assert!(
