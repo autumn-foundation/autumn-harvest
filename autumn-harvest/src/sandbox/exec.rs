@@ -2208,6 +2208,12 @@ mod tests {
     async fn a_background_process_is_killed_when_the_main_process_exits() {
         let out = run(sh("sleep 300 & echo $!")).await;
         let pid: i32 = out.stdout.trim().parse().unwrap();
+        // The run sends `SIGKILL` to the group and does not wait for the
+        // orphan. The kernel can deliver it a moment later on a busy host.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_is_gone(pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         assert!(process_is_gone(pid), "pid {pid} must not outlive the run");
     }
 
