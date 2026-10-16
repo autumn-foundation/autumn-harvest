@@ -740,17 +740,33 @@ async fn resume_republishes_hints_for_tasks_created_during_the_pause() {
         .expect("task row")
         .id;
 
-    // Drop the start's reference, as a parked or lost reference would be.
+    // The background publisher sends the start's hint. Wait for it, then
+    // drop the reference, as a parked or lost reference would be.
+    let published = |channel: &MemoryDispatch| {
+        channel
+            .published_ids()
+            .iter()
+            .filter(|id| **id == task_id)
+            .count()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while published(&channel) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the start never published a hint"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     channel.drop_all();
-    assert!(channel.is_drained());
+    let before = published(&channel);
 
     autumn_harvest::queue_pause::resume_queue(&mut conn, "default", "operator")
         .await
         .expect("resume");
 
-    // The background publisher sends the hint, so poll for it.
+    // The background publisher sends the resume hint, so poll for it.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while channel.is_drained() {
+    while published(&channel) <= before {
         assert!(
             std::time::Instant::now() < deadline,
             "the resume must republish task {task_id}, which the late pass shifted"

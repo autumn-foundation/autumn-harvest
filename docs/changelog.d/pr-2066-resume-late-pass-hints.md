@@ -1,4 +1,4 @@
-## Phase 2066 — Republish tasks shifted by the late resume pass (issue #2066)
+## Phase — Republish tasks shifted by the late resume pass (issue #2066)
 
 `resume_queue` shifts held tasks in two passes. The late pass shifts tasks that
 the first pass cannot see, such as a task created during the pause. The late

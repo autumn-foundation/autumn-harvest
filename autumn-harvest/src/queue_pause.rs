@@ -1404,7 +1404,7 @@ pub async fn resume_queue(
     // emits the level on the `BEGIN`, so it travels with the query. This
     // mirrors `queue::claim_task`, which pins the same level for the same
     // fresh-snapshot reason.
-    // Ids the shift below thawed, collected so the dispatch hints for them are
+    // Ids both shift passes below thawed, collected so the dispatch hints for them are
     // published **after** this transaction commits (issue #1312). Publishing
     // from inside would name rows a channel reader still sees as held.
     let thawed: std::sync::Arc<std::sync::Mutex<Vec<uuid::Uuid>>> =
@@ -2061,7 +2061,7 @@ mod tests {
     fn the_late_resume_pass_returns_the_ids_it_shifts() {
         let late = resume_shift_late_arrivals_query();
         assert!(
-            late.trim_end().ends_with("RETURNING id"),
+            late.starts_with("UPDATE harvest_task_queue") && late.contains("RETURNING id"),
             "pass 2 must return the shifted ids; got:\n{late}"
         );
     }
