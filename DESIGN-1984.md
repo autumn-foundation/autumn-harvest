@@ -149,6 +149,8 @@ cancel reason name it. No other worker path changes.
   in `is_cancelled()`. A shield hides that request, so its cleanup runs.
   SQLite still seals the run `CANCELLED` when the body returns, also after a
   final shield. A body that parks inside an open shield keeps its run. The
-  seal waits until the shield closes, as a Postgres cancel does.
+  seal waits until the shield closes, as a Postgres cancel does. While the
+  history holds an open shield, the body does not see the request at all. A
+  check before the shield then replays as it ran.
 - Local activities and external activities in a scope are not cancelled. The scope still drops the body, and replay consumes a
   late external result.

@@ -2568,6 +2568,34 @@ mod tests {
         );
     }
 
+    /// A history with an open block hides a pending cancel from the whole
+    /// replay, also before the block. A closed block hides nothing there.
+    #[test]
+    fn an_open_block_in_history_hides_a_pending_cancel() {
+        let marker = |name: &str| WorkflowEvent::MarkerRecorded {
+            name: name.into(),
+            details: Value::Null,
+        };
+        let open = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![started(), marker("non_cancellable_open:1")],
+        )
+        .with_pending_cancellation(Some("stop".into()));
+        assert!(!open.is_cancelled());
+        assert!(open.check_cancellation().is_ok());
+
+        let closed = WorkflowContext::for_replay(
+            ExecutionId::new(),
+            vec![
+                started(),
+                marker("non_cancellable_open:1"),
+                marker("non_cancellable_close:1"),
+            ],
+        )
+        .with_pending_cancellation(Some("stop".into()));
+        assert_eq!(closed.cancellation_reason(), Some("stop"));
+    }
+
     /// A withdrawn scope gives back the whole log budget, also for log calls
     /// over the line cap that queued nothing.
     #[tokio::test]

@@ -53,8 +53,9 @@ A scope cannot acquire a durable mutex, or signal, cancel or await an
 external workflow. A scope cannot create a session, spawn a detached child or run an admitted update. Such an update fails at once, and its result survives the cancel. A cancel that finds no open block is
 still terminal at once. A scope does not cancel local activities or external
 activities. On SQLite, a cooperative cancel request is hidden from
-`is_cancelled()` inside a block, so the block's cleanup runs. SQLite does
-not seal a run that parks inside an open block. It still ends such a run
+`is_cancelled()` inside a block, so the block's cleanup runs. While the
+history holds an open block, the request is hidden from the whole replay.
+SQLite does not seal a run that parks inside an open block. It still ends such a run
 `CANCELLED` when the body returns.
 
 **Tests.**

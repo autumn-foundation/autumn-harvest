@@ -89,6 +89,20 @@ async fn shields_a_wait(ctx: &WorkflowContext, n: i64) -> Result<Value, String> 
     ctx.wait_for_signal("done").await.map_err(|e| e.to_string())
 }
 
+/// Runs `step`, checks for a cancel, then waits for `go` in a
+/// non-cancellable block.
+#[workflow]
+async fn checks_then_shields(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity_raw("step", json!(n), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    ctx.check_cancellation().map_err(|e| e.to_string())?;
+    ctx.non_cancellable(ctx.wait_for_signal("go"))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
 /// Sleeps on a one-hour durable timer.
 #[workflow]
 async fn naps(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
@@ -360,6 +374,7 @@ fn register(rt: &mut SqliteRuntime, calls: &Arc<Calls>) {
     rt.register_workflow(&fans_out_mixed_on_cancel_info());
     rt.register_workflow(&fans_out_missing_on_cancel_info());
     rt.register_workflow(&shields_a_wait_info());
+    rt.register_workflow(&checks_then_shields_info());
     let c = Arc::clone(calls);
     rt.register_activity_raw(
         "step",
@@ -558,6 +573,33 @@ async fn cancel_waits_for_an_open_non_cancellable_block() {
         "the run seals after the block closes, got {state:?}"
     );
     assert_eq!(leftover_rows(&path, exec), (0, 0, 0));
+}
+
+/// A check before an open block replays as it ran (issue #1984). The
+/// request stays hidden, so the block completes before the seal.
+#[tokio::test]
+async fn a_check_before_an_open_block_does_not_skip_it() {
+    let (_dir, path) = temp_db();
+    let (mut rt, _calls) = runtime(&path);
+    let exec = start_parked(&mut rt, "checks_then_shields").await;
+
+    rt.cancel(exec, "stop").unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(&state, RunState::WaitingSignal(name) if name == "go"),
+        "the block stays open, got {state:?}"
+    );
+
+    rt.send_signal(exec, "go", json!(1)).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(&state, RunState::Cancelled(reason) if reason == "stop"),
+        "got {state:?}"
+    );
+    let closed = rt.load_history(exec).unwrap().iter().any(|e| {
+        matches!(e, WorkflowEvent::MarkerRecorded { name, .. } if name == "non_cancellable_close:1")
+    });
+    assert!(closed, "the block completes before the seal");
 }
 
 #[tokio::test]

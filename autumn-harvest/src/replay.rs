@@ -6167,6 +6167,12 @@ impl HistoryMatcher {
     /// execution (empty history) the memo is `false`, so a residual
     /// `patched(id)` treats post-deprecation runs as unpatched — the
     /// documented footgun whose fix is deleting the residual call.
+    /// The number of non-cancellable blocks that the history leaves open
+    /// (issue #1984).
+    pub(crate) fn open_non_cancellable_blocks(&self) -> usize {
+        crate::cancellation_scope::open_non_cancellable_blocks(&self.events)
+    }
+
     /// Whether this replay cycle deprecated the gate `patch_id` (issue #1984).
     pub(crate) fn patch_is_deprecated(&self, patch_id: &str) -> bool {
         self.deprecated_patches.contains_key(patch_id)

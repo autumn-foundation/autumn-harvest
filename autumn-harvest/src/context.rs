@@ -3208,6 +3208,9 @@ pub struct WorkflowContext {
     /// `true` when `cancellation_reason` is a pending request, not a recorded
     /// `WorkflowCancelled` (issue #1984). A non-cancellable block hides it.
     cancellation_pending: bool,
+    /// `true` when the history holds an open non-cancellable block at a
+    /// pending request (issue #1984). The body does not see the request then.
+    pending_behind_open_block: bool,
     /// When `true`, activity and local-activity dispatch compares the input
     /// payload against what was recorded in history, in addition to the name.
     /// Set by the `WorkflowReplayer` to detect non-deterministic input changes.
@@ -3820,6 +3823,7 @@ impl WorkflowContext {
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
             cancellation_pending: false,
+            pending_behind_open_block: false,
             strict_replay: false,
             canary_mode: false,
             update_dispatch: None,
@@ -4016,6 +4020,7 @@ impl WorkflowContext {
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
             cancellation_pending: false,
+            pending_behind_open_block: false,
             strict_replay: false,
             canary_mode: false,
             update_dispatch: None,
@@ -4102,6 +4107,7 @@ impl WorkflowContext {
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason: None,
             cancellation_pending: false,
+            pending_behind_open_block: false,
             strict_replay: false,
             canary_mode: false,
             update_dispatch: None,
@@ -4403,11 +4409,26 @@ impl WorkflowContext {
     /// replace a recorded reason. `None` changes nothing. A backend that
     /// rebuilds a context outside the executor, such as for an update, calls
     /// it directly.
+    ///
+    /// Issue #1984: a history with an open non-cancellable block hides the
+    /// request for the whole replay. A check before the block then reads as it
+    /// did when the block opened. The request shows once no block is open.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
     #[must_use]
     pub fn with_pending_cancellation(mut self, reason: Option<String>) -> Self {
         if self.cancellation_reason.is_none() {
             self.cancellation_pending = reason.is_some();
             self.cancellation_reason = reason;
+            self.pending_behind_open_block = self.cancellation_pending
+                && self
+                    .matcher
+                    .lock()
+                    .expect("matcher lock poisoned")
+                    .open_non_cancellable_blocks()
+                    > 0;
         }
         self
     }
@@ -5352,6 +5373,9 @@ impl WorkflowContext {
 
     /// The cancellation reason that the workflow body sees (issue #1984).
     fn visible_cancellation_reason(&self) -> Option<&str> {
+        if self.pending_behind_open_block {
+            return None;
+        }
         if self.cancellation_pending
             && self
                 .scope_stack
