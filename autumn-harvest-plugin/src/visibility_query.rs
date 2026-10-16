@@ -1104,6 +1104,43 @@ mod tests {
     }
 
     #[test]
+    fn number_literals_keep_every_digit_when_bound() {
+        for literal in [
+            "12345678901234567890123",
+            "12345678901234567890124",
+            "18446744073709551616",
+            "1.00000000000000000001",
+            "-9007199254740993.5",
+        ] {
+            for template in [
+                "attrs.a = N",
+                "attrs.a != N",
+                "attrs.a IN (N, 2)",
+            ] {
+                let bound = sql(&template.replace('N', literal));
+                assert!(bound.contains(literal), "{template} lost {literal}: {bound}");
+            }
+        }
+        assert_ne!(
+            sql("attrs.a = 12345678901234567890123"),
+            sql("attrs.a = 12345678901234567890124")
+        );
+        assert_ne!(
+            sql("attrs.a = 1.00000000000000000001"),
+            sql("attrs.a = 1.0")
+        );
+    }
+
+    #[test]
+    fn number_literals_bind_as_valid_json() {
+        // A leading zero is not valid JSON, and Postgres would reject it.
+        let bound = sql("attrs.a = 007.50");
+        assert!(bound.contains("7.50") && !bound.contains("007"), "{bound}");
+        let bound = sql("attrs.a = -0.5e+3");
+        assert!(bound.contains("-0.5e+3"), "{bound}");
+    }
+
+    #[test]
     fn values_that_postgres_rejects_fail_early() {
         assert!(rejected("attrs.a > 1e-2000000000").contains("out of range"));
         assert!(rejected("attrs.a = 1e400").contains("out of range"));
