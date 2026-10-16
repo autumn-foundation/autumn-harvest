@@ -1,0 +1,206 @@
+# Nightly line and branch coverage (issue #1818).
+#
+# - `unit`: the autumn-harvest lib tests, under `cargo llvm-cov`.
+# - `db`: every `linux` row of `.github/ci/integration-suites.txt`, in the
+#   shards of `test-db-linux`. `show-env` instruments the plain `cargo test`
+#   calls of `run-suites.sh`.
+# - Each test job exports `llvm-cov` JSON and converts it into LCOV. The
+#   LCOV exporter of LLVM 23 crashes on this crate (a SIGSEGV in
+#   `CoverageExporterLcov::renderRoot` on `worker.rs`).
+# - `report`: merges the LCOV files of all jobs. It publishes per-module line
+#   and branch coverage as the `coverage-report` artifact and as the run
+#   summary. It then runs the ratchet on the critical modules.
+# - `alert`: a failed scheduled run opens an issue, or comments on the open
+#   one.
+#
+# Branch coverage needs `-Zcoverage-options=branch`, so the test jobs use a
+# dated nightly. `RUSTUP_TOOLCHAIN` wins over `rust-toolchain.toml`. It is
+# set for the whole workflow, because a job `env` cannot read `env`.
+#
+# `autumn-harvest/tests/integration/coverage_nightly_wiring.rs` guards this
+# file. `docs/testing/coverage.md` tells how to read the report and how to
+# raise a floor.
+name: Coverage nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 04:11 UTC, away from the fuzz, proptest and chaos runs.
+    - cron: "11 4 * * *"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [trunk, trunk-dev]
+    paths:
+      - ".github/workflows/coverage-nightly.yml"
+      - ".github/ci/coverage.py"
+      - ".github/ci/coverage-baseline.json"
+
+concurrency:
+  group: coverage-nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # `-eo pipefail`, so a failed command in a pipe fails the step.
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  # The nightly that the fuzz jobs pin. Newer nightlies fail to build the
+  # `db` feature (see `fuzz-nightly.yml`).
+  RUSTUP_TOOLCHAIN: nightly-2026-08-14
+  CARGO_LLVM_COV_VERSION: 0.9.1
+
+jobs:
+  unit:
+    name: Coverage (unit)
+    # Draft-skip, as in ci.yml. A schedule or a dispatch always runs.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: coverage-unit
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
+      - name: Run the lib tests under coverage
+        run: cargo llvm-cov --branch --no-report -p autumn-harvest --all-features --lib
+      - name: Export coverage
+        if: always()
+        run: |
+          cargo llvm-cov report --branch --json --output-path unit.json
+          python3 .github/ci/coverage.py convert unit.json --root "$GITHUB_WORKSPACE" --output unit.lcov
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: coverage-lcov-unit
+          path: unit.lcov
+          if-no-files-found: warn
+          overwrite: true
+
+  db:
+    name: Coverage (db, shard ${{ matrix.shard }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      # The `test-db-linux` layout. SEMAPHORE_SHARD_COUNT must equal the
+      # length of this list.
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    env:
+      SEMAPHORE_SHARD_COUNT: "21"
+      SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: coverage-db
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked --version "$CARGO_LLVM_COV_VERSION"
+      - name: Pre-pull Docker test images
+        run: bash .github/ci/pull-test-images.sh
+      - name: Run the Linux manifest suites under coverage
+        env:
+          HARVEST_DEV_REQUIRE_POSTGRES: "1"
+          HARVEST_TEST_REQUIRE_REDIS: "1"
+        run: |
+          # An assignment fails the step when `show-env` fails. A bare
+          # `source <(...)` would run the suites with no instrumentation.
+          coverage_env="$(cargo llvm-cov show-env --sh --branch)"
+          eval "$coverage_env"
+          cargo llvm-cov clean --workspace
+          bash .github/ci/run-suites.sh run linux
+      - name: Export coverage
+        if: always()
+        run: |
+          coverage_env="$(cargo llvm-cov show-env --sh --branch)"
+          eval "$coverage_env"
+          cargo llvm-cov report --branch --json --output-path db.json
+          python3 .github/ci/coverage.py convert db.json --root "$GITHUB_WORKSPACE" \
+            --output "db-${SEMAPHORE_SHARD_INDEX}.lcov"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: coverage-lcov-db-${{ matrix.shard }}
+          path: db-${{ matrix.shard }}.lcov
+          if-no-files-found: warn
+          overwrite: true
+
+  report:
+    name: Coverage report
+    needs: [unit, db]
+    # Publish what the shards measured, also after a failed shard.
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: coverage-lcov-*
+          path: lcov
+      - name: Merge and summarize
+        run: |
+          mkdir -p coverage-report
+          python3 .github/ci/coverage.py merge --output coverage-report/coverage.lcov lcov/*/*.lcov
+          python3 .github/ci/coverage.py summary coverage-report/coverage.lcov \
+            --baseline .github/ci/coverage-baseline.json \
+            --json coverage-report/summary.json --markdown coverage-report/summary.md
+          cat coverage-report/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage-report
+          overwrite: true
+      - name: Ratchet the critical modules
+        # A failed test cuts coverage short, so a drop then is noise. The
+        # failed test job already fails the run.
+        if: needs.unit.result == 'success' && needs.db.result == 'success'
+        run: python3 .github/ci/coverage.py ratchet --baseline .github/ci/coverage-baseline.json --summary coverage-report/summary.json
+
+  alert:
+    name: Report a failed nightly
+    needs: [unit, db, report]
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update the alert issue
+        run: |
+          title="Coverage nightly: a scheduled run failed"
+          body="The coverage run failed: ${RUN_URL}. The run summary names each module below its floor."
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$title\"" --json number,title \
+            --jq "map(select(.title == \"$title\")) | .[0].number // empty")"
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

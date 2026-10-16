@@ -1,0 +1,12 @@
+{
+  "tolerance": 0.5,
+  "modules": {
+    "autumn-harvest/src/codec_rotation.rs": {"lines": null, "branches": null},
+    "autumn-harvest/src/erase.rs": {"lines": null, "branches": null},
+    "autumn-harvest/src/poison_pill.rs": {"lines": null, "branches": null},
+    "autumn-harvest/src/queue.rs": {"lines": null, "branches": null},
+    "autumn-harvest/src/scheduler.rs": {"lines": null, "branches": null},
+    "autumn-harvest/src/timeout.rs": {"lines": null, "branches": null},
+    "autumn-harvest/src/worker.rs": {"lines": null, "branches": null}
+  }
+}
