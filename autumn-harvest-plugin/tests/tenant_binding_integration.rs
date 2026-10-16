@@ -160,6 +160,19 @@ fn embedder_app(state: &HarvestApiState, tenant: &'static str) -> App {
     ))
 }
 
+/// A raw `harvest_api_router` mount (issue #2076). The embedder's middleware
+/// verifies `tenant`. No `StandaloneAdminAuth` layer is installed.
+fn raw_mount_app(state: &HarvestApiState, tenant: &'static str) -> App {
+    state.set_admin_auth_boundary(true);
+    composed_router(state).layer(axum::middleware::from_fn(
+        move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+            req.extensions_mut()
+                .insert(VerifiedTenant::new(tenant).expect("valid tenant"));
+            next.run(req).await
+        },
+    ))
+}
+
 /// The boundary app with an authorizer installed.
 fn authorized_app<F>(state: &HarvestApiState, authorizer: F) -> App
 where
@@ -1117,4 +1130,67 @@ async fn an_invalid_stored_token_tenant_fails_closed() {
             .any(|s| s.contains("not a valid tenant key")),
         "{summaries:?}"
     );
+}
+
+/// A raw mount gets the same answers as `HarvestEmbedding` (issue #2076).
+#[tokio::test]
+async fn a_raw_mount_binds_the_verified_tenant() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let state = api_state(&pool);
+    let app = raw_mount_app(&state, "acme");
+    let own = start_run_for(&mut conn, &unique("acme"), Some("acme")).await;
+    let other = start_run_for(&mut conn, &unique("globex"), Some("globex")).await;
+
+    let (status, _) = send(&app, Call::new("GET", &format!("/workflows/{own}"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = send(&app, Call::new("GET", &format!("/workflows/{other}"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "another tenant's run");
+    let (status, _) = send(
+        &app,
+        Call::new("POST", &format!("/workflows/{other}/cancel")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "cancel another tenant's run");
+    let (status, _) = send(&app, Call::new("GET", "/workflows")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a list route");
+    let (status, _) = send(
+        &app,
+        Call::new("GET", &format!("/workflows/{own}")).tenant("globex"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a header for another tenant");
+
+    let shared = unique("shared");
+    start_run_for(&mut conn, &shared, Some("globex")).await;
+    let (status, resp) = send(
+        &app,
+        Call::new("POST", &format!("/workflows/{WORKFLOW}/start"))
+            .body(json!({ "workflow_id": shared, "input": {} })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{resp:?}");
+    assert!(resp.get("execution_id").is_none(), "{resp:?}");
+}
+
+/// A full mount runs the owner lookup and the audit write once per refusal
+/// (issue #2076). The inner copy of the layer must skip.
+#[tokio::test]
+async fn a_full_mount_audits_a_refusal_once() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let state = api_state(&pool);
+    let app = embedder_app(&state, "acme");
+    let other = start_run_for(&mut conn, &unique("globex"), Some("globex")).await;
+
+    let (status, _) = send(&app, Call::new("GET", &format!("/workflows/{other}"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(&app, Call::new("GET", "/workflows")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let summaries = deny_summaries(&mut conn).await;
+    assert_eq!(summaries.len(), 2, "{summaries:?}");
 }
