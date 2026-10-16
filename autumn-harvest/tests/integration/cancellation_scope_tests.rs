@@ -209,6 +209,19 @@ fn shield_cleanup_then_fail_wf(ctx: &WorkflowContext, _input: Value) -> WfFuture
     })
 }
 
+/// Cleanup in a block, then a wait on a future that Harvest does not drive.
+/// The cycle after the block deadlocks.
+fn shield_then_deadlock_wf(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        ctx.non_cancellable(ctx.execute_activity_raw("gated_cleanup", Value::Null, "default"))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        std::future::pending::<()>().await;
+        Ok(json!("unreachable"))
+    })
+}
+
 /// A child that parks on a long timer.
 fn parked_child(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
     Box::pin(async move {
@@ -786,6 +799,47 @@ async fn deferred_cancel_keeps_the_cleanup_commands_of_the_failing_cycle() {
     let attrs = execution.search_attrs.unwrap_or_default();
     assert_eq!(attrs.get("cleanup"), Some(&json!("done")), "{attrs}");
     assert_eq!(child_rows.len(), 1, "the detached child exists");
+}
+
+/// A cycle that closes its block and then deadlocks cannot record the close.
+/// A pending deferred cancel then ends the run instead of a retry loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_cancel_ends_a_run_that_deadlocks_after_its_block() {
+    CLEANUP_GATE.store(false, Ordering::SeqCst);
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect");
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
+    let reg = Arc::new(HandlerRegistry::new(
+        vec![wf_info("e2e_test_workflow", shield_then_deadlock_wf)],
+        vec![act_info("gated_cleanup", gated_cleanup)],
+    ));
+    let worker = build_runtime_worker("worker-1984-shield-deadlock", 4, 2, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&database_url));
+
+    wait_for_event(&database_url, exec_id, "the cleanup start", |e| {
+        matches!(e, WorkflowEvent::ActivityStarted { .. })
+    })
+    .await;
+    let cancelled = cancel_workflow_execution(&mut conn, exec_id, "operator abort", &NoOpMetrics)
+        .await
+        .expect("cancel");
+    assert!(cancelled.deferred, "an open block defers the cancel");
+
+    CLEANUP_GATE.store(true, Ordering::SeqCst);
+    let execution = wait_for_execution_state_with_timeout(
+        &database_url,
+        exec_id,
+        "CANCELLED",
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    assert_eq!(execution.error.as_deref(), Some("operator abort"));
 }
 
 /// A paused run cannot close its block, so its cancel is not deferred.

@@ -27,8 +27,8 @@ non-determinism. A withdrawn timer command restores the timer state.
   `WorkflowCancelRequested` once. The run keeps running.
 - The first suspended cycle with no open block cancels the run. This also
   holds when the block closes in an inline local-activity loop.
-- A cycle that would fail or continue as new is cancelled instead. A cycle
-  that completes keeps its result.
+- A cycle that would fail, continue as new or deadlock is cancelled
+  instead. A cycle that completes keeps its result.
 - A paused run is not deferred, and a run with a pending deferred cancel
   cannot be paused. A reset drops a copied request. The
   same-shard parent-close cascade defers like the cross-shard path.

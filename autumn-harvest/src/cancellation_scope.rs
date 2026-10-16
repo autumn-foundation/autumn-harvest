@@ -1061,7 +1061,8 @@ impl WorkflowContext {
     /// workflow cancel that arrives while a block is open is deferred. The
     /// cancel request is recorded as `WorkflowCancelRequested`, and the run
     /// continues. The first suspended cycle with no open block cancels the
-    /// run. A cycle that would fail or continue as new is cancelled instead.
+    /// run. A cycle that would fail, continue as new or deadlock is cancelled
+    /// instead.
     /// A cycle that completes keeps its result. A terminate, a paused run
     /// and a replace-on-start policy are never deferred.
     ///

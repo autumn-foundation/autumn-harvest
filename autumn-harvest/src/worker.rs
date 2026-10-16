@@ -27234,6 +27234,26 @@ async fn process_workflow_task(
     //
     // The requeue is fenced by the claim. The cycle ran for at least
     // `DEADLOCK_TIMEOUT`, so a reclaim can have moved the row meanwhile.
+    // Issue #1984: a deadlocked cycle cannot record the close of a block, so
+    // its retry keeps a deferred cancel waiting without end. The run is
+    // cancelled instead, as a failing cycle is. The deadlocked cycle's
+    // commands are still not trusted, so none of them persist.
+    let outcome = match outcome {
+        WorkflowOutcome::TaskFailed { error }
+            if crate::execution::DeferredCancelState::of(&history_events)
+                .requested
+                .is_some() =>
+        {
+            pending_cmds.clear();
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details: None,
+                handler_panic: false,
+                unhandled_signals: std::collections::BTreeMap::new(),
+            }
+        }
+        other => other,
+    };
     if let WorkflowOutcome::TaskFailed { error } = &outcome {
         clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
         let strikes = workflow_deadlock_strikes.record(prepared.exec_id.as_uuid());

@@ -120,7 +120,8 @@ The worker reads the request from the history that the cycle replayed:
 - A cycle that suspends completes the cancel when no block is open. This
   covers a block that closed in an inline local-activity loop.
 - A cycle that fails or continues as new is cancelled instead, so a retry or
-  a successor cannot drop the cancel.
+  a successor cannot drop the cancel. A cycle that deadlocks is cancelled
+  too, because its retry cannot record the close of a block.
 - A cycle that completes keeps its result.
 
 The same-shard parent-close cascade defers in the same way as the
