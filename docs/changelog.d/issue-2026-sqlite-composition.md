@@ -119,6 +119,7 @@ tests. Each test replays every history it asserts on the core
   child.
 
 Unit tests cover the schema step, a race loser with no row, and the panic
-strikes of a run that another run cancels. The core test
+strikes of runs that another run seals: by a cancel, a terminate cascade, an
+unsupported seal or an error-path cancel. The core test
 `match_external_await_resolves_past_a_sibling_child` pins the replay fix. The
 design record is `DESIGN-2026.md`.

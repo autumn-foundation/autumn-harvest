@@ -2333,10 +2333,25 @@ impl SqliteRuntime {
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
     ) -> SqliteResult<RunState> {
         let result = self.drive_one_cycle_inner(exec, now, failure_now).await;
-        // A cycle can seal other runs, such as a cancel target or a detached
-        // child (issue #2026). No drive reaches a sealed run again, so forget
-        // its strikes here.
+        let result = self.seal_after_error(exec, result, now, failure_now);
+        // The cycle, or a seal after it, can seal other runs too, such as a
+        // cancel target or a detached child (issue #2026). No drive reaches a
+        // sealed run again, so forget their strikes after the last seal.
         self.forget_sealed_strikes()?;
+        result
+    }
+
+    /// Seal a run whose cycle ended in an error that every drive would repeat.
+    ///
+    /// The drive's error still returns to the caller, so the drive that seals
+    /// the run reports why.
+    fn seal_after_error(
+        &mut self,
+        exec: ExecutionId,
+        result: SqliteResult<RunState>,
+        now: i64,
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> SqliteResult<RunState> {
         if let Err(SqliteError::Unsupported(message)) = &result
             && let Err(seal_error) = self.seal_unsupported(exec, message, now, failure_now())
         {
@@ -6185,6 +6200,18 @@ mod panic_strike_tests {
         rt.register_workflow(&spawns_panicker_info());
         let parent = rt.start_workflow("spawns_panicker", json!(0)).unwrap();
         rt.run_until_blocked(parent).await.unwrap();
+        strike_detached_child(&mut rt, parent).await;
+
+        rt.terminate(parent, "ops").unwrap();
+
+        assert!(
+            rt.workflow_panic_strikes.is_empty(),
+            "the cascade is forgotten"
+        );
+    }
+
+    /// Give the detached child of `parent` one panic strike.
+    async fn strike_detached_child(rt: &mut SqliteRuntime, parent: ExecutionId) {
         let child = rt
             .load_history(parent)
             .unwrap()
@@ -6196,9 +6223,79 @@ mod panic_strike_tests {
             .unwrap();
         rt.run_until_blocked(child).await.unwrap_err();
         assert_eq!(rt.workflow_panic_strikes.get(&child), Some(&1));
+    }
 
-        rt.terminate(parent, "ops").unwrap();
+    /// Spawns `always_panics` detached under `request_cancel`, waits for
+    /// `go`, then schedules an unsupported external activity.
+    #[workflow]
+    async fn spawns_then_unsupported(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+        ctx.spawn_child_workflow_detached_raw(
+            "always_panics",
+            json!(0),
+            ParentClosePolicy::RequestCancel,
+        )
+        .map_err(|e| e.to_string())?;
+        ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        ctx.execute_activity_external("external", json!(0), "default", 60)
+            .await
+            .map_err(|e| e.to_string())
+    }
 
+    #[tokio::test]
+    async fn an_unsupported_seal_forgets_the_strikes_of_descendants() {
+        let mut rt = SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&always_panics_info());
+        rt.register_workflow(&spawns_then_unsupported_info());
+        let parent = rt
+            .start_workflow("spawns_then_unsupported", json!(0))
+            .unwrap();
+        rt.run_until_blocked(parent).await.unwrap();
+        strike_detached_child(&mut rt, parent).await;
+
+        rt.send_signal(parent, "go", json!(1)).unwrap();
+        let err = rt.run_until_blocked(parent).await.unwrap_err();
+
+        assert!(matches!(err, SqliteError::Unsupported(_)), "{err:?}");
+        assert!(
+            rt.workflow_panic_strikes.is_empty(),
+            "the cascade is forgotten"
+        );
+    }
+
+    /// Spawns `always_panics` detached under `request_cancel`, then waits on
+    /// an activity that no one registers.
+    #[workflow]
+    async fn spawns_then_waits_on_missing(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+        ctx.spawn_child_workflow_detached_raw(
+            "always_panics",
+            json!(0),
+            ParentClosePolicy::RequestCancel,
+        )
+        .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("missing", json!(0), "default")
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn an_error_path_cancel_forgets_the_strikes_of_descendants() {
+        let mut rt = SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&always_panics_info());
+        rt.register_workflow(&spawns_then_waits_on_missing_info());
+        let parent = rt
+            .start_workflow("spawns_then_waits_on_missing", json!(0))
+            .unwrap();
+        let err = rt.run_until_blocked(parent).await.unwrap_err();
+        assert!(
+            matches!(err, SqliteError::UnregisteredActivity(_)),
+            "{err:?}"
+        );
+        strike_detached_child(&mut rt, parent).await;
+
+        rt.cancel(parent, "ops").unwrap();
+        let state = rt.run_until_blocked(parent).await.unwrap();
+
+        assert!(matches!(state, RunState::Cancelled(_)), "{state:?}");
         assert!(
             rt.workflow_panic_strikes.is_empty(),
             "the cascade is forgotten"
