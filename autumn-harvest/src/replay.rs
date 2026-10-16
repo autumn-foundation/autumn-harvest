@@ -449,6 +449,27 @@ pub enum SideEffectNowMatch {
 /// `Now` under this name.
 pub const DEADLINE_PROBE_SIDE_EFFECT_NAME: &str = "__harvest_deadline_probe";
 
+/// Reserved side-effect name for a live `should_continue_as_new()` history-size
+/// decision that answered `true` (issue #2080).
+///
+/// Only a `true` answer is recorded. A replay that finds no record at a
+/// position that has later history reads `false`. This makes the answer the
+/// same on every replay, however large the loaded history has grown.
+pub const CONTINUE_AS_NEW_SIDE_EFFECT_NAME: &str = "__harvest_continue_as_new";
+
+/// The replayed state of a `should_continue_as_new()` history-size decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinueAsNewMatch {
+    /// The cursor holds the recorded `true` decision, or a checkpoint from a
+    /// history that predates the record. The answer is `true`.
+    True,
+    /// Recorded history continues with other events. The live answer was
+    /// `false`.
+    False,
+    /// The cursor is past the recorded history. The caller decides live.
+    Frontier,
+}
+
 /// Marker name recorded by `ctx.patched(patch_id)` (issue #687).
 pub(crate) fn patch_marker_name(patch_id: &str) -> String {
     format!("patch:{patch_id}")
@@ -5851,6 +5872,36 @@ impl HistoryMatcher {
             // history-count-only for the recorded portion of a pre-#772 history,
             // and a user `Now` is left for its own strict read to consume.
             _ => SideEffectNowMatch::NotRecorded,
+        }
+    }
+
+    /// Replay a `should_continue_as_new()` history-size decision (issue #2080).
+    ///
+    /// Reads the cursor, never the loaded event count, so the answer does not
+    /// change when the loaded history grows.
+    ///
+    /// - A recorded `true` decision is consumed.
+    /// - A `WorkflowContinuedAsNew` event is a checkpoint from a history that
+    ///   predates the record. It is left in place and reads as `true`.
+    /// - Any other event reads as `false`, with the cursor untouched.
+    /// - A cursor past the end is the live frontier.
+    #[must_use]
+    pub fn match_continue_as_new_decision(&mut self) -> ContinueAsNewMatch {
+        if !self.prepare_match() {
+            return ContinueAsNewMatch::Frontier;
+        }
+        match &self.events[self.cursor] {
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some(name),
+                value,
+            } if name == CONTINUE_AS_NEW_SIDE_EFFECT_NAME && value == &Value::Bool(true) => {
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                ContinueAsNewMatch::True
+            }
+            WorkflowEvent::WorkflowContinuedAsNew { .. } => ContinueAsNewMatch::True,
+            _ => ContinueAsNewMatch::False,
         }
     }
 

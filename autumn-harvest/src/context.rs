@@ -4786,9 +4786,12 @@ impl WorkflowContext {
 
     /// Number of events currently loaded in this workflow execution history.
     ///
-    /// This is replay-safe: it is computed from the in-memory history snapshot
-    /// loaded before the current workflow task, not from a side-effecting
-    /// counter maintained by author code.
+    /// The count is the size of the history loaded for this task. It is not the
+    /// position the code has reached, and it grows from task to task. A replay
+    /// can read a larger value than the live run read at the same code
+    /// position. Do not branch workflow commands on it. Use
+    /// [`should_continue_as_new`](Self::should_continue_as_new), which records
+    /// its answer (issue #2080).
     ///
     /// **Note:** this routes through [`match_history`](Self::match_history), so
     /// its `pump_signal_handlers` post-hook runs — a call here can dispatch a
@@ -4806,7 +4809,8 @@ impl WorkflowContext {
     /// Two independent triggers, either of which is sufficient:
     ///
     /// 1. **History size** — [`Self::history_event_count`] exceeds the configured
-    ///    soft continue-as-new threshold (the pre-issue-#772 behaviour).
+    ///    soft continue-as-new threshold. The engine reads the count only at the
+    ///    live frontier. It records a `true` answer (issue #2080).
     /// 2. **Deadline fraction** (issue #772) — the run has consumed at least
     ///    [`WorkflowHistoryPolicy::continue_as_new_deadline_fraction`] of its
     ///    `execution_timeout` budget. This lets a **long-lived, low-event**
@@ -4826,11 +4830,20 @@ impl WorkflowContext {
     ///
     /// ## Replay determinism
     ///
+    /// The loaded event count grows from task to task. The history-size
+    /// trigger therefore never reads it on replay. A live `true` answer is
+    /// recorded as a side effect, and a replay reads it back. Where history
+    /// continues with no record, the replay answers `false`. A loop that calls
+    /// this method once per iteration replays clean under any threshold.
+    ///
+    /// A history from before issue #2080 has no record. A checkpoint event at
+    /// the cursor reads as `true`. Any other event reads as `false`.
+    ///
     /// The deadline check consults the replay-safe recorded clock via a
     /// **tolerant** read ([`deadline_clock_read`](Self::deadline_clock_read)),
     /// so its answer is deterministic across replays and workers. A workflow
-    /// with **no** `execution_timeout` records zero side-effects here and
-    /// behaves exactly as before (AC4). The two triggers are combined without
+    /// with **no** `execution_timeout` records no deadline side-effect
+    /// (AC4). The two triggers are combined without
     /// short-circuiting the deadline check, so a timeout-bearing workflow reads
     /// the deadline clock regardless of the event-count branch — keeping the
     /// recorded side-effect stream a pure function of the recorded history at
@@ -4845,13 +4858,38 @@ impl WorkflowContext {
     /// its frontier.
     #[must_use]
     pub fn should_continue_as_new(&self) -> bool {
-        let by_events =
-            self.history_event_count() > self.history_policy.continue_as_new_threshold();
+        let by_events = self.history_size_trigger();
         // Evaluate the deadline branch unconditionally (bound before the `||`)
         // so the tolerant clock read it performs is not gated by the
         // event-count trigger.
         let by_deadline = self.deadline_fraction_reached();
         by_events || by_deadline
+    }
+
+    /// The history-size trigger of [`should_continue_as_new`](Self::should_continue_as_new)
+    /// (issue #2080).
+    ///
+    /// The loaded event count grows from task to task, so a replay cannot
+    /// rederive a live answer from it. At the live frontier this reads the
+    /// count and records a `true` answer as a side effect. A replay reads that
+    /// record, or reads `false` where history continues without one.
+    fn history_size_trigger(&self) -> bool {
+        match self.match_history(HistoryMatcher::match_continue_as_new_decision) {
+            crate::replay::ContinueAsNewMatch::True => true,
+            crate::replay::ContinueAsNewMatch::False => false,
+            crate::replay::ContinueAsNewMatch::Frontier => {
+                let due =
+                    self.history_event_count() > self.history_policy.continue_as_new_threshold();
+                if due {
+                    self.push_command(WorkflowCommand::RecordSideEffect {
+                        kind: crate::event::SideEffectKind::Custom,
+                        name: Some(crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME.to_string()),
+                        value: serde_json::Value::Bool(true),
+                    });
+                }
+                due
+            }
+        }
     }
 
     /// Returns `true` when the run has consumed at least the configured fraction
@@ -18463,36 +18501,103 @@ mod tests {
         );
     }
 
-    #[test]
-    fn workflow_context_should_continue_as_new_uses_soft_threshold() {
-        let events = vec![
-            WorkflowEvent::WorkflowStarted {
-                input: Value::Null,
-                timestamp: Utc::now(),
-                last_completion_result: None,
-                last_error: None,
-                scheduled_time: None,
-            },
-            WorkflowEvent::MarkerRecorded {
-                name: "poll-cycle".into(),
-                details: serde_json::json!({"n": 1}),
-            },
-            WorkflowEvent::MarkerRecorded {
-                name: "poll-cycle".into(),
-                details: serde_json::json!({"n": 2}),
-            },
-        ];
-        let policy = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
-
-        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
+    /// A context at the live frontier: `extra` events precede it, and the
+    /// threshold is `threshold`.
+    fn frontier_ctx(extra: usize, threshold: u64) -> WorkflowContext {
+        let mut events = vec![WorkflowEvent::WorkflowStarted {
+            input: Value::Null,
+            timestamp: Utc::now(),
+            last_completion_result: None,
+            last_error: None,
+            scheduled_time: None,
+        }];
+        events.extend((0..extra).map(|n| WorkflowEvent::MarkerRecorded {
+            name: "poll-cycle".into(),
+            details: serde_json::json!({ "n": n }),
+        }));
+        WorkflowContext::for_replay_with_state_and_history_policy(
             ExecutionId::new(),
             events,
             empty_shared_state(),
-            policy,
-        );
+            WorkflowHistoryPolicy::default().with_continue_as_new_threshold(threshold),
+        )
+    }
 
-        assert_eq!(ctx.history_event_count(), 3);
+    fn next_side_effect() -> WorkflowEvent {
+        WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Custom,
+            name: Some("next".to_string()),
+            value: serde_json::json!(7),
+        }
+    }
+
+    fn continue_decision(value: bool) -> WorkflowEvent {
+        WorkflowEvent::SideEffectRecorded {
+            kind: crate::event::SideEffectKind::Custom,
+            name: Some(crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME.to_string()),
+            value: serde_json::json!(value),
+        }
+    }
+
+    #[test]
+    fn should_continue_as_new_records_a_live_true_decision() {
+        let ctx = frontier_ctx(0, 0);
+        assert_eq!(ctx.history_event_count(), 1);
         assert!(ctx.should_continue_as_new());
+        let cmds = ctx.drain_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Custom,
+                    name: Some(name),
+                    value,
+                }] if name == crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME
+                    && value == &serde_json::json!(true)
+            ),
+            "a live true decision records one side effect, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn should_continue_as_new_ignores_history_that_grows_after_the_call() {
+        // Three events are loaded and the threshold is two. The cursor is
+        // still inside the history, so the live answer was false (issue #2080).
+        let ctx = frontier_ctx(2, 2);
+        assert_eq!(ctx.history_event_count(), 3);
+        assert!(!ctx.should_continue_as_new());
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn should_continue_as_new_replays_a_recorded_true_decision() {
+        let ctx = deadline_ctx_with_policy(
+            Utc::now(),
+            vec![continue_decision(true), next_side_effect()],
+            None,
+            WorkflowHistoryPolicy::default(),
+        );
+        assert!(ctx.should_continue_as_new());
+        assert!(ctx.drain_commands().is_empty());
+        // The decision event is consumed. The next side effect still matches.
+        assert_eq!(ctx.side_effect("next", || 0).unwrap(), 7);
+    }
+
+    #[test]
+    fn should_continue_as_new_reads_a_legacy_checkpoint_as_true() {
+        // A history that predates the decision event ends in the checkpoint.
+        let ctx = deadline_ctx_with_policy(
+            Utc::now(),
+            vec![WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: ExecutionId::new(),
+                input: Value::Null,
+                new_workflow_type: None,
+            }],
+            None,
+            WorkflowHistoryPolicy::default(),
+        );
+        assert!(ctx.should_continue_as_new());
+        assert!(ctx.drain_commands().is_empty());
     }
 
     #[test]
@@ -18940,33 +19045,9 @@ mod tests {
 
     #[test]
     fn should_continue_as_new_still_trips_on_history_count() {
-        // Existing behaviour preserved: the event-count trigger fires
-        // independently of the deadline path (no execution_timeout here).
-        let events = vec![
-            WorkflowEvent::WorkflowStarted {
-                input: Value::Null,
-                timestamp: Utc::now(),
-                last_completion_result: None,
-                last_error: None,
-                scheduled_time: None,
-            },
-            WorkflowEvent::MarkerRecorded {
-                name: "poll".into(),
-                details: serde_json::json!({"n": 1}),
-            },
-            WorkflowEvent::MarkerRecorded {
-                name: "poll".into(),
-                details: serde_json::json!({"n": 2}),
-            },
-        ];
-        let policy = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
-        let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
-            ExecutionId::new(),
-            events,
-            empty_shared_state(),
-            policy,
-        );
-        assert!(ctx.should_continue_as_new());
+        // The event-count trigger fires at the frontier, independent of the
+        // deadline path (no execution_timeout here).
+        assert!(frontier_ctx(0, 0).should_continue_as_new());
     }
 
     #[test]

@@ -107,7 +107,9 @@ async fn long_running_job(ctx: &WorkflowContext, input: JobInput) -> Result<(), 
 
 `should_continue_as_new()` returns `true` when the event count exceeds
 `continue_as_new_threshold` (default 10 000, configurable via
-`HarvestBuilder::history_continue_as_new_threshold`).
+`HarvestBuilder::history_continue_as_new_threshold`). The engine records a
+`true` answer as a `__harvest_continue_as_new` side effect. A replay reads that
+record, so the answer does not change when the loaded history grows.
 
 `continue_as_new` starts a fresh execution with its own clean event log and
 the same `workflow_id`, so clients polling the workflow ID continue to see

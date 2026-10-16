@@ -657,8 +657,7 @@ mod tests {
         })
     }
 
-    /// A loop that calls `should_continue_as_new()` directly. It shows the
-    /// replay hazard that the entity avoids.
+    /// A loop that calls `should_continue_as_new()` directly.
     fn naive_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
         Box::pin(async move {
             let mut count = input.as_i64().unwrap_or_default();
@@ -1144,8 +1143,8 @@ mod tests {
     }
 
     /// A replay with a larger loaded history keeps the recorded decisions.
-    /// A naive loop over `should_continue_as_new()` diverges on the same
-    /// history.
+    /// A naive loop over `should_continue_as_new()` replays clean on the
+    /// same history (issue #2080).
     #[tokio::test]
     async fn the_checkpoint_decision_is_stable_when_history_grows() {
         let small_threshold = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
@@ -1182,8 +1181,8 @@ mod tests {
             .replay_from_events(naive)
             .await;
         assert!(
-            matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
-            "a naive loop must diverge here: {report}"
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "a naive loop must replay clean: {report}"
         );
     }
 
