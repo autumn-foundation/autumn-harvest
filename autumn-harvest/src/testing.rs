@@ -6597,7 +6597,7 @@ impl WorkflowTestEnv {
             start_time: self.simulated_now,
             history,
             pending_signals: self.queued_signals.clone(),
-            mocks: self.run_mocks(0),
+            mocks: self.run_mocks(0, self.simulated_now),
             // Issue #790: the durable log lines this run would have persisted,
             // accumulated across every decision cycle and de-duplicated by `seq`
             // exactly the way the store's unique index does.
@@ -6959,11 +6959,12 @@ impl WorkflowTestEnv {
     }
 
     /// The fresh mock state of one run (issue #2033).
-    pub(crate) fn run_mocks(&self, seed: u64) -> RunMocks {
+    pub(crate) fn run_mocks(&self, seed: u64, start: DateTime<Utc>) -> RunMocks {
         RunMocks {
             call_counts: HashMap::new(),
             retry_sequences: self.retry_sequences.clone(),
             seed,
+            start,
         }
     }
 }
@@ -6977,6 +6978,8 @@ pub(crate) struct RunMocks {
         HashMap<String, std::collections::VecDeque<Vec<Result<Value, String>>>>,
     /// The seed that a seeded mock derives its generator from.
     pub(crate) seed: u64,
+    /// The start time of the run, which anchors the virtual clock.
+    pub(crate) start: DateTime<Utc>,
 }
 
 /// What a deferred delivery resolves (issue #2033).
@@ -7135,7 +7138,7 @@ impl WorkflowTestEnv {
                 {
                     Self::push_activity_retry_sequence(&mut events, activity_id, attempts);
                 } else {
-                    let now = virtual_now(self.simulated_now, history);
+                    let now = virtual_now(mocks.start, history);
                     let mock = MockCall::new(&name, call_num, 1, now, mocks.seed);
                     let result = self.resolve_activity(&mock, act_input)?;
                     Self::push_activity_terminal(&mut events, activity_id, result);
@@ -7153,7 +7156,7 @@ impl WorkflowTestEnv {
                 ..
             } => {
                 let call_num = Self::next_call_count(&mut mocks.call_counts, &name);
-                let now = virtual_now(self.simulated_now, history);
+                let now = virtual_now(mocks.start, history);
                 let mock = MockCall::new(&name, call_num, 1, now, mocks.seed);
                 let result = self.resolve_activity(&mock, act_input.clone())?;
                 history.push(WorkflowEvent::LocalActivityScheduled {
@@ -7544,7 +7547,7 @@ impl WorkflowTestEnv {
                 history.push(WorkflowEvent::MutexGranted {
                     key,
                     lock_seq,
-                    acquired_at: self.simulated_now,
+                    acquired_at: mocks.start,
                 });
                 Ok(true)
             }

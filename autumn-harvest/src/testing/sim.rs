@@ -1362,7 +1362,7 @@ impl<'a, 'env> SimRun<'a, 'env> {
             held: Vec::new(),
             signals: sim.signals.iter().cloned().collect(),
             cancel: sim.cancel.clone(),
-            mocks: env.run_mocks(seed),
+            mocks: env.run_mocks(seed, start),
             side_output: RecordedSideOutput::default(),
             faults: Vec::new(),
             task: 0,
@@ -1869,8 +1869,8 @@ impl<'a, 'env> SimRun<'a, 'env> {
     }
 
     fn outcome(self, status: SimStatus, run: TestRunOutcome) -> SimOutcome {
-        let (mut trace, ids) = render_trace(&run.events, &self.event_tasks);
-        let payloads = payload_digests(&run.events, &ids);
+        let mut trace = render_trace(&run.events, &self.event_tasks);
+        let payloads = payload_digests(&run.events);
         if let Some(task) = self.crashed_at {
             trace.push(format!("crash after the cycle of task {task}"));
         }
@@ -1926,11 +1926,9 @@ impl Ordinals {
 }
 
 /// One trace line per event: the task, the virtual time and the event.
-///
-/// It also returns the ordinals, so [`payload_digests`] can use them.
-fn render_trace(events: &[WorkflowEvent], tasks: &[usize]) -> (Vec<String>, Ordinals) {
+fn render_trace(events: &[WorkflowEvent], tasks: &[usize]) -> Vec<String> {
     let mut ids = Ordinals::default();
-    let trace = events
+    events
         .iter()
         .enumerate()
         .map(|(index, event)| {
@@ -1938,35 +1936,32 @@ fn render_trace(events: &[WorkflowEvent], tasks: &[usize]) -> (Vec<String>, Ordi
             let clock = fired_timer_duration_secs(&events[..=index]);
             format!("{task:04} +{clock}s {}", render_event(event, &mut ids))
         })
-        .collect();
-    (trace, ids)
+        .collect()
 }
 
 /// A digest of each event with its payloads.
 ///
 /// The trace holds no payload, so these digests catch a value that changes
-/// on the same path. Each activity and child id becomes its ordinal first,
-/// because those ids are random.
-fn payload_digests(events: &[WorkflowEvent], ids: &Ordinals) -> Vec<u64> {
-    let mut names: Vec<(String, String)> = ids
-        .activities
-        .iter()
-        .map(|(id, n)| (id.as_uuid().to_string(), format!("a{n}")))
-        .chain(
-            ids.children
-                .iter()
-                .map(|(id, n)| (id.as_uuid().to_string(), format!("c{n}"))),
-        )
-        .collect();
-    names.sort();
+/// on the same path. The harness and the context mint random ids, such as
+/// activity ids, child ids and the successor of a continue-as-new. So each
+/// `*_id` field of an event becomes an ordinal by first use. A payload keeps
+/// its own fields, so a user value still counts.
+fn payload_digests(events: &[WorkflowEvent]) -> Vec<u64> {
+    let mut ordinals: HashMap<String, usize> = HashMap::new();
     events
         .iter()
         .map(|event| {
-            let mut text = serde_json::to_string(event).unwrap_or_default();
-            for (id, ordinal) in &names {
-                text = text.replace(id.as_str(), ordinal);
+            let mut value = serde_json::to_value(event).unwrap_or(Value::Null);
+            if let Some(Value::Object(fields)) = value.get_mut("data") {
+                for (key, field) in fields.iter_mut() {
+                    if let (true, Value::String(id)) = (key.ends_with("_id"), &*field) {
+                        let next = ordinals.len() + 1;
+                        let ordinal = *ordinals.entry(id.clone()).or_insert(next);
+                        *field = Value::String(format!("id{ordinal}"));
+                    }
+                }
             }
-            fnv1a(text.as_bytes())
+            fnv1a(value.to_string().as_bytes())
         })
         .collect()
 }
@@ -2228,7 +2223,7 @@ mod tests {
             completed(b),
             completed(a),
         ];
-        let (trace, _) = render_trace(&events, &[0, 1, 1, 2, 3]);
+        let trace = render_trace(&events, &[0, 1, 1, 2, 3]);
         assert_eq!(
             trace,
             [

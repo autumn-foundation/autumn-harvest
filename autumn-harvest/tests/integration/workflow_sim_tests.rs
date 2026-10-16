@@ -980,3 +980,55 @@ async fn a_start_alone_runs_no_cycle() {
         }
     }
 }
+
+/// Spawns a detached child, runs one activity, then continues as new.
+fn detach_then_continue(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
+    Box::pin(async move {
+        ctx.spawn_child_workflow_detached_raw(
+            "audit",
+            json!(1),
+            autumn_harvest::types::ParentClosePolicy::Abandon,
+        )
+        .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("quote_primary", json!(null), "q")
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.continue_as_new(json!({"round": 2}))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!(null))
+    })
+}
+
+#[tokio::test]
+async fn generated_ids_do_not_break_the_payload_check() {
+    // The child id and the successor id are random on each run.
+    let report = quotes_env()
+        .simulation()
+        .seeds(SEEDS)
+        .sweep(detach_then_continue, json!(null), |outcome| {
+            always!(
+                outcome.status() == SimStatus::ContinuedAsNew,
+                "the run continues as new"
+            );
+        })
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+    assert!(report.seeds > 0);
+}
+
+#[tokio::test]
+async fn a_seeded_local_activity_mock_sees_the_sim_clock() {
+    fn wf(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
+        Box::pin(async move {
+            ctx.execute_local_activity_raw("stamp", json!(null), None, None)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+    let env = WorkflowTestEnv::new()
+        .mock_activity_seeded("stamp", |_, mock| Ok(json!(mock.now().timestamp())));
+    let outcome = env.simulation().run(1, wf, json!(null)).await;
+    // Monday 2024-01-01 00:00 UTC, the fixed start of a run.
+    assert_eq!(outcome.result(), &Ok(json!(1_704_067_200)));
+}
