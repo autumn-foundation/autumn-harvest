@@ -671,7 +671,9 @@ mod lock;
 mod mutex;
 mod query;
 mod queue;
+mod retention;
 mod runtime;
+mod schedule;
 mod schema;
 mod store;
 mod update;
@@ -688,6 +690,7 @@ pub use crate::runtime::{
     SignalWithStartOutcome, SqliteRuntime, StartOptions, StartOutcome,
     UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
+pub use crate::schedule::ScheduleSummary;
 pub use crate::store::ActivityAttempt;
 pub use crate::visibility::{
     DEFAULT_LIST_LIMIT, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,

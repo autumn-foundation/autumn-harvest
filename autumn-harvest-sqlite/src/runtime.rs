@@ -14,6 +14,7 @@ use autumn_harvest::executor::{
     QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
     run_workflow_with_state_history_policy_and_caps,
 };
+use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::{
     ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, TimerId,
     UpdateHandlerInfo, UpdateId, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn,
@@ -27,8 +28,9 @@ use crate::error::{SqliteError, SqliteResult};
 use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::lock::WriterLock;
 use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
+use crate::schedule::ScheduleSummary;
 use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
-use crate::{lock, mutex, queue, schema, store, update, visibility, worker};
+use crate::{lock, mutex, queue, retention, schedule, schema, store, update, visibility, worker};
 
 /// A synchronous activity body, keyed by name.
 ///
@@ -1861,6 +1863,67 @@ impl SqliteRuntime {
     /// [`SqliteError::Sqlite`] if the query fails.
     pub fn describe(&self, exec: ExecutionId) -> SqliteResult<ExecutionDescription> {
         visibility::describe(&self.conn, exec)
+    }
+
+    /// Insert or update the schedule of `schedule.workflow_name` (issue
+    /// #2031).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
+    pub fn upsert_schedule(&mut self, schedule: &WorkflowSchedule) -> SqliteResult<()> {
+        let now = (self.now_fn)().timestamp_millis();
+        schedule::upsert(&self.conn, schedule, now)
+    }
+
+    /// Remove the schedule of `workflow_name` (issue #2031).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ScheduleNotFound`] when no schedule exists.
+    pub fn delete_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
+        schedule::delete(&self.conn, workflow_name)
+    }
+
+    /// Pause the schedule of `workflow_name` (issue #2031).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ScheduleNotFound`] when no schedule exists.
+    pub fn pause_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
+        let now = (self.now_fn)().timestamp_millis();
+        schedule::set_paused(&self.conn, workflow_name, true, now)
+    }
+
+    /// Resume the schedule of `workflow_name` (issue #2031).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ScheduleNotFound`] when no schedule exists.
+    pub fn resume_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
+        let now = (self.now_fn)().timestamp_millis();
+        schedule::set_paused(&self.conn, workflow_name, false, now)
+    }
+
+    /// Every stored schedule (issue #2031).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if the query fails.
+    pub fn list_schedules(&self) -> SqliteResult<Vec<ScheduleSummary>> {
+        schedule::list(&self.conn)
+    }
+
+    /// Remove each terminal run closed more than `older_than` ago (issue
+    /// #2031). Returns the number of runs removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if a delete fails.
+    pub fn purge_terminal(&mut self, older_than: std::time::Duration) -> SqliteResult<u64> {
+        let now = (self.now_fn)().timestamp_micros();
+        let window = i64::try_from(older_than.as_micros()).unwrap_or(i64::MAX);
+        retention::purge_terminal(&mut self.conn, now.saturating_sub(window))
     }
 
     /// Run the query `name` on `exec` with `args`, and return its answer
