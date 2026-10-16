@@ -1829,14 +1829,14 @@ fn plain(token: &str) -> &str {
     if word { token } else { HIDDEN }
 }
 
-/// Refuses a URL where a file or name belongs.
+/// Refuses a database URL or key-value DSN where a file or name belongs.
 ///
-/// Later errors and reports echo these values. A mistyped database URL would reach them.
+/// Later errors and reports echo these values. A mistyped database address would reach them.
 #[cfg(feature = "db")]
 fn not_a_url(flag: &str, value: String) -> Result<String, UpgradeCheckError> {
-    if value.contains("://") {
+    if value.contains("://") || value.to_ascii_lowercase().contains("password=") {
         return Err(UpgradeCheckError::Usage(format!(
-            "{flag} takes a name or file, not a URL"
+            "{flag} takes a name or file, not a database address"
         )));
     }
     Ok(value)
@@ -2112,14 +2112,24 @@ mod tests {
 
     #[test]
     fn a_url_given_to_a_name_or_file_flag_is_refused() {
+        let refused = |args: &[&str]| {
+            let Err(err) = parse(args) else {
+                panic!("expected a refusal for {args:?}");
+            };
+            let text = err.to_string();
+            assert!(text.contains("takes a name or file"), "{text}");
+            assert!(!text.contains("SECRETPW"), "{text}");
+        };
         for flag in [
             "--baseline-structure",
             "--candidate-structure",
             "--baseline-build",
             "--workflow-name",
         ] {
-            assert_no_secret(&[flag, SECRET_URL]);
-            assert_no_secret(&[&format!("{flag}={SECRET_URL}")]);
+            refused(&[flag, SECRET_URL]);
+            refused(&[&format!("{flag}={SECRET_URL}")]);
+            refused(&[flag, "host=h user=u PassWord=SECRETPW"]);
+            refused(&[&format!("{flag}=password=SECRETPW")]);
         }
     }
 
