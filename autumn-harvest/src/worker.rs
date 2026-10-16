@@ -28070,7 +28070,10 @@ async fn process_workflow_task(
     // children.
 
     match persist_flow {
-        Ok(WorkflowPersistFlow::ParkedPaused | WorkflowPersistFlow::RependedForSignals) => {
+        Ok(WorkflowPersistFlow::ParkedPaused) => return Ok(()),
+        Ok(WorkflowPersistFlow::RependedForSignals) => {
+            // A handler panic marked the cycle failed. The run goes on.
+            cycle_failure.discarded();
             return Ok(());
         }
         Ok(WorkflowPersistFlow::Persisted {
@@ -28470,6 +28473,12 @@ impl CycleFailure {
             Self::FAILED_TERMINALLY,
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// The cycle discarded its failure, because the task was re-pended
+    /// for a late signal (issue #2079).
+    fn discarded(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The dispatch outcome of the cycle.

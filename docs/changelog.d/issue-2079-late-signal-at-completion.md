@@ -1,4 +1,4 @@
-## Phase — A signal staged during the final decision is no longer lost (issue #2079)
+## Fix — A signal staged during the final decision is no longer lost (issue #2079)
 
 A task ingests the pending signals at its start. A signal that arrived later
 stayed unconsumed. If the run then completed or failed, the run sealed over
@@ -11,6 +11,9 @@ lock, and `send_signal` takes the same lock. If a signal exists, the engine
 discards the decision, re-pends the task and returns. The next pass ingests
 the signal and decides again. A body that ignores the signal still ends on
 that pass, because the signal is then in history.
+
+A sender that stages a signal in every pass can delay the end of the run.
+The delay lasts as long as the sender keeps sending.
 
 Park and continue-as-new needed no change. Park already re-checks signals,
 and continue-as-new moves unconsumed rows to the next run.

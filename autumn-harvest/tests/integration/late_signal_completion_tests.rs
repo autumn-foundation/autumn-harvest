@@ -109,7 +109,7 @@ fn build_worker(queue: &str) -> Arc<Worker> {
     Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker should build"))
 }
 
-/// The started run, the worker handle, and the pool of one test.
+/// The started run and its worker.
 struct Started {
     url: String,
     exec_id: ExecutionId,
@@ -120,7 +120,7 @@ struct Started {
 /// Start `key` with a `kick` signal and run it on a fresh worker.
 macro_rules! start_run {
     ($stub:ident, $key:expr) => {{
-        let (url, _container) = setup_test_database_url_or_env().await;
+        let (url, container) = setup_test_database_url_or_env().await;
         let pool: DbPool = build_test_pool(&url);
         let client = WorkflowHandleClient::single(pool.clone(), url.clone());
         let queue = unique_id("late-signal-q");
@@ -153,7 +153,7 @@ macro_rules! start_run {
                 worker,
                 handle: task,
             },
-            _container,
+            container,
         )
     }};
 }
