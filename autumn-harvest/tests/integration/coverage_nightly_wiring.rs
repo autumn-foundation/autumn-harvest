@@ -339,9 +339,8 @@ fn ratchet_check_rejects_a_soft_gate() {
 #[test]
 fn db_step_check_rejects_a_broken_run() {
     let job = |lines: &[&str], extra: &str| {
-        let body: String = lines.iter().map(|l| format!("          {l}\n")).collect();
-        let text = format!("steps:\n  - name: run\n    {extra}run: |\n{body}");
-        let text = text.replace("\n          ", "\n        ");
+        let body = lines.join("\n        ");
+        let text = format!("steps:\n  - name: run\n    {extra}run: |\n        {body}\n");
         runs_the_linux_rows_instrumented(
             &parse_workflow_text(&text).expect("synthetic job must parse"),
         )

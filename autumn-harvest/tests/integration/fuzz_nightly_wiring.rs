@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use super::ci_run_coverage::{
     DRAFT_SKIP, alerts_on_scheduled_failure, dated_nightly, parse_workflow, parse_workflow_text,
-    repo_root, runs_on_every_schedule, soft, steps, str_at, ungated, workflow_crons,
+    repo_root, runs_on_every_schedule, steps, str_at, ungated, workflow_crons,
 };
 
 const FUZZ_CARGO_TOML: &str = include_str!("../../../fuzz/Cargo.toml");
