@@ -980,6 +980,33 @@ async fn a_parent_waits_on_a_blocked_child_and_starts_it_once() {
     assert_replays(&rt, child, "waits_for_go").await;
 }
 
+/// Retention can remove a closed parent while its awaited child still runs
+/// (issue #2031). The child then has no parent to notify, so it seals alone.
+#[tokio::test]
+async fn an_awaited_child_completes_after_retention_removes_its_parent() {
+    let mut rt = runtime();
+    let parent = rt.start_workflow("parent_of_waiter", json!(0)).unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    let child = children_of(&rt, parent)[0];
+    rt.run_until_blocked(child).await.unwrap();
+
+    rt.terminate(parent, "operator").unwrap();
+    let purged = rt
+        .purge_terminal_as_of(
+            Utc::now() + chrono::Duration::hours(2),
+            std::time::Duration::from_secs(3600),
+        )
+        .unwrap();
+    assert_eq!(purged, 1, "only the terminated parent is past the window");
+
+    rt.send_signal(child, "go", json!("late")).unwrap();
+    let state = rt.run_until_blocked(child).await.unwrap();
+    assert!(
+        matches!(state, RunState::Completed(ref v) if *v == json!("late")),
+        "{state:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_typed_child_failure_surfaces_in_the_parent() {
     let mut rt = runtime();

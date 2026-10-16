@@ -33,8 +33,8 @@ you need:
 - **Distributed / multi-worker** execution or **multi-server** crash recovery.
 - **High throughput** — a single writer with `BEGIN IMMEDIATE` is not built for
   a fleet claiming thousands of tasks per second.
-- **`LISTEN`/`NOTIFY` push wake-ups**, schedules, DAGs, the management API,
-  worker sessions, retention, or sharding — all v0.1 non-goals here (see below).
+- **`LISTEN`/`NOTIFY` push wake-ups**, DAGs, the management API, worker
+  sessions, or sharding — all v0.1 non-goals here (see below).
 
 ## Quickstart
 
@@ -144,6 +144,13 @@ A complete, runnable version is in
   inline after its decision commits. `#[workflow(execution_timeout = ..)]` ends a
   late run `TIMED_OUT`. `#[workflow(retry = ..)]` starts a retry run, which
   `successor(exec)` returns. Each records the Postgres events.
+- **Schedules, retention and the append-only guard (issue #2031).**
+  `upsert_schedule` stores a core `WorkflowSchedule`. Each `poll_once` pass
+  fires the due slots. A reopen keeps every slot. `purge_terminal(older_than)`
+  removes old terminal runs and keeps live ones. Two triggers keep
+  `harvest_events` append-only, the analog of the Postgres guard of issue
+  #1817. This backend has no sanctioned rewriter, so they refuse every
+  `UPDATE` and an `INSERT OR REPLACE`.
 
 ## v0.1 non-goals
 
@@ -151,7 +158,7 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
-- Schedules, the management API, DAGs, worker sessions, retention, sharding.
+- The management API, DAGs, worker sessions, sharding.
 - External activities and a continue-as-new to a different workflow type
   (`continue_as_new_as_type`) — a workflow reaching one of these is rejected
   **loudly, by name**, never silently dropped. The run then ends

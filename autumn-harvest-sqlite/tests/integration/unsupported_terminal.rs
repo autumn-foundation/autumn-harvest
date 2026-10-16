@@ -299,8 +299,8 @@ async fn races_then_runs_external(ctx: &WorkflowContext, _n: i64) -> Result<(), 
         .map_err(|e| e.to_string())
 }
 
-/// A sealed run is terminal, and this backend has no retention pass. The seal
-/// therefore removes the run's PENDING tasks, unfired timers and staged
+/// A sealed run is terminal. Retention removes its rows only with the whole run
+/// (issue #2031). The seal therefore removes the run's PENDING tasks, unfired timers and staged
 /// signals, as the `TerminateIfRunning` seal does. Nothing can ever use them.
 #[tokio::test]
 async fn sealing_removes_the_runs_outstanding_rows() {

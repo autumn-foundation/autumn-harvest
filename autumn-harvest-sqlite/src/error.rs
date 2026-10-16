@@ -274,6 +274,15 @@ pub enum SqliteError {
     #[error("invalid filter: {0}")]
     InvalidFilter(String),
 
+    /// A schedule has an invalid cron expression, timezone or interval
+    /// (issue #2031).
+    #[error("invalid schedule: {0}")]
+    InvalidSchedule(String),
+
+    /// No schedule exists for this workflow name (issue #2031).
+    #[error("schedule not found: {0}")]
+    ScheduleNotFound(String),
+
     /// A value stored in `SQLite` could not be parsed back into its Rust type.
     #[error("corrupt stored value: {0}")]
     Corrupt(String),

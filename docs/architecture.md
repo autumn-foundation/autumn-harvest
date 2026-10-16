@@ -1955,6 +1955,9 @@ randomized- and model-checking-based testing layers, and CI run coverage:
 * [`docs/testing/property-and-fuzz.md`](testing/property-and-fuzz.md) —
   `proptest` property tests and fuzzing, the two complementary randomized-testing
   layers.
+* [`docs/testing/coverage.md`](testing/coverage.md) — the nightly
+  line and branch coverage report, and the ratchet on the critical modules
+  (issue #1818).
 * [`docs/testing/chaos.md`](testing/chaos.md) — the deterministic,
   seedable fault-injection harness (issue #940) that kills workers, injects
   Diesel/connection errors, and drops `LISTEN`/`NOTIFY` wakes at named points

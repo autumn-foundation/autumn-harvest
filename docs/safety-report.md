@@ -375,8 +375,9 @@ pins the fix.
 
 ## Limits of this report
 
-- No tool measures test coverage (#1818, open). The report lists the tests
-  that exist. It cannot say which code paths no test reaches.
+- A nightly job measures line and branch coverage (#1818). The report does
+  not cite those numbers, so it cannot say which code paths no test
+  reaches.
 - The chaos suite runs nightly, not on each PR. The `test-db-linux` and
   `test-nodb` jobs run the PR suites, and neither is a required check yet.
 - The thread timing of a DB test is not deterministic. A seed fixes the

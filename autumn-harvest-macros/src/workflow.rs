@@ -1129,6 +1129,30 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let declared_activities_expr = declaration_expr(attrs.declared_activities.as_deref());
     let declared_children_expr = declaration_expr(attrs.declared_children.as_deref());
 
+    // Shared by `start_with_options` and `signal_with_start` below, which
+    // read both fields identically (see `optional_chrono_duration_tokens`'s
+    // doc comment).
+    let stub_execution_timeout_tokens = crate::attr_util::optional_chrono_duration_tokens(
+        "execution_timeout",
+        &quote! { opts.execution_timeout.or(info.execution_timeout) },
+    );
+    let stub_max_execution_timeout_ceiling_tokens =
+        crate::attr_util::optional_chrono_duration_tokens(
+            "max_execution_timeout_ceiling",
+            &quote! { client.max_workflow_execution_timeout() },
+        );
+    // `start_with_options`-only (issue #617): `signal_with_start` and
+    // `update.rs`'s `update_with_start` pass `None` for both instead.
+    let stub_chain_execution_timeout_tokens = crate::attr_util::optional_chrono_duration_tokens(
+        "chain_execution_timeout",
+        &quote! { info.chain_execution_timeout },
+    );
+    let stub_max_workflow_chain_timeout_ceiling_tokens =
+        crate::attr_util::optional_chrono_duration_tokens(
+            "max_workflow_chain_timeout_ceiling",
+            &quote! { client.max_workflow_chain_timeout() },
+        );
+
     quote! {
         #warnings_tokens
         #input_fn
@@ -1254,47 +1278,15 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         (None, None, ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer)
                     };
 
-                    let execution_timeout = match opts.execution_timeout.or(info.execution_timeout) {
-                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                    "execution_timeout exceeds chrono duration range".to_string()
-                                ))?
-                        ),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    };
+                    let execution_timeout = #stub_execution_timeout_tokens;
 
-                    let max_execution_timeout_ceiling = match client.max_workflow_execution_timeout() {
-                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                    "max_execution_timeout_ceiling exceeds chrono duration range".to_string()
-                                ))?
-                        ),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    };
+                    let max_execution_timeout_ceiling = #stub_max_execution_timeout_ceiling_tokens;
 
                     // Chain-scoped lifetime cap (issue #617). Resolved from the
                     // workflow-type default and the fleet-wide ceiling, at parity
                     // with the per-run `execution_timeout` above.
-                    let chain_execution_timeout = match info.chain_execution_timeout {
-                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                    "chain_execution_timeout exceeds chrono duration range".to_string()
-                                ))?
-                        ),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    };
-                    let max_workflow_chain_timeout_ceiling = match client.max_workflow_chain_timeout() {
-                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                    "max_workflow_chain_timeout_ceiling exceeds chrono duration range".to_string()
-                                ))?
-                        ),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    };
+                    let chain_execution_timeout = #stub_chain_execution_timeout_tokens;
+                    let max_workflow_chain_timeout_ceiling = #stub_max_workflow_chain_timeout_ceiling_tokens;
 
                     let max_workflow_start_delay = {
                         let ceiling_chrono = ::autumn_harvest::chrono::Duration::from_std(client.max_workflow_start_delay())
@@ -1384,25 +1376,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         (None, None, ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer)
                     };
 
-                    let execution_timeout = match opts.execution_timeout.or(info.execution_timeout) {
-                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                    "execution_timeout exceeds chrono duration range".to_string()
-                                ))?
-                        ),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    };
+                    let execution_timeout = #stub_execution_timeout_tokens;
 
-                    let max_execution_timeout_ceiling = match client.max_workflow_execution_timeout() {
-                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                    "max_execution_timeout_ceiling exceeds chrono duration range".to_string()
-                                ))?
-                        ),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    };
+                    let max_execution_timeout_ceiling = #stub_max_execution_timeout_ceiling_tokens;
 
                     // Note (issue #617): this typed-stub signal-with-start passes
                     // `None` for the two chain-cap fields below, so it does NOT

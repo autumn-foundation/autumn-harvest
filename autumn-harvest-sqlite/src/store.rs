@@ -575,19 +575,33 @@ pub fn set_start_fields(
     Ok(())
 }
 
-/// Copy the memo and the search attributes of `from` to `to`. A
-/// continue-as-new successor keeps both, as on Postgres (issue #2027).
-pub fn copy_memo_and_search_attrs(
+/// Copy the fields a successor inherits from `from` to `to`: the memo and
+/// the search attributes (issue #2027), and the schedule (issue #2031). A
+/// continue-as-new and a workflow retry are the same logical run.
+pub fn copy_inherited_fields(
     conn: &Connection,
     from: ExecutionId,
     to: ExecutionId,
 ) -> SqliteResult<()> {
     conn.execute(
         "UPDATE harvest_executions SET \
-           memo = (SELECT memo FROM harvest_executions WHERE exec_id = ?1), \
-           search_attrs = (SELECT search_attrs FROM harvest_executions WHERE exec_id = ?1) \
+           (memo, search_attrs, schedule_name) = \
+           (SELECT memo, search_attrs, schedule_name FROM harvest_executions WHERE exec_id = ?1) \
          WHERE exec_id = ?2",
         params![from.to_string(), to.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Mark `exec_id` as a run of the schedule `workflow_name` (issue #2031).
+pub fn set_schedule_name(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    workflow_name: &str,
+) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_executions SET schedule_name = ?2 WHERE exec_id = ?1",
+        params![exec_id.to_string(), workflow_name],
     )?;
     Ok(())
 }

@@ -358,7 +358,9 @@ fn notify_parent(
     let Some((parent, None)) = store::parent_link(conn, exec)? else {
         return Ok(());
     };
-    if store::execution_state(conn, parent)? != "RUNNING" {
+    // Retention can remove a closed parent before its awaited child ends
+    // (issue #2031). A parent with no row has nothing to notify.
+    if state_of(conn, parent)?.as_deref() != Some("RUNNING") {
         return Ok(());
     }
     for timer_id in queue::due_timers(conn, parent, now)? {
