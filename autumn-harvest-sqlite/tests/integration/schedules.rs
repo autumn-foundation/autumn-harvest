@@ -4,6 +4,11 @@
 //! the due schedules, then drives the fleet. The tests use a settable clock,
 //! so no test sleeps.
 
+// The `#[workflow]` macro reads the unused `_n` input through its expansion.
+#![allow(clippy::used_underscore_binding)]
+// A `#[workflow]` must be `async`, even when its body has no `.await`.
+#![allow(clippy::unused_async)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -113,7 +118,7 @@ async fn an_interval_schedule_starts_runs_on_time_across_a_reopen() {
     rt.upsert_schedule(&every_minute("tick")).unwrap();
     assert_eq!(next_run_at(&rt, "tick"), Some(T0 + MINUTE), "kept");
     assert!(!rt.poll_once().await.unwrap());
-    assert!(runs(&rt, "tick").is_empty());
+    assert_eq!(runs(&rt, "tick").len(), 0);
 
     // At the slot, one run starts and completes in the same pass.
     clock.store(T0 + MINUTE, Ordering::SeqCst);
@@ -268,13 +273,13 @@ async fn a_paused_schedule_does_not_fire() {
     let mut rt = runtime_at(&path, &clock);
     rt.upsert_schedule(&every_minute("tick")).unwrap();
     rt.poll_once().await.unwrap();
-    assert!(runs(&rt, "tick").is_empty(), "a re-upsert keeps the pause");
+    assert_eq!(runs(&rt, "tick").len(), 0, "a re-upsert keeps the pause");
     assert!(rt.list_schedules().unwrap()[0].paused);
 
     rt.resume_schedule("tick").unwrap();
     assert_eq!(next_run_at(&rt, "tick"), Some(T0 + 6 * MINUTE));
     rt.poll_once().await.unwrap();
-    assert!(runs(&rt, "tick").is_empty(), "no burst on resume");
+    assert_eq!(runs(&rt, "tick").len(), 0, "no burst on resume");
 }
 
 // A deleted schedule stops firing. Its run history stays.
@@ -334,7 +339,7 @@ async fn unsupported_fields_are_rejected_by_name() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&tick_info());
     let base = || every_minute("tick");
-    let mut cases: Vec<(&str, WorkflowSchedule)> = vec![
+    let cases: Vec<(&str, WorkflowSchedule)> = vec![
         ("catchup", {
             let mut s = base();
             s.catchup = true;
@@ -365,7 +370,7 @@ async fn unsupported_fields_are_rejected_by_name() {
         }),
         ("queue_name", base().with_queue_name("other")),
     ];
-    for (field, schedule) in cases.drain(..) {
+    for (field, schedule) in cases {
         let err = rt.upsert_schedule(&schedule).unwrap_err();
         assert!(
             matches!(&err, SqliteError::Unsupported(m) if m.starts_with(&format!("WorkflowSchedule.{field}"))),
@@ -399,7 +404,7 @@ async fn a_manual_schedule_never_fires() {
     assert_eq!(next_run_at(&rt, "tick"), None);
     clock.store(T0 + 1_000 * MINUTE, Ordering::SeqCst);
     rt.poll_once().await.unwrap();
-    assert!(runs(&rt, "tick").is_empty());
+    assert_eq!(runs(&rt, "tick").len(), 0);
 }
 
 // The `_as_of` pass fires at its own time.

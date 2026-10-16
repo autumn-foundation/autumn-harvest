@@ -5,8 +5,12 @@
 //! an `INSERT OR REPLACE` of a stored event. `DELETE` stays open for
 //! retention.
 
+// A `#[workflow]` must be `async`, even when its body has no `.await`.
+#![allow(clippy::unused_async)]
+
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::SqliteRuntime;
+use autumn_harvest_sqlite::append_only::with_guard_off;
 use rusqlite::Connection;
 use serde_json::json;
 
@@ -126,5 +130,39 @@ async fn an_old_file_gains_the_guard_on_open() {
     let err = conn
         .execute("UPDATE harvest_events SET event_json = '{}'", [])
         .expect_err("the reopened file has the guard");
+    assert!(err.to_string().contains("append-only"), "{err}");
+}
+
+// A test fixture turns the guard off for one transaction. The guard is back
+// after it, and after an error inside it.
+#[tokio::test]
+async fn a_fixture_can_turn_the_guard_off_for_one_transaction() {
+    let (_dir, path, exec) = file_with_history().await;
+    let mut conn = Connection::open(&path).unwrap();
+
+    let err = with_guard_off(&mut conn, |tx| {
+        tx.execute("UPDATE harvest_events SET event_json = '[]'", [])?;
+        tx.execute("SELECT no_such_function()", [])
+    });
+    assert!(err.is_err(), "the fixture error returns");
+    assert_ne!(
+        first_event(&conn, &exec),
+        "[]",
+        "the error rolls back the write"
+    );
+
+    let changed = with_guard_off(&mut conn, |tx| {
+        tx.execute(
+            "UPDATE harvest_events SET event_json = '[]' WHERE exec_id = ?1 AND seq = 0",
+            [&exec],
+        )
+    })
+    .unwrap();
+    assert_eq!(changed, 1);
+    assert_eq!(first_event(&conn, &exec), "[]");
+
+    let err = conn
+        .execute("UPDATE harvest_events SET event_json = '{}'", [])
+        .expect_err("the guard is back");
     assert!(err.to_string().contains("append-only"), "{err}");
 }

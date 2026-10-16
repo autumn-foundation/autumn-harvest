@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use croner::Cron;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
@@ -5179,54 +5178,7 @@ fn rebase_logical_date(
 }
 
 fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    match schedule {
-        Some(Schedule::Cron(expr)) => Cron::new(expr)
-            .with_seconds_optional()
-            .parse()
-            .ok()
-            .and_then(|cron| cron.find_next_occurrence(&reference, false).ok()),
-        Some(Schedule::CronInTimezone { expr, tz }) => {
-            // Parse the IANA timezone; if it's invalid we return None so the
-            // schedule simply doesn't fire (validation should have caught this).
-            let tz: chrono_tz::Tz = tz.parse().ok()?;
-            let cron = Cron::new(expr).with_seconds_optional().parse().ok()?;
-            // Convert the reference instant into the schedule's local timezone.
-            let local_ref = reference.with_timezone(&tz);
-            // First pass: find the candidate next occurrence strictly after the
-            // reference time.
-            let candidate = cron.find_next_occurrence(&local_ref, false).ok()?;
-            // DST spring-forward correction: when `croner` computes a next
-            // occurrence that falls inside a gap (e.g. "02:30 AM" on a day
-            // where 02:00–03:00 is skipped), `chrono_tz` silently advances the
-            // non-existent local time to the first valid second after the gap
-            // (e.g. 03:00:00 PDT).  That instant does NOT match the cron
-            // pattern, so calling `find_next_occurrence` again with
-            // `include_current = true` from the candidate advances to the
-            // actual next matching wall-clock time (e.g. 02:30 on the next day)
-            // without double-advancing on ordinary (non-gap) results.
-            //
-            // Fall-back is handled correctly by the strict `false` on the first
-            // call: `croner` advances past the first occurrence of the repeated
-            // hour when called from it, producing the next-day result.  Calling
-            // `find_next_occurrence(&candidate, true)` on a genuine match
-            // returns the same instant, preserving that behavior.
-            let local_next = cron.find_next_occurrence(&candidate, true).ok()?;
-            Some(local_next.with_timezone(&Utc))
-        }
-        Some(Schedule::Interval(interval)) => chrono::Duration::from_std(*interval)
-            .ok()
-            // A zero (or non-positive) interval would return `reference` unchanged,
-            // which spins any catchup walk forever and makes a due tick loop
-            // indefinitely (issue #484 / Codex #3223). Treat a non-advancing
-            // interval as "no next occurrence" so every caller terminates; such a
-            // schedule simply never fires. (`validate_schedule` also rejects it at
-            // registration time.)
-            .filter(|duration| *duration > chrono::Duration::zero())
-            // A sum past the last date that chrono holds also means no next
-            // run (issue #2048).
-            .and_then(|duration| reference.checked_add_signed(duration)),
-        Some(Schedule::Manual) | None => None,
-    }
+    schedule.and_then(|schedule| crate::schedule_plan::next_fire_after(schedule, reference))
 }
 
 // ── Overdue-schedule detection (issue #696) ──────────────────────────────────
@@ -5969,10 +5921,11 @@ fn due_run_plan(
         // does not drift the schedule (interval schedules: next = first_due +
         // period, not now + period). Fall back to next_run_after(now) when the
         // slot-anchored next is already in the past to preserve the non-catchup
-        // skip-overdue-slots semantics for very late dispatchers.
-        let next = next_run_after(schedule, first_due)
-            .filter(|&t| t > now)
-            .or_else(|| next_run_after(schedule, now));
+        // skip-overdue-slots semantics for very late dispatchers. The SQLite
+        // backend shares this rule (issue #2031).
+        let next = schedule.and_then(|schedule| {
+            crate::schedule_plan::next_slot_after_fire(schedule, first_due, now)
+        });
         return (vec![first_due], next);
     }
 

@@ -3,6 +3,9 @@
 //! A terminal write stores `closed_at` from the real clock. These tests move
 //! the runtime clock forward to age a run past the window.
 
+// A `#[workflow]` must be `async`, even when its body has no `.await`.
+#![allow(clippy::unused_async)]
+
 use std::time::Duration;
 
 use autumn_harvest::WorkflowIdReusePolicy;
@@ -115,6 +118,7 @@ async fn purge_removes_terminal_runs_past_the_window_and_keeps_live_ones() {
         ),
         "the live run still finishes"
     );
+    rt.set_clock(Utc::now);
     assert_eq!(rt.purge_terminal(HOUR).unwrap(), 0, "it closed just now");
 }
 

@@ -45,6 +45,12 @@
 //! - `harvest_mutex_locks`, `harvest_mutex_waiters` and `harvest_mutex_seq` —
 //!   the workflow mutex (issue #2029). A lock row holds a key. The waiter rows
 //!   form a FIFO queue per key. The counter mints each fencing `lock_seq`.
+//! - `harvest_schedules` — cron and interval schedules (issue #2031). One row
+//!   per workflow name, as on Postgres.
+//!
+//! Two triggers keep `harvest_events` append-only (issue #2031). They refuse
+//! every `UPDATE`, and an `INSERT` over a stored `(exec_id, seq)`. See
+//! [`APPEND_ONLY_GUARD`].
 
 /// The full schema, applied idempotently on
 /// [`SqliteRuntime::open`](crate::SqliteRuntime::open).
@@ -100,9 +106,12 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
                                            -- (issue #2029). NULL = no retry.
     retry_of_exec_id TEXT,                 -- the failed run that this retry replaces
                                            -- (issue #2029).
-    local_retry_at INTEGER                 -- the epoch-millisecond end of a local
+    local_retry_at INTEGER,                -- the epoch-millisecond end of a local
                                            -- activity's retry backoff (issue #2029).
                                            -- A drive before it waits.
+    schedule_name TEXT                     -- the schedule that started this run
+                                           -- (issue #2031). A successor copies it.
+                                           -- NULL = not a scheduled run.
 );
 
 -- Non-unique lookup index for the (workflow_name, workflow_id) reuse-policy probe
@@ -293,6 +302,21 @@ CREATE TABLE IF NOT EXISTS harvest_mutex_seq (
     last INTEGER NOT NULL
 );
 
+-- Cron and interval schedules (issue #2031). The workflow name is the key,
+-- as on Postgres. Each `poll_once` pass fires the rows whose slot is due.
+CREATE TABLE IF NOT EXISTS harvest_schedules (
+    workflow_name   TEXT PRIMARY KEY,
+    schedule_json   TEXT NOT NULL,         -- the `Schedule` spec as JSON
+    input_json      TEXT NOT NULL,         -- the input of each run
+    overlap_policy  TEXT NOT NULL,         -- skip | allow_all
+    max_active_runs INTEGER NOT NULL,      -- the run limit of `skip`
+    paused          INTEGER NOT NULL DEFAULT 0,
+    next_run_at     INTEGER,               -- the next slot in epoch milliseconds.
+                                           -- NULL = never fires.
+    last_run_at     INTEGER                -- the slot of the last started run in
+                                           -- epoch milliseconds
+);
+
 CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
     attempt_seq INTEGER PRIMARY KEY AUTOINCREMENT,
     exec_id     TEXT NOT NULL,
@@ -302,6 +326,38 @@ CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
     detail      TEXT NOT NULL             -- output JSON on success, error on failure
 );
 ";
+
+/// The append-only guard on `harvest_events` (issue #2031), the analog of
+/// the Postgres trigger of issue #1817.
+///
+/// Replay reads the log back in order, so a rewritten event changes what a
+/// past run means. This backend has no sanctioned rewrite, so the guard
+/// refuses every `UPDATE`. `INSERT OR REPLACE` deletes the old row and fires
+/// no `UPDATE` trigger. So a second trigger refuses an `INSERT` over a stored
+/// key. `DELETE` stays open, because retention needs it.
+///
+/// [`SqliteRuntime::open`](crate::SqliteRuntime::open) applies it after
+/// [`SCHEMA`]. Both statements are idempotent, so an older file gains the
+/// guard on its next open.
+pub const APPEND_ONLY_GUARD: &str = r"
+CREATE TRIGGER IF NOT EXISTS harvest_events_append_only_upd
+    BEFORE UPDATE ON harvest_events
+BEGIN
+    SELECT RAISE(ABORT, 'harvest_events is append-only (issue #2031)');
+END;
+CREATE TRIGGER IF NOT EXISTS harvest_events_append_only_ins
+    BEFORE INSERT ON harvest_events
+    WHEN EXISTS (SELECT 1 FROM harvest_events
+                 WHERE exec_id = NEW.exec_id AND seq = NEW.seq)
+BEGIN
+    SELECT RAISE(ABORT, 'harvest_events is append-only (issue #2031)');
+END;
+";
+
+/// Drop both triggers of [`APPEND_ONLY_GUARD`].
+pub const DROP_APPEND_ONLY_GUARD: &str = "\
+    DROP TRIGGER IF EXISTS harvest_events_append_only_upd; \
+    DROP TRIGGER IF EXISTS harvest_events_append_only_ins;";
 
 use rusqlite::Connection;
 
@@ -347,6 +403,11 @@ use crate::error::SqliteResult;
 ///   `local_retry_at`.
 ///   Each is nullable or has a default, so an old row has no timeout and no
 ///   retry. The mutex tables are new, so `CREATE TABLE IF NOT EXISTS` adds them.
+/// - **issue #2031** — `harvest_executions.schedule_name`, and two partial
+///   indexes: the run count of a schedule and the close time that retention
+///   reads. The column is nullable, so an old row is not a scheduled run. The
+///   indexes are built here, because the base [`SCHEMA`] runs before an old
+///   table has the columns.
 ///
 /// # Errors
 ///
@@ -430,6 +491,15 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
             &format!("ALTER TABLE harvest_executions ADD COLUMN {column} {ddl}"),
         )?;
     }
+    // issue #2031: the schedule of a run, and the two indexes that schedules
+    // and retention read.
+    add_column_if_absent(
+        conn,
+        "harvest_executions",
+        "schedule_name",
+        "ALTER TABLE harvest_executions ADD COLUMN schedule_name TEXT",
+    )?;
+    conn.execute_batch(SCHEDULE_AND_RETENTION_INDEXES)?;
     // issue #2028: the signal idempotency key. The back-fill runs only when the
     // column is new. So the column, the index and the back-fill share one
     // transaction: a crash after the column must not skip the back-fill.
@@ -447,6 +517,15 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     tx.commit()?;
     Ok(())
 }
+
+/// The indexes of issue #2031. The first counts the active runs of a
+/// schedule. The second finds the runs that retention can remove. Both are
+/// partial, so a row that is not scheduled or not closed costs nothing.
+const SCHEDULE_AND_RETENTION_INDEXES: &str = "\
+    CREATE INDEX IF NOT EXISTS idx_harvest_executions_schedule \
+        ON harvest_executions (schedule_name, state) WHERE schedule_name IS NOT NULL; \
+    CREATE INDEX IF NOT EXISTS idx_harvest_executions_closed \
+        ON harvest_executions (closed_at) WHERE closed_at IS NOT NULL;";
 
 /// The partial unique index that enforces a signal idempotency key (issue
 /// #2028). A NULL key is outside the index, so an unkeyed signal always

@@ -54,8 +54,8 @@ would write, so it replays unchanged on the core `WorkflowReplayer`.
 
 **Reach for the Postgres core ([`autumn-harvest`](../autumn-harvest)) instead
 when** you need distributed / multi-worker execution, multi-server crash
-recovery, high throughput, `LISTEN`/`NOTIFY` push wake-ups, schedules, DAGs, the
-management API, worker sessions, retention, or sharding.
+recovery, high throughput, `LISTEN`/`NOTIFY` push wake-ups, DAGs, the
+management API, worker sessions, or sharding.
 
 | | SQLite backend | Postgres core |
 | --- | --- | --- |
@@ -64,7 +64,8 @@ management API, worker sessions, retention, or sharding.
 | Wake-ups | Polling (you drive it) | `LISTEN`/`NOTIFY` push |
 | Crash recovery | Single-process reopen | Multi-server heartbeat/reclaim |
 | Throughput | Modest, single-writer | High, horizontally scaled |
-| Extras (schedules, DAGs, mgmt API, sharding) | v0.1 non-goals | Yes |
+| Schedules, retention | Yes (issue #2031) | Yes |
+| Extras (DAGs, mgmt API, sharding) | v0.1 non-goals | Yes |
 
 ---
 
@@ -439,8 +440,9 @@ drive of the old run returns the same successor and starts no other run.
 `start_workflow_with_id` with the same id attaches to the newest run. Send
 later signals to the successor, because the old run is terminal.
 
-`continue_as_new` bounds the replay cost of a run, not the database size. This
-backend has no retention, so each sealed run keeps its history in the file.
+`continue_as_new` bounds the replay cost of a run, not the database size. Each
+sealed run keeps its history in the file until `purge_terminal` removes it
+(see [Schedules, retention and the append-only guard](#schedules-retention-and-the-append-only-guard-issue-2031)).
 
 `outcome()` of the old run is `ExecutionOutcome::Terminated("CONTINUED_AS_NEW")`.
 `successor(old)` returns the successor id without a drive.
@@ -539,6 +541,78 @@ its backoff: before then a drive returns `RunState::WaitingTimer`.
 `successor(failed)` returns it. A panic, a replay divergence, a cap, a
 timeout, a cancel and a non-retryable error never retry.
 
+### Schedules, retention and the append-only guard (issue #2031)
+
+**Schedules.** `upsert_schedule` stores a core `WorkflowSchedule` in
+`harvest_schedules`. The workflow name is the key, as on Postgres. Each
+`poll_once` pass fires the due schedules, then drives the fleet, so a new run
+starts in the same pass. `run_until_idle` and `poll_once_as_of` fire too.
+`run_until_blocked` drives one run and fires nothing.
+
+```rust
+use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+
+rt.register_workflow(&nightly_info());
+// Safe on every open: the same spec keeps its next slot and its pause.
+rt.upsert_schedule(
+    &WorkflowSchedule::new("nightly", Schedule::Cron("0 3 * * *".into()))
+        .with_input(serde_json::json!({ "full": true })),
+)?;
+loop {
+    rt.poll_once().await?;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+}
+```
+
+- The slot arithmetic is the core `schedule_plan` module. The Postgres
+  scheduler calls it too, so both backends compute the same slots.
+- One transaction checks the overlap, starts the run and moves the slot. A
+  crash cannot start a slot twice. The run of a slot has the `workflow_id`
+  `sched:<workflow>:<slot seconds>`.
+- Catch-up is off. After a gap, a schedule fires one run, then counts its
+  next slot from now.
+- `Skip` drops a slot while `max_active_runs` runs of the schedule are
+  `RUNNING`. A continue-as-new or retry successor counts. `AllowAll` starts a
+  run for every slot.
+- `pause_schedule` stops the fires. `resume_schedule` counts the next slot
+  from now, so the missed slots do not fire. `delete_schedule` removes the
+  row, and the runs keep running. `list_schedules` reads every row.
+- A slot of an unregistered workflow stays due. The pass returns
+  `UnknownWorkflow`, and the slot fires once the app registers it.
+- `jitter` is ignored. Jitter spreads the fires of a fleet, and one writer
+  has no fleet.
+- Each other field this backend cannot honor is rejected with
+  `SqliteError::Unsupported("WorkflowSchedule.<field> — ...")`: `catchup`,
+  a `catchup_policy` other than `SkipAll`, the buffer and cancel overlap
+  policies, `calendar`, `end_at`, `max_runs`, `consecutive_failure_limit`,
+  `retry_policy`, `execution_timeout`, `chain_execution_timeout`,
+  `all_writable_shards`, `dag_name` and a `queue_name` other than `default`.
+
+**Retention.** `purge_terminal(older_than)` removes each terminal run closed
+more than `older_than` ago, with its events, tasks, timers, signals and
+activity attempts. It returns the number of runs removed. It works in batches
+of 256 runs, one short transaction each.
+
+- A `RUNNING` run is never removed.
+- A terminal run stays while a `RUNNING` run shares its
+  `(workflow_name, workflow_id)`. That run reads the keyed signals of its
+  chain (issue #2028).
+- A run closed before issue #2027 has no close time, so it stays.
+- A purged id is gone. A later start with its `workflow_id` creates a fresh
+  run, as after a Postgres retention sweep.
+- The purge frees pages for reuse, so the file stops growing. It does not
+  shrink. Run `VACUUM` to shrink it.
+
+**The append-only guard.** Two triggers keep `harvest_events` append-only, as
+the Postgres trigger of issue #1817 does. One refuses every `UPDATE`. The
+other refuses an `INSERT` over a stored `(exec_id, seq)`, so
+`INSERT OR REPLACE` cannot rewrite an event. `DELETE` stays open for
+retention. This backend has no erase and no codec rotation, so no writer has a
+sanction. The schema creates both triggers on every open, so an older file
+gains the guard. A test fixture that must damage an event calls
+`autumn_harvest_sqlite::append_only::with_guard_off`. Production code must
+not call it.
+
 ---
 
 ## 8. Signals, queries and updates
@@ -594,7 +668,7 @@ rejected rather than silently lost.
 A webhook can deliver the same event twice. Give the signal an idempotency
 key, and the run gets it once:
 
-```rust,ignore
+```rust
 // `true`: staged. `false`: this run already holds the key.
 let staged = rt.send_signal_idempotent(exec, "approve", json!(true), Some("hook-42"))?;
 ```
@@ -614,7 +688,7 @@ let staged = rt.send_signal_idempotent(exec, "approve", json!(true), Some("hook-
 
 Signal a run by its business id:
 
-```rust,ignore
+```rust
 let delivery = rt.send_signal_by_workflow_id("order", "order-7", "approve", json!(true), None)?;
 // delivery.exec_id is the run that holds the signal.
 ```
@@ -634,7 +708,7 @@ let delivery = rt.send_signal_by_workflow_id("order", "order-7", "approve", json
 
 Start a run and signal it, or signal the run that exists:
 
-```rust,ignore
+```rust
 let out = rt.signal_with_start(SignalWithStart {
     workflow_name: "order",
     workflow_id: "order-7",
@@ -1018,8 +1092,9 @@ the first execution error to the caller. A sealed execution is terminal, so
 later passes skip it.
 
 Backend-level non-goals: distributed / multi-writer workers, `LISTEN`/`NOTIFY`
-push wake-ups, multi-server crash recovery, schedules, the management API,
-retention, worker sessions, sharding, and DAGs. Rejection is deliberate, so a
+push wake-ups, multi-server crash recovery, the management API, worker
+sessions, sharding, and DAGs. Schedules and retention shipped under issue
+#2031. Rejection is deliberate, so a
 partial, silently-wrong implementation never ships.
 
 The `WorkflowIdReusePolicy` matrix (see [§6](#6-starting-a-workflow)) shipped
