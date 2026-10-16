@@ -2119,7 +2119,9 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                             target_shard: source_shard.as_i32(),
                             target_workflow_name: trigger_db.target_workflow_name.clone(),
                             target_workflow_id: target_workflow_id.clone(),
-                            target_input: target_input.clone(),
+                            // The row stores the input in the column form
+                            // (issue #2043). The relay decodes it.
+                            target_input: codecs.encode_column(&target_input)?,
                             queue_name: trigger_db.queue_name.clone(),
                             concurrency_key: concurrency_key.clone(),
                             concurrency_limit: concurrency_limit
@@ -2212,7 +2214,9 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
                         target_shard: target_shard.as_i32(),
                         target_workflow_name: trigger_db.target_workflow_name.clone(),
                         target_workflow_id: target_workflow_id.clone(),
-                        target_input: target_input.clone(),
+                        // The row stores the input in the column form
+                        // (issue #2043). The relay decodes it.
+                        target_input: codecs.encode_column(&target_input)?,
                         queue_name: trigger_db.queue_name.clone(),
                         concurrency_key: concurrency_key.clone(),
                         concurrency_limit: concurrency_limit.map(|l| i32::try_from(l).unwrap_or(i32::MAX)),
@@ -2511,6 +2515,22 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
 
     let mut processed_count = 0;
     for task in pending_tasks {
+        // The row stores the input in the column form (issue #2043). A row
+        // that does not decode stays pending and backs off. It starts after
+        // an operator restores the key.
+        let target_input = match codecs.decode_column(&task.target_input) {
+            Ok(input) => input,
+            Err(error) => {
+                tracing::warn!(
+                    outbox_id = %task.id,
+                    error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                    "outbox input could not be decoded; the row stays pending"
+                );
+                stamp_outbox_relay_backoff(conn, task.id).await;
+                continue;
+            }
+        };
+
         let target_shard = crate::types::ShardId::new(task.target_shard);
         let Some(target_pool) = sharded_pool
             .as_ref()
@@ -2616,7 +2636,7 @@ pub async fn enforce_completion_triggers_outbox_with_codecs(
                 &task.target_workflow_name,
                 &task.target_workflow_id,
                 crate::types::ExecutionId::new_for_shard(target_shard),
-                task.target_input,
+                target_input,
                 &queue_name,
             )
         };

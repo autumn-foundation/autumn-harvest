@@ -57,12 +57,18 @@ async fn child_typed_failure(ctx: &WorkflowContext, _n: i64) -> Result<i64, Work
         .with_details(json!({ "code": 51 })))
 }
 
-/// Completes, but its last cycle upserts a search attribute. This backend
-/// still rejects that, so the child is sealed with a typed failure.
+/// Completes, but its last cycle schedules an external activity. This
+/// backend still rejects that, so the child is sealed with a typed failure.
 #[workflow]
 async fn child_unsupported(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
-    ctx.upsert_search_attrs([("stage".to_string(), Some(json!("done")))])
-        .map_err(|e| e.to_string())?;
+    // Poll the external activity once, so its command joins the last batch,
+    // then return without awaiting it.
+    let mut external =
+        std::pin::pin!(ctx.execute_activity_external("external", json!({}), "default", 60));
+    let _ = std::future::Future::poll(
+        external.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    );
     Ok(n)
 }
 
@@ -613,6 +619,21 @@ async fn mints_then_continues(ctx: &WorkflowContext, _n: i64) -> Result<i64, Str
     Ok(0)
 }
 
+/// Spawns a detached child under `request_cancel`, then waits past its 30 s
+/// execution timeout.
+#[workflow(execution_timeout = "30s")]
+async fn spawns_then_times_out(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    ctx.spawn_child_workflow_detached_raw(
+        "waits_for_go",
+        json!(0),
+        ParentClosePolicy::RequestCancel,
+    )
+    .map_err(|e| e.to_string())?;
+    ctx.wait_for_signal("never")
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn runtime() -> SqliteRuntime {
@@ -683,6 +704,7 @@ fn fixtures() -> Vec<WorkflowInfo> {
         spawns_then_cleans_up_info(),
         spawns_then_waits_on_missing_info(),
         mints_then_continues_info(),
+        spawns_then_times_out_info(),
     ]
 }
 
@@ -929,7 +951,7 @@ async fn an_unsupported_child_surfaces_as_a_typed_failure() {
     rt.run_until_blocked(parent).await.unwrap();
     let out = completed(&rt, parent);
     assert_eq!(out["error_type"], json!(UNSUPPORTED_FEATURE_ERROR_TYPE));
-    assert_eq!(out["details"]["feature"], json!("UpsertSearchAttributes"));
+    assert_eq!(out["details"]["feature"], json!("ScheduleExternalActivity"));
     assert_eq!(out["non_retryable"], json!(true));
     assert_replays(&rt, parent, "parent_reports_child_failure").await;
 }
@@ -2318,4 +2340,41 @@ async fn a_child_continue_as_new_keeps_its_side_effects() {
         .position(|e| matches!(e, WorkflowEvent::WorkflowFailed { .. }))
         .expect("the child failed");
     assert!(minted < failed, "{history:#?}");
+}
+
+/// A run that passes its execution timeout closes like any terminal run. Its
+/// detached children get their policy, as on Postgres.
+#[tokio::test]
+async fn a_timed_out_parent_applies_its_close_policy() {
+    let mut rt = runtime();
+    let clock = Arc::new(AtomicI64::new(1_767_225_600_000));
+    let read = Arc::clone(&clock);
+    rt.set_clock(move || {
+        chrono::DateTime::from_timestamp_millis(read.load(Ordering::SeqCst)).unwrap()
+    });
+    let parent = rt
+        .start_workflow("spawns_then_times_out", json!(0))
+        .unwrap();
+    rt.run_until_blocked(parent).await.unwrap();
+    let child = children_of(&rt, parent)[0];
+
+    clock.fetch_add(31_000, Ordering::SeqCst);
+    let state = rt.run_until_blocked(parent).await.unwrap();
+
+    assert!(matches!(state, RunState::TimedOut(_)), "{state:?}");
+    let child_state = rt.run_until_blocked(child).await.unwrap();
+    assert!(
+        matches!(child_state, RunState::Cancelled(_)),
+        "{child_state:?}"
+    );
+    let history = rt.load_history(parent).unwrap();
+    let timed_out = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::WorkflowExecutionTimedOut { .. }))
+        .expect("the run timed out");
+    let cascade = history
+        .iter()
+        .position(|e| matches!(e, WorkflowEvent::ChildWorkflowCascadeApplied { .. }))
+        .expect("the cascade is recorded");
+    assert!(timed_out < cascade, "{history:#?}");
 }

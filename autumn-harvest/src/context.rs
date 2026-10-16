@@ -3137,6 +3137,10 @@ pub struct WorkflowContext {
     /// canary, allowing it to suspend at the end of its history without throwing
     /// non-determinism errors.
     canary_mode: bool,
+    /// When set, the executor runs each admitted update that has no result at
+    /// the end of the cycle (issue #2035). Only the worker sets it. A replay
+    /// gate leaves it `None`, so a gate never runs a handler.
+    update_dispatch: Option<crate::update::UpdateDispatch>,
     // ── Payload size caps (issue #252) ────────────────────────────────
     /// Logical workflow type name for use in `PayloadTooLarge` errors.
     /// Empty string when not known (legacy contexts, update handlers).
@@ -3725,6 +3729,7 @@ impl WorkflowContext {
             cancellation_reason,
             strict_replay: false,
             canary_mode: false,
+            update_dispatch: None,
             workflow_name: String::new(),
             queue_name: String::new(),
             workflow_id: String::new(),
@@ -3912,6 +3917,7 @@ impl WorkflowContext {
             cancellation_reason,
             strict_replay: false,
             canary_mode: false,
+            update_dispatch: None,
             workflow_name: String::new(),
             queue_name: String::new(),
             workflow_id: String::new(),
@@ -3989,6 +3995,7 @@ impl WorkflowContext {
             cancellation_reason: None,
             strict_replay: false,
             canary_mode: false,
+            update_dispatch: None,
             workflow_name: String::new(),
             queue_name: String::new(),
             workflow_id: String::new(),
@@ -4293,6 +4300,27 @@ impl WorkflowContext {
             self.cancellation_reason = reason;
         }
         self
+    }
+
+    /// Let the executor run admitted updates at the end of each cycle
+    /// (issue #2035).
+    ///
+    /// The worker calls this for a live decision. A replay gate does not.
+    /// `dispatch` holds the end of the workflow-task budget. The dispatch
+    /// stops early, so the cycle persists before the budget ends.
+    #[must_use]
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the worker dispatches updates.
+    pub(crate) const fn with_update_dispatch(
+        mut self,
+        dispatch: crate::update::UpdateDispatch,
+    ) -> Self {
+        self.update_dispatch = Some(dispatch);
+        self
+    }
+
+    /// How the executor dispatches admitted updates, or `None` when it does not.
+    pub(crate) const fn update_dispatch(&self) -> Option<crate::update::UpdateDispatch> {
+        self.update_dispatch
     }
 
     /// Set the shard the parent row lives on right now (issue #1405).
@@ -14317,18 +14345,7 @@ impl WorkflowContext {
         }
 
         // Live path: invoke the registered handler.
-        let handler_opt = {
-            let registry = self
-                .update_registry
-                .lock()
-                .expect("update_registry lock poisoned");
-            registry.get_handler(name)
-        };
-
-        let result = match handler_opt {
-            Some(handler) => handler(input).await,
-            None => Err(format!("update handler '{name}' not found")),
-        };
+        let result = self.run_update_handler(name, input).await;
 
         // Durably record the terminal result so the worker can append
         // UpdateCompleted/UpdateFailed before persisting other side effects.
@@ -14338,6 +14355,45 @@ impl WorkflowContext {
         });
 
         result
+    }
+
+    /// Run the registered handler for `name`. This call does not read history.
+    ///
+    /// Returns `Err("update handler 'name' not found")` if no handler has the
+    /// name.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal update registry mutex is poisoned.
+    pub(crate) async fn run_update_handler(
+        &self,
+        name: &str,
+        input: Value,
+    ) -> Result<Value, String> {
+        let handler = self
+            .update_registry
+            .lock()
+            .expect("update_registry lock poisoned")
+            .get_handler(name);
+        match handler {
+            Some(handler) => handler(input).await,
+            None => Err(format!("update handler '{name}' not found")),
+        }
+    }
+
+    /// List the admitted updates that have no result in the loaded history,
+    /// in history order (issue #2035).
+    ///
+    /// This read does not move the replay position.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
+    pub(crate) fn pending_updates(&self) -> Vec<(UpdateId, String, Value)> {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .drain_admitted_updates()
     }
 
     // ── Signal handlers (issue #546) ────────────────────────────────────
@@ -15712,7 +15768,6 @@ impl ActivityContext {
         }
     }
 
-    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) fn new_local_activity(
         state: SharedState,
         cancel: tokio_util::sync::CancellationToken,
@@ -15779,6 +15834,23 @@ impl ActivityContext {
         )
         .seed_heartbeat_details(heartbeat_details)
         .with_idempotency_key(key)
+    }
+
+    /// Build a local-activity context for an embedded backend, such as
+    /// `autumn-harvest-sqlite` (issue #2029).
+    ///
+    /// The context is the one the Postgres worker builds for its inline
+    /// local-activity path. `is_local()` is `true`, and a heartbeat reports
+    /// that local activities do not support it. The idempotency key derives
+    /// from `identity.activity_id`. The cancellation token never fires.
+    ///
+    /// Not for activity authors.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_embedded_local(state: SharedState, identity: ActivityIdentity) -> Self {
+        let key = IdempotencyKey::from_activity_exec_id(identity.activity_id);
+        Self::new_local_activity(state, tokio_util::sync::CancellationToken::new(), identity)
+            .with_idempotency_key(key)
     }
 
     /// Seed the checkpoint of the previous attempt and the auto-heartbeat
@@ -17311,7 +17383,10 @@ impl ActivityContext {
                 // Mark the task COMPLETED. The row lock above keeps the claim
                 // current, so a lost lease here is a bug, and the error rolls
                 // back.
-                crate::queue::complete_claimed_task(conn, &claim, output)
+                // The row stores the result in the column form (issue #2043).
+                let row_output =
+                    crate::queue::activity_row_output(&codecs, &output, stored.is_some())?;
+                crate::queue::complete_claimed_task(conn, &claim, row_output)
                     .await?
                     .require_applied(task_id)?;
 

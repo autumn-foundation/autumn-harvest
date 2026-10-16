@@ -14,7 +14,7 @@
 
 // The `#[workflow]` macro references its input param through expansion.
 #![allow(clippy::used_underscore_binding)]
-// `upserts_then_completes` and `healthy` hold no `.await`; each ends in one cycle.
+// `schedules_external_then_completes` and `healthy` hold no `.await`; each ends in one cycle.
 #![allow(clippy::unused_async)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -26,25 +26,29 @@ use autumn_harvest_sqlite::{
 };
 use serde_json::json;
 
-/// Counts runs of `runs_local_counted` only. Other tests run in parallel in
-/// this binary, so they use `runs_local` and never touch this counter.
+/// Counts runs of `runs_external_counted` only. Other tests run in parallel in
+/// this binary, so they use `runs_external` and never touch this counter.
 static COUNTED_RUNS: AtomicU32 = AtomicU32::new(0);
 
-/// A local activity is still outside the subset. Child workflows are
-/// supported since issue #2026, so they no longer serve as the example.
+/// An external activity is still outside the subset. Child workflows (issue
+/// #2026) and local activities (issue #2029) are supported, so neither serves
+/// as the example.
 #[workflow]
-async fn runs_local_counted(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
+async fn runs_external_counted(
+    ctx: &WorkflowContext,
+    _n: i64,
+) -> Result<serde_json::Value, String> {
     COUNTED_RUNS.fetch_add(1, Ordering::SeqCst);
-    ctx.execute_local_activity_raw("local", json!({}), None, None)
+    ctx.execute_activity_external("external", json!({}), "default", 60)
         .await
         .map_err(|e| e.to_string())
 }
 
 #[workflow]
-async fn runs_local(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
+async fn runs_external(ctx: &WorkflowContext, _n: i64) -> Result<serde_json::Value, String> {
     // A side effect in the same cycle. The rejected cycle must not keep it.
     let _id = ctx.new_uuid();
-    ctx.execute_local_activity_raw("local", json!({}), None, None)
+    ctx.execute_activity_external("external", json!({}), "default", 60)
         .await
         .map_err(|e| e.to_string())
 }
@@ -68,12 +72,20 @@ async fn uses_a_session(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
     Ok(())
 }
 
-/// Completes, but its last cycle also emits a search-attribute upsert. The
-/// terminal drain rejects that command.
+/// Completes, but its last cycle also schedules an external activity. The
+/// terminal drain rejects that command. A search-attribute upsert (issue
+/// #2027) and a detached spawn (issue #2026) were the examples until each
+/// became supported.
 #[workflow]
-async fn upserts_then_completes(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
-    ctx.upsert_search_attrs([("stage".to_string(), Some(json!("done")))])
-        .map_err(|e| e.to_string())?;
+async fn schedules_external_then_completes(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    // Poll the external activity once, so its command joins the last batch,
+    // then return without awaiting it.
+    let mut external =
+        std::pin::pin!(ctx.execute_activity_external("external", json!({}), "default", 60));
+    let _ = std::future::Future::poll(
+        external.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    );
     Ok(n)
 }
 
@@ -123,17 +135,17 @@ fn assert_sealed_unsupported(rt: &SqliteRuntime, exec: ExecutionId, feature: &st
 }
 
 #[tokio::test]
-async fn a_local_activity_ends_failed_with_a_typed_reason() {
+async fn an_external_activity_ends_failed_with_a_typed_reason() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&runs_local_info());
-    let exec = rt.start_workflow("runs_local", json!(0)).unwrap();
+    rt.register_workflow(&runs_external_info());
+    let exec = rt.start_workflow("runs_external", json!(0)).unwrap();
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(
-        matches!(err, SqliteError::Unsupported(ref c) if c == "RunLocalActivity"),
+        matches!(err, SqliteError::Unsupported(ref c) if c == "ScheduleExternalActivity"),
         "the sealing drive still reports the reason: {err}"
     );
-    assert_sealed_unsupported(&rt, exec, "RunLocalActivity");
+    assert_sealed_unsupported(&rt, exec, "ScheduleExternalActivity");
 
     // The rejected cycle rolled back as a whole: no side effect survives.
     let history = rt.load_history(exec).unwrap();
@@ -144,14 +156,16 @@ async fn a_local_activity_ends_failed_with_a_typed_reason() {
 #[tokio::test]
 async fn a_sealed_execution_is_not_driven_again() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&runs_local_counted_info());
-    let exec = rt.start_workflow("runs_local_counted", json!(0)).unwrap();
+    rt.register_workflow(&runs_external_counted_info());
+    let exec = rt
+        .start_workflow("runs_external_counted", json!(0))
+        .unwrap();
     let _ = rt.run_until_blocked(exec).await.unwrap_err();
     let runs = COUNTED_RUNS.load(Ordering::SeqCst);
 
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
-        matches!(state, RunState::Failed(ref m) if m.contains("RunLocalActivity")),
+        matches!(state, RunState::Failed(ref m) if m.contains("ScheduleExternalActivity")),
         "a later drive reports the terminal state: {state:?}"
     );
     assert_eq!(
@@ -189,14 +203,14 @@ async fn a_worker_session_ends_failed_with_a_typed_reason() {
 #[tokio::test]
 async fn an_unsupported_command_in_the_terminal_cycle_ends_failed() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&upserts_then_completes_info());
+    rt.register_workflow(&schedules_external_then_completes_info());
     let exec = rt
-        .start_workflow("upserts_then_completes", json!(7))
+        .start_workflow("schedules_external_then_completes", json!(7))
         .unwrap();
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
-    assert_sealed_unsupported(&rt, exec, "UpsertSearchAttributes");
+    assert_sealed_unsupported(&rt, exec, "ScheduleExternalActivity");
     assert!(
         !rt.load_history(exec)
             .unwrap()
@@ -209,14 +223,14 @@ async fn an_unsupported_command_in_the_terminal_cycle_ends_failed() {
 #[tokio::test]
 async fn the_fleet_stops_reporting_a_sealed_execution() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&runs_local_info());
+    rt.register_workflow(&runs_external_info());
     rt.register_workflow(&healthy_info());
-    let broken = rt.start_workflow("runs_local", json!(0)).unwrap();
+    let broken = rt.start_workflow("runs_external", json!(0)).unwrap();
     let ok = rt.start_workflow("healthy", json!(4)).unwrap();
 
     let err = rt.poll_once().await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
-    assert_sealed_unsupported(&rt, broken, "RunLocalActivity");
+    assert_sealed_unsupported(&rt, broken, "ScheduleExternalActivity");
     assert!(matches!(
         rt.outcome(ok).unwrap(),
         ExecutionOutcome::Completed(ref v) if v.as_i64() == Some(8)
@@ -233,14 +247,14 @@ async fn the_sealed_state_survives_a_reopen() {
     let path = dir.path().join("harvest.sqlite3");
     let exec = {
         let mut rt = SqliteRuntime::open(&path).unwrap();
-        rt.register_workflow(&runs_local_info());
-        let exec = rt.start_workflow("runs_local", json!(0)).unwrap();
+        rt.register_workflow(&runs_external_info());
+        let exec = rt.start_workflow("runs_external", json!(0)).unwrap();
         let _ = rt.run_until_blocked(exec).await.unwrap_err();
         exec
     };
 
     let rt = SqliteRuntime::open(&path).unwrap();
-    assert_sealed_unsupported(&rt, exec, "RunLocalActivity");
+    assert_sealed_unsupported(&rt, exec, "ScheduleExternalActivity");
 }
 
 /// Only an unsupported feature seals. A missing registration is fixable in
@@ -269,17 +283,17 @@ async fn an_unregistered_activity_does_not_seal_the_run() {
 }
 
 /// Races a quick activity against a long timer. The activity wins, and the
-/// same cycle meets an unsupported local activity. The cycle's loser
+/// same cycle meets an unsupported external activity. The cycle's loser
 /// cancellation rolls back with it, so only the seal can remove the timer row.
 #[workflow]
-async fn races_then_runs_local(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
+async fn races_then_runs_external(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
     ctx.race()
         .activity_raw("quick", json!(1), "default")
         .timer(std::time::Duration::from_secs(3600))
         .run()
         .await
         .map_err(|e| e.to_string())?;
-    ctx.execute_local_activity_raw("local", json!({}), None, None)
+    ctx.execute_activity_external("external", json!({}), "default", 60)
         .await
         .map(drop)
         .map_err(|e| e.to_string())
@@ -293,15 +307,15 @@ async fn sealing_removes_the_runs_outstanding_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("harvest.sqlite3");
     let mut rt = SqliteRuntime::open(&path).unwrap();
-    rt.register_workflow(&races_then_runs_local_info());
+    rt.register_workflow(&races_then_runs_external_info());
     rt.register_activity_raw("quick", ActivitySpec::new(1, Ok));
     let exec = rt
-        .start_workflow("races_then_runs_local", json!(0))
+        .start_workflow("races_then_runs_external", json!(0))
         .unwrap();
 
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
-    assert_sealed_unsupported(&rt, exec, "RunLocalActivity");
+    assert_sealed_unsupported(&rt, exec, "ScheduleExternalActivity");
 
     let inspector = rusqlite::Connection::open(&path).unwrap();
     let count = |sql: &str| -> i64 {

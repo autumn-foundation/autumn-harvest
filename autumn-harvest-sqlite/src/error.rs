@@ -66,7 +66,9 @@ pub enum SqliteError {
     ///
     /// [`send_signal`](crate::SqliteRuntime::send_signal) mirrors the Postgres
     /// rejection of a signal to a terminal target. No drive consumes a row
-    /// staged for a sealed run, so the wakeup would be lost silently. `update`
+    /// staged for a sealed run, so the wakeup would be lost silently.
+    /// [`send_signal_by_workflow_id`](crate::SqliteRuntime::send_signal_by_workflow_id)
+    /// returns it when the newest run of the key is terminal (issue #2028). `update`
     /// also returns it (issue #2025), and so do
     /// [`cancel`](crate::SqliteRuntime::cancel) and
     /// [`terminate`](crate::SqliteRuntime::terminate) (issue #2021). An unknown
@@ -240,11 +242,37 @@ pub enum SqliteError {
         existing_state: String,
     },
 
+    /// No run exists for this `(workflow_name, workflow_id)` key (issue
+    /// #2028). [`send_signal_by_workflow_id`](crate::SqliteRuntime::send_signal_by_workflow_id)
+    /// returns it.
+    #[error("no workflow run for ({workflow_name}, {workflow_id})")]
+    WorkflowIdNotFound {
+        /// The workflow type of the request.
+        workflow_name: String,
+        /// The business id of the request.
+        workflow_id: String,
+    },
+
+    /// A call that addresses a run by its business id has a blank id (issue
+    /// #2028). A blank id has no reuse key, so it matches no run.
+    #[error("the workflow_id must not be blank")]
+    BlankWorkflowId,
+
     /// A signal broke a rule of its name. A `harvest.promise:` signal must
     /// carry a [`PromiseSettlement`](autumn_harvest::durable_promise::PromiseSettlement)
     /// (issue #1985).
     #[error("invalid signal: {0}")]
     InvalidSignal(String),
+
+    /// A search attribute at start, or in a list filter, is not a JSON
+    /// primitive (issue #2027).
+    #[error("invalid search attribute: {0}")]
+    InvalidSearchAttribute(String),
+
+    /// A list filter has more terms than
+    /// [`MAX_FILTER_TERMS`](crate::MAX_FILTER_TERMS) allows (issue #2027).
+    #[error("invalid filter: {0}")]
+    InvalidFilter(String),
 
     /// A value stored in `SQLite` could not be parsed back into its Rust type.
     #[error("corrupt stored value: {0}")]

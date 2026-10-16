@@ -423,7 +423,7 @@ fn model_mismatch(exec_id: &str, recorded: &str, served: &str) -> String {
 /// The activity-level checks stay as a backstop, but they can only fail a run.
 /// This is the check that protects the work.
 fn check_resumable(
-    reader: &Connection,
+    reader: &inspect::Reader,
     workspace: &str,
     model: &str,
 ) -> Result<Vec<ExecutionId>, String> {
@@ -750,7 +750,7 @@ async fn answer(write_half: &mut tokio::net::unix::OwnedWriteHalf, response: &Re
 /// Apply one control command.
 fn handle(
     runtime: &mut SqliteRuntime,
-    reader: &Connection,
+    reader: &inspect::Reader,
     blocked: &mut Parked,
     live: &mut Live,
     workspace: &str,
@@ -1070,7 +1070,7 @@ fn expired(reader: &Connection, execution_id: &str, signal: &str) -> Result<Opti
 /// The session must exist. An event read of an unknown id returns no rows, so
 /// without this check a mistyped audit target prints an empty history and
 /// exits clean. That reads as a session that did nothing.
-fn history(reader: &Connection, execution_id: &str, before: Option<i64>) -> Response {
+fn history(reader: &inspect::Reader, execution_id: &str, before: Option<i64>) -> Response {
     // Parsed for the message it gives, and not for a value. A mistyped id is
     // told apart from a real one this database does not hold.
     if let Err(e) = execution_id.parse::<ExecutionId>() {
@@ -1148,7 +1148,7 @@ fn describe(line: &inspect::EventLine) -> String {
 
 /// Project every execution row into an operator view.
 pub fn sessions(
-    reader: &Connection,
+    reader: &inspect::Reader,
     blocked: &Parked,
     full: bool,
     before: Option<i64>,
@@ -1803,6 +1803,15 @@ async fn drive_one(
         Ok(RunState::WaitingWorkflow(other)) => {
             note(blocked, exec, format!("waiting for run {other}"), None);
         }
+        // Issue #2029: another run holds the mutex. A later tick retries.
+        Ok(RunState::WaitingMutex(key)) => {
+            note(
+                blocked,
+                exec,
+                format!("waiting for the `{key}` mutex"),
+                None,
+            );
+        }
         Ok(RunState::Completed(output)) => {
             retire(blocked, live, exec);
             // The output holds the model's own answer, and this log reaches a
@@ -1816,7 +1825,10 @@ async fn drive_one(
             tracing::error!(%exec, error = %crate::one_line(&error), "session failed");
         }
         // Issue #2021: a cancelled or terminated run cannot be driven again.
-        Ok(RunState::Cancelled(reason) | RunState::Terminated(reason)) => {
+        // Issue #2029: a timed-out run cannot be driven again either.
+        Ok(
+            RunState::Cancelled(reason) | RunState::Terminated(reason) | RunState::TimedOut(reason),
+        ) => {
             retire(blocked, live, exec);
             tracing::info!(%exec, reason = %crate::one_line(&reason), "session stopped");
         }

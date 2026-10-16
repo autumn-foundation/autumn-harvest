@@ -112,22 +112,22 @@ async fn timed(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
 
 /// Reaches an unsupported feature, so the drive seals the run `FAILED`.
 #[workflow]
-async fn runs_local_activity(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+async fn runs_external_activity(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     let stage = Arc::new(Mutex::new(json!("started")));
     let read = Arc::clone(&stage);
     ctx.register_query("stage", move || read.lock().unwrap().clone());
-    set(&stage, json!("before-local"));
-    ctx.execute_local_activity_raw("local", json!({}), None, None)
+    set(&stage, json!("before-external"));
+    ctx.execute_activity_external("external", json!({}), "default", 60)
         .await
         .map_err(|e| e.to_string())
 }
 
-/// Like `runs_local_activity`, with a side effect in the rolled-back cycle.
+/// Like `runs_external_activity`, with a side effect in the rolled-back cycle.
 #[workflow]
-async fn local_activity_after_uuid(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+async fn external_activity_after_uuid(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     let id = ctx.new_uuid().to_string();
     ctx.register_query("stage", move || json!(id));
-    ctx.execute_local_activity_raw("local", json!({}), None, None)
+    ctx.execute_activity_external("external", json!({}), "default", 60)
         .await
         .map_err(|e| e.to_string())
 }
@@ -625,8 +625,10 @@ async fn query_does_not_fire_a_due_timer() {
 async fn unsupported_sealed_run_serves_state_before_the_feature() {
     let (_dir, path) = temp_db();
     let mut rt = SqliteRuntime::open(&path).unwrap();
-    rt.register_workflow(&runs_local_activity_info());
-    let exec = rt.start_workflow("runs_local_activity", json!(0)).unwrap();
+    rt.register_workflow(&runs_external_activity_info());
+    let exec = rt
+        .start_workflow("runs_external_activity", json!(0))
+        .unwrap();
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "got {err:?}");
 
@@ -634,7 +636,7 @@ async fn unsupported_sealed_run_serves_state_before_the_feature() {
     let rows_before = snapshot(&reader);
     let version_before = data_version(&reader);
     let answer = rt.query(exec, "stage", Value::Null).await.unwrap();
-    assert_eq!(answer, json!("before-local"));
+    assert_eq!(answer, json!("before-external"));
     assert_eq!(
         snapshot(&reader),
         rows_before,
@@ -648,9 +650,9 @@ async fn unsupported_sealed_run_serves_state_before_the_feature() {
 #[tokio::test]
 async fn unrecorded_side_effect_on_a_terminal_run_is_query_unavailable() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    rt.register_workflow(&local_activity_after_uuid_info());
+    rt.register_workflow(&external_activity_after_uuid_info());
     let exec = rt
-        .start_workflow("local_activity_after_uuid", json!(0))
+        .start_workflow("external_activity_after_uuid", json!(0))
         .unwrap();
     rt.run_until_blocked(exec).await.unwrap_err();
 

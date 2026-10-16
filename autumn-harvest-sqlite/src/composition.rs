@@ -194,10 +194,13 @@ pub fn start_child(
         parent,
         policy.map(ParentClosePolicy::as_str),
     )?;
+    // List and describe read the start time from the row (issue #2027).
+    let started_at = Utc::now();
+    store::set_start_fields(conn, child_id, started_at.timestamp_micros(), None, None)?;
     store::append_event(
         conn,
         child_id,
-        &WorkflowEvent::workflow_started(input.clone(), Utc::now()),
+        &WorkflowEvent::workflow_started(input.clone(), started_at),
     )?;
     Ok(true)
 }
@@ -344,7 +347,14 @@ fn notify_parent(
     }
     // `terminate` writes `WorkflowCancelled` too. Only the state tells it apart.
     let terminated = store::execution_state(conn, exec)? == "TERMINATED";
-    if let Some(event) = child_result_event(exec, terminal, terminated) {
+    let event = match terminal {
+        // A timeout keeps the stored error text, as the Postgres
+        // `wake_parent_for_child_timeout` does (issue #2029).
+        WorkflowEvent::WorkflowExecutionTimedOut { .. } => store::execution_error(conn, exec)?
+            .map(|error| WorkflowEvent::child_workflow_failed(exec, error)),
+        _ => child_result_event(exec, terminal, terminated),
+    };
+    if let Some(event) = event {
         store::append_event(conn, parent, &event)?;
     }
     Ok(())
@@ -460,7 +470,7 @@ fn resolve_target(
         ExternalTarget::WorkflowId {
             workflow_name,
             workflow_id,
-        } => store::resolve_workflow_id(conn, workflow_name, workflow_id),
+        } => store::resolve_run_by_key(conn, workflow_name, workflow_id),
     }
 }
 
@@ -551,7 +561,7 @@ fn signal_failure(
             workflow_id,
         },
     ) = (key, request.target)
-        && store::business_key_signal_seen(conn, workflow_name, workflow_id, key)?
+        && store::find_signal_key_in_chain(conn, workflow_name, workflow_id, key)?.is_some()
     {
         return Ok(None);
     }
@@ -559,7 +569,7 @@ fn signal_failure(
         return Ok(Some("target_unknown"));
     };
     if let Some(key) = key
-        && store::signal_key_seen(conn, target, key)?
+        && store::has_signal_key(conn, target, key)?
     {
         return Ok(None);
     }
@@ -569,7 +579,7 @@ fn signal_failure(
             ExternalTarget::WorkflowId { .. } => "not_running",
         }));
     }
-    store::stage_keyed_signal(conn, target, request.signal_name, request.payload, now, key)?;
+    store::stage_signal(conn, target, request.signal_name, request.payload, now, key)?;
     Ok(None)
 }
 

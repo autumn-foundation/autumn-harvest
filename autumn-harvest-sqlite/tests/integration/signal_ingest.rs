@@ -584,7 +584,7 @@ async fn spawn_on_signal(ctx: &WorkflowContext, _n: i64) -> Result<Value, String
     {
         return Ok(Value::Null);
     }
-    ctx.execute_local_activity_raw("local", json!({}), None, None)
+    ctx.execute_activity_external("external", json!({}), "default", 60)
         .await
         .map_err(|e| e.to_string())
 }

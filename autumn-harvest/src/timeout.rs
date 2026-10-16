@@ -6042,6 +6042,7 @@ async fn enforce_timeouts_pass(
         conn_shard,
         sharded_pool.as_ref(),
         shard_assignments,
+        payload_codecs,
     )
     .await?;
     if let Some(ceiling) = max_workflow_history_events {

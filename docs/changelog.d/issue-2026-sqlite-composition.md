@@ -60,14 +60,24 @@ backend.
 
 **Breaking change.** `RunState` has a new variant, `WaitingWorkflow`. An
 exhaustive `match` on `RunState` needs a new arm. This change updates the
-in-tree agent daemon and `docs/sqlite-backend.md` §7. Tests that used a child
-or an external command as the unsupported example now use a local activity.
+in-tree agent daemon and `docs/sqlite-backend.md` §7. Tests that used a child,
+an external command, a local activity or a search-attribute upsert as the
+unsupported example now use an external activity.
 
 **Invariants.** No new `WorkflowEvent` variant. Every event this backend writes
 has the Postgres shape. No write to an existing `harvest_events` row. One
-additive schema step adds three nullable columns and their indexes:
-`harvest_executions.parent_exec_id`, `harvest_executions.parent_close_policy`
-and `harvest_signals.idempotency_key`. An old file gains them on open.
+additive schema step adds two nullable columns and an index:
+`harvest_executions.parent_exec_id` and
+`harvest_executions.parent_close_policy`. An old file gains them on open. A
+signal to another run stores its key in `harvest_signals.idempotency_key`,
+which issue #2028 added, and dedups through the same helpers as
+`send_signal_with_idempotency`.
+
+**With issue #2029.** A run that passes its `execution_timeout` closes like
+any terminal run. Its detached children get their policy, and an awaiting
+parent records a `ChildWorkflowFailed` with the timeout text, as on Postgres.
+A failed run that retries does not close: its successor starts in the same
+transaction, and its detached children keep running, as on Postgres.
 
 **Known limits.**
 
@@ -79,8 +89,11 @@ and `harvest_signals.idempotency_key`. An old file gains them on open.
 - This backend writes a mixed batch in command order. Postgres writes the
   external events first. Each event is the same, and replay accepts both
   orders.
+- A child run starts with no `execution_timeout` and no workflow retry policy.
+  An awaited child never retries on Postgres either. A detached child does on
+  Postgres, when its type declares a policy.
 
-**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 57
+**Tests.** `autumn-harvest-sqlite/tests/integration/composition.rs` has 58
 tests. Each test replays every history it asserts on the core
 `WorkflowReplayer`, with the run's ids. They cover:
 
@@ -101,7 +114,9 @@ tests. Each test replays every history it asserts on the core
   child that continues as new, and an await across a continue-as-new;
 - the terminal, cancel and fallback cancel cap checks with and without
   cascade events, and an update and
-  a query on a child that read its parent.
+  a query on a child that read its parent;
+- a parent that passes its `execution_timeout` and cascades to its detached
+  child.
 
 Unit tests cover the schema step, a race loser with no row, and the panic
 strikes of a run that another run cancels. The core test

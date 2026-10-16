@@ -177,20 +177,21 @@ rt.register_workflow(&process_order_info());
 rt.register_activity(&reserve_inventory_info());
 ```
 
-- **`register_workflow(&WorkflowInfo)`** retains only the workflow's `name` +
-  `handler`. If the `#[workflow(...)]` attributes declare an
-  execution/admission-affecting feature this v0.1 backend cannot honor
-  (`execution_timeout`, a workflow-level `retry_policy`, `concurrency`,
-  `debounce`, `batch`, `throttle`, a raised `max_input_bytes`), registration
-  **panics at setup time** naming the feature — never a silently-dropped setting.
+- **`register_workflow(&WorkflowInfo)`** retains the workflow's `name`,
+  `handler`, `execution_timeout` and workflow-level `retry_policy` (issue
+  #2029). If `#[workflow(...)]` declares a feature this v0.1 backend cannot
+  honor, registration **panics at setup time** and names it. These features
+  are `concurrency`, `debounce`, `batch`, `throttle`, `quota` and a raised
+  `max_input_bytes`. A setting is never dropped silently.
 - **`register_activity(&ActivityInfo)`** is the default. It runs the
   `#[activity]` body with an `ActivityContext`. It honors the
   declared `#[activity(...)]` defaults it can (`schedule_to_close`, the full
   `retry` policy — `max_attempts` + backoff + non-retryable classification —
   `start_to_close`, `queue`) and **panics** for one it cannot
   (`heartbeat_timeout`, `schedule_to_start`, `circuit_breaker`, `rate_limit_*`,
-  `max_concurrent`, `is_local`, …). This keeps a declared setting from taking
-  silently-wrong effect.
+  `max_concurrent`, …). This keeps a declared setting from taking
+  silently-wrong effect. A `local = true` activity runs inline as a local
+  activity (issue #2029). Like Postgres, it cannot declare `schedule_to_close`.
 - **`register_activity_with_body(&ActivityInfo, body)`** runs the same audit,
   but runs a synchronous `Fn(Value) -> Result<Value, String>` closure in place of
   the `#[activity]` body. The closure gets no `ActivityContext`. Use it to stub an
@@ -282,7 +283,9 @@ match rt.run_until_blocked(exec).await? {
     RunState::WaitingSignal(name) => println!("blocked on signal `{name}`"),
     RunState::WaitingTimer      => println!("blocked on a durable timer"),
     RunState::WaitingWorkflow(other) => println!("blocked on run {other}"),
+    RunState::WaitingMutex(key) => println!("blocked on the `{key}` mutex"),
     RunState::Cancelled(reason) => println!("cancelled: {reason}"),
+    RunState::TimedOut(error)   => println!("timed out: {error}"),
     RunState::Terminated(reason) => println!("terminated: {reason}"),
     RunState::ContinuedAsNew(next) => println!("continued as new; drive {next}"),
     RunState::InProgress        => {} // not returned by run_until_blocked
@@ -294,7 +297,7 @@ match rt.outcome(exec)? {
     ExecutionOutcome::Completed(output) => println!("{output}"),
     ExecutionOutcome::Failed(err)       => println!("{err}"),
     ExecutionOutcome::Running           => println!("still running"),
-    ExecutionOutcome::Terminated(state) => println!("terminal ({state}) — superseded, cancelled or terminated"),
+    ExecutionOutcome::Terminated(state) => println!("terminal ({state}) — superseded, cancelled, terminated or timed out"),
 }
 ```
 
@@ -400,7 +403,8 @@ body does not run again, and `terminate` drops a pending cancel request.
 
 - The run gets the core `WorkflowCancelled { reason }` event as its last
   event, as on Postgres. Cleanup events come before it.
-- The pending tasks, unfired timers and staged signals are deleted.
+- The pending tasks, unfired timers and staged signals are deleted. A signal
+  with an idempotency key stays, so its key still dedupes (issue #2028).
 - An unknown id returns `SqliteError::ExecutionNotFound`. A terminal run
   returns `SqliteError::WorkflowNotRunning`. Postgres treats a repeat call on
   a terminal run as a no-op, but this backend refuses it.
@@ -460,12 +464,84 @@ fails, and the drive returns `RunState::Failed` with the reason JSON. The
 `WorkflowFailed` event holds the same JSON in `error`. The event is
 byte-identical to the one the Postgres worker writes. Parse the JSON as
 `HistoryCapReason`. The seal removes the run's pending tasks, unfired timers
-and staged signals.
+and unkeyed staged signals.
 
 A continuing run is exempt, because its successor starts a new history. The
 event count includes the decision's own appends. The byte count is the stored
 event JSON length when the decision starts. Postgres measures
 `pg_column_size` instead, so the two byte counts can differ.
+
+### Timers, mutex, local activities, timeout and retry (issue #2029)
+
+These primitives work as on Postgres. Each one records the Postgres events,
+so its history replays on the core `WorkflowReplayer`.
+
+**Cancellable timers.** `ctx.start_timer(id, secs)` appends `TimerStarted`.
+`TimerHandle::await_fire` arms the durable row once, so the deadline counts
+from the first await. `cancel` deletes the unfired row and appends
+`TimerCancelled`, and `await_fire` then returns `TimerOutcome::Cancelled`.
+`reset` cancels and arms again. A cancelled id can arm a `ctx.timer` later.
+
+**Workflow mutex.** `ctx.mutex(key).acquire()` queues the run for the key.
+The first run in the queue gets a free key, with a new fencing `lock_seq`,
+and the history gets `MutexGranted`. A run that waits returns
+`RunState::WaitingMutex(key)`. The guard's release frees the key. A run that
+ends, for any reason, releases every lock and queue place that it holds.
+
+No step wakes a waiter. `run_until_idle` and `poll_once` drive it again, and
+a release counts as progress, so `run_until_idle` makes one more pass. A held
+lock survives a reopen. An acquire must be the only awaitable in its batch,
+as on Postgres. Another awaitable beside it ends the run `FAILED`. This
+backend also rejects a cancellable timer await beside an acquire, which
+Postgres accepts. A timer that fires first would break the replay of the
+grant.
+
+**Local activities.** Register a `#[activity(local = true)]` fn as usual.
+`ctx.execute_local_activity` then appends `LocalActivityScheduled` and runs
+the body inline, after the decision commits. Each failed attempt appends
+`LocalActivityFailed`. Success appends `LocalActivityCompleted`. A terminal
+failure also appends `LocalActivityExhausted`. A crash resumes at the next
+attempt. Some limits apply:
+
+- The per-attempt budget is `start_to_close`, capped at 60 seconds. Under a
+  Tokio runtime, an `#[activity]` body that runs past it is dropped, as on
+  Postgres. A closure body cannot be stopped, so its budget is checked after
+  it returns. The workflow deadline also bounds an attempt. An attempt that
+  ends past it records no result, and the run ends `TIMED_OUT`.
+- A backoff and a timeout round up to whole milliseconds.
+- A retry backoff ends the cycle. A drive before its end returns
+  `RunState::WaitingTimer`. Postgres sleeps inline instead. A pending cancel
+  skips the wait, so the next attempt runs at once. So a signal can
+  reach the run between two attempts. A signal handler that then issues a
+  durable command shares a batch with the local activity, and the run ends
+  `FAILED`.
+- A local activity cannot share a batch with a durable awaitable, as on
+  Postgres (issue #950). This backend also rejects a second local activity
+  in one batch. Such a batch ends the run `FAILED`.
+
+**Execution timeout.** `#[workflow(execution_timeout = "30s")]` stores a
+deadline at start, from the runtime clock. Each cycle checks it first, and again after the body runs. The deadline
+also bounds the activity drain and an update. A run
+past it gets `WorkflowExecutionTimedOut`, ends `TIMED_OUT` with the error
+`timeout: WorkflowExecution for <name>`, and loses its open rows and locks.
+The drive returns `RunState::TimedOut(error)`. `ctx.deadline()` reports the
+deadline. A continue-as-new successor and a retry count a new deadline from
+their own start. A run that nothing drives times out at its next drive. A
+signal or an update after the deadline gets `WorkflowNotRunning`.
+
+A drive after the deadline seals the run before it reads new input. A timer
+or a signal that came due before the deadline is then lost, if no drive ran
+in between. Drive a run more often than its timeout to avoid this. Postgres
+has the same race when its worker lags behind the timeout sweeper.
+
+**Workflow retry.** `#[workflow(retry = ..)]` freezes the policy at start.
+A run that returns a retryable error ends `FAILED`. The same transaction then
+starts a retry with the same input and the next attempt, and appends
+`WorkflowRetryScheduled`. The retry has its own exec id as its `workflow_id`,
+as on Postgres. It gets every signal of the failed run again. It waits for
+its backoff: before then a drive returns `RunState::WaitingTimer`.
+`successor(failed)` returns it. A panic, a replay divergence, a cap, a
+timeout, a cancel and a non-retryable error never retry.
 
 ---
 
@@ -516,6 +592,100 @@ awaited. The first drive after the upgrade appends them to history.
 `SqliteError::ExecutionNotFound` and a terminal one is
 `SqliteError::WorkflowNotRunning`, so a wakeup no drive could ever consume is
 rejected rather than silently lost.
+
+### Keyed signals, signals by workflow id, signal-with-start (issue #2028)
+
+A webhook can deliver the same event twice. Give the signal an idempotency
+key, and the run gets it once:
+
+```rust,ignore
+// `true`: staged. `false`: this run already holds the key.
+let staged = rt.send_signal_idempotent(exec, "approve", json!(true), Some("hook-42"))?;
+```
+
+- A partial unique index on `harvest_signals (exec_id, idempotency_key)`
+  enforces the key.
+- The key probe runs before the state check. A retry after the run ends
+  returns `Ok(false)`, not an error, as on Postgres.
+- A seal (cancel, terminate, failure, replace) keeps a keyed row, so its key
+  still dedupes. Unkeyed rows are deleted, as before.
+- The key is scoped to the run that holds the row. A continue-as-new moves an
+  undelivered row to the successor. A retry to the old `exec` then returns
+  `SqliteError::WorkflowNotRunning`. Use `send_signal_by_workflow_id` for a
+  key that spans the chain.
+- An empty key is no key, on every path. A normal signal cannot use a
+  `harvest.promise:` key. That is `SqliteError::InvalidSignal`.
+
+Signal a run by its business id:
+
+```rust,ignore
+let delivery = rt.send_signal_by_workflow_id("order", "order-7", "approve", json!(true), None)?;
+// delivery.exec_id is the run that holds the signal.
+```
+
+- The call picks the `RUNNING` run of the `(workflow_name, workflow_id)`
+  key. A continue-as-new successor keeps the key, so the call reaches it.
+- With no running run, the newest run is terminal, and the call returns
+  `SqliteError::WorkflowNotRunning`. With no run at all, it returns
+  `SqliteError::WorkflowIdNotFound`. A blank id is
+  `SqliteError::BlankWorkflowId`.
+- The checks run in this order: the blank id, the key rules, the chain key
+  probe, the run lookup, then the run state and the payload cap. Postgres
+  reports these outcomes as `ByIdSignalOutcome` values. This backend returns
+  errors.
+- A key that the chain already holds returns `delivered: false`, with the
+  `exec_id` of the run that holds it.
+
+Start a run and signal it, or signal the run that exists:
+
+```rust,ignore
+let out = rt.signal_with_start(SignalWithStart {
+    workflow_name: "order",
+    workflow_id: "order-7",
+    input: json!({ "sku": "A1" }),
+    reuse_policy: WorkflowIdReusePolicy::AllowDuplicate,
+    signal_name: "approve",
+    signal_payload: json!(true),
+    idempotency_key: Some("hook-42"),
+})?;
+// out.started_fresh, out.signal_delivered
+```
+
+One transaction holds the key probe, the start decision, any start or
+replace, and the signal stage. An error rolls back all of them. The next
+drive appends the signal before the body runs.
+
+| Prior state | `AllowDuplicate` | `RejectDuplicate` | `AllowDuplicateFailedOnly` | `TerminateIfRunning` |
+|---|---|---|---|---|
+| none | start + signal | start + signal | start + signal | start + signal |
+| `RUNNING` | signal | `AlreadyExists` | signal | cancel + start + signal |
+| `COMPLETED` / `FAILED` / `CANCELLED` | start + signal | `AlreadyExists` | start + signal | start + signal |
+| `TERMINATED` / `CONTINUED_AS_NEW` | start + signal | start + signal | start + signal | start + signal |
+
+A terminal prior is the difference from the plain start matrix in
+[§6](#6-starting-a-workflow). A signal cannot land on a terminal run, so
+the call starts a fresh run, as on Postgres. The fresh run seals the prior
+`CONTINUED_AS_NEW`.
+
+- A `RUNNING` run with a pending cooperative cancel counts as `CANCELLED`.
+  The next drive ends it, so a signal cannot act there. Postgres sets
+  `CANCELLED` at once, so its matrix gives the same result.
+- A replace seals every active run of the key, as `TerminateIfRunning` does.
+- The input cap applies only when the call starts a run. An attach ignores
+  the input, as on Postgres.
+- The new calls stamp the arrival time from the wall clock, as `send_signal`
+  does.
+- A cancelled `RUNNING` prior gets `WorkflowCancelled` with the reason
+  `"terminated by signal-with-start"`, the Postgres text.
+- After a replace, `outcome(prior)` returns
+  `ExecutionOutcome::Terminated("CONTINUED_AS_NEW")`, as for a plain-start
+  replace. Postgres still reports the prior's own outcome. Read the result of
+  a replaced `COMPLETED` prior from the last event of `load_history(prior)`.
+
+Both `send_signal_by_workflow_id` and `signal_with_start` dedupe a key
+across every run of the key, in any state. A retry after a continue-as-new,
+or after the first run ends, stages nothing and starts nothing. A promise key
+dedupes per run only, as on Postgres.
 
 ### Queries (issue #2022)
 
@@ -609,6 +779,108 @@ recorded result and does not run the handler again.
 The handler can await any future, within a 5 second limit. It cannot await a
 durable command, such as an activity or a timer. Such a handler returns
 `SqliteError::UpdateTimedOut` and writes no event.
+
+### List, describe and search attributes (issue #2027)
+
+List the runs in a file, newest first, one page at a time:
+
+```rust
+use autumn_harvest_sqlite::{ExecutionFilter, StartOptions};
+use serde_json::json;
+
+// Start a run with a memo and a first search attribute.
+let mut first = serde_json::Map::new();
+first.insert("tenant".into(), json!("acme"));
+let started = rt.start_workflow_with_options(
+    "order",
+    json!({ "id": 7 }),
+    StartOptions {
+        workflow_id: Some("order-7".into()),
+        memo: Some(json!({ "owner": "ops" })),
+        search_attributes: first,
+        ..StartOptions::default()
+    },
+)?;
+
+// Inside a workflow, merge more attributes in:
+// ctx.upsert_search_attrs([("stage".to_string(), Some(json!("paid")))])?;
+
+let mut filter = ExecutionFilter::new()
+    .workflow_name("order")
+    .state("RUNNING")
+    .search_attribute("tenant", json!("acme"))
+    .limit(50);
+loop {
+    let page = rt.list_executions(&filter)?;
+    for run in &page.executions {
+        println!("{:?} {:?}", run.exec_id, run.state);
+    }
+    match page.next {
+        Some(cursor) => filter = filter.before(cursor),
+        None => break,
+    }
+}
+
+// One run, with its input, output and error:
+let run = rt.describe(started.exec_id)?;
+```
+
+- **Filters.** `workflow_name`, `exec_id`, `workflow_id` (exact),
+  `workflow_id_prefix`, `state` (repeat it for several states),
+  `started_after` (inclusive), `started_before` (exclusive) and
+  `search_attribute`. Set filters combine with AND. A filter holds at most
+  64 states and 64 search attributes. A larger one is
+  `SqliteError::InvalidFilter`.
+- **Times.** `started_at` is the `WorkflowStarted` time, to the microsecond.
+  `closed_at` is the time of the first terminal write. A later reuse-policy
+  seal does not move it.
+- **Search attributes.** A filter tests equality. Numbers compare as numbers,
+  so `1` matches `1.0`. A filter value must be a JSON string, number, boolean
+  or `null`. Another value is `SqliteError::InvalidSearchAttribute`. So is a
+  number of magnitude 2^63 or more, integer or float. JSON1 reads a stored
+  integer of that size as a float, which cannot tell neighbouring values
+  apart.
+- **Pages.** A page holds `limit` rows: 100 by default, cut to the range 1 to
+  1000. `next` is the cursor of the next page, or `None` at the end. The
+  cursor is the table `rowid`. A `VACUUM` can renumber it, so do not keep a
+  cursor across one.
+- **No payloads in a list.** `list_executions` returns no input, output or
+  error. `visit_executions(&filter, |run| ...)` passes the same rows with
+  their payloads, one row at a time. The visit holds one read snapshot until
+  it returns, so keep the closure short. A long one stops the WAL file from
+  shrinking.
+- **Damaged rows.** Each field is a `Stored` value: `Value`, `Null` or
+  `Unreadable`. A value in the wrong storage class or text that is not
+  UTF-8 is `Unreadable`. So is a memo or search-attribute value that does
+  not parse, and search attributes that are not an object. One bad row does
+  not fail the page.
+- **A reader beside the writer.** `SqliteReader::open(path)` opens the file
+  `READ_ONLY` and takes no writer lock. It has the same three reads. It
+  reads a file that an older version wrote. A column that the file does not
+  have reads as `Null`.
+- **Upserts.** `ctx.upsert_search_attrs` merges its patch in the cycle
+  transaction, on the suspend path and on the terminal path, as on
+  Postgres. `None` removes a key. A cycle that rolls back keeps no patch.
+- **Memo.** The start sets it. No command changes it later. A start that
+  returns an existing run leaves its memo and its search attributes as they
+  are.
+- **Continue-as-new and retry.** The successor keeps the memo and the
+  search attributes, as on Postgres.
+
+Limits:
+
+- A run written before issue #2027 has no `started_at`. A time filter does
+  not match it.
+- Search-attribute filters test equality only. There is no comparison,
+  `IN` or `EXISTS` predicate.
+- One state filter seeks on an index. Every other filter walks the table
+  from the newest row. A filter that matches few rows in a large file walks
+  far to fill a page. A run's later columns sit after its input, so the walk
+  also reads past each large input.
+- A start does not check search-attribute keys against the
+  `upsert_search_attrs` rules, as on Postgres. Search attributes have no
+  size cap of their own.
+- The memo is stored as plain JSON. This backend has no payload codec.
 
 ---
 
@@ -802,14 +1074,17 @@ silently dropped. A workflow reaching one of these surfaces
 `SqliteError::Unsupported` (or a setup-time panic at registration) naming the
 specific command/feature. The run then ends `FAILED` (see below):
 
-- **Local activities** (`execute_local_activity`) and **external / task-token
-  activities**.
-- **Search attributes** (`upsert_search_attributes`) and a **continue-as-new
-  to a different type** (`continue_as_new_as_type`). The token is
-  `ContinueAsNew.new_workflow_type`. A same-type `continue_as_new` is
-  supported (see [§7](#7-the-drive-model)).
-- **Worker sessions** (`create_session`) and **cancellable durable timers**
-  (`start_timer` / `TimerHandle::…` — use the fire-once `ctx.timer(...)`).
+- **External / task-token activities**.
+- A **continue-as-new to a different type** (`continue_as_new_as_type`).
+  The token is `ContinueAsNew.new_workflow_type`. A same-type
+  `continue_as_new` is supported (see [§7](#7-the-drive-model)).
+- **Worker sessions** (`create_session`).
+- **A batch that breaks a solo rule**: a mutex acquire beside another
+  awaitable, or a local activity beside a durable awaitable or a second
+  local activity. The token is `AcquireMutex` or `RunLocalActivity`.
+
+Search attributes are supported since issue #2027. See
+[§8](#list-describe-and-search-attributes-issue-2027).
 
 A rejected execution ends `FAILED` (issue #1834). The drive that meets the
 feature rolls back the whole cycle. It then seals the run in a new
@@ -822,15 +1097,17 @@ transaction, with a typed `WorkflowFailed` event:
 | `non_retryable` | `true` |
 | `error` | The `SqliteError::Unsupported` message |
 
-The seal also removes the run's pending tasks, unfired timers and staged
-signals. The cycle's own cleanup rolled back, and nothing can use them now.
+The seal also removes the run's pending tasks, unfired timers and unkeyed
+staged signals. The cycle's own cleanup rolled back, and nothing can use them
+now. A keyed signal stays, so its key still dedupes (issue #2028).
 
 That drive still returns `SqliteError::Unsupported`, so the caller sees the
 reason. When the sealed run is a child or await target, the waiter's drive does
 not return the error. The waiter records the typed failure instead. A later drive returns `RunState::Failed` and does not run the handler
 again. `outcome()` returns `ExecutionOutcome::Failed`.
 
-Only an unsupported feature or a history cap seals a run. Other errors leave
+Only an unsupported feature or a history cap seals a run `FAILED`. An
+execution timeout ends a run `TIMED_OUT`. Other errors leave
 the run `RUNNING`:
 an unregistered workflow or activity, a replay divergence, a contained panic
 under its budget, or a failed task. A fix in the same runtime can then resume

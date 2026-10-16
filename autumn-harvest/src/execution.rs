@@ -121,6 +121,12 @@ pub struct StartWorkflowParams<'a> {
     /// replay determinism. Defaults to [`Priority::Normal`] so pre-upgrade
     /// callers that do not set this field are unaffected.
     pub priority: Priority,
+    /// The fairness key of the run (issue #1976).
+    ///
+    /// Stored on the run's task rows. A worker with fairness keys on rotates
+    /// its claims across the keys of a queue. `None` takes the run's quota
+    /// key, if any. The key does not change the event history or replay.
+    pub fairness_key: Option<String>,
     /// Maximum allowed byte size for the workflow input payload (issue #252).
     ///
     /// Enforced only on the fresh-insert path: duplicate collisions resolve
@@ -318,6 +324,7 @@ impl<'a> StartWorkflowParams<'a> {
             concurrency_limit: None,
             concurrency_on_conflict: ConcurrencyOnConflict::default(),
             priority: Priority::default(),
+            fairness_key: None,
             max_workflow_input_bytes: 0,
             start_at: None,
             delay: None,
@@ -601,6 +608,7 @@ mod start_params_new_tests {
             concurrency_limit,
             concurrency_on_conflict,
             priority,
+            fairness_key,
             max_workflow_input_bytes,
             start_at,
             delay,
@@ -645,6 +653,7 @@ mod start_params_new_tests {
         assert!(concurrency_limit.is_none());
         assert_eq!(concurrency_on_conflict, ConcurrencyOnConflict::Defer);
         assert_eq!(priority, Priority::Normal);
+        assert_eq!(fairness_key, None);
         assert_eq!(max_workflow_input_bytes, 0);
         assert!(start_at.is_none());
         assert!(delay.is_none());
@@ -1330,6 +1339,10 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // typed rejection (issue #946 Codex review, "bound resolved quota keys
     // before indexing them"). Rejecting rather than truncating/hashing is
     // deliberate -- see `quota::MAX_QUOTA_KEY_BYTES`'s doc comment for why.
+    // An explicit fairness key is caller input. Check it before any DB work.
+    if let Some(key) = request.fairness_key.as_deref() {
+        crate::queue_fairness::validate_fairness_key(key)?;
+    }
     if let Some(key) = quota_key.as_deref()
         && let Some(observed_bytes) = crate::quota::quota_key_over_cap(key)
     {
@@ -1439,8 +1452,24 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // hold a lock across the gap to the later authoritative check. A
     // non-quota-governed request (`quota_key.is_none()`, the common case)
     // keeps the pre-check-cancel shortcut byte-for-byte unchanged.
+
+    // Encode `input` and `memo` now, but hold a failure (issue #2054). A
+    // duplicate start writes nothing, so a broken codec must not change its
+    // result. Each branch that writes a run raises the held error first.
+    let (encoded_input, encoded_memo, encode_failure) = match codecs
+        .encode_shared_column(&request.input)
+        .and_then(|input| Ok((input, codecs.encode_column_opt(request.memo.as_ref())?)))
+    {
+        Ok((input, memo)) => (input, memo, None),
+        // The placeholder is never stored: every write path checks the held error.
+        Err(error) => (serde_json::Value::Null.into(), None, Some(error)),
+    };
+
     if terminate_via_pre_check
         && quota_key.is_none()
+        // The pre-check cancel is durable. Skip it when this start cannot
+        // write a replacement; the locked branch below then refuses first.
+        && encode_failure.is_none()
         // Skip the pre-check cancellation when we're going to reject this fresh
         // start for a debounced workflow — otherwise we'd cancel the prior run
         // (Transaction 1) and then reject, leaving it cancelled with no successor.
@@ -1531,14 +1560,14 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         workflow_id: request.workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: shard_id_value,
-        input: codecs.encode_shared_column(&request.input)?,
+        input: encoded_input,
         parent_id: request.parent_id,
         queue_name: request.queue_name,
         execution_timeout: effective_timeout,
         deadline_at,
         sla: effective_sla,
         sla_deadline_at,
-        memo: codecs.encode_column_opt(request.memo.as_ref())?,
+        memo: encoded_memo,
         search_attrs: request.search_attrs.clone(),
         assigned_build_id: assigned_build.clone(),
         parent_close_policy: None, // root or awaited child; detached uses worker path
@@ -1581,6 +1610,12 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     enqueue.concurrency_key.clone_from(&request.concurrency_key);
     enqueue.max_concurrent = request.concurrency_limit;
     enqueue.priority = request.priority.as_i32();
+    // The run's fairness key: the explicit key, else the quota key (issue
+    // #1976). Activities take it from this row.
+    enqueue.fairness_key = crate::queue_fairness::fairness_key_for(
+        request.fairness_key.as_deref(),
+        quota_key.as_deref(),
+    );
     // A fresh admission yields to continuations at claim (issue #1824). A
     // workflow retry continues a failed run, so it does not yield.
     enqueue.new_start = request.retry_of_exec_id.is_none();
@@ -1596,6 +1631,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     ), HarvestError, _>(async |conn| {
         let row = row;
         let enqueue = enqueue;
+        let mut encode_failure = encode_failure;
         let quota_key = quota_key.clone();
         // `gate`, `metrics`, `shard_id_value`, `quota_policy`, and
         // `quota_enforcement_policy` (issue #946) are all `Copy`, so the
@@ -1809,14 +1845,31 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         // `TERMINATED`). A previously sealed continue-as-new chain or reset
         // source therefore does not block reusing the same
         // (workflow_name, workflow_id).
-        let inserted = diesel::insert_into(harvest_workflow_executions::table)
-            .values(&row)
-            .on_conflict_do_nothing()
-            .returning(WorkflowExecution::as_returning())
-            .get_result(conn)
-            .await
-            .optional()
-            .map_err(database_error)?;
+        let inserted = if encode_failure.is_some() {
+            // The row holds a placeholder, so probe instead of insert. The
+            // probe sees what the unique index would reject. With no
+            // occupant this start needs a new run, so raise the codec error.
+            if try_load_active_execution_for_update(
+                conn,
+                request.workflow_name,
+                request.workflow_id,
+            )
+            .await?
+            .is_none()
+            {
+                refuse_unencoded(&mut encode_failure)?;
+            }
+            None
+        } else {
+            diesel::insert_into(harvest_workflow_executions::table)
+                .values(&row)
+                .on_conflict_do_nothing()
+                .returning(WorkflowExecution::as_returning())
+                .get_result(conn)
+                .await
+                .optional()
+                .map_err(database_error)?
+        };
 
         if let Some(execution) = inserted {
             // Atomic debounce gate: this INSERT is a fresh start. For a
@@ -2141,6 +2194,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                             ),
                         });
                     }
+                    refuse_unencoded(&mut encode_failure)?;
                     let mut tx_cancel_metrics = vec![StartCancelledRun::terminated(
                         existing.workflow_name.clone(),
                         existing.queue_name.clone(),
@@ -2221,6 +2275,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                                 });
                             }
                             // Only these two explicitly abnormal states start fresh.
+                            refuse_unencoded(&mut encode_failure)?;
                             let (started_wf, mut deferred, credited_ids) = replace_execution(
                                 conn,
                                 existing,
@@ -2278,6 +2333,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
                             workflow_id: request.workflow_id.to_string(),
                         });
                     }
+                    refuse_unencoded(&mut encode_failure)?;
                     let (started_wf, mut extra_deferred, credited_ids) = replace_execution(
                         conn,
                         existing,
@@ -2355,6 +2411,13 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
             Err(e)
         }
     }
+}
+
+/// Raise the encode error a start held back (issue #2054).
+///
+/// Call it before any write of the start's payload columns.
+fn refuse_unencoded(held: &mut Option<HarvestError>) -> HarvestResult<()> {
+    held.take().map_or(Ok(()), Err)
 }
 
 /// Start a workflow execution or load the existing one, applying the caller's
@@ -6885,8 +6948,9 @@ fn should_escalate_terminal_prior(
 ///
 /// A with-start call always begins a fresh chain origin, so the macro sets no
 /// inherited chain deadline (issue #617). The start step enforces the input
-/// cap, so the macro sets none. The macro leaves priority and `started_by` at
-/// their defaults.
+/// cap, so the macro sets none. The macro leaves priority, the fairness key
+/// and `started_by` at their defaults. The run then takes its quota key as
+/// its fairness key.
 macro_rules! with_start_params {
     ($request:ident, $exec_id:expr, $policy:expr, $source:expr, $source_ref:expr) => {
         crate::execution::StartWorkflowParams {
@@ -6910,6 +6974,7 @@ macro_rules! with_start_params {
             concurrency_limit: $request.concurrency_limit,
             concurrency_on_conflict: $request.concurrency_on_conflict,
             priority: crate::types::Priority::default(),
+            fairness_key: None,
             max_workflow_input_bytes: 0,
             start_at: None,
             delay: None,
@@ -8204,6 +8269,12 @@ pub async fn rerun_workflow_execution_with_codecs(
                 // Documented gap: priority (issue #249) lives on the task-queue
                 // row, not the execution row, so it cannot be recovered here.
                 priority: Priority::default(),
+                // The re-run keeps the source run's tenant: a valid source
+                // quota key is its fairness key (issue #1976).
+                fairness_key: crate::queue_fairness::fairness_key_for(
+                    None,
+                    source.quota_key.as_deref(),
+                ),
                 max_workflow_input_bytes: request.max_workflow_input_bytes,
                 start_at: None,
                 delay: None,

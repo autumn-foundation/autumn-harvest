@@ -137,6 +137,7 @@ mod debugger_tests;
 mod decision_boundary_db_tests;
 #[cfg(feature = "testing")]
 mod decision_boundary_replay_tests;
+mod declarative_update_tests;
 #[cfg(feature = "db")]
 mod deep_backlog_fixture_tests;
 #[cfg(feature = "db")]
@@ -161,6 +162,8 @@ mod executor_span_tests;
 #[cfg(feature = "testing")]
 mod external_completion_tests;
 mod external_outbox_scan_tests;
+mod fairness_key_tests;
+mod fairness_key_worker_tests;
 #[cfg(feature = "db")]
 mod fanout_result_writer_db_tests;
 mod fanout_tests;
@@ -222,6 +225,7 @@ mod nd_block_tests;
 #[cfg(feature = "db")]
 mod notify_post_commit_tests;
 mod otel_semconv_docs;
+mod otel_workflow_semconv_docs;
 mod panic_containment_tests;
 #[cfg(feature = "db")]
 mod parent_close_cascade_unfinished_handlers_perf;
@@ -298,6 +302,7 @@ mod retry_clock_skew_tests;
 mod retry_now_tests;
 mod safety_report_docs;
 mod saga_tests;
+mod sandbox_activities_docs;
 mod scanner_lease_tests;
 mod scanner_liveness_tests;
 mod scanner_tick_db_tests;
@@ -348,6 +353,8 @@ mod standalone_activity_docs;
 #[cfg(feature = "db")]
 mod standalone_activity_overhead_perf;
 mod standalone_activity_support;
+#[cfg(feature = "db")]
+mod start_duplicate_codec_failure_tests;
 #[cfg(feature = "db")]
 mod start_idempotency_tests;
 #[cfg(feature = "db")]

@@ -36,12 +36,12 @@ use autumn_harvest_sqlite::{ExecutionOutcome, SqliteError, SqliteRuntime};
 use chrono::Utc;
 use serde_json::json;
 
-// Reaches `WorkflowCommand::RunLocalActivity` through ordinary dynamic
+// Reaches `WorkflowCommand::ScheduleExternalActivity` through ordinary dynamic
 // control flow — not a statically-declared `#[workflow(...)]` feature, so
 // `register_workflow`'s static audit cannot catch it up front.
 #[workflow]
 async fn broken_wf(ctx: &WorkflowContext, _target: ExecutionId) -> Result<(), String> {
-    ctx.execute_local_activity_raw("local", json!({}), None, None)
+    ctx.execute_activity_external("external", json!({}), "default", 60)
         .await
         .map(drop)
         .map_err(|e| e.to_string())
@@ -76,9 +76,9 @@ fn increment_activity() -> autumn_harvest_sqlite::ActivitySpec {
 }
 
 /// Errors on a LATER pass, not the first. Cycle 1 schedules a real activity
-/// (progress, no error). Only once that activity resolves does cycle 2 reach
-/// `UpsertSearchAttributes`, a DIFFERENT unsupported command than
-/// `broken_wf`'s `RunLocalActivity`.
+/// (progress, no error). Only once that activity resolves does cycle 2 reach a
+/// cross-type continue-as-new, a DIFFERENT unsupported command than
+/// `broken_wf`'s `ScheduleExternalActivity`.
 #[workflow]
 async fn broken_after_one_cycle_wf(
     ctx: &WorkflowContext,
@@ -88,7 +88,8 @@ async fn broken_after_one_cycle_wf(
         .execute_activity_raw("increment", json!(0), "default")
         .await
         .map_err(|e| e.to_string())?;
-    ctx.upsert_search_attrs([("stage".to_string(), Some(json!("done")))])
+    ctx.continue_as_new_as_type("healthy_wf", json!(0))
+        .await
         .map_err(|e| e.to_string())
 }
 
@@ -100,7 +101,7 @@ static COUNTING_BROKEN_ATTEMPTS: AtomicU32 = AtomicU32::new(0);
 #[workflow]
 async fn counting_broken_wf(ctx: &WorkflowContext, _target: ExecutionId) -> Result<(), String> {
     COUNTING_BROKEN_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
-    ctx.execute_local_activity_raw("local", json!({}), None, None)
+    ctx.execute_activity_external("external", json!({}), "default", 60)
         .await
         .map(drop)
         .map_err(|e| e.to_string())
@@ -178,7 +179,7 @@ async fn poll_once_drives_the_rest_of_the_fleet_past_an_unsupported_command() {
     match err {
         SqliteError::Unsupported(msg) => {
             assert!(
-                msg.contains("RunLocalActivity"),
+                msg.contains("ScheduleExternalActivity"),
                 "the surfaced error must name the offending command; got: {msg}"
             );
         }
@@ -353,9 +354,9 @@ async fn run_until_idle_keeps_the_first_error_seen_across_passes_not_a_later_one
     match err {
         SqliteError::Unsupported(msg) => {
             assert!(
-                msg.contains("RunLocalActivity"),
+                msg.contains("ScheduleExternalActivity"),
                 "run_until_idle must keep pass 1's error (broken_wf's), not \
-                 pass 2's different error (UpsertSearchAttributes); \
+                 pass 2's different error (ContinueAsNew.new_workflow_type); \
                  got: {msg}"
             );
         }
