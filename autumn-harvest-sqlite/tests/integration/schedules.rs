@@ -49,11 +49,16 @@ async fn hand_off(ctx: &WorkflowContext, phase: i64) -> Result<(), String> {
 const T0: i64 = 1_767_225_600_000;
 const MINUTE: i64 = 60_000;
 
+/// Make the clock of `rt` read `clock`, in epoch milliseconds.
+fn follow(rt: &mut SqliteRuntime, clock: &Arc<AtomicI64>) {
+    let clock = clock.clone();
+    rt.set_clock(move || DateTime::from_timestamp_millis(clock.load(Ordering::SeqCst)).unwrap());
+}
+
 /// A runtime whose clock reads `clock`, with every test workflow registered.
 fn runtime_at(path: &std::path::Path, clock: &Arc<AtomicI64>) -> SqliteRuntime {
     let mut rt = SqliteRuntime::open(path).unwrap();
-    let clock = clock.clone();
-    rt.set_clock(move || DateTime::from_timestamp_millis(clock.load(Ordering::SeqCst)).unwrap());
+    follow(&mut rt, clock);
     rt.register_workflow(&tick_info());
     rt.register_workflow(&hold_info());
     rt.register_workflow(&hand_off_info());
@@ -319,8 +324,7 @@ async fn an_unregistered_workflow_keeps_its_slot() {
 
     clock.store(T0 + MINUTE, Ordering::SeqCst);
     let mut bare = SqliteRuntime::open(&path).unwrap();
-    let clock2 = clock.clone();
-    bare.set_clock(move || DateTime::from_timestamp_millis(clock2.load(Ordering::SeqCst)).unwrap());
+    follow(&mut bare, &clock);
     assert!(matches!(
         bare.poll_once().await,
         Err(SqliteError::UnknownWorkflow(name)) if name == "tick"

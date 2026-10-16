@@ -62,6 +62,7 @@ pub struct Due {
 /// every open. An update with the same spec also keeps the next slot, so a
 /// reopen never moves a slot. A changed spec counts its next slot from `now`.
 pub fn upsert(conn: &Connection, schedule: &WorkflowSchedule, now: i64) -> SqliteResult<()> {
+    // After this check the overlap policy is `skip` or `allow_all`.
     check_supported(schedule)?;
     autumn_harvest::policy::validate_schedule(&schedule.schedule)
         .map_err(SqliteError::InvalidSchedule)?;
@@ -78,11 +79,6 @@ pub fn upsert(conn: &Connection, schedule: &WorkflowSchedule, now: i64) -> Sqlit
         Some((old_spec, next)) if old_spec == spec => next,
         _ => first_slot(&schedule.schedule, now),
     };
-    let overlap = if schedule.overlap_policy == OverlapPolicy::AllowAll {
-        OverlapPolicy::AllowAll
-    } else {
-        OverlapPolicy::Skip
-    };
     tx.execute(
         "INSERT INTO harvest_schedules (workflow_name, schedule_json, input_json, \
            overlap_policy, max_active_runs, paused, next_run_at) \
@@ -95,7 +91,7 @@ pub fn upsert(conn: &Connection, schedule: &WorkflowSchedule, now: i64) -> Sqlit
             schedule.workflow_name,
             spec,
             serde_json::to_string(&schedule.input)?,
-            overlap.as_str(),
+            schedule.overlap_policy.as_str(),
             i64::from(schedule.max_active_runs),
             schedule.paused,
             next_run_at,

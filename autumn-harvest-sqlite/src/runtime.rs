@@ -2310,34 +2310,13 @@ impl SqliteRuntime {
         let Some(due) = schedule::load_due(&tx, name, now)? else {
             return Ok(false);
         };
-        let full = !due.allow_all && schedule::active_runs(&tx, name)? >= due.max_active_runs;
-        let started = !full && {
-            let workflow_id = schedule::slot_workflow_id(name, due.slot);
-            let fresh = FreshRun {
-                config: &config,
-                started_at: now,
-                fields: RunFields::default(),
-            };
-            match start_in_tx(
-                &tx,
-                name,
-                Some(&workflow_id),
-                due.input.clone(),
-                WorkflowIdReusePolicy::RejectDuplicate,
-                StartMatrix::Plain,
-                fresh,
-            ) {
-                Ok(outcome) => {
-                    store::set_schedule_name(&tx, outcome.exec_id, name)?;
-                    true
-                }
-                Err(SqliteError::AlreadyExists { .. }) => false,
-                Err(err) => return Err(err),
-            }
-        };
-        if full {
+        let started = if !due.allow_all && schedule::active_runs(&tx, name)? >= due.max_active_runs
+        {
             tracing::info!(schedule = %name, "a schedule slot is dropped: its run limit is reached");
-        }
+            false
+        } else {
+            start_slot(&tx, &due, &config, now)?
+        };
         schedule::advance(&tx, &due, now, started)?;
         tx.commit()?;
         Ok(started)
@@ -3796,6 +3775,38 @@ struct FreshRun<'a> {
     started_at: i64,
     /// The memo and the search attributes (issue #2027).
     fields: RunFields<'a>,
+}
+
+/// Start the run of the slot of `due` inside the caller's fire transaction
+/// (issue #2031). Returns `false` when the slot already has its run.
+fn start_slot(
+    conn: &Connection,
+    due: &schedule::Due,
+    config: &store::RunConfig,
+    now: i64,
+) -> SqliteResult<bool> {
+    let workflow_id = schedule::slot_workflow_id(&due.workflow_name, due.slot);
+    let fresh = FreshRun {
+        config,
+        started_at: now,
+        fields: RunFields::default(),
+    };
+    match start_in_tx(
+        conn,
+        &due.workflow_name,
+        Some(&workflow_id),
+        due.input.clone(),
+        WorkflowIdReusePolicy::RejectDuplicate,
+        StartMatrix::Plain,
+        fresh,
+    ) {
+        Ok(outcome) => {
+            store::set_schedule_name(conn, outcome.exec_id, &due.workflow_name)?;
+            Ok(true)
+        }
+        Err(SqliteError::AlreadyExists { .. }) => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 /// Apply the `(workflow_name, workflow_id)` reuse matrix inside the caller's

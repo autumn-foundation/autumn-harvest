@@ -11,9 +11,9 @@ use crate::policy::Schedule;
 
 /// The first slot of `schedule` strictly after `reference`.
 ///
-/// Returns `None` for [`Schedule::Manual`], for a spec that does not parse,
-/// and for an interval that does not advance or passes the last date that
-/// `chrono` holds.
+/// Returns `None` for [`Schedule::Manual`] and for a spec that does not
+/// parse. Also returns `None` for an interval that does not advance, or that
+/// passes the last date that `chrono` holds.
 #[must_use]
 pub fn next_fire_after(schedule: &Schedule, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
     match schedule {
