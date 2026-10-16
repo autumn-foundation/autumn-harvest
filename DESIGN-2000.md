@@ -189,6 +189,7 @@ A multi-angle review found these gaps. Each one has a fix and a test.
 | A fork of an old run is pinned to a retired source build. | A fork at point 0 resolves its build like a fresh start. A carried prefix keeps the source build; the runbook gives the compatibility remedy. |
 | The JSON extractor rejects a bad body before the handler runs, so the attempt writes no audit row. | The handler unwraps the body itself and writes a failed `workflow.fork` row. The status stays `400`, `415` or `422`. |
 | A fork whose source shard gives no connection returns before any audit row. | The route writes a failed `workflow.fork` row on the default shard, as for the other refusals before the source shard resolves. |
+| A source shard that the router reads but this node has no pool for falls back to the default shard, which answers a false `404`. | The route resolves the source with `db_conn_for_execution_exact`, so that case is a retryable `503`. |
 
 ## 2. Tests
 

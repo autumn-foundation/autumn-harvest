@@ -25830,8 +25830,17 @@ async fn fork_workflow(
             return map_error(e).into_response();
         }
     };
-    let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
-        Ok(conn) => conn,
+    // The exact resolver never stands the default shard in for the source
+    // shard. A source shard that this node has no pool for answers `503`, not a
+    // false `404` from the wrong database.
+    let mut conn = match db_conn_for_execution_exact(&api_state, exec_id).await {
+        Ok(Some(conn)) => conn,
+        Ok(None) => {
+            let error = HarvestError::NotFound(format!("workflow execution {exec_id_str}"));
+            let failure = error.to_string();
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return map_error(error).into_response();
+        }
         Err(e) => {
             let failure = e.to_string();
             let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
