@@ -747,7 +747,8 @@ pub enum Schedule {
     Cron(String),
     /// Fixed interval from the end of the previous run.
     ///
-    /// The period must be a whole number of seconds greater than zero.
+    /// The period must be a whole number of seconds. It must be greater than
+    /// zero and at most [`MAX_INTERVAL_PERIOD`].
     Interval(Duration),
     /// Only runs when triggered manually via API.
     Manual,
@@ -1592,17 +1593,26 @@ impl WorkflowSchedule {
     }
 }
 
+/// Longest accepted [`Schedule::Interval`] period: 100 years of 365 days.
+///
+/// A period of about 8.2e12 seconds or more pushes the next fire time past
+/// the last date that `chrono` holds (issue #2048). The cap sits far below
+/// that limit and far above any real cadence. [`validate_schedule`] rejects a
+/// longer period.
+pub const MAX_INTERVAL_PERIOD: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
 /// Validate a [`Schedule`] value, returning an error string if it is invalid.
 ///
 /// For [`Schedule::Cron`] expressions this parses the expression using
 /// `croner` (5-field or 6-field with seconds). A [`Schedule::Interval`] period
-/// must be a whole number of seconds greater than zero.
+/// must be a whole number of seconds. It must be greater than zero and at most
+/// [`MAX_INTERVAL_PERIOD`].
 ///
 /// # Errors
 ///
 /// Returns a human-readable error string if the cron expression is
-/// syntactically invalid. Also returns one if the interval is zero or has a
-/// fractional second.
+/// syntactically invalid. Also returns one if the interval is zero, has a
+/// fractional second, or is longer than [`MAX_INTERVAL_PERIOD`].
 pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     match schedule {
         Schedule::Cron(expr) => Cron::new(expr)
@@ -1635,6 +1645,14 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
         // cannot keep a shorter cadence.
         Schedule::Interval(period) if period.subsec_nanos() != 0 => Err(format!(
             "interval schedule period must be a whole number of seconds, got {period:?}"
+        )),
+        // The scheduler adds the period to a timestamp. chrono cannot hold a
+        // date past year 262143. The cap keeps the sum in range (issue #2048).
+        Schedule::Interval(period) if *period > MAX_INTERVAL_PERIOD => Err(format!(
+            "interval schedule period must not exceed {} seconds, got {} seconds. \
+             Use a manual schedule to stop automatic runs.",
+            MAX_INTERVAL_PERIOD.as_secs(),
+            period.as_secs()
         )),
         Schedule::Interval(_) | Schedule::Manual => Ok(()),
     }
@@ -2674,7 +2692,42 @@ mod tests {
                 "{interval:?} must be rejected: {err}"
             );
         }
-        assert!(validate_schedule(&Schedule::Interval(Duration::from_secs(u64::MAX))).is_ok());
+    }
+
+    #[test]
+    fn interval_schedule_over_the_cap_is_rejected() {
+        // Adding this period to a timestamp overflows chrono (issue #2048).
+        for secs in [
+            MAX_INTERVAL_PERIOD.as_secs() + 1,
+            8_000_000_000_000,
+            8_300_000_000_000,
+            9_000_000_000_000_000,
+            u64::MAX,
+        ] {
+            let err =
+                validate_schedule(&Schedule::Interval(Duration::from_secs(secs))).unwrap_err();
+            assert!(
+                err.contains("must not exceed"),
+                "{secs} s must be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn interval_schedule_at_the_cap_is_accepted() {
+        assert!(validate_schedule(&Schedule::Interval(MAX_INTERVAL_PERIOD)).is_ok());
+        let one_below = Duration::from_secs(MAX_INTERVAL_PERIOD.as_secs() - 1);
+        assert!(validate_schedule(&Schedule::Interval(one_below)).is_ok());
+    }
+
+    #[test]
+    fn interval_schedule_cap_is_100_years() {
+        // The changelog fragment states this value (issue #2048). Change both together.
+        assert_eq!(MAX_INTERVAL_PERIOD.as_secs(), 3_153_600_000);
+        for secs in [1, 31_536_000] {
+            let schedule = Schedule::Interval(Duration::from_secs(secs));
+            assert!(validate_schedule(&schedule).is_ok(), "{secs} s");
+        }
     }
 
     #[test]

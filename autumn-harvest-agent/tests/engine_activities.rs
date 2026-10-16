@@ -60,6 +60,10 @@ fn turn_request() -> ModelTurnRequest {
         memory_scope: None,
         extra_tools: Vec::new(),
         tenant: None,
+        agent: None,
+        allowed_tools: None,
+        flow_labels: std::collections::BTreeSet::new(),
+        flow_released: autumn_harvest_agent::Released::new(),
     }
 }
 
@@ -146,6 +150,8 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
         step: 0,
         memory_scope: None,
         read_only: false,
+        allowed_tools: None,
+        labels: None,
         call: ToolCall {
             id: "c1".into(),
             name: "read".into(),
@@ -246,6 +252,7 @@ fn the_engine_registration_builds() {
             "agent_memory_snapshot",
             "agent_deliver",
             "agent_precheck",
+            "agent_discover_peers",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();
@@ -354,6 +361,8 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
             step: 0,
             memory_scope: None,
             read_only: false,
+            allowed_tools: None,
+            labels: None,
             call: ToolCall {
                 id: "c".into(),
                 name: "fail".into(),
@@ -579,6 +588,8 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
             step: 0,
             memory_scope: None,
             read_only: true,
+            allowed_tools: None,
+            labels: None,
             call: ToolCall {
                 id: "c".into(),
                 name: "write".into(),
@@ -631,4 +642,92 @@ async fn a_refused_cost_still_records_the_turn_as_unpriced() {
     );
     assert_eq!(ledger[0].input_tokens(), 11);
     assert_eq!(ledger[0].cost_usd_micros(), None, "the bad cost is dropped");
+}
+
+/// A reply over the result cap must not fail the activity with a
+/// non-retryable `PayloadTooLarge`, because the model call is paid for
+/// (issue #2040).
+#[tokio::test]
+async fn a_reply_over_the_result_cap_is_a_typed_outcome_not_a_failed_activity() {
+    let model = ScriptedModel::named("test-model-1", vec![answer(&"y".repeat(8_192), 5)]);
+    let ctx = with_harness(AgentHarness::new(model).max_result_bytes(2_048));
+
+    let info = agent_model_turn_info();
+    let raw = (info.handler)(&ctx, serde_json::to_value(turn_request()).unwrap())
+        .await
+        .expect("the reply is a typed outcome, not a failure");
+
+    assert!(raw.to_string().len() <= 2_048, "{}", raw.to_string().len());
+    let turn: ModelTurn = serde_json::from_value(raw).unwrap();
+    assert!(turn.oversized);
+    assert_eq!(turn.content, Vec::new());
+    assert_eq!(turn.usage.input_tokens, 5, "the paid call stays counted");
+    assert_eq!(ctx.llm_calls().len(), 1, "the ledger still has the call");
+}
+
+/// A policy reason is free text. A huge one is cut before the reply is
+/// dropped.
+#[tokio::test]
+async fn a_huge_decision_reason_is_cut_to_fit_the_result_cap() {
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![calls(&[("r", "read", json!({}))], 3)]);
+    let harness = AgentHarness::new(model)
+        .tool(recorded_tool("read", ToolEffect::ReadOnly, &recorder))
+        .policy(common::CountingPolicy::new(ToolDecision::Deny {
+            reason: "r".repeat(64 * 1024),
+        }))
+        .max_result_bytes(4_096);
+
+    let turn = harness.model_turn(turn_request()).await.unwrap();
+
+    assert!(!turn.oversized);
+    assert!(serde_json::to_vec(&turn).unwrap().len() <= 4_096);
+    assert_eq!(turn.calls().len(), 1, "the call is kept");
+    let [ToolDecision::Deny { reason }] = turn.decisions.as_slice() else {
+        panic!("one decision for the one call: {:?}", turn.decisions);
+    };
+    assert!(reason.ends_with("…[truncated]"), "{}", reason.len());
+}
+
+/// A worker reads a result cap of zero as no cap (issue #2040).
+#[tokio::test]
+async fn a_zero_result_cap_leaves_a_big_reply_and_a_big_tool_result_alone() {
+    let model = ScriptedModel::new(vec![answer(&"y".repeat(8_192), 5)]);
+    let harness = AgentHarness::new(model)
+        .max_result_bytes(0)
+        .tool_output_limit(usize::MAX)
+        .tool(
+            autumn_harvest_agent::FnTool::new(
+                "big",
+                "Returns a large result.",
+                json!({"type": "object"}),
+                |_input| async { Ok(json!("z".repeat(50_000))) },
+            )
+            .effect(ToolEffect::ReadOnly)
+            .shared(),
+        );
+
+    let turn = harness.model_turn(turn_request()).await.unwrap();
+    assert!(!turn.oversized);
+    assert_eq!(turn.text().len(), 8_192);
+
+    let outcome = harness
+        .tool_call(ToolCallRequest {
+            run_id: "run-1".into(),
+            session_id: None,
+            step: 0,
+            memory_scope: None,
+            read_only: false,
+            allowed_tools: None,
+            labels: None,
+            call: ToolCall {
+                id: "c".into(),
+                name: "big".into(),
+                arguments: json!({}),
+            },
+        })
+        .await
+        .unwrap();
+    assert!(outcome.content.len() >= 50_000, "{}", outcome.content.len());
+    assert!(!outcome.content.ends_with("…[truncated]"));
 }

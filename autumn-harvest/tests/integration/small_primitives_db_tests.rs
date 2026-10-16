@@ -311,6 +311,7 @@ async fn start_full(
             runbook_url: None,
             severity: None,
             tenant: None,
+            fairness_key: None,
             context_headers: None,
             sla: None,
             schedule_id,

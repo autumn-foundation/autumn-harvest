@@ -1896,7 +1896,7 @@ pub enum ResidentOutcome {
     /// The workflow runs in a hot-swap module, which binds around one drive.
     HotSwap,
     /// Another context state blocked the capture, such as a park token, a
-    /// push signal handler or unread history.
+    /// push signal handler, unread history or a deferred update.
     Blocked,
     /// The last suspension had a command that the resident path does not
     /// cover, such as a child workflow or a local activity.

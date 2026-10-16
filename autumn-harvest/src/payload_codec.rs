@@ -722,6 +722,31 @@ pub struct PayloadCodecs {
     /// the client and the management API. See
     /// [`PayloadCodecs::set_column_encoding`].
     columns: Arc<AtomicBool>,
+    /// Where each shard's column sweep stopped (issue #2054).
+    ///
+    /// Shared across clones: one cursor for each registry and shard id. Give
+    /// each runtime its own registry. Do not share one registry, or its
+    /// clones, across databases or schemas.
+    #[cfg(feature = "db")]
+    column_cursors: Arc<std::sync::Mutex<BTreeMap<i32, ColumnCursor>>>,
+}
+
+/// Where one shard's column cycle stopped (issue #1979).
+///
+/// It lives in this process only. A restart or a second worker starts a
+/// cycle from the first column, which is safe: the census, not this
+/// cursor, decides completion.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ColumnCursor {
+    /// The key id this cycle converts onto.
+    pub(crate) active_key_id: String,
+    /// Index into the codec column list.
+    pub(crate) column: usize,
+    /// The last primary key examined in that column.
+    pub(crate) after: Option<uuid::Uuid>,
+    /// Cells this cycle could not convert so far.
+    pub(crate) unresolved: i64,
 }
 
 /// When the key set or the active key last changed (issue #1815).
@@ -795,6 +820,8 @@ impl Default for PayloadCodecs {
             })),
             any_keys: Arc::new(AtomicBool::new(false)),
             columns: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "db")]
+            column_cursors: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -1671,10 +1698,10 @@ impl PayloadCodecs {
 
     /// Turn encoding of the codec columns on or off (issue #1979).
     ///
-    /// The codec columns are `harvest_workflow_executions.input`, `.output`
-    /// and `.memo`, `harvest_signals.payload`, `harvest_dead_letters.input`,
-    /// and the workflow task's `harvest_task_queue.input` and `.output`. The
-    /// default is off.
+    /// The codec columns are the entries of `codec_rotation::CODEC_COLUMNS`
+    /// (issue #1979, issue #2043). The coverage table in
+    /// `docs/security-posture.md` gives a reason for each column that stays
+    /// clear. The default is off.
     ///
     /// Readers always decode these columns, whatever this switch says. So
     /// turn it on only after every process in the fleet runs a release that
@@ -1684,6 +1711,25 @@ impl PayloadCodecs {
     /// once.
     pub fn set_column_encoding(&self, on: bool) {
         self.columns.store(on, Ordering::Release);
+    }
+
+    /// The column sweep cursor stored for `shard_id` (issue #2054).
+    #[cfg(feature = "db")]
+    pub(crate) fn column_cursor(&self, shard_id: i32) -> Option<ColumnCursor> {
+        self.column_cursors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&shard_id)
+            .cloned()
+    }
+
+    /// Store the column sweep cursor for `shard_id` (issue #2054).
+    #[cfg(feature = "db")]
+    pub(crate) fn set_column_cursor(&self, shard_id: i32, cursor: ColumnCursor) {
+        self.column_cursors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(shard_id, cursor);
     }
 
     /// Whether writes encode the codec columns (issue #1979).
@@ -1924,6 +1970,11 @@ impl PayloadCodecs {
     /// switch is off or on, and the same value as a row written before
     /// issue #1979. A layer that fails to decode becomes a marker, as in
     /// `decode_value_lossy`.
+    ///
+    /// The second pass is deliberate (issue #2054). A business value that is
+    /// itself an envelope decodes here. [`PayloadCodecs::decode_column`]
+    /// returns it as written. The difference is intended: an old row has
+    /// nested envelopes and no column layer.
     ///
     /// For the operator read path only. Never write the result back.
     pub fn decode_column_lossy(&self, value: &mut Value) -> LossyDecodeOutcome {

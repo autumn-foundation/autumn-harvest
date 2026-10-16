@@ -11,13 +11,15 @@
 //! - `agent_model_turn` asks the candidate model, then the candidate policy.
 //!   These are the only live calls. A retryable failure retries under the
 //!   retry policy of the activity, as on a worker. A turn over the worker
-//!   result cap fails, as on a worker with no payload store. The response
-//!   cache is skipped, so every turn asks the candidate.
+//!   result cap is cut or dropped, as on a worker with no payload store. The
+//!   response cache is skipped, so every turn asks the candidate.
 //! - `agent_tool_call` returns the recorded outcome of the same call. A call
 //!   with no recorded outcome gets an error stub. No tool runs.
 //! - `agent_memory_snapshot` returns the recorded snapshot, or an empty one.
-//! - A tool or snapshot activity that failed the source fails the candidate
-//!   at the same activity.
+//! - `agent_discover_peers` returns the recorded peers for the same names, or
+//!   none. The candidate needs no roster.
+//! - A tool, snapshot or peer-lookup activity that failed the source fails
+//!   the candidate at the same activity.
 //! - `agent_deliver` is a stub. No report leaves the harness.
 //! - Any other activity has no mock, so it fails the candidate run.
 //!
@@ -44,11 +46,16 @@
 //!
 //! A recorded tool outcome answers a call with the same step, tool name and
 //! arguments. A model gives new call ids on each call, so the key holds no id.
+//! In a delegation run, the call must also come from the same agent of the
+//! tree. An agent is its lane, the child run id suffix such as `:d1`, with
+//! its name. The lane alone is a delegation ordinal, so another peer can hold
+//! it.
 //!
 //! A candidate call that equals the recorded call at the same turn and
-//! position takes the recorded id. The ids change before the policy runs.
-//! Approval signal names hold the id, so the recorded approvals stay valid. Any other candidate call gets a new id with
-//! the prefix `eval_`. A recorded approval therefore never releases it.
+//! position, of the same agent, takes the recorded id. The ids change before
+//! the policy runs. Approval signal names hold the id, so the recorded
+//! approvals stay valid. Any other candidate call gets a new id with the
+//! prefix `eval_`. A recorded approval therefore never releases it.
 //!
 //! # The diff
 //!
@@ -83,7 +90,7 @@ use std::time::Duration;
 
 use autumn_harvest::erase::is_erasure_tombstone;
 use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString, parse_typed_payload};
+use autumn_harvest::failure::parse_typed_payload;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::testing::WorkflowTestEnv;
 use autumn_harvest::types::ActivityExecId;
@@ -91,16 +98,16 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::bounds::exceeds_bytes;
-use crate::harness::AgentHarness;
+use crate::harness::{AgentHarness, fit_turn};
+use crate::mesh::Peer;
 use crate::message::{ContentPart, StopReason, ToolCall};
 use crate::policy::ToolDecision;
 use crate::types::{
     AgentReport, AgentTask, ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome,
 };
 use crate::workflow::{
-    WORKFLOW_NAME, agent_deliver_info, agent_loop_info, agent_memory_snapshot_info,
-    agent_model_turn_info, agent_tool_call_info,
+    WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
+    agent_memory_snapshot_info, agent_model_turn_info, agent_tool_call_info,
 };
 
 /// The error text of the stub outcome. A candidate call with no recorded
@@ -219,7 +226,8 @@ pub enum Divergence {
     Calls,
     /// The calls agree, but a policy decision differs.
     Policy,
-    /// The calls and decisions agree, but the stop reasons differ.
+    /// The calls and decisions agree, but the stop reasons differ, or only
+    /// one side dropped its reply as too large.
     Stop,
     /// Only one side has this turn. The value names the side that lacks it.
     Missing(Side),
@@ -259,6 +267,10 @@ pub struct TurnDecision {
     pub text: String,
     /// Why the model stopped.
     pub stop: StopReason,
+    /// The reply exceeded the result cap and the worker dropped it (issue
+    /// #2040). Such a turn holds no text and no calls.
+    #[serde(default, skip_serializing_if = "crate::types::is_false")]
+    pub dropped: bool,
 }
 
 impl TurnDecision {
@@ -283,6 +295,7 @@ impl TurnDecision {
             calls,
             text: turn.text(),
             stop: turn.stop,
+            dropped: turn.oversized,
         }
     }
 }
@@ -381,11 +394,15 @@ pub async fn evaluate(
 
     let session = Arc::new(Mutex::new(Session {
         recorded_calls: recording.turns.iter().map(ModelTurn::calls).collect(),
+        recorded_agents: recording.turn_agents.clone(),
+        candidate_names: HashMap::new(),
         turn: 0,
         max_turns,
         cap_reached: false,
         tools: recording.tools.clone(),
         snapshots: recording.snapshots.iter().cloned().collect(),
+        peers: recording.peers.clone(),
+        root: None,
         replayed: 0,
         stubbed: 0,
     }));
@@ -407,7 +424,13 @@ pub async fn evaluate(
         }
     };
 
+    let peers = {
+        let session = Arc::clone(&session);
+        move |names: Value| -> Result<Value, String> { encode(&lock(&session).lookup(&names)?) }
+    };
+
     let mut env = engine()
+        .mock_activity(agent_discover_peers_info().name, peers)
         .mock_activity(agent_model_turn_info().name, model)
         .mock_activity(agent_tool_call_info().name, tool)
         .mock_activity(agent_memory_snapshot_info().name, snapshot)
@@ -456,12 +479,28 @@ struct Recording {
     snapshots: Vec<Result<String, String>>,
     /// Signals for waits that the source opened, received in time, in order.
     signals: Vec<(String, Value)>,
+    /// The recorded peer lookups: the names asked and the peers found.
+    peers: Vec<RecordedPeers>,
+    /// The agent of each recorded model turn, in order.
+    turn_agents: Vec<AgentKey>,
     end: RunEnd,
+}
+
+/// One recorded peer lookup.
+#[derive(Clone)]
+struct RecordedPeers {
+    names: Value,
+    /// The peers found, or the error of a lookup that failed for good.
+    peers: Result<Vec<Peer>, String>,
+    /// A recorded lookup answers one candidate lookup at most.
+    used: bool,
 }
 
 /// One recorded tool call and its outcome.
 #[derive(Clone)]
 struct RecordedTool {
+    /// The agent of the tree that made the call.
+    agent: AgentKey,
     step: u32,
     name: String,
     arguments: Value,
@@ -475,12 +514,9 @@ impl Recording {
     fn read(history: &[WorkflowEvent]) -> Result<Self, EvalError> {
         let task = task_of(history)?;
         let model_name = agent_model_turn_info().name;
-        let tool_name = agent_tool_call_info().name;
-        let snapshot_name = agent_memory_snapshot_info().name;
         let mut scheduled: HashMap<ActivityExecId, (&str, &Value)> = HashMap::new();
         let mut run_id = None;
-        let mut tools = Vec::new();
-        let mut snapshots = Vec::new();
+        let mut effects = Effects::default();
         let mut opened: HashSet<&str> = HashSet::new();
         let mut timed_out: HashSet<&str> = HashSet::new();
         let mut signals = Vec::new();
@@ -518,16 +554,10 @@ impl Recording {
                 WorkflowEvent::ActivityCompleted {
                     activity_id,
                     output,
-                } => match scheduled.get(activity_id) {
-                    Some((name, input)) if *name == tool_name => {
-                        let outcome = decode(output.clone()).map_err(EvalError::Undecodable)?;
-                        tools.push(recorded_tool(input, Ok(outcome))?);
-                    }
-                    Some((name, _)) if *name == snapshot_name => {
-                        snapshots.push(Ok(decode(output.clone()).map_err(EvalError::Undecodable)?));
-                    }
-                    _ => {}
-                },
+                } => {
+                    let scheduled = scheduled.get(activity_id).copied();
+                    effects.completed(scheduled, output, run_id.as_deref())?;
+                }
                 WorkflowEvent::TimerStarted { timer_id, .. } => {
                     if let Some(signal) = deadline_signal(timer_id.as_str()) {
                         opened.insert(signal);
@@ -561,11 +591,11 @@ impl Recording {
                 }
             }
         }
-        // A source that failed on a tool or snapshot activity replays that
-        // failure, so the candidate fails at the same activity.
+        // A source that failed on a tool, snapshot or peer-lookup activity
+        // replays that failure, so the candidate fails at the same activity.
         if let (Some(RunEnd::Failed(_)), Some((activity_id, error))) = (&end, last_failure) {
             let scheduled = scheduled.get(&activity_id).copied();
-            push_failure(scheduled, error, &mut tools, &mut snapshots)?;
+            effects.failed(scheduled, error, run_id.as_deref())?;
         }
         // Only a signal for a wait that the source opened is sent again. A
         // wait opens with its deadline timer. A signal that arrived before
@@ -573,36 +603,96 @@ impl Recording {
         // then times out, which shows as a divergence.
         signals.retain(|(name, _)| opened.contains(name.as_str()));
         let turns = model_turns(history)?;
+        let turn_agents = model_turn_agents(history, run_id.as_deref())?;
+        // One lane holds one agent in a run, so its model turns name it.
+        let names: HashMap<&str, &Option<String>> = turn_agents
+            .iter()
+            .map(|agent| (agent.lane.as_str(), &agent.name))
+            .collect();
+        for tool in &mut effects.tools {
+            tool.agent.name = names
+                .get(tool.agent.lane.as_str())
+                .and_then(|name| (*name).clone());
+        }
         Ok(Self {
             task,
             run_id,
             turns,
-            tools,
-            snapshots,
+            tools: effects.tools,
+            snapshots: effects.snapshots,
             signals,
+            peers: effects.peers,
+            turn_agents,
             end: end.ok_or(EvalError::InFlightSource)?,
         })
     }
 }
 
-/// Record the terminal failure of the `scheduled` activity, when it is a
-/// tool call or a snapshot.
-fn push_failure(
-    scheduled: Option<(&str, &Value)>,
-    error: String,
-    tools: &mut Vec<RecordedTool>,
-    snapshots: &mut Vec<Result<String, String>>,
-) -> Result<(), EvalError> {
-    match scheduled {
-        Some((name, input)) if name == agent_tool_call_info().name => {
-            tools.push(recorded_tool(input, Err(error))?);
+/// The recorded results of the effect activities of a source run.
+#[derive(Default)]
+struct Effects {
+    tools: Vec<RecordedTool>,
+    /// The recorded snapshots, and the error of a snapshot that failed for
+    /// good.
+    snapshots: Vec<Result<String, String>>,
+    peers: Vec<RecordedPeers>,
+}
+
+impl Effects {
+    /// Record the `output` of the `scheduled` activity, when it is a tool
+    /// call, a snapshot or a peer lookup. `root` is the run id of the root
+    /// agent.
+    fn completed(
+        &mut self,
+        scheduled: Option<(&str, &Value)>,
+        output: &Value,
+        root: Option<&str>,
+    ) -> Result<(), EvalError> {
+        let Some((name, input)) = scheduled else {
+            return Ok(());
+        };
+        if name == agent_tool_call_info().name {
+            let outcome = decode(output.clone()).map_err(EvalError::Undecodable)?;
+            self.tools.push(recorded_tool(input, Ok(outcome), root)?);
+        } else if name == agent_discover_peers_info().name {
+            self.peers.push(RecordedPeers {
+                names: input.clone(),
+                peers: Ok(decode(output.clone()).map_err(EvalError::Undecodable)?),
+                used: false,
+            });
+        } else if name == agent_memory_snapshot_info().name {
+            let snapshot = decode(output.clone()).map_err(EvalError::Undecodable)?;
+            self.snapshots.push(Ok(snapshot));
         }
-        Some((name, _)) if name == agent_memory_snapshot_info().name => {
-            snapshots.push(Err(error));
-        }
-        _ => {}
+        Ok(())
     }
-    Ok(())
+
+    /// Record the terminal failure of the `scheduled` activity, when it is a
+    /// tool call, a snapshot or a peer lookup.
+    fn failed(
+        &mut self,
+        scheduled: Option<(&str, &Value)>,
+        error: String,
+        root: Option<&str>,
+    ) -> Result<(), EvalError> {
+        match scheduled {
+            Some((name, input)) if name == agent_tool_call_info().name => {
+                self.tools.push(recorded_tool(input, Err(error), root)?);
+            }
+            Some((name, _)) if name == agent_memory_snapshot_info().name => {
+                self.snapshots.push(Err(error));
+            }
+            Some((name, input)) if name == agent_discover_peers_info().name => {
+                self.peers.push(RecordedPeers {
+                    names: input.clone(),
+                    peers: Err(error),
+                    used: false,
+                });
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 /// The task of an agent run history.
@@ -627,18 +717,47 @@ fn task_of(history: &[WorkflowEvent]) -> Result<AgentTask, EvalError> {
 }
 
 /// The recorded tool call of the tool-call activity `input`, with `outcome`.
+/// `root` is the run id of the root agent.
 fn recorded_tool(
     input: &Value,
     outcome: Result<ToolOutcome, String>,
+    root: Option<&str>,
 ) -> Result<RecordedTool, EvalError> {
     let request: ToolCallRequest = decode(input.clone()).map_err(EvalError::Undecodable)?;
     Ok(RecordedTool {
+        // The name comes from the model turns of the lane, after the read.
+        agent: AgentKey {
+            lane: lane_of(&request.run_id, root).to_owned(),
+            name: None,
+        },
         step: request.step,
         name: request.call.name,
         arguments: request.call.arguments,
         outcome,
         used: false,
     })
+}
+
+/// The lane of `run_id` under the root run id `root`: the suffix that names
+/// one agent of a delegation tree. The root agent, and a run id that does not
+/// start with `root`, have the empty lane.
+fn lane_of<'a>(run_id: &'a str, root: Option<&str>) -> &'a str {
+    root.and_then(|root| run_id.strip_prefix(root))
+        .unwrap_or_default()
+}
+
+/// One agent of a delegation tree.
+///
+/// The lane is a delegation ordinal, so two runs can give the same lane to
+/// different peers. The name tells them apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AgentKey {
+    /// The run id suffix after the root run id. The root agent has an empty
+    /// lane.
+    lane: String,
+    /// The agent that holds the mandate, or `None` for a run with no
+    /// mandate.
+    name: Option<String>,
 }
 
 /// How a terminal event ends a run, or `None` for another event.
@@ -667,31 +786,51 @@ fn run_end(event: &WorkflowEvent) -> Result<Option<RunEnd>, EvalError> {
 struct Session {
     /// The tool calls of each recorded turn, for id alignment.
     recorded_calls: Vec<Vec<ToolCall>>,
+    /// The agent of each recorded turn. A candidate turn of another agent
+    /// takes no recorded id.
+    recorded_agents: Vec<AgentKey>,
+    /// The name of the agent in each candidate lane, from its model turns.
+    candidate_names: HashMap<String, Option<String>>,
     /// The index of the next candidate turn.
     turn: usize,
     max_turns: usize,
     cap_reached: bool,
     tools: Vec<RecordedTool>,
     snapshots: VecDeque<Result<String, String>>,
+    peers: Vec<RecordedPeers>,
+    /// The run id of the candidate root agent: the run id of its first model
+    /// request.
+    root: Option<String>,
     replayed: u32,
     stubbed: u32,
 }
 
 impl Session {
-    /// Claim the next candidate turn. Returns its index and the recorded
-    /// calls of the same turn.
+    /// Claim the next candidate turn, of `agent`. Returns its index and the
+    /// recorded calls of the same turn.
+    ///
+    /// A recorded turn of another agent gives no calls. Its call ids could
+    /// otherwise match an approval that a person gave to another agent.
     ///
     /// # Errors
     ///
     /// Returns [`TURN_CAP_ERROR`] when the turn cap is reached.
-    fn next_turn(&mut self) -> Result<(usize, Vec<ToolCall>), String> {
+    fn next_turn(&mut self, agent: &AgentKey) -> Result<(usize, Vec<ToolCall>), String> {
         if self.turn >= self.max_turns {
             self.cap_reached = true;
             return Err(TURN_CAP_ERROR.to_owned());
         }
         let index = self.turn;
         self.turn += 1;
-        let recorded = self.recorded_calls.get(index).cloned().unwrap_or_default();
+        let same_agent = self
+            .recorded_agents
+            .get(index)
+            .is_none_or(|recorded| recorded == agent);
+        let recorded = if same_agent {
+            self.recorded_calls.get(index).cloned().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         Ok((index, recorded))
     }
 
@@ -701,8 +840,12 @@ impl Session {
     ///
     /// Returns the recorded error of a call that failed for good.
     fn answer(&mut self, request: &ToolCallRequest) -> Result<ToolOutcome, String> {
+        let lane = lane_of(&request.run_id, self.root.as_deref()).to_owned();
+        let name = self.candidate_names.get(&lane).cloned().flatten();
+        let agent = AgentKey { lane, name };
         let recorded = self.tools.iter_mut().find(|tool| {
             !tool.used
+                && tool.agent == agent
                 && tool.step == request.step
                 && tool.name == request.call.name
                 && tool.arguments == request.call.arguments
@@ -715,6 +858,24 @@ impl Session {
             self.stubbed = self.stubbed.saturating_add(1);
             Ok(ToolOutcome::error(NOT_RUN))
         }
+    }
+
+    /// The recorded peers for the same `names`, or none.
+    ///
+    /// # Errors
+    ///
+    /// Returns the recorded error of a lookup that failed the source.
+    fn lookup(&mut self, names: &Value) -> Result<Vec<Peer>, String> {
+        self.peers
+            .iter_mut()
+            .find(|recorded| !recorded.used && recorded.names == *names)
+            .map_or_else(
+                || Ok(Vec::new()),
+                |recorded| {
+                    recorded.used = true;
+                    recorded.peers.clone()
+                },
+            )
     }
 }
 
@@ -789,12 +950,25 @@ fn model_mock(
         .unwrap_or_default();
     move |input: Value| -> Result<Value, String> {
         let mut request: ModelTurnRequest = decode(input)?;
-        // The test engine has its own ids. The policy sees the recorded run
-        // id instead.
-        if let Some(run_id) = &run_id {
-            request.run_id.clone_from(run_id);
-        }
-        let (index, recorded) = lock(&session).next_turn()?;
+        let (index, recorded) = {
+            let mut session = lock(&session);
+            // The root agent makes the first model request.
+            let root = session.root.get_or_insert_with(|| request.run_id.clone());
+            let lane = lane_of(&request.run_id, Some(root.as_str())).to_owned();
+            let agent = AgentKey {
+                lane: lane.clone(),
+                name: request.agent.clone(),
+            };
+            session
+                .candidate_names
+                .insert(lane.clone(), request.agent.clone());
+            // The test engine has its own ids. The policy sees the recorded
+            // run id instead, with the lane of the same agent.
+            if let Some(run_id) = &run_id {
+                request.run_id = format!("{run_id}{lane}");
+            }
+            session.next_turn(&agent)?
+        };
         let turn = live_turn(
             &handle,
             &harness,
@@ -822,6 +996,10 @@ fn live_turn(
     (recorded, taken, index): (&[ToolCall], &HashSet<String>, usize),
     retry: &RetryPolicy,
 ) -> Result<ModelTurn, String> {
+    // The cap applies after the call, to the turn as a worker records it. So
+    // the harness must not cut the turn with the aligned ids.
+    let result_cap = harness.result_cap();
+    let harness = &harness.clone().max_result_bytes(0);
     let mut attempt = 1;
     loop {
         // The provider ids, before the alignment changes them.
@@ -834,7 +1012,7 @@ fn live_turn(
             handle.block_on(harness.model_turn_with(request.clone(), align))
         });
         let payload = match result {
-            Ok(turn) => return fit_result_cap(turn, &provider_ids, harness.result_cap()),
+            Ok(turn) => return Ok(fit_result_cap(turn, &provider_ids, result_cap)),
             Err(payload) => payload,
         };
         let delay = retry_delay(&payload, retry, attempt).ok_or(payload)?;
@@ -854,16 +1032,12 @@ fn call_ids(content: &[ContentPart]) -> Vec<String> {
         .collect()
 }
 
-/// Refuse a turn over the worker result cap, as a worker with no payload
-/// store does.
+/// Fit a turn to the worker result cap, as a worker with no payload store
+/// does: cut the decision reasons, or drop the reply.
 ///
-/// A worker records the turn with the provider ids. So the check measures
-/// the turn with `provider_ids`, not with the aligned ids.
-///
-/// # Errors
-///
-/// Returns a non-retryable `PayloadTooLarge` failure payload.
-fn fit_result_cap(turn: ModelTurn, provider_ids: &[String], cap: u64) -> Result<ModelTurn, String> {
+/// A worker records the turn with the provider ids. So the fit measures the
+/// turn with `provider_ids`, not with the aligned ids.
+fn fit_result_cap(turn: ModelTurn, provider_ids: &[String], cap: u64) -> ModelTurn {
     let mut as_recorded = turn.clone();
     let parts = as_recorded
         .content
@@ -875,15 +1049,14 @@ fn fit_result_cap(turn: ModelTurn, provider_ids: &[String], cap: u64) -> Result<
     for (id, provider_id) in parts.zip(provider_ids) {
         id.clone_from(provider_id);
     }
-    // A worker reads a zero cap as no cap.
-    if cap > 0 && exceeds_bytes(&as_recorded, cap) {
-        return Err(ActivityFailure::non_retryable(
-            "PayloadTooLarge",
-            format!("the model turn is larger than the result cap of {cap} bytes"),
-        )
-        .into_error_payload());
+    let fitted = fit_turn(as_recorded, cap);
+    if fitted.oversized {
+        return turn.into_oversized();
     }
-    Ok(turn)
+    ModelTurn {
+        decisions: fitted.decisions,
+        ..turn
+    }
 }
 
 /// The wait before attempt `attempt + 1` of a failed model turn, or `None`
@@ -923,6 +1096,42 @@ fn model_turns(history: &[WorkflowEvent]) -> Result<Vec<ModelTurn>, EvalError> {
         }
     }
     Ok(turns)
+}
+
+/// The agent of each completed model turn of a history, in order. `root` is
+/// the run id of the root agent.
+fn model_turn_agents(
+    history: &[WorkflowEvent],
+    root: Option<&str>,
+) -> Result<Vec<AgentKey>, EvalError> {
+    let model_name = agent_model_turn_info().name;
+    let mut scheduled: HashMap<ActivityExecId, AgentKey> = HashMap::new();
+    let mut agents = Vec::new();
+    for event in history {
+        match event {
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name,
+                input,
+                ..
+            } if name == model_name => {
+                let request: ModelTurnRequest =
+                    decode(input.clone()).map_err(EvalError::Undecodable)?;
+                let agent = AgentKey {
+                    lane: lane_of(&request.run_id, root).to_owned(),
+                    name: request.agent,
+                };
+                scheduled.insert(*activity_id, agent);
+            }
+            WorkflowEvent::ActivityCompleted { activity_id, .. } => {
+                if let Some(agent) = scheduled.remove(activity_id) {
+                    agents.push(agent);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(agents)
 }
 
 /// Compare the two runs turn by turn.
@@ -969,7 +1178,7 @@ fn verdict(recorded: Option<&TurnDecision>, candidate: Option<&TurnDecision>) ->
         Verdict::Diverged(Divergence::Calls)
     } else if decisions_of(recorded) != decisions_of(candidate) {
         Verdict::Diverged(Divergence::Policy)
-    } else if recorded.stop != candidate.stop {
+    } else if recorded.dropped != candidate.dropped || recorded.stop != candidate.stop {
         Verdict::Diverged(Divergence::Stop)
     } else if recorded.calls.is_empty() && recorded.text != candidate.text {
         Verdict::Reworded
@@ -1054,6 +1263,7 @@ mod tests {
                 .collect(),
             text: text.to_owned(),
             stop,
+            dropped: false,
         }
     }
 
@@ -1079,6 +1289,9 @@ mod tests {
             usage: TokenUsage::default(),
             decisions: Vec::new(),
             cache_hit: false,
+            labels: Vec::new(),
+            releases: Vec::new(),
+            oversized: false,
         }
     }
 
@@ -1198,15 +1411,59 @@ mod tests {
     }
 
     #[test]
+    fn the_result_cap_cuts_a_long_reason_before_it_drops_the_reply() {
+        let mut turn = turn_of(&[call("c1", "a", json!(1))]);
+        turn.decisions = vec![ToolDecision::Deny {
+            reason: "r".repeat(5_000),
+        }];
+        let fitted = fit_result_cap(turn.clone(), &["c1".to_owned()], 2_048);
+        assert!(!fitted.oversized);
+        assert_eq!(fitted.content, turn.content);
+        let [ToolDecision::Deny { reason }] = fitted.decisions.as_slice() else {
+            panic!("one cut reason: {:?}", fitted.decisions);
+        };
+        assert!(reason.len() <= 256, "{}", reason.len());
+    }
+
+    #[test]
+    fn a_dropped_reply_is_a_divergence() {
+        let answer = decision(&[], "done", StopReason::EndTurn);
+        let dropped = TurnDecision {
+            text: String::new(),
+            dropped: true,
+            ..answer.clone()
+        };
+        assert_eq!(
+            verdict(Some(&answer), Some(&dropped)),
+            Verdict::Diverged(Divergence::Stop)
+        );
+        assert_eq!(
+            verdict(Some(&dropped), Some(&answer)),
+            Verdict::Diverged(Divergence::Stop)
+        );
+        assert_eq!(verdict(Some(&dropped), Some(&dropped)), Verdict::Same);
+        // The flag is left out at its default, so a recorded diff encodes as before.
+        assert!(
+            serde_json::to_value(&answer)
+                .unwrap()
+                .get("dropped")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn the_result_cap_measures_the_provider_ids() {
         let mut turn = turn_of(&[call("c1", "a", json!(1))]);
         let fits = crate::bounds::json_len(&turn);
         align_call_ids(&mut turn.content, &[], &HashSet::new(), 0);
         let original = vec!["c1".to_owned()];
-        assert!(fit_result_cap(turn.clone(), &original, fits).is_ok());
-        assert!(fit_result_cap(turn.clone(), &original, fits - 1).is_err());
+        // The aligned ids are longer, so only the provider form fits.
+        let fitted = fit_result_cap(turn.clone(), &original, fits);
+        assert!(!fitted.oversized);
+        assert_eq!(fitted.content, turn.content, "the aligned ids stay");
+        assert!(fit_result_cap(turn.clone(), &original, fits - 1).oversized);
         assert!(
-            fit_result_cap(turn, &original, 0).is_ok(),
+            !fit_result_cap(turn, &original, 0).oversized,
             "a zero cap is no cap"
         );
     }
@@ -1253,6 +1510,8 @@ mod tests {
                 messages: Vec::new(),
                 followups: 0,
                 followup_dropped: false,
+                delegations: Vec::new(),
+                flow_labels: std::collections::BTreeSet::new(),
             })
         };
         let done = report(crate::AgentStop::Completed);

@@ -26,7 +26,17 @@
 /// Weights decide **which queue** to claim from. `claim_task` then picks the
 /// best row in that queue by its standard claim order. That order is
 /// `priority`, then the claim-order due time (issue #1824).
-use std::collections::HashMap;
+///
+/// # Fairness keys within a queue (issue #1976)
+///
+/// Queue weights do not help when many tenants share one queue. A fairness
+/// key on each task does. [`FairClock`] is the pure model of the fair claim:
+/// start-time fair queuing (SFQ) across the keys of one queue. The fair claim
+/// splice in `queue.rs` is the SQL form of the same rules. See
+/// `DESIGN-1976.md` and `tests/property/fairness_key_props.rs`.
+use std::collections::{BTreeMap, HashMap};
+
+use crate::error::{HarvestError, HarvestResult};
 
 /// Pair a queue name with its effective non-negative weight.
 ///
@@ -109,6 +119,267 @@ pub fn weighted_queue_order<'a>(
     let mut result: Vec<&'a str> = positive.iter().map(|(n, _)| *n).collect();
     result.extend(zeros.iter().copied());
     result
+}
+
+/// The key of a task that has no fairness key.
+///
+/// The fair claim puts every unkeyed row in this one key. A start rejects an
+/// empty key, so no caller can collide with it.
+pub const DEFAULT_FAIRNESS_KEY: &str = "";
+
+/// The weight of a key that has no override.
+pub const DEFAULT_FAIRNESS_WEIGHT: f64 = 1.0;
+
+/// The smallest weight an override can set.
+pub const MIN_FAIRNESS_WEIGHT: f64 = 0.001;
+
+/// The largest weight an override can set.
+pub const MAX_FAIRNESS_WEIGHT: f64 = 1000.0;
+
+/// The most weight overrides one queue can hold.
+///
+/// Temporal uses the same cap. The claim reads one override per claim, so the
+/// cap bounds the table, not the claim cost.
+pub const MAX_FAIRNESS_OVERRIDES_PER_QUEUE: usize = 1000;
+
+/// The longest fairness key, in bytes.
+///
+/// It equals the quota key cap, so a valid quota key fits as a fairness key.
+pub const MAX_FAIRNESS_KEY_LEN: usize = 256;
+
+/// Check a fairness key that a caller supplies.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] for an empty key or for the key `.` or
+/// `..`. It also rejects a key with outer whitespace or a control character,
+/// and a key longer than [`MAX_FAIRNESS_KEY_LEN`] bytes. The empty key is
+/// [`DEFAULT_FAIRNESS_KEY`].
+pub fn validate_fairness_key(key: &str) -> HarvestResult<()> {
+    if key.is_empty() {
+        return Err(HarvestError::Config(
+            "fairness key must not be empty".to_owned(),
+        ));
+    }
+    // The admin routes carry the key in a URL path segment. URL parsing
+    // removes a `.` or `..` segment, so no route could address such a key.
+    if key == "." || key == ".." {
+        return Err(HarvestError::Config(
+            "fairness key must not be `.` or `..`".to_owned(),
+        ));
+    }
+    if key.trim() != key {
+        return Err(HarvestError::Config(
+            "fairness key must not start or end with whitespace".to_owned(),
+        ));
+    }
+    // A control character in a key would reach logs, audit rows and CLI
+    // output unescaped.
+    if key.chars().any(char::is_control) {
+        return Err(HarvestError::Config(
+            "fairness key must not contain a control character".to_owned(),
+        ));
+    }
+    if key.len() > MAX_FAIRNESS_KEY_LEN {
+        return Err(HarvestError::Config(format!(
+            "fairness key is {} bytes; the limit is {MAX_FAIRNESS_KEY_LEN}",
+            key.len()
+        )));
+    }
+    Ok(())
+}
+
+/// The fairness key of a new run: the explicit key, else the quota key.
+///
+/// A quota key names a tenant already, so it is the natural default. A quota
+/// key that fails [`validate_fairness_key`] is not used. Every stored key is
+/// thus one that the weight API can address, and an inherited key passes
+/// validation again on a workflow retry. A run with neither key gets `None`,
+/// which is [`DEFAULT_FAIRNESS_KEY`].
+#[must_use]
+pub fn fairness_key_for(explicit: Option<&str>, quota_key: Option<&str>) -> Option<String> {
+    explicit
+        .or_else(|| quota_key.filter(|k| validate_fairness_key(k).is_ok()))
+        .map(str::to_owned)
+}
+
+/// Check a weight override.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when `weight` is not finite, is below
+/// [`MIN_FAIRNESS_WEIGHT`], or is above [`MAX_FAIRNESS_WEIGHT`].
+pub fn validate_fairness_weight(weight: f64) -> HarvestResult<f64> {
+    if weight.is_finite() && (MIN_FAIRNESS_WEIGHT..=MAX_FAIRNESS_WEIGHT).contains(&weight) {
+        Ok(weight)
+    } else {
+        Err(HarvestError::Config(format!(
+            "fairness weight must be a finite number from {MIN_FAIRNESS_WEIGHT} to \
+             {MAX_FAIRNESS_WEIGHT}; got {weight}"
+        )))
+    }
+}
+
+/// The stored state of one fairness key in one queue.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FairPass {
+    /// The virtual time at which the key may next start: its last start plus
+    /// `1 / weight`.
+    pub pass: f64,
+    /// The start tag of the last claim of the key.
+    pub last_start: f64,
+}
+
+/// Pure model of the fair claim within one queue (issue #1976).
+///
+/// Each key has a [`FairPass`]. The queue clock `V` is the largest
+/// `last_start` of any key. It never decreases.
+///
+/// - The start tag of a key is `max(pass, V)`. A key with no state starts
+///   at `V`. Idle time thus earns no credit.
+/// - The claim takes the row whose key has the smallest lag
+///   `start - V`. The due time breaks a tie.
+/// - A claim charges the key: `last_start = start` and
+///   `pass = start + 1 / weight`. See [`fair_charge`].
+///
+/// The SQL in `queue::splice_fairness` follows the same rules. The DB test
+/// `fair_claim_matches_the_model_sequence` compares the two.
+#[derive(Debug, Clone, Default)]
+pub struct FairClock {
+    keys: BTreeMap<String, FairPass>,
+}
+
+impl FairClock {
+    /// The queue clock `V`: the largest `last_start`, or `0` with no state.
+    #[must_use]
+    pub fn vclock(&self) -> f64 {
+        self.keys.values().map(|p| p.last_start).fold(0.0, f64::max)
+    }
+
+    /// The stored state of `key`, if any.
+    #[must_use]
+    pub fn state(&self, key: &str) -> Option<FairPass> {
+        self.keys.get(key).copied()
+    }
+
+    /// The start tag of `key`: `max(pass, V)`.
+    #[must_use]
+    pub fn start_tag(&self, key: &str) -> f64 {
+        fair_start(self.keys.get(key).map(|p| p.pass), self.vclock())
+    }
+
+    /// The lag of `key`: its start tag minus `V`. The claim sorts on it.
+    #[must_use]
+    pub fn lag(&self, key: &str) -> f64 {
+        fair_lag(self.keys.get(key).map(|p| p.pass), self.vclock())
+    }
+
+    /// Pick the key of the next claim from `(key, due)` rows.
+    ///
+    /// Returns the key with the smallest lag. The smallest due time breaks a
+    /// tie. Returns `None` for no rows.
+    pub fn pick<'k, D: Ord>(
+        &self,
+        rows: impl IntoIterator<Item = (&'k str, D)>,
+    ) -> Option<&'k str> {
+        let v = self.vclock();
+        rows.into_iter()
+            .map(|(k, due)| (fair_lag(self.keys.get(k).map(|p| p.pass), v), due, k))
+            .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+            .map(|(_, _, k)| k)
+    }
+
+    /// Pick the index of the next claim from `(key, due)` rows.
+    ///
+    /// Same order as [`FairClock::pick`]. The first row wins a full tie.
+    #[must_use]
+    pub fn pick_row<D: Ord + Copy>(&self, rows: &[(&str, D)]) -> Option<usize> {
+        let v = self.vclock();
+        rows.iter()
+            .enumerate()
+            .min_by(|(ia, a), (ib, b)| {
+                let la = fair_lag(self.keys.get(a.0).map(|p| p.pass), v);
+                let lb = fair_lag(self.keys.get(b.0).map(|p| p.pass), v);
+                la.total_cmp(&lb)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| ia.cmp(ib))
+            })
+            .map(|(i, _)| i)
+    }
+
+    /// Charge one claim to `key` at `weight` and return its new state.
+    ///
+    /// The start tag comes from the current state, as the SQL upsert does
+    /// after it waits for a concurrent charge of the same key.
+    pub fn charge(&mut self, key: &str, weight: f64) -> FairPass {
+        let v = self.vclock();
+        let pass = self.keys.get(key).map(|p| p.pass);
+        let next = fair_charge(pass, v, weight);
+        self.keys.insert(key.to_owned(), next);
+        next
+    }
+
+    /// Delete the state of idle keys that the claim cannot tell apart from
+    /// no state. Returns the number of keys deleted.
+    ///
+    /// A key goes when three things hold. `is_active` is false. Its `pass` is
+    /// at most `V`, so it has no debt. Its `last_start` is below `V`, so it
+    /// does not set `V`. Such a key starts at `V` with or without its row.
+    pub fn prune(&mut self, is_active: impl Fn(&str) -> bool) -> usize {
+        let v = self.vclock();
+        let before = self.keys.len();
+        self.keys
+            .retain(|k, p| is_active(k) || p.pass > v || p.last_start >= v);
+        before - self.keys.len()
+    }
+
+    /// Forget every key when the queue has no pending task. Returns the
+    /// number of keys deleted.
+    ///
+    /// This is the idle rule of start-time fair queuing. With no backlog, no
+    /// key is behind another, so every debt is forgiven. Keys that claim once
+    /// never move `V`. Without this rule [`FairClock::prune`] never deletes
+    /// them, and the state grows with each new key.
+    pub fn reset_if_idle(&mut self, any_active: bool) -> usize {
+        if any_active {
+            return 0;
+        }
+        let n = self.keys.len();
+        self.keys.clear();
+        n
+    }
+}
+
+/// The start tag of a key: `max(pass, v)`. A key with no state starts at `v`.
+#[must_use]
+pub fn fair_start(pass: Option<f64>, v: f64) -> f64 {
+    pass.map_or(v, |p| p.max(v))
+}
+
+/// The lag of a key: its start tag minus `v`. Never negative.
+#[must_use]
+pub fn fair_lag(pass: Option<f64>, v: f64) -> f64 {
+    pass.map_or(0.0, |p| (p - v).max(0.0))
+}
+
+/// The state of a key after one claim (issue #1976).
+///
+/// `pass` is the key's stored pass, if any, and `v` is the queue clock. The
+/// key starts at `max(pass, v)`. Its new pass is that start plus
+/// `1 / weight`, and its `last_start` is that start.
+///
+/// A new key starts at `v`, so its first claim comes before any key in debt.
+/// While new keys arrive more slowly than the queue drains, a backlogged key
+/// gets every other claim. When new keys arrive as fast as the queue drains,
+/// they take every claim, as in any per-key fair queue. See the `Limits`
+/// section of `docs/fairness-keys.md`.
+#[must_use]
+pub fn fair_charge(pass: Option<f64>, v: f64, weight: f64) -> FairPass {
+    let start = fair_start(pass, v);
+    FairPass {
+        pass: start + 1.0 / weight,
+        last_start: start,
+    }
 }
 
 #[cfg(test)]
@@ -278,5 +549,77 @@ mod tests {
                 "'light' must always appear in the permutation"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Fairness keys (issue #1976)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn explicit_key_wins_over_the_quota_key() {
+        assert_eq!(fairness_key_for(Some("a"), Some("q")).as_deref(), Some("a"));
+        assert_eq!(fairness_key_for(None, Some("q")).as_deref(), Some("q"));
+        assert_eq!(fairness_key_for(None, None), None);
+    }
+
+    #[test]
+    fn an_invalid_quota_key_is_not_a_fairness_key() {
+        for bad in ["", " acme", "acme\u{1f}", ".", ".."] {
+            assert_eq!(fairness_key_for(None, Some(bad)), None, "{bad:?}");
+        }
+        let at_cap = "q".repeat(MAX_FAIRNESS_KEY_LEN);
+        assert_eq!(fairness_key_for(None, Some(&at_cap)), Some(at_cap.clone()));
+        // A quota key at the quota cap is a valid fairness key.
+        assert_eq!(
+            u64::try_from(MAX_FAIRNESS_KEY_LEN).unwrap(),
+            crate::quota::MAX_QUOTA_KEY_BYTES
+        );
+    }
+
+    #[test]
+    fn fairness_key_validation_rejects_reserved_and_malformed_keys() {
+        assert!(validate_fairness_key("tenant-a").is_ok());
+        assert!(validate_fairness_key(&"x".repeat(MAX_FAIRNESS_KEY_LEN)).is_ok());
+        assert!(validate_fairness_key(DEFAULT_FAIRNESS_KEY).is_err());
+        assert!(validate_fairness_key(" a").is_err());
+        assert!(validate_fairness_key("a\n").is_err());
+        assert!(validate_fairness_key("a\u{1f}b").is_err());
+        assert!(validate_fairness_key(".").is_err());
+        assert!(validate_fairness_key("..").is_err());
+        assert!(validate_fairness_key("...").is_ok());
+        assert!(validate_fairness_key(&"x".repeat(MAX_FAIRNESS_KEY_LEN + 1)).is_err());
+    }
+
+    #[test]
+    fn fairness_weight_validation_is_inclusive_at_both_bounds() {
+        assert!(validate_fairness_weight(MIN_FAIRNESS_WEIGHT).is_ok());
+        assert!(validate_fairness_weight(MAX_FAIRNESS_WEIGHT).is_ok());
+        assert!(validate_fairness_weight(DEFAULT_FAIRNESS_WEIGHT).is_ok());
+        for bad in [0.0, -1.0, 0.000_9, 1000.1, f64::NAN, f64::INFINITY] {
+            assert!(validate_fairness_weight(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_flood_cannot_hold_a_new_key_for_more_than_one_claim() {
+        let mut clock = FairClock::default();
+        for _ in 0..1_000 {
+            clock.charge("a", 1.0);
+        }
+        // A new key has lag 0; the flood's key has lag 1.
+        assert!(clock.lag("b") < clock.lag("a"));
+        assert_eq!(clock.pick([("a", 0u64), ("b", 9)]), Some("b"));
+    }
+
+    #[test]
+    fn a_heavier_key_gets_its_weight_in_claims() {
+        let mut clock = FairClock::default();
+        let mut served = [0u32; 2];
+        for _ in 0..400 {
+            let k = clock.pick([("light", 0u8), ("heavy", 0u8)]).unwrap();
+            served[usize::from(k == "heavy")] += 1;
+            clock.charge(k, if k == "heavy" { 3.0 } else { 1.0 });
+        }
+        assert_eq!(served, [100, 300]);
     }
 }

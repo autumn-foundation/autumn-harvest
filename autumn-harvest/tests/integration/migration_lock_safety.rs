@@ -60,13 +60,16 @@ const GRANDFATHER_CEILING: &str = "20261003201739";
 /// Tables that the engine reads or writes on every claim or workflow step.
 ///
 /// A blocking lock on one of them stalls the engine, not one feature. Each
-/// operator action writes `harvest_audit_log`. `harvest_workflow_outbox` lives
+/// operator action writes `harvest_audit_log`. A claim with fairness keys on
+/// reads both fairness tables and writes `harvest_fairness_state`. `harvest_workflow_outbox` lives
 /// in the application database, and the application writes it in its own
 /// transactions.
 const HOT_TABLES: &[&str] = &[
     "harvest_activity_pauses",
     "harvest_audit_log",
     "harvest_events",
+    "harvest_fairness_state",
+    "harvest_fairness_weights",
     "harvest_queue_pauses",
     "harvest_rate_limit_buckets",
     "harvest_shard_generation",
@@ -5236,6 +5239,8 @@ fn the_claim_path_tables_are_hot() {
     // Every claim reads these, so a waiting ACCESS EXCLUSIVE stalls claims.
     for table in [
         "harvest_activity_pauses",
+        "harvest_fairness_state",
+        "harvest_fairness_weights",
         "harvest_queue_pauses",
         "harvest_rate_limit_buckets",
         "harvest_shard_generation",

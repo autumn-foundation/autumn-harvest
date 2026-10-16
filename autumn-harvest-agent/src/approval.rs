@@ -48,11 +48,13 @@ pub const SIGNAL_TOOL_APPROVAL: &str = "tool_approval";
 
 /// The signal name that releases one tool call.
 ///
-/// `step` and `position` identify the wait. `call_id` names the call, so an
-/// operator can read it from the name.
+/// `round` and `position` identify the wait. `round` counts the tool rounds
+/// of the whole run tree, so a parent and a delegated child never share a
+/// name. With no delegation, it is the step of the run. `call_id` names the
+/// call, so an operator can read it from the name.
 #[must_use]
-pub fn approval_signal(step: u32, position: usize, call_id: &str) -> String {
-    format!("{SIGNAL_TOOL_APPROVAL}:{step}:{position}:{call_id}")
+pub fn approval_signal(round: u32, position: usize, call_id: &str) -> String {
+    format!("{SIGNAL_TOOL_APPROVAL}:{round}:{position}:{call_id}")
 }
 
 /// The tool-call id that one approval signal name releases.

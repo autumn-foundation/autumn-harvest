@@ -140,6 +140,16 @@ STALE_CLAIMS = [
         r"search\s+attributes,\s+and\s+`continue_as_new`",
         "the SQLite backend supports continue_as_new (issue #2023)",
     ),
+    (
+        "docs/rnd/sqlite-feasibility.md",
+        r"local\s+and\s+external\s+activities,\s+cancellable\s+timers",
+        "the SQLite backend runs local activities and cancellable timers (issue #2029)",
+    ),
+    (
+        "autumn-harvest-sqlite/README.md",
+        r"external\s+signals/cancels,\s+local\s+activities",
+        "the SQLite backend runs local activities (issue #2029)",
+    ),
 ]
 
 

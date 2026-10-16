@@ -94,6 +94,12 @@ A complete, runnable version is in
   handler that `ctx.register_query` registered. It replays the stored history
   to the run's frontier and writes nothing. A terminal run answers with the
   state at its recorded end.
+- **List and describe (issue #2027).** `list_executions(&filter)` pages runs
+  newest first. It filters by workflow name, workflow id prefix, state, start
+  time and search attributes. `describe(exec)` reads one run with its
+  payloads. `SqliteReader::open(path)` gives the same reads without the
+  writer. `ctx.upsert_search_attrs` and the memo of
+  `start_workflow_with_options` are stored on the run.
 - **Durability & crash recovery.** All state is in the database. Dropping the
   runtime and re-`open`-ing the same file is a faithful restart: any task left
   `RUNNING` by a crash is reclaimed and the workflow resumes purely by
@@ -111,6 +117,12 @@ A complete, runnable version is in
   starting a second one. The new call's input is discarded. Use
   `start_workflow_with_reuse_policy` for the full `WorkflowIdReusePolicy`
   matrix — reject, replace-if-failed, or terminate-and-restart.
+- **Keyed signals and signal-with-start (issue #2028).**
+  `send_signal_idempotent(exec, name, payload, key)` stages a signal once per
+  key, so a retried webhook is safe. `send_signal_by_workflow_id` signals the
+  running run of a `(workflow_name, workflow_id)` key and refuses a terminal
+  one. `signal_with_start` starts a run and signals it, or signals the run
+  that exists, in one transaction.
 - **Cancel and terminate (issue #2021).** `cancel(exec, reason)` is
   cooperative. The next drive replays the body with
   `ctx.cancellation_reason()` set, so the body can run cleanup activities. The
@@ -125,6 +137,13 @@ A complete, runnable version is in
   history caps apply with the Postgres defaults: 50,000 events and 50 MiB per
   run. A run that reaches a cap fails. Its error is `HistoryCapReason` JSON. Change
   the caps with `set_history_event_hard_cap` and `set_history_byte_hard_cap`.
+- **Timers, mutex, local activities, timeout and retry (issue #2029).**
+  `ctx.start_timer` and `TimerHandle` arm, cancel and reset durable timers.
+  `ctx.mutex(key).acquire()` grants a key in FIFO order, and a waiting run
+  returns `RunState::WaitingMutex(key)`. `#[activity(local = true)]` runs
+  inline after its decision commits. `#[workflow(execution_timeout = ..)]` ends a
+  late run `TIMED_OUT`. `#[workflow(retry = ..)]` starts a retry run, which
+  `successor(exec)` returns. Each records the Postgres events.
 
 ## v0.1 non-goals
 
@@ -133,8 +152,8 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
 - Schedules, the management API, DAGs, worker sessions, retention, sharding.
-- Child workflows, external signals/cancels, local activities, search
-  attributes, and a continue-as-new to a different workflow type
+- Child workflows, external signals/cancels, and a continue-as-new to a
+  different workflow type
   (`continue_as_new_as_type`) — a workflow reaching one of these is
   rejected **loudly, by name**, never silently dropped. The run then ends
   `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).

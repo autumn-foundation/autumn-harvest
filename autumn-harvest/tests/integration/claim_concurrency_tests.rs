@@ -10,6 +10,9 @@
 //! each claim interval in a probe table. Each probe test uses its own queue,
 //! probe table and trigger, and drops them at the end.
 //!
+//! The permit tests add a second trigger. At each claim, it counts the rows
+//! that the claiming worker holds.
+//!
 //! Set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run against it.
 //! Otherwise a testcontainers Postgres 16 starts.
 
@@ -144,10 +147,10 @@ impl ClaimProbe {
 
     /// How many claims the probe saw.
     async fn claims(&self) -> i64 {
-        self.scalar(&format!(
-            "SELECT count(*) AS v FROM claim_probe_{}",
-            self.suffix
-        ))
+        scalar(
+            &self.url,
+            &format!("SELECT count(*) AS v FROM claim_probe_{}", self.suffix),
+        )
         .await
     }
 
@@ -157,57 +160,155 @@ impl ClaimProbe {
     /// claims that started by then and had not finished.
     async fn max_overlap(&self) -> i64 {
         let s = &self.suffix;
-        self.scalar(&format!(
-            "SELECT coalesce(max(n), 0) AS v FROM (
-                 SELECT count(*) AS n
-                   FROM claim_probe_{s} p
-                   JOIN claim_probe_{s} q
-                     ON q.started <= p.started AND q.finished > p.started
-                  GROUP BY p.ctid) o"
-        ))
+        scalar(
+            &self.url,
+            &format!(
+                "SELECT coalesce(max(n), 0) AS v FROM (
+                     SELECT count(*) AS n
+                       FROM claim_probe_{s} p
+                       JOIN claim_probe_{s} q
+                         ON q.started <= p.started AND q.finished > p.started
+                      GROUP BY p.ctid) o"
+            ),
+        )
         .await
     }
 
     /// Claims that started more than `slack_ms` after the database time
     /// `at_ms`, in epoch milliseconds.
     async fn started_after(&self, at_ms: i64, slack_ms: i64) -> i64 {
-        self.scalar(&format!(
-            "SELECT count(*) AS v FROM claim_probe_{}
-              WHERE extract(epoch FROM started) * 1000 > {}",
-            self.suffix,
-            at_ms + slack_ms
-        ))
+        scalar(
+            &self.url,
+            &format!(
+                "SELECT count(*) AS v FROM claim_probe_{}
+                  WHERE extract(epoch FROM started) * 1000 > {}",
+                self.suffix,
+                at_ms + slack_ms
+            ),
+        )
         .await
-    }
-
-    async fn scalar(&self, sql: &str) -> i64 {
-        #[derive(diesel::QueryableByName)]
-        struct Row {
-            #[diesel(sql_type = BigInt)]
-            v: i64,
-        }
-        let mut conn = connect(&self.url).await;
-        diesel::sql_query(sql)
-            .get_result::<Row>(&mut conn)
-            .await
-            .unwrap_or_else(|e| panic!("{sql}: {e}"))
-            .v
     }
 
     /// Drop the trigger, its function and the probe table.
     async fn remove(self) {
-        let s = &self.suffix;
-        let mut conn = connect(&self.url).await;
+        drop_probe(&self.url, "claim_probe", &self.suffix).await;
+    }
+}
+
+/// A trigger that counts, at each claim of one kind, the rows of that kind
+/// that the claiming worker holds.
+///
+/// A sampler reads the table between claims, so it can miss every short
+/// hold. This count runs as each claim commits, so it misses no claim.
+///
+/// An advisory lock makes the counts of one probe run one at a time.
+/// Postgres frees the lock only after the commit is visible. So of two claims
+/// that commit together, the later count sees the earlier row.
+struct HeldProbe {
+    url: String,
+    suffix: String,
+}
+
+impl HeldProbe {
+    /// Install the probe on the `kind` rows of `queue`.
+    async fn install(url: &str, queue: &str, kind: &str) -> Self {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let mut conn = connect(url).await;
         exec(&mut conn, PROBE_DDL_LOCK).await;
         exec(
             &mut conn,
-            &format!("DROP TRIGGER claim_probe_trg_{s} ON harvest_task_queue"),
+            &format!("CREATE TABLE held_probe_{suffix} (held bigint NOT NULL)"),
         )
         .await;
-        exec(&mut conn, &format!("DROP FUNCTION claim_probe_fn_{s}()")).await;
-        exec(&mut conn, &format!("DROP TABLE claim_probe_{s}")).await;
+        exec(
+            &mut conn,
+            &format!(
+                "CREATE FUNCTION held_probe_fn_{suffix}() RETURNS trigger AS $$
+                 BEGIN
+                     PERFORM pg_advisory_xact_lock(hashtext('held_probe_{suffix}'));
+                     INSERT INTO held_probe_{suffix}
+                     SELECT count(*) FROM harvest_task_queue
+                      WHERE worker_id = NEW.worker_id AND state = 'RUNNING'
+                        AND task_type = NEW.task_type;
+                     RETURN NULL;
+                 END $$ LANGUAGE plpgsql"
+            ),
+        )
+        .await;
+        exec(
+            &mut conn,
+            &format!(
+                "CREATE CONSTRAINT TRIGGER held_probe_trg_{suffix}
+                 AFTER UPDATE ON harvest_task_queue
+                 DEFERRABLE INITIALLY DEFERRED
+                 FOR EACH ROW
+                 WHEN (OLD.state <> 'RUNNING' AND NEW.state = 'RUNNING'
+                       AND NEW.queue_name = '{queue}' AND NEW.task_type = '{kind}')
+                 EXECUTE FUNCTION held_probe_fn_{suffix}()"
+            ),
+        )
+        .await;
         exec(&mut conn, PROBE_DDL_UNLOCK).await;
+        Self {
+            url: url.to_owned(),
+            suffix,
+        }
     }
+
+    /// How many claims the probe counted at.
+    async fn claims(&self) -> i64 {
+        scalar(
+            &self.url,
+            &format!("SELECT count(*) AS v FROM held_probe_{}", self.suffix),
+        )
+        .await
+    }
+
+    /// The most rows that the worker held at one claim.
+    async fn most(&self) -> i64 {
+        scalar(
+            &self.url,
+            &format!(
+                "SELECT coalesce(max(held), 0) AS v FROM held_probe_{}",
+                self.suffix
+            ),
+        )
+        .await
+    }
+
+    /// Drop the trigger, its function and the count table.
+    async fn remove(self) {
+        drop_probe(&self.url, "held_probe", &self.suffix).await;
+    }
+}
+
+/// One `bigint` value named `v`.
+async fn scalar(url: &str, sql: &str) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = BigInt)]
+        v: i64,
+    }
+    let mut conn = connect(url).await;
+    diesel::sql_query(sql)
+        .get_result::<Row>(&mut conn)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .v
+}
+
+/// Drop the trigger, the function and the table of the probe `name`.
+async fn drop_probe(url: &str, name: &str, suffix: &str) {
+    let mut conn = connect(url).await;
+    exec(&mut conn, PROBE_DDL_LOCK).await;
+    exec(
+        &mut conn,
+        &format!("DROP TRIGGER {name}_trg_{suffix} ON harvest_task_queue"),
+    )
+    .await;
+    exec(&mut conn, &format!("DROP FUNCTION {name}_fn_{suffix}()")).await;
+    exec(&mut conn, &format!("DROP TABLE {name}_{suffix}")).await;
+    exec(&mut conn, PROBE_DDL_UNLOCK).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +722,7 @@ async fn most_rows_held(kind: &str, permits: usize, n: usize) -> (i64, i64) {
     let (url, _container) = setup_db().await;
     let queue = format!("cc-permits-{kind}-{}", Uuid::new_v4());
     let probe = ClaimProbe::install(&url, &queue, 50).await;
+    let held = HeldProbe::install(&url, &queue, kind).await;
     let with_activity = kind == "activity";
     seed(&url, &queue, n, with_activity).await;
     let pool = build_pool(&url);
@@ -633,25 +735,19 @@ async fn most_rows_held(kind: &str, permits: usize, n: usize) -> (i64, i64) {
     let worker = build_worker(&queue, &queue, &knobs, Arc::new(NoOpMetrics));
     let handle = spawn_worker(&worker, &pool);
 
-    // Sample the rows of `kind` this worker holds until the backlog drains.
-    let held_sql = format!(
-        "SELECT count(*) AS v FROM harvest_task_queue
-          WHERE worker_id = $1 AND state = 'RUNNING' AND task_type = '{kind}'"
-    );
-    let mut most = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    while completed(&url, &queue).await < as_count(n) && tokio::time::Instant::now() < deadline {
-        most = most.max(count(&url, &held_sql, &queue).await);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let drained = wait_completed(&url, &queue, as_count(n), Duration::from_secs(60)).await;
     worker.shutdown();
     handle.await.expect("worker joins");
     let overlap = probe.max_overlap().await;
+    let most = held.most().await;
+    let counted = held.claims().await;
     probe.remove().await;
-    assert_eq!(
-        completed(&url, &queue).await,
-        as_count(n),
-        "every workflow completes"
+    held.remove().await;
+    assert!(drained, "every workflow completes");
+    // Each workflow needs at least one claim of `kind`, so a blind probe fails here.
+    assert!(
+        counted >= as_count(n),
+        "the held probe counts at every {kind} claim: {counted} of {n}"
     );
     (most, overlap)
 }
