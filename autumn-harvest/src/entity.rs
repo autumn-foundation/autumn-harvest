@@ -675,6 +675,9 @@ mod tests {
                         .await
                         .map_err(|e| e.to_string())?;
                 }
+                if add == 0 {
+                    return Ok(json!(count));
+                }
             }
         })
     }
@@ -1163,22 +1166,15 @@ mod tests {
             "{report}"
         );
 
-        let added = |n: i64| WorkflowEvent::SideEffectRecorded {
-            kind: SideEffectKind::Custom,
-            name: Some("naive.add".to_string()),
-            value: json!(n),
-        };
-        let naive = vec![
-            started(json!(0)),
-            signal(json!(1)),
-            added(1),
-            signal(json!(2)),
-            added(2),
-        ];
+        // The run finishes, so a call never sits at the end of its history.
+        let outcome = env_with(&[json!(1), json!(2), json!(3), json!(0)])
+            .run(naive_counter, json!(0))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(6)));
         let report = WorkflowReplayer::new()
             .with_history_policy(small_threshold)
             .register_fn("naive_counter", naive_counter)
-            .replay_from_events(naive)
+            .replay_from_events(outcome.events().to_vec())
             .await;
         assert!(
             matches!(report.status, ReplayStatus::ReplaySucceeded),

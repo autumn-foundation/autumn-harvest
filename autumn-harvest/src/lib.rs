@@ -755,9 +755,8 @@ pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{
     CONTINUE_AS_NEW_SIDE_EFFECT_NAME, ChildOrTimerMatch, ContinueAsNewMatch,
-    DEADLINE_PROBE_SIDE_EFFECT_NAME, HistoryMatch, HistoryMatcher,
-    MutexGrantMatch, PatchMarkerMatch, SagaMarkerMatch, SideEffectNowMatch, SignalOrTimerMatch,
-    TimerFireMatch,
+    DEADLINE_PROBE_SIDE_EFFECT_NAME, HistoryMatch, HistoryMatcher, MutexGrantMatch,
+    PatchMarkerMatch, SagaMarkerMatch, SideEffectNowMatch, SignalOrTimerMatch, TimerFireMatch,
 };
 #[cfg(feature = "db")]
 pub use reset::{
