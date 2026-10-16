@@ -3384,6 +3384,39 @@ mod tests {
         );
     }
 
+    /// `hints_wanted` is true for a per-shard install, yet an unbound caller
+    /// has no channel to publish to. `hints_deliverable` tells them apart
+    /// (issue #2066).
+    #[tokio::test]
+    async fn hints_are_deliverable_only_with_a_publish_target() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+        assert!(!hints_deliverable(), "an empty topology has no target");
+
+        install_shards(vec![(
+            crate::types::ShardId::new(1),
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        )]);
+        assert!(hints_wanted(), "a per-shard install sets the any flag");
+        assert!(
+            !hints_deliverable(),
+            "an unbound caller publishes to the empty global slot"
+        );
+        let bound = Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>;
+        assert!(with_bound_channel(Some(bound), async { hints_deliverable() }).await);
+        assert!(!with_bound_channel(None, async { hints_deliverable() }).await);
+        uninstall_all_shards();
+
+        install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        assert!(hints_deliverable(), "the global slot is a target");
+        uninstall();
+    }
+
     /// A scope bound to no channel publishes nothing, even while another
     /// runtime has a channel installed (issue #1431).
     #[tokio::test]
