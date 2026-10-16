@@ -438,6 +438,7 @@ fn parent_start_params<'a>(
         start_source: autumn_harvest::types::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     }
 }
@@ -578,6 +579,7 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
         concurrency_key: None,
         max_concurrent: None,
         trace_context: None,
+        fairness_key: None,
         tenant: None,
     };
 
@@ -688,6 +690,7 @@ async fn a_cross_shard_child_cancelled_before_creation_is_born_cancelled() {
         concurrency_key: None,
         max_concurrent: None,
         trace_context: None,
+        fairness_key: None,
         tenant: None,
     };
 
@@ -799,6 +802,7 @@ async fn a_cross_shard_child_cancelled_before_creation_bypasses_an_exceeded_quot
         concurrency_key: None,
         max_concurrent: None,
         trace_context: None,
+        fairness_key: None,
         tenant: None,
     };
 
@@ -918,6 +922,7 @@ async fn erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads() {
             concurrency_key: None,
             max_concurrent: None,
             trace_context: None,
+            fairness_key: None,
             tenant: None,
         };
         autumn_harvest::cross_shard_child::record_cross_shard_child(
@@ -1047,6 +1052,7 @@ async fn erasing_a_parent_scrubs_the_outbox_child_specs_input() {
             concurrency_key: None,
             max_concurrent: None,
             trace_context: None,
+            fairness_key: None,
             tenant: None,
         };
         autumn_harvest::cross_shard_child::record_cross_shard_child(
@@ -1178,6 +1184,7 @@ async fn erasing_a_parent_preserves_a_still_running_started_childs_outbox_spec()
             concurrency_key: None,
             max_concurrent: None,
             trace_context: None,
+            fairness_key: None,
             tenant: None,
         };
         autumn_harvest::cross_shard_child::record_cross_shard_child(
@@ -1295,6 +1302,7 @@ async fn erasing_a_parent_with_a_pending_start_child_reports_it_as_skipped() {
         concurrency_key: None,
         max_concurrent: None,
         trace_context: None,
+        fairness_key: None,
         tenant: None,
     };
     autumn_harvest::cross_shard_child::record_cross_shard_child(
@@ -1403,6 +1411,7 @@ async fn erasing_a_parent_scrubs_a_started_childs_spec_after_target_side_retenti
         concurrency_key: None,
         max_concurrent: None,
         trace_context: None,
+        fairness_key: None,
         tenant: None,
     };
     autumn_harvest::cross_shard_child::record_cross_shard_child(
@@ -2341,6 +2350,7 @@ async fn a_fenced_child_sweep_abandons_its_pass_on_a_busy_target_pool() {
         chain_execution_timeout_secs: None,
         retry_policy: None,
         quota_key: None,
+        fairness_key: None,
         quota: None,
         concurrency_key: None,
         max_concurrent: None,

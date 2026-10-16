@@ -40,6 +40,12 @@ pub struct QueryReplay {
     terminal: bool,
     history_policy: WorkflowHistoryPolicy,
     pending_cancel: Option<String>,
+    /// The drive's timeout and deadline, so `ctx.deadline()` matches (issue
+    /// #2029).
+    deadline: (
+        Option<chrono::Duration>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ),
 }
 
 impl QueryReplay {
@@ -80,6 +86,7 @@ impl QueryReplay {
             terminal,
             history_policy,
             pending_cancel,
+            deadline: store::run_config(conn, exec)?.context_deadline(),
         })
     }
 
@@ -104,7 +111,9 @@ impl QueryReplay {
         )
         .with_workflow_name(self.workflow_name)
         .with_workflow_id(self.workflow_id)
-        .with_pending_cancellation(self.pending_cancel);
+        .with_pending_cancellation(self.pending_cancel)
+        .with_execution_timeout(self.deadline.0)
+        .with_deadline(self.deadline.1);
 
         let outcome = drive_query_replay_async(&ctx, self.handler, self.input, timeout).await;
         let refusal = if self.terminal {

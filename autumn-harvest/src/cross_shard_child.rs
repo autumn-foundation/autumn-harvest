@@ -150,6 +150,10 @@ pub struct CrossShardChildSpec {
     /// The child's OWN resolved quota key (issue #946), never the parent's.
     #[serde(default)]
     pub quota_key: Option<String>,
+    /// The child's fairness key (issue #1976): the parent's key, else the
+    /// child's quota key.
+    #[serde(default)]
+    pub fairness_key: Option<String>,
     /// The child's own declared quota **caps**, enforced on the target shard at
     /// creation time exactly as the same-shard path enforces them inline.
     ///
@@ -1599,6 +1603,12 @@ async fn start_child_on_target(
                 params.required_build_id = spec.assigned_build_id.clone();
                 params.concurrency_key = spec.concurrency_key.clone();
                 params.max_concurrent = spec.max_concurrent;
+                // A spec from before issue #1976 has no fairness key. It then
+                // takes the child's quota key, as a local child does.
+                params.fairness_key = crate::queue_fairness::fairness_key_for(
+                    spec.fairness_key.as_deref(),
+                    spec.quota_key.as_deref(),
+                );
                 params.trace_context = spec.trace_context.clone();
                 queue::enqueue(conn, &params).await?;
                 Ok((None, Vec::new()))

@@ -261,6 +261,9 @@ seconds, one job per target (issue #1835).
   repository. It prefers its own branch, then the default branch, and never
   takes a fork's corpus. An artifact stays 30 days, or 7 days for a pull
   request. With none left, the fuzzer starts again from the seeds.
+  A failed lookup or download, such as an artifact quota error, does not
+  fail the run. The fuzzer then starts from the seeds, and that run saves
+  no corpus, so the grown corpus stays the newest.
 - **Why not the actions cache.** The CI build caches fill the repository's
   cache budget. In a test on the pull request, GitHub evicted every corpus
   entry within 11 minutes, so a nightly corpus would never survive a day.

@@ -932,7 +932,15 @@ pub async fn reset_workflow_execution(
             let signals_buffered =
                 reapply_or_drop_signals(conn, exec_id, new_exec_id, request.signal_reapply).await?;
 
-            enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry, false).await?;
+            enqueue_fork_workflow_task(
+                conn,
+                &fork,
+                source.quota_key.as_deref(),
+                new_exec_id,
+                registry,
+                false,
+            )
+            .await?;
 
             Ok((
                 ResetResult {
@@ -1934,6 +1942,10 @@ async fn reapply_or_drop_signals(
 pub(crate) async fn enqueue_fork_workflow_task(
     conn: &mut AsyncPgConnection,
     fork: &WorkflowExecution,
+    // The quota key of the new run. It is also its fairness key (issue
+    // #1976). A reset keeps the key of its source, and a fork passes the key
+    // of its own admission.
+    quota_key: Option<&str>,
     new_exec_id: ExecutionId,
     registry: Option<&HandlerRegistry>,
     new_start: bool,
@@ -1955,6 +1967,7 @@ pub(crate) async fn enqueue_fork_workflow_task(
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = fork.assigned_build_id.clone();
     enqueue.new_start = new_start;
+    enqueue.fairness_key = crate::queue_fairness::fairness_key_for(None, quota_key);
     if let Some(reg) = registry
         && let Some(input) = &decoded
         && let Some(info) = reg.workflows.get(&fork.workflow_name)

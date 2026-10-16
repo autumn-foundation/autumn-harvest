@@ -1411,6 +1411,26 @@ mod tests {
         }
     }
 
+    /// Issue #2054: the operator read decodes one layer more than the engine read.
+    #[test]
+    fn an_operator_read_decodes_a_business_envelope_that_the_engine_read_keeps() {
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        codecs.set_column_encoding(true);
+        let plaintext = json!({"ssn": PAYLOAD_SECRET});
+        // The business value is itself an envelope.
+        let business = codecs.encode_payload(&plaintext).unwrap();
+        let stored = codecs.encode_column(&business).unwrap();
+
+        assert_eq!(codecs.decode_column(&stored).unwrap(), business);
+
+        let mut operator_view = stored;
+        let outcome = codecs.decode_column_lossy(&mut operator_view);
+        assert_eq!(operator_view, plaintext);
+        assert_eq!(outcome.decoded, 2);
+        assert_eq!(outcome.failed, 0);
+    }
+
     #[test]
     fn a_column_read_decodes_a_plain_row_once_and_marks_a_missing_key() {
         let writer = PayloadCodecs::default();

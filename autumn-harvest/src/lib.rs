@@ -346,6 +346,9 @@ pub mod external_target_location;
 #[cfg(feature = "db")]
 pub mod external_task;
 pub mod failure;
+/// Runtime weight overrides and state upkeep for fairness keys (issue #1976).
+#[cfg(feature = "db")]
+pub mod fairness_keys;
 pub mod fan_out;
 /// Non-destructive fork of a workflow run (issue #2000).
 #[cfg(feature = "db")]
@@ -575,6 +578,8 @@ pub mod notify;
 pub mod queue;
 /// Metric-gated automatic abort of a build ramp (issue #1814).
 pub mod ramp_guard;
+#[cfg(feature = "sandbox-activities")]
+pub mod sandbox;
 #[cfg(feature = "db")]
 pub mod schedule_decision;
 #[cfg(feature = "db")]

@@ -435,11 +435,10 @@ async fn local_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     Ok(n)
 }
 
+// Issue #2029: a local activity registers. `local_activities.rs` covers it.
 #[test]
-#[should_panic(expected = "local = true")]
-fn registering_a_local_activity_panics_naming_the_feature() {
+fn registering_a_local_activity_is_accepted() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    // Local activities dispatch via RunLocalActivity, a command-layer non-goal here.
     rt.register_activity_with_body(&local_act_info(), Ok);
 }
 

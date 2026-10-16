@@ -26,7 +26,7 @@ use autumn_harvest::queue::{self, EnqueueParams, TaskType};
 use autumn_harvest::reset::{
     ResetPoint, WorkflowResetError, WorkflowResetRequest, reset_workflow_execution,
 };
-use autumn_harvest::schema::{harvest_events, harvest_workflow_executions};
+use autumn_harvest::schema::{harvest_events, harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::store;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
 use autumn_harvest::{ExecutionId, ShardId};
@@ -281,6 +281,20 @@ async fn seed_run_with(
 }
 
 /// Run a source to `COMPLETED` and return it.
+/// The fairness key of the first workflow task of `exec` (issue #1976).
+async fn first_task_fairness_key(
+    conn: &mut AsyncPgConnection,
+    exec: ExecutionId,
+) -> Option<String> {
+    harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(exec.as_uuid()))
+        .filter(harvest_task_queue::task_type.eq("workflow"))
+        .select(harvest_task_queue::fairness_key)
+        .first(conn)
+        .await
+        .expect("read the first workflow task")
+}
+
 async fn completed_source(url: &str, pool: &DbPool, queue: &str, tag: &str) -> ExecutionId {
     let mut conn = connect(url).await;
     let source = seed_run(&mut conn, queue, &json!({ "tag": tag, "amount": 42 })).await;
@@ -1530,6 +1544,11 @@ async fn a_fork_is_admitted_under_the_tenant_quota() {
     .new_exec_id;
     let row = snapshot(&url, first).await.0;
     assert_eq!(row.quota_key.as_deref(), Some(queue.as_str()));
+    // The admission key is also the fairness key of the first task.
+    assert_eq!(
+        first_task_fairness_key(&mut conn, first).await.as_deref(),
+        Some(queue.as_str())
+    );
 
     let over = fork_workflow_execution(
         &mut conn,
@@ -2191,4 +2210,10 @@ async fn a_reset_keeps_the_quota_key_of_its_source() {
         .await
         .expect("read the reset row");
     assert_eq!(key.as_deref(), Some("tenant-a"));
+    assert_eq!(
+        first_task_fairness_key(&mut conn, reset.new_exec_id)
+            .await
+            .as_deref(),
+        Some("tenant-a")
+    );
 }

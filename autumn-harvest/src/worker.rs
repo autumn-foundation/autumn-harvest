@@ -170,6 +170,9 @@ pub struct WorkerRuntimeConfig {
     pub queues: Vec<String>,
     /// Optional per-queue dispatch weights (issue #515). Empty = default unchanged behaviour.
     pub queue_weights: std::collections::HashMap<String, u32>,
+    /// Rotate claims across fairness keys (issue #1976). `false` = the
+    /// unchanged claim statement.
+    pub fairness_keys: bool,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
     /// Optional per-shard LISTEN/NOTIFY database URLs for multi-shard workers
@@ -339,7 +342,8 @@ impl WorkerRuntimeConfig {
     ///
     /// Returns [`HarvestError::Config`] if `queues` is empty, if
     /// `max_concurrent_claims` is 0, or if `cancellation_grace_period`
-    /// exceeds [`MAX_CANCELLATION_GRACE_PERIOD`].
+    /// exceeds [`MAX_CANCELLATION_GRACE_PERIOD`]. With `fairness_keys` on, it
+    /// also rejects a queue name that the weight API does not accept.
     pub fn validate(&self) -> HarvestResult<()> {
         if self.queues.is_empty() {
             return Err(HarvestError::Config(
@@ -371,6 +375,34 @@ impl WorkerRuntimeConfig {
                         queue = %name,
                         "queue_weights entry has no matching bound queue and will be ignored"
                     );
+                }
+            }
+        }
+        // Priority ageing sorts before the fairness lag (issue #1976). An old
+        // flood's rows then carry the largest ageing boost, so they can
+        // outrank a newer key until its rows age too. Warn, as the two do not
+        // combine well in a shared queue.
+        if self.fairness_keys && self.priority_aging_secs.is_some_and(|k| k > 0) {
+            tracing::warn!(
+                "fairness_keys and priority_aging_secs are both on: ageing sorts \
+                 before the fairness lag, so an old flood can outrank a newer key; \
+                 see docs/fairness-keys.md"
+            );
+        }
+        // A fair worker's queues must be names that the weight API accepts
+        // (issue #1976). Otherwise no operator could set a weight for their
+        // keys. The weight routes put the queue in a URL path segment. URL
+        // parsing removes `.` and `..` there, so those names are refused too.
+        if self.fairness_keys {
+            for queue in &self.queues {
+                crate::queue_pause::validate_queue_name(queue).map_err(|e| {
+                    HarvestError::Config(format!("fairness_keys: queue {queue:?}: {e}"))
+                })?;
+                if queue == "." || queue == ".." {
+                    return Err(HarvestError::Config(format!(
+                        "fairness_keys: queue {queue:?} is a URL dot segment, \
+                         which the weight API cannot address"
+                    )));
                 }
             }
         }
@@ -456,6 +488,7 @@ impl From<WorkerConfig> for WorkerRuntimeConfig {
             worker_id: uuid::Uuid::new_v4().to_string(),
             queues: cfg.queues,
             queue_weights: cfg.queue_weights,
+            fairness_keys: cfg.fairness_keys,
             notification_database_url: cfg.notification_database_url,
             shard_notification_database_urls: cfg.shard_notification_database_urls,
             max_concurrent_workflows: cfg.max_concurrent_workflows,
@@ -2160,6 +2193,8 @@ struct DetachedSpawnPersistence<'a> {
     registry: &'a HandlerRegistry,
     parent_execution: &'a WorkflowExecution,
     execute_span: &'a tracing::Span,
+    // The parent task's fairness key (issue #1976).
+    parent_fairness_key: Option<&'a str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&'a crate::shard::ShardRouter>,
@@ -2177,6 +2212,7 @@ impl DetachedSpawnPersistence<'_> {
             self.parent_execution,
             commands,
             self.execute_span,
+            self.parent_fairness_key,
             self.resolved_router,
         )
         .await
@@ -9566,6 +9602,9 @@ pub async fn persist_workflow_failure(
     // Priority from the current task so the retry inherits the same queue priority
     // and is not silently demoted behind normal work (issue #523 P2).
     priority: crate::types::Priority,
+    // The current task's fairness key, so the retry stays with its tenant
+    // (issue #1976). `None` takes the retry's quota key.
+    fairness_key: Option<String>,
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
@@ -9774,6 +9813,7 @@ pub async fn persist_workflow_failure(
                     ),
                     start_source_ref: exec_ref.start_source_ref.as_deref(),
                     started_by: exec_ref.started_by.as_deref(),
+                    fairness_key: fairness_key.clone(),
                     // A retry belongs to the tenant of the run it retries
                     // (issue #1977).
                     tenant: exec_ref.tenant.as_deref(),
@@ -11260,6 +11300,7 @@ fn build_activity_enqueue_plan(
     execute_span: &tracing::Span,
     assigned_build_id: Option<&str>,
     parent_priority: i32,
+    parent_fairness_key: Option<&str>,
     context_headers: Option<&serde_json::Value>,
     workflow_input: &serde_json::Value,
 ) -> HarvestResult<ActivityEnqueuePlan> {
@@ -11296,11 +11337,19 @@ fn build_activity_enqueue_plan(
             scheduled.queue.clone()
         };
 
-        let mut params = queue::EnqueueParams::new(
-            queue_name.clone(),
-            TaskType::Activity,
-            scheduled.input.clone(),
-        );
+        // A reserved session activity carries a session id, not payload. Its
+        // row keeps the id as it is, so a missing key cannot fail the run.
+        let is_reserved = crate::context::is_reserved_session_activity_name(&scheduled.name);
+        // Any other row stores the input as the column form (issue #2043).
+        // The `ActivityScheduled` event below keeps the plain input, and the
+        // event codec encodes it.
+        let row_input = if is_reserved {
+            scheduled.input.clone()
+        } else {
+            registry.payload_codecs().encode_column(&scheduled.input)?
+        };
+        let mut params =
+            queue::EnqueueParams::new(queue_name.clone(), TaskType::Activity, row_input);
         params.workflow_exec_id = Some(exec_id.as_uuid());
         params.activity_name = Some(scheduled.name.clone());
         params.activity_id = Some(scheduled.activity_id.as_uuid());
@@ -11309,6 +11358,8 @@ fn build_activity_enqueue_plan(
         // workflows' activities are also claimed ahead of lower-priority work
         // on the same queue (issue #249).
         params.priority = parent_priority;
+        // The activity shares its workflow's tenant (issue #1976).
+        params.fairness_key = parent_fairness_key.map(str::to_owned);
 
         if let Some(requires) = activity.requires {
             let reqs = crate::eligibility::parse_requirements(requires).map_err(|err| {
@@ -11329,7 +11380,6 @@ fn build_activity_enqueue_plan(
         // floor. They must NOT inherit the builder-level default — fall back to
         // the pre-feature resolution (call-site override → activity default) for
         // them so an operator's floor never governs session acquire/release.
-        let is_reserved = crate::context::is_reserved_session_activity_name(&scheduled.name);
         let builder_retry_default = if is_reserved {
             None
         } else {
@@ -11574,6 +11624,7 @@ async fn persist_scheduled_activities(
     execute_span: &tracing::Span,
     assigned_build_id: Option<&str>,
     parent_priority: i32,
+    parent_fairness_key: Option<&str>,
     context_headers: Option<&serde_json::Value>,
     workflow_input: &serde_json::Value,
     // Issue #2000: `true` when the run is a fork, so a recorded fork serves
@@ -11591,6 +11642,7 @@ async fn persist_scheduled_activities(
         execute_span,
         assigned_build_id,
         parent_priority,
+        parent_fairness_key,
         context_headers,
         workflow_input,
     )?;
@@ -11997,6 +12049,8 @@ async fn persist_all_started_child_workflows(
     children: &[StartedChildWorkflowCommand],
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
+    // The parent's fairness key. A child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -12280,6 +12334,7 @@ async fn persist_all_started_child_workflows(
             parent_execution,
             commands,
             &execute_span,
+            parent_fairness_key,
             resolved_router,
         )
         .await?;
@@ -12317,6 +12372,7 @@ async fn persist_all_started_child_workflows(
                     .get(&child.child_id.as_uuid())
                     .cloned()
                     .flatten(),
+                parent_fairness_key,
             )?;
             crate::cross_shard_child::record_cross_shard_child(
                 conn,
@@ -12435,6 +12491,10 @@ async fn persist_all_started_child_workflows(
             params.required_build_id = parent_execution.assigned_build_id.clone();
             (params.concurrency_key, params.max_concurrent) =
                 resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+            params.fairness_key = crate::queue_fairness::fairness_key_for(
+                parent_fairness_key,
+                plan.child_quota_key.as_deref(),
+            );
             params.trace_context = child_trace_ctxs
                 .get(&child.child_id.as_uuid())
                 .cloned()
@@ -12575,6 +12635,10 @@ async fn persist_all_started_child_workflows(
                         .clone_from(&parent_execution.assigned_build_id);
                     (params.concurrency_key, params.max_concurrent) =
                         resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+                    params.fairness_key = crate::queue_fairness::fairness_key_for(
+                        parent_fairness_key,
+                        plan.child_quota_key.as_deref(),
+                    );
                     params.trace_context = child_trace_ctxs
                         .get(&child.child_id.as_uuid())
                         .cloned()
@@ -13016,6 +13080,8 @@ fn cross_shard_child_spec(
     // placement changes WHERE a child runs, never what it is.
     parent_close_policy: Option<crate::types::ParentClosePolicy>,
     trace_context: Option<TraceContextCarrier>,
+    // The parent's fairness key. The child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
 ) -> HarvestResult<crate::cross_shard_child::CrossShardChildSpec> {
     let detached = parent_close_policy.is_some();
     let defaults = resolve_child_workflow_defaults(registry, workflow_name);
@@ -13077,6 +13143,10 @@ fn cross_shard_child_spec(
             defaults.retry_policy.as_deref().cloned()
         },
         trace_context,
+        fairness_key: crate::queue_fairness::fairness_key_for(
+            parent_fairness_key,
+            quota_key.as_deref(),
+        ),
         quota_key,
         quota: defaults
             .quota
@@ -13193,7 +13263,7 @@ fn resolve_child_workflow_defaults(
 // Long by construction (and longer since #956 added the cross-shard early
 // return): the body is dominated by a wide, fully-explicit `NewWorkflowExecution`
 // literal, matching its `persist_all_started_child_workflows` twin.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn insert_awaited_child_execution(
     conn: &mut AsyncPgConnection,
     registry: &HandlerRegistry,
@@ -13201,6 +13271,8 @@ async fn insert_awaited_child_execution(
     parent_exec_id: ExecutionId,
     child: &StartedChildWorkflowCommand,
     trace_context: Option<TraceContextCarrier>,
+    // The parent's fairness key. A child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -13228,6 +13300,7 @@ async fn insert_awaited_child_execution(
             &child.input,
             None, // awaited child
             trace_context,
+            parent_fairness_key,
         )?;
         return crate::cross_shard_child::record_cross_shard_child(
             conn,
@@ -13325,6 +13398,8 @@ async fn insert_awaited_child_execution(
     params.required_build_id = parent_execution.assigned_build_id.clone();
     (params.concurrency_key, params.max_concurrent) =
         resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
+    params.fairness_key =
+        crate::queue_fairness::fairness_key_for(parent_fairness_key, child_quota_key.as_deref());
     params.trace_context = trace_context;
 
     diesel::insert_into(harvest_workflow_executions::table)
@@ -13395,6 +13470,8 @@ async fn persist_child_timeout_race(
     timer: &StartedTimerCommand,
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
+    // The parent's fairness key. A child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -13557,6 +13634,7 @@ async fn persist_child_timeout_race(
                     parent_exec_id,
                     child,
                     child_trace_ctx,
+                    parent_fairness_key,
                     resolved_router,
                 )
                 .await?;
@@ -13746,6 +13824,7 @@ async fn persist_mixed_suspension_batch(
     sticky: Option<queue::StickyHint<'_>>,
     execute_span: &tracing::Span,
     parent_priority: i32,
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -13804,6 +13883,7 @@ async fn persist_mixed_suspension_batch(
         execute_span,
         parent_execution.assigned_build_id.as_deref(),
         parent_priority,
+        parent_fairness_key,
         parent_execution.context_headers.as_ref(),
         &parent_execution.input,
     )?;
@@ -14075,6 +14155,7 @@ async fn persist_mixed_suspension_batch(
                 exec_id,
                 child,
                 trace_ctx,
+                parent_fairness_key,
                 resolved_router,
             )
             .await?;
@@ -14734,6 +14815,7 @@ pub async fn fail_task_and_execution_with_history(
             None,
             None,
             crate::types::Priority::default(),
+            None,
             codecs,
             // `metrics: None` above -- nothing can ever be collected here.
             &mut Vec::new(),
@@ -14807,6 +14889,15 @@ async fn finalize_activity_completion_write(
         return Ok(queue::ClaimWrite::LeaseLost);
     };
 
+    // The row stores the result in the column form (issue #2043). Encode it
+    // before the transaction, so the execution lock and the claim lock are not
+    // held across the encode. A stored-result reference stays as it is.
+    let encoded_row_output = if stored.is_some() {
+        None
+    } else {
+        Some(queue::activity_row_output(codecs, &output, false)?)
+    };
+
     let result = Box::pin(
         conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
             let mut output = output.clone();
@@ -14859,7 +14950,8 @@ async fn finalize_activity_completion_write(
                 llm_calls,
             )
             .await?;
-            queue::complete_claimed_task(conn, &claim_of_task(task)?, output)
+            let row_output = encoded_row_output.clone().unwrap_or_else(|| output.clone());
+            queue::complete_claimed_task(conn, &claim_of_task(task)?, row_output)
                 .await?
                 .require_applied(task.id)?;
             // Worker sessions (issue #606): a session member activity's
@@ -15594,6 +15686,8 @@ async fn create_detached_child_executions(
     parent_execution: &WorkflowExecution,
     commands: &[WorkflowCommand],
     execute_span: &tracing::Span,
+    // The parent's fairness key. A child inherits it (issue #1976).
+    parent_fairness_key: Option<&str>,
     // The EXPLICIT context-local router this placement was resolved against,
     // if any (issue #1263 items 11/15/17) — see `effective_placement_router`.
     resolved_router: Option<&crate::shard::ShardRouter>,
@@ -15683,6 +15777,7 @@ async fn create_detached_child_executions(
                     { ATTR_SHARD_ID } = child_id.shard().as_i32(),
                 )
                 .in_scope(|| registry.telemetry().capture_trace_context()),
+                parent_fairness_key,
             )?;
             crate::cross_shard_child::record_cross_shard_child(
                 conn,
@@ -15866,6 +15961,10 @@ async fn create_detached_child_executions(
         params.required_build_id = parent_execution.assigned_build_id.clone();
         (params.concurrency_key, params.max_concurrent) =
             resolve_workflow_concurrency(registry, workflow_name, input);
+        params.fairness_key = crate::queue_fairness::fairness_key_for(
+            parent_fairness_key,
+            child_quota_key.as_deref(),
+        );
         params.trace_context = tracing::info_span!(
             parent: execute_span,
             "harvest.child_workflow.start",
@@ -16737,6 +16836,19 @@ fn is_worker_local_failure(error_type: &str) -> bool {
         crate::failure::ERROR_TYPE_SANDBOX_DENIED,
         crate::failure::ERROR_TYPE_WASM_OUTPUT_TOO_LARGE,
         crate::failure::ERROR_TYPE_WASM_JOURNAL_DIVERGENCE,
+    ]
+    .contains(&error_type)
+    {
+        return true;
+    }
+    // A sandbox fault, such as a host without KVM or a broken guest, is not
+    // pressure from a dependency either.
+    #[cfg(feature = "sandbox-activities")]
+    if [
+        crate::failure::ERROR_TYPE_SANDBOX_DENIED,
+        crate::failure::ERROR_TYPE_SANDBOX_UNAVAILABLE,
+        crate::failure::ERROR_TYPE_SANDBOX_PROTOCOL_VIOLATION,
+        crate::failure::ERROR_TYPE_SANDBOX_CANCELLED,
     ]
     .contains(&error_type)
     {
@@ -17874,6 +17986,72 @@ async fn record_session_acquire_schedule_to_start_timeout(
     crate::dispatch::settle_scope(result).await
 }
 
+/// The session id in a session task's input (issue #2043).
+///
+/// A new row keeps the id as it is. The decode only serves a row that holds a
+/// column form. An input that does not decode is not a valid session id.
+fn session_id_of_input(
+    input: &serde_json::Value,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> Option<crate::types::SessionId> {
+    codecs
+        .decode_column(input)
+        .ok()?
+        .as_str()?
+        .parse::<crate::types::SessionId>()
+        .ok()
+}
+
+#[cfg(test)]
+mod session_input_tests {
+    use super::session_id_of_input;
+    use crate::aead_codec::{AeadCodec, DataKey};
+    use crate::payload_codec::PayloadCodecs;
+    use crate::types::SessionId;
+    use serde_json::json;
+
+    fn aead_codecs() -> PayloadCodecs {
+        let codecs = PayloadCodecs::default();
+        let key = DataKey::from_bytes(&[0x21; 32]).expect("key");
+        AeadCodec::new("k1", &key)
+            .expect("codec")
+            .register_with(&codecs)
+            .expect("register");
+        codecs.set_column_encoding(true);
+        codecs
+    }
+
+    #[test]
+    fn a_clear_session_id_reads_back() {
+        let id = SessionId::new();
+        let input = json!(id.as_uuid().to_string());
+        assert_eq!(session_id_of_input(&input, &aead_codecs()), Some(id));
+    }
+
+    #[test]
+    fn an_encoded_session_id_reads_back() {
+        let codecs = aead_codecs();
+        let id = SessionId::new();
+        let stored = codecs
+            .encode_column(&json!(id.as_uuid().to_string()))
+            .expect("encode");
+        assert_eq!(session_id_of_input(&stored, &codecs), Some(id));
+    }
+
+    #[test]
+    fn an_input_that_does_not_decode_is_not_a_session_id() {
+        let id = SessionId::new();
+        let stored = aead_codecs()
+            .encode_column(&json!(id.as_uuid().to_string()))
+            .expect("encode");
+        assert_eq!(
+            session_id_of_input(&stored, &PayloadCodecs::default()),
+            None
+        );
+        assert_eq!(session_id_of_input(&json!(7), &aead_codecs()), None);
+    }
+}
+
 /// Handle the internal session-acquire activity (issue #606) -- see the
 /// interception in [`process_activity_task`].
 ///
@@ -17921,11 +18099,7 @@ async fn handle_session_acquire(
     };
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
 
-    let Some(session_id) = task
-        .input
-        .as_str()
-        .and_then(|s| s.parse::<crate::types::SessionId>().ok())
-    else {
+    let Some(session_id) = session_id_of_input(&task.input, codecs) else {
         let error = "session-acquire task input is not a valid SessionId".to_string();
         fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
@@ -18151,11 +18325,7 @@ async fn handle_session_release(
     };
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
 
-    let Some(session_id) = task
-        .input
-        .as_str()
-        .and_then(|s| s.parse::<crate::types::SessionId>().ok())
-    else {
+    let Some(session_id) = session_id_of_input(&task.input, codecs) else {
         let error = "session-release task input is not a valid SessionId".to_string();
         fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
@@ -18557,6 +18727,107 @@ pub async fn handle_session_acquire_for_test(
     )
     .await
     .map(|_| ())
+}
+
+/// Why an attempt ends before its handler runs.
+struct PreHandlerFailure {
+    /// The metric label.
+    error_type: &'static str,
+    /// Whether the retry policy skips this failure.
+    non_retryable: bool,
+    /// The failure text that the result carries.
+    payload: String,
+}
+
+/// Where a failed attempt reports its outcome (issue #1815).
+struct ActivityOutcomeSinks<'a> {
+    task_outcomes: &'a crate::worker_outlier::TaskOutcomeWindow,
+    deferred_failure: &'a DeferredActivityFailure,
+    outlier_clock: std::time::Instant,
+}
+
+/// End an attempt that fails before its handler runs.
+///
+/// The circuit breaker and a bad stored payload both use it. It records the
+/// failure metrics, writes the result, and reports the outcome.
+///
+/// `ActivityStarted` is already committed, and a start is not idempotent.
+/// So the write uses the same retries as a handler result (issue #1788). A
+/// released claim would append a second start. A rejection whose claim a later
+/// owner took is skipped, as for any attempt.
+async fn fail_attempt_before_handler(
+    pool: &DbPool,
+    registry: &HandlerRegistry,
+    attempt: &ActivityAttempt<'_>,
+    build_id: &str,
+    failure: PreHandlerFailure,
+    sinks: &ActivityOutcomeSinks<'_>,
+) -> HarvestResult<()> {
+    let PreHandlerFailure {
+        error_type,
+        non_retryable,
+        payload,
+    } = failure;
+    let ActivityAttempt {
+        task,
+        worker_id,
+        activity_name,
+        ..
+    } = *attempt;
+    let telemetry = registry.telemetry().clone();
+    let build_label = crate::telemetry::build_id_label(build_id);
+    let build_label = build_label.as_ref();
+    telemetry.metrics.record_activity_completed_for_build(
+        activity_name,
+        &task.queue_name,
+        build_label,
+        0.0,
+        ActivityStatus::Failed,
+        Some(error_type),
+    );
+    // The label follows the retry decision, as for a handler failure. It
+    // honours the typed flag and the policy's `non_retryable_errors` list. A
+    // policy that does not load leaves the typed flag.
+    let retry_policy =
+        retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await;
+    let non_retryable = non_retryable
+        || failure_is_non_retryable(
+            &payload,
+            retry_policy.as_ref().ok().and_then(Option::as_ref),
+        );
+    telemetry
+        .metrics
+        .record_activity_failed(activity_name, "", error_type, non_retryable);
+    telemetry.metrics.record_activity_attempt_for_build(
+        activity_name,
+        &task.queue_name,
+        build_label,
+        ActivityStatus::Failed,
+    );
+    let finalized = match retry_policy {
+        Ok(retry_policy) => {
+            write_activity_result(
+                pool,
+                registry,
+                attempt,
+                retry_policy.as_ref(),
+                &Err(payload),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    let write = finalize_write_for_outcome(&finalized);
+    if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write, false) {
+        record_activity_outcome(
+            sinks.task_outcomes,
+            sinks.deferred_failure,
+            sinks.outlier_clock,
+            failed,
+            finalized.as_ref().err(),
+        );
+    }
+    finalized.map(|_| ())
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -19027,6 +19298,14 @@ async fn process_activity_task(
         ) + dispatched_at.elapsed().as_secs_f64(),
     );
 
+    let attempt = ActivityAttempt {
+        task,
+        exec_id,
+        activity_id,
+        worker_id,
+        activity_name,
+        llm_calls: &[],
+    };
     if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
         opened_at,
         retry_after,
@@ -19036,70 +19315,70 @@ async fn process_activity_task(
         let payload =
             crate::failure::ActivityFailure::circuit_open(activity_name, opened_at, retry_after)
                 .into_error_payload();
-        let telemetry = registry.telemetry().clone();
-        let build_label = crate::telemetry::build_id_label(build_id);
-        let build_label = build_label.as_ref();
-        telemetry.metrics.record_activity_completed_for_build(
-            activity_name,
-            &task.queue_name,
-            build_label,
-            0.0,
-            ActivityStatus::Failed,
-            Some(crate::failure::ERROR_TYPE_CIRCUIT_OPEN),
-        );
-        telemetry.metrics.record_activity_failed(
-            activity_name,
-            "",
-            crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
-            true,
-        );
-        telemetry.metrics.record_activity_attempt_for_build(
-            activity_name,
-            &task.queue_name,
-            build_label,
-            ActivityStatus::Failed,
-        );
-        // `ActivityStarted` is already committed, and a start is not
-        // idempotent. So this write uses the same retries as a handler result
-        // (issue #1788). A released claim would append a second start.
-        let finalized = async {
-            let retry_policy =
-                retry_policy_or_fail_task(pool, task, worker_id, registry.payload_codecs()).await?;
-            let attempt = ActivityAttempt {
-                task,
-                exec_id,
-                activity_id,
-                worker_id,
-                activity_name,
-                llm_calls: &[],
-            };
-            write_activity_result(
-                pool,
-                registry,
-                &attempt,
-                retry_policy.as_ref(),
-                &Err(payload),
-            )
-            .await
-        }
-        .await;
-        // Issue #1815: a breaker is per worker, so a rejected attempt counts as
-        // a failure. Otherwise the ratio would improve while the worker rejects
-        // work. A rejection whose claim a later owner took is skipped, as for
-        // any attempt.
-        let write = finalize_write_for_outcome(&finalized);
-        if let Some(failed) = activity_attempt_outcome(ActivityStatus::Failed, false, write, false)
-        {
-            record_activity_outcome(
+        // Issue #1815: a breaker is per worker, so a rejected attempt counts
+        // as a failure. Otherwise the ratio would improve while the worker
+        // rejects work.
+        return fail_attempt_before_handler(
+            pool,
+            registry,
+            &attempt,
+            build_id,
+            PreHandlerFailure {
+                error_type: crate::failure::ERROR_TYPE_CIRCUIT_OPEN,
+                non_retryable: true,
+                payload,
+            },
+            &ActivityOutcomeSinks {
                 task_outcomes,
                 deferred_failure,
                 outlier_clock,
-                failed,
-                finalized.as_ref().err(),
-            );
-        }
-        return finalized.map(|_| ());
+            },
+        )
+        .await;
     }
+
+    // The row stores the input and the last checkpoint as the column form
+    // (issue #2043). The handler gets the plain values. A value that does not
+    // decode fails the attempt. The retry policy then applies, and an
+    // operator can restore the key.
+    let codecs = registry.payload_codecs();
+    let decoded = codecs.decode_column(&task.input).and_then(|input| {
+        let checkpoint = codecs.decode_column_opt(task.heartbeat_details.as_ref())?;
+        Ok((input, checkpoint))
+    });
+    let (handler_input, previous_checkpoint) = match decoded {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            use crate::failure::IntoActivityErrorString as _;
+            tracing::warn!(
+                task_id = %task.id,
+                error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                "activity payload could not be decoded"
+            );
+            let payload = crate::failure::ActivityFailure::retryable(
+                crate::failure::ERROR_TYPE_PAYLOAD_DECODE_FAILED,
+                "the stored activity input or checkpoint could not be decoded",
+            )
+            .into_error_payload();
+            return fail_attempt_before_handler(
+                pool,
+                registry,
+                &attempt,
+                build_id,
+                PreHandlerFailure {
+                    error_type: crate::failure::ERROR_TYPE_PAYLOAD_DECODE_FAILED,
+                    non_retryable: false,
+                    payload,
+                },
+                &ActivityOutcomeSinks {
+                    task_outcomes,
+                    deferred_failure,
+                    outlier_clock,
+                },
+            )
+            .await;
+        }
+    };
 
     // The context token is a child of the flusher token. A lost lease
     // cancels both. A drain cancels the context alone, so a handler that
@@ -19107,7 +19386,7 @@ async fn process_activity_task(
     let heartbeat_stop = CancellationToken::new();
     let cancel = heartbeat_stop.child_token();
     let activity_claim = claim_of_task(task)?;
-    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher_with(
+    let heartbeat_tx = crate::heartbeat::spawn_heartbeat_flusher_with_codecs(
         activity_claim.clone(),
         pool.clone(),
         heartbeat_stop.clone(),
@@ -19116,6 +19395,7 @@ async fn process_activity_task(
             metrics: Arc::clone(&registry.telemetry().metrics),
             shards: Arc::clone(pool_labels),
         },
+        codecs.clone(),
     );
     let trace_carrier = task
         .trace_context
@@ -19149,7 +19429,7 @@ async fn process_activity_task(
     let ctx = ActivityContext::new_with_cancellation_check(
         registry.shared_state(),
         Some(heartbeat_tx.into()),
-        task.heartbeat_details.clone(),
+        previous_checkpoint,
         cancel.clone(),
         activity_claim.clone(),
         pool.clone(),
@@ -19411,7 +19691,7 @@ async fn process_activity_task(
                 activity_interceptors,
                 &invocation,
                 &ctx,
-                task.input.clone(),
+                handler_input,
                 // `move` captures the resolved dispatch; it does NOT borrow
                 // `&ctx`, so it composes with the chain's own `&ctx` borrow. The
                 // explicit return type unifies the two `Box::pin` arms.
@@ -19451,7 +19731,7 @@ async fn process_activity_task(
                 activity_interceptors,
                 &invocation,
                 &ctx,
-                task.input.clone(),
+                handler_input,
                 |input| (activity_handler)(&ctx, input),
             )
         }),
@@ -19464,7 +19744,7 @@ async fn process_activity_task(
                 activity_interceptors,
                 &invocation,
                 &ctx,
-                task.input.clone(),
+                handler_input,
                 |input| (activity_handler)(&ctx, input),
             )
         })
@@ -21274,6 +21554,7 @@ async fn handle_suspended_workflow(
         registry,
         parent_execution: context.execution,
         execute_span: context.execute_span,
+        parent_fairness_key: context.persistence.task.fairness_key.as_deref(),
         resolved_router,
     };
 
@@ -21315,6 +21596,7 @@ async fn handle_suspended_workflow(
             context.execute_span,
             context.execution.assigned_build_id.as_deref(),
             context.persistence.task.priority,
+            context.persistence.task.fairness_key.as_deref(),
             context.execution.context_headers.as_ref(),
             &context.execution.input,
             crate::fork::is_fork(context.execution),
@@ -21347,6 +21629,7 @@ async fn handle_suspended_workflow(
             &timer,
             sticky,
             context.execute_span,
+            context.persistence.task.fairness_key.as_deref(),
             resolved_router,
         )
         .await;
@@ -21392,6 +21675,7 @@ async fn handle_suspended_workflow(
             &children,
             sticky,
             context.execute_span,
+            context.persistence.task.fairness_key.as_deref(),
             resolved_router,
         )
         .await
@@ -21442,6 +21726,7 @@ async fn handle_suspended_workflow(
             sticky,
             context.execute_span,
             context.persistence.task.priority,
+            context.persistence.task.fairness_key.as_deref(),
             resolved_router,
         )
         .await
@@ -22205,6 +22490,7 @@ async fn reject_child_continue_as_new(
             None,
             None,
             crate::types::Priority::default(),
+            None,
             codecs,
             // `metrics: None` above -- nothing can ever be collected here.
             &mut Vec::new(),
@@ -23272,6 +23558,7 @@ async fn persist_workflow_continue_as_new_with_verdict(
                 None,
                 None,
                 crate::types::Priority::default(),
+                None,
                 registry.payload_codecs(),
                 &mut Vec::new(),
             )
@@ -23487,6 +23774,12 @@ async fn persist_workflow_continue_as_new_with_verdict(
     enqueue.concurrency_key = successor_concurrency_key;
     enqueue.max_concurrent = successor_concurrency_cap;
     enqueue.rate_limit_key = persistence.task.rate_limit_key.clone();
+    // The successor stays with its tenant, for a cross-type target too
+    // (issue #1976). With no key it takes its own quota key.
+    enqueue.fairness_key = crate::queue_fairness::fairness_key_for(
+        persistence.task.fairness_key.as_deref(),
+        successor_quota_key.as_deref(),
+    );
 
     Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         // Issue #1184: this transaction seals the predecessor
@@ -23824,6 +24117,7 @@ async fn persist_workflow_outcome(
                     .concurrency_cap
                     .and_then(|c| u32::try_from(c).ok()),
                 crate::types::Priority::from_i32(persistence.task.priority).unwrap_or_default(),
+                persistence.task.fairness_key.clone(),
                 registry.payload_codecs(),
                 pending_cancel_metrics,
             )
@@ -24369,6 +24663,7 @@ async fn persist_terminal_outcome_commands(
         execution,
         pending_cmds,
         execute_span,
+        persistence.task.fairness_key.as_deref(),
         resolved_router,
     )
     .await?;
@@ -25644,6 +25939,9 @@ async fn process_workflow_task(
         }
     });
     let mut warm_resident = warm_residency.into_workflow();
+    // Issue #2035: set after the first drive of this decision. Only that drive
+    // may run an update past the dispatch window.
+    let mut drove_before = false;
     // The resident state of the final cycle, kept for the next decision.
     let mut final_resident: crate::resident::Residency;
     // A module-hosted workflow binds its module around one drive only, so
@@ -25779,6 +26077,7 @@ async fn process_workflow_task(
             registry.payload_codecs(),
         )
         .await?;
+        let run_first = !std::mem::replace(&mut drove_before, true);
         let workflow_drive = async {
             if let Some(resident) = warm_resident.take() {
                 match resident
@@ -25827,7 +26126,14 @@ async fn process_workflow_task(
                 // consumed by the LOCAL activity path in `execute_local_activity_with_opts`.
                 registry.default_activity_retry_policy(),
                 registry.default_activity_start_to_close(),
-            );
+            )
+            // Issue #2035: a live decision runs the admitted updates. A replay
+            // gate does not, so it never runs a handler. The cut-off keeps the
+            // dispatch inside the workflow-task budget.
+            .with_update_dispatch(crate::update::UpdateDispatch {
+                cutoff: workflow_task_deadline,
+                run_first,
+            });
             crate::executor::drive_workflow_keep(
                 ctx,
                 workflow.handler,
@@ -25864,7 +26170,16 @@ async fn process_workflow_task(
             span: execute_span,
             router: resolved_router,
             resident: iter_resident,
+            updates_deferred,
         } = drive;
+        // Issue #2035: the dispatch window closed with updates left. This
+        // claimed row only records the wake. The park that ends the cycle then
+        // re-pends the task, and the next cycle runs the rest. A failed wake
+        // fails the cycle, so the retry runs the rest. A parked task with no
+        // wake would leave those updates waiting.
+        if updates_deferred {
+            queue::wake_workflow_task(conn, prepared.exec_id).await?;
+        }
         // Issue #2007: one sample per decision, after its first drive.
         if let Some(outcome) = resident_outcome.take() {
             telemetry.metrics.record_workflow_resident(
@@ -26125,6 +26440,7 @@ async fn process_workflow_task(
                     registry,
                     parent_execution: &prepared.execution,
                     execute_span: &detached_execute_span,
+                    parent_fairness_key: task.fairness_key.as_deref(),
                     resolved_router: resolved_router.as_ref(),
                 };
                 let local_batch = extract_run_local_activity(commands);
@@ -31492,8 +31808,21 @@ pub struct Worker {
     gate_refused: Arc<GateRefused>,
     /// A claim skipped a type at its adaptive limit since the last idle
     /// wait (issue #1836). The next idle wait then also wakes on
-    /// `capacity_freed`, even when the slot freed before the wait began.
+    /// `capacity_freed`, even when the slot freed before the wait began. A
+    /// wake on `capacity_freed` also clears it.
     limit_refused: AtomicBool,
+    /// The poll gate refused a kind, and no idle wait has woken on
+    /// `capacity_freed` since (issue #1787). An idle wait then also wakes on
+    /// `capacity_freed`, even when the permit freed during the claim. A read
+    /// does not clear the flag, so a refusal of another claim loop stays
+    /// armed. Only the wake clears it, because the next poll then sees the
+    /// gate again.
+    pool_refused: AtomicBool,
+    /// Arms an unbound idle wait when a refusal follows its snapshot (issue
+    /// #1787). `record_gate_refusal` and `claim_exclusions` fire it when
+    /// their flag turns on. `notify_waiters` stores no wake, so a refusal
+    /// never arms a wait that starts after it.
+    refusal_recorded: tokio::sync::Notify,
     /// Set the first time `spawn_monitoring_tasks` runs to completion (issue
     /// #548 review). Guards against a hypothetical second invocation (e.g. a
     /// future caller wrapping `run`/`run_with_listener` in a retry loop)
@@ -33159,6 +33488,39 @@ impl Drop for CapacityPermit {
     }
 }
 
+/// The capacity part of one idle wait of a poll loop (issue #1787).
+///
+/// [`Worker::capacity_wait`] takes it just before the wait. A released
+/// permit or a freed limit slot ends a `bound` wait. An unbound wait first
+/// waits for a refusal after its snapshot. Another claim loop records one
+/// when the gate holds a kind back, or when an adaptive limit holds a type
+/// back. After that refusal, the wait acts like a bound wait.
+struct CapacityWait<'a> {
+    worker: &'a Worker,
+    bound: bool,
+    /// Created before `bound` is read. See [`Worker::capacity_wait`].
+    refused: tokio::sync::futures::Notified<'a>,
+}
+
+impl CapacityWait<'_> {
+    /// Resolve on a released permit or a freed limit slot. An unbound wait
+    /// first waits for a refusal after its snapshot. The wake clears both
+    /// refusal flags, and the loop then polls again.
+    ///
+    /// A refusal alone does not end the wait. A poll right after it would
+    /// meet the same full pool or limit, so it could not claim the refused
+    /// backlog. A release that `capacity_freed` stored before the refusal
+    /// still ends the wait at once, as it ends a bound wait. That costs one
+    /// poll.
+    async fn woken(self) {
+        if !self.bound {
+            self.refused.await;
+        }
+        self.worker.capacity_freed.notified().await;
+        self.worker.capacity_woke();
+    }
+}
+
 /// One flag per task kind: the poll gate refused this kind (issue #1787).
 #[derive(Debug, Default)]
 struct GateRefused {
@@ -33294,10 +33656,11 @@ fn reference_outcome(
 /// [`Worker::dispatch_leases`] collects these across a whole read.
 /// It settles them in one `ack_many`/`release_many` call, instead of
 /// one channel round trip per lease (Codex review, issue #1429).
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum ReferenceDisposition {
-    /// Claimed and dispatched. The lease still owes an `ack`.
-    Dispatched(crate::dispatch::DispatchLease),
+    /// Claimed. The caller starts the task at once. The lease still owes an
+    /// `ack`.
+    Dispatched(crate::dispatch::DispatchLease, Box<ClaimedReference>),
     /// Not claimed; the row is already terminal. The lease owes an `ack`.
     AlreadyTerminal(crate::dispatch::DispatchLease),
     /// Not claimed and retryable. The lease owes a `release` after this
@@ -33308,6 +33671,146 @@ enum ReferenceDisposition {
     /// recovery, not the common claim path this batches. Nothing left
     /// for the caller to settle.
     Handled,
+}
+
+/// The pools that refused a reference of one dispatch batch (issue #1429).
+///
+/// A pool refuses a reference when it has no free permit, or when the
+/// shard's share of it is spent. See [`Worker::wait_for_refused_permit`].
+#[derive(Debug, Clone, Copy, Default)]
+struct RefusedPools {
+    workflow: bool,
+    activity: bool,
+}
+
+impl RefusedPools {
+    /// Note a reference that went back with no claim attempt.
+    const fn note(&mut self, kind: Option<crate::dispatch::DispatchKind>) {
+        match kind {
+            Some(crate::dispatch::DispatchKind::Workflow) => self.workflow = true,
+            Some(crate::dispatch::DispatchKind::Activity) => self.activity = true,
+            None => {}
+        }
+    }
+}
+
+/// The longest wait of a single-shard reader after a batch that gave every
+/// reference back (issue #1429).
+///
+/// A free permit of the refused pool ends the wait at once. The cap bounds
+/// two costs of the wait. A reference of the other kind that arrives during
+/// the wait waits up to this long. A backlog of refused references ahead of
+/// a claimable one costs one wait per read. The cap is fixed, because
+/// `poll_interval` can be seconds. It keeps the reader under 100 reads per
+/// second while a pool is full.
+const DISPATCH_REFUSED_WAIT: Duration = Duration::from_millis(10);
+
+/// A task that a dispatch reference claimed, before the task starts.
+#[derive(Debug)]
+struct ClaimedReference {
+    task: TaskQueueItem,
+    reservation: Option<DispatchReservation>,
+}
+
+/// How long a hint for the own row of a task that a dispatch batch claimed
+/// waits for the batch to ack the task's reference.
+///
+/// A channel drops a publish for a reference that it has leased out. A task
+/// can put its own row back to `PENDING` within milliseconds. An activity
+/// that fails fast and retries does this. So does one that a limit defers.
+/// The batch acks its references after its last claim. A hint that the task
+/// published before that ack was lost, and the row waited for the reconcile
+/// sweep. A healthy ack takes milliseconds. The bound keeps a stalled
+/// channel from holding the hint for the whole batch timeout. The task never
+/// waits, so it cannot hold a pooled connection that the batch needs.
+const DISPATCH_HINT_ACK_WAIT: Duration = Duration::from_secs(1);
+
+/// The channel of a task that a dispatch batch claimed.
+///
+/// A hint that names the task's own row goes out after the batch acks the
+/// task's reference, or after [`DISPATCH_HINT_ACK_WAIT`]. Every other hint,
+/// and every other call, goes straight to the inner channel.
+#[derive(Debug)]
+struct AckGatedChannel {
+    inner: Arc<dyn crate::dispatch::TaskDispatch>,
+    own_row: uuid::Uuid,
+    acked: tokio::sync::watch::Receiver<bool>,
+}
+
+#[async_trait::async_trait]
+impl crate::dispatch::TaskDispatch for AckGatedChannel {
+    async fn publish(&self, hints: &[crate::dispatch::DispatchHint]) -> HarvestResult<()> {
+        if *self.acked.borrow() || hints.iter().all(|hint| hint.task_id != self.own_row) {
+            return self.inner.publish(hints).await;
+        }
+        // The hint for the own row waits off the task. The task may hold a
+        // pooled connection here, and the batch ack may wait for one.
+        let (own, others): (Vec<_>, Vec<_>) = hints
+            .iter()
+            .cloned()
+            .partition(|hint| hint.task_id == self.own_row);
+        let inner = Arc::clone(&self.inner);
+        let mut acked = self.acked.clone();
+        tokio::spawn(async move {
+            // A dropped sender means the batch ended, so the wait ends too.
+            let _ =
+                tokio::time::timeout(DISPATCH_HINT_ACK_WAIT, acked.wait_for(|acked| *acked)).await;
+            if let Err(error) = inner.publish(&own).await {
+                tracing::warn!(
+                    error = %error,
+                    "dispatch publish failed; the reconcile sweep republishes this row"
+                );
+            }
+        });
+        if others.is_empty() {
+            return Ok(());
+        }
+        self.inner.publish(&others).await
+    }
+
+    async fn next(
+        &self,
+        queues: &[String],
+        consumer: &str,
+        max: usize,
+        wait: Duration,
+    ) -> HarvestResult<Vec<crate::dispatch::DispatchLease>> {
+        self.inner.next(queues, consumer, max, wait).await
+    }
+
+    async fn ack(&self, lease: &crate::dispatch::DispatchLease) -> HarvestResult<()> {
+        self.inner.ack(lease).await
+    }
+
+    async fn release(
+        &self,
+        lease: &crate::dispatch::DispatchLease,
+        delay: Duration,
+    ) -> HarvestResult<()> {
+        self.inner.release(lease, delay).await
+    }
+
+    async fn ack_many(&self, leases: &[crate::dispatch::DispatchLease]) -> HarvestResult<()> {
+        self.inner.ack_many(leases).await
+    }
+
+    async fn release_many(
+        &self,
+        leases: &[(crate::dispatch::DispatchLease, Duration)],
+    ) -> HarvestResult<()> {
+        self.inner.release_many(leases).await
+    }
+
+    async fn maintain(
+        &self,
+        queues: &[String],
+    ) -> HarvestResult<crate::dispatch::DispatchMaintenance> {
+        self.inner.maintain(queues).await
+    }
+
+    fn next_round_trips(&self, queue_count: usize) -> usize {
+        self.inner.next_round_trips(queue_count)
+    }
 }
 
 impl Worker {
@@ -33516,6 +34019,8 @@ impl Worker {
             deferral_due,
             gate_refused: Arc::new(GateRefused::default()),
             limit_refused: AtomicBool::new(false),
+            pool_refused: AtomicBool::new(false),
+            refusal_recorded: tokio::sync::Notify::new(),
             monitoring_started: std::sync::atomic::AtomicBool::new(false),
             shutdown: CancellationToken::new(),
             drain_cancel: CancellationToken::new(),
@@ -34358,17 +34863,17 @@ impl Worker {
             let poll_interval = self.config.poll_interval;
             let shutdown = &self.shutdown;
             // A full pool also wakes on a released permit (issue #1787).
-            let capacity_bound = self.capacity_bound();
+            let capacity = self.capacity_wait();
 
             if shard_listeners.iter().all(Option::is_none) {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
-                    () = self.capacity_freed.notified(), if capacity_bound => {}
+                    () = capacity.woken() => {}
                     () = self.deferral_due.notified() => {}
                     () = tokio::time::sleep(poll_interval) => {}
                 }
             } else {
-                self.wait_on_shard_listeners(&mut shard_listeners, capacity_bound)
+                self.wait_on_shard_listeners(&mut shard_listeners, capacity)
                     .await;
             }
         }
@@ -34377,12 +34882,11 @@ impl Worker {
     /// Wait on every per-shard listener in round-robin, for up to one
     /// `poll_interval` (extracted from [`Self::run_poll_loop_multi`]).
     ///
-    /// With `capacity_bound`, a released permit also ends the wait (issue
-    /// #1787).
+    /// `capacity` can also end the wait (issue #1787).
     async fn wait_on_shard_listeners(
         &self,
         shard_listeners: &mut [Option<crate::notify::QueueListener>],
-        capacity_bound: bool,
+        capacity: CapacityWait<'_>,
     ) {
         let poll_interval = self.config.poll_interval;
         let shutdown = &self.shutdown;
@@ -34390,13 +34894,13 @@ impl Worker {
         let per_check = Duration::from_millis(10).min(poll_interval);
         let deadline = tokio::time::Instant::now() + poll_interval;
         let mut notified = false;
+        let capacity = capacity.woken();
+        tokio::pin!(capacity);
 
         'notify_wait: while tokio::time::Instant::now() < deadline && !shutdown.is_cancelled() {
             // One check per round of listener slices. A released
             // permit waits at most one round.
-            if capacity_bound
-                && futures::FutureExt::now_or_never(self.capacity_freed.notified()).is_some()
-            {
+            if futures::FutureExt::now_or_never(capacity.as_mut()).is_some() {
                 break 'notify_wait;
             }
             if futures::FutureExt::now_or_never(self.deferral_due.notified()).is_some() {
@@ -35670,6 +36174,7 @@ impl Worker {
                     ),
                     session_slots: self.config.max_concurrent_sessions,
                     priority_aging_secs: self.config.priority_aging_secs,
+                    fairness_keys: self.config.fairness_keys,
                     ineligible_activities: &self.ineligible_activities,
                     shard_assignments: &self.config.shard_assignments,
                     registered_workflows: &registered_workflows,
@@ -35903,6 +36408,9 @@ impl Worker {
         // `DISPATCH_READ_MAX` separate acknowledgement round trips, despite
         // `ack_many` already existing on the trait.
         let mut to_ack: Vec<crate::dispatch::DispatchLease> = Vec::new();
+        // Opens after the batch ack. A task of this batch holds a hint for
+        // its own row until then. See [`DISPATCH_HINT_ACK_WAIT`].
+        let (acked_tx, acked_rx) = tokio::sync::watch::channel(false);
         // Each kind's fair share of this batch, snapshotted once per shard's
         // turn. See [`dispatch_kind_within_share`] for why the read-size
         // share is not enough on its own (Codex review, issue #1429).
@@ -35915,6 +36423,7 @@ impl Worker {
                 .div_ceil(divisor);
         let mut claimed_workflow = 0usize;
         let mut claimed_activity = 0usize;
+        let mut refused = RefusedPools::default();
         let mut leases = leases.into_iter();
         while let Some(lease) = leases.next() {
             if self.shutdown.is_cancelled() {
@@ -35938,6 +36447,7 @@ impl Worker {
                 // No permit for this pool, or this shard's own share of it is
                 // already spent this batch. Give the reference straight
                 // back, so a peer with capacity reads it on its next poll.
+                refused.note(lease.kind);
                 to_release.push((lease, Duration::ZERO));
                 continue;
             }
@@ -35957,7 +36467,15 @@ impl Worker {
                 .consume_reference(pool, shard, installed, lease, reservation, shard_count)
                 .await
             {
-                ReferenceDisposition::Dispatched(lease) => {
+                ReferenceDisposition::Dispatched(lease, claimed) => {
+                    self.dispatch_task(
+                        claimed.task,
+                        pool,
+                        shard,
+                        claimed.reservation,
+                        None,
+                        Some(acked_rx.clone()),
+                    );
                     dispatched += 1;
                     // Only a reference this shard actually dispatched spends
                     // its share of the pool (Codex review, issue #1429). A
@@ -35979,6 +36497,60 @@ impl Worker {
                 ReferenceDisposition::Handled => {}
             }
         }
+        self.settle_leases(state, installed, &to_ack, &to_release, &acked_tx)
+            .await;
+        // A multi-shard turn that dispatched nothing returns to its round,
+        // and the round waits when every shard is idle. A wait here would
+        // delay the turn of a busy shard.
+        if dispatched == 0 && shard_count == 1 {
+            let wait = installed.settings.poll_interval.min(DISPATCH_REFUSED_WAIT);
+            self.wait_for_refused_permit(refused, wait).await;
+        }
+        dispatched
+    }
+
+    /// Wait until a pool that refused a reference of one batch frees a
+    /// permit (issue #1429). `wait` caps the wait.
+    ///
+    /// The batch gives such a reference straight back, so a peer with a
+    /// permit can read it. The other pool can still have free permits, so
+    /// the next read still runs. Without this wait, the reader read the same
+    /// reference again at once and gave it back again. That loop made
+    /// thousands of channel calls per second. A channel call that completes
+    /// without a yield then starved the tasks of this worker.
+    async fn wait_for_refused_permit(&self, refused: RefusedPools, wait: Duration) {
+        if !refused.workflow && !refused.activity {
+            return;
+        }
+        // A refused pool can still show a free permit. A claimed task holds
+        // it as a reservation until its first poll, or the permit freed
+        // after the check. The reader yields, so that task can run, and the
+        // next read sees the pool again.
+        let shows_permit = (refused.workflow && self.workflow_semaphore.available_permits() > 0)
+            || (refused.activity && self.activity_semaphore.available_permits() > 0);
+        if shows_permit {
+            tokio::task::yield_now().await;
+            return;
+        }
+        tokio::select! {
+            () = self.shutdown.cancelled() => {}
+            () = tokio::time::sleep(wait) => {}
+            Ok(permit) = self.workflow_semaphore.acquire(), if refused.workflow => drop(permit),
+            Ok(permit) = self.activity_semaphore.acquire(), if refused.activity => drop(permit),
+        }
+    }
+
+    /// Settle one batch of [`Self::dispatch_leases`] in one `ack_many` and one
+    /// `release_many` call (issue #1429). The ack opens `acked` for the tasks
+    /// of the batch. See [`DISPATCH_HINT_ACK_WAIT`].
+    async fn settle_leases(
+        &self,
+        state: &mut DispatchLoopState,
+        installed: &crate::dispatch::InstalledDispatch,
+        to_ack: &[crate::dispatch::DispatchLease],
+        to_release: &[(crate::dispatch::DispatchLease, Duration)],
+        acked: &tokio::sync::watch::Sender<bool>,
+    ) {
         // A failed batched call is still self-healing. A stuck ack costs one
         // redelivery; a stuck release costs one visibility-timeout wait. So
         // neither error changes what this call returns. But swallowing it
@@ -35999,12 +36571,14 @@ impl Worker {
             // follow-up) — whichever this installed channel actually costs.
             let timeout = dispatch_batch_timeout(queues.len(), 2, to_ack.len());
             if let Err(error) =
-                dispatch_call_with_timeout(installed.channel.ack_many(&to_ack), "ack", timeout)
-                    .await
+                dispatch_call_with_timeout(installed.channel.ack_many(to_ack), "ack", timeout).await
             {
                 self.log_dispatch_error(state, &error, "dispatch batched ack failed");
             }
         }
+        // A failed ack opens the gate too. Its references come back by
+        // redelivery, and the reader acks a row that is not `PENDING`.
+        let _ = acked.send(true);
         if !to_release.is_empty() {
             let queues: HashSet<&str> = to_release
                 .iter()
@@ -36012,7 +36586,7 @@ impl Worker {
                 .collect();
             let timeout = dispatch_batch_timeout(queues.len(), 1, to_release.len());
             if let Err(error) = dispatch_call_with_timeout(
-                installed.channel.release_many(&to_release),
+                installed.channel.release_many(to_release),
                 "release",
                 timeout,
             )
@@ -36021,7 +36595,6 @@ impl Worker {
                 self.log_dispatch_error(state, &error, "dispatch batched release failed");
             }
         }
-        dispatched
     }
 
     /// Permits of one pool that no claimed task has reserved yet.
@@ -36100,11 +36673,19 @@ impl Worker {
         // idle, so it always waits, unchanged.
         if idle {
             let wait = dispatch_read_block(shard_count, self.config.poll_interval);
-            // A full pool also wakes on a released permit (issue #1787).
-            let capacity_bound = self.capacity_bound();
+            // A full pool also wakes on a released permit (issue #1787). A
+            // multi-shard turn waits at most 10 ms here, so it leaves that
+            // wake to the idle wait of its round. Here it would clear the
+            // flag and take the stored wake of an earlier gated shard.
+            let capacity = (shard_count == 1).then(|| self.capacity_wait());
             tokio::select! {
                 () = self.shutdown.cancelled() => {}
-                () = self.capacity_freed.notified(), if capacity_bound => {}
+                () = async {
+                    match capacity {
+                        Some(capacity) => capacity.woken().await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
                 () = self.deferral_due.notified() => {}
                 () = tokio::time::sleep(wait) => {}
             }
@@ -36191,7 +36772,7 @@ impl Worker {
         let claim_started = std::time::Instant::now();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
-                queue::claim_task_by_id_on_shard(
+                queue::claim_task_by_id_with_fairness(
                     conn,
                     lease.task_id,
                     &self.config.queues,
@@ -36201,6 +36782,7 @@ impl Worker {
                     circuit_breakers.tracked_activity_names(),
                     &exclusions,
                     shard,
+                    self.claim_fairness(),
                 )
                 .await
             })
@@ -36227,8 +36809,10 @@ impl Worker {
                     queue = %task.queue_name,
                     "claimed task (dispatch)"
                 );
-                self.dispatch_task(task, pool, shard, reservation, None);
-                ReferenceDisposition::Dispatched(lease)
+                ReferenceDisposition::Dispatched(
+                    lease,
+                    Box::new(ClaimedReference { task, reservation }),
+                )
             }
             Ok(None) => {
                 let probe = match queue::dispatch_probe(
@@ -36581,12 +37165,7 @@ impl Worker {
                         .wait_for_notification(self.config.poll_interval)
                         .await
                     {
-                        Ok(Some(_)) => {
-                            // Host clocks can run ahead of the database NOW(). A
-                            // jittered delay lets a new task become claimable,
-                            // and spreads the claims of many workers (issue #1796).
-                            tokio::time::sleep(crate::notify::settle_delay()).await;
-                        }
+                        Ok(Some(_)) => return true,
                         Ok(None) => {}
                         Err(error) => {
                             tracing::warn!(
@@ -36600,14 +37179,32 @@ impl Worker {
                 } else {
                     tokio::time::sleep(self.config.poll_interval).await;
                 }
+                false
             };
-            // A full pool also wakes on a released permit (issue #1787).
-            let capacity_bound = self.capacity_bound();
-            tokio::select! {
-                () = self.capacity_freed.notified(), if capacity_bound => {}
-                () = self.deferral_due.notified() => {}
-                () = idle_wait => {}
-            }
+            self.idle_wait_then_settle(idle_wait).await;
+        }
+    }
+
+    /// One idle wait of the single-pool leader (issues #1787, #1796).
+    ///
+    /// `idle` waits on the listener or the timer. It returns `true` on a
+    /// NOTIFY. A released permit or a due deferral also ends the wait.
+    ///
+    /// After a NOTIFY, the leader sleeps the settle delay. Host clocks can
+    /// run ahead of the database `NOW()`. The jittered delay lets a new task
+    /// become claimable, and spreads the claims of many workers. It runs
+    /// after the select, so no other wake cuts it short. An earlier wake
+    /// leaves the NOTIFY queued for the next wait.
+    async fn idle_wait_then_settle(&self, idle: impl std::future::Future<Output = bool>) {
+        // A full pool also wakes on a released permit (issue #1787).
+        let capacity = self.capacity_wait();
+        let notified = tokio::select! {
+            () = capacity.woken() => false,
+            () = self.deferral_due.notified() => false,
+            notified = idle => notified,
+        };
+        if notified {
+            tokio::time::sleep(crate::notify::settle_delay()).await;
         }
     }
 
@@ -37233,16 +37830,68 @@ impl Worker {
     /// wake, because `Notify` stores it until the wait polls it. The attempt
     /// frees its limit slot before its dispatch permit, so the wake finds
     /// the slot free.
+    ///
+    /// Also true when the gate refused a kind and no wait has woken on
+    /// `capacity_freed` since. A permit can free while the gated poll
+    /// claims. The pools then look free here, but the backlog of the refused
+    /// kind still waits. `Notify` stores the release, so the wait finds it.
+    /// The flag is read after the pools, so a refusal between the two reads
+    /// still counts. A refusal after both reads arms the wait through
+    /// `refusal_recorded`. See [`Worker::capacity_wait`].
     fn capacity_bound(&self) -> bool {
         let limit_refused = self.limit_refused.swap(false, Ordering::Relaxed);
-        self.poll_admission_now() != PollAdmission::Any
+        let pools_full = self.poll_admission_now() != PollAdmission::Any;
+        pools_full
             || limit_refused
+            || AtomicBool::load(&self.pool_refused, Ordering::Relaxed)
             || self.registry.adaptive_limits.any_saturated()
+    }
+
+    /// Take the capacity part of one idle wait (issue #1787). See
+    /// [`CapacityWait`].
+    ///
+    /// The wait registers for a refusal before it reads `capacity_bound`.
+    /// Another claim loop can record a refusal just after that read. A
+    /// `Notified` future receives each `notify_waiters` call made after its
+    /// creation, so that refusal still arms the wait.
+    fn capacity_wait(&self) -> CapacityWait<'_> {
+        self.capacity_wait_after(|| {})
+    }
+
+    /// [`Self::capacity_wait`], with a hook that runs right after the read.
+    /// A test records a refusal there. The hook moves with the read, so the
+    /// test pins that the registration comes first.
+    fn capacity_wait_after(&self, after_read: impl FnOnce()) -> CapacityWait<'_> {
+        let refused = self.refusal_recorded.notified();
+        let bound = {
+            let bound = self.capacity_bound();
+            after_read();
+            bound
+        };
+        CapacityWait {
+            worker: self,
+            bound,
+            refused,
+        }
+    }
+
+    /// An idle wait woke on `capacity_freed` (issue #1787). The next poll
+    /// sees the gate and the limits again, so both refusal flags have done
+    /// their work. That poll sets `limit_refused` again while a type is at
+    /// its limit. A poll of another shard cannot claim the refused backlog,
+    /// so no poll clears `pool_refused`.
+    fn capacity_woke(&self) {
+        self.pool_refused.store(false, Ordering::Relaxed);
+        self.limit_refused.store(false, Ordering::Relaxed);
     }
 
     /// Mark each kind the gate refuses (issue #1787). See `gate_refused`.
     fn record_gate_refusal(&self, admission: PollAdmission) {
         use crate::queue::TaskType;
+        // The `Notify` orders the flag write before the wake.
+        if admission != PollAdmission::Any && !self.pool_refused.swap(true, Ordering::Relaxed) {
+            self.refusal_recorded.notify_waiters();
+        }
         let (workflow, activity) = match admission {
             PollAdmission::Saturated => (true, true),
             PollAdmission::Any => (false, false),
@@ -37340,6 +37989,16 @@ impl Worker {
         .await
     }
 
+    /// The claim's fairness mode, from [`WorkerRuntimeConfig::fairness_keys`]
+    /// (issue #1976).
+    const fn claim_fairness(&self) -> queue::ClaimFairness {
+        if self.config.fairness_keys {
+            queue::ClaimFairness::Keys
+        } else {
+            queue::ClaimFairness::Off
+        }
+    }
+
     /// The activity names that a claim must skip: the names with unmet
     /// requirements, plus the types at their adaptive limit (issue #1836).
     fn claim_exclusions(&self) -> std::borrow::Cow<'_, [String]> {
@@ -37349,8 +38008,10 @@ impl Worker {
             return std::borrow::Cow::Borrowed(&self.ineligible_activities);
         }
         let exclusions = claim_exclusions(&self.ineligible_activities, limits.saturated());
-        if matches!(exclusions, std::borrow::Cow::Owned(_)) {
-            self.limit_refused.store(true, Ordering::Relaxed);
+        if matches!(exclusions, std::borrow::Cow::Owned(_))
+            && !self.limit_refused.swap(true, Ordering::Relaxed)
+        {
+            self.refusal_recorded.notify_waiters();
         }
         exclusions
     }
@@ -37607,7 +38268,7 @@ impl Worker {
                 let claim_started = std::time::Instant::now();
                 let claimed = self
                     .claim_with_conflict_retry(&mut conn, async |conn| {
-                        queue::claim_task_of_kind_on_shard(
+                        queue::claim_task_with_fairness(
                             conn,
                             &single_queue,
                             &self.config.worker_id,
@@ -37617,6 +38278,7 @@ impl Worker {
                             &exclusions,
                             shard,
                             kind,
+                            self.claim_fairness(),
                         )
                         .await
                     })
@@ -37631,7 +38293,7 @@ impl Worker {
                             "claimed task (weighted)"
                         );
                         let permit = permits.take(&task.task_type);
-                        self.dispatch_task(task, pool, shard, None, permit);
+                        self.dispatch_task(task, pool, shard, None, permit, None);
                         return true;
                     }
                     Ok(None) => {
@@ -37659,7 +38321,7 @@ impl Worker {
         let claim_started = std::time::Instant::now();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
-                queue::claim_task_of_kind_on_shard(
+                queue::claim_task_with_fairness(
                     conn,
                     &self.config.queues,
                     &self.config.worker_id,
@@ -37669,6 +38331,7 @@ impl Worker {
                     &exclusions,
                     shard,
                     kind,
+                    self.claim_fairness(),
                 )
                 .await
             })
@@ -37688,7 +38351,7 @@ impl Worker {
                 // includes the `PENDING` wait behind a saturated worker (issue
                 // #1787) and the short permit wait after the claim.
                 let permit = permits.take(&task.task_type);
-                self.dispatch_task(task, pool, shard, None, permit);
+                self.dispatch_task(task, pool, shard, None, permit, None);
                 true
             }
             Ok(None) => {
@@ -37719,6 +38382,7 @@ impl Worker {
         shard: Option<crate::types::ShardId>,
         reservation: Option<DispatchReservation>,
         held_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        acked: Option<tokio::sync::watch::Receiver<bool>>,
     ) {
         // Debug-only tripwire (issue #548 review): dispatch must never race
         // ahead of `spawn_monitoring_tasks`, which withholds a tuned
@@ -38354,8 +39018,18 @@ impl Worker {
         };
         // Every publish from this task body uses this worker's bound channel,
         // not the live slot (issue #1431). Another runtime can replace the
-        // slot after this worker starts.
-        let bound_channel = self.bound_channel();
+        // slot after this worker starts. A task that a dispatch batch claimed
+        // holds a hint for its own row until the batch ack. See
+        // [`DISPATCH_HINT_ACK_WAIT`].
+        let bound_channel = match (self.bound_channel(), acked) {
+            (Some(inner), Some(acked)) => Some(Arc::new(AckGatedChannel {
+                inner,
+                own_row: task_id,
+                acked,
+            })
+                as Arc<dyn crate::dispatch::TaskDispatch>),
+            (channel, _) => channel,
+        };
         let live = LiveClaim::new(
             &self.dispatched.live,
             claim_started_at.map(|started_at| (task_id, claim_attempt, started_at)),
@@ -41466,6 +42140,7 @@ mod tests {
             max_concurrent_sessions: 0,
             codec_rotation_batch_size: crate::codec_rotation::CODEC_ROTATION_DEFAULT_BATCH,
             scanner: crate::scanner_lease::ScannerConfig::default(),
+            fairness_keys: false,
         }
     }
 
@@ -41539,6 +42214,26 @@ mod tests {
             err.to_string().contains("cancellation_grace_period"),
             "{err}"
         );
+    }
+
+    /// A fair worker only polls queues whose keys the weight API can address
+    /// (issue #1976).
+    #[test]
+    fn runtime_config_validate_checks_queue_names_with_fairness_keys() {
+        let mut cfg = default_runtime_config();
+        cfg.queues = vec![" padded ".to_owned()];
+        assert!(cfg.validate().is_ok(), "fairness off accepts any name");
+        cfg.fairness_keys = true;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("fairness_keys"), "{err}");
+        // A URL drops a dot segment, so the weight routes cannot name it.
+        for dots in [".", ".."] {
+            cfg.queues = vec![dots.to_owned()];
+            let err = cfg.validate().unwrap_err();
+            assert!(err.to_string().contains("dot segment"), "{err}");
+        }
+        cfg.queues = vec!["shared".to_owned()];
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
@@ -42359,6 +43054,7 @@ mod tests {
             adaptive_limit: crate::adaptive_limit::AdaptiveLimitConfig::disabled(),
             #[cfg(feature = "db")]
             sharded_pool: None,
+            fairness_keys: false,
         };
 
         let runtime_cfg: WorkerRuntimeConfig = builder_cfg.into();
@@ -50762,6 +51458,7 @@ mod tests {
             timed_out_claims: None,
             handler_started_at: None,
             new_start: false,
+            fairness_key: None,
         }
     }
 
@@ -53506,6 +54203,334 @@ mod tests {
         assert_eq!(permits.admission(), PollAdmission::Only(TaskType::Workflow));
         let none = PollPermits::acquire(PollAdmission::Any, &workflow, &activity);
         assert_eq!(none.admission(), PollAdmission::Saturated);
+    }
+
+    /// A permit that frees while a gated poll claims must still wake the idle
+    /// wait (issue #1787). The pools then look free when the wait begins.
+    /// Without the wake, the backlog of the gated kind waits one poll
+    /// interval.
+    #[test]
+    fn a_permit_freed_during_a_gated_poll_still_wakes_the_idle_wait() {
+        use crate::queue::TaskType;
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_activities = 1;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+
+        let running = Arc::clone(&worker.activity_semaphore)
+            .try_acquire_owned()
+            .expect("one activity permit");
+        let admission = worker.poll_admission_now();
+        assert_eq!(admission, PollAdmission::Only(TaskType::Workflow));
+        worker.record_gate_refusal(admission);
+        // The running activity ends during the claim of the gated poll.
+        drop(running);
+        assert_eq!(worker.poll_admission_now(), PollAdmission::Any);
+        assert!(
+            worker.capacity_bound(),
+            "the idle wait after a gated poll must wake on a freed permit"
+        );
+        // A read does not clear the flag, and neither does a poll that may
+        // claim any kind. The wake on the freed permit does.
+        assert!(worker.capacity_bound());
+        worker.record_gate_refusal(PollAdmission::Any);
+        assert!(worker.capacity_bound());
+        worker.capacity_woke();
+        assert!(!worker.capacity_bound());
+    }
+
+    /// A refusal that another claim loop records while the leader decides
+    /// its wait stays armed for the next decision (issue #1787).
+    #[test]
+    fn a_refusal_stays_armed_until_a_wait_wakes_on_it() {
+        use crate::queue::TaskType;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        assert!(!worker.capacity_bound());
+        // A follower's poll is refused between two reads of the leader.
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        assert!(worker.capacity_bound());
+        assert!(
+            worker.capacity_bound(),
+            "a read of the leader must not clear a refusal of another loop"
+        );
+    }
+
+    /// A refusal that a follower records after the leader takes its snapshot
+    /// arms the leader's idle wait on a released permit (issue #1787).
+    /// Without it, the refused backlog waits up to one poll interval.
+    #[test]
+    fn a_refusal_after_the_snapshot_arms_the_wake_on_a_released_permit() {
+        use crate::queue::TaskType;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let wait = worker.capacity_wait();
+        assert!(
+            !wait.bound,
+            "free pools and no refusal: no wake on a permit"
+        );
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_none());
+        // A follower's poll is refused after the snapshot.
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_none(),
+            "a refusal alone does not end the wait"
+        );
+        // The running task of the refused kind ends.
+        worker.capacity_freed.notify_one();
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_some(),
+            "a refusal after the snapshot must arm the wake on a released permit"
+        );
+        assert!(
+            !AtomicBool::load(&worker.pool_refused, Ordering::Relaxed),
+            "the wake on a released permit clears the refusal flag"
+        );
+    }
+
+    /// The wait registers for a refusal before it reads `capacity_bound`
+    /// (issue #1787). A refusal right after the read still arms it.
+    #[test]
+    fn a_refusal_right_after_the_read_still_arms_the_wait() {
+        use crate::queue::TaskType;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let wait = worker.capacity_wait_after(|| {
+            worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        });
+        assert!(!wait.bound, "the read came before the refusal");
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        worker.capacity_freed.notify_one();
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_some(),
+            "a refusal between the read and the wait must arm the wait"
+        );
+    }
+
+    /// A claim that skips a type at its adaptive limit after the snapshot
+    /// also arms the idle wait (issue #1836). The freed limit slot then
+    /// ends it.
+    #[test]
+    fn a_limit_refusal_after_the_snapshot_arms_the_wake_on_a_freed_slot() {
+        use crate::adaptive_limit::{Acquire, AdaptiveLimitConfig};
+        use crate::policy::AdaptiveLimitPolicy;
+        let registry = Arc::new(
+            HandlerRegistry::new(vec![], vec![]).with_adaptive_limit(
+                AdaptiveLimitConfig::disabled()
+                    .with_activity("capped", Some(AdaptiveLimitPolicy::new(1, 1))),
+            ),
+        );
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let wait = worker.capacity_wait();
+        assert!(!wait.bound, "no type at its limit: no wake on a permit");
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        let Acquire::Acquired(slot) = worker.registry.adaptive_limits.try_acquire("capped") else {
+            panic!("the first attempt takes the one slot");
+        };
+        // A follower's claim skips the type at its limit.
+        assert!(matches!(
+            worker.claim_exclusions(),
+            std::borrow::Cow::Owned(_)
+        ));
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_none());
+        drop(slot);
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_some(),
+            "a limit refusal after the snapshot must arm the wake on a freed slot"
+        );
+        assert!(
+            !AtomicBool::load(&worker.limit_refused, Ordering::Relaxed),
+            "the wake clears the limit refusal too"
+        );
+    }
+
+    /// A limit refusal before the snapshot does not arm a later unbound
+    /// wait (issue #1836). `notify_waiters` stores no wake for it.
+    #[test]
+    fn an_earlier_limit_refusal_does_not_arm_a_later_wait() {
+        use crate::adaptive_limit::{Acquire, AdaptiveLimitConfig};
+        use crate::policy::AdaptiveLimitPolicy;
+        let registry = Arc::new(
+            HandlerRegistry::new(vec![], vec![]).with_adaptive_limit(
+                AdaptiveLimitConfig::disabled()
+                    .with_activity("capped", Some(AdaptiveLimitPolicy::new(1, 1))),
+            ),
+        );
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        let Acquire::Acquired(slot) = worker.registry.adaptive_limits.try_acquire("capped") else {
+            panic!("the first attempt takes the one slot");
+        };
+        assert!(matches!(
+            worker.claim_exclusions(),
+            std::borrow::Cow::Owned(_)
+        ));
+        // The freed slot stores a wake on `capacity_freed`.
+        drop(slot);
+        assert!(worker.capacity_bound(), "the limit refusal binds this read");
+        let wait = worker.capacity_wait();
+        assert!(!wait.bound);
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_none(),
+            "an earlier limit refusal must not arm a later wait"
+        );
+    }
+
+    /// A refusal before the snapshot does not arm a later unbound wait. Only
+    /// a refusal after that snapshot does (issue #1787).
+    #[test]
+    fn an_earlier_refusal_does_not_arm_a_later_wait() {
+        use crate::queue::TaskType;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        worker.capacity_woke();
+        let wait = worker.capacity_wait();
+        assert!(!wait.bound);
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        worker.capacity_freed.notify_one();
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_none(),
+            "an earlier refusal must not arm a later wait"
+        );
+    }
+
+    /// A refusal does not end a bound wait. A released permit ends it and
+    /// clears the flag (issue #1787).
+    #[test]
+    fn a_bound_wait_ends_on_a_released_permit_only() {
+        use crate::queue::TaskType;
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_activities = 1;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+
+        let running = Arc::clone(&worker.activity_semaphore)
+            .try_acquire_owned()
+            .expect("one activity permit");
+        let wait = worker.capacity_wait();
+        assert!(wait.bound, "a full pool binds the wait");
+        assert!(!AtomicBool::load(&worker.pool_refused, Ordering::Relaxed));
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_none());
+        // This refusal turns the flag on, so it fires the refusal wake.
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        assert!(AtomicBool::load(&worker.pool_refused, Ordering::Relaxed));
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_none(),
+            "a refusal must not end a bound wait"
+        );
+        drop(running);
+        worker.capacity_freed.notify_one();
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_some());
+        assert!(
+            !AtomicBool::load(&worker.pool_refused, Ordering::Relaxed),
+            "the wake on a released permit clears the refusal flag"
+        );
+    }
+
+    /// A bound wait ends on a released permit with no refusal (issue #1787).
+    #[test]
+    fn a_bound_wait_ends_on_a_released_permit_without_a_refusal() {
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_activities = 1;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+
+        let _running = Arc::clone(&worker.activity_semaphore)
+            .try_acquire_owned()
+            .expect("one activity permit");
+        let wait = worker.capacity_wait();
+        assert!(wait.bound, "a full pool binds the wait");
+        let woken = wait.woken();
+        tokio::pin!(woken);
+        assert!(futures::FutureExt::now_or_never(woken.as_mut()).is_none());
+        worker.capacity_freed.notify_one();
+        assert!(
+            futures::FutureExt::now_or_never(woken.as_mut()).is_some(),
+            "a released permit must end a bound wait"
+        );
+    }
+
+    /// A released permit during the settle delay does not cut it short
+    /// (issue #1796). An idle wait with no NOTIFY does not settle.
+    #[tokio::test(start_paused = true)]
+    async fn a_released_permit_does_not_cut_the_settle_delay_short() {
+        let mut cfg = default_runtime_config();
+        cfg.max_concurrent_activities = 1;
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(cfg, registry).expect("valid config");
+        let _running = Arc::clone(&worker.activity_semaphore)
+            .try_acquire_owned()
+            .expect("one activity permit");
+
+        // A NOTIFY at 10 ms, then a released permit at 20 ms.
+        let start = tokio::time::Instant::now();
+        let notify = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            true
+        };
+        let freed = Arc::clone(&worker.capacity_freed);
+        let release = async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            freed.notify_one();
+        };
+        tokio::join!(worker.idle_wait_then_settle(notify), release);
+        assert!(
+            start.elapsed() >= Duration::from_millis(10) + crate::notify::SETTLE_DELAY_MIN,
+            "the settle delay must run in full after a NOTIFY"
+        );
+
+        let start = tokio::time::Instant::now();
+        worker.idle_wait_then_settle(async { false }).await;
+        assert!(
+            start.elapsed() < crate::notify::SETTLE_DELAY_MIN,
+            "an idle wait with no NOTIFY must not settle"
+        );
+    }
+
+    /// The short closing wait of a multi-shard turn leaves the capacity
+    /// wake to the round's own idle wait (issue #1787). Otherwise a gated
+    /// poll on one shard loses its wake to the drain of the next shard.
+    #[tokio::test(start_paused = true)]
+    async fn a_multi_shard_drain_leaves_the_capacity_wake_to_the_round() {
+        use crate::queue::TaskType;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an ephemeral loopback port");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            diesel_async::AsyncPgConnection,
+        >::new(format!("postgres://silent@{addr}/silent"));
+        let pool = deadpool::managed::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("pool builds without connecting");
+        let registry = Arc::new(HandlerRegistry::new(vec![], vec![]));
+        let worker = Worker::new(default_runtime_config(), registry).expect("valid config");
+
+        // An earlier shard's poll was gated, and its permit then freed.
+        worker.record_gate_refusal(PollAdmission::Only(TaskType::Workflow));
+        assert_eq!(worker.poll_admission_now(), PollAdmission::Any);
+        let dispatched = worker.drain_postgres(&pool, None, 2).await;
+        assert_eq!(dispatched, 0);
+        assert!(
+            worker.capacity_bound(),
+            "the round's idle wait must still wake on the freed permit"
+        );
     }
 
     /// A slot tuner shrink cannot take the permit a poll holds for its claim

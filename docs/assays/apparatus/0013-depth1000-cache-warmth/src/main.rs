@@ -733,6 +733,7 @@ async fn start_one(
             start_source_ref: None,
             started_by: None,
             tenant: None,
+            fairness_key: None,
         },
         None,
     )

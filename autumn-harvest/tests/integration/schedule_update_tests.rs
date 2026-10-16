@@ -477,6 +477,21 @@ async fn invalid_merged_schedule_writes_nothing() {
         "validation failure must surface as Config, got {err:?}"
     );
 
+    // An interval over the cap is rejected before any write (issue #2048).
+    let patch = WorkflowSchedulePatch {
+        schedule: Some(Schedule::Interval(std::time::Duration::from_secs(
+            9_000_000_000_000_000,
+        ))),
+        ..Default::default()
+    };
+    let err = update_workflow_schedule(&mut conn, before.id, &patch)
+        .await
+        .expect_err("an interval over the cap must be rejected");
+    assert!(
+        matches!(err, autumn_harvest::HarvestError::Config(_)),
+        "validation failure must surface as Config, got {err:?}"
+    );
+
     // Invalid cron expression is also rejected before any write.
     let patch = WorkflowSchedulePatch {
         schedule: Some(Schedule::Cron("not a cron".to_string())),

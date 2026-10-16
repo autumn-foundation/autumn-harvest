@@ -34,7 +34,9 @@ pub use crate::event::ForkEffects;
 use crate::event::WorkflowEvent;
 use crate::models::{HarvestEvent, WorkflowExecution};
 use crate::payload_codec::PayloadCodecs;
-use crate::reset::{ResetInvalidPoint, ResetPlan, ResetPoint, ResetSkipReason};
+use crate::reset::{
+    ResetInvalidPoint, ResetPlan, ResetPoint, ResetSkipReason, enqueue_fork_workflow_task,
+};
 use crate::schema::{harvest_events, harvest_task_queue, harvest_workflow_executions};
 use crate::types::{ActivityExecId, ExecutionId, ShardId, StartSource};
 use crate::worker::HandlerRegistry;
@@ -328,11 +330,12 @@ async fn fork_in_transaction(
         None => source.input.clone(),
     };
     let quota = admit_fork(conn, registry, &source, request, codecs, new_exec_id).await?;
+    let quota_key = quota.as_ref().map(|(key, _)| key.as_str());
     let row = crate::reset::ForkRow {
         workflow_id: &workflow_id,
         input,
         start_source: StartSource::Fork,
-        quota_key: quota.as_ref().map(|(key, _)| key.as_str()),
+        quota_key,
         // The row keeps the callback targets of its source. A recorded fork
         // never sends them, because the terminal path checks its marker. A
         // later live fork of this fork then sends them.
@@ -404,8 +407,9 @@ async fn fork_in_transaction(
     )
     .await?;
     // A fork is admitted as a fresh start, so its first task is a new start in
-    // the claim order (issue #1824).
-    crate::reset::enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry, true).await?;
+    // the claim order (issue #1824). Its quota key is also its fairness key
+    // (issue #1976).
+    enqueue_fork_workflow_task(conn, &fork, quota_key, new_exec_id, registry, true).await?;
 
     Ok(ForkResult {
         new_exec_id,

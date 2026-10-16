@@ -137,7 +137,7 @@ for around two hours, and no command is answered in that time. Raising
 `--max-turns` raises that bound with it.
 
 The cause is the loop and not the engine. A `status`, `list` or `history` reads
-through a second, read-only connection and needs nothing the drive holds, so
+through read-only handles and needs nothing the drive holds, so
 those three could be answered during a drive by a daemon that served them on
 another task. `submit` and `approve` write, and they would still wait: this
 backend has one writer by design.
@@ -318,10 +318,12 @@ approval by hand from a trimmed view is still yours to do.
   approval.
 - **[`src/daemon.rs`](src/daemon.rs)** — the socket, the drive tick, and the
   single-writer main loop.
-- **[`src/inspect.rs`](src/inspect.rs)** — a second, **read-only** connection
-  for the reads the runtime does not expose. Each one asks for what it needs: a
-  `status` reads one row, the startup check and the drive tick read the running
-  rows, and only `list` reads them all.
+- **[`src/inspect.rs`](src/inspect.rs)** — read-only handles beside the
+  writer. The backend's `SqliteReader` lists and describes executions (issue
+  #2027). A read-only connection reads the event, timer, signal and task
+  tables. Each read asks for what it needs: a `status` reads one row, the
+  startup check reads the running rows, and only `list` reads a page of them
+  all.
 - **[`src/guard.rs`](src/guard.rs)** — the exclusive lock on the database file
   that keeps "one writer" true across processes.
 

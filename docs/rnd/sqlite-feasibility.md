@@ -191,6 +191,7 @@ Classification rule:
 | `execution` | diesel, skip-locked, row-lock, advisory-lock, interval-sql, raw-pg-sql, raw-sql | (c) | Start/reuse matrix under `FOR UPDATE`; row-lock ordering is load-bearing. Issue #1596 review added `pg_advisory_xact_lock(hashtext(key)::bigint)` ahead of the row lock, closing an admission race between concurrent starts and a reconciled seal; subsumed by the single write lock. |
 | `external_target_location` | diesel | (c) | Placement-aware resolution for `workflow_id`-addressed signal/cancel (#1146). Like `cross_shard_child` above, the coupling is **architectural, not syntactic**: the module exists *because* there is more than one database. It answers "which shard holds this business key?" by fanning a read across every expected shard and merging the per-shard answers. A single-file SQLite deployment has exactly one shard, so the fan-out has nothing to do — the engine's own single-shard short-circuit already skips it — and the whole module would be dropped, leaving the shard-local resolver it delegates to (`execution::resolve_execution_id_by_workflow_id`) as the entire answer. Its lone mechanism is the `AsyncPgConnection` in its signatures. |
 | `external_task` | diesel, row-lock | (b) | `find_by_token_locked` serialises completion/failure; subsumed. |
+| `fairness_keys` | diesel, skip-locked, advisory-lock, raw-pg-sql, raw-sql | (b) | Fairness-key weight overrides and state prune (issue #1976). The claim-time logic lives in `queue`. The advisory lock serialises the 1,000-override cap check, and prune skips locked rows; the single write lock subsumes both. The only cast is `$3::TEXT`, a dialect rewrite. |
 | `fork` | diesel, raw-pg-sql, raw-sql | (b) | Non-destructive fork of a run (issue #2000). It copies a history prefix to a new root execution, in chunks of 1,000 rows. The source row, each ancestor and the record source are read `FOR SHARE` through the Diesel builder. The single write lock subsumes those share locks. The history-cap check sums `pg_column_size(event_data)` over the stored fork rows with a `::BIGINT` cast; SQLite's `length(event_data)` is a direct substitute, as for `quota`. |
 | `handle` | diesel | (a) | Read paths. |
 | `heartbeat` | diesel | (a) | Batched last-write-wins update. |
@@ -509,10 +510,12 @@ re-opened, not extended.
 Multi-worker/multi-process; push wakeups (polling latency floor); per-key fleet
 concurrency (#247); sticky routing (#235); poison-pill peer reclaim (#367);
 sharding; management API and Vantage UI; child workflows, external
-signal/cancel, local and external activities, cancellable timers,
+signal/cancel, external activities,
 worker sessions, and a cross-type continue-as-new (same-type `continue_as_new`
 shipped in #2023) — each **rejected loudly by name** at the
-command layer rather than silently ignored. Activity execution is
+command layer rather than silently ignored. Local activities, cancellable
+timers, the workflow mutex, `execution_timeout` and workflow retry shipped in
+#2029. Activity execution is
 **at-least-once** (a crash mid-body re-runs it on resume), so bodies must be
 idempotent.
 
