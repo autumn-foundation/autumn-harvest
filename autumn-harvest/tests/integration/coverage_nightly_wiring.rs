@@ -47,10 +47,19 @@ const DB_RUN: &[&str] = &[
     "bash .github/ci/run-suites.sh run linux",
 ];
 
+/// The `if` of a step that also runs after a failed test, but not after a
+/// cancel.
+const UNLESS_CANCELLED: &str = "${{ !cancelled() }}";
+
 /// The `if` of the `report` job. It also runs after a failed shard, so the
 /// report shows what the other shards measured.
 fn report_if() -> String {
-    format!("always() && ({DRAFT_SKIP})")
+    format!("${{{{ !cancelled() && ({DRAFT_SKIP}) }}}}")
+}
+
+/// True when the `if` of `node` equals `expected`, whitespace aside.
+fn if_is(node: &serde_yaml::Value, expected: &str) -> bool {
+    compact(str_at(node, &["if"])) == compact(expected)
 }
 
 /// An expression with its whitespace removed, so `${{ x }}` equals `${{x}}`.
@@ -96,18 +105,18 @@ fn uses_the_coverage_toolchain(job: &serde_yaml::Value) -> bool {
 ///
 /// The LCOV exporter of LLVM 23 crashes on `worker.rs`, so the job exports
 /// JSON and the script converts it.
-fn exports_lcov_always(job: &serde_yaml::Value) -> bool {
+fn exports_lcov_after_a_failure(job: &serde_yaml::Value) -> bool {
     let steps = steps(job);
     let export = steps.iter().position(|s| {
         let run = str_at(s, &["run"]);
         run.contains("cargo llvm-cov report --branch --json")
             && run.contains(&format!("{SCRIPT} convert"))
-            && str_at(s, &["if"]).contains("always()")
+            && if_is(s, UNLESS_CANCELLED)
     });
     let upload = steps.iter().position(|s| {
         str_at(s, &["uses"]).starts_with("actions/upload-artifact@")
             && str_at(s, &["with", "name"]).starts_with(LCOV_PREFIX)
-            && str_at(s, &["if"]).contains("always()")
+            && if_is(s, UNLESS_CANCELLED)
     });
     matches!((export, upload), (Some(e), Some(u)) if e < u)
 }
@@ -200,6 +209,14 @@ fn test_jobs_use_a_dated_nightly_with_branch_coverage() {
         dated_nightly(pin),
         "{NIGHTLY} must pin `env.RUSTUP_TOOLCHAIN: nightly-YYYY-MM-DD`; found {pin:?}"
     );
+    // The fuzz pin is the nightly known to build the `db` feature. One pin
+    // moves both workflows.
+    let fuzz = parse_workflow(".github/workflows/fuzz-nightly.yml");
+    assert_eq!(
+        pin,
+        str_at(&fuzz, &["env", "FUZZ_TOOLCHAIN"]),
+        "{NIGHTLY} must pin the nightly that fuzz-nightly.yml pins"
+    );
     for name in ["unit", "db"] {
         let job = &doc["jobs"][name];
         assert!(
@@ -212,9 +229,9 @@ fn test_jobs_use_a_dated_nightly_with_branch_coverage() {
              and must not override it"
         );
         assert!(
-            exports_lcov_always(job),
+            exports_lcov_after_a_failure(job),
             "the `{name}` job must export JSON, convert it with {SCRIPT} and upload a \
-             `{LCOV_PREFIX}*` artifact, each with `if: always()`"
+             `{LCOV_PREFIX}*` artifact, each with `if: {UNLESS_CANCELLED}`"
         );
     }
     assert!(
@@ -237,6 +254,13 @@ fn db_shards_run_every_linux_row_under_coverage() {
         "the `db` matrix must be exactly 0..SEMAPHORE_SHARD_COUNT, and each shard must set \
          SEMAPHORE_SHARD_INDEX to its own `matrix.shard`"
     );
+    let ci = parse_workflow(".github/workflows/ci.yml");
+    let count = |job: &serde_yaml::Value| number_at(job, &["env", "SEMAPHORE_SHARD_COUNT"]);
+    assert_eq!(
+        count(db),
+        count(&ci["jobs"]["test-db-linux"]),
+        "`db` must use the shard count of the ci.yml `test-db-linux` job"
+    );
 }
 
 #[test]
@@ -245,7 +269,7 @@ fn report_job_publishes_and_ratchets() {
     let report = &doc["jobs"]["report"];
     assert!(
         job_needs(report) == BTreeSet::from(["unit", "db"])
-            && str_at(report, &["if"]) == report_if()
+            && if_is(report, &report_if())
             && !soft(report),
         "the `report` job must need `unit` and `db`, run with `if: {}`, and not set \
          `continue-on-error`",
@@ -267,13 +291,13 @@ fn report_job_publishes_and_ratchets() {
     let upload = position(&|s| {
         str_at(s, &["uses"]).starts_with("actions/upload-artifact@")
             && str_at(s, &["with", "name"]) == "coverage-report"
-            && str_at(s, &["if"]).contains("always()")
+            && if_is(s, UNLESS_CANCELLED)
     });
     let ratchet = position(&|s| ratchets(s));
     assert!(
         matches!((download, summary, upload, ratchet), (Some(d), Some(s), Some(u), Some(r)) if d < s && s < u && s < r),
         "the `report` job must download the {LCOV_PREFIX}* artifacts, merge and summarize \
-         them into $GITHUB_STEP_SUMMARY, upload `coverage-report` with `if: always()`, and \
+         them into $GITHUB_STEP_SUMMARY, upload `coverage-report` unless cancelled, and \
          ratchet against {BASELINE} with `if: {RATCHET_IF}`"
     );
 }
@@ -409,6 +433,9 @@ fn baseline_lists_the_critical_modules_with_recorded_floors() {
     }
 }
 
+/// A change to the script or the baseline runs no DB shard on its PR. The
+/// `lint` self-test checks the script in seconds. A PR that changes the
+/// workflow runs the whole pipeline.
 #[test]
 fn lint_runs_the_script_self_test_and_prs_run_the_pipeline() {
     let ci = parse_workflow(".github/workflows/ci.yml");
@@ -425,10 +452,9 @@ fn lint_runs_the_script_self_test_and_prs_run_the_pipeline() {
         .flatten()
         .filter_map(serde_yaml::Value::as_str)
         .collect();
-    for file in [NIGHTLY, SCRIPT, BASELINE] {
-        assert!(
-            paths.contains(file),
-            "{NIGHTLY} `on.pull_request.paths` must list {file}"
-        );
-    }
+    assert_eq!(
+        paths,
+        BTreeSet::from([NIGHTLY]),
+        "{NIGHTLY} `on.pull_request.paths` must list only {NIGHTLY}"
+    );
 }

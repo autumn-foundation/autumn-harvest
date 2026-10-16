@@ -14,7 +14,7 @@ modules.
 
 - No workflow, script or manifest uses `llvm-cov`, `tarpaulin` or `grcov`.
 - `test-db-linux` runs the `linux` rows of `.github/ci/integration-suites.txt`
-  through `run-suites.sh`, in 21 shards.
+  through `run-suites.sh`, in shards.
 - `run-suites.sh` calls plain `cargo test`. `cargo llvm-cov show-env` sets
   a `RUSTC_WRAPPER`, so a plain `cargo test` builds instrumented binaries.
 - Stable Rust gives line and region coverage. Branch coverage needs
@@ -41,7 +41,7 @@ modules.
 | B11 | The nightly commits a raised floor. | Rejected. It needs a write token on `trunk-dev`. |
 | B12 | The report names each floor that can rise. `--update` raises it. | **Adopted.** `--update` never lowers a floor. |
 | B13 | Gate every PR on coverage. | Rejected. It doubles the DB shard cost of each PR. |
-| B14 | Run the whole pipeline on a PR that changes the coverage tooling. | **Adopted.** The fuzz nightly does the same. |
+| B14 | Run the whole pipeline on a PR that changes the workflow. | **Adopted.** A script or baseline change runs only the `lint` self-test, because one full run costs about 15 runner-hours. |
 | B15 | A Rust guard over the workflow and the baseline. | **Adopted.** It follows `fuzz_nightly_wiring.rs`. |
 | B16 | The script self-test runs in the `lint` job. | **Adopted.** It costs seconds. |
 
@@ -56,19 +56,19 @@ modules.
 | R5 | A newer nightly fails to build the crate. | The pin is a date. The guard rejects `nightly` with no date. |
 | R6 | LCOV paths are absolute and differ per runner. | The script makes each path relative to the workspace root. |
 | R7 | The merge counts a line twice. Totals inflate. | The merge keys each line by file and number. The self-test proves it. |
-| R8 | A failed shard stops the report. | The report job runs with `if: always()`. |
+| R8 | A failed shard stops the report. | The report job runs unless the run is cancelled. Its summary then shows "Ratchet skipped". |
 | R9 | A scheduled failure goes unseen. | An alert job opens or updates an issue. |
 | R10 | A `--update` lowers a floor. | `--update` keeps the larger value. The self-test proves it. |
-| R11 | `continue-on-error` hides a drop. | The guard rejects it on the ratchet step. |
-| R12 | Instrumented builds fill the runner disk. | Each test job frees disk first, as `test-db-linux` does. |
+| R11 | `continue-on-error`, `--update` or `|| true` hides a drop. | The guard compares the ratchet step and its gates exactly. Mutation self-tests pin each case. |
+| R12 | Instrumented builds fill the runner disk. | Each `db` shard frees disk first, as `test-db-linux` does. |
 | R13 | The LCOV exporter crashes. | Found in the green phase: LLVM 23 `llvm-cov export -format=lcov` crashes on `worker.rs`. Each job exports JSON. The script converts it with the LLVM line rule. |
 | R14 | `show-env` fails, so the suites run with no instrumentation. | The step assigns its output to a variable first, so the failure fails the step. |
 
 ### 0.4 Six thinking hats
 
-- **White (facts).** 187 core, 103 plugin, 4 Redis and 1 runner `linux`
-  rows exist. The pinned nightly builds the `db` feature. `cargo-llvm-cov`
-  0.9.1 is current.
+- **White (facts).** On 2026-10-16 the manifest had 187 core, 103 plugin, 4
+  Redis and 1 runner `linux` rows. The pinned nightly builds the `db`
+  feature. `cargo-llvm-cov` 0.9.1 was the current release.
 - **Red (feelings).** A nightly that fails by noise gets ignored. Low noise
   matters more than a tight floor.
 - **Black (risks).** 23 jobs each night. Nightly drift. Coverage jitter
@@ -85,9 +85,10 @@ modules.
 
 ### 1.1 Workflow `.github/workflows/coverage-nightly.yml`
 
-- Triggers: a cron, `workflow_dispatch`, and a PR that changes the tooling.
+- Triggers: a cron, `workflow_dispatch`, and a PR that changes the workflow.
 - `unit`: `cargo llvm-cov --branch` over `autumn-harvest --all-features --lib`.
-- `db`: 21 shards. Each runs `run-suites.sh run linux` under `show-env`.
+- `db`: the shard layout of `test-db-linux`. Each shard runs
+  `run-suites.sh run linux` under `show-env`.
 - Each test job exports `llvm-cov` JSON, converts it into LCOV, and
   uploads the LCOV file as an artifact.
 - `report`: merges the LCOV files, writes a JSON and a Markdown summary,
@@ -99,8 +100,10 @@ modules.
 Stdlib only. Subcommands:
 
 - `convert IN.json --root R --output OUT` — applies the LLVM
-  `LineCoverageStats` rule to the JSON segments. On four critical modules
-  it gives the same lines and counts as the LCOV exporter.
+  `LineCoverageStats` rule to the JSON segments. On `queue.rs`, `erase.rs`,
+  `scheduler.rs` and `timeout.rs`, it gives the same lines and counts as the
+  LCOV exporter of `nightly-2026-08-14` (LLVM 23). That exporter crashes on
+  `worker.rs`, so `worker.rs` has no LCOV output to compare.
 - `merge --output OUT IN...` — sums hits per file and line, and per branch.
 - `summary LCOV --json J --markdown M [--baseline B]` — line and branch
   data per file. With `--baseline`, it also shows each critical module
@@ -118,9 +121,18 @@ Each critical module has a line floor and a branch floor, in percent. The
 ### 1.4 Guard `autumn-harvest/tests/integration/coverage_nightly_wiring.rs`
 
 It checks the cron, the two test jobs, the shard count, the artifact, the
-ratchet step, the alert job and the baseline module list.
+ratchet step, the alert job and the baseline module list. It requires a
+recorded floor for each module. Mutation self-tests prove that each check
+rejects the softened forms that review found.
+
+### 1.5 Baseline period
+
+The issue asks for a baseline period before the gate. The PR runs of this
+change are that period. Each floor is the lowest value of its module over
+those runs. The tolerance covers the jitter between them.
 
 ## 2. Out of scope
 
 - A PR gate on coverage (B13).
-- Coverage of the `linuxpart` and `allos` rows.
+- Coverage of the `linuxpart` and `allos` rows, the no-DB and `dst`
+  binaries, and the lib tests of the other crates.

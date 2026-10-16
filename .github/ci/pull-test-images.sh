@@ -4,8 +4,26 @@
 # `testcontainers` retries nothing on a pull, so a registry blip fails a
 # live-DB test. This script retries each pull. It reads SEMAPHORE_SHARD_COUNT
 # and SEMAPHORE_SHARD_INDEX through `run-suites.sh`, as the suite step does.
-# `ci.yml` (`test-db-linux`) and `coverage-nightly.yml` (`db`) call it. The
-# `test-db-linux` comment above its call lists why each image is here.
+# `ci.yml` (`test-db-linux`) and `coverage-nightly.yml` (`db`) call it.
+#
+# Every tag the suites actually request, not just the testcontainers-modules
+# default (Codex review: the default alone left the suites that override it
+# just as exposed as before):
+# - `postgres:11-alpine`: the unoverridden default. `autumn-web`'s own
+#   `TestDb` uses it, for example in the webhook suites.
+# - `postgres:16`: the tag that about 220 of this repo's own DB suites
+#   request via `.with_tag("16")`.
+# - `postgres:16-alpine`: one outlier suite's override.
+# - `redis:5.0`: the Redis default, overridden nowhere. The issue #1312
+#   dispatch suites need it, and the jobs force them via
+#   HARVEST_TEST_REQUIRE_REDIS.
+# - `redis:7.4-alpine`: the TLS-only server of the issue #1834 `tls_redis`
+#   suite. Redis 5 has no TLS.
+# - `softwaremill/elasticmq:1.5.2`: only on the shard that runs the
+#   `connector_sqs_broker` suite. "bytes remaining on stream" failed it on
+#   PR #1773 because it was not pre-pulled.
+# - The MinIO and fake-gcs-server emulators: only on the shards that run
+#   their suites (issue #1983).
 set -euo pipefail
 
 images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0 redis:7.4-alpine"

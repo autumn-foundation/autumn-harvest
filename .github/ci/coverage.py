@@ -33,8 +33,8 @@ def parse_lcov(text, root):
 
     Each file maps to `lines` (line number to hits) and `branches`
     ((line, block, branch) to hits). LCOV writes `-` for a branch whose
-    block never ran. That counts as zero hits. Function records are
-    dropped, because the report does not use them.
+    block never ran. That counts as zero hits. The parser drops function
+    records, because the report does not use them.
     """
     records = {}
     current = None
@@ -91,6 +91,11 @@ def from_export(doc, root):
     The LCOV exporter of LLVM 23 crashes on this crate, so the jobs export
     JSON. A branch key is its line, its column and its side. Two
     instantiations of one generic branch share a key, so their hits add up.
+
+    The JSON does not mark a folded branch side. LLVM drops a folded side
+    from its own totals, and this script counts it as not taken. So a branch
+    percent here can be lower than `cargo llvm-cov report` shows. The
+    difference is the same each night, so the ratchet is not affected.
     """
     if doc.get("type") != "llvm.coverage.json.export":
         raise ValueError("not an llvm-cov export JSON file")
@@ -173,7 +178,8 @@ def check(baseline, summary):
     A module fails when its coverage is lower than its floor minus the
     tolerance. A module with no data fails too. Otherwise a moved or renamed
     module would leave the gate in silence. A `null` floor is not recorded
-    yet, so it passes.
+    yet, so it passes. The guard forbids a `null` floor in the committed
+    baseline.
     """
     tolerance = baseline["tolerance"]
     found = []
@@ -189,7 +195,7 @@ def check(baseline, summary):
                 continue
             if current is None:
                 found.append(f"{path}: no branch data, but the {kind} floor is {floor}")
-            elif current < floor - tolerance:
+            elif current < round(floor - tolerance, 2):
                 found.append(
                     f"{path}: {kind} coverage {current}% is below the floor {floor}% "
                     f"minus the tolerance {tolerance}"
@@ -198,7 +204,8 @@ def check(baseline, summary):
 
 
 def _round_down(pct):
-    return math.floor(pct * 100) / 100
+    # The epsilon stops float error from taking 37.80 down to 37.79.
+    return math.floor(pct * 100 + 1e-6) / 100
 
 
 def raised(baseline, summary):
@@ -227,7 +234,10 @@ def files_markdown(files):
     """Render the per-crate totals and the per-file table."""
     crates = {}
     for path, row in files.items():
-        crate = path.split("/src/")[0] if "/src/" in path else path.split("/")[0]
+        if "/src/" in path:
+            crate = path.split("/src/")[0]
+        else:
+            crate = "." if path.startswith("src/") else path.split("/")[0]
         total = crates.setdefault(crate, dict.fromkeys(row, 0))
         for key in ("lines_hit", "lines_total", "branches_hit", "branches_total"):
             total[key] += row[key]
@@ -247,8 +257,12 @@ def files_markdown(files):
     return "\n".join(out)
 
 
-def ratchet_markdown(baseline, summary, found):
-    """Render each critical module against its floor."""
+def ratchet_markdown(baseline, summary, found, partial=False):
+    """Render each critical module against its floor.
+
+    A `partial` run had a failed test job. Its coverage is short, so the
+    summary shows no verdict and suggests no new floor.
+    """
     out = ["## Critical modules (issue #1818)", ""]
     out.append(f"Tolerance: {baseline['tolerance']} points.")
     out += ["", "| Module | Lines | Floor | Branches | Floor |", "|---|---:|---:|---:|---:|"]
@@ -259,6 +273,11 @@ def ratchet_markdown(baseline, summary, found):
             f"| {_fmt(row.get('branches_pct'))} | {_fmt(floors.get('branches'))} |"
         )
     out.append("")
+    if partial:
+        out += ["Ratchet skipped: a test job failed, so the coverage of this run is partial.", ""]
+        return "\n".join(out)
+    if all(v is None for _, floors in _module_floors(baseline) for v in floors.values()):
+        out += ["No floor is recorded yet. The ratchet checks only that each module has data.", ""]
     out += [f"- FAIL: {m}" for m in found] or ["No critical module is below its floor."]
     if raised(baseline, summary) != baseline:
         out += ["", "A floor can rise. Download `summary.json`, run `python3 .github/ci/coverage.py "
@@ -295,7 +314,8 @@ def cmd_summary(args):
     text = files_markdown(files)
     if args.baseline:
         baseline = _read_json(args.baseline)
-        text = ratchet_markdown(baseline, summary, check(baseline, summary)) + "\n" + text
+        found = check(baseline, summary)
+        text = ratchet_markdown(baseline, summary, found, args.partial) + "\n" + text
     _write(args.markdown, text)
     return 0
 
@@ -333,6 +353,7 @@ def _parser():
     p.add_argument("--json", required=True)
     p.add_argument("--markdown", required=True)
     p.add_argument("--baseline", help="also render the critical modules against their floors")
+    p.add_argument("--partial", action="store_true", help="a test job failed; show no verdict")
     p.set_defaults(func=cmd_summary)
     p = sub.add_parser("ratchet", help="compare critical modules with their floors")
     p.add_argument("--baseline", required=True)
@@ -393,7 +414,7 @@ EXPORT = {
 
 def self_test():
     timeout = from_export(EXPORT, "/w/r")["autumn-harvest/src/timeout.rs"]
-    # Line 2 and 4 follow a segment with no count. Line 6 follows a counted
+    # Lines 2 and 4 follow a segment with no count. Line 6 follows a counted
     # region. Line 8 starts a skipped region. Line 10 starts with a gap, so
     # only its second region counts.
     assert timeout["lines"] == {1: 5, 3: 7, 5: 0, 6: 0, 10: 3}, timeout
@@ -463,6 +484,20 @@ def self_test():
     text = files_markdown(files)
     assert "| `autumn-harvest` | 50.00% | 100.00% |" in text, text
     assert "| `autumn-harvest/src/erase.rs` | 0.00% (0/1) | n/a (0/0) |" in text, text
+    assert "| `.` |" in files_markdown({"src/lib.rs": erase}), "a root crate"
+
+    # Float error must not move a floor or the tolerance edge.
+    assert _round_down(37.8) == 37.8 and _round_down(19.49) == 19.49
+    edge = {"files": {"m.rs": {"lines_total": 1, "lines_pct": 0.01, "branches_pct": None}}}
+    assert check(base({"m.rs": {"lines": 0.51, "branches": None}}), edge) == []
+    assert len(check(base({"m.rs": {"lines": 0.52, "branches": None}}), edge)) == 1
+    # A run with a failed test job shows no verdict.
+    text = ratchet_markdown(high, summary, check(high, summary), partial=True)
+    assert "Ratchet skipped" in text and "FAIL" not in text and "can rise" not in text, text
+    # With no floor recorded, the summary says what the gate still checks.
+    unarmed = base({"autumn-harvest/src/queue.rs": pending})
+    assert "No floor is recorded yet" in ratchet_markdown(unarmed, summary, [])
+    assert "No floor is recorded yet" not in ratchet_markdown(low, summary, [])
     print("coverage.py self-test: ok")
 
 
