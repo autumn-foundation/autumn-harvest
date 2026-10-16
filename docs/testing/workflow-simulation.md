@@ -126,7 +126,7 @@ simulation run, they only evaluate the condition.
 
 | Delivery | Rule |
 |---|---|
-| Activity result | Lands at any later task. Each attempt's `ActivityStarted` lands first, in its own step. |
+| Activity result | Lands at any later task. Each attempt's `ActivityStarted` lands first, in its own step. A start wakes no task, so it lands with the next waking delivery. |
 | Child result | Lands at any later task. |
 | Timer fire | Lands when the virtual clock reaches its deadline. Due timers fire by deadline, then by timer id. |
 | Signal | `Simulation::signal` sends it at a seed-chosen task. Signals arrive in call order. |
@@ -196,7 +196,9 @@ one seed with a crash at a given task.
 
 Each seed runs twice, and the traces must match. A trace line names the task,
 the virtual time and the event. Ids become ordinals such as `a1` and `c1`.
-The trace holds no payload.
+The trace holds no payload, so the two runs also compare a digest of each
+event with its payloads. The digest uses the same ordinals. The crash check
+compares both too.
 
 A run seeds the live values of `ctx.new_uuid()`, the `ctx.random_*` helpers
 and the `ctx.system_*` clock reads. A clock read returns the virtual time. A

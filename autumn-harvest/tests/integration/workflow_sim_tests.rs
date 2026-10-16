@@ -842,26 +842,25 @@ async fn an_awaited_timer_fires_by_its_deadline_beside_a_classic_timer() {
 
 #[tokio::test]
 async fn an_activity_start_can_land_before_its_result() {
+    // A start lands without a wake, beside another activity's result. Its
+    // own result can then land in a later task.
     quotes_env()
         .simulation()
+        .signal("go", json!("now"))
         .seeds(SEEDS)
-        .sweep(two_steps, json!(null), |outcome| {
+        .sweep(fan_out_then_signal, json!(null), |outcome| {
             let events = outcome.events();
-            let start = events
-                .iter()
-                .position(|e| matches!(e, WorkflowEvent::ActivityStarted { .. }));
-            let done = events
-                .iter()
-                .position(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. }));
-            sometimes!(
-                match (start, done) {
-                    (Some(s), Some(d)) => {
-                        outcome.tasks_of_events(&[s]) != outcome.tasks_of_events(&[d])
-                    }
-                    _ => false,
-                },
-                "a start and its result land in different tasks"
-            );
+            let task_of = |i: usize| outcome.tasks_of_events(&[i]);
+            let split = events.iter().enumerate().any(|(s, start)| {
+                let WorkflowEvent::ActivityStarted { activity_id, .. } = start else {
+                    return false;
+                };
+                events.iter().enumerate().any(|(d, done)| {
+                    matches!(done, WorkflowEvent::ActivityCompleted { activity_id: id, .. } if id == activity_id)
+                        && task_of(s) != task_of(d)
+                })
+            });
+            sometimes!(split, "a start and its result land in different tasks");
         })
         .await
         .unwrap_or_else(|failure| panic!("{failure}"));
@@ -932,6 +931,51 @@ async fn an_activity_start_alone_does_not_wake_a_parked_task() {
                     .iter()
                     .any(|e| matches!(e, WorkflowEvent::ActivityCompleted { .. })),
                 "seed {seed}: the timer fired before the result woke the task"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_mock_that_changes_a_value_on_the_same_path_fails_the_sweep() {
+    // Each call returns a new number, but the workflow takes one path.
+    let calls = Arc::new(AtomicU32::new(0));
+    let env = WorkflowTestEnv::new()
+        .mock_activity("quote_primary", move |_| {
+            Ok(json!(calls.fetch_add(1, Ordering::SeqCst)))
+        })
+        .mock_activity("quote_backup", |_| Ok(json!(2)));
+    let failure = env
+        .simulation()
+        .seeds(SeedPlan { first: 0, count: 4 })
+        .sweep(two_steps, json!(null), |_| {})
+        .await
+        .expect_err("the payloads of the two runs differ");
+    assert!(failure.reason.contains("not deterministic"), "{failure}");
+    assert!(failure.reason.contains("payload"), "{failure}");
+}
+
+#[tokio::test]
+async fn a_start_alone_runs_no_cycle() {
+    // The worker appends `ActivityStarted` without a wake. So no task may
+    // hold only `ActivityStarted` events: the next cycle runs only after a
+    // waking delivery lands with them.
+    let env = quotes_env();
+    let sim = env.simulation();
+    for seed in 0..SEEDS.count {
+        let outcome = sim.run(seed, two_steps, json!(null)).await;
+        let events = outcome.events();
+        for task in 1..=outcome.tasks() {
+            let in_task: Vec<&WorkflowEvent> = (0..events.len())
+                .filter(|&i| outcome.tasks_of_events(&[i]).contains(&task))
+                .map(|i| &events[i])
+                .collect();
+            assert!(
+                in_task.is_empty()
+                    || !in_task
+                        .iter()
+                        .all(|e| matches!(e, WorkflowEvent::ActivityStarted { .. })),
+                "seed {seed}: task {task} ran on a start alone"
             );
         }
     }

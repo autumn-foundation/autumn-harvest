@@ -569,6 +569,8 @@ pub struct SimOutcome {
     outcome: TestRunOutcome,
     /// The task of each event in history.
     event_tasks: Vec<usize>,
+    /// A digest of each event, payloads included, with ids as ordinals.
+    payloads: Vec<u64>,
     tasks: usize,
     trace: Vec<String>,
     faults: Vec<String>,
@@ -667,11 +669,22 @@ impl SimOutcome {
     pub fn same_outcome(&self, other: &Self) -> Result<(), String> {
         let a = comparable(&self.trace);
         let b = comparable(&other.trace);
-        first_divergence(&a, &b).map_or(Ok(()), |line| {
-            Err(format!(
+        if let Some(line) = first_divergence(&a, &b) {
+            return Err(format!(
                 "trace line {line} differs\n  first:  {}\n  second: {}",
                 a.get(line).map_or("", String::as_str),
                 b.get(line).map_or("", String::as_str)
+            ));
+        }
+        let index = self
+            .payloads
+            .iter()
+            .zip(&other.payloads)
+            .position(|(x, y)| x != y);
+        index.map_or(Ok(()), |index| {
+            Err(format!(
+                "the payload of event {index} differs: {}",
+                self.trace.get(index).map_or("", String::as_str)
             ))
         })
     }
@@ -1141,6 +1154,10 @@ impl Simulation<'_> {
             );
             return Err(Box::new((first, reason)));
         }
+        if let Err(diff) = first.same_outcome(&second) {
+            let reason = format!("seed {seed} is not deterministic: {diff}");
+            return Err(Box::new((first, reason)));
+        }
         if let Err(rule) = check_legal(first.events()) {
             return Err(Box::new((
                 first,
@@ -1234,6 +1251,9 @@ struct HeldTimer {
 enum Delivery {
     /// This many events landed.
     Events(usize),
+    /// Only `ActivityStarted` events landed. The worker appends them without
+    /// a wake, so no cycle runs.
+    Quiet,
     /// The scripted cancel landed.
     Cancelled,
 }
@@ -1399,7 +1419,12 @@ impl<'a, 'env> SimRun<'a, 'env> {
                 return self.finish(SimStatus::HarnessError, Err(error));
             }
             let changed = self.history.len() != before;
-            match self.deliver() {
+            let mut delivery = self.deliver();
+            while matches!(delivery, Delivery::Quiet) {
+                delivery = self.deliver();
+            }
+            match delivery {
+                Delivery::Quiet => unreachable!("the loop above lands a waking delivery"),
                 Delivery::Cancelled => {
                     let reason = self.cancel.take().unwrap_or_default();
                     return self.finish(SimStatus::Cancelled, Err(reason));
@@ -1719,8 +1744,16 @@ impl<'a, 'env> SimRun<'a, 'env> {
             self.tag(self.task + 1);
             return Delivery::Cancelled;
         }
+        let ingested = self.history.len();
         self.ingest(clock, &timers, advance, woken, arrive);
         self.tag(self.task + 1);
+        let quiet = self.history.len() == ingested
+            && self.history[before..ingested]
+                .iter()
+                .all(|e| matches!(e, WorkflowEvent::ActivityStarted { .. }));
+        if quiet && ingested > before {
+            return Delivery::Quiet;
+        }
         Delivery::Events(self.history.len() - before)
     }
 
@@ -1836,7 +1869,8 @@ impl<'a, 'env> SimRun<'a, 'env> {
     }
 
     fn outcome(self, status: SimStatus, run: TestRunOutcome) -> SimOutcome {
-        let mut trace = render_trace(&run.events, &self.event_tasks);
+        let (mut trace, ids) = render_trace(&run.events, &self.event_tasks);
+        let payloads = payload_digests(&run.events, &ids);
         if let Some(task) = self.crashed_at {
             trace.push(format!("crash after the cycle of task {task}"));
         }
@@ -1845,6 +1879,7 @@ impl<'a, 'env> SimRun<'a, 'env> {
             status,
             outcome: run,
             event_tasks: self.event_tasks,
+            payloads,
             tasks: self.task,
             trace,
             faults: self.faults,
@@ -1891,15 +1926,47 @@ impl Ordinals {
 }
 
 /// One trace line per event: the task, the virtual time and the event.
-fn render_trace(events: &[WorkflowEvent], tasks: &[usize]) -> Vec<String> {
+///
+/// It also returns the ordinals, so [`payload_digests`] can use them.
+fn render_trace(events: &[WorkflowEvent], tasks: &[usize]) -> (Vec<String>, Ordinals) {
     let mut ids = Ordinals::default();
-    events
+    let trace = events
         .iter()
         .enumerate()
         .map(|(index, event)| {
             let task = tasks.get(index).copied().unwrap_or(0);
             let clock = fired_timer_duration_secs(&events[..=index]);
             format!("{task:04} +{clock}s {}", render_event(event, &mut ids))
+        })
+        .collect();
+    (trace, ids)
+}
+
+/// A digest of each event with its payloads.
+///
+/// The trace holds no payload, so these digests catch a value that changes
+/// on the same path. Each activity and child id becomes its ordinal first,
+/// because those ids are random.
+fn payload_digests(events: &[WorkflowEvent], ids: &Ordinals) -> Vec<u64> {
+    let mut names: Vec<(String, String)> = ids
+        .activities
+        .iter()
+        .map(|(id, n)| (id.as_uuid().to_string(), format!("a{n}")))
+        .chain(
+            ids.children
+                .iter()
+                .map(|(id, n)| (id.as_uuid().to_string(), format!("c{n}"))),
+        )
+        .collect();
+    names.sort();
+    events
+        .iter()
+        .map(|event| {
+            let mut text = serde_json::to_string(event).unwrap_or_default();
+            for (id, ordinal) in &names {
+                text = text.replace(id.as_str(), ordinal);
+            }
+            fnv1a(text.as_bytes())
         })
         .collect()
 }
@@ -2161,7 +2228,7 @@ mod tests {
             completed(b),
             completed(a),
         ];
-        let trace = render_trace(&events, &[0, 1, 1, 2, 3]);
+        let (trace, _) = render_trace(&events, &[0, 1, 1, 2, 3]);
         assert_eq!(
             trace,
             [
