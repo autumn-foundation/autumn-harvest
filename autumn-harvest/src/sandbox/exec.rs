@@ -1724,20 +1724,35 @@ mod tests {
             .plan(&sh("i=0; while [ $i -lt 20 ]; do \
                  ( echo started; exec sleep 5 >/dev/null 2>&1 ) & i=$((i+1)); done; wait"))
             .unwrap();
-        match execute_plan(&plan, &options(), &CancellationToken::new()).await {
-            Ok(out) => {
-                let started = out.stdout.lines().filter(|l| *l == "started").count();
-                // The limit counts the processes of this run, not those of
-                // the worker, so some forks work and some fail.
-                assert!(
-                    (1..20).contains(&started),
-                    "{started} forks worked: {}",
-                    out.stderr
-                );
+        // The new user namespace also keeps the worker's own process limit
+        // for all tasks of its uid. A busy test host can reach that limit for
+        // a moment. Then the run does not start, or each fork of the run
+        // fails. So such a run is tried again. The limit must hold on every
+        // attempt.
+        let mut stderr = String::new();
+        for _ in 0..3 {
+            match execute_plan(&plan, &options(), &CancellationToken::new()).await {
+                Ok(out) => {
+                    let started = out.stdout.lines().filter(|l| *l == "started").count();
+                    assert!(
+                        started < 20,
+                        "the limit did not hold: {started} forks worked"
+                    );
+                    // The limit counts the processes of this run, not those
+                    // of the worker, so some forks work.
+                    if started > 0 {
+                        return;
+                    }
+                    stderr = out.stderr;
+                }
+                Err(SandboxError::Unavailable(m)) if m.contains("user namespace") => return,
+                // EAGAIN: the worker uid is at its process limit.
+                Err(SandboxError::Unavailable(m)) if m.contains("(os error 11)") => stderr = m,
+                Err(e) => panic!("{e:?}"),
             }
-            Err(SandboxError::Unavailable(m)) if m.contains("user namespace") => {}
-            Err(e) => panic!("{e:?}"),
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
+        panic!("no run could fork in 3 attempts: {stderr}");
     }
 
     #[test]
