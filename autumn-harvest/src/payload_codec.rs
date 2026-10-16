@@ -1485,7 +1485,7 @@ impl PayloadCodecs {
         let raw = serde_json::to_vec(payload)?;
         let encoded = codec
             .encode(&raw)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+            .map_err(|e| HarvestError::Codec(e.to_string()))?;
         Ok(Self::envelope(
             codec.codec_id(),
             key_id.as_deref().unwrap_or(CODEC_LEGACY_KEY_ID),
@@ -1521,7 +1521,7 @@ impl PayloadCodecs {
         let raw = serde_json::to_vec(&payload)?;
         let encoded = codec
             .encode(&raw)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+            .map_err(|e| HarvestError::Codec(e.to_string()))?;
         Ok(Self::envelope(
             codec.codec_id(),
             key_id.as_deref().unwrap_or(CODEC_LEGACY_KEY_ID),
@@ -1600,7 +1600,7 @@ impl PayloadCodecs {
         }
         let encoded = codec
             .encode(raw)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+            .map_err(|e| HarvestError::Codec(e.to_string()))?;
         // Never the escape case: identity is refused above, so this key id
         // is always a genuinely active rotation key.
         Ok(Self::envelope(codec.codec_id(), key_id, &encoded, false))
@@ -1811,12 +1811,28 @@ impl PayloadCodecs {
 
     /// Re-encode a stored column value for a copy into a new row (issue #2065).
     ///
-    /// The stub keeps the stored form.
+    /// A retry, a continue-as-new successor and a reset fork are new writes.
+    /// This decodes `stored`, then encodes it as [`PayloadCodecs::encode_column`]
+    /// does. A clear legacy value is encoded, and ciphertext moves to the active
+    /// key. A value this registry cannot decode keeps its stored bytes, so the
+    /// copy never loses or guesses a value.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError`] when the codec fails to encode the decoded value.
     pub(crate) fn recode_column_for_copy(&self, stored: &Value) -> HarvestResult<Value> {
-        Ok(stored.clone())
+        match self.decode_column(stored) {
+            Ok(plain) => self.encode_column(&plain),
+            Err(error) if error.is_codec_failure() => Ok(stored.clone()),
+            Err(error) => Err(error),
+        }
     }
 
     /// [`PayloadCodecs::recode_column_for_copy`] for an optional column.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::recode_column_for_copy`].
     pub(crate) fn recode_column_opt_for_copy(
         &self,
         stored: Option<&Value>,
@@ -1913,10 +1929,10 @@ impl PayloadCodecs {
         })?;
         let encoded = base64::engine::general_purpose::STANDARD
             .decode(parts.encoded_b64)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+            .map_err(|e| HarvestError::Codec(e.to_string()))?;
         codec
             .decode(&encoded)
-            .map_err(|e| HarvestError::Config(e.to_string()))
+            .map_err(|e| HarvestError::Codec(e.to_string()))
     }
 
     /// Decode one already-shape-verified envelope, mapping every failure mode

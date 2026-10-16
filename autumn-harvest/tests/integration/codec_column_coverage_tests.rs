@@ -2604,7 +2604,7 @@ impl PayloadCodec for ToggleAead {
     }
 
     fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
-        if self.failing.load(Ordering::SeqCst) {
+        if AtomicBool::load(&self.failing, Ordering::SeqCst) {
             return Err(CodecError("simulated key outage".to_string()));
         }
         self.inner.encode(raw)
@@ -2645,6 +2645,23 @@ async fn history_types(
         .collect()
 }
 
+async fn sweep_outbox(
+    conn: &mut AsyncPgConnection,
+    codecs: &PayloadCodecs,
+    shard: ShardId,
+) -> usize {
+    autumn_harvest::timeout::enforce_external_signals_outbox(
+        conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+        Duration::from_secs(60),
+        &None,
+        &[shard],
+        codecs,
+    )
+    .await
+    .expect("outbox sweep")
+}
+
 #[tokio::test]
 async fn the_outbox_leaves_a_signal_pending_while_the_codec_fails() {
     use autumn_harvest::event::WorkflowEvent;
@@ -2653,20 +2670,16 @@ async fn the_outbox_leaves_a_signal_pending_while_the_codec_fails() {
     let (url, _c) = setup_test_database_url_or_env().await;
     let queue = format!("cc-{}", Uuid::new_v4().simple());
     let mut conn = connect(&url).await;
-    // Shard 7 keeps a worker of another test from sweeping these rows.
-    let shard = ShardId::new(7);
+    let shard = ShardId::new(0);
     let plain = aead_codecs(false);
-    let mut begin = |name: &'static str| {
-        let id = ExecutionId::new_for_shard(shard);
-        let params =
-            StartWorkflowParams::new(name, &Uuid::new_v4().to_string(), id, json!({}), &queue);
-        (id, params)
-    };
-    let (target, target_params) = begin("cc_outbox_target");
-    let (caller, caller_params) = begin("cc_outbox_caller");
-    for params in [target_params, caller_params] {
+    let target = ExecutionId::new_for_shard(shard);
+    let caller = ExecutionId::new_for_shard(shard);
+    for (id, name) in [(target, "cc_outbox_target"), (caller, "cc_outbox_caller")] {
         autumn_harvest::execution::start_or_load_workflow_execution_with_codecs(
-            &mut conn, params, None, &plain,
+            &mut conn,
+            StartWorkflowParams::new(name, &Uuid::new_v4().to_string(), id, json!({}), &queue),
+            None,
+            &plain,
         )
         .await
         .expect("start");
@@ -2689,19 +2702,7 @@ async fn the_outbox_leaves_a_signal_pending_while_the_codec_fails() {
 
     let failing = Arc::new(AtomicBool::new(true));
     let codecs = toggle_codecs(&failing);
-    let metrics = autumn_harvest::telemetry::NoOpMetrics;
-    let sweep = |conn: &mut AsyncPgConnection| {
-        autumn_harvest::timeout::enforce_external_signals_outbox(
-            conn,
-            &metrics,
-            Duration::from_secs(60),
-            &None,
-            &[shard],
-            &codecs,
-        )
-    };
-
-    sweep(&mut conn).await.expect("sweep while the codec fails");
+    sweep_outbox(&mut conn, &codecs, shard).await;
     let types = history_types(&mut conn, caller, &codecs).await;
     assert!(
         !types.contains(&"ExternalSignalFailed".to_string()),
@@ -2713,8 +2714,8 @@ async fn the_outbox_leaves_a_signal_pending_while_the_codec_fails() {
             .is_empty()
     );
 
-    failing.store(false, Ordering::SeqCst);
-    sweep(&mut conn).await.expect("sweep after the codec heals");
+    AtomicBool::store(&failing, false, Ordering::SeqCst);
+    sweep_outbox(&mut conn, &codecs, shard).await;
     let types = history_types(&mut conn, caller, &codecs).await;
     assert!(
         types.contains(&"ExternalSignalDelivered".to_string()),
@@ -2746,7 +2747,7 @@ impl PayloadCodec for FailSecondMarker {
     fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
         let marker = SIGNAL_MARKER.as_bytes();
         if raw.windows(marker.len()).any(|w| w == marker)
-            && self.seen.fetch_add(1, Ordering::SeqCst) == 1
+            && AtomicUsize::fetch_add(&self.seen, 1, Ordering::SeqCst) == 1
         {
             return Err(CodecError("simulated key outage".to_string()));
         }
@@ -2842,7 +2843,7 @@ async fn inline_delivery_leaves_a_signal_pending_when_the_codec_fails() {
         json!({"poke": SIGNAL_MARKER})
     );
     assert!(
-        seen.load(Ordering::SeqCst) >= 3,
+        AtomicUsize::load(&seen, Ordering::SeqCst) >= 3,
         "the codec must fail once and the outbox must encode again"
     );
     let types = history_types(&mut conn, sender, &codecs).await;

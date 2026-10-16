@@ -4110,6 +4110,15 @@ async fn attempt_signal_delivery(
                     tracing::error!(error = %e, "outbox sweep: db error during signal delivery");
                     None
                 }
+                // A codec failure says nothing about the target, so the
+                // request stays pending for the next sweep (issue #2065).
+                Err(error) if error.is_codec_failure() => {
+                    tracing::warn!(
+                        %signal_id,
+                        "outbox sweep: signal left pending, the payload codec failed"
+                    );
+                    None
+                }
                 Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
                     signal_id,
                     reason_code: "target_terminal".to_string(),

@@ -1470,7 +1470,10 @@ impl HarvestError {
     /// end, so the operation is retryable and not a verdict on its target.
     #[must_use]
     pub const fn is_codec_failure(&self) -> bool {
-        false
+        matches!(
+            self,
+            Self::Codec(_) | Self::UnknownCodecKey { .. } | Self::UnknownPayloadCodec { .. }
+        )
     }
 
     /// Is this a [`HarvestError::PoolAcquireTimeout`]?
