@@ -1,0 +1,43 @@
+# Upstream OpenTelemetry policy checks on the workflow conventions draft
+# (issue #2015).
+#
+# The `otel_workflow_semconv_docs` guards in the `lint` job check the model
+# shape. This workflow runs scripts/check-otel-workflow-semconv.sh. The
+# script runs the upstream Weaver policies on the model, at a pinned upstream
+# commit. It pulls an image and clones three trees, so it runs only when the
+# draft, the script or this file changes.
+#
+# Guarded by `otel_workflow_semconv_docs::the_weaver_check_runs_when_the_model_changes`.
+name: OTel semconv (Weaver)
+
+on:
+  pull_request:
+    paths:
+      - "docs/otel-workflow-semconv/**"
+      - "scripts/check-otel-workflow-semconv.sh"
+      - ".github/workflows/otel-semconv.yml"
+  push:
+    branches: [trunk-dev]
+    paths:
+      - "docs/otel-workflow-semconv/**"
+      - "scripts/check-otel-workflow-semconv.sh"
+      - ".github/workflows/otel-semconv.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: otel-semconv-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  weaver:
+    name: Upstream Weaver policy checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run the upstream policy checks on the model
+        run: scripts/check-otel-workflow-semconv.sh

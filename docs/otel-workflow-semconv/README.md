@@ -15,7 +15,8 @@ The model files use the upstream Weaver format:
   spans.
 
 The `otel_workflow_semconv_docs` guard suite keeps this page, the model and
-ADR 0001 in agreement.
+ADR 0001 in agreement. A script runs the upstream Weaver policy checks on
+the model. Section 10 gives the result.
 
 ## 1. Summary
 
@@ -250,6 +251,8 @@ A draft Weaver model (`model/workflow/registry.yaml` and
 `model/workflow/spans.yaml`) is at
 https://github.com/autumn-foundation/autumn-harvest/tree/<commit>/docs/otel-workflow-semconv
 
+The model passes the upstream `make check-policies` checks.
+
 Autumn Harvest emits these spans under its own `harvest.*` names. Its
 draft lists where it does not yet conform.
 
@@ -277,14 +280,22 @@ The steps to submit:
    co-propose. Upstream asks for a group of owners for a new area.
 3. Read the project process in the `open-telemetry/community` repository.
    A new area can need a project and a sponsor.
-4. Replace `<commit>` in the section 9 link with a merged commit or a tag.
+4. Move the pins in `check-otel-workflow-semconv.sh` to the current
+   upstream `main` and the latest release. Run the script. It must pass.
+5. Replace `<commit>` in the section 9 link with a merged commit or a tag.
    Then file the text in `open-telemetry/semantic-conventions`.
-5. Put the issue link in the status paragraph. Change `pending` to
+6. Put the issue link in the status paragraph. Change `pending` to
    `submitted`.
 
 If the project decides not to submit, change `pending` to `declined` and
 give the reason in the same paragraph.
 
-The guard suite checks the model shape and the names. It does not run
-Weaver or the upstream policy checks. Upstream runs `make check` on the
-pull request that follows the issue.
+The guard suite checks the model shape and the names.
+[`check-otel-workflow-semconv.sh`](../../scripts/check-otel-workflow-semconv.sh)
+runs the upstream Weaver policy checks. It mirrors `make check-policies` at
+upstream commit `331541c`, with the `v1.44.0` baseline and Weaver 0.28.0.
+The model passes and adds no warning. A copy with an unresolved `ref` fails.
+
+The `otel-semconv.yml` workflow runs the script when the draft changes.
+Upstream runs the full `make check` on the pull request that follows the
+issue. That check also generates the Markdown tables.

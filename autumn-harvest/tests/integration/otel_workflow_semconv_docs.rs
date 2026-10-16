@@ -99,7 +99,7 @@ const WEAVER_SCRIPT_PARTS: &[(&str, &str)] = &[
     ),
     ("model/workflow", "the model must sit at its upstream path"),
     (
-        "negative control",
+        "if check \"${broken}\"",
         "a broken copy must fail, so a pass is not vacuous",
     ),
 ];
