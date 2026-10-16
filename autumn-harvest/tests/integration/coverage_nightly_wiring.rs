@@ -9,8 +9,9 @@
 use std::collections::BTreeSet;
 
 use super::ci_run_coverage::{
-    alerts_on_scheduled_failure, dated_nightly, job_needs, parse_workflow, parse_workflow_text,
-    repo_root, soft, steps, str_at, ungated, workflow_crons,
+    DRAFT_SKIP, SHELL_OPERATORS, alerts_on_scheduled_failure, dated_nightly, job_needs,
+    parse_workflow, parse_workflow_text, repo_root, runs_on_every_schedule, soft, steps, str_at,
+    ungated, workflow_crons,
 };
 
 const NIGHTLY: &str = ".github/workflows/coverage-nightly.yml";
@@ -31,12 +32,56 @@ const CRITICAL: &[&str] = &[
 /// The `coverage-lcov-*` artifact prefix that the report job downloads.
 const LCOV_PREFIX: &str = "coverage-lcov-";
 
+/// The `if` of the ratchet step. A failed test cuts coverage short, so a
+/// drop in that run is noise. The failed job already fails the run.
+const RATCHET_IF: &str = "needs.unit.result == 'success' && needs.db.result == 'success'";
+
+/// The script lines of the `db` step that runs the suites, in order.
+///
+/// The assignment fails the step when `show-env` fails. The `clean` must
+/// come before the suites, or it deletes their profile data.
+const DB_RUN: &[&str] = &[
+    "coverage_env=\"$(cargo llvm-cov show-env --sh --branch)\"",
+    "eval \"$coverage_env\"",
+    "cargo llvm-cov clean --workspace",
+    "bash .github/ci/run-suites.sh run linux",
+];
+
+/// The `if` of the `report` job. It also runs after a failed shard, so the
+/// report shows what the other shards measured.
+fn report_if() -> String {
+    format!("always() && ({DRAFT_SKIP})")
+}
+
+/// An expression with its whitespace removed, so `${{ x }}` equals `${{x}}`.
+fn compact(expr: &str) -> String {
+    expr.split_whitespace().collect()
+}
+
+/// True when `run` is one command with no shell operator.
+fn plain(run: &str) -> bool {
+    !SHELL_OPERATORS.iter().any(|op| run.trim().contains(op))
+}
+
+/// True when `tokens` holds `pair` as two adjacent tokens.
+fn has_pair(tokens: &[&str], pair: [&str; 2]) -> bool {
+    tokens.windows(2).any(|w| w == pair)
+}
+
+/// The non-blank, non-comment lines of a `run` script, trimmed.
+fn script_lines(run: &str) -> Vec<&str> {
+    run.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
 /// True when a test job installs the pinned nightly and its LLVM tools, and
 /// does not override the workflow `RUSTUP_TOOLCHAIN`.
 fn uses_the_coverage_toolchain(job: &serde_yaml::Value) -> bool {
     let installs = steps(job).iter().any(|s| {
         str_at(s, &["uses"]).starts_with("dtolnay/rust-toolchain@")
-            && str_at(s, &["with", "toolchain"]) == "${{ env.RUSTUP_TOOLCHAIN }}"
+            && compact(str_at(s, &["with", "toolchain"])) == "${{env.RUSTUP_TOOLCHAIN}}"
             && str_at(s, &["with", "components"]).contains("llvm-tools-preview")
     });
     installs
@@ -67,28 +112,67 @@ fn exports_lcov_always(job: &serde_yaml::Value) -> bool {
     matches!((export, upload), (Some(e), Some(u)) if e < u)
 }
 
-/// True when one ungated step sources `show-env --branch` and then runs the
-/// `linux` manifest rows. A second step would not see the exported variables.
-fn runs_the_linux_rows_instrumented(job: &serde_yaml::Value) -> bool {
+/// True when one ungated step runs the autumn-harvest lib tests under
+/// `cargo llvm-cov --branch`, as one plain command.
+fn runs_the_lib_tests_instrumented(job: &serde_yaml::Value) -> bool {
     steps(job).iter().any(|s| {
-        let run = str_at(s, &["run"]);
-        let env = run.find("cargo llvm-cov show-env");
-        let rows = run.find("run-suites.sh run linux");
-        ungated(s) && run.contains("--branch") && matches!((env, rows), (Some(e), Some(r)) if e < r)
+        let run = str_at(s, &["run"]).trim();
+        let tokens: Vec<&str> = run.split_whitespace().collect();
+        ungated(s)
+            && plain(run)
+            && run.starts_with("cargo llvm-cov ")
+            && tokens.contains(&"--branch")
+            && tokens.contains(&"--lib")
+            && has_pair(&tokens, ["-p", "autumn-harvest"])
     })
+}
+
+/// True when one ungated step runs exactly the [`DB_RUN`] lines.
+///
+/// One step must hold them all. A later step does not see the variables
+/// that `eval` exports.
+fn runs_the_linux_rows_instrumented(job: &serde_yaml::Value) -> bool {
+    steps(job)
+        .iter()
+        .any(|s| ungated(s) && script_lines(str_at(s, &["run"])) == DB_RUN)
+}
+
+/// The number at `path`, written as a YAML number or a string.
+fn number_at(node: &serde_yaml::Value, path: &[&str]) -> Option<u64> {
+    let mut cur = node;
+    for key in path {
+        cur = cur.get(key)?;
+    }
+    cur.as_u64().or_else(|| cur.as_str()?.parse().ok())
+}
+
+/// True when the `db` matrix is exactly `0..SEMAPHORE_SHARD_COUNT`.
+///
+/// `run-suites.sh` keeps a row when `ordinal % count == index`. A missing
+/// index drops its rows in silence.
+fn shards_cover_every_row(db: &serde_yaml::Value) -> bool {
+    let shards: Option<Vec<u64>> = db["strategy"]["matrix"]["shard"]
+        .as_sequence()
+        .map(|s| s.iter().filter_map(serde_yaml::Value::as_u64).collect());
+    let count = number_at(db, &["env", "SEMAPHORE_SHARD_COUNT"]).unwrap_or(0);
+    count > 0
+        && shards == Some((0..count).collect())
+        && compact(str_at(db, &["env", "SEMAPHORE_SHARD_INDEX"])) == "${{matrix.shard}}"
 }
 
 /// True when the ratchet step gates the run.
 ///
-/// It must run only when both test jobs passed: a failed test cuts coverage
-/// short, so a drop then is noise. It must not soften its own failure.
+/// It is one plain `coverage.py ratchet` command against the committed
+/// baseline. `--update` rewrites the baseline and always passes, so it is
+/// rejected.
 fn ratchets(step: &serde_yaml::Value) -> bool {
-    let run = str_at(step, &["run"]);
-    let condition = str_at(step, &["if"]);
-    run.contains(&format!("{SCRIPT} ratchet"))
-        && run.contains(&format!("--baseline {BASELINE}"))
-        && condition.contains("needs.unit.result == 'success'")
-        && condition.contains("needs.db.result == 'success'")
+    let run = str_at(step, &["run"]).trim();
+    let tokens: Vec<&str> = run.split_whitespace().collect();
+    run.starts_with(&format!("python3 {SCRIPT} ratchet "))
+        && plain(run)
+        && has_pair(&tokens, ["--baseline", BASELINE])
+        && !tokens.contains(&"--update")
+        && str_at(step, &["if"]) == RATCHET_IF
         && !soft(step)
 }
 
@@ -119,6 +203,10 @@ fn test_jobs_use_a_dated_nightly_with_branch_coverage() {
     for name in ["unit", "db"] {
         let job = &doc["jobs"][name];
         assert!(
+            runs_on_every_schedule(job),
+            "the `{name}` job must have no `continue-on-error` and no `if` but the draft-skip"
+        );
+        assert!(
             uses_the_coverage_toolchain(job),
             "the `{name}` job must install `env.RUSTUP_TOOLCHAIN` with llvm-tools-preview \
              and must not override it"
@@ -128,21 +216,11 @@ fn test_jobs_use_a_dated_nightly_with_branch_coverage() {
             "the `{name}` job must export JSON, convert it with {SCRIPT} and upload a \
              `{LCOV_PREFIX}*` artifact, each with `if: always()`"
         );
-        assert!(
-            !soft(job),
-            "the `{name}` job must not set `continue-on-error`"
-        );
     }
-    let unit = steps(&doc["jobs"]["unit"]).into_iter().any(|s| {
-        let run = str_at(s, &["run"]);
-        run.contains("cargo llvm-cov")
-            && run.contains("--branch")
-            && run.contains("-p autumn-harvest")
-            && run.contains("--lib")
-    });
     assert!(
-        unit,
-        "the `unit` job must run `cargo llvm-cov --branch` over the autumn-harvest lib tests"
+        runs_the_lib_tests_instrumented(&doc["jobs"]["unit"]),
+        "one ungated `unit` step must run `cargo llvm-cov --branch` over the autumn-harvest \
+         lib tests, as one plain command"
     );
 }
 
@@ -152,23 +230,12 @@ fn db_shards_run_every_linux_row_under_coverage() {
     let db = &doc["jobs"]["db"];
     assert!(
         runs_the_linux_rows_instrumented(db),
-        "one ungated `db` step must source `cargo llvm-cov show-env --branch` and then run \
-         `run-suites.sh run linux`"
+        "one ungated `db` step must run exactly these lines: {DB_RUN:?}"
     );
-    let shards = db["strategy"]["matrix"]["shard"]
-        .as_sequence()
-        .map_or(0, Vec::len);
-    let count: usize = str_at(db, &["env", "SEMAPHORE_SHARD_COUNT"])
-        .parse()
-        .unwrap_or(0);
     assert!(
-        shards > 0 && shards == count,
-        "`db` must have one matrix shard per SEMAPHORE_SHARD_COUNT; found {shards} and {count}"
-    );
-    assert_eq!(
-        str_at(db, &["env", "SEMAPHORE_SHARD_INDEX"]),
-        "${{ matrix.shard }}",
-        "each `db` shard must run its own slice of the manifest"
+        shards_cover_every_row(db),
+        "the `db` matrix must be exactly 0..SEMAPHORE_SHARD_COUNT, and each shard must set \
+         SEMAPHORE_SHARD_INDEX to its own `matrix.shard`"
     );
 }
 
@@ -178,8 +245,11 @@ fn report_job_publishes_and_ratchets() {
     let report = &doc["jobs"]["report"];
     assert!(
         job_needs(report) == BTreeSet::from(["unit", "db"])
-            && str_at(report, &["if"]).contains("always()"),
-        "the `report` job must need `unit` and `db` and run with `if: always()`"
+            && str_at(report, &["if"]) == report_if()
+            && !soft(report),
+        "the `report` job must need `unit` and `db`, run with `if: {}`, and not set \
+         `continue-on-error`",
+        report_if()
     );
     let steps = steps(report);
     let position = |pred: &dyn Fn(&serde_yaml::Value) -> bool| steps.iter().position(|s| pred(s));
@@ -204,23 +274,99 @@ fn report_job_publishes_and_ratchets() {
         matches!((download, summary, upload, ratchet), (Some(d), Some(s), Some(u), Some(r)) if d < s && s < u && s < r),
         "the `report` job must download the {LCOV_PREFIX}* artifacts, merge and summarize \
          them into $GITHUB_STEP_SUMMARY, upload `coverage-report` with `if: always()`, and \
-         ratchet against {BASELINE} when both test jobs passed"
+         ratchet against {BASELINE} with `if: {RATCHET_IF}`"
     );
 }
 
 /// Self-test: each way to soften the ratchet fails the check.
 #[test]
 fn ratchet_check_rejects_a_soft_gate() {
-    let good = "run: python3 .github/ci/coverage.py ratchet --baseline .github/ci/coverage-baseline.json --summary s.json\n\
-                if: needs.unit.result == 'success' && needs.db.result == 'success'\n";
-    let parse = |text: &str| parse_workflow_text(text).expect("synthetic step must parse");
-    assert!(ratchets(&parse(good)));
-    let soft = format!("{good}continue-on-error: true\n");
-    assert!(!ratchets(&parse(&soft)), "a soft ratchet");
-    let other = good.replace("coverage-baseline.json", "other.json");
-    assert!(!ratchets(&parse(&other)), "another baseline");
-    let half = good.replace(" && needs.db.result == 'success'", "");
-    assert!(!ratchets(&parse(&half)), "a ratchet over a failed shard");
+    let run = "python3 .github/ci/coverage.py ratchet --baseline .github/ci/coverage-baseline.json --summary s.json";
+    let step = |run: &str, condition: &str, extra: &str| {
+        let text = format!("run: '{run}'\nif: \"{condition}\"\n{extra}");
+        ratchets(&parse_workflow_text(&text).expect("synthetic step must parse"))
+    };
+    assert!(step(run, RATCHET_IF, ""));
+    assert!(
+        !step(run, RATCHET_IF, "continue-on-error: true\n"),
+        "a soft ratchet"
+    );
+    let other = run.replace("coverage-baseline.json", "other.json");
+    assert!(!step(&other, RATCHET_IF, ""), "another baseline");
+    let update = run.replace(" ratchet ", " ratchet --update ");
+    assert!(!step(&update, RATCHET_IF, ""), "`--update` always passes");
+    assert!(
+        !step(&format!("{run} || true"), RATCHET_IF, ""),
+        "a swallowed failure"
+    );
+    assert!(
+        !step(&format!("echo {run}"), RATCHET_IF, ""),
+        "a command that ratchets nothing"
+    );
+    let half = RATCHET_IF.replace(" && needs.db.result == 'success'", "");
+    assert!(!step(run, &half, ""), "a ratchet over a failed shard");
+    let either = RATCHET_IF.replace(" && ", " || ");
+    assert!(!step(run, &either, ""), "a ratchet over a failed shard");
+    let pr_only = format!("{RATCHET_IF} && github.event_name == 'pull_request'");
+    assert!(!step(run, &pr_only, ""), "a ratchet that skips the cron");
+}
+
+/// Self-test: each way to break the instrumented `db` step fails the check.
+#[test]
+fn db_step_check_rejects_a_broken_run() {
+    let job = |lines: &[&str], extra: &str| {
+        let body: String = lines.iter().map(|l| format!("          {l}\n")).collect();
+        let text = format!("steps:\n  - name: run\n    {extra}run: |\n{body}");
+        let text = text.replace("\n          ", "\n        ");
+        runs_the_linux_rows_instrumented(
+            &parse_workflow_text(&text).expect("synthetic job must parse"),
+        )
+    };
+    assert!(job(DB_RUN, ""));
+    assert!(!job(DB_RUN, "if: false\n    "), "a gated step");
+    assert!(
+        !job(&[DB_RUN[0], DB_RUN[2], DB_RUN[3]], ""),
+        "no instrumentation"
+    );
+    assert!(
+        !job(&[DB_RUN[0], DB_RUN[1], DB_RUN[3], DB_RUN[2]], ""),
+        "a clean after the suites"
+    );
+    let swallowed = format!("{} || true", DB_RUN[3]);
+    assert!(
+        !job(&[DB_RUN[0], DB_RUN[1], DB_RUN[2], &swallowed], ""),
+        "a swallowed failure"
+    );
+}
+
+/// Self-test: the shard check needs every index once.
+#[test]
+fn shard_check_needs_every_index() {
+    let db = |shards: &str, count: &str| {
+        let text = format!(
+            "strategy:\n  matrix:\n    shard: {shards}\nenv:\n  SEMAPHORE_SHARD_COUNT: {count}\n  \
+             SEMAPHORE_SHARD_INDEX: ${{{{ matrix.shard }}}}\n"
+        );
+        shards_cover_every_row(&parse_workflow_text(&text).expect("synthetic job must parse"))
+    };
+    assert!(db("[0, 1, 2]", "\"3\""));
+    assert!(db("[0, 1, 2]", "3"), "an unquoted count");
+    assert!(!db("[1, 2, 3]", "\"3\""), "index 0 missing");
+    assert!(!db("[0, 1, 1]", "\"3\""), "a repeated index");
+    assert!(!db("[0, 1]", "\"3\""), "a short matrix");
+}
+
+/// Self-test: a job gate that skips the cron fails the check.
+#[test]
+fn job_gate_check_rejects_a_skipped_cron() {
+    let job = |extra: &str| {
+        let text = format!("runs-on: x\n{extra}");
+        runs_on_every_schedule(&parse_workflow_text(&text).expect("synthetic job must parse"))
+    };
+    assert!(job(""));
+    assert!(job(&format!("if: \"{DRAFT_SKIP}\"\n")));
+    assert!(!job("if: github.event_name == 'pull_request'\n"));
+    assert!(!job("continue-on-error: true\n"));
 }
 
 /// The JSON number at `key`, or `None` for `null` or a missing key.

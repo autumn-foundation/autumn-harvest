@@ -1708,6 +1708,19 @@ pub fn ungated(node: &serde_yaml::Value) -> bool {
     node.get("if").is_none() && !soft(node)
 }
 
+/// The draft-skip condition that `ci.yml` uses. A schedule always runs.
+pub const DRAFT_SKIP: &str =
+    "github.event_name != 'pull_request' || github.event.pull_request.draft == false";
+
+/// True when a job has no `continue-on-error` and no `if` but [`DRAFT_SKIP`].
+pub fn runs_on_every_schedule(job: &serde_yaml::Value) -> bool {
+    !soft(job)
+        && matches!(
+            job.get("if").map(serde_yaml::Value::as_str),
+            None | Some(Some(DRAFT_SKIP))
+        )
+}
+
 /// True when a job or step sets `continue-on-error` to anything but `false`.
 pub fn soft(node: &serde_yaml::Value) -> bool {
     node.get("continue-on-error")
@@ -1743,7 +1756,7 @@ pub fn job_needs(job: &serde_yaml::Value) -> BTreeSet<&str> {
     }
 }
 
-/// True when a dated nightly pin, such as `nightly-2026-08-14`.
+/// True when `pin` is a dated nightly, such as `nightly-2026-08-14`.
 ///
 /// A newer nightly can fail to compile the crate, so a pin must be a date.
 pub fn dated_nightly(pin: &str) -> bool {
@@ -1751,8 +1764,8 @@ pub fn dated_nightly(pin: &str) -> bool {
         .is_some_and(|d| d.len() == 10 && d.chars().all(|c| c.is_ascii_digit() || c == '-'))
 }
 
-/// True when a job opens an issue when a scheduled run of each of `needs`
-/// fails. GitHub tells only the last editor of a cron about a failure.
+/// True when a job needs each of `needs` and opens an issue after a failed
+/// scheduled run. GitHub tells only the last editor of a cron about a failure.
 pub fn alerts_on_scheduled_failure(job: &serde_yaml::Value, needs: &[&str]) -> bool {
     let condition = str_at(job, &["if"]);
     let listed = job_needs(job);

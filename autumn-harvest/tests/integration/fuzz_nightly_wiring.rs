@@ -10,8 +10,8 @@
 use std::collections::BTreeSet;
 
 use super::ci_run_coverage::{
-    alerts_on_scheduled_failure, dated_nightly, parse_workflow, parse_workflow_text, repo_root,
-    soft, steps, str_at, ungated, workflow_crons,
+    DRAFT_SKIP, alerts_on_scheduled_failure, dated_nightly, parse_workflow, parse_workflow_text,
+    repo_root, runs_on_every_schedule, soft, steps, str_at, ungated, workflow_crons,
 };
 
 const FUZZ_CARGO_TOML: &str = include_str!("../../../fuzz/Cargo.toml");
@@ -144,19 +144,6 @@ fn tolerates_a_lost_corpus(job: &serde_yaml::Value) -> bool {
         && run.contains("lost=true")
         && run.contains("$GITHUB_OUTPUT")
         && str_at(save, &["if"]).contains("steps.restore.outputs.lost != 'true'")
-}
-
-/// The draft-skip condition that `ci.yml` uses. A schedule always runs.
-const DRAFT_SKIP: &str =
-    "github.event_name != 'pull_request' || github.event.pull_request.draft == false";
-
-/// True when a job has no `continue-on-error` and no `if` but [`DRAFT_SKIP`].
-fn runs_on_every_schedule(job: &serde_yaml::Value) -> bool {
-    !soft(job)
-        && matches!(
-            job.get("if").map(serde_yaml::Value::as_str),
-            None | Some(Some(DRAFT_SKIP))
-        )
 }
 
 #[test]
