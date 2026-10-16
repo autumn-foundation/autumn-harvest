@@ -1466,8 +1466,9 @@ impl HarvestError {
     /// Did a payload codec fail to encode or decode a value (issue #2065)?
     ///
     /// True for [`HarvestError::Codec`], [`HarvestError::UnknownCodecKey`] and
-    /// [`HarvestError::UnknownPayloadCodec`]. A key outage or a missing key can
-    /// end, so the operation is retryable and not a verdict on its target.
+    /// [`HarvestError::UnknownPayloadCodec`]. A key outage ends, and an operator
+    /// can add a missing key. So the operation is retryable and is not a
+    /// verdict on its target.
     #[must_use]
     pub const fn is_codec_failure(&self) -> bool {
         matches!(

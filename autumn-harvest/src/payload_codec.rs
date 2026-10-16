@@ -1812,15 +1812,21 @@ impl PayloadCodecs {
     /// Re-encode a stored column value for a copy into a new row (issue #2065).
     ///
     /// A retry, a continue-as-new successor and a reset fork are new writes.
-    /// This decodes `stored`, then encodes it as [`PayloadCodecs::encode_column`]
-    /// does. A clear legacy value is encoded, and ciphertext moves to the active
-    /// key. A value this registry cannot decode keeps its stored bytes, so the
+    /// With column encoding on, this decodes `stored`, then encodes it as
+    /// [`PayloadCodecs::encode_column`] does. A clear legacy value is encoded,
+    /// and ciphertext moves to the active key. With column encoding off, the
+    /// copy keeps the stored bytes, so it never turns ciphertext into clear.
+    /// A value this registry cannot decode also keeps its stored bytes, so the
     /// copy never loses or guesses a value.
     ///
     /// # Errors
     ///
     /// [`HarvestError`] when the codec fails to encode the decoded value.
+    #[cfg(feature = "db")]
     pub(crate) fn recode_column_for_copy(&self, stored: &Value) -> HarvestResult<Value> {
+        if !self.column_encoding() {
+            return Ok(stored.clone());
+        }
         match self.decode_column(stored) {
             Ok(plain) => self.encode_column(&plain),
             Err(error) if error.is_codec_failure() => Ok(stored.clone()),
@@ -1833,6 +1839,7 @@ impl PayloadCodecs {
     /// # Errors
     ///
     /// As [`PayloadCodecs::recode_column_for_copy`].
+    #[cfg(feature = "db")]
     pub(crate) fn recode_column_opt_for_copy(
         &self,
         stored: Option<&Value>,
@@ -3997,6 +4004,7 @@ mod tests {
 
     // ── recode for a row copy (issue #2065) ──────────────────────────────
 
+    #[cfg(feature = "db")]
     fn keyed_codecs(columns: bool) -> PayloadCodecs {
         let codecs = PayloadCodecs::default();
         codecs
@@ -4007,6 +4015,7 @@ mod tests {
         codecs
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn recode_encodes_a_legacy_plaintext_value() {
         let codecs = keyed_codecs(true);
@@ -4016,6 +4025,7 @@ mod tests {
         assert_eq!(codecs.decode_column(&copied).expect("decode"), plain);
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn recode_rewraps_ciphertext_once() {
         let codecs = keyed_codecs(true);
@@ -4030,6 +4040,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "db")]
     #[test]
     fn recode_leaves_plaintext_in_clear_while_column_encoding_is_off() {
         let codecs = keyed_codecs(false);
@@ -4040,6 +4051,20 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_keeps_ciphertext_while_column_encoding_is_off() {
+        let on = keyed_codecs(true);
+        let stored = on.encode_column(&json!({"a": 1})).expect("encode");
+        let off = keyed_codecs(false);
+        assert_eq!(
+            off.recode_column_for_copy(&stored).expect("recode"),
+            stored,
+            "a copy must not turn ciphertext into clear"
+        );
+    }
+
+    #[cfg(feature = "db")]
     #[test]
     fn recode_keeps_the_stored_bytes_when_the_key_is_missing() {
         let writer = keyed_codecs(true);
@@ -4053,6 +4078,24 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_keeps_a_corrupt_envelope_as_stored() {
+        let codecs = keyed_codecs(true);
+        let corrupt = json!({
+            CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_KEYED,
+            "codec_id": "xor",
+            "kid": "k1",
+            "data": "not base64 !!",
+        });
+        assert_eq!(
+            codecs.recode_column_for_copy(&corrupt).expect("recode"),
+            corrupt,
+            "an unreadable value is copied as stored"
+        );
+    }
+
+    #[cfg(feature = "db")]
     #[test]
     fn recode_reports_an_encode_failure() {
         let err = broken_codecs()

@@ -107,6 +107,89 @@ pub async fn send_signal_idempotent(
     .await
 }
 
+/// Refuse a signal for an execution that cannot accept one (issue #2065).
+///
+/// The insert path runs it after the insert. A codec failure runs it first, so
+/// a terminal target still reports its terminal state, not the codec failure.
+#[cfg(feature = "db")]
+fn signal_state_refusal(
+    exec_id: ExecutionId,
+    execution: &crate::models::WorkflowExecution,
+) -> HarvestResult<()> {
+    match execution.state.as_str() {
+        // PAUSED is a non-terminal active state: a paused workflow
+        // waiting on a signal must still accept (buffer) it so it is
+        // delivered on resume. The wake after the insert re-pends the task, which
+        // the claim gate defers until the execution is RUNNING.
+        "RUNNING" | "PAUSED" => {}
+        // Issue #964. Neither is terminal, and calling them terminal is the
+        // damaging answer: a caller that sees "terminal" reasonably stops
+        // retrying, and the outbox records `target_terminal` in the
+        // sender's history for a workflow that is alive.
+        //
+        // `MIGRATED` — the run was rebalanced onto another shard; this row
+        // is the seal it left behind. The caller reached the wrong database
+        // and should re-resolve through the forwarding pointer.
+        // `MIGRATING` — a staged copy that is not live yet; it becomes
+        // claimable at activation, moments away.
+        //
+        // Both are reported as `ShardUnavailable`, which is the engine's
+        // existing RETRYABLE classification (`HarvestError::is_shard_unavailable`),
+        // so the outbox leaves the row pending and tries again rather than
+        // failing the delivery permanently.
+        //
+        // `MIGRATING` covers two different moments (issue #1317). This
+        // row cannot tell them apart. `commit_cutover` writes only the
+        // SOURCE database, on purpose. That lets it commit even when
+        // the target is briefly unreachable. No distributed two-phase
+        // commit is needed.
+        //
+        // A connection resolved to the target sees the same
+        // `MIGRATING` row in both moments: before cutover, and after
+        // cutover but before activation.
+        //
+        // Accepting the write in the first moment is not safe. If the
+        // migration later aborts, the staged copy is discarded. This
+        // signal would go with it. The caller would see `Ok` for a
+        // signal that silently never existed.
+        //
+        // Refusing in the second moment is suboptimal, not unsafe.
+        // Activation normally follows cutover in the same call.
+        // `resume_incomplete_migrations` finishes the pair after a
+        // crash in between.
+        //
+        // Telling the two moments apart needs a source connection, or
+        // a target-side marker from `commit_cutover`. Callers of this
+        // function are not guaranteed a source connection. A
+        // target-side marker would revive the two-phase dependency
+        // cutover deliberately avoids. So this refuses both,
+        // retryably, rather than risk the unsafe one.
+        state @ ("MIGRATED" | "MIGRATING") => {
+            return Err(HarvestError::ShardUnavailable {
+                shard_id: exec_id.shard().as_i32(),
+                reason: format!(
+                    "workflow execution {exec_id} is mid shard-rebalance on this shard \
+                 ({state}); re-resolve it through its forwarding pointer and retry"
+                ),
+            });
+        }
+        "CANCELLED" => {
+            return Err(HarvestError::Cancelled(
+                execution
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("workflow execution {exec_id} is cancelled")),
+            ));
+        }
+        state => {
+            return Err(HarvestError::Config(format!(
+                "workflow execution {exec_id} is terminal ({state})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// [`send_signal_idempotent`], encoding the payload column with `codecs`
 /// (issue #1979).
 ///
@@ -162,6 +245,8 @@ pub async fn send_signal_idempotent_with_codecs(
                     {
                         return Ok(false);
                     }
+                    // A terminal target is a verdict. A codec failure is not.
+                    signal_state_refusal(exec_id, &execution)?;
                     return Err(error);
                 }
             };
@@ -194,74 +279,7 @@ pub async fn send_signal_idempotent_with_codecs(
 
             // Fresh row: the execution must be able to accept it. Returning Err
             // here rolls back the transaction, undoing the insert above.
-            match execution.state.as_str() {
-                // PAUSED is a non-terminal active state: a paused workflow
-                // waiting on a signal must still accept (buffer) it so it is
-                // delivered on resume. The wake below re-pends the task, which
-                // the claim gate defers until the execution is RUNNING.
-                "RUNNING" | "PAUSED" => {}
-                // Issue #964. Neither is terminal, and calling them terminal is the
-                // damaging answer: a caller that sees "terminal" reasonably stops
-                // retrying, and the outbox records `target_terminal` in the
-                // sender's history for a workflow that is alive.
-                //
-                // `MIGRATED` — the run was rebalanced onto another shard; this row
-                // is the seal it left behind. The caller reached the wrong database
-                // and should re-resolve through the forwarding pointer.
-                // `MIGRATING` — a staged copy that is not live yet; it becomes
-                // claimable at activation, moments away.
-                //
-                // Both are reported as `ShardUnavailable`, which is the engine's
-                // existing RETRYABLE classification (`HarvestError::is_shard_unavailable`),
-                // so the outbox leaves the row pending and tries again rather than
-                // failing the delivery permanently.
-                //
-                // `MIGRATING` covers two different moments (issue #1317). This
-                // row cannot tell them apart. `commit_cutover` writes only the
-                // SOURCE database, on purpose. That lets it commit even when
-                // the target is briefly unreachable. No distributed two-phase
-                // commit is needed.
-                //
-                // A connection resolved to the target sees the same
-                // `MIGRATING` row in both moments: before cutover, and after
-                // cutover but before activation.
-                //
-                // Accepting the write in the first moment is not safe. If the
-                // migration later aborts, the staged copy is discarded. This
-                // signal would go with it. The caller would see `Ok` for a
-                // signal that silently never existed.
-                //
-                // Refusing in the second moment is suboptimal, not unsafe.
-                // Activation normally follows cutover in the same call.
-                // `resume_incomplete_migrations` finishes the pair after a
-                // crash in between.
-                //
-                // Telling the two moments apart needs a source connection, or
-                // a target-side marker from `commit_cutover`. Callers of this
-                // function are not guaranteed a source connection. A
-                // target-side marker would revive the two-phase dependency
-                // cutover deliberately avoids. So this refuses both,
-                // retryably, rather than risk the unsafe one.
-                state @ ("MIGRATED" | "MIGRATING") => {
-                    return Err(HarvestError::ShardUnavailable {
-                        shard_id: exec_id.shard().as_i32(),
-                        reason: format!(
-                            "workflow execution {exec_id} is mid shard-rebalance on this shard \
-                         ({state}); re-resolve it through its forwarding pointer and retry"
-                        ),
-                    });
-                }
-                "CANCELLED" => {
-                    return Err(HarvestError::Cancelled(execution.error.unwrap_or_else(
-                        || format!("workflow execution {exec_id} is cancelled"),
-                    )));
-                }
-                state => {
-                    return Err(HarvestError::Config(format!(
-                        "workflow execution {exec_id} is terminal ({state})"
-                    )));
-                }
-            }
+            signal_state_refusal(exec_id, &execution)?;
 
             // ADR-0001 §2.5: harvest.signal.send — PRODUCER, emitted only for an
             // accepted signal. in_scope is synchronous so EnteredSpan (!Send) is
