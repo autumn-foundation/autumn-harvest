@@ -2400,3 +2400,210 @@ async fn activity_rows_stay_clear_while_column_encoding_is_off() {
         "the result stays clear"
     );
 }
+
+// ── event batch buffers (issue #2043) ────────────────────────────────────────
+
+const BATCH_SECRET_A: &str = "cc-batch-a-ssn-111";
+const BATCH_SECRET_B: &str = "cc-batch-b-ssn-222";
+
+fn batch_params(
+    name: &str,
+    key: &str,
+    workflow_id: &str,
+    payload: Value,
+    max_size: usize,
+) -> autumn_harvest::event_batch::AdmitBatchParams {
+    autumn_harvest::event_batch::AdmitBatchParams {
+        workflow_name: name.to_string(),
+        batch_key: key.to_string(),
+        workflow_id: workflow_id.to_string(),
+        queue_name: "default".to_string(),
+        payload,
+        start_options: Default::default(),
+        max_wait: Duration::from_millis(1),
+        max_size,
+        shard_id: 0,
+    }
+}
+
+async fn batch_cells(conn: &mut AsyncPgConnection, key: &str) -> Vec<Value> {
+    let cell: JsonCell = diesel::sql_query(
+        "SELECT buffered_payloads AS value FROM harvest_event_batches WHERE batch_key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(key)
+    .get_result(conn)
+    .await
+    .expect("load the batch row");
+    cell.value.as_array().expect("an array").clone()
+}
+
+#[tokio::test]
+async fn a_buffered_batch_payload_is_ciphertext_and_the_fire_starts_on_plaintext() {
+    use autumn_harvest::event_batch::{
+        admit_batched_start_with_codecs, fire_due_event_batches_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let workflow_id = format!("cc-batch-{}", Uuid::new_v4().simple());
+    let (a, b) = (
+        json!({"ssn": BATCH_SECRET_A}),
+        json!({"ssn": BATCH_SECRET_B}),
+    );
+    for payload in [&a, &b] {
+        admit_batched_start_with_codecs(
+            &mut conn,
+            batch_params("cc_batch_wf", &key, &workflow_id, payload.clone(), 10),
+            None,
+            &codecs,
+        )
+        .await
+        .expect("admit")
+        .expect("admitted");
+    }
+
+    let cells = batch_cells(&mut conn, &key).await;
+    assert_eq!(cells.len(), 2, "one array element per admission");
+    assert_ciphertext(&cells[0], BATCH_SECRET_A, "the first buffered payload");
+    assert_ciphertext(&cells[1], BATCH_SECRET_B, "the second buffered payload");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let fired = fire_due_event_batches_with_codecs(
+        &mut conn,
+        &None,
+        &[],
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &codecs,
+    )
+    .await
+    .expect("fire");
+    assert!(fired >= 1, "the due batch fired");
+    let started = started_execution(&mut conn, "cc_batch_wf", &workflow_id).await;
+    assert_ciphertext(&started.input, BATCH_SECRET_A, "the batched run input");
+    assert_eq!(
+        codecs.decode_column(&started.input).expect("decode"),
+        json!([a, b]),
+        "the run input is the plaintext array, one layer deep"
+    );
+}
+
+#[tokio::test]
+async fn an_immediate_batch_flush_starts_on_plaintext() {
+    use autumn_harvest::event_batch::admit_batched_start_with_codecs;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let workflow_id = format!("cc-flush-{}", Uuid::new_v4().simple());
+    let (a, b) = (
+        json!({"ssn": BATCH_SECRET_A}),
+        json!({"ssn": BATCH_SECRET_B}),
+    );
+    for payload in [&a, &b] {
+        admit_batched_start_with_codecs(
+            &mut conn,
+            batch_params("cc_flush_wf", &key, &workflow_id, payload.clone(), 2),
+            None,
+            &codecs,
+        )
+        .await
+        .expect("admit")
+        .expect("admitted");
+    }
+    let started = started_execution(&mut conn, "cc_flush_wf", &workflow_id).await;
+    assert_ciphertext(&started.input, BATCH_SECRET_A, "the flushed run input");
+    assert_eq!(
+        codecs.decode_column(&started.input).expect("decode"),
+        json!([a, b]),
+        "the flush decodes each element once"
+    );
+}
+
+#[tokio::test]
+async fn batch_payloads_stay_in_clear_while_column_encoding_is_off() {
+    use autumn_harvest::event_batch::admit_batched_start_with_codecs;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(false);
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let payload = json!({"ssn": BATCH_SECRET_A});
+    admit_batched_start_with_codecs(
+        &mut conn,
+        batch_params(
+            "cc_batch_off_wf",
+            &key,
+            &format!("cc-off-{key}"),
+            payload.clone(),
+            10,
+        ),
+        None,
+        &codecs,
+    )
+    .await
+    .expect("admit")
+    .expect("admitted");
+    assert_eq!(batch_cells(&mut conn, &key).await, vec![payload]);
+}
+
+#[tokio::test]
+async fn an_undecodable_batch_row_moves_back_and_is_never_dropped_or_started() {
+    use autumn_harvest::event_batch::{
+        admit_batched_start_with_codecs, fire_due_event_batches_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let reader = reader_without_the_key();
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let workflow_id = format!("cc-stuck-batch-{}", Uuid::new_v4().simple());
+    admit_batched_start_with_codecs(
+        &mut conn,
+        batch_params(
+            "cc_batch_stuck_wf",
+            &key,
+            &workflow_id,
+            json!({"ssn": BATCH_SECRET_A}),
+            10,
+        ),
+        None,
+        &codecs,
+    )
+    .await
+    .expect("admit")
+    .expect("admitted");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    fire_due_event_batches_with_codecs(
+        &mut conn,
+        &None,
+        &[],
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &reader,
+    )
+    .await
+    .expect("a bad row never fails the scan");
+
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_event_batches \
+             WHERE batch_key = $1 AND fire_at > now() + interval '10 seconds'",
+            &key,
+        )
+        .await,
+        1,
+        "the row stays and moves back"
+    );
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
+             WHERE workflow_name = $1",
+            "cc_batch_stuck_wf",
+        )
+        .await,
+        0,
+        "the batch must not start on ciphertext"
+    );
+}
