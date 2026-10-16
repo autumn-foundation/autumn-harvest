@@ -7614,7 +7614,12 @@ impl WorkflowContext {
     /// A withdrawn `CancelTimer` or arm never reaches the worker, so its
     /// durable row is unchanged. Replay holds the same commands, so it
     /// restores the same entries. The newest entry is restored first.
-    pub(crate) fn undo_scope_timer_mutations(&self, seq: u32) {
+    ///
+    /// Returns the timers that the undo gives back to an arm made before the
+    /// scope. That arm's durable row is not the scope's, so the scope cancel
+    /// must not tear it down.
+    pub(crate) fn undo_scope_timer_mutations(&self, seq: u32) -> Vec<TimerId> {
+        let mut restored_arms = Vec::new();
         let undone: Vec<TimerUndo> = {
             let mut journal = self.timer_undo.lock().expect("timer_undo lock poisoned");
             let (undone, kept) = std::mem::take(&mut *journal)
@@ -7624,6 +7629,13 @@ impl WorkflowContext {
             undone
         };
         for entry in undone.into_iter().rev() {
+            if matches!(entry.state, Some(TimerLogicalState::Armed { .. }))
+                && !restored_arms
+                    .iter()
+                    .any(|id: &TimerId| id.as_str() == entry.timer_id)
+            {
+                restored_arms.push(TimerId::new(entry.timer_id.as_str()));
+            }
             {
                 let mut states = self
                     .cancellable_timer_state
@@ -7656,6 +7668,7 @@ impl WorkflowContext {
                 );
             }
         }
+        restored_arms
     }
 
     /// Mark each armed cancellable timer in `timer_ids` as cancelled (issue #1984).

@@ -726,7 +726,7 @@ impl<F: Future> ScopeRun<'_, F> {
                 }
                 ctx.consume_scope_members(&marker.members, marker.horizon..index);
                 // The held commands are the commands that the live cycle withdrew.
-                ctx.undo_scope_timer_mutations(seq);
+                let _ = ctx.undo_scope_timer_mutations(seq);
                 ctx.mark_scope_timers_cancelled(&marker.members.timers);
                 ctx.mark_scope_arms_cancelled(&self.armed_timers());
                 Ok(marker.reason)
@@ -741,7 +741,13 @@ impl<F: Future> ScopeRun<'_, F> {
             ))
         } else {
             withdrawn = ctx.withdraw_scope_commands(seq);
-            let members = ctx.open_scope_members(&self.shared.lock().members);
+            // A withdrawn reset or re-arm leaves an earlier arm in force. Its
+            // durable row is not the scope's, so the cancel keeps it.
+            let restored_arms = ctx.undo_scope_timer_mutations(seq);
+            let mut members = ctx.open_scope_members(&self.shared.lock().members);
+            members
+                .timers
+                .retain(|timer| !restored_arms.contains(timer));
             ctx.consume_cancelled_member_frontier(&members);
             let marker = CancelMarker {
                 reason: SCOPE_CANCEL_REASON.to_string(),
@@ -753,7 +759,6 @@ impl<F: Future> ScopeRun<'_, F> {
                 name,
                 details: serde_json::to_value(&marker).unwrap_or(Value::Null),
             });
-            ctx.undo_scope_timer_mutations(seq);
             ctx.mark_scope_timers_cancelled(&marker.members.timers);
             ctx.mark_scope_arms_cancelled(&self.armed_timers());
             if !marker.members.is_empty() {
@@ -2263,6 +2268,38 @@ mod tests {
         // The next history read delivers the signal.
         let _ = ctx.history_event_count();
         assert!(poked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A timer armed before the scope, then reset and awaited in it. The
+    /// cancel withdraws the reset, so the original arm and its durable row
+    /// stay: the cancel does not tear the timer down.
+    #[tokio::test]
+    async fn a_withdrawn_reset_and_await_keeps_the_pre_scope_timer() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), armed_deadline_history());
+        let _outer = ctx.start_timer("deadline", 60);
+        let result = bounded(run_then_cancel(&ctx, async {
+            ctx.reset_timer("deadline", 30).expect("reset_timer");
+            let _ = ctx.start_timer("deadline", 30).await_fire().await;
+        }))
+        .await;
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+
+        let commands = ctx.drain_commands();
+        assert!(
+            losers(&commands).is_none_or(|losers| losers.timers.is_empty()),
+            "the pre-scope timer is not a member: {commands:?}"
+        );
+        let details = marker(&commands, "cancel_scope:1").expect("recorded");
+        assert_eq!(details["timers"], json!([]), "{details}");
+        let _again = ctx.start_timer("deadline", 60);
+        assert_eq!(
+            arms(&ctx.drain_commands()),
+            0,
+            "the original arm stays armed"
+        );
     }
 
     /// A deploy moves a gate from `version` to `patched`, as documented. A

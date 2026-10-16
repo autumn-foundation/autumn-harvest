@@ -27619,6 +27619,16 @@ async fn process_workflow_task(
                         registry.payload_codecs(),
                     )
                     .await?;
+                    // A race that resolved this cycle tears its losers down.
+                    // The run cancel does not reach an awaited loser child.
+                    let (mut race_starts, _) = apply_race_loser_cancellations(
+                        conn,
+                        prepared.exec_id,
+                        &pending_cmds,
+                        &mut update_event_id,
+                        registry,
+                    )
+                    .await?;
                     let (_, starts, checks, terminal_metric) =
                         crate::execution::cancel_workflow_execution_collect_now(
                             conn,
@@ -27635,13 +27645,14 @@ async fn process_workflow_task(
                             )
                         },
                     ));
+                    race_starts.extend(starts);
                     return Ok(WorkflowPersistFlow::Persisted {
                         retry_scheduled: false,
                         deferred_checks: checks
                             .into_iter()
                             .map(|(id, name)| (id, Some(name)))
                             .collect(),
-                        race_deferred_triggers: starts,
+                        race_deferred_triggers: race_starts,
                         pending_cancel_metrics,
                         continue_as_new_redirected_to_failure: false,
                         deferred_cancel_ended_run: true,
