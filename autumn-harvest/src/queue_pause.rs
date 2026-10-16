@@ -68,6 +68,30 @@ use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
 use diesel_async::AsyncPgConnection;
 
+/// Build the late-pass statement. `$tail` is the optional `RETURNING` clause.
+///
+/// One body feeds both variants, so they cannot drift apart.
+macro_rules! late_arrivals_sql {
+    ($tail:literal) => {
+        concat!(
+            "UPDATE harvest_task_queue \
+             SET scheduled_at = CASE \
+                   WHEN created_at IS NULL OR created_at < $2 \
+                     THEN scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2)) \
+                   ELSE clock_timestamp() \
+                 END \
+             WHERE queue_name = $1 \
+               AND state = 'PENDING' \
+               AND scheduled_at <= clock_timestamp() \
+               AND NOT EXISTS ( \
+                     SELECT 1 FROM unnest($3::uuid[]) AS already(id) \
+                     WHERE already.id = harvest_task_queue.id \
+                   )",
+            $tail
+        )
+    };
+}
+
 /// One id returned by a resume shift pass.
 ///
 /// The second pass excludes the ids of the first pass. The resume publishes a
@@ -920,26 +944,25 @@ pub const fn resume_shift_scheduled_at_query() -> &'static str {
 /// rather than eliminated.
 ///
 /// The statement returns the ids it shifts. The resume publishes a dispatch
-/// hint for each one after commit (issue #2066).
+/// hint for each one after commit (issue #2066). A resume with no dispatch
+/// channel runs [`resume_shift_late_arrivals_count_query`] instead.
 ///
 /// Binds: `$1` = queue name, `$2` = the hold's `paused_at`, `$3` = the ids the
 /// primary pass reported shifting.
 #[must_use]
 pub const fn resume_shift_late_arrivals_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET scheduled_at = CASE \
-           WHEN created_at IS NULL OR created_at < $2 \
-             THEN scheduled_at + (clock_timestamp() - GREATEST(scheduled_at, $2)) \
-           ELSE clock_timestamp() \
-         END \
-     WHERE queue_name = $1 \
-       AND state = 'PENDING' \
-       AND scheduled_at <= clock_timestamp() \
-       AND NOT EXISTS ( \
-             SELECT 1 FROM unnest($3::uuid[]) AS already(id) \
-             WHERE already.id = harvest_task_queue.id \
-           ) \
-     RETURNING id"
+    late_arrivals_sql!(" RETURNING id")
+}
+
+/// The same statement as [`resume_shift_late_arrivals_query`], without the
+/// `RETURNING` clause.
+///
+/// The late pass covers every due task created during the pause. After a long
+/// pause that set can be the whole backlog. A resume with no dispatch channel
+/// needs only the row count, so it must not load the ids (issue #2066).
+#[must_use]
+pub const fn resume_shift_late_arrivals_count_query() -> &'static str {
+    late_arrivals_sql!("")
 }
 
 /// The `GET /admin/queues/paused` read, and the Vantage Workers banner's source.
@@ -1493,22 +1516,32 @@ pub async fn resume_queue(
         // (the counts sum exactly, no row is shifted twice) for any commit
         // order rather than only for the ones a `created_at` test happens
         // to separate.
-        let late_shifted: Vec<ShiftedTaskId> =
-            diesel::sql_query(resume_shift_late_arrivals_query())
-                .bind::<diesel::sql_types::Text, _>(&queue_owned)
-                .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
-                .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
-                .load(conn)
-                .await?;
-        let late = late_shifted.len();
-        // The late rows need a hint too. Their reference may sit in release
-        // backoff (issue #2066).
-        if crate::dispatch::hints_wanted() {
+        // Load the ids only when a channel will publish them. The late pass can
+        // cover the whole backlog created during a long pause (issue #2066).
+        let late = if crate::dispatch::hints_wanted() {
+            let late_shifted: Vec<ShiftedTaskId> =
+                diesel::sql_query(resume_shift_late_arrivals_query())
+                    .bind::<diesel::sql_types::Text, _>(&queue_owned)
+                    .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
+                    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
+                    .load(conn)
+                    .await?;
+            let count = late_shifted.len();
+            // The late rows need a hint too. Their reference may sit in
+            // release backoff.
             collector
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .extend(late_shifted.into_iter().map(|r| r.id));
-        }
+            count
+        } else {
+            diesel::sql_query(resume_shift_late_arrivals_count_query())
+                .bind::<diesel::sql_types::Text, _>(&queue_owned)
+                .bind::<diesel::sql_types::Timestamptz, _>(row.paused_at)
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&shifted_ids)
+                .execute(conn)
+                .await?
+        };
 
         // Wake sleeping listeners (issue #619 round-17 review).
         //
