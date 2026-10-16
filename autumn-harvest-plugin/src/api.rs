@@ -10818,8 +10818,14 @@ fn schema_validation_response(
 /// `eq`/`ne`/`in` compare against the stored JSONB value by type (so
 /// `amount:eq:100` matches numeric `100`, not the string `"100"`).
 pub(crate) fn coerce_scalar(raw: &str) -> JsonText {
-    // A number keeps every digit. Text such as `+5` or `.5` is a number too.
-    if let Some(number) = number_json(raw.strip_prefix('+').unwrap_or(raw)) {
+    // A number keeps every digit. One leading `+`, as in `+5`, is allowed.
+    // A second sign, as in `+-5`, makes the token a string.
+    let digits = match raw.strip_prefix('+') {
+        Some(rest) if rest.starts_with(['+', '-']) => None,
+        Some(rest) => Some(rest),
+        None => Some(raw),
+    };
+    if let Some(number) = digits.and_then(number_json) {
         return number;
     }
     match raw {
@@ -54584,7 +54590,7 @@ mod tests {
     fn coerce_scalar_never_builds_invalid_json() {
         // A second `+` is not a number, so the token stays a string.
         assert_eq!(coerce_scalar("++5"), serde_json::json!("++5"));
-        assert_eq!(coerce_scalar("+-5"), serde_json::json!(-5));
+        assert_eq!(coerce_scalar("+-5"), serde_json::json!("+-5"));
         // A very long number stays a string and costs no more memory.
         let long = "1".repeat(2000);
         assert_eq!(coerce_scalar(&long), serde_json::json!(long));

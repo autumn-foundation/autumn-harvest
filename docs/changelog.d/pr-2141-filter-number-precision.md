@@ -8,7 +8,7 @@ loses its leading zeros, a bare `.5` and a trailing `.`, so it stays valid JSON.
 A number outside the `f64` range, or longer than 1024 bytes, still gets `400`.
 
 The legacy `search_attr_filter` parameter uses the same conversion. It still
-reads `+5` and `.5` as numbers. A token such as `++5` or an over-long number
+reads `+5` and `.5` as numbers. A token such as `++5`, `+-5` or an over-long number
 stays a string.
 
 Tests: `number_literals_keep_every_digit_when_bound`,
