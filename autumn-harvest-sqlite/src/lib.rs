@@ -118,7 +118,7 @@
 //!   `finalize_activity_failure` (issue #1069 P2). A legacy `Err(String)` decodes to
 //!   `error_type = "Error"`, `non_retryable = false`, `details = None`, unchanged.
 //! - **Payload depth is capped at ingress** (issue #2157). `serde_json` reads at most
-//!   128 levels. A start input, memo or signal payload that nests deeper than
+//!   128 levels. A start input, memo, signal payload or update input that nests deeper than
 //!   [`MAX_PAYLOAD_DEPTH`] is refused with [`SqliteError::PayloadTooDeep`] before
 //!   anything is persisted. The run stays live and the driver stays healthy.
 //! - **Payload-size caps are enforced at every boundary, matching the core** (issue

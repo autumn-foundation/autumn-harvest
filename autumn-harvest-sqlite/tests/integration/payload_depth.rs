@@ -40,9 +40,11 @@ async fn echo_input(ctx: &WorkflowContext, input: Value) -> Result<Value, String
     Ok(input)
 }
 
-/// Wait for the `go` signal, then echo its payload.
+/// Wait for the `go` signal, then echo its payload. Also serves an `echo`
+/// update.
 #[workflow]
 async fn echo_signal(ctx: &WorkflowContext, _input: Value) -> Result<Value, String> {
+    ctx.register_update_handler_no_validator("echo", |input: Value| async move { Ok(input) });
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
@@ -213,4 +215,27 @@ async fn memo_at_the_cap_is_accepted() {
         .unwrap();
     let state = rt.run_until_blocked(outcome.exec_id).await.unwrap();
     assert!(matches!(state, RunState::Completed(_)));
+}
+
+#[tokio::test]
+async fn update_input_obeys_the_cap_and_the_run_stays_live() {
+    let mut rt = runtime();
+    let exec = rt.start_workflow("echo_signal", json!(0)).unwrap();
+    rt.run_until_idle().await.unwrap();
+
+    let err = rt
+        .update(exec, "echo", nested(MAX_PAYLOAD_DEPTH + 1))
+        .await
+        .unwrap_err();
+    assert_too_deep(&err, "update_input");
+    rt.run_until_idle().await.unwrap();
+
+    let input = nested(MAX_PAYLOAD_DEPTH);
+    let result = rt.update(exec, "echo", input.clone()).await.unwrap();
+    assert_eq!(result, input);
+    // The history, with the stored update, reads back.
+    rt.run_until_idle().await.unwrap();
+    rt.send_signal(exec, "go", json!("ok")).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(ref v) if v == "ok"));
 }

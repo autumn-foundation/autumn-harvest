@@ -1547,6 +1547,8 @@ impl SqliteRuntime {
     /// - [`SqliteError::ExecutionNotFound`] for an unknown id.
     /// - [`SqliteError::WorkflowNotRunning`] for a terminal run.
     /// - [`SqliteError::UnknownWorkflow`] if the workflow is not registered.
+    /// - [`SqliteError::PayloadTooDeep`] if `input` nests past
+    ///   [`MAX_PAYLOAD_DEPTH`].
     /// - [`SqliteError::UpdateInputInvalid`] if `input` fails the arg schema
     ///   of a declarative handler.
     /// - [`SqliteError::UpdateRejected`] if the validator rejects `input` or
@@ -1565,6 +1567,7 @@ impl SqliteRuntime {
     /// - [`SqliteError::UpdateFailed`] if the handler returns an error or
     ///   panics. History records `WorkflowEvent::UpdateFailed`.
     /// - A persistence error if the history cannot be read or written.
+    #[allow(clippy::too_many_lines)] // one linear admission sequence
     pub async fn update(
         &mut self,
         exec: ExecutionId,
@@ -1573,6 +1576,7 @@ impl SqliteRuntime {
     ) -> SqliteResult<Value> {
         self.seal_if_overdue(exec)?;
         refuse_unless_running(&self.conn, exec)?;
+        check_depth("update_input", &input)?;
         let workflow_name = store::workflow_name_of(&self.conn, exec)?;
         let handler = *self
             .workflows
@@ -3997,6 +4001,9 @@ fn children(value: &Value) -> Option<Children<'_>> {
 /// The walk keeps one iterator per open container. A recursive walk would
 /// overflow the call stack on the input it must refuse. Memory use is bound
 /// by the cap, not by the width of the value.
+///
+/// Call it before any code that recurses over the value, such as a schema check
+/// or a settlement decoder.
 fn check_depth(kind: &'static str, value: &Value) -> SqliteResult<()> {
     let mut open: Vec<Children<'_>> = children(value).into_iter().collect();
     while let Some(top) = open.last_mut() {

@@ -1,7 +1,7 @@
 ## Fix — SQLite payload depth cap (issue #2157)
 
-The SQLite backend refuses a start input, memo or signal payload that nests
-deeper than `MAX_PAYLOAD_DEPTH` (100). Ingress returns the new
+The SQLite backend refuses a start input, memo, signal payload or update
+input that nests deeper than `MAX_PAYLOAD_DEPTH` (100). Ingress returns the new
 `SqliteError::PayloadTooDeep` before it persists anything.
 
 `serde_json` writes any depth but reads at most 128 levels. Before this fix, a
