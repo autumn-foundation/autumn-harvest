@@ -2762,10 +2762,8 @@ async fn the_outbox_leaves_a_signal_pending_while_the_codec_fails() {
     assert_ciphertext(&stored[0], SIGNAL_SECRET, "the delivered signal");
 }
 
-#[tokio::test]
-async fn a_terminal_target_wins_over_a_codec_failure() {
-    use autumn_harvest::schema::harvest_workflow_executions;
-
+/// Send a signal to a target in `state` while the codec fails.
+async fn signal_with_failing_codec(state: &str) -> autumn_harvest::error::HarvestError {
     let (url, _c) = setup_test_database_url_or_env().await;
     let queue = format!("cc-{}", Uuid::new_v4().simple());
     let mut conn = connect(&url).await;
@@ -2777,14 +2775,20 @@ async fn a_terminal_target_wins_over_a_codec_failure() {
         None,
     )
     .await;
-    diesel::update(harvest_workflow_executions::table.find(target.as_uuid()))
-        .set(harvest_workflow_executions::state.eq("COMPLETED"))
-        .execute(&mut conn)
-        .await
-        .expect("seal the target");
+    // A `MIGRATED` row also needs its forward pointer (a check constraint).
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = $1, \
+         migrated_to_shard = CASE WHEN $1 = 'MIGRATED' THEN 1 END, \
+         migrated_at = CASE WHEN $1 = 'MIGRATED' THEN now() END WHERE id = $2",
+    )
+    .bind::<diesel::sql_types::Text, _>(state)
+    .bind::<diesel::sql_types::Uuid, _>(target.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("move the target to the state");
 
     let failing = Arc::new(AtomicBool::new(true));
-    let err = autumn_harvest::signal::send_signal_idempotent_with_codecs(
+    autumn_harvest::signal::send_signal_idempotent_with_codecs(
         &mut conn,
         target,
         "go",
@@ -2793,11 +2797,27 @@ async fn a_terminal_target_wins_over_a_codec_failure() {
         &toggle_codecs(&failing),
     )
     .await
-    .expect_err("the target is terminal");
+    .expect_err("the signal is refused")
+}
+
+#[tokio::test]
+async fn a_terminal_target_wins_over_a_codec_failure() {
+    let err = signal_with_failing_codec("COMPLETED").await;
     assert!(
         !err.is_codec_failure(),
         "a terminal target must report its state: {err:?}"
     );
+}
+
+#[tokio::test]
+async fn a_shard_move_does_not_hide_a_codec_failure() {
+    for state in ["MIGRATED", "MIGRATING"] {
+        let err = signal_with_failing_codec(state).await;
+        assert!(
+            err.is_codec_failure(),
+            "{state} must leave the request pending: {err:?}"
+        );
+    }
 }
 
 const SIGNAL_MARKER: &str = "cc-inline-poke-marker";

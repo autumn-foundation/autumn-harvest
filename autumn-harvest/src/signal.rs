@@ -246,7 +246,13 @@ pub async fn send_signal_idempotent_with_codecs(
                         return Ok(false);
                     }
                     // A terminal target is a verdict. A codec failure is not.
-                    signal_state_refusal(exec_id, &execution)?;
+                    // A shard move is not a verdict either, so the codec
+                    // failure stays and the request stays pending.
+                    if let Err(refusal) = signal_state_refusal(exec_id, &execution)
+                        && !refusal.is_shard_unavailable()
+                    {
+                        return Err(refusal);
+                    }
                     return Err(error);
                 }
             };
