@@ -69,9 +69,11 @@ fn rows_of(path: &std::path::Path, exec: &str) -> Vec<(&'static str, i64)> {
         .collect()
 }
 
-/// Age every closed run by two hours.
-fn two_hours_later(rt: &mut SqliteRuntime) {
-    rt.set_clock(|| Utc::now() + chrono::Duration::hours(2));
+/// Purge with the window counted from two hours on, so each run closed now
+/// is past a one-hour window.
+fn purge_two_hours_on(rt: &mut SqliteRuntime) -> u64 {
+    rt.purge_terminal_as_of(Utc::now() + chrono::Duration::hours(2), HOUR)
+        .unwrap()
 }
 
 // AC2: purge removes a terminal run past the window, with every row of it,
@@ -99,8 +101,7 @@ async fn purge_removes_terminal_runs_past_the_window_and_keeps_live_ones() {
         rows_of(&path, &done.to_string())
     );
 
-    two_hours_later(&mut rt);
-    assert_eq!(rt.purge_terminal(HOUR).unwrap(), 1);
+    assert_eq!(purge_two_hours_on(&mut rt), 1);
 
     for (table, n) in rows_of(&path, &done.to_string()) {
         assert_eq!(n, 0, "{table} keeps no row of the purged run");
@@ -118,11 +119,11 @@ async fn purge_removes_terminal_runs_past_the_window_and_keeps_live_ones() {
         ),
         "the live run still finishes"
     );
-    rt.set_clock(Utc::now);
     assert_eq!(rt.purge_terminal(HOUR).unwrap(), 0, "it closed just now");
 }
 
-// A run closed inside the window stays.
+// A run closed inside the window stays. The window counts on the real clock,
+// as `closed_at` does, so the runtime clock does not move it.
 #[tokio::test]
 async fn purge_keeps_terminal_runs_inside_the_window() {
     let dir = tempfile::tempdir().unwrap();
@@ -132,14 +133,37 @@ async fn purge_keeps_terminal_runs_inside_the_window() {
     rt.run_until_blocked(exec).await.unwrap();
 
     assert_eq!(rt.purge_terminal(HOUR).unwrap(), 0);
+    rt.set_clock(|| Utc::now() + chrono::Duration::days(30));
+    assert_eq!(
+        rt.purge_terminal(HOUR).unwrap(),
+        0,
+        "the runtime clock is not used"
+    );
     rt.describe(exec).expect("the run stays");
     assert_eq!(rt.purge_terminal(Duration::MAX).unwrap(), 0);
 }
 
-// A terminal run whose key has a RUNNING run stays. Its keyed signals still
-// dedupe for the live run of the chain (issue #2028).
+// A RUNNING row is never a candidate, even with a close time.
 #[tokio::test]
-async fn purge_keeps_the_sealed_prior_of_a_running_key() {
+async fn purge_never_removes_a_running_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("running.sqlite3");
+    let mut rt = runtime(&path);
+    let live = rt.start_workflow("busy", json!(1)).unwrap();
+    rt.run_until_blocked(live).await.unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute("UPDATE harvest_executions SET closed_at = 1", [])
+        .unwrap();
+
+    assert_eq!(purge_two_hours_on(&mut rt), 0);
+    rt.describe(live).expect("the running row stays");
+}
+
+// Only the close time counts, as on Postgres. The old run of a chain goes,
+// even while the newest run of the chain still runs.
+#[tokio::test]
+async fn purge_removes_an_old_run_of_a_live_chain() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("prior.sqlite3");
     let mut rt = runtime(&path);
@@ -155,15 +179,16 @@ async fn purge_keeps_the_sealed_prior_of_a_running_key() {
         .unwrap();
     rt.run_until_blocked(new.exec_id).await.unwrap();
 
-    two_hours_later(&mut rt);
-    assert_eq!(rt.purge_terminal(HOUR).unwrap(), 0);
-    rt.describe(old)
-        .expect("the sealed prior stays while its key runs");
-
+    assert_eq!(purge_two_hours_on(&mut rt), 1);
+    assert!(matches!(
+        rt.describe(old),
+        Err(SqliteError::ExecutionNotFound(_))
+    ));
     rt.send_signal(new.exec_id, "go", json!(null)).unwrap();
-    rt.run_until_blocked(new.exec_id).await.unwrap();
-    rt.set_clock(|| Utc::now() + chrono::Duration::hours(2));
-    assert_eq!(rt.purge_terminal(HOUR).unwrap(), 2, "both go once it ends");
+    assert!(matches!(
+        rt.run_until_blocked(new.exec_id).await.unwrap(),
+        RunState::Completed(_)
+    ));
 }
 
 // A row closed before issue #2027 has no `closed_at`. Its age is unknown, so
@@ -180,8 +205,29 @@ async fn purge_keeps_a_row_with_no_close_time() {
         .execute("UPDATE harvest_executions SET closed_at = NULL", [])
         .unwrap();
 
-    two_hours_later(&mut rt);
-    assert_eq!(rt.purge_terminal(HOUR).unwrap(), 0);
+    assert_eq!(purge_two_hours_on(&mut rt), 0);
+}
+
+// A damaged id cannot stall retention. The purge skips it and removes the
+// rest, and a second purge ends at once.
+#[tokio::test]
+async fn purge_skips_a_damaged_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("damaged.sqlite3");
+    let mut rt = runtime(&path);
+    let exec = rt.start_workflow("echo", json!(1)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO harvest_executions (exec_id, workflow_name, input_json, state, closed_at) \
+             VALUES (x'00ff', 'echo', '1', 'COMPLETED', 1)",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(purge_two_hours_on(&mut rt), 1);
+    assert_eq!(purge_two_hours_on(&mut rt), 0);
 }
 
 // More runs than one batch all go, and the count is exact.
@@ -194,7 +240,6 @@ async fn purge_removes_more_runs_than_one_batch() {
     }
     rt.run_until_idle().await.unwrap();
 
-    two_hours_later(&mut rt);
-    assert_eq!(rt.purge_terminal(HOUR).unwrap(), 600);
-    assert_eq!(rt.purge_terminal(HOUR).unwrap(), 0);
+    assert_eq!(purge_two_hours_on(&mut rt), 600);
+    assert_eq!(purge_two_hours_on(&mut rt), 0);
 }

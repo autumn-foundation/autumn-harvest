@@ -236,6 +236,12 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
 CREATE INDEX IF NOT EXISTS idx_harvest_tasks_seq
     ON harvest_tasks (seq);
 
+-- A purge deletes the tasks of a batch of runs by `exec_id` (issue #2031).
+-- Without this index, each batch scans the whole table, so a large purge is
+-- quadratic. The column exists in every file, so the base schema builds it.
+CREATE INDEX IF NOT EXISTS idx_harvest_tasks_exec
+    ON harvest_tasks (exec_id);
+
 CREATE TABLE IF NOT EXISTS harvest_timers (
     timer_id TEXT NOT NULL,
     exec_id  TEXT NOT NULL,
@@ -325,6 +331,11 @@ CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
     ok          INTEGER NOT NULL,         -- 1 = success, 0 = failure
     detail      TEXT NOT NULL             -- output JSON on success, error on failure
 );
+
+-- A purge deletes the attempts of a batch of runs by `exec_id` (issue
+-- #2031), as for `harvest_tasks` above.
+CREATE INDEX IF NOT EXISTS idx_harvest_activity_attempts_exec
+    ON harvest_activity_attempts (exec_id);
 ";
 
 /// The append-only guard on `harvest_events` (issue #2031), the analog of
@@ -403,11 +414,11 @@ use crate::error::SqliteResult;
 ///   `local_retry_at`.
 ///   Each is nullable or has a default, so an old row has no timeout and no
 ///   retry. The mutex tables are new, so `CREATE TABLE IF NOT EXISTS` adds them.
-/// - **issue #2031** — `harvest_executions.schedule_name`, and two partial
-///   indexes: the run count of a schedule and the close time that retention
-///   reads. The column is nullable, so an old row is not a scheduled run. The
-///   indexes are built here, because the base [`SCHEMA`] runs before an old
-///   table has the columns.
+/// - **issue #2031** — `harvest_executions.schedule_name` and two indexes.
+///   One counts the active runs of a schedule. The other holds the close
+///   time that retention reads. The column is nullable, so an old row is not
+///   a scheduled run. The indexes are built here, because the base
+///   [`SCHEMA`] runs before an old table has the columns.
 ///
 /// # Errors
 ///
@@ -518,14 +529,15 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     Ok(())
 }
 
-/// The indexes of issue #2031. The first counts the active runs of a
-/// schedule. The second finds the runs that retention can remove. Both are
-/// partial, so a row that is not scheduled or not closed costs nothing.
+/// The two `harvest_executions` indexes of issue #2031. The first counts the
+/// active runs of a schedule. The second finds the runs that retention can
+/// remove, in cursor order. Both are partial, so a row that is not scheduled
+/// or not closed costs nothing.
 const SCHEDULE_AND_RETENTION_INDEXES: &str = "\
     CREATE INDEX IF NOT EXISTS idx_harvest_executions_schedule \
         ON harvest_executions (schedule_name, state) WHERE schedule_name IS NOT NULL; \
     CREATE INDEX IF NOT EXISTS idx_harvest_executions_closed \
-        ON harvest_executions (closed_at) WHERE closed_at IS NOT NULL;";
+        ON harvest_executions (closed_at, exec_id) WHERE closed_at IS NOT NULL;";
 
 /// The partial unique index that enforces a signal idempotency key (issue
 /// #2028). A NULL key is outside the index, so an unkeyed signal always

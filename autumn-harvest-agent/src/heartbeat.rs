@@ -319,9 +319,10 @@ pub async fn agent_heartbeat(
     })
 }
 
-/// A Postgres engine schedule that starts one heartbeat tick per firing.
+/// An engine schedule that starts one heartbeat tick per firing.
 ///
-/// Register it with `HarvestBuilder::workflow_schedule`, for example with
+/// Register it with `HarvestBuilder::workflow_schedule` on Postgres, or with
+/// `SqliteRuntime::upsert_schedule` on SQLite (issue #2031). For example, use
 /// `Schedule::Interval(Duration::from_secs(1_800))` for a tick every 30
 /// minutes.
 ///

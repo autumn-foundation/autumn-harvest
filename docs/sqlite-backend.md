@@ -549,7 +549,7 @@ timeout, a cancel and a non-retryable error never retry.
 starts in the same pass. `run_until_idle` and `poll_once_as_of` fire too.
 `run_until_blocked` drives one run and fires nothing.
 
-```rust
+```rust,ignore
 use autumn_harvest::policy::{Schedule, WorkflowSchedule};
 
 rt.register_workflow(&nightly_info());
@@ -572,13 +572,18 @@ loop {
 - Catch-up is off. After a gap, a schedule fires one run, then counts its
   next slot from now.
 - `Skip` drops a slot while `max_active_runs` runs of the schedule are
-  `RUNNING`. A continue-as-new or retry successor counts. `AllowAll` starts a
-  run for every slot.
+  `RUNNING`. A continue-as-new or retry successor counts. A run past its
+  deadline, or with a pending cancel, does not: Postgres has already ended
+  it. `AllowAll` starts a run for every slot.
+- `run_until_idle` fires on its first pass only. So a slow pass cannot meet
+  new slots without end. The next call fires them.
 - `pause_schedule` stops the fires. `resume_schedule` counts the next slot
   from now, so the missed slots do not fire. `delete_schedule` removes the
   row, and the runs keep running. `list_schedules` reads every row.
-- A slot of an unregistered workflow stays due. The pass returns
-  `UnknownWorkflow`, and the slot fires once the app registers it.
+- A schedule that cannot fire logs a warning and keeps its slot due. It
+  does not fail the pass. An unregistered workflow is one such case: its
+  slot fires once the app registers it. Register each workflow before you
+  poll, or call `delete_schedule` when you remove one.
 - `jitter` is ignored. Jitter spreads the fires of a fleet, and one writer
   has no fleet.
 - Each other field this backend cannot honor is rejected with
@@ -591,13 +596,17 @@ loop {
 **Retention.** `purge_terminal(older_than)` removes each terminal run closed
 more than `older_than` ago, with its events, tasks, timers, signals and
 activity attempts. It returns the number of runs removed. It works in batches
-of 256 runs, one short transaction each.
+of 256 runs, one short transaction each. Indexes on `closed_at` and on each
+table's `exec_id` keep each batch a set of seeks. A damaged row is skipped.
 
 - A `RUNNING` run is never removed.
-- A terminal run stays while a `RUNNING` run shares its
-  `(workflow_name, workflow_id)`. That run reads the keyed signals of its
-  chain (issue #2028).
+- Only the close time counts, as on Postgres. So an old run of a chain goes
+  even while the newest run of the chain runs. Its `successor` is then
+  `ExecutionNotFound`, and a keyed signal that it received no longer
+  dedupes a retry.
 - A run closed before issue #2027 has no close time, so it stays.
+- The window counts on the real clock, because a terminal write stamps
+  `closed_at` from the real clock.
 - A purged id is gone. A later start with its `workflow_id` creates a fresh
   run, as after a Postgres retention sweep.
 - The purge frees pages for reuse, so the file stops growing. It does not
@@ -668,7 +677,7 @@ rejected rather than silently lost.
 A webhook can deliver the same event twice. Give the signal an idempotency
 key, and the run gets it once:
 
-```rust
+```rust,ignore
 // `true`: staged. `false`: this run already holds the key.
 let staged = rt.send_signal_idempotent(exec, "approve", json!(true), Some("hook-42"))?;
 ```
@@ -688,7 +697,7 @@ let staged = rt.send_signal_idempotent(exec, "approve", json!(true), Some("hook-
 
 Signal a run by its business id:
 
-```rust
+```rust,ignore
 let delivery = rt.send_signal_by_workflow_id("order", "order-7", "approve", json!(true), None)?;
 // delivery.exec_id is the run that holds the signal.
 ```
@@ -708,7 +717,7 @@ let delivery = rt.send_signal_by_workflow_id("order", "order-7", "approve", json
 
 Start a run and signal it, or signal the run that exists:
 
-```rust
+```rust,ignore
 let out = rt.signal_with_start(SignalWithStart {
     workflow_name: "order",
     workflow_id: "order-7",

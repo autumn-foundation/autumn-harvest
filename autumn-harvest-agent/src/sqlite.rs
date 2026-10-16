@@ -68,7 +68,9 @@ pub fn start(rt: &mut SqliteRuntime, task: &AgentTask) -> SqliteResult<Execution
 
 /// Start one heartbeat tick. Returns its execution id.
 ///
-/// SQLite has no engine scheduler. Call it from the app on each tick.
+/// Call it from the app on each tick. To let the engine start the ticks,
+/// pass `heartbeat::schedule` to `SqliteRuntime::upsert_schedule` instead
+/// (issue #2031).
 ///
 /// # Errors
 ///

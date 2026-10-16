@@ -501,8 +501,9 @@ let built = HarvestBuilder::new()
 
 The engine keeps one schedule per workflow name, so a deployment has one
 heartbeat schedule. For one heartbeat per user, start each tick from the
-app, or let one scheduled workflow start the ticks. SQLite has no
-scheduler: the app calls `sqlite::start_heartbeat` on each tick.
+app, or let one scheduled workflow start the ticks. On SQLite, pass the
+same `heartbeat::schedule` to `SqliteRuntime::upsert_schedule` (issue
+#2031). An app can also call `sqlite::start_heartbeat` on each tick.
 
 ### Follow-ups
 

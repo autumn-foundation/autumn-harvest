@@ -147,8 +147,10 @@ A complete, runnable version is in
 - **Schedules, retention and the append-only guard (issue #2031).**
   `upsert_schedule` stores a core `WorkflowSchedule`. Each `poll_once` pass
   fires the due slots. A reopen keeps every slot. `purge_terminal(older_than)`
-  removes old terminal runs and keeps live ones. A trigger refuses every
-  `UPDATE` of `harvest_events`, as on Postgres.
+  removes old terminal runs and keeps live ones. Two triggers keep
+  `harvest_events` append-only, the analog of the Postgres guard of issue
+  #1817. This backend has no sanctioned rewriter, so they refuse every
+  `UPDATE` and an `INSERT OR REPLACE`.
 
 ## v0.1 non-goals
 

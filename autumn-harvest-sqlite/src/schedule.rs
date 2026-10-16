@@ -25,6 +25,9 @@ use crate::error::{SqliteError, SqliteResult};
 
 /// One stored schedule, as [`SqliteRuntime::list_schedules`](crate::SqliteRuntime::list_schedules)
 /// returns it.
+///
+/// It is `non_exhaustive`, so a later field is not a breaking change. It has
+/// no `PartialEq`, because [`Schedule`] has none.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct ScheduleSummary {
@@ -224,19 +227,24 @@ pub fn load_due(conn: &Connection, workflow_name: &str, now: i64) -> SqliteResul
     }))
 }
 
-/// The active runs of the schedule `workflow_name`, successors included.
-pub fn active_runs(conn: &Connection, workflow_name: &str) -> SqliteResult<i64> {
+/// The active runs of the schedule `workflow_name` at `now`, successors
+/// included.
+///
+/// A run past its deadline or with a pending cancel does not count. Its next
+/// drive ends it, and Postgres has already ended it.
+pub fn active_runs(conn: &Connection, workflow_name: &str, now: i64) -> SqliteResult<i64> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM harvest_executions \
-         WHERE schedule_name = ?1 AND state = 'RUNNING'",
-        [workflow_name],
+         WHERE schedule_name = ?1 AND state = 'RUNNING' AND cancel_reason IS NULL \
+           AND (deadline_at IS NULL OR deadline_at > ?2)",
+        params![workflow_name, now],
         |row| row.get(0),
     )?)
 }
 
-/// Move `due` to its next slot after a fire at `now`. `started` is `true`
-/// when the fire started a run, so its slot becomes `last_run_at`.
-pub fn advance(conn: &Connection, due: &Due, now: i64, started: bool) -> SqliteResult<()> {
+/// Move `due` to its next slot after a fire at `now`. `dispatched` is `true`
+/// when the slot has its run, so the slot becomes `last_run_at`.
+pub fn advance(conn: &Connection, due: &Due, now: i64, dispatched: bool) -> SqliteResult<()> {
     let slot = to_time(due.slot);
     let next = schedule_plan::next_slot_after_fire(&due.schedule, slot, to_time(now))
         .map(|at| at.timestamp_millis());
@@ -244,7 +252,7 @@ pub fn advance(conn: &Connection, due: &Due, now: i64, started: bool) -> SqliteR
         "UPDATE harvest_schedules SET next_run_at = ?2, \
            last_run_at = CASE WHEN ?3 THEN ?4 ELSE last_run_at END \
          WHERE workflow_name = ?1",
-        params![due.workflow_name, next, started, due.slot],
+        params![due.workflow_name, next, dispatched, due.slot],
     )?;
     Ok(())
 }

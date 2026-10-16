@@ -1896,11 +1896,13 @@ impl SqliteRuntime {
         schedule::upsert(&self.conn, schedule, now)
     }
 
-    /// Remove the schedule of `workflow_name` (issue #2031).
+    /// Remove the schedule of `workflow_name` (issue #2031). Its runs keep
+    /// running.
     ///
     /// # Errors
     ///
     /// Returns [`SqliteError::ScheduleNotFound`] when no schedule exists.
+    /// Returns [`SqliteError::Sqlite`] if the write fails.
     pub fn delete_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
         schedule::delete(&self.conn, workflow_name)
     }
@@ -1910,26 +1912,31 @@ impl SqliteRuntime {
     /// # Errors
     ///
     /// Returns [`SqliteError::ScheduleNotFound`] when no schedule exists.
+    /// Returns [`SqliteError::Sqlite`] if the write fails.
     pub fn pause_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
         let now = (self.now_fn)().timestamp_millis();
         schedule::set_paused(&self.conn, workflow_name, true, now)
     }
 
-    /// Resume the schedule of `workflow_name` (issue #2031).
+    /// Resume the schedule of `workflow_name` (issue #2031). The next slot
+    /// counts from now, so the slots missed while paused do not fire.
     ///
     /// # Errors
     ///
     /// Returns [`SqliteError::ScheduleNotFound`] when no schedule exists.
+    /// Returns [`SqliteError::Corrupt`] for a stored spec that does not parse,
+    /// and [`SqliteError::Sqlite`] if the write fails.
     pub fn resume_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
         let now = (self.now_fn)().timestamp_millis();
         schedule::set_paused(&self.conn, workflow_name, false, now)
     }
 
-    /// Every stored schedule (issue #2031).
+    /// Every stored schedule, by workflow name (issue #2031).
     ///
     /// # Errors
     ///
-    /// Returns [`SqliteError::Sqlite`] if the query fails.
+    /// Returns [`SqliteError::Corrupt`] for a stored spec that does not parse,
+    /// and [`SqliteError::Sqlite`] if the query fails.
     pub fn list_schedules(&self) -> SqliteResult<Vec<ScheduleSummary>> {
         schedule::list(&self.conn)
     }
@@ -1938,22 +1945,44 @@ impl SqliteRuntime {
     /// #2031). Returns the number of runs removed.
     ///
     /// The purge removes the run's events, tasks, timers, signals, activity
-    /// attempts and row. A `RUNNING` run is never removed. A terminal run
-    /// stays while a `RUNNING` run shares its `(workflow_name, workflow_id)`,
-    /// because that run reads the keyed signals of its chain. A run closed
+    /// attempts and row. It works in batches of 256 runs, one short
+    /// transaction each. A `RUNNING` run is never removed. A run closed
     /// before issue #2027 has no close time, so it stays.
+    ///
+    /// The rule is the Postgres one: only the close time counts. So the
+    /// purge also removes an old run of a chain whose newest run still runs.
+    /// Then `successor` of that old run is `ExecutionNotFound`. A keyed
+    /// signal that it received no longer dedupes a retry.
     ///
     /// A purged id is gone. A later start with its `workflow_id` creates a
     /// fresh run, as after a Postgres retention sweep. The purge frees pages
     /// for reuse, so the file stops growing. Run `VACUUM` to shrink it.
     ///
+    /// The window counts on the real clock, because a terminal write stamps
+    /// `closed_at` from the real clock.
+    ///
     /// # Errors
     ///
     /// Returns [`SqliteError::Sqlite`] if a delete fails.
     pub fn purge_terminal(&mut self, older_than: std::time::Duration) -> SqliteResult<u64> {
-        let now = (self.now_fn)().timestamp_micros();
+        self.purge_terminal_as_of(Utc::now(), older_than)
+    }
+
+    /// Like [`purge_terminal`](Self::purge_terminal), with the window counted
+    /// back from `now`. A test seam that ages runs without a sleep.
+    ///
+    /// # Errors
+    ///
+    /// See [`purge_terminal`](Self::purge_terminal).
+    #[doc(hidden)]
+    pub fn purge_terminal_as_of(
+        &mut self,
+        now: DateTime<Utc>,
+        older_than: std::time::Duration,
+    ) -> SqliteResult<u64> {
         let window = i64::try_from(older_than.as_micros()).unwrap_or(i64::MAX);
-        retention::purge_terminal(&mut self.conn, now.saturating_sub(window))
+        let cutoff = now.timestamp_micros().saturating_sub(window);
+        retention::purge_terminal(&mut self.conn, cutoff)
     }
 
     /// Run the query `name` on `exec` with `args`, and return its answer
@@ -2125,6 +2154,10 @@ impl SqliteRuntime {
     /// drives many UNRELATED executions, so one failure must not silently
     /// starve the rest.
     ///
+    /// The pass first fires each due schedule (issue #2031). A fire that
+    /// starts a run is progress. A schedule that cannot fire logs a warning
+    /// and keeps its slot due. It does not fail the pass.
+    ///
     /// # Errors
     ///
     /// Returns the FIRST execution's error, in `ExecutionId` order, if any.
@@ -2134,7 +2167,7 @@ impl SqliteRuntime {
     /// returns `ExecutionNotFound`, because it drives only stored executions.
     pub async fn poll_once(&mut self) -> SqliteResult<bool> {
         let mut skip = HashSet::new();
-        let (progress, first_error) = self.poll_once_pass(&mut skip).await?;
+        let (progress, first_error) = self.poll_once_pass(&mut skip, true).await?;
         first_error.map_or(Ok(progress), Err)
     }
 
@@ -2165,6 +2198,7 @@ impl SqliteRuntime {
     async fn poll_once_pass(
         &mut self,
         skip: &mut HashSet<ExecutionId>,
+        fire: bool,
     ) -> SqliteResult<(bool, Option<SqliteError>)> {
         // Re-read the wall clock per driven cycle (issue #1069 P2) — see the
         // rationale on `run_until_blocked`. The `_as_of` variant keeps a fixed
@@ -2175,7 +2209,7 @@ impl SqliteRuntime {
         let failure_now = move || now_fn().timestamp_millis();
         let mut first_error = None;
         let now = (self.now_fn)().timestamp_millis();
-        let mut progress = self.fire_due_schedules(now, &mut first_error)?;
+        let mut progress = fire && self.fire_due_schedules(now)?;
         for exec in store::running_executions(&self.conn)? {
             if skip.contains(&exec) {
                 continue;
@@ -2211,7 +2245,7 @@ impl SqliteRuntime {
         // `_as_of` simulation: `failure_now() == now` (deterministic, sleep-free).
         let failure_now = move || now;
         let mut first_error = None;
-        let mut progress = self.fire_due_schedules(now, &mut first_error)?;
+        let mut progress = self.fire_due_schedules(now)?;
         for exec in store::running_executions(&self.conn)? {
             match self.drive_one_cycle(exec, now, &failure_now).await {
                 Ok(
@@ -2258,8 +2292,11 @@ impl SqliteRuntime {
     pub async fn run_until_idle(&mut self) -> SqliteResult<()> {
         let mut first_error = None;
         let mut skip = HashSet::new();
-        for _ in 0..MAX_ITERATIONS {
-            let (progress, err) = self.poll_once_pass(&mut skip).await?;
+        for pass in 0..MAX_ITERATIONS {
+            // Only the first pass fires schedules (issue #2031). A later pass
+            // could meet a new slot on a slow clock, and the call would never
+            // quiesce. The next call fires that slot.
+            let (progress, err) = self.poll_once_pass(&mut skip, pass == 0).await?;
             if let Some(err) = err {
                 first_error.get_or_insert(err);
             }
@@ -2273,22 +2310,17 @@ impl SqliteRuntime {
     /// Fire each schedule due at `now` (issue #2031). Returns `true` when a
     /// fire started a run.
     ///
-    /// One schedule's error does not stop the others. It goes to
-    /// `first_error`, as a fleet pass reports a run's error. The slot of an
-    /// unregistered workflow stays due, so it fires once the app registers
-    /// the workflow.
-    fn fire_due_schedules(
-        &mut self,
-        now: i64,
-        first_error: &mut Option<SqliteError>,
-    ) -> SqliteResult<bool> {
+    /// A schedule that cannot fire logs a warning and keeps its slot due. An
+    /// unregistered workflow and a damaged row are such cases. The pass does
+    /// not fail, so one stale schedule cannot stop the fleet. The slot of an
+    /// unregistered workflow fires once the app registers it.
+    fn fire_due_schedules(&mut self, now: i64) -> SqliteResult<bool> {
         let mut started = false;
         for name in schedule::due_names(&self.conn, now)? {
             match self.fire_schedule(&name, now) {
                 Ok(fired) => started |= fired,
                 Err(err) => {
                     tracing::warn!(schedule = %name, error = %err, "a due schedule did not fire");
-                    first_error.get_or_insert(err);
                 }
             }
         }
@@ -2299,10 +2331,15 @@ impl SqliteRuntime {
     /// when the fire started a run.
     ///
     /// The overlap check, the start and the move to the next slot share one
-    /// transaction. So a crash cannot start a slot twice or lose it. Under
-    /// `skip`, a schedule at its run limit drops the slot. The run of a slot
-    /// has a fixed `workflow_id` and starts under `RejectDuplicate`, as on
-    /// Postgres. A slot that already has its run counts as started.
+    /// transaction. So a crash cannot start a slot twice or lose it.
+    ///
+    /// Under `skip`, a schedule at its run limit drops the slot. A run past
+    /// its deadline, or with a pending cancel, does not count. Postgres has
+    /// already ended such a run.
+    ///
+    /// The run of a slot has a fixed `workflow_id` and starts under
+    /// `RejectDuplicate`, as on Postgres. A slot that already has its run is
+    /// dispatched, so it becomes `last_run_at`. It starts no second run.
     fn fire_schedule(&mut self, name: &str, now: i64) -> SqliteResult<bool> {
         self.check_registered(name)?;
         let config = self.start_config(name, now)?;
@@ -2310,16 +2347,16 @@ impl SqliteRuntime {
         let Some(due) = schedule::load_due(&tx, name, now)? else {
             return Ok(false);
         };
-        let started = if !due.allow_all && schedule::active_runs(&tx, name)? >= due.max_active_runs
-        {
+        let full = !due.allow_all && schedule::active_runs(&tx, name, now)? >= due.max_active_runs;
+        let created = if full {
             tracing::info!(schedule = %name, "a schedule slot is dropped: its run limit is reached");
             false
         } else {
             start_slot(&tx, &due, &config, now)?
         };
-        schedule::advance(&tx, &due, now, started)?;
+        schedule::advance(&tx, &due, now, !full)?;
         tx.commit()?;
-        Ok(started)
+        Ok(created)
     }
 
     /// Run one decision cycle, and seal the run `FAILED` when the cycle meets an
@@ -2497,8 +2534,9 @@ impl SqliteRuntime {
         store::append_event(&tx, exec, event)?;
         store::set_failed(&tx, exec, error)?;
         // The cycle's own cleanup, such as a race's loser cancellation, rolled
-        // back with the cycle. This backend has no retention pass, so remove
-        // the work no one can use any more, as the `TerminateIfRunning` seal does.
+        // back with the cycle. Retention removes only whole runs, once they
+        // age out (issue #2031). So remove the work no one can use any more
+        // now, as the `TerminateIfRunning` seal does.
         delete_open_rows(&tx, exec)?;
         tx.commit()?;
         self.workflow_panic_strikes.remove(&exec);
@@ -3685,8 +3723,8 @@ const SEALED_STATE: &str = "CONTINUED_AS_NEW";
 /// staged signals deleted. A keyed row stays (issue #2028). A signal can be staged while the prior is RUNNING. It can then
 /// outlive the prior even if the prior reaches COMPLETED/FAILED on its own (the
 /// workflow never awaited that signal name). The row is then just as unreachable,
-/// regardless of which state sealed it. This backend has no retention/GC pass, so
-/// the row would otherwise survive forever. Then seal to [`SEALED_STATE`] so the prior
+/// regardless of which state sealed it. Retention removes it only with the whole
+/// run, once the run ages out (issue #2031). So the row would otherwise survive. Then seal to [`SEALED_STATE`] so the prior
 /// leaves the active set. Byte-identical
 /// to the pre-#1080 single-prior inline path — extracted so the `TerminateIfRunning`
 /// arm can loop it over EVERY active row for the key
@@ -3778,7 +3816,8 @@ struct FreshRun<'a> {
 }
 
 /// Start the run of the slot of `due` inside the caller's fire transaction
-/// (issue #2031). Returns `false` when the slot already has its run.
+/// (issue #2031). Returns `true` when it creates the run, and `false` when
+/// the slot already has its run.
 fn start_slot(
     conn: &Connection,
     due: &schedule::Due,
@@ -4132,8 +4171,8 @@ fn seal_with_cancel_event(
 
 /// Delete the pending tasks, unfired timers and staged signals of a sealed
 /// `exec`, inside the caller's transaction. No drive uses them again, and
-/// this backend has no retention pass. A keyed signal stays, so a retry of its
-/// key still dedupes (issue #2028).
+/// retention removes them only with the whole run (issue #2031). A keyed
+/// signal stays, so a retry of its key still dedupes (issue #2028).
 fn delete_open_rows(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> {
     queue::delete_pending_tasks_for_execution(conn, exec)?;
     queue::delete_unfired_timers_for_execution(conn, exec)?;

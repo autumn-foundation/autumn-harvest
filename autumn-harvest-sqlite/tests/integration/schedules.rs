@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use autumn_harvest::policy::{CatchupPolicy, OverlapPolicy, Schedule, WorkflowSchedule};
+use autumn_harvest::policy::{
+    CatchupPolicy, JitterPolicy, OverlapPolicy, RetryPolicy, Schedule, WorkflowSchedule,
+};
 use autumn_harvest::prelude::*;
 use autumn_harvest_sqlite::{
     ExecutionFilter, ExecutionSummary, SqliteError, SqliteRuntime, Stored,
@@ -45,6 +47,26 @@ async fn hand_off(ctx: &WorkflowContext, phase: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// Fails at once. Its retry waits ten minutes, so it stays `RUNNING`.
+#[workflow(retry = RetryPolicy {
+    max_attempts: 2,
+    initial_interval: Duration::from_secs(600),
+    backoff_coefficient: 1.0,
+    max_interval: Duration::from_secs(600),
+    non_retryable_errors: Vec::new(),
+    jitter: JitterPolicy::None,
+})]
+async fn fail_then_retry(_ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
+    Err("boom".to_string())
+}
+
+/// Waits for `go` with a 30-second execution timeout.
+#[workflow(execution_timeout = "30s")]
+async fn short_lived(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// 2026-01-01T00:00:00Z in epoch milliseconds.
 const T0: i64 = 1_767_225_600_000;
 const MINUTE: i64 = 60_000;
@@ -62,6 +84,8 @@ fn runtime_at(path: &std::path::Path, clock: &Arc<AtomicI64>) -> SqliteRuntime {
     rt.register_workflow(&tick_info());
     rt.register_workflow(&hold_info());
     rt.register_workflow(&hand_off_info());
+    rt.register_workflow(&fail_then_retry_info());
+    rt.register_workflow(&short_lived_info());
     rt
 }
 
@@ -283,8 +307,28 @@ async fn a_paused_schedule_does_not_fire() {
 
     rt.resume_schedule("tick").unwrap();
     assert_eq!(next_run_at(&rt, "tick"), Some(T0 + 6 * MINUTE));
+    clock.store(T0 + 6 * MINUTE, Ordering::SeqCst);
     rt.poll_once().await.unwrap();
-    assert_eq!(runs(&rt, "tick").len(), 0, "no burst on resume");
+    assert_eq!(
+        runs(&rt, "tick").len(),
+        1,
+        "one run, not one per missed slot"
+    );
+}
+
+// A new schedule upserted paused stays paused.
+#[tokio::test]
+async fn a_new_schedule_can_start_paused() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(AtomicI64::new(T0));
+    let mut rt = runtime_at(&dir.path().join("paused.db"), &clock);
+    let mut paused = every_minute("tick");
+    paused.paused = true;
+    rt.upsert_schedule(&paused).unwrap();
+    assert!(rt.list_schedules().unwrap()[0].paused);
+    clock.store(T0 + MINUTE, Ordering::SeqCst);
+    rt.poll_once().await.unwrap();
+    assert_eq!(runs(&rt, "tick").len(), 0);
 }
 
 // A deleted schedule stops firing. Its run history stays.
@@ -312,7 +356,8 @@ async fn delete_stops_a_schedule() {
     ));
 }
 
-// A slot whose workflow is not registered stays due, and the pass says why.
+// A slot whose workflow is not registered stays due. It logs a warning and
+// does not fail the pass, so the other schedules still fire.
 #[tokio::test]
 async fn an_unregistered_workflow_keeps_its_slot() {
     let dir = tempfile::tempdir().unwrap();
@@ -320,20 +365,46 @@ async fn an_unregistered_workflow_keeps_its_slot() {
     let clock = Arc::new(AtomicI64::new(T0));
     let mut rt = runtime_at(&path, &clock);
     rt.upsert_schedule(&every_minute("tick")).unwrap();
+    rt.upsert_schedule(&every_minute("hold")).unwrap();
     drop(rt);
 
     clock.store(T0 + MINUTE, Ordering::SeqCst);
     let mut bare = SqliteRuntime::open(&path).unwrap();
     follow(&mut bare, &clock);
-    assert!(matches!(
-        bare.poll_once().await,
-        Err(SqliteError::UnknownWorkflow(name)) if name == "tick"
-    ));
+    bare.register_workflow(&hold_info());
+    assert!(bare.poll_once().await.unwrap(), "the hold slot fires");
+    assert_eq!(runs(&bare, "hold").len(), 1);
+    assert_eq!(next_run_at(&bare, "tick"), Some(T0 + MINUTE), "still due");
     drop(bare);
 
     let mut rt = runtime_at(&path, &clock);
     rt.poll_once().await.unwrap();
     assert_eq!(runs(&rt, "tick").len(), 1, "the slot fires once registered");
+}
+
+// A damaged row does not stop the other schedules. `list_schedules` reports
+// it.
+#[tokio::test]
+async fn a_damaged_schedule_row_does_not_stop_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("damaged.db");
+    let clock = Arc::new(AtomicI64::new(T0));
+    let mut rt = runtime_at(&path, &clock);
+    rt.upsert_schedule(&every_minute("tick")).unwrap();
+    rt.upsert_schedule(&every_minute("hold")).unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE harvest_schedules SET schedule_json = 'nope' WHERE workflow_name = 'tick'",
+            [],
+        )
+        .unwrap();
+
+    clock.store(T0 + MINUTE, Ordering::SeqCst);
+    rt.poll_once().await.unwrap();
+    assert_eq!(runs(&rt, "hold").len(), 1);
+    assert_eq!(runs(&rt, "tick").len(), 0);
+    assert!(matches!(rt.list_schedules(), Err(SqliteError::Corrupt(_))));
 }
 
 // Each field this backend cannot honor is rejected by name. A bad spec and
@@ -373,11 +444,41 @@ async fn unsupported_fields_are_rejected_by_name() {
             s
         }),
         ("queue_name", base().with_queue_name("other")),
+        ("dag_name", {
+            let mut s = base();
+            s.dag_name = Some("dag".to_string());
+            s
+        }),
+        ("consecutive_failure_limit", {
+            let mut s = base();
+            s.consecutive_failure_limit = Some(3);
+            s
+        }),
+        ("retry_policy", {
+            let mut s = base();
+            s.retry_policy = Some(RetryPolicy::default());
+            s
+        }),
+        ("execution_timeout", {
+            let mut s = base();
+            s.execution_timeout = Some(Duration::from_secs(5));
+            s
+        }),
+        ("chain_execution_timeout", {
+            let mut s = base();
+            s.chain_execution_timeout = Some(Duration::from_secs(5));
+            s
+        }),
+        ("all_writable_shards", {
+            let mut s = base();
+            s.all_writable_shards = true;
+            s
+        }),
     ];
     for (field, schedule) in cases {
         let err = rt.upsert_schedule(&schedule).unwrap_err();
         assert!(
-            matches!(&err, SqliteError::Unsupported(m) if m.starts_with(&format!("WorkflowSchedule.{field}"))),
+            matches!(&err, SqliteError::Unsupported(m) if m.starts_with(&format!("WorkflowSchedule.{field} —"))),
             "{field}: {err}"
         );
     }
@@ -421,4 +522,190 @@ async fn poll_once_as_of_fires_due_schedules() {
     let at = DateTime::<Utc>::from_timestamp_millis(T0 + MINUTE).unwrap();
     assert!(rt.poll_once_as_of(at).await.unwrap());
     assert_eq!(runs(&rt, "tick").len(), 1);
+}
+
+fn last_run_at(rt: &SqliteRuntime, workflow: &str) -> Option<i64> {
+    rt.list_schedules()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.workflow_name == workflow)
+        .expect("the schedule exists")
+        .last_run_at
+        .map(|at| at.timestamp_millis())
+}
+
+// A late fire keeps the cadence: the next slot counts from the slot, not
+// from the fire. The fired slot becomes `last_run_at`.
+#[tokio::test]
+async fn a_late_fire_keeps_the_cadence() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(AtomicI64::new(T0));
+    let mut rt = runtime_at(&dir.path().join("late.db"), &clock);
+    rt.upsert_schedule(&every_minute("tick")).unwrap();
+
+    clock.store(T0 + MINUTE + 10_000, Ordering::SeqCst);
+    rt.poll_once().await.unwrap();
+    let fired = runs(&rt, "tick");
+    assert_eq!(
+        started_at(&fired[0]),
+        T0 + MINUTE + 10_000,
+        "starts at the fire"
+    );
+    assert_eq!(next_run_at(&rt, "tick"), Some(T0 + 2 * MINUTE));
+    assert_eq!(last_run_at(&rt, "tick"), Some(T0 + MINUTE));
+}
+
+// A dropped slot moves on but keeps the last run's slot.
+#[tokio::test]
+async fn a_dropped_slot_keeps_the_last_run_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(AtomicI64::new(T0));
+    let mut rt = runtime_at(&dir.path().join("drop.db"), &clock);
+    rt.upsert_schedule(&every_minute("hold")).unwrap();
+    clock.store(T0 + MINUTE, Ordering::SeqCst);
+    rt.poll_once().await.unwrap();
+    clock.store(T0 + 2 * MINUTE, Ordering::SeqCst);
+    rt.poll_once().await.unwrap();
+    assert_eq!(last_run_at(&rt, "hold"), Some(T0 + MINUTE));
+    assert_eq!(next_run_at(&rt, "hold"), Some(T0 + 3 * MINUTE));
+}
+
+// `Skip` honors a `max_active_runs` above one.
+#[tokio::test]
+async fn skip_honors_max_active_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(AtomicI64::new(T0));
+    let mut rt = runtime_at(&dir.path().join("max.db"), &clock);
+    let mut two = every_minute("hold");
+    two.max_active_runs = 2;
+    rt.upsert_schedule(&two).unwrap();
+    for slot in 1..=3 {
+        clock.store(T0 + slot * MINUTE, Ordering::SeqCst);
+        rt.poll_once().await.unwrap();
+    }
+    assert_eq!(runs(&rt, "hold").len(), 2, "the third slot is dropped");
+}
+
+// A slot that already has its run starts no second run. It still counts as
+// dispatched, so it becomes `last_run_at`.
+#[tokio::test]
+async fn a_slot_with_a_run_starts_no_second_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dup.db");
+    let clock = Arc::new(AtomicI64::new(T0));
+    let mut rt = runtime_at(&path, &clock);
+    let mut many = every_minute("tick").with_overlap_policy(OverlapPolicy::AllowAll);
+    many.max_active_runs = 10;
+    rt.upsert_schedule(&many).unwrap();
+    clock.store(T0 + MINUTE, Ordering::SeqCst);
+    rt.poll_once().await.unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE harvest_schedules SET next_run_at = ?1, last_run_at = NULL",
+        [T0 + MINUTE],
+    )
+    .unwrap();
+
+    rt.poll_once().await.unwrap();
+    assert_eq!(runs(&rt, "tick").len(), 1, "no second run of the slot");
+    assert_eq!(last_run_at(&rt, "tick"), Some(T0 + MINUTE));
+    assert_eq!(next_run_at(&rt, "tick"), Some(T0 + 2 * MINUTE));
+}
+
+// A workflow retry is the same logical run, so it blocks the next slot.
+#[tokio::test]
+async fn skip_counts_a_workflow_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(AtomicI64::new(T0));
+    let mut rt = runtime_at(&dir.path().join("retry.db"), &clock);
+    rt.upsert_schedule(&every_minute("fail_then_retry"))
+        .unwrap();
+    clock.store(T0 + MINUTE, Ordering::SeqCst);
+    rt.poll_once().await.unwrap();
+    clock.store(T0 + 2 * MINUTE, Ordering::SeqCst);
+    rt.poll_once().await.unwrap();
+    let states: Vec<String> = runs(&rt, "fail_then_retry").iter().map(state).collect();
+    assert_eq!(
+        states,
+        vec!["FAILED".to_string(), "RUNNING".to_string()],
+        "the retry waits for its backoff and blocks the slot"
+    );
+}
+
+// A run past its deadline does not count. Postgres has already ended it.
+#[tokio::test]
+async fn skip_does_not_count_an_overdue_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(AtomicI64::new(T0));
+    let mut rt = runtime_at(&dir.path().join("overdue.db"), &clock);
+    rt.upsert_schedule(&every_minute("short_lived")).unwrap();
+    clock.store(T0 + MINUTE, Ordering::SeqCst);
+    rt.poll_once().await.unwrap();
+    clock.store(T0 + 2 * MINUTE, Ordering::SeqCst);
+    rt.poll_once().await.unwrap();
+    let states: Vec<String> = runs(&rt, "short_lived").iter().map(state).collect();
+    assert_eq!(states, vec!["TIMED_OUT".to_string(), "RUNNING".to_string()]);
+}
+
+// A run with a pending cancel does not count. Postgres has already ended it.
+#[tokio::test]
+async fn skip_does_not_count_a_cancelled_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(AtomicI64::new(T0));
+    let mut rt = runtime_at(&dir.path().join("cancel.db"), &clock);
+    rt.upsert_schedule(&every_minute("hold")).unwrap();
+    clock.store(T0 + MINUTE, Ordering::SeqCst);
+    rt.poll_once().await.unwrap();
+    let first = runs(&rt, "hold")[0].execution_id().unwrap();
+    rt.cancel(first, "stop").unwrap();
+    clock.store(T0 + 2 * MINUTE, Ordering::SeqCst);
+    rt.poll_once().await.unwrap();
+    let states: Vec<String> = runs(&rt, "hold").iter().map(state).collect();
+    assert_eq!(states, vec!["CANCELLED".to_string(), "RUNNING".to_string()]);
+}
+
+// `run_until_idle` fires on its first pass only. A clock that passes a slot
+// on each pass cannot keep it busy.
+#[tokio::test]
+async fn run_until_idle_quiesces_on_a_fast_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rt = runtime_at(&dir.path().join("fast.db"), &Arc::new(AtomicI64::new(T0)));
+    rt.upsert_schedule(&WorkflowSchedule::new(
+        "tick",
+        Schedule::Interval(Duration::from_secs(1)),
+    ))
+    .unwrap();
+    let clock = Arc::new(AtomicI64::new(T0 + 1_000));
+    let ticks = clock.clone();
+    rt.set_clock(move || {
+        DateTime::from_timestamp_millis(ticks.fetch_add(1_000, Ordering::SeqCst)).unwrap()
+    });
+    rt.run_until_idle().await.expect("the call quiesces");
+    assert_eq!(runs(&rt, "tick").len(), 1);
+}
+
+// A cron in a time zone round-trips through the row. Its slot is local.
+#[tokio::test]
+async fn a_cron_in_a_time_zone_fires_at_its_local_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(AtomicI64::new(T0));
+    let mut rt = runtime_at(&dir.path().join("tz.db"), &clock);
+    rt.upsert_schedule(&WorkflowSchedule::new(
+        "tick",
+        Schedule::CronInTimezone {
+            expr: "0 9 * * *".to_string(),
+            tz: "America/New_York".to_string(),
+        },
+    ))
+    .unwrap();
+    let nine_est = T0 + 14 * 60 * MINUTE;
+    assert_eq!(
+        next_run_at(&rt, "tick"),
+        Some(nine_est),
+        "09:00 EST is 14:00Z"
+    );
+    assert!(matches!(
+        &rt.list_schedules().unwrap()[0].schedule,
+        Schedule::CronInTimezone { tz, .. } if tz == "America/New_York"
+    ));
 }
