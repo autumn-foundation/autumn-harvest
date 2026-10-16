@@ -619,10 +619,30 @@ pub(crate) async fn share_payload_refs(
     input_refs: &[crate::payload_store::OffloadedRef],
 ) -> HarvestResult<()> {
     let keys = shared_keys(copied, kept_input, prefix);
-    let refs = crate::store::load_payload_refs(conn, source_id).await?;
-    let mut shared = refs_named_in(refs, &keys);
+    let mut shared = refs_for_keys(conn, source_id, &keys).await?;
     shared.extend_from_slice(input_refs);
     crate::store::insert_payload_refs(conn, new_exec_id, &shared).await
+}
+
+/// The references to `keys`, first from `source_id`, then from any other run.
+///
+/// A reset from before issue #2000 copied envelopes without references. Its
+/// history then names blobs that only an ancestor references. A key that no
+/// run references gets no reference.
+pub(crate) async fn refs_for_keys(
+    conn: &mut AsyncPgConnection,
+    source_id: ExecutionId,
+    keys: &std::collections::HashSet<String>,
+) -> HarvestResult<Vec<crate::payload_store::OffloadedRef>> {
+    let refs = crate::store::load_payload_refs(conn, source_id).await?;
+    let mut found = refs_named_in(refs, keys);
+    let missing = keys
+        .iter()
+        .filter(|key| !found.iter().any(|blob| &blob.blob_key == *key))
+        .cloned()
+        .collect::<Vec<_>>();
+    found.extend(crate::store::load_payload_refs_for_keys(conn, &missing).await?);
+    Ok(found)
 }
 
 /// The blob keys that the copied history names.
@@ -2072,9 +2092,9 @@ pub(crate) async fn serve_recorded_activities(
         // A served stored result names a source blob. The offloader records
         // only the blobs that it uploads, so the fork takes its own reference.
         if let (Some(key), Some(source_id)) = (stored_key, record_source) {
-            let refs = crate::store::load_payload_refs(conn, source_id).await?;
             let named = std::collections::HashSet::from([key]);
-            crate::store::insert_payload_refs(conn, exec_id, &refs_named_in(refs, &named)).await?;
+            let refs = refs_for_keys(conn, source_id, &named).await?;
+            crate::store::insert_payload_refs(conn, exec_id, &refs).await?;
         }
         *next_event_id = next_event_id.saturating_add(1);
         settlement.served = true;

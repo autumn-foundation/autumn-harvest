@@ -821,6 +821,44 @@ pub async fn load_payload_refs(
         .collect())
 }
 
+/// One reference to each of `keys` that any execution on this shard holds.
+///
+/// A copied history can name a blob that its direct source does not
+/// reference. A reset from before issue #2000 copied envelopes without
+/// references, for example. The rows are locked `FOR SHARE`. Retention then
+/// cannot drop the last reference to a blob before the caller commits its own.
+#[cfg(feature = "db")]
+pub async fn load_payload_refs_for_keys(
+    conn: &mut AsyncPgConnection,
+    keys: &[String],
+) -> HarvestResult<Vec<crate::payload_store::OffloadedRef>> {
+    use crate::schema::harvest_payload_refs::dsl;
+
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let rows: Vec<(String, String, i64)> = dsl::harvest_payload_refs
+        .filter(dsl::blob_key.eq_any(wanted))
+        .select((dsl::blob_key, dsl::store_id, dsl::byte_len))
+        .for_share()
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(rows
+        .into_iter()
+        .filter(|(blob_key, _, _)| seen.insert(blob_key.clone()))
+        .map(
+            |(blob_key, store_id, byte_len)| crate::payload_store::OffloadedRef {
+                blob_key,
+                store_id,
+                byte_len: byte_len.max(0).cast_unsigned(),
+            },
+        )
+        .collect())
+}
+
 /// Whether any execution still references `blob_key` (issue #524).
 ///
 /// The retention sweep calls this after an execution row (and its
