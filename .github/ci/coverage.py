@@ -110,11 +110,16 @@ def from_export(doc, root):
                 _add_branch(into, branch[0], str(branch[1]), branch)
             # A branch inside a macro expansion counts at the line of the
             # call, as in the LCOV exporter. Its key also holds the call
-            # column and its own place, so two branches stay apart.
+            # column, its source file and its own place, so two branches
+            # stay apart.
             for expansion in item.get("expansions", []):
                 line, column = expansion["source_region"][:2]
+                names = expansion.get("filenames", [])
                 for branch in expansion.get("branches", []):
-                    _add_branch(into, line, f"{column}@{branch[0]}:{branch[1]}", branch)
+                    file_id = branch[6]
+                    source = _relative(names[file_id], root) if file_id < len(names) else file_id
+                    block = f"{column}@{source}:{branch[0]}:{branch[1]}"
+                    _add_branch(into, line, block, branch)
     return records
 
 
@@ -424,9 +429,11 @@ EXPORT = {
         "branches": [[3, 5, 3, 8, 2, 0, 0, 0, 4], [3, 5, 3, 8, 1, 1, 0, 0, 4]],
         # A macro call on line 6, column 3. Its branch is at line 40 of the
         # macro definition.
+        # A second branch sits at the same place in another file.
         "expansions": [{
             "source_region": [6, 3, 6, 20, 1, 0, 1, 1],
-            "branches": [[40, 9, 40, 14, 1, 0, 1, 0, 4]],
+            "filenames": ["/w/r/autumn-harvest/src/timeout.rs", "/w/r/m.rs", "/w/r/n.rs"],
+            "branches": [[40, 9, 40, 14, 1, 0, 1, 0, 4], [40, 9, 40, 14, 0, 2, 2, 0, 4]],
         }],
     }]}],
 }
@@ -440,9 +447,11 @@ def self_test():
     assert timeout["lines"] == {1: 5, 3: 7, 5: 0, 6: 0, 10: 3}, timeout
     # Two instantiations of one branch add up. A branch inside a macro
     # expansion counts at the line of the call, as the LCOV exporter does.
+    # Its key names its source file, so two files stay apart.
     assert timeout["branches"] == {
         (3, "5", "0"): 3, (3, "5", "1"): 1,
-        (6, "3@40:9", "0"): 1, (6, "3@40:9", "1"): 0,
+        (6, "3@m.rs:40:9", "0"): 1, (6, "3@m.rs:40:9", "1"): 0,
+        (6, "3@n.rs:40:9", "0"): 0, (6, "3@n.rs:40:9", "1"): 2,
     }, timeout
     try:
         from_export({"type": "other"}, "")
