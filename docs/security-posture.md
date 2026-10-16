@@ -466,6 +466,11 @@ runs and sets `workflow_id`. It never gives the body to the hook.
   auto-generated id.
 - `start_input_present` is `input` on `start`, and `start_input` on the
   with-start routes. A `null` value counts as absent.
+- A `start` with an idempotency key replays the first run for that key. The
+  replay ignores the body `workflow_id`, so the hook cannot see the id of the
+  run it returns. The engine still refuses a replay across tenants. Treat an
+  idempotency key as a secret within one tenant. Signal-with-start and
+  update-with-start do not have this path.
 - The hook runs on the management API only. A webhook or connector binding
   calls the handler directly, so the hook does not see it.
 
