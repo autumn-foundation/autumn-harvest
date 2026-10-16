@@ -3731,6 +3731,7 @@ impl WorkflowContext {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn for_replay_with_state_and_history_policy(
         exec_id: ExecutionId,
         events: Vec<WorkflowEvent>,
@@ -7643,11 +7644,10 @@ impl WorkflowContext {
     /// durable row is unchanged. Replay holds the same commands, so it
     /// restores the same entries. The newest entry is restored first.
     ///
-    /// Returns the timers that the undo gives back to an arm made before the
-    /// scope. That arm's durable row is not the scope's, so the scope cancel
-    /// must not tear it down.
-    pub(crate) fn undo_scope_timer_mutations(&self, seq: u32) -> Vec<TimerId> {
-        let mut restored_arms = Vec::new();
+    /// Returns each timer that the undo gives back to an arm, with the epoch
+    /// of that arm. The oldest entry of an id holds the state that the undo
+    /// restores, so only that entry counts.
+    pub(crate) fn undo_scope_timer_mutations(&self, seq: u32) -> Vec<(TimerId, Option<u64>)> {
         let undone: Vec<TimerUndo> = {
             let mut journal = self.timer_undo.lock().expect("timer_undo lock poisoned");
             let (undone, kept) = std::mem::take(&mut *journal)
@@ -7656,14 +7656,14 @@ impl WorkflowContext {
             *journal = kept;
             undone
         };
+        let mut seen = std::collections::HashSet::new();
+        let restored_arms = undone
+            .iter()
+            .filter(|entry| seen.insert(entry.timer_id.as_str()))
+            .filter(|entry| matches!(entry.state, Some(TimerLogicalState::Armed { .. })))
+            .map(|entry| (TimerId::new(entry.timer_id.as_str()), entry.epoch))
+            .collect();
         for entry in undone.into_iter().rev() {
-            if matches!(entry.state, Some(TimerLogicalState::Armed { .. }))
-                && !restored_arms
-                    .iter()
-                    .any(|id: &TimerId| id.as_str() == entry.timer_id)
-            {
-                restored_arms.push(TimerId::new(entry.timer_id.as_str()));
-            }
             {
                 let mut states = self
                     .cancellable_timer_state
@@ -7722,17 +7722,20 @@ impl WorkflowContext {
     ///
     /// A later arm of the same id has a new epoch, so a scope cancel leaves it.
     pub(crate) fn mark_scope_arms_cancelled(&self, arms: &[(TimerId, u64)]) {
-        let current: Vec<TimerId> = {
-            let epochs = self
-                .timer_arm_epochs
-                .lock()
-                .expect("timer_arm_epochs lock poisoned");
-            arms.iter()
-                .filter(|(id, epoch)| epochs.get(id.as_str()) == Some(epoch))
-                .map(|(id, _)| id.clone())
-                .collect()
-        };
+        let current = self.current_scope_arms(arms);
         self.mark_scope_timers_cancelled(&current);
+    }
+
+    /// The timers in `arms` whose recorded arm is still the current arm (issue #1984).
+    pub(crate) fn current_scope_arms(&self, arms: &[(TimerId, u64)]) -> Vec<TimerId> {
+        let epochs = self
+            .timer_arm_epochs
+            .lock()
+            .expect("timer_arm_epochs lock poisoned");
+        arms.iter()
+            .filter(|(id, epoch)| epochs.get(id.as_str()) == Some(epoch))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Whether the workflow logically cancelled `timer_id` this task without a
