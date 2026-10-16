@@ -2066,6 +2066,23 @@ mod tests {
         );
     }
 
+    /// A resume with no dispatch channel must not load the late ids. The pass
+    /// can cover the whole backlog created during a long pause (issue #2066).
+    #[test]
+    fn the_count_only_late_pass_returns_no_rows_and_shares_the_id_pass_body() {
+        let with_ids = resume_shift_late_arrivals_query();
+        let count_only = resume_shift_late_arrivals_count_query();
+        assert!(
+            !count_only.contains("RETURNING"),
+            "the count-only pass must not return rows; got:\n{count_only}"
+        );
+        assert_eq!(
+            with_ids.strip_suffix(" RETURNING id"),
+            Some(count_only),
+            "the two passes must differ only in the RETURNING clause"
+        );
+    }
+
     /// The partition must be **total**, and `created_at` is nullable (a
     /// pre-`20260619000000` `PENDING` row has none). In SQL a comparison against
     /// `NULL` yields `NULL`, not `false`, so a bare `<` / `>=` split would leave
