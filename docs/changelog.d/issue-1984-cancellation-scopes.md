@@ -56,7 +56,9 @@ activities. On SQLite, a cooperative cancel request is hidden from
 `is_cancelled()` inside a block, so the block's cleanup runs. While the
 history holds an open block, the request is hidden from the whole replay.
 SQLite does not seal a run that parks inside an open block. It still ends such a run
-`CANCELLED` when the body returns.
+`CANCELLED` when the body returns. A session that a scope cancel drops holds its slot
+until the run ends or its lease expires (#2193). A cross-shard child that a
+scope cancels gets the generic parent-cancel reason (#2194).
 
 **Tests.**
 

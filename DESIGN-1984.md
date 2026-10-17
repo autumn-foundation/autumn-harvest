@@ -138,7 +138,10 @@ cancel reason name it. No other worker path changes.
   durable mutex: a dropped acquire would block the key's waiter queue. A
   scope cannot signal, cancel or await an external workflow: a dropped body
   would strand the late result. A scope cannot create a session: a dropped
-  session is never released. A scope cannot run an admitted update either:
+  session holds its slot until the run ends or its lease expires. A session
+  created before the scope and dropped by its cancel does the same. Issue
+  #2193 tracks a release on drop for scopes, races and `select!`. A scope
+  cannot run an admitted update either:
   a dropped handler leaves the update without a terminal. The update fails
   at once, and the cancel keeps its `RecordUpdateResult`. A scope cannot
   spawn a detached child: a cancel withdraws the spawn, and replay mints
@@ -155,3 +158,6 @@ cancel reason name it. No other worker path changes.
   check before the shield then replays as it ran.
 - Local activities and external activities in a scope are not cancelled. The scope still drops the body, and replay consumes a
   late external result.
+- A scope cancel gives a same-shard child its own reason. A cross-shard child
+  gets the generic "parent requested cancellation" reason, because the relay
+  row stores no reason. Issue #2194 tracks the migration that carries it.
