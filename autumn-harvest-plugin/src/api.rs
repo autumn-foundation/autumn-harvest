@@ -26732,6 +26732,8 @@ pub(crate) async fn signal_workflow(
 
 /// Hydrate a workflow context by replaying its history into the workflow
 /// handler long enough for it to register its query handlers.
+// One linear context setup. A split would only move the lines.
+#[allow(clippy::too_many_lines)]
 async fn hydrate_ctx_for_query(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
