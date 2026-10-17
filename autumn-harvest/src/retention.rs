@@ -2582,6 +2582,12 @@ struct CandidateExecution {
     /// in no `WorkflowEvent` and the archive is its last surviving copy.
     #[diesel(sql_type = Text)]
     queue_name: String,
+    /// Start source and predecessor (issue #2082), carried into the archive
+    /// document. The archive is the last copy of them once the row is deleted.
+    #[diesel(sql_type = Nullable<Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = Nullable<SqlUuid>)]
+    continued_from_exec_id: Option<uuid::Uuid>,
     /// Stored tenant (issue #1977). It selects a per-tenant retention override.
     #[diesel(sql_type = Nullable<Text>)]
     tenant: Option<String>,
@@ -3214,9 +3220,11 @@ async fn run_shard_tick(
                             parent_execution_id: candidate
                                 .parent_id
                                 .map(crate::types::ExecutionId::from_uuid),
-                            // The candidate scan reads no start source yet
-                            // (issue #2082).
-                            start_provenance: None,
+                            // Issue #2082: the archive keeps the row's start source.
+                            start_provenance: Some(crate::types::StartProvenance::from_row(
+                                candidate.start_source.as_deref(),
+                                candidate.continued_from_exec_id,
+                            )),
                         };
                         match crate::history_export::export_history(req) {
                             Ok(document) => {
@@ -3476,7 +3484,7 @@ const RETENTION_CANDIDATE_STATES: &[&str] = crate::erase::TERMINAL_STATES_WITHOU
 /// The tenant override arrays are bound last, as `$7` and `$8` (issue #1977).
 /// The tenant arm comes first in the `COALESCE`, so a tenant override wins.
 #[cfg(feature = "db")]
-const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name, tenant
+const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name, start_source, continued_from_exec_id, tenant
                  FROM harvest_workflow_executions
                  WHERE state IN ({states})
                    AND completed_at IS NOT NULL
@@ -3502,7 +3510,7 @@ const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflo
 ///
 /// The tenant override arrays are bound last, as `$6` and `$7` (issue #1977).
 #[cfg(feature = "db")]
-const CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name, tenant
+const CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name, start_source, continued_from_exec_id, tenant
                  FROM harvest_workflow_executions
                  WHERE state IN ({states})
                    AND completed_at IS NOT NULL
@@ -5732,6 +5740,8 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             queue_name: "default".to_string(),
+            start_source: None,
+            continued_from_exec_id: None,
             tenant: None,
         };
         let candidate_skip = CandidateExecution {
@@ -5747,6 +5757,8 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             queue_name: "default".to_string(),
+            start_source: None,
+            continued_from_exec_id: None,
             tenant: None,
         };
 

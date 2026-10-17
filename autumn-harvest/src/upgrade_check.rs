@@ -492,6 +492,8 @@ pub struct EncodedHistory {
     pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The run's parent, when it is a child run.
     pub parent_execution_id: Option<ExecutionId>,
+    /// How the run started (issue #2082). `None` replays with an unknown source.
+    pub start_provenance: Option<crate::types::StartProvenance>,
     /// The run's `workflow_id`.
     pub workflow_id: Option<String>,
     /// The run's task queue.
@@ -796,8 +798,7 @@ impl UpgradeCheck {
             execution_timeout: history.execution_timeout,
             deadline_at: history.deadline_at,
             parent_execution_id: history.parent_execution_id,
-            // The upgrade check reads no start source yet (issue #2082).
-            start_provenance: None,
+            start_provenance: history.start_provenance,
             workflow_id: history.workflow_id,
             queue_name: history.queue_name,
         };
@@ -1523,6 +1524,10 @@ struct InFlightRow {
     assigned_build_id: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Text)]
     state: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    continued_from_exec_id: Option<uuid::Uuid>,
 }
 
 /// The columns of [`InFlightRow`]. Both row queries select them.
@@ -1530,7 +1535,8 @@ struct InFlightRow {
 macro_rules! in_flight_select {
     () => {
         "SELECT id, shard_id, workflow_name, context_headers, execution_timeout, \
-         deadline_at, parent_id, workflow_id, queue_name, assigned_build_id, state \
+         deadline_at, parent_id, workflow_id, queue_name, assigned_build_id, state, \
+         start_source, continued_from_exec_id \
          FROM harvest_workflow_executions "
     };
 }
@@ -1743,8 +1749,11 @@ impl UpgradeCheck {
             execution_timeout: row.execution_timeout,
             deadline_at: row.deadline_at,
             parent_execution_id: row.parent_id.map(ExecutionId::from_uuid),
-            // The upgrade check reads no start source yet (issue #2082).
-            start_provenance: None,
+            // Issue #2082: the row's start source and predecessor.
+            start_provenance: Some(crate::types::StartProvenance::from_row(
+                row.start_source.as_deref(),
+                row.continued_from_exec_id,
+            )),
             workflow_id: Some(row.workflow_id.clone()),
             queue_name: Some(row.queue_name.clone()),
         })

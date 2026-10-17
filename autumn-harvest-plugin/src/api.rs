@@ -3470,6 +3470,12 @@ struct HistoryExportCandidate {
     // lives in no `WorkflowEvent` — same family as `context_headers` above.
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
+    // Issue #2082: the run's start source and predecessor, carried into the
+    // export document so a replay takes the same branch as the live run.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    continued_from_exec_id: Option<uuid::Uuid>,
 }
 
 /// One in-flight execution selected by the stratified sample query (issue #798).
@@ -3514,6 +3520,12 @@ struct HistorySampleCandidate {
     // a FALSE divergence.
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
+    // Issue #2082: the run's start source and predecessor, carried into the
+    // export document so a replay takes the same branch as the live run.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    continued_from_exec_id: Option<uuid::Uuid>,
     /// `COUNT(*) OVER (PARTITION BY workflow_name)` — the in-flight population
     /// of this workflow type **on this shard**. Summed across shards to give
     /// the AC2 coverage denominator.
@@ -3545,6 +3557,8 @@ impl HistorySampleCandidate {
             context_headers: self.context_headers,
             // Issue #798: likewise the queue the live run was claimed on.
             queue_name: self.queue_name,
+            start_source: self.start_source,
+            continued_from_exec_id: self.continued_from_exec_id,
         }
     }
 }
@@ -43904,9 +43918,13 @@ fn export_history_for_candidate(
             // candidate query now SELECTs `parent_id`) so a batch-exported child
             // history round-trips its parent into the JSON / `harvest-replay`
             // replay path — parity with the single-execution export.
-            // The candidate scan reads no start source yet (issue #2082).
-            start_provenance: None,
             parent_execution_id: candidate.parent_id.map(ExecutionId::from_uuid),
+            // Issue #2082: carry the start source and predecessor — parity with
+            // the single-execution export.
+            start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
+                candidate.start_source.as_deref(),
+                candidate.continued_from_exec_id,
+            )),
         },
         decoder,
         outcome,
@@ -44174,7 +44192,9 @@ SELECT
     w.deadline_at AS deadline_at,
     w.parent_id AS parent_id,
     w.context_headers AS context_headers,
-    w.queue_name AS queue_name
+    w.queue_name AS queue_name,
+    w.start_source AS start_source,
+    w.continued_from_exec_id AS continued_from_exec_id
 FROM harvest_workflow_executions w
 LEFT JOIN harvest_events e
     ON e.workflow_exec_id = w.id
@@ -44182,7 +44202,7 @@ WHERE ($1::TEXT IS NULL OR w.workflow_name = $1::TEXT)
   AND (cardinality($2::TEXT[]) = 0 OR w.state = ANY($2::TEXT[]))
 GROUP BY w.id, w.workflow_name, w.workflow_id, w.shard_id, w.state, w.completed_at, w.started_at,
          w.created_at, w.execution_timeout, w.deadline_at, w.parent_id, w.context_headers,
-         w.queue_name
+         w.queue_name, w.start_source, w.continued_from_exec_id
 HAVING ($3::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) >= $3::TIMESTAMPTZ)
    AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) < $4::TIMESTAMPTZ)
 ORDER BY last_history_event_at DESC, w.id DESC
@@ -44304,6 +44324,8 @@ WITH ranked AS (
         w.parent_id AS parent_id,
         w.context_headers AS context_headers,
         w.queue_name AS queue_name,
+        w.start_source AS start_source,
+        w.continued_from_exec_id AS continued_from_exec_id,
         ROW_NUMBER() OVER (
             PARTITION BY w.workflow_name
             ORDER BY w.started_at ASC, w.id ASC
@@ -44320,7 +44342,7 @@ type_count AS (
 )
 SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
        execution_timeout, deadline_at, parent_id, context_headers, queue_name,
-       in_flight_total
+       start_source, continued_from_exec_id, in_flight_total
 FROM ranked, type_count
 WHERE rn <= LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))
 ORDER BY workflow_name ASC, rn ASC
@@ -44345,6 +44367,8 @@ WITH ranked AS (
         w.parent_id AS parent_id,
         w.context_headers AS context_headers,
         w.queue_name AS queue_name,
+        w.start_source AS start_source,
+        w.continued_from_exec_id AS continued_from_exec_id,
         ROW_NUMBER() OVER (
             PARTITION BY w.workflow_name
             ORDER BY w.started_at DESC, w.id DESC
@@ -44361,7 +44385,7 @@ type_count AS (
 )
 SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
        execution_timeout, deadline_at, parent_id, context_headers, queue_name,
-       in_flight_total
+       start_source, continued_from_exec_id, in_flight_total
 FROM ranked, type_count
 WHERE rn <= LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))
 ORDER BY workflow_name ASC, rn ASC
@@ -56046,6 +56070,8 @@ mod tests {
             deadline_at: Some(stale_deadline),
             parent_id: None,
             context_headers: None,
+            start_source: None,
+            continued_from_exec_id: None,
             queue_name: "default".to_string(),
         };
 
@@ -56163,6 +56189,8 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             context_headers: None,
+            start_source: None,
+            continued_from_exec_id: None,
             queue_name: "default".to_string(),
         }
     }
@@ -56225,6 +56253,8 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             context_headers: None,
+            start_source: None,
+            continued_from_exec_id: None,
             queue_name: "default".to_string(),
             in_flight_total,
         }
