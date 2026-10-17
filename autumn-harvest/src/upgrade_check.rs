@@ -1879,7 +1879,7 @@ impl CommandArgs {
                 }
                 "--baseline-structure" => out.baseline = Some(plain_path(&flag, value()?)?.into()),
                 "--candidate-structure" => {
-                    out.candidate = Some(plain_path(&flag, value()?)?.into())
+                    out.candidate = Some(plain_path(&flag, value()?)?.into());
                 }
                 "--workflow-name" => out.workflow_name = Some(plain_path(&flag, value()?)?),
                 "--baseline-build" => out.baseline_build = Some(plain_path(&flag, value()?)?),
