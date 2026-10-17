@@ -6,11 +6,12 @@
 //! the store listing instead. See `DESIGN-2123.md`.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 
-use crate::payload_store::{PayloadOffloader, PayloadStore, StoredBlob};
+use crate::payload_store::{PayloadOffloader, PayloadStore, PayloadStoreFuture, StoredBlob};
 use crate::retention::{MIN_ORPHAN_BLOB_GRACE, RetentionConfig};
 use crate::shard::ShardedDbPool;
 use crate::telemetry::MetricsRecorder;
@@ -60,54 +61,115 @@ struct PageOutcome {
     found: u64,
     deleted: u64,
     delete_failures: u64,
+    first_failure: Option<String>,
 }
 
-/// Find and delete the orphans of one listing page.
-async fn sweep_page(
-    store: &dyn PayloadStore,
-    pools: &ShardedDbPool,
-    blobs: &[StoredBlob],
+/// The inputs that one sweep page shares.
+struct PageSweep<'a> {
+    store: &'a dyn PayloadStore,
+    pools: &'a ShardedDbPool,
     cutoff: DateTime<Utc>,
     dry_run: bool,
-    shutdown: &CancellationToken,
-) -> Result<PageOutcome, String> {
-    // A store can ignore `created_before`, so filter again here.
-    let old_keys: Vec<String> = blobs
-        .iter()
-        .filter(|blob| blob.created_at < cutoff)
-        .map(|blob| blob.key.clone())
-        .collect();
-    if old_keys.is_empty() {
-        return Ok(PageOutcome::default());
-    }
-    let referenced = referenced_keys(pools, &old_keys).await?;
-    let mut orphans = select_orphans(blobs, cutoff, &referenced);
-    if !dry_run && !orphans.is_empty() {
-        // A writer can commit a reference after the first check. Check again
-        // just before the delete to keep that window short.
-        let referenced = referenced_keys(pools, &orphans).await?;
-        orphans.retain(|key| !referenced.contains(key));
-    }
-    let mut outcome = PageOutcome {
-        found: orphans.len() as u64,
-        ..PageOutcome::default()
-    };
-    if dry_run {
-        return Ok(outcome);
-    }
-    for key in &orphans {
-        if shutdown.is_cancelled() {
-            break;
+    /// The longest that one store call may take.
+    call_timeout: Duration,
+    shutdown: &'a CancellationToken,
+}
+
+impl PageSweep<'_> {
+    /// Run a store call. It fails on timeout and on shutdown, so a hung store
+    /// cannot hold the tick or its fence guards.
+    async fn call<T>(&self, call: PayloadStoreFuture<'_, T>) -> Result<T, String> {
+        tokio::select! {
+            () = self.shutdown.cancelled() => Err("shutdown".to_string()),
+            result = tokio::time::timeout(self.call_timeout, call) => match result {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(err)) => Err(err.to_string()),
+                Err(_) => Err(format!("timed out after {}s", self.call_timeout.as_secs())),
+            },
         }
-        match store.delete(key).await {
-            Ok(()) => outcome.deleted += 1,
-            Err(err) => {
-                outcome.delete_failures += 1;
-                tracing::warn!(blob_key = %key, error = %err, "harvest orphan-blob delete failed");
+    }
+
+    /// Whether the store still lists `key` as older than the cutoff.
+    ///
+    /// A writer that uploads the same key again resets its creation time. The
+    /// page holds the old time. This read happens just before the delete, so
+    /// it sees a re-upload that happened since the page was listed.
+    async fn still_old(&self, after: Option<&str>, key: &str) -> Result<bool, String> {
+        let page = self.call(self.store.list(after, self.cutoff, 1)).await?;
+        Ok(page
+            .and_then(|page| page.blobs.into_iter().next())
+            .is_some_and(|blob| blob.key == key && blob.created_at < self.cutoff))
+    }
+
+    /// Find and delete the orphans of one listing page.
+    ///
+    /// `after` is the cursor that produced `blobs`.
+    async fn sweep(
+        &self,
+        after: Option<&str>,
+        blobs: &[StoredBlob],
+    ) -> Result<PageOutcome, String> {
+        // A store can ignore `created_before`, so filter again here.
+        let old_keys: Vec<String> = blobs
+            .iter()
+            .filter(|blob| blob.created_at < self.cutoff)
+            .map(|blob| blob.key.clone())
+            .collect();
+        if old_keys.is_empty() {
+            return Ok(PageOutcome::default());
+        }
+        let referenced = referenced_keys(self.pools, &old_keys).await?;
+        let orphans = select_orphans(blobs, self.cutoff, &referenced);
+        let mut outcome = PageOutcome {
+            found: orphans.len() as u64,
+            ..PageOutcome::default()
+        };
+        if self.dry_run {
+            return Ok(outcome);
+        }
+        for key in &orphans {
+            if self.shutdown.is_cancelled() {
+                break;
+            }
+            // The listing of this key precedes it in the page, or is the cursor.
+            let before = old_keys
+                .iter()
+                .position(|k| k == key)
+                .and_then(|at| at.checked_sub(1))
+                .map(|at| old_keys[at].as_str())
+                .or(after);
+            match self.delete_if_orphan(before, key).await {
+                Ok(true) => outcome.deleted += 1,
+                Ok(false) => {}
+                // Shutdown is not a store failure.
+                Err(_) if self.shutdown.is_cancelled() => break,
+                Err(err) => {
+                    outcome.delete_failures += 1;
+                    tracing::debug!(blob_key = %key, error = %err, "harvest orphan-blob delete failed");
+                    outcome.first_failure.get_or_insert(err);
+                }
             }
         }
+        Ok(outcome)
     }
-    Ok(outcome)
+
+    /// Delete `key` when it is still an orphan. Returns `false` when it is not.
+    ///
+    /// Two checks run just before the delete. A writer can commit a reference
+    /// after the page check. A writer can also upload the key again, which
+    /// resets its creation time. Neither check closes the window completely,
+    /// because a delete is not conditional. The window is one store round trip.
+    async fn delete_if_orphan(&self, before: Option<&str>, key: &str) -> Result<bool, String> {
+        let one = [key.to_string()];
+        if !referenced_keys(self.pools, &one).await?.is_empty() {
+            return Ok(false);
+        }
+        if !self.still_old(before, key).await? {
+            return Ok(false);
+        }
+        self.call(self.store.delete(key)).await?;
+        Ok(true)
+    }
 }
 
 /// The state that the orphan sweep keeps between ticks.
@@ -117,6 +179,8 @@ pub struct OrphanBlobSweeper {
     cursor: Option<String>,
     /// Set when the store cannot list. The sweep then stays off.
     unsupported: bool,
+    /// Set after the sweep logs that it is on.
+    announced: bool,
 }
 
 impl OrphanBlobSweeper {
@@ -153,13 +217,24 @@ impl OrphanBlobSweeper {
             );
             return;
         };
-        let store = offloader.store().as_ref();
+        let sweep = PageSweep {
+            store: offloader.store().as_ref(),
+            pools,
+            cutoff,
+            dry_run: config.dry_run,
+            call_timeout: config.archival_timeout(),
+            shutdown,
+        };
+        let limit = config.batch_size.max(1);
         for _ in 0..MAX_PAGES_PER_TICK {
             if shutdown.is_cancelled() {
                 return;
             }
-            let limit = config.batch_size.max(1);
-            let page = match store.list(self.cursor.as_deref(), cutoff, limit).await {
+            let after = self.cursor.clone();
+            let listed = sweep
+                .call(sweep.store.list(after.as_deref(), cutoff, limit))
+                .await;
+            let mut page = match listed {
                 Ok(Some(page)) => page,
                 Ok(None) => {
                     self.unsupported = true;
@@ -173,7 +248,18 @@ impl OrphanBlobSweeper {
                     return;
                 }
             };
-            match sweep_page(store, pools, &page.blobs, cutoff, config.dry_run, shutdown).await {
+            if !self.announced {
+                self.announced = true;
+                tracing::info!(
+                    store_id = offloader.store_id(),
+                    grace_secs = grace.as_secs(),
+                    dry_run = config.dry_run,
+                    "harvest orphan-blob sweep is on"
+                );
+            }
+            // A store must honour `limit`. Do not trust it.
+            page.blobs.truncate(limit);
+            match sweep.sweep(after.as_deref(), &page.blobs).await {
                 Ok(outcome) => {
                     if outcome != PageOutcome::default() {
                         metrics.record_orphan_blob_sweep(
@@ -189,12 +275,23 @@ impl OrphanBlobSweeper {
                             "harvest orphan-blob sweep page"
                         );
                     }
+                    if let Some(error) = &outcome.first_failure {
+                        tracing::warn!(
+                            delete_failures = outcome.delete_failures,
+                            first_error = %error,
+                            "harvest orphan-blob delete failed"
+                        );
+                    }
                 }
                 Err(error) => {
                     // The cursor stays, so the next tick retries this page.
                     tracing::warn!(error = %error, "harvest orphan-blob sweep page failed");
                     return;
                 }
+            }
+            // A page that shutdown cut short keeps its cursor.
+            if shutdown.is_cancelled() {
+                return;
             }
             self.cursor = page.next;
             if self.cursor.is_none() {
@@ -244,6 +341,9 @@ mod tests {
             key: "edge".to_string(),
             created_at: cutoff,
         };
-        assert!(select_orphans(&[at], cutoff, &HashSet::new()).is_empty());
+        assert_eq!(
+            select_orphans(&[at], cutoff, &HashSet::new()),
+            Vec::<String>::new()
+        );
     }
 }

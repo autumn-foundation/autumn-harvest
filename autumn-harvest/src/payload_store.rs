@@ -136,16 +136,32 @@ pub trait PayloadStore: Send + Sync + 'static {
 
     /// List blobs older than `created_before`, for the orphan sweep (issue #2123).
     ///
-    /// Return at most `limit` blobs in key order, after the key `after`. Set
-    /// [`BlobPage::next`] to the cursor for the next page. Return `Ok(None)`
+    /// Return at most `limit` blobs in key order, after the key `after`
+    /// (exclusive). Return only blobs created strictly before `created_before`.
+    /// `limit` is at least 1. Set [`BlobPage::next`] to the cursor for the next
+    /// page. A page can be empty and still have a `next`. Return `Ok(None)`
     /// when the store cannot list. The sweep is then off. The default does so.
+    /// Implementing `list` is the opt-in to the sweep.
     ///
-    /// Two rules keep the sweep safe:
-    /// - Return only blobs that [`put`](PayloadStore::put) wrote. The sweep
-    ///   deletes any listed blob that no run references.
-    /// - A `put` of an existing key must reset its creation time. Otherwise
-    ///   the sweep can delete a blob that a writer has just uploaded again.
-    ///   A store that uses a new key for each upload meets this rule.
+    /// The sweep deletes every listed blob that no run references. Keep these
+    /// rules:
+    /// - Return only blobs that [`put`](PayloadStore::put) of this store wrote.
+    ///   Scope the listing to the store prefix. A bucket can also hold other
+    ///   data, such as history archives.
+    /// - Do not share one store between deployments that have different
+    ///   databases. The sweep sees only the references of its own databases.
+    ///   A restored or staging database that points at a production store
+    ///   would delete production blobs.
+    /// - A `put` of an existing key must reset its creation time. A store that
+    ///   uses a new key for each upload meets this rule.
+    /// - [`delete`](PayloadStore::delete) of a missing key must succeed. More
+    ///   than one process can sweep the same store.
+    /// - The sweep needs every database that references the store. Run it
+    ///   only from a process that has a pool for each shard.
+    ///
+    /// The sweep reads the creation time again just before each delete. A
+    /// delete is not conditional, so a re-upload in that last round trip can
+    /// still be lost.
     fn list(
         &self,
         after: Option<&str>,

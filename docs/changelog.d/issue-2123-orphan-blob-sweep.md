@@ -13,13 +13,17 @@ transaction (#954). A rollback left those blobs in the store with no
 - A blob is an orphan when it is older than the grace period and no
   `harvest_payload_refs` row names it on any database.
 - A failed reference check on any database deletes nothing from that page.
-- The sweep checks the references again just before it deletes.
+- Just before each delete, the sweep checks the references of that key and
+  reads its creation time again. A re-upload since the listing keeps the blob.
+- Each `list` and `delete` has the `archival_timeout` and ends at shutdown.
 - It reads up to 10 pages of `batch_size` blobs per tick and keeps its cursor
   between ticks.
 - Under `dry_run`, it counts orphans and deletes none.
 
-**Store contract.** `list` returns only blobs that `put` wrote. A `put` of an
-existing key must reset its creation time. `ObjectPayloadStore` uses a new key
+**Store contract.** Implementing `list` is the opt-in. It returns only blobs
+that `put` wrote, scoped to the store prefix. Do not share one store between
+deployments with different databases. A `put` of an existing key must reset its
+creation time. `delete` of a missing key must succeed. `ObjectPayloadStore` uses a new key
 for each upload and needs no reset. No shipped backend lists yet, so the sweep
 is inert until an embedder implements `list`.
 

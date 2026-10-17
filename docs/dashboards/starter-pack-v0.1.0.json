@@ -4126,6 +4126,73 @@
           "description": "Terminal harvest_task_queue rows deleted by the terminal-task janitor (issue #1811), by task state. A flat zero while the table grows means the janitor is off (terminal_task_retention_secs = null) or the role lacks DELETE. GET /admin/retention reports the per-shard outcome and any error."
         },
         {
+          "id": 832869,
+          "type": "timeseries",
+          "title": "Payload store — orphaned blobs swept (issue #2123)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 108
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum(rate(harvest_retention_orphan_blobs_found_total[$__rate_interval]))",
+              "legendFormat": "found",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "sum(rate(harvest_retention_orphan_blobs_deleted_total[$__rate_interval]))",
+              "legendFormat": "deleted",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "C",
+              "expr": "sum(rate(harvest_retention_orphan_blob_delete_failures_total[$__rate_interval]))",
+              "legendFormat": "delete failures",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Payload blobs that the orphan sweep found, deleted and failed to delete (issue #2123). A write uploads its blobs before its transaction, so a rollback leaves blobs with no harvest_payload_refs row. The sweep runs only when the payload store implements list. Found counts a dry_run preview too. Deleted counts real deletes only. A flat zero while the store grows means the store cannot list or orphan_blob_grace_secs = null. Delete failures are retried on the next full pass."
+        },
+        {
           "id": 931,
           "type": "timeseries",
           "title": "Dispatch rate by shard",

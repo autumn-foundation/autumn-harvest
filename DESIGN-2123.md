@@ -50,6 +50,10 @@ so nothing deletes them. This change adds a periodic sweep of such orphans.
 | R8 | A fenced region deletes. | The pass runs inside the fenced retention tick. |
 | R9 | A delete fails and loops forever. | The failure is counted. The next pass retries. The cursor moves on. |
 | R10 | A store that cannot list fails on every tick. | The first `None` disables the sweep. It logs once. |
+| R11 | A writer uploads an old orphan key again after the page is listed (review of PR 2191). | Just before each delete, the sweep checks the references of that key and reads its creation time again. The delete is not conditional, so one store round trip stays open. |
+| R12 | A hung store holds the tick and its fence guards. | Each `list` and `delete` has the `archival_timeout` and ends at shutdown. |
+| R13 | Two deployments with different databases share a store. | The `list` contract forbids it and tells the store to scope its listing. Implementing `list` is the opt-in. |
+| R14 | A failing store floods the log. | The sweep logs one warning for each page. Keys go to the debug level. |
 
 ### 0.4 Six hats
 
@@ -88,6 +92,8 @@ fn list(&self, after: Option<&str>, created_before: DateTime<Utc>, limit: usize)
 - A store returns blobs in key order, after `after`, older than
   `created_before`, at most `limit`. `next` is the cursor for the next page.
   `None` means the end.
+- A `put` of an existing key resets its creation time. `delete` of a missing key
+  succeeds.
 - The issue sketch has a `prefix` argument. A store knows its own prefix, so
   the trait omits it.
 
@@ -100,7 +106,8 @@ Module `orphan_blob_sweep`. One pass:
 3. Drop any blob not older than `cutoff`.
 4. Ask every physical database which keys it references. Any error aborts.
 5. The unreferenced keys are the orphans. Count them as `found`.
-6. Outside a dry run, check the references again, then delete each orphan.
+6. Outside a dry run, for each orphan: check its references again, read its
+   creation time again, then delete it.
 7. Count `deleted` and `failed`.
 
 ### 1.3 Runtime and config
@@ -128,3 +135,8 @@ Module `orphan_blob_sweep`. One pass:
 | `a_dry_run_deletes_nothing` (DB) | R7. |
 | `a_failed_reference_check_deletes_nothing` (DB) | R2. |
 | `a_failed_delete_is_counted_and_retried` (DB) | R9. |
+| `a_store_that_ignores_the_cutoff_*` (DB) | R3 with a store that ignores the filter. |
+| `a_key_uploaded_again_after_the_listing_is_not_deleted` (DB) | R11. |
+| `blobs_referenced_on_different_shards_all_survive` (DB) | R1 with a reference on each shard. |
+| `a_hung_delete_times_out_and_is_counted` (DB) | R12. |
+| `a_failed_listing_*`, `one_tick_reads_at_most_ten_pages` (DB) | Error and page cap. |

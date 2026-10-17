@@ -868,7 +868,10 @@ impl RetentionConfig {
         self.orphan_blob_grace_secs.map(Duration::from_secs)
     }
 
-    /// Whether the orphan-blob sweep runs this tick (issue #2123).
+    /// Whether the orphan-blob sweep is on (issue #2123).
+    ///
+    /// The sweep rides the retention runtime and does not spawn it. It also
+    /// needs a payload store that can list.
     #[must_use]
     pub const fn orphan_blob_sweep_active(&self) -> bool {
         self.orphan_blob_grace_secs.is_some()
@@ -1108,8 +1111,6 @@ impl RetentionConfig {
             // A bounded summary policy spawns the janitor so its GC pass runs
             // even if the history horizon was later removed (issue #752).
             || self.summary_gc_active()
-            // The orphan-blob sweep is work in its own right (issue #2123).
-            || self.orphan_blob_sweep_active()
             // Partition maintenance is work in its own right, not a rider on
             // history retention (issue #958). Without this, a deployment that
             // turned every retention horizon off — `audit_retention_days = 0`,
@@ -5702,12 +5703,7 @@ mod tests {
             config.enabled(),
             "the task janitor alone must spawn the runtime"
         );
-        assert!(
-            !config
-                .without_terminal_task_gc()
-                .without_orphan_blob_sweep()
-                .enabled()
-        );
+        assert!(!config.without_terminal_task_gc().enabled());
     }
 
     #[test]
@@ -5735,7 +5731,7 @@ mod tests {
     #[test]
     fn orphan_blob_sweep_validate_bounds_the_grace_period() {
         let too_short = RetentionConfig::default()
-            .with_orphan_blob_grace(MIN_ORPHAN_BLOB_GRACE - Duration::from_secs(1));
+            .with_orphan_blob_grace(Duration::from_secs(MIN_ORPHAN_BLOB_GRACE.as_secs() - 1));
         assert!(too_short.validate().is_err());
         let too_long =
             RetentionConfig::default().with_orphan_blob_grace(MAX_MAX_AGE + Duration::from_secs(1));

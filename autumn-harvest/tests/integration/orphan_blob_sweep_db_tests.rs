@@ -48,11 +48,21 @@ use uuid::Uuid;
 // Harness
 // ---------------------------------------------------------------------------
 
+/// The bytes and creation time of one stored blob.
+type StoredObject = (Vec<u8>, DateTime<Utc>);
+
 /// A store with a creation time on each blob and switches for each failure.
 struct MemStore {
-    blobs: Mutex<BTreeMap<String, (Vec<u8>, DateTime<Utc>)>>,
+    blobs: Mutex<BTreeMap<String, StoredObject>>,
     can_list: bool,
     fail_delete: AtomicBool,
+    hang_delete: AtomicBool,
+    fail_list: AtomicBool,
+    /// Return blobs of any age, as a store that ignores `created_before`.
+    ignore_cutoff: AtomicBool,
+    /// Reset every creation time on a one-blob listing. This simulates a
+    /// writer that uploads a key again after the page was listed.
+    reupload_on_revalidate: AtomicBool,
     list_calls: AtomicUsize,
 }
 
@@ -62,6 +72,10 @@ impl MemStore {
             blobs: Mutex::new(BTreeMap::new()),
             can_list,
             fail_delete: AtomicBool::new(false),
+            hang_delete: AtomicBool::new(false),
+            fail_list: AtomicBool::new(false),
+            ignore_cutoff: AtomicBool::new(false),
+            reupload_on_revalidate: AtomicBool::new(false),
             list_calls: AtomicUsize::new(0),
         })
     }
@@ -111,6 +125,9 @@ impl PayloadStore for MemStore {
     }
 
     fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()> {
+        if self.hang_delete.load(Ordering::SeqCst) {
+            return Box::pin(std::future::pending());
+        }
         let fail = self.fail_delete.load(Ordering::SeqCst);
         if !fail {
             self.blobs.lock().unwrap().remove(key);
@@ -134,13 +151,23 @@ impl PayloadStore for MemStore {
         if !self.can_list {
             return Box::pin(async { Ok(None) });
         }
+        if self.fail_list.load(Ordering::SeqCst) {
+            return Box::pin(async { Err(PayloadStoreError("list refused".to_string())) });
+        }
+        if limit == 1 && self.reupload_on_revalidate.load(Ordering::SeqCst) {
+            for (_, created) in self.blobs.lock().unwrap().values_mut() {
+                *created = Utc::now();
+            }
+        }
+        let ignore_cutoff = self.ignore_cutoff.load(Ordering::SeqCst);
         let mut matching: Vec<StoredBlob> = self
             .blobs
             .lock()
             .unwrap()
             .iter()
             .filter(|(key, (_, created))| {
-                *created < created_before && after.is_none_or(|a| key.as_str() > a)
+                (ignore_cutoff || *created < created_before)
+                    && after.is_none_or(|a| key.as_str() > a)
             })
             .map(|(key, (_, created))| StoredBlob {
                 key: key.clone(),
@@ -255,7 +282,6 @@ async fn connect(url: &str) -> AsyncPgConnection {
 
 async fn insert_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
     // Scoped: the trait's `load` would shadow the atomics' `load` elsewhere.
-    use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
@@ -429,14 +455,22 @@ async fn a_blob_younger_than_the_grace_period_is_never_deleted() {
     let dbs = setup_dbs().await;
     let store = MemStore::new(true);
     store.plant_orphan("young", 0);
+    store.blobs.lock().unwrap().insert(
+        "half-hour".to_string(),
+        (Vec::new(), Utc::now() - chrono::Duration::minutes(30)),
+    );
+    store.plant_orphan("two-hours", 2);
     store.plant_orphan("old", 48);
     let off = offloader(&store);
 
     let metrics = Arc::new(CapturingMetrics::default());
     run_ticks(one_shard(&dbs), sweep_config(), &metrics, off, 1).await;
 
-    assert_eq!(store.keys(), BTreeSet::from(["young".to_string()]));
-    assert_eq!(metrics.counts(), (1, 1, 0));
+    assert_eq!(
+        store.keys(),
+        BTreeSet::from(["half-hour".to_string(), "young".to_string()])
+    );
+    assert_eq!(metrics.counts(), (2, 2, 0));
 }
 
 #[tokio::test]
@@ -456,10 +490,19 @@ async fn a_failed_reference_check_deletes_nothing() {
     let sharded = ShardedDbPool::from_map(pools, ShardId::new(0));
 
     let metrics = Arc::new(CapturingMetrics::default());
-    run_ticks(sharded, sweep_config(), &metrics, off, 1).await;
+    run_ticks(sharded, sweep_config(), &metrics, Arc::clone(&off), 1).await;
 
+    assert!(
+        store.list_calls.load(Ordering::SeqCst) >= 1,
+        "the sweep ran and stopped at the reference check"
+    );
     assert_eq!(store.keys(), BTreeSet::from(["old".to_string()]));
     assert_eq!(metrics.counts(), (0, 0, 0));
+
+    // Control: with every database reachable, the same blob goes.
+    let dbs_ok = two_shards(&dbs);
+    run_ticks(dbs_ok, sweep_config(), &metrics, off, 1).await;
+    assert!(store.keys().is_empty());
 }
 
 #[tokio::test]
@@ -571,4 +614,123 @@ async fn a_grace_below_the_floor_skips_the_pass() {
 
     assert_eq!(store.list_calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.keys().len(), 1);
+}
+
+#[tokio::test]
+async fn a_store_that_ignores_the_cutoff_cannot_make_the_sweep_delete_a_young_blob() {
+    let dbs = setup_dbs().await;
+    let store = MemStore::new(true);
+    store.ignore_cutoff.store(true, Ordering::SeqCst);
+    store.plant_orphan("young", 0);
+    store.plant_orphan("old", 48);
+    let off = offloader(&store);
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_ticks(one_shard(&dbs), sweep_config(), &metrics, off, 1).await;
+
+    assert_eq!(store.keys(), BTreeSet::from(["young".to_string()]));
+    assert_eq!(metrics.counts(), (1, 1, 0));
+}
+
+#[tokio::test]
+async fn a_key_uploaded_again_after_the_listing_is_not_deleted() {
+    let dbs = setup_dbs().await;
+    let store = MemStore::new(true);
+    store.plant_orphan("old", 48);
+    store.reupload_on_revalidate.store(true, Ordering::SeqCst);
+    let off = offloader(&store);
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_ticks(one_shard(&dbs), sweep_config(), &metrics, off, 1).await;
+
+    assert_eq!(
+        store.keys(),
+        BTreeSet::from(["old".to_string()]),
+        "a fresh upload of the key must survive"
+    );
+    assert_eq!(metrics.counts().1, 0);
+}
+
+#[tokio::test]
+async fn blobs_referenced_on_different_shards_all_survive() {
+    let dbs = setup_dbs().await;
+    let store = MemStore::new(true);
+    let off = offloader(&store);
+
+    let mut conn_a = connect(&dbs.url_a).await;
+    let exec_a = insert_execution(&mut conn_a).await;
+    store::append_events_offloaded(&mut conn_a, exec_a, &big_events(), 0, Some(&off))
+        .await
+        .expect("append on shard 0");
+    let mut conn_b = connect(&dbs.url_b).await;
+    let exec_b = insert_execution(&mut conn_b).await;
+    store::append_events_offloaded(&mut conn_b, exec_b, &big_events(), 0, Some(&off))
+        .await
+        .expect("append on shard 1");
+    let referenced = store.keys();
+    assert_eq!(referenced.len(), 2);
+    store.age_all(2);
+    store.plant_orphan("orphan-key", 48);
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_ticks(two_shards(&dbs), sweep_config(), &metrics, off, 1).await;
+
+    let mut expected = referenced;
+    assert_eq!(store.keys(), std::mem::take(&mut expected));
+    assert_eq!(metrics.counts(), (1, 1, 0));
+}
+
+#[tokio::test]
+async fn a_failed_listing_deletes_nothing_and_leaves_the_sweep_on() {
+    let dbs = setup_dbs().await;
+    let store = MemStore::new(true);
+    store.plant_orphan("old", 48);
+    store.fail_list.store(true, Ordering::SeqCst);
+    let off = offloader(&store);
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_ticks(one_shard(&dbs), sweep_config(), &metrics, off, 2).await;
+
+    assert_eq!(store.keys().len(), 1);
+    assert_eq!(
+        store.list_calls.load(Ordering::SeqCst),
+        2,
+        "an error is retried on the next tick"
+    );
+    assert_eq!(metrics.counts(), (0, 0, 0));
+}
+
+#[tokio::test]
+async fn a_hung_delete_times_out_and_is_counted() {
+    let dbs = setup_dbs().await;
+    let store = MemStore::new(true);
+    store.plant_orphan("old", 48);
+    store.hang_delete.store(true, Ordering::SeqCst);
+    let off = offloader(&store);
+    let mut config = sweep_config();
+    config.archival_timeout_secs = 1;
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_ticks(one_shard(&dbs), config, &metrics, off, 1).await;
+
+    assert_eq!(store.keys().len(), 1);
+    assert_eq!(metrics.counts(), (1, 0, 1));
+}
+
+#[tokio::test]
+async fn one_tick_reads_at_most_ten_pages() {
+    let dbs = setup_dbs().await;
+    let store = MemStore::new(true);
+    for n in 0..25 {
+        store.plant_orphan(&format!("old-{n:02}"), 48);
+    }
+    let off = offloader(&store);
+    let mut config = sweep_config();
+    config.batch_size = 2;
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_ticks(one_shard(&dbs), config, &metrics, off, 1).await;
+
+    assert_eq!(store.keys().len(), 5, "ten pages of two cover twenty blobs");
+    assert_eq!(metrics.counts(), (20, 20, 0));
 }
