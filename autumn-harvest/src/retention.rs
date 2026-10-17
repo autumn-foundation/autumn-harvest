@@ -44,7 +44,7 @@ use crate::types::ShardId;
 const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_BATCH_SIZE: usize = 1_000;
 const MIN_MAX_AGE: Duration = Duration::from_secs(1);
-const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
+pub(crate) const MAX_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 10);
 const DEFAULT_ARCHIVAL_TIMEOUT_SECS: u64 = 30;
 
 /// Default idle window before an inert per-tenant rate-limit bucket is
@@ -2067,6 +2067,8 @@ impl RetentionRuntime {
         );
         let handle = tokio::spawn(async move {
             let mut scan_cursors: HashMap<ShardId, Option<RetentionScanCursor>> = HashMap::new();
+            // Issue #2123: the orphan-blob sweep keeps its listing cursor here.
+            let mut orphan_blob_sweeper = crate::orphan_blob_sweep::OrphanBlobSweeper::default();
             // See `run_partition_maintenance_pass`'s review finding on
             // `resume_cursors`. Local state this task owns outright, for
             // the identical reason `scan_cursors` above is local rather
@@ -2527,6 +2529,19 @@ impl RetentionRuntime {
                         &shutdown_task,
                     )
                     .await;
+
+                    // Orphan-blob sweep (issue #2123). It is outside the
+                    // history-retention gate: rolled-back writes leak blobs
+                    // whether or not history retention is on.
+                    orphan_blob_sweeper
+                        .run_pass(
+                            &pools,
+                            &config,
+                            offloader.as_deref(),
+                            metrics.as_ref(),
+                            &shutdown_task,
+                        )
+                        .await;
                 };
                 if let Err(error) =
                     crate::replication::run_fenced_pass(&tick_fence, Box::pin(tick)).await
@@ -5722,8 +5737,8 @@ mod tests {
         let too_short = RetentionConfig::default()
             .with_orphan_blob_grace(MIN_ORPHAN_BLOB_GRACE - Duration::from_secs(1));
         assert!(too_short.validate().is_err());
-        let too_long = RetentionConfig::default()
-            .with_orphan_blob_grace(MAX_MAX_AGE + Duration::from_secs(1));
+        let too_long =
+            RetentionConfig::default().with_orphan_blob_grace(MAX_MAX_AGE + Duration::from_secs(1));
         assert!(too_long.validate().is_err());
         let at_floor = RetentionConfig::default().with_orphan_blob_grace(MIN_ORPHAN_BLOB_GRACE);
         assert!(at_floor.validate().is_ok());

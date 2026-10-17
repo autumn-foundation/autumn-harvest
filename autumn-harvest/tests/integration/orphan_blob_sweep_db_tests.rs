@@ -37,7 +37,7 @@ use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::DbPool;
 use chrono::{DateTime, Utc};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use diesel_async::{AsyncConnection, AsyncPgConnection, SimpleAsyncConnection};
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
@@ -149,7 +149,9 @@ impl PayloadStore for MemStore {
             .collect();
         let more = matching.len() > limit;
         matching.truncate(limit);
-        let next = more.then(|| matching.last().map(|b| b.key.clone())).flatten();
+        let next = more
+            .then(|| matching.last().map(|b| b.key.clone()))
+            .flatten();
         Box::pin(async move {
             Ok(Some(BlobPage {
                 blobs: matching,
@@ -252,6 +254,9 @@ async fn connect(url: &str) -> AsyncPgConnection {
 }
 
 async fn insert_execution(conn: &mut AsyncPgConnection) -> ExecutionId {
+    // Scoped: the trait's `load` would shadow the atomics' `load` elsewhere.
+    use diesel::prelude::*;
+    use diesel_async::RunQueryDsl;
     let exec_id = ExecutionId::new();
     let row = NewWorkflowExecution {
         quota_key: None,
@@ -549,4 +554,21 @@ async fn one_tick_pages_through_a_listing_larger_than_the_batch() {
 
     assert!(store.keys().is_empty(), "three pages cover five blobs");
     assert_eq!(metrics.counts(), (5, 5, 0));
+}
+
+#[tokio::test]
+async fn a_grace_below_the_floor_skips_the_pass() {
+    let dbs = setup_dbs().await;
+    let store = MemStore::new(true);
+    store.plant_orphan("young", 0);
+    let off = offloader(&store);
+    // `spawn` does not call `validate`. The pass must refuse a one-minute grace.
+    let mut config = sweep_config();
+    config.orphan_blob_grace_secs = Some(60);
+
+    let metrics = Arc::new(CapturingMetrics::default());
+    run_ticks(one_shard(&dbs), config, &metrics, off, 1).await;
+
+    assert_eq!(store.list_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.keys().len(), 1);
 }

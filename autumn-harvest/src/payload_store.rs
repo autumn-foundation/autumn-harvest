@@ -599,7 +599,11 @@ mod tests {
                 Box::pin(async { Ok(Some(BlobPage::default())) })
             }
         }
-        let off = PayloadOffloader::new(Arc::new(Lister), 16, Arc::new(crate::telemetry::NoOpMetrics));
+        let off = PayloadOffloader::new(
+            Arc::new(Lister),
+            16,
+            Arc::new(crate::telemetry::NoOpMetrics),
+        );
         let (counting, _) = off.counting_uploads();
         let page = counting.store().list(None, Utc::now(), 1).await.unwrap();
         assert_eq!(page, Some(BlobPage::default()));
