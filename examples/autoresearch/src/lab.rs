@@ -546,9 +546,9 @@ impl Lab {
     /// A fixed file is each tracked file but the free ones. A score
     /// must belong to the files of its commit. So a change that no commit
     /// holds, such as a hand edit of `prepare.py`, is refused. The bytes on
-    /// disk are hashed with no git filter. When they differ from the blob,
-    /// git compares the file with the commit, so a checkout that converts
-    /// line ends is no change. A file that is gone, or is not a
+    /// disk are hashed with no git filter. Bytes that are the blob with CRLF
+    /// line ends, or the content of an LFS pointer, are no change either. A
+    /// file that is gone, or is not a
     /// regular file, is a change too. So is a staged fixed file that the
     /// commit does not hold.
     ///
@@ -592,20 +592,14 @@ impl Lab {
             args.extend(present.iter().map(|(path, _)| *path));
             let ids = self.git(&args)?;
             // Raw bytes that differ from the blob can still be a clean
-            // checkout: git converts line ends, and LFS swaps a pointer. Git
-            // decides those. A change that a run makes during its run is
-            // caught by the raw snapshot, which no git setting can hide.
-            changed.extend(
-                present
-                    .iter()
-                    .zip(ids.lines())
-                    .filter(|((_, want), got)| want != got)
-                    .map(|((path, _), _)| *path)
-                    .filter(|path| {
-                        self.git(&["diff", "--quiet", "--no-ext-diff", commit, "--", path])
-                            .is_err()
-                    }),
-            );
+            // checkout that converted line ends or swapped an LFS pointer.
+            // The runner decides that itself. A git filter would let a run
+            // that wrote `.git/config` hide a change.
+            for ((path, want), got) in present.iter().zip(ids.lines()) {
+                if want != &got && !self.is_checkout_of(path, want) {
+                    changed.push(path);
+                }
+            }
         }
         if changed.is_empty() {
             return Ok(());
@@ -616,6 +610,40 @@ impl Lab {
             changed.join(", "),
             changed.join(" ")
         ))
+    }
+
+    /// `true` when the bytes of `path` on disk are a checkout of the blob
+    /// `id`. Two forms pass: the blob with each LF as CRLF, and the content
+    /// that a Git LFS pointer names. No filter runs, so a run cannot set one up.
+    fn is_checkout_of(&self, path: &str, id: &str) -> bool {
+        let (Ok(Some(disk)), Ok(blob)) = (
+            crate::stores::read_regular(&self.root.join(path)),
+            git_bytes(&self.root, &["cat-file", "blob", id]),
+        ) else {
+            return false;
+        };
+        let mut crlf = Vec::with_capacity(blob.len() + blob.len() / 16);
+        for (i, byte) in blob.iter().enumerate() {
+            if *byte == b'\n' && (i == 0 || blob[i - 1] != b'\r') {
+                crlf.push(b'\r');
+            }
+            crlf.push(*byte);
+        }
+        disk == crlf || lfs_holds(&blob, &disk)
+    }
+
+    /// Keep each change to a tracked file in a stash named `message`, and
+    /// leave the work tree as it is. A lab with no change gets no stash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when git fails.
+    pub fn keep_changes(&self, message: &str) -> Result<(), String> {
+        let id = self.git(&["stash", "create"])?;
+        if !id.is_empty() {
+            self.git(&["stash", "store", "--quiet", "-m", message, &id])?;
+        }
+        Ok(())
     }
 
     /// Put `branch` at `commit`, check it out, and reset as
@@ -631,7 +659,8 @@ impl Lab {
     }
 
     /// Reset the branch and each tracked file to `commit`, but keep the
-    /// bytes of each free file, such as `program.md`.
+    /// bytes of each free file, such as `program.md`. A staged file that
+    /// `commit` does not hold stays on disk, out of the index.
     ///
     /// A person edits a free file, maybe for the next night while this one
     /// runs. Each fixed file goes back, so a change to `prepare.py`, the
@@ -658,6 +687,20 @@ impl Lab {
                 Some((file, bytes))
             })
             .collect();
+        // A hard reset deletes a file that the index holds and `target` does
+        // not, such as a new file that a person staged. Out of the index, it
+        // stays on disk as a file that git does not track.
+        let held = self.git(&["ls-tree", "-r", "-z", "--name-only", "--full-tree", &target])?;
+        let held: std::collections::HashSet<&str> = held.split('\0').collect();
+        let staged: Vec<&str> = tracked
+            .split('\0')
+            .filter(|path| !path.is_empty() && !held.contains(path))
+            .collect();
+        if !staged.is_empty() {
+            let mut args = vec!["rm", "--cached", "--quiet", "--"];
+            args.extend(staged);
+            self.git(&args)?;
+        }
         self.git(&["reset", "--quiet", "--hard", &target])?;
         for (file, bytes) in kept {
             let now = crate::stores::read_regular(&file).ok().flatten();
@@ -912,6 +955,11 @@ pub fn check_tag(tag: &str) -> Result<(), String> {
 
 /// Run git in `dir` with the example's author and [`SAFE_GIT`].
 fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
+    git_bytes(dir, args).map(|out| String::from_utf8_lossy(&out).trim().to_string())
+}
+
+/// The output of a git command in `dir`, byte for byte. See [`git_in`].
+fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let mut command = Command::new("git");
     command
         .args(AUTHOR)
@@ -930,7 +978,7 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
         .output()
         .map_err(|e| format!("cannot run git: {e}"))?;
     if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        Ok(out.stdout)
     } else {
         Err(format!(
             "git {} failed: {}",
@@ -938,6 +986,23 @@ fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ))
     }
+}
+
+/// `true` when `pointer` is a Git LFS pointer whose `oid` and `size` are
+/// those of `content`.
+fn lfs_holds(pointer: &[u8], content: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(pointer) else {
+        return false;
+    };
+    if !text.starts_with("version https://git-lfs.github.com/spec/v1\n") {
+        return false;
+    }
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name).map(str::trim))
+    };
+    field("oid sha256:") == Some(crate::stores::hashed_bytes(content).as_str())
+        && field("size ") == Some(content.len().to_string().as_str())
 }
 
 /// Create `dir`, and let only its owner read it.
@@ -1768,5 +1833,61 @@ mod tests {
         );
         lab.start_branch("t1", "s1").unwrap();
         lab.require_fixed_files(&lab.head().unwrap()).unwrap();
+    }
+
+    /// A reset must not delete a new file that a person staged. It stays on
+    /// disk, as a file that git does not track.
+    #[test]
+    fn a_reset_keeps_a_staged_new_file_on_disk() {
+        let (_dir, lab) = lab();
+        lab.start_branch("t1", "s1").unwrap();
+        let base = lab.head().unwrap();
+        let helper = lab.root().join("helper.py");
+        std::fs::write(&helper, "X = 1\n").unwrap();
+        lab.git(&["add", "helper.py"]).unwrap();
+        lab.reset_to(&base).unwrap();
+        assert_eq!(std::fs::read_to_string(&helper).unwrap(), "X = 1\n");
+        lab.require_fixed_files(&base).unwrap();
+    }
+
+    /// A run can write `.git/config` and `.git/info/attributes`. A clean
+    /// filter that it sets up there must not hide a change to a fixed file.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_clean_filter_cannot_hide_a_fixed_file_change() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, lab) = lab();
+        lab.start_branch("t1", "s1").unwrap();
+        let head = lab.head().unwrap();
+        let prepare = lab.root().join(PREPARE);
+        let fixed = dir.path().join("fixed");
+        std::fs::copy(&prepare, &fixed).unwrap();
+        let script = dir.path().join("clean.sh");
+        let body = format!("#!/bin/sh\ncat > /dev/null\ncat '{}'\n", fixed.display());
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        lab.git(&["config", "filter.hide.clean", &script.display().to_string()])
+            .unwrap();
+        let attributes = lab.root().join(".git").join("info").join("attributes");
+        std::fs::create_dir_all(attributes.parent().unwrap()).unwrap();
+        std::fs::write(&attributes, "prepare.py filter=hide\n").unwrap();
+        std::fs::write(&prepare, "EVAL = 999\n").unwrap();
+        let why = lab.require_fixed_files(&head).unwrap_err();
+        assert!(why.contains(PREPARE), "{why}");
+    }
+
+    /// An LFS pointer holds the hash and the size of the file that a
+    /// checkout writes in its place.
+    #[test]
+    fn an_lfs_pointer_holds_only_its_own_content() {
+        let content = b"weights";
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
+            crate::stores::hashed_bytes(content),
+            content.len()
+        );
+        assert!(lfs_holds(pointer.as_bytes(), content));
+        assert!(!lfs_holds(pointer.as_bytes(), b"weightz"));
+        assert!(!lfs_holds(b"not a pointer", content));
     }
 }

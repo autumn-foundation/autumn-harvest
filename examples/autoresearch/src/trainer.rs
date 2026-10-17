@@ -429,8 +429,10 @@ pub async fn run(
     let log_path = lab.join(RUN_LOG);
     match spec {
         TrainerSpec::Simulated { seconds } => {
-            let train_py = std::fs::read_to_string(lab.join("train.py"))
-                .map_err(|e| format!("cannot read train.py: {e}"))?;
+            let train_py = crate::stores::read_regular(&lab.join("train.py"))
+                .map_err(|e| format!("cannot read train.py: {e}"))?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .ok_or("cannot read train.py: it does not exist")?;
             let run = simulate(&train_py);
             let lines: Vec<&str> = run.log.lines().collect();
             let pause =

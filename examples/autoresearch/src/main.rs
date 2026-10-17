@@ -823,7 +823,7 @@ fn post(args: &LabArgs, command: &Command) -> Result<(), String> {
     // its pause, which a session with `--pace 0` does not have.
     let when = match command {
         Command::Approve { .. } | Command::Deny { .. } => "on its next tick",
-        _ => "in the pause before the next experiment",
+        _ => "in the pause before the next experiment, or at the next hand-off with `--pace 0`",
     };
     println!("queued {id}: the runner delivers it {when}");
     Ok(())

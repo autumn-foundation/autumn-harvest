@@ -211,7 +211,7 @@ impl Turns {
         {
             return Some(raw.clone());
         }
-        let bytes = std::fs::read(self.path(&key)?).ok()?;
+        let bytes = crate::stores::read_regular(&self.path(&key)?).ok()??;
         serde_json::from_slice(&bytes).ok()
     }
 }

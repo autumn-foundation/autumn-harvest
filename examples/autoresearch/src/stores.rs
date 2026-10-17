@@ -79,10 +79,10 @@ impl FileMemoryStore {
     }
 
     fn read(&self, scope: &MemoryScope) -> Result<ScopeFile, AgentError> {
-        match std::fs::read(self.path(scope)) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
+        match read_regular(&self.path(scope)) {
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes)
                 .map_err(|e| AgentError::new(ErrorKind::Decode, format!("memory file: {e}"))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ScopeFile {
+            Ok(None) => Ok(ScopeFile {
                 blocks: MemoryBlock::defaults(),
                 applied: BTreeMap::new(),
             }),
@@ -263,9 +263,10 @@ impl ResultsPrecheck {
         let (Ok(rows), Ok(state)) = (lab.rows(), lab.state_dir()) else {
             return false;
         };
-        let alerted: usize = std::fs::read_to_string(state.join(ALERTED))
+        let alerted: usize = read_regular(&state.join(ALERTED))
             .ok()
-            .and_then(|text| text.trim().parse().ok())
+            .flatten()
+            .and_then(|bytes| String::from_utf8_lossy(&bytes).trim().parse().ok())
             .unwrap_or(0);
         let streak = rows.len() >= CRASH_STREAK
             && rows
@@ -376,7 +377,8 @@ impl FileCacheIndex {
 
 /// The order number and the blob key in the entry file at `path`.
 fn read_entry(path: &Path) -> Option<(u64, String)> {
-    let text = std::fs::read_to_string(path).ok()?;
+    let bytes = read_regular(path).ok()??;
+    let text = String::from_utf8_lossy(&bytes);
     let (order, blob) = text.split_once('\n')?;
     Some((order.parse().ok()?, blob.trim().to_string()))
 }
@@ -449,7 +451,9 @@ impl PayloadStore for DirPayloadStore {
 
     fn get(&self, key: &str) -> PayloadStoreFuture<'_, Vec<u8>> {
         let result = self.path(key).and_then(|path| {
-            std::fs::read(&path).map_err(|e| PayloadStoreError(format!("blob {key}: {e}")))
+            read_regular(&path)
+                .map_err(|e| PayloadStoreError(format!("blob {key}: {e}")))?
+                .ok_or_else(|| PayloadStoreError(format!("blob {key}: it does not exist")))
         });
         Box::pin(std::future::ready(result))
     }
@@ -854,5 +858,31 @@ mod tests {
         write_atomic(&path, b"two").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"two");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    /// The runner reads a state file only when it is a regular file. A
+    /// symlink is refused, a pipe is refused without a wait, and a missing
+    /// file is `None`.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_refuses_a_symlink_and_a_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "KEY=hunter2").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(read_regular(&link).is_err());
+        let pipe = dir.path().join("pipe");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &pipe,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        assert!(read_regular(&pipe).is_err());
+        assert_eq!(read_regular(&dir.path().join("none")).unwrap(), None);
+        assert_eq!(read_regular(&target).unwrap().unwrap(), b"KEY=hunter2");
     }
 }

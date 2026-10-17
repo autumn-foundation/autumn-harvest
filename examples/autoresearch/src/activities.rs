@@ -334,6 +334,8 @@ fn after_run(
                 .chain(after.keys())
                 .filter(|path| before.get(*path) != after.get(*path))
                 .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
                 .collect();
             if moved.is_empty() {
                 Ok(())
@@ -390,15 +392,18 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
     // again. The second delivery waits here, then finds the saved run. The
     // checks come after the lock, because a run can change the lab.
     let _call = call_lock(&saved).await?;
-    if let Some(run) = std::fs::read(&saved)
+    if let Some(run) = crate::stores::read_regular(&saved)
         .ok()
+        .flatten()
         .and_then(|bytes| serde_json::from_slice::<TrainRun>(&bytes).ok())
     {
         return Ok(run);
     }
     // The mark says that a delivery of this call began a run. With no saved
-    // run, its runner stopped. The checks passed before that run, so each
-    // change since then is the run's: stop what is left, and put it back.
+    // run, its runner stopped. The checks passed before that run, so a
+    // change since then is the run's, or a person's while the runner was
+    // stopped. Stop what is left, keep the changes in a stash, and put the
+    // lab back.
     let started = saved.with_extension("started");
     let marked = crate::stores::open_regular(&started)
         .map_err(|e| format!("cannot read {}: {e}", started.display()))?
@@ -406,7 +411,13 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
     if marked {
         crate::trainer::reap(&state).await?;
         let (back, branch, commit) = (lab.clone(), input.branch.clone(), input.commit.clone());
-        blocking(move || back.restore(&branch, &commit)).await?;
+        blocking(move || {
+            back.keep_changes(&format!(
+                "autoresearch: the lab before a resume of {branch}"
+            ))?;
+            back.restore(&branch, &commit)
+        })
+        .await?;
     }
     let (checked, branch, commit) = (lab.clone(), input.branch.clone(), input.commit.clone());
     blocking(move || {
@@ -670,6 +681,13 @@ mod tests {
                 run.log_tail.contains("changed the lab"),
                 "{change}: {run:?}"
             );
+            if change.contains("prepare.py") {
+                // Each file is named once.
+                assert!(
+                    run.log_tail.ends_with("it changed prepare.py\n"),
+                    "{change}: {run:?}"
+                );
+            }
             let lab = Lab::open(&input.lab).unwrap();
             lab.require_branch(&input.branch).unwrap();
             lab.require_head(&input.commit).unwrap();
@@ -737,8 +755,17 @@ mod tests {
             lab.require_branch(&input.branch).is_err(),
             "the run moved it"
         );
+        // A person changes the lab while the runner is stopped.
+        let prepare = lab.root().join(crate::lab::PREPARE);
+        let text = std::fs::read_to_string(&prepare).unwrap();
+        std::fs::write(&prepare, format!("{text}PERSON = 1\n")).unwrap();
         let run = train(&ctx, input.clone()).await.unwrap();
         assert_eq!(run.exit_code, Some(0), "{run:?}");
+        // What the resume put back stays in a stash.
+        let kept = lab.git(&["stash", "list"]).unwrap();
+        assert!(kept.contains("autoresearch"), "{kept}");
+        let shown = lab.git(&["stash", "show", "-p", "stash@{0}"]).unwrap();
+        assert!(shown.contains("PERSON = 1"), "{shown}");
         lab.require_branch(&input.branch).unwrap();
         lab.require_head(&input.commit).unwrap();
         lab.require_clean_train().unwrap();

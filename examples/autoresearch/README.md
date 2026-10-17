@@ -278,20 +278,24 @@ experiment set the search attribute `status`, which the engine reserves.
   or changes a fixed file, such as `train.py` or `prepare.py`, is a crash,
   and the lab goes back. The check reads the bytes on disk, so a git filter
   cannot hide a change. `uv.lock` counts too, so run `uv run prepare.py` once
-  first, as step 1 says. After a stop in
-  the middle of a run, the train call puts the lab back before it trains
-  again. The code can still read your files, write `.git` and
+  first, as step 1 says, and commit `uv.lock` if that run changes it. After a
+  stop in the middle of a run, the train call puts the lab back before it
+  trains again. It keeps the changes that it puts back in `git stash list`.
+  The code can still read your files, write `.git` and
   `.autoresearch`, and escape the kill with `setsid`. Run it in a container,
   or as a user with no other rights.
 - **Fixed files and free files.** A free file is tracked Markdown, a
   notebook or an image, such as `program.md` or `progress.png`. Each other
   tracked file is fixed. A run trains only when each fixed file holds the
   bytes of its commit, so a score belongs to the tracked files of that
-  commit. A hand edit of `prepare.py` during a night is refused: commit it
-  first. So is a staged fixed file that the commit does not hold. A file that
-  git does not track, such as a module next to `train.py`, is not checked,
-  and Python can load it. A reset does not remove it, so read `git status`
-  in the morning. A discard, a crash and a rewind reset the branch and each
+  commit. A hand edit of `prepare.py` during a night makes the next
+  experiment a crash, and its reset puts the file back. So does a staged
+  fixed file that the commit does not hold, and the reset unstages it.
+  Commit such a change before a night. A file that git does not track is
+  not checked, and Python can load it. Examples are a module next to
+  `train.py`, bytecode in `__pycache__` and a package in `.venv`. A reset
+  does not remove such a file, so read `git status --ignored` in the
+  morning. A discard, a crash and a rewind reset the branch and each
   fixed file, and keep each free file. So an edit of `program.md` for the
   next night stays. A change that a run makes there stays too, so read
   `program.md` before a night.

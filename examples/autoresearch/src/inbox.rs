@@ -126,11 +126,14 @@ impl Inbox {
         let mut commands = Vec::new();
         for name in names {
             let path = self.dir.join(&name);
-            let parsed = std::fs::File::open(&path).ok().and_then(|file| {
-                let mut bytes = Vec::new();
-                file.take(MAX_COMMAND).read_to_end(&mut bytes).ok()?;
-                serde_json::from_slice::<Command>(&bytes).ok()
-            });
+            let parsed = crate::stores::open_regular(&path)
+                .ok()
+                .flatten()
+                .and_then(|file| {
+                    let mut bytes = Vec::new();
+                    file.take(MAX_COMMAND).read_to_end(&mut bytes).ok()?;
+                    serde_json::from_slice::<Command>(&bytes).ok()
+                });
             match parsed {
                 Some(command) => {
                     let id = name.trim_end_matches(".json").to_string();

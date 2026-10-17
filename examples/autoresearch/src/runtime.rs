@@ -421,8 +421,10 @@ pub fn check_model(rt: &SqliteRuntime, exec: ExecutionId, model: &str) -> Result
 ///
 /// `waiting_for` names the mutex that the session of `run` waits for. Two
 /// sessions that wait for each other take turns, one experiment for each
-/// `run`, so the message then puts the stop first. Each command works as
-/// printed: it has the database, the model and the tag of the session.
+/// `run`, so the message then puts the stop first. Each `run` and `stop`
+/// command works as printed: it has the database, the model and the tag of
+/// the session. The `serve` hint names no options, because `serve` writes
+/// its nightly schedule from its own options.
 #[must_use]
 pub fn finish_first(
     lab: &std::path::Path,
@@ -449,18 +451,16 @@ pub fn finish_first(
     let db = db.map_or_else(String::new, |db| {
         format!(" --db {}", shell_word(&db.display().to_string()))
     });
-    let model = model
-        .strip_prefix("claude:")
-        .map_or_else(String::new, |id| {
-            format!(" --model claude --claude-model {}", shell_word(id))
-        });
+    let model = model_flags(model);
     let tag_flag = if tag.is_empty() {
         String::new()
     } else {
         format!(" --tag {}", shell_word(tag))
     };
     let resume = format!("`autoresearch run --lab {lab}{db}{model}{tag_flag}`");
-    let serve = format!("`autoresearch serve --lab {lab}{db}{model}` drives every session.");
+    // `serve` writes its nightly schedule from its own options, so the
+    // message names no `serve` command that could replace them.
+    let serve = "`autoresearch serve` with your usual options drives every session.";
     let head = format!(
         "{} is running, and only one runner can drive this database.",
         names.join(", ")
@@ -484,6 +484,17 @@ pub fn finish_first(
             )
         },
     )
+}
+
+/// The flags that pick the model of `label`, such as
+/// ` --model claude --claude-model <id>`. The scripted model is the default,
+/// so it needs none.
+fn model_flags(label: &str) -> String {
+    label
+        .strip_prefix("claude:")
+        .map_or_else(String::new, |id| {
+            format!(" --model claude --claude-model {}", shell_word(id))
+        })
 }
 
 /// `word` as one shell word: as it is, or in single quotes.
@@ -564,8 +575,9 @@ pub fn check_agents(
             && started != model
         {
             return Err(format!(
-                "a heartbeat run that `serve --model {started}` started is not finished. \
-                 Serve with the same --model and --claude-model until it ends"
+                "a heartbeat run that `serve` started with the model {started} is not \
+                 finished. Run `autoresearch serve{}` until it ends",
+                model_flags(started)
             ));
         }
     }
@@ -573,13 +585,20 @@ pub fn check_agents(
 }
 
 /// The top run above `exec`: the run that no other run started.
+///
+/// `purge` can remove a terminal parent while its detached child runs on.
+/// The top run that still exists is then the root.
 fn root_of(rt: &SqliteRuntime, exec: ExecutionId) -> Result<ExecutionId, String> {
     let mut run = exec;
     // A session, an experiment and two agent runs nest at most four deep.
     for _ in 0..16 {
-        match rt.parent_execution(run).map_err(|e| e.to_string())? {
-            Some(parent) => run = parent,
-            None => return Ok(run),
+        let Some(parent) = rt.parent_execution(run).map_err(|e| e.to_string())? else {
+            return Ok(run);
+        };
+        match rt.parent_execution(parent) {
+            Err(SqliteError::ExecutionNotFound(_)) => return Ok(run),
+            Err(e) => return Err(e.to_string()),
+            Ok(_) => run = parent,
         }
     }
     Ok(run)
@@ -980,7 +999,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("autoresearch serve --lab '/labs/my lab' --db"),
+            text.contains("`autoresearch serve` with your usual options"),
             "{text}"
         );
 
