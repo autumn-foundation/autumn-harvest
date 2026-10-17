@@ -10,6 +10,9 @@ records each answer, `true` or `false`, as a `SideEffectRecorded` event named
 reads the event at the same position. The record keeps the positions of a
 signal-driven loop apart, where no other command separates two calls.
 
+The `__harvest_` prefix is reserved for engine side-effect ids. Author code must
+not use `__harvest_continue_as_new`.
+
 Older histories have no record. A `WorkflowContinuedAsNew` event at the cursor
 reads as `true`, also after a deadline probe clock read. Any other event reads
 as `false`. No migration is needed, and no `WorkflowEvent` variant is new.
