@@ -2419,8 +2419,9 @@ impl RetentionRuntime {
                                 }
                             }
                             // Fairness-key state upkeep (issue #1976). It uses the
-                            // same idle window. A pruned row changes no claim, so
-                            // a failure only delays upkeep to the next tick.
+                            // same idle window. A pruned key restarts at `V` and loses
+                            // at most one claim of debt. A failure only delays
+                            // upkeep to the next tick.
                             match crate::fairness_keys::prune_fairness_state(
                                 &mut conn,
                                 None,

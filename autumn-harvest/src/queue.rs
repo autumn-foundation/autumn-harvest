@@ -2187,7 +2187,9 @@ pub enum ClaimFairness {
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
+/// Returns [`crate::error::HarvestError::Database`] on query failure. With
+/// [`ClaimFairness::Keys`], it returns [`crate::error::HarvestError::Config`]
+/// for a queue name that the weight API cannot address, before any statement.
 /// The queues of a fair claim, each once, in first-seen order.
 ///
 /// The fair claim polls the queues in a random order. A name listed twice
@@ -2211,6 +2213,11 @@ pub async fn claim_task_with_fairness(
     kind: Option<TaskType>,
     fairness: ClaimFairness,
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    if fairness == ClaimFairness::Keys {
+        for queue in queues {
+            crate::queue_fairness::validate_fairness_queue_name(queue)?;
+        }
+    }
     if fairness == ClaimFairness::Keys && queues.len() > 1 {
         use rand::seq::SliceRandom as _;
         let mut order = distinct_queues(queues);
@@ -3098,7 +3105,9 @@ pub async fn claim_task_by_id_on_shard(
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
+/// Returns [`crate::error::HarvestError::Database`] on query failure. With
+/// [`ClaimFairness::Keys`], it returns [`crate::error::HarvestError::Config`]
+/// for a queue name that the weight API cannot address, before any statement.
 #[allow(clippy::too_many_arguments)]
 pub async fn claim_task_by_id_with_fairness(
     conn: &mut AsyncPgConnection,
@@ -3112,6 +3121,11 @@ pub async fn claim_task_by_id_with_fairness(
     shard: Option<crate::types::ShardId>,
     fairness: ClaimFairness,
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    if fairness == ClaimFairness::Keys {
+        for queue in queues {
+            crate::queue_fairness::validate_fairness_queue_name(queue)?;
+        }
+    }
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
     let mut tx = conn.build_transaction().read_committed();
