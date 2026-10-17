@@ -1448,6 +1448,35 @@ A stored value that does not decode never starts work on ciphertext:
   backs off. After its last attempt, it moves to the dead-letter queue with the
   stored body. A redrive sends the body after an operator restores the key.
 
+**Buffers, specs, schedules and headers (issue #2043).** Four more groups hold
+payload copies. The engine encodes them too.
+
+- An event batch stores one envelope for each buffered input. The SQL append
+  and the element count still work. The immediate flush and the timed fire
+  decode each element before the start. The byte cap of a batch counts the
+  stored bytes, so ciphertext reaches the cap sooner than plaintext.
+- A cross-shard child spec is one envelope. It holds the child input and its
+  headers. The relay decodes it before it creates the child.
+- A schedule input is one envelope. Registration and the schedule API encode
+  it. The reconciler compares the decoded value, so a new nonce is not drift.
+  The tick, a manual trigger and a backfill decode it before the start. The
+  schedule API and the UI show the stored envelope.
+- The context headers of an execution and of an activity row are one envelope
+  each. The start path, a retry, a rerun, the workflow worker and the activity
+  worker decode them. The start options of a debounce, throttle or batch row
+  hold the headers and the memo as an envelope too. The rotation census and
+  sweep cover those two keys.
+
+A value that does not decode never starts work without it:
+
+- A workflow run whose headers do not decode fails. An activity attempt fails
+  with `PayloadDecodeFailed`. A workflow retry is skipped.
+- A batch, debounce or throttle row moves back and stays. A cross-shard child
+  stays pending. A due schedule stays due. A backfill slot counts as failed.
+- An export includes the headers only for a caller who may decode. The
+  retention archive never decodes, so it leaves an encoded header map out of
+  the archived document. Plaintext headers never reach cold storage.
+
 Every worker needs every key that can read a row. A worker without the key
 fails an attempt that a peer could run.
 
@@ -1482,7 +1511,8 @@ again.
 
 **Erasure.** Erasure (issue #495) does not reach the task rows or the outbox.
 They stay until task retention or the relay removes them. Their ciphertext is
-not readable without the key.
+not readable without the key. Erasure replaces an encoded cross-shard child
+spec with a tombstone, and it needs no key.
 
 **Behavior change for API clients.** Before column encoding, the output
 column was always plaintext, so every caller of `GET /workflows/{id}/result`
@@ -1509,7 +1539,7 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_workflow_executions.output` | Covered | The workflow result. |
 | `harvest_workflow_executions.memo` | Covered | Operator notes can hold PII. No query reads into them. |
 | `harvest_workflow_executions.search_attrs` | Clear | Visibility queries filter on it. Do not put PII in it. |
-| `harvest_workflow_executions.context_headers` | Clear | The worker, the replay export, the archive and the history export read the headers as a string map with no codec. An unreadable value means no headers. Do not put PII in a header. |
+| `harvest_workflow_executions.context_headers` | Covered | The whole header map is one envelope. The worker, the retry and the rerun decode it, and a failure stops the run. An export decodes it only for a caller who may decode. The archive leaves it out. |
 | `harvest_workflow_executions.workflow_retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_workflow_executions.completion_callbacks` | Clear | Callback targets, not payload. |
 | `harvest_workflow_executions.migrated_from_shards` | Clear | Shard bookkeeping, not payload. |
@@ -1519,8 +1549,8 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_task_queue.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_task_queue.trace_context` | Clear | Trace ids, not payload. |
 | `harvest_task_queue.required_capabilities` | Clear | Routing labels, not payload. |
-| `harvest_task_queue.context_headers` | Clear | A copy of the execution headers. The worker reads them as a string map. |
-| `harvest_schedules.workflow_input` | Clear | An operator template that the schedule API lists and edits. The reconciler compares it by value on each tick, and each encode makes a new nonce. |
+| `harvest_task_queue.context_headers` | Covered | A copy of the execution cell, which an activity row can extend with the result-writer marker. The activity worker decodes it, and a failure fails the attempt. |
+| `harvest_schedules.workflow_input` | Covered | The input of every scheduled run. Registration and the schedule API encode it. The reconciler compares the decoded value, so a new nonce is not drift. The tick decodes it before the start. |
 | `harvest_schedules.buffered_runs` | Clear | Fire times only. |
 | `harvest_schedules.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_signals.payload` | Covered | The signal payload. Signal ingest decodes it before it records `SignalReceived`. |
@@ -1540,13 +1570,13 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_completion_triggers.condition` | Clear | Trigger configuration, not payload. |
 | `harvest_completion_trigger_outbox.target_input` | Covered | The input of a deferred trigger start. The relay decodes it before the target start. |
 | `harvest_completion_trigger_outbox.priority` | Clear | Scheduling, not payload. |
-| `harvest_cross_shard_children.child_spec` | Clear | Erasure rewrites the `input` field inside the spec, and the sweep reads one envelope at the cell root. The spec holds the child input in clear until erasure or retirement. |
+| `harvest_cross_shard_children.child_spec` | Covered | The whole spec is one envelope. It holds the child input and its headers. The relay decodes it before it starts the child. Erasure replaces an encoded cell with a tombstone and needs no key. |
 | `harvest_debounce.last_input` | Covered | The buffered start input. The fire path decodes it before the start. |
-| `harvest_debounce.start_options` | Clear | Start configuration, not payload. |
+| `harvest_debounce.start_options` | Covered | The `context_headers` and `memo` keys each hold an envelope. The other keys are start configuration. The fire path decodes both keys before the start. |
 | `harvest_start_throttle.input` | Covered | The deferred start input. The fire path decodes it before the start. |
-| `harvest_start_throttle.start_options` | Clear | Start configuration, not payload. |
-| `harvest_event_batches.buffered_payloads` | Clear | SQL appends to the array and counts its elements, and the sweep reads one envelope at the cell root. The array holds each buffered input in clear until the batch fires. |
-| `harvest_event_batches.start_options` | Clear | Start configuration, not payload. |
+| `harvest_start_throttle.start_options` | Covered | The `context_headers` and `memo` keys each hold an envelope. The other keys are start configuration. The fire path decodes both keys before the start. |
+| `harvest_event_batches.buffered_payloads` | Covered | One envelope for each buffered input. The SQL append and the element count still work. The fire path and the immediate flush decode each element before the start. |
+| `harvest_event_batches.start_options` | Covered | The `context_headers` and `memo` keys each hold an envelope. The other keys are start configuration. The fire path decodes both keys before the start. |
 | `harvest_completion_deliveries.event_filter` | Clear | Callback configuration, not payload. |
 | `harvest_completion_deliveries.payload` | Covered | The webhook body. The scanner decodes it before it signs and sends the body. |
 | `harvest_completion_deliveries.retry_policy` | Clear | Callback configuration, not payload. |

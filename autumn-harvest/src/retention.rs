@@ -3194,10 +3194,15 @@ async fn run_shard_tick(
                             exported_at: chrono::Utc::now(),
                             payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
                             max_bytes: Some(usize::MAX),
-                            context_headers: candidate
-                                .context_headers
-                                .as_ref()
-                                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                            // The archive never decodes (issue #1983), so an
+                            // encoded cell leaves the headers out of the
+                            // document. Plaintext never reaches cold storage
+                            // (issue #2043).
+                            context_headers: crate::history_export::export_headers(
+                                candidate.context_headers.as_ref(),
+                                None,
+                                &mut crate::payload_codec::LossyDecodeOutcome::default(),
+                            ),
                             // Issue #772 (Finding A): the archive is the LAST
                             // surviving copy before the row is deleted. A terminal
                             // (completed/continued) run can carry a recorded

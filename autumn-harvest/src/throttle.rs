@@ -629,6 +629,9 @@ async fn insert_pending_throttle_row(
     let stored_input = codecs.encode_column(&params.input)?;
     let start_options_json = serde_json::to_value(&params.start_options)
         .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+    // The headers take the column form too (issue #2043).
+    let start_options_json =
+        crate::debounce::encode_stored_start_options(codecs, start_options_json)?;
     diesel::sql_query(
         "INSERT INTO harvest_start_throttle \
             (id, workflow_name, throttle_key, bucket_key, workflow_id, queue_name, \
@@ -1031,9 +1034,14 @@ async fn decode_due_rows(
 ) -> crate::error::HarvestResult<Vec<FireDueRow>> {
     let mut decodable = Vec::with_capacity(rows.len());
     for mut row in rows {
-        match codecs.decode_column(&row.input) {
-            Ok(plain) => {
+        match codecs.decode_column(&row.input).and_then(|plain| {
+            let options =
+                crate::debounce::decode_stored_start_options(codecs, row.start_options.clone())?;
+            Ok((plain, options))
+        }) {
+            Ok((plain, options)) => {
                 row.input = plain;
+                row.start_options = options;
                 decodable.push(row);
             }
             Err(error) => {
@@ -1051,7 +1059,7 @@ async fn decode_due_rows(
                     throttle_id = %row.id,
                     expired,
                     error_kind = crate::codec_rotation::sweep_error_kind(&error),
-                    "throttle input could not be decoded"
+                    "throttle input or headers could not be decoded"
                 );
                 if expired {
                     delete_throttle_row(conn, row.id).await?;

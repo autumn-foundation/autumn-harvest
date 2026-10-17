@@ -105,7 +105,7 @@ use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
     ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowSchedulePatch,
     ensure_dag_schedule, parse_schedule_from_expr_pub, plan_backfill_timestamps,
-    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule,
+    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule_with_codecs,
 };
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
@@ -14031,6 +14031,12 @@ pub(crate) async fn build_awaitables_report(
             }
         }
 
+        // The headers decode with the same registry as the history. A cell
+        // that does not decode degrades the report the same way (issue #2043).
+        let decoded_headers = codecs.decode_headers_opt(execution.context_headers.as_ref());
+        if decoded_headers.is_err() {
+            decode_failed = true;
+        }
         if decode_failed {
             (
                 "history_only",
@@ -14048,14 +14054,7 @@ pub(crate) async fn build_awaitables_report(
             // threads (issues #772/#698/#481) so a deadline-aware /
             // parent-aware / identity-reading / header-branching workflow
             // replays cleanly instead of spuriously degrading.
-            let context_headers = execution
-                .context_headers
-                .as_ref()
-                .and_then(|v| {
-                    serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone())
-                        .ok()
-                })
-                .unwrap_or_default();
+            let context_headers = decoded_headers.unwrap_or_default();
             let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
                 exec_id,
                 events,
@@ -28291,7 +28290,10 @@ async fn upsert_workflow_schedule_and_read_back(
     registry: Option<&HandlerRegistry>,
 ) -> Result<ScheduleEntry, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    autumn_harvest::register_workflow_schedules(conn, std::slice::from_ref(ws))
+    // The registry holds the write codec (issue #2043).
+    let identity_codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    let codecs = registry.map_or(&identity_codecs, HandlerRegistry::payload_codecs);
+    autumn_harvest::register_workflow_schedules_with_codecs(conn, std::slice::from_ref(ws), codecs)
         .await
         .map_err(map_error)?;
     let row: autumn_harvest::models::HarvestSchedule = dsl::harvest_schedules
@@ -29247,7 +29249,13 @@ async fn update_schedule_handler(
         retry_policy: request.retry_policy.clone(),
     };
 
-    match update_workflow_schedule(&mut conn, id, &patch).await {
+    // The registry holds the write codec. The API mirror serves the read path
+    // (issue #2043).
+    let write_codecs = api_state.runtime().map_or_else(
+        |_| api_state.payload_codecs(),
+        |rt| rt.registry.payload_codecs().clone(),
+    );
+    match update_workflow_schedule_with_codecs(&mut conn, id, &patch, &write_codecs).await {
         Ok(ScheduleUpdateOutcome::Updated(row)) => {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -30143,10 +30151,15 @@ async fn trigger_schedule_now(
         schedule.dag_name.as_deref(),
     ) {
         (Some(wf_name), _) => {
-            let input = schedule
-                .workflow_input
-                .clone()
-                .unwrap_or(serde_json::Value::Null);
+            // The engine reads the stored input strictly (issue #2043).
+            let input = match schedule.workflow_input.as_ref() {
+                Some(stored) => runtime
+                    .registry
+                    .payload_codecs()
+                    .decode_column(stored)
+                    .map_err(map_error)?,
+                None => serde_json::Value::Null,
+            };
             let queue = schedule
                 .queue_name
                 .as_deref()
@@ -31768,11 +31781,6 @@ pub(crate) async fn schedule_backfill_inner(
                 // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
                 // the execution lands on the default shard, same as tick_one_workflow_schedule.
                 let exec_id = ExecutionId::new();
-                let input = schedule
-                    .workflow_input
-                    .clone()
-                    .unwrap_or(serde_json::Value::Null);
-
                 let Ok(mut conn) = acquire_conn(wf_shard_pool).await else {
                     shard_failures.push(BackfillShardFailure {
                         shard_id: 0,
@@ -31817,6 +31825,25 @@ pub(crate) async fn schedule_backfill_inner(
                         continue;
                     }
                 }
+
+                // A stored input that does not decode never starts a run. A
+                // slot that already ran needs no input, so the prior-run check
+                // above comes first (issue #2043).
+                let input = match schedule.workflow_input.as_ref() {
+                    Some(stored) => {
+                        let Ok(plain) = runtime.registry.payload_codecs().decode_column(stored)
+                        else {
+                            shard_failures.push(BackfillShardFailure {
+                                shard_id: 0,
+                                reason: "stored schedule input could not be decoded".to_string(),
+                            });
+                            failed += 1;
+                            continue;
+                        };
+                        plain
+                    }
+                    None => serde_json::Value::Null,
+                };
 
                 let (
                     owner,
@@ -34940,10 +34967,9 @@ async fn replay_diagnosis(
     // configured) are not offload-inflated for the count, so the audit
     // conservatively counts inline-encrypted envelopes only — a rare-combo edge
     // that under-counts, never a leak.
-    let history = if let Some(codecs) =
-        read_path_decoder(&api_state, extension_session(maybe_session)).await
-    {
-        let history = store::load_history_inflated(&mut conn, exec_id, &codecs, offloader)
+    let decode_codecs = read_path_decoder(&api_state, extension_session(maybe_session)).await;
+    let history = if let Some(codecs) = decode_codecs.as_ref() {
+        let history = store::load_history_inflated(&mut conn, exec_id, codecs, offloader)
             .await
             .map_err(map_error)?;
         let mut outcome = LossyDecodeOutcome::default();
@@ -34953,6 +34979,13 @@ async fn replay_diagnosis(
                     outcome = outcome.merged(codecs.decode_value_lossy(&mut value));
                 }
             }
+        }
+        // The replay below decodes the header cell too. The audit counts it,
+        // so a run whose payloads are all offloaded still leaves a record
+        // (issue #2043).
+        if let Some(cell) = execution.context_headers.as_ref() {
+            let mut cell = cell.clone();
+            outcome = outcome.merged(codecs.decode_value_lossy(&mut cell));
         }
         let target = exec_id.to_string();
         // Reuse the handler's own (execution-shard) connection, mirroring the
@@ -35035,9 +35068,22 @@ async fn replay_diagnosis(
     // exactly the values hydrate_ctx_for_query threads for the query path — so a
     // deadline-aware, parent-aware, or header-branching run replays cleanly instead
     // of surfacing FALSE non-determinism.
-    let context_headers = execution.context_headers.as_ref().and_then(|v| {
-        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
-    });
+    // The headers decode under the same gate as the history. A cell this
+    // caller may not decode makes the run undiagnosable. It never replays
+    // without its headers (issue #2043).
+    let context_headers = decode_codecs
+        .clone()
+        .unwrap_or_default()
+        .decode_headers_opt(execution.context_headers.as_ref())
+        .map(|headers| execution.context_headers.is_some().then_some(headers))
+        .map_err(|_| {
+            map_error(HarvestError::HistoryUnavailable {
+                exec_id,
+                reason: "payload decoding is required to diagnose this execution; \
+                         enable decode-on-read (admin)"
+                    .to_string(),
+            })
+        })?;
     let snapshot = autumn_harvest::testing::HistorySnapshot {
         workflow_name: execution.workflow_name.clone(),
         execution_id: exec_id,
@@ -43807,9 +43853,13 @@ fn export_history_for_execution(
     decoder: Option<&PayloadCodecs>,
     outcome: &mut LossyDecodeOutcome,
 ) -> Result<HistoryExportDocument, HistoryExportError> {
-    let context_headers = execution.context_headers.as_ref().and_then(|v| {
-        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
-    });
+    // A cell the caller may not decode stays out of the export (issue #2043).
+    // The Redacted policy drops the headers, so it decodes nothing.
+    let context_headers = autumn_harvest::history_export::export_headers(
+        execution.context_headers.as_ref(),
+        decoder.filter(|_| query.payload_policy != HistoryPayloadPolicy::Redacted),
+        outcome,
+    );
     export_history_decoded(
         HistoryExportRequest {
             workflow_name: execution.workflow_name.clone(),
@@ -43875,10 +43925,11 @@ fn export_history_for_candidate(
             // Issue #798: carry the execution's own ambient headers so a
             // header-branching workflow replays against what the live run saw
             // instead of an empty map (which would be a FALSE divergence).
-            context_headers: candidate.context_headers.as_ref().and_then(|value| {
-                serde_json::from_value::<std::collections::HashMap<String, String>>(value.clone())
-                    .ok()
-            }),
+            context_headers: autumn_harvest::history_export::export_headers(
+                candidate.context_headers.as_ref(),
+                decoder.filter(|_| query.payload_policy != HistoryPayloadPolicy::Redacted),
+                outcome,
+            ),
             // Issue #772: carry the deadline-aware replay metadata (the batch
             // candidate query now SELECTs `execution_timeout`/`deadline_at`) so a
             // batch-exported deadline-aware history round-trips its continue-as-new
