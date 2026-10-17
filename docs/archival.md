@@ -498,6 +498,9 @@ The orphan sweep deletes them. It is off by default. Turn it on with
 The sweep needs a `PayloadStore` that implements `list`. A store without it
 turns the sweep off, and the log says so once. `list` must report the time of
 the latest `put` of a key. A `put` of an existing key must refresh that time.
+Implement `delete_if_older` too, with an atomic precondition such as `If-Match`.
+It keeps a blob that a writer re-uploads after the listing. Without it, the
+sweep uses a plain `delete`, and that re-upload can lose its blob.
 
 Use a store that holds only harvest blobs. The sweep deletes every old blob
 that no execution references. Do not share the store with the agent response

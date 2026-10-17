@@ -21,10 +21,11 @@
 //! - The sweep checks only the databases in its own pool set. Give every
 //!   retention process the full shard list. A ref on an unlisted database is
 //!   invisible.
-//! - A re-upload of identical bytes to a key that the sweep already listed can
-//!   race the delete. The window is one page of reference checks and deletes.
-//!   The `list` contract requires `put` to refresh `created_at`. That closes
-//!   the race for every upload before the listing.
+//! - A re-upload of identical bytes after the listing can race a plain
+//!   delete. [`PayloadStore::delete_if_older`] closes the race with an atomic
+//!   conditional delete. A store without it keeps the race open for one page of
+//!   reference checks and deletes. The `list` contract requires `put` to
+//!   refresh `created_at`, which closes the race for earlier uploads.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -144,8 +145,15 @@ async fn sweep_page(
         if options.dry_run {
             continue;
         }
-        match store.delete(key).await {
-            Ok(()) => report.deleted += 1,
+        // A conditional delete skips a blob that a writer re-uploaded after
+        // the listing. A store without one falls back to a plain delete.
+        let outcome = match store.delete_if_older(key, cutoff) {
+            Some(delete) => delete.await,
+            None => store.delete(key).await.map(|()| true),
+        };
+        match outcome {
+            Ok(true) => report.deleted += 1,
+            Ok(false) => {}
             Err(error) => {
                 report.failed += 1;
                 tracing::warn!(blob_key = %key, error = %error, "harvest orphan blob delete failed");

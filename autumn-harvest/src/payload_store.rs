@@ -146,6 +146,25 @@ pub trait PayloadStore: Send + Sync + 'static {
         let _ = (prefix, created_before, cursor);
         None
     }
+
+    /// Delete the blob under `key` only if its latest write is before
+    /// `created_before` (issue #2123). Resolve to `true` when it deleted the
+    /// blob and to `false` when the blob is newer or gone.
+    ///
+    /// The check and the delete must be one atomic step in the backend, for
+    /// example an `If-Match` or generation precondition. That closes the race
+    /// with a writer that uploads the same content-addressed key again after
+    /// the sweep listed it. Return `None` when the store cannot do this. The
+    /// sweep then falls back to [`delete`](PayloadStore::delete), and that
+    /// race stays open.
+    fn delete_if_older(
+        &self,
+        key: &str,
+        created_before: chrono::DateTime<chrono::Utc>,
+    ) -> Option<PayloadStoreFuture<'_, bool>> {
+        let _ = (key, created_before);
+        None
+    }
 }
 
 /// A blob that [`PayloadStore::list`] found (issue #2123).
@@ -220,6 +239,14 @@ impl PayloadStore for CountingStore {
         cursor: Option<&str>,
     ) -> Option<PayloadStoreFuture<'_, BlobPage>> {
         self.inner.list(prefix, created_before, cursor)
+    }
+
+    fn delete_if_older(
+        &self,
+        key: &str,
+        created_before: chrono::DateTime<chrono::Utc>,
+    ) -> Option<PayloadStoreFuture<'_, bool>> {
+        self.inner.delete_if_older(key, created_before)
     }
 }
 

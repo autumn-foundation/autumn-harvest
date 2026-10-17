@@ -20,7 +20,7 @@
 //! testcontainers Postgres.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -72,6 +72,10 @@ struct ListingStore {
     /// Keys whose `delete` fails and keeps the blob.
     fail_deletes: Mutex<HashSet<String>>,
     list_calls: AtomicUsize,
+    /// Offer an atomic `delete_if_older`.
+    conditional: AtomicBool,
+    /// A key that a writer re-uploads right after the next `list`.
+    reput_after_list: Mutex<Option<String>>,
 }
 
 impl ListingStore {
@@ -83,6 +87,8 @@ impl ListingStore {
             deletes: Mutex::default(),
             fail_deletes: Mutex::default(),
             list_calls: AtomicUsize::new(0),
+            conditional: AtomicBool::new(true),
+            reput_after_list: Mutex::default(),
         })
     }
 
@@ -121,6 +127,14 @@ impl ListingStore {
         AtomicUsize::load(&self.list_calls, Ordering::SeqCst)
     }
 
+    fn set_conditional_delete(&self, on: bool) {
+        self.conditional.store(on, Ordering::SeqCst);
+    }
+
+    fn reput_after_next_list(&self, key: &str) {
+        *self.reput_after_list.lock().unwrap() = Some(key.to_owned());
+    }
+
     fn fail_delete_of(&self, key: &str) {
         self.fail_deletes.lock().unwrap().insert(key.to_owned());
     }
@@ -155,6 +169,31 @@ impl PayloadStore for ListingStore {
         Box::pin(async move { Ok(()) })
     }
 
+    fn delete_if_older(
+        &self,
+        key: &str,
+        created_before: DateTime<Utc>,
+    ) -> Option<PayloadStoreFuture<'_, bool>> {
+        if !AtomicBool::load(&self.conditional, Ordering::SeqCst) {
+            return None;
+        }
+        self.deletes.lock().unwrap().push(key.to_owned());
+        if self.fail_deletes.lock().unwrap().contains(key) {
+            return Some(Box::pin(async {
+                Err(PayloadStoreError("delete refused".to_owned()))
+            }));
+        }
+        let deleted = {
+            let mut blobs = self.blobs.lock().unwrap();
+            let old = blobs.get(key).is_some_and(|(_, at)| *at < created_before);
+            if old {
+                blobs.remove(key);
+            }
+            old
+        };
+        Some(Box::pin(async move { Ok(deleted) }))
+    }
+
     fn list(
         &self,
         prefix: &str,
@@ -180,6 +219,12 @@ impl PayloadStore for ListingStore {
             .collect();
         found.sort_by(|a, b| a.key.cmp(&b.key));
         found.retain(|blob| cursor.is_none_or(|after| blob.key.as_str() > after));
+        // A writer re-uploads the key after the listing.
+        if let Some(key) = self.reput_after_list.lock().unwrap().take()
+            && let Some(entry) = self.blobs.lock().unwrap().get_mut(&key)
+        {
+            entry.1 = Utc::now();
+        }
         let more = found.len() > PAGE_SIZE;
         found.truncate(PAGE_SIZE);
         let next = more
@@ -743,4 +788,35 @@ async fn out_of_range_grace_is_an_error_and_keeps_the_cursor() {
     assert!(swept.error.is_some());
     assert_eq!(swept.next_cursor.as_deref(), Some("a"));
     assert_eq!(store.keys(), ["old"]);
+}
+
+#[tokio::test]
+async fn blob_re_uploaded_after_the_listing_is_not_deleted() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    let store = ListingStore::listing();
+    store.add_aged("reused", GRACE * 2);
+    store.reput_after_next_list("reused");
+
+    let swept = report(sweep(&store, &single(&url), &options()).await);
+    assert_eq!(
+        swept.deleted, 0,
+        "the conditional delete must see the new write"
+    );
+    assert_eq!(store.keys(), ["reused"]);
+}
+
+#[tokio::test]
+async fn store_without_a_conditional_delete_falls_back_to_a_plain_delete() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    let store = ListingStore::listing();
+    store.set_conditional_delete(false);
+    store.add_aged("old", GRACE * 2);
+
+    let swept = report(sweep(&store, &single(&url), &options()).await);
+    assert_eq!((swept.found, swept.deleted), (1, 1));
+    assert_eq!(store.keys().len(), 0);
 }
