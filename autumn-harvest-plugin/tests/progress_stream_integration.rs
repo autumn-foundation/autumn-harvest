@@ -810,10 +810,11 @@ async fn durable_stream_resume_has_no_gap_and_no_duplicate() {
 }
 
 /// Issue #2083: a re-run can offer an offset below a reader's cursor, after a
-/// serialization failure in the first run. The store drops it, so a fresh
-/// reader and a reader at the cursor see the same chunks above the cursor.
+/// serialization failure in the first run. The reader holds its cursor across
+/// the re-run. The store drops the late offset, so a fresh reader finds no
+/// chunk that the first reader missed.
 #[tokio::test]
-async fn durable_stream_re_run_stores_no_chunk_below_a_cursor() {
+async fn durable_stream_stores_no_chunk_below_a_live_readers_cursor() {
     let (url, _guard) = setup_database().await;
     let pool = build_pool(&url);
     let app = build_app(&pool, &url);
@@ -835,6 +836,9 @@ async fn durable_stream_re_run_stores_no_chunk_below_a_cursor() {
     autumn_harvest::store::append_stream_chunks(&mut conn, exec_id, &[chunk(1)], 100)
         .await
         .expect("first run");
+    let resp = durable_response(&app, exec_id, "", Some("1")).await;
+    let reader = tokio::spawn(read_sse(resp, Duration::from_secs(20)));
+
     // The cold re-drive offers offsets 0 to 2. Offset 0 now serializes.
     autumn_harvest::store::append_stream_chunks(
         &mut conn,
@@ -849,9 +853,7 @@ async fn durable_stream_re_run_stores_no_chunk_below_a_cursor() {
         .execute(&mut conn)
         .await
         .unwrap();
-
-    let resp = durable_response(&app, exec_id, "", Some("1")).await;
-    let (cursor_frames, _) = read_sse(resp, Duration::from_secs(20)).await;
+    let (cursor_frames, _) = reader.await.expect("reader task");
     assert_eq!(durable_progress(&cursor_frames), expected_tokens(2..3));
 
     let resp = durable_response(&app, exec_id, "", None).await;

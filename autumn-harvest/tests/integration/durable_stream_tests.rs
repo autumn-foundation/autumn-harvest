@@ -321,6 +321,62 @@ async fn an_unordered_first_batch_stores_every_offset() {
     .await
     .expect("append an unordered batch");
     assert_eq!(written, 3, "the rule compares with stored rows, not the batch");
+    assert_eq!(
+        read_all(&mut conn, exec_id).await,
+        vec![(0, json!(0)), (1, json!(1)), (2, json!(2))]
+    );
+}
+
+/// Issue #2083: at a full cap, a batch with a late chunk and a new chunk
+/// drops both. The new chunk alone makes the marker.
+#[tokio::test]
+async fn a_mixed_batch_at_the_cap_marks_only_the_new_chunk() {
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "stream_mixed").await;
+    store::append_stream_chunks(&mut conn, exec_id, &[chunk(2, json!(2))], 1)
+        .await
+        .expect("append offset 2 at the cap");
+    let batch = [chunk(0, json!(0)), chunk(3, json!(3))];
+    let written = store::append_stream_chunks(&mut conn, exec_id, &batch, 1)
+        .await
+        .expect("append a mixed batch");
+    assert_eq!(written, 0);
+    let rows = read_all(&mut conn, exec_id).await;
+    assert_eq!(rows.len(), 2, "one chunk and one marker: {rows:?}");
+    assert_eq!(rows[0], (2, json!(2)));
+    assert_eq!(rows[1].0, DURABLE_STREAM_TRUNCATION_OFFSET);
+}
+
+/// Issue #2083: two overlapping appends for one run, such as a stale worker
+/// after a lease reclaim, must run one after the other. The second writer then
+/// sees the first writer's rows, so it cannot store an offset below them.
+#[tokio::test]
+async fn overlapping_appends_for_one_run_are_serialized() {
+    let (url, _c) = setup_database().await;
+    let mut first = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut second = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut first, exec_id, "stream_overlap").await;
+
+    first.batch_execute("BEGIN").await.expect("begin");
+    store::append_stream_chunks(&mut first, exec_id, &[chunk(5, json!(5))], 100)
+        .await
+        .expect("first writer");
+    let late = tokio::spawn(async move {
+        let written = store::append_stream_chunks(&mut second, exec_id, &[chunk(3, json!(3))], 100)
+            .await
+            .expect("second writer");
+        (written, second)
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!late.is_finished(), "the second writer waits for the first");
+    first.batch_execute("COMMIT").await.expect("commit");
+
+    let (written, mut second) = late.await.expect("second writer task");
+    assert_eq!(written, 0, "offset 3 sits below the committed offset 5");
+    assert_eq!(read_all(&mut second, exec_id).await, vec![(5, json!(5))]);
 }
 
 #[tokio::test]
