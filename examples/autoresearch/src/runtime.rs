@@ -499,12 +499,14 @@ fn shell_word(word: &str) -> String {
     }
 }
 
-/// Fail when an unfinished run would go on with another model than `model`.
+/// Fail when an unfinished run has another model than `model`.
 ///
-/// `serve` drives every unfinished run. A run of an agent belongs to a
-/// session or to a heartbeat. A session records its model, and its report
-/// agent can run on after the session ends. A heartbeat run has the model
-/// of the `serve` that started it, `heartbeat_model`, when one is known.
+/// `serve` drives every unfinished run, and `run` must not start work that
+/// needs another model than one that is still unfinished. A run of an agent
+/// belongs to a session or to a heartbeat. A session records its model, and
+/// its report agent can run on after the session ends. A heartbeat run has
+/// the model of the `serve` that started it, `heartbeat_model`, when one is
+/// known.
 ///
 /// # Errors
 ///
@@ -534,10 +536,29 @@ pub fn check_agents(
             .into_value()
             .unwrap_or_default();
         if name == SESSION {
-            check_model(rt, root, model).map_err(|why| {
-                let id = run.workflow_id.clone().into_value().unwrap_or_default();
-                format!("the run {id} is not finished, and {why}")
-            })?;
+            let recorded = session_config(rt, root)?.model;
+            if recorded.is_empty() || recorded == model {
+                continue;
+            }
+            let id = run.workflow_id.clone().into_value().unwrap_or_default();
+            let ended = !matches!(
+                rt.outcome(root).map_err(|e| e.to_string())?,
+                ExecutionOutcome::Running
+            );
+            // The session ended, and its report agent runs on. Only `serve`
+            // drives such a run.
+            return Err(if ended {
+                format!(
+                    "the report agent {id} runs with the model {recorded}, not {model}, \
+                     and it is not finished. Let `autoresearch serve` finish it with the \
+                     same --model and --claude-model"
+                )
+            } else {
+                format!(
+                    "the session {id} runs with the model {recorded}, not {model}, and it is \
+                     not finished. Resume it with the same --model and --claude-model"
+                )
+            });
         } else if name == heartbeat::HEARTBEAT_WORKFLOW_NAME
             && let Some(started) = heartbeat_model
             && started != model

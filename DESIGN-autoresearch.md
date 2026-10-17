@@ -235,7 +235,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC | Evidence |
 |----|----------|
 | AC1 | `e2e::a_night_of_research_keeps_only_improvements`: setup, a baseline and six experiments, seven rows, the upstream header. `cli::a_night_runs_offline_from_one_command`. |
-| AC2 | The same test: `HEAD` is the best commit, the branch holds only the kept commits, the tree is clean. `sim::an_experiment_holds_its_invariants_on_every_seed`: a discard or a crash resets to the base last. `activities::tests::a_run_that_changes_the_lab_is_a_crash_and_the_lab_is_restored` (a moved branch, a commit, a change to `train.py`, a change to `prepare.py`, a removed `prepare.py`). `lab::tests::a_reset_and_a_restore_keep_a_change_to_program_md`, `a_reset_and_a_restore_put_back_prepare_py`, `the_fixed_files_must_match_their_commit`. `activities::tests::train_refuses_a_change_to_a_fixed_file_that_no_commit_holds`. |
+| AC2 | The same test: `HEAD` is the best commit, the branch holds only the kept commits, the tree is clean. `sim::an_experiment_holds_its_invariants_on_every_seed`: a discard or a crash resets to the base last. `activities::tests::a_run_that_changes_the_lab_is_a_crash_and_the_lab_is_restored` (a moved branch, a commit, a change to `train.py`, a change to `prepare.py`, a removed `prepare.py`). `lab::tests::a_reset_and_a_restore_keep_a_change_to_program_md`, `a_reset_and_a_restore_put_back_prepare_py`, `the_fixed_files_must_match_their_commit` (a staged new file too), `a_converted_checkout_is_not_a_change`. `activities::tests::train_refuses_a_change_to_a_fixed_file_that_no_commit_holds`. |
 | AC3 | `rules::tests` (seven cases and three property tests, one against an oracle from the README). `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row` checks the zero crash row. |
 | AC4 | `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row`. The sim targets "a fix recovers a crash", "a run crashes for good", "a run passes its time budget" and "a run fails after its summary". |
 | AC5 | `agent::tests::edit_train_writes_train_py_only`, `the_policy_gates_rewind_and_denies_unknown_tools`, `lab::tests::the_agent_reads_only_known_files_and_papers`. |
@@ -263,7 +263,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC27 | `ci.yml`: the test step, the demo step and the clippy step. `dst-nightly.yml`: the `autoresearch` job. |
 | AC28 | `docs/audits/comment-hygiene.py --base origin/trunk-dev` passes. |
 | AC29 | `e2e::two_sessions_in_one_lab_take_turns_on_their_own_branches`, `lab::tests::checkout_moves_back_to_the_session_branch_only_when_clean`, `two_sessions_never_share_a_commit`, `a_tag_that_another_session_used_is_refused`, `activities::tests::train_refuses_a_moved_branch_and_a_change_no_commit_holds`, `setup_refuses_a_tag_that_another_session_used`. One runner drives a database: `cli::a_new_session_waits_until_the_running_one_ends`, `e2e::a_drive_names_the_mutex_that_a_session_waits_for`, `runtime::tests::a_refusal_names_commands_that_work_as_printed`. |
-| AC30 | `e2e::a_nightly_session_takes_commands_by_its_tag`, `e2e::a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag`, `e2e::a_command_waits_for_a_session_that_has_no_tag_yet`, `cli::run_with_no_tag_resumes_the_one_running_session`, which also refuses a resume with another model. `e2e::a_session_resumes_only_with_its_own_model`, `serve_checks_the_model_of_each_unfinished_agent_run`. |
+| AC30 | `e2e::a_nightly_session_takes_commands_by_its_tag`, `e2e::a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag`, `e2e::a_command_waits_for_a_session_that_has_no_tag_yet`, `cli::run_with_no_tag_resumes_the_one_running_session`, which also refuses a resume with another model. `e2e::a_session_resumes_only_with_its_own_model`, `serve_checks_the_model_of_each_unfinished_agent_run`, `run_refuses_while_a_report_of_another_model_is_unfinished`. |
 | AC31 | `lab::tests::a_commit_is_made_once_per_key`, `an_edit_runs_once_per_call`, `an_edit_whose_write_was_lost_runs_on_its_retry`, `a_row_is_recorded_once_per_key`, `a_row_whose_write_was_lost_lands_on_its_retry`. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`, `two_deliveries_at_once_train_once`. `agent::tests::an_edit_call_that_runs_again_changes_nothing`. |
 | AC32 | `trainer::tests::a_dropped_run_kills_its_whole_group`, `the_next_run_kills_a_run_that_outlived_its_runner`, `a_timeout_kills_the_children_of_the_run_too`, `a_finished_run_names_no_group`, `a_free_lock_forgets_the_group_of_an_earlier_run`, `a_stale_lock_spares_a_group_that_reused_its_id`. |
 | AC33 | `claude::tests::a_thinking_block_goes_back_unchanged_in_the_next_request`, `a_turn_with_the_same_text_in_another_conversation_keeps_its_own_block`, `a_turn_survives_in_the_turn_directory`, `the_key_stays_out_of_debug_output`. |
@@ -384,7 +384,15 @@ with a skeptic per angle. Codex reviewed the same commit. The fixes:
   free ones: Markdown, notebooks and images, which a person edits or makes
   during a night. Codex then found that a hand edit of `prepare.py` between
   two experiments passed both snapshots. A run now trains only when each
-  fixed file holds the bytes of its commit, so a score belongs to it.
+  fixed file holds the bytes of its commit, so a score belongs to it. A
+  staged fixed file that the commit does not hold is refused too. A
+  checkout that converts line ends is no change: git decides it when the
+  raw bytes differ. The raw snapshot before and after a run still catches a
+  change that a run makes.
+- **Codex.** A raw Claude turn is keyed by the messages before it too, so
+  two conversations that end a turn with the same text keep their own
+  thinking blocks. `run`, as `serve`, refuses to start while an unfinished
+  run has another model, so no two models wait for one runner.
 - **One runner.** `serve` refuses to start while an unfinished report
   agent or heartbeat run has another model. A refusal of `run` prints
   commands that work as printed: with the database, the model and the tag

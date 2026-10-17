@@ -546,20 +546,26 @@ impl Lab {
     /// A fixed file is each tracked file but the free ones. A score
     /// must belong to the files of its commit. So a change that no commit
     /// holds, such as a hand edit of `prepare.py`, is refused. The bytes on
-    /// disk are hashed with no git filter. A file that is gone, or is not a
-    /// regular file, is a change too.
+    /// disk are hashed with no git filter. When they differ from the blob,
+    /// git compares the file with the commit, so a checkout that converts
+    /// line ends is no change. A file that is gone, or is not a
+    /// regular file, is a change too. So is a staged fixed file that the
+    /// commit does not hold.
     ///
     /// # Errors
     ///
     /// Returns an error that names each changed file, or when git fails.
     pub fn require_fixed_files(&self, commit: &str) -> Result<(), String> {
         let tree = self.git(&["ls-tree", "-r", "-z", "--full-tree", commit])?;
+        let index = self.git(&["ls-files", "-z"])?;
+        let mut held = std::collections::HashSet::new();
         let mut changed = Vec::new();
         let mut present = Vec::new();
         for entry in tree.split('\0').filter(|entry| !entry.is_empty()) {
             let Some((meta, path)) = entry.split_once('\t') else {
                 continue;
             };
+            held.insert(path);
             let mut fields = meta.split(' ');
             let (Some(mode), Some(kind), Some(id)) = (fields.next(), fields.next(), fields.next())
             else {
@@ -574,16 +580,31 @@ impl Lab {
                 _ => changed.push(path),
             }
         }
+        // A fixed file that is staged and that the commit does not hold, such
+        // as a new module that `train.py` could import.
+        for path in index.split('\0') {
+            if !path.is_empty() && !is_free(path) && !held.contains(path) {
+                changed.push(path);
+            }
+        }
         if !present.is_empty() {
             let mut args = vec!["hash-object", "--no-filters", "--"];
             args.extend(present.iter().map(|(path, _)| *path));
             let ids = self.git(&args)?;
+            // Raw bytes that differ from the blob can still be a clean
+            // checkout: git converts line ends, and LFS swaps a pointer. Git
+            // decides those. A change that a run makes during its run is
+            // caught by the raw snapshot, which no git setting can hide.
             changed.extend(
                 present
                     .iter()
                     .zip(ids.lines())
                     .filter(|((_, want), got)| want != got)
-                    .map(|((path, _), _)| *path),
+                    .map(|((path, _), _)| *path)
+                    .filter(|path| {
+                        self.git(&["diff", "--quiet", "--no-ext-diff", commit, "--", path])
+                            .is_err()
+                    }),
             );
         }
         if changed.is_empty() {
@@ -1714,5 +1735,38 @@ mod tests {
                 .unwrap_err()
                 .contains(PREPARE)
         );
+        std::fs::remove_file(&prepare).unwrap();
+        lab.git(&["checkout", "--quiet", "--", PREPARE]).unwrap();
+        lab.require_fixed_files(&head).unwrap();
+        // A fixed file that the index holds and the commit does not.
+        std::fs::write(lab.root().join("helper.py"), "X = 1\n").unwrap();
+        lab.git(&["add", "helper.py"]).unwrap();
+        let why = lab.require_fixed_files(&head).unwrap_err();
+        assert!(why.contains("helper.py"), "{why}");
+    }
+
+    /// A checkout can convert line ends, as an `eol` attribute says. The
+    /// bytes on disk then differ from the blob, and nothing changed.
+    #[test]
+    fn a_converted_checkout_is_not_a_change() {
+        let (_dir, lab) = lab();
+        std::fs::write(
+            lab.root().join(".gitattributes"),
+            "prepare.py text eol=crlf\n",
+        )
+        .unwrap();
+        lab.git(&["add", ".gitattributes"]).unwrap();
+        lab.git(&["commit", "--quiet", "-m", "line ends"]).unwrap();
+        let prepare = lab.root().join(PREPARE);
+        std::fs::remove_file(&prepare).unwrap();
+        lab.git(&["checkout", "--quiet", "--", PREPARE]).unwrap();
+        assert!(
+            std::fs::read(&prepare)
+                .unwrap()
+                .windows(2)
+                .any(|w| w == b"\r\n")
+        );
+        lab.start_branch("t1", "s1").unwrap();
+        lab.require_fixed_files(&lab.head().unwrap()).unwrap();
     }
 }

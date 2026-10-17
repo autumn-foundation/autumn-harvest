@@ -1261,3 +1261,35 @@ async fn serve_checks_the_model_of_each_unfinished_agent_run() {
     // A database from before the record: nothing to check against.
     runtime::check_agents(&rt, "claude:claude-x", None).unwrap();
 }
+
+/// `run` must not start a session while an unfinished run has another
+/// model. Each would wait for a runner with its own model, and `serve`
+/// could finish neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_refuses_while_a_report_of_another_model_is_unfinished() {
+    let fx = Fixture::new();
+    {
+        let mut rt = fx.open(&model());
+        let mut config = fx.config("night", 1);
+        config.report = true;
+        config.model = "claude:claude-x".into();
+        let exec = runtime::start(&mut rt, &config).unwrap();
+        let report = run_to_end(&mut rt, exec).await;
+        assert!(report.report_run.is_some(), "the report agent waits");
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_autoresearch"))
+        .args(["run", "--lab", &fx.labs[0].root().display().to_string()])
+        .args(["--db", &fx.db.display().to_string()])
+        .args(["--tag", "next", "--experiments", "1", "--no-report"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("AUTORESEARCH_LAB")
+        .env_remove("AUTORESEARCH_DB")
+        .output()
+        .unwrap();
+    let why = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{why}");
+    assert!(
+        why.contains("claude:claude-x") && why.contains("serve"),
+        "{why}"
+    );
+}

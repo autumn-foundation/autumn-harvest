@@ -376,6 +376,16 @@ fn open_runtime(db: &Path, harness: AgentHarness) -> Result<SqliteRuntime, Strin
 /// The file in the state directory that names the model of `serve`.
 const SERVE_MODEL: &str = "serve-model";
 
+/// Fail when an unfinished run has another model than `label`. A heartbeat
+/// run has the model of the `serve` that started it, kept in a file.
+fn check_unfinished(rt: &SqliteRuntime, state: &Path, label: &str) -> Result<(), String> {
+    let marker = state.join(SERVE_MODEL);
+    let started = autoresearch::stores::read_regular(&marker)
+        .map_err(|e| format!("cannot read {}: {e}", marker.display()))?
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string());
+    runtime::check_agents(rt, label, started.as_deref())
+}
+
 /// The model as history records it, such as `claude:<model id>`.
 fn model_label(args: &ModelArgs) -> String {
     match args.model {
@@ -517,6 +527,8 @@ async fn shutdown() {
 async fn run(args: &LabArgs, session: &SessionArgs) -> Result<(), String> {
     let (lab, state, db) = open_lab(args)?;
     let mut rt = open_runtime(&db, harness(&lab, &state, &session.model)?)?;
+    // A run of another model that no runner finishes would wait for good.
+    check_unfinished(&rt, &state, &model_label(&session.model))?;
     let mut exec = pick_session(&mut rt, &lab, args.db.as_deref(), session)?;
     let inbox = Inbox::new(&state)?;
     let mut rows = Rows::from_now(&lab);
@@ -706,15 +718,10 @@ fn print_report(report: &SessionReport) {
 async fn serve(args: &LabArgs, session: &SessionArgs) -> Result<(), String> {
     let (lab, state, db) = open_lab(args)?;
     let mut rt = open_runtime(&db, harness(&lab, &state, &session.model)?)?;
-    // `serve` drives every unfinished run with its own model. A heartbeat
-    // run has the model of the `serve` that started it, kept in a file.
+    // `serve` drives every unfinished run with its own model.
     let label = model_label(&session.model);
-    let marker = state.join(SERVE_MODEL);
-    let started = autoresearch::stores::read_regular(&marker)
-        .map_err(|e| format!("cannot read {}: {e}", marker.display()))?
-        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string());
-    runtime::check_agents(&rt, &label, started.as_deref())?;
-    autoresearch::stores::write_atomic(&marker, label.as_bytes())?;
+    check_unfinished(&rt, &state, &label)?;
+    autoresearch::stores::write_atomic(&state.join(SERVE_MODEL), label.as_bytes())?;
     let base = config(&lab, session, String::new());
     rt.upsert_schedule(&runtime::nightly(&base)?)
         .map_err(|e| e.to_string())?;

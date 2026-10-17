@@ -141,8 +141,8 @@ An `approve` or a `deny` lands on the next tick of the runner.
 Only one runner can drive a database. So `run` refuses a new session while
 another one runs, and it prints the commands that finish or stop the other
 one. History records the model, and a resume needs the same `--model`.
-`serve` refuses to start while an unfinished run, such as a report agent or a
-heartbeat, has another model.
+`run` and `serve` refuse to start while an unfinished run, such as a report
+agent or a heartbeat, has another model. `serve` with that model finishes it.
 
 ```bash
 cargo run -p autoresearch -- hint --lab /tmp/ar-lab --tag demo "paper:warmdown"
@@ -286,12 +286,15 @@ experiment set the search attribute `status`, which the engine reserves.
 - **Fixed files and free files.** A free file is tracked Markdown, a
   notebook or an image, such as `program.md` or `progress.png`. Each other
   tracked file is fixed. A run trains only when each fixed file holds the
-  bytes of its commit, so a score belongs to that commit. A hand edit of
-  `prepare.py` during a night is refused: commit it first. A discard, a crash
-  and a rewind reset the branch and each fixed file, and keep each free file.
-  So an edit of `program.md` for the next night stays. A change that a run
-  makes there stays too, so read `program.md` before a night. A file that git
-  does not track stays as it is.
+  bytes of its commit, so a score belongs to the tracked files of that
+  commit. A hand edit of `prepare.py` during a night is refused: commit it
+  first. So is a staged fixed file that the commit does not hold. A file that
+  git does not track, such as a module next to `train.py`, is not checked,
+  and Python can load it. A reset does not remove it, so read `git status`
+  in the morning. A discard, a crash and a rewind reset the branch and each
+  fixed file, and keep each free file. So an edit of `program.md` for the
+  next night stays. A change that a run makes there stays too, so read
+  `program.md` before a night.
 - **The score is what `train.py` prints.** As upstream, the last `val_bpb:`
   line counts. An edit can print a false score. Read each kept diff. Unlike
   upstream, a run that exits with an error is a crash, even after a summary.
