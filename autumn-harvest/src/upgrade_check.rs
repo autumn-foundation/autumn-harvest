@@ -2161,6 +2161,23 @@ mod tests {
     }
 
     #[test]
+    fn the_documented_binaries_read_argv_lossily() {
+        // `env::args()` panics on a non-UTF-8 argument and prints it, password included.
+        for (name, text) in [
+            (
+                "docs/upgrade-check.md",
+                include_str!("../../docs/upgrade-check.md"),
+            ),
+            (
+                "examples/upgrade_check.rs",
+                include_str!("../examples/upgrade_check.rs"),
+            ),
+        ] {
+            assert!(!text.contains("env::args()"), "{name} uses env::args()");
+        }
+    }
+
+    #[test]
     fn a_plain_unknown_flag_and_env_name_stay_in_the_error() {
         let err = parse(&["--bogus"]).expect_err("unknown flag");
         assert!(err.to_string().contains("--bogus"), "{err}");
