@@ -292,6 +292,47 @@ pub fn check_trainer(trainer: &TrainerSpec) -> Result<(), String> {
     }
 }
 
+/// Hold an exclusive lock on the lock file beside `saved` until the file
+/// drops. Two deliveries of one call that run at once take turns.
+async fn call_lock(saved: &Path) -> Result<std::fs::File, String> {
+    let path = saved.with_extension("lock");
+    blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        #[cfg(unix)]
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
+            .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+        Ok(file)
+    })
+    .await
+}
+
+/// The run is code that the model wrote, and the checks before it are stale
+/// once it ends. When it changed the branch, `HEAD` or `train.py`, put the
+/// lab back and count the run as a crash.
+fn after_run(lab: &Lab, branch: &str, commit: &str, run: TrainRun) -> Result<TrainRun, String> {
+    let changed = lab
+        .require_branch(branch)
+        .and_then(|()| lab.require_head(commit))
+        .and_then(|()| lab.require_clean_train());
+    let Err(why) = changed else {
+        return Ok(run);
+    };
+    lab.restore(branch, commit)?;
+    Ok(TrainRun {
+        exit_code: None,
+        timed_out: run.timed_out,
+        log_tail: format!(
+            "{}\nautoresearch: the run changed the lab, so it counts as a crash: {why}\n",
+            run.log_tail
+        ),
+    })
+}
+
 /// Train the commit at `HEAD`. Each progress line is a heartbeat.
 ///
 /// A crash or a timeout is a result. Only a run that cannot start is an
@@ -313,7 +354,6 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
         .map_err(|e| e.to_string())?
         .to_string();
     let path = input.lab.clone();
-    let (branch, commit) = (input.branch.clone(), input.commit.clone());
     let (lab, state, saved) = blocking(move || {
         let lab = Lab::open(&path)?;
         let state = lab.state_dir()?;
@@ -321,20 +361,30 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
         std::fs::create_dir_all(&runs)
             .map_err(|e| format!("cannot create {}: {e}", runs.display()))?;
         let saved = runs.join(format!("{}.json", crate::stores::hashed(&key)));
-        lab.require_branch(&branch)
-            .and_then(|()| lab.require_head(&commit))
-            .map_err(|e| fatal(BRANCH_MOVED, e))?;
-        lab.require_clean_train()
-            .map_err(|e| fatal(DIRTY_TREE, e))?;
         Ok((lab, state, saved))
     })
     .await?;
+    // A worker that lost its lease can run on while the call is delivered
+    // again. The second delivery waits here, then finds the saved run. The
+    // checks come after the lock, because a run can change the lab.
+    let _call = call_lock(&saved).await?;
     if let Some(run) = std::fs::read(&saved)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<TrainRun>(&bytes).ok())
     {
         return Ok(run);
     }
+    let (checked, branch, commit) = (lab.clone(), input.branch.clone(), input.commit.clone());
+    blocking(move || {
+        checked
+            .require_branch(&branch)
+            .and_then(|()| checked.require_head(&commit))
+            .map_err(|e| fatal(BRANCH_MOVED, e))?;
+        checked
+            .require_clean_train()
+            .map_err(|e| fatal(DIRTY_TREE, e))
+    })
+    .await?;
     let (lines, mut progress) = tokio::sync::mpsc::unbounded_channel::<String>();
     let run = crate::trainer::run(&input.trainer, lab.root(), &state, move |line| {
         let _ = lines.send(line.to_string());
@@ -348,6 +398,7 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
     };
     let (run, ()) = tokio::join!(run, beat);
     let run = run?;
+    let run = blocking(move || after_run(&lab, &input.branch, &input.commit, run)).await?;
     let bytes = serde_json::to_vec(&run).map_err(|e| e.to_string())?;
     crate::stores::write_atomic(&saved, &bytes)?;
     Ok(run)
@@ -517,5 +568,62 @@ mod tests {
             pass_env: Vec::new(),
         };
         assert!(check_trainer(&command).is_err());
+    }
+
+    /// The run is code that the model wrote. A run that changes the branch,
+    /// `HEAD` or `train.py` is a crash, and the lab goes back as it was.
+    #[tokio::test]
+    async fn a_run_that_changes_the_lab_is_a_crash_and_the_lab_is_restored() {
+        let (_dir, mut input, _counter) = lab_with_counter();
+        input.trainer = TrainerSpec::Command {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "echo 'DEPTH = 99' >> train.py; git checkout -q -b elsewhere; \
+                 echo ---; echo 'val_bpb: 0.5'"
+                    .into(),
+            ],
+            timeout_secs: 30,
+            pass_env: Vec::new(),
+        };
+        let run = train(&ActivityContext::new_test(), input.clone())
+            .await
+            .unwrap();
+        assert_eq!(run.exit_code, None, "{run:?}");
+        assert!(run.log_tail.contains("changed the lab"), "{run:?}");
+        let lab = Lab::open(&input.lab).unwrap();
+        lab.require_branch(&input.branch).unwrap();
+        lab.require_head(&input.commit).unwrap();
+        lab.require_clean_train().unwrap();
+    }
+
+    /// A worker that lost its lease can run on while the call is delivered
+    /// again. The two deliveries train once. The second delivery comes while
+    /// the first run has a change in `train.py`, and it does not fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_deliveries_at_once_train_once() {
+        let (_dir, mut input, counter) = lab_with_counter();
+        let script = format!(
+            "echo run >> '{}'; echo '# scratch' >> train.py; sleep 1; \
+             git checkout -q train.py; echo 'val_bpb: 0.99'",
+            counter.display()
+        );
+        input.trainer = TrainerSpec::Command {
+            program: "sh".into(),
+            args: vec!["-c".into(), script],
+            timeout_secs: 30,
+            pass_env: Vec::new(),
+        };
+        let ctx = ActivityContext::new_test();
+        let again = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            train(&ctx, input.clone()).await
+        };
+        let (first, second) = tokio::join!(train(&ctx, input.clone()), again);
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            1
+        );
     }
 }

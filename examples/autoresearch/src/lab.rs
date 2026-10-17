@@ -490,7 +490,16 @@ impl Lab {
         }
         let parent = self.full("HEAD^")?;
         // `--numstat` prints "<added> <removed> <path>".
-        let stat = self.git(&["diff", "--numstat", "HEAD^", "HEAD", "--", TRAIN])?;
+        let stat = self.git(&[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--numstat",
+            "HEAD^",
+            "HEAD",
+            "--",
+            TRAIN,
+        ])?;
         let mut numbers = stat
             .split_whitespace()
             .take(2)
@@ -504,7 +513,21 @@ impl Lab {
         })
     }
 
-    /// Reset the branch and the work tree to `commit`.
+    /// Put `branch` at `commit`, check it out, and put back `train.py`.
+    /// The branch is made again when it is gone. A change to another file
+    /// stays, as [`Lab::reset_to`] keeps it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when git fails.
+    pub fn restore(&self, branch: &str, commit: &str) -> Result<(), String> {
+        self.git(&["update-ref", &format!("refs/heads/{branch}"), commit])?;
+        self.git(&["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")])?;
+        self.reset_to(commit)
+    }
+
+    /// Reset the branch and `train.py` to `commit`. A change to another
+    /// tracked file stays in the work tree.
     ///
     /// # Errors
     ///
@@ -516,7 +539,10 @@ impl Lab {
             "--quiet",
             &format!("{commit}^{{commit}}"),
         ])?;
-        self.git(&["reset", "--quiet", "--hard", &target])?;
+        // `program.md` is the file that a person edits, maybe while a night
+        // runs. So only `train.py` goes back with `HEAD`.
+        self.git(&["reset", "--quiet", "--mixed", &target])?;
+        self.git(&["checkout", "--quiet", &target, "--", TRAIN])?;
         Ok(())
     }
 
@@ -526,7 +552,14 @@ impl Lab {
     ///
     /// Returns an error when git fails.
     pub fn diff_train(&self) -> Result<String, String> {
-        self.git(&["diff", "HEAD", "--", TRAIN])
+        self.git(&[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "HEAD",
+            "--",
+            TRAIN,
+        ])
     }
 
     /// Read one of the [`READABLE`] files for an agent. A missing file reads
@@ -753,11 +786,21 @@ pub fn check_tag(tag: &str) -> Result<(), String> {
 
 /// Run git in `dir` with the example's author and [`SAFE_GIT`].
 fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(AUTHOR)
         .args(SAFE_GIT)
         .args(args)
-        .current_dir(dir)
+        .current_dir(dir);
+    // A run can write `.git/config`, and git runs the commands that it
+    // names. Git gets the list of a training run, so the key stays out.
+    command.env_clear();
+    for (name, value) in std::env::vars_os() {
+        if crate::trainer::passes(&name.to_string_lossy(), &value.to_string_lossy(), &[]) {
+            command.env(name, value);
+        }
+    }
+    let out = command
         .output()
         .map_err(|e| format!("cannot run git: {e}"))?;
     if out.status.success() {
@@ -1338,5 +1381,98 @@ mod tests {
         );
         lab.record(&row(&short(&on)), "k2").unwrap();
         assert_eq!(lab.kept(&on).unwrap(), Some(row(&short(&on))));
+    }
+
+    /// `program.md` is the file that a person edits, maybe while a night
+    /// runs. A reset or a restore puts back `train.py`, the branch and
+    /// `HEAD`. A change to another file stays.
+    #[test]
+    fn a_reset_and_a_restore_keep_a_change_to_program_md() {
+        let (_dir, lab) = lab();
+        lab.start_branch("t1", "s1").unwrap();
+        let base = lab.head().unwrap();
+        let program = lab.root().join(PROGRAM);
+        std::fs::write(&program, "# my next program\n").unwrap();
+        lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
+        lab.commit_train("deeper", "k-1", &base).unwrap();
+        lab.edit_train("DEPTH = 9", "DEPTH = 10").unwrap();
+        lab.reset_to(&base).unwrap();
+        lab.require_head(&base).unwrap();
+        lab.require_clean_train().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&program).unwrap(),
+            "# my next program\n"
+        );
+
+        // A run moved to another branch and changed `train.py`.
+        lab.git(&["checkout", "--quiet", "-b", "elsewhere"])
+            .unwrap();
+        lab.edit_train("DEPTH = 8", "DEPTH = 11").unwrap();
+        lab.restore("autoresearch/t1", &base).unwrap();
+        lab.require_branch("autoresearch/t1").unwrap();
+        lab.require_head(&base).unwrap();
+        lab.require_clean_train().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&program).unwrap(),
+            "# my next program\n"
+        );
+    }
+
+    /// A run can write `.git/config`, and git runs the commands that it
+    /// names, such as a clean filter. Git gets the trainer's list of
+    /// variables, so such a command cannot read the key of the runner.
+    #[cfg(unix)]
+    #[test]
+    fn git_runs_with_the_trainer_environment() {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert!(
+            std::env::vars().any(|(name, _)| name.starts_with("CARGO_")),
+            "cargo sets CARGO_ variables for a test"
+        );
+        let (dir, lab) = lab();
+        let seen = dir.path().join("seen");
+        let script = dir.path().join("clean.sh");
+        let body = format!("#!/bin/sh\nenv > '{}'\ncat\n", seen.display());
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        lab.git(&[
+            "config",
+            "filter.probe.clean",
+            &script.display().to_string(),
+        ])
+        .unwrap();
+        let attributes = lab.root().join(".git").join("info").join("attributes");
+        std::fs::create_dir_all(attributes.parent().unwrap()).unwrap();
+        std::fs::write(&attributes, "train.py filter=probe\n").unwrap();
+        lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
+        lab.diff_train().unwrap();
+        let seen = std::fs::read_to_string(&seen).unwrap();
+        assert!(seen.lines().any(|line| line.starts_with("PATH=")), "{seen}");
+        assert!(
+            !seen.lines().any(|line| line.starts_with("CARGO_")),
+            "{seen}"
+        );
+    }
+
+    /// The diffs that the agent and the keep rule read run no external diff
+    /// and no text conversion that a run put in `.git/config`.
+    #[cfg(unix)]
+    #[test]
+    fn a_diff_runs_no_external_program() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, lab) = lab();
+        let seen = dir.path().join("seen");
+        let script = dir.path().join("diff.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch '{}'\n", seen.display())).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        lab.git(&["config", "diff.external", &script.display().to_string()])
+            .unwrap();
+        lab.start_branch("t1", "s1").unwrap();
+        let base = lab.head().unwrap();
+        lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
+        assert!(lab.diff_train().unwrap().contains("DEPTH = 9"));
+        let info = lab.commit_train("deeper", "k-1", &base).unwrap();
+        assert_eq!((info.lines_added, info.lines_removed), (1, 1));
+        assert!(!seen.exists(), "git ran the external diff");
     }
 }

@@ -17,13 +17,12 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::{Read as _, Seek as _, SeekFrom};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 
 /// The file that each run writes, as upstream redirects it.
 pub const RUN_LOG: &str = "run.log";
@@ -506,7 +505,7 @@ fn new_log(path: &Path) -> Result<(), String> {
 /// A run gets a name that `extra` lists. It also gets a name of
 /// [`PASSED_ENV`] that marks no secret, with a value that holds no login
 /// details.
-fn passes(name: &str, value: &str, extra: &[String]) -> bool {
+pub(crate) fn passes(name: &str, value: &str, extra: &[String]) -> bool {
     if extra.iter().any(|e| e == name) {
         return true;
     }
@@ -560,20 +559,26 @@ async fn run_command(
     } = *run;
     let lock = Lock::take(state).await?;
     new_log(log_path)?;
+    // The run can put a symlink at `run.log`. The runner reads and appends
+    // through this handle, so the path never sends it to another file.
     let log = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .open(log_path)
         .map_err(|e| format!("cannot create run.log: {e}"))?;
-    let errors = log
-        .try_clone()
-        .map_err(|e| format!("cannot share run.log: {e}"))?;
+    let reader = LogReader::new(&log, log_path)?;
+    let share = || {
+        log.try_clone()
+            .map_err(|e| format!("cannot share run.log: {e}"))
+    };
+    let (output, errors) = (share()?, share()?);
     let mut command = tokio::process::Command::new(program);
     command
         .args(args)
         .current_dir(lab)
         .stdin(lock.stdin()?)
-        .stdout(log)
+        .stdout(output)
         .stderr(errors)
         .kill_on_drop(true);
     command.env_clear();
@@ -609,7 +614,7 @@ async fn run_command(
                 break (None, true);
             }
             _ = beat.tick() => {
-                if let Some(line) = last_line(log_path) {
+                if let Some(line) = last_line(&reader) {
                     progress(&line);
                 }
             }
@@ -618,20 +623,17 @@ async fn run_command(
     // A child that the run left behind dies now too.
     drop(group);
     if timed_out {
-        let mut file = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(log_path)
-            .await
-            .map_err(|e| format!("cannot open run.log: {e}"))?;
+        // The group is dead, so nothing else writes at the end of the log.
         let note = format!("\nautoresearch: killed after the {timeout_secs}s time budget\n");
-        file.write_all(note.as_bytes())
-            .await
+        let mut file = &log;
+        file.seek(SeekFrom::End(0))
+            .and_then(|_| file.write_all(note.as_bytes()))
             .map_err(|e| format!("cannot write run.log: {e}"))?;
     }
     Ok(TrainRun {
         exit_code,
         timed_out,
-        log_tail: tail_of(log_path, TAIL_BYTES),
+        log_tail: tail_of(&reader, TAIL_BYTES),
     })
 }
 
@@ -783,22 +785,76 @@ fn group_start(id: u32) -> Option<u64> {
     (group == id).then(|| fields.get(19)?.parse().ok())?
 }
 
-/// The end of the log at `path`: at most `bytes` bytes and [`TAIL_LINES`]
-/// lines, as lossy UTF-8. A carriage return counts as a line end, so a
-/// progress line that redraws itself reads as its last state.
-fn tail_of(path: &Path, bytes: u64) -> String {
-    let Ok(mut file) = std::fs::File::open(path) else {
+/// Reads a log that a run writes, through a handle and not by path.
+///
+/// On Unix it reads the handle that the run writes to, at an offset, so the
+/// offset of the run does not move. Off Unix it is a second handle that is
+/// opened before the run starts.
+struct LogReader<'a> {
+    #[cfg(unix)]
+    file: &'a std::fs::File,
+    #[cfg(not(unix))]
+    file: std::fs::File,
+    #[cfg(not(unix))]
+    owner: std::marker::PhantomData<&'a std::fs::File>,
+}
+
+impl<'a> LogReader<'a> {
+    #[cfg(unix)]
+    #[allow(clippy::unnecessary_wraps)]
+    const fn new(file: &'a std::fs::File, _path: &Path) -> Result<Self, String> {
+        Ok(Self { file })
+    }
+
+    #[cfg(not(unix))]
+    fn new(_file: &'a std::fs::File, path: &Path) -> Result<Self, String> {
+        let file = std::fs::File::open(path).map_err(|e| format!("cannot read run.log: {e}"))?;
+        Ok(Self {
+            file,
+            owner: std::marker::PhantomData,
+        })
+    }
+
+    /// The bytes from `start` to the end, at most `limit` of them.
+    #[cfg(unix)]
+    fn read(&self, start: u64, limit: u64) -> std::io::Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt as _;
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 8192];
+        while (buffer.len() as u64) < limit {
+            let at = start + buffer.len() as u64;
+            let n = self.file.read_at(&mut chunk, at)?;
+            if n == 0 {
+                break;
+            }
+            buffer.extend_from_slice(&chunk[..n]);
+        }
+        buffer.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+        Ok(buffer)
+    }
+
+    /// The bytes from `start` to the end, at most `limit` of them.
+    #[cfg(not(unix))]
+    fn read(&self, start: u64, limit: u64) -> std::io::Result<Vec<u8>> {
+        let mut file = &self.file;
+        file.seek(SeekFrom::Start(start))?;
+        let mut buffer = Vec::new();
+        file.take(limit).read_to_end(&mut buffer)?;
+        Ok(buffer)
+    }
+
+    fn len(&self) -> u64 {
+        self.file.metadata().map_or(0, |meta| meta.len())
+    }
+}
+
+/// The end of a log: at most `bytes` bytes and [`TAIL_LINES`] lines, as
+/// lossy UTF-8. A carriage return counts as a line end, so a progress line
+/// that redraws itself reads as its last state.
+fn tail_of(log: &LogReader<'_>, bytes: u64) -> String {
+    let Ok(buffer) = log.read(log.len().saturating_sub(bytes), bytes) else {
         return String::new();
     };
-    let len = file.metadata().map_or(0, |meta| meta.len());
-    let mut buffer = Vec::new();
-    if file
-        .seek(SeekFrom::Start(len.saturating_sub(bytes)))
-        .is_err()
-        || file.take(bytes).read_to_end(&mut buffer).is_err()
-    {
-        return String::new();
-    }
     let text = String::from_utf8_lossy(&buffer).replace('\r', "\n");
     let lines: Vec<&str> = text
         .lines()
@@ -807,9 +863,9 @@ fn tail_of(path: &Path, bytes: u64) -> String {
     lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n")
 }
 
-/// The last non-empty line of `path`, for a heartbeat.
-fn last_line(path: &Path) -> Option<String> {
-    tail_of(path, 4 * 1024)
+/// The last non-empty line of a log, for a heartbeat.
+fn last_line(log: &LogReader<'_>) -> Option<String> {
+    tail_of(log, 4 * 1024)
         .lines()
         .next_back()
         .map(|line| line.trim().to_string())
@@ -1153,6 +1209,55 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
         assert!(!dir.path().join(RUN_LOG).is_symlink());
     }
 
+    /// The run is code that the model wrote. It can put a symlink at
+    /// `run.log` while it runs. The runner reads the log that the run wrote,
+    /// not the file that the symlink names, such as `/proc/self/environ`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_runner_reads_the_log_the_run_wrote_not_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "hunter2\n").unwrap();
+        let script = format!(
+            "echo ---; echo 'val_bpb: 0.99'; rm run.log; ln -s '{}' run.log",
+            secret.display()
+        );
+        let spec = TrainerSpec::Command {
+            program: "sh".into(),
+            args: vec!["-c".into(), script],
+            timeout_secs: 30,
+            pass_env: Vec::new(),
+        };
+        let run = run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
+        assert!(!run.log_tail.contains("hunter2"), "{run:?}");
+        assert!(run.log_tail.contains("val_bpb"), "{run:?}");
+    }
+
+    /// A run past its time budget gets a note at the end of its log. The
+    /// note goes to the log that the run wrote, not through a symlink.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_timeout_note_does_not_follow_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "keep me").unwrap();
+        let script = format!(
+            "echo started; rm run.log; ln -s '{}' run.log; sleep 30",
+            target.display()
+        );
+        let spec = TrainerSpec::Command {
+            program: "sh".into(),
+            args: vec!["-c".into(), script],
+            timeout_secs: 1,
+            pass_env: Vec::new(),
+        };
+        let run = run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
+        assert!(run.timed_out);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+        assert!(run.log_tail.contains("started"), "{run:?}");
+        assert!(run.log_tail.contains("time budget"), "{run:?}");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn the_runner_hides_its_memory_and_environment() {
@@ -1238,10 +1343,12 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
         let log = dir.path().join(RUN_LOG);
         let redraw = "\rstep 00042".repeat(100_000);
         std::fs::write(&log, format!("{redraw}\n---\nval_bpb: 0.99\n")).unwrap();
-        let tail = tail_of(&log, TAIL_BYTES);
+        let file = std::fs::File::open(&log).unwrap();
+        let reader = LogReader::new(&file, &log).unwrap();
+        let tail = tail_of(&reader, TAIL_BYTES);
         assert!(tail.len() <= usize::try_from(TAIL_BYTES).unwrap());
         assert!(tail.ends_with("val_bpb: 0.99"));
-        assert_eq!(last_line(&log).as_deref(), Some("val_bpb: 0.99"));
+        assert_eq!(last_line(&reader).as_deref(), Some("val_bpb: 0.99"));
         assert!(tail.lines().count() <= TAIL_LINES);
     }
 
