@@ -375,10 +375,23 @@ async fn overlapping_appends_for_one_run_are_serialized() {
     let exec_id = ExecutionId::new();
     insert_execution(&mut first, exec_id, "stream_overlap").await;
 
-    first.batch_execute("BEGIN").await.expect("begin");
-    store::append_stream_chunks(&mut first, exec_id, &[chunk(5, json!(5))], 100)
-        .await
-        .expect("first writer");
+    // Hold the first writer's transaction open, so its lock stays taken.
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let holder = tokio::spawn(async move {
+        first
+            .transaction::<(), diesel::result::Error, _>(async move |c| {
+                store::append_stream_chunks(c, exec_id, &[chunk(5, json!(5))], 100)
+                    .await
+                    .expect("first writer");
+                locked_tx.send(()).expect("signal the lock");
+                release_rx.await.expect("wait for the release");
+                Ok(())
+            })
+            .await
+            .expect("first transaction");
+    });
+    locked_rx.await.expect("first writer holds the lock");
     let late = tokio::spawn(async move {
         let written = store::append_stream_chunks(&mut second, exec_id, &[chunk(3, json!(3))], 100)
             .await
@@ -387,7 +400,8 @@ async fn overlapping_appends_for_one_run_are_serialized() {
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!late.is_finished(), "the second writer waits for the first");
-    first.batch_execute("COMMIT").await.expect("commit");
+    release_tx.send(()).expect("release the first writer");
+    holder.await.expect("first writer task");
 
     let (written, mut second) = late.await.expect("second writer task");
     assert_eq!(written, 0, "offset 3 sits below the committed offset 5");
