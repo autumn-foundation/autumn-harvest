@@ -878,7 +878,16 @@ pub async fn reset_workflow_execution(
                 ),
             )
             .await?;
-            let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
+            let fork = insert_fork_execution(
+                conn,
+                &source,
+                new_exec_id,
+                registry.map_or(
+                    &crate::store::DEFAULT_PAYLOAD_CODECS,
+                    HandlerRegistry::payload_codecs,
+                ),
+            )
+            .await?;
             copy_carried_events(conn, new_exec_id, &rows, reset_event_id).await?;
             share_carried_refs(
                 conn,
@@ -1496,14 +1505,19 @@ async fn insert_fork_execution(
     conn: &mut AsyncPgConnection,
     source: &WorkflowExecution,
     new_exec_id: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> Result<WorkflowExecution, WorkflowResetError> {
+    // The fork is a new write: encode a clear legacy `input` and `memo` (issue #2065).
+    let input = codecs.recode_column_for_copy(&source.input)?;
+    let memo = codecs.recode_column_opt_for_copy(source.memo.as_ref())?;
     insert_fork_row(
         conn,
         source,
         new_exec_id,
         ForkRow {
             workflow_id: &source.workflow_id,
-            input: source.input.clone(),
+            input,
+            memo,
             // A reset of a fork stays a fork (issue #2000). With reset
             // provenance, a recorded fork would run its effects live.
             start_source: if crate::fork::is_fork(source) {
@@ -1533,6 +1547,8 @@ pub(crate) struct ForkRow<'a> {
     pub(crate) workflow_id: &'a str,
     /// The stored input. A fork can replace it.
     pub(crate) input: Value,
+    /// The stored memo, encoded for the new row (issue #2065).
+    pub(crate) memo: Option<Value>,
     /// Provenance. `start_source_ref` is always the source id.
     pub(crate) start_source: crate::types::StartSource,
     /// A recorded fork drops the targets, so that it sends no notification.
@@ -1604,7 +1620,7 @@ pub(crate) async fn insert_fork_row(
         deadline_at,
         sla: source.sla,
         sla_deadline_at,
-        memo: source.memo.clone(),
+        memo: spec.memo,
         search_attrs: fork_search_attrs,
         assigned_build_id: spec.assigned_build_id,
         parent_close_policy: None, // reset fork is a fresh root execution

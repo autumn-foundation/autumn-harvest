@@ -4307,6 +4307,16 @@ async fn persist_external_signal_inline(
                                     Err(HarvestError::Database(e)) => {
                                         return Err(HarvestError::Database(e));
                                     }
+                                    // A codec failure says nothing about the
+                                    // target. Leave the request to the outbox
+                                    // (issue #2065).
+                                    Err(error) if error.is_codec_failure() => {
+                                        tracing::warn!(
+                                            signal_id = %run.signal_id,
+                                            "inline signal left pending, the payload codec failed"
+                                        );
+                                        None
+                                    }
                                     Err(_) => Some(WorkflowEvent::ExternalSignalFailed {
                                         signal_id: run.signal_id,
                                         reason_code: "target_terminal".to_string(),
@@ -23703,7 +23713,10 @@ async fn persist_workflow_continue_as_new_with_verdict(
         chain_deadline_at: defaults.chain_deadline_at,
         sla: defaults.sla,
         sla_deadline_at: defaults.sla_deadline_at,
-        memo: execution.memo.clone(),
+        // The successor is a new write: a clear legacy memo is encoded (issue #2065).
+        memo: registry
+            .payload_codecs()
+            .recode_column_opt_for_copy(execution.memo.as_ref())?,
         search_attrs: execution.search_attrs.clone(),
         assigned_build_id: execution.assigned_build_id.clone(),
         parent_close_policy: None, // root workflow

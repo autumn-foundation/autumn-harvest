@@ -9335,14 +9335,16 @@ async fn a_reply_the_engine_cannot_load_offers_no_call() {
     );
     drop(reader);
 
-    let writer = rusqlite::Connection::open(&db).expect("the database opens");
-    writer
-        .execute(
+    // The append-only guard refuses the rewrite, so the fixture turns it off.
+    let mut writer = rusqlite::Connection::open(&db).expect("the database opens");
+    autumn_harvest_sqlite::append_only::with_guard_off(&mut writer, |tx| {
+        tx.execute(
             "UPDATE harvest_events SET event_json = cast(event_json as blob) \
              WHERE exec_id = ?1 AND seq = ?2",
             rusqlite::params![exec_id, seq],
         )
-        .expect("the row is rewritten");
+    })
+    .expect("the row is rewritten");
     let class: String = writer
         .query_row(
             "SELECT typeof(event_json) FROM harvest_events WHERE exec_id = ?1 AND seq = ?2",
@@ -9436,7 +9438,7 @@ async fn a_row_after_the_reply_the_engine_cannot_load_offers_no_call() {
     drop(reader);
 
     // One row AFTER the reply changes class. Nothing else is touched.
-    let writer = rusqlite::Connection::open(&db).expect("the database opens");
+    let mut writer = rusqlite::Connection::open(&db).expect("the database opens");
     let target: i64 = writer
         .query_row(
             "SELECT min(seq) FROM harvest_events WHERE exec_id = ?1 AND seq > ?2",
@@ -9444,13 +9446,15 @@ async fn a_row_after_the_reply_the_engine_cannot_load_offers_no_call() {
             |row| row.get(0),
         )
         .expect("a row follows the reply");
-    writer
-        .execute(
+    // The append-only guard refuses the rewrite, so the fixture turns it off.
+    autumn_harvest_sqlite::append_only::with_guard_off(&mut writer, |tx| {
+        tx.execute(
             "UPDATE harvest_events SET event_json = cast(event_json as blob) \
              WHERE exec_id = ?1 AND seq = ?2",
             rusqlite::params![exec_id, target],
         )
-        .expect("the row is rewritten");
+    })
+    .expect("the row is rewritten");
     let class: String = writer
         .query_row(
             "SELECT typeof(event_json) FROM harvest_events WHERE exec_id = ?1 AND seq = ?2",

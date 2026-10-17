@@ -182,6 +182,11 @@ need them.
 A new sanctioned writer needs a new `EventRewrite` variant, a migration that
 adds its value to the trigger, and an entry in the list above.
 
+**The SQLite backend (issue #2031).** Its `harvest_events` has its own guard
+in `autumn-harvest-sqlite/src/schema.rs`. It has no sanctioned writer, so it
+refuses every `UPDATE`, and an `INSERT OR REPLACE` over a stored event. A
+test fixture calls `autumn_harvest_sqlite::append_only::with_guard_off`.
+
 ## Project Documentation
 
 `CLAUDE.md` holds agent instructions and engine invariants only. Do not park

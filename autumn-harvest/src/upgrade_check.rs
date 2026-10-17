@@ -1778,17 +1778,11 @@ async fn load_pending_signals(
 
 /// A history read failed because the codecs cannot decode it.
 ///
-/// A missing key or codec has its own variant. A failed decrypt is a
-/// `Config` error, and plaintext that is not JSON is a `Serialization` error.
+/// A codec failure covers a missing key, a missing codec and a failed
+/// decrypt. Plaintext that is not JSON is a `Serialization` error.
 #[cfg(feature = "db")]
 const fn is_codec_error(e: &crate::error::HarvestError) -> bool {
-    matches!(
-        e,
-        crate::error::HarvestError::UnknownCodecKey { .. }
-            | crate::error::HarvestError::UnknownPayloadCodec { .. }
-            | crate::error::HarvestError::Config(_)
-            | crate::error::HarvestError::Serialization(_)
-    )
+    e.is_codec_failure() || matches!(e, crate::error::HarvestError::Serialization(_))
 }
 
 // ── the command ─────────────────────────────────────────────────────────────

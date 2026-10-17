@@ -325,15 +325,13 @@ async fn fork_in_transaction(
     let workflow_id = fork_workflow_id(conn, &source, request).await?;
 
     let new_exec_id = ExecutionId::new_for_shard(ShardId::new(source.shard_id));
-    let input = match &request.input {
-        Some(input) => codecs.encode_column(input)?,
-        None => source.input.clone(),
-    };
+    let (input, memo) = fork_columns(codecs, &source, request)?;
     let quota = admit_fork(conn, registry, &source, request, codecs, new_exec_id).await?;
     let quota_key = quota.as_ref().map(|(key, _)| key.as_str());
     let row = crate::reset::ForkRow {
         workflow_id: &workflow_id,
         input,
+        memo,
         start_source: StartSource::Fork,
         quota_key,
         // The row keeps the callback targets of its source. A recorded fork
@@ -602,6 +600,25 @@ async fn check_shards(
             })
         }
     }
+}
+
+/// The stored `input` and `memo` of the fork row.
+///
+/// A new input is encoded as a start encodes it. The fork is a new write, so a
+/// kept input and the memo are encoded again, as for a reset (issue #2065).
+fn fork_columns(
+    codecs: &PayloadCodecs,
+    source: &WorkflowExecution,
+    request: &WorkflowForkRequest,
+) -> HarvestResult<(Value, Option<Value>)> {
+    let input = match &request.input {
+        Some(input) => codecs.encode_column(input)?,
+        None => codecs.recode_column_for_copy(&source.input)?,
+    };
+    Ok((
+        input,
+        codecs.recode_column_opt_for_copy(source.memo.as_ref())?,
+    ))
 }
 
 /// Give the fork its own references to the source blobs that it names.

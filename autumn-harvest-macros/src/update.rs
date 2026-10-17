@@ -170,6 +170,19 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let mod_name = format_ident!("__autumn_update_impl_{fn_name}");
     let path_tokens = parsed_path.path_tokens;
+    // `update_with_start` reads only its own `opts`, with no `.or(info....)`
+    // fallback. See `optional_chrono_duration_tokens`'s doc comment for the
+    // full clone class this and `workflow.rs`'s two typed stubs share.
+    let update_with_start_execution_timeout_tokens =
+        crate::attr_util::optional_chrono_duration_tokens(
+            "execution_timeout",
+            &quote! { opts.execution_timeout },
+        );
+    let update_with_start_max_execution_timeout_ceiling_tokens =
+        crate::attr_util::optional_chrono_duration_tokens(
+            "max_execution_timeout_ceiling",
+            &quote! { client.max_workflow_execution_timeout() },
+        );
     // The three typed-stub methods are identical whether `#stub_ident` is
     // implemented directly (same-module case) or inside a private mod that
     // re-imports it (nested-module case, needed so the `impl` sees the type
@@ -260,24 +273,8 @@ pub fn update_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 let shard = client.pick_shard_for_new_workflow(#workflow_simple_name, &workflow_id);
                 ::autumn_harvest::types::ExecutionId::new_for_shard(shard)
             });
-            let execution_timeout = match opts.execution_timeout {
-                ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::chrono::Duration::from_std(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "execution_timeout exceeds chrono duration range".to_string()
-                        ))?
-                ),
-                ::std::option::Option::None => ::std::option::Option::None,
-            };
-            let max_execution_timeout_ceiling = match client.max_workflow_execution_timeout() {
-                ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                    ::autumn_harvest::chrono::Duration::from_std(d)
-                        .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                            "max_execution_timeout_ceiling exceeds chrono duration range".to_string()
-                        ))?
-                ),
-                ::std::option::Option::None => ::std::option::Option::None,
-            };
+            let execution_timeout = #update_with_start_execution_timeout_tokens;
+            let max_execution_timeout_ceiling = #update_with_start_max_execution_timeout_ceiling_tokens;
             let concurrency_key = Self::info().concurrency.and_then(|p|
                 ::autumn_harvest::concurrency::resolve_concurrency_key(p.key_expr, &start_input)
             );

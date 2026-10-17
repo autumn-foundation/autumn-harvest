@@ -189,8 +189,9 @@
 //! # Non-goals (see issue #1068 follow-ups)
 //!
 //! Out of scope for this backend: distributed / multi-writer workers, `LISTEN`/
-//! `NOTIFY` push wake-ups, multi-server crash recovery, schedules, the management
-//! API, retention, worker sessions, sharding, and DAGs.
+//! `NOTIFY` push wake-ups, multi-server crash recovery, the management API,
+//! worker sessions, sharding, and DAGs. Schedules and retention shipped under
+//! issue #2031.
 //!
 //! ## Start-boundary reuse policy — enforced (issue #1068)
 //!
@@ -650,6 +651,23 @@
 //! sets the first search attributes and a memo. A continue-as-new and a
 //! workflow retry copy both to the successor.
 //!
+//! # Schedules, retention and the append-only guard (issue #2031)
+//!
+//! [`SqliteRuntime::upsert_schedule`] stores a core
+//! [`WorkflowSchedule`](autumn_harvest::policy::WorkflowSchedule). Each
+//! [`poll_once`](SqliteRuntime::poll_once) pass fires the due schedules, then
+//! drives the fleet. The slot moves in the start transaction, so a crash
+//! cannot fire a slot twice. A reopen keeps every slot. The slot arithmetic
+//! is the core [`schedule_plan`](autumn_harvest::schedule_plan) module, which
+//! the Postgres scheduler also calls.
+//!
+//! [`SqliteRuntime::purge_terminal`] removes each terminal run closed before
+//! its window, with all its rows. It keeps every live run.
+//!
+//! Two triggers keep `harvest_events` append-only, as the Postgres trigger of
+//! issue #1817 does. They refuse every `UPDATE`, and an `INSERT OR REPLACE`
+//! of a stored event. `DELETE` stays open for retention.
+//!
 //! # Deterministic side effects
 //!
 //! `ctx.system_now()`, `ctx.new_uuid()`, `ctx.random_*()`, and `ctx.side_effect()`
@@ -665,13 +683,17 @@
 //! deterministic primitive is **never** silently dropped, and a history written
 //! here always replays byte-identically on the core `WorkflowReplayer`.
 
+#[doc(hidden)]
+pub mod append_only;
 mod error;
 mod history_cap;
 mod lock;
 mod mutex;
 mod query;
 mod queue;
+mod retention;
 mod runtime;
+mod schedule;
 mod schema;
 mod store;
 mod update;
@@ -688,6 +710,7 @@ pub use crate::runtime::{
     SignalWithStartOutcome, SqliteRuntime, StartOptions, StartOutcome,
     UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
+pub use crate::schedule::ScheduleSummary;
 pub use crate::store::ActivityAttempt;
 pub use crate::visibility::{
     DEFAULT_LIST_LIMIT, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,

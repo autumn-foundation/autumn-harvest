@@ -15,7 +15,8 @@ The model files use the upstream Weaver format:
   spans.
 
 The `otel_workflow_semconv_docs` guard suite keeps this page, the model and
-ADR 0001 in agreement.
+ADR 0001 in agreement. A script runs the upstream Weaver policy checks on
+the model. Section 10 gives the result.
 
 ## 1. Summary
 
@@ -206,11 +207,17 @@ Harvest does not yet conform to every rule of this draft:
 7. **Namespace.** "Workflow" also names CI/CD workflows and batch DAG
    tools. The area can need a narrower name, such as `durable_workflow`.
 8. **System values.** `workflow.system.name` has no list of well-known
-   values yet.
-9. **Timer fire.** A timer fire is close to a point in time. The OTel
-   guidance models such an occurrence as an event, not a span. This draft
-   keeps the ADR 0001 span. An event on `execute_workflow` is the
-   alternative.
+   values yet. Upstream `db.system.name` is an enum with well-known
+   members, such as `temporal` or `dapr`.
+9. **Timer fire and signal delivery.** Both are short steps inside the
+   `execute_workflow` cycle. The OTel guidance models a short in-process
+   step as an event, not a span. This draft keeps the ADR 0001 spans.
+   Events on `execute_workflow` are the alternative.
+10. **Operation attribute.** Upstream `*.operation.name` is a free string,
+    and `*.operation.type` is the enum. Examples are `db.operation.name`
+    and `messaging.operation.type`. This draft uses an enum named
+    `workflow.operation.name`. `workflow.operation.type` is the
+    alternative.
 
 ## 9. Upstream issue text
 
@@ -250,6 +257,9 @@ A draft Weaver model (`model/workflow/registry.yaml` and
 `model/workflow/spans.yaml`) is at
 https://github.com/autumn-foundation/autumn-harvest/tree/<commit>/docs/otel-workflow-semconv
 
+The model passes the upstream `make check-policies` policies at
+semantic-conventions commit `331541c`.
+
 Autumn Harvest emits these spans under its own `harvest.*` names. Its
 draft lists where it does not yet conform.
 
@@ -260,7 +270,9 @@ draft lists where it does not yet conform.
 - A separate business id beside `workflow.run.id`.
 - Reuse of `messaging.destination.name` for the task queue.
 - A narrower namespace than `workflow`.
-- A span or an event for `fire_timer`.
+- A span or an event for `fire_timer` and `deliver_signal`.
+- `workflow.operation.name` or `workflow.operation.type` for the
+  operation enum.
 
 #### Group
 
@@ -277,14 +289,32 @@ The steps to submit:
    co-propose. Upstream asks for a group of owners for a new area.
 3. Read the project process in the `open-telemetry/community` repository.
    A new area can need a project and a sponsor.
-4. Replace `<commit>` in the section 9 link with a merged commit or a tag.
+4. Move the pins in `check-otel-workflow-semconv.sh` to upstream `main`
+   and the latest release. Run the script. Then update the commit and the
+   release below and in section 9.
+5. Replace `<commit>` in the section 9 link with a merged commit or a tag.
    Then file the text in `open-telemetry/semantic-conventions`.
-5. Put the issue link in the status paragraph. Change `pending` to
+6. Put the issue link in the status paragraph. Change `pending` to
    `submitted`.
 
 If the project decides not to submit, change `pending` to `declined` and
 give the reason in the same paragraph.
 
-The guard suite checks the model shape and the names. It does not run
-Weaver or the upstream policy checks. Upstream runs `make check` on the
-pull request that follows the issue.
+The guard suite checks the model shape and the names.
+[`check-otel-workflow-semconv.sh`](../../scripts/check-otel-workflow-semconv.sh)
+runs the upstream Weaver policies. It mirrors the `make check-policies`
+recipe at upstream commit `331541c`, with the `v1.44.0` baseline. It uses
+the Weaver image that upstream pins at that commit. The model passes, and
+Weaver reports no warning for it. A copy with a namespace collision fails
+on the upstream naming policy.
+
+The `otel-semconv.yml` workflow runs the script on a ready pull request
+that changes the draft. A weekly job runs it against upstream `main`.
+
+The script mirrors the policy check only. The upstream pull request that
+follows the issue needs more files, and upstream CI checks each one:
+
+- A `docs/workflow/` page that holds the generated span tables.
+- The generated attribute registry page and the issue template changes.
+- A `.chloggen` entry.
+- An `areas.yaml` entry, an `AREAS.md` row and `CODEOWNERS` lines.
