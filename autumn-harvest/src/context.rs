@@ -7692,11 +7692,7 @@ impl WorkflowContext {
     /// A withdrawn `CancelTimer` or arm never reaches the worker, so its
     /// durable row is unchanged. Replay holds the same commands, so it
     /// restores the same entries. The newest entry is restored first.
-    ///
-    /// Returns each timer that the undo gives back to an arm, with the epoch
-    /// of that arm. The oldest entry of an id holds the state that the undo
-    /// restores, so only that entry counts.
-    pub(crate) fn undo_scope_timer_mutations(&self, seq: u32) -> Vec<(TimerId, Option<u64>)> {
+    pub(crate) fn undo_scope_timer_mutations(&self, seq: u32) {
         let undone: Vec<TimerUndo> = {
             let mut journal = self.timer_undo.lock().expect("timer_undo lock poisoned");
             let (undone, kept) = std::mem::take(&mut *journal)
@@ -7705,13 +7701,6 @@ impl WorkflowContext {
             *journal = kept;
             undone
         };
-        let mut seen = std::collections::HashSet::new();
-        let restored_arms = undone
-            .iter()
-            .filter(|entry| seen.insert(entry.timer_id.as_str()))
-            .filter(|entry| matches!(entry.state, Some(TimerLogicalState::Armed { .. })))
-            .map(|entry| (TimerId::new(entry.timer_id.as_str()), entry.epoch))
-            .collect();
         for entry in undone.into_iter().rev() {
             {
                 let mut states = self
@@ -7745,7 +7734,6 @@ impl WorkflowContext {
                 );
             }
         }
-        restored_arms
     }
 
     /// Mark each armed cancellable timer in `timer_ids` as cancelled (issue #1984).
@@ -7773,6 +7761,15 @@ impl WorkflowContext {
     pub(crate) fn mark_scope_arms_cancelled(&self, arms: &[(TimerId, u64)]) {
         let current = self.current_scope_arms(arms);
         self.mark_scope_timers_cancelled(&current);
+    }
+
+    /// The current arm epoch of the handle timer `timer_id` (issue #1984).
+    pub(crate) fn timer_arm_epoch(&self, timer_id: &TimerId) -> Option<u64> {
+        self.timer_arm_epochs
+            .lock()
+            .expect("timer_arm_epochs lock poisoned")
+            .get(timer_id.as_str())
+            .copied()
     }
 
     /// The timers in `arms` whose recorded arm is still the current arm (issue #1984).

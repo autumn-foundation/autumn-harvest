@@ -792,7 +792,7 @@ impl<F: Future> ScopeRun<'_, F> {
                 }
                 ctx.consume_scope_members(&marker.members, marker.horizon..index);
                 // The held commands are the commands that the live cycle withdrew.
-                let _ = ctx.undo_scope_timer_mutations(seq);
+                ctx.undo_scope_timer_mutations(seq);
                 ctx.mark_scope_timers_cancelled(&marker.members.timers);
                 ctx.mark_scope_arms_cancelled(&self.armed_timers());
                 Ok(marker.reason)
@@ -807,11 +807,7 @@ impl<F: Future> ScopeRun<'_, F> {
             ))
         } else {
             withdrawn = ctx.withdraw_scope_commands(seq);
-            // A withdrawn reset or re-arm leaves an earlier arm in force. An
-            // arm from before the scope has a durable row that is not the
-            // scope's, so the cancel keeps it. The cancel still tears down an
-            // arm that the body made.
-            let restored_arms = ctx.undo_scope_timer_mutations(seq);
+            ctx.undo_scope_timer_mutations(seq);
             let (mut recorded, armed, own_arms) = {
                 let inner = self.shared.lock();
                 (
@@ -827,12 +823,14 @@ impl<F: Future> ScopeRun<'_, F> {
                     recorded.timers.push(timer);
                 }
             }
+            // A handle timer is the scope's only while its current arm is one
+            // that the body made. An arm from before the scope keeps its
+            // durable row: the body only awaits it, or a withdrawn reset gives
+            // it back. A timer with no arm epoch starts in the scope.
             let mut members = ctx.open_scope_members(&recorded);
             members.timers.retain(|timer| {
-                restored_arms.iter().all(|(id, epoch)| {
-                    id != timer
-                        || epoch.is_some_and(|epoch| own_arms.contains(&(id.clone(), epoch)))
-                })
+                ctx.timer_arm_epoch(timer)
+                    .is_none_or(|epoch| own_arms.contains(&(timer.clone(), epoch)))
             });
             ctx.consume_cancelled_member_frontier(&members);
             let marker = CancelMarker {
@@ -2391,6 +2389,36 @@ mod tests {
             arms(&ctx.drain_commands()),
             0,
             "the original arm stays armed"
+        );
+    }
+
+    /// A handle timer that an earlier cycle armed outside the scope. The body
+    /// only awaits it, so the cancel leaves the arm and its durable row.
+    #[tokio::test]
+    async fn a_scope_that_only_awaits_an_outside_timer_keeps_it() {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), armed_deadline_history());
+        let outer = ctx.start_timer("deadline", 60);
+        let result = bounded(run_then_cancel(&ctx, async {
+            let _ = outer.await_fire().await;
+        }))
+        .await;
+        assert!(
+            matches!(result, Err(HarvestError::Cancelled(_))),
+            "{result:?}"
+        );
+
+        let commands = ctx.drain_commands();
+        assert!(
+            losers(&commands).is_none_or(|losers| losers.timers.is_empty()),
+            "an outside arm is not a member: {commands:?}"
+        );
+        let details = marker(&commands, "cancel_scope:1").expect("recorded");
+        assert_eq!(details["timers"], json!([]), "{details}");
+        let _again = ctx.start_timer("deadline", 60);
+        assert_eq!(
+            arms(&ctx.drain_commands()),
+            0,
+            "the outside arm stays armed"
         );
     }
 
