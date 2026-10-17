@@ -63,21 +63,24 @@ async fn send_late_signal_once(ctx: &WorkflowContext) {
 
 /// Sends a late signal, then completes with every `late` signal it can read.
 #[workflow]
-async fn late_signal_reader(ctx: &WorkflowContext, _input: String) -> Result<Vec<String>, String> {
+async fn late_signal_reader(ctx: &WorkflowContext, input: String) -> Result<Vec<String>, String> {
+    drop(input);
     send_late_signal_once(ctx).await;
     ctx.drain_signals::<String>(LATE).map_err(|e| e.to_string())
 }
 
 /// Sends a late signal, then completes and never reads it.
 #[workflow]
-async fn late_signal_ignorer(ctx: &WorkflowContext, _input: String) -> Result<String, String> {
+async fn late_signal_ignorer(ctx: &WorkflowContext, input: String) -> Result<String, String> {
+    drop(input);
     send_late_signal_once(ctx).await;
     Ok("done".to_string())
 }
 
 /// Sends a late signal, then fails unless it can read that signal.
 #[workflow]
-async fn late_signal_failer(ctx: &WorkflowContext, _input: String) -> Result<String, String> {
+async fn late_signal_failer(ctx: &WorkflowContext, input: String) -> Result<String, String> {
+    drop(input);
     send_late_signal_once(ctx).await;
     let seen = ctx
         .drain_signals::<String>(LATE)
