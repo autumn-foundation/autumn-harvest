@@ -556,7 +556,7 @@ pub(crate) const fn sweep_error_kind(error: &HarvestError) -> &'static str {
         HarvestError::UnknownPayloadCodec { .. } => "unknown_codec",
         HarvestError::Serialization(_) => "invalid_json",
         HarvestError::Database(_) => "database",
-        HarvestError::Config(_) => "codec_error",
+        HarvestError::Codec(_) | HarvestError::Config(_) => "codec_error",
         _ => "other",
     }
 }

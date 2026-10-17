@@ -102,6 +102,30 @@ async fn setup_sharded_databases() -> ((String, String), ContainerAsync<Postgres
     ((shard0_url, shard1_url), container)
 }
 
+/// Wait until `pool` holds a run with `workflow_id`, and return it.
+///
+/// A deferred trigger start runs on a spawned task. A fixed sleep races it on
+/// a loaded runner, so the test polls with a bound instead.
+async fn wait_for_run(pool: &DbPool, workflow_id: &str) -> WorkflowExecution {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let mut conn = pool.get().await.unwrap();
+            let found: Option<WorkflowExecution> = harvest_workflow_executions::table
+                .filter(harvest_workflow_executions::workflow_id.eq(workflow_id))
+                .first(&mut conn)
+                .await
+                .optional()
+                .unwrap();
+            if let Some(exec) = found {
+                return exec;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the deferred start must commit within 30 s")
+}
+
 fn build_pool(url: &str) -> DbPool {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
     deadpool::managed::Pool::builder(manager)
@@ -1466,16 +1490,9 @@ async fn test_trigger_cross_shard() {
         start.spawn();
     }
 
-    // Since cross-shard triggers run asynchronously via tokio::spawn, wait briefly
-    tokio::time::sleep(Duration::from_millis(250)).await;
-
-    // Verify target workflow has been started on Shard 1's database
-    let mut conn1 = pool1.get().await.unwrap();
-    let target_exec: WorkflowExecution = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
-        .first(&mut conn1)
-        .await
-        .unwrap();
+    // Cross-shard triggers start on a spawned task, so wait for the row on
+    // Shard 1's database.
+    let target_exec = wait_for_run(&pool1, &target_workflow_id).await;
 
     assert_eq!(target_exec.workflow_name, "target_wf");
     assert_eq!(target_exec.input, json!({"status": "ok"}));
@@ -2176,15 +2193,9 @@ async fn test_trigger_cross_shard_queue_preservation() {
         start.spawn();
     }
 
-    // Since starts asynchronously, wait briefly
-    tokio::time::sleep(Duration::from_millis(250)).await;
-
-    // Verify target execution was started on Shard 1, preserving schedule's "target-custom-queue" queue resolved from Shard 0!
-    let target_exec: WorkflowExecution = harvest_workflow_executions::table
-        .filter(harvest_workflow_executions::workflow_id.eq(&target_workflow_id))
-        .first(&mut conn1)
-        .await
-        .unwrap();
+    // The start runs on a spawned task, so wait for the row. It must keep the
+    // "target-custom-queue" queue resolved from Shard 0.
+    let target_exec = wait_for_run(&pool1, &target_workflow_id).await;
     assert_eq!(target_exec.queue_name, "target-custom-queue");
 }
 

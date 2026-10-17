@@ -41,6 +41,10 @@ pub enum SqliteError {
     Json(#[from] serde_json::Error),
 
     /// A workflow name with no registered handler.
+    ///
+    /// A drive also returns it when a workflow starts a child whose name has
+    /// no handler (issue #2026). The cycle rolls back, and the parent stays
+    /// `RUNNING`.
     #[error("unknown workflow: {0}")]
     UnknownWorkflow(String),
 
@@ -181,8 +185,8 @@ pub enum SqliteError {
     },
 
     /// A workflow emitted a [`WorkflowCommand`](autumn_harvest::WorkflowCommand)
-    /// outside the single-writer backend's supported subset (child workflows,
-    /// external signals/cancels, continue-as-new, local activities, …).
+    /// outside the single-writer backend's supported subset (continue-as-new,
+    /// local activities, updates, …).
     ///
     /// The run is terminal (issue #1834). The drive that returns this error
     /// first rolls back the cycle. It then seals the run `FAILED` with a typed
@@ -216,6 +220,22 @@ pub enum SqliteError {
         observed_bytes: u64,
         /// The configured cap (bytes) at that boundary.
         cap_bytes: u64,
+    },
+
+    /// A caller-supplied payload nests deeper than
+    /// [`MAX_PAYLOAD_DEPTH`](crate::MAX_PAYLOAD_DEPTH) at an ingress boundary
+    /// (issue #2157).
+    ///
+    /// `serde_json` writes any depth but refuses to read past 128 levels. The
+    /// payload is refused before it is stored, so a later drive never fails on
+    /// a value it cannot read back. `kind` names the boundary
+    /// (`"workflow_input"`, `"memo"`, `"signal_payload"` or `"update_input"`).
+    #[error("payload too deep: {kind} nests more than {cap_depth} levels")]
+    PayloadTooDeep {
+        /// The ingress boundary that was violated.
+        kind: &'static str,
+        /// The deepest nesting that ingress accepts.
+        cap_depth: usize,
     },
 
     /// A start carrying the [`RejectDuplicate`](autumn_harvest::WorkflowIdReusePolicy::RejectDuplicate)
@@ -269,6 +289,15 @@ pub enum SqliteError {
     /// [`MAX_FILTER_TERMS`](crate::MAX_FILTER_TERMS) allows (issue #2027).
     #[error("invalid filter: {0}")]
     InvalidFilter(String),
+
+    /// A schedule has an invalid cron expression, timezone or interval
+    /// (issue #2031).
+    #[error("invalid schedule: {0}")]
+    InvalidSchedule(String),
+
+    /// No schedule exists for this workflow name (issue #2031).
+    #[error("schedule not found: {0}")]
+    ScheduleNotFound(String),
 
     /// A value stored in `SQLite` could not be parsed back into its Rust type.
     #[error("corrupt stored value: {0}")]
@@ -406,8 +435,10 @@ pub enum SqliteError {
         details: String,
     },
 
-    /// A driven execution made no durable progress and could not be classified
-    /// as waiting on a timer or a signal — surfaced honestly instead of looping.
+    /// A driven execution made no durable progress. It waits on no timer, no
+    /// signal and no other run, so this error surfaces it instead of a loop.
+    /// It also names a run that spent its cycle budget in one
+    /// `run_until_blocked` call.
     /// The most common cause is a task stranded `RUNNING` by a crash that the
     /// orphan reclaim on [`SqliteRuntime::open`](crate::SqliteRuntime::open) did
     /// not clear (e.g. a different database file).

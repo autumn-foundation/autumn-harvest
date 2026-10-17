@@ -764,12 +764,13 @@ pub fn delete_unfired_timers_for_execution(
 /// Delete every unkeyed, undelivered staged signal row for an execution — companion to
 /// [`delete_pending_tasks_for_execution`] / [`delete_unfired_timers_for_execution`]
 /// for the `TerminateIfRunning` seal. A signal staged against a sealed prior can
-/// never be delivered, because the prior is never driven again. This backend has
-/// no retention/GC pass to reclaim it otherwise. Returns the number of rows deleted.
+/// never be delivered, because the prior is never driven again. Retention removes
+/// it only with the whole run (issue #2031). Returns the number of rows deleted.
 /// Delivered rows are left untouched (inert audit history).
 ///
-/// A row with an idempotency key also stays (issue #2028). It is the record
-/// that dedupes a retry of its key after the seal.
+/// A row with an idempotency key stays (issues #2026 and #2028). It is the
+/// dedup record of its key, so a retry of the key after the seal still reports
+/// delivered, as on Postgres. No pull primitive consumes it again.
 pub fn delete_undelivered_signals_for_execution(
     conn: &Connection,
     exec_id: ExecutionId,

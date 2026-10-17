@@ -511,6 +511,9 @@ pub mod tx_retry;
 mod shuttle_sync;
 /// Signal handler registry for push-based reactive signal handling (issue #546).
 pub mod signal_handler;
+/// `always!` and `sometimes!` for workflow code (issue #2033).
+#[doc(hidden)]
+pub mod sim_probe;
 pub mod simulator;
 /// Adaptive worker dispatch-slot tuner (issue #548).
 pub mod slot_tuner;
@@ -579,6 +582,8 @@ pub mod ramp_guard;
 pub mod sandbox;
 #[cfg(feature = "db")]
 pub mod schedule_decision;
+/// Backend-neutral cron and interval slot arithmetic (issue #2031).
+pub mod schedule_plan;
 #[cfg(feature = "db")]
 pub mod scheduler;
 #[cfg(feature = "db")]

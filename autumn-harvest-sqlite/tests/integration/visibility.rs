@@ -60,15 +60,17 @@ async fn staged(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
 
 /// Upserts, then reaches an unsupported command in the same cycle.
 #[workflow]
-async fn upserts_then_spawns(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+async fn upserts_then_schedules_external(ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
     ctx.upsert_search_attrs([("stage".to_string(), Some(json!("lost")))])
         .map_err(|e| e.to_string())?;
-    ctx.spawn_child_workflow_detached_raw(
-        "child",
-        json!({}),
-        autumn_harvest::ParentClosePolicy::Abandon,
-    )
-    .map_err(|e| e.to_string())?;
+    // Poll the external activity once, so its command joins the last batch,
+    // then return without awaiting it.
+    let mut external =
+        std::pin::pin!(ctx.execute_activity_external("external", json!({}), "default", 60));
+    let _ = std::future::Future::poll(
+        external.as_mut(),
+        &mut std::task::Context::from_waker(std::task::Waker::noop()),
+    );
     Ok(0)
 }
 
@@ -107,7 +109,7 @@ fn runtime() -> SqliteRuntime {
         fails_info(),
         waits_info(),
         staged_info(),
-        upserts_then_spawns_info(),
+        upserts_then_schedules_external_info(),
         chained_info(),
         retried_info(),
     ] {
@@ -561,7 +563,9 @@ async fn upserted_search_attributes_filter_the_list() {
 #[tokio::test]
 async fn a_rolled_back_cycle_keeps_no_upsert() {
     let mut rt = runtime();
-    let exec = rt.start_workflow("upserts_then_spawns", json!(0)).unwrap();
+    let exec = rt
+        .start_workflow("upserts_then_schedules_external", json!(0))
+        .unwrap();
     let err = rt.run_until_blocked(exec).await.unwrap_err();
     assert!(matches!(err, SqliteError::Unsupported(_)), "{err}");
     let row = rt.describe(exec).unwrap();

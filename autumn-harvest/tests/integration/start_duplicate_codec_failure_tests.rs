@@ -249,7 +249,7 @@ async fn a_fresh_start_still_reports_the_codec_error_and_stores_nothing() {
     .await
     .expect_err("a new run needs the codec");
 
-    assert!(matches!(err, HarvestError::Config(_)), "{err:?}");
+    assert!(err.is_codec_failure(), "{err:?}");
     assert_eq!(run_count(&mut conn, &workflow_id).await, 0);
 }
 
@@ -268,7 +268,7 @@ async fn a_replacing_start_still_reports_the_codec_error_and_keeps_the_prior_run
     .await
     .expect_err("a replacement needs the codec");
 
-    assert!(matches!(err, HarvestError::Config(_)), "{err:?}");
+    assert!(err.is_codec_failure(), "{err:?}");
     assert_eq!(run_count(&mut conn, &workflow_id).await, 1);
     let state = state_of(&mut conn, first.exec_id.as_uuid()).await;
     assert_eq!(state, "FAILED", "the failed replace must roll back");
@@ -288,7 +288,7 @@ async fn assert_terminate_refused(
         .await
         .expect_err("a terminating start needs the codec");
 
-    assert!(matches!(err, HarvestError::Config(_)), "{err:?}");
+    assert!(err.is_codec_failure(), "{err:?}");
     assert_eq!(run_count(&mut conn, &workflow_id).await, 1);
     assert_eq!(
         state_of(&mut conn, first.exec_id.as_uuid()).await,

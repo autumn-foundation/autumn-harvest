@@ -427,6 +427,8 @@ needs I/O implements `HarvestAuthorizer` directly and returns a boxed future.
 | `tenant_key` | The verified tenant, when the credential carries one (issue #1977). Otherwise the `x-harvest-tenant` header, trimmed. A repeated header, a blank value, a non-ASCII byte or more than 128 bytes gets `400`. |
 | `tenant_verified` | `true` when `tenant_key` is the verified tenant. `false` when it is the header. Do not grant access on an unverified tenant. |
 | `shard` | Only a source the route's handler uses. See the table below. |
+| `workflow_id` | The body business key on `start`, `signal-with-start` and `update-with-start`. `None` on every other route. See [Body key](#body-key-issue-2081). |
+| `start_input_present` | `true` when the body carries start input. `false` on every other route. |
 | `method`, `path`, `extensions` | The request. |
 
 | Route | Shard source |
@@ -450,6 +452,43 @@ shard, it calls it once with `shard: None`. `None` means Harvest cannot name
 the shard before the handler runs. A list route then reads every shard. A by-id
 route (`/workflows/by-id/...`) and a start with no placement each reach one
 shard by hash. To confine a caller to some shards, deny `None` too.
+
+### Body key (issue #2081)
+
+The business key is in the JSON body on `POST /workflows/{name}/start`,
+`/signal-with-start` and `/update-with-start`. Harvest reads it before the hook
+runs and sets `workflow_id`. It never gives the body to the hook.
+
+- `workflow_id` is the raw value. The handler does not trim it.
+- A key nested in the input is not the business key.
+- `None` means the body has no usable key. On the two with-start routes, the
+  handler rejects such a body. On `start`, `None` can also mean an
+  auto-generated id.
+- `start_input_present` is `input` on `start`, and `start_input` on the
+  with-start routes. A `null` value counts as absent.
+- A `start` with an idempotency key replays the first run for that key. The
+  replay ignores the body `workflow_id`, so the hook cannot see the id of the
+  run it returns. A tenant-bound caller cannot replay another tenant's run. Treat
+  an idempotency key as a secret within one tenant. Signal-with-start and
+  update-with-start do not have this path.
+- The hook runs on the management API only. A webhook or connector binding
+  calls the handler directly, so the hook does not see it.
+
+To confine a caller to its own keys, check `workflow_id` on the three routes
+and deny `None` there:
+
+```rust
+.with_authorizer(|req: &AuthzRequest<'_>| {
+    let keyed = req.method == Method::POST
+        && (req.path.ends_with("/start") || req.path.ends_with("-with-start"));
+    match req.workflow_id {
+        _ if !keyed => AuthzDecision::Allow,
+        Some(id) if id.starts_with("acme/") => AuthzDecision::Allow,
+        Some(_) => AuthzDecision::deny("key is out of scope"),
+        None => AuthzDecision::deny("no key"),
+    }
+})
+```
 
 ### Rules
 
@@ -970,7 +1009,7 @@ credential is *tenant-bound*. Harvest then confines it without an authorizer.
 - **The embedder's own principal.** In the auth middleware that wraps the
   Harvest router, insert
   `autumn_harvest_plugin::tenant::VerifiedTenant::new(tenant)?` as a request
-  extension.
+  extension. A raw `harvest_api_router` mount needs no other step.
 
 A request with a token tenant and an embedder tenant that differ gets `403`.
 
@@ -1129,11 +1168,11 @@ route and no table.
   full state. It is a read route like `GET /workflows/{id}`, and it is not
   audited. Outside the `dev` profile, mount the API behind your own auth, for
   example `api_with_auth`. A key is guessable.
-- **The authorizer hook sees the path, not the body.** It can check the key
-  on the by-id query and signal routes. On signal-with-start the key is in
-  the body, so the hook cannot see it. To confine a caller to its own keys,
-  deny signal-with-start in the hook and send ops through the by-id signal
-  route. Or check the body in your own middleware.
+- **The authorizer hook sees the key on the keyed-entity routes.** It reads
+  the key from the path on the by-id query and signal routes. On signal-with-start and
+  update-with-start, it reads `AuthzRequest::workflow_id` from the body (see
+  [Body key](#body-key-issue-2081)). Check the key there, and deny `None`.
+  `start_input_present` shows whether a caller sets the first state.
 - **The key is a business id, not a secret.** A key appears in requests,
   audit rows and logs. Do not put a secret or a customer name in it.
 - **State is stored in clear unless you encrypt it.** Each operation is a
@@ -1454,6 +1493,21 @@ cell unresolved, and an activity attempt on it fails with
 `PayloadDecodeFailed`. Drain the activity queues before you turn column
 encoding on. Wait for task retention, or run terminal task GC, before you
 retire a key.
+
+**Copies into a new row.** A continue-as-new successor and a reset fork are
+new writes, as a workflow retry is (issue #2065). Each decodes the stored `input` and
+`memo`, then encodes them under the active key. A fork or successor of a clear row is
+therefore encoded, even though the sweep never encodes clear values. With the
+switch off, the copy keeps the stored bytes. It never turns ciphertext into
+clear. A registry that cannot decode a value also copies the stored bytes, so
+no value is lost or guessed.
+A shard move still copies the stored bytes.
+
+**Codec failures during a signal.** A codec failure is `HarvestError::Codec`.
+`HarvestError::is_codec_failure` is true for it and for the unknown-codec
+errors. A failed encode never fails an external signal for good. The outbox and
+inline delivery leave the request pending, and the next outbox sweep tries
+again.
 
 **Erasure.** Erasure (issue #495) does not reach the task rows or the outbox.
 They stay until task retention or the relay removes them. Their ciphertext is

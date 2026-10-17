@@ -1485,7 +1485,7 @@ impl PayloadCodecs {
         let raw = serde_json::to_vec(payload)?;
         let encoded = codec
             .encode(&raw)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+            .map_err(|e| HarvestError::Codec(e.to_string()))?;
         Ok(Self::envelope(
             codec.codec_id(),
             key_id.as_deref().unwrap_or(CODEC_LEGACY_KEY_ID),
@@ -1521,7 +1521,7 @@ impl PayloadCodecs {
         let raw = serde_json::to_vec(&payload)?;
         let encoded = codec
             .encode(&raw)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+            .map_err(|e| HarvestError::Codec(e.to_string()))?;
         Ok(Self::envelope(
             codec.codec_id(),
             key_id.as_deref().unwrap_or(CODEC_LEGACY_KEY_ID),
@@ -1600,7 +1600,7 @@ impl PayloadCodecs {
         }
         let encoded = codec
             .encode(raw)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+            .map_err(|e| HarvestError::Codec(e.to_string()))?;
         // Never the escape case: identity is refused above, so this key id
         // is always a genuinely active rotation key.
         Ok(Self::envelope(codec.codec_id(), key_id, &encoded, false))
@@ -1856,6 +1856,51 @@ impl PayloadCodecs {
         )
     }
 
+    /// Re-encode a stored column value for a copy into a new row (issue #2065).
+    ///
+    /// A retry, a continue-as-new successor and a reset fork are new writes.
+    /// With column encoding on, this decodes `stored`, then encodes it as
+    /// [`PayloadCodecs::encode_column`] does. A clear legacy value is encoded,
+    /// and ciphertext moves to the active key. With column encoding off, the
+    /// copy keeps the stored bytes, so it never turns ciphertext into clear.
+    /// A value this registry cannot decode, or that decodes to bytes which are
+    /// not JSON, also keeps its stored bytes. The copy never loses or guesses a
+    /// value.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError`] when the codec fails to encode the decoded value.
+    #[cfg(feature = "db")]
+    pub(crate) fn recode_column_for_copy(&self, stored: &Value) -> HarvestResult<Value> {
+        // Read the switch once. A concurrent flip must not leave a decoded
+        // value to be stored in clear.
+        if !self.column_encoding() {
+            return Ok(stored.clone());
+        }
+        match self.decode_column(stored) {
+            Ok(plain) => self.encode_payload(&plain),
+            Err(error)
+                if error.is_codec_failure() || matches!(error, HarvestError::Serialization(_)) =>
+            {
+                Ok(stored.clone())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// [`PayloadCodecs::recode_column_for_copy`] for an optional column.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::recode_column_for_copy`].
+    #[cfg(feature = "db")]
+    pub(crate) fn recode_column_opt_for_copy(
+        &self,
+        stored: Option<&Value>,
+    ) -> HarvestResult<Option<Value>> {
+        stored.map(|v| self.recode_column_for_copy(v)).transpose()
+    }
+
     /// [`PayloadCodecs::decode_payload`], taking `payload` by value.
     ///
     /// [`PayloadCodecs::transform_event_data`] already owns the whole event
@@ -1945,10 +1990,10 @@ impl PayloadCodecs {
         })?;
         let encoded = base64::engine::general_purpose::STANDARD
             .decode(parts.encoded_b64)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+            .map_err(|e| HarvestError::Codec(e.to_string()))?;
         codec
             .decode(&encoded)
-            .map_err(|e| HarvestError::Config(e.to_string()))
+            .map_err(|e| HarvestError::Codec(e.to_string()))
     }
 
     /// Decode one already-shape-verified envelope, mapping every failure mode
@@ -3944,5 +3989,184 @@ mod tests {
                  pair can leave the mirror disagreeing with a non-empty map"
             );
         }
+    }
+
+    // ── codec failure classification (issue #2065) ───────────────────────
+
+    /// A codec whose `encode` always fails, as a remote key service can.
+    #[derive(Debug)]
+    struct BrokenEncode;
+
+    impl PayloadCodec for BrokenEncode {
+        fn codec_id(&self) -> &'static str {
+            "broken"
+        }
+        fn encode(&self, _raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Err(CodecError("key service down".to_string()))
+        }
+        fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Ok(encoded.to_vec())
+        }
+    }
+
+    fn broken_codecs() -> PayloadCodecs {
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(BrokenEncode));
+        codecs.set_column_encoding(true);
+        codecs
+    }
+
+    #[test]
+    fn an_encode_failure_is_a_codec_failure() {
+        let err = broken_codecs()
+            .encode_column(&json!({"k": "v"}))
+            .expect_err("the codec fails");
+        assert!(matches!(err, HarvestError::Codec(_)), "{err:?}");
+        assert!(err.is_codec_failure());
+    }
+
+    #[test]
+    fn a_decode_failure_is_a_codec_failure() {
+        let codecs = PayloadCodecs::default();
+        let envelope = json!({
+            CODEC_ENVELOPE_KEY: 1,
+            "codec_id": "identity",
+            "data": "not base64 !!",
+        });
+        let err = codecs.decode_column(&envelope).expect_err("bad base64");
+        assert!(matches!(err, HarvestError::Codec(_)), "{err:?}");
+        assert!(err.is_codec_failure());
+    }
+
+    #[test]
+    fn unknown_codec_errors_are_codec_failures() {
+        assert!(
+            HarvestError::UnknownCodecKey {
+                key_id: "k".into(),
+                codec_id: "c".into(),
+            }
+            .is_codec_failure()
+        );
+        assert!(HarvestError::UnknownPayloadCodec { id: "c".into() }.is_codec_failure());
+    }
+
+    #[test]
+    fn other_errors_are_not_codec_failures() {
+        assert!(!HarvestError::Config("terminal target".into()).is_codec_failure());
+        assert!(!HarvestError::NotFound("x".into()).is_codec_failure());
+    }
+
+    // ── recode for a row copy (issue #2065) ──────────────────────────────
+
+    #[cfg(feature = "db")]
+    fn keyed_codecs(columns: bool) -> PayloadCodecs {
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k1", Arc::new(XorCodec(1)))
+            .expect("register k1");
+        codecs.set_active_key("k1").expect("activate k1");
+        codecs.set_column_encoding(columns);
+        codecs
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_encodes_a_legacy_plaintext_value() {
+        let codecs = keyed_codecs(true);
+        let plain = json!({"ssn": "123-45-6789"});
+        let copied = codecs.recode_column_for_copy(&plain).expect("recode");
+        assert!(is_codec_envelope(&copied), "{copied}");
+        assert_eq!(codecs.decode_column(&copied).expect("decode"), plain);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_rewraps_ciphertext_once() {
+        let codecs = keyed_codecs(true);
+        let plain = json!({"ssn": "123-45-6789"});
+        let stored = codecs.encode_column(&plain).expect("encode");
+        let copied = codecs.recode_column_for_copy(&stored).expect("recode");
+        assert!(is_codec_envelope(&copied));
+        assert_eq!(
+            codecs.decode_column(&copied).expect("decode"),
+            plain,
+            "one decode must give the plaintext, not another envelope"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_leaves_plaintext_in_clear_while_column_encoding_is_off() {
+        let codecs = keyed_codecs(false);
+        let plain = json!({"a": 1});
+        assert_eq!(
+            codecs.recode_column_for_copy(&plain).expect("recode"),
+            plain
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_keeps_ciphertext_while_column_encoding_is_off() {
+        let on = keyed_codecs(true);
+        let stored = on.encode_column(&json!({"a": 1})).expect("encode");
+        let off = keyed_codecs(false);
+        assert_eq!(
+            off.recode_column_for_copy(&stored).expect("recode"),
+            stored,
+            "a copy must not turn ciphertext into clear"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_keeps_the_stored_bytes_when_the_key_is_missing() {
+        let writer = keyed_codecs(true);
+        let stored = writer.encode_column(&json!({"a": 1})).expect("encode");
+        let reader = PayloadCodecs::default();
+        reader.set_column_encoding(true);
+        assert_eq!(
+            reader.recode_column_for_copy(&stored).expect("recode"),
+            stored,
+            "an unreadable value is copied as stored, never dropped or guessed"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_keeps_a_corrupt_envelope_as_stored() {
+        let codecs = keyed_codecs(true);
+        let corrupt = json!({
+            CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_KEYED,
+            "codec_id": "xor",
+            "kid": "k1",
+            "data": "not base64 !!",
+        });
+        assert_eq!(
+            codecs.recode_column_for_copy(&corrupt).expect("recode"),
+            corrupt,
+            "an unreadable value is copied as stored"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_keeps_the_stored_bytes_when_the_decoded_bytes_are_not_json() {
+        let codecs = keyed_codecs(true);
+        let bytes = XorCodec(1).encode(b"not json").expect("encode");
+        let stored = PayloadCodecs::envelope("xor", "k1", &bytes, false);
+        assert_eq!(
+            codecs.recode_column_for_copy(&stored).expect("recode"),
+            stored
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_reports_an_encode_failure() {
+        let err = broken_codecs()
+            .recode_column_for_copy(&json!({"a": 1}))
+            .expect_err("the codec fails");
+        assert!(err.is_codec_failure(), "{err:?}");
     }
 }

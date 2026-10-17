@@ -25,10 +25,11 @@ R&D decision record [`docs/rnd/sqlite-feasibility.md`](rnd/sqlite-feasibility.md
 6. [Starting a workflow](#6-starting-a-workflow)
 7. [The drive model](#7-the-drive-model)
 8. [Signals, queries and updates](#8-signals-queries-and-updates)
-9. [Durability and crash recovery](#9-durability-and-crash-recovery)
-10. [The single-writer / single-server contract](#10-the-single-writer--single-server-contract)
-11. [v0.1 non-goals and follow-ups](#11-v01-non-goals-and-follow-ups)
-12. [Runnable examples](#12-runnable-examples)
+9. [Child workflows and commands between runs](#9-child-workflows-and-commands-between-runs)
+10. [Durability and crash recovery](#10-durability-and-crash-recovery)
+11. [The single-writer / single-server contract](#11-the-single-writer--single-server-contract)
+12. [v0.1 non-goals and follow-ups](#12-v01-non-goals-and-follow-ups)
+13. [Runnable examples](#13-runnable-examples)
 
 ---
 
@@ -54,8 +55,8 @@ would write, so it replays unchanged on the core `WorkflowReplayer`.
 
 **Reach for the Postgres core ([`autumn-harvest`](../autumn-harvest)) instead
 when** you need distributed / multi-worker execution, multi-server crash
-recovery, high throughput, `LISTEN`/`NOTIFY` push wake-ups, schedules, DAGs, the
-management API, worker sessions, retention, or sharding.
+recovery, high throughput, `LISTEN`/`NOTIFY` push wake-ups, DAGs, the
+management API, worker sessions, or sharding.
 
 | | SQLite backend | Postgres core |
 | --- | --- | --- |
@@ -64,7 +65,8 @@ management API, worker sessions, retention, or sharding.
 | Wake-ups | Polling (you drive it) | `LISTEN`/`NOTIFY` push |
 | Crash recovery | Single-process reopen | Multi-server heartbeat/reclaim |
 | Throughput | Modest, single-writer | High, horizontally scaled |
-| Extras (schedules, DAGs, mgmt API, sharding) | v0.1 non-goals | Yes |
+| Schedules, retention | Yes (issue #2031) | Yes |
+| Extras (DAGs, mgmt API, sharding) | v0.1 non-goals | Yes |
 
 ---
 
@@ -154,9 +156,9 @@ let mut rt = SqliteRuntime::open_in_memory()?;
 
 - Use **`open(path)`** for anything that must survive a process restart. Opening
   applies the schema idempotently and reclaims any task stranded `RUNNING` by a
-  previous crash (see [§9](#9-durability-and-crash-recovery)). It first takes the
+  previous crash (see [§10](#10-durability-and-crash-recovery)). It first takes the
   single-writer lock, so a second open of a held file fails with
-  `SqliteError::DatabaseLocked` (see [§10](#10-the-single-writer--single-server-contract)).
+  `SqliteError::DatabaseLocked` (see [§11](#11-the-single-writer--single-server-contract)).
 - Use **`open_in_memory()`** for tests, demos, and throwaway runs. Each call is a
   brand-new database and is **not** reopen-safe — dropping the runtime discards
   all state.
@@ -256,6 +258,10 @@ cross-backend-identical).
 An oversized start input (over the 2 MiB default cap) is rejected with
 `SqliteError::PayloadTooLarge` before anything is persisted, matching the core.
 
+A start input, memo, signal payload or update input nested over
+`MAX_PAYLOAD_DEPTH` (100) levels is rejected with `SqliteError::PayloadTooDeep` before anything is
+persisted. Postgres has no such cap.
+
 ---
 
 ## 7. The drive model
@@ -269,7 +275,7 @@ blocked on external input. All three drivers are `async`.
 | Driver | Scope | Stops when | Returns |
 | --- | --- | --- | --- |
 | `poll_once().await` | Every running execution, **one cycle each** | after a single pass | `bool` — did anything make progress? |
-| `run_until_blocked(exec).await` | **One** execution | that run is terminal or blocked | `RunState` |
+| `run_until_blocked(exec).await` | **One** execution, plus each run it waits on | that run is terminal or blocked | `RunState` |
 | `run_until_idle().await` | **Every** execution, repeatedly | the whole fleet quiesces | `()` |
 
 ```rust
@@ -281,6 +287,7 @@ match rt.run_until_blocked(exec).await? {
     RunState::Failed(err)       => println!("failed: {err}"),
     RunState::WaitingSignal(name) => println!("blocked on signal `{name}`"),
     RunState::WaitingTimer      => println!("blocked on a durable timer"),
+    RunState::WaitingWorkflow(other) => println!("blocked on run {other}"),
     RunState::WaitingMutex(key) => println!("blocked on the `{key}` mutex"),
     RunState::Cancelled(reason) => println!("cancelled: {reason}"),
     RunState::TimedOut(error)   => println!("timed out: {error}"),
@@ -311,9 +318,11 @@ match rt.outcome(exec)? {
 
 
 `poll_once()`/`run_until_idle()` drive every execution in a pass even if an
-earlier one errors — see [§11](#11-v01-non-goals-and-follow-ups) for what
+earlier one errors — see [§12](#12-v01-non-goals-and-follow-ups) for what
 happens to a rejected execution. `run_until_blocked(exec)` is the one
-fail-fast driver, since it already targets a single execution.
+fail-fast driver, since it targets one execution. It also drives each run that
+`exec` waits on, so an error from that run can return too (see
+[§9](#9-child-workflows-and-commands-between-runs)).
 
 `outcome(exec)`, `load_history(exec)`, and `activity_attempts(exec, name)` are
 **pure reads** — they never advance a run.
@@ -368,8 +377,8 @@ The run ends `CANCELLED` when one of these occurs:
 
 - The body returns `Ok` or `Err`, or continues as new. The output of an `Ok`
   is not kept, and no successor starts.
-- The body blocks on a signal or a timer, and no activity task is left to
-  run. A parked await cannot see the request.
+- The body blocks on a signal, a timer or another run (issue #2026), and no
+  activity task is left to run. A parked await cannot see the request.
 - The cycle diverges or deadlocks. The driver discards that cycle.
 - The drive meets an error that repeats on every drive: an unregistered
   activity or workflow, or a stuck cycle.
@@ -439,8 +448,9 @@ drive of the old run returns the same successor and starts no other run.
 `start_workflow_with_id` with the same id attaches to the newest run. Send
 later signals to the successor, because the old run is terminal.
 
-`continue_as_new` bounds the replay cost of a run, not the database size. This
-backend has no retention, so each sealed run keeps its history in the file.
+`continue_as_new` bounds the replay cost of a run, not the database size. Each
+sealed run keeps its history in the file until `purge_terminal` removes it
+(see [Schedules, retention and the append-only guard](#schedules-retention-and-the-append-only-guard-issue-2031)).
 
 `outcome()` of the old run is `ExecutionOutcome::Terminated("CONTINUED_AS_NEW")`.
 `successor(old)` returns the successor id without a drive.
@@ -538,6 +548,89 @@ as on Postgres. It gets every signal of the failed run again. It waits for
 its backoff: before then a drive returns `RunState::WaitingTimer`.
 `successor(failed)` returns it. A panic, a replay divergence, a cap, a
 timeout, a cancel and a non-retryable error never retry.
+
+### Schedules, retention and the append-only guard (issue #2031)
+
+**Schedules.** `upsert_schedule` stores a core `WorkflowSchedule` in
+`harvest_schedules`. The workflow name is the key, as on Postgres. Each
+`poll_once` pass fires the due schedules, then drives the fleet, so a new run
+starts in the same pass. `run_until_idle` and `poll_once_as_of` fire too.
+`run_until_blocked` drives one run and fires nothing.
+
+```rust,ignore
+use autumn_harvest::policy::{Schedule, WorkflowSchedule};
+
+rt.register_workflow(&nightly_info());
+// Safe on every open: the same spec keeps its next slot and its pause.
+rt.upsert_schedule(
+    &WorkflowSchedule::new("nightly", Schedule::Cron("0 3 * * *".into()))
+        .with_input(serde_json::json!({ "full": true })),
+)?;
+loop {
+    rt.poll_once().await?;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+}
+```
+
+- The slot arithmetic is the core `schedule_plan` module. The Postgres
+  scheduler calls it too, so both backends compute the same slots.
+- One transaction checks the overlap, starts the run and moves the slot. A
+  crash cannot start a slot twice. The run of a slot has the `workflow_id`
+  `sched:<workflow>:<slot seconds>`.
+- Catch-up is off. After a gap, a schedule fires one run, then counts its
+  next slot from now.
+- `Skip` drops a slot while `max_active_runs` runs of the schedule are
+  `RUNNING`. A continue-as-new or retry successor counts. A run past its
+  deadline, or with a pending cancel, does not: Postgres has already ended
+  it. `AllowAll` starts a run for every slot.
+- `run_until_idle` fires on its first pass only. So a slow pass cannot meet
+  new slots without end. The next call fires them.
+- `pause_schedule` stops the fires. `resume_schedule` counts the next slot
+  from now, so the missed slots do not fire. `delete_schedule` removes the
+  row, and the runs keep running. `list_schedules` reads every row.
+- A schedule that cannot fire keeps its slot due. An unregistered workflow
+  or a damaged row only logs a warning, so it cannot stop the fleet. The
+  slot of an unregistered workflow fires once the app registers it.
+  Register each workflow before you poll, or call `delete_schedule` when
+  you remove one. Any other fire error, such as a failed write, is
+  returned after the pass, as a run's error is.
+- `jitter` is ignored. Jitter spreads the fires of a fleet, and one writer
+  has no fleet.
+- Each other field this backend cannot honor is rejected with
+  `SqliteError::Unsupported("WorkflowSchedule.<field> — ...")`: `catchup`,
+  a `catchup_policy` other than `SkipAll`, the buffer and cancel overlap
+  policies, `calendar`, `end_at`, `max_runs`, `consecutive_failure_limit`,
+  `retry_policy`, `execution_timeout`, `chain_execution_timeout`,
+  `all_writable_shards`, `dag_name` and a `queue_name` other than `default`.
+
+**Retention.** `purge_terminal(older_than)` removes each terminal run closed
+more than `older_than` ago, with its events, tasks, timers, signals and
+activity attempts. It returns the number of runs removed. It works in batches
+of 256 runs, one short transaction each. Indexes on `closed_at` and on each
+table's `exec_id` keep each batch a set of seeks. A damaged row is skipped.
+
+- A `RUNNING` run is never removed.
+- Only the close time counts, as on Postgres. So an old run of a chain goes
+  even while the newest run of the chain runs. Its `successor` is then
+  `ExecutionNotFound`, and a keyed signal that it received no longer
+  dedupes a retry.
+- A run closed before issue #2027 has no close time, so it stays.
+- The window counts on the real clock, because a terminal write stamps
+  `closed_at` from the real clock.
+- A purged id is gone. A later start with its `workflow_id` creates a fresh
+  run, as after a Postgres retention sweep.
+- The purge frees pages for reuse, so the file stops growing. It does not
+  shrink. Run `VACUUM` to shrink it.
+
+**The append-only guard.** Two triggers keep `harvest_events` append-only, as
+the Postgres trigger of issue #1817 does. One refuses every `UPDATE`. The
+other refuses an `INSERT` over a stored `(exec_id, seq)`, so
+`INSERT OR REPLACE` cannot rewrite an event. `DELETE` stays open for
+retention. This backend has no erase and no codec rotation, so no writer has a
+sanction. The schema creates both triggers on every open, so an older file
+gains the guard. A test fixture that must damage an event calls
+`autumn_harvest_sqlite::append_only::with_guard_off`. Production code must
+not call it.
 
 ---
 
@@ -880,7 +973,107 @@ Limits:
 
 ---
 
-## 9. Durability and crash recovery
+## 9. Child workflows and commands between runs
+
+A workflow can start a child, await another run, and signal or cancel
+another run (issue #2026). Each command takes effect in the caller's decision
+transaction. An await of a running target stays open, and each later cycle
+checks it again. One file holds every run, so the backend needs no outbox.
+
+```rust
+// Inside a workflow: start a child and wait for its result.
+let receipt: serde_json::Value = ctx
+    .spawn_child_workflow_raw("charge_card", serde_json::json!({ "cents": 500 }))
+    .await
+    .map_err(|e| e.to_string())?;
+
+// Start a detached child. The parent does not wait for it.
+let audit = ctx
+    .spawn_child_workflow_detached_raw(
+        "audit",
+        serde_json::json!({}),
+        autumn_harvest::ParentClosePolicy::Abandon,
+    )
+    .map_err(|e| e.to_string())?;
+
+// Signal or await another run. `ctx.request_cancel_external_workflow(id)`
+// cancels one.
+ctx.signal_external_workflow(audit, "flush", ()).await.map_err(|e| e.to_string())?;
+let report = ctx.await_external_workflow_value(audit).await.map_err(|e| e.to_string())?;
+```
+
+| Command | What the target gets | What the caller sees |
+| --- | --- | --- |
+| Attached child | Its own run, with a parent link | The child's output, or its typed failure |
+| Detached child | Its own run, with a parent-close policy | The child's execution id at once |
+| Await | Nothing | The target's output, or its typed failure |
+| Signal | A staged signal | `Ok(())`, or `target_terminal` / `not_running` |
+| Cancel | `WorkflowCancelled`, then `CANCELLED` | `Ok(())`, also for a terminal target |
+
+Signal, cancel and await get `target_unknown` at once for a run that does not
+exist. An await follows a target that continues as new to its last run, as on
+Postgres. A `TERMINATED` target gives `target_terminated`.
+Postgres waits a grace window first, because another shard can still create
+the run. One file has no other shard, so its answer is final.
+
+**Children.** A child is a full run. Its `workflow_id` is its execution id.
+`ctx.info().parent_execution_id` names its parent. A child failure reaches
+the parent as `HarvestError::WorkflowFailed`, with the child's `error_type`,
+`details` and `non_retryable`. A cancelled child fails the parent's wait with
+`child workflow cancelled: <reason>`. A terminated child fails it with
+`child workflow terminated: <reason>`. A child cannot continue as new. It
+fails with `continue_as_new is not supported in child workflows in this
+release`, as on Postgres. Under `spawn_child_workflow_timeout`, a
+deadline that is due fires before a late child's result, so the deadline wins,
+as on Postgres. A drive that starts an unregistered child workflow returns
+`SqliteError::UnknownWorkflow`. The cycle rolls back, and the parent stays
+`RUNNING`, so a fix in the same runtime can resume it.
+`rt.parent_execution(child)` reads a child's parent.
+
+**Parent-close policy.** When a parent ends, each running detached child gets
+its policy. `request_cancel` cancels it with reason `parent closed`.
+`terminate` fails it with `ParentClosed`. `abandon` leaves it running. The
+cascade reaches every level of a chain of detached children. An attached child
+is left running, as on Postgres.
+
+**A cancel from another run is a hard seal.** It differs from the
+cooperative `rt.cancel` (see [Cancel and terminate](#cancel-and-terminate)).
+The target ends `CANCELLED` at once. The backend
+deletes its pending tasks, unfired timers and unkeyed staged signals. A keyed
+signal row stays, so a duplicate send still dedups. The target's body does not
+run again, so `ctx.cancellation_reason()` stays unobserved. This matches the
+Postgres external cancel. A run that its own cancel seals, through a
+parent-close cascade, applies no more of its batch. A drive of a cancelled run
+returns `RunState::Cancelled` with the reason, and `outcome()` returns
+`Terminated("CANCELLED")`. `AllowDuplicateFailedOnly` replaces a cancelled run,
+as core does.
+
+**Driving.** A run that waits on a `RUNNING` child or await target returns
+`RunState::WaitingWorkflow(target)`. `run_until_blocked` drives each such
+target in the same call. So a parent whose children need no outside input
+completes in one call. When every target blocks, the parent returns
+`WaitingWorkflow` naming the run it waits on directly. That run can wait on
+another run in turn, so call `run_until_blocked` on it to find the run that
+needs input. The parent can also wait on a timer, such as a child deadline,
+so drive it again after the deadline. `poll_once` and `run_until_idle` treat
+`WaitingWorkflow` as blocked. Each run gets its own cycle budget in one call.
+An error from a waited-on run returns from the call, unless that run is now
+terminal. Such an error does not always name `exec`.
+
+**Replay.** Every history replays on the core `WorkflowReplayer`. This change
+also fixes a core replay gap: an await whose result lands after a sibling's
+child or activity events now resolves on replay, on both backends. Postgres
+has the same single exception: a run cancelled while it waits ends in a
+`WorkflowCancelled` that its code never saw. Strict replay reports that run
+as still parked. Replay the events before the cancel in canary mode instead.
+
+**Event order.** This backend writes a batch in command order. Postgres
+writes the external signal, cancel and await events of a mixed batch first.
+Each event is the same, and replay accepts both orders.
+
+---
+
+## 10. Durability and crash recovery
 
 All durable state lives in the database. Dropping a runtime and re-`open`-ing the
 **same file** is a faithful crash/restart:
@@ -907,7 +1100,7 @@ from history in session 2) and the ship body ran exactly once (session 2 only).
 
 ---
 
-## 10. The single-writer / single-server contract
+## 11. The single-writer / single-server contract
 
 This backend assumes **one writer process** against **one** SQLite file:
 
@@ -917,7 +1110,7 @@ This backend assumes **one writer process** against **one** SQLite file:
   exactly-once by construction — no two claimers race.
 - **Polling replaces `LISTEN`/`NOTIFY`** (see [§7](#7-the-drive-model)).
 - **Restart = drop the runtime + reopen the file** (see
-  [§9](#9-durability-and-crash-recovery)).
+  [§10](#10-durability-and-crash-recovery)).
 
 The runtime opens the database with `journal_mode = WAL`, `synchronous = FULL`
 (fsync on every commit — the crash tests depend on it), and a `busy_timeout` so
@@ -963,16 +1156,13 @@ next `open`. A single-process design has no heartbeat-timeout reclaimer for a
 
 ---
 
-## 11. v0.1 non-goals and follow-ups
+## 12. v0.1 non-goals and follow-ups
 
 Out-of-subset workflow primitives are rejected **loudly, by name** — never
 silently dropped. A workflow reaching one of these surfaces
 `SqliteError::Unsupported` (or a setup-time panic at registration) naming the
 specific command/feature. The run then ends `FAILED` (see below):
 
-- **Child workflows** (`spawn_child_workflow`, `spawn_child_workflow_detached`).
-- **External signals / cancels** (`signal_external_workflow`,
-  `request_cancel_external_workflow`).
 - **External / task-token activities**.
 - A **continue-as-new to a different type** (`continue_as_new_as_type`).
   The token is `ContinueAsNew.new_workflow_type`. A same-type
@@ -992,7 +1182,7 @@ transaction, with a typed `WorkflowFailed` event:
 | Field | Value |
 |---|---|
 | `error_type` | `"UnsupportedFeature"` (`UNSUPPORTED_FEATURE_ERROR_TYPE`) |
-| `details` | `{"feature": "<stable token>", "message": "<full text>"}`. The token is a command or field name, such as `StartChildWorkflow` or `ScheduleActivity.session_id`. |
+| `details` | `{"feature": "<stable token>", "message": "<full text>"}`. The token is a command or field name, such as `RunLocalActivity` or `ScheduleActivity.session_id`. |
 | `non_retryable` | `true` |
 | `error` | The `SqliteError::Unsupported` message |
 
@@ -1001,7 +1191,8 @@ staged signals. The cycle's own cleanup rolled back, and nothing can use them
 now. A keyed signal stays, so its key still dedupes (issue #2028).
 
 That drive still returns `SqliteError::Unsupported`, so the caller sees the
-reason. A later drive returns `RunState::Failed` and does not run the handler
+reason. When the sealed run is a child or await target, the waiter's drive does
+not return the error. The waiter records the typed failure instead. A later drive returns `RunState::Failed` and does not run the handler
 again. `outcome()` returns `ExecutionOutcome::Failed`.
 
 Only an unsupported feature or a history cap seals a run `FAILED`. An
@@ -1018,12 +1209,15 @@ the first execution error to the caller. A sealed execution is terminal, so
 later passes skip it.
 
 Backend-level non-goals: distributed / multi-writer workers, `LISTEN`/`NOTIFY`
-push wake-ups, multi-server crash recovery, schedules, the management API,
-retention, worker sessions, sharding, and DAGs. Rejection is deliberate, so a
+push wake-ups, multi-server crash recovery, the management API, worker
+sessions, sharding, and DAGs. Schedules and retention shipped under issue
+#2031. Rejection is deliberate, so a
 partial, silently-wrong implementation never ships.
 
 The `WorkflowIdReusePolicy` matrix (see [§6](#6-starting-a-workflow)) shipped
-under issue #1068. It is no longer a non-goal.
+under issue #1068. It is no longer a non-goal. Child workflows and commands
+between runs (see [§9](#9-child-workflows-and-commands-between-runs)) shipped
+under issue #2026.
 
 Two benign bookkeeping commands are silently no-ops (they append no event and
 gate no control flow): `ctx.set_current_details(...)` and a re-park
@@ -1031,7 +1225,7 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
 
 ---
 
-## 12. Runnable examples
+## 13. Runnable examples
 
 - **[`examples/quickstart.rs`](../autumn-harvest-sqlite/examples/quickstart.rs)**
   — a complete order-processing workflow: open in-memory → register a workflow +
@@ -1055,7 +1249,7 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
   sessions as durable workflows. It shows the drive loop
   ([§7](#7-the-drive-model)), signals with a deadline
   ([§8](#8-signals-queries-and-updates)), and crash recovery
-  ([§9](#9-durability-and-crash-recovery)) in one place, and it runs with no API
+  ([§10](#10-durability-and-crash-recovery)) in one place, and it runs with no API
   key against a scripted offline model.
 
   ```text

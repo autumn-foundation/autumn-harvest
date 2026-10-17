@@ -1799,6 +1799,10 @@ async fn drive_one(
                 None,
             );
         }
+        // A session spawns no child, but the match must stay exhaustive.
+        Ok(RunState::WaitingWorkflow(other)) => {
+            note(blocked, exec, format!("waiting for run {other}"), None);
+        }
         // Issue #2029: another run holds the mutex. A later tick retries.
         Ok(RunState::WaitingMutex(key)) => {
             note(

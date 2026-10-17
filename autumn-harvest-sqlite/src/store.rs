@@ -100,6 +100,31 @@ pub fn insert_execution_with_config(
     Ok(())
 }
 
+/// Insert a child run with its parent link (issue #2026).
+///
+/// `parent` is the parent run and the close policy. The policy is `None` for
+/// an awaited child. A detached child stores its policy, as the Postgres
+/// `parent_close_policy` column does. `config` holds the timeout and retry
+/// settings of the child's type (issue #2029).
+pub fn insert_child_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    workflow_name: &str,
+    input: &Value,
+    parent: (ExecutionId, Option<&str>),
+    config: &RunConfig,
+) -> SqliteResult<()> {
+    // A child's business id is its own execution id, as on Postgres.
+    let workflow_id = exec_id.to_string();
+    insert_execution_with_config(conn, exec_id, workflow_name, &workflow_id, input, config)?;
+    conn.execute(
+        "UPDATE harvest_executions SET parent_exec_id = ?2, parent_close_policy = ?3 \
+         WHERE exec_id = ?1",
+        params![exec_id.to_string(), parent.0.to_string(), parent.1],
+    )?;
+    Ok(())
+}
+
 impl RunConfig {
     /// The timeout and the deadline that a workflow context gets, so
     /// `ctx.deadline()` reads the same values on a drive, an update and a
@@ -175,6 +200,51 @@ pub fn set_local_retry_at(conn: &Connection, exec_id: ExecutionId, at: i64) -> S
         params![exec_id.to_string(), at],
     )?;
     Ok(())
+}
+
+/// The parent of `exec_id` and the stored close policy, if `exec_id` is a child.
+pub fn parent_link(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<Option<(ExecutionId, Option<String>)>> {
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT parent_exec_id, parent_close_policy FROM harvest_executions WHERE exec_id = ?1",
+            params![exec_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((Some(parent), policy)) => {
+            let parent = parent
+                .parse()
+                .map_err(|_| SqliteError::corrupt("parent_exec_id"))?;
+            Ok(Some((parent, policy)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The `RUNNING` detached children of `parent` with their close policies.
+pub fn running_detached_children(
+    conn: &Connection,
+    parent: ExecutionId,
+) -> SqliteResult<Vec<(ExecutionId, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT exec_id, parent_close_policy FROM harvest_executions \
+         WHERE parent_exec_id = ?1 AND parent_close_policy IS NOT NULL AND state = 'RUNNING' \
+         ORDER BY rowid",
+    )?;
+    let rows = stmt.query_map(params![parent.to_string()], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (exec, policy) = r?;
+        let exec = exec.parse().map_err(|_| SqliteError::corrupt("exec_id"))?;
+        out.push((exec, policy));
+    }
+    Ok(out)
 }
 
 pub fn execution_exists(conn: &Connection, exec_id: ExecutionId) -> SqliteResult<bool> {
@@ -454,6 +524,20 @@ pub fn set_completed(conn: &Connection, exec_id: ExecutionId, output: &Value) ->
     crate::mutex::release_all(conn, exec_id)
 }
 
+/// Move a run to `CANCELLED` and store the reason in `error` (issue #2026).
+///
+/// It records the close time and releases the run's mutex locks and waits,
+/// as every terminal setter does (issues #2027 and #2029).
+pub fn set_cancelled(conn: &Connection, exec_id: ExecutionId, reason: &str) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_executions SET state = 'CANCELLED', output_json = NULL, error = ?2, \
+           closed_at = ?3 \
+         WHERE exec_id = ?1",
+        params![exec_id.to_string(), reason, now_micros()],
+    )?;
+    crate::mutex::release_all(conn, exec_id)
+}
+
 pub fn set_failed(conn: &Connection, exec_id: ExecutionId, error: &str) -> SqliteResult<()> {
     conn.execute(
         "UPDATE harvest_executions SET state = 'FAILED', error = ?2, closed_at = ?3 \
@@ -491,19 +575,33 @@ pub fn set_start_fields(
     Ok(())
 }
 
-/// Copy the memo and the search attributes of `from` to `to`. A
-/// continue-as-new successor keeps both, as on Postgres (issue #2027).
-pub fn copy_memo_and_search_attrs(
+/// Copy the fields a successor inherits from `from` to `to`: the memo and
+/// the search attributes (issue #2027), and the schedule (issue #2031). A
+/// continue-as-new and a workflow retry are the same logical run.
+pub fn copy_inherited_fields(
     conn: &Connection,
     from: ExecutionId,
     to: ExecutionId,
 ) -> SqliteResult<()> {
     conn.execute(
         "UPDATE harvest_executions SET \
-           memo = (SELECT memo FROM harvest_executions WHERE exec_id = ?1), \
-           search_attrs = (SELECT search_attrs FROM harvest_executions WHERE exec_id = ?1) \
+           (memo, search_attrs, schedule_name) = \
+           (SELECT memo, search_attrs, schedule_name FROM harvest_executions WHERE exec_id = ?1) \
          WHERE exec_id = ?2",
         params![from.to_string(), to.to_string()],
+    )?;
+    Ok(())
+}
+
+/// Mark `exec_id` as a run of the schedule `workflow_name` (issue #2031).
+pub fn set_schedule_name(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    workflow_name: &str,
+) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_executions SET schedule_name = ?2 WHERE exec_id = ?1",
+        params![exec_id.to_string(), workflow_name],
     )?;
     Ok(())
 }

@@ -45,6 +45,12 @@
 //! - `harvest_mutex_locks`, `harvest_mutex_waiters` and `harvest_mutex_seq` —
 //!   the workflow mutex (issue #2029). A lock row holds a key. The waiter rows
 //!   form a FIFO queue per key. The counter mints each fencing `lock_seq`.
+//! - `harvest_schedules` — cron and interval schedules (issue #2031). One row
+//!   per workflow name, as on Postgres.
+//!
+//! Two triggers keep `harvest_events` append-only (issue #2031). They refuse
+//! every `UPDATE`, and an `INSERT` over a stored `(exec_id, seq)`. See
+//! [`APPEND_ONLY_GUARD`].
 
 /// The full schema, applied idempotently on
 /// [`SqliteRuntime::open`](crate::SqliteRuntime::open).
@@ -75,6 +81,9 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
     cancel_from_seq INTEGER,               -- the history length when `cancel` stored
                                            -- the request (issue #2021). It bounds the
                                            -- events that a cleanup can add.
+    parent_exec_id      TEXT,              -- the parent run of a child (issue #2026)
+    parent_close_policy TEXT,              -- NULL for an awaited child; the policy of a
+                                           -- detached child
     started_at    INTEGER,                 -- the `WorkflowStarted` time in epoch
                                            -- microseconds (issue #2027). NULL on a row
                                            -- written before that issue.
@@ -100,9 +109,12 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
                                            -- (issue #2029). NULL = no retry.
     retry_of_exec_id TEXT,                 -- the failed run that this retry replaces
                                            -- (issue #2029).
-    local_retry_at INTEGER                 -- the epoch-millisecond end of a local
+    local_retry_at INTEGER,                -- the epoch-millisecond end of a local
                                            -- activity's retry backoff (issue #2029).
                                            -- A drive before it waits.
+    schedule_name TEXT                     -- the schedule that started this run
+                                           -- (issue #2031). A successor copies it.
+                                           -- NULL = not a scheduled run.
 );
 
 -- Non-unique lookup index for the (workflow_name, workflow_id) reuse-policy probe
@@ -227,6 +239,12 @@ CREATE TABLE IF NOT EXISTS harvest_tasks (
 CREATE INDEX IF NOT EXISTS idx_harvest_tasks_seq
     ON harvest_tasks (seq);
 
+-- A purge deletes the tasks of a batch of runs by `exec_id` (issue #2031).
+-- Without this index, each batch scans the whole table, so a large purge is
+-- quadratic. The column exists in every file, so the base schema builds it.
+CREATE INDEX IF NOT EXISTS idx_harvest_tasks_exec
+    ON harvest_tasks (exec_id);
+
 CREATE TABLE IF NOT EXISTS harvest_timers (
     timer_id TEXT NOT NULL,
     exec_id  TEXT NOT NULL,
@@ -293,6 +311,21 @@ CREATE TABLE IF NOT EXISTS harvest_mutex_seq (
     last INTEGER NOT NULL
 );
 
+-- Cron and interval schedules (issue #2031). The workflow name is the key,
+-- as on Postgres. Each `poll_once` pass fires the rows whose slot is due.
+CREATE TABLE IF NOT EXISTS harvest_schedules (
+    workflow_name   TEXT PRIMARY KEY,
+    schedule_json   TEXT NOT NULL,         -- the `Schedule` spec as JSON
+    input_json      TEXT NOT NULL,         -- the input of each run
+    overlap_policy  TEXT NOT NULL,         -- skip | allow_all
+    max_active_runs INTEGER NOT NULL,      -- the run limit of `skip`
+    paused          INTEGER NOT NULL DEFAULT 0,
+    next_run_at     INTEGER,               -- the next slot in epoch milliseconds.
+                                           -- NULL = never fires.
+    last_run_at     INTEGER                -- the slot of the last started run in
+                                           -- epoch milliseconds
+);
+
 CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
     attempt_seq INTEGER PRIMARY KEY AUTOINCREMENT,
     exec_id     TEXT NOT NULL,
@@ -301,7 +334,44 @@ CREATE TABLE IF NOT EXISTS harvest_activity_attempts (
     ok          INTEGER NOT NULL,         -- 1 = success, 0 = failure
     detail      TEXT NOT NULL             -- output JSON on success, error on failure
 );
+
+-- A purge deletes the attempts of a batch of runs by `exec_id` (issue
+-- #2031), as for `harvest_tasks` above.
+CREATE INDEX IF NOT EXISTS idx_harvest_activity_attempts_exec
+    ON harvest_activity_attempts (exec_id);
 ";
+
+/// The append-only guard on `harvest_events` (issue #2031), the analog of
+/// the Postgres trigger of issue #1817.
+///
+/// Replay reads the log back in order, so a rewritten event changes what a
+/// past run means. This backend has no sanctioned rewrite, so the guard
+/// refuses every `UPDATE`. `INSERT OR REPLACE` deletes the old row and fires
+/// no `UPDATE` trigger. So a second trigger refuses an `INSERT` over a stored
+/// key. `DELETE` stays open, because retention needs it.
+///
+/// [`SqliteRuntime::open`](crate::SqliteRuntime::open) applies it after
+/// [`SCHEMA`]. Both statements are idempotent, so an older file gains the
+/// guard on its next open.
+pub const APPEND_ONLY_GUARD: &str = r"
+CREATE TRIGGER IF NOT EXISTS harvest_events_append_only_upd
+    BEFORE UPDATE ON harvest_events
+BEGIN
+    SELECT RAISE(ABORT, 'harvest_events is append-only (issue #2031)');
+END;
+CREATE TRIGGER IF NOT EXISTS harvest_events_append_only_ins
+    BEFORE INSERT ON harvest_events
+    WHEN EXISTS (SELECT 1 FROM harvest_events
+                 WHERE exec_id = NEW.exec_id AND seq = NEW.seq)
+BEGIN
+    SELECT RAISE(ABORT, 'harvest_events is append-only (issue #2031)');
+END;
+";
+
+/// Drop both triggers of [`APPEND_ONLY_GUARD`].
+pub const DROP_APPEND_ONLY_GUARD: &str = "\
+    DROP TRIGGER IF EXISTS harvest_events_append_only_upd; \
+    DROP TRIGGER IF EXISTS harvest_events_append_only_ins;";
 
 use rusqlite::Connection;
 
@@ -325,6 +395,10 @@ use crate::error::SqliteResult;
 /// Current migrations:
 /// - **issue #2024** — `harvest_tasks.heartbeat_details` and
 ///   `harvest_tasks.last_error`. Both are nullable, so an old row is valid.
+/// - **issue #2026** — `harvest_executions.parent_exec_id` and
+///   `parent_close_policy` link a child to its parent. `harvest_signals.idempotency_key`
+///   holds the dedup key of an external signal. All are nullable. Their indexes
+///   are built here, after the columns exist.
 /// - **issue #1068** — `harvest_tasks.schedule_to_close_at` (the frozen absolute
 ///   total-deadline column) and `harvest_tasks.defaults_frozen` (the
 ///   resolved-defaults flag). Both are nullable/defaulted, so a pre-#1068 row is
@@ -347,6 +421,11 @@ use crate::error::SqliteResult;
 ///   `local_retry_at`.
 ///   Each is nullable or has a default, so an old row has no timeout and no
 ///   retry. The mutex tables are new, so `CREATE TABLE IF NOT EXISTS` adds them.
+/// - **issue #2031** — `harvest_executions.schedule_name` and two indexes.
+///   One counts the active runs of a schedule. The other holds the close
+///   time that retention reads. The column is nullable, so an old row is not
+///   a scheduled run. The indexes are built here, because the base
+///   [`SCHEMA`] runs before an old table has the columns.
 ///
 /// # Errors
 ///
@@ -392,6 +471,15 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "cancel_from_seq",
         "ALTER TABLE harvest_executions ADD COLUMN cancel_from_seq INTEGER",
     )?;
+    // issue #2026: the parent link of a child run.
+    for column in ["parent_exec_id", "parent_close_policy"] {
+        add_column_if_absent(
+            conn,
+            "harvest_executions",
+            column,
+            &format!("ALTER TABLE harvest_executions ADD COLUMN {column} TEXT"),
+        )?;
+    }
     // issue #2027: the columns that list and describe read.
     for (column, sql) in [
         (
@@ -430,15 +518,34 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
             &format!("ALTER TABLE harvest_executions ADD COLUMN {column} {ddl}"),
         )?;
     }
-    // issue #2028: the signal idempotency key. The back-fill runs only when the
-    // column is new. So the column, the index and the back-fill share one
-    // transaction: a crash after the column must not skip the back-fill.
+    // issue #2031: the schedule of a run, and the two indexes that schedules
+    // and retention read.
+    add_column_if_absent(
+        conn,
+        "harvest_executions",
+        "schedule_name",
+        "ALTER TABLE harvest_executions ADD COLUMN schedule_name TEXT",
+    )?;
+    conn.execute_batch(SCHEDULE_AND_RETENTION_INDEXES)?;
+    add_signal_key(conn)
+}
+
+/// Issue #2028: the signal idempotency key. The back-fill runs only when the
+/// column is new. So the column, the index and the back-fill share one
+/// transaction: a crash after the column must not skip the back-fill.
+fn add_signal_key(conn: &Connection) -> SqliteResult<()> {
     let tx = conn.unchecked_transaction()?;
     let key_added = add_column_if_absent(
         &tx,
         "harvest_signals",
         "idempotency_key",
         "ALTER TABLE harvest_signals ADD COLUMN idempotency_key TEXT",
+    )?;
+    // An index on a new column must follow its `ADD COLUMN`. In `SCHEMA` it
+    // would fail on an old file, which still lacks the column (issue #2026).
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_harvest_executions_parent \
+             ON harvest_executions (parent_exec_id);",
     )?;
     tx.execute_batch(SIGNAL_KEY_INDEX)?;
     if key_added {
@@ -447,6 +554,16 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
     tx.commit()?;
     Ok(())
 }
+
+/// The two `harvest_executions` indexes of issue #2031. The first counts the
+/// active runs of a schedule. The second finds the runs that retention can
+/// remove, in cursor order. Both are partial, so a row that is not scheduled
+/// or not closed costs nothing.
+const SCHEDULE_AND_RETENTION_INDEXES: &str = "\
+    CREATE INDEX IF NOT EXISTS idx_harvest_executions_schedule \
+        ON harvest_executions (schedule_name, state) WHERE schedule_name IS NOT NULL; \
+    CREATE INDEX IF NOT EXISTS idx_harvest_executions_closed \
+        ON harvest_executions (closed_at, exec_id) WHERE closed_at IS NOT NULL;";
 
 /// The partial unique index that enforces a signal idempotency key (issue
 /// #2028). A NULL key is outside the index, so an unkeyed signal always
@@ -769,6 +886,8 @@ mod tests {
         assert!(!column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
         assert!(!column_exists(&conn, "harvest_tasks", "defaults_frozen").unwrap());
 
+        // An open applies `SCHEMA` first. It keeps the old `harvest_tasks`.
+        conn.execute_batch(SCHEMA).unwrap();
         migrate(&conn).unwrap();
 
         assert!(column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
@@ -819,5 +938,50 @@ mod tests {
         fresh.execute_batch(SCHEMA).unwrap();
         assert!(column_exists(&fresh, "harvest_tasks", "heartbeat_details").unwrap());
         assert!(column_exists(&fresh, "harvest_tasks", "last_error").unwrap());
+    }
+
+    // The pre-#2026 `harvest_executions` and `harvest_signals` shapes.
+    const OLD_COMPOSITION_DDL: &str = "\
+        CREATE TABLE harvest_executions (\
+            exec_id TEXT PRIMARY KEY, workflow_name TEXT NOT NULL, \
+            workflow_id TEXT NOT NULL DEFAULT '', input_json TEXT NOT NULL, \
+            state TEXT NOT NULL, output_json TEXT, error TEXT);\
+        CREATE TABLE harvest_signals (\
+            signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, exec_id TEXT NOT NULL, \
+            name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+            delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0);\
+        INSERT INTO harvest_executions (exec_id, workflow_name, input_json, state) \
+            VALUES ('e1', 'wf', '{}', 'RUNNING');";
+
+    // Issue #2026: an old file gains the parent link and the signal key. Its
+    // rows survive, and a pre-#2026 run reads as top-level.
+    #[test]
+    fn migrate_adds_composition_columns_to_an_old_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_COMPOSITION_DDL).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        assert!(!column_exists(&conn, "harvest_executions", "parent_exec_id").unwrap());
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        for (table, column) in [
+            ("harvest_executions", "parent_exec_id"),
+            ("harvest_executions", "parent_close_policy"),
+            ("harvest_signals", "idempotency_key"),
+        ] {
+            assert!(
+                column_exists(&conn, table, column).unwrap(),
+                "{table}.{column}"
+            );
+        }
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_exec_id FROM harvest_executions WHERE exec_id = 'e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, None);
     }
 }

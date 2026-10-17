@@ -658,9 +658,11 @@ value     = quoted-string | number | "true" | "false"
 | `started_at` | `>`, `>=`, `<`, `<=` | RFC 3339 string |
 
 **Types.** Quotes decide the type. `attrs.n = 100` matches the number `100`.
-`attrs.n = '100'` matches the string `"100"`. A string takes single or double
-quotes. A backslash escapes the next character. `attrs."my key"` names a key
-that is not a plain word.
+`attrs.n = '100'` matches the string `"100"`. A number keeps all its digits,
+so `attrs.n = 12345678901234567890123` matches only that number. A number is
+1024 bytes or fewer. A string takes single or double quotes. A backslash
+escapes the next character. `attrs."my key"` names a key that is not a plain
+word.
 
 **Semantics.** Attribute predicates have the same meaning as the
 [typed predicates](#typed-search-attribute-predicates-get-workflows). `!=`
@@ -683,8 +685,8 @@ and 100 `IN` values. All `filter` values of a request hold at most 32
 predicates. A filter over a limit gets `400`.
 
 **Errors.** A syntax error gets `400`, and the message gives the byte offset.
-A number that Postgres cannot hold, such as `1e400`, also gets `400`. So does
-a string with a control character. An empty `filter` value is ignored.
+A number outside the range of a 64-bit float, such as `1e400`, also gets
+`400`. So does a string with a control character. An empty `filter` value is ignored.
 
 **States.** The default list hides `MIGRATED` rows, so `state = 'MIGRATED'`
 and an `IN` list with `MIGRATED` get `400`. `state != 'MIGRATED'` is valid. Use the `state=MIGRATED` parameter. The stalled list

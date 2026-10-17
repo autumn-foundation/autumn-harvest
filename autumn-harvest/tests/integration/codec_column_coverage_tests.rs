@@ -30,6 +30,7 @@ use autumn_harvest::payload_codec::{
     CodecError, PayloadCodec, PayloadCodecs, codec_envelope_key_id, is_codec_envelope,
 };
 use autumn_harvest::policy::{JitterPolicy, RetryPolicy};
+use autumn_harvest::reset::{ResetSignalReapplyPolicy, WorkflowResetRequest};
 use autumn_harvest::telemetry::TelemetryConfig;
 use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use autumn_harvest::{ExecutionId, ShardId, StartWorkflowParams, WorkflowContext};
@@ -4154,4 +4155,549 @@ async fn a_patch_for_a_missing_schedule_reports_not_found_while_the_encoder_is_d
     .await
     .expect("a missing row is an outcome, not a codec error");
     assert!(matches!(outcome, ScheduleUpdateOutcome::NotFound));
+}
+
+// ── carried columns and codec failures (issue #2065) ─────────────────────────
+
+/// Continues as new once. The successor returns its input.
+fn wf_continue_once(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        if input.get("second").is_some() {
+            return Ok(input);
+        }
+        ctx.continue_as_new(json!({"second": true}))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Value::Null)
+    })
+}
+
+async fn wait_for_successor(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> WorkflowExecution {
+    use autumn_harvest::schema::harvest_workflow_executions;
+    for _ in 0..100 {
+        let found: Option<WorkflowExecution> = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::continued_from_exec_id.eq(Some(exec_id.as_uuid())))
+            .select(WorkflowExecution::as_select())
+            .first(conn)
+            .await
+            .optional()
+            .expect("load the successor");
+        if let Some(row) = found {
+            return row;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("no successor row appeared");
+}
+
+#[tokio::test]
+async fn a_successor_of_a_legacy_row_encodes_its_memo() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let mut conn = connect(&url).await;
+    // The source row predates column encoding.
+    let exec_id = start(
+        &mut conn,
+        &aead_codecs(false),
+        "cc_continue_once",
+        &queue,
+        None,
+    )
+    .await;
+    let source = load_execution(&mut conn, exec_id.as_uuid()).await;
+    assert_eq!(source.memo, Some(json!({"account": MEMO_SECRET})));
+
+    let codecs = aead_codecs(true);
+    let pool = build_pool(&url);
+    let worker = worker(
+        &queue,
+        registry(
+            vec![wf_info("cc_continue_once", wf_continue_once, None)],
+            Vec::new(),
+            &codecs,
+        ),
+    );
+    let run = worker.clone();
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(30), run.run(&run_pool)).await;
+    });
+    let successor = wait_for_successor(&mut conn, exec_id).await;
+    worker.shutdown();
+    let _ = handle.await;
+
+    let memo = successor.memo.expect("the successor keeps the memo");
+    assert_ciphertext(&memo, MEMO_SECRET, "the successor memo");
+    assert_eq!(
+        codecs.decode_column(&memo).expect("decode"),
+        json!({"account": MEMO_SECRET}),
+        "the successor memo decodes once to plaintext"
+    );
+}
+
+#[tokio::test]
+async fn a_successor_of_an_encoded_row_wraps_its_memo_once() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let exec_id = start(&mut conn, &codecs, "cc_continue_once", &queue, None).await;
+
+    let pool = build_pool(&url);
+    let worker = worker(
+        &queue,
+        registry(
+            vec![wf_info("cc_continue_once", wf_continue_once, None)],
+            Vec::new(),
+            &codecs,
+        ),
+    );
+    let run = worker.clone();
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(30), run.run(&run_pool)).await;
+    });
+    let successor = wait_for_successor(&mut conn, exec_id).await;
+    worker.shutdown();
+    let _ = handle.await;
+
+    let memo = successor.memo.expect("the successor keeps the memo");
+    assert_one_layer(
+        &codecs,
+        &memo,
+        &json!({"account": MEMO_SECRET}),
+        "successor memo",
+    );
+}
+
+/// Reset `exec_id` at its first event under `registry`, and return the fork.
+async fn reset_fork(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    registry: Option<&HandlerRegistry>,
+) -> WorkflowExecution {
+    let result = autumn_harvest::reset::reset_workflow_execution(
+        conn,
+        exec_id,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "codec copy test".to_string(),
+            operator_id: "op-1".to_string(),
+            signal_reapply: ResetSignalReapplyPolicy::default(),
+            allow_terminal_source: false,
+        },
+        registry,
+    )
+    .await
+    .expect("reset");
+    load_execution(conn, result.new_exec_id.as_uuid()).await
+}
+
+#[tokio::test]
+async fn a_reset_fork_of_a_legacy_row_encodes_input_and_memo() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let mut conn = connect(&url).await;
+    let exec_id = start(
+        &mut conn,
+        &aead_codecs(false),
+        "cc_reset_legacy",
+        &queue,
+        None,
+    )
+    .await;
+    let source = load_execution(&mut conn, exec_id.as_uuid()).await;
+    assert_eq!(source.input, json!({"ssn": INPUT_SECRET}));
+
+    let codecs = aead_codecs(true);
+    let reg = registry(Vec::new(), Vec::new(), &codecs);
+    let fork = reset_fork(&mut conn, exec_id, Some(&reg)).await;
+
+    assert_ciphertext(&fork.input, INPUT_SECRET, "the fork input");
+    let memo = fork.memo.expect("the fork keeps the memo");
+    assert_ciphertext(&memo, MEMO_SECRET, "the fork memo");
+    assert_eq!(
+        codecs.decode_column(&fork.input).expect("decode input"),
+        json!({"ssn": INPUT_SECRET})
+    );
+    assert_eq!(
+        codecs.decode_column(&memo).expect("decode memo"),
+        json!({"account": MEMO_SECRET})
+    );
+}
+
+#[tokio::test]
+async fn a_reset_fork_of_an_encoded_row_wraps_once() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let mut conn = connect(&url).await;
+    let codecs = aead_codecs(true);
+    let exec_id = start(&mut conn, &codecs, "cc_reset_encoded", &queue, None).await;
+    let reg = registry(Vec::new(), Vec::new(), &codecs);
+    let fork = reset_fork(&mut conn, exec_id, Some(&reg)).await;
+
+    assert_one_layer(
+        &codecs,
+        &fork.input,
+        &json!({"ssn": INPUT_SECRET}),
+        "fork input",
+    );
+    let memo = fork.memo.expect("the fork keeps the memo");
+    assert_one_layer(
+        &codecs,
+        &memo,
+        &json!({"account": MEMO_SECRET}),
+        "fork memo",
+    );
+}
+
+#[tokio::test]
+async fn a_reset_without_a_registry_copies_the_stored_bytes() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let mut conn = connect(&url).await;
+    let exec_id = start(
+        &mut conn,
+        &aead_codecs(true),
+        "cc_reset_keyless",
+        &queue,
+        None,
+    )
+    .await;
+    let source = load_execution(&mut conn, exec_id.as_uuid()).await;
+    let fork = reset_fork(&mut conn, exec_id, None).await;
+
+    assert_eq!(
+        fork.input, source.input,
+        "a keyless reset keeps the ciphertext"
+    );
+    assert_eq!(fork.memo, source.memo);
+}
+
+/// An AES-256-GCM codec whose `encode` fails while `failing` is set.
+struct ToggleAead {
+    inner: AeadCodec,
+    failing: Arc<AtomicBool>,
+}
+
+impl PayloadCodec for ToggleAead {
+    fn codec_id(&self) -> &'static str {
+        self.inner.codec_id()
+    }
+
+    fn bound_key_id(&self) -> Option<&str> {
+        self.inner.bound_key_id()
+    }
+
+    fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+        if AtomicBool::load(&self.failing, Ordering::SeqCst) {
+            return Err(CodecError("simulated key outage".to_string()));
+        }
+        self.inner.encode(raw)
+    }
+
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+        self.inner.decode(encoded)
+    }
+}
+
+fn toggle_codecs(failing: &Arc<AtomicBool>) -> PayloadCodecs {
+    let codecs = PayloadCodecs::default();
+    let key = DataKey::from_bytes(&[0x5a; 32]).expect("data key");
+    codecs
+        .register_key(
+            "cc-k1",
+            Arc::new(ToggleAead {
+                inner: AeadCodec::new("cc-k1", &key).expect("aead codec"),
+                failing: Arc::clone(failing),
+            }),
+        )
+        .expect("register");
+    codecs.set_column_encoding(true);
+    codecs
+}
+
+async fn history_types(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    codecs: &PayloadCodecs,
+) -> Vec<String> {
+    autumn_harvest::store::load_history_with_codecs(conn, exec_id, codecs)
+        .await
+        .expect("load history")
+        .events
+        .iter()
+        .map(|e| e.type_name().to_string())
+        .collect()
+}
+
+async fn sweep_outbox(
+    conn: &mut AsyncPgConnection,
+    codecs: &PayloadCodecs,
+    shard: ShardId,
+) -> usize {
+    autumn_harvest::timeout::enforce_external_signals_outbox(
+        conn,
+        &autumn_harvest::telemetry::NoOpMetrics,
+        Duration::from_secs(60),
+        &None,
+        &[shard],
+        codecs,
+    )
+    .await
+    .expect("outbox sweep")
+}
+
+#[tokio::test]
+async fn the_outbox_leaves_a_signal_pending_while_the_codec_fails() {
+    use autumn_harvest::event::WorkflowEvent;
+    use autumn_harvest::types::{ExternalSignalId, ExternalTarget};
+
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let mut conn = connect(&url).await;
+    let shard = ShardId::new(0);
+    let plain = aead_codecs(false);
+    let target = ExecutionId::new_for_shard(shard);
+    let caller = ExecutionId::new_for_shard(shard);
+    for (id, name) in [(target, "cc_outbox_target"), (caller, "cc_outbox_caller")] {
+        autumn_harvest::execution::start_or_load_workflow_execution_with_codecs(
+            &mut conn,
+            StartWorkflowParams::new(name, &Uuid::new_v4().to_string(), id, json!({}), &queue),
+            None,
+            &plain,
+        )
+        .await
+        .expect("start");
+    }
+    let signal_id = ExternalSignalId::new();
+    autumn_harvest::store::append_events(
+        &mut conn,
+        caller,
+        &[WorkflowEvent::ExternalSignalRequested {
+            signal_id,
+            target: ExternalTarget::ExecutionId(target),
+            signal_name: "go".to_string(),
+            payload: json!({"pin": SIGNAL_SECRET}),
+            idempotency_key: None,
+        }],
+        1,
+    )
+    .await
+    .expect("seed the request");
+
+    let failing = Arc::new(AtomicBool::new(true));
+    let codecs = toggle_codecs(&failing);
+    sweep_outbox(&mut conn, &codecs, shard).await;
+    let types = history_types(&mut conn, caller, &codecs).await;
+    assert_eq!(
+        types,
+        ["WorkflowStarted", "ExternalSignalRequested"],
+        "a codec failure must leave the request pending"
+    );
+    assert_eq!(
+        signal_payloads(&mut conn, target.as_uuid()).await,
+        Vec::<Value>::new(),
+        "no signal reaches the target"
+    );
+
+    AtomicBool::store(&failing, false, Ordering::SeqCst);
+    sweep_outbox(&mut conn, &codecs, shard).await;
+    let types = history_types(&mut conn, caller, &codecs).await;
+    assert!(
+        types.contains(&"ExternalSignalDelivered".to_string()),
+        "the next sweep must deliver the signal: {types:?}"
+    );
+    let stored = signal_payloads(&mut conn, target.as_uuid()).await;
+    assert_eq!(stored.len(), 1);
+    assert_ciphertext(&stored[0], SIGNAL_SECRET, "the delivered signal");
+}
+
+/// Send a signal to a target in `state` while the codec fails.
+async fn signal_with_failing_codec(state: &str) -> autumn_harvest::error::HarvestError {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let mut conn = connect(&url).await;
+    let target = start(
+        &mut conn,
+        &aead_codecs(false),
+        "cc_terminal_target",
+        &queue,
+        None,
+    )
+    .await;
+    // A `MIGRATED` row also needs its forward pointer (a check constraint).
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = $1, \
+         migrated_to_shard = CASE WHEN $1 = 'MIGRATED' THEN 1 END, \
+         migrated_at = CASE WHEN $1 = 'MIGRATED' THEN now() END WHERE id = $2",
+    )
+    .bind::<diesel::sql_types::Text, _>(state)
+    .bind::<diesel::sql_types::Uuid, _>(target.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("move the target to the state");
+
+    let failing = Arc::new(AtomicBool::new(true));
+    autumn_harvest::signal::send_signal_idempotent_with_codecs(
+        &mut conn,
+        target,
+        "go",
+        json!({"pin": SIGNAL_SECRET}),
+        None,
+        &toggle_codecs(&failing),
+    )
+    .await
+    .expect_err("the signal is refused")
+}
+
+#[tokio::test]
+async fn a_terminal_target_wins_over_a_codec_failure() {
+    let err = signal_with_failing_codec("COMPLETED").await;
+    assert!(
+        !err.is_codec_failure(),
+        "a terminal target must report its state: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_shard_move_does_not_hide_a_codec_failure() {
+    for state in ["MIGRATED", "MIGRATING"] {
+        let err = signal_with_failing_codec(state).await;
+        assert!(
+            err.is_codec_failure(),
+            "{state} must leave the request pending: {err:?}"
+        );
+    }
+}
+
+const SIGNAL_MARKER: &str = "cc-inline-poke-marker";
+
+/// An AES-256-GCM codec whose second `encode` of the marker fails. The first
+/// is the `ExternalSignalRequested` event. The second is the signal column.
+struct FailSecondMarker {
+    inner: AeadCodec,
+    seen: Arc<AtomicUsize>,
+}
+
+impl PayloadCodec for FailSecondMarker {
+    fn codec_id(&self) -> &'static str {
+        self.inner.codec_id()
+    }
+
+    fn bound_key_id(&self) -> Option<&str> {
+        self.inner.bound_key_id()
+    }
+
+    fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+        let marker = SIGNAL_MARKER.as_bytes();
+        if raw.windows(marker.len()).any(|w| w == marker)
+            && AtomicUsize::fetch_add(&self.seen, 1, Ordering::SeqCst) == 1
+        {
+            return Err(CodecError("simulated key outage".to_string()));
+        }
+        self.inner.encode(raw)
+    }
+
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+        self.inner.decode(encoded)
+    }
+}
+
+/// Sends `go` to the execution named in its input.
+fn wf_sender(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let target: ExecutionId = input["target"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| "the input names no target".to_string())?;
+        ctx.signal_external_workflow(target, "go", json!({"poke": SIGNAL_MARKER}))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({"sent": true}))
+    })
+}
+
+/// Waits for `go` and returns it.
+fn wf_waiter(ctx: &WorkflowContext, _input: Value) -> BoxFut<'_> {
+    Box::pin(async move { ctx.receive_signal("go").await.map_err(|e| e.to_string()) })
+}
+
+#[tokio::test]
+async fn inline_delivery_leaves_a_signal_pending_when_the_codec_fails() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let seen = Arc::new(AtomicUsize::new(0));
+    let codecs = PayloadCodecs::default();
+    let key = DataKey::from_bytes(&[0x5a; 32]).expect("data key");
+    codecs
+        .register_key(
+            "cc-k1",
+            Arc::new(FailSecondMarker {
+                inner: AeadCodec::new("cc-k1", &key).expect("aead codec"),
+                seen: Arc::clone(&seen),
+            }),
+        )
+        .expect("register");
+    codecs.set_column_encoding(true);
+
+    let mut conn = connect(&url).await;
+    let target = ExecutionId::new_for_shard(ShardId::new(0));
+    let sender = ExecutionId::new_for_shard(ShardId::new(0));
+    for (id, name, input) in [
+        (target, "cc_waiter", json!({})),
+        (sender, "cc_sender", json!({"target": target.to_string()})),
+    ] {
+        autumn_harvest::execution::start_or_load_workflow_execution_with_codecs(
+            &mut conn,
+            StartWorkflowParams::new(name, &Uuid::new_v4().to_string(), id, input, &queue),
+            None,
+            &codecs,
+        )
+        .await
+        .expect("start");
+    }
+
+    let pool = build_pool(&url);
+    let worker = worker(
+        &queue,
+        registry(
+            vec![
+                wf_info("cc_waiter", wf_waiter, None),
+                wf_info("cc_sender", wf_sender, None),
+            ],
+            Vec::new(),
+            &codecs,
+        ),
+    );
+    let run = worker.clone();
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(40), run.run(&run_pool)).await;
+    });
+    let client = WorkflowHandleClient::single(pool, url.clone()).with_codecs(codecs.clone());
+    let result = client
+        .handle(target)
+        .result_raw_with_timeout(Duration::from_secs(30))
+        .await;
+    worker.shutdown();
+    let _ = handle.await;
+
+    assert_eq!(
+        result.expect("the target receives the signal"),
+        json!({"poke": SIGNAL_MARKER})
+    );
+    assert!(
+        AtomicUsize::load(&seen, Ordering::SeqCst) >= 3,
+        "the codec must fail once and the outbox must encode again"
+    );
+    let types = history_types(&mut conn, sender, &codecs).await;
+    assert!(
+        !types.contains(&"ExternalSignalFailed".to_string()),
+        "a codec failure must not fail the signal for good: {types:?}"
+    );
 }

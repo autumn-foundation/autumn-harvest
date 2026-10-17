@@ -11,6 +11,10 @@ Issue #2002 adds a second harness, the world simulation. It runs the real
 `worker.rs` poll loop on Postgres. See
 [The world simulation](#the-world-simulation).
 
+Issue #2033 adds a third harness for user workflow code. It runs your
+workflow against seeded delivery orders, with no database. See
+[`workflow-simulation.md`](workflow-simulation.md).
+
 ## What it simulates
 
 The module is `autumn_harvest::dst`. It is test infrastructure, not a

@@ -228,11 +228,15 @@ const AUDIT_EXCLUDED_MODULES: &[&str] = &["chaos"];
 /// in it stays free of the `MECHANISMS` tokens, so the skip cannot hide
 /// coupling.
 ///
+/// `testing` holds the workflow simulation of issue #2033, under the
+/// `testing` feature. It is test infrastructure, like `dst`, and it has no
+/// Postgres coupling. The same check covers it.
+///
 /// `sandbox` holds the sandboxed code activities. It is backend-neutral: a
 /// sandbox run is an ordinary activity, so a port to `SQLite` carries it with
 /// no change. The same check keeps it free of Postgres coupling, nested
 /// directories included.
-const SKIPPED_SUBDIRS: &[&str] = &["dst", "sandbox"];
+const SKIPPED_SUBDIRS: &[&str] = &["dst", "sandbox", "testing"];
 
 /// R&D spike subdirectories of `autumn-harvest/src` that the flat scan
 /// skips, each with the Cargo feature that turns it on.
