@@ -7,6 +7,8 @@
 # - `world`: the world simulation of issue #2002. It runs the real worker
 #   loop, the resident path, timers and the scheduler fire claim on
 #   Postgres. Four shards run 250 seeds each.
+# - `autoresearch`: the seeded simulation sweeps (issue #2033) of the
+#   autoresearch example, widened from 64 seeds to 5000 per sweep.
 # - `alert`: a failed scheduled run opens an issue, or comments on the open
 #   one. GitHub tells only the last editor of a cron about a failure.
 #
@@ -186,9 +188,39 @@ jobs:
         timeout-minutes: 70
         run: 'cargo test -p autumn-harvest --test integration dst_world_tests::world_seed_sweep -- --nocapture --test-threads=1'
 
+  autoresearch:
+    name: autoresearch workflow sweeps
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SEED_BASE: ${{ github.event.inputs.seed_base || '' }}
+      RUN_NUMBER: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Pick the seeds
+        run: |
+          case "$SEED_BASE" in
+            *[!0-9]*) echo "not a decimal number: '$SEED_BASE'" >&2; exit 1 ;;
+          esac
+          if [ "${#SEED_BASE}" -gt 18 ]; then
+            echo "seed_base must have at most 18 digits" >&2
+            exit 1
+          fi
+          if [ -n "$SEED_BASE" ]; then SEED_BASE=$((10#$SEED_BASE)); fi
+          # Each run explores 5000 new seeds.
+          echo "HARVEST_SIM_SEED_BASE=${SEED_BASE:-$((RUN_NUMBER * 5000))}" >> "$GITHUB_ENV"
+          echo "HARVEST_SIM_SEEDS=5000" >> "$GITHUB_ENV"
+      - name: Sweep the session and experiment workflows
+        timeout-minutes: 40
+        run: cargo test --release -p autoresearch --test simulation -- --nocapture
+
   alert:
     name: Report a failed nightly
-    needs: [sweep, differential, world]
+    needs: [sweep, differential, world, autoresearch]
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10

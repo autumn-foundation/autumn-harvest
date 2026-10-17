@@ -206,7 +206,8 @@ async fn an_experiment_holds_its_invariants_on_every_seed() {
         )
         .await
         .unwrap_or_else(|failure| panic!("{failure}"));
-    assert_eq!(report.seeds, SEEDS.count);
+    // The nightly job overrides the count, so check that each seed replayed.
+    assert_eq!(report.replayed, report.seeds);
 }
 
 #[tokio::test]
