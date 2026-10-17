@@ -957,6 +957,65 @@ pub enum WorkflowEvent {
         /// Id of the worker that made the decision.
         worker_id: WorkerId,
     },
+
+    // ── Workflow fork (issue #2000) ───────────────────────────────────────────
+    /// Marker on a fork, just after the history that the fork carries over.
+    ///
+    /// It names the source. The fork never changes the source. Replay skips
+    /// this event, because no workflow command makes it.
+    WorkflowForked {
+        /// The source execution.
+        forked_from_exec_id: ExecutionId,
+        /// Last source event copied into this fork.
+        fork_event_id: i64,
+        /// How the fork resolves an effect after the fork point.
+        effects: ForkEffects,
+        /// Operator-supplied reason.
+        reason: String,
+        /// Operator identity for audit.
+        operator_id: String,
+    },
+    /// A result that the caller of a fork sets for one activity.
+    ///
+    /// It replaces the result of occurrence `occurrence` of `activity_name`.
+    /// Replay skips this event. `output` is a payload field, so the codec
+    /// encodes it and erasure replaces it with a tombstone.
+    ForkActivityResultOverridden {
+        /// Name of the activity.
+        activity_name: String,
+        /// 1-based count of `ActivityScheduled` events with this name.
+        occurrence: u32,
+        /// The result that the activity returns in the fork.
+        #[cfg_attr(feature = "fuzzing", arbitrary(with = crate::fuzzing::value))]
+        output: serde_json::Value,
+    },
+}
+
+/// How a fork resolves an effect after its fork point (issue #2000).
+///
+/// **Append-only invariant:** never remove or rename a variant. Stored
+/// `WorkflowForked` events hold the serialized name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "fuzzing", derive(arbitrary::Arbitrary))]
+pub enum ForkEffects {
+    /// The default. An activity takes the result that the source recorded, or
+    /// a caller override. With neither, the activity fails and never runs.
+    #[default]
+    Recorded,
+    /// An activity runs for real. The caller must ask for this mode.
+    Live,
+}
+
+impl ForkEffects {
+    /// Stable wire label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::Live => "live",
+        }
+    }
 }
 
 impl WorkflowEvent {
@@ -1087,6 +1146,8 @@ impl WorkflowEvent {
             Self::ExternalAwaitFailed { .. } => "ExternalAwaitFailed",
             Self::MutexGranted { .. } => "MutexGranted",
             Self::DecisionCommitted { .. } => "DecisionCommitted",
+            Self::WorkflowForked { .. } => "WorkflowForked",
+            Self::ForkActivityResultOverridden { .. } => "ForkActivityResultOverridden",
         }
     }
 
@@ -1757,11 +1818,23 @@ mod tests {
                 build_id: crate::types::BuildId::new("b-1"),
                 worker_id: WorkerId::new("w-1"),
             },
+            WorkflowEvent::WorkflowForked {
+                forked_from_exec_id: ExecutionId::new(),
+                fork_event_id: 0,
+                effects: ForkEffects::Recorded,
+                reason: "r".into(),
+                operator_id: "o".into(),
+            },
+            WorkflowEvent::ForkActivityResultOverridden {
+                activity_name: "a".into(),
+                occurrence: 1,
+                output: serde_json::Value::Null,
+            },
         ];
 
-        assert_eq!(events.len(), 50);
+        assert_eq!(events.len(), 52);
         let names: HashSet<_> = events.iter().map(WorkflowEvent::type_name).collect();
-        assert_eq!(names.len(), 50, "duplicate type names detected");
+        assert_eq!(names.len(), 52, "duplicate type names detected");
     }
 
     // ── TimerCancelled tests (issue #768) ─────────────────────────────────────
