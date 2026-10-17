@@ -521,24 +521,31 @@ pub fn decision_commands(lab: &std::path::Path, token: &str) -> [String; 2] {
     ["approve", "deny"].map(|verb| format!("autoresearch {verb} --lab {lab} {token}"))
 }
 
-/// Fail when an unfinished run has another model than `model`.
+/// Fail when an unfinished run has another lab than `lab`, or another
+/// model than `model`.
 ///
 /// `serve` drives every unfinished run, and `run` must not start work that
 /// needs another model than one that is still unfinished. A run of an agent
-/// belongs to a session or to a heartbeat. A session records its model, and
-/// its report agent can run on after the session ends. A heartbeat run has
-/// the model of the `serve` that started it, `heartbeat_model`, when one is
-/// known.
+/// belongs to a session or to a heartbeat. A session records its lab and
+/// its model, and its report agent can run on after the session ends. A
+/// heartbeat run names the lab that it watches. It has the model of the
+/// `serve` that started it, `heartbeat_model`, when one is known.
+///
+/// A runner serves one lab, and the agent tools of a run find their lab by
+/// its path. So a run of another lab in the same database must wait for a
+/// runner of that lab.
 ///
 /// # Errors
 ///
-/// Returns an error that names the run and both models when they differ,
-/// or when the backend fails.
+/// Returns an error that names the run and both labs or both models when
+/// they differ, or when the backend fails.
 pub fn check_agents(
     rt: &SqliteRuntime,
+    lab: &std::path::Path,
     model: &str,
     heartbeat_model: Option<&str>,
 ) -> Result<(), String> {
+    let lab = canonical_lab(&lab.display().to_string());
     let filter = ExecutionFilter::new().state("RUNNING").limit(1000);
     let page = rt.list_executions(&filter).map_err(|e| e.to_string())?;
     let mut checked = HashSet::new();
@@ -558,11 +565,15 @@ pub fn check_agents(
             .into_value()
             .unwrap_or_default();
         if name == SESSION {
-            let recorded = session_config(rt, root)?.model;
+            let config = session_config(rt, root)?;
+            let id = run.workflow_id.clone().into_value().unwrap_or_default();
+            if canonical_lab(&config.lab) != lab {
+                return Err(other_lab(&format!("the session {id}"), &config.lab));
+            }
+            let recorded = config.model;
             if recorded.is_empty() || recorded == model {
                 continue;
             }
-            let id = run.workflow_id.clone().into_value().unwrap_or_default();
             let ended = !matches!(
                 rt.outcome(root).map_err(|e| e.to_string())?,
                 ExecutionOutcome::Running
@@ -581,10 +592,15 @@ pub fn check_agents(
                      not finished. Resume it with the same --model and --claude-model"
                 )
             });
-        } else if name == heartbeat::HEARTBEAT_WORKFLOW_NAME
-            && let Some(started) = heartbeat_model
-            && started != model
-        {
+        } else if name == heartbeat::HEARTBEAT_WORKFLOW_NAME {
+            if let Some(watched) = watched_lab(rt, root)?
+                && canonical_lab(&watched) != lab
+            {
+                return Err(other_lab("a heartbeat run", &watched));
+            }
+            let Some(started) = heartbeat_model.filter(|started| *started != model) else {
+                continue;
+            };
             return Err(format!(
                 "a heartbeat run that `serve` started with the model {started} is not \
                  finished. Run `autoresearch serve{}` until it ends",
@@ -593,6 +609,29 @@ pub fn check_agents(
         }
     }
     Ok(())
+}
+
+/// Why a runner of one lab cannot drive `what`, a run of the lab `other`.
+fn other_lab(what: &str, other: &str) -> String {
+    format!(
+        "{what} belongs to the lab {other} and is not finished. Only a runner \
+         with `--lab {}` can drive it",
+        shell_word(other)
+    )
+}
+
+/// The lab that the heartbeat run `exec` watches: the session id of its
+/// task. `None` when the task names no session.
+fn watched_lab(rt: &SqliteRuntime, exec: ExecutionId) -> Result<Option<String>, String> {
+    let input = rt
+        .describe(exec)
+        .map_err(|e| e.to_string())?
+        .input_json
+        .into_value()
+        .unwrap_or_default();
+    let task: autumn_harvest_agent::heartbeat::HeartbeatTask = serde_json::from_str(&input)
+        .map_err(|e| format!("the input of {exec} does not decode: {e}"))?;
+    Ok(task.session_id.map(|id| id.as_str().to_string()))
 }
 
 /// Remove the finished runs that closed more than `older_than` ago, and

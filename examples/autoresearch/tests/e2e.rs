@@ -1322,9 +1322,9 @@ async fn serve_checks_the_model_of_each_unfinished_agent_run() {
     let exec = runtime::start(&mut rt, &config).unwrap();
     let report = run_to_end(&mut rt, exec).await;
     assert!(report.report_run.is_some(), "the report agent waits");
-    let refused = runtime::check_agents(&rt, "scripted", None).unwrap_err();
+    let refused = runtime::check_agents(&rt, fx.lab().root(), "scripted", None).unwrap_err();
     assert!(refused.contains("claude:claude-x"), "{refused}");
-    runtime::check_agents(&rt, "claude:claude-x", None).unwrap();
+    runtime::check_agents(&rt, fx.lab().root(), "claude:claude-x", None).unwrap();
 
     // A heartbeat run that an earlier `serve` started and did not finish.
     let fx = Fixture::new();
@@ -1332,11 +1332,12 @@ async fn serve_checks_the_model_of_each_unfinished_agent_run() {
     let schedule = runtime::heartbeat(fx.labs[0].root()).unwrap();
     rt.start_workflow(&schedule.workflow_name, schedule.input.clone())
         .unwrap();
-    let refused = runtime::check_agents(&rt, "claude:claude-x", Some("scripted")).unwrap_err();
+    let refused = runtime::check_agents(&rt, fx.lab().root(), "claude:claude-x", Some("scripted"))
+        .unwrap_err();
     assert!(refused.contains("scripted"), "{refused}");
-    runtime::check_agents(&rt, "scripted", Some("scripted")).unwrap();
+    runtime::check_agents(&rt, fx.lab().root(), "scripted", Some("scripted")).unwrap();
     // A database from before the record: nothing to check against.
-    runtime::check_agents(&rt, "claude:claude-x", None).unwrap();
+    runtime::check_agents(&rt, fx.lab().root(), "claude:claude-x", None).unwrap();
 }
 
 /// `run` must not start a session while an unfinished run has another
@@ -1393,6 +1394,29 @@ async fn a_session_started_through_a_link_to_its_lab_runs() {
     assert_eq!(got.experiments, want.experiments);
 }
 
+/// Two labs can share one database. A runner serves one lab, and the agent
+/// tools of a run find their lab by its path. So a runner refuses an
+/// unfinished run of another lab, a heartbeat run included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runner_refuses_an_unfinished_run_of_another_lab() {
+    let fx = Fixture::with_labs(2);
+    let mut rt = fx.open(&model());
+    let (mine, other) = (fx.labs[0].root(), fx.labs[1].root());
+    runtime::start(&mut rt, &fx.config_for(0, "mine", 1)).unwrap();
+    let refused = runtime::check_agents(&rt, other, "scripted", None).unwrap_err();
+    assert!(refused.contains(&mine.display().to_string()), "{refused}");
+    runtime::check_agents(&rt, mine, "scripted", None).unwrap();
+
+    let fx = Fixture::with_labs(2);
+    let mut rt = fx.open(&model());
+    let schedule = runtime::heartbeat(fx.labs[0].root()).unwrap();
+    rt.start_workflow(&schedule.workflow_name, schedule.input.clone())
+        .unwrap();
+    let refused = runtime::check_agents(&rt, fx.labs[1].root(), "scripted", None).unwrap_err();
+    assert!(refused.contains("heartbeat"), "{refused}");
+    runtime::check_agents(&rt, fx.labs[0].root(), "scripted", None).unwrap();
+}
+
 /// A purge would remove an ended session while its report agent runs on, and
 /// with the session the model that the report needs. So `purge` refuses
 /// until the report ends. A window that keeps the session purges as usual.
@@ -1429,7 +1453,7 @@ async fn a_report_whose_session_was_purged_does_not_block_serve() {
     let report = run_to_end(&mut rt, exec).await;
     let reporter = report.report_run.expect("the report agent waits");
     rt.purge_terminal(Duration::ZERO).unwrap();
-    runtime::check_agents(&rt, "scripted", None).unwrap();
+    runtime::check_agents(&rt, fx.lab().root(), "scripted", None).unwrap();
     runtime::drive_report(&mut rt, &reporter).await.unwrap();
     let reports = autoresearch::stores::FileDelivery::dir(fx.lab()).unwrap();
     assert_eq!(std::fs::read_dir(reports).unwrap().count(), 1);

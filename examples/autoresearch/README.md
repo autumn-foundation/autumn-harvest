@@ -316,7 +316,9 @@ experiment set the search attribute `status`, which the engine reserves.
   or `serve` first. `status` reads beside them.
 - **The GPU mutex lives in one database.** The CLI serves one lab per process
   and per database. So two labs on one GPU take turns only when one process
-  serves both, as `tests/e2e.rs` does, or on Postgres.
+  serves both, as `tests/e2e.rs` does, or on Postgres. With `--db`, two
+  labs can share a database file. Then `run` and `serve` refuse while a run
+  of the other lab is not finished, and name the `--lab` that drives it.
 - **On SQLite, one activity runs at a time.** The GPU mutex orders the grants
   there. Its exclusion matters on a Postgres fleet.
 - **A taint covers one session.** Rows in `results.tsv` stay visible to

@@ -262,7 +262,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC26 | `cli::*` and the CI demo step. |
 | AC27 | `ci.yml`: the test step, the demo step and the clippy step. `dst-nightly.yml`: the `autoresearch` job. |
 | AC28 | `docs/audits/comment-hygiene.py --base origin/trunk-dev` passes. |
-| AC29 | `e2e::two_sessions_in_one_lab_take_turns_on_their_own_branches`, `lab::tests::checkout_moves_back_to_the_session_branch_only_when_clean`, `two_sessions_never_share_a_commit`, `a_tag_that_another_session_used_is_refused`, `activities::tests::train_refuses_a_moved_branch_and_a_change_no_commit_holds`, `setup_refuses_a_tag_that_another_session_used`. One runner drives a database: `cli::a_new_session_waits_until_the_running_one_ends`, `e2e::a_drive_names_the_mutex_that_a_session_waits_for`, `runtime::tests::a_refusal_names_commands_that_work_as_printed`. A lab has one path: `activities::tests::setup_refuses_a_lab_path_that_is_not_canonical`, `e2e::a_session_started_through_a_link_to_its_lab_runs`. |
+| AC29 | `e2e::two_sessions_in_one_lab_take_turns_on_their_own_branches`, `lab::tests::checkout_moves_back_to_the_session_branch_only_when_clean`, `two_sessions_never_share_a_commit`, `a_tag_that_another_session_used_is_refused`, `activities::tests::train_refuses_a_moved_branch_and_a_change_no_commit_holds`, `setup_refuses_a_tag_that_another_session_used`. One runner drives a database: `cli::a_new_session_waits_until_the_running_one_ends`, `e2e::a_drive_names_the_mutex_that_a_session_waits_for`, `runtime::tests::a_refusal_names_commands_that_work_as_printed`. A lab has one path: `activities::tests::setup_refuses_a_lab_path_that_is_not_canonical`, `e2e::a_session_started_through_a_link_to_its_lab_runs`. A runner drives its own lab only: `e2e::a_runner_refuses_an_unfinished_run_of_another_lab`. |
 | AC30 | `e2e::a_nightly_session_takes_commands_by_its_tag`, `e2e::a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag`, `e2e::a_command_waits_for_a_session_that_has_no_tag_yet`, `cli::run_with_no_tag_resumes_the_one_running_session`, which also refuses a resume with another model. `e2e::a_session_resumes_only_with_its_own_model`, `serve_checks_the_model_of_each_unfinished_agent_run`, `run_refuses_while_a_report_of_another_model_is_unfinished`, `a_report_whose_session_was_purged_does_not_block_serve`. |
 | AC31 | `lab::tests::a_commit_is_made_once_per_key`, `an_edit_runs_once_per_call`, `an_edit_whose_write_was_lost_runs_on_its_retry`, `a_row_is_recorded_once_per_key`, `a_row_whose_write_was_lost_lands_on_its_retry`. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`, `two_deliveries_at_once_train_once`. `agent::tests::an_edit_call_that_runs_again_changes_nothing`. |
 | AC32 | `trainer::tests::a_dropped_run_kills_its_whole_group`, `the_next_run_kills_a_run_that_outlived_its_runner`, `a_timeout_kills_the_children_of_the_run_too`, `a_finished_run_names_no_group`, `a_free_lock_forgets_the_group_of_an_earlier_run`, `a_stale_lock_spares_a_group_that_reused_its_id`. |
@@ -474,6 +474,10 @@ held, and none was refuted. Codex reviewed the same commits. The fixes:
   and `deny` commands quote the lab and the token.
 - **Off Unix.** A session refuses to start, with the reason, before setup.
   Before, the reason was lost in a baseline crash.
+- **Codex, one lab per runner.** Two labs can share a database through
+  `--db`. A runner of one lab then refuses while a session or a heartbeat
+  run of the other lab is not finished. Its agent tools could not find
+  that lab, so its experiments and its report would fail.
 
 One mutant cannot fail a test on SQLite: a GPU mutex released before the
 training. The release writes no event, and one activity runs at a time.
