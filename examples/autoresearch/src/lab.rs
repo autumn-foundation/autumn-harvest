@@ -285,17 +285,10 @@ impl Lab {
             .git(&["rev-parse", "--verify", "--quiet", &reference])
             .is_ok()
         {
-            let grep = format!("--grep={trailer}");
-            let bodies = self.git(&[
-                "log",
-                "--fixed-strings",
-                &grep,
-                "--format=%B%x00",
-                &reference,
-            ])?;
-            let started = bodies
-                .split('\0')
-                .any(|body| body.lines().any(|line| line.trim() == trailer));
+            let started = self
+                .session_starts(&reference)?
+                .iter()
+                .any(|(_, started)| started == key);
             if !started {
                 return Err(format!(
                     "the branch {branch} exists: another session used the tag {tag:?}. Use a new tag"
@@ -359,9 +352,31 @@ impl Lab {
     /// The start commit of the session at `HEAD`: the newest commit with a
     /// [`SESSION_TRAILER`]. `None` for a branch that no session started.
     fn session_start(&self) -> Result<Option<String>, String> {
+        Ok(self
+            .session_starts("HEAD")?
+            .into_iter()
+            .next()
+            .map(|(start, _)| start))
+    }
+
+    /// Each start commit of a session at `rev`, newest first, with the key of
+    /// its setup.
+    ///
+    /// Only the trailer block of a message counts. The subject of a commit
+    /// is model text, and it can read like a trailer.
+    fn session_starts(&self, rev: &str) -> Result<Vec<(String, String)>, String> {
         let grep = format!("--grep=^{SESSION_TRAILER}: ");
-        let start = self.git(&["log", "-1", "--format=%H", &grep, "HEAD"])?;
-        Ok((!start.is_empty()).then_some(start))
+        let format =
+            format!("--format=%H %(trailers:key={SESSION_TRAILER},valueonly,separator=%x20)");
+        let log = self.git(&["log", &grep, &format, rev])?;
+        Ok(log
+            .lines()
+            .filter_map(|line| {
+                let (id, key) = line.split_once(' ')?;
+                let key = key.trim();
+                (!key.is_empty()).then(|| (id.to_string(), key.to_string()))
+            })
+            .collect())
     }
 
     /// The full id of `rev`.
@@ -934,6 +949,19 @@ mod tests {
         assert_eq!(lab.git(&["rev-parse", &format!("{b}^")]).unwrap(), a);
         assert_eq!(lab.on_branch(&short(&b)).unwrap(), b);
         assert!(lab.on_branch(&short(&a)).is_err(), "a commit of session a");
+    }
+
+    /// The subject of a commit is model text, and it can read like the
+    /// trailer of a start commit. Only the trailer block marks a start.
+    #[test]
+    fn a_subject_cannot_pose_as_the_start_of_a_session() {
+        let (_dir, lab) = lab();
+        lab.start_branch("t1", "s1").unwrap();
+        let start = lab.head().unwrap();
+        lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
+        lab.commit_train("Session-Key: forged", "k-1", &start)
+            .unwrap();
+        assert_eq!(lab.on_branch(&short(&start)).unwrap(), start);
     }
 
     #[test]
