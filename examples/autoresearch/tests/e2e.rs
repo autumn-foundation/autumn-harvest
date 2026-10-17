@@ -58,7 +58,7 @@ async fn run_approving(
         match runtime::drive(rt, exec).await.unwrap() {
             Step::Done(_) => return asked,
             Step::Continued(next) => exec = next,
-            Step::Waiting => tokio::time::sleep(Duration::from_millis(20)).await,
+            Step::Waiting | Step::Mutex(_) => tokio::time::sleep(Duration::from_millis(20)).await,
             Step::Approval(pending) => {
                 let token = pending.token.clone();
                 asked.push(pending);
@@ -1121,10 +1121,112 @@ async fn drive_a_little(
 ) -> autumn_harvest_sqlite::ExecutionId {
     for _ in 0..5 {
         match runtime::drive(rt, exec).await.unwrap() {
-            Step::Waiting => tokio::time::sleep(Duration::from_millis(20)).await,
+            Step::Waiting | Step::Mutex(_) => tokio::time::sleep(Duration::from_millis(20)).await,
             Step::Continued(next) => exec = next,
             other => panic!("the night ended early: {other:?}"),
         }
     }
     exec
+}
+
+/// The session pauses on a durable timer before each experiment. The pause
+/// ends the drive, so the runner delivers its inbox between two experiments
+/// and not only when the session continues as new.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_lands_before_the_next_experiment() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    // Zero experiments: the night runs until a stop.
+    let mut config = fx.config("paced", 0);
+    config.experiments_per_run = 50;
+    config.pace_secs = 1;
+    let exec = runtime::start(&mut rt, &config).unwrap();
+    let first = runtime::drive(&mut rt, exec).await.unwrap();
+    assert_eq!(first, Step::Waiting, "the drive stops at the first pause");
+    let status: StatusView =
+        serde_json::from_value(rt.query(exec, "status", Value::Null).await.unwrap()).unwrap();
+    assert_eq!(status.experiments, 0, "the baseline ran, no experiment yet");
+    let stop = Command::Stop {
+        tag: "paced".into(),
+        reason: "morning".into(),
+    };
+    runtime::apply(&mut rt, "s1", &stop).unwrap();
+    let report = run_to_end(&mut rt, exec).await;
+    assert_eq!(report.stopped.as_deref(), Some("morning"));
+    assert_eq!(report.experiments, 0);
+}
+
+/// `serve` names each session that ends, once. A night that fails is not
+/// silent. A run that continues as new is not an end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_ended_session_is_named_once() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let mut seen = std::collections::HashSet::new();
+    let mut config = fx.config("two", 2);
+    config.experiments_per_run = 1;
+    let exec = runtime::start(&mut rt, &config).unwrap();
+    run_to_end(&mut rt, exec).await;
+    let ended = runtime::newly_ended(&rt, &mut seen).unwrap();
+    assert_eq!(ended.len(), 1, "{ended:?}");
+    assert_eq!(ended[0].0, session_id("two"));
+    assert!(
+        matches!(&ended[0].1, runtime::Ended::Done(report) if report.experiments == 2),
+        "{ended:?}"
+    );
+    assert_eq!(runtime::newly_ended(&rt, &mut seen).unwrap().len(), 0);
+
+    let mut config = fx.config("nodata", 1);
+    config.data_dir = Some(fx.dir.path().join("missing").display().to_string());
+    let exec = runtime::start(&mut rt, &config).unwrap();
+    let _ = runtime::drive(&mut rt, exec).await.unwrap();
+    let ended = runtime::newly_ended(&rt, &mut seen).unwrap();
+    assert!(
+        matches!(ended.as_slice(), [(id, runtime::Ended::Failed(why))]
+            if *id == session_id("nodata") && why.contains("data")),
+        "{ended:?}"
+    );
+    assert_eq!(runtime::newly_ended(&rt, &mut seen).unwrap().len(), 0);
+}
+
+/// A session that waits for a mutex says so. Here another session holds
+/// the lab while it waits for a person, and only its own runner can free it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drive_names_the_mutex_that_a_session_waits_for() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let holder = runtime::start(&mut rt, &fx.config("holder", 0)).unwrap();
+    // A paper taints the run, so its next write waits for a person.
+    hint(&mut rt, "holder", "paper:muon", "h1");
+    run_to_approval(&mut rt, holder).await;
+    let waiter = runtime::start(&mut rt, &fx.config("waiter", 1)).unwrap();
+    let step = runtime::drive(&mut rt, waiter).await.unwrap();
+    assert!(
+        matches!(&step, Step::Mutex(key) if key.starts_with("lab:")),
+        "{step:?}"
+    );
+}
+
+/// History records the model of a session. A resume with another model is
+/// refused, so a Claude night does not go on with the scripted researcher.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_resumes_only_with_its_own_model() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let mut config = fx.config("gpu", 3);
+    config.experiments_per_run = 1;
+    config.model = "claude:claude-x".into();
+    let exec = runtime::start(&mut rt, &config).unwrap();
+    let next = match runtime::drive(&mut rt, exec).await.unwrap() {
+        Step::Continued(next) => next,
+        other => panic!("expected a hand-off, got {other:?}"),
+    };
+    for run in [exec, next] {
+        runtime::check_model(&rt, run, "claude:claude-x").unwrap();
+        let refused = runtime::check_model(&rt, run, "scripted").unwrap_err();
+        assert!(refused.contains("claude:claude-x"), "{refused}");
+    }
+    // A session from before the model was recorded resumes with any model.
+    let old = runtime::start(&mut rt, &fx.config("old", 1)).unwrap();
+    runtime::check_model(&rt, old, "scripted").unwrap();
 }

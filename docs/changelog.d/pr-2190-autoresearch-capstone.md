@@ -7,7 +7,9 @@ night, offline by default: a simulated trainer and a scripted researcher.
 
 - `research_session` runs setup and a baseline, then one `experiment` child
   per idea. Signals (`hint`, `stop`, `policy`), a `status` query and a
-  `whatif` update steer it. It continues as new every N experiments. A kept
+  `whatif` update steer it. A durable pause before each experiment ends the
+  drive, so a command lands before the next experiment. It continues as new
+  every N experiments. A kept
   idea goes to sibling sessions as an external signal by workflow id. A
   detached `agent_loop` writes the morning report.
 - `experiment` asks an `agent_loop` child for one edit. A saga commits it,
@@ -24,8 +26,9 @@ night, offline by default: a simulated trainer and a scripted researcher.
   by the activity idempotency key. The process group of a run dies with it.
 - The CLI has `init`, `run`, `serve`, `status`, `hint`, `stop`, `policy`,
   `approve`, `deny`, `eval`, `verify` and `purge`. Commands find a session
-  by its tag. A Claude model and a command trainer run the real thing on a
-  GPU. The Claude model sends thinking blocks back unchanged.
+  by its tag. History records the model, and a resume needs the same one. A
+  Claude model and a command trainer run the real thing on a GPU. The Claude
+  model sends thinking blocks back unchanged.
 
 No new `WorkflowEvent` variant, no migration, no engine change.
 

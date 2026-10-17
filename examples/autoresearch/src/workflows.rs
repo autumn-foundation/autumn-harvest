@@ -119,6 +119,16 @@ pub struct SessionConfig {
     /// Start a detached agent that writes the morning report at the end.
     #[serde(default)]
     pub report: bool,
+    /// Seconds of pause on a durable timer before each experiment. The
+    /// pause ends the drive, so the runner delivers its inbox. Zero means no
+    /// pause: a command then lands only when the session blocks.
+    #[serde(default)]
+    pub pace_secs: u64,
+    /// The model that the agents use, such as `scripted` or
+    /// `claude:<model id>`. Empty means "not recorded". A resume needs the
+    /// same model.
+    #[serde(default)]
+    pub model: String,
 }
 
 impl SessionConfig {
@@ -138,6 +148,8 @@ impl SessionConfig {
             siblings: Vec::new(),
             agent: AgentSettings::default(),
             report: true,
+            pace_secs: 1,
+            model: String::new(),
         }
     }
 }
@@ -352,6 +364,7 @@ pub async fn research_session(
     let mut this_run = 0_u32;
     let mut stopped = None;
     loop {
+        pause(ctx, &config, carry.done).await?;
         if let Some(reason) = absorb(ctx, &mut carry)? {
             stopped = Some(reason);
             break;
@@ -593,6 +606,18 @@ fn validate_whatif(input: &Value) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Wait [`SessionConfig::pace_secs`] on a durable timer. The wait ends the
+/// drive of the runner, so a command in its inbox lands before the next
+/// experiment.
+async fn pause(ctx: &WorkflowContext, config: &SessionConfig, done: u32) -> Result<(), String> {
+    if config.pace_secs == 0 {
+        return Ok(());
+    }
+    ctx.timer(&format!("pace-{done}"), config.pace_secs)
+        .await
+        .map_err(|e| format!("cannot pause: {e}"))
 }
 
 /// Read the signals that arrived since the last experiment. Returns the

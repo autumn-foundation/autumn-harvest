@@ -27,7 +27,8 @@ use autumn_harvest_agent::heartbeat;
 use autumn_harvest_agent::workflow::agent_loop_info;
 use autumn_harvest_agent::{AgentHarness, Approval, ModelTurn, agent_heartbeat_info, sqlite};
 use autumn_harvest_sqlite::{
-    ExecutionFilter, ExecutionId, RunState, SqliteError, SqliteRuntime, StartOptions,
+    ExecutionFilter, ExecutionId, ExecutionOutcome, RunState, SqliteError, SqliteRuntime,
+    StartOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -120,7 +121,9 @@ pub enum Step {
     Continued(ExecutionId),
     /// A gated call waits for a person.
     Approval(Pending),
-    /// The session waits for a timer, a mutex or a run in flight.
+    /// The session waits for this mutex. Another run holds it.
+    Mutex(String),
+    /// The session waits for a timer or a run in flight.
     Waiting,
 }
 
@@ -187,6 +190,7 @@ pub async fn drive(rt: &mut SqliteRuntime, exec: ExecutionId) -> Result<Step, St
                 return Ok(Step::Done(report));
             }
             RunState::ContinuedAsNew(next) if run == exec => return Ok(Step::Continued(next)),
+            RunState::WaitingMutex(key) => return Ok(Step::Mutex(key)),
             RunState::Failed(error)
             | RunState::Cancelled(error)
             | RunState::TimedOut(error)
@@ -195,8 +199,8 @@ pub async fn drive(rt: &mut SqliteRuntime, exec: ExecutionId) -> Result<Step, St
             {
                 return Ok(Step::Failed(error));
             }
-            // A child ended or waits on a timer or a mutex: the session
-            // goes on at the next drive.
+            // A child ended or waits on a timer: the session goes on at the
+            // next drive.
             _ => return Ok(Step::Waiting),
         }
     }
@@ -375,6 +379,96 @@ pub fn running_sessions(rt: &SqliteRuntime) -> Result<Vec<(ExecutionId, String)>
             Some((run.execution_id()?, tag))
         })
         .collect())
+}
+
+/// The config of the session run `exec`, as its history records it.
+///
+/// # Errors
+///
+/// Returns an error when the run is unknown or its input does not decode.
+pub fn session_config(rt: &SqliteRuntime, exec: ExecutionId) -> Result<SessionConfig, String> {
+    let run = rt.describe(exec).map_err(|e| e.to_string())?;
+    let input = run
+        .input_json
+        .into_value()
+        .ok_or_else(|| format!("{exec} has no input"))?;
+    let input: SessionInput = serde_json::from_str(&input)
+        .map_err(|e| format!("the input of {exec} does not decode: {e}"))?;
+    Ok(input.config)
+}
+
+/// Fail when the session run `exec` records a model other than `model`.
+/// A session that records no model resumes with any.
+///
+/// # Errors
+///
+/// Returns an error that names both models when they differ.
+pub fn check_model(rt: &SqliteRuntime, exec: ExecutionId, model: &str) -> Result<(), String> {
+    let recorded = session_config(rt, exec)?.model;
+    if recorded.is_empty() || recorded == model {
+        Ok(())
+    } else {
+        Err(format!(
+            "the session runs with the model {recorded}, not {model}. \
+             Resume it with the same --model and --claude-model"
+        ))
+    }
+}
+
+/// How a session ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Ended {
+    /// It completed with this report.
+    Done(SessionReport),
+    /// It failed, or it was cancelled or terminated, for this reason.
+    Failed(String),
+}
+
+/// The newest session runs that ended, by workflow id, less those in `seen`.
+///
+/// Each run that this returns goes into `seen`, so a caller names it once.
+/// A run that continued as new did not end.
+///
+/// # Errors
+///
+/// Returns an error when the backend fails.
+pub fn newly_ended<S: std::hash::BuildHasher>(
+    rt: &SqliteRuntime,
+    seen: &mut HashSet<ExecutionId, S>,
+) -> Result<Vec<(String, Ended)>, String> {
+    let filter = ExecutionFilter::new().workflow_name(SESSION).limit(100);
+    let page = rt.list_executions(&filter).map_err(|e| e.to_string())?;
+    let mut ended = Vec::new();
+    for run in &page.executions {
+        let Some(exec) = run.execution_id() else {
+            continue;
+        };
+        if seen.contains(&exec) {
+            continue;
+        }
+        let end = match rt.outcome(exec).map_err(|e| e.to_string())? {
+            ExecutionOutcome::Running => continue,
+            ExecutionOutcome::Terminated(state) if state == "CONTINUED_AS_NEW" => {
+                seen.insert(exec);
+                continue;
+            }
+            ExecutionOutcome::Completed(output) => serde_json::from_value(output)
+                .map_or_else(|e| Ended::Failed(format!("no report: {e}")), Ended::Done),
+            ExecutionOutcome::Failed(why) => Ended::Failed(why),
+            ExecutionOutcome::Terminated(state) => {
+                let why = rt
+                    .describe(exec)
+                    .ok()
+                    .and_then(|run| run.error.into_value())
+                    .unwrap_or_default();
+                Ended::Failed(format!("{state}: {why}"))
+            }
+        };
+        seen.insert(exec);
+        let id = run.workflow_id.clone().into_value().unwrap_or_default();
+        ended.push((id, end));
+    }
+    Ok(ended)
 }
 
 /// The nightly schedule: a session at 23:00 UTC with the tag derived from

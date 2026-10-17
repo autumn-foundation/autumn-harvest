@@ -118,8 +118,10 @@ With `gain = best - val_bpb` and `net = lines_added - lines_removed`:
 
 The defaults are `min_improvement = 0` and `line_cost = 0.0001`. So a change
 that adds 20 lines needs a gain over 0.002, and an equal result from less code
-is a keep. Equal or worse is a discard, as upstream. A proposal that changes
-nothing is a discard row with the numbers of its base.
+is a keep. With no net change in lines, equal or worse is a discard, as
+upstream. A deleted line earns the credit that an added line costs, so a small
+loss from much less code can be a keep. A proposal that changes nothing is
+a discard row with the numbers of its base.
 
 ## Steer a running night
 
@@ -129,6 +131,13 @@ resend after a crash does not deliver twice. A command that can never land,
 such as a stop for a session that ended, moves to `inbox/rejected`. While a
 session runs that has not published its tag yet, a command for an unknown
 tag waits.
+
+Before each experiment, the session pauses on a durable timer, one second by
+default (`--pace`). The pause ends the drive, so a command lands before the
+next experiment, and `serve` fires its heartbeat. Only one runner can drive a
+database. So `run` refuses a new session while another one runs, and it
+names the command that finishes the other one. History records the model, and
+a resume needs the same `--model`.
 
 ```bash
 cargo run -p autoresearch -- hint --lab /tmp/ar-lab --tag demo "paper:warmdown"
@@ -255,9 +264,17 @@ experiment set the search attribute `status`, which the engine reserves.
   `--pass-env NAME`. On Linux the runner is not dumpable, so a run cannot
   read the Claude key from the runner. A shell that exported the key can
   still leak it, so set the key for the runner alone:
-  `ANTHROPIC_API_KEY=... autoresearch run ...`. Git runs with hooks off. The code can still read your
-  files, write `.git` and `.autoresearch`, and escape the kill with
-  `setsid`. Run it in a container, or as a user with no other rights.
+  `ANTHROPIC_API_KEY=... autoresearch run ...`. Git runs with hooks off and
+  with the list of the run, so a command that a run puts in `.git/config`
+  cannot read the key either. The runner reads `run.log` through its own
+  handle, so a symlink there cannot send the read to another file. A run
+  that moves the branch or `HEAD`, or changes `train.py`, is a crash, and the
+  lab goes back. The code can still read your files, write `.git` and
+  `.autoresearch`, and escape the kill with `setsid`. Run it in a container,
+  or as a user with no other rights.
+- **A reset puts back `train.py` only.** A discard, a crash and a rewind
+  reset the branch and `train.py`. A change to another file, such as an edit
+  to `program.md` for the next night, stays.
 - **The score is what `train.py` prints.** As upstream, the last `val_bpb:`
   line counts. An edit can print a false score. Read each kept diff. Unlike
   upstream, a run that exits with an error is a crash, even after a summary.

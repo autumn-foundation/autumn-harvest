@@ -75,6 +75,8 @@ impl Fixture {
         config.explore_percent = 0;
         config.report = false;
         config.agent.approval_timeout_secs = 120;
+        // No pause: a test with a fixed clock would wait for it forever.
+        config.pace_secs = 0;
         config
     }
 
@@ -89,7 +91,7 @@ pub async fn run_to_end(rt: &mut SqliteRuntime, mut exec: ExecutionId) -> Sessio
         match runtime::drive(rt, exec).await.unwrap() {
             Step::Done(report) => return report,
             Step::Continued(next) => exec = next,
-            Step::Waiting => tokio::time::sleep(Duration::from_millis(20)).await,
+            Step::Waiting | Step::Mutex(_) => tokio::time::sleep(Duration::from_millis(20)).await,
             Step::Approval(pending) => panic!("unexpected approval wait: {pending:?}"),
             Step::Failed(error) => panic!("the session failed: {error}"),
         }
@@ -102,7 +104,7 @@ pub async fn run_to_approval(rt: &mut SqliteRuntime, exec: ExecutionId) -> Pendi
     for _ in 0..10_000 {
         match runtime::drive(rt, exec).await.unwrap() {
             Step::Approval(pending) => return pending,
-            Step::Waiting => tokio::time::sleep(Duration::from_millis(20)).await,
+            Step::Waiting | Step::Mutex(_) => tokio::time::sleep(Duration::from_millis(20)).await,
             other => panic!("expected an approval wait, got {other:?}"),
         }
     }
