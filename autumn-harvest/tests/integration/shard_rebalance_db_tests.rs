@@ -770,19 +770,14 @@ async fn activation_copies_stream_chunks_written_after_verification() {
     );
 }
 
-/// Issue #1974: activation must not copy stream chunks over a staged target
-/// that an operator terminated, because erasure can have scrubbed it since.
-/// The chunks stay on the sealed source, where erasure also reaches them.
-#[tokio::test]
-async fn activation_copies_no_stream_chunks_over_a_force_terminated_target() {
-    let shards = setup_two_shards().await;
-    let exec_id = quiescent_fixture(&shards, "entity-stream-terminated").await;
+/// Stage a copy, store `chunk(0)` on the source, cut over, then terminate the
+/// staged target. Activation is left to the caller.
+async fn terminated_target_with_late_chunk(
+    shards: &TwoShards,
+    entity: &str,
+) -> (ExecutionId, AsyncPgConnection, AsyncPgConnection) {
+    let exec_id = quiescent_fixture(shards, entity).await;
     let (mut source, mut target) = (shards.source().await, shards.target().await);
-    let chunk = |offset: i64| store::DurableStreamChunk {
-        offset,
-        chunk: json!({ "email": "alice@example.com", "n": offset }),
-    };
-
     begin_migration(&mut source, exec_id, SOURCE, TARGET)
         .await
         .expect("begin");
@@ -792,7 +787,11 @@ async fn activation_copies_no_stream_chunks_over_a_force_terminated_target() {
     verify_target_copy(&mut source, &mut target, exec_id, &codecs())
         .await
         .expect("verify");
-    store::append_stream_chunks(&mut source, exec_id, &[chunk(0)], 100)
+    let late = store::DurableStreamChunk {
+        offset: 0,
+        chunk: json!({ "email": "alice@example.com" }),
+    };
+    store::append_stream_chunks(&mut source, exec_id, &[late], 100)
         .await
         .expect("chunk after verification");
     assert!(
@@ -800,20 +799,54 @@ async fn activation_copies_no_stream_chunks_over_a_force_terminated_target() {
             .await
             .expect("cutover")
     );
-
-    // Terminate the staged copy, then erase it, before activation runs.
     diesel::sql_query("UPDATE harvest_workflow_executions SET state = 'TERMINATED' WHERE id = $1")
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
         .execute(&mut target)
         .await
         .expect("force-terminate the staged copy");
-    store::delete_stream_chunks(&mut target, exec_id)
-        .await
-        .expect("erase the target's chunks");
+    (exec_id, source, target)
+}
+
+/// Issue #2128: an operator can terminate the staged target before
+/// activation. The terminated target is not erased, so activation must still
+/// copy the late chunks. Otherwise the forwarded durable read ends without them.
+#[tokio::test]
+async fn activation_copies_late_stream_chunks_over_a_terminated_target() {
+    let shards = setup_two_shards().await;
+    let (exec_id, mut source, mut target) =
+        terminated_target_with_late_chunk(&shards, "entity-stream-terminated").await;
 
     activate_target(&mut source, &mut target, exec_id)
         .await
-        .expect("activation is a no-op over a terminated target");
+        .expect("activation over a terminated target");
+
+    let offsets: Vec<i64> = store::load_stream_chunks(&mut target, exec_id, None, 100)
+        .await
+        .expect("target chunks")
+        .into_iter()
+        .map(|row| row.stream_offset)
+        .collect();
+    assert_eq!(
+        offsets,
+        vec![0],
+        "the terminated target must keep the chunk"
+    );
+}
+
+/// Issue #2128: erasure between terminate and activation must win. Activation
+/// must not restore erased author output.
+#[tokio::test]
+async fn activation_copies_no_stream_chunks_over_an_erased_target() {
+    let shards = setup_two_shards().await;
+    let (exec_id, mut source, mut target) =
+        terminated_target_with_late_chunk(&shards, "entity-stream-erased").await;
+    autumn_harvest::erase::erase_workflow_payloads(&mut target, exec_id, "test erasure")
+        .await
+        .expect("erase the terminated target");
+
+    activate_target(&mut source, &mut target, exec_id)
+        .await
+        .expect("activation over an erased target");
 
     assert_eq!(
         store::load_stream_chunks(&mut target, exec_id, None, 100)
@@ -821,7 +854,62 @@ async fn activation_copies_no_stream_chunks_over_a_force_terminated_target() {
             .expect("target chunks")
             .len(),
         0,
-        "activation must not restore chunks over a terminated, erased target"
+        "activation must not restore chunks over an erased target"
+    );
+}
+
+/// Issue #2128: an erasure that holds the target row lock when activation
+/// starts must win. Activation waits for the lock, reads the erased input,
+/// and copies nothing.
+#[tokio::test]
+async fn activation_waits_for_an_erasure_holding_the_target_row() {
+    let shards = setup_two_shards().await;
+    let (exec_id, mut source, mut target) =
+        terminated_target_with_late_chunk(&shards, "entity-stream-erasure-race").await;
+    let mut eraser = shards.target().await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut eraser)
+        .await
+        .expect("begin the erasure");
+    diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut eraser)
+        .await
+        .expect("lock the target row");
+
+    let activation = tokio::spawn(async move {
+        activate_target(&mut source, &mut target, exec_id)
+            .await
+            .expect("activation after the erasure");
+        target
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !activation.is_finished(),
+        "activation must wait for the lock"
+    );
+
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+            SET input = '{\"_harvest_erased\": true}'::jsonb WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut eraser)
+    .await
+    .expect("tombstone the input");
+    diesel::sql_query("COMMIT")
+        .execute(&mut eraser)
+        .await
+        .expect("commit the erasure");
+
+    let mut target = activation.await.expect("activation task");
+    assert_eq!(
+        store::load_stream_chunks(&mut target, exec_id, None, 100)
+            .await
+            .expect("target chunks")
+            .len(),
+        0,
+        "activation must not restore chunks after a concurrent erasure"
     );
 }
 
