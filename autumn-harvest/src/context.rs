@@ -18597,6 +18597,46 @@ mod tests {
     }
 
     #[test]
+    fn should_continue_as_new_dispatches_signal_handlers_like_history_event_count() {
+        // Both calls pass through `match_history`, so a signal at the cursor
+        // reaches its handler at the same point as before issue #2080.
+        let dispatched = |call: fn(&WorkflowContext)| {
+            let events = vec![
+                WorkflowEvent::WorkflowStarted {
+                    input: Value::Null,
+                    timestamp: Utc::now(),
+                    last_completion_result: None,
+                    last_error: None,
+                    scheduled_time: None,
+                },
+                WorkflowEvent::SignalReceived {
+                    signal_name: "cancel".into(),
+                    payload: serde_json::json!(1),
+                },
+                next_side_effect(),
+            ];
+            let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+            let received: Arc<std::sync::Mutex<Vec<Value>>> =
+                Arc::new(std::sync::Mutex::new(vec![]));
+            let sink = received.clone();
+            ctx.register_signal_handler_raw("cancel", move |payload: Value| {
+                sink.lock().unwrap().push(payload);
+            });
+            call(&ctx);
+            let count = received.lock().unwrap().len();
+            assert_eq!(ctx.side_effect("next", || 0).unwrap(), 7);
+            count
+        };
+        let old = dispatched(|ctx| {
+            let _ = ctx.history_event_count();
+        });
+        let new = dispatched(|ctx| {
+            assert!(!ctx.should_continue_as_new());
+        });
+        assert_eq!(new, old, "the dispatch point must not move");
+    }
+
+    #[test]
     fn should_continue_as_new_reads_a_recorded_false_as_false() {
         let ctx = deadline_ctx_with_policy(
             Utc::now(),
