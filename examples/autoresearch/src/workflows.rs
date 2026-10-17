@@ -434,6 +434,10 @@ async fn first_run(
         config.tag.clone()
     };
     lock(view).tag.clone_from(&tag);
+    // Commands find a session by its tag. A scheduled session has no other
+    // name, so the tag goes out before the first wait for the lab.
+    ctx.upsert_search_attrs([("tag".to_string(), Some(json!(tag)))])
+        .map_err(|e| e.to_string())?;
     // The setup and the baseline run while the session holds its lab.
     let lab = ctx
         .mutex(lab_key(&config.lab))
@@ -454,7 +458,6 @@ async fn first_run(
     // The wall-clock start, recorded once so replay reads the same value.
     let started = ctx.system_now();
     ctx.upsert_search_attrs([
-        ("tag".to_string(), Some(json!(tag))),
         ("started_at".to_string(), Some(json!(started.to_rfc3339()))),
         ("phase".to_string(), Some(json!("baseline"))),
     ])

@@ -885,6 +885,45 @@ async fn a_paper_taints_every_later_run_of_the_session() {
     assert!(labelled >= 1, "the second proposal starts with the label");
 }
 
+/// A nightly session that waits for its lab takes commands by its tag.
+/// Session A holds the lab while its edit waits for a person, so the
+/// nightly session waits for the lab before its setup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let clock = Arc::new(std::sync::Mutex::new(
+        Utc.with_ymd_and_hms(2026, 10, 17, 22, 59, 50).unwrap(),
+    ));
+    let read = Arc::clone(&clock);
+    rt.set_clock(move || *read.lock().unwrap());
+    rt.upsert_schedule(&runtime::nightly(&fx.config("", 0)).unwrap())
+        .unwrap();
+    let exec_a = runtime::start(&mut rt, &fx.config("a", 2)).unwrap();
+    hint(&mut rt, "a", "paper:warmdown", "h1");
+    run_to_approval(&mut rt, exec_a).await;
+    // Forty seconds on: the edit of A still waits, and A holds the lab.
+    let slot = Utc.with_ymd_and_hms(2026, 10, 17, 23, 0, 30).unwrap();
+    *clock.lock().unwrap() = slot;
+    rt.poll_once_as_of(slot).await.unwrap();
+    rt.run_until_idle().await.unwrap();
+    let night = runs_of(&rt, SESSION)
+        .into_iter()
+        .find(|exec| *exec != exec_a)
+        .unwrap();
+    assert!(
+        activities_of(&rt, night).is_empty(),
+        "the night waits for the lab before its setup"
+    );
+    assert_eq!(
+        runtime::find_session(&rt, "20261017-2300")
+            .unwrap()
+            .map(|(exec, _)| exec),
+        Some(night)
+    );
+    hint(&mut rt, "20261017-2300", "try a longer warmdown", "h2");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_sessions_in_one_lab_take_turns_on_their_own_branches() {
     let fx = Fixture::new();
