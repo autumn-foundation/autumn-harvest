@@ -541,7 +541,7 @@ fn report(done: &[Exchange]) -> Reply {
         },
     );
     Reply::Text(format!(
-        "Morning report: {} experiments, {} kept. {best}",
+        "Morning report: {} runs, {} kept. {best}",
         rows.len(),
         kept.len()
     ))
@@ -885,7 +885,7 @@ mod tests {
         let report = text(&chat.answer());
         assert!(report.contains("0.993200"), "{report}");
         assert!(report.contains("b2c3d4e"));
-        assert!(report.contains("3 experiments"));
+        assert!(report.contains("3 runs"), "{report}");
     }
 
     #[test]

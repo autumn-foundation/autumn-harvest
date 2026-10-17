@@ -781,6 +781,11 @@ carry. It therefore keeps its own turn activity. It takes three parts from
 this crate: the approval signal names, the durable approval wait
 (`approval::await_decision`), and the payload-cap checks.
 
+`examples/autoresearch` runs `agent_loop` as a child workflow of each
+experiment. It uses a mandate with a reviewer peer, a flow rule, approvals,
+memory, delivery, a heartbeat with a precheck, the response cache and
+`eval`.
+
 ## 14. Agent mesh
 
 A run can delegate a task to a peer agent. The peer runs as a sub-agent
