@@ -619,8 +619,13 @@ impl Drop for Group {
 /// So the lock stays held while any process of the run lives, even after
 /// the runner dies. The next run tries the lock. When the lock is held,
 /// the file names the group of a run that outlived its runner, and the next
-/// run kills that group first. A free lock proves that no run lives, so a
-/// stale group id is never used.
+/// run kills that group first.
+///
+/// A free lock proves that no run lives. Its group id can name another
+/// group by now, so the run that takes the lock clears it first. A runner
+/// that dies between the start of its run and the write of the group
+/// leaves zero in the file. The next run then kills nothing. It waits
+/// [`Lock::WAIT`] and fails, and the activity retries.
 struct Lock(std::fs::File);
 
 impl Lock {
@@ -649,6 +654,7 @@ impl Lock {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        lock.name(0)?;
         Ok(lock)
     }
 
@@ -687,11 +693,16 @@ impl Lock {
     /// Write the group of the run into the file. The run holds the lock
     /// through its stdin, so this handle can close.
     fn hold(self, group: Option<u32>) -> Result<(), String> {
+        self.name(group.unwrap_or(0))
+    }
+
+    /// Write `group` into the file. Zero names no group.
+    fn name(&self, group: u32) -> Result<(), String> {
         use std::io::Write as _;
-        let mut file = self.0;
+        let mut file = &self.0;
         file.set_len(0)
             .and_then(|()| file.seek(SeekFrom::Start(0)).map(drop))
-            .and_then(|()| writeln!(file, "{}", group.unwrap_or(0)))
+            .and_then(|()| writeln!(file, "{group}"))
             .map_err(|e| format!("cannot write the trainer lock: {e}"))
     }
 }
@@ -973,6 +984,18 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
         assert_eq!(fresh.exit_code, Some(0));
         let status = orphan.wait().unwrap();
         assert!(!status.success(), "the old run was killed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_free_lock_forgets_the_group_of_an_earlier_run() {
+        let dir = tempfile::tempdir().unwrap();
+        // The group of a run that ended. Its id can name another group now.
+        std::fs::write(dir.path().join(TRAINER_LOCK), "424242\n").unwrap();
+        let lock = Lock::take(dir.path()).await.unwrap();
+        let text = std::fs::read_to_string(dir.path().join(TRAINER_LOCK)).unwrap();
+        assert_eq!(text.trim(), "0");
+        drop(lock);
     }
 
     #[cfg(unix)]

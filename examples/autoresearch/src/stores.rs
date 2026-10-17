@@ -195,18 +195,18 @@ impl FileDelivery {
         let dir = Self::dir(lab).map_err(|e| AgentError::new(ErrorKind::Unavailable, e))?;
         // The key dedupes a retried delivery: the same report, the same file.
         let path = dir.join(format!("{}.md", hashed(&report.key())));
-        if path.exists() {
-            return Ok(());
+        if !path.exists() {
+            let text = format!(
+                "# autoresearch report\n\nrun: {}\nstop: {:?}\n\n{}\n",
+                report.run_id.as_str(),
+                report.stop,
+                report.text.trim()
+            );
+            write_atomic(&path, text.as_bytes())
+                .map_err(|e| AgentError::new(ErrorKind::Unavailable, e))?;
         }
-        let text = format!(
-            "# autoresearch report\n\nrun: {}\nstop: {:?}\n\n{}\n",
-            report.run_id.as_str(),
-            report.stop,
-            report.text.trim()
-        );
-        write_atomic(&path, text.as_bytes())
-            .map_err(|e| AgentError::new(ErrorKind::Unavailable, e))?;
         // A heartbeat speaks only to alert, so the alert holds these rows.
+        // A retry marks them too, when the process died before the mark.
         if report.source == ReportSource::Heartbeat {
             mark_alerted(lab).map_err(|e| AgentError::new(ErrorKind::Unavailable, e))?;
         }
@@ -531,6 +531,37 @@ mod tests {
         assert!(
             precheck.should_run(&tick).await,
             "a new crash in the streak"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_alert_marks_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = Lab::init(dir.path().join("lab")).unwrap();
+        let precheck = ResultsPrecheck::new(vec![lab.clone()]);
+        let tick = crate::agent::heartbeat_task(lab.root());
+        for key in ["c1", "c2", "c3"] {
+            let row = ResultRow {
+                commit: "aaaaaaa".into(),
+                val_bpb: 0.0,
+                memory_gb: 0.0,
+                status: Status::Crash,
+                description: key.into(),
+            };
+            lab.record(&row, key).unwrap();
+        }
+        let alert = Report {
+            source: ReportSource::Heartbeat,
+            ..report(&lab, 0)
+        };
+        let delivery = FileDelivery::new(vec![lab.clone()]);
+        delivery.deliver(&alert).await.unwrap();
+        // The process died after the report and before the mark.
+        std::fs::remove_file(lab.state_dir().unwrap().join(ALERTED)).unwrap();
+        delivery.deliver(&alert).await.unwrap();
+        assert!(
+            !precheck.should_run(&tick).await,
+            "the redelivery marks the rows"
         );
     }
 

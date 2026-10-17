@@ -269,6 +269,13 @@ experiment set the search attribute `status`, which the engine reserves.
   Delete `.autoresearch/cache` when no process runs.
 - **The response cache index lives in memory.** A restart starts it empty.
   The blobs stay on disk.
+- **A runner killed as its run starts leaves the run alive.** The lock file
+  then names no group, so the next run cannot kill it. That run waits ten
+  seconds and fails, and the activity retries. Stop the old run by hand,
+  or let it end at its own time budget.
+- **A heartbeat alert holds the rows at its delivery.** Crash rows that land
+  while the alert is written get no alert of their own. The next crash
+  alerts again.
 
 See [`DESIGN-autoresearch.md`](../../DESIGN-autoresearch.md) for the plan and
 the acceptance criteria.

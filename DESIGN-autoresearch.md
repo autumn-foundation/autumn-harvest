@@ -88,7 +88,7 @@ The crate is `examples/autoresearch`. The guide is its `README.md`.
 | R14 | The command trainer hangs. | The trainer kills the process group at ten minutes. `start_to_close` is 15 minutes. |
 | R15 | The sim proves nothing. | Each sweep requires its `sometimes!` targets. A mutation run checks that a broken session fails a sweep. |
 | R16 | Two sessions share one lab, and one commits or resets on the branch of the other. | A mutex per lab for each experiment. Each write step names its branch and refuses another one. |
-| R17 | A training run outlives its runner and shares the GPU with the next run. | The process group dies on every exit path. A lock file finds a group that a dead runner left, and the next run kills it. |
+| R17 | A training run outlives its runner and shares the GPU with the next run. | The process group dies on every exit path. A lock file finds a group that a dead runner left, and the next run kills it. A free lock clears the old group id, so a reused id is never killed. |
 | R18 | A tool call or an activity runs again after a crash and writes twice. | Each write is keyed: a commit by its trailer, an edit by its tool call, a row and a run by the activity idempotency key. |
 | R19 | Code that the model wrote reads a secret or plants a git hook. | The run gets a fixed list of environment variables, and more only by name. Git runs with hooks off. The README says that the command trainer is not a sandbox. |
 | R22 | A heartbeat tick fails, and its crash rows are never checked again. | The precheck reads and writes nothing. Only a delivered alert marks the rows. |
@@ -246,7 +246,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC11 | `e2e::the_session_continues_as_new_and_carries_its_best`: three runs, the carried count and best. `sim::a_session_hands_off_its_carry_past_a_failed_experiment`: the count, the best, each hint and the labels. `sim::a_continued_session_finishes_from_its_carry`. |
 | AC12 | `e2e::two_sessions_share_one_gpu_and_a_kept_idea`: the hint reaches B, and the unknown sibling fails only its own signal. |
 | AC13 | `e2e::a_night_of_research_keeps_only_improvements`: the attributes, the memo, and a list by the `tag` attribute. |
-| AC14 | `e2e::the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up`. `stores::tests::the_precheck_runs_a_tick_only_for_a_new_crash_streak`. |
+| AC14 | `e2e::the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up`. `stores::tests::the_precheck_runs_a_tick_only_for_a_new_crash_streak`, `a_redelivered_alert_marks_its_rows`. |
 | AC15 | `e2e::a_finished_night_leaves_a_morning_report`, `scripted::tests::the_reporter_reports_the_summary_of_its_own_session`. |
 | AC16 | `e2e::a_restart_resumes_without_paying_for_a_turn_or_a_run_twice`: the model calls and the trainings across two processes equal one process. |
 | AC17 | `e2e::a_night_of_research_keeps_only_improvements` and `e2e::the_session_continues_as_new_and_carries_its_best` run `verify`. The CI demo runs `verify`. |
@@ -264,7 +264,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC29 | `e2e::two_sessions_in_one_lab_take_turns_on_their_own_branches`, `lab::tests::checkout_moves_back_to_the_session_branch_only_when_clean`, `activities::tests::train_refuses_a_moved_branch_and_a_change_no_commit_holds`. |
 | AC30 | `e2e::a_nightly_session_takes_commands_by_its_tag`. |
 | AC31 | `lab::tests::a_commit_is_made_once_per_key`, `an_edit_runs_once_per_call`, `an_edit_whose_write_was_lost_runs_on_its_retry`, `a_row_is_recorded_once_per_key`, `a_row_whose_write_was_lost_lands_on_its_retry`. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`. `agent::tests::an_edit_call_that_runs_again_changes_nothing`. |
-| AC32 | `trainer::tests::a_dropped_run_kills_its_whole_group`, `the_next_run_kills_a_run_that_outlived_its_runner`, `a_timeout_kills_the_children_of_the_run_too`. |
+| AC32 | `trainer::tests::a_dropped_run_kills_its_whole_group`, `the_next_run_kills_a_run_that_outlived_its_runner`, `a_timeout_kills_the_children_of_the_run_too`, `a_free_lock_forgets_the_group_of_an_earlier_run`. |
 | AC33 | `claude::tests::a_thinking_block_goes_back_unchanged_in_the_next_request`, `a_turn_survives_in_the_turn_directory`, `the_key_stays_out_of_debug_output`. |
 
 ---
@@ -288,7 +288,8 @@ The fixes:
   because it counted the downtime of the runner. Workflow state keeps full
   commit ids. A short id can become ambiguous as the lab grows, so only
   `results.tsv` and the console show it. A rewind resolves a short id on
-  the session branch only.
+  the session branch only. A free trainer lock clears the old group id. A
+  redelivered heartbeat alert marks its rows.
 - **Steering.** Commands by tag, `run` resumes across midnight, rejected
   commands kept, one decision per approval wait.
 - **Security.** Flow labels follow the session. No secrets in the trainer
@@ -309,3 +310,14 @@ The fixes:
 One mutant cannot fail a test on SQLite: a GPU mutex released before the
 training. The release writes no event, and one activity runs at a time.
 Section 3 states it.
+
+Two findings stay as limits in the README, because a full fix costs more
+than it buys:
+
+- A runner killed between the start of its run and the write of the group
+  leaves a run that the next run cannot kill. No await sits in that window,
+  so only an outside kill can hit it. The next run fails safe: it waits and
+  retries, and never shares the GPU.
+- A heartbeat alert marks the rows at its delivery. Crash rows that land
+  while the alert is written get no alert of their own, and the next crash
+  alerts again. An exact mark needs the rows that each tick read.
