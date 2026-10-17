@@ -355,8 +355,11 @@ pub async fn record_cross_shard_child_with_codecs(
     workflow_name: &str,
     parent_close_policy: Option<ParentClosePolicy>,
     spec: &CrossShardChildSpec,
-    _codecs: &crate::payload_codec::PayloadCodecs,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
+    // The whole spec is one cell. It holds the child input and its headers
+    // (issue #2043).
+    let spec_json = serde_json::to_value(spec).map_err(HarvestError::Serialization)?;
     let row = NewCrossShardChildRow {
         child_exec_id: child_exec_id.as_uuid(),
         parent_exec_id: parent_exec_id.as_uuid(),
@@ -364,7 +367,7 @@ pub async fn record_cross_shard_child_with_codecs(
         status: CrossShardChildStatus::PendingStart.as_db_str().to_string(),
         parent_close_policy: parent_close_policy.map(|p| p.to_string()),
         workflow_name: workflow_name.to_string(),
-        child_spec: serde_json::to_value(spec).map_err(HarvestError::Serialization)?,
+        child_spec: codecs.encode_column(&spec_json)?,
     };
     diesel::insert_into(harvest_cross_shard_children::table)
         .values(&row)
@@ -1333,8 +1336,10 @@ async fn start_child_on_target(
 ) -> HarvestResult<()> {
     let mut conn = target_conn(pool, row, acquire_bound).await?;
 
-    let spec: CrossShardChildSpec =
-        serde_json::from_value(row.child_spec.clone()).map_err(HarvestError::Serialization)?;
+    // A spec that does not decode never starts a child. The error leaves the
+    // row pending, so a restored key lets it start (issue #2043).
+    let spec: CrossShardChildSpec = serde_json::from_value(codecs.decode_column(&row.child_spec)?)
+        .map_err(HarvestError::Serialization)?;
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
     let parent_exec_id = ExecutionId::from_uuid(row.parent_exec_id);
     let child_workflow_id = child_exec_id.to_string();

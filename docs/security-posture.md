@@ -1486,7 +1486,7 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_completion_triggers.condition` | Clear | Trigger configuration, not payload. |
 | `harvest_completion_trigger_outbox.target_input` | Covered | The input of a deferred trigger start. The relay decodes it before the target start. |
 | `harvest_completion_trigger_outbox.priority` | Clear | Scheduling, not payload. |
-| `harvest_cross_shard_children.child_spec` | Clear | Erasure rewrites the `input` field inside the spec, and the sweep reads one envelope at the cell root. The spec holds the child input in clear until erasure or retirement. |
+| `harvest_cross_shard_children.child_spec` | Covered | The whole spec is one envelope. It holds the child input and its headers. The relay decodes it before it starts the child. Erasure replaces an encoded cell with a tombstone and needs no key. |
 | `harvest_debounce.last_input` | Covered | The buffered start input. The fire path decodes it before the start. |
 | `harvest_debounce.start_options` | Clear | Start configuration, not payload. |
 | `harvest_start_throttle.input` | Covered | The deferred start input. The fire path decodes it before the start. |

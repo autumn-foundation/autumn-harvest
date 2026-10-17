@@ -284,6 +284,13 @@ pub const CODEC_COLUMNS: &[CodecColumn] = &[
         rows: ALL_ROWS,
         shape: CellShape::Elements,
     },
+    CodecColumn {
+        table: "harvest_cross_shard_children",
+        id_column: "child_exec_id",
+        column: "child_spec",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
 ];
 
 /// What [`reencrypt_field_under`] found in one stored value.
@@ -3649,6 +3656,7 @@ mod tests {
             "submit_batch_job(",
             "fire_due_debounced_starts(",
             "fire_due_throttled_starts(",
+            "record_cross_shard_child(",
             "admit_batched_start(",
             "fire_due_event_batches(",
             "enforce_completion_triggers_outbox(",

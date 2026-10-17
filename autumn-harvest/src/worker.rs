@@ -12347,13 +12347,14 @@ async fn persist_all_started_child_workflows(
                     .flatten(),
                 parent_fairness_key,
             )?;
-            crate::cross_shard_child::record_cross_shard_child(
+            crate::cross_shard_child::record_cross_shard_child_with_codecs(
                 conn,
                 parent_exec_id,
                 child.child_id,
                 &child.workflow_name,
                 None, // awaited child
                 &spec,
+                registry.payload_codecs(),
             )
             .await?;
         }
@@ -13275,13 +13276,14 @@ async fn insert_awaited_child_execution(
             trace_context,
             parent_fairness_key,
         )?;
-        return crate::cross_shard_child::record_cross_shard_child(
+        return crate::cross_shard_child::record_cross_shard_child_with_codecs(
             conn,
             parent_exec_id,
             child.child_id,
             &child.workflow_name,
             None, // awaited child
             &spec,
+            registry.payload_codecs(),
         )
         .await;
     }
@@ -15739,13 +15741,14 @@ async fn create_detached_child_executions(
                 .in_scope(|| registry.telemetry().capture_trace_context()),
                 parent_fairness_key,
             )?;
-            crate::cross_shard_child::record_cross_shard_child(
+            crate::cross_shard_child::record_cross_shard_child_with_codecs(
                 conn,
                 ExecutionId::from_uuid(parent_execution.id),
                 *child_id,
                 workflow_name,
                 Some(*parent_close_policy),
                 &spec,
+                registry.payload_codecs(),
             )
             .await?;
             continue;

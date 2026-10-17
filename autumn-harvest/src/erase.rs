@@ -915,7 +915,11 @@ mod db {
         else {
             return Ok(());
         };
-        if let Some(obj) = spec_json.as_object_mut() {
+        if crate::payload_codec::is_codec_envelope(&spec_json) {
+            // An encoded spec is one opaque cell. Erasure needs no key, so it
+            // replaces the whole cell (issue #2043).
+            spec_json = erasure_tombstone();
+        } else if let Some(obj) = spec_json.as_object_mut() {
             if let Some(input) = obj.get_mut("input")
                 && !is_tombstone(input)
             {
