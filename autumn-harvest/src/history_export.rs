@@ -298,14 +298,20 @@ pub enum HistoryExportError {
 /// decoder, or with a cell the decoder cannot read, the document carries no
 /// headers. Plaintext headers never reach an export that a caller may not
 /// decode, and never reach cold storage.
+///
+/// A decode adds to `outcome`, so the read audit counts a header-only decode
+/// like any other (issue #608).
 #[must_use]
 pub fn export_headers(
     stored: Option<&Value>,
     decoder: Option<&crate::payload_codec::PayloadCodecs>,
+    outcome: &mut LossyDecodeOutcome,
 ) -> Option<HashMap<String, String>> {
     let stored = stored?;
     if crate::payload_codec::is_codec_envelope(stored) {
-        return decoder.and_then(|codecs| codecs.decode_headers(stored).ok());
+        let mut cell = stored.clone();
+        *outcome = outcome.merged(decoder?.decode_value_lossy(&mut cell));
+        return serde_json::from_value(cell).ok();
     }
     serde_json::from_value(stored.clone()).ok()
 }
@@ -1951,30 +1957,37 @@ mod tests {
     #[test]
     fn export_headers_reads_a_clear_map() {
         let stored = serde_json::json!({"x-tenant": "acme"});
-        let headers = export_headers(Some(&stored), None).expect("a clear map");
+        let mut outcome = LossyDecodeOutcome::default();
+        let headers = export_headers(Some(&stored), None, &mut outcome).expect("a clear map");
         assert_eq!(headers.get("x-tenant").map(String::as_str), Some("acme"));
-        assert!(export_headers(None, None).is_none());
+        assert!(export_headers(None, None, &mut outcome).is_none());
+        assert!(!outcome.touched(), "a clear map is not a decode");
     }
 
     #[test]
     fn export_headers_leaves_an_envelope_out_without_a_decoder() {
         let stored = fixed_plaintext_envelope(8);
-        assert!(export_headers(Some(&stored), None).is_none());
+        let mut outcome = LossyDecodeOutcome::default();
+        assert!(export_headers(Some(&stored), None, &mut outcome).is_none());
+        assert!(!outcome.touched());
     }
 
     #[test]
     fn export_headers_decodes_an_envelope_for_a_decoder() {
         let stored = fixed_plaintext_envelope(8);
         let decoder = fixed_plaintext_registry(r#"{"x-tenant":"acme"}"#);
-        let headers = export_headers(Some(&stored), Some(&decoder)).expect("decoded");
+        let mut outcome = LossyDecodeOutcome::default();
+        let headers = export_headers(Some(&stored), Some(&decoder), &mut outcome).expect("decoded");
         assert_eq!(headers.get("x-tenant").map(String::as_str), Some("acme"));
+        assert_eq!(outcome.decoded, 1, "the audit counts a header-only decode");
     }
 
     #[test]
     fn export_headers_leaves_out_an_envelope_the_decoder_cannot_read() {
         let stored = fixed_plaintext_envelope(8);
         let identity_only = PayloadCodecs::default();
-        assert!(export_headers(Some(&stored), Some(&identity_only)).is_none());
+        let mut outcome = LossyDecodeOutcome::default();
+        assert!(export_headers(Some(&stored), Some(&identity_only), &mut outcome).is_none());
     }
 
     fn envelope_export_request(envelope: Value, max_bytes: usize) -> HistoryExportRequest {

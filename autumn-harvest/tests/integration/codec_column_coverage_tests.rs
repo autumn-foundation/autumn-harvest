@@ -3666,6 +3666,68 @@ async fn a_batch_append_needs_no_key_for_the_headers() {
 }
 
 #[tokio::test]
+async fn a_flush_that_cannot_decode_gets_a_short_deadline_and_keeps_its_elements() {
+    use autumn_harvest::event_batch::admit_batched_start_with_codecs;
+    let _serial = BATCH_FIRE_LOCK.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let name = format!("cc_hdr_flush_late_{}", Uuid::new_v4().simple());
+
+    let mut first = batch_params(&name, &key, "cc-hdr-late-1", json!({"n": 1}), 2);
+    first.max_wait = Duration::from_secs(3600);
+    first.start_options = header_start_options();
+    admit_batched_start_with_codecs(&mut conn, first, None, &codecs)
+        .await
+        .expect("admit")
+        .expect("admitted");
+    diesel::sql_query(
+        "UPDATE harvest_event_batches \
+         SET start_options = jsonb_set(start_options, '{context_headers}', $2) \
+         WHERE batch_key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&key)
+    .bind::<diesel::sql_types::Jsonb, _>(&gone_key_envelope())
+    .execute(&mut conn)
+    .await
+    .expect("corrupt the headers");
+
+    // The second admission reaches max_size. The flush cannot decode.
+    let mut second = batch_params(&name, &key, "cc-hdr-late-2", json!({"n": 2}), 2);
+    second.max_wait = Duration::from_secs(3600);
+    second.start_options = header_start_options();
+    admit_batched_start_with_codecs(&mut conn, second, None, &codecs)
+        .await
+        .expect("an admission never fails on a flush it cannot decode")
+        .expect("admitted");
+
+    assert_eq!(batch_cells(&mut conn, &key).await.len(), 2);
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_event_batches \
+             WHERE batch_key = $1 AND fire_at < now() + interval '120 seconds'",
+            &key,
+        )
+        .await,
+        1,
+        "the deadline moves in from one hour, so a restored key retries soon"
+    );
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
+             WHERE workflow_name = $1",
+            &name,
+        )
+        .await,
+        0,
+        "no run starts without its headers"
+    );
+}
+
+#[tokio::test]
 async fn a_batch_row_that_cannot_decode_does_not_hold_up_the_next_due_row() {
     use autumn_harvest::event_batch::{
         admit_batched_start_with_codecs, fire_due_event_batches_with_codecs,

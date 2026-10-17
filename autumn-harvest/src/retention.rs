@@ -3201,6 +3201,7 @@ async fn run_shard_tick(
                             context_headers: crate::history_export::export_headers(
                                 candidate.context_headers.as_ref(),
                                 None,
+                                &mut crate::payload_codec::LossyDecodeOutcome::default(),
                             ),
                             // Issue #772 (Finding A): the archive is the LAST
                             // surviving copy before the row is deleted. A terminal

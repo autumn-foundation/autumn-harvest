@@ -43840,8 +43840,12 @@ fn export_history_for_execution(
     outcome: &mut LossyDecodeOutcome,
 ) -> Result<HistoryExportDocument, HistoryExportError> {
     // A cell the caller may not decode stays out of the export (issue #2043).
-    let context_headers =
-        autumn_harvest::history_export::export_headers(execution.context_headers.as_ref(), decoder);
+    // The Redacted policy drops the headers, so it decodes nothing.
+    let context_headers = autumn_harvest::history_export::export_headers(
+        execution.context_headers.as_ref(),
+        decoder.filter(|_| query.payload_policy != HistoryPayloadPolicy::Redacted),
+        outcome,
+    );
     export_history_decoded(
         HistoryExportRequest {
             workflow_name: execution.workflow_name.clone(),
@@ -43909,7 +43913,8 @@ fn export_history_for_candidate(
             // instead of an empty map (which would be a FALSE divergence).
             context_headers: autumn_harvest::history_export::export_headers(
                 candidate.context_headers.as_ref(),
-                decoder,
+                decoder.filter(|_| query.payload_policy != HistoryPayloadPolicy::Redacted),
+                outcome,
             ),
             // Issue #772: carry the deadline-aware replay metadata (the batch
             // candidate query now SELECTs `execution_timeout`/`deadline_at`) so a

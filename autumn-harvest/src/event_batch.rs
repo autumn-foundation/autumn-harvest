@@ -285,6 +285,14 @@ pub async fn admit_batched_start_with_codecs(
                             error_kind = crate::codec_rotation::sweep_error_kind(&error),
                             "batch flush skipped: a payload or header could not be decoded"
                         );
+                        // The row keeps its elements. A short deadline lets the
+                        // scanner retry once the key returns.
+                        pull_in_event_batch_row(
+                            conn,
+                            row.id,
+                            Utc::now() + UNDECODABLE_REDEFER_BACKOFF,
+                        )
+                        .await?;
                         None
                     }
                 }
@@ -533,6 +541,27 @@ async fn redefer_event_batch_row(
         .execute(conn)
         .await
         .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Pull the fire time of a row in to `latest`, and never out (issue #2043).
+///
+/// A flush that cannot decode leaves the row buffered. This gives the scanner
+/// a short deadline to retry it, so a restored key does not wait for `max_wait`.
+#[cfg(feature = "db")]
+async fn pull_in_event_batch_row(
+    conn: &mut AsyncPgConnection,
+    row_id: uuid::Uuid,
+    latest: DateTime<Utc>,
+) -> HarvestResult<()> {
+    diesel::sql_query(
+        "UPDATE harvest_event_batches SET fire_at = LEAST(fire_at, $2) WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(row_id)
+    .bind::<diesel::sql_types::Timestamptz, _>(latest)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
     Ok(())
 }
 
