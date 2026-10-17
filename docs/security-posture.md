@@ -1455,7 +1455,7 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_workflow_executions.output` | Covered | The workflow result. |
 | `harvest_workflow_executions.memo` | Covered | Operator notes can hold PII. No query reads into them. |
 | `harvest_workflow_executions.search_attrs` | Clear | Visibility queries filter on it. Do not put PII in it. |
-| `harvest_workflow_executions.context_headers` | Clear | The worker, the replay export, the archive and the history export read the headers as a string map with no codec. An unreadable value means no headers. Do not put PII in a header. |
+| `harvest_workflow_executions.context_headers` | Covered | The whole header map is one envelope. The worker, the retry and the rerun decode it, and a failure stops the run. An export decodes it only for a caller who may decode. The archive leaves it out. |
 | `harvest_workflow_executions.workflow_retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_workflow_executions.completion_callbacks` | Clear | Callback targets, not payload. |
 | `harvest_workflow_executions.migrated_from_shards` | Clear | Shard bookkeeping, not payload. |
@@ -1465,7 +1465,7 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_task_queue.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_task_queue.trace_context` | Clear | Trace ids, not payload. |
 | `harvest_task_queue.required_capabilities` | Clear | Routing labels, not payload. |
-| `harvest_task_queue.context_headers` | Clear | A copy of the execution headers. The worker reads them as a string map. |
+| `harvest_task_queue.context_headers` | Covered | A copy of the execution cell, which an activity row can extend with the result-writer marker. The activity worker decodes it, and a failure fails the attempt. |
 | `harvest_schedules.workflow_input` | Covered | The input of every scheduled run. Registration and the schedule API encode it. The reconciler compares the decoded value, so a new nonce is not drift. The tick decodes it before the start. |
 | `harvest_schedules.buffered_runs` | Clear | Fire times only. |
 | `harvest_schedules.retry_policy` | Clear | Engine configuration, not payload. |

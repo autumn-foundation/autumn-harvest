@@ -3756,13 +3756,15 @@ const COLUMN_BATCH: &str = "column-batch";
 const COLUMN_BATCH_BUFFER: &str = "column-batch-buffer";
 const COLUMN_CHILD_SPEC: &str = "column-child-spec";
 const COLUMN_SCHEDULE: &str = "column-schedule";
+const COLUMN_EXEC_HEADERS: &str = "column-exec-headers";
+const COLUMN_TASK_HEADERS: &str = "column-task-headers";
 
 /// The cells one [`seed_codec_columns`] call writes. A workflow task row and
 /// an activity task row each hold an input and an output. The activity row
 /// also holds a heartbeat. The event batch buffer holds one element, and the
 /// census counts its row once. Every other swept column holds one cell.
 /// `the_seed_covers_every_codec_column` pins this to `CODEC_COLUMNS`.
-const CELLS_PER_SEED: usize = 19;
+const CELLS_PER_SEED: usize = 21;
 
 /// Write one envelope under `key_id` into every swept codec column.
 async fn seed_codec_columns(
@@ -3772,12 +3774,14 @@ async fn seed_codec_columns(
 ) -> SeededColumns {
     let exec_id = insert_execution(conn, "column_rotation").await;
     diesel::sql_query(
-        "UPDATE harvest_workflow_executions SET input = $1, output = $2, memo = $3 WHERE id = $4",
+        "UPDATE harvest_workflow_executions \
+         SET input = $1, output = $2, memo = $3, context_headers = $5 WHERE id = $4",
     )
     .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_INPUT)))
     .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_OUTPUT)))
     .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_MEMO)))
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_EXEC_HEADERS)))
     .execute(conn)
     .await
     .expect("encode execution columns");
@@ -3849,14 +3853,16 @@ async fn seed_short_lived_columns(
 
     diesel::sql_query(
         "INSERT INTO harvest_task_queue \
-         (id, queue_name, task_type, workflow_exec_id, input, output, heartbeat_details, state) \
-         VALUES ($1, 'default', 'activity', $2, $3, $4, $5, 'COMPLETED')",
+         (id, queue_name, task_type, workflow_exec_id, input, output, heartbeat_details, \
+          context_headers, state) \
+         VALUES ($1, 'default', 'activity', $2, $3, $4, $5, $6, 'COMPLETED')",
     )
     .bind::<SqlUuid, _>(Uuid::new_v4())
     .bind::<SqlUuid, _>(exec_id.as_uuid())
     .bind::<Jsonb, _>(cell(COLUMN_ACTIVITY_INPUT))
     .bind::<Jsonb, _>(cell(COLUMN_ACTIVITY_OUTPUT))
     .bind::<Jsonb, _>(cell(COLUMN_HEARTBEAT))
+    .bind::<Jsonb, _>(cell(COLUMN_TASK_HEADERS))
     .execute(conn)
     .await
     .expect("insert activity task");
@@ -4012,6 +4018,10 @@ async fn codec_cells(conn: &mut AsyncPgConnection) -> Vec<(String, Value)> {
              FROM harvest_cross_shard_children \
            UNION ALL SELECT 17, id::TEXT, 'schedule', workflow_input \
              FROM harvest_schedules WHERE workflow_input IS NOT NULL \
+           UNION ALL SELECT 18, id::TEXT, 'exec_headers', context_headers \
+             FROM harvest_workflow_executions WHERE context_headers IS NOT NULL \
+           UNION ALL SELECT 19, id::TEXT, 'task_headers', context_headers \
+             FROM harvest_task_queue WHERE context_headers IS NOT NULL \
          ) c ORDER BY ord, row_id",
     )
     .load(conn)

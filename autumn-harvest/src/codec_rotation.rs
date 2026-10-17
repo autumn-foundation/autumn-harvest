@@ -298,6 +298,20 @@ pub const CODEC_COLUMNS: &[CodecColumn] = &[
         rows: ALL_ROWS,
         shape: CellShape::Cell,
     },
+    CodecColumn {
+        table: "harvest_workflow_executions",
+        id_column: "id",
+        column: "context_headers",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_task_queue",
+        id_column: "id",
+        column: "context_headers",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
 ];
 
 /// What [`reencrypt_field_under`] found in one stored value.
