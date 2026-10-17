@@ -478,8 +478,14 @@ async fn run(args: &LabArgs, session: &SessionArgs) -> Result<(), String> {
         match step {
             Step::Done(report) => {
                 print_report(&report);
-                if report.report_run.is_some() {
-                    rt.run_until_idle().await.map_err(|e| e.to_string())?;
+                if let Some(run) = &report.report_run {
+                    tokio::select! {
+                        driven = runtime::drive_report(&mut rt, run) => driven?,
+                        () = &mut quit => {
+                            println!("stopped driving the report. It is durable: `serve` finishes it.");
+                            return Ok(());
+                        }
+                    }
                     println!(
                         "report: {}",
                         autoresearch::stores::FileDelivery::dir(&lab)?.display()

@@ -123,6 +123,34 @@ pub enum Step {
     Waiting,
 }
 
+/// Drive the detached report agent `run` to its end. Only that run, and the
+/// runs it waits on, move. Another session in the database waits for its
+/// own runner.
+///
+/// # Errors
+///
+/// Returns an error when `run` is not a run id, the backend fails, or the
+/// run waits on a person.
+pub async fn drive_report(rt: &mut SqliteRuntime, run: &str) -> Result<(), String> {
+    let exec = ExecutionId::from_str(run).map_err(|e| format!("{run} is not a run id: {e}"))?;
+    loop {
+        let state = rt
+            .run_until_blocked(exec)
+            .await
+            .map_err(|e| format!("cannot drive the report {run}: {e}"))?;
+        match state {
+            // A retry waits on a timer, or a peer holds a mutex.
+            RunState::WaitingTimer | RunState::WaitingMutex(_) | RunState::InProgress => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            RunState::WaitingSignal(signal) => {
+                return Err(format!("the report {run} waits on {signal}"));
+            }
+            _ => return Ok(()),
+        }
+    }
+}
+
 /// Drive the session `exec` until it ends or blocks. Follows a blocked child
 /// down to the run that waits.
 ///

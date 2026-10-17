@@ -626,10 +626,16 @@ async fn a_finished_night_leaves_a_morning_report() {
     config.report = true;
     let exec = runtime::start(&mut rt, &config).unwrap();
     let report = run_to_end(&mut rt, exec).await;
+    // Another session in the database, which no runner drives now.
+    let other = runtime::start(&mut rt, &fx.config("other", 2)).unwrap();
 
     // AC15: the report agent is a detached child. It runs after the parent.
     let reporter = report.report_run.expect("a report agent started");
-    rt.run_until_idle().await.unwrap();
+    runtime::drive_report(&mut rt, &reporter).await.unwrap();
+    assert!(
+        activities_of(&rt, other).is_empty(),
+        "the report drives no other session"
+    );
     assert!(
         runs_of(&rt, "agent_loop")
             .iter()
