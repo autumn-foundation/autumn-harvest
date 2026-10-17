@@ -3189,6 +3189,8 @@ fn queue_fairness_accepts_percent_spelled_keys() {
         (".%2e", ".%252e"),
         ("%2e.", "%252e."),
         ("%2e%2e", "%252e%252e"),
+        (".%2E", ".%252E"),
+        ("%2e%2E", "%252e%252E"),
     ] {
         for verb in ["set", "clear"] {
             let mut args = vec!["harvest", "queue", "fairness", verb, "q", key];

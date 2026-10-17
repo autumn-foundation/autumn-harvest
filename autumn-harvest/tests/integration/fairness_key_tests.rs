@@ -426,6 +426,10 @@ async fn prune_bounds_one_shot_keys_on_a_queue_that_never_drains() {
     let left = list_fairness_state(&mut conn, &queue_name).await.unwrap();
     assert_eq!(left.len(), 1, "{left:?}");
     assert_eq!(left[0].fairness_key, "once-0999", "the greatest key stays");
+    let again = prune_fairness_state(&mut conn, Some(&queue_name), cutoff, 500, true)
+        .await
+        .unwrap();
+    assert_eq!(again, 0, "a second preview counts nothing");
     assert!(left[0].last_start.abs() < 1e-9, "V holds");
 }
 
@@ -722,6 +726,31 @@ async fn a_fair_claim_refuses_an_unaddressable_queue_name() {
             "{bad:?} wrote state"
         );
     }
+    // A bad name after a good one still fails before any statement.
+    let good = fresh_queue("good");
+    enqueue_keyed(&mut conn, &good, Some("a"), Duration::seconds(1)).await;
+    let err = queue::claim_task_with_fairness(
+        &mut conn,
+        &[good.clone(), "..".to_owned()],
+        "fair-test-worker",
+        "",
+        None,
+        &[],
+        &[],
+        None,
+        None,
+        ClaimFairness::Keys,
+    )
+    .await
+    .expect_err("one bad name fails the whole claim");
+    assert!(err.to_string().contains("\"..\""), "{err}");
+    assert!(
+        list_fairness_state(&mut conn, &good)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the good queue was not charged"
+    );
     // The plain claim keeps its old contract.
     claim(&mut conn, " q ", ClaimFairness::Off).await;
 }

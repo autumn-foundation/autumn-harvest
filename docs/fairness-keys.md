@@ -160,14 +160,16 @@ cases:
 - **An idle key.** Its key has no pending task, and it is not the clock row.
   The clock row has the greatest `(last_start, key)` of its queue and defines
   `V`. Prune keeps it, so `V` never falls. The key loses its debt. After a
-  charge, `pass - V <= 1/w`, so the loss is at most one claim at its weight.
+  charge, `pass - V <= 1/w`, so the loss is at most one claim, at the weight of its last claim.
 - **An idle queue.** The queue has no pending task, and no claim charged it
   inside the window. Its last row goes, so all debts are forgiven. This is
   the idle rule of start-time fair queuing.
 
-A queue that never drains, with one new key per request, thus keeps one row
-plus its active keys. A preview (`preview = true`) counts on a temp copy of
-the rows. It takes no lock on the real rows, so a claim never waits for it.
+A queue that never drains, with one new key per request, thus keeps one old
+row, its active keys and the keys charged inside the window.
+
+A preview (`preview = true`) counts on a temp copy of the rows. It takes no
+lock on the real rows, so a claim never waits for it.
 
 ## Limits
 

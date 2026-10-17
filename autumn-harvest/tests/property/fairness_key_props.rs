@@ -261,13 +261,20 @@ proptest! {
         }
         let before: Vec<f64> = (0..8).map(|k| clock.start_tag(&key(k))).collect();
         let v_before = clock.vclock();
-        let pruned = clock.prune(|name| {
+        let is_active = |name: &str| {
             name.strip_prefix('k')
                 .and_then(|n| n.parse::<usize>().ok())
                 .is_some_and(|n| active[n])
-        });
+        };
+        let pruned = clock.prune(is_active);
         let after: Vec<f64> = (0..8).map(|k| clock.start_tag(&key(k))).collect();
         prop_assert_eq!(clock.vclock().to_bits(), v_before.to_bits());
+        if !last_weight.is_empty() {
+            prop_assert!(
+                (0..8).any(|k| clock.state(&key(k)).is_some_and(|p| p.last_start == v_before)),
+                "the clock row must survive"
+            );
+        }
         let mut gone = 0usize;
         for k in 0..8 {
             let name = key(k);
@@ -285,6 +292,7 @@ proptest! {
             }
         }
         prop_assert_eq!(pruned, gone);
+        prop_assert_eq!(clock.prune(is_active), 0, "prune is idempotent");
     }
 }
 

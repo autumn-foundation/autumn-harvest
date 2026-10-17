@@ -258,8 +258,9 @@ pub const MAX_PRUNE_BATCHES: usize = 10;
 /// - **An idle key.** No `PENDING` task of its queue has its key, and the row
 ///   is not the clock row. The clock row has the greatest
 ///   `(last_start, fairness_key)` of its queue, and it defines `V`. Prune
-///   keeps it, so `V` never falls. The key restarts at `V`, so it loses its
-///   debt. That debt is at most `1 / weight`, one claim. The property test
+///   keeps it, so `V` never falls. The key restarts at `V` and loses its debt,
+///   if any. That loss is at most `1 / weight`, one claim, at the weight of
+///   its last claim. The property test
 ///   `prune_forgives_at_most_one_claim_of_debt` proves that on the model.
 /// - **An idle queue.** The queue has no `PENDING` task, and no claim charged
 ///   any of its keys since `cutoff`. Its last row, the clock row, goes. This
@@ -271,8 +272,8 @@ pub const MAX_PRUNE_BATCHES: usize = 10;
 /// Prune deletes in batches of `batch_size`, up to [`MAX_PRUNE_BATCHES`]
 /// batches, and stops at the first short batch. With `preview`, nothing is
 /// deleted, and the count is what one call would delete. A preview takes no
-/// lock on the real rows. With `queue_name`,
-/// only that queue is pruned. Returns the number of rows.
+/// lock on the real rows. With `queue_name`, only that queue is pruned.
+/// Returns the number of rows.
 ///
 /// # Errors
 ///
@@ -308,6 +309,9 @@ pub async fn prune_fairness_state(
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(queue.as_deref())
             .execute(conn)
             .await?;
+            diesel::sql_query(format!("ANALYZE {PREVIEW_TABLE}"))
+                .execute(conn)
+                .await?;
             let n =
                 delete_prune_batches(conn, PREVIEW_TABLE, queue.as_deref(), cutoff, batch).await?;
             Err(PreviewEnd::Count(n))

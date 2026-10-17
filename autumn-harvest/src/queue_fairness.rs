@@ -370,8 +370,8 @@ impl FairClock {
     ///
     /// This is the idle rule of start-time fair queuing. With no backlog, no
     /// key is behind another, so every debt is forgiven. Keys that claim once
-    /// never move `V`. [`FairClock::prune`] keeps one row, so this rule clears
-    /// the last one.
+    /// never move `V`. [`FairClock::prune`] always keeps the clock row. This rule
+    /// clears that last row.
     pub fn reset_if_idle(&mut self, any_active: bool) -> usize {
         if any_active {
             return 0;
