@@ -414,6 +414,9 @@ pub mod partition;
 /// Export of aged event partitions to object storage (issue #2009).
 pub mod partition_archive;
 pub mod payload_codec;
+/// Sweep of payload blobs that no execution references (issue #2123).
+#[cfg(feature = "db")]
+pub mod payload_orphans;
 pub mod payload_store;
 /// The connection transport a DSN's `sslmode` selects, with TLS through
 /// rustls.
