@@ -239,8 +239,8 @@ fn allowlisted(key: &str) -> bool {
 struct SuiteRow {
     /// `linux` | `linuxpart` | `allos` | `compileonly`.
     osclass: String,
-    /// `autumn-harvest` | `autumn-harvest-plugin` | `autumn-harvest-redis` |
-    /// `standalone-runner`.
+    /// `autumn-harvest` | `autumn-harvest-conformance` | `autumn-harvest-plugin`
+    /// | `autumn-harvest-redis` | `standalone-runner`.
     krate: String,
     /// The `--test <target>` binary (core suites use `integration`).
     target: String,
@@ -295,6 +295,8 @@ fn parse_manifest() -> Vec<SuiteRow> {
     const VALID_OSCLASS: &[&str] = &["linux", "linuxpart", "allos", "compileonly"];
     const VALID_CRATE: &[&str] = &[
         "autumn-harvest",
+        // Issue #2030: the cross-backend conformance suite.
+        "autumn-harvest-conformance",
         "autumn-harvest-plugin",
         "autumn-harvest-redis",
         // Issue #1615: the example's live-Postgres acceptance suite.
