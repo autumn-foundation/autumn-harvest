@@ -2897,8 +2897,15 @@ pub struct DurableStreamChunk {
 /// with the cycle or not at all.
 ///
 /// **Keep-first dedup.** A re-driven cycle offers the same offsets again.
-/// `ON CONFLICT DO NOTHING` on `(workflow_exec_id, stream_offset)` keeps the
-/// stored row, so a reader never sees a chunk change or repeat.
+/// The store keeps the stored row, so a reader never sees a chunk change or
+/// repeat. `ON CONFLICT DO NOTHING` on `(workflow_exec_id, stream_offset)`
+/// backs this up.
+///
+/// **Monotonic.** The store admits only offsets above the highest stored
+/// real offset (issue #2083). A reader can hold a cursor above a hole that a
+/// failed call left. A later chunk in that hole is below the cursor, so no
+/// reader would get it. The store drops it. This also stops two overlapping
+/// writers from filling different holes and passing the cap.
 ///
 /// **Cap.** Once the execution holds `max_chunks` real chunks, the store
 /// drops newer chunks and stores one marker at
@@ -2984,27 +2991,26 @@ async fn append_stream_chunks_in_tx(
 
     // Admit by the real row count, so the cap holds for any stored offsets.
     // A failed serialization leaves an offset unused, so stored offsets can
-    // have holes. A chunk that is already stored is a re-drive: it costs no
-    // budget and is never a drop. Only new offsets use the budget.
-    let batch_offsets: Vec<i64> = chunks.iter().map(|c| c.offset).collect();
+    // have holes. A reader can hold a cursor above a hole, so a hole never
+    // fills: only offsets above the highest stored real offset are new. This
+    // also drops a re-driven offset, which is already stored. Only new
+    // offsets use the budget. The marker is not a real offset.
     let stored: i64 = dsl::harvest_stream_chunks
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
         .count()
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;
-    let already: std::collections::HashSet<i64> = dsl::harvest_stream_chunks
+    let highest: Option<i64> = dsl::harvest_stream_chunks
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(dsl::stream_offset.eq_any(batch_offsets))
-        .select(dsl::stream_offset)
-        .load::<i64>(conn)
+        .filter(dsl::stream_offset.lt(DURABLE_STREAM_TRUNCATION_OFFSET))
+        .select(diesel::dsl::max(dsl::stream_offset))
+        .get_result(conn)
         .await
-        .map_err(crate::error::database_error)?
-        .into_iter()
-        .collect();
+        .map_err(crate::error::database_error)?;
     let mut new_chunks: Vec<&DurableStreamChunk> = chunks
         .iter()
-        .filter(|c| !already.contains(&c.offset))
+        .filter(|c| highest.is_none_or(|h| c.offset > h))
         .collect();
     new_chunks.sort_by_key(|c| c.offset);
     new_chunks.dedup_by_key(|c| c.offset);

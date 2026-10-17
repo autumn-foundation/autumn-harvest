@@ -274,14 +274,21 @@ Resume by the last offset you received, not by a count.
 
 A re-driven decision cycle runs the body again and gives each chunk the same
 offset. The store keeps the first copy, so a reader never sees a chunk twice
-or a chunk change. The chunk content can be non-deterministic. The **number
+or a chunk change. The chunk content can be non-deterministic.
+
+The store admits only offsets above the highest stored offset. A chunk whose
+call failed once is therefore never stored later. A reader can already hold a
+cursor above its offset, so a late chunk would be lost to that reader. The **number
 and order** of `publish_durable_progress` calls must be deterministic, as for
 any workflow code.
 
 ### Delivery
 
-- **No gap, no duplicate.** A chunk commits with its decision cycle, or not
-  at all. The reader opens `LISTEN` before its first read. Each wake and each
+- **No gap, no duplicate.** On the persist-transaction paths, a chunk commits
+  with its decision cycle, or not at all. The inline local-activity paths
+  store chunks before the pause check. A paused or crashed cycle can store
+  chunks, and its re-run offers the same offsets. The first stored copy stays
+  canonical. The reader opens `LISTEN` before its first read. Each wake and each
   keepalive tick reads the rows above the reader's cursor.
 - **The wake is a hint.** The worker sends it after the commit, outside the
   write transaction. A failed or lost wake never fails the write. The reader
