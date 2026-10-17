@@ -28285,13 +28285,8 @@ async fn upsert_workflow_schedule_and_read_back(
 ) -> Result<ScheduleEntry, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
     // The registry holds the write codec (issue #2043).
-    let identity_codecs;
-    let codecs = if let Some(registry) = registry {
-        registry.payload_codecs()
-    } else {
-        identity_codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
-        &identity_codecs
-    };
+    let identity_codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    let codecs = registry.map_or(&identity_codecs, HandlerRegistry::payload_codecs);
     autumn_harvest::register_workflow_schedules_with_codecs(conn, std::slice::from_ref(ws), codecs)
         .await
         .map_err(map_error)?;
@@ -31783,17 +31778,18 @@ pub(crate) async fn schedule_backfill_inner(
                 // A stored input that does not decode never starts a run
                 // (issue #2043).
                 let input = match schedule.workflow_input.as_ref() {
-                    Some(stored) => match runtime.registry.payload_codecs().decode_column(stored) {
-                        Ok(plain) => plain,
-                        Err(_) => {
+                    Some(stored) => {
+                        let Ok(plain) = runtime.registry.payload_codecs().decode_column(stored)
+                        else {
                             shard_failures.push(BackfillShardFailure {
                                 shard_id: 0,
                                 reason: "stored schedule input could not be decoded".to_string(),
                             });
                             failed += 1;
                             continue;
-                        }
-                    },
+                        };
+                        plain
+                    }
                     None => serde_json::Value::Null,
                 };
 

@@ -2664,9 +2664,13 @@ async fn a_schedule_input_is_ciphertext_and_a_second_registration_writes_nothing
     let mut conn = connect(&url).await;
     let name = format!("cc_sched_{}", Uuid::new_v4().simple());
     let ws = secret_schedule(&name);
-    autumn_harvest::register_workflow_schedules_with_codecs(&mut conn, &[ws.clone()], &codecs)
-        .await
-        .expect("register");
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&ws),
+        &codecs,
+    )
+    .await
+    .expect("register");
     let (first, first_updated) = schedule_cell(&mut conn, &name).await;
     assert_ciphertext(&first, SCHEDULE_SECRET, "schedules.workflow_input");
 
@@ -2691,9 +2695,13 @@ async fn a_due_schedule_starts_its_run_on_the_plaintext_input() {
     let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
     let reg = registry(vec![wf_info(static_name, wf_noop, None)], vec![], &codecs);
     let ws = secret_schedule(&name);
-    autumn_harvest::register_workflow_schedules_with_codecs(&mut conn, &[ws.clone()], &codecs)
-        .await
-        .expect("register");
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&ws),
+        &codecs,
+    )
+    .await
+    .expect("register");
     diesel::sql_query(
         "UPDATE harvest_schedules SET next_run_at = now() - interval '1 minute' \
          WHERE workflow_name = $1",
