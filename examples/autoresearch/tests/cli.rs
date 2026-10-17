@@ -163,6 +163,55 @@ fn a_run_longer_than_the_train_budget_is_refused() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("budget"));
 }
 
+/// A training run is code that the model wrote, and it runs as the same
+/// user. It must not read the key from the environment of the runner.
+/// Root can read any process, so the check needs another user.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_run_cannot_read_the_environment_of_the_runner() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let lab = dir.path().join("lab");
+    ok(&["init", &lab_arg(&lab)]);
+    // A stand-in for `uv run train.py` that reads its parent: the runner.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let uv = bin.join("uv");
+    std::fs::write(
+        &uv,
+        "#!/bin/sh\ncat /proc/$PPID/environ >> leak 2>/dev/null\n\
+         echo ---\necho 'val_bpb:          0.990000'\necho 'peak_vram_mb:     1024.0'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&uv, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = Command::new(env!("CARGO_BIN_EXE_autoresearch"))
+        .args(["run", "--lab", &lab_arg(&lab), "--tag", "env"])
+        .args(["--trainer", "command", "--experiments", "1", "--no-report"])
+        .env("PATH", path)
+        .env("AUTORESEARCH_TEST_SECRET", "hunter2")
+        .env_remove("AUTORESEARCH_LAB")
+        .env_remove("AUTORESEARCH_DB")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rows = std::fs::read_to_string(lab.join("results.tsv")).unwrap();
+    assert!(rows.contains("0.990000"), "the stand-in trained: {rows}");
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipped: root reads every process");
+        return;
+    }
+    let leak = std::fs::read(lab.join("leak")).unwrap_or_default();
+    assert!(
+        !String::from_utf8_lossy(&leak).contains("hunter2"),
+        "the run read the runner's environment"
+    );
+}
+
 #[test]
 fn claude_needs_a_key() {
     let dir = tempfile::tempdir().unwrap();

@@ -250,7 +250,10 @@ experiment set the search attribute `status`, which the engine reserves.
   basics, the locale, and the CUDA, PyTorch, Python, uv and Hugging Face
   settings. A name that looks like a secret stays out, and so does a URL
   with login details, such as a private package index. Pass another with
-  `--pass-env NAME`. Git runs with hooks off. The code can still read your
+  `--pass-env NAME`. On Linux the runner is not dumpable, so a run cannot
+  read the Claude key from the runner. A shell that exported the key can
+  still leak it, so set the key for the runner alone:
+  `ANTHROPIC_API_KEY=... autoresearch run ...`. Git runs with hooks off. The code can still read your
   files, write `.git` and `.autoresearch`, and escape the kill with
   `setsid`. Run it in a container, or as a user with no other rights.
 - **The score is what `train.py` prints.** As upstream, the last `val_bpb:`

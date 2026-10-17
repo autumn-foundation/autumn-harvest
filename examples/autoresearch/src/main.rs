@@ -233,6 +233,11 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
+    // A training run must not read the key from this process.
+    if let Err(error) = autoresearch::trainer::hide_runner() {
+        eprintln!("error: {error}");
+        return ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter(

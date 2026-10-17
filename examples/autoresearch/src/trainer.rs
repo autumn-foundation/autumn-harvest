@@ -473,6 +473,24 @@ pub async fn run(
     }
 }
 
+/// Hide the memory and the environment of this process from the other
+/// processes of the user, such as a training run.
+///
+/// The run is code that the model wrote, and it runs as the same user. It
+/// could read the Claude key from `/proc/<runner>/environ`. On Linux the
+/// runner stops being dumpable, so only root can read it. An exec resets
+/// the flag, so a run is not hidden.
+///
+/// # Errors
+///
+/// Returns an error when the kernel refuses.
+pub fn hide_runner() -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .map_err(|e| format!("cannot hide the runner from its training runs: {e}"))?;
+    Ok(())
+}
+
 /// Remove `run.log`, so the run writes a new file. A symlink that code in
 /// the lab planted then cannot send the log to another file.
 fn new_log(path: &Path) -> Result<(), String> {
@@ -574,7 +592,8 @@ async fn run_command(
     // The group dies when this guard drops, on every path out. The lock
     // drops after it and clears the file.
     let group = Group::of(&child);
-    lock.name(child.id().unwrap_or(0))?;
+    let id = child.id().unwrap_or(0);
+    lock.name(id, group_start(id).unwrap_or(0))?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut beat = tokio::time::interval(Duration::from_secs(5));
     let (exit_code, timed_out) = loop {
@@ -645,7 +664,9 @@ impl Drop for Group {
 /// So the lock stays held while any process of the run lives, even after
 /// the runner dies. The next run tries the lock. When the lock is held,
 /// the file names the group of a run that outlived its runner, and the next
-/// run kills that group first.
+/// run kills that group first. On Linux the file also holds the start time
+/// of the group leader. The next run kills the group only when that time
+/// still matches, so a group that reused the id lives on.
 ///
 /// A group id in the file can name another group once its run ends. So a
 /// run writes zero when it ends, on every path out, and the run that takes
@@ -681,7 +702,7 @@ impl Lock {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        lock.name(0)?;
+        lock.name(0, 0)?;
         Ok(lock)
     }
 
@@ -701,12 +722,22 @@ impl Lock {
         Ok(true)
     }
 
-    /// Kill the group that the file names.
+    /// Kill the group that the file names, when it is still that group.
+    ///
+    /// On Linux, the start time of the group leader must match the file, so
+    /// a group that reused the id lives on. Elsewhere the id alone counts.
     fn kill_holder(&self) {
         let mut text = String::new();
         let _ = (&self.0).read_to_string(&mut text);
-        let group = Group(text.trim().parse().ok());
-        group.kill();
+        let mut fields = text.split_whitespace();
+        let Some(id) = fields.next().and_then(|f| f.parse::<u32>().ok()) else {
+            return;
+        };
+        let start = fields.next().and_then(|f| f.parse::<u64>().ok());
+        if cfg!(target_os = "linux") && (start.is_none() || group_start(id) != start) {
+            return;
+        }
+        Group(i32::try_from(id).ok()).kill();
     }
 
     /// A copy of the locked file, for the stdin of the run.
@@ -717,13 +748,14 @@ impl Lock {
             .map_err(|e| format!("cannot share the trainer lock: {e}"))
     }
 
-    /// Write `group` into the file. Zero names no group.
-    fn name(&self, group: u32) -> Result<(), String> {
+    /// Write `group` and the start time of its leader into the file. Zero
+    /// names no group.
+    fn name(&self, group: u32, start: u64) -> Result<(), String> {
         use std::io::Write as _;
         let mut file = &self.0;
         file.set_len(0)
             .and_then(|()| file.seek(SeekFrom::Start(0)).map(drop))
-            .and_then(|()| writeln!(file, "{group}"))
+            .and_then(|()| writeln!(file, "{group} {start}"))
             .map_err(|e| format!("cannot write the trainer lock: {e}"))
     }
 }
@@ -731,8 +763,22 @@ impl Lock {
 impl Drop for Lock {
     /// The run has ended, so its group is dead. The file names no group.
     fn drop(&mut self) {
-        let _ = self.name(0);
+        let _ = self.name(0, 0);
     }
+}
+
+/// The start time of process `id`, in clock ticks after boot, when it leads
+/// its own process group. `None` off Linux, or when no such group lives.
+fn group_start(id: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{id}/stat")).ok()?;
+    // Field 2, the name, can hold spaces and parentheses. Count from its end.
+    let fields: Vec<&str> = stat
+        .get(stat.rfind(')')? + 1..)?
+        .split_whitespace()
+        .collect();
+    // `fields` starts at field 3. The group is field 5, the start time 22.
+    let group: u32 = fields.get(2)?.parse().ok()?;
+    (group == id).then(|| fields.get(19)?.parse().ok())?
 }
 
 /// The end of the log at `path`: at most `bytes` bytes and [`TAIL_LINES`]
@@ -999,7 +1045,8 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             .process_group(0)
             .spawn()
             .unwrap();
-        writeln!(&lock, "{}", orphan.id()).unwrap();
+        let start = group_start(orphan.id()).unwrap_or(0);
+        writeln!(&lock, "{} {start}", orphan.id()).unwrap();
         drop(lock);
 
         let spec = TrainerSpec::Command {
@@ -1029,7 +1076,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
         };
         run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
         let text = std::fs::read_to_string(dir.path().join(TRAINER_LOCK)).unwrap();
-        assert_eq!(text.trim(), "0");
+        assert_eq!(text.trim(), "0 0");
     }
 
     #[cfg(unix)]
@@ -1040,8 +1087,45 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
         std::fs::write(dir.path().join(TRAINER_LOCK), "424242\n").unwrap();
         let lock = Lock::take(dir.path()).await.unwrap();
         let text = std::fs::read_to_string(dir.path().join(TRAINER_LOCK)).unwrap();
-        assert_eq!(text.trim(), "0");
+        assert_eq!(text.trim(), "0 0");
         drop(lock);
+    }
+
+    /// The id in the lock file can name another group by now. The start time
+    /// tells them apart.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stale_lock_spares_a_group_that_reused_its_id() {
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut other = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let id = other.id();
+        let start = group_start(id).unwrap();
+        let path = dir.path().join(TRAINER_LOCK);
+        let open = || {
+            Lock(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .unwrap(),
+            )
+        };
+        // The file names the id with the start time of an earlier group.
+        std::fs::write(&path, format!("{id} {}\n", start + 1)).unwrap();
+        open().kill_holder();
+        assert!(other.try_wait().unwrap().is_none(), "the other group lives");
+        std::fs::write(&path, format!("{id} {start}\n")).unwrap();
+        open().kill_holder();
+        assert!(
+            !other.wait().unwrap().success(),
+            "the group of the run dies"
+        );
     }
 
     #[cfg(unix)]
@@ -1057,6 +1141,16 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             .unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
         assert!(!dir.path().join(RUN_LOG).is_symlink());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_runner_hides_its_memory_and_environment() {
+        hide_runner().unwrap();
+        assert_eq!(
+            rustix::process::dumpable_behavior().unwrap(),
+            rustix::process::DumpableBehavior::NotDumpable
+        );
     }
 
     #[test]
