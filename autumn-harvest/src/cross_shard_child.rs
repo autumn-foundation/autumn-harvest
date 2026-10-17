@@ -1449,7 +1449,11 @@ async fn start_child_on_target(
                     owner: spec.owner.as_deref(),
                     runbook_url: spec.runbook_url.as_deref(),
                     severity: spec.severity.as_deref(),
-                    context_headers: spec.context_headers.clone(),
+                    context_headers: spec
+                        .context_headers
+                        .as_ref()
+                        .map(|plain| codecs.encode_column(plain))
+                        .transpose()?,
                     schedule_id: None,
                     scheduled_for: None,
                     workflow_attempt: 1,

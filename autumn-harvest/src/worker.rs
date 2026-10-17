@@ -13131,7 +13131,14 @@ fn cross_shard_child_spec(
         input: input.clone(),
         queue_name: parent_execution.queue_name.clone(),
         assigned_build_id: parent_execution.assigned_build_id.clone(),
-        context_headers: parent_execution.context_headers.clone(),
+        // The spec is one encoded cell. It holds the headers in plaintext, so
+        // an old-key envelope cannot hide inside it from the rotation census.
+        // The relay encodes them again for the child row (issue #2043).
+        context_headers: parent_execution
+            .context_headers
+            .as_ref()
+            .map(|stored| registry.payload_codecs().decode_column(stored))
+            .transpose()?,
         tenant: parent_execution.tenant.clone(),
         owner: defaults.owner.map(str::to_string),
         runbook_url: defaults.runbook_url.map(str::to_string),

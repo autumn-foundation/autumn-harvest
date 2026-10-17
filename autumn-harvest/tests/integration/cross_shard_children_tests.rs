@@ -2415,6 +2415,7 @@ async fn a_fenced_child_sweep_abandons_its_pass_on_a_busy_target_pool() {
 // ── Column encoding of the outbox spec (issue #2043) ─────────────────────────
 
 const SPEC_SECRET: &str = "cc-spec-input-ssn-555";
+const SPEC_HEADER: &str = "cc-spec-header-tenant-5";
 
 /// An AES-256-GCM registry with column encoding on.
 fn aead_codecs() -> autumn_harvest::payload_codec::PayloadCodecs {
@@ -2434,7 +2435,7 @@ fn secret_spec() -> autumn_harvest::cross_shard_child::CrossShardChildSpec {
         input: json!({ "ssn": SPEC_SECRET }),
         queue_name: "default".to_string(),
         assigned_build_id: None,
-        context_headers: None,
+        context_headers: Some(json!({ "x-tenant": SPEC_HEADER })),
         owner: None,
         runbook_url: None,
         severity: None,
@@ -2490,8 +2491,8 @@ async fn an_encoded_spec_is_ciphertext_and_the_relay_starts_the_child_on_plainte
         "the spec is one envelope: {stored}"
     );
     assert!(
-        !stored.to_string().contains(SPEC_SECRET),
-        "the spec must not hold the input in clear"
+        !stored.to_string().contains(SPEC_SECRET) && !stored.to_string().contains(SPEC_HEADER),
+        "the spec must not hold the input or the headers in clear"
     );
 
     let started = std::time::Instant::now();
@@ -2525,6 +2526,23 @@ async fn an_encoded_spec_is_ciphertext_and_the_relay_starts_the_child_on_plainte
         codecs.decode_column(&input).expect("decode one layer"),
         json!({ "ssn": SPEC_SECRET }),
         "the child starts on the plaintext input"
+    );
+    let headers: Option<Value> = harvest_workflow_executions::table
+        .find(child_id.as_uuid())
+        .select(harvest_workflow_executions::context_headers)
+        .first(&mut *child_conn)
+        .await
+        .expect("child headers");
+    let headers = headers.expect("the child keeps the headers");
+    assert!(
+        autumn_harvest::payload_codec::is_codec_envelope(&headers)
+            && !headers.to_string().contains(SPEC_HEADER),
+        "the child row holds the headers as ciphertext: {headers}"
+    );
+    assert_eq!(
+        codecs.decode_column(&headers).expect("decode one layer"),
+        json!({ "x-tenant": SPEC_HEADER }),
+        "the child headers decode once, with no second layer"
     );
 }
 

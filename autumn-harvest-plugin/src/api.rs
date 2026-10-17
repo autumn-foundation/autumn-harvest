@@ -14025,6 +14025,12 @@ pub(crate) async fn build_awaitables_report(
             }
         }
 
+        // The headers decode with the same registry as the history. A cell
+        // that does not decode degrades the report the same way (issue #2043).
+        let decoded_headers = codecs.decode_headers_opt(execution.context_headers.as_ref());
+        if decoded_headers.is_err() {
+            decode_failed = true;
+        }
         if decode_failed {
             (
                 "history_only",
@@ -14042,14 +14048,7 @@ pub(crate) async fn build_awaitables_report(
             // threads (issues #772/#698/#481) so a deadline-aware /
             // parent-aware / identity-reading / header-branching workflow
             // replays cleanly instead of spuriously degrading.
-            let context_headers = execution
-                .context_headers
-                .as_ref()
-                .and_then(|v| {
-                    serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone())
-                        .ok()
-                })
-                .unwrap_or_default();
+            let context_headers = decoded_headers.unwrap_or_default();
             let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
                 exec_id,
                 events,
@@ -34965,10 +34964,9 @@ async fn replay_diagnosis(
     // configured) are not offload-inflated for the count, so the audit
     // conservatively counts inline-encrypted envelopes only — a rare-combo edge
     // that under-counts, never a leak.
-    let history = if let Some(codecs) =
-        read_path_decoder(&api_state, extension_session(maybe_session)).await
-    {
-        let history = store::load_history_inflated(&mut conn, exec_id, &codecs, offloader)
+    let decode_codecs = read_path_decoder(&api_state, extension_session(maybe_session)).await;
+    let history = if let Some(codecs) = decode_codecs.as_ref() {
+        let history = store::load_history_inflated(&mut conn, exec_id, codecs, offloader)
             .await
             .map_err(map_error)?;
         let mut outcome = LossyDecodeOutcome::default();
@@ -35060,9 +35058,22 @@ async fn replay_diagnosis(
     // exactly the values hydrate_ctx_for_query threads for the query path — so a
     // deadline-aware, parent-aware, or header-branching run replays cleanly instead
     // of surfacing FALSE non-determinism.
-    let context_headers = execution.context_headers.as_ref().and_then(|v| {
-        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
-    });
+    // The headers decode under the same gate as the history. A cell this
+    // caller may not decode makes the run undiagnosable. It never replays
+    // without its headers (issue #2043).
+    let context_headers = decode_codecs
+        .clone()
+        .unwrap_or_default()
+        .decode_headers_opt(execution.context_headers.as_ref())
+        .map(|headers| execution.context_headers.is_some().then_some(headers))
+        .map_err(|_| {
+            map_error(HarvestError::HistoryUnavailable {
+                exec_id,
+                reason: "payload decoding is required to diagnose this execution; \
+                         enable decode-on-read (admin)"
+                    .to_string(),
+            })
+        })?;
     let snapshot = autumn_harvest::testing::HistorySnapshot {
         workflow_name: execution.workflow_name.clone(),
         execution_id: exec_id,
@@ -43832,9 +43843,9 @@ fn export_history_for_execution(
     decoder: Option<&PayloadCodecs>,
     outcome: &mut LossyDecodeOutcome,
 ) -> Result<HistoryExportDocument, HistoryExportError> {
-    let context_headers = execution.context_headers.as_ref().and_then(|v| {
-        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
-    });
+    // A cell the caller may not decode stays out of the export (issue #2043).
+    let context_headers =
+        autumn_harvest::history_export::export_headers(execution.context_headers.as_ref(), decoder);
     export_history_decoded(
         HistoryExportRequest {
             workflow_name: execution.workflow_name.clone(),
@@ -43900,10 +43911,10 @@ fn export_history_for_candidate(
             // Issue #798: carry the execution's own ambient headers so a
             // header-branching workflow replays against what the live run saw
             // instead of an empty map (which would be a FALSE divergence).
-            context_headers: candidate.context_headers.as_ref().and_then(|value| {
-                serde_json::from_value::<std::collections::HashMap<String, String>>(value.clone())
-                    .ok()
-            }),
+            context_headers: autumn_harvest::history_export::export_headers(
+                candidate.context_headers.as_ref(),
+                decoder,
+            ),
             // Issue #772: carry the deadline-aware replay metadata (the batch
             // candidate query now SELECTs `execution_timeout`/`deadline_at`) so a
             // batch-exported deadline-aware history round-trips its continue-as-new
