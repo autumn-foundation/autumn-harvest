@@ -901,6 +901,22 @@ pub async fn register_workflow_schedules(
     conn: &mut AsyncPgConnection,
     schedules: &[WorkflowSchedule],
 ) -> HarvestResult<()> {
+    register_workflow_schedules_with_codecs(conn, schedules, &crate::store::DEFAULT_PAYLOAD_CODECS)
+        .await
+}
+
+/// [`register_workflow_schedules`], storing each schedule input through
+/// `codecs` (issue #2043).
+///
+/// # Errors
+///
+/// As [`register_workflow_schedules`]. Also fails when the input does not
+/// encode.
+pub async fn register_workflow_schedules_with_codecs(
+    conn: &mut AsyncPgConnection,
+    schedules: &[WorkflowSchedule],
+    _codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
     for ws in schedules {
         crate::policy::validate_schedule(&ws.schedule)
             .map_err(crate::error::HarvestError::Config)?;

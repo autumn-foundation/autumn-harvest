@@ -2615,3 +2615,175 @@ async fn an_undecodable_batch_row_moves_back_and_is_never_dropped_or_started() {
         "the batch must not start on ciphertext"
     );
 }
+
+// ── schedule input (issue #2043) ─────────────────────────────────────────────
+
+const SCHEDULE_SECRET: &str = "cc-schedule-input-ssn-777";
+
+fn wf_noop(_ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    Box::pin(async move { Ok(input) })
+}
+
+fn secret_schedule(name: &str) -> autumn_harvest::WorkflowSchedule {
+    let mut ws = autumn_harvest::WorkflowSchedule::new(
+        name,
+        autumn_harvest::Schedule::Interval(Duration::from_secs(3600)),
+    );
+    ws.input = json!({"ssn": SCHEDULE_SECRET});
+    ws
+}
+
+async fn schedule_cell(
+    conn: &mut AsyncPgConnection,
+    name: &str,
+) -> (Value, chrono::DateTime<chrono::Utc>) {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        value: Value,
+        #[diesel(sql_type = diesel::sql_types::Timestamptz)]
+        updated_at: chrono::DateTime<chrono::Utc>,
+    }
+    let row: Row = diesel::sql_query(
+        "SELECT workflow_input AS value, updated_at FROM harvest_schedules \
+         WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(name)
+    .get_result(conn)
+    .await
+    .expect("load the schedule row");
+    (row.value, row.updated_at)
+}
+
+#[tokio::test]
+async fn a_schedule_input_is_ciphertext_and_a_second_registration_writes_nothing() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let name = format!("cc_sched_{}", Uuid::new_v4().simple());
+    let ws = secret_schedule(&name);
+    autumn_harvest::register_workflow_schedules_with_codecs(&mut conn, &[ws.clone()], &codecs)
+        .await
+        .expect("register");
+    let (first, first_updated) = schedule_cell(&mut conn, &name).await;
+    assert_ciphertext(&first, SCHEDULE_SECRET, "schedules.workflow_input");
+
+    autumn_harvest::register_workflow_schedules_with_codecs(&mut conn, &[ws], &codecs)
+        .await
+        .expect("register again");
+    let (second, second_updated) = schedule_cell(&mut conn, &name).await;
+    assert_eq!(first, second, "a converged row keeps its envelope");
+    assert_eq!(
+        first_updated, second_updated,
+        "a converged row is not written"
+    );
+}
+
+#[tokio::test]
+async fn a_due_schedule_starts_its_run_on_the_plaintext_input() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let name = format!("cc_sched_fire_{}", Uuid::new_v4().simple());
+    // Leak the name: a workflow info holds a `&'static str`.
+    let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
+    let reg = registry(vec![wf_info(static_name, wf_noop, None)], vec![], &codecs);
+    let ws = secret_schedule(&name);
+    autumn_harvest::register_workflow_schedules_with_codecs(&mut conn, &[ws.clone()], &codecs)
+        .await
+        .expect("register");
+    diesel::sql_query(
+        "UPDATE harvest_schedules SET next_run_at = now() - interval '1 minute' \
+         WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&name)
+    .execute(&mut conn)
+    .await
+    .expect("make it due");
+
+    autumn_harvest::scheduler::tick_once(
+        build_pool(&url),
+        reg,
+        Arc::new(autumn_harvest::DagCatalog::new()),
+        Arc::new(vec![ws]),
+        autumn_harvest::SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("tick");
+
+    use autumn_harvest::schema::harvest_workflow_executions;
+    let input: Value = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::workflow_name.eq(&name))
+        .select(harvest_workflow_executions::input)
+        .first(&mut conn)
+        .await
+        .expect("the tick started a run");
+    assert_ciphertext(&input, SCHEDULE_SECRET, "the scheduled run input");
+    assert_eq!(
+        codecs.decode_column(&input).expect("decode one layer"),
+        json!({"ssn": SCHEDULE_SECRET}),
+        "the run starts on the plaintext input"
+    );
+    let (cell, _) = schedule_cell(&mut conn, &name).await;
+    assert_ciphertext(&cell, SCHEDULE_SECRET, "the tick keeps the stored envelope");
+}
+
+#[tokio::test]
+async fn a_schedule_input_that_cannot_decode_never_starts_a_run() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let name = format!("cc_sched_stuck_{}", Uuid::new_v4().simple());
+    let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
+    let keyless = reader_without_the_key();
+    let reg = registry(vec![wf_info(static_name, wf_noop, None)], vec![], &keyless);
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        &[secret_schedule(&name)],
+        &codecs,
+    )
+    .await
+    .expect("register");
+    diesel::sql_query(
+        "UPDATE harvest_schedules SET next_run_at = now() - interval '1 minute' \
+         WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&name)
+    .execute(&mut conn)
+    .await
+    .expect("make it due");
+
+    // No in-memory schedules: the tick fires the stored row as it is.
+    autumn_harvest::scheduler::tick_once(
+        build_pool(&url),
+        reg,
+        Arc::new(autumn_harvest::DagCatalog::new()),
+        Arc::new(vec![]),
+        autumn_harvest::SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("a bad row never fails the tick");
+
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
+             WHERE workflow_name = $1",
+            &name,
+        )
+        .await,
+        0,
+        "no run starts on ciphertext"
+    );
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_schedules \
+             WHERE workflow_name = $1 AND next_run_at <= now()",
+            &name,
+        )
+        .await,
+        1,
+        "the slot stays due, so a restored key fires it"
+    );
+}
