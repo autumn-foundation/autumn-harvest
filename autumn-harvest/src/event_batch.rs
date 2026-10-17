@@ -264,6 +264,7 @@ pub async fn admit_batched_start_with_codecs(
             // An admission that only appends needs no key (issue #2043). A flush
             // that does not decode stays buffered, and the scanner then moves
             // the row back.
+            let mut effective_fire_at = row.fire_at;
             let flush_inputs = if row.current_size >= row.max_size {
                 let decoded = crate::debounce::decode_stored_start_options(
                     codecs,
@@ -287,12 +288,9 @@ pub async fn admit_batched_start_with_codecs(
                         );
                         // The row keeps its elements. A short deadline lets the
                         // scanner retry once the key returns.
-                        pull_in_event_batch_row(
-                            conn,
-                            row.id,
-                            Utc::now() + UNDECODABLE_REDEFER_BACKOFF,
-                        )
-                        .await?;
+                        let retry_at = Utc::now() + UNDECODABLE_REDEFER_BACKOFF;
+                        pull_in_event_batch_row(conn, row.id, retry_at).await?;
+                        effective_fire_at = effective_fire_at.min(retry_at);
                         None
                     }
                 }
@@ -429,7 +427,7 @@ pub async fn admit_batched_start_with_codecs(
                 BatchAdmitOutcome {
                     batch_key,
                     workflow_id: row.workflow_id,
-                    fire_at: row.fire_at,
+                    fire_at: effective_fire_at,
                     pending_count: row.current_size,
                     max_size: row.max_size.cast_unsigned() as usize,
                     is_flushed,
