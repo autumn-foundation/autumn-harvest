@@ -29,7 +29,7 @@ the reverse brainstorm).
 - `should_continue_as_new()` compares the size of the loaded history with the
   threshold. The loaded size grows from task to task. Before issue #2080, a
   replay in a loop could answer `true` at an earlier iteration than the live
-  run did. The engine now records a `true` answer.
+  run did. The engine now records each answer.
 - A side effect records its value once. Replay returns the recorded value.
 - The SQLite backend has no continue-as-new and no queries.
 

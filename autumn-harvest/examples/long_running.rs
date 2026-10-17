@@ -63,7 +63,7 @@ pub async fn poll_customer_exports(ctx: &WorkflowContext, state: Value) -> Harve
             "cursor": page.get("next_cursor").cloned().unwrap_or(Value::Null),
         });
 
-        // The engine records a `true` answer, so a replay is stable.
+        // The engine records each answer, so a replay is stable.
         if ctx.should_continue_as_new() {
             ctx.continue_as_new(next_state).await?;
             unreachable!("continue_as_new does not resolve while the execution is active");

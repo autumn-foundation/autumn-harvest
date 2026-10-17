@@ -20,7 +20,7 @@ follow-up plan for the checkpoint budget and the error bound (issue #2049) is
   - `should_continue_as_new()` reads the size of the loaded history. That
     size grows from task to task. Before issue #2080, a replay in a loop could
     answer `true` at an earlier iteration than the live run did, and the replay
-    then diverged. The engine now records a `true` answer.
+    then diverged. The engine now records each answer.
 - Issue #1964 ranks keyed state P1. Issue #1965 ranks it 13, behind customer
   pull.
 

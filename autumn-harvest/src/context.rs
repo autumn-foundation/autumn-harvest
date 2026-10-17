@@ -4810,7 +4810,7 @@ impl WorkflowContext {
     ///
     /// 1. **History size** — [`Self::history_event_count`] exceeds the configured
     ///    soft continue-as-new threshold. The engine reads the count only at the
-    ///    live frontier. It records a `true` answer (issue #2080).
+    ///    live frontier. It records the answer (issue #2080).
     /// 2. **Deadline fraction** (issue #772) — the run has consumed at least
     ///    [`WorkflowHistoryPolicy::continue_as_new_deadline_fraction`] of its
     ///    `execution_timeout` budget. This lets a **long-lived, low-event**
@@ -4831,10 +4831,10 @@ impl WorkflowContext {
     /// ## Replay determinism
     ///
     /// The loaded event count grows from task to task. The history-size
-    /// trigger therefore never reads it on replay. A live `true` answer is
-    /// recorded as a side effect, and a replay reads it back. Where history
-    /// continues with no record, the replay answers `false`. A loop that calls
-    /// this method once per iteration replays clean under any threshold.
+    /// trigger therefore never reads it on replay. Each live call records its
+    /// answer as a side effect, and a replay reads it back at the same
+    /// position. A loop that calls this method once per iteration replays
+    /// clean under any threshold.
     ///
     /// A history from before issue #2080 has no record. A checkpoint event at
     /// the cursor reads as `true`. Any other event reads as `false`.
@@ -4870,25 +4870,37 @@ impl WorkflowContext {
     ///
     /// The loaded event count grows from task to task, so a replay cannot
     /// rederive a live answer from it. At the live frontier this reads the
-    /// count and records a `true` answer as a side effect. A replay reads that
-    /// record, or reads `false` where history continues without one.
+    /// count and records the answer as a side effect. A replay reads that
+    /// record at the same position.
     fn history_size_trigger(&self) -> bool {
         match self.match_history(HistoryMatcher::match_continue_as_new_decision) {
             crate::replay::ContinueAsNewMatch::True => true,
             crate::replay::ContinueAsNewMatch::False => false,
             crate::replay::ContinueAsNewMatch::Frontier => {
-                let due =
-                    self.history_event_count() > self.history_policy.continue_as_new_threshold();
-                if due {
-                    self.push_command(WorkflowCommand::RecordSideEffect {
-                        kind: crate::event::SideEffectKind::Custom,
-                        name: Some(crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME.to_string()),
-                        value: serde_json::Value::Bool(true),
-                    });
-                }
+                let due = self.history_size_exceeded();
+                self.push_command(WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Custom,
+                    name: Some(crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME.to_string()),
+                    value: serde_json::Value::Bool(due),
+                });
                 due
             }
         }
+    }
+
+    fn history_size_exceeded(&self) -> bool {
+        self.history_event_count() > self.history_policy.continue_as_new_threshold()
+    }
+
+    /// Like [`should_continue_as_new`](Self::should_continue_as_new), but it
+    /// records no history-size decision. A replay can read a different answer.
+    /// Use it only when the caller records its own decision, as the entity
+    /// loop does. The deadline clock read still happens, so a replay consumes
+    /// the same events.
+    pub(crate) fn continue_as_new_hint(&self) -> bool {
+        let by_events = self.history_size_exceeded();
+        let by_deadline = self.deadline_fraction_reached();
+        by_events || by_deadline
     }
 
     /// Returns `true` when the run has consumed at least the configured fraction
@@ -18637,6 +18649,51 @@ mod tests {
     }
 
     #[test]
+    fn should_continue_as_new_keeps_false_positions_apart_across_signals() {
+        // A signal-driven loop calls the method between signals, with no other
+        // command in between. Each call owns its own decision (issue #2080).
+        let signal = |n: i64| WorkflowEvent::SignalReceived {
+            signal_name: "op".into(),
+            payload: serde_json::json!(n),
+        };
+        let ctx = deadline_ctx_with_policy(
+            Utc::now(),
+            vec![
+                continue_decision(false),
+                signal(1),
+                continue_decision(false),
+                signal(2),
+                continue_decision(true),
+            ],
+            None,
+            WorkflowHistoryPolicy::default(),
+        );
+        assert!(!ctx.should_continue_as_new());
+        assert!(!ctx.should_continue_as_new());
+        assert!(ctx.should_continue_as_new());
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn should_continue_as_new_records_a_live_false_decision() {
+        let ctx = WorkflowContext::new_test();
+        assert!(!ctx.should_continue_as_new());
+        let cmds = ctx.drain_commands();
+        assert!(
+            matches!(
+                cmds.as_slice(),
+                [WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Custom,
+                    name: Some(name),
+                    value,
+                }] if name == crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME
+                    && value == &serde_json::json!(false)
+            ),
+            "a live false decision records one side effect, got {cmds:?}"
+        );
+    }
+
+    #[test]
     fn should_continue_as_new_reads_a_recorded_false_as_false() {
         let ctx = deadline_ctx_with_policy(
             Utc::now(),
@@ -18645,6 +18702,7 @@ mod tests {
             WorkflowHistoryPolicy::default(),
         );
         assert!(!ctx.should_continue_as_new());
+        assert_eq!(ctx.side_effect("next", || 0).unwrap(), 7);
     }
 
     #[test]
@@ -19120,14 +19178,21 @@ mod tests {
     }
 
     #[test]
-    fn should_continue_as_new_no_timeout_records_no_event_and_is_false() {
-        // AC4: a workflow with NO execution_timeout behaves exactly as today
-        // and records ZERO new side-effect events.
+    fn should_continue_as_new_no_timeout_records_no_deadline_event() {
+        // A workflow with no execution_timeout records no deadline clock read.
+        // It records only the history-size decision.
         let ctx = WorkflowContext::new_test();
         assert!(!ctx.should_continue_as_new());
+        let cmds = ctx.drain_commands();
         assert!(
-            ctx.drain_commands().is_empty(),
-            "should_continue_as_new must not record a side-effect when there is no deadline"
+            cmds.iter().all(|c| !matches!(
+                c,
+                WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Now,
+                    ..
+                }
+            )),
+            "no deadline clock read without a deadline, got {cmds:?}"
         );
     }
 
@@ -19335,14 +19400,27 @@ mod tests {
             "a run past its deadline must trip the deadline branch"
         );
         let cmds = ctx.drain_commands();
+        // The history-size decision comes first, then the deadline clock read.
         assert_eq!(
             cmds.len(),
-            1,
-            "the frontier read must record exactly one command, got {cmds:?}"
+            2,
+            "the frontier read must record the decision and one clock read, got {cmds:?}"
         );
         assert!(
             matches!(
                 &cmds[0],
+                WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::Custom,
+                    name: Some(name),
+                    ..
+                } if name == crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME
+            ),
+            "the first command must be the decision, got {:?}",
+            cmds[0]
+        );
+        assert!(
+            matches!(
+                &cmds[1],
                 WorkflowCommand::RecordSideEffect {
                     kind: crate::event::SideEffectKind::Now,
                     name: Some(name),
@@ -19350,7 +19428,7 @@ mod tests {
                 } if name == crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME
             ),
             "the recorded command must be a sentinel-named Now side-effect, got {:?}",
-            cmds[0]
+            cmds[1]
         );
     }
 

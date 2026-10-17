@@ -509,7 +509,7 @@ fn checkpoint_due(
         return Ok(true);
     }
     let policy = ctx.history_policy();
-    let by_engine = ctx.should_continue_as_new();
+    let by_engine = ctx.continue_as_new_hint();
     let events = ctx.history_event_count();
     let by_events = events.saturating_add(run.ops) > policy.continue_as_new_threshold();
     let by_bytes = match policy.byte_hard_cap() {

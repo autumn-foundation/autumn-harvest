@@ -1159,7 +1159,7 @@ reason = "context.rs:7041; calls `push_command` directly. Every argument is reco
 [[sink]]
 path = "should_continue_as_new"
 receiver = "WorkflowContext"
-reason = "context.rs:4361 -> `deadline_fraction_reached` (4382) -> `deadline_clock_read` (4478), which pushes `RecordSideEffect{Now, DEADLINE_PROBE}` at the live frontier. A live `true` history-size answer also pushes `RecordSideEffect{Custom, __harvest_continue_as_new}`. DUAL ROLE (see `[[sanctioned]]`): the doc at context.rs:4335-4360 states the replay-safety contract (\"when this returns true the workflow must call continue_as_new\")."
+reason = "context.rs:4361 -> `deadline_fraction_reached` (4382) -> `deadline_clock_read` (4478), which pushes `RecordSideEffect{Now, DEADLINE_PROBE}` at the live frontier. Each live call also pushes `RecordSideEffect{Custom, __harvest_continue_as_new}`. DUAL ROLE (see `[[sanctioned]]`): the doc at context.rs:4335-4360 states the replay-safety contract (\"when this returns true the workflow must call continue_as_new\")."
 [[sink]]
 path = "side_effect"
 receiver = "WorkflowContext"
