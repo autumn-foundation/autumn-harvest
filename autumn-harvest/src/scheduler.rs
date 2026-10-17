@@ -784,9 +784,10 @@ async fn register_one_dag_schedule(
 async fn register_one_workflow_schedule_locked(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<RegistrationOutcome> {
     crate::policy::validate_schedule(&ws.schedule).map_err(crate::error::HarvestError::Config)?;
-    if workflow_registration_is_converged(conn, ws).await? {
+    if workflow_registration_is_converged(conn, ws, codecs).await? {
         return Ok(RegistrationOutcome::Settled);
     }
     // See `register_one_dag_schedule` for why the isolation level is pinned.
@@ -795,7 +796,7 @@ async fn register_one_workflow_schedule_locked(
         if !try_take_registration_lock(c).await? {
             return Ok(RegistrationOutcome::Skipped);
         }
-        upsert_workflow_schedule(c, ws).await?;
+        upsert_workflow_schedule(c, ws, codecs).await?;
         Ok(RegistrationOutcome::Settled)
     }))
     .await
@@ -848,6 +849,7 @@ async fn dag_registration_is_converged(
 async fn workflow_registration_is_converged(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_schedules::dsl;
 
@@ -885,7 +887,7 @@ async fn workflow_registration_is_converged(
     }
 
     Ok(workflow_schedule_row_is_converged(
-        &existing,
+        &schedule_row_with_plain_input(&existing, codecs),
         ws,
         Utc::now(),
     ))
@@ -915,12 +917,12 @@ pub async fn register_workflow_schedules(
 pub async fn register_workflow_schedules_with_codecs(
     conn: &mut AsyncPgConnection,
     schedules: &[WorkflowSchedule],
-    _codecs: &crate::payload_codec::PayloadCodecs,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
     for ws in schedules {
         crate::policy::validate_schedule(&ws.schedule)
             .map_err(crate::error::HarvestError::Config)?;
-        upsert_workflow_schedule(conn, ws).await?;
+        upsert_workflow_schedule(conn, ws, codecs).await?;
     }
     Ok(())
 }
@@ -967,6 +969,32 @@ pub async fn register_workflow_schedules_for_shard(
     shard: ShardId,
     backoff: &ScheduleRegistrationBackoff,
 ) -> HarvestResult<ShardFiringDecision> {
+    register_workflow_schedules_for_shard_with_codecs(
+        conn,
+        schedules,
+        router,
+        shard,
+        backoff,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`register_workflow_schedules_for_shard`], storing each input through
+/// `codecs` (issue #2043).
+///
+/// # Errors
+///
+/// As [`register_workflow_schedules_for_shard`].
+#[doc(hidden)]
+pub async fn register_workflow_schedules_for_shard_with_codecs(
+    conn: &mut AsyncPgConnection,
+    schedules: &[WorkflowSchedule],
+    router: &ShardRouter,
+    shard: ShardId,
+    backoff: &ScheduleRegistrationBackoff,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<ShardFiringDecision> {
     let now = Utc::now();
     let mut decision = ShardFiringDecision::Allowed;
     for ws in schedules {
@@ -982,7 +1010,7 @@ pub async fn register_workflow_schedules_for_shard(
             // costs a missed fire on the owning shard, never a duplicate — the
             // row's previous owner still collects its stale copy — so it is
             // backed off and the pass keeps going.
-            let outcome = register_one_workflow_schedule_locked(conn, ws).await;
+            let outcome = register_one_workflow_schedule_locked(conn, ws, codecs).await;
             record_registration_outcome(
                 backoff,
                 &key,
@@ -1440,12 +1468,13 @@ pub async fn tick_once_sharded_with_backoff(
             // fleet-wide registration lock, and a per-schedule failure is collected
             // and backed off rather than aborting the rest of the pass.
             register_schedules_for_shard(&mut conn, dags.as_ref(), &router, shard, backoff).await?;
-            let firing = register_workflow_schedules_for_shard(
+            let firing = register_workflow_schedules_for_shard_with_codecs(
                 &mut conn,
                 workflow_schedules.as_ref(),
                 &router,
                 shard,
                 backoff,
+                registry.payload_codecs(),
             )
             .await?;
 
@@ -2554,19 +2583,55 @@ fn dag_schedule_row_is_converged(
 }
 
 #[allow(clippy::too_many_lines)]
+/// A copy of `ws` whose input is ready to store (issue #2043).
+///
+/// Every write of `harvest_schedules.workflow_input` goes through this copy.
+fn schedule_for_storage(
+    ws: &WorkflowSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<WorkflowSchedule> {
+    let mut stored = ws.clone();
+    stored.input = codecs.encode_column(&ws.input)?;
+    Ok(stored)
+}
+
+/// A copy of `row` whose input is plaintext, for the convergence probe
+/// (issue #2043).
+///
+/// Each encode makes a new nonce, so the probe cannot compare stored bytes.
+/// An input that does not decode becomes `None`. The row then reads as drifted,
+/// and registration writes it again.
+fn schedule_row_with_plain_input(
+    row: &HarvestSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestSchedule {
+    let mut plain = row.clone();
+    plain.workflow_input = row
+        .workflow_input
+        .as_ref()
+        .and_then(|stored| codecs.decode_column(stored).ok());
+    plain
+}
+
 async fn upsert_workflow_schedule(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<HarvestSchedule> {
     let expr = schedule_expr(Some(&ws.schedule));
-    let existing = find_or_insert_workflow_schedule(conn, ws, expr.as_deref()).await?;
+    let stored_ws = schedule_for_storage(ws, codecs)?;
+    let existing = find_or_insert_workflow_schedule(conn, &stored_ws, expr.as_deref()).await?;
     // Issue #1157, defect 3: a row that already says exactly what registration
     // would write needs no write. This also covers the public/API entry points
     // (`register_workflow_schedules`), not just the tick.
-    if workflow_schedule_row_is_converged(&existing, ws, Utc::now()) {
+    if workflow_schedule_row_is_converged(
+        &schedule_row_with_plain_input(&existing, codecs),
+        ws,
+        Utc::now(),
+    ) {
         return Ok(existing);
     }
-    match apply_workflow_schedule_update(conn, ws, &existing, false).await? {
+    match apply_workflow_schedule_update(conn, &stored_ws, &existing, false).await? {
         AppliedScheduleUpdate::Updated(row) => Ok(*row),
         // Unreachable: the unguarded (guard_live_fire_claim = false) path never
         // skips. Kept as an error rather than a panic for defensive robustness.
@@ -3059,8 +3124,35 @@ pub async fn update_workflow_schedule(
     schedule_id: uuid::Uuid,
     patch: &WorkflowSchedulePatch,
 ) -> HarvestResult<ScheduleUpdateOutcome> {
+    update_workflow_schedule_with_codecs(
+        conn,
+        schedule_id,
+        patch,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`update_workflow_schedule`], storing a patched input through `codecs`
+/// (issue #2043).
+///
+/// An input the patch leaves out keeps its stored form.
+///
+/// # Errors
+///
+/// As [`update_workflow_schedule`]. Also fails when the new input does not
+/// encode.
+pub async fn update_workflow_schedule_with_codecs(
+    conn: &mut AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    patch: &WorkflowSchedulePatch,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<ScheduleUpdateOutcome> {
     use crate::schema::harvest_schedules::dsl;
     use diesel_async::AsyncConnection;
+
+    let mut patch = patch.clone();
+    patch.input = codecs.encode_column_opt(patch.input.as_ref())?;
 
     Box::pin(conn.transaction(async |conn| {
         // FOR UPDATE: serialize this PATCH against a concurrent scheduler
@@ -4658,10 +4750,12 @@ async fn tick_one_workflow_schedule(
         // duplication stays.
         let workflow_id = scheduled_workflow_id(schedule.id, wf_name, *original_slot);
         let exec_id = scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
-        let input = schedule
-            .workflow_input
-            .clone()
-            .unwrap_or(serde_json::Value::Null);
+        // A stored input that does not decode never starts a run. The error
+        // leaves the slot unclaimed, so the next tick retries it (issue #2043).
+        let input = match schedule.workflow_input.as_ref() {
+            Some(stored) => registry.payload_codecs().decode_column(stored)?,
+            None => serde_json::Value::Null,
+        };
         let wf_info = registry.workflows.get(wf_name);
         let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
             wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
@@ -6704,10 +6798,12 @@ async fn drain_claimed_buffered_schedule(
         // `tick_one_workflow_schedule`.
         let workflow_id = scheduled_workflow_id(schedule.id, wf_name, scheduled_for);
         let exec_id = scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
-        let input = schedule
-            .workflow_input
-            .clone()
-            .unwrap_or(serde_json::Value::Null);
+        // A stored input that does not decode never starts a run. The error
+        // leaves the slot unclaimed, so the next tick retries it (issue #2043).
+        let input = match schedule.workflow_input.as_ref() {
+            Some(stored) => registry.payload_codecs().decode_column(stored)?,
+            None => serde_json::Value::Null,
+        };
         let wf_info = registry.workflows.get(wf_name);
         let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
             wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
