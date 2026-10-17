@@ -858,6 +858,61 @@ async fn activation_copies_no_stream_chunks_over_an_erased_target() {
     );
 }
 
+/// Issue #2128: an erasure that holds the target row lock when activation
+/// starts must win. Activation waits for the lock, reads the erased input,
+/// and copies nothing.
+#[tokio::test]
+async fn activation_waits_for_an_erasure_holding_the_target_row() {
+    let shards = setup_two_shards().await;
+    let (exec_id, mut source, mut target) =
+        terminated_target_with_late_chunk(&shards, "entity-stream-erasure-race").await;
+    let mut eraser = shards.target().await;
+    diesel::sql_query("BEGIN")
+        .execute(&mut eraser)
+        .await
+        .expect("begin the erasure");
+    diesel::sql_query("SELECT id FROM harvest_workflow_executions WHERE id = $1 FOR UPDATE")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .execute(&mut eraser)
+        .await
+        .expect("lock the target row");
+
+    let activation = tokio::spawn(async move {
+        activate_target(&mut source, &mut target, exec_id)
+            .await
+            .expect("activation after the erasure");
+        target
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !activation.is_finished(),
+        "activation must wait for the lock"
+    );
+
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions \
+            SET input = '{\"_harvest_erased\": true}'::jsonb WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(&mut eraser)
+    .await
+    .expect("tombstone the input");
+    diesel::sql_query("COMMIT")
+        .execute(&mut eraser)
+        .await
+        .expect("commit the erasure");
+
+    let mut target = activation.await.expect("activation task");
+    assert_eq!(
+        store::load_stream_chunks(&mut target, exec_id, None, 100)
+            .await
+            .expect("target chunks")
+            .len(),
+        0,
+        "activation must not restore chunks after a concurrent erasure"
+    );
+}
+
 /// Issue #1317 review, P1: a retained terminal copy of an UNRELATED
 /// execution can already occupy the target's active-uniqueness slot for
 /// this business key. Reconciliation lets a fresh run start on the shard a

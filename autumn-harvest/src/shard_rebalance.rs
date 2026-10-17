@@ -2957,8 +2957,8 @@ mod db {
         activate_target_inner(source, target, exec_id, Some(settle)).await
     }
 
-    #[allow(clippy::too_many_lines)] // One target transaction, gated as a
-    // whole on `activated > 0`: splitting it would scatter that gate.
+    #[allow(clippy::too_many_lines)] // One target transaction. The task and
+    // signal steps need `activated > 0`: splitting it would scatter that gate.
     async fn activate_target_inner(
         source: &mut AsyncPgConnection,
         target: &mut AsyncPgConnection,
@@ -3064,12 +3064,15 @@ mod db {
                 // Late chunks are not gated on `activated` (issue #2128). An
                 // operator can terminate the staged copy before activation.
                 // A terminated copy is not erased, and its durable stream
-                // reader must still see every chunk. The row lock waits for
-                // an erasure in flight. The check then reads the committed
-                // input, so activation never restores erased output.
+                // reader must still see every chunk. Erasure locks the same
+                // row (`load_erase_gate_row`), so this lock waits for an
+                // erasure in flight. The check then reads the committed
+                // input, so activation never restores erased output. A
+                // missing row, or a `MIGRATED` seal that an aborted
+                // migration restored, gets no copy.
                 let target_input: Option<TargetInputRow> = diesel::sql_query(
                     "SELECT input FROM harvest_workflow_executions \
-                      WHERE id = $1 FOR UPDATE",
+                      WHERE id = $1 AND state <> 'MIGRATED' FOR UPDATE",
                 )
                 .bind::<SqlUuid, _>(exec_id.as_uuid())
                 .get_result(&mut *conn)
@@ -3081,8 +3084,8 @@ mod db {
                     insert_stream_chunk_pages(&mut *conn, &late_chunk_pages).await?;
                 }
 
-                // Gated on `activated > 0` (issue #1596 review, finding
-                // 1). Termination is an operator override with no
+                // The task restore and signal re-pend below are gated on
+                // `activated > 0` (issue #1596 review, finding 1). Termination is an operator override with no
                 // state-precondition filter. It can seal this copy
                 // `TERMINATED` before activation ever runs. The update
                 // above then matches zero rows against an
