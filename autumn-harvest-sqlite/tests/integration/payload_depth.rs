@@ -156,26 +156,32 @@ async fn signal_with_start_rejects_both_payloads_and_stores_nothing() {
     rt.run_until_idle().await.unwrap();
 }
 
+/// Far past the cap, yet shallow enough that the caller can drop the value.
+/// Dropping a `Value` recurses, so a much deeper one overflows on macOS.
+const FAR_PAST_THE_CAP: usize = 1_000;
+
 #[test]
-fn a_very_deep_value_is_rejected_without_overflowing_the_stack() {
+fn a_value_far_past_the_cap_is_rejected() {
     let mut rt = runtime();
-    // Deep enough that a recursive walk would overflow the call stack.
-    let deep = nested(10_000);
+    let deep = nested(FAR_PAST_THE_CAP);
     let err = rt.start_workflow("echo_input", deep).unwrap_err();
     assert_too_deep(&err, "workflow_input");
 }
 
 #[tokio::test]
-async fn a_very_deep_promise_signal_is_rejected_without_overflowing_the_stack() {
+async fn a_deep_promise_signal_is_rejected_as_too_deep() {
     let mut rt = runtime();
     let exec = rt.start_workflow("echo_signal", json!(0)).unwrap();
     rt.run_until_idle().await.unwrap();
-    // Promise signals are decoded before the generic payload checks run.
+    // Promise signals are decoded before the generic payload checks run. A
+    // wrong order reports an invalid settlement and not a depth error.
     let name = format!(
         "{}x",
         autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX
     );
-    let err = rt.send_signal(exec, &name, nested(10_000)).unwrap_err();
+    let err = rt
+        .send_signal(exec, &name, nested(FAR_PAST_THE_CAP))
+        .unwrap_err();
     assert_too_deep(&err, "signal_payload");
 }
 

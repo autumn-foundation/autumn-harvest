@@ -5323,10 +5323,11 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        command_name, persist_scheduled_activity, persist_started_timer,
-        unsupported_activity_feature,
+        MAX_PAYLOAD_DEPTH, check_depth, command_name, persist_scheduled_activity,
+        persist_started_timer, unsupported_activity_feature,
     };
-    use crate::{queue, schema, store};
+    use crate::{SqliteError, queue, schema, store};
+    use serde_json::Value;
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -5662,6 +5663,34 @@ mod tests {
 
         assert!(store::load_history(&conn, exec).unwrap().is_empty());
         assert!(!queue::has_unfired_timer(&conn, exec).unwrap());
+    }
+
+    /// A value of `depth` nested one-element arrays.
+    fn nested(depth: usize) -> Value {
+        let mut value = Value::Null;
+        for _ in 0..depth {
+            value = Value::Array(vec![value]);
+        }
+        value
+    }
+
+    /// Take a nested value apart from the inside out. A plain drop recurses.
+    fn tear_down(mut value: Value) {
+        while let Value::Array(mut items) = value {
+            value = items.pop().unwrap_or(Value::Null);
+        }
+    }
+
+    #[test]
+    fn check_depth_walks_a_huge_value_without_recursion() {
+        // A recursive walk overflows the call stack long before this depth.
+        let deep = nested(100_000);
+        let err = check_depth("memo", &deep).unwrap_err();
+        assert!(matches!(
+            err,
+            SqliteError::PayloadTooDeep { kind: "memo", cap_depth } if cap_depth == MAX_PAYLOAD_DEPTH
+        ));
+        tear_down(deep);
     }
 }
 
