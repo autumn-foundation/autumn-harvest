@@ -3697,7 +3697,7 @@ async fn a_flush_that_cannot_decode_gets_a_short_deadline_and_keeps_its_elements
     let mut second = batch_params(&name, &key, "cc-hdr-late-2", json!({"n": 2}), 2);
     second.max_wait = Duration::from_secs(3600);
     second.start_options = header_start_options();
-    let outcome = admit_batched_start_with_codecs(&mut conn, second, None, &codecs)
+    let (outcome, _deferred) = admit_batched_start_with_codecs(&mut conn, second, None, &codecs)
         .await
         .expect("an admission never fails on a flush it cannot decode")
         .expect("admitted");
