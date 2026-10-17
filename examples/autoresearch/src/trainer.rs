@@ -698,15 +698,7 @@ impl Lock {
     const WAIT: Duration = Duration::from_secs(10);
 
     async fn take(state: &Path) -> Result<Self, String> {
-        let path = state.join(TRAINER_LOCK);
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        let lock = Self(file);
+        let lock = Self(Self::open(&state.join(TRAINER_LOCK))?);
         let deadline = tokio::time::Instant::now() + Self::WAIT;
         let mut killed = false;
         while !lock.try_lock()? {
@@ -721,6 +713,35 @@ impl Lock {
         }
         lock.name(0, 0)?;
         Ok(lock)
+    }
+
+    /// Open the lock file, and make it when it is missing. It must be a
+    /// regular file. A run can plant a link there, and the runner must not
+    /// write the group to its target. A pipe must not hang the runner.
+    fn open(path: &Path) -> Result<std::fs::File, String> {
+        #[cfg(unix)]
+        let opened = {
+            use rustix::fs::{Mode, OFlags};
+            rustix::fs::open(
+                path,
+                OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .map(std::fs::File::from)
+            .map_err(std::io::Error::from)
+        };
+        #[cfg(not(unix))]
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path);
+        let file = opened.map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        match file.metadata() {
+            Ok(meta) if meta.is_file() => Ok(file),
+            _ => Err(format!("{} is not a regular file", path.display())),
+        }
     }
 
     #[cfg(unix)]
@@ -1162,6 +1183,31 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
         let text = std::fs::read_to_string(dir.path().join(TRAINER_LOCK)).unwrap();
         assert_eq!(text.trim(), "0 0");
         drop(lock);
+    }
+
+    /// A run can plant a link or a pipe at the lock file. The next run must
+    /// not write the group to the target of a link, or hang on a pipe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_planted_link_or_pipe_at_the_lock_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(TRAINER_LOCK);
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep me").unwrap();
+        std::os::unix::fs::symlink(&victim, &lock).unwrap();
+        assert!(Lock::take(dir.path()).await.is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        std::fs::remove_file(&lock).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &lock,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        let taken = tokio::time::timeout(Duration::from_secs(5), Lock::take(dir.path())).await;
+        assert!(taken.expect("no hang").is_err());
     }
 
     /// The id in the lock file can name another group by now. The start time

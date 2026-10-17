@@ -244,6 +244,21 @@ mod tests {
         assert!(dir.path().join("inbox/rejected/0000-bad.json").is_file());
     }
 
+    /// A run can plant a link in the inbox. A command must come from a file
+    /// in the inbox, so the link is set aside.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_link_is_set_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = Inbox::new(dir.path()).unwrap();
+        let outside = dir.path().join("outside.json");
+        std::fs::write(&outside, serde_json::to_vec(&hint("planted")).unwrap()).unwrap();
+        let link = dir.path().join("inbox").join("0000-link.json");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert_eq!(inbox.pending().unwrap(), Vec::new());
+        assert!(!link.exists(), "the link is set aside");
+    }
+
     #[test]
     fn a_token_splits_at_the_first_slash() {
         let token = token("0192-abc", "tool_approval:0:1:call/x");

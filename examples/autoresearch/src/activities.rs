@@ -34,6 +34,8 @@ pub const BAD_TAG: &str = "BadTag";
 pub const DIRTY_TREE: &str = "DirtyTree";
 /// The error type of a tag whose branch another session started.
 pub const TAG_USED: &str = "TagUsed";
+/// The error type of a lab path that is not canonical.
+pub const LAB_PATH: &str = "LabPath";
 /// The directory in the state directory with one finished run per train call.
 const RUNS: &str = "runs";
 
@@ -139,6 +141,7 @@ pub struct RecordInput {
 /// - [`BAD_TAG`]: the tag cannot name a branch.
 /// - [`DIRTY_TREE`]: `train.py` has a change that no commit holds.
 /// - [`TAG_USED`]: another session started the branch of the tag.
+/// - [`LAB_PATH`]: the lab path is not canonical.
 ///
 /// The activity idempotency key marks the start commit of the branch, so a
 /// retry finds its own branch.
@@ -153,6 +156,18 @@ pub async fn setup(ctx: &ActivityContext, input: SetupInput) -> Result<SetupRepo
 
 fn setup_lab(input: &SetupInput, key: &str) -> Result<SetupReport, String> {
     let lab = Lab::open(&input.lab)?;
+    // The lab mutex and the agent runs find the lab by its canonical path.
+    // Another path for the same lab would get its own mutex.
+    if lab.root().to_str() != Some(input.lab.as_str()) {
+        return Err(fatal(
+            LAB_PATH,
+            format!(
+                "the lab {} is not a canonical path. Start the session with {}",
+                input.lab,
+                lab.root().display()
+            ),
+        ));
+    }
     if let Some(dir) = &input.data_dir
         && !Path::new(dir).is_dir()
     {
@@ -412,9 +427,13 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
         crate::trainer::reap(&state).await?;
         let (back, branch, commit) = (lab.clone(), input.branch.clone(), input.commit.clone());
         blocking(move || {
-            back.keep_changes(&format!(
-                "autoresearch: the lab before a resume of {branch}"
-            ))?;
+            // The stash is only a backup. Git cannot stash some states, such
+            // as an unborn branch or a conflicted index, and the lab must
+            // still go back.
+            let message = format!("autoresearch: the lab before a resume of {branch}");
+            if let Err(error) = back.keep_changes(&message) {
+                tracing::warn!(%error, "the lab before a resume is not kept");
+            }
             back.restore(&branch, &commit)
         })
         .await?;
@@ -606,6 +625,27 @@ mod tests {
         assert!(used.unwrap_err().contains(TAG_USED));
     }
 
+    /// A link to the lab would give the session another lab mutex, and no
+    /// agent run would find the lab.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn setup_refuses_a_lab_path_that_is_not_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = Lab::init(dir.path().join("lab")).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(lab.root(), &link).unwrap();
+        let input = SetupInput {
+            lab: link.display().to_string(),
+            tag: "oct17".into(),
+            data_dir: None,
+        };
+        let why = setup(&ActivityContext::new_test(), input)
+            .await
+            .unwrap_err();
+        assert!(why.contains(LAB_PATH), "{why}");
+        assert!(why.contains(&lab.root().display().to_string()), "{why}");
+    }
+
     /// The row shows the short form. The base keeps the full id, so a
     /// later reset never meets an ambiguous prefix.
     #[tokio::test]
@@ -773,5 +813,35 @@ mod tests {
             std::fs::read_to_string(&counter).unwrap().lines().count(),
             1
         );
+    }
+
+    /// The stash is only a backup. A lab that git cannot stash, such as one
+    /// on an unborn branch, still goes back on resume.
+    #[tokio::test]
+    async fn a_resume_puts_back_a_lab_that_git_cannot_stash() {
+        let (_dir, input, _counter) = lab_with_counter();
+        let ctx = ActivityContext::new_test();
+        let mut stopped = input.clone();
+        stopped.trainer = TrainerSpec::Command {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "git checkout -q --orphan elsewhere; sleep 30".into(),
+            ],
+            timeout_secs: 60,
+            pass_env: Vec::new(),
+        };
+        let cut = tokio::time::timeout(Duration::from_millis(1500), train(&ctx, stopped)).await;
+        assert!(cut.is_err(), "the runner stopped mid-run");
+        let lab = Lab::open(&input.lab).unwrap();
+        assert!(
+            lab.git(&["stash", "create"]).is_err(),
+            "git cannot stash it"
+        );
+        let run = train(&ctx, input.clone()).await.unwrap();
+        assert_eq!(run.exit_code, Some(0), "{run:?}");
+        lab.require_branch(&input.branch).unwrap();
+        lab.require_head(&input.commit).unwrap();
+        lab.require_clean_train().unwrap();
     }
 }

@@ -221,7 +221,7 @@ raw turn in `.autoresearch/claude-turns` and sends it back unchanged.
 | `approve`, `deny` | Queue a decision for a gated tool call. |
 | `eval --candidate <file>` | Re-drive the newest recorded proposal with a new `program.md`. Prints the first turn that differs. |
 | `verify` | Replay every stored history with this build. Run it before a deploy. |
-| `purge --older-than-days <n>` | Remove old finished runs from the database. It waits while a report agent runs on after its session ended: let `serve` finish it first. |
+| `purge --older-than-days <n>` | Remove old finished runs from the database. It refuses while a report agent runs on after a session that it would remove. Let `serve` finish the report, then purge. |
 
 The database is `<lab>/.autoresearch/harvest.db` unless `--db` names one.
 The memory notes, the response cache, the inbox and the reports stay in
@@ -280,8 +280,10 @@ experiment set the search attribute `status`, which the engine reserves.
   cannot hide a change. `uv.lock` counts too, so run `uv run prepare.py` once
   first, as step 1 says, and commit `uv.lock` if that run changes it. After a
   stop in the middle of a run, the train call puts the lab back before it
-  trains again. It keeps the changes that it puts back in `git stash list`.
-  The code can still read your files, write `.git` and
+  trains again. Before that, it keeps the uncommitted changes to tracked
+  files in `git stash list`, when git can stash them. A commit that it moves
+  the branch past stays in the reflog. Git reads no replace ref, so a run
+  cannot give a commit another tree. The code can still read your files, write `.git` and
   `.autoresearch`, and escape the kill with `setsid`. Run it in a container,
   or as a user with no other rights.
 - **Fixed files and free files.** A free file is tracked Markdown, a
@@ -291,7 +293,9 @@ experiment set the search attribute `status`, which the engine reserves.
   commit. A hand edit of `prepare.py` during a night makes the next
   experiment a crash, and its reset puts the file back. So does a staged
   fixed file that the commit does not hold, and the reset unstages it.
-  Commit such a change before a night. A file that git does not track is
+  Commit such a change before a night. A link that git tracks is fixed by
+  its target. A lab with a submodule does not train, because the runner
+  cannot check its files. A file that git does not track is
   not checked, and Python can load it. Examples are a module next to
   `train.py`, bytecode in `__pycache__` and a package in `.venv`. A reset
   does not remove such a file, so read `git status --ignored` in the
@@ -304,7 +308,8 @@ experiment set the search attribute `status`, which the engine reserves.
   upstream, a run that exits with an error is a crash, even after a summary.
 - **Activity inputs are trusted.** The lab path and the trainer command come
   from the workflow input. On Postgres, let only people you trust with a
-  shell on the GPU host start a session.
+  shell on the GPU host start a session. The lab path must be canonical:
+  `runtime::start` makes it so, and setup refuses another path.
 - **One writer.** One process drives the database, as the SQLite backend
   requires. `eval`, `verify` and `purge` need the writer lock, so stop `run`
   or `serve` first. `status` reads beside them.

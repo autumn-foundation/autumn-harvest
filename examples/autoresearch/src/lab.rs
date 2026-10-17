@@ -531,10 +531,19 @@ impl Lab {
             .split('\0')
             .filter(|path| !path.is_empty() && !is_free(path))
             .map(|path| {
-                let mark = match crate::stores::read_regular(&self.root.join(path)) {
-                    Ok(Some(bytes)) => crate::stores::hashed_bytes(&bytes),
-                    Ok(None) => "gone".to_string(),
-                    Err(_) => "not a regular file".to_string(),
+                let file = self.root.join(path);
+                let mark = match std::fs::symlink_metadata(&file) {
+                    // A link is fixed by its target.
+                    Ok(meta) if meta.file_type().is_symlink() => std::fs::read_link(&file)
+                        .map_or_else(
+                            |_| "a link".to_string(),
+                            |target| format!("a link to {}", target.display()),
+                        ),
+                    _ => match crate::stores::read_regular(&file) {
+                        Ok(Some(bytes)) => crate::stores::hashed_bytes(&bytes),
+                        Ok(None) => "gone".to_string(),
+                        Err(_) => "not a regular file".to_string(),
+                    },
                 };
                 (path.to_string(), mark)
             })
@@ -548,19 +557,24 @@ impl Lab {
     /// holds, such as a hand edit of `prepare.py`, is refused. The bytes on
     /// disk are hashed with no git filter. Bytes that are the blob with CRLF
     /// line ends, or the content of an LFS pointer, are no change either. A
-    /// file that is gone, or is not a
-    /// regular file, is a change too. So is a staged fixed file that the
-    /// commit does not hold.
+    /// file that is gone, or is not a regular file, is a change too. So is a
+    /// staged fixed file that the commit does not hold.
+    ///
+    /// A link that git tracks is fixed by its target. The runner cannot
+    /// check the files of a submodule, so a lab with a fixed submodule does
+    /// not train.
     ///
     /// # Errors
     ///
-    /// Returns an error that names each changed file, or when git fails.
+    /// Returns an error that names each changed file or submodule, or when
+    /// git fails.
     pub fn require_fixed_files(&self, commit: &str) -> Result<(), String> {
         let tree = self.git(&["ls-tree", "-r", "-z", "--full-tree", commit])?;
         let index = self.git(&["ls-files", "-z"])?;
         let mut held = std::collections::HashSet::new();
         let mut changed = Vec::new();
         let mut present = Vec::new();
+        let mut submodules = Vec::new();
         for entry in tree.split('\0').filter(|entry| !entry.is_empty()) {
             let Some((meta, path)) = entry.split_once('\t') else {
                 continue;
@@ -571,14 +585,34 @@ impl Lab {
             else {
                 continue;
             };
-            // A link that git tracks, a submodule and a free file may change.
-            if kind != "blob" || mode == "120000" || is_free(path) {
+            if is_free(path) {
                 continue;
             }
-            match std::fs::symlink_metadata(self.root.join(path)) {
+            if kind == "commit" {
+                submodules.push(path);
+                continue;
+            }
+            if kind != "blob" {
+                continue;
+            }
+            let file = self.root.join(path);
+            match std::fs::symlink_metadata(&file) {
                 Ok(meta) if meta.is_file() => present.push((path, id)),
+                // A tracked link holds its target as its blob.
+                Ok(meta) if mode == "120000" && meta.file_type().is_symlink() => {
+                    if !self.links_to(&file, id) {
+                        changed.push(path);
+                    }
+                }
                 _ => changed.push(path),
             }
+        }
+        if !submodules.is_empty() {
+            return Err(format!(
+                "{} is a submodule. The runner cannot check the files of a submodule, \
+                 so it does not train with one. Copy its files into the lab and commit them",
+                submodules.join(", ")
+            ));
         }
         // A fixed file that is staged and that the commit does not hold, such
         // as a new module that `train.py` could import.
@@ -610,6 +644,17 @@ impl Lab {
             changed.join(", "),
             changed.join(" ")
         ))
+    }
+
+    /// `true` when the link `file` points where the blob `id` says.
+    fn links_to(&self, file: &Path, id: &str) -> bool {
+        match (
+            std::fs::read_link(file),
+            git_bytes(&self.root, &["cat-file", "blob", id]),
+        ) {
+            (Ok(target), Ok(blob)) => target.as_os_str().as_encoded_bytes() == blob.as_slice(),
+            _ => false,
+        }
     }
 
     /// `true` when the bytes of `path` on disk are a checkout of the blob
@@ -697,7 +742,9 @@ impl Lab {
             .filter(|path| !path.is_empty() && !held.contains(path))
             .collect();
         if !staged.is_empty() {
-            let mut args = vec!["rm", "--cached", "--quiet", "--"];
+            // `--force` drops a file that changed again after `git add`.
+            // With `--cached` it changes the index only.
+            let mut args = vec!["rm", "--cached", "--force", "--quiet", "--"];
             args.extend(staged);
             self.git(&args)?;
         }
@@ -974,6 +1021,9 @@ fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
             command.env(name, value);
         }
     }
+    // A run can plant a replace ref that gives a commit another tree. Git
+    // reads the real objects, for the checks and for each reset.
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
     let out = command
         .output()
         .map_err(|e| format!("cannot run git: {e}"))?;
@@ -1840,7 +1890,7 @@ mod tests {
     #[test]
     fn a_reset_keeps_a_staged_new_file_on_disk() {
         let (_dir, lab) = lab();
-        lab.start_branch("t1", "s1").unwrap();
+        let branch = lab.start_branch("t1", "s1").unwrap();
         let base = lab.head().unwrap();
         let helper = lab.root().join("helper.py");
         std::fs::write(&helper, "X = 1\n").unwrap();
@@ -1848,6 +1898,58 @@ mod tests {
         lab.reset_to(&base).unwrap();
         assert_eq!(std::fs::read_to_string(&helper).unwrap(), "X = 1\n");
         lab.require_fixed_files(&base).unwrap();
+        // A staged file that changed again after `git add`.
+        lab.git(&["add", "helper.py"]).unwrap();
+        std::fs::write(&helper, "X = 2\n").unwrap();
+        lab.restore(&branch, &base).unwrap();
+        assert_eq!(std::fs::read_to_string(&helper).unwrap(), "X = 2\n");
+        lab.require_fixed_files(&base).unwrap();
+    }
+
+    /// A run can plant a replace ref that gives a commit another tree. Git
+    /// must read the real objects, for the check and for the reset.
+    #[test]
+    fn a_replace_ref_cannot_swap_the_tree_of_a_commit() {
+        let (_dir, lab) = lab();
+        lab.start_branch("t1", "s1").unwrap();
+        let base = lab.head().unwrap();
+        let prepare = lab.root().join(PREPARE);
+        let fixed = std::fs::read(&prepare).unwrap();
+        std::fs::write(&prepare, "EVAL = 999\n").unwrap();
+        lab.git(&["add", PREPARE]).unwrap();
+        let tree = lab.git(&["write-tree"]).unwrap();
+        let evil = lab.git(&["commit-tree", &tree, "-m", "evil"]).unwrap();
+        lab.git(&["reset", "--quiet", "--hard", &base]).unwrap();
+        lab.git(&["replace", &base, &evil]).unwrap();
+        lab.reset_to(&base).unwrap();
+        assert_eq!(std::fs::read(&prepare).unwrap(), fixed);
+        std::fs::write(&prepare, "EVAL = 999\n").unwrap();
+        let why = lab.require_fixed_files(&base).unwrap_err();
+        assert!(why.contains(PREPARE), "{why}");
+    }
+
+    /// A tracked LFS pointer passes when the file on disk is the content
+    /// that it names, and only then.
+    #[test]
+    fn a_checkout_of_an_lfs_pointer_is_not_a_change() {
+        let (_dir, lab) = lab();
+        let content = b"weights\n";
+        let pointer = format!(
+            "version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n",
+            crate::stores::hashed_bytes(content),
+            content.len()
+        );
+        let file = lab.root().join("weights.bin");
+        std::fs::write(&file, pointer).unwrap();
+        lab.git(&["add", "weights.bin"]).unwrap();
+        lab.git(&["commit", "--quiet", "-m", "weights"]).unwrap();
+        lab.start_branch("t1", "s1").unwrap();
+        let head = lab.head().unwrap();
+        std::fs::write(&file, content).unwrap();
+        lab.require_fixed_files(&head).unwrap();
+        std::fs::write(&file, b"weightz\n").unwrap();
+        let why = lab.require_fixed_files(&head).unwrap_err();
+        assert!(why.contains("weights.bin"), "{why}");
     }
 
     /// A run can write `.git/config` and `.git/info/attributes`. A clean
@@ -1874,6 +1976,43 @@ mod tests {
         std::fs::write(&prepare, "EVAL = 999\n").unwrap();
         let why = lab.require_fixed_files(&head).unwrap_err();
         assert!(why.contains(PREPARE), "{why}");
+    }
+
+    /// A tracked link is fixed by its target, before a run and across it.
+    #[cfg(unix)]
+    #[test]
+    fn a_tracked_link_must_point_where_its_commit_says() {
+        let (_dir, lab) = lab();
+        let link = lab.root().join("data.py");
+        std::os::unix::fs::symlink(PREPARE, &link).unwrap();
+        lab.git(&["add", "data.py"]).unwrap();
+        lab.git(&["commit", "--quiet", "-m", "a link"]).unwrap();
+        lab.start_branch("t1", "s1").unwrap();
+        let head = lab.head().unwrap();
+        lab.require_fixed_files(&head).unwrap();
+        let before = lab.tracked_snapshot().unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(TRAIN, &link).unwrap();
+        let why = lab.require_fixed_files(&head).unwrap_err();
+        assert!(why.starts_with("data.py "), "{why}");
+        let after = lab.tracked_snapshot().unwrap();
+        assert_ne!(before.get("data.py"), after.get("data.py"));
+    }
+
+    /// The runner cannot check the files of a submodule, so a lab with one
+    /// does not train.
+    #[test]
+    fn a_lab_with_a_submodule_is_refused() {
+        let (_dir, lab) = lab();
+        let entry = format!("160000,{},vendor", lab.head().unwrap());
+        lab.git(&["update-index", "--add", "--cacheinfo", &entry])
+            .unwrap();
+        lab.git(&["commit", "--quiet", "-m", "a submodule"])
+            .unwrap();
+        std::fs::create_dir(lab.root().join("vendor")).unwrap();
+        lab.start_branch("t1", "s1").unwrap();
+        let why = lab.require_fixed_files(&lab.head().unwrap()).unwrap_err();
+        assert!(why.starts_with("vendor is a submodule"), "{why}");
     }
 
     /// An LFS pointer holds the hash and the size of the file that a

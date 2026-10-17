@@ -78,6 +78,14 @@ pub fn start(rt: &mut SqliteRuntime, config: &SessionConfig) -> Result<Execution
     config.policy.validate()?;
     let mut config = config.clone();
     config.tag = tag.to_string();
+    // The lab mutex and the agent runs name the lab by its canonical path.
+    if let Some(root) = std::path::Path::new(&config.lab)
+        .canonicalize()
+        .ok()
+        .and_then(|root| root.to_str().map(str::to_string))
+    {
+        config.lab = root;
+    }
     let input = SessionInput {
         config: config.clone(),
         carry: None,
@@ -584,37 +592,59 @@ pub fn check_agents(
     Ok(())
 }
 
-/// Why `purge` must wait for an agent run.
+/// Remove the finished runs that closed more than `older_than` ago, and
+/// return how many went.
 ///
-/// A detached report agent runs on after its session ends. A purge removes
-/// the ended session, and with it the model that the report needs. Then
-/// `run` and `serve` can no longer check that model.
+/// A detached report agent runs on after its session ends. A purge that
+/// removes the ended session removes the model that the report needs. Then
+/// `run` and `serve` can no longer check that model. So such a purge is
+/// refused until the report ends.
 ///
 /// # Errors
 ///
 /// Returns an error that names the unfinished run, or a backend error.
-pub fn check_purge(rt: &SqliteRuntime) -> Result<(), String> {
+pub fn purge(rt: &mut SqliteRuntime, older_than: Duration) -> Result<u64, String> {
+    // The cutoff of `purge_terminal`. The purge holds the writer lock, so no
+    // run closes between the two reads of the clock. A window past the
+    // clock purges nothing.
+    if let Some(cutoff) = chrono::TimeDelta::from_std(older_than)
+        .ok()
+        .and_then(|window| chrono::Utc::now().checked_sub_signed(window))
+    {
+        check_purge(rt, cutoff)?;
+    }
+    rt.purge_terminal(older_than).map_err(|e| e.to_string())
+}
+
+/// Fail when a purge with `cutoff` would remove a run above an unfinished
+/// run.
+fn check_purge(rt: &SqliteRuntime, cutoff: chrono::DateTime<chrono::Utc>) -> Result<(), String> {
     let filter = ExecutionFilter::new().state("RUNNING").limit(1000);
     let page = rt.list_executions(&filter).map_err(|e| e.to_string())?;
     for run in &page.executions {
-        let Some(exec) = run.execution_id() else {
+        let Some(mut child) = run.execution_id() else {
             continue;
         };
-        let root = root_of(rt, exec)?;
-        if root == exec
-            || matches!(
-                rt.outcome(root).map_err(|e| e.to_string())?,
-                ExecutionOutcome::Running
-            )
-        {
-            continue;
+        // A session, an experiment and two agent runs nest at most four deep.
+        for _ in 0..16 {
+            let Some(parent) = rt.parent_execution(child).map_err(|e| e.to_string())? else {
+                break;
+            };
+            let closed = match rt.describe(parent) {
+                Ok(described) => described.summary.closed_at.into_value(),
+                Err(SqliteError::ExecutionNotFound(_)) => break,
+                Err(e) => return Err(e.to_string()),
+            };
+            if closed.is_some_and(|closed| closed < cutoff) {
+                let id = run.workflow_id.clone().into_value().unwrap_or_default();
+                return Err(format!(
+                    "the agent run {id} is not finished, and the purge would remove the \
+                     run that started it. Let `autoresearch serve` finish it with the \
+                     same --model and --claude-model, then purge"
+                ));
+            }
+            child = parent;
         }
-        let id = run.workflow_id.clone().into_value().unwrap_or_default();
-        return Err(format!(
-            "the agent run {id} is not finished, and the run that started it ended. \
-             Let `autoresearch serve` finish it with the same --model and \
-             --claude-model, then purge"
-        ));
     }
     Ok(())
 }

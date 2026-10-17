@@ -820,6 +820,28 @@ mod tests {
         );
     }
 
+    /// A run can plant a link in the state directory. The memory store and
+    /// the blob store refuse it, so no model reads another file through them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_stores_refuse_a_planted_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let memory = FileMemoryStore::new(dir.path().join("memory")).unwrap();
+        let (mine, other) = (MemoryScope::new("mine"), MemoryScope::new("other"));
+        memory
+            .apply(&other, add("a secret note"), &EditKey::new("k1"))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(memory.path(&other), memory.path(&mine)).unwrap();
+        assert!(memory.load(&mine).await.is_err());
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "KEY=hunter2").unwrap();
+        let blobs = DirPayloadStore::new(dir.path().join("blobs")).unwrap();
+        let key = "a".repeat(64);
+        std::os::unix::fs::symlink(&secret, dir.path().join("blobs").join(&key)).unwrap();
+        assert!(blobs.get(&key).await.is_err());
+    }
+
     #[tokio::test]
     async fn the_blob_store_round_trips_and_deletes() {
         let dir = tempfile::tempdir().unwrap();

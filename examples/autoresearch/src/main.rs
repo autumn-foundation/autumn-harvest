@@ -892,10 +892,7 @@ fn purge(args: &LabArgs, days: u64) -> Result<(), String> {
         claude_model: String::new(),
     };
     let mut rt = open_existing(&db, harness(&lab, &state, &scripted)?)?;
-    runtime::check_purge(&rt)?;
-    let removed = rt
-        .purge_terminal(Duration::from_secs(days.saturating_mul(86_400)))
-        .map_err(|e| e.to_string())?;
+    let removed = runtime::purge(&mut rt, Duration::from_secs(days.saturating_mul(86_400)))?;
     println!("removed {removed} runs older than {days} days");
     Ok(())
 }

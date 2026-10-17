@@ -90,7 +90,9 @@ impl Default for AgentSettings {
 /// The settings of one session. History records them at the start.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// The lab path.
+    /// The canonical lab path. The lab mutex and the agent runs name the
+    /// lab by it. [`crate::runtime::start`] makes it canonical, and setup
+    /// refuses another path.
     pub lab: String,
     /// The run tag. Empty means "derive it from the start time", such as
     /// `20261017-2300`.

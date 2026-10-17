@@ -1294,10 +1294,33 @@ async fn run_refuses_while_a_report_of_another_model_is_unfinished() {
     );
 }
 
-/// A purge would remove an ended session while its report agent runs on, and
-/// with the session the model that the report needs. So `purge` waits.
+/// A caller can name the lab through a link. `start` makes the path
+/// canonical, so the night is the night of the real path.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_purge_waits_for_a_report_whose_session_ended() {
+async fn a_session_started_through_a_link_to_its_lab_runs() {
+    let plain = Fixture::new();
+    let mut rt = plain.open(&model());
+    let exec = runtime::start(&mut rt, &plain.config("night", 3)).unwrap();
+    let want = run_to_end(&mut rt, exec).await;
+
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let link = fx.lab().root().with_file_name("link");
+    std::os::unix::fs::symlink(fx.lab().root(), &link).unwrap();
+    let mut config = fx.config("night", 3);
+    config.lab = link.display().to_string();
+    let exec = runtime::start(&mut rt, &config).unwrap();
+    let got = run_to_end(&mut rt, exec).await;
+    assert_eq!(got.counts, want.counts);
+    assert_eq!(got.experiments, want.experiments);
+}
+
+/// A purge would remove an ended session while its report agent runs on, and
+/// with the session the model that the report needs. So `purge` refuses
+/// until the report ends. A window that keeps the session purges as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_purge_refuses_to_remove_a_session_whose_report_runs() {
     let fx = Fixture::new();
     let mut rt = fx.open(&model());
     let mut config = fx.config("night", 1);
@@ -1307,10 +1330,12 @@ async fn a_purge_waits_for_a_report_whose_session_ended() {
         .await
         .report_run
         .expect("the report agent waits");
-    let refusal = runtime::check_purge(&rt).unwrap_err();
+    let refusal = runtime::purge(&mut rt, Duration::ZERO).unwrap_err();
     assert!(refusal.contains("autoresearch serve"), "{refusal}");
+    let day = Duration::from_secs(86_400);
+    assert_eq!(runtime::purge(&mut rt, day).unwrap(), 0);
     runtime::drive_report(&mut rt, &reporter).await.unwrap();
-    runtime::check_purge(&rt).unwrap();
+    assert!(runtime::purge(&mut rt, Duration::ZERO).unwrap() > 0);
 }
 
 /// `purge` can remove a session while its detached report agent runs on.
