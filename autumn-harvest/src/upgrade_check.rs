@@ -1829,18 +1829,21 @@ fn plain(token: &str) -> &str {
     if word { token } else { HIDDEN }
 }
 
-/// Refuses a database address where a file or name belongs.
+/// Refuses a value that is not a plain file path or name.
 ///
-/// Later errors and reports echo these values. A database address is a URL or has `key=value`
-/// pairs. So a value with `://` or `=` never passes, whatever the spacing around the `=`.
+/// Later errors and reports echo these values. A mistyped database address would reach them.
+/// A listed set of characters is safe. Any other character, such as `:`, `@` or `=`, fails.
 #[cfg(feature = "db")]
-fn not_a_url(flag: &str, value: String) -> Result<String, UpgradeCheckError> {
-    if value.contains("://") || value.contains('=') {
-        return Err(UpgradeCheckError::Usage(format!(
-            "{flag} takes a name or file, not a database address"
-        )));
+fn plain_path(flag: &str, value: String) -> Result<String, UpgradeCheckError> {
+    let plain = value
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '+' | '~' | ' '));
+    if plain {
+        return Ok(value);
     }
-    Ok(value)
+    Err(UpgradeCheckError::Usage(format!(
+        "{flag} takes a name or file made of letters, digits and _-./+~"
+    )))
 }
 
 #[cfg(feature = "db")]
@@ -1874,10 +1877,12 @@ impl CommandArgs {
                     })?;
                     out.database_urls.push(url);
                 }
-                "--baseline-structure" => out.baseline = Some(not_a_url(&flag, value()?)?.into()),
-                "--candidate-structure" => out.candidate = Some(not_a_url(&flag, value()?)?.into()),
-                "--workflow-name" => out.workflow_name = Some(not_a_url(&flag, value()?)?),
-                "--baseline-build" => out.baseline_build = Some(not_a_url(&flag, value()?)?),
+                "--baseline-structure" => out.baseline = Some(plain_path(&flag, value()?)?.into()),
+                "--candidate-structure" => {
+                    out.candidate = Some(plain_path(&flag, value()?)?.into())
+                }
+                "--workflow-name" => out.workflow_name = Some(plain_path(&flag, value()?)?),
+                "--baseline-build" => out.baseline_build = Some(plain_path(&flag, value()?)?),
                 "--limit" => {
                     let raw = value()?;
                     out.limit = Some(raw.parse().map_err(|_| {
@@ -2131,9 +2136,30 @@ mod tests {
             refused(&[&format!("{flag}={SECRET_URL}")]);
             refused(&[flag, "host=h user=u PassWord=SECRETPW"]);
             refused(&[flag, "host=h user=u password = SECRETPW"]);
+            refused(&[flag, "postgres:/u:SECRETPW@h/db"]);
+            refused(&[flag, "u:SECRETPW@h"]);
+            refused(&[flag, "h?pw%3DSECRETPW"]);
             refused(&[flag, "host=h user=u password\t=\tSECRETPW"]);
             refused(&[&format!("{flag}=password=SECRETPW")]);
         }
+    }
+
+    #[test]
+    fn a_plain_file_or_build_name_is_accepted() {
+        let args = parse(&[
+            "--database-url",
+            "x",
+            "--baseline-structure",
+            "/tmp/.tmpAb12/old file.structure.json",
+            "--candidate-structure",
+            "out/new-structure_2.json",
+            "--baseline-build",
+            "v1.2+abc",
+            "--workflow-name",
+            "order",
+        ])
+        .expect("parses");
+        assert_eq!(args.baseline_build.as_deref(), Some("v1.2+abc"));
     }
 
     #[test]
