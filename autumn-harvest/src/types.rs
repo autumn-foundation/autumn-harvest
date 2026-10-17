@@ -1119,11 +1119,13 @@ impl StartSource {
 /// Workflow code reads it through `ctx.info()`. It comes from the execution
 /// row, which never changes after the insert, so a replay sees the same value.
 /// The default is an unknown source with no predecessor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StartProvenance {
     /// How the run started.
+    #[serde(default)]
     pub source: StartSource,
     /// The run that continued as new into this one. `None` for any other start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continued_from: Option<ExecutionId>,
 }
 

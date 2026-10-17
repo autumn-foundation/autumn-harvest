@@ -3214,6 +3214,9 @@ async fn run_shard_tick(
                             parent_execution_id: candidate
                                 .parent_id
                                 .map(crate::types::ExecutionId::from_uuid),
+                            // The candidate scan reads no start source yet
+                            // (issue #2082).
+                            start_provenance: None,
                         };
                         match crate::history_export::export_history(req) {
                             Ok(document) => {

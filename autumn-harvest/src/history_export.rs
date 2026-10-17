@@ -219,6 +219,16 @@ pub struct HistoryExportDocument {
     /// [`testing::HistorySnapshot::parent_execution_id`]: crate::testing::HistorySnapshot::parent_execution_id
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution_id: Option<ExecutionId>,
+    /// How the run started (issue #2082), from the `start_source` and
+    /// `continued_from_exec_id` columns. Like `parent_execution_id`, no
+    /// `WorkflowEvent` holds it, so it rides the export. The name matches
+    /// [`testing::HistorySnapshot::start_provenance`], so a replay of the export
+    /// takes the same branch as the live run. `None` for a legacy export.
+    /// Non-payload metadata, so it is never redacted.
+    ///
+    /// [`testing::HistorySnapshot::start_provenance`]: crate::testing::HistorySnapshot::start_provenance
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_provenance: Option<crate::types::StartProvenance>,
 }
 
 /// Input needed to export one workflow execution history.
@@ -272,6 +282,9 @@ pub struct HistoryExportRequest {
     /// `execution_timeout`/`deadline_at`: the value lives in no `WorkflowEvent`,
     /// so it must be carried explicitly on the request.
     pub parent_execution_id: Option<ExecutionId>,
+    /// How the run started (issue #2082), from the execution row. `None` when the
+    /// caller has no row, as for a legacy export.
+    pub start_provenance: Option<crate::types::StartProvenance>,
 }
 
 /// History export failure modes.
@@ -390,6 +403,8 @@ pub fn export_history_decoded(
         // child's exported history round-trips its `parent_execution_id` into the
         // JSON replay path, exactly like the deadline metadata above.
         parent_execution_id: request.parent_execution_id,
+        // Start provenance (issue #2082) — non-payload metadata, never redacted.
+        start_provenance: request.start_provenance,
     };
 
     let actual_bytes = measure_export_bytes(&mut document)?;
@@ -1263,6 +1278,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1317,6 +1333,7 @@ mod tests {
             context_headers: None,
             execution_timeout: Some(timeout),
             deadline_at: Some(deadline),
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1378,6 +1395,7 @@ mod tests {
                 context_headers: None,
                 execution_timeout: None,
                 deadline_at: None,
+                start_provenance: None,
                 parent_execution_id: None,
                 workflow_id: None,
                 queue_name: Some("priority-queue".to_string()),
@@ -1426,6 +1444,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1473,6 +1492,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: Some(parent),
             workflow_id: None,
             queue_name: None,
@@ -1567,6 +1587,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1629,6 +1650,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1669,6 +1691,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1838,6 +1861,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1869,6 +1893,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1940,6 +1965,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,

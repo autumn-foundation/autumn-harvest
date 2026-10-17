@@ -350,6 +350,14 @@ pub struct HistorySnapshot {
     /// replayer's global parent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution_id: Option<ExecutionId>,
+    /// How the run started (issue #2082), sourced from the `start_source` and
+    /// `continued_from_exec_id` columns. Like
+    /// [`parent_execution_id`](Self::parent_execution_id), no `WorkflowEvent`
+    /// holds it. When `Some`, it wins over the replayer-wide
+    /// [`with_start_provenance`](WorkflowReplayer::with_start_provenance). `None`
+    /// is a legacy snapshot, and it falls back to the replayer value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_provenance: Option<crate::types::StartProvenance>,
     /// The business-level workflow identifier (issue #698), sourced from the
     /// `harvest_workflow_executions.workflow_id` column. Like
     /// [`parent_execution_id`](Self::parent_execution_id), it lives in no
@@ -1154,6 +1162,8 @@ impl WorkflowReplayer {
             .queue_name
             .clone()
             .or_else(|| self.queue_name.clone());
+        // Issue #2082: prefer the snapshot's own provenance; fall back to the global.
+        let start_provenance = snapshot.start_provenance.unwrap_or(self.start_provenance);
         self.replay_from_snapshot_effective(
             snapshot,
             execution_timeout,
@@ -1161,7 +1171,7 @@ impl WorkflowReplayer {
             parent_execution_id,
             workflow_id,
             queue_name,
-            self.start_provenance,
+            start_provenance,
         )
         .await
     }
@@ -1173,7 +1183,7 @@ impl WorkflowReplayer {
     /// [`replay_from_db`](Self::replay_from_db) passes the loaded execution row's
     /// own values.
     // One linear setup per replay mode. A split would only move the lines.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn replay_from_snapshot_effective(
         &self,
         snapshot: HistorySnapshot,
@@ -1354,6 +1364,8 @@ impl WorkflowReplayer {
             .queue_name
             .clone()
             .or_else(|| self.queue_name.clone());
+        // Issue #2082: prefer the snapshot's own provenance; fall back to the global.
+        let start_provenance = snapshot.start_provenance.unwrap_or(self.start_provenance);
         self.replay_canary_snapshot_effective(
             snapshot,
             execution_timeout,
@@ -1361,7 +1373,7 @@ impl WorkflowReplayer {
             parent_execution_id,
             workflow_id,
             queue_name,
-            self.start_provenance,
+            start_provenance,
         )
         .await
     }
@@ -1369,6 +1381,7 @@ impl WorkflowReplayer {
     /// Canary snapshot replay with an explicit per-execution `execution_timeout`
     /// / live `deadline_at` (issue #772) / spawning-parent id (issue #698) /
     /// task queue (issue #798).
+    #[allow(clippy::too_many_arguments)]
     async fn replay_canary_snapshot_effective(
         &self,
         snapshot: HistorySnapshot,
@@ -1852,6 +1865,8 @@ impl WorkflowReplayer {
             // Issue #698: the row's own spawning-parent id, so a parent-aware
             // child replays deterministically from the store.
             parent_execution_id: meta.parent_execution_id,
+            // Issue #2082: the row's own start source and predecessor.
+            start_provenance: Some(meta.start_provenance),
             // Issue #698: the row's own business `workflow_id`.
             workflow_id: Some(meta.workflow_id.clone()),
             // Issue #798: the row's own task queue.
@@ -1973,6 +1988,8 @@ impl WorkflowReplayer {
                                     deadline_at: exec.deadline_at,
                                     // Issue #698: the sampled row's own parent id.
                                     parent_execution_id: exec.parent_execution_id,
+                                    // Issue #2082: the sampled row's own provenance.
+                                    start_provenance: Some(exec.start_provenance),
                                     // Issue #698: the sampled row's own business id.
                                     workflow_id: Some(exec.workflow_id.clone()),
                                     // Issue #798: the sampled row's own task queue.
@@ -2472,6 +2489,8 @@ fn timed_out_prefix(
         execution_timeout: None,
         deadline_at: None,
         parent_execution_id: None,
+        // The caller falls back to the replayer value (issue #2082).
+        start_provenance: None,
         workflow_id,
         queue_name,
     }
@@ -5507,6 +5526,8 @@ impl TestRunOutcome {
             // parent-aware child self-checks deterministically (matches the live
             // run, which received it via span_meta).
             parent_execution_id: self.parent_execution_id,
+            // Issue #2082: the live run saw this provenance via span_meta.
+            start_provenance: Some(self.start_provenance),
             // Issue #698 (Codex P2): carry the producing env's business
             // `workflow_id` so a workflow recording `ctx.info().workflow_id`
             // (e.g. in an activity input) self-checks deterministically. `None`
@@ -8023,6 +8044,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -8466,6 +8488,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -8508,6 +8531,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -8545,6 +8569,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,

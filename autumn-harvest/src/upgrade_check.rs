@@ -796,6 +796,8 @@ impl UpgradeCheck {
             execution_timeout: history.execution_timeout,
             deadline_at: history.deadline_at,
             parent_execution_id: history.parent_execution_id,
+            // The upgrade check reads no start source yet (issue #2082).
+            start_provenance: None,
             workflow_id: history.workflow_id,
             queue_name: history.queue_name,
         };
@@ -1741,6 +1743,8 @@ impl UpgradeCheck {
             execution_timeout: row.execution_timeout,
             deadline_at: row.deadline_at,
             parent_execution_id: row.parent_id.map(ExecutionId::from_uuid),
+            // The upgrade check reads no start source yet (issue #2082).
+            start_provenance: None,
             workflow_id: Some(row.workflow_id.clone()),
             queue_name: Some(row.queue_name.clone()),
         })

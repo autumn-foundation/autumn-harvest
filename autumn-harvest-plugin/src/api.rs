@@ -35049,6 +35049,11 @@ async fn replay_diagnosis(
         context_headers,
         execution_timeout: execution.execution_timeout,
         deadline_at: execution.deadline_at,
+        // Issue #2082: carry the row's start source and predecessor.
+        start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
+            execution.start_source.as_deref(),
+            execution.continued_from_exec_id,
+        )),
         parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         workflow_id: Some(execution.workflow_id.clone()),
         queue_name: None,
@@ -43844,6 +43849,11 @@ fn export_history_for_execution(
             // child history round-trips its parent into the JSON / `harvest-replay`
             // replay path (mirrors `execution_timeout`/`deadline_at`; `parent_id`
             // lives in no `WorkflowEvent`). `None` for a top-level run.
+            // Issue #2082: carry the row's start source and predecessor.
+            start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
+                execution.start_source.as_deref(),
+                execution.continued_from_exec_id,
+            )),
             parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         },
         decoder,
@@ -43894,6 +43904,8 @@ fn export_history_for_candidate(
             // candidate query now SELECTs `parent_id`) so a batch-exported child
             // history round-trips its parent into the JSON / `harvest-replay`
             // replay path — parity with the single-execution export.
+            // The candidate scan reads no start source yet (issue #2082).
+            start_provenance: None,
             parent_execution_id: candidate.parent_id.map(ExecutionId::from_uuid),
         },
         decoder,
@@ -56986,6 +56998,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
         }
     }
