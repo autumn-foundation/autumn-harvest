@@ -1064,15 +1064,18 @@ jobs:
       - name: Run autoresearch example tests
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autoresearch
-      # The README demo, verbatim in shape: a night of research from an
-      # empty directory, then a replay of every history it wrote.
+      # The README demo, as the README runs it: a night of research from an
+      # empty directory, then a replay of every history it wrote. The night
+      # is deterministic, so the counts match the README sample.
       - name: Run the autoresearch demo offline
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: |
           set -euo pipefail
           lab="$RUNNER_TEMP/ar-lab"
           cargo run -p autoresearch -- init "$lab"
-          cargo run -p autoresearch -- run --lab "$lab" --tag ci --experiments 8
+          cargo run -p autoresearch -- run --lab "$lab" --tag demo --experiments 8 --explore 100 \
+            | tee "$RUNNER_TEMP/ar-run.txt"
+          grep -qF "(6 kept, 2 discarded, 1 crashed)" "$RUNNER_TEMP/ar-run.txt"
           cargo run -p autoresearch -- status --lab "$lab"
           cargo run -p autoresearch -- verify --lab "$lab"
           test "$(wc -l < "$lab/results.tsv")" -eq 10

@@ -1255,12 +1255,12 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
 - **[`examples/autoresearch/`](../examples/autoresearch/)** — Karpathy's
   autoresearch loop on this backend: a session parent, one experiment child per
   idea, and an agent child per proposal ([§9](#9-child-workflows-and-commands-between-runs)).
-  It also uses a saga, a mutex, signals, a query, an update, schedules,
+  It also uses a saga, mutexes, signals, a query, an update, schedules,
   continue-as-new and search attributes. It runs offline.
 
   ```text
   cargo run -p autoresearch -- init /tmp/ar-lab
-  cargo run -p autoresearch -- run --lab /tmp/ar-lab --experiments 8
+  cargo run -p autoresearch -- run --lab /tmp/ar-lab --tag demo --experiments 8 --explore 100
   ```
 
 For the full API/contract reference, run

@@ -83,9 +83,9 @@ Need a real reference instead of the tiny hello-world path? See:
   of paying for completed turns twice. It runs with no API key (a scripted offline model).
 - [`examples/autoresearch/`](examples/autoresearch/) for Karpathy's autoresearch loop as durable
   workflows: an agent edits `train.py`, a trainer runs it, and a keep rule decides, all night. It is
-  the capstone of the agent primitives and of most of the engine surface: child workflows, a saga,
-  a mutex, signals, a query, an update, schedules, continue-as-new and seeded simulation sweeps. It
-  runs offline with a simulated trainer and a scripted researcher.
+  the capstone of the agent primitives and of most of the engine surface. It uses child workflows, a
+  saga, mutexes, signals, a query, an update, schedules, continue-as-new and seeded simulation
+  sweeps. It runs offline with a simulated trainer and a scripted researcher.
 
 ```rust
 use autumn_harvest::prelude::*;
