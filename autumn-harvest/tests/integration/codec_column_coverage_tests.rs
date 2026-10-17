@@ -1672,6 +1672,7 @@ impl autumn_harvest::telemetry::MetricsRecorder for FailureLabels {
 async fn fail_a_corrupt_activity_row(
     workflow_name: &'static str,
     handler: autumn_harvest::info::WorkflowHandlerFn,
+    corrupt_column: &'static str,
 ) -> Vec<(String, bool)> {
     let (url, _c) = setup_test_database_url_or_env().await;
     let wf_queue: &'static str =
@@ -1712,10 +1713,10 @@ async fn fail_a_corrupt_activity_row(
 
     // History still decodes. Only the task row names a key that no registry
     // holds, as a corrupt cell would.
-    diesel::sql_query(
-        "UPDATE harvest_task_queue SET input = $2 \
-         WHERE task_type = 'activity' AND workflow_exec_id::TEXT = $1",
-    )
+    diesel::sql_query(format!(
+        "UPDATE harvest_task_queue SET {corrupt_column} = $2 \
+         WHERE task_type = 'activity' AND workflow_exec_id::TEXT = $1"
+    ))
     .bind::<diesel::sql_types::Text, _>(&exec)
     .bind::<diesel::sql_types::Jsonb, _>(&json!({
         autumn_harvest::payload_codec::CODEC_ENVELOPE_KEY:
@@ -1773,7 +1774,7 @@ async fn fail_a_corrupt_activity_row(
 
 #[tokio::test]
 async fn an_activity_that_cannot_decode_its_input_fails_the_attempt_and_never_runs() {
-    let labels = fail_a_corrupt_activity_row("cc_guarded_wf", wf_guarded).await;
+    let labels = fail_a_corrupt_activity_row("cc_guarded_wf", wf_guarded, "input").await;
     assert!(!labels.is_empty(), "the failed attempt is counted");
     assert!(
         labels.iter().all(
@@ -1785,7 +1786,8 @@ async fn an_activity_that_cannot_decode_its_input_fails_the_attempt_and_never_ru
 
 #[tokio::test]
 async fn a_decode_failure_the_policy_skips_is_counted_as_non_retryable() {
-    let labels = fail_a_corrupt_activity_row("cc_guarded_nr_wf", wf_guarded_non_retryable).await;
+    let labels =
+        fail_a_corrupt_activity_row("cc_guarded_nr_wf", wf_guarded_non_retryable, "input").await;
     assert!(!labels.is_empty(), "the failed attempt is counted");
     assert!(
         labels.iter().all(
@@ -2851,5 +2853,627 @@ async fn a_schedule_patch_encodes_a_new_input_and_keeps_a_stored_one() {
     assert_eq!(
         codecs.decode_column(&patched).expect("decode one layer"),
         json!({"ssn": new_secret})
+    );
+}
+
+// ── context headers (issue #2043) ────────────────────────────────────────────
+
+const HEADER_SECRET: &str = "cc-header-tenant-acme-9";
+
+fn secret_headers() -> HashMap<String, String> {
+    HashMap::from([("x-tenant".to_string(), HEADER_SECRET.to_string())])
+}
+
+/// Start a run that carries `secret_headers`.
+async fn start_with_headers(
+    conn: &mut AsyncPgConnection,
+    codecs: &PayloadCodecs,
+    workflow_name: &'static str,
+    queue: &str,
+    retry_policy: Option<RetryPolicy>,
+) -> ExecutionId {
+    let workflow_id = Uuid::new_v4().to_string();
+    let params = StartWorkflowParams {
+        context_headers: Some(secret_headers()),
+        workflow_retry_policy: retry_policy,
+        ..StartWorkflowParams::new(
+            workflow_name,
+            &workflow_id,
+            ExecutionId::new_for_shard(ShardId::new(0)),
+            json!({}),
+            queue,
+        )
+    };
+    autumn_harvest::execution::start_or_load_workflow_execution_with_codecs(
+        conn, params, None, codecs,
+    )
+    .await
+    .expect("start")
+    .exec_id
+}
+
+/// Run one worker until `exec_id` completes, and return its result.
+async fn run_to_result(
+    url: &str,
+    queue: &str,
+    reg: Arc<HandlerRegistry>,
+    codecs: &PayloadCodecs,
+    exec_id: ExecutionId,
+) -> Value {
+    let pool = build_pool(url);
+    let worker = worker(queue, reg);
+    let run = worker.clone();
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(30), run.run(&run_pool)).await;
+    });
+    let client = WorkflowHandleClient::single(pool, url.to_string()).with_codecs(codecs.clone());
+    let result = client
+        .handle(exec_id)
+        .result_raw_with_timeout(Duration::from_secs(25))
+        .await
+        .expect("the workflow completes");
+    worker.shutdown();
+    let _ = handle.await;
+    result
+}
+
+fn wf_headers(ctx: &WorkflowContext, _input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        let seen = ctx.header("x-tenant").map(str::to_string);
+        let queue = ctx.queue_name().to_string();
+        let act = ctx
+            .execute_activity_raw("cc_headers_act", json!({}), &queue)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(json!({"wf": seen, "act": act}))
+    })
+}
+
+fn headers_activity(ctx: &autumn_harvest::ActivityContext, _input: Value) -> BoxFut<'_> {
+    Box::pin(async move { Ok(json!(ctx.header("x-tenant"))) })
+}
+
+fn wf_headers_parent(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        ctx.spawn_child_workflow_raw("cc_headers_child", input)
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn wf_headers_child(ctx: &WorkflowContext, _input: Value) -> BoxFut<'_> {
+    Box::pin(async move { Ok(json!(ctx.header("x-tenant"))) })
+}
+
+static HEADER_RETRY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+fn wf_headers_retry(ctx: &WorkflowContext, _input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        if HEADER_RETRY_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err("transient".to_string());
+        }
+        Ok(json!(ctx.header("x-tenant")))
+    })
+}
+
+static HEADER_GUARDED_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+fn wf_headers_guarded(_ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
+    Box::pin(async move {
+        HEADER_GUARDED_RUNS.fetch_add(1, Ordering::SeqCst);
+        Ok(input)
+    })
+}
+
+#[tokio::test]
+async fn context_headers_are_ciphertext_and_handlers_read_plaintext() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue: &'static str = Box::leak(format!("cc-{}", Uuid::new_v4().simple()).into_boxed_str());
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let exec_id = start_with_headers(&mut conn, &codecs, "cc_headers_wf", queue, None).await;
+    let execution = load_execution(&mut conn, exec_id.as_uuid()).await;
+    assert_ciphertext(
+        execution.context_headers.as_ref().expect("headers"),
+        HEADER_SECRET,
+        "executions.context_headers",
+    );
+
+    let result = run_to_result(
+        &url,
+        queue,
+        registry(
+            vec![wf_info("cc_headers_wf", wf_headers, None)],
+            vec![activity_info("cc_headers_act", queue, headers_activity)],
+            &codecs,
+        ),
+        &codecs,
+        exec_id,
+    )
+    .await;
+    assert_eq!(
+        result,
+        json!({"wf": HEADER_SECRET, "act": HEADER_SECRET}),
+        "the workflow and the activity both saw the plaintext header"
+    );
+
+    #[derive(diesel::QueryableByName)]
+    struct Cell {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        value: Value,
+    }
+    let rows: Vec<Cell> = diesel::sql_query(
+        "SELECT context_headers AS value FROM harvest_task_queue \
+         WHERE workflow_exec_id = $1 AND task_type = 'activity' \
+           AND context_headers IS NOT NULL",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .load(&mut conn)
+    .await
+    .expect("activity rows");
+    assert!(!rows.is_empty(), "the activity row carries the headers");
+    for row in rows {
+        assert_ciphertext(&row.value, HEADER_SECRET, "task_queue.context_headers");
+    }
+}
+
+#[tokio::test]
+async fn headers_stay_in_clear_while_column_encoding_is_off() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(false);
+    let mut conn = connect(&url).await;
+    let exec_id =
+        start_with_headers(&mut conn, &codecs, "cc_headers_off_wf", "default", None).await;
+    let execution = load_execution(&mut conn, exec_id.as_uuid()).await;
+    assert_eq!(
+        execution.context_headers,
+        Some(json!({"x-tenant": HEADER_SECRET}))
+    );
+}
+
+#[tokio::test]
+async fn a_child_workflow_inherits_the_encoded_headers_one_layer_deep() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue: &'static str = Box::leak(format!("cc-{}", Uuid::new_v4().simple()).into_boxed_str());
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let exec_id = start_with_headers(&mut conn, &codecs, "cc_headers_parent", queue, None).await;
+    let result = run_to_result(
+        &url,
+        queue,
+        registry(
+            vec![
+                wf_info("cc_headers_parent", wf_headers_parent, None),
+                wf_info("cc_headers_child", wf_headers_child, None),
+            ],
+            Vec::new(),
+            &codecs,
+        ),
+        &codecs,
+        exec_id,
+    )
+    .await;
+    assert_eq!(result, json!(HEADER_SECRET), "the child saw the header");
+    let child: WorkflowExecution = {
+        use autumn_harvest::schema::harvest_workflow_executions;
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::parent_id.eq(Some(exec_id.as_uuid())))
+            .select(WorkflowExecution::as_select())
+            .first(&mut conn)
+            .await
+            .expect("load the child row")
+    };
+    let cell = child.context_headers.expect("the child keeps the headers");
+    assert_ciphertext(&cell, HEADER_SECRET, "child context_headers");
+    assert_eq!(
+        codecs.decode_column(&cell).expect("decode one layer"),
+        json!({"x-tenant": HEADER_SECRET}),
+        "the child cell decodes once, with no second layer"
+    );
+}
+
+#[tokio::test]
+async fn a_workflow_retry_keeps_the_headers_one_layer_deep() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue: &'static str = Box::leak(format!("cc-{}", Uuid::new_v4().simple()).into_boxed_str());
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let policy = RetryPolicy {
+        max_attempts: 2,
+        initial_interval: Duration::from_millis(10),
+        backoff_coefficient: 1.0,
+        max_interval: Duration::from_millis(10),
+        non_retryable_errors: vec![],
+        jitter: JitterPolicy::None,
+    };
+    let exec_id = start_with_headers(
+        &mut conn,
+        &codecs,
+        "cc_headers_retry",
+        queue,
+        Some(policy.clone()),
+    )
+    .await;
+    let result = run_to_result(
+        &url,
+        queue,
+        registry(
+            vec![wf_info("cc_headers_retry", wf_headers_retry, Some(policy))],
+            Vec::new(),
+            &codecs,
+        ),
+        &codecs,
+        exec_id,
+    )
+    .await;
+    assert_eq!(result, json!(HEADER_SECRET), "the retry saw the header");
+    let cell: Option<Value> = {
+        use autumn_harvest::schema::harvest_workflow_executions;
+        harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::retry_of_exec_id.eq(Some(exec_id.as_uuid())))
+            .select(harvest_workflow_executions::context_headers)
+            .first(&mut conn)
+            .await
+            .expect("load the retry row")
+    };
+    let cell = cell.expect("the retry keeps the headers");
+    assert_ciphertext(&cell, HEADER_SECRET, "retry context_headers");
+    assert_eq!(
+        codecs.decode_column(&cell).expect("decode one layer"),
+        json!({"x-tenant": HEADER_SECRET})
+    );
+}
+
+#[tokio::test]
+async fn an_activity_that_cannot_decode_its_headers_fails_the_attempt_and_never_runs() {
+    let labels =
+        fail_a_corrupt_activity_row("cc_guarded_hdr_wf", wf_guarded, "context_headers").await;
+    assert!(!labels.is_empty(), "the failed attempt is counted");
+    assert!(
+        labels.iter().all(
+            |(error_type, non_retryable)| error_type == "PayloadDecodeFailed" && !non_retryable
+        ),
+        "the default policy retries a decode failure: {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_workflow_whose_headers_cannot_decode_fails_and_never_runs() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue: &'static str = Box::leak(format!("cc-{}", Uuid::new_v4().simple()).into_boxed_str());
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let exec_id = start_with_headers(&mut conn, &codecs, "cc_headers_guarded", queue, None).await;
+    // History still decodes. Only the headers name a key that no registry holds.
+    diesel::sql_query("UPDATE harvest_workflow_executions SET context_headers = $2 WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+        .bind::<diesel::sql_types::Jsonb, _>(&json!({
+            autumn_harvest::payload_codec::CODEC_ENVELOPE_KEY:
+                {"codec_id": "aes-256-gcm", "kid": "cc-gone", "data": "AAAA"}
+        }))
+        .execute(&mut conn)
+        .await
+        .expect("corrupt the headers");
+
+    let pool = build_pool(&url);
+    let worker = worker(
+        queue,
+        registry(
+            vec![wf_info("cc_headers_guarded", wf_headers_guarded, None)],
+            Vec::new(),
+            &codecs,
+        ),
+    );
+    let run = worker.clone();
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(30), run.run(&run_pool)).await;
+    });
+    let mut state = String::new();
+    for _ in 0..800 {
+        state = load_execution(&mut conn, exec_id.as_uuid()).await.state;
+        if state == "FAILED" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    worker.shutdown();
+    let _ = handle.await;
+    assert_eq!(
+        state, "FAILED",
+        "the run fails instead of losing its headers"
+    );
+    assert_eq!(
+        HEADER_GUARDED_RUNS.load(Ordering::SeqCst),
+        0,
+        "the handler never runs without its headers"
+    );
+}
+
+fn header_start_options() -> autumn_harvest::debounce::DebounceStartOptions {
+    autumn_harvest::debounce::DebounceStartOptions {
+        context_headers: Some(secret_headers()),
+        ..Default::default()
+    }
+}
+
+async fn stored_start_options_headers(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    where_sql: &str,
+    bind: &str,
+) -> Value {
+    #[derive(diesel::QueryableByName)]
+    struct Cell {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        value: Value,
+    }
+    let cell: Cell = diesel::sql_query(format!(
+        "SELECT start_options -> 'context_headers' AS value FROM {table} WHERE {where_sql}"
+    ))
+    .bind::<diesel::sql_types::Text, _>(bind)
+    .get_result(conn)
+    .await
+    .expect("load start options");
+    cell.value
+}
+
+#[tokio::test]
+async fn buffered_start_headers_are_ciphertext_and_the_fire_starts_with_plaintext() {
+    use autumn_harvest::debounce::{
+        AdmitDebounceParams, admit_debounced_start_with_codecs,
+        fire_due_debounced_starts_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let workflow_id = format!("cc-hdr-debounce-{}", Uuid::new_v4().simple());
+    admit_debounced_start_with_codecs(
+        &mut conn,
+        AdmitDebounceParams {
+            workflow_name: "cc_hdr_debounce_wf",
+            debounce_key: &key,
+            workflow_id: &workflow_id,
+            queue_name: "default",
+            last_input: json!({}),
+            start_options: header_start_options(),
+            window: Duration::from_millis(1),
+            max_wait: Duration::from_secs(60),
+            shard_id: 0,
+        },
+        false,
+        &codecs,
+    )
+    .await
+    .expect("admit")
+    .expect("admitted");
+    let stored = stored_start_options_headers(
+        &mut conn,
+        "harvest_debounce",
+        "workflow_name = 'cc_hdr_debounce_wf' AND debounce_key = $1",
+        &key,
+    )
+    .await;
+    assert_ciphertext(&stored, HEADER_SECRET, "debounce start_options headers");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fire_due_debounced_starts_with_codecs(
+        &mut conn,
+        &None,
+        &[],
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &codecs,
+    )
+    .await
+    .expect("fire");
+    let started = started_execution(&mut conn, "cc_hdr_debounce_wf", &workflow_id).await;
+    let cell = started.context_headers.expect("the run keeps the headers");
+    assert_ciphertext(&cell, HEADER_SECRET, "the started run headers");
+    assert_eq!(
+        codecs.decode_column(&cell).expect("decode one layer"),
+        json!({"x-tenant": HEADER_SECRET})
+    );
+}
+
+#[tokio::test]
+async fn throttled_start_headers_are_ciphertext_and_the_fire_starts_with_plaintext() {
+    use autumn_harvest::throttle::{
+        AdmitThrottleParams, ThrottleAdmission, fire_due_throttled_starts_with_codecs,
+        reserve_or_defer_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let mut defer = async |workflow_id: &str| {
+        reserve_or_defer_with_codecs(
+            &mut conn,
+            AdmitThrottleParams {
+                workflow_name: "cc_hdr_throttle_wf",
+                throttle_key: &key,
+                workflow_id,
+                queue_name: "default",
+                input: json!({}),
+                start_options: header_start_options(),
+                refill_per_sec: 0.001,
+                burst: 1.0,
+                schedule_to_start: None,
+                shard_id: 0,
+            },
+            &codecs,
+        )
+        .await
+        .expect("admit")
+    };
+    assert!(matches!(
+        defer("cc-hdr-throttle-first").await,
+        ThrottleAdmission::Reserved { .. }
+    ));
+    let workflow_id = format!("cc-hdr-throttle-{}", Uuid::new_v4().simple());
+    assert!(matches!(
+        defer(&workflow_id).await,
+        ThrottleAdmission::Deferred(_)
+    ));
+    let stored = stored_start_options_headers(
+        &mut conn,
+        "harvest_start_throttle",
+        "workflow_id = $1",
+        &workflow_id,
+    )
+    .await;
+    assert_ciphertext(&stored, HEADER_SECRET, "throttle start_options headers");
+
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets SET tokens = 5, last_refilled_at = NOW() \
+         WHERE key IN (SELECT bucket_key FROM harvest_start_throttle WHERE workflow_id = $1)",
+    )
+    .bind::<diesel::sql_types::Text, _>(&workflow_id)
+    .execute(&mut conn)
+    .await
+    .expect("refill the bucket");
+    autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+    let fired = fire_due_throttled_starts_with_codecs(
+        &mut conn,
+        &None,
+        &[],
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &codecs,
+    )
+    .await
+    .expect("fire");
+    assert!(fired >= 1, "the deferred row fired");
+    let started = started_execution(&mut conn, "cc_hdr_throttle_wf", &workflow_id).await;
+    let cell = started.context_headers.expect("the run keeps the headers");
+    assert_eq!(
+        codecs.decode_column(&cell).expect("decode one layer"),
+        json!({"x-tenant": HEADER_SECRET})
+    );
+}
+
+#[tokio::test]
+async fn batched_start_headers_are_ciphertext_and_both_start_paths_decode_them() {
+    use autumn_harvest::event_batch::{
+        admit_batched_start_with_codecs, fire_due_event_batches_with_codecs,
+    };
+    let _serial = BATCH_FIRE_LOCK.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+
+    // The timed fire.
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let timed_id = format!("cc-hdr-batch-{}", Uuid::new_v4().simple());
+    let mut params = batch_params("cc_hdr_batch_wf", &key, &timed_id, json!({}), 10);
+    params.start_options = header_start_options();
+    admit_batched_start_with_codecs(&mut conn, params, None, &codecs)
+        .await
+        .expect("admit")
+        .expect("admitted");
+    let stored =
+        stored_start_options_headers(&mut conn, "harvest_event_batches", "batch_key = $1", &key)
+            .await;
+    assert_ciphertext(&stored, HEADER_SECRET, "batch start_options headers");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fire_due_event_batches_with_codecs(
+        &mut conn,
+        &None,
+        &[],
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &codecs,
+    )
+    .await
+    .expect("fire");
+    let started = started_execution(&mut conn, "cc_hdr_batch_wf", &timed_id).await;
+    let cell = started
+        .context_headers
+        .expect("the timed run keeps the headers");
+    assert_eq!(
+        codecs.decode_column(&cell).expect("decode one layer"),
+        json!({"x-tenant": HEADER_SECRET})
+    );
+
+    // The immediate flush.
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let flush_id = format!("cc-hdr-flush-{}", Uuid::new_v4().simple());
+    let mut params = batch_params("cc_hdr_flush_wf", &key, &flush_id, json!({}), 1);
+    params.start_options = header_start_options();
+    admit_batched_start_with_codecs(&mut conn, params, None, &codecs)
+        .await
+        .expect("admit")
+        .expect("admitted");
+    let started = started_execution(&mut conn, "cc_hdr_flush_wf", &flush_id).await;
+    let cell = started
+        .context_headers
+        .expect("the flushed run keeps the headers");
+    assert_eq!(
+        codecs.decode_column(&cell).expect("decode one layer"),
+        json!({"x-tenant": HEADER_SECRET})
+    );
+}
+
+#[tokio::test]
+async fn a_debounce_row_whose_headers_cannot_decode_moves_back_and_never_starts() {
+    use autumn_harvest::debounce::{
+        AdmitDebounceParams, admit_debounced_start_with_codecs,
+        fire_due_debounced_starts_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let name = format!("cc_hdr_stuck_{}", Uuid::new_v4().simple());
+    admit_debounced_start_with_codecs(
+        &mut conn,
+        AdmitDebounceParams {
+            workflow_name: &name,
+            debounce_key: &key,
+            workflow_id: &format!("cc-hdr-stuck-{key}"),
+            queue_name: "default",
+            // Clear input, so only the headers can fail the decode.
+            last_input: json!({}),
+            start_options: header_start_options(),
+            window: Duration::from_millis(1),
+            max_wait: Duration::from_secs(60),
+            shard_id: 0,
+        },
+        false,
+        &codecs,
+    )
+    .await
+    .expect("admit")
+    .expect("admitted");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    fire_due_debounced_starts_with_codecs(
+        &mut conn,
+        &None,
+        &[],
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &reader_without_the_key(),
+    )
+    .await
+    .expect("a bad row never fails the scan");
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_debounce \
+             WHERE debounce_key = $1 AND effective_fire_at > now() + interval '10 seconds'",
+            &key,
+        )
+        .await,
+        1,
+        "the row moves back and stays"
+    );
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
+             WHERE workflow_name = $1",
+            &name,
+        )
+        .await,
+        0,
+        "no run starts without its headers"
     );
 }
