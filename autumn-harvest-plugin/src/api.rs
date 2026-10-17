@@ -5511,6 +5511,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         // A route layer runs on a matched route only, so an unknown path
         // still answers 404. It wraps every per-route layer above.
         .route_layer(require_mutation_auth)
+        // Issue #2076: a raw mount binds the tenant too. A mount through
+        // `apply_admin_auth_layers` runs the outer copy first, and this copy
+        // then skips.
+        .layer(middleware::from_fn_with_state(
+            api_state.clone(),
+            crate::tenant::enforce_tenant_binding_once,
+        ))
         .layer(Extension(api_state))
 }
 
