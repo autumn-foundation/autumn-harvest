@@ -3224,9 +3224,6 @@ pub async fn update_workflow_schedule_with_codecs(
     use crate::schema::harvest_schedules::dsl;
     use diesel_async::AsyncConnection;
 
-    let mut patch = patch.clone();
-    patch.input = codecs.encode_column_opt(patch.input.as_ref())?;
-
     Box::pin(conn.transaction(async |conn| {
         // FOR UPDATE: serialize this PATCH against a concurrent scheduler
         // tick (whose claim/advance/finalize UPDATEs take the row lock)
@@ -3252,9 +3249,14 @@ pub async fn update_workflow_schedule_with_codecs(
             return Ok(ScheduleUpdateOutcome::DagSchedule);
         }
 
+        // Encode the new input only now. A missing row and a DAG row return
+        // their outcome first, so a down encoder changes neither (issue #2043).
+        let mut stored_patch = patch.clone();
+        stored_patch.input = codecs.encode_column_opt(patch.input.as_ref())?;
+
         // Validate the MERGED spec (e.g. new cron + existing timezone)
         // before any write; a Config error rolls the transaction back.
-        let merged = merge_schedule_patch(&existing, &patch)?;
+        let merged = merge_schedule_patch(&existing, &stored_patch)?;
         crate::policy::validate_schedule(&merged.schedule).map_err(HarvestError::Config)?;
         // The merge keeps the stored jitter on a cadence change (issue #1792).
         // The new cadence must still hold it.

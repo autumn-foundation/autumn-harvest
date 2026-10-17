@@ -4130,3 +4130,24 @@ async fn an_overlap_policy_disturbs_no_run_when_the_schedule_input_cannot_decode
         "the replacement run started"
     );
 }
+
+#[tokio::test]
+async fn a_patch_for_a_missing_schedule_reports_not_found_while_the_encoder_is_down() {
+    use autumn_harvest::scheduler::{
+        ScheduleUpdateOutcome, WorkflowSchedulePatch, update_workflow_schedule_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let outcome = update_workflow_schedule_with_codecs(
+        &mut conn,
+        Uuid::new_v4(),
+        &WorkflowSchedulePatch {
+            input: Some(json!({"ssn": SCHEDULE_SECRET})),
+            ..Default::default()
+        },
+        &encoder_down(),
+    )
+    .await
+    .expect("a missing row is an outcome, not a codec error");
+    assert!(matches!(outcome, ScheduleUpdateOutcome::NotFound));
+}
