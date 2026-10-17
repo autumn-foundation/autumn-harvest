@@ -31,6 +31,8 @@ pub const BRANCH_MOVED: &str = "BranchMoved";
 pub const BAD_TAG: &str = "BadTag";
 /// The error type of a `train.py` change that no commit holds.
 pub const DIRTY_TREE: &str = "DirtyTree";
+/// The error type of a tag whose branch another session started.
+pub const TAG_USED: &str = "TagUsed";
 /// The directory in the state directory with one finished run per train call.
 const RUNS: &str = "runs";
 
@@ -135,12 +137,20 @@ pub struct RecordInput {
 /// - [`DATA_MISSING`]: `data_dir` is missing.
 /// - [`BAD_TAG`]: the tag cannot name a branch.
 /// - [`DIRTY_TREE`]: `train.py` has a change that no commit holds.
+/// - [`TAG_USED`]: another session started the branch of the tag.
+///
+/// The activity idempotency key marks the start commit of the branch, so a
+/// retry finds its own branch.
 #[activity(start_to_close = "1m", retry = RetryPolicy::exponential(3, Duration::from_secs(1)))]
-pub async fn setup(_ctx: &ActivityContext, input: SetupInput) -> Result<SetupReport, String> {
-    blocking(move || setup_lab(&input)).await
+pub async fn setup(ctx: &ActivityContext, input: SetupInput) -> Result<SetupReport, String> {
+    let key = ctx
+        .idempotency_key()
+        .map_err(|e| e.to_string())?
+        .to_string();
+    blocking(move || setup_lab(&input, &key)).await
 }
 
-fn setup_lab(input: &SetupInput) -> Result<SetupReport, String> {
+fn setup_lab(input: &SetupInput, key: &str) -> Result<SetupReport, String> {
     let lab = Lab::open(&input.lab)?;
     if let Some(dir) = &input.data_dir
         && !Path::new(dir).is_dir()
@@ -156,8 +166,16 @@ fn setup_lab(input: &SetupInput) -> Result<SetupReport, String> {
         lab.require_clean_train()
             .map_err(|e| fatal(DIRTY_TREE, e))?;
     }
+    let used = format!("{branch} exists");
+    let branch = lab.start_branch(&input.tag, key).map_err(|e| {
+        if e.contains(&used) {
+            fatal(TAG_USED, e)
+        } else {
+            e
+        }
+    })?;
     Ok(SetupReport {
-        branch: lab.start_branch(&input.tag)?,
+        branch,
         head: lab.head()?,
         program: lab.read(PROGRAM)?,
     })
@@ -364,7 +382,7 @@ mod tests {
     fn lab_with_counter() -> (tempfile::TempDir, TrainInput, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let lab = Lab::init(dir.path().join("lab")).unwrap();
-        let branch = lab.start_branch("t").unwrap();
+        let branch = lab.start_branch("t", "s1").unwrap();
         let counter = dir.path().join("runs");
         let script = format!("echo run >> '{}'; echo 'val_bpb: 0.99'", counter.display());
         let input = TrainInput {
@@ -409,9 +427,27 @@ mod tests {
         let dirty = train(&ActivityContext::new_test(), input.clone()).await;
         assert!(dirty.unwrap_err().contains(DIRTY_TREE));
         lab.git(&["checkout", "--", "train.py"]).unwrap();
-        lab.start_branch("other").unwrap();
+        lab.start_branch("other", "s2").unwrap();
         let moved = train(&ActivityContext::new_test(), input).await;
         assert!(moved.unwrap_err().contains(BRANCH_MOVED));
         assert!(!counter.exists(), "nothing trained");
+    }
+
+    #[tokio::test]
+    async fn setup_refuses_a_tag_that_another_session_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = Lab::init(dir.path().join("lab")).unwrap();
+        let input = SetupInput {
+            lab: lab.root().display().to_string(),
+            tag: "oct17".into(),
+            data_dir: None,
+        };
+        let ctx = ActivityContext::new_test();
+        let first = setup(&ctx, input.clone()).await.unwrap();
+        // The same call after a crash: the same branch and start commit.
+        assert_eq!(setup(&ctx, input.clone()).await.unwrap(), first);
+        // A new session with the tag, such as after `purge`.
+        let used = setup(&ActivityContext::new_test(), input).await;
+        assert!(used.unwrap_err().contains(TAG_USED));
     }
 }

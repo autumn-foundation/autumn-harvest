@@ -40,6 +40,9 @@ pub const PAPERS_DIR: &str = "papers";
 pub const READABLE: &[&str] = &[TRAIN, PREPARE, PROGRAM, RESULTS, "README.md", "run.log"];
 /// The trailer that names the experiment of a commit.
 pub const KEY_TRAILER: &str = "Experiment-Key";
+/// The trailer of the start commit of a session. It holds the key of the
+/// setup step.
+pub const SESSION_TRAILER: &str = "Session-Key";
 /// The prefix of every research branch.
 pub const BRANCH_PREFIX: &str = "autoresearch/";
 /// The most bytes that one agent read returns. A longer file returns its end.
@@ -258,35 +261,57 @@ impl Lab {
         }
     }
 
-    /// Check out `autoresearch/<tag>`. Create it from `HEAD` when it does not
-    /// exist. Hide `results.tsv`, `run.log` and the state directory from git.
+    /// Check out `autoresearch/<tag>`, the branch of the session whose setup
+    /// step has `key`. Hide `results.tsv`, `run.log` and the state directory
+    /// from git.
+    ///
+    /// A new branch starts on `HEAD` with an empty commit that holds `key`.
+    /// So two sessions in one lab never share a commit, and a row of one
+    /// session cannot name the commit of another. A retried setup finds its
+    /// start commit. Any other branch with the name belongs to another
+    /// session, such as one that `purge` removed, and is refused.
     ///
     /// # Errors
     ///
-    /// Returns an error when the tag is not a valid branch name, or git fails.
-    pub fn start_branch(&self, tag: &str) -> Result<String, String> {
+    /// Returns an error when the tag is not a valid branch name, the branch
+    /// exists with no start commit of `key`, or git fails.
+    pub fn start_branch(&self, tag: &str, key: &str) -> Result<String, String> {
         check_tag(tag)?;
         let branch = format!("{BRANCH_PREFIX}{tag}");
+        let reference = format!("refs/heads/{branch}");
+        let trailer = format!("{SESSION_TRAILER}: {key}");
         self.exclude_local_files()?;
-        if self.git(&["branch", "--show-current"])? == branch {
+        if self
+            .git(&["rev-parse", "--verify", "--quiet", &reference])
+            .is_ok()
+        {
+            let grep = format!("--grep={trailer}");
+            let bodies = self.git(&[
+                "log",
+                "--fixed-strings",
+                &grep,
+                "--format=%B%x00",
+                &reference,
+            ])?;
+            let started = bodies
+                .split('\0')
+                .any(|body| body.lines().any(|line| line.trim() == trailer));
+            if !started {
+                return Err(format!(
+                    "the branch {branch} exists: another session used the tag {tag:?}. Use a new tag"
+                ));
+            }
+            self.checkout(&branch)?;
             return Ok(branch);
         }
         // A change that no commit holds would move to the new branch, and
         // the baseline would train it under the wrong commit.
         self.require_clean_train()?;
-        let exists = self
-            .git(&[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ])
-            .is_ok();
-        if exists {
-            self.git(&["checkout", "--quiet", &branch])?;
-        } else {
-            self.git(&["checkout", "--quiet", "-b", &branch])?;
-        }
+        let message = format!("autoresearch: start {tag}\n\n{trailer}");
+        // `HEAD:` is the tree of `HEAD`, so the start commit changes no file.
+        let start = self.git(&["commit-tree", "HEAD:", "-p", "HEAD", "-m", &message])?;
+        self.git(&["branch", &branch, &start])?;
+        self.git(&["checkout", "--quiet", &branch])?;
         Ok(branch)
     }
 
@@ -819,13 +844,21 @@ mod tests {
     #[test]
     fn start_branch_creates_or_resumes_the_tag_branch() {
         let (_dir, lab) = lab();
-        assert_eq!(lab.start_branch("oct17").unwrap(), "autoresearch/oct17");
+        assert_eq!(
+            lab.start_branch("oct17", "s1").unwrap(),
+            "autoresearch/oct17"
+        );
         assert_eq!(
             lab.git(&["branch", "--show-current"]).unwrap(),
             "autoresearch/oct17"
         );
-        // Again: it resumes the branch.
-        assert_eq!(lab.start_branch("oct17").unwrap(), "autoresearch/oct17");
+        // The same setup again, after a crash: it resumes the branch.
+        lab.git(&["checkout", "--quiet", "master"]).unwrap();
+        assert_eq!(
+            lab.start_branch("oct17", "s1").unwrap(),
+            "autoresearch/oct17"
+        );
+        lab.require_branch("autoresearch/oct17").unwrap();
         for bad in [
             "bad tag",
             "../escape",
@@ -836,16 +869,44 @@ mod tests {
             "a..b",
             "",
         ] {
-            assert!(lab.start_branch(bad).is_err(), "{bad}");
+            assert!(lab.start_branch(bad, "s2").is_err(), "{bad}");
         }
         assert!(check_tag("Oct17-a_1.b").is_ok());
+    }
+
+    #[test]
+    fn a_tag_that_another_session_used_is_refused() {
+        let (_dir, lab) = lab();
+        lab.start_branch("oct17", "s1").unwrap();
+        let used = lab.start_branch("oct17", "s2").unwrap_err();
+        assert!(used.contains("exists"), "{used}");
+        // A branch that a person made has no start commit either.
+        lab.git(&["branch", "autoresearch/hand", "master"]).unwrap();
+        assert!(lab.start_branch("hand", "s3").is_err());
+    }
+
+    /// Each session starts on its own commit, so a row of one session never
+    /// names the commit of another.
+    #[test]
+    fn two_sessions_never_share_a_commit() {
+        let (_dir, lab) = lab();
+        let base = lab.head().unwrap();
+        lab.start_branch("a", "s1").unwrap();
+        let a = lab.head().unwrap();
+        lab.git(&["checkout", "--quiet", "master"]).unwrap();
+        lab.start_branch("b", "s2").unwrap();
+        let b = lab.head().unwrap();
+        assert_ne!(a, b);
+        assert_ne!(a, base);
+        assert_eq!(lab.git(&["rev-parse", &format!("{a}^")]).unwrap(), base);
+        assert_eq!(lab.git(&["diff", "--stat", &base, &a]).unwrap(), "");
     }
 
     #[test]
     fn a_new_branch_refuses_a_train_py_that_no_commit_holds() {
         let (_dir, lab) = lab();
         lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
-        let refused = lab.start_branch("t1").unwrap_err();
+        let refused = lab.start_branch("t1", "s1").unwrap_err();
         assert!(refused.contains("no commit holds"), "{refused}");
         assert_eq!(lab.git(&["branch", "--show-current"]).unwrap(), "master");
     }
@@ -853,8 +914,8 @@ mod tests {
     #[test]
     fn checkout_moves_back_to_the_session_branch_only_when_clean() {
         let (_dir, lab) = lab();
-        lab.start_branch("a").unwrap();
-        lab.start_branch("b").unwrap();
+        lab.start_branch("a", "s1").unwrap();
+        lab.start_branch("b", "s2").unwrap();
         assert!(lab.require_branch("autoresearch/a").is_err());
         lab.checkout("autoresearch/a").unwrap();
         lab.require_branch("autoresearch/a").unwrap();
@@ -871,7 +932,7 @@ mod tests {
         user.push(0xe9);
         user.extend_from_slice(b"/\n*.ckpt");
         std::fs::write(&exclude, &user).unwrap();
-        lab.start_branch("t1").unwrap();
+        lab.start_branch("t1", "s1").unwrap();
         let after = std::fs::read(&exclude).unwrap();
         assert!(
             after.starts_with(&user),
@@ -884,7 +945,7 @@ mod tests {
     #[test]
     fn local_files_stay_untracked() {
         let (_dir, lab) = lab();
-        lab.start_branch("t1").unwrap();
+        lab.start_branch("t1", "s1").unwrap();
         lab.record(&row("aaaaaaa"), "k").unwrap();
         std::fs::write(lab.root().join("run.log"), "x").unwrap();
         lab.state_dir().unwrap();
@@ -894,7 +955,7 @@ mod tests {
     #[test]
     fn a_commit_is_made_once_per_key() {
         let (_dir, lab) = lab();
-        lab.start_branch("t1").unwrap();
+        lab.start_branch("t1", "s1").unwrap();
         let base = lab.head().unwrap();
         lab.edit_train("MATRIX_LR = 0.04", "MATRIX_LR = 0.05")
             .unwrap();
@@ -905,13 +966,16 @@ mod tests {
         // A re-run after a crash finds the same commit.
         let again = lab.commit_train("raise matrix LR", "k-1", &base).unwrap();
         assert_eq!(again, first);
-        assert_eq!(lab.git(&["rev-list", "--count", "HEAD"]).unwrap(), "2");
+        assert_eq!(
+            lab.git(&["rev-list", "--count", "master..HEAD"]).unwrap(),
+            "2"
+        );
     }
 
     #[test]
     fn a_commit_refuses_a_head_that_moved() {
         let (_dir, lab) = lab();
-        lab.start_branch("t1").unwrap();
+        lab.start_branch("t1", "s1").unwrap();
         lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
         let refused = lab.commit_train("deeper", "k-1", "0000000").unwrap_err();
         assert!(refused.contains("the branch moved"), "{refused}");
@@ -920,7 +984,7 @@ mod tests {
     #[test]
     fn a_commit_with_no_change_reports_head() {
         let (_dir, lab) = lab();
-        lab.start_branch("t1").unwrap();
+        lab.start_branch("t1", "s1").unwrap();
         let head = lab.head().unwrap();
         let info = lab.commit_train("nothing", "k-2", &head).unwrap();
         assert!(!info.changed);
@@ -930,7 +994,7 @@ mod tests {
     #[test]
     fn reset_restores_the_base_and_is_idempotent() {
         let (_dir, lab) = lab();
-        lab.start_branch("t1").unwrap();
+        lab.start_branch("t1", "s1").unwrap();
         let base = lab.head().unwrap();
         lab.edit_train("DEPTH = 8", "DEPTH = 10").unwrap();
         lab.commit_train("deeper", "k-3", &base).unwrap();
@@ -1099,7 +1163,7 @@ mod tests {
     #[test]
     fn a_short_id_names_one_commit_of_the_branch() {
         let (dir, lab) = lab();
-        lab.start_branch("t1").unwrap();
+        lab.start_branch("t1", "s1").unwrap();
         let base = lab.head().unwrap();
         let tree = lab.git(&["rev-parse", "HEAD:"]).unwrap();
         let objects = dir.path().join("objects");

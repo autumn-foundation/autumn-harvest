@@ -113,10 +113,13 @@ async fn a_night_of_research_keeps_only_improvements() {
     assert!(kept >= 3, "the scripted ideas mostly help: {rows:#?}");
     assert_eq!(report.counts.kept as usize, kept);
 
-    // AC2: the branch holds the baseline and the kept commits only.
+    // AC2: the branch holds the baseline and the kept commits only. The
+    // baseline is the start commit of the session.
     assert_eq!(fx.lab().head().unwrap(), report.best.commit);
     assert_eq!(
-        fx.lab().git(&["rev-list", "--count", "HEAD"]).unwrap(),
+        fx.lab()
+            .git(&["rev-list", "--count", "master..HEAD"])
+            .unwrap(),
         kept.to_string()
     );
     assert_eq!(fx.lab().git(&["status", "--porcelain"]).unwrap(), "");
@@ -153,12 +156,12 @@ async fn a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row() {
     let mut config = fx.config("bold", 2);
     config.explore_percent = 100;
     let exec = runtime::start(&mut rt, &config).unwrap();
-    let base = fx.lab().head().unwrap();
     run_to_end(&mut rt, exec).await;
 
     let outputs = experiment_outputs(&rt);
     // Baseline, then the out-of-memory idea, then the diverging one.
     assert_eq!(outputs.len(), 3);
+    let base = outputs[0].best.as_ref().unwrap().commit.clone();
     let oom = &outputs[1];
     assert_eq!(oom.fixes, 1, "{oom:?}");
     assert_ne!(
@@ -276,13 +279,14 @@ async fn an_approved_rewind_moves_the_base_to_an_older_kept_commit() {
     let fx = Fixture::new();
     let mut rt = fx.open(&model());
     let exec = runtime::start(&mut rt, &fx.config("rw", 2)).unwrap();
-    let baseline = fx.lab().head().unwrap();
     hint(&mut rt, "rw", "paper:warmdown", "h1");
-    // A person copies the short form from results.tsv.
-    hint(&mut rt, "rw", &format!("rewind:{}", short(&baseline)), "h2");
 
     let edit = run_to_approval(&mut rt, exec).await;
     assert_eq!(edit.tool, agent::EDIT_TRAIN);
+    // The edit waits, so `HEAD` is still the baseline: the start commit of
+    // the session. A person copies its short form from results.tsv.
+    let baseline = fx.lab().head().unwrap();
+    hint(&mut rt, "rw", &format!("rewind:{}", short(&baseline)), "h2");
     runtime::apply(&mut rt, "a1", &Command::Approve { token: edit.token }).unwrap();
     let rewind = run_to_approval(&mut rt, exec).await;
     assert_eq!(rewind.tool, agent::REWIND);

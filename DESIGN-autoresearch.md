@@ -257,11 +257,11 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC22 | `e2e::the_command_trainer_runs_a_real_command_per_commit`, `trainer::tests::the_command_trainer_*`. |
 | AC23 | `claude::tests` (nine cases). |
 | AC24 | `e2e::the_workflows_register_on_a_postgres_builder_with_an_llm_budget`. |
-| AC25 | `e2e::purge_removes_old_finished_runs`, `cli::eval_and_purge_work_on_a_finished_night`. |
+| AC25 | `e2e::purge_removes_old_finished_runs`, `cli::eval_and_purge_work_on_a_finished_night`: the tag of a purged night stays used. |
 | AC26 | `cli::*` and the CI demo step. |
 | AC27 | `ci.yml`: the test step, the demo step and the clippy step. `dst-nightly.yml`: the `autoresearch` job. |
 | AC28 | `docs/audits/comment-hygiene.py --base origin/trunk-dev` passes. |
-| AC29 | `e2e::two_sessions_in_one_lab_take_turns_on_their_own_branches`, `lab::tests::checkout_moves_back_to_the_session_branch_only_when_clean`, `activities::tests::train_refuses_a_moved_branch_and_a_change_no_commit_holds`. |
+| AC29 | `e2e::two_sessions_in_one_lab_take_turns_on_their_own_branches`, `lab::tests::checkout_moves_back_to_the_session_branch_only_when_clean`, `two_sessions_never_share_a_commit`, `a_tag_that_another_session_used_is_refused`, `activities::tests::train_refuses_a_moved_branch_and_a_change_no_commit_holds`, `setup_refuses_a_tag_that_another_session_used`. |
 | AC30 | `e2e::a_nightly_session_takes_commands_by_its_tag`. |
 | AC31 | `lab::tests::a_commit_is_made_once_per_key`, `an_edit_runs_once_per_call`, `an_edit_whose_write_was_lost_runs_on_its_retry`, `a_row_is_recorded_once_per_key`, `a_row_whose_write_was_lost_lands_on_its_retry`. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`. `agent::tests::an_edit_call_that_runs_again_changes_nothing`. |
 | AC32 | `trainer::tests::a_dropped_run_kills_its_whole_group`, `the_next_run_kills_a_run_that_outlived_its_runner`, `a_timeout_kills_the_children_of_the_run_too`, `a_free_lock_forgets_the_group_of_an_earlier_run`. |
@@ -289,7 +289,10 @@ The fixes:
   commit ids. A short id can become ambiguous as the lab grows, so only
   `results.tsv` and the console show it. A rewind resolves a short id on
   the session branch only. A free trainer lock clears the old group id. A
-  redelivered heartbeat alert marks its rows.
+  redelivered heartbeat alert marks its rows. Each session starts with an
+  empty commit that holds the key of its setup. So two sessions in one lab
+  never share a commit, and setup refuses a branch that another session
+  started, such as one that `purge` left.
 - **Steering.** Commands by tag, `run` resumes across midnight, rejected
   commands kept, one decision per approval wait.
 - **Security.** Flow labels follow the session. No secrets in the trainer

@@ -47,7 +47,9 @@ Experiment 1 ran out of memory. A fix proposal halved the device batch, and
 the fixed run lost to the base, so it is a discard. Experiment 2 diverged,
 and the fix agent gave up, so the row is a crash. The six kept rows count the
 baseline. The branch `autoresearch/demo` holds the baseline and the five
-kept commits only. `results.tsv` and a morning report sit in the lab.
+kept commits only. The baseline is an empty start commit, so two sessions in
+one lab never share a commit. `results.tsv` and a morning report sit in the
+lab.
 
 ## How upstream maps to Harvest
 
@@ -56,7 +58,7 @@ kept commits only. `results.tsv` and a morning report sit in the lab.
 | `program.md`, which the human edits | The system prompt of each `agent_loop` run. `eval` tests a new one against recorded runs. |
 | The agent edits `train.py` only | The `edit_train` tool writes that one file. The policy denies every unknown tool. |
 | `prepare.py` is read-only | `read_file` serves a fixed list of files. No tool writes `prepare.py`. |
-| The branch `autoresearch/<tag>` must not exist | The session workflow id is `autoresearch/<tag>`, started with `RejectDuplicate`. |
+| The branch `autoresearch/<tag>` must not exist | The session workflow id is `autoresearch/<tag>`, started with `RejectDuplicate`. Setup also refuses a branch that another session started, such as one that `purge` left. |
 | Commit, train, then keep or `git reset` | A saga: the commit is a step, and `git reset` is its compensation. |
 | Five minutes of training, kill a run at ten | The `train` activity, `start_to_close = "15m"`. The trainer kills the process group at ten minutes. |
 | A run over ten minutes is a failure | A crash row. The run gets one fix proposal first, as a crash does. |

@@ -123,6 +123,26 @@ fn eval_and_purge_work_on_a_finished_night() {
     assert!(out.contains("first divergence"), "{out}");
     let out = ok(&["purge", "--lab", &lab, "--older-than-days", "30"]);
     assert!(out.contains("removed 0"), "{out}");
+    let out = ok(&["purge", "--lab", &lab, "--older-than-days", "0"]);
+    assert!(!out.contains("removed 0"), "{out}");
+    // The branch of the purged night stays, so its tag stays used.
+    let again = autoresearch(&[
+        "run",
+        "--lab",
+        &lab,
+        "--tag",
+        "e",
+        "--experiments",
+        "1",
+        "--no-report",
+    ]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&again.stdout),
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert!(!again.status.success(), "{text}");
+    assert!(text.contains("autoresearch/e exists"), "{text}");
 }
 
 #[test]
