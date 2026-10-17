@@ -16,6 +16,7 @@ use autumn_harvest::executor::{
     QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
     run_workflow_with_state_history_policy_and_caps,
 };
+use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::{
     ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, TimerId,
     UpdateHandlerInfo, UpdateId, WorkflowCommand, WorkflowEvent, WorkflowHandlerFn,
@@ -29,8 +30,9 @@ use crate::error::{SqliteError, SqliteResult};
 use crate::history_cap::{CapCheck, HistoryCapReason};
 use crate::lock::WriterLock;
 use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
+use crate::schedule::ScheduleSummary;
 use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
-use crate::{lock, mutex, queue, schema, store, update, visibility, worker};
+use crate::{lock, mutex, queue, retention, schedule, schema, store, update, visibility, worker};
 
 /// A synchronous activity body, keyed by name.
 ///
@@ -441,6 +443,7 @@ impl SqliteRuntime {
              PRAGMA synchronous = FULL;",
         )?;
         conn.execute_batch(schema::SCHEMA)?;
+        conn.execute_batch(schema::APPEND_ONLY_GUARD)?;
         // Bring an existing file up to the current shape (issue #1068): the
         // `CREATE TABLE IF NOT EXISTS` above leaves a pre-existing table with its
         // ORIGINAL columns, so this additive, idempotent step adds any column
@@ -1865,6 +1868,125 @@ impl SqliteRuntime {
         visibility::describe(&self.conn, exec)
     }
 
+    /// Insert or update the schedule of `schedule.workflow_name` (issue
+    /// #2031).
+    ///
+    /// The workflow name is the key, as on Postgres. A new schedule fires
+    /// first at its first slot after now. An update keeps the stored pause.
+    /// An update with the same spec also keeps the next slot. So an app can
+    /// upsert its schedules on every open, and a reopen moves no slot.
+    ///
+    /// [`poll_once`](Self::poll_once) and [`run_until_idle`](Self::run_until_idle)
+    /// fire due schedules. [`run_until_blocked`](Self::run_until_blocked)
+    /// drives one run and fires nothing. Catch-up is off: after a gap, a
+    /// schedule fires one run, then counts its next slot from now. `jitter`
+    /// is ignored, because one writer has no fleet to spread.
+    ///
+    /// # Errors
+    ///
+    /// - [`SqliteError::UnknownWorkflow`]: the workflow is not registered.
+    /// - [`SqliteError::PayloadTooLarge`]: the input is over the workflow-input
+    ///   cap.
+    /// - [`SqliteError::InvalidSchedule`]: the spec does not validate.
+    /// - [`SqliteError::Unsupported`]: a field that this backend cannot
+    ///   honor is set. The message starts with `WorkflowSchedule.<field>`.
+    ///   The supported overlap policies are `Skip` and `AllowAll`.
+    /// - [`SqliteError::Sqlite`]: the write fails.
+    pub fn upsert_schedule(&mut self, schedule: &WorkflowSchedule) -> SqliteResult<()> {
+        self.check_start(&schedule.workflow_name, &schedule.input)?;
+        let now = (self.now_fn)().timestamp_millis();
+        schedule::upsert(&self.conn, schedule, now)
+    }
+
+    /// Remove the schedule of `workflow_name` (issue #2031). Its runs keep
+    /// running.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ScheduleNotFound`] when no schedule exists.
+    /// Returns [`SqliteError::Sqlite`] if the write fails.
+    pub fn delete_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
+        schedule::delete(&self.conn, workflow_name)
+    }
+
+    /// Pause the schedule of `workflow_name` (issue #2031).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ScheduleNotFound`] when no schedule exists.
+    /// Returns [`SqliteError::Sqlite`] if the write fails.
+    pub fn pause_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
+        let now = (self.now_fn)().timestamp_millis();
+        schedule::set_paused(&self.conn, workflow_name, true, now)
+    }
+
+    /// Resume the schedule of `workflow_name` (issue #2031). The next slot
+    /// counts from now, so the slots missed while paused do not fire.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ScheduleNotFound`] when no schedule exists.
+    /// Returns [`SqliteError::Corrupt`] for a stored spec that does not parse,
+    /// and [`SqliteError::Sqlite`] if the write fails.
+    pub fn resume_schedule(&mut self, workflow_name: &str) -> SqliteResult<()> {
+        let now = (self.now_fn)().timestamp_millis();
+        schedule::set_paused(&self.conn, workflow_name, false, now)
+    }
+
+    /// Every stored schedule, by workflow name (issue #2031).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Corrupt`] for a stored spec that does not parse,
+    /// and [`SqliteError::Sqlite`] if the query fails.
+    pub fn list_schedules(&self) -> SqliteResult<Vec<ScheduleSummary>> {
+        schedule::list(&self.conn)
+    }
+
+    /// Remove each terminal run closed more than `older_than` ago (issue
+    /// #2031). Returns the number of runs removed.
+    ///
+    /// The purge removes the run's events, tasks, timers, signals, activity
+    /// attempts and row. It works in batches of 256 runs, one short
+    /// transaction each. A `RUNNING` run is never removed. A run closed
+    /// before issue #2027 has no close time, so it stays.
+    ///
+    /// The rule is the Postgres one: only the close time counts. So the
+    /// purge also removes an old run of a chain whose newest run still runs.
+    /// Then `successor` of that old run is `ExecutionNotFound`. A keyed
+    /// signal that it received no longer dedupes a retry.
+    ///
+    /// A purged id is gone. A later start with its `workflow_id` creates a
+    /// fresh run, as after a Postgres retention sweep. The purge frees pages
+    /// for reuse, so the file stops growing. Run `VACUUM` to shrink it.
+    ///
+    /// The window counts on the real clock, because a terminal write stamps
+    /// `closed_at` from the real clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::Sqlite`] if a delete fails.
+    pub fn purge_terminal(&mut self, older_than: std::time::Duration) -> SqliteResult<u64> {
+        self.purge_terminal_as_of(Utc::now(), older_than)
+    }
+
+    /// Like [`purge_terminal`](Self::purge_terminal), with the window counted
+    /// back from `now`. A test seam that ages runs without a sleep.
+    ///
+    /// # Errors
+    ///
+    /// See [`purge_terminal`](Self::purge_terminal).
+    #[doc(hidden)]
+    pub fn purge_terminal_as_of(
+        &mut self,
+        now: DateTime<Utc>,
+        older_than: std::time::Duration,
+    ) -> SqliteResult<u64> {
+        let window = i64::try_from(older_than.as_micros()).unwrap_or(i64::MAX);
+        let cutoff = now.timestamp_micros().saturating_sub(window);
+        retention::purge_terminal(&mut self.conn, cutoff)
+    }
+
     /// Run the query `name` on `exec` with `args`, and return its answer
     /// (issue #2022).
     ///
@@ -2034,6 +2156,12 @@ impl SqliteRuntime {
     /// drives many UNRELATED executions, so one failure must not silently
     /// starve the rest.
     ///
+    /// The pass first fires each due schedule (issue #2031). A fire that
+    /// starts a run is progress. A schedule that cannot fire keeps its slot
+    /// due. An unregistered workflow or a damaged row only logs a warning.
+    /// Any other fire error, such as a failed write, is returned like a
+    /// run's error, after the pass drives the fleet.
+    ///
     /// # Errors
     ///
     /// Returns the FIRST execution's error, in `ExecutionId` order, if any.
@@ -2043,7 +2171,7 @@ impl SqliteRuntime {
     /// returns `ExecutionNotFound`, because it drives only stored executions.
     pub async fn poll_once(&mut self) -> SqliteResult<bool> {
         let mut skip = HashSet::new();
-        let (progress, first_error) = self.poll_once_pass(&mut skip).await?;
+        let (progress, first_error) = self.poll_once_pass(&mut skip, true).await?;
         first_error.map_or(Ok(progress), Err)
     }
 
@@ -2074,6 +2202,7 @@ impl SqliteRuntime {
     async fn poll_once_pass(
         &mut self,
         skip: &mut HashSet<ExecutionId>,
+        fire: bool,
     ) -> SqliteResult<(bool, Option<SqliteError>)> {
         // Re-read the wall clock per driven cycle (issue #1069 P2) — see the
         // rationale on `run_until_blocked`. The `_as_of` variant keeps a fixed
@@ -2082,8 +2211,9 @@ impl SqliteRuntime {
         // `now_fn` per finalize; cloned once so it does not borrow `self`.
         let now_fn = self.now_fn.clone();
         let failure_now = move || now_fn().timestamp_millis();
-        let mut progress = false;
         let mut first_error = None;
+        let now = (self.now_fn)().timestamp_millis();
+        let mut progress = fire && self.fire_due_schedules(now, &mut first_error)?;
         for exec in store::running_executions(&self.conn)? {
             if skip.contains(&exec) {
                 continue;
@@ -2118,8 +2248,8 @@ impl SqliteRuntime {
         let now = now.timestamp_millis();
         // `_as_of` simulation: `failure_now() == now` (deterministic, sleep-free).
         let failure_now = move || now;
-        let mut progress = false;
         let mut first_error = None;
+        let mut progress = self.fire_due_schedules(now, &mut first_error)?;
         for exec in store::running_executions(&self.conn)? {
             match self.drive_one_cycle(exec, now, &failure_now).await {
                 Ok(
@@ -2166,8 +2296,11 @@ impl SqliteRuntime {
     pub async fn run_until_idle(&mut self) -> SqliteResult<()> {
         let mut first_error = None;
         let mut skip = HashSet::new();
-        for _ in 0..MAX_ITERATIONS {
-            let (progress, err) = self.poll_once_pass(&mut skip).await?;
+        for pass in 0..MAX_ITERATIONS {
+            // Only the first pass fires schedules (issue #2031). A later pass
+            // could meet a new slot on a slow clock, and the call would never
+            // quiesce. The next call fires that slot.
+            let (progress, err) = self.poll_once_pass(&mut skip, pass == 0).await?;
             if let Some(err) = err {
                 first_error.get_or_insert(err);
             }
@@ -2176,6 +2309,74 @@ impl SqliteRuntime {
             }
         }
         Err(first_error.unwrap_or(SqliteError::Runaway))
+    }
+
+    /// Fire each schedule due at `now` (issue #2031). Returns `true` when a
+    /// fire started a run.
+    ///
+    /// One schedule's error does not stop the others. Its slot stays due.
+    ///
+    /// - An unregistered workflow or a damaged row only logs a warning. It
+    ///   does not fail the pass, so one stale schedule cannot stop the
+    ///   fleet. The slot of an unregistered workflow fires once the app
+    ///   registers it.
+    /// - Any other error, such as a failed write, goes to `first_error`, as
+    ///   a run's error does. So the caller sees that a due slot did not fire.
+    fn fire_due_schedules(
+        &mut self,
+        now: i64,
+        first_error: &mut Option<SqliteError>,
+    ) -> SqliteResult<bool> {
+        let mut started = false;
+        for name in schedule::due_names(&self.conn, now)? {
+            match self.fire_schedule(&name, now) {
+                Ok(fired) => started |= fired,
+                Err(err) => {
+                    tracing::warn!(schedule = %name, error = %err, "a due schedule did not fire");
+                    if !matches!(
+                        err,
+                        SqliteError::UnknownWorkflow(_)
+                            | SqliteError::Corrupt(_)
+                            | SqliteError::Json(_)
+                    ) {
+                        first_error.get_or_insert(err);
+                    }
+                }
+            }
+        }
+        Ok(started)
+    }
+
+    /// Fire the schedule `name` if it is still due at `now`. Returns `true`
+    /// when the fire started a run.
+    ///
+    /// The overlap check, the start and the move to the next slot share one
+    /// transaction. So a crash cannot start a slot twice or lose it.
+    ///
+    /// Under `skip`, a schedule at its run limit drops the slot. A run past
+    /// its deadline, or with a pending cancel, does not count. Postgres has
+    /// already ended such a run.
+    ///
+    /// The run of a slot has a fixed `workflow_id` and starts under
+    /// `RejectDuplicate`, as on Postgres. A slot that already has its run is
+    /// dispatched, so it becomes `last_run_at`. It starts no second run.
+    fn fire_schedule(&mut self, name: &str, now: i64) -> SqliteResult<bool> {
+        self.check_registered(name)?;
+        let config = self.start_config(name, now)?;
+        let tx = self.conn.transaction()?;
+        let Some(due) = schedule::load_due(&tx, name, now)? else {
+            return Ok(false);
+        };
+        let full = !due.allow_all && schedule::active_runs(&tx, name, now)? >= due.max_active_runs;
+        let created = if full {
+            tracing::info!(schedule = %name, "a schedule slot is dropped: its run limit is reached");
+            false
+        } else {
+            start_slot(&tx, &due, &config, now)?
+        };
+        schedule::advance(&tx, &due, now, !full)?;
+        tx.commit()?;
+        Ok(created)
     }
 
     /// Run one decision cycle, and seal the run `FAILED` when the cycle meets an
@@ -2353,8 +2554,9 @@ impl SqliteRuntime {
         store::append_event(&tx, exec, event)?;
         store::set_failed(&tx, exec, error)?;
         // The cycle's own cleanup, such as a race's loser cancellation, rolled
-        // back with the cycle. This backend has no retention pass, so remove
-        // the work no one can use any more, as the `TerminateIfRunning` seal does.
+        // back with the cycle. Retention removes only whole runs, once they
+        // age out (issue #2031). So remove the work no one can use any more
+        // now, as the `TerminateIfRunning` seal does.
         delete_open_rows(&tx, exec)?;
         tx.commit()?;
         self.workflow_panic_strikes.remove(&exec);
@@ -2431,7 +2633,7 @@ impl SqliteRuntime {
                 fields: RunFields::default(),
             },
         )?;
-        store::copy_memo_and_search_attrs(&tx, exec, successor)?;
+        store::copy_inherited_fields(&tx, exec, successor)?;
         queue::move_undelivered_signals(&tx, exec, successor)?;
         tx.commit()?;
         Ok(RunState::ContinuedAsNew(successor))
@@ -3545,8 +3747,8 @@ const SEALED_STATE: &str = "CONTINUED_AS_NEW";
 /// staged signals deleted. A keyed row stays (issue #2028). A signal can be staged while the prior is RUNNING. It can then
 /// outlive the prior even if the prior reaches COMPLETED/FAILED on its own (the
 /// workflow never awaited that signal name). The row is then just as unreachable,
-/// regardless of which state sealed it. This backend has no retention/GC pass, so
-/// the row would otherwise survive forever. Then seal to [`SEALED_STATE`] so the prior
+/// regardless of which state sealed it. Retention removes it only with the whole
+/// run, once the run ages out (issue #2031). So the row would otherwise survive. Then seal to [`SEALED_STATE`] so the prior
 /// leaves the active set. Byte-identical
 /// to the pre-#1080 single-prior inline path — extracted so the `TerminateIfRunning`
 /// arm can loop it over EVERY active row for the key
@@ -3635,6 +3837,39 @@ struct FreshRun<'a> {
     started_at: i64,
     /// The memo and the search attributes (issue #2027).
     fields: RunFields<'a>,
+}
+
+/// Start the run of the slot of `due` inside the caller's fire transaction
+/// (issue #2031). Returns `true` when it creates the run, and `false` when
+/// the slot already has its run.
+fn start_slot(
+    conn: &Connection,
+    due: &schedule::Due,
+    config: &store::RunConfig,
+    now: i64,
+) -> SqliteResult<bool> {
+    let workflow_id = schedule::slot_workflow_id(&due.workflow_name, due.slot);
+    let fresh = FreshRun {
+        config,
+        started_at: now,
+        fields: RunFields::default(),
+    };
+    match start_in_tx(
+        conn,
+        &due.workflow_name,
+        Some(&workflow_id),
+        due.input.clone(),
+        WorkflowIdReusePolicy::RejectDuplicate,
+        StartMatrix::Plain,
+        fresh,
+    ) {
+        Ok(outcome) => {
+            store::set_schedule_name(conn, outcome.exec_id, &due.workflow_name)?;
+            Ok(true)
+        }
+        Err(SqliteError::AlreadyExists { .. }) => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 /// Apply the `(workflow_name, workflow_id)` reuse matrix inside the caller's
@@ -3960,8 +4195,8 @@ fn seal_with_cancel_event(
 
 /// Delete the pending tasks, unfired timers and staged signals of a sealed
 /// `exec`, inside the caller's transaction. No drive uses them again, and
-/// this backend has no retention pass. A keyed signal stays, so a retry of its
-/// key still dedupes (issue #2028).
+/// retention removes them only with the whole run (issue #2031). A keyed
+/// signal stays, so a retry of its key still dedupes (issue #2028).
 fn delete_open_rows(conn: &Connection, exec: ExecutionId) -> SqliteResult<()> {
     queue::delete_pending_tasks_for_execution(conn, exec)?;
     queue::delete_unfired_timers_for_execution(conn, exec)?;
@@ -4152,9 +4387,9 @@ fn start_retry(
             fields: RunFields::default(),
         },
     )?;
-    // A retry is the same logical run, so it keeps the memo and the search
-    // attributes, as on Postgres (issue #2027).
-    store::copy_memo_and_search_attrs(conn, exec, successor)?;
+    // A retry is the same logical run. It keeps the memo, the search
+    // attributes (issue #2027) and the schedule (issue #2031), as on Postgres.
+    store::copy_inherited_fields(conn, exec, successor)?;
     queue::move_all_signals_to_retry(conn, exec, successor)?;
     store::append_event(
         conn,

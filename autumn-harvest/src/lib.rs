@@ -581,6 +581,8 @@ pub mod ramp_guard;
 pub mod sandbox;
 #[cfg(feature = "db")]
 pub mod schedule_decision;
+/// Backend-neutral cron and interval slot arithmetic (issue #2031).
+pub mod schedule_plan;
 #[cfg(feature = "db")]
 pub mod scheduler;
 #[cfg(feature = "db")]

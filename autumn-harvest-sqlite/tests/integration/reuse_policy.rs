@@ -456,8 +456,8 @@ async fn terminate_if_running_cleans_up_orphan_timer() {
 // A signal can reach a still-RUNNING execution whose workflow never reaches a
 // matching `wait_for_signal`/`wait_for_signal_timeout`. `TerminateIfRunning`
 // then replaces that execution. The signal must not stay in `harvest_signals`
-// forever. This backend has no retention/GC pass, so nothing else will ever
-// reclaim it.
+// forever. Retention removes it only with the whole run (issue #2031), so
+// nothing else reclaims it while the run is kept.
 #[tokio::test]
 async fn terminate_if_running_orphans_an_undelivered_signal_across_repeated_cycles() {
     let (_dir, path) = temp_db();
@@ -505,7 +505,7 @@ async fn terminate_if_running_orphans_an_undelivered_signal_across_repeated_cycl
         total_orphaned,
         0,
         "every sealed prior's undelivered signal must be cleaned up, not left to \
-         accumulate forever with no retention pass to ever reclaim it (got {total_orphaned} \
+         accumulate until a purge removes the whole run (got {total_orphaned} \
          orphaned rows across {} cycles)",
         priors.len()
     );
@@ -875,7 +875,7 @@ async fn allow_duplicate_failed_only_orphans_an_undelivered_signal_on_the_replac
         0,
         "the replaced FAILED prior's undelivered signal must be cleaned up too, \
          exactly as issue #1374 fixed for the TerminateIfRunning seal path — \
-         otherwise it is orphaned forever (no retention/GC pass on this backend)"
+         otherwise it is orphaned until a purge removes the whole run"
     );
 }
 

@@ -70,7 +70,6 @@ groups:
         stability: development
         brief: >
           The workflow operation that the span describes.
-        examples: ["execute_workflow", "execute_activity"]
       - id: workflow.queue.name
         type: string
         stability: development

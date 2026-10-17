@@ -107,6 +107,7 @@ mod concurrency_model_ci;
 mod concurrency_supersede_tests;
 mod contention_adaptive_atomicity_docs;
 mod context_headers_tests;
+mod coverage_nightly_wiring;
 mod cross_region_dr_docs;
 #[cfg(feature = "db")]
 mod cross_region_dr_tests;
