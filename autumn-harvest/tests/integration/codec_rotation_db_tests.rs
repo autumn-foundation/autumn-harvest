@@ -4041,17 +4041,17 @@ async fn codec_cells(conn: &mut AsyncPgConnection) -> Vec<(String, Value)> {
            UNION ALL SELECT 19, id::TEXT, 'task_headers', context_headers \
              FROM harvest_task_queue WHERE context_headers IS NOT NULL \
            UNION ALL SELECT 20, id::TEXT, 'debounce_headers', start_options -> 'context_headers' \
-             FROM harvest_debounce \
+             FROM harvest_debounce WHERE start_options -> 'context_headers' IS NOT NULL \
            UNION ALL SELECT 21, id::TEXT, 'debounce_memo', start_options -> 'memo' \
-             FROM harvest_debounce \
+             FROM harvest_debounce WHERE start_options -> 'memo' IS NOT NULL \
            UNION ALL SELECT 22, id::TEXT, 'throttle_headers', start_options -> 'context_headers' \
-             FROM harvest_start_throttle \
+             FROM harvest_start_throttle WHERE start_options -> 'context_headers' IS NOT NULL \
            UNION ALL SELECT 23, id::TEXT, 'throttle_memo', start_options -> 'memo' \
-             FROM harvest_start_throttle \
+             FROM harvest_start_throttle WHERE start_options -> 'memo' IS NOT NULL \
            UNION ALL SELECT 24, id::TEXT, 'batch_headers', start_options -> 'context_headers' \
-             FROM harvest_event_batches \
+             FROM harvest_event_batches WHERE start_options -> 'context_headers' IS NOT NULL \
            UNION ALL SELECT 25, id::TEXT, 'batch_memo', start_options -> 'memo' \
-             FROM harvest_event_batches \
+             FROM harvest_event_batches WHERE start_options -> 'memo' IS NOT NULL \
          ) c ORDER BY ord, row_id",
     )
     .load(conn)
