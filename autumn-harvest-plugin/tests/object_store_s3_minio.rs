@@ -167,6 +167,7 @@ async fn s3_archiver_uploads_ciphertext_and_fetches_it_back() {
         execution_timeout: None,
         deadline_at: None,
         parent_execution_id: None,
+        start_provenance: None,
     })
     .unwrap();
     archiver.archive(&doc).await.unwrap();

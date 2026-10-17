@@ -292,6 +292,7 @@ impl std::fmt::Display for ReplayReport {
 ///     execution_timeout: None,
 ///     deadline_at: None,
 ///     parent_execution_id: None,
+///     start_provenance: None,
 ///     workflow_id: None,
 ///     queue_name: None,
 /// };
