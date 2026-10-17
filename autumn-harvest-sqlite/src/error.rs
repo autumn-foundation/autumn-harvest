@@ -41,6 +41,10 @@ pub enum SqliteError {
     Json(#[from] serde_json::Error),
 
     /// A workflow name with no registered handler.
+    ///
+    /// A drive also returns it when a workflow starts a child whose name has
+    /// no handler (issue #2026). The cycle rolls back, and the parent stays
+    /// `RUNNING`.
     #[error("unknown workflow: {0}")]
     UnknownWorkflow(String),
 
@@ -181,8 +185,8 @@ pub enum SqliteError {
     },
 
     /// A workflow emitted a [`WorkflowCommand`](autumn_harvest::WorkflowCommand)
-    /// outside the single-writer backend's supported subset (child workflows,
-    /// external signals/cancels, continue-as-new, local activities, …).
+    /// outside the single-writer backend's supported subset (continue-as-new,
+    /// local activities, updates, …).
     ///
     /// The run is terminal (issue #1834). The drive that returns this error
     /// first rolls back the cycle. It then seals the run `FAILED` with a typed
@@ -415,8 +419,10 @@ pub enum SqliteError {
         details: String,
     },
 
-    /// A driven execution made no durable progress and could not be classified
-    /// as waiting on a timer or a signal — surfaced honestly instead of looping.
+    /// A driven execution made no durable progress. It waits on no timer, no
+    /// signal and no other run, so this error surfaces it instead of a loop.
+    /// It also names a run that spent its cycle budget in one
+    /// `run_until_blocked` call.
     /// The most common cause is a task stranded `RUNNING` by a crash that the
     /// orphan reclaim on [`SqliteRuntime::open`](crate::SqliteRuntime::open) did
     /// not clear (e.g. a different database file).

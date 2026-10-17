@@ -2456,8 +2456,16 @@ impl HistoryMatcher {
     /// terminal events (delivered or failed) for any in-progress stashed signals.
     /// This ensures we resolve signals that are finished but blocked by subsequent
     /// un-fired timers or un-executed activities (mixed batch).
+    ///
+    /// A stashed await is resolved the same way (issue #2026). Its terminal
+    /// lands later than its request, often past a sibling's child or activity
+    /// events, as in `join!(await_external_workflow, spawn_child_workflow)`.
+    /// Without this scan the stashed await stays in progress and parks forever.
     fn scan_ahead_for_external_signal_terminals(&mut self) {
-        if self.pending_external_signals.is_empty() && self.pending_external_cancels.is_empty() {
+        if self.pending_external_signals.is_empty()
+            && self.pending_external_cancels.is_empty()
+            && self.pending_external_awaits.is_empty()
+        {
             return;
         }
 
@@ -2521,9 +2529,47 @@ impl HistoryMatcher {
                         self.consumed_signal_events.insert(scan_cursor);
                     }
                 }
-                _ => {}
+                event => {
+                    if let Some((id, terminal)) = Self::await_terminal_of(event)
+                        && let Some(p) = self
+                            .pending_external_awaits
+                            .iter_mut()
+                            .find(|p| p.await_id == id && p.terminal.is_none())
+                    {
+                        p.terminal = Some(terminal);
+                        self.consumed_signal_events.insert(scan_cursor);
+                    }
+                }
             }
             scan_cursor += 1;
+        }
+    }
+
+    /// The await id and stash terminal of an `ExternalAwaitResolved` or
+    /// `ExternalAwaitFailed` event, or `None` for any other event.
+    fn await_terminal_of(event: &WorkflowEvent) -> Option<(ExternalAwaitId, StashedAwaitTerminal)> {
+        match event {
+            WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                Some((*await_id, StashedAwaitTerminal::Resolved(output.clone())))
+            }
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+            } => Some((
+                *await_id,
+                StashedAwaitTerminal::Failed {
+                    reason_code: reason_code.clone(),
+                    message: message.clone(),
+                    error_type: error_type.clone(),
+                    details: details.clone(),
+                    non_retryable: *non_retryable,
+                },
+            )),
+            _ => None,
         }
     }
 
@@ -13528,18 +13574,65 @@ mod tests {
             }
         );
 
-        // Reverse order: polling the await future first (before the concurrent
-        // activity future has scanned forward past the interleaved
-        // `ActivityScheduled`) yields `ExternalAwaitInProgress` — never a
-        // divergence — exactly like the cancel primitive. In a real
-        // `tokio::join!` re-drive the activity future settles the await's
-        // terminal on a later fresh cycle; full end-to-end resolution across
-        // randomized re-drives is covered by the `WorkflowReplayer` fixtures.
+        // Reverse order: the await future is polled first, before the activity
+        // future scans past the interleaved `ActivityScheduled`. The look-ahead
+        // still finds the await's own terminal (issue #2026). Each cycle builds
+        // a fresh matcher and polls the await first again, so an in-progress
+        // answer here would park the await permanently.
         let mut matcher2 = HistoryMatcher::new(events);
-        assert!(matches!(
+        assert_eq!(
             matcher2.match_external_await(target),
-            HistoryMatch::ExternalAwaitInProgress { .. }
-        ));
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true})
+            }
+        );
+        assert_eq!(
+            matcher2.match_activity("compute"),
+            HistoryMatch::Matched {
+                output: serde_json::json!(7)
+            }
+        );
+    }
+
+    #[test]
+    fn match_external_await_resolves_past_a_sibling_child() {
+        // Issue #2026: `join!(await_external_workflow, spawn_child_workflow)`.
+        // The child ends before the awaited target, so the await's terminal
+        // lands after the child's events. The await, polled first, must still
+        // resolve, and the child must still match.
+        let target = ExecutionId::new();
+        let await_id = ExternalAwaitId::new();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!(4),
+            },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!("ready"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!("ready")
+            }
+        );
+        assert_eq!(
+            matcher.match_child_workflow("child", &Value::Null),
+            HistoryMatch::Matched {
+                output: serde_json::json!(4)
+            }
+        );
+        assert!(!matcher.has_non_lifecycle_unconsumed());
     }
 
     // ── Issue #1338: characterization tests for the 10 sites consolidated onto

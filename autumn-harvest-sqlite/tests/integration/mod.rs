@@ -13,6 +13,7 @@ mod append_only_guard;
 mod atomicity;
 mod cancel_terminate;
 mod cancellable_timers;
+mod composition;
 mod continue_as_new;
 mod cross_backend;
 mod docs_start_contract;
