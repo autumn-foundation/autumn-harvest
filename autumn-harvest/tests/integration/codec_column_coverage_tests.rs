@@ -3185,7 +3185,7 @@ async fn a_workflow_whose_headers_cannot_decode_fails_and_never_runs() {
         "the run fails instead of losing its headers"
     );
     assert_eq!(
-        HEADER_GUARDED_RUNS.load(Ordering::SeqCst),
+        AtomicUsize::load(&HEADER_GUARDED_RUNS, Ordering::SeqCst),
         0,
         "the handler never runs without its headers"
     );
