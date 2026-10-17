@@ -2582,7 +2582,6 @@ fn dag_schedule_row_is_converged(
         && existing.buffered_runs == desired_buffered
 }
 
-#[allow(clippy::too_many_lines)]
 /// A copy of `ws` whose input is ready to store (issue #2043).
 ///
 /// Every write of `harvest_schedules.workflow_input` goes through this copy.
@@ -2613,6 +2612,7 @@ fn schedule_row_with_plain_input(
     plain
 }
 
+#[allow(clippy::too_many_lines)]
 async fn upsert_workflow_schedule(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
