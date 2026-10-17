@@ -334,6 +334,9 @@ experiment set the search attribute `status`, which the engine reserves.
   then names no group, so the next run cannot kill it. That run waits ten
   seconds and fails, and the activity retries. Stop the old run by hand,
   or let it end at its own time budget.
+- **Training needs a Unix worker.** Two deliveries of one train call take
+  turns on a `flock`, and so do two runs of the command trainer. Off Unix
+  no such lock exists, so the train activity refuses to train.
 - **Off Linux, the next run kills no run that outlived its runner.** It
   cannot read the start time that tells the group of that run from a group
   that reused its id. It waits and fails in the same way.

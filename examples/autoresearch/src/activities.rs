@@ -36,6 +36,8 @@ pub const DIRTY_TREE: &str = "DirtyTree";
 pub const TAG_USED: &str = "TagUsed";
 /// The error type of a lab path that is not canonical.
 pub const LAB_PATH: &str = "LabPath";
+/// The error type of a train call on a worker that cannot serialize it.
+pub const UNSUPPORTED: &str = "Unsupported";
 /// The directory in the state directory with one finished run per train call.
 const RUNS: &str = "runs";
 
@@ -315,12 +317,27 @@ async fn call_lock(saved: &Path) -> Result<std::fs::File, String> {
     let path = saved.with_extension("lock");
     blocking(move || {
         let file = crate::stores::open_lock(&path)?;
-        #[cfg(unix)]
-        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
-            .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+        lock_exclusive(&file, &path)?;
         Ok(file)
     })
     .await
+}
+
+/// Wait for an exclusive `flock` on `file`.
+#[cfg(unix)]
+fn lock_exclusive(file: &std::fs::File, path: &Path) -> Result<(), String> {
+    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive)
+        .map_err(|e| format!("cannot lock {}: {e}", path.display()))
+}
+
+/// Off Unix no lock serializes two deliveries of one call. Both could
+/// train, so the call refuses to train.
+#[cfg(not(unix))]
+fn lock_exclusive(_file: &std::fs::File, _path: &Path) -> Result<(), String> {
+    Err(fatal(
+        UNSUPPORTED,
+        "the train activity needs a Unix worker, because it serializes the deliveries of a call with flock",
+    ))
 }
 
 /// The run is code that the model wrote, and the checks before it are stale

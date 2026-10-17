@@ -725,10 +725,11 @@ impl Lock {
         }
     }
 
+    /// Off Unix no lock keeps a second run off the GPU, so no run starts.
     #[cfg(not(unix))]
-    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    #[allow(clippy::unused_self)]
     fn try_lock(&self) -> Result<bool, String> {
-        Ok(true)
+        Err("the command trainer needs a Unix worker, because it holds the GPU with flock".into())
     }
 
     /// Kill the group that the file names, when it is still that group.

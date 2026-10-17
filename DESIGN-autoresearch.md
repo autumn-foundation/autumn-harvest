@@ -450,7 +450,8 @@ Codex reviewed the same commit. The fixes:
   link that git tracks is fixed by its target. A lab with a submodule does
   not train, because the runner cannot check its files. The lock file of
   each train call opens as the trainer lock does: no link, no pipe, and no
-  wait.
+  wait. Off Unix no `flock` serializes two deliveries of one call, so the
+  train activity refuses to train there.
 - **Tests and docs.** New tests plant a link at the real paths of the
   memory store, the cache and the inbox. A test commits an LFS pointer and
   checks the content on disk. `purge` refuses, and the docs now say so.
