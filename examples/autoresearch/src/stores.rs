@@ -519,6 +519,45 @@ pub fn open_regular(path: &Path) -> std::io::Result<Option<std::fs::File>> {
     }
 }
 
+/// Open the lock file at `path`, and make it when it is missing.
+///
+/// It must be a regular file. A run can plant a link there, and a write
+/// must not reach the target of the link. A pipe must not hang the runner,
+/// so the open does not block. The file blocks as usual after the open,
+/// because the trainer lock becomes the stdin of a run.
+///
+/// # Errors
+///
+/// Returns an error when the open fails, or the path is not a regular file.
+pub fn open_lock(path: &Path) -> Result<std::fs::File, String> {
+    #[cfg(unix)]
+    let opened = {
+        use rustix::fs::{Mode, OFlags};
+        rustix::fs::open(
+            path,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map(std::fs::File::from)
+        .map_err(std::io::Error::from)
+    };
+    #[cfg(not(unix))]
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path);
+    let file = opened.map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    #[cfg(unix)]
+    rustix::fs::fcntl_setfl(&file, rustix::fs::OFlags::empty())
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    Ok(file)
+}
+
 /// The error of an open that [`open_regular`] refused. A symlink at the
 /// path fails with `ELOOP`, and the message says so.
 fn not_regular(path: &Path, error: &std::io::Error) -> std::io::Error {
@@ -840,6 +879,19 @@ mod tests {
         let key = "a".repeat(64);
         std::os::unix::fs::symlink(&secret, dir.path().join("blobs").join(&key)).unwrap();
         assert!(blobs.get(&key).await.is_err());
+    }
+
+    /// A lock file opens without a block, then blocks as usual. The trainer
+    /// lock becomes the stdin of a run, which must see a plain file.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_file_opens_as_a_plain_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = open_lock(&dir.path().join("a.lock")).unwrap();
+        let flags = rustix::fs::fcntl_getfl(&file).unwrap();
+        assert!(!flags.contains(rustix::fs::OFlags::NONBLOCK), "{flags:?}");
+        std::os::unix::fs::symlink(dir.path().join("a.lock"), dir.path().join("b.lock")).unwrap();
+        assert!(open_lock(&dir.path().join("b.lock")).is_err());
     }
 
     #[tokio::test]

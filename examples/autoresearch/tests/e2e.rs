@@ -851,6 +851,25 @@ fn the_workflows_register_on_a_postgres_builder_with_an_llm_budget() {
     assert_eq!(built.workflow_schedules().len(), 2);
 }
 
+/// The Postgres registration builds its schedules from the config, not
+/// through `start`. Each schedule must name the lab by its canonical path.
+#[cfg(unix)]
+#[test]
+fn the_schedules_name_the_lab_by_its_canonical_path() {
+    let fx = Fixture::new();
+    let link = fx.lab().root().with_file_name("link");
+    std::os::unix::fs::symlink(fx.lab().root(), &link).unwrap();
+    let mut config = fx.config("", 1);
+    config.lab = link.display().to_string();
+    let real = fx.lab().root().display().to_string();
+    let built = runtime::postgres(fx.harness(&model()), &config).unwrap();
+    for schedule in built.workflow_schedules() {
+        let input = schedule.input.to_string();
+        assert!(input.contains(&real), "{input}");
+        assert!(!input.contains(&config.lab), "{input}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_paper_taints_every_later_run_of_the_session() {
     let fx = Fixture::new();

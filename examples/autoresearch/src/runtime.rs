@@ -78,14 +78,7 @@ pub fn start(rt: &mut SqliteRuntime, config: &SessionConfig) -> Result<Execution
     config.policy.validate()?;
     let mut config = config.clone();
     config.tag = tag.to_string();
-    // The lab mutex and the agent runs name the lab by its canonical path.
-    if let Some(root) = std::path::Path::new(&config.lab)
-        .canonicalize()
-        .ok()
-        .and_then(|root| root.to_str().map(str::to_string))
-    {
-        config.lab = root;
-    }
+    config.lab = canonical_lab(&config.lab);
     let input = SessionInput {
         config: config.clone(),
         carry: None,
@@ -736,6 +729,7 @@ pub fn nightly(config: &SessionConfig) -> Result<WorkflowSchedule, String> {
     config.policy.validate()?;
     let mut config = config.clone();
     config.tag.clear();
+    config.lab = canonical_lab(&config.lab);
     let input = SessionInput {
         config,
         carry: None,
@@ -752,7 +746,19 @@ pub fn nightly(config: &SessionConfig) -> Result<WorkflowSchedule, String> {
 /// Returns an error when the tick does not encode.
 pub fn heartbeat(lab: &std::path::Path) -> Result<WorkflowSchedule, String> {
     let every = Schedule::Interval(Duration::from_secs(30 * 60));
-    heartbeat::schedule(every, &crate::agent::heartbeat_task(lab)).map_err(|e| e.to_string())
+    let lab = std::path::PathBuf::from(canonical_lab(&lab.display().to_string()));
+    heartbeat::schedule(every, &crate::agent::heartbeat_task(&lab)).map_err(|e| e.to_string())
+}
+
+/// The canonical form of the lab path `lab`. The lab mutex and the agent
+/// runs name the lab by it. A path that does not resolve stays as it is,
+/// and setup then names the problem.
+fn canonical_lab(lab: &str) -> String {
+    std::path::Path::new(lab)
+        .canonicalize()
+        .ok()
+        .and_then(|root| root.to_str().map(str::to_string))
+        .unwrap_or_else(|| lab.to_string())
 }
 
 /// The same workflows and activities on a Postgres `HarvestBuilder`, with an

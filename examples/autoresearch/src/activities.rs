@@ -309,16 +309,12 @@ pub fn check_trainer(trainer: &TrainerSpec) -> Result<(), String> {
 }
 
 /// Hold an exclusive lock on the lock file beside `saved` until the file
-/// drops. Two deliveries of one call that run at once take turns.
+/// drops. Two deliveries of one call that run at once take turns. A run can
+/// plant a link or a pipe at the lock file, and the open refuses both.
 async fn call_lock(saved: &Path) -> Result<std::fs::File, String> {
     let path = saved.with_extension("lock");
     blocking(move || {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let file = crate::stores::open_lock(&path)?;
         #[cfg(unix)]
         rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
             .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
@@ -813,6 +809,29 @@ mod tests {
             std::fs::read_to_string(&counter).unwrap().lines().count(),
             1
         );
+    }
+
+    /// A run can plant a pipe at the lock file of a call. The call must not
+    /// hang on it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_planted_pipe_at_a_call_lock_is_refused() {
+        use rustix::fs::{FileType, Mode, OFlags};
+        let dir = tempfile::tempdir().unwrap();
+        let saved = dir.path().join("call.json");
+        let lock = saved.with_extension("lock");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &lock,
+            FileType::Fifo,
+            Mode::RUSR | Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        let locked = tokio::time::timeout(Duration::from_secs(5), call_lock(&saved)).await;
+        // A reader frees an open that blocks, so a failure cannot hang the test.
+        let _reader = rustix::fs::open(&lock, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty());
+        assert!(matches!(locked, Ok(Err(_))), "{locked:?}");
     }
 
     /// The stash is only a backup. A lab that git cannot stash, such as one

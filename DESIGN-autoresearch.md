@@ -255,9 +255,9 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC19 | `e2e::eval_names_the_first_turn_where_a_new_program_differs`, `cli::eval_and_purge_work_on_a_finished_night`. |
 | AC20 | `e2e::the_response_cache_serves_an_identical_report_turn`: the second report turn runs in a new process and asks no model. |
 | AC21 | `e2e::the_inbox_delivers_a_command_once`, `cli::inbox_commands_queue_for_the_runner`, `inbox::tests`. |
-| AC22 | `e2e::the_command_trainer_runs_a_real_command_per_commit`, `trainer::tests::the_command_trainer_*`. `trainer::tests::the_runner_reads_the_log_the_run_wrote_not_a_symlink`, `the_timeout_note_does_not_follow_a_symlink`. `lab::tests::git_runs_with_the_trainer_environment`, `a_diff_runs_no_external_program`, `a_planted_symlink_is_refused_and_never_copied`. `stores::tests::a_read_refuses_a_symlink_and_a_pipe`, `the_stores_refuse_a_planted_link`. `inbox::tests::a_planted_link_is_set_aside`. `trainer::tests::a_planted_link_or_pipe_at_the_lock_is_refused`. |
+| AC22 | `e2e::the_command_trainer_runs_a_real_command_per_commit`, `trainer::tests::the_command_trainer_*`. `trainer::tests::the_runner_reads_the_log_the_run_wrote_not_a_symlink`, `the_timeout_note_does_not_follow_a_symlink`. `lab::tests::git_runs_with_the_trainer_environment`, `a_diff_runs_no_external_program`, `a_planted_symlink_is_refused_and_never_copied`. `stores::tests::a_read_refuses_a_symlink_and_a_pipe`, `the_stores_refuse_a_planted_link`. `inbox::tests::a_planted_link_is_set_aside`. `trainer::tests::a_planted_link_or_pipe_at_the_lock_is_refused`. `activities::tests::a_planted_pipe_at_a_call_lock_is_refused`. `stores::tests::a_lock_file_opens_as_a_plain_file`. |
 | AC23 | `claude::tests` (nine cases). |
-| AC24 | `e2e::the_workflows_register_on_a_postgres_builder_with_an_llm_budget`. |
+| AC24 | `e2e::the_workflows_register_on_a_postgres_builder_with_an_llm_budget`. `e2e::the_schedules_name_the_lab_by_its_canonical_path`: the registration names the lab by its canonical path. |
 | AC25 | `e2e::purge_removes_old_finished_runs`, `e2e::a_purge_refuses_to_remove_a_session_whose_report_runs`, `cli::eval_and_purge_work_on_a_finished_night`: the tag of a purged night stays used. |
 | AC26 | `cli::*` and the CI demo step. |
 | AC27 | `ci.yml`: the test step, the demo step and the clippy step. `dst-nightly.yml`: the `autoresearch` job. |
@@ -445,9 +445,12 @@ Codex reviewed the same commit. The fixes:
   refuses a pipe.
 - **Codex.** A lab has one path. `runtime::start` makes the path canonical,
   and setup refuses another path. Two paths to one lab would get two lab
-  mutexes, and no agent run would find the lab. A link that git tracks is
-  fixed by its target. A lab with a submodule does not train, because the
-  runner cannot check its files.
+  mutexes, and no agent run would find the lab. The schedules, which the
+  Postgres registration builds, name the lab by its canonical path too. A
+  link that git tracks is fixed by its target. A lab with a submodule does
+  not train, because the runner cannot check its files. The lock file of
+  each train call opens as the trainer lock does: no link, no pipe, and no
+  wait.
 - **Tests and docs.** New tests plant a link at the real paths of the
   memory store, the cache and the inbox. A test commits an LFS pointer and
   checks the content on disk. `purge` refuses, and the docs now say so.

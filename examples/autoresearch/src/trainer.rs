@@ -698,7 +698,7 @@ impl Lock {
     const WAIT: Duration = Duration::from_secs(10);
 
     async fn take(state: &Path) -> Result<Self, String> {
-        let lock = Self(Self::open(&state.join(TRAINER_LOCK))?);
+        let lock = Self(crate::stores::open_lock(&state.join(TRAINER_LOCK))?);
         let deadline = tokio::time::Instant::now() + Self::WAIT;
         let mut killed = false;
         while !lock.try_lock()? {
@@ -713,35 +713,6 @@ impl Lock {
         }
         lock.name(0, 0)?;
         Ok(lock)
-    }
-
-    /// Open the lock file, and make it when it is missing. It must be a
-    /// regular file. A run can plant a link there, and the runner must not
-    /// write the group to its target. A pipe must not hang the runner.
-    fn open(path: &Path) -> Result<std::fs::File, String> {
-        #[cfg(unix)]
-        let opened = {
-            use rustix::fs::{Mode, OFlags};
-            rustix::fs::open(
-                path,
-                OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR,
-            )
-            .map(std::fs::File::from)
-            .map_err(std::io::Error::from)
-        };
-        #[cfg(not(unix))]
-        let opened = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path);
-        let file = opened.map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-        match file.metadata() {
-            Ok(meta) if meta.is_file() => Ok(file),
-            _ => Err(format!("{} is not a regular file", path.display())),
-        }
     }
 
     #[cfg(unix)]
