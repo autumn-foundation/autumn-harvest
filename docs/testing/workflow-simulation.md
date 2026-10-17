@@ -245,6 +245,11 @@ A sweep is a normal `#[tokio::test]`. Enable the `testing` feature of
 `HARVEST_SIM_SEEDS=10000` in a nightly job. Change `HARVEST_SIM_SEED_BASE` to
 explore new seeds without a code change.
 
+[`examples/autoresearch/tests/simulation.rs`](../../examples/autoresearch/tests/simulation.rs)
+sweeps the two workflows of a whole application. It mocks child workflows,
+sends signals, injects faults, and names its `sometimes!` targets with
+`require_reached`.
+
 ## What it does not cover
 
 - **Activity bodies.** Mocks replace them. The simulation tests the order of

@@ -1,0 +1,495 @@
+# Design — autoresearch on Harvest: a capstone example
+
+Karpathy's [autoresearch](https://github.com/karpathy/autoresearch) lets an
+agent edit `train.py`, train for five minutes, keep or discard the change,
+and repeat all night. This example runs that loop as durable Harvest
+workflows. It uses the agent primitives and as much of the engine surface as
+fits the problem. It runs on the embedded SQLite backend, offline, with no
+GPU, no API key and no Docker.
+
+The crate is `examples/autoresearch`. The guide is its `README.md`.
+
+---
+
+## 0. Planning record
+
+### 0.1 Facts found before the plan
+
+- Upstream has three files that matter. `prepare.py` is fixed. `train.py` is
+  the one file that the agent edits. `program.md` is the instructions that
+  the human edits.
+- Upstream setup: agree a run tag, create the branch `autoresearch/<tag>`,
+  read the files, check the data, start `results.tsv`, run a baseline.
+- Upstream loop: edit, commit, train, read `val_bpb` and `peak_vram_mb`, log
+  a row, keep the commit on a lower `val_bpb`, else `git reset`. A run over
+  ten minutes is a failure. A crash gets a fix attempt or a `crash` row. The
+  loop never stops on its own.
+- `results.tsv` has five tab-separated columns: `commit`, `val_bpb`,
+  `memory_gb`, `status` and `description`. It stays untracked.
+- The simplicity criterion weighs the gain against the lines added.
+- Several GPUs run several branches, for example `autoresearch/mar5-gpu0`.
+- PR #2135 gives the SQLite backend child workflows, detached children, and
+  signal, cancel and await between runs. A child cannot continue as new.
+- PR #2179 gives `WorkflowTestEnv::simulation()`: seeded delivery orders,
+  `always!`, `sometimes!`, faults, crash and resume, and a replay check.
+  It mocks children and activities. It sends no query and no update.
+- On SQLite, an update handler cannot change the state of the body.
+  `ctx.state::<T>()` is `None`. `heartbeat_timeout` is refused.
+- `autumn-harvest-agent` runs `agent_loop` as a workflow. A tool keys its
+  idempotency on `(run_id, step, call_id)`. The run id is the execution id.
+  So two loops inline in one run share a run id. A child loop does not.
+- The workflow macro refuses the wall clock, `rand`, `std::env` and sleeps
+  in a workflow body.
+- `harvest-verify` classifies each `ctx.<method>(` call in `examples/*/src`.
+
+### 0.2 Brainstorm — how can Harvest run autoresearch?
+
+| # | Idea | Verdict |
+|---|------|---------|
+| B1 | One workflow per session. The loop runs `agent_loop` inline for each experiment. | Rejected. Inline loops share a run id, so tool keys and memory keys collide. |
+| B2 | A session parent. Each experiment is a child. Each proposal is an `agent_loop` grandchild. | **Adopted.** Each agent run gets its own run id. Each experiment has its own history. |
+| B3 | Loop forever with `continue_as_new` every N experiments. Carry the best result. | **Adopted.** It bounds the history of the parent. |
+| B4 | Commit as a saga step. A discard or a crash runs the compensation: `git reset`. | **Adopted.** It is the upstream keep-or-reset rule. |
+| B5 | A workflow mutex per GPU around training. | **Adopted.** Two sessions in one database do not train on one GPU at once. |
+| B6 | A simulated trainer with a known loss landscape, and a command trainer for a real GPU. | **Adopted.** CI runs the simulated one. A GPU host runs `uv run train.py`. |
+| B7 | A scripted researcher model offline, and a Claude model with an API key. | **Adopted.** The scripted model makes every test deterministic. |
+| B8 | A `reviewer` peer that judges a diff against the simplicity criterion. | **Adopted.** It uses the mesh with a mandate. |
+| B9 | A `read_paper` tool labelled `untrusted`, and a flow rule: an edit after it needs approval. | **Adopted.** Untrusted text must not steer code that runs on the GPU host unseen. |
+| B10 | A `rewind` tool that needs approval. | **Adopted.** Upstream says to rewind "very very sparingly". |
+| B11 | Hints, stop and policy as signals. Status as a query. A what-if check as an update. | **Adopted.** It respects the SQLite update rule. |
+| B12 | Sibling sessions share a kept idea through an external signal by workflow id. | **Adopted.** It is "more agents in the mix". |
+| B13 | A nightly schedule starts a session. A heartbeat agent watches the results. | **Adopted.** |
+| B14 | A detached agent child writes the morning report when a session ends. | **Adopted.** The session ends without a wait for the report. |
+| B15 | `eval::evaluate` re-drives a recorded proposal with a candidate `program.md`. | **Adopted.** The human programs `program.md`, so the human needs a regression check. |
+| B16 | A file inbox for `hint`, `stop`, `approve` and `deny` while a runner holds the writer lock. | **Adopted.** Keyed signals dedupe a resend after a crash. |
+| B17 | Search attributes and a memo on each session. Commands find a session by its `tag` attribute. | **Adopted.** A nightly session has an id that the engine picks. |
+| B18 | Run training in a sandbox activity. | Rejected. The sandbox needs KVM and has no GPU. |
+| B19 | Run on Postgres in CI. | Rejected. It needs Docker. A test builds the Postgres registration instead. |
+| B20 | Use a DAG for one night. | Rejected. SQLite has no DAGs, and the loop is not a static graph. |
+| B21 | A follow-up timer on the agent. | Rejected. The session loop already owns the cadence. |
+
+### 0.3 Reverse brainstorm — how can this example do harm?
+
+| # | How to make it harmful | Mitigation |
+|---|------------------------|------------|
+| R1 | A restart trains the same commit again, or pays for a model turn again. | Each step is an activity or a child. A restart test counts model calls and training runs in each process. |
+| R2 | A discard leaves the bad commit on the branch. | The saga compensation resets to the base commit. A sweep checks that each non-keep row has a reset. |
+| R3 | A row lands twice in `results.tsv` after a crash, or an equal row of another experiment is lost. | The record activity keys each row on its idempotency key. Tests crash it before and after the write. |
+| R4 | The agent edits `prepare.py` or another file. | The edit tool writes `train.py` only. Unknown tools are denied. A test calls the tool with other paths. |
+| R5 | Text in a paper plants code that runs on the GPU host. | A flow rule gates an edit after `read_paper`. The labels follow the session, so a later run that reads the text through memory or a row asks too. Tests wait on both approvals. |
+| R6 | Two sessions train on one GPU at once. | A workflow mutex per GPU, in one database. A test runs two sessions on one key. |
+| R7 | A crashed run reads as a kept one. | A crash row has `0.000000` and `0.0`. A run past its time budget is a crash. A sweep checks both. |
+| R8 | The workflow reads the clock or the environment, so replay diverges. | The macro lint refuses it. Each sweep seed replays. Each SQLite history replays on `WorkflowReplayer`. |
+| R9 | An update tries to change the policy and silently does nothing on SQLite. | The policy is a signal. The update only answers a what-if. |
+| R10 | A stale approval releases a later rewind. | Each wait has its own signal name. The test approves a token after its deadline and expects no rewind. |
+| R11 | The history of the session grows without bound. | `continue_as_new` every N experiments. A test checks the carry. |
+| R12 | The example rots. | CI runs its tests, its sweeps, its clippy and a demo run of the binary. |
+| R13 | A test needs a GPU, Python or the network. | The simulated trainer and the scripted model are the defaults. Tests use a temporary git repository. |
+| R14 | The command trainer hangs. | The trainer kills the process group at ten minutes. `start_to_close` is 15 minutes. |
+| R15 | The sim proves nothing. | Each sweep requires its `sometimes!` targets. A mutation run checks that a broken session fails a sweep. |
+| R16 | Two sessions share one lab, and one commits or resets on the branch of the other. | A mutex per lab for each experiment. Each write step names its branch and refuses another one. |
+| R17 | A training run outlives its runner and shares the GPU with the next run. | The process group dies on every exit path. A lock file finds a group that a dead runner left, and the next run kills it. A free lock clears the old group id, so a reused id is never killed. |
+| R18 | A tool call or an activity runs again after a crash and writes twice. | Each write is keyed: a commit by its trailer, an edit by its tool call, a row and a run by the activity idempotency key. |
+| R19 | Code that the model wrote reads a secret or plants a git hook. | The run gets a fixed list of environment variables, with no URL login details, and more only by name. On Linux the runner is not dumpable, so the run cannot read its environment. Git runs with hooks off. The README says that the command trainer is not a sandbox. Tests: `trainer::tests::a_run_gets_only_the_listed_environment`, `a_run_sees_no_variable_off_the_list`, `cli::a_run_cannot_read_the_environment_of_the_runner`. |
+| R22 | A heartbeat tick fails, and its crash rows are never checked again. | The precheck reads and writes nothing. Only a delivered alert marks the rows. |
+| R23 | The morning report counts the rows of another session in the lab. | The report reads the session's own summary, not `results.tsv`. |
+| R24 | A nightly tag repeats a year later and reuses the old branch. | A derived tag holds the year. |
+| R20 | `hint` or `stop` misses a nightly session, and the command is lost. | Commands find a session by tag. A command that can never land moves to `inbox/rejected`. |
+| R21 | The Claude model drops thinking blocks in a tool loop. | The model keeps each raw turn by hash and sends it back unchanged. |
+
+### 0.4 Six thinking hats
+
+- **White (facts).** Section 0.1. SQLite now has children and external
+  commands. The sim mocks children. The agent crate registers on SQLite.
+- **Red (feelings).** A reader wants one command that runs a night of
+  research offline. A reader wants to see the engine save them when the
+  process dies.
+- **Black (risks).** Scope creep: the surface is large. Git and file I/O in
+  tests can be slow or flaky. The scripted model can hide bugs that a real
+  model shows. Many CI gates apply to a new crate.
+- **Yellow (benefits).** One example shows many engine primitives: children,
+  sagas, mutexes, signals, queries, updates, schedules, continue-as-new and
+  search attributes. It shows the agent mesh, approvals, flow rules, memory,
+  delivery, heartbeats, the response cache, eval and the new DST. It also
+  maps to a story that many readers know.
+- **Green (ideas).** A sibling-session hint channel. A file inbox. A what-if
+  update. A morning report as a detached child.
+- **Blue (process).** Red, then green, then refactor. Pure types and rules
+  first. Then activities, then workflows under the sim, then SQLite
+  end-to-end tests, then the CLI, docs and CI. Then a review from several
+  angles.
+
+---
+
+## 1. Architecture
+
+```text
+schedule "0 23 * * *" ─► research_session  (parent, continue-as-new every N)
+                          │  signals: hint, stop, policy · query: status · update: whatif
+                          │  activity setup · search attributes · memo
+                          ├─ mutex lab:<path> ─► experiment (child, one per idea)
+                          │     ├─ activity head: check out the session branch
+                          │     ├─► agent_loop (grandchild: propose an edit)
+                          │     │     tools: read_file, read_paper, show_diff, edit_train, rewind
+                          │     │     peer: reviewer · memory · loop guard · response cache
+                          │     ├─ saga: commit ─► compensation: reset
+                          │     ├─ mutex gpu:<id> ─► activity train (start_to_close 15m)
+                          │     ├─ local activity parse_summary
+                          │     └─ activity record (results.tsv)
+                          ├─► signal_external_workflow_by_id: sibling sessions
+                          └─► detached agent_loop: the morning report
+schedule every 30m ─► agent_heartbeat (precheck: a new crash streak) ─► delivery
+```
+
+The keep rule is one pure function. With `gain = best - val_bpb` and
+`net = lines_added - lines_removed`:
+
+- no `val_bpb`: `crash`;
+- `memory_gb > max_memory_gb`: `discard`;
+- `gain - line_cost * net > min_improvement`: `keep`;
+- else `discard`.
+
+A baseline that does not crash is always `keep`. The defaults are
+`min_improvement = 0` and `line_cost = 0.0001`, so 20 added lines need a gain
+over 0.002. With no net change in lines, equal or worse is a discard, as
+upstream. A deleted line earns the credit that an added line costs.
+
+---
+
+## 2. Acceptance criteria
+
+| AC | Criterion |
+|----|-----------|
+| AC1 | A session runs setup, a baseline and N experiments, and completes. `results.tsv` has one row per experiment in the upstream format. |
+| AC2 | The branch head is the best kept commit. Each discard and crash resets to the base commit. |
+| AC3 | The keep rule: lower `val_bpb` keeps, equal or worse discards, a crash logs `0.000000` and `0.0`, the line cost and the VRAM cap apply. Property tests cover it. |
+| AC4 | A crash gets one fix proposal and one retry. A run over its time budget is a crash, even with a summary. |
+| AC5 | The agent edits `train.py` only. `prepare.py` and other paths are refused. |
+| AC6 | An edit after `read_paper` waits for approval, and so does each later edit of the session. A `rewind` waits for approval. A deny or a timeout runs nothing. |
+| AC7 | The proposal agent delegates to a `reviewer` peer under a mandate. |
+| AC8 | The agent keeps notes in a durable memory scope per tag. A restart keeps them. |
+| AC9 | Signals `hint`, `stop` and `policy` steer a live session. Query `status` reads it. Update `whatif` answers a what-if with a validator. |
+| AC10 | A workflow mutex per GPU orders the training of the sessions in one database. |
+| AC11 | The session continues as new every N experiments and carries the best result, the count and the pending hints. |
+| AC12 | A kept idea reaches sibling sessions through an external signal by workflow id. An unknown sibling does not fail the session. |
+| AC13 | Each session has search attributes (`tag`, `phase`, `experiments`, `best_bpb`, `best_commit`) and a memo. `status` lists the sessions with their tags. |
+| AC14 | A nightly schedule starts a session. A heartbeat agent with a precheck delivers a report only when it has something to say. |
+| AC15 | A detached agent child writes the morning report of the session, from the session's own summary, when it ends. |
+| AC16 | A restart mid-session resumes by replay. No completed model call or training run runs again. |
+| AC17 | Every SQLite history of the example replays on the core `WorkflowReplayer`. |
+| AC18 | DST: seeded sweeps of `experiment` and `research_session` hold the invariants under reordering, faults, crashes, signals and replay. Each `sometimes!` target is reached. |
+| AC19 | `eval` re-drives a recorded proposal with a candidate `program.md` and reports the first divergence. |
+| AC20 | The response cache serves an identical model call across runs. |
+| AC21 | A file inbox carries `hint`, `stop`, `approve` and `deny` to a running session. A resend after a crash is deduped. |
+| AC22 | The command trainer runs a real `train.py` command, kills it at the timeout, and parses the summary. A test uses a fake command. |
+| AC23 | A Claude model implements `AgentModel` over the Messages API. Offline tests cover the request and the response mapping. |
+| AC24 | The same workflows and activities build a Postgres `HarvestBuilder` registration, with an LLM budget on `agent_loop`. |
+| AC25 | `retention`: `purge` removes old terminal sessions. |
+| AC26 | The CLI: `init`, `run`, `serve`, `status`, `hint`, `stop`, `policy`, `approve`, `deny`, `eval`, `verify`, `purge`. A demo runs offline in one command. |
+| AC27 | CI runs the tests, the sweeps, clippy and the demo, so the example cannot rot. |
+| AC28 | Comments and docs are short and in ASD-STE100 style. The comment-hygiene gate passes. |
+| AC29 | Two sessions in one lab take turns. Each experiment commits and resets on its own branch. |
+| AC30 | Commands find a running session by its tag, a nightly session included. `run` with no tag resumes the one running session. |
+| AC31 | Each write runs once across a crash: a commit per key, an edit per tool call, a row per record call, a training per train call. |
+| AC32 | A training run never outlives its runner. Its process group dies at the end, at the timeout and on a drop. The next run kills a group that a dead runner left. |
+| AC33 | The Claude model sends each thinking block back unchanged, and redacts its key. |
+
+---
+
+## 3. Limits
+
+- Training runs on the host, not in a sandbox. The sandbox has no GPU.
+  The command trainer runs code that the model wrote, as the user.
+- The simulated trainer is a model of a loss landscape, not a model of a
+  GPT. It exists so the loop is testable offline.
+- The scripted researcher is not Claude. It tries a fixed list of ideas.
+- One writer process owns the database, as the SQLite backend requires.
+  On SQLite one activity runs at a time, so the GPU mutex orders grants.
+  Its exclusion matters on a Postgres fleet.
+- The cost ledger and LLM budgets need Postgres. AC24 builds that
+  registration but does not run it.
+- Activity inputs are trusted. Whoever can start a session picks the lab
+  path and the trainer command.
+
+The README lists the rest.
+
+---
+
+## 4. Test plan
+
+| Layer | Where | What it proves |
+|---|---|---|
+| Unit and property | `src/*.rs` | The pure parts: the keep rule, the TSV, the summary, the trainers, the lab, the tools, the stores, both models. Each idempotent write is crashed before and after its write. |
+| Simulation | `tests/simulation.rs` | Both workflows under seeded orders, faults, crashes, signals and replay. Seed-driven mocks take every path. Each target is required. |
+| SQLite end to end | `tests/e2e.rs` | Each AC with a real git lab, the real activities and the scripted model. |
+| CLI | `tests/cli.rs` | The binary as a reader runs it. |
+| CI | `ci.yml`, `dst-nightly.yml` | The suite, clippy, the README demo and `verify` on each PR. 5000 seeds per sweep each night. |
+
+---
+
+## 5. Acceptance criteria evidence
+
+Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
+`sim::` is `tests/simulation.rs`, and `cli::` is `tests/cli.rs`.
+
+| AC | Evidence |
+|----|----------|
+| AC1 | `e2e::a_night_of_research_keeps_only_improvements`: setup, a baseline and six experiments, seven rows, the upstream header. `cli::a_night_runs_offline_from_one_command`. |
+| AC2 | The same test: `HEAD` is the best commit, the branch holds only the kept commits, the tree is clean. `sim::an_experiment_holds_its_invariants_on_every_seed`: a discard or a crash resets to the base last. `activities::tests::a_run_that_changes_the_lab_is_a_crash_and_the_lab_is_restored` (a moved branch, a commit, a change to `train.py`, a change to `prepare.py`, a removed `prepare.py`). `lab::tests::a_reset_and_a_restore_keep_a_change_to_program_md`, `a_reset_and_a_restore_put_back_prepare_py`, `the_fixed_files_must_match_their_commit` (a staged new file too), `a_converted_checkout_is_not_a_change`, `a_planted_clean_filter_cannot_hide_a_fixed_file_change`, `an_lfs_pointer_holds_only_its_own_content`, `a_checkout_of_an_lfs_pointer_is_not_a_change`, `a_reset_keeps_a_staged_new_file_on_disk` (a file that changed again after `git add` too), `a_tracked_link_must_point_where_its_commit_says`, `a_lab_with_a_submodule_is_refused`, `a_replace_ref_cannot_swap_the_tree_of_a_commit`. `activities::tests::train_refuses_a_change_to_a_fixed_file_that_no_commit_holds`. |
+| AC3 | `rules::tests` (seven cases and three property tests, one against an oracle from the README). `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row` checks the zero crash row. |
+| AC4 | `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row`. The sim targets "a fix recovers a crash", "a run crashes for good", "a run passes its time budget" and "a run fails after its summary". |
+| AC5 | `agent::tests::edit_train_writes_train_py_only`, `the_policy_gates_rewind_and_denies_unknown_tools`, `lab::tests::the_agent_reads_only_known_files_and_papers`. |
+| AC6 | `e2e::an_edit_after_a_paper_waits_and_a_deny_changes_nothing`, `e2e::a_paper_taints_every_later_run_of_the_session`, `e2e::an_approved_rewind_moves_the_base_to_an_older_kept_commit`, `lab::tests::a_short_id_names_one_commit_of_the_branch`, `a_rewind_stays_inside_its_own_session`, `kept_refuses_a_row_whose_id_names_two_commits`, `e2e::a_late_approval_never_releases_the_call`. `runtime::tests::the_decision_commands_work_as_printed`: the printed `approve` and `deny` commands quote the lab and the token. |
+| AC7 | `scripted::tests::the_researcher_reads_edits_asks_the_reviewer_and_answers`, `agent::tests::the_reviewer_is_read_only_with_two_tools`. The e2e nights delegate in every proposal. |
+| AC8 | `e2e::memory_notes_survive_a_restart`, `stores::tests::memory_survives_a_new_store_and_dedupes_a_key`. |
+| AC9 | `e2e::signals_a_query_and_an_update_steer_a_live_session`. `sim::a_session_holds_its_invariants_under_signals_and_faults` requires the hint, policy and stop targets. `sim::a_stop_at_the_hand_off_ends_the_night` requires a stop that meets the hand-off. `e2e::a_command_lands_before_the_next_experiment` and `cli::a_stop_posted_mid_night_lands_before_the_next_experiment`: a command lands in the pause before the next experiment. |
+| AC10 | `e2e::two_sessions_share_one_gpu_and_a_kept_idea`: every training takes `gpu:gpu0`, and each grant has its own fencing token. The sim checks one grant per training. |
+| AC11 | `e2e::the_session_continues_as_new_and_carries_its_best`: three runs, the carried count and best. `sim::a_session_hands_off_its_carry_past_a_failed_experiment`: the count, the best, each hint and the labels. `sim::a_continued_session_finishes_from_its_carry`. |
+| AC12 | `e2e::two_sessions_share_one_gpu_and_a_kept_idea`: the hint reaches B, and the unknown sibling fails only its own signal. |
+| AC13 | `e2e::a_night_of_research_keeps_only_improvements`: the attributes, the memo, and a list by the `tag` attribute. `e2e::status_shows_each_session_once`: a chain of runs shows once. |
+| AC14 | `e2e::the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up`. `stores::tests::the_precheck_runs_a_tick_only_for_a_new_crash_streak`, `a_redelivered_alert_marks_its_rows`. The drive ends at each pause (`e2e::a_command_lands_before_the_next_experiment`), and `serve` polls its schedules after each drive. `cli::serve_names_a_night_that_ends_once`: `serve` drives a night that `run` left and names its end once. `e2e::each_ended_session_is_named_once`: a failed night is named too. |
+| AC15 | `e2e::a_finished_night_leaves_a_morning_report`: the report lands, and driving it moves no other session. `e2e::a_failed_report_run_is_an_error`. `scripted::tests::the_reporter_reports_the_summary_of_its_own_session`. |
+| AC16 | `e2e::a_restart_resumes_without_paying_for_a_turn_or_a_run_twice`: the model calls across two processes equal those of one process, and each row has one `train` activity. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`: a train call that runs again does not train again. `stores::tests::the_cache_index_survives_a_new_process_and_evicts_the_oldest`: a model call that runs again in a new process gets the stored answer. `activities::tests::a_call_that_comes_again_after_a_stopped_run_puts_the_lab_back`: a run that a stop cut puts the lab back and trains again, and `git stash list` keeps the uncommitted changes that it put back. `a_resume_puts_back_a_lab_that_git_cannot_stash`: a lab on an unborn branch goes back too. |
+| AC17 | `e2e::a_night_of_research_keeps_only_improvements` and `e2e::the_session_continues_as_new_and_carries_its_best` run `verify`. The CI demo runs `verify`. `cli::a_missing_database_is_an_error_not_a_new_file`: `verify` refuses a missing database, so a mistyped `--db` fails. |
+| AC18 | `sim::*`: nine sweeps. Each seed runs twice, replays, and runs again with a crash. Each target is required. The mocks give full commit ids, so a sweep sees a short id where a full one belongs. |
+| AC19 | `e2e::eval_names_the_first_turn_where_a_new_program_differs`, `cli::eval_and_purge_work_on_a_finished_night`. |
+| AC20 | `e2e::the_response_cache_serves_an_identical_report_turn`: the second report turn runs in a new process and asks no model. |
+| AC21 | `e2e::the_inbox_delivers_a_command_once`, `cli::inbox_commands_queue_for_the_runner`, `inbox::tests`. |
+| AC22 | `e2e::the_command_trainer_runs_a_real_command_per_commit`, `trainer::tests::the_command_trainer_*`. `trainer::tests::the_runner_reads_the_log_the_run_wrote_not_a_symlink`, `the_timeout_note_does_not_follow_a_symlink`. `lab::tests::git_runs_with_the_trainer_environment`, `a_diff_runs_no_external_program`, `a_planted_symlink_is_refused_and_never_copied`. `stores::tests::a_read_refuses_a_symlink_and_a_pipe`, `the_stores_refuse_a_planted_link`. `inbox::tests::a_planted_link_is_set_aside`. `trainer::tests::a_planted_link_or_pipe_at_the_lock_is_refused`. `activities::tests::a_planted_pipe_at_a_call_lock_is_refused`, `a_held_call_lock_fails_the_call_in_time`. `stores::tests::a_lock_file_opens_as_a_plain_file` (a hard link too). `e2e::a_command_run_hides_the_runner`. |
+| AC23 | `claude::tests` (nine cases). |
+| AC24 | `e2e::the_workflows_register_on_a_postgres_builder_with_an_llm_budget`. `e2e::the_schedules_name_the_lab_by_its_canonical_path`: the registration names the lab by its canonical path. |
+| AC25 | `e2e::purge_removes_old_finished_runs`, `e2e::a_purge_refuses_to_remove_a_session_whose_report_runs`, `cli::eval_and_purge_work_on_a_finished_night`: the tag of a purged night stays used. |
+| AC26 | `cli::*` and the CI demo step. |
+| AC27 | `ci.yml`: the test step, the demo step and the clippy step. `dst-nightly.yml`: the `autoresearch` job. |
+| AC28 | `docs/audits/comment-hygiene.py --base origin/trunk-dev` passes. |
+| AC29 | `e2e::two_sessions_in_one_lab_take_turns_on_their_own_branches`, `lab::tests::checkout_moves_back_to_the_session_branch_only_when_clean`, `two_sessions_never_share_a_commit`, `a_tag_that_another_session_used_is_refused`, `activities::tests::train_refuses_a_moved_branch_and_a_change_no_commit_holds`, `setup_refuses_a_tag_that_another_session_used`. One runner drives a database: `cli::a_new_session_waits_until_the_running_one_ends`, `e2e::a_drive_names_the_mutex_that_a_session_waits_for`, `runtime::tests::a_refusal_names_commands_that_work_as_printed`. A lab has one path: `activities::tests::setup_refuses_a_lab_path_that_is_not_canonical`, `e2e::a_session_started_through_a_link_to_its_lab_runs`. A runner drives its own lab only: `e2e::a_runner_refuses_an_unfinished_run_of_another_lab`. |
+| AC30 | `e2e::a_nightly_session_takes_commands_by_its_tag`, `e2e::a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag`, `e2e::a_command_waits_for_a_session_that_has_no_tag_yet`, `cli::run_with_no_tag_resumes_the_one_running_session`, which also refuses a resume with another model. `e2e::a_session_resumes_only_with_its_own_model`, `serve_checks_the_model_of_each_unfinished_agent_run`, `run_refuses_while_a_report_of_another_model_is_unfinished`, `a_report_whose_session_was_purged_does_not_block_serve`. |
+| AC31 | `lab::tests::a_commit_is_made_once_per_key`, `an_edit_runs_once_per_call`, `an_edit_whose_write_was_lost_runs_on_its_retry`, `a_row_is_recorded_once_per_key`, `a_row_whose_write_was_lost_lands_on_its_retry`. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`, `two_deliveries_at_once_train_once`. `agent::tests::an_edit_call_that_runs_again_changes_nothing`. |
+| AC32 | `trainer::tests::a_dropped_run_kills_its_whole_group`, `the_next_run_kills_a_run_that_outlived_its_runner`, `a_timeout_kills_the_children_of_the_run_too`, `a_finished_run_names_no_group`, `a_free_lock_forgets_the_group_of_an_earlier_run`, `a_stale_lock_spares_a_group_that_reused_its_id`. |
+| AC33 | `claude::tests::a_thinking_block_goes_back_unchanged_in_the_next_request`, `a_turn_with_the_same_text_in_another_conversation_keeps_its_own_block`, `a_turn_under_another_system_prompt_keeps_its_own_block`, `a_turn_survives_in_the_turn_directory`, `the_key_stays_out_of_debug_output`. |
+
+---
+
+## 6. Review record
+
+Five agents reviewed the first green build from five angles: durability,
+security, tests and CI, API fidelity and docs, and code quality. Codex
+reviewed the PR. A workflow then tried to refute each finding against the
+reviewed commit, with probes. Most findings held. One did not: a train
+call that runs again after its result is lost has a window of under a
+millisecond on SQLite. The saved run stays, because it is cheap and it
+covers the completion call on a Postgres worker.
+
+The fixes:
+
+- **Durability.** Rows keyed on the activity idempotency key. Edits keyed on
+  the tool call. A saved run per train call. The process group dies with the
+  run. A mutex per lab and a branch on each write step. A `train.py` change
+  that no commit holds is refused. No execution timeout on `experiment`,
+  because it counted the downtime of the runner. Workflow state keeps full
+  commit ids. A short id can become ambiguous as the lab grows, so only
+  people and the model see it: `results.tsv`, the console, the prompts,
+  the hints, the report and the `best_commit` attribute. A rewind resolves a short id on
+  the session branch only. A row of `results.tsv` whose short id names two
+  commits is refused, so a lookup never gives the score of the wrong
+  commit. A trainer run clears its group id from the lock file when it
+  ends, and a free lock clears an old one. The file holds the start time
+  of the group leader, and a kill needs it to match. Off Linux no start
+  time can be read, so no group is killed. A
+  redelivered heartbeat alert marks its rows. The response cache index is
+  on disk, so a model call whose result a crash lost is not paid twice.
+  `run` drives only the report agent of its session at the end, not every
+  run in the database. Each session starts with an
+  empty commit that holds the key of its setup. So two sessions in one lab
+  never share a commit, and setup refuses a branch that another session
+  started, such as one that `purge` left. A scheduled session publishes its
+  tag before it waits for its lab, so commands reach it from the start.
+  While a running session has no tag yet, a command for an unknown tag
+  waits in the inbox and is not rejected. A session refuses a keep policy
+  that a policy signal could not carry. `verify` drops the heartbeats of
+  an activity in flight with its start. A run that exits with an error is a
+  crash, even after a summary. A rewind stays inside its session: at its
+  start commit or later, and never in the commits of a session it started
+  on.
+  A trainer whose run cannot end inside the budget of a `train` activity
+  is refused at start, at the schedule and in the session.
+- **Steering.** Commands by tag, `run` resumes across midnight, rejected
+  commands kept, one decision per approval wait.
+- **Security.** Flow labels follow the session. No secrets in the trainer
+  environment. Git hooks off. Symlinks refused and reads capped. The state
+  directory is private. Model text loses control and bidirectional
+  characters in `results.tsv`, the console and each commit message. A URL
+  with login details stays out of the trainer environment. On Linux the
+  runner is not dumpable, so a run cannot read the key from
+  `/proc/<runner>/environ`. The Claude key is redacted.
+- **Claude client.** Thinking blocks go back unchanged. A timeout, a body
+  cap, automatic caching, and retries on 408 and 409.
+- **Tests.** The tests review ran mutants. Several survived every test: a
+  stop lost at the hand-off, a crash that moved the base, a lost carried
+  best, and lost hints. The sweeps now check the base, the carry, the
+  hints, the stop, the policy and the taint on every seed. A no-stop sweep
+  reaches the hand-off and carries a hint and a new policy. A failed
+  experiment must reset the branch to its base. A sibling's hint carries
+  its labels in, and a shared idea carries the session's labels out. A sweep with one experiment per
+  run lands a stop at the hand-off. Seed-driven mocks take the rewind, no-change,
+  time-out and failure paths. The review also found a product bug: a run
+  past its budget was scored. It is a crash now.
+
+A third review ran from four angles: the CLI and the runtime, the trainer
+and the activities, the lab and the agent, and the workflows and the stores.
+A skeptic per angle tried to refute each finding with probes, and Codex
+reviewed again. The fixes:
+
+- **Steering.** The session pauses on a durable timer before each
+  experiment. The pause ends the drive, so a command lands before the next
+  experiment. Before, it waited for the hand-off. `serve` also fires the
+  heartbeat in the pause, and it names each night that ends, a failed one
+  included.
+- **One runner.** `run` refuses a new session while another one runs,
+  because no other runner can finish it. A drive names the mutex that a
+  session waits for, and `run` stops with the command that frees it.
+  History records the model, and a resume needs the same one. `verify`,
+  `eval` and `purge` refuse a database that does not exist.
+- **Security.** The runner reads `run.log` through its own handle, so a
+  symlink that the run puts there cannot make the runner read its own
+  environment. Git gets the environment of a training run, so a command
+  that a run writes into `.git/config` cannot read the key.
+- **Durability.** A run that moves the branch or `HEAD`, or changes
+  `train.py`, is a crash, and the lab goes back. Two deliveries of one
+  train call train once: a lock per call covers the check, the run and the
+  save. A reset puts back `train.py` and keeps a change to another file,
+  such as `program.md`.
+
+One finding was refuted: a deleted line earns the credit that an added
+line costs, as the README states. Its wording is now exact.
+
+A fourth review checked the fixes of the third, from the same four angles,
+with a skeptic per angle. Codex reviewed the same commit. The fixes:
+
+- **Security.** The runner refused a symlink only at `run.log`. A run
+  could link `results.tsv` or the state file of the rows to
+  `/proc/self/environ`, and the runner copied what it read back into the
+  lab. Each read of the lab and the state directory now opens without
+  following a symlink, and checks the open handle.
+- **Durability.** A stop in the middle of a run left the lab as the run
+  changed it, and the next delivery of the call failed for good. A mark
+  per call now says that a run began. The next delivery stops what is
+  left and puts the lab back before it trains again. A reset is a hard
+  reset again that keeps each free file, such as `program.md`, so a
+  change that a run makes to `prepare.py` does not stay.
+- **Codex.** A run that changed `prepare.py` and printed a good score was
+  kept, and a keep runs no reset. The check after a run now compares the
+  bytes of each fixed file with those from before the run. A change is a
+  crash, and the lab goes back. A fixed file is each tracked file but the
+  free ones: Markdown, notebooks and images, which a person edits or makes
+  during a night. Codex then found that a hand edit of `prepare.py` between
+  two experiments passed both snapshots. A run now trains only when each
+  fixed file holds the bytes of its commit, so a score belongs to it. A
+  staged fixed file that the commit does not hold is refused too. A
+  checkout that converts line ends is no change. The raw snapshot before and after a run still catches a
+  change that a run makes.
+- **Codex.** A raw Claude turn is keyed by the messages before it too, so
+  two conversations that end a turn with the same text keep their own
+  thinking blocks. `run`, as `serve`, refuses to start while an unfinished
+  run has another model, so no two models wait for one runner.
+- **One runner.** `serve` refuses to start while an unfinished report
+  agent or heartbeat run has another model. A refusal of `run` prints
+  commands that work as printed: with the database, the model and the tag
+  of the other session. Two sessions that wait for each other get the
+  stop first.
+- **Tests and docs.** The tests now cover each trigger of the check after
+  a run, the text conversion of a diff, a stop with no further experiment,
+  and `serve` itself. The evidence rows say only what the tests show.
+
+Three findings were refuted. Two are covered by the fixes above anyway.
+
+A fifth review checked the fixes of the fourth, from the same four angles,
+with a skeptic per angle. Thirteen findings held, and three were refuted.
+The fixes:
+
+- **Security.** The line-end check of the fourth round asked git whether
+  the raw bytes differ. A planted clean filter could map a changed file
+  back to its commit, so git saw no change. The check now reads the blob
+  with no filter. A file passes when its bytes equal the blob, the blob
+  with CRLF line ends, or the content that an LFS pointer names. Other
+  reads of the state directory and the inbox open without following a
+  symlink, and refuse a pipe.
+- **Durability.** Before a resume puts the lab back, it keeps the changes
+  in `git stash list`, so a hand edit is not lost. A reset unstages a
+  staged new file first, so the file stays on disk. A report agent whose
+  session was purged no longer blocks `serve`. Codex found that path, and
+  `purge` now refuses while a report agent runs on after its session ended.
+- **Docs and messages.** A crash note names each changed file once. The
+  heartbeat refusal names the model options. `post` names `--pace 0`. The
+  README names `uv.lock`, `__pycache__`, `.venv` and `git status
+  --ignored`. The `serve` hint of a refusal names no options, because
+  `serve` writes its nightly schedule from its own options.
+
+The refuted findings are the `post` text, the `uv.lock` note and the
+heartbeat refusal text. The fixes above cover them anyway.
+
+A sixth review checked the fixes of the fifth, from three angles:
+security, durability, and tests and docs. A skeptic tried to refute each
+finding. Eleven held, some found from two angles, and none was refuted.
+Codex reviewed the same commit. The fixes:
+
+- **Durability.** Git cannot stash some states, such as an unborn branch or
+  a conflicted index. The stash of a resume is now a backup only, and the
+  lab goes back anyway. A reset forces the removal of a staged new file
+  from the index, so a file that changed again after `git add` does not
+  stop the reset. `purge` refuses only when it would remove the session of
+  a report that runs, so a purge of old runs works during a night.
+- **Security.** Git reads no replace ref. A run could plant one that gives
+  the base commit another tree, and a reset would then check out a changed
+  `prepare.py`. The trainer lock opens without following a symlink, and
+  refuses a pipe.
+- **Codex.** A lab has one path. `runtime::start` makes the path canonical,
+  and setup refuses another path. Two paths to one lab would get two lab
+  mutexes, and no agent run would find the lab. The schedules, which the
+  Postgres registration builds, name the lab by its canonical path too. A
+  link that git tracks is fixed by its target. A lab with a submodule does
+  not train, because the runner cannot check its files. The lock file of
+  each train call opens as the trainer lock does: no link, no pipe, and no
+  wait. Off Unix no `flock` serializes two deliveries of one call, so the
+  train activity refuses to train there. `status` shows each session once,
+  by the newest run of its chain.
+- **Tests and docs.** New tests plant a link at the real paths of the
+  memory store, the cache and the inbox. A test commits an LFS pointer and
+  checks the content on disk. `purge` refuses, and the docs now say so.
+  The record of the fifth round now counts its findings right.
+
+A seventh review checked the lock files, the refusal off Unix, `status`
+and the docs, from two angles, with a skeptic per finding. Two findings
+held, and none was refuted. Codex reviewed the same commits. The fixes:
+
+- **Security.** A run could plant a hard link at a lock file, for example
+  to the writer lock of the database. A resumed call then waited for good
+  on its own lock, and the trainer lock could truncate `harvest.db`. A lock
+  file must now have one name. A call waits for its lock with a deadline,
+  so a process that a run left cannot park the runner.
+- **Codex.** The command trainer makes the runner not dumpable before each
+  run. Before, only the CLI did that, so a Postgres worker could leak the
+  key. A raw Claude turn is keyed by the system prompt too, so `eval` under
+  another `program.md` keeps its own thinking blocks. The printed `approve`
+  and `deny` commands quote the lab and the token.
+- **Off Unix.** A session refuses to start, with the reason, before setup.
+  Before, the reason was lost in a baseline crash.
+- **Codex, one lab per runner.** Two labs can share a database through
+  `--db`. A runner of one lab then refuses while a session or a heartbeat
+  run of the other lab is not finished. Its agent tools could not find
+  that lab, so its experiments and its report would fail.
+
+One mutant cannot fail a test on SQLite: a GPU mutex released before the
+training. The release writes no event, and one activity runs at a time.
+Section 3 states it.
+
+Two findings stay as limits in the README, because a full fix costs more
+than it buys:
+
+- A runner killed between the start of its run and the write of the group
+  leaves a run that the next run cannot kill. No await sits in that window,
+  so only an outside kill can hit it. The next run fails safe: it waits and
+  retries, and never shares the GPU.
+- A heartbeat alert marks the rows at its delivery. Crash rows that land
+  while the alert is written get no alert of their own, and the next crash
+  alerts again. An exact mark needs the rows that each tick read.

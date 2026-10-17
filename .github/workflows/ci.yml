@@ -91,8 +91,13 @@ jobs:
           # Same carve-out for the API contract and the OpenAPI document
           # generated from it. Both live under `docs/`, so without this a
           # contract-only PR skips the tests that compare them.
+          #
+          # The autoresearch example compiles its `program.md` and the
+          # markdown of its lab template into the binary, and its tests read
+          # them. A change to one of them is a code change.
           if echo "$changed" | grep -qvE '^(docs/|.*\.md$)' \
-            || echo "$changed" | grep -qxE 'docs/(workflow-schema-contract|api-contract|openapi)\.json'; then
+            || echo "$changed" | grep -qxE 'docs/(workflow-schema-contract|api-contract|openapi)\.json' \
+            || echo "$changed" | grep -qE '^examples/autoresearch/(program\.md|lab/)'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
@@ -1053,6 +1058,27 @@ jobs:
       - name: "Run agent-loop-hit-rate example tests (issue #2007)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p agent-loop-hit-rate --bins
+      # The autoresearch capstone. Its suite is offline: a simulated
+      # trainer, a scripted researcher, seeded simulation sweeps and SQLite
+      # end-to-end runs. Linux only, because the tests drive `git` and `sh`.
+      - name: Run autoresearch example tests
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
+        run: cargo test -p autoresearch
+      # The README demo, as the README runs it: a night of research from an
+      # empty directory, then a replay of every history it wrote. The night
+      # is deterministic, so the counts match the README sample.
+      - name: Run the autoresearch demo offline
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
+        run: |
+          set -euo pipefail
+          lab="$RUNNER_TEMP/ar-lab"
+          cargo run -p autoresearch -- init "$lab"
+          cargo run -p autoresearch -- run --lab "$lab" --tag demo --experiments 8 --explore 100 \
+            | tee "$RUNNER_TEMP/ar-run.txt"
+          grep -qF "(6 kept, 2 discarded, 1 crashed)" "$RUNNER_TEMP/ar-run.txt"
+          cargo run -p autoresearch -- status --lab "$lab"
+          cargo run -p autoresearch -- verify --lab "$lab"
+          test "$(wc -l < "$lab/results.tsv")" -eq 10
       - name: Run business_metrics example tests (issue #758)
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: cargo test -p autumn-harvest --no-default-features --features testing --example business_metrics
@@ -2122,6 +2148,10 @@ jobs:
       # carries pre-existing warnings in that configuration.
       - name: Clippy claude-agent-daemon example
         run: cargo clippy -p claude-agent-daemon --all-targets --no-deps -- -D warnings
+      # The autoresearch capstone. `--no-deps` for the same reason as the
+      # daemon above: it uses `autumn-harvest` with no default features.
+      - name: Clippy autoresearch example
+        run: cargo clippy -p autoresearch --all-targets --no-deps -- -D warnings
 
   doc-snippets:
     name: Doc snippets compile
