@@ -31,9 +31,11 @@ CREATE TABLE harvest_fairness_state (
 -- The claim reads the queue clock V, the largest last_start, and the keys
 -- whose pass is above V. These two indexes serve both reads without a scan of
 -- every key of the queue. The table is new in this migration, so a plain
--- CREATE INDEX takes no lock that live traffic waits on.
+-- CREATE INDEX takes no lock that live traffic waits on. The clock index ends
+-- in the key, so prune finds the clock row (greatest last_start, then key)
+-- with one index probe, even when many keys tie at V.
 CREATE INDEX harvest_fairness_state_clock
-    ON harvest_fairness_state (queue_name, last_start);
+    ON harvest_fairness_state (queue_name, last_start, fairness_key);
 CREATE INDEX harvest_fairness_state_pass
     ON harvest_fairness_state (queue_name, pass);
 
