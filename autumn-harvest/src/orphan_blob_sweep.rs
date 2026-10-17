@@ -55,6 +55,25 @@ async fn referenced_keys(
     Ok(referenced)
 }
 
+/// Why a store call failed.
+enum CallError {
+    /// The process is shutting down.
+    Shutdown,
+    /// The store did not answer in time. The store is probably hung.
+    TimedOut(String),
+    /// The store or a database returned an error.
+    Failed(String),
+}
+
+impl CallError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Shutdown => "shutdown".to_string(),
+            Self::TimedOut(message) | Self::Failed(message) => message,
+        }
+    }
+}
+
 /// What one page of the sweep did.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PageOutcome {
@@ -62,6 +81,9 @@ struct PageOutcome {
     deleted: u64,
     delete_failures: u64,
     first_failure: Option<String>,
+    /// A store call timed out. The pass stops, so a hung store costs one
+    /// timeout and not one for each blob.
+    timed_out: bool,
 }
 
 /// The inputs that one sweep page shares.
@@ -78,13 +100,16 @@ struct PageSweep<'a> {
 impl PageSweep<'_> {
     /// Run a store call. It fails on timeout and on shutdown, so a hung store
     /// cannot hold the tick or its fence guards.
-    async fn call<T>(&self, call: PayloadStoreFuture<'_, T>) -> Result<T, String> {
+    async fn call<T>(&self, call: PayloadStoreFuture<'_, T>) -> Result<T, CallError> {
         tokio::select! {
-            () = self.shutdown.cancelled() => Err("shutdown".to_string()),
+            () = self.shutdown.cancelled() => Err(CallError::Shutdown),
             result = tokio::time::timeout(self.call_timeout, call) => match result {
                 Ok(Ok(value)) => Ok(value),
-                Ok(Err(err)) => Err(err.to_string()),
-                Err(_) => Err(format!("timed out after {}s", self.call_timeout.as_secs())),
+                Ok(Err(err)) => Err(CallError::Failed(err.to_string())),
+                Err(_) => Err(CallError::TimedOut(format!(
+                    "timed out after {}s",
+                    self.call_timeout.as_secs()
+                ))),
             },
         }
     }
@@ -94,7 +119,7 @@ impl PageSweep<'_> {
     /// A writer that uploads the same key again resets its creation time. The
     /// page holds the old time. This read happens just before the delete, so
     /// it sees a re-upload that happened since the page was listed.
-    async fn still_old(&self, after: Option<&str>, key: &str) -> Result<bool, String> {
+    async fn still_old(&self, after: Option<&str>, key: &str) -> Result<bool, CallError> {
         let page = self.call(self.store.list(after, self.cutoff, 1)).await?;
         Ok(page
             .and_then(|page| page.blobs.into_iter().next())
@@ -142,11 +167,17 @@ impl PageSweep<'_> {
                 Ok(true) => outcome.deleted += 1,
                 Ok(false) => {}
                 // Shutdown is not a store failure.
-                Err(_) if self.shutdown.is_cancelled() => break,
+                Err(CallError::Shutdown) => break,
                 Err(err) => {
+                    let timed_out = matches!(err, CallError::TimedOut(_));
+                    let message = err.into_message();
                     outcome.delete_failures += 1;
-                    tracing::debug!(blob_key = %key, error = %err, "harvest orphan-blob delete failed");
-                    outcome.first_failure.get_or_insert(err);
+                    tracing::debug!(blob_key = %key, error = %message, "harvest orphan-blob delete failed");
+                    outcome.first_failure.get_or_insert(message);
+                    if timed_out {
+                        outcome.timed_out = true;
+                        break;
+                    }
                 }
             }
         }
@@ -159,9 +190,13 @@ impl PageSweep<'_> {
     /// after the page check. A writer can also upload the key again, which
     /// resets its creation time. Neither check closes the window completely,
     /// because a delete is not conditional. The window is one store round trip.
-    async fn delete_if_orphan(&self, before: Option<&str>, key: &str) -> Result<bool, String> {
+    async fn delete_if_orphan(&self, before: Option<&str>, key: &str) -> Result<bool, CallError> {
         let one = [key.to_string()];
-        if !referenced_keys(self.pools, &one).await?.is_empty() {
+        if !referenced_keys(self.pools, &one)
+            .await
+            .map_err(CallError::Failed)?
+            .is_empty()
+        {
             return Ok(false);
         }
         if !self.still_old(before, key).await? {
@@ -169,6 +204,27 @@ impl PageSweep<'_> {
         }
         self.call(self.store.delete(key)).await?;
         Ok(true)
+    }
+}
+
+/// Record the metrics and logs of one swept page.
+fn report_page(outcome: &PageOutcome, dry_run: bool, metrics: &dyn MetricsRecorder) {
+    if *outcome != PageOutcome::default() {
+        metrics.record_orphan_blob_sweep(outcome.found, outcome.deleted, outcome.delete_failures);
+        tracing::info!(
+            found = outcome.found,
+            deleted = outcome.deleted,
+            delete_failures = outcome.delete_failures,
+            dry_run,
+            "harvest orphan-blob sweep page"
+        );
+    }
+    if let Some(error) = &outcome.first_failure {
+        tracing::warn!(
+            delete_failures = outcome.delete_failures,
+            first_error = %error,
+            "harvest orphan-blob delete failed"
+        );
     }
 }
 
@@ -233,7 +289,8 @@ impl OrphanBlobSweeper {
             let after = self.cursor.clone();
             let listed = sweep
                 .call(sweep.store.list(after.as_deref(), cutoff, limit))
-                .await;
+                .await
+                .map_err(CallError::into_message);
             let mut page = match listed {
                 Ok(Some(page)) => page,
                 Ok(None) => {
@@ -261,26 +318,10 @@ impl OrphanBlobSweeper {
             page.blobs.truncate(limit);
             match sweep.sweep(after.as_deref(), &page.blobs).await {
                 Ok(outcome) => {
-                    if outcome != PageOutcome::default() {
-                        metrics.record_orphan_blob_sweep(
-                            outcome.found,
-                            outcome.deleted,
-                            outcome.delete_failures,
-                        );
-                        tracing::info!(
-                            found = outcome.found,
-                            deleted = outcome.deleted,
-                            delete_failures = outcome.delete_failures,
-                            dry_run = config.dry_run,
-                            "harvest orphan-blob sweep page"
-                        );
-                    }
-                    if let Some(error) = &outcome.first_failure {
-                        tracing::warn!(
-                            delete_failures = outcome.delete_failures,
-                            first_error = %error,
-                            "harvest orphan-blob delete failed"
-                        );
+                    report_page(&outcome, config.dry_run, metrics);
+                    // A hung store ends the pass. The page keeps its cursor.
+                    if outcome.timed_out {
+                        return;
                     }
                 }
                 Err(error) => {

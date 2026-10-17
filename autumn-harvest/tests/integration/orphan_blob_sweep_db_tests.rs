@@ -701,10 +701,12 @@ async fn a_failed_listing_deletes_nothing_and_leaves_the_sweep_on() {
 }
 
 #[tokio::test]
-async fn a_hung_delete_times_out_and_is_counted() {
+async fn a_hung_delete_costs_one_timeout_and_ends_the_pass() {
     let dbs = setup_dbs().await;
     let store = MemStore::new(true);
-    store.plant_orphan("old", 48);
+    for n in 0..3 {
+        store.plant_orphan(&format!("old-{n}"), 48);
+    }
     store.hang_delete.store(true, Ordering::SeqCst);
     let off = offloader(&store);
     let mut config = sweep_config();
@@ -713,8 +715,12 @@ async fn a_hung_delete_times_out_and_is_counted() {
     let metrics = Arc::new(CapturingMetrics::default());
     run_ticks(one_shard(&dbs), config, &metrics, off, 1).await;
 
-    assert_eq!(store.keys().len(), 1);
-    assert_eq!(metrics.counts(), (1, 0, 1));
+    assert_eq!(store.keys().len(), 3);
+    assert_eq!(
+        metrics.counts(),
+        (3, 0, 1),
+        "the first timeout stops the pass, so the other two are not tried"
+    );
 }
 
 #[tokio::test]

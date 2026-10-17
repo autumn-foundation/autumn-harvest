@@ -138,5 +138,5 @@ Module `orphan_blob_sweep`. One pass:
 | `a_store_that_ignores_the_cutoff_*` (DB) | R3 with a store that ignores the filter. |
 | `a_key_uploaded_again_after_the_listing_is_not_deleted` (DB) | R11. |
 | `blobs_referenced_on_different_shards_all_survive` (DB) | R1 with a reference on each shard. |
-| `a_hung_delete_times_out_and_is_counted` (DB) | R12. |
+| `a_hung_delete_costs_one_timeout_and_ends_the_pass` (DB) | R12. |
 | `a_failed_listing_*`, `one_tick_reads_at_most_ten_pages` (DB) | Error and page cap. |
