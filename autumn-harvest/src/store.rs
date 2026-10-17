@@ -2904,8 +2904,11 @@ pub struct DurableStreamChunk {
 /// **Monotonic.** The store admits only offsets above the highest stored
 /// real offset (issue #2083). A reader can hold a cursor above a hole that a
 /// failed call left. A later chunk in that hole is below the cursor, so no
-/// reader would get it. The store drops it. This also stops two overlapping
-/// writers from filling different holes and passing the cap.
+/// reader would get it. The store drops it.
+///
+/// **Serialized.** An advisory lock on the run orders overlapping writers,
+/// such as a stale worker after a lease reclaim. The second writer reads the
+/// first writer's rows, so the rule and the cap hold across both.
 ///
 /// **Cap.** Once the execution holds `max_chunks` real chunks, the store
 /// drops newer chunks and stores one marker at
@@ -2976,6 +2979,17 @@ async fn append_stream_chunks_in_tx(
     }) {
         return Ok(0);
     }
+
+    // `FOR KEY SHARE` does not conflict with itself, so two overlapping
+    // appends for one run could read the same stored rows. Each could then
+    // admit offsets below the other's, or pass the cap together. A
+    // transaction-scoped advisory lock on the run orders the reads and the
+    // inserts below. A terminal write does not take it, so no cycle forms.
+    diesel::sql_query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind::<diesel::sql_types::Text, _>(format!("harvest_stream_chunks:{}", exec_id.as_uuid()))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
 
     let truncated: bool = diesel::select(diesel::dsl::exists(
         dsl::harvest_stream_chunks

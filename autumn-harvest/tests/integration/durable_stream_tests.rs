@@ -233,9 +233,14 @@ async fn the_cap_holds_when_stored_offsets_are_not_a_prefix() {
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     let exec_id = ExecutionId::new();
     insert_execution(&mut conn, exec_id, "stream_cap_holes").await;
-    store::append_stream_chunks(&mut conn, exec_id, &[chunk(0, json!(0)), chunk(2, json!(2))], 3)
-        .await
-        .expect("append with a hole at offset 1");
+    store::append_stream_chunks(
+        &mut conn,
+        exec_id,
+        &[chunk(0, json!(0)), chunk(2, json!(2))],
+        3,
+    )
+    .await
+    .expect("append with a hole at offset 1");
     let batch: Vec<_> = (3..5).map(|i| chunk(i, json!(i))).collect();
     store::append_stream_chunks(&mut conn, exec_id, &batch, 3)
         .await
@@ -269,12 +274,19 @@ async fn a_hole_behind_the_highest_stored_offset_is_never_filled() {
     let written = store::append_stream_chunks(&mut conn, exec_id, &[chunk(0, json!(0))], 100)
         .await
         .expect("append offset 0 after offset 1");
-    assert_eq!(written, 0, "a late chunk below the highest offset is dropped");
+    assert_eq!(
+        written, 0,
+        "a late chunk below the highest offset is dropped"
+    );
 
     let written = store::append_stream_chunks(
         &mut conn,
         exec_id,
-        &[chunk(0, json!(0)), chunk(1, json!("again")), chunk(2, json!(2))],
+        &[
+            chunk(0, json!(0)),
+            chunk(1, json!("again")),
+            chunk(2, json!(2)),
+        ],
         100,
     )
     .await
@@ -320,7 +332,10 @@ async fn an_unordered_first_batch_stores_every_offset() {
     )
     .await
     .expect("append an unordered batch");
-    assert_eq!(written, 3, "the rule compares with stored rows, not the batch");
+    assert_eq!(
+        written, 3,
+        "the rule compares with stored rows, not the batch"
+    );
     assert_eq!(
         read_all(&mut conn, exec_id).await,
         vec![(0, json!(0)), (1, json!(1)), (2, json!(2))]

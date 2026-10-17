@@ -8,7 +8,11 @@ advisory lock orders overlapping writers, such as a stale worker after a
 lease reclaim, so they cannot pass the cap or insert out of order. No
 migration and no new event.
 
-Tests: `a_hole_behind_the_highest_stored_offset_is_never_filled`,
+Updated tests: `the_cap_holds_when_stored_offsets_are_not_a_prefix` and
+`activation_copies_stream_chunks_written_after_verification`, which now
+expects offsets 0, 2, 3 and 4.
+
+New tests: `a_hole_behind_the_highest_stored_offset_is_never_filled`,
 `a_dropped_hole_chunk_writes_no_truncation_marker`,
 `an_unordered_first_batch_stores_every_offset`,
 `a_mixed_batch_at_the_cap_marks_only_the_new_chunk`,
