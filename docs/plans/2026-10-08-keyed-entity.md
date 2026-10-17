@@ -70,8 +70,9 @@ creates one run for each operation and has no state between runs.
   sessions. Issue #1965 ranks it 13 and asks for customer pull.
 - **Red.** Users want one call, not a recipe. Maintainers fear a new event
   variant on the append-only log.
-- **Black.** Each operation adds a side-effect event. An operation that races
-  a delete of an idle entity can be lost, as for any workflow that completes.
+- **Black.** Each operation adds a side-effect event. The engine re-pends a
+  completing run that has an unconsumed signal (issue #2079), so an operation
+  that races a delete is not lost.
   No request/response call exists. SQLite cannot run an entity.
 - **Yellow.** No migration and no new event. Crash recovery is plain replay.
   The two engine hazards above are solved once, in the library.

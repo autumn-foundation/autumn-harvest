@@ -849,6 +849,29 @@ pub async fn signal_idempotency_key_exists(
     .map_err(crate::error::database_error)
 }
 
+/// Report whether an execution has an unconsumed signal (issue #2079).
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) if
+/// the query fails.
+#[cfg(feature = "db")]
+pub async fn has_pending_signals(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_signals::dsl;
+
+    diesel::select(diesel::dsl::exists(
+        dsl::harvest_signals
+            .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(dsl::consumed.eq(false)),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
 /// Load all unconsumed queued signals for an execution, ordered by receive time.
 ///
 /// # Errors

@@ -40,7 +40,7 @@ pub use store::{
     Claim, ClaimStore, Fencing, Op, OracleStore, Orphan, Outcome, Row, TaskState, WriteOutcome,
 };
 pub use sweep::{
-    CHECKS_VAR, FENCING_VAR, Nondeterminism, SEED_BASE_VAR, SEED_VAR, SEEDS_VAR, SeedPlan,
-    SweepFailure, SweepSummary, TAIL_LINES, config_from_env, config_from_vars, first_divergence,
-    repro_command, run_twice, run_twice_with, sweep,
+    CHECKS_VAR, DST_SEED_VARS, FENCING_VAR, Nondeterminism, SEED_BASE_VAR, SEED_VAR, SEEDS_VAR,
+    SeedPlan, SeedVars, SweepFailure, SweepSummary, TAIL_LINES, config_from_env, config_from_vars,
+    first_divergence, repro_command, run_twice, run_twice_with, sweep,
 };

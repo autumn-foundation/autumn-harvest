@@ -596,6 +596,20 @@ async fn a_bad_flag_is_a_usage_error() {
     assert_eq!(code, 2);
     assert!(out.is_empty(), "a usage error goes to stderr only");
     let text = String::from_utf8(err).expect("utf8");
-    assert!(text.contains("unknown flag `--no-such-flag`"), "{text}");
+    assert!(text.contains("unknown argument `--no-such-flag`"), "{text}");
     assert!(!text.contains("secret"), "{text}");
+}
+
+#[tokio::test]
+async fn a_bare_url_is_not_echoed_to_stderr() {
+    let check = UpgradeCheck::new();
+    let args = ["upgrade-check", "postgres://u:SECRETPW@h/db"]
+        .map(String::from)
+        .to_vec();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = run_command_with_output(check, args, &mut out, &mut err).await;
+    assert_eq!(code, 2);
+    let text = String::from_utf8(err).expect("utf8");
+    assert!(!text.contains("SECRETPW"), "{text}");
 }

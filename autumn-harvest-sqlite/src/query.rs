@@ -40,6 +40,7 @@ pub struct QueryReplay {
     terminal: bool,
     history_policy: WorkflowHistoryPolicy,
     pending_cancel: Option<String>,
+    parent: Option<ExecutionId>,
     /// The drive's timeout and deadline, so `ctx.deadline()` matches (issue
     /// #2029).
     deadline: (
@@ -86,6 +87,8 @@ impl QueryReplay {
             terminal,
             history_policy,
             pending_cancel,
+            // A child sees its parent here, as on a drive (issue #2026).
+            parent: store::parent_link(conn, exec)?.map(|(parent, _)| parent),
             deadline: store::run_config(conn, exec)?.context_deadline(),
         })
     }
@@ -100,9 +103,9 @@ impl QueryReplay {
     pub async fn run(self, name: String, args: Value, timeout: Duration) -> SqliteResult<Value> {
         let exec = self.exec;
         let sealed = self.terminal && history_reached_terminal_seal(&self.history);
-        // The drive builds its context with the same name, id, history policy
-        // and pending cancel, so a handler that reads them replays the same
-        // path.
+        // The drive builds its context with the same name, id, parent, history
+        // policy and pending cancel. A handler that reads them then replays
+        // the same path.
         let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
             exec,
             self.history,
@@ -111,6 +114,7 @@ impl QueryReplay {
         )
         .with_workflow_name(self.workflow_name)
         .with_workflow_id(self.workflow_id)
+        .with_parent_execution_id(self.parent)
         .with_pending_cancellation(self.pending_cancel)
         .with_execution_timeout(self.deadline.0)
         .with_deadline(self.deadline.1);

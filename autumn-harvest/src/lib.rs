@@ -513,6 +513,9 @@ pub mod tx_retry;
 mod shuttle_sync;
 /// Signal handler registry for push-based reactive signal handling (issue #546).
 pub mod signal_handler;
+/// `always!` and `sometimes!` for workflow code (issue #2033).
+#[doc(hidden)]
+pub mod sim_probe;
 pub mod simulator;
 /// Adaptive worker dispatch-slot tuner (issue #548).
 pub mod slot_tuner;

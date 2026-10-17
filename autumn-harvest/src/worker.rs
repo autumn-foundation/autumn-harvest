@@ -9290,6 +9290,51 @@ pub async fn check_paused_and_park(
     Ok(true)
 }
 
+/// Re-pend the task instead of sealing a run that has an unconsumed signal
+/// (issue #2079).
+///
+/// The task ingests the pending signals at its start. A signal that arrives
+/// later stays unconsumed. A complete or fail decision would seal the run
+/// over it, and the sender would never learn that the run did not read it.
+///
+/// The caller holds the execution row lock, and `send_signal` takes the same
+/// lock. So a signal is either visible here, or it commits after this
+/// transaction and finds a re-pended task to wake. The next pass ingests the
+/// signal and decides again. A signal that nothing reads is in history by
+/// then, so the run still ends.
+///
+/// Returns `true` when the task is re-pended and the decision is discarded.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::TerminalWriteClaimAmbiguous`] when the task claim
+/// moved to another worker, and a database error on query failure.
+async fn repend_for_late_signals(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    task_id: uuid::Uuid,
+    worker_id: &str,
+    crash_strikes: i32,
+    attempt: i32,
+    sticky_timeout: Duration,
+) -> HarvestResult<bool> {
+    if !signal::has_pending_signals(conn, exec_id).await? {
+        return Ok(false);
+    }
+    if !queue::claim_still_held_for_update(conn, task_id, worker_id, crash_strikes, attempt).await?
+    {
+        return Err(HarvestError::TerminalWriteClaimAmbiguous { task_id });
+    }
+    let sticky = if sticky_timeout.is_zero() {
+        None
+    } else {
+        Some(queue::StickyHint::new(worker_id, sticky_timeout))
+    };
+    queue::park_workflow_task(conn, task_id, sticky).await?;
+    queue::wake_workflow_task(conn, exec_id).await?;
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn block_workflow_for_non_determinism(
     conn: &mut AsyncPgConnection,
@@ -24372,6 +24417,10 @@ enum WorkflowPersistFlow {
     /// without persisting any new commands. Resume re-derives the decision on
     /// replay.
     ParkedPaused,
+    /// A complete or fail decision met an unconsumed signal (issue #2079). The
+    /// task was re-pended in the same transaction and the decision discarded.
+    /// The next task pass ingests the signal and decides again.
+    RependedForSignals,
     /// The decision was persisted under the execution row lock.
     /// `retry_scheduled` is `true` when a workflow-level retry was atomically
     /// started inside the failure transaction; the deferred schedule-failure
@@ -27961,6 +28010,35 @@ async fn process_workflow_task(
                     return Ok(WorkflowPersistFlow::ParkedPaused);
                 }
 
+                // Issue #2079: do not seal a run over a signal it never read.
+                if matches!(
+                    &outcome,
+                    WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
+                ) && repend_for_late_signals(
+                    conn,
+                    prepared.exec_id,
+                    task.id,
+                    worker_id,
+                    task.crash_strikes,
+                    task.attempt,
+                    sticky_timeout,
+                )
+                .await?
+                {
+                    record_decision_boundary(
+                        conn,
+                        registry,
+                        prepared.exec_id,
+                        decision_start_event_id,
+                        inline_appends,
+                        true,
+                        worker_id,
+                        build_id,
+                    )
+                    .await?;
+                    return Ok(WorkflowPersistFlow::RependedForSignals);
+                }
+
                 // Issue #1833: the boundary follows only rows this decision
                 // writes. The execution row is locked now, and every history
                 // writer takes that lock. So a row past this id is this
@@ -28126,6 +28204,11 @@ async fn process_workflow_task(
 
     match persist_flow {
         Ok(WorkflowPersistFlow::ParkedPaused) => return Ok(()),
+        Ok(WorkflowPersistFlow::RependedForSignals) => {
+            // A handler panic marked the cycle failed. The run goes on.
+            cycle_failure.discarded();
+            return Ok(());
+        }
         Ok(WorkflowPersistFlow::Persisted {
             retry_scheduled,
             deferred_checks,
@@ -28566,6 +28649,12 @@ impl CycleFailure {
             Self::FAILED_TERMINALLY,
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// The cycle discarded its failure, because the task was re-pended
+    /// for a late signal (issue #2079).
+    fn discarded(&self) {
+        self.0.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The dispatch outcome of the cycle.
@@ -42995,6 +43084,58 @@ mod tests {
     }
 
     // ── merge_wake_events (issue #476 review) ─────────────────────────────
+
+    /// The workflow simulation orders an ingest with its own model (issue
+    /// #2033). This differential test ties that model to the worker.
+    ///
+    /// The worker side loads due timers as the SQL does: `fires_at <= NOW()`,
+    /// ordered by `(fires_at, timer_id)`. Signals arrive in `received_at`
+    /// order. `workflow_sim_ingest_tests` checks the rule on the real ingest.
+    #[test]
+    fn sim_wake_order_matches_merge_wake_events() {
+        let base = chrono::Utc::now();
+        let at = |secs: u64| base + chrono::Duration::seconds(i64::try_from(secs).unwrap());
+        for seed in 0..2_000 {
+            let mut rng = crate::dst::SplitMix64::new(seed);
+            let clock = rng.below(8);
+            let timers: Vec<(TimerId, u64)> = (0..rng.below(4))
+                .map(|i| {
+                    (
+                        TimerId::new(format!("t{}", rng.below(3) * 10 + i)),
+                        rng.below(10),
+                    )
+                })
+                .collect();
+            let mut received: Vec<u64> = (0..rng.below(4)).map(|_| rng.below(10)).collect();
+            received.sort_unstable();
+            let signals: Vec<(String, serde_json::Value, u64)> = received
+                .iter()
+                .enumerate()
+                .map(|(i, &secs)| (format!("s{i}"), serde_json::json!(i), secs))
+                .collect();
+
+            let mut due: Vec<(TimerId, chrono::DateTime<chrono::Utc>)> = timers
+                .iter()
+                .filter(|(_, deadline)| *deadline <= clock)
+                .map(|(id, deadline)| (id.clone(), at(*deadline)))
+                .collect();
+            due.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.as_str().cmp(b.0.as_str())));
+            let worker = merge_wake_events(
+                due,
+                signals
+                    .iter()
+                    .map(|(name, payload, secs)| (name.clone(), payload.clone(), at(*secs)))
+                    .collect(),
+            );
+
+            let sim = crate::testing::sim::wake_order(clock, &timers, &signals);
+            assert_eq!(
+                serde_json::to_value(&sim).unwrap(),
+                serde_json::to_value(&worker).unwrap(),
+                "seed {seed}: clock {clock}, timers {timers:?}, signals {signals:?}"
+            );
+        }
+    }
 
     #[test]
     fn merge_wake_events_signal_before_deadline_is_recorded_first() {
