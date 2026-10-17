@@ -677,6 +677,31 @@ async fn a_preview_takes_no_lock_on_the_state_rows() {
     );
 }
 
+/// A preview works inside a caller's transaction, after the caller queried.
+#[tokio::test]
+async fn a_preview_nests_in_a_caller_transaction() {
+    let (mut conn, _container) = connect().await;
+    let queue_name = fresh_queue("preview-nested");
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_fairness_state (queue_name, fairness_key, pass, last_start, updated_at) VALUES \
+         ('{queue_name}', 'a', 1, 0, NOW() - INTERVAL '30 minutes'), \
+         ('{queue_name}', 'b', 1, 0, NOW() - INTERVAL '30 minutes')"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed state");
+    let cutoff = Utc::now() - Duration::minutes(10);
+    let name = queue_name.clone();
+    let counted = conn
+        .transaction::<u64, autumn_harvest::error::HarvestError, _>(async move |conn| {
+            list_fairness_state(conn, &name).await?;
+            prune_fairness_state(conn, Some(&name), cutoff, 100, true).await
+        })
+        .await
+        .expect("a nested preview must not fail");
+    assert_eq!(counted, 1, "the clock row stays");
+}
+
 /// A fair claim on a name the weight API cannot address fails first.
 #[tokio::test]
 async fn a_fair_claim_refuses_an_unaddressable_queue_name() {

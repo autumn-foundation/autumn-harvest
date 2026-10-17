@@ -288,7 +288,15 @@ pub async fn prune_fairness_state(
     let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
     let queue = queue_name.map(str::to_owned);
     if !preview {
-        return Ok(delete_prune_batches(conn, STATE_TABLE, queue.as_deref(), cutoff, batch).await?);
+        return Ok(delete_prune_batches(
+            conn,
+            STATE_TABLE,
+            ACTIVE_LIVE,
+            queue.as_deref(),
+            cutoff,
+            batch,
+        )
+        .await?);
     }
     // A preview runs the live batches on a temp copy of the state rows, then
     // rolls back. A one-pass count would miss rows that qualify only in a
@@ -296,11 +304,6 @@ pub async fn prune_fairness_state(
     // real rows unlocked, so a claim never waits for a preview.
     let ended = conn
         .transaction::<(), PreviewEnd, _>(async move |conn| {
-            // One snapshot for the row copy and the pending-key reads, so the
-            // count equals a live prune at one instant.
-            diesel::sql_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
-                .execute(conn)
-                .await?;
             diesel::sql_query(format!(
                 "CREATE TEMP TABLE {PREVIEW_TABLE} \
                  (LIKE {STATE_TABLE} INCLUDING INDEXES) ON COMMIT DROP"
@@ -308,8 +311,20 @@ pub async fn prune_fairness_state(
             .execute(conn)
             .await?;
             diesel::sql_query(format!(
-                "INSERT INTO {PREVIEW_TABLE} SELECT * FROM {STATE_TABLE} \
-                 WHERE $1::TEXT IS NULL OR queue_name = $1"
+                "CREATE TEMP TABLE {PREVIEW_ACTIVE} \
+                 (queue_name TEXT NOT NULL, fairness_key TEXT NOT NULL) ON COMMIT DROP"
+            ))
+            .execute(conn)
+            .await?;
+            // One statement copies both inputs, so they share one snapshot at
+            // any isolation level and nesting depth. The count then equals a
+            // live prune at one instant.
+            diesel::sql_query(format!(
+                "WITH cp AS ( \
+                     INSERT INTO {PREVIEW_TABLE} SELECT * FROM {STATE_TABLE} \
+                     WHERE $1::TEXT IS NULL OR queue_name = $1 \
+                 ) \
+                 INSERT INTO {PREVIEW_ACTIVE} {ACTIVE_LIVE_SQL}"
             ))
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(queue.as_deref())
             .execute(conn)
@@ -317,8 +332,15 @@ pub async fn prune_fairness_state(
             diesel::sql_query(format!("ANALYZE {PREVIEW_TABLE}"))
                 .execute(conn)
                 .await?;
-            let n =
-                delete_prune_batches(conn, PREVIEW_TABLE, queue.as_deref(), cutoff, batch).await?;
+            let n = delete_prune_batches(
+                conn,
+                PREVIEW_TABLE,
+                PREVIEW_ACTIVE,
+                queue.as_deref(),
+                cutoff,
+                batch,
+            )
+            .await?;
             Err(PreviewEnd::Count(n))
         })
         .await;
@@ -331,6 +353,25 @@ pub async fn prune_fairness_state(
 
 /// The state table.
 const STATE_TABLE: &str = "harvest_fairness_state";
+
+/// The pending keys that the live prune reads. A subquery over the task
+/// table, limited to the queues in `clock`.
+const ACTIVE_LIVE: &str = "( \
+    SELECT DISTINCT t.queue_name, COALESCE(t.fairness_key, '') AS fairness_key \
+    FROM harvest_task_queue t \
+    WHERE t.state = 'PENDING' \
+      AND t.queue_name IN (SELECT queue_name FROM clock) \
+)";
+
+/// The pending keys of a preview: a one-statement copy of the task table.
+/// `$1` is the queue, or `NULL` for every queue.
+const ACTIVE_LIVE_SQL: &str = "\
+    SELECT DISTINCT t.queue_name, COALESCE(t.fairness_key, '') \
+    FROM harvest_task_queue t \
+    WHERE t.state = 'PENDING' AND ($1::TEXT IS NULL OR t.queue_name = $1)";
+
+/// The temp copy of the pending keys that a preview reads.
+const PREVIEW_ACTIVE: &str = "harvest_fairness_preview_active";
 
 /// The temp copy that a preview prunes.
 const PREVIEW_TABLE: &str = "harvest_fairness_preview";
@@ -354,6 +395,7 @@ impl From<diesel::result::Error> for PreviewEnd {
 async fn delete_prune_batches(
     conn: &mut AsyncPgConnection,
     state: &str,
+    active: &str,
     queue_name: Option<&str>,
     cutoff: DateTime<Utc>,
     batch: i64,
@@ -363,7 +405,9 @@ async fn delete_prune_batches(
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         n: i64,
     }
-    let victims = PRUNE_VICTIMS_SQL.replace("@state@", state);
+    let victims = PRUNE_VICTIMS_SQL
+        .replace("@state@", state)
+        .replace("@active@", active);
     let sql = format!(
         "WITH {victims}, gone AS ( \
              DELETE FROM {state} d USING victims v \
@@ -389,7 +433,7 @@ async fn delete_prune_batches(
 
 /// The rows that [`prune_fairness_state`] may delete. Binds `$1` cutoff,
 /// `$2` row limit and `$3` queue (`NULL` for every queue). `@state@` stands
-/// for the state table.
+/// for the state table and `@active@` for the pending keys.
 ///
 /// A row goes in one of two cases:
 ///
@@ -424,10 +468,7 @@ const PRUNE_VICTIMS_SQL: &str = "\
         ) k \
     ), \
     active AS MATERIALIZED ( \
-        SELECT DISTINCT t.queue_name, COALESCE(t.fairness_key, '') AS fairness_key \
-        FROM harvest_task_queue t \
-        WHERE t.state = 'PENDING' \
-          AND t.queue_name IN (SELECT queue_name FROM clock) \
+        SELECT x.queue_name, x.fairness_key FROM @active@ x \
     ), \
     victims AS ( \
         SELECT s.queue_name, s.fairness_key \
@@ -476,7 +517,8 @@ mod tests {
         assert!(PRUNE_VICTIMS_SQL.contains("s.fairness_key <> c.clock_key"));
         assert!(PRUNE_VICTIMS_SQL.contains("ORDER BY c.last_start DESC, c.fairness_key DESC"));
         assert!(PRUNE_VICTIMS_SQL.contains("SKIP LOCKED"));
-        assert!(PRUNE_VICTIMS_SQL.contains("t.state = 'PENDING'"));
+        assert!(ACTIVE_LIVE.contains("t.state = 'PENDING'"));
+        assert!(ACTIVE_LIVE_SQL.contains("t.state = 'PENDING'"));
         assert!(PRUNE_VICTIMS_SQL.contains("active AS MATERIALIZED"));
     }
 
@@ -493,5 +535,6 @@ mod tests {
     #[test]
     fn prune_reads_the_state_table_only_through_the_placeholder() {
         assert!(!PRUNE_VICTIMS_SQL.contains("harvest_fairness_state"));
+        assert!(!PRUNE_VICTIMS_SQL.contains("harvest_task_queue"));
     }
 }
