@@ -23,7 +23,12 @@ use crate::lab::Lab;
 
 /// A file name for any key: its SHA-256 in hex.
 pub(crate) fn hashed(key: &str) -> String {
-    hex(&Sha256::digest(key.as_bytes()))
+    hashed_bytes(key.as_bytes())
+}
+
+/// The SHA-256 of `bytes`, in hex.
+pub(crate) fn hashed_bytes(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
 }
 
 fn hex(bytes: &[u8]) -> String {

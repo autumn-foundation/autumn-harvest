@@ -14,6 +14,7 @@
 //! The agent tools read only [`READABLE`] files and write only `train.py`.
 //! A read refuses a symlink and returns at most [`MAX_READ`] bytes.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -511,6 +512,32 @@ impl Lab {
             lines_added: numbers.next().unwrap_or(0),
             lines_removed: numbers.next().unwrap_or(0),
         })
+    }
+
+    /// A mark for the bytes of each tracked file but `program.md`.
+    ///
+    /// Two snapshots differ when a file changed between them, such as
+    /// `prepare.py`, the fixed evaluation. The bytes are read as they are on
+    /// disk, so no git filter that a run set up can hide a change. A file
+    /// that is gone, or is not a regular file, has its own mark.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when git fails.
+    pub fn tracked_snapshot(&self) -> Result<BTreeMap<String, String>, String> {
+        let list = self.git(&["ls-files", "-z"])?;
+        Ok(list
+            .split('\0')
+            .filter(|path| !path.is_empty() && *path != PROGRAM)
+            .map(|path| {
+                let mark = match crate::stores::read_regular(&self.root.join(path)) {
+                    Ok(Some(bytes)) => crate::stores::hashed_bytes(&bytes),
+                    Ok(None) => "gone".to_string(),
+                    Err(_) => "not a regular file".to_string(),
+                };
+                (path.to_string(), mark)
+            })
+            .collect())
     }
 
     /// Put `branch` at `commit`, check it out, and reset as

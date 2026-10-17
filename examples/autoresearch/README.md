@@ -275,7 +275,10 @@ experiment set the search attribute `status`, which the engine reserves.
   handle. It refuses a symlink at `results.tsv`, `train.py`, the files that
   the agent reads and its state files. So a link cannot send a read to another
   file, such as `/proc/self/environ`. A run that moves the branch or `HEAD`,
-  or changes `train.py`, is a crash, and the lab goes back. After a stop in
+  or changes a tracked file other than `program.md`, such as `train.py` or
+  the fixed `prepare.py`, is a crash, and the lab goes back. The check reads
+  the bytes on disk, so a git filter cannot hide a change. `uv.lock` counts
+  too, so run `uv run prepare.py` once first, as step 1 says. After a stop in
   the middle of a run, the train call puts the lab back before it trains
   again. The code can still read your files, write `.git` and
   `.autoresearch`, and escape the kill with `setsid`. Run it in a container,

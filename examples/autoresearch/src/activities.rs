@@ -9,6 +9,7 @@
 //! run on another branch, so a second session in the lab cannot make it
 //! commit or reset on the wrong branch.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -312,13 +313,34 @@ async fn call_lock(saved: &Path) -> Result<std::fs::File, String> {
 }
 
 /// The run is code that the model wrote, and the checks before it are stale
-/// once it ends. When it changed the branch, `HEAD` or `train.py`, put the
-/// lab back and count the run as a crash.
-fn after_run(lab: &Lab, branch: &str, commit: &str, run: TrainRun) -> Result<TrainRun, String> {
+/// once it ends. A run can change the branch, `HEAD` or a tracked file, such
+/// as `train.py` or `prepare.py`. Then put the lab back and count the run as
+/// a crash. `before` is the [`Lab::tracked_snapshot`] from before the run.
+fn after_run(
+    lab: &Lab,
+    target: (&str, &str),
+    before: &BTreeMap<String, String>,
+    run: TrainRun,
+) -> Result<TrainRun, String> {
+    let (branch, commit) = target;
     let changed = lab
         .require_branch(branch)
         .and_then(|()| lab.require_head(commit))
-        .and_then(|()| lab.require_clean_train());
+        .and_then(|()| lab.require_clean_train())
+        .and_then(|()| {
+            let after = lab.tracked_snapshot()?;
+            let moved: Vec<&str> = before
+                .keys()
+                .chain(after.keys())
+                .filter(|path| before.get(*path) != after.get(*path))
+                .map(String::as_str)
+                .collect();
+            if moved.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("it changed {}", moved.join(", ")))
+            }
+        });
     let Err(why) = changed else {
         return Ok(run);
     };
@@ -397,6 +419,8 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
             .map_err(|e| fatal(DIRTY_TREE, e))
     })
     .await?;
+    let snapshot = lab.clone();
+    let before = blocking(move || snapshot.tracked_snapshot()).await?;
     crate::stores::write_atomic(&started, b"")?;
     let (lines, mut progress) = tokio::sync::mpsc::unbounded_channel::<String>();
     let run = crate::trainer::run(&input.trainer, lab.root(), &state, move |line| {
@@ -411,7 +435,8 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
     };
     let (run, ()) = tokio::join!(run, beat);
     let run = run?;
-    let run = blocking(move || after_run(&lab, &input.branch, &input.commit, run)).await?;
+    let run =
+        blocking(move || after_run(&lab, (&input.branch, &input.commit), &before, run)).await?;
     let bytes = serde_json::to_vec(&run).map_err(|e| e.to_string())?;
     crate::stores::write_atomic(&saved, &bytes)?;
     // The saved run answers each later delivery, so the mark has no use.
@@ -593,6 +618,10 @@ mod tests {
             "git checkout -q -b elsewhere",
             "echo '# x' >> train.py; git -c user.name=r -c user.email=r@r commit -qam x",
             "echo 'DEPTH = 99' >> train.py",
+            // The fixed evaluation. A keep runs no reset, so the check must
+            // catch it.
+            "echo 'TAMPERED = 1' >> prepare.py",
+            "rm prepare.py",
         ];
         for change in changes {
             let (_dir, mut input, _counter) = lab_with_counter();
@@ -617,6 +646,12 @@ mod tests {
             lab.require_branch(&input.branch).unwrap();
             lab.require_head(&input.commit).unwrap();
             lab.require_clean_train().unwrap();
+            assert_eq!(
+                lab.git(&["status", "--porcelain", "--untracked-files=no"])
+                    .unwrap(),
+                "",
+                "{change}"
+            );
         }
     }
 
