@@ -450,4 +450,32 @@ mod tests {
         let used = setup(&ActivityContext::new_test(), input).await;
         assert!(used.unwrap_err().contains(TAG_USED));
     }
+
+    /// The row shows the short form. The base keeps the full id, so a
+    /// later reset never meets an ambiguous prefix.
+    #[tokio::test]
+    async fn find_kept_returns_the_full_id_of_the_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = Lab::init(dir.path().join("lab")).unwrap();
+        let head = lab.head().unwrap();
+        let row = ResultRow {
+            commit: crate::results::short(&head),
+            val_bpb: 0.99,
+            memory_gb: 44.0,
+            status: crate::rules::Status::Keep,
+            description: "baseline".into(),
+        };
+        lab.record(&row, "k1").unwrap();
+        let input = CommitRef {
+            lab: lab.root().display().to_string(),
+            branch: "master".into(),
+            commit: head.clone(),
+        };
+        let best = find_kept(&ActivityContext::new_test(), input)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(best.commit, head);
+        assert_eq!(best.val_bpb, 0.99);
+    }
 }

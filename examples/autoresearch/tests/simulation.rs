@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use autoresearch::results::ResultRow;
+use autoresearch::results::{ResultRow, short};
 use autoresearch::rules::{Best, KeepPolicy, Status, Verdict};
 use autoresearch::scripted::FIX_MODE;
 use autoresearch::workflows::{
@@ -31,7 +31,8 @@ const SEEDS: SeedPlan = SeedPlan {
     count: 64,
 };
 
-const BASE: &str = "aaaaaaa";
+/// Commit ids are full ids, as git gives them. A row shows the short form.
+const BASE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const BASE_BPB: f64 = 0.9979;
 
 /// The report of a finished agent run with `text` as its answer.
@@ -80,7 +81,9 @@ fn experiment_input(baseline: bool) -> ExperimentInput {
 }
 
 /// An older kept commit that a rewind can move the base to.
-const KEPT: &str = "k000001";
+const KEPT: &str = "k000001000000000000000000000000000000000";
+/// A commit that `results.tsv` does not keep.
+const LOST: &str = "x000001000000000000000000000000000000000";
 
 fn kept() -> Best {
     Best {
@@ -117,7 +120,7 @@ fn experiment_env() -> WorkflowTestEnv {
             }
             Ok(match mock.rng().below(100) {
                 0..10 => json!(KEPT),
-                10..14 => json!("x000001"),
+                10..14 => json!(LOST),
                 _ => json!(BASE),
             })
         })
@@ -132,7 +135,7 @@ fn experiment_env() -> WorkflowTestEnv {
             let call = mock.call();
             let changed = !(call == 1 && mock.rng().below(100) < 10);
             Ok(json!({
-                "commit": if changed { format!("c{call:06}") } else { input["parent"].as_str().unwrap_or(BASE).to_string() },
+                "commit": if changed { format!("c{call:06}{:0>33}", "") } else { input["parent"].as_str().unwrap_or(BASE).to_string() },
                 "parent": input["parent"],
                 "changed": changed,
                 "lines_added": u32::from(changed),
@@ -250,8 +253,10 @@ fn check_experiment(run: &SimOutcome) {
         Status::Keep => {
             always!(resets.is_empty(), "a keep resets nothing");
             always!(
-                out.best.as_ref().map(|b| b.commit.as_str()) == Some(out.row.commit.as_str()),
-                "a keep is the new base"
+                out.best
+                    .as_ref()
+                    .is_some_and(|b| b.commit.len() == 40 && short(&b.commit) == out.row.commit),
+                "a keep is the new base, by its full id"
             );
             always!(out.row.val_bpb < base.val_bpb, "a kept run beats the base");
             sometimes!(true, "a change is kept");
@@ -373,7 +378,7 @@ async fn a_baseline_trains_head_with_no_proposal() {
                 if let Ok(output) = run.result() {
                     let out: ExperimentOutcome = serde_json::from_value(output.clone()).unwrap();
                     always!(out.row.description == "baseline", "the row says baseline");
-                    always!(out.row.commit == BASE, "the baseline is HEAD");
+                    always!(out.row.commit == short(BASE), "the baseline is HEAD");
                 }
             },
         )
@@ -408,10 +413,10 @@ fn mock_experiment(input: Value) -> Result<Value, String> {
     let commit = if input.baseline {
         BASE.to_string()
     } else {
-        format!("e{n:06}")
+        format!("e{n:06}{:0>33}", "")
     };
     let row = ResultRow {
-        commit: commit.clone(),
+        commit: short(&commit),
         val_bpb,
         memory_gb: if status == Status::Crash { 0.0 } else { 44.0 },
         status,

@@ -250,7 +250,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC15 | `e2e::a_finished_night_leaves_a_morning_report`, `scripted::tests::the_reporter_reports_the_summary_of_its_own_session`. |
 | AC16 | `e2e::a_restart_resumes_without_paying_for_a_turn_or_a_run_twice`: the model calls across two processes equal those of one process, and each row has one `train` activity. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`: a train call that runs again does not train again. |
 | AC17 | `e2e::a_night_of_research_keeps_only_improvements` and `e2e::the_session_continues_as_new_and_carries_its_best` run `verify`. The CI demo runs `verify`. |
-| AC18 | `sim::*`: nine sweeps. Each seed runs twice, replays, and runs again with a crash. Each target is required. |
+| AC18 | `sim::*`: nine sweeps. Each seed runs twice, replays, and runs again with a crash. Each target is required. The mocks give full commit ids, so a sweep sees a short id where a full one belongs. |
 | AC19 | `e2e::eval_names_the_first_turn_where_a_new_program_differs`, `cli::eval_and_purge_work_on_a_finished_night`. |
 | AC20 | `e2e::the_response_cache_serves_an_identical_report_turn`. |
 | AC21 | `e2e::the_inbox_delivers_a_command_once`, `cli::inbox_commands_queue_for_the_runner`, `inbox::tests`. |
