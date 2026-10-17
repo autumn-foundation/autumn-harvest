@@ -5,7 +5,12 @@
 //! under the workflow id `autoresearch/<tag>`, and refuses a tag in use, as
 //! upstream refuses a branch that exists. [`drive`] carries the session
 //! forward until it ends or needs a person.
+//!
+//! A session started by the nightly schedule has an id that the engine
+//! picks. So the commands find a running session by its `tag` search
+//! attribute, not by its id.
 
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,14 +20,14 @@ use autumn_harvest::builder::{BuiltHarvest, HarvestBuilder};
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::policy::{Schedule, WorkflowSchedule};
 use autumn_harvest::quota::QuotaPolicy;
-use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
+use autumn_harvest::testing::{HistorySnapshot, ReplayStatus, WorkflowReplayer};
 use autumn_harvest_agent::approval::approval_call_id;
 use autumn_harvest_agent::eval::{Candidate, evaluate};
 use autumn_harvest_agent::heartbeat;
 use autumn_harvest_agent::workflow::agent_loop_info;
 use autumn_harvest_agent::{AgentHarness, Approval, ModelTurn, agent_heartbeat_info, sqlite};
 use autumn_harvest_sqlite::{
-    ExecutionFilter, ExecutionId, ExecutionSummary, RunState, SqliteRuntime, StartOptions,
+    ExecutionFilter, ExecutionId, RunState, SqliteError, SqliteRuntime, StartOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,8 +39,9 @@ use crate::workflows::{
     self, HINT, POLICY, SESSION, STOP, SessionConfig, SessionInput, SessionReport, with_program,
 };
 
-/// The workflow id prefix of a session. The rest is the tag.
-pub const SESSION_PREFIX: &str = "autoresearch/";
+/// The workflow id prefix of a session: the branch prefix. The rest is the
+/// tag.
+pub const SESSION_PREFIX: &str = crate::lab::BRANCH_PREFIX;
 
 /// The workflow id of the session with `tag`: the branch name.
 #[must_use]
@@ -66,9 +72,9 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
 /// Returns an error when the tag is empty or a session with the tag exists.
 pub fn start(rt: &mut SqliteRuntime, config: &SessionConfig) -> Result<ExecutionId, String> {
     let tag = config.tag.trim();
-    if tag.is_empty() {
-        return Err("a session needs a tag".into());
-    }
+    crate::lab::check_tag(tag)?;
+    let mut config = config.clone();
+    config.tag = tag.to_string();
     let input = SessionInput {
         config: config.clone(),
         carry: None,
@@ -126,7 +132,10 @@ pub async fn drive(rt: &mut SqliteRuntime, exec: ExecutionId) -> Result<Step, St
     let mut run = exec;
     // A session waits on an experiment, which waits on an agent run.
     for _ in 0..8 {
-        let state = rt.run_until_blocked(run).await.map_err(|e| e.to_string())?;
+        let state = rt
+            .run_until_blocked(run)
+            .await
+            .map_err(|e| format!("cannot drive {run}: {e}"))?;
         match state {
             RunState::WaitingWorkflow(target) => run = target,
             RunState::WaitingSignal(signal) if run != exec => {
@@ -176,34 +185,70 @@ fn pending(rt: &SqliteRuntime, run: ExecutionId, signal: &str) -> Option<Pending
     })
 }
 
+/// Why an inbox command did not land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    /// It can never land, such as a stop for a session that ended.
+    Permanent(String),
+    /// It can land later, such as when the database is busy.
+    Transient(String),
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Permanent(why) | Self::Transient(why) => f.write_str(why),
+        }
+    }
+}
+
+impl Refused {
+    /// A backend error, sorted by whether a retry can help.
+    fn backend(context: &str, error: &SqliteError) -> Self {
+        let why = format!("{context}: {error}");
+        match error {
+            SqliteError::Sqlite(_)
+            | SqliteError::DatabaseLocked { .. }
+            | SqliteError::Io { .. }
+            | SqliteError::TaskFailed { .. } => Self::Transient(why),
+            _ => Self::Permanent(why),
+        }
+    }
+}
+
 /// Deliver one inbox command, keyed by its inbox id.
 ///
 /// Returns a line for the operator.
 ///
 /// # Errors
 ///
-/// Returns an error when the target is unknown or not running.
-pub fn apply(rt: &mut SqliteRuntime, id: &str, command: &Command) -> Result<String, String> {
-    let (session, name, payload) = match command {
-        Command::Hint { session, text } => (session, HINT, json!({"text": text, "from": "human"})),
-        Command::Stop { session, reason } => (session, STOP, json!({ "reason": reason })),
-        Command::Policy { session, policy } => {
-            policy.validate()?;
-            let payload = serde_json::to_value(policy).map_err(|e| e.to_string())?;
-            (session, POLICY, payload)
+/// Returns [`Refused`] when the command cannot land now or ever.
+pub fn apply(rt: &mut SqliteRuntime, id: &str, command: &Command) -> Result<String, Refused> {
+    let (tag, name, payload) = match command {
+        Command::Hint { tag, text } => (tag, HINT, json!({"text": text, "from": "human"})),
+        Command::Stop { tag, reason } => (tag, STOP, json!({ "reason": reason })),
+        Command::Policy { tag, policy } => {
+            policy.validate().map_err(Refused::Permanent)?;
+            let payload =
+                serde_json::to_value(policy).map_err(|e| Refused::Permanent(e.to_string()))?;
+            (tag, POLICY, payload)
         }
-        Command::Approve { token } => return decide(rt, id, token, &Approval::Approve),
+        Command::Approve { token } => return decide(rt, token, &Approval::Approve),
         Command::Deny { token, reason } => {
             let reject = Approval::Reject {
                 reason: reason.clone(),
             };
-            return decide(rt, id, token, &reject);
+            return decide(rt, token, &reject);
         }
     };
+    let session = find_session(rt, tag)
+        .map_err(Refused::Transient)?
+        .map(|(_, workflow_id)| workflow_id)
+        .ok_or_else(|| Refused::Permanent(format!("no running session has the tag {tag}")))?;
     // The inbox id is the key: a resend after a crash is not staged twice.
     let delivery = rt
-        .send_signal_by_workflow_id(SESSION, session, name, payload, Some(id))
-        .map_err(|e| format!("cannot signal {session}: {e}"))?;
+        .send_signal_by_workflow_id(SESSION, &session, name, payload, Some(id))
+        .map_err(|e| Refused::backend(&format!("cannot signal {session}"), &e))?;
     Ok(if delivery.delivered {
         format!("{name} sent to {session}")
     } else {
@@ -211,42 +256,74 @@ pub fn apply(rt: &mut SqliteRuntime, id: &str, command: &Command) -> Result<Stri
     })
 }
 
-/// Send a decision to the approval wait that `token` names.
-fn decide(
-    rt: &mut SqliteRuntime,
-    id: &str,
-    token: &str,
-    approval: &Approval,
-) -> Result<String, String> {
-    let (exec, signal) = parse_token(token)?;
-    let exec = ExecutionId::from_str(&exec).map_err(|e| format!("{exec} is not a run id: {e}"))?;
-    let payload = serde_json::to_value(approval).map_err(|e| e.to_string())?;
+/// Send a decision to the approval wait that `token` names. The token is
+/// the key, so a second decision for one wait is not staged.
+fn decide(rt: &mut SqliteRuntime, token: &str, approval: &Approval) -> Result<String, Refused> {
+    let (exec, signal) = parse_token(token).map_err(Refused::Permanent)?;
+    if approval_call_id(&signal).is_none() {
+        return Err(Refused::Permanent(format!(
+            "{token} does not name an approval wait"
+        )));
+    }
+    let exec = ExecutionId::from_str(&exec)
+        .map_err(|e| Refused::Permanent(format!("{exec} is not a run id: {e}")))?;
+    let payload = serde_json::to_value(approval).map_err(|e| Refused::Permanent(e.to_string()))?;
     let staged = rt
-        .send_signal_idempotent(exec, &signal, payload, Some(id))
-        .map_err(|e| format!("cannot decide {token}: {e}"))?;
+        .send_signal_idempotent(exec, &signal, payload, Some(token))
+        .map_err(|e| Refused::backend(&format!("cannot decide {token}"), &e))?;
     Ok(if staged {
         format!("decision sent for {token}")
     } else {
-        format!("the decision for {token} was already sent")
+        format!("a decision for {token} was already sent")
     })
 }
 
-/// The running run of the session with `tag`, across `continue_as_new`.
+/// The running session with `tag`, across `continue_as_new`: its run and
+/// its workflow id.
 ///
 /// # Errors
 ///
 /// Returns an error when the backend fails.
-pub fn find_session(rt: &SqliteRuntime, tag: &str) -> Result<Option<ExecutionId>, String> {
+pub fn find_session(
+    rt: &SqliteRuntime,
+    tag: &str,
+) -> Result<Option<(ExecutionId, String)>, String> {
     let filter = ExecutionFilter::new()
         .workflow_name(SESSION)
-        .workflow_id(session_id(tag))
+        .search_attribute("tag", json!(tag))
         .state("RUNNING")
         .limit(1);
     let page = rt.list_executions(&filter).map_err(|e| e.to_string())?;
     Ok(page
         .executions
         .first()
-        .and_then(ExecutionSummary::execution_id))
+        .and_then(|run| Some((run.execution_id()?, run.workflow_id.clone().into_value()?))))
+}
+
+/// Every running session: its run and its tag. A session that has not set
+/// its tag yet has an empty tag.
+///
+/// # Errors
+///
+/// Returns an error when the backend fails.
+pub fn running_sessions(rt: &SqliteRuntime) -> Result<Vec<(ExecutionId, String)>, String> {
+    let filter = ExecutionFilter::new()
+        .workflow_name(SESSION)
+        .state("RUNNING");
+    let page = rt.list_executions(&filter).map_err(|e| e.to_string())?;
+    Ok(page
+        .executions
+        .iter()
+        .filter_map(|run| {
+            let tag = run
+                .search_attributes
+                .clone()
+                .into_value()
+                .and_then(|attrs| attrs.get("tag")?.as_str().map(str::to_string))
+                .unwrap_or_default();
+            Some((run.execution_id()?, tag))
+        })
+        .collect())
 }
 
 /// The nightly schedule: a session at 23:00 UTC with the tag derived from
@@ -400,7 +477,7 @@ async fn replay_one(replayer: &WorkflowReplayer, run: StoredRun) -> Result<(), S
     if running {
         // An activity in flight has a start and no end. The matcher does not
         // consume such a start at the frontier.
-        let ended: Vec<_> = history
+        let ended: HashSet<_> = history
             .iter()
             .filter_map(|event| match event {
                 WorkflowEvent::ActivityCompleted { activity_id, .. }
@@ -418,14 +495,17 @@ async fn replay_one(replayer: &WorkflowReplayer, run: StoredRun) -> Result<(), S
         WorkflowEvent::WorkflowFailed { error, .. } => Some(error.clone()),
         _ => None,
     });
-    let snapshot = serde_json::from_value(json!({
-        "workflow_name": name,
-        "execution_id": exec,
-        "events": history,
-        "parent_execution_id": parent,
-        "workflow_id": workflow_id,
-    }))
-    .map_err(|e| format!("cannot build a snapshot: {e}"))?;
+    let snapshot = HistorySnapshot {
+        workflow_name: name,
+        execution_id: exec,
+        events: history,
+        context_headers: None,
+        execution_timeout: None,
+        deadline_at: None,
+        parent_execution_id: parent,
+        workflow_id: Some(workflow_id),
+        queue_name: None,
+    };
     let result = if running {
         replayer.replay_canary_snapshot(snapshot).await
     } else {
@@ -443,42 +523,43 @@ async fn replay_one(replayer: &WorkflowReplayer, run: StoredRun) -> Result<(), S
     }
 }
 
-/// The finished proposal runs of the researcher, newest first.
+/// The newest finished proposal run of the researcher. It reads one page
+/// of runs at a time, with their inputs, and stops at the first proposal.
 ///
 /// # Errors
 ///
 /// Returns an error when the backend fails.
-pub fn proposals(rt: &SqliteRuntime) -> Result<Vec<ExecutionId>, String> {
-    let filter = ExecutionFilter::new()
+pub fn latest_proposal(rt: &SqliteRuntime) -> Result<Option<ExecutionId>, String> {
+    let mut filter = ExecutionFilter::new()
         .workflow_name(autumn_harvest_agent::WORKFLOW_NAME)
         .state("COMPLETED")
-        .limit(1_000);
-    let page = rt.list_executions(&filter).map_err(|e| e.to_string())?;
-    let mut runs = Vec::new();
-    for exec in page
-        .executions
-        .iter()
-        .filter_map(ExecutionSummary::execution_id)
-    {
-        let started = rt
-            .load_history(exec)
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find_map(|event| match event {
-                WorkflowEvent::WorkflowStarted { input, .. } => Some(input),
-                _ => None,
-            });
-        let is_proposal = started.is_some_and(|task| {
-            task["system"]
-                .as_str()
-                .is_some_and(|s| s.contains(RESEARCHER_ROLE))
-                && !task["input"].as_str().is_some_and(|i| i.contains(FIX_MODE))
-        });
-        if is_proposal {
-            runs.push(exec);
+        .limit(100);
+    loop {
+        let mut found = None;
+        let next = rt
+            .visit_executions(&filter, |run| {
+                let is_proposal = run
+                    .input_json
+                    .clone()
+                    .into_value()
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    .is_some_and(|task| {
+                        task["system"]
+                            .as_str()
+                            .is_some_and(|s| s.contains(RESEARCHER_ROLE))
+                            && !task["input"].as_str().is_some_and(|i| i.contains(FIX_MODE))
+                    });
+                if is_proposal && found.is_none() {
+                    found = run.summary.execution_id();
+                }
+            })
+            .map_err(|e| format!("cannot list the agent runs: {e}"))?;
+        match (found, next) {
+            (Some(exec), _) => return Ok(Some(exec)),
+            (None, Some(cursor)) => filter = filter.before(cursor),
+            (None, None) => return Ok(None),
         }
     }
-    Ok(runs)
 }
 
 /// Re-drive a recorded proposal with `program` in place of the recorded

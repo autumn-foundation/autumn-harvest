@@ -5,17 +5,24 @@
 //!
 //! - [`Lab::commit_train`] finds its own commit by an `Experiment-Key`
 //!   trailer and does not commit twice.
-//! - [`Lab::record`] does not append a row that `results.tsv` already holds.
-//! - [`Lab::reset_to`] is a no-op at its target.
+//! - [`Lab::record`] keys each row on the activity idempotency key, so a
+//!   retry does not append its row twice.
+//! - [`Lab::edit_train_once`] keys each edit on its tool call, so a re-run
+//!   does not apply it twice.
+//! - [`Lab::reset_to`] is idempotent.
 //!
 //! The agent tools read only [`READABLE`] files and write only `train.py`.
+//! A read refuses a symlink and returns at most [`MAX_READ`] bytes.
 
+use std::fmt::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use crate::results::ResultRow;
+use crate::results::{HEADER, ResultRow};
 
 /// The file that the agent edits.
 pub const TRAIN: &str = "train.py";
@@ -35,12 +42,31 @@ pub const READABLE: &[&str] = &[TRAIN, PREPARE, PROGRAM, RESULTS, "README.md", "
 pub const KEY_TRAILER: &str = "Experiment-Key";
 /// The prefix of every research branch.
 pub const BRANCH_PREFIX: &str = "autoresearch/";
+/// The most bytes that one agent read returns. A longer file returns its end.
+pub const MAX_READ: u64 = 64 * 1024;
+/// The newest rows of `results.tsv` that one agent read returns.
+pub const READ_ROWS: usize = 50;
+/// The file in the state directory that maps each recorded key to its row.
+const RECORDED: &str = "recorded.tsv";
+/// The directory in the state directory with one marker per applied edit.
+const EDITS: &str = "edits";
+
+/// One process writes `results.tsv` and `train.py` from several threads.
+/// This lock makes each read-modify-write whole.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// The author of every commit that the example makes.
 const AUTHOR: [&str; 4] = [
     "-c",
     "user.name=autoresearch",
     "-c",
     "user.email=autoresearch@localhost",
+];
+/// Git settings that keep code in the lab from running through git.
+const SAFE_GIT: [&str; 4] = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
 ];
 
 /// The bundled lab template. `autoresearch init` writes these files.
@@ -126,30 +152,28 @@ impl Lab {
             }
             std::fs::write(&file, text).map_err(|e| format!("cannot write {name}: {e}"))?;
         }
-        let run = |args: &[&str]| {
-            let out = Command::new("git")
-                .args(AUTHOR)
-                .args(args)
-                .current_dir(path)
-                .output()
-                .map_err(|e| format!("cannot run git: {e}"))?;
-            if out.status.success() {
-                Ok(())
-            } else {
-                Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-            }
-        };
-        run(&["init", "--quiet", "--initial-branch=master"])?;
-        run(&["add", "--all"])?;
-        run(&[
-            "commit",
-            "--quiet",
-            "-m",
-            "baseline lab from the autoresearch template",
-        ])?;
+        git_in(path, &["init", "--quiet", "--initial-branch=master"])?;
+        git_in(path, &["add", "--all"])?;
+        git_in(
+            path,
+            &[
+                "commit",
+                "--quiet",
+                "-m",
+                "baseline lab from the autoresearch template",
+            ],
+        )?;
         let lab = Self::open(path)?;
         lab.exclude_local_files()?;
         Ok(lab)
+    }
+
+    /// The lab of `labs` whose root is `session`, the session id of an
+    /// agent run.
+    #[must_use]
+    pub fn serving<'a>(labs: &'a [Self], session: Option<&str>) -> Option<&'a Self> {
+        let session = session?;
+        labs.iter().find(|lab| lab.root.to_str() == Some(session))
     }
 
     /// The canonical root of the lab.
@@ -158,15 +182,15 @@ impl Lab {
         &self.root
     }
 
-    /// The state directory, created on first use.
+    /// The state directory, created on first use. Only its owner can read
+    /// it, because it holds prompts, transcripts and the database.
     ///
     /// # Errors
     ///
     /// Returns an error when the directory cannot be created.
     pub fn state_dir(&self) -> Result<PathBuf, String> {
         let dir = self.root.join(STATE_DIR);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        private_dir(&dir)?;
         Ok(dir)
     }
 
@@ -176,19 +200,55 @@ impl Lab {
     ///
     /// Returns git's stderr when git exits non-zero.
     pub fn git(&self, args: &[&str]) -> Result<String, String> {
-        let out = Command::new("git")
-            .args(AUTHOR)
-            .args(args)
-            .current_dir(&self.root)
-            .output()
-            .map_err(|e| format!("cannot run git: {e}"))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        git_in(&self.root, args)
+    }
+
+    /// Fail unless `branch` is checked out.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error that names both branches when they differ.
+    pub fn require_branch(&self, branch: &str) -> Result<(), String> {
+        let current = self.git(&["branch", "--show-current"])?;
+        if current == branch {
+            Ok(())
         } else {
             Err(format!(
-                "git {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
+                "the lab is on {current:?}, not {branch:?}: another session moved it"
+            ))
+        }
+    }
+
+    /// Check out `branch` when another branch is checked out. Refuse when
+    /// `train.py` has a change that no commit holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `train.py` has a change, or git fails.
+    pub fn checkout(&self, branch: &str) -> Result<(), String> {
+        if self.require_branch(branch).is_ok() {
+            return Ok(());
+        }
+        self.require_clean_train()?;
+        self.git(&["checkout", "--quiet", branch])?;
+        Ok(())
+    }
+
+    /// Fail when `train.py` has a change that no commit holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error that says how to fix the work tree.
+    pub fn require_clean_train(&self) -> Result<(), String> {
+        if self
+            .git(&["status", "--porcelain", "--", TRAIN])?
+            .is_empty()
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "{TRAIN} has a change that no commit holds. \
+                 Commit it, or discard it with `git checkout -- {TRAIN}`"
             ))
         }
     }
@@ -200,23 +260,15 @@ impl Lab {
     ///
     /// Returns an error when the tag is not a valid branch name, or git fails.
     pub fn start_branch(&self, tag: &str) -> Result<String, String> {
-        let valid = !tag.is_empty()
-            && tag.len() <= 64
-            && tag
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-            && !tag.starts_with(['.', '-'])
-            && !tag.contains("..");
-        if !valid {
-            return Err(format!(
-                "the tag {tag:?} must be 1 to 64 of a-z, 0-9, '.', '-' and '_'"
-            ));
-        }
+        check_tag(tag)?;
         let branch = format!("{BRANCH_PREFIX}{tag}");
         self.exclude_local_files()?;
         if self.git(&["branch", "--show-current"])? == branch {
             return Ok(branch);
         }
+        // A change that no commit holds would move to the new branch, and
+        // the baseline would train it under the wrong commit.
+        self.require_clean_train()?;
         let exists = self
             .git(&[
                 "rev-parse",
@@ -233,11 +285,14 @@ impl Lab {
         Ok(branch)
     }
 
-    /// Add the local files to `.git/info/exclude`, once.
+    /// Add the local files to `.git/info/exclude`, once. The lines are
+    /// appended, so the patterns of the user stay as they are.
     fn exclude_local_files(&self) -> Result<(), String> {
-        let path = self.git(&["rev-parse", "--git-path", "info/exclude"])?;
-        let path = self.root.join(path);
-        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        use std::io::Write as _;
+        let path = self
+            .root
+            .join(self.git(&["rev-parse", "--git-path", "info/exclude"])?);
+        let text = read_or_empty(&path)?;
         let missing: Vec<String> = [RESULTS, "run.log", STATE_DIR]
             .iter()
             .map(|name| format!("/{name}"))
@@ -250,40 +305,55 @@ impl Lab {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
-        let mut text = text;
+        let mut lines = missing.join("\n") + "\n";
         if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
+            lines.insert(0, '\n');
         }
-        for line in missing {
-            text.push_str(&line);
-            text.push('\n');
-        }
-        std::fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(lines.as_bytes()))
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))
     }
 
-    /// The short hash of `HEAD`.
+    /// The short hash of `HEAD`: its first seven hex digits.
     ///
     /// # Errors
     ///
     /// Returns an error when git fails.
     pub fn head(&self) -> Result<String, String> {
-        self.git(&["rev-parse", "--short=7", "HEAD"])
+        self.short("HEAD")
     }
 
-    /// Commit `train.py` with `message` and an [`KEY_TRAILER`] of `key`.
+    /// The first seven hex digits of `rev`. Git's own short form grows
+    /// when a prefix becomes ambiguous, so a hash could change length
+    /// during a session. This form never does.
+    fn short(&self, rev: &str) -> Result<String, String> {
+        let full = self.git(&["rev-parse", "--verify", rev])?;
+        Ok(full.chars().take(7).collect())
+    }
+
+    /// Commit `train.py` on `parent` with `message` and a [`KEY_TRAILER`] of
+    /// `key`.
     ///
     /// When `HEAD` already carries `key`, return it and commit nothing. When
     /// `train.py` has no change, return `HEAD` with `changed: false`.
     ///
     /// # Errors
     ///
-    /// Returns an error when git fails.
-    pub fn commit_train(&self, message: &str, key: &str) -> Result<CommitInfo, String> {
-        let trailer = format!("{KEY_TRAILER}: {key}");
-        let head_message = self.git(&["log", "-1", "--format=%B"])?;
-        if head_message.lines().any(|line| line.trim() == trailer) {
-            return self.describe_head(true);
+    /// Returns an error when `HEAD` is not `parent`, or git fails.
+    pub fn commit_train(
+        &self,
+        message: &str,
+        key: &str,
+        parent: &str,
+    ) -> Result<CommitInfo, String> {
+        if let Some(info) = self.committed(key)? {
+            return Ok(info);
         }
+        self.require_head(parent)?;
+        let trailer = format!("{KEY_TRAILER}: {key}");
         let status = self.git(&["status", "--porcelain", "--", TRAIN])?;
         if status.is_empty() {
             return self.describe_head(false);
@@ -293,7 +363,37 @@ impl Lab {
         self.describe_head(true)
     }
 
-    /// `HEAD` as a [`CommitInfo`]. `changed: false` has no parent or lines.
+    /// `HEAD` as a [`CommitInfo`] when it carries the trailer of `key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when git fails.
+    pub fn committed(&self, key: &str) -> Result<Option<CommitInfo>, String> {
+        let trailer = format!("{KEY_TRAILER}: {key}");
+        let message = self.git(&["log", "-1", "--format=%B"])?;
+        if message.lines().any(|line| line.trim() == trailer) {
+            self.describe_head(true).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Fail unless `HEAD` is `commit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error that names both commits when they differ.
+    pub fn require_head(&self, commit: &str) -> Result<(), String> {
+        let head = self.head()?;
+        if head == commit {
+            Ok(())
+        } else {
+            Err(format!("HEAD is {head}, not {commit}: the branch moved"))
+        }
+    }
+
+    /// `HEAD` as a [`CommitInfo`]. With `changed: false`, the parent is
+    /// `HEAD` itself and no lines changed.
     fn describe_head(&self, changed: bool) -> Result<CommitInfo, String> {
         let commit = self.head()?;
         if !changed {
@@ -305,7 +405,7 @@ impl Lab {
                 lines_removed: 0,
             });
         }
-        let parent = self.git(&["rev-parse", "--short=7", "HEAD^"])?;
+        let parent = self.short("HEAD^")?;
         // `--numstat` prints "<added> <removed> <path>".
         let stat = self.git(&["diff", "--numstat", "HEAD^", "HEAD", "--", TRAIN])?;
         let mut numbers = stat
@@ -346,11 +446,14 @@ impl Lab {
         self.git(&["diff", "HEAD", "--", TRAIN])
     }
 
-    /// Read one of the [`READABLE`] files. A missing file reads as empty.
+    /// Read one of the [`READABLE`] files for an agent. A missing file reads
+    /// as empty. `results.tsv` reads as its header and the newest
+    /// [`READ_ROWS`] rows.
     ///
     /// # Errors
     ///
-    /// Returns an error for any other path.
+    /// Returns an error for any other path, or a file that is not a regular
+    /// file.
     pub fn read(&self, name: &str) -> Result<String, String> {
         if !READABLE.contains(&name) {
             return Err(format!(
@@ -358,11 +461,21 @@ impl Lab {
                 READABLE.join(", ")
             ));
         }
-        match std::fs::read_to_string(self.root.join(name)) {
-            Ok(text) => Ok(text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            Err(e) => Err(format!("cannot read {name}: {e}")),
+        let Some(text) = read_capped(&self.root.join(name))? else {
+            return Ok(String::new());
+        };
+        if name != RESULTS {
+            return Ok(text);
         }
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty() && *line != HEADER)
+            .collect();
+        let newest = &rows[rows.len().saturating_sub(READ_ROWS)..];
+        if newest.is_empty() {
+            return Ok(String::new());
+        }
+        Ok(format!("{HEADER}\n{}\n", newest.join("\n")))
     }
 
     /// Read `papers/<name>.md`. The name is letters, digits, `-` and `_`.
@@ -381,8 +494,8 @@ impl Lab {
                 "{name:?} is not a paper name: use letters, digits, '-' and '_'"
             ));
         }
-        std::fs::read_to_string(self.root.join(PAPERS_DIR).join(format!("{name}.md")))
-            .map_err(|_| format!("no paper named {name:?}"))
+        read_capped(&self.root.join(PAPERS_DIR).join(format!("{name}.md")))?
+            .ok_or_else(|| format!("no paper named {name:?}"))
     }
 
     /// Replace the one occurrence of `old` in `train.py` with `new`.
@@ -391,46 +504,78 @@ impl Lab {
     ///
     /// Returns an error when `old` is empty, absent, or not unique.
     pub fn edit_train(&self, old: &str, new: &str) -> Result<(), String> {
-        if old.is_empty() {
-            return Err("old must not be empty".into());
-        }
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
         let path = self.root.join(TRAIN);
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| format!("cannot read {TRAIN}: {e}"))?;
-        match text.matches(old).count() {
-            0 => Err(format!("{old:?} does not occur in {TRAIN}")),
-            1 => {
-                let edited = text.replacen(old, new, 1);
-                crate::stores::write_atomic(&path, edited.as_bytes())
-            }
-            n => Err(format!(
-                "{old:?} occurs {n} times in {TRAIN}; quote more of the line"
-            )),
-        }
+        let text = read_train(&path)?;
+        crate::stores::write_atomic(&path, replace_once(&text, old, new)?.as_bytes())
     }
 
-    /// Append `row` to `results.tsv`, with the header on a new file. A row
-    /// with the same commit and description is not appended twice.
+    /// [`Lab::edit_train`] once per `call`, a key of the tool call.
+    ///
+    /// A marker with the hashes of the file before and after the edit is
+    /// written before the file. A re-run of `call` reads it. When the file
+    /// is no longer at the "before" hash, the edit ran, so the re-run
+    /// changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the edit does not apply, or a write fails.
+    pub fn edit_train_once(&self, old: &str, new: &str, call: &str) -> Result<(), String> {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = self.root.join(TRAIN);
+        let text = read_train(&path)?;
+        let dir = self.state_dir()?.join(EDITS);
+        private_dir(&dir)?;
+        let marker = dir.join(crate::stores::hashed(call));
+        let before = crate::stores::hashed(&text);
+        if let Ok(saved) = std::fs::read_to_string(&marker)
+            && saved.lines().next() != Some(before.as_str())
+        {
+            return Ok(());
+        }
+        let edited = replace_once(&text, old, new)?;
+        let note = format!("{before}\n{}\n", crate::stores::hashed(&edited));
+        crate::stores::write_atomic(&marker, note.as_bytes())?;
+        crate::stores::write_atomic(&path, edited.as_bytes())
+    }
+
+    /// Append `row` to `results.tsv`, with the header on a new file.
+    ///
+    /// `key` names the call, such as the activity idempotency key. The key
+    /// and the index of its row go to the state directory before the row
+    /// goes to `results.tsv`. A retry with the same key finds its row and
+    /// appends nothing. Two experiments with equal rows both land.
     ///
     /// Returns `true` when the row was appended.
     ///
     /// # Errors
     ///
-    /// Returns an error when the file cannot be read or written.
-    pub fn record(&self, row: &ResultRow) -> Result<bool, String> {
-        let rows = self.rows()?;
-        let held = rows.iter().any(|r| {
-            r.commit == row.commit
-                && r.description == row.description.trim()
-                && r.status == row.status
-        });
-        if held {
-            return Ok(false);
-        }
+    /// Returns an error when a file cannot be read or written.
+    pub fn record(&self, row: &ResultRow, key: &str) -> Result<bool, String> {
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let keys_path = self.state_dir()?.join(RECORDED);
+        let mut keys = read_or_empty(&keys_path)?;
         let path = self.root.join(RESULTS);
-        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut text = read_or_empty(&path)?;
+        let held = data_lines(&text).count();
+        let key = crate::stores::hashed(key);
+        let index = keys
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, index)| index.parse::<usize>().ok());
+        match index {
+            // The row landed before a crash or a lost result.
+            Some(index) if index < held => return Ok(false),
+            // The key landed, and the row did not.
+            Some(_) => {}
+            None => {
+                let _ = writeln!(keys, "{key}\t{held}");
+                crate::stores::write_atomic(&keys_path, keys.as_bytes())?;
+            }
+        }
         if text.trim().is_empty() {
-            text = format!("{}\n", crate::results::HEADER);
+            text = format!("{HEADER}\n");
         } else if !text.ends_with('\n') {
             text.push('\n');
         }
@@ -440,14 +585,161 @@ impl Lab {
         Ok(true)
     }
 
-    /// Every row of `results.tsv`. A missing file has no rows.
+    /// Every row of `results.tsv`. A missing file has no rows. A line that
+    /// does not parse, such as a hand edit, is skipped.
     ///
     /// # Errors
     ///
-    /// Returns an error when the file does not parse.
+    /// Returns an error when the file cannot be read.
     pub fn rows(&self) -> Result<Vec<ResultRow>, String> {
-        crate::results::parse(&self.read(RESULTS)?)
+        let text = read_or_empty(&self.root.join(RESULTS))?;
+        Ok(data_lines(&text)
+            .filter_map(|line| ResultRow::parse_line(line).ok())
+            .collect())
     }
+
+    /// The newest kept row of `commit`, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `results.tsv` cannot be read.
+    pub fn kept(&self, commit: &str) -> Result<Option<ResultRow>, String> {
+        Ok(self
+            .rows()?
+            .into_iter()
+            .rev()
+            .find(|row| row.status == crate::rules::Status::Keep && row.commit == commit))
+    }
+}
+
+/// Check that `tag` can name the branch `autoresearch/<tag>`.
+///
+/// # Errors
+///
+/// Returns an error that states the rule.
+pub fn check_tag(tag: &str) -> Result<(), String> {
+    let valid = !tag.is_empty()
+        && tag.len() <= 64
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        && !tag.starts_with(['.', '-'])
+        && !tag.ends_with('.')
+        && !Path::new(tag)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("lock"))
+        && !tag.contains("..");
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "the tag {tag:?} is not valid. Use 1 to 64 letters, digits, '.', '-' and '_'. \
+             Do not start with '.' or '-', end with '.' or \".lock\", or use \"..\""
+        ))
+    }
+}
+
+/// Run git in `dir` with the example's author and safe settings.
+///
+/// The settings turn off hooks and the file system monitor. Code that the
+/// agent writes runs in the lab, so it could plant either one.
+fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .args(AUTHOR)
+        .args(SAFE_GIT)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// Create `dir`, and let only its owner read it.
+fn private_dir(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot protect {}: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+/// The lines of a `results.tsv` text that can hold a row.
+fn data_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty() && *line != HEADER)
+}
+
+/// The text of `path`, or an empty text when it does not exist.
+fn read_or_empty(path: &Path) -> Result<String, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    }
+}
+
+/// The text of `train.py`.
+fn read_train(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|e| format!("cannot read {TRAIN}: {e}"))
+}
+
+/// `text` with the one occurrence of `old` replaced by `new`.
+fn replace_once(text: &str, old: &str, new: &str) -> Result<String, String> {
+    if old.is_empty() {
+        return Err("old must not be empty".into());
+    }
+    match text.matches(old).count() {
+        0 => Err(format!("{old:?} does not occur in {TRAIN}")),
+        1 => Ok(text.replacen(old, new, 1)),
+        n => Err(format!(
+            "{old:?} occurs {n} times in {TRAIN}; quote more of the line"
+        )),
+    }
+}
+
+/// Read at most [`MAX_READ`] bytes from the end of `path`, as lossy UTF-8.
+/// Returns `None` when the file does not exist.
+///
+/// A symlink is refused, so a link that the agent's code planted cannot
+/// send a file from outside the lab to the model.
+fn read_capped(path: &Path) -> Result<Option<String>, String> {
+    let name = path.display();
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {name}: {e}")),
+    };
+    if !meta.is_file() {
+        return Err(format!("{name} is not a regular file"));
+    }
+    let mut file = std::fs::File::open(path).map_err(|e| format!("cannot read {name}: {e}"))?;
+    let skip = meta.len().saturating_sub(MAX_READ);
+    file.seek(SeekFrom::Start(skip))
+        .map_err(|e| format!("cannot read {name}: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_READ)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read {name}: {e}"))?;
+    let text = String::from_utf8_lossy(&bytes);
+    if skip == 0 {
+        return Ok(Some(text.into_owned()));
+    }
+    // Start at a whole line, and say what was cut.
+    let rest = text.split_once('\n').map_or("", |(_, rest)| rest);
+    Ok(Some(format!(
+        "[the first {skip} bytes are not shown]\n{rest}"
+    )))
 }
 
 #[cfg(test)]
@@ -503,15 +795,66 @@ mod tests {
         );
         // Again: it resumes the branch.
         assert_eq!(lab.start_branch("oct17").unwrap(), "autoresearch/oct17");
-        assert!(lab.start_branch("bad tag").is_err());
-        assert!(lab.start_branch("../escape").is_err());
+        for bad in [
+            "bad tag",
+            "../escape",
+            "x.lock",
+            "x.",
+            ".x",
+            "-x",
+            "a..b",
+            "",
+        ] {
+            assert!(lab.start_branch(bad).is_err(), "{bad}");
+        }
+        assert!(check_tag("Oct17-a_1.b").is_ok());
+    }
+
+    #[test]
+    fn a_new_branch_refuses_a_train_py_that_no_commit_holds() {
+        let (_dir, lab) = lab();
+        lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
+        let refused = lab.start_branch("t1").unwrap_err();
+        assert!(refused.contains("no commit holds"), "{refused}");
+        assert_eq!(lab.git(&["branch", "--show-current"]).unwrap(), "master");
+    }
+
+    #[test]
+    fn checkout_moves_back_to_the_session_branch_only_when_clean() {
+        let (_dir, lab) = lab();
+        lab.start_branch("a").unwrap();
+        lab.start_branch("b").unwrap();
+        assert!(lab.require_branch("autoresearch/a").is_err());
+        lab.checkout("autoresearch/a").unwrap();
+        lab.require_branch("autoresearch/a").unwrap();
+        lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
+        assert!(lab.checkout("autoresearch/b").is_err());
+        lab.require_branch("autoresearch/a").unwrap();
+    }
+
+    #[test]
+    fn the_exclude_file_keeps_the_patterns_of_the_user() {
+        let (_dir, lab) = lab();
+        let exclude = lab.root().join(".git/info/exclude");
+        let mut user = b"/build/\n/caf".to_vec();
+        user.push(0xe9);
+        user.extend_from_slice(b"/\n*.ckpt");
+        std::fs::write(&exclude, &user).unwrap();
+        lab.start_branch("t1").unwrap();
+        let after = std::fs::read(&exclude).unwrap();
+        assert!(
+            after.starts_with(&user),
+            "the user lines stay byte for byte"
+        );
+        let text = String::from_utf8_lossy(&after);
+        assert!(text.contains("\n/results.tsv\n") && text.contains("/.autoresearch"));
     }
 
     #[test]
     fn local_files_stay_untracked() {
         let (_dir, lab) = lab();
         lab.start_branch("t1").unwrap();
-        lab.record(&row("aaaaaaa")).unwrap();
+        lab.record(&row("aaaaaaa"), "k").unwrap();
         std::fs::write(lab.root().join("run.log"), "x").unwrap();
         lab.state_dir().unwrap();
         assert_eq!(lab.git(&["status", "--porcelain"]).unwrap(), "");
@@ -524,21 +867,31 @@ mod tests {
         let base = lab.head().unwrap();
         lab.edit_train("MATRIX_LR = 0.04", "MATRIX_LR = 0.05")
             .unwrap();
-        let first = lab.commit_train("raise matrix LR", "k-1").unwrap();
+        let first = lab.commit_train("raise matrix LR", "k-1", &base).unwrap();
         assert!(first.changed);
         assert_eq!(first.parent, base);
         assert_eq!((first.lines_added, first.lines_removed), (1, 1));
         // A re-run after a crash finds the same commit.
-        let again = lab.commit_train("raise matrix LR", "k-1").unwrap();
+        let again = lab.commit_train("raise matrix LR", "k-1", &base).unwrap();
         assert_eq!(again, first);
         assert_eq!(lab.git(&["rev-list", "--count", "HEAD"]).unwrap(), "2");
+    }
+
+    #[test]
+    fn a_commit_refuses_a_head_that_moved() {
+        let (_dir, lab) = lab();
+        lab.start_branch("t1").unwrap();
+        lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
+        let refused = lab.commit_train("deeper", "k-1", "0000000").unwrap_err();
+        assert!(refused.contains("the branch moved"), "{refused}");
     }
 
     #[test]
     fn a_commit_with_no_change_reports_head() {
         let (_dir, lab) = lab();
         lab.start_branch("t1").unwrap();
-        let info = lab.commit_train("nothing", "k-2").unwrap();
+        let head = lab.head().unwrap();
+        let info = lab.commit_train("nothing", "k-2", &head).unwrap();
         assert!(!info.changed);
         assert_eq!(info.commit, lab.head().unwrap());
     }
@@ -549,7 +902,7 @@ mod tests {
         lab.start_branch("t1").unwrap();
         let base = lab.head().unwrap();
         lab.edit_train("DEPTH = 8", "DEPTH = 10").unwrap();
-        lab.commit_train("deeper", "k-3").unwrap();
+        lab.commit_train("deeper", "k-3", &base).unwrap();
         lab.reset_to(&base).unwrap();
         lab.reset_to(&base).unwrap();
         assert_eq!(lab.head().unwrap(), base);
@@ -577,6 +930,52 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_read_refuses_a_symlink_and_returns_the_end_of_a_long_file() {
+        let (dir, lab) = lab();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "key").unwrap();
+        std::os::unix::fs::symlink(&secret, lab.root().join("run.log")).unwrap();
+        assert!(lab.read("run.log").is_err());
+        std::fs::remove_file(lab.root().join("run.log")).unwrap();
+
+        let long = format!(
+            "{}\nthe end\n",
+            "x".repeat(usize::try_from(MAX_READ).unwrap() * 2)
+        );
+        std::fs::write(lab.root().join("run.log"), long).unwrap();
+        let text = lab.read("run.log").unwrap();
+        assert!(text.len() < usize::try_from(MAX_READ).unwrap() + 100);
+        assert!(text.starts_with("[the first") && text.ends_with("the end\n"));
+    }
+
+    #[test]
+    fn the_agent_reads_the_newest_rows_of_results() {
+        let (_dir, lab) = lab();
+        for n in 0..READ_ROWS + 5 {
+            lab.record(&row(&format!("{n:07}")), &format!("k{n}"))
+                .unwrap();
+        }
+        let text = lab.read(RESULTS).unwrap();
+        assert!(text.starts_with(HEADER));
+        assert_eq!(text.lines().count(), READ_ROWS + 1);
+        assert!(!text.contains("0000004\t") && text.contains("0000005\t"));
+        assert_eq!(lab.rows().unwrap().len(), READ_ROWS + 5);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_owner_can_read_the_state_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_dir, lab) = lab();
+        let mode = std::fs::metadata(lab.state_dir().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
     #[test]
     fn an_edit_needs_one_exact_match() {
         let (_dir, lab) = lab();
@@ -589,13 +988,69 @@ mod tests {
     }
 
     #[test]
-    fn a_row_is_recorded_once() {
+    fn an_edit_runs_once_per_call() {
         let (_dir, lab) = lab();
-        assert!(lab.record(&row("aaaaaaa")).unwrap());
-        assert!(!lab.record(&row("aaaaaaa")).unwrap());
-        assert!(lab.record(&row("bbbbbbb")).unwrap());
+        let insert = "DEPTH = 8\nEXTRA_KNOB = 1";
+        lab.edit_train_once("DEPTH = 8", insert, "run/0/call_1")
+            .unwrap();
+        // The same call again, after a crash: the insertion is not doubled.
+        lab.edit_train_once("DEPTH = 8", insert, "run/0/call_1")
+            .unwrap();
+        assert_eq!(lab.read(TRAIN).unwrap().matches("EXTRA_KNOB").count(), 1);
+        // A new call is a new edit.
+        assert!(
+            lab.edit_train_once("DEPTH = 8", insert, "run/1/call_1")
+                .is_ok()
+        );
+        assert_eq!(lab.read(TRAIN).unwrap().matches("EXTRA_KNOB").count(), 2);
+    }
+
+    #[test]
+    fn an_edit_whose_write_was_lost_runs_on_its_retry() {
+        let (_dir, lab) = lab();
+        let before = lab.read(TRAIN).unwrap();
+        lab.edit_train_once("DEPTH = 8", "DEPTH = 9", "c").unwrap();
+        // The crash came after the marker and before the file.
+        std::fs::write(lab.root().join(TRAIN), &before).unwrap();
+        lab.edit_train_once("DEPTH = 8", "DEPTH = 9", "c").unwrap();
+        assert!(lab.read(TRAIN).unwrap().contains("DEPTH = 9"));
+    }
+
+    #[test]
+    fn a_row_is_recorded_once_per_key() {
+        let (_dir, lab) = lab();
+        assert!(lab.record(&row("aaaaaaa"), "k1").unwrap());
+        assert!(!lab.record(&row("aaaaaaa"), "k1").unwrap());
+        // An equal row from another experiment lands too.
+        assert!(lab.record(&row("aaaaaaa"), "k2").unwrap());
+        assert!(lab.record(&row("bbbbbbb"), "k3").unwrap());
         let text = lab.read(RESULTS).unwrap();
-        assert!(text.starts_with(crate::results::HEADER));
+        assert!(text.starts_with(HEADER));
+        assert_eq!(lab.rows().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_row_whose_write_was_lost_lands_on_its_retry() {
+        let (_dir, lab) = lab();
+        lab.record(&row("aaaaaaa"), "k1").unwrap();
+        let rows = lab.root().join(RESULTS);
+        let before = std::fs::read_to_string(&rows).unwrap();
+        lab.record(&row("bbbbbbb"), "k2").unwrap();
+        // The crash came after the key and before the row.
+        std::fs::write(&rows, before).unwrap();
+        assert!(lab.record(&row("bbbbbbb"), "k2").unwrap());
+        assert_eq!(lab.rows().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_line_that_does_not_parse_is_skipped() {
+        let (_dir, lab) = lab();
+        lab.record(&row("aaaaaaa"), "k1").unwrap();
+        let path = lab.root().join(RESULTS);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("a hand edit\n");
+        std::fs::write(&path, text).unwrap();
+        assert!(lab.record(&row("bbbbbbb"), "k2").unwrap());
         assert_eq!(lab.rows().unwrap().len(), 2);
     }
 }

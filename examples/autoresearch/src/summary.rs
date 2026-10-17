@@ -29,26 +29,28 @@ pub struct Summary {
 /// Parse the summary of `log`. The last occurrence of each key wins.
 ///
 /// Returns `None` when the log has no finite `val_bpb`, which is a crash. A
-/// log with `val_bpb` and no `peak_vram_mb` reports zero memory.
+/// log with `val_bpb` and no finite `peak_vram_mb` reports zero memory.
 #[must_use]
 pub fn parse(log: &str) -> Option<Summary> {
-    let last = |key: &str| {
-        log.lines()
-            .rev()
-            .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))
-            .and_then(|value| value.trim().parse::<f64>().ok())
-    };
-    let val_bpb = last("val_bpb").filter(|value| value.is_finite())?;
+    let val_bpb = last::<f64>(log, "val_bpb").filter(|value| value.is_finite())?;
+    // A value that is not finite does not encode as JSON, so it reads as
+    // missing.
     Some(Summary {
         val_bpb,
-        peak_vram_mb: last("peak_vram_mb").unwrap_or(0.0),
-        training_seconds: last("training_seconds"),
-        num_steps: log
-            .lines()
-            .rev()
-            .find_map(|line| line.strip_prefix("num_steps:"))
-            .and_then(|value| value.trim().parse::<u64>().ok()),
+        peak_vram_mb: last::<f64>(log, "peak_vram_mb")
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0),
+        training_seconds: last::<f64>(log, "training_seconds").filter(|value| value.is_finite()),
+        num_steps: last(log, "num_steps"),
     })
+}
+
+/// The value of the last `key:` line of `log` that parses as `T`.
+fn last<T: std::str::FromStr>(log: &str, key: &str) -> Option<T> {
+    log.lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))
+        .and_then(|value| value.trim().parse().ok())
 }
 
 /// The last `lines` lines of `text`, as upstream reads a crash with
@@ -97,6 +99,11 @@ mod tests {
     fn a_non_finite_val_bpb_is_a_crash() {
         assert_eq!(parse("val_bpb: nan\npeak_vram_mb: 1.0\n"), None);
         assert_eq!(parse("val_bpb: inf\n"), None);
+        // A memory that is not finite reads as missing, so the summary
+        // still encodes as JSON.
+        let summary = parse("val_bpb: 0.9\npeak_vram_mb: inf\n").unwrap();
+        assert_eq!(summary.peak_vram_mb, 0.0);
+        assert!(serde_json::to_value(summary).unwrap()["peak_vram_mb"].is_number());
     }
 
     #[test]

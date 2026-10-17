@@ -10,6 +10,8 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use autumn_harvest_agent::memory::MEMORY_TOOL;
+use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::{
     AgentError, AgentModel, BoxFuture, ChatMessage, ChatRequest, ChatResponse, ChatRole,
     ContentPart, StopReason, TokenUsage,
@@ -20,6 +22,7 @@ use crate::agent::{
     EDIT_TRAIN, READ_FILE, READ_PAPER, REPORTER_ROLE, REVIEWER, REVIEWER_ROLE, REWIND, SHOW_DIFF,
     WATCHER_ROLE,
 };
+use crate::lab::{RESULTS, TRAIN};
 use crate::rules::Status;
 
 /// The model id that the response cache keys on.
@@ -315,8 +318,8 @@ fn research(system: &str, input: &str, done: &[Exchange]) -> Reply {
     let reads: Vec<&Exchange> = done.iter().filter(|e| e.name == READ_FILE).collect();
     if reads.is_empty() {
         let mut calls = vec![
-            (READ_FILE, json!({"path": "train.py"})),
-            (READ_FILE, json!({"path": "results.tsv"})),
+            (READ_FILE, json!({"path": TRAIN})),
+            (READ_FILE, json!({"path": RESULTS})),
         ];
         if let Some(name) = paper {
             calls.push((READ_PAPER, json!({"name": name.trim()})));
@@ -333,13 +336,13 @@ fn research(system: &str, input: &str, done: &[Exchange]) -> Reply {
     };
     let edits: Vec<&Exchange> = done.iter().filter(|e| e.name == EDIT_TRAIN).collect();
     let Some(first_edit) = edits.first() else {
-        let train = file("train.py");
+        let train = file(TRAIN);
         let topic = paper.or(hint.as_deref());
-        return match choose(system, input, &train, &file("results.tsv"), topic) {
+        return match choose(system, input, &train, &file(RESULTS), topic) {
             Some((description, old, new)) => Reply::Calls(vec![
                 (EDIT_TRAIN, json!({"old": old, "new": new})),
                 (
-                    "memory",
+                    MEMORY_TOOL,
                     json!({"action": "add", "block": "memory", "text": format!("tried {description}")}),
                 ),
             ]),
@@ -350,14 +353,17 @@ fn research(system: &str, input: &str, done: &[Exchange]) -> Reply {
         let why = first_edit.result.clone().unwrap_or_default();
         return Reply::Text(format!("{GIVE_UP}: the edit did not run: {why}"));
     }
-    let description = last(done, "memory")
+    let description = last(done, MEMORY_TOOL)
         .and_then(|e| e.arguments["text"].as_str())
         .and_then(|text| text.strip_prefix("tried "))
         .unwrap_or("an edit of train.py")
         .to_string();
-    let Some(review) = last(done, "delegate") else {
+    let Some(review) = last(done, DELEGATE_TOOL) else {
         let task = "Review the diff of train.py against the simplicity rule.";
-        return Reply::Calls(vec![("delegate", json!({"agent": REVIEWER, "task": task}))]);
+        return Reply::Calls(vec![(
+            DELEGATE_TOOL,
+            json!({"agent": REVIEWER, "task": task}),
+        )]);
     };
     let verdict = review
         .result
@@ -400,7 +406,7 @@ fn choose(
     let rank = |idea: &Idea| {
         let pointed = topic.as_deref().is_some_and(|t| t.contains(idea.topic));
         let preferred = (explore && idea.bold) || (simpler && idea.simpler);
-        (!pointed, !preferred, idea.bold && !explore)
+        (!pointed, !preferred)
     };
     let mut ideas: Vec<&Idea> = IDEAS.iter().collect();
     ideas.sort_by_key(|idea| rank(idea));
@@ -426,7 +432,7 @@ fn apply(idea: &Idea, train: &str) -> Option<(String, String, String)> {
     let new_value = match idea.change {
         Change::Scale(factor) => {
             let x: f64 = value.parse().ok()?;
-            short(x * factor, !value.contains('.'))
+            short(x * factor, !value.contains(['.', 'e', 'E']))
         }
         Change::Set(text) => text.to_string(),
         Change::Delete => return None,

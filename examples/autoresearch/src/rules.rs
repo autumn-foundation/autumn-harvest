@@ -19,6 +19,19 @@ pub enum Status {
     Crash,
 }
 
+impl std::str::FromStr for Status {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text.trim() {
+            "keep" => Ok(Self::Keep),
+            "discard" => Ok(Self::Discard),
+            "crash" => Ok(Self::Crash),
+            other => Err(format!("status is not keep, discard or crash: {other:?}")),
+        }
+    }
+}
+
 impl Status {
     /// The word that `results.tsv` uses.
     #[must_use]

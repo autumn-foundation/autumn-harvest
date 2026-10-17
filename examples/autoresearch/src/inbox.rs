@@ -5,8 +5,10 @@
 //! `hint`, `stop`, `policy`, `approve` and `deny` write one JSON file each
 //! into the inbox. The runner turns each file into a keyed signal, then
 //! deletes it. The file name is the idempotency key, so a crash between the
-//! signal and the delete cannot deliver a command twice.
+//! signal and the delete cannot deliver a command twice. A command that can
+//! never land moves to `inbox/rejected`.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,24 +21,24 @@ use crate::rules::KeepPolicy;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
-    /// Send an idea to the session with workflow id `session`.
+    /// Send an idea to the running session with `tag`.
     Hint {
-        /// The session workflow id.
-        session: String,
+        /// The session tag.
+        tag: String,
         /// The idea.
         text: String,
     },
     /// End the session after the experiment in flight.
     Stop {
-        /// The session workflow id.
-        session: String,
+        /// The session tag.
+        tag: String,
         /// Why.
         reason: String,
     },
     /// Replace the keep policy.
     Policy {
-        /// The session workflow id.
-        session: String,
+        /// The session tag.
+        tag: String,
         /// The new policy.
         policy: KeepPolicy,
     },
@@ -53,6 +55,10 @@ pub enum Command {
         reason: String,
     },
 }
+
+/// The most bytes of one command file that the runner reads. A longer file
+/// does not parse, so it is set aside.
+const MAX_COMMAND: u64 = 64 * 1024;
 
 /// The inbox directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,9 +126,11 @@ impl Inbox {
         let mut commands = Vec::new();
         for name in names {
             let path = self.dir.join(&name);
-            let parsed = std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Command>(&bytes).ok());
+            let parsed = std::fs::File::open(&path).ok().and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(MAX_COMMAND).read_to_end(&mut bytes).ok()?;
+                serde_json::from_slice::<Command>(&bytes).ok()
+            });
             match parsed {
                 Some(command) => {
                     let id = name.trim_end_matches(".json").to_string();
@@ -134,6 +142,20 @@ impl Inbox {
             }
         }
         Ok(commands)
+    }
+
+    /// Move a command that can never land to `inbox/rejected`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file exists and cannot be moved.
+    pub fn reject(&self, id: &str) -> Result<(), String> {
+        let name = format!("{id}.json");
+        match std::fs::rename(self.dir.join(&name), self.dir.join("rejected").join(&name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("cannot set aside inbox entry {id}: {e}")),
+        }
     }
 
     /// Remove a command that the runner delivered.
@@ -180,7 +202,7 @@ mod tests {
 
     fn hint(text: &str) -> Command {
         Command::Hint {
-            session: "autoresearch/oct17".into(),
+            tag: "oct17".into(),
             text: text.into(),
         }
     }
@@ -199,6 +221,13 @@ mod tests {
         inbox.done(&first).unwrap();
         inbox.done(&first).unwrap();
         assert_eq!(inbox.pending().unwrap().len(), 1);
+        inbox.reject(&second).unwrap();
+        assert_eq!(inbox.pending().unwrap(), Vec::new());
+        assert!(
+            dir.path()
+                .join(format!("inbox/rejected/{second}.json"))
+                .is_file()
+        );
     }
 
     #[test]

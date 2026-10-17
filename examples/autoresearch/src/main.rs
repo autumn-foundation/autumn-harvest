@@ -19,7 +19,7 @@ use autoresearch::claude::ClaudeModel;
 use autoresearch::inbox::{Command, Inbox};
 use autoresearch::lab::Lab;
 use autoresearch::results::ResultRow;
-use autoresearch::runtime::{self, Step, session_id};
+use autoresearch::runtime::{self, Refused, Step, session_id};
 use autoresearch::scripted::ScriptedResearcher;
 use autoresearch::trainer::TrainerSpec;
 use autoresearch::workflows::{SESSION, SessionConfig, SessionReport};
@@ -245,20 +245,8 @@ async fn dispatch(command: Cmd) -> Result<(), String> {
         Cmd::Run { lab, session } => run(&lab, &session).await,
         Cmd::Serve { lab, session } => serve(&lab, &session).await,
         Cmd::Status { lab } => status(&lab),
-        Cmd::Hint { lab, tag, text } => post(
-            &lab,
-            &Command::Hint {
-                session: session_id(&tag),
-                text,
-            },
-        ),
-        Cmd::Stop { lab, tag, reason } => post(
-            &lab,
-            &Command::Stop {
-                session: session_id(&tag),
-                reason,
-            },
-        ),
+        Cmd::Hint { lab, tag, text } => post(&lab, &Command::Hint { tag, text }),
+        Cmd::Stop { lab, tag, reason } => post(&lab, &Command::Stop { tag, reason }),
         Cmd::Approve { lab, token } => post(&lab, &Command::Approve { token }),
         Cmd::Deny { lab, token, reason } => post(&lab, &Command::Deny { token, reason }),
         Cmd::Eval {
@@ -290,7 +278,7 @@ fn open_lab(args: &LabArgs) -> Result<(Lab, PathBuf, PathBuf), String> {
     Ok((lab, state, db))
 }
 
-fn model(args: &ModelArgs) -> Result<Arc<dyn AgentModel>, String> {
+fn model(args: &ModelArgs, state: &Path) -> Result<Arc<dyn AgentModel>, String> {
     match args.model {
         ModelKind::Scripted => Ok(Arc::new(ScriptedResearcher::default())),
         ModelKind::Claude => {
@@ -301,7 +289,10 @@ fn model(args: &ModelArgs) -> Result<Arc<dyn AgentModel>, String> {
             if key.is_empty() {
                 return Err("--model claude needs ANTHROPIC_API_KEY in the environment".into());
             }
-            Ok(Arc::new(ClaudeModel::new(key).model(&args.claude_model)))
+            let model = ClaudeModel::new(key)
+                .model(&args.claude_model)
+                .turn_dir(state.join("claude-turns"));
+            Ok(Arc::new(model))
         }
     }
 }
@@ -311,7 +302,7 @@ fn harness(lab: &Lab, state: &Path, args: &ModelArgs) -> Result<AgentHarness, St
         labs: vec![lab.clone()],
         state_dir: state.to_path_buf(),
     };
-    agent::harness(model(args)?, &parts)
+    agent::harness(model(args, state)?, &parts)
 }
 
 /// Open the database as the single writer and register everything.
@@ -340,35 +331,94 @@ fn config(lab: &Lab, args: &SessionArgs, tag: String) -> SessionConfig {
     config
 }
 
+/// The session that `run` drives: the one that `--tag` names, the one
+/// running session, or a new one.
+fn pick_session(
+    rt: &mut SqliteRuntime,
+    lab: &Lab,
+    session: &SessionArgs,
+) -> Result<ExecutionId, String> {
+    if let Some(tag) = &session.tag {
+        if let Some((exec, id)) = runtime::find_session(rt, tag)? {
+            println!("resuming {id}");
+            return Ok(exec);
+        }
+        return start_session(rt, lab, session, tag);
+    }
+    // No tag: resume the one running session, so the same command resumes
+    // a night that crossed midnight.
+    match runtime::running_sessions(rt)?.as_slice() {
+        [] => {
+            let tag = chrono::Utc::now().format("%b%d").to_string().to_lowercase();
+            start_session(rt, lab, session, &tag)
+        }
+        [(exec, tag)] => {
+            println!("resuming the session with the tag {tag:?}");
+            Ok(*exec)
+        }
+        several => {
+            let tags: Vec<&str> = several.iter().map(|(_, tag)| tag.as_str()).collect();
+            Err(format!(
+                "several sessions are running: name one with --tag ({})",
+                tags.join(", ")
+            ))
+        }
+    }
+}
+
+fn start_session(
+    rt: &mut SqliteRuntime,
+    lab: &Lab,
+    session: &SessionArgs,
+    tag: &str,
+) -> Result<ExecutionId, String> {
+    let exec = runtime::start(rt, &config(lab, session, tag.to_string()))?;
+    println!("started {} on branch {}", session_id(tag), session_id(tag));
+    Ok(exec)
+}
+
+/// Resolves on Ctrl-C, or on SIGTERM on Unix.
+async fn shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 async fn run(args: &LabArgs, session: &SessionArgs) -> Result<(), String> {
     let (lab, state, db) = open_lab(args)?;
     let mut rt = open_runtime(&db, harness(&lab, &state, &session.model)?)?;
-    let tag = session
-        .tag
-        .clone()
-        .unwrap_or_else(|| chrono::Utc::now().format("%b%d").to_string().to_lowercase());
-    let mut exec = if let Some(exec) = runtime::find_session(&rt, &tag)? {
-        println!("resuming {}", session_id(&tag));
-        exec
-    } else {
-        let exec = runtime::start(&mut rt, &config(&lab, session, tag.clone()))?;
-        println!("started {} on branch autoresearch/{tag}", session_id(&tag));
-        exec
-    };
+    let mut exec = pick_session(&mut rt, &lab, session)?;
     let inbox = Inbox::new(&state)?;
-    let mut printed = 0;
+    let mut rows = Rows::from_now(&lab);
     let mut asked = HashSet::new();
     let tick = Duration::from_millis(session.tick_ms.max(10));
+    // The signal handlers stay in place for the whole run.
+    let quit = shutdown();
+    tokio::pin!(quit);
     loop {
         deliver(&mut rt, &inbox)?;
         let step = tokio::select! {
             step = runtime::drive(&mut rt, exec) => step?,
-            _ = tokio::signal::ctrl_c() => {
+            () = &mut quit => {
                 println!("stopped driving. The session is durable: run the same command to resume.");
                 return Ok(());
             }
         };
-        printed = print_rows(&lab, printed);
+        rows.print_new(&lab);
         match step {
             Step::Done(report) => {
                 print_report(&report);
@@ -388,19 +438,7 @@ async fn run(args: &LabArgs, session: &SessionArgs) -> Result<(), String> {
             }
             Step::Approval(pending) => {
                 if asked.insert(pending.token.clone()) {
-                    let lab_arg = lab.root().display();
-                    println!(
-                        "waiting for a person: {} {}",
-                        pending.tool, pending.arguments
-                    );
-                    println!(
-                        "  approve: autoresearch approve --lab {lab_arg} '{}'",
-                        pending.token
-                    );
-                    println!(
-                        "  deny:    autoresearch deny --lab {lab_arg} '{}'",
-                        pending.token
-                    );
+                    ask(&lab, &pending);
                 }
                 tokio::time::sleep(tick).await;
             }
@@ -409,27 +447,92 @@ async fn run(args: &LabArgs, session: &SessionArgs) -> Result<(), String> {
     }
 }
 
-/// Deliver every inbox command, then remove it. A command that cannot be
-/// delivered is reported and removed: it names a run that is gone.
+/// Print a gated call and the two commands that decide it.
+fn ask(lab: &Lab, pending: &runtime::Pending) {
+    let lab_arg = lab.root().display();
+    println!(
+        "waiting for a person: {} {}",
+        pending.tool,
+        printable(&pending.arguments.to_string())
+    );
+    println!(
+        "  approve: autoresearch approve --lab {lab_arg} '{}'",
+        pending.token
+    );
+    println!(
+        "  deny:    autoresearch deny --lab {lab_arg} '{}'",
+        pending.token
+    );
+}
+
+/// `text` with each control, format and bidirectional character shown as
+/// its code point. Model text then cannot move the cursor, hide a line, or
+/// show code in an order other than its byte order.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if autoresearch::results::hidden(c) {
+                format!("\\u{{{:04x}}}", u32::from(c))
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// Deliver every inbox command. A delivered command is removed. A command
+/// that can never land moves to `inbox/rejected`. A command that can land
+/// later stays for the next tick.
 fn deliver(rt: &mut SqliteRuntime, inbox: &Inbox) -> Result<(), String> {
     for (id, command) in inbox.pending()? {
         match runtime::apply(rt, &id, &command) {
-            Ok(line) => println!("inbox: {line}"),
-            Err(error) => eprintln!("inbox: {error}"),
+            Ok(line) => {
+                println!("inbox: {line}");
+                inbox.done(&id)?;
+            }
+            Err(Refused::Permanent(why)) => {
+                eprintln!("inbox: {why}. The command is set aside.");
+                inbox.reject(&id)?;
+            }
+            Err(Refused::Transient(why)) => eprintln!("inbox: {why}. It is tried again."),
         }
-        inbox.done(&id)?;
     }
     Ok(())
 }
 
-/// Print the rows of `results.tsv` after the first `printed`. Returns the
-/// new count.
-fn print_rows(lab: &Lab, printed: usize) -> usize {
-    let rows = lab.rows().unwrap_or_default();
-    for (n, row) in rows.iter().enumerate().skip(printed) {
-        print_row(n, row);
+/// The rows of `results.tsv` that the runner has printed.
+struct Rows {
+    printed: usize,
+    bytes: u64,
+}
+
+impl Rows {
+    /// Start after the rows that the file holds now.
+    fn from_now(lab: &Lab) -> Self {
+        Self {
+            printed: lab.rows().map_or(0, |rows| rows.len()),
+            bytes: Self::size(lab),
+        }
     }
-    rows.len().max(printed)
+
+    fn size(lab: &Lab) -> u64 {
+        std::fs::metadata(lab.root().join(autoresearch::lab::RESULTS)).map_or(0, |m| m.len())
+    }
+
+    /// Print the rows that landed since the last call. The file is read
+    /// only when its size changed.
+    fn print_new(&mut self, lab: &Lab) {
+        let bytes = Self::size(lab);
+        if bytes == self.bytes {
+            return;
+        }
+        self.bytes = bytes;
+        let rows = lab.rows().unwrap_or_default();
+        for (n, row) in rows.iter().enumerate().skip(self.printed) {
+            print_row(n, row);
+        }
+        self.printed = rows.len().max(self.printed);
+    }
 }
 
 fn print_row(n: usize, row: &ResultRow) {
@@ -439,15 +542,15 @@ fn print_row(n: usize, row: &ResultRow) {
         row.val_bpb,
         row.memory_gb,
         row.commit,
-        row.description
+        printable(&row.description)
     );
 }
 
 fn print_report(report: &SessionReport) {
     let counts = report.counts;
     println!(
-        "done: autoresearch/{}: {} experiments, best val_bpb {:.6} at {} ({} kept, {} discarded, {} crashed)",
-        report.tag,
+        "done: {}: {} experiments, best val_bpb {:.6} at {} ({} kept, {} discarded, {} crashed)",
+        report.branch,
         report.experiments,
         report.best.val_bpb,
         report.best.commit,
@@ -474,49 +577,33 @@ async fn serve(args: &LabArgs, session: &SessionArgs) -> Result<(), String> {
     );
     let inbox = Inbox::new(&state)?;
     let mut asked = HashSet::new();
-    let mut printed = lab.rows().unwrap_or_default().len();
+    let mut rows = Rows::from_now(&lab);
     let tick = Duration::from_millis(session.tick_ms.max(10)).max(Duration::from_secs(1));
-    loop {
-        deliver(&mut rt, &inbox)?;
-        if let Err(error) = rt.poll_once().await {
-            eprintln!("poll: {error}");
-        }
-        for exec in running_sessions(&rt)? {
-            if let Step::Approval(pending) = runtime::drive(&mut rt, exec).await?
-                && asked.insert(pending.token.clone())
-            {
-                println!(
-                    "waiting for a person: {} {}",
-                    pending.tool, pending.arguments
-                );
-                println!(
-                    "  approve: autoresearch approve --lab {} '{}'",
-                    lab.root().display(),
-                    pending.token
-                );
+    let serving = async {
+        loop {
+            deliver(&mut rt, &inbox)?;
+            if let Err(error) = rt.poll_once().await {
+                eprintln!("poll: {error}");
             }
-        }
-        printed = print_rows(&lab, printed);
-        tokio::select! {
-            () = tokio::time::sleep(tick) => {}
-            _ = tokio::signal::ctrl_c() => {
-                println!("stopped serving. Every session is durable.");
-                return Ok(());
+            for (exec, _) in runtime::running_sessions(&rt)? {
+                if let Step::Approval(pending) = runtime::drive(&mut rt, exec).await?
+                    && asked.insert(pending.token.clone())
+                {
+                    ask(&lab, &pending);
+                }
             }
+            rows.print_new(&lab);
+            tokio::time::sleep(tick).await;
+        }
+    };
+    // A stop drops the drive in flight. The trainer kills its process group.
+    tokio::select! {
+        result = serving => result,
+        () = shutdown() => {
+            println!("stopped serving. Every session is durable.");
+            Ok(())
         }
     }
-}
-
-fn running_sessions(rt: &SqliteRuntime) -> Result<Vec<ExecutionId>, String> {
-    let filter = ExecutionFilter::new()
-        .workflow_name(SESSION)
-        .state("RUNNING");
-    let page = rt.list_executions(&filter).map_err(|e| e.to_string())?;
-    Ok(page
-        .executions
-        .iter()
-        .filter_map(autumn_harvest_sqlite::ExecutionSummary::execution_id)
-        .collect())
 }
 
 /// Read the sessions beside a running writer, with a read-only handle.
@@ -541,7 +628,8 @@ fn status(args: &LabArgs) -> Result<(), String> {
                     .map_or_else(|| "-".to_string(), ToString::to_string)
             };
             println!(
-                "{id}  {state}  phase {}  experiments {}  best_bpb {}  best {}",
+                "{id}  {state}  tag {}  phase {}  experiments {}  best_bpb {}  best {}",
+                field("tag"),
                 field("phase"),
                 field("experiments"),
                 field("best_bpb"),
@@ -583,9 +671,9 @@ async fn eval(
         Some(id) => id
             .parse::<ExecutionId>()
             .map_err(|e| format!("{id} is not a run id: {e}"))?,
-        None => *runtime::proposals(&rt)?
-            .first()
-            .ok_or("no recorded proposal yet: run a session first")?,
+        None => {
+            runtime::latest_proposal(&rt)?.ok_or("no recorded proposal yet: run a session first")?
+        }
     };
     let history = rt.load_history(run).map_err(|e| e.to_string())?;
     drop(rt);

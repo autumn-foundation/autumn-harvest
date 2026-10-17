@@ -16,7 +16,7 @@ pub const HEADER: &str = "commit\tval_bpb\tmemory_gb\tstatus\tdescription";
 /// One row of `results.tsv`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResultRow {
-    /// The short commit hash, 7 characters.
+    /// The short commit hash: its first 7 hex digits.
     pub commit: String,
     /// The validation bits per byte. Zero for a crash.
     pub val_bpb: f64,
@@ -31,8 +31,8 @@ pub struct ResultRow {
 impl ResultRow {
     /// The row as one TSV line, with no line end.
     ///
-    /// A tab or a line break in the description becomes a space, so the row
-    /// always has five columns.
+    /// A tab, a line break or another hidden character in the description
+    /// becomes a space, so the row always has five columns.
     #[must_use]
     pub fn to_line(&self) -> String {
         format!(
@@ -65,12 +65,7 @@ impl ResultRow {
                 .filter(|value| value.is_finite())
                 .ok_or_else(|| format!("{name} is not a number: {text:?}"))
         };
-        let status = match status.trim() {
-            "keep" => Status::Keep,
-            "discard" => Status::Discard,
-            "crash" => Status::Crash,
-            other => return Err(format!("status is not keep, discard or crash: {other:?}")),
-        };
+        let status: Status = status.parse()?;
         Ok(Self {
             commit: commit.trim().to_string(),
             val_bpb: number("val_bpb", val_bpb)?,
@@ -120,9 +115,26 @@ pub fn table(rows: &[ResultRow]) -> String {
     text
 }
 
-/// `text` on one line: each tab and line break becomes a space.
+/// `text` on one line: each control, format or bidirectional character
+/// becomes a space. Model text then cannot add a column, move a terminal
+/// cursor, or show text in an order other than its byte order.
 fn one_line(text: &str) -> String {
-    text.replace(['\t', '\r', '\n'], " ").trim().to_string()
+    text.chars()
+        .map(|c| if hidden(c) { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// `true` for a control character, or a format character that can hide or
+/// reorder text, such as a bidirectional override.
+#[must_use]
+pub fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}'
+        )
 }
 
 #[cfg(test)]
@@ -170,6 +182,18 @@ mod tests {
         assert_eq!(line.split('\t').count(), 5);
         assert!(!line.contains('\n'));
         assert_eq!(ResultRow::parse_line(&line).unwrap().description, "a b c");
+    }
+
+    #[test]
+    fn terminal_and_bidirectional_controls_never_reach_the_log() {
+        let hostile = ResultRow {
+            description: "ok\u{1b}[2K\u{202e}gnp.exe\u{7}".into(),
+            ..row(Status::Discard)
+        };
+        let line = hostile.to_line();
+        let description = line.rsplit('\t').next().unwrap();
+        assert!(!description.chars().any(hidden), "{line:?}");
+        assert_eq!(description, "ok [2K gnp.exe");
     }
 
     #[test]

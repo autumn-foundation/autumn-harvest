@@ -8,13 +8,24 @@
 //! [`experiment`] is one idea. An `agent_loop` child proposes an edit. A saga
 //! commits it, with a reset as the compensation. A GPU mutex guards the
 //! training. The keep rule decides, and a discard or a crash compensates.
+//!
+//! The session holds a mutex on its lab for each experiment. So two sessions
+//! in one lab take turns, and each experiment checks out its own branch
+//! first.
+//!
+//! Flow labels follow the session. A run that reads untrusted text can put
+//! it into a memory note or an answer line, and later runs read both. So the
+//! labels of each run go into the next run of the session, and with each
+//! hint to a sibling.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use autumn_harvest::ParentClosePolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest::saga::Saga;
+use autumn_harvest_agent::flow::labels;
 use autumn_harvest_agent::workflow::agent_loop_info;
 use autumn_harvest_agent::{AgentReport, AgentStop, AgentTask, Mandate, MemoryScope, SessionId};
 use serde::{Deserialize, Serialize};
@@ -137,6 +148,9 @@ pub struct Hint {
     pub text: String,
     /// Who sent it: `human` or a sibling workflow id.
     pub from: String,
+    /// The flow labels of the sender. The receiver adds them to its own.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub labels: BTreeSet<String>,
 }
 
 /// How many experiments ended in each status.
@@ -173,6 +187,9 @@ pub struct Carry {
     pub counts: Counts,
     /// Runs of this session before this one.
     pub runs: u32,
+    /// The flow labels that the runs of this session exercised.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 /// The input of [`research_session`].
@@ -246,6 +263,8 @@ pub struct ExperimentInput {
     pub lab: String,
     /// The run tag.
     pub tag: String,
+    /// The session branch.
+    pub branch: String,
     /// The workflow id of the session, for the agent memory and the logs.
     pub session: String,
     /// The GPU mutex key suffix.
@@ -274,6 +293,9 @@ pub struct ExperimentInput {
     /// The bounds of each agent run.
     #[serde(default)]
     pub agent: AgentSettings,
+    /// The flow labels of the session so far. Each agent run starts with them.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 /// The output of [`experiment`].
@@ -289,6 +311,9 @@ pub struct ExperimentOutcome {
     pub rewound: bool,
     /// Fix proposals after a crash.
     pub fixes: u32,
+    /// The flow labels of the session after this experiment.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 /// One night of research. See the module docs.
@@ -345,11 +370,6 @@ pub async fn research_session(
         let explore = ctx.random_range(0_u8..100) < config.explore_percent;
         let hint = (!carry.hints.is_empty()).then(|| carry.hints.remove(0));
         let input = ExperimentInput {
-            lab: config.lab.clone(),
-            tag: carry.tag.clone(),
-            session: ctx.workflow_id().to_string(),
-            gpu: config.gpu.clone(),
-            trainer: config.trainer.clone(),
             number: carry.done + 1,
             baseline: false,
             best: Some(carry.best.clone()),
@@ -357,17 +377,17 @@ pub async fn research_session(
             hint,
             explore,
             recent: carry.recent.clone(),
-            program: carry.program.clone(),
-            agent: config.agent,
+            flow_labels: carry.flow_labels.clone(),
+            ..experiment_input(ctx, &config, &carry.tag, &carry.branch, &carry.program)
         };
-        let outcome = match ctx.spawn_child_workflow(&experiment_info(), &input).await {
-            Ok(outcome) => outcome,
-            Err(error) => failed_experiment(ctx, &config, &carry, &error.to_string()).await?,
-        };
+        let outcome = run_experiment(ctx, &config, &input).await?;
         this_run += 1;
         carry.done += 1;
         count(&mut carry.counts, outcome.row.status);
         remember(&mut carry.recent, outcome.row.clone());
+        carry
+            .flow_labels
+            .extend(outcome.flow_labels.iter().cloned());
         if let Some(best) = outcome.best.clone() {
             carry.best = best;
         }
@@ -411,6 +431,12 @@ async fn first_run(
         config.tag.clone()
     };
     lock(view).tag.clone_from(&tag);
+    // The setup and the baseline run while the session holds its lab.
+    let lab = ctx
+        .mutex(lab_key(&config.lab))
+        .acquire()
+        .await
+        .map_err(|e| format!("cannot take the lab: {e}"))?;
     let setup: SetupReport = ctx
         .execute_activity(
             &setup_info(),
@@ -431,26 +457,12 @@ async fn first_run(
     ])
     .map_err(|e| e.to_string())?;
     lock(view).phase = "baseline".into();
-    let baseline = ExperimentInput {
-        lab: config.lab.clone(),
-        tag: tag.clone(),
-        session: ctx.workflow_id().to_string(),
-        gpu: config.gpu.clone(),
-        trainer: config.trainer.clone(),
-        number: 0,
-        baseline: true,
-        best: None,
-        policy: config.policy,
-        hint: None,
-        explore: false,
-        recent: Vec::new(),
-        program: setup.program.clone(),
-        agent: config.agent,
-    };
+    let baseline = experiment_input(ctx, config, &tag, &setup.branch, &setup.program);
     let outcome: ExperimentOutcome = ctx
         .spawn_child_workflow(&experiment_info(), &baseline)
         .await
         .map_err(|e| format!("the baseline failed: {e}"))?;
+    lab.release();
     let (Status::Keep, Some(best)) = (outcome.row.status, outcome.best.clone()) else {
         return Err(format!(
             "the baseline crashed, so there is nothing to compare against: {}",
@@ -470,7 +482,62 @@ async fn first_run(
         policy: config.policy,
         counts,
         runs: 0,
+        flow_labels: BTreeSet::new(),
     })
+}
+
+/// The input of an experiment of this session: the baseline as given. The
+/// loop sets the fields of a later experiment.
+fn experiment_input(
+    ctx: &WorkflowContext,
+    config: &SessionConfig,
+    tag: &str,
+    branch: &str,
+    program: &str,
+) -> ExperimentInput {
+    ExperimentInput {
+        lab: config.lab.clone(),
+        tag: tag.to_string(),
+        branch: branch.to_string(),
+        session: ctx.workflow_id().to_string(),
+        gpu: config.gpu.clone(),
+        trainer: config.trainer.clone(),
+        number: 0,
+        baseline: true,
+        best: None,
+        policy: config.policy,
+        hint: None,
+        explore: false,
+        recent: Vec::new(),
+        program: program.to_string(),
+        agent: config.agent,
+        flow_labels: BTreeSet::new(),
+    }
+}
+
+/// The name of the mutex on a lab.
+fn lab_key(lab: &str) -> String {
+    format!("lab:{lab}")
+}
+
+/// Run one experiment child while the session holds its lab. A child that
+/// fails for good becomes a crash row.
+async fn run_experiment(
+    ctx: &WorkflowContext,
+    config: &SessionConfig,
+    input: &ExperimentInput,
+) -> Result<ExperimentOutcome, String> {
+    let lab = ctx
+        .mutex(lab_key(&config.lab))
+        .acquire()
+        .await
+        .map_err(|e| format!("cannot take the lab: {e}"))?;
+    let outcome = match ctx.spawn_child_workflow(&experiment_info(), input).await {
+        Ok(outcome) => outcome,
+        Err(error) => failed_experiment(ctx, input, &error.to_string()).await?,
+    };
+    lab.release();
+    Ok(outcome)
 }
 
 /// Register the `status` query and the `whatif` update.
@@ -524,7 +591,10 @@ fn validate_whatif(input: &Value) -> Result<(), String> {
 fn absorb(ctx: &WorkflowContext, carry: &mut Carry) -> Result<Option<String>, String> {
     for raw in ctx.drain_signals_raw(HINT).map_err(|e| e.to_string())? {
         match serde_json::from_value::<Hint>(raw) {
-            Ok(hint) if !hint.text.trim().is_empty() => carry.hints.push(hint),
+            Ok(hint) if !hint.text.trim().is_empty() => {
+                carry.flow_labels.extend(hint.labels.iter().cloned());
+                carry.hints.push(hint);
+            }
             _ => ctx.log_warn("a hint signal was not {text, from}; it is skipped"),
         }
     }
@@ -552,6 +622,7 @@ async fn share(ctx: &WorkflowContext, config: &SessionConfig, carry: &Carry, row
             row.commit, row.description, row.val_bpb
         ),
         from: me.clone(),
+        labels: carry.flow_labels.clone(),
     };
     for sibling in &config.siblings {
         // One key per experiment, so a replayed send dedupes.
@@ -568,41 +639,35 @@ async fn share(ctx: &WorkflowContext, config: &SessionConfig, carry: &Carry, row
     }
 }
 
-/// A row for an experiment child that failed for good, and a reset to the
-/// base so the next experiment starts clean.
+/// A crash row for an experiment child that failed for good, after a reset
+/// to the base so the next experiment starts clean.
+///
+/// The labels of the child are lost with it. It could have read a paper, so
+/// the session counts it as untrusted input.
 async fn failed_experiment(
     ctx: &WorkflowContext,
-    config: &SessionConfig,
-    carry: &Carry,
+    input: &ExperimentInput,
     error: &str,
 ) -> Result<ExperimentOutcome, String> {
-    let lab = config.lab.clone();
-    let base = carry.best.commit.clone();
-    ctx.execute_activity::<_, String>(
-        &reset_info(),
-        CommitRef {
-            lab: lab.clone(),
-            commit: base.clone(),
-        },
-    )
-    .await
-    .map_err(|e| format!("cannot reset after a failed experiment: {e}"))?;
+    let base = input
+        .best
+        .clone()
+        .ok_or("a failed experiment has no base to reset to")?;
+    // The row names the hint, so a person can send it again.
+    let hint = input
+        .hint
+        .as_ref()
+        .map_or_else(String::new, |h| format!(" (hint: {})", h.text));
     let row = ResultRow {
-        commit: base,
+        commit: base.commit.clone(),
         val_bpb: 0.0,
         memory_gb: 0.0,
         status: Status::Crash,
-        description: format!("experiment failed: {error}"),
+        description: format!("experiment {} failed{hint}: {error}", input.number),
     };
-    ctx.execute_activity::<_, bool>(
-        &record_info(),
-        RecordInput {
-            lab,
-            row: row.clone(),
-        },
-    )
-    .await
-    .map_err(|e| format!("cannot record a failed experiment: {e}"))?;
+    reset_and_record(ctx, input, &base.commit, &row).await?;
+    let mut flow_labels = input.flow_labels.clone();
+    flow_labels.insert(labels::UNTRUSTED_INPUT.to_string());
     Ok(ExperimentOutcome {
         verdict: Verdict {
             status: Status::Crash,
@@ -610,10 +675,69 @@ async fn failed_experiment(
             reason: "the experiment workflow failed".into(),
         },
         row,
-        best: Some(carry.best.clone()),
+        best: Some(base),
         rewound: false,
         fixes: 0,
+        flow_labels,
     })
+}
+
+/// Reset the session branch to `commit`, then record `row`: the end of an
+/// experiment that trained nothing.
+async fn reset_and_record(
+    ctx: &WorkflowContext,
+    input: &ExperimentInput,
+    commit: &str,
+    row: &ResultRow,
+) -> Result<(), String> {
+    reset(ctx, input, commit).await?;
+    record(ctx, input, row).await
+}
+
+/// Reset the session branch to `commit`.
+async fn reset(ctx: &WorkflowContext, input: &ExperimentInput, commit: &str) -> Result<(), String> {
+    ctx.execute_activity::<_, String>(
+        &reset_info(),
+        CommitRef {
+            lab: input.lab.clone(),
+            branch: input.branch.clone(),
+            commit: commit.to_string(),
+        },
+    )
+    .await
+    .map(drop)
+    .map_err(|e| format!("cannot reset the branch to {commit}: {e}"))
+}
+
+/// Append `row` to `results.tsv`.
+async fn record(
+    ctx: &WorkflowContext,
+    input: &ExperimentInput,
+    row: &ResultRow,
+) -> Result<(), String> {
+    ctx.execute_activity::<_, bool>(
+        &record_info(),
+        RecordInput {
+            lab: input.lab.clone(),
+            row: row.clone(),
+        },
+    )
+    .await
+    .map(drop)
+    .map_err(|e| format!("cannot record the row: {e}"))
+}
+
+/// The head of the session branch. The step checks the branch out first.
+async fn head(ctx: &WorkflowContext, input: &ExperimentInput) -> Result<String, String> {
+    ctx.execute_activity(
+        &head_info(),
+        LabInput {
+            lab: input.lab.clone(),
+            branch: input.branch.clone(),
+        },
+    )
+    .await
+    .map_err(|e| format!("cannot read HEAD: {e}"))
 }
 
 const fn count(counts: &mut Counts, status: Status) {
@@ -659,41 +783,37 @@ fn publish(ctx: &WorkflowContext, carry: &Carry, phase: &str) -> Result<(), Stri
 
 /// One idea: propose, commit, train, decide, record.
 ///
+/// It has no execution timeout. A timeout counts wall time, a stopped
+/// runner included, so a resume the next day would throw away paid work.
+/// The step budget, the approval timeout and the trainer timeout bound it.
+///
 /// # Errors
 ///
 /// Returns an error when a git step fails for good, or a child fails.
-#[workflow(execution_timeout = "4h")]
+#[workflow]
 pub async fn experiment(
     ctx: &WorkflowContext,
     input: ExperimentInput,
 ) -> Result<ExperimentOutcome, String> {
     let mut saga = Saga::new(ctx);
+    // The first step checks out the session branch.
+    let start = head(ctx, &input).await?;
+    let mut labels = input.flow_labels.clone();
     let proposal = if input.baseline {
-        let head: String = ctx
-            .execute_activity(
-                &head_info(),
-                LabInput {
-                    lab: input.lab.clone(),
-                },
-            )
-            .await
-            .map_err(|e| format!("cannot read HEAD: {e}"))?;
         Proposal {
-            commit: head,
+            commit: start,
             description: "baseline".into(),
             base: None,
             rewound: false,
             lines: (0, 0),
         }
     } else {
-        match propose(ctx, &mut saga, &input).await? {
-            Ok(proposal) => proposal,
-            Err(idle) => {
-                return no_change(ctx, &input, idle.base, idle.rewound, &idle.answer).await;
-            }
+        match propose(ctx, &mut saga, &input, &mut labels).await? {
+            Proposed::Change(proposal) => proposal,
+            Proposed::NoChange(idle) => return no_change(ctx, &input, idle, labels).await,
         }
     };
-    let (measured, commit, fixes) = measure(ctx, &mut saga, &input, &proposal).await?;
+    let (measured, commit, fixes) = measure(ctx, &mut saga, &input, &proposal, &mut labels).await?;
     let verdict = decide(&input.policy, proposal.base.as_ref(), &measured);
     let crashed = verdict.status == Status::Crash;
     let row = ResultRow {
@@ -713,14 +833,18 @@ pub async fn experiment(
             .await
             .map_err(|e| format!("cannot reset the branch: {e}"))?;
     }
+    let base = proposal.base;
     finish(
         ctx,
         &input,
-        row,
-        verdict,
-        proposal.base,
-        proposal.rewound,
-        fixes,
+        Ended {
+            row,
+            verdict,
+            base,
+            rewound: proposal.rewound,
+            fixes,
+            labels,
+        },
     )
     .await
 }
@@ -729,7 +853,8 @@ pub async fn experiment(
 struct Proposal {
     commit: String,
     description: String,
-    /// The base to beat. An approved `rewind` can move it.
+    /// The base to beat. An approved `rewind` can move it. `None` only for
+    /// the baseline.
     base: Option<Best>,
     rewound: bool,
     /// Lines added and removed.
@@ -738,67 +863,75 @@ struct Proposal {
 
 /// A proposal that changed nothing.
 struct Idle {
-    base: Option<Best>,
+    base: Best,
     rewound: bool,
     answer: String,
 }
 
-/// Ask the agent for one change and commit it as a saga step.
+/// What the agent proposed.
+enum Proposed {
+    /// A committed change.
+    Change(Proposal),
+    /// No change.
+    NoChange(Idle),
+}
+
+/// Ask the agent for one change and commit it as a saga step. Adds the
+/// labels of the agent run to `labels`.
 async fn propose<'a>(
     ctx: &'a WorkflowContext,
     saga: &mut Saga<'a>,
     input: &ExperimentInput,
-) -> Result<Result<Proposal, Idle>, String> {
+    labels: &mut BTreeSet<String>,
+) -> Result<Proposed, String> {
+    let old = input
+        .best
+        .clone()
+        .ok_or("an experiment that is not the baseline needs a base")?;
     let report: AgentReport = ctx
         .spawn_child_workflow(&agent_loop_info(), proposal_task(input))
         .await
         .map_err(|e| format!("the proposal agent failed: {e}"))?;
-    let head: String = ctx
-        .execute_activity(
-            &head_info(),
-            LabInput {
-                lab: input.lab.clone(),
-            },
-        )
-        .await
-        .map_err(|e| format!("cannot read HEAD: {e}"))?;
+    labels.extend(report.flow_labels.iter().cloned());
+    let head = head(ctx, input).await?;
     // Only an approved `rewind` moves the branch during a proposal.
-    let rewound = input.best.as_ref().is_some_and(|old| head != old.commit);
+    let rewound = head != old.commit;
     let base = if rewound {
         let kept: Option<Best> = ctx
             .execute_activity(
                 &find_kept_info(),
                 CommitRef {
                     lab: input.lab.clone(),
+                    branch: input.branch.clone(),
                     commit: head.clone(),
                 },
             )
             .await
             .map_err(|e| format!("cannot read results.tsv: {e}"))?;
-        Some(kept.ok_or_else(|| format!("the branch moved to {head}, which is not a kept commit"))?)
+        kept.ok_or_else(|| format!("the branch moved to {head}, which is not a kept commit"))?
     } else {
-        input.best.clone()
+        old
     };
     let answer = answer_line(&report);
     if report.stop != AgentStop::Completed || answer.starts_with(GIVE_UP) {
-        return Ok(Err(Idle {
+        return Ok(Proposed::NoChange(Idle {
             base,
             rewound,
             answer,
         }));
     }
-    let info = commit_step(ctx, saga, input, &answer).await?;
+    let info = commit_step(ctx, saga, input, &head, &answer).await?;
     if !info.changed {
-        return Ok(Err(Idle {
+        return Ok(Proposed::NoChange(Idle {
             base,
             rewound,
             answer,
         }));
     }
-    Ok(Ok(Proposal {
+    Ok(Proposed::Change(Proposal {
         commit: info.commit,
         description: answer,
-        base,
+        base: Some(base),
         rewound,
         lines: (info.lines_added, info.lines_removed),
     }))
@@ -811,6 +944,7 @@ async fn measure<'a>(
     saga: &mut Saga<'a>,
     input: &ExperimentInput,
     proposal: &Proposal,
+    labels: &mut BTreeSet<String>,
 ) -> Result<(Measured, String, u32), String> {
     let mut commit = proposal.commit.clone();
     let mut lines = proposal.lines;
@@ -841,14 +975,15 @@ async fn measure<'a>(
         // Upstream: fix a dumb crash and run again.
         fixes += 1;
         let fix: AgentReport = ctx
-            .spawn_child_workflow(&agent_loop_info(), fix_task(input, &run))
+            .spawn_child_workflow(&agent_loop_info(), fix_task(input, &run, labels))
             .await
             .map_err(|e| format!("the fix agent failed: {e}"))?;
+        labels.extend(fix.flow_labels.iter().cloned());
         let answer = answer_line(&fix);
         if fix.stop != AgentStop::Completed || answer.starts_with(GIVE_UP) {
             return Ok((crashed, commit, fixes));
         }
-        let info = commit_step(ctx, saga, input, &answer).await?;
+        let info = commit_step(ctx, saga, input, &commit, &answer).await?;
         if !info.changed {
             return Ok((crashed, commit, fixes));
         }
@@ -857,16 +992,20 @@ async fn measure<'a>(
     }
 }
 
-/// Commit `train.py` as a saga step. Its compensation resets to the parent.
+/// Commit `train.py` on `parent` as a saga step. Its compensation resets
+/// to the parent.
 async fn commit_step<'a>(
     ctx: &'a WorkflowContext,
     saga: &mut Saga<'a>,
     input: &ExperimentInput,
+    parent: &str,
     message: &str,
 ) -> Result<CommitInfo, String> {
-    let lab = input.lab.clone();
+    let (lab, branch) = (input.lab.clone(), input.branch.clone());
     let commit = CommitInput {
         lab: input.lab.clone(),
+        branch: input.branch.clone(),
+        parent: parent.to_string(),
         message: message.to_string(),
     };
     saga.step(
@@ -876,15 +1015,14 @@ async fn commit_step<'a>(
         },
         move |info: CommitInfo| async move {
             if info.changed {
-                ctx.execute_activity::<_, String>(
-                    &reset_info(),
-                    CommitRef {
-                        lab,
-                        commit: info.parent,
-                    },
-                )
-                .await
-                .map(drop)
+                let target = CommitRef {
+                    lab,
+                    branch,
+                    commit: info.parent,
+                };
+                ctx.execute_activity::<_, String>(&reset_info(), target)
+                    .await
+                    .map(drop)
             } else {
                 Ok(())
             }
@@ -911,6 +1049,7 @@ async fn train_once(
             &train_info(),
             TrainInput {
                 lab: input.lab.clone(),
+                branch: input.branch.clone(),
                 trainer: input.trainer.clone(),
                 commit: commit.to_string(),
             },
@@ -925,58 +1064,62 @@ async fn train_once(
 }
 
 /// An experiment whose agent proposed no change: reset the work tree and
-/// log a discard with no run.
+/// log a discard with no run. The row holds the numbers of the base, so a
+/// plot of the non-crash rows does not drop to zero.
 async fn no_change(
     ctx: &WorkflowContext,
     input: &ExperimentInput,
+    idle: Idle,
+    labels: BTreeSet<String>,
+) -> Result<ExperimentOutcome, String> {
+    let row = ResultRow {
+        commit: idle.base.commit.clone(),
+        val_bpb: idle.base.val_bpb,
+        memory_gb: idle.base.memory_gb,
+        status: Status::Discard,
+        description: format!("no change: {}", idle.answer),
+    };
+    reset(ctx, input, &idle.base.commit).await?;
+    let ended = Ended {
+        row,
+        verdict: Verdict {
+            status: Status::Discard,
+            score: 0.0,
+            reason: "the agent proposed no change".into(),
+        },
+        base: Some(idle.base),
+        rewound: idle.rewound,
+        fixes: 0,
+        labels,
+    };
+    finish(ctx, input, ended).await
+}
+
+/// How an experiment ended.
+struct Ended {
+    row: ResultRow,
+    verdict: Verdict,
     base: Option<Best>,
     rewound: bool,
-    answer: &str,
-) -> Result<ExperimentOutcome, String> {
-    let at = base.as_ref().map_or_else(String::new, |b| b.commit.clone());
-    ctx.execute_activity::<_, String>(
-        &reset_info(),
-        CommitRef {
-            lab: input.lab.clone(),
-            commit: at.clone(),
-        },
-    )
-    .await
-    .map_err(|e| format!("cannot reset the work tree: {e}"))?;
-    let row = ResultRow {
-        commit: at,
-        val_bpb: 0.0,
-        memory_gb: 0.0,
-        status: Status::Discard,
-        description: format!("no change: {answer}"),
-    };
-    let verdict = Verdict {
-        status: Status::Discard,
-        score: 0.0,
-        reason: "the agent proposed no change".into(),
-    };
-    finish(ctx, input, row, verdict, base, rewound, 0).await
+    fixes: u32,
+    labels: BTreeSet<String>,
 }
 
 /// Record the row, publish it, and build the outcome.
 async fn finish(
     ctx: &WorkflowContext,
     input: &ExperimentInput,
-    row: ResultRow,
-    verdict: Verdict,
-    base: Option<Best>,
-    rewound: bool,
-    fixes: u32,
+    ended: Ended,
 ) -> Result<ExperimentOutcome, String> {
-    ctx.execute_activity::<_, bool>(
-        &record_info(),
-        RecordInput {
-            lab: input.lab.clone(),
-            row: row.clone(),
-        },
-    )
-    .await
-    .map_err(|e| format!("cannot record the row: {e}"))?;
+    let Ended {
+        row,
+        verdict,
+        base,
+        rewound,
+        fixes,
+        labels,
+    } = ended;
+    record(ctx, input, &row).await?;
     ctx.upsert_search_attrs([
         ("tag".to_string(), Some(json!(input.tag))),
         ("outcome".to_string(), Some(json!(row.status.as_str()))),
@@ -998,6 +1141,7 @@ async fn finish(
         verdict,
         rewound,
         fixes,
+        flow_labels: labels,
     })
 }
 
@@ -1030,9 +1174,11 @@ fn system_prompt(input: &ExperimentInput) -> String {
     )
 }
 
-/// The shared parts of each researcher task.
-fn researcher_task(input: &ExperimentInput, text: String) -> AgentTask {
+/// The shared parts of each researcher task. `labels` are the flow labels
+/// that earlier runs of the session exercised.
+fn researcher_task(input: &ExperimentInput, text: String, labels: &BTreeSet<String>) -> AgentTask {
     AgentTask::new(text)
+        .flow_labels(labels.iter().cloned())
         .system(system_prompt(input))
         .session(SessionId::new(input.lab.clone()))
         .memory(MemoryScope::new(input.session.clone()))
@@ -1056,12 +1202,14 @@ pub fn proposal_task(input: &ExperimentInput) -> AgentTask {
         lines.push(EXPLORE.into());
         lines.push("Try a bolder idea than usual.".into());
     }
-    researcher_task(input, lines.join("\n")).mandate(Mandate::new("researcher").peers([REVIEWER]))
+    researcher_task(input, lines.join("\n"), &input.flow_labels)
+        .mandate(Mandate::new("researcher").peers([REVIEWER]))
 }
 
-/// The task of the researcher agent after a crash.
+/// The task of the researcher agent after a crash. `labels` holds the
+/// labels of the proposal run too.
 #[must_use]
-pub fn fix_task(input: &ExperimentInput, run: &TrainRun) -> AgentTask {
+pub fn fix_task(input: &ExperimentInput, run: &TrainRun, labels: &BTreeSet<String>) -> AgentTask {
     let how = if run.timed_out {
         "ran past its time budget"
     } else {
@@ -1073,6 +1221,7 @@ pub fn fix_task(input: &ExperimentInput, run: &TrainRun) -> AgentTask {
             "{FIX_MODE}\nThe run of experiment {} {how}. The end of run.log:\n\n{}",
             input.number, run.log_tail
         ),
+        labels,
     )
 }
 

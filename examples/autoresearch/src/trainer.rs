@@ -8,9 +8,16 @@
 //! [`TrainerSpec::Command`] runs a real command, such as `uv run train.py`,
 //! in the lab. It writes stdout and stderr to `run.log` and kills the child
 //! at its timeout, as upstream kills a run over ten minutes.
+//!
+//! The command runs code that the agent wrote, so it gets no secrets from
+//! the environment. Its process group dies with the run: at the end, at the
+//! timeout, and when the runner drops the activity. A runner that dies
+//! with no cleanup leaves the group alive. A lock file finds that group,
+//! and the next run kills it first. This is not a sandbox: see the README.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -23,6 +30,17 @@ pub const RUN_LOG: &str = "run.log";
 
 /// The lines of the log that a run returns, as `tail -n 50 run.log`.
 pub const TAIL_LINES: usize = 50;
+
+/// The most bytes of the log that a run returns.
+pub const TAIL_BYTES: u64 = 16 * 1024;
+
+/// The lock file of the command trainer, in the state directory. It holds
+/// the process group of the run in flight.
+pub const TRAINER_LOCK: &str = "trainer.lock";
+
+/// Parts of an environment variable name that mark a secret. The command
+/// trainer does not pass such a variable to the run.
+const SECRET_MARKS: &[&str] = &["API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"];
 
 /// The memory of one H100, in MB. A simulated run above it is out of memory.
 pub const GPU_MEMORY_MB: f64 = 81_920.0;
@@ -232,25 +250,29 @@ fn hyperparameters(train_py: &str) -> Result<BTreeMap<String, Value>, String> {
     Ok(values)
 }
 
-/// A number, `a**b`, a quoted string, or a tuple. Anything else does not parse.
+/// A number, `a**b`, or a quoted string. A digit separator `_` is allowed.
+/// An empty value, or one that starts with `=`, is a syntax error. Any
+/// other value, such as `True` or an expression, is [`Value::Other`]: the
+/// landscape does not score it, so its knob keeps the default.
 fn parse_value(code: &str) -> Option<Value> {
     if code.is_empty() || code.starts_with('=') {
         return None;
     }
-    if let Some((base, exp)) = code.split_once("**") {
-        let base: f64 = base.trim().parse().ok()?;
-        let exp: i32 = exp.trim().parse().ok()?;
-        return Some(Value::Number(base.powi(exp)));
+    let number = |text: &str| text.trim().replace('_', "").parse::<f64>().ok();
+    if let Some((base, exp)) = code.split_once("**")
+        && let (Some(base), Some(exp)) = (number(base), number(exp))
+    {
+        return Some(Value::Number(base.powf(exp)));
     }
-    if let Ok(number) = code.parse::<f64>() {
-        return Some(Value::Number(number));
+    if let Some(value) = number(code) {
+        return Some(Value::Number(value));
     }
     let quoted = (code.starts_with('"') && code.ends_with('"'))
         || (code.starts_with('\'') && code.ends_with('\''));
     if quoted && code.len() >= 2 {
         return Some(Value::Text(code[1..code.len() - 1].to_string()));
     }
-    (code.starts_with('(') && code.ends_with(')')).then_some(Value::Other)
+    Some(Value::Other)
 }
 
 /// The 64-bit FNV-1a hash: stable on every platform.
@@ -340,7 +362,8 @@ pub fn simulate(train_py: &str) -> Simulated {
     Simulated { log, exit_code: 0 }
 }
 
-/// Run one training of the lab at `lab`.
+/// Run one training of the lab at `lab`. `state` is the state directory,
+/// which holds the lock file of the command trainer.
 ///
 /// `progress` gets each progress line, for an activity heartbeat.
 ///
@@ -351,6 +374,7 @@ pub fn simulate(train_py: &str) -> Simulated {
 pub async fn run(
     spec: &TrainerSpec,
     lab: &Path,
+    state: &Path,
     mut progress: impl FnMut(&str) + Send,
 ) -> Result<TrainRun, String> {
     let log_path = lab.join(RUN_LOG);
@@ -370,6 +394,7 @@ pub async fn run(
                     tokio::time::sleep(pause).await;
                 }
             }
+            new_log(&log_path)?;
             std::fs::write(&log_path, &run.log)
                 .map_err(|e| format!("cannot write run.log: {e}"))?;
             Ok(TrainRun {
@@ -382,20 +407,66 @@ pub async fn run(
             program,
             args,
             timeout_secs,
-        } => run_command(program, args, *timeout_secs, lab, &log_path, &mut progress).await,
+        } => {
+            let run = Run {
+                program,
+                args,
+                timeout_secs: *timeout_secs,
+                lab,
+                state,
+                log_path: &log_path,
+            };
+            run_command(&run, &mut progress).await
+        }
     }
 }
 
-/// Run `program` with its output in `log_path`. Kill it at the timeout.
-async fn run_command(
-    program: &str,
-    args: &[String],
+/// Remove `run.log`, so the run writes a new file. A symlink that code in
+/// the lab planted then cannot send the log to another file.
+fn new_log(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot remove the old run.log: {e}")),
+    }
+}
+
+/// `true` for the name of an environment variable that holds a secret.
+fn is_secret(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_MARKS.iter().any(|mark| upper.contains(mark))
+}
+
+/// One command run.
+struct Run<'a> {
+    program: &'a str,
+    args: &'a [String],
     timeout_secs: u64,
-    lab: &Path,
-    log_path: &Path,
+    lab: &'a Path,
+    state: &'a Path,
+    log_path: &'a Path,
+}
+
+/// Run the command with its output in `run.log`. Kill it at the timeout.
+async fn run_command(
+    run: &Run<'_>,
     progress: &mut (impl FnMut(&str) + Send),
 ) -> Result<TrainRun, String> {
-    let log = std::fs::File::create(log_path).map_err(|e| format!("cannot create run.log: {e}"))?;
+    let Run {
+        program,
+        args,
+        timeout_secs,
+        lab,
+        state,
+        log_path,
+    } = *run;
+    let lock = Lock::take(state).await?;
+    new_log(log_path)?;
+    let log = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(log_path)
+        .map_err(|e| format!("cannot create run.log: {e}"))?;
     let errors = log
         .try_clone()
         .map_err(|e| format!("cannot share run.log: {e}"))?;
@@ -403,16 +474,25 @@ async fn run_command(
     command
         .args(args)
         .current_dir(lab)
-        .stdin(Stdio::null())
+        .stdin(lock.stdin()?)
         .stdout(log)
         .stderr(errors)
         .kill_on_drop(true);
+    for (name, _) in std::env::vars_os() {
+        if is_secret(&name.to_string_lossy()) {
+            command.env_remove(&name);
+        }
+    }
     // A new process group, so a kill reaches the children of the run too.
     #[cfg(unix)]
     command.process_group(0);
     let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start {program}: {e}"))?;
+    drop(command);
+    // The group dies when this guard drops, on every path out.
+    let group = Group::of(&child);
+    lock.hold(child.id())?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut beat = tokio::time::interval(Duration::from_secs(5));
     let (exit_code, timed_out) = loop {
@@ -423,7 +503,7 @@ async fn run_command(
             }
             () = tokio::time::sleep_until(deadline) => {
                 // Upstream: "If a run exceeds 10 minutes, kill it".
-                kill_group(&child);
+                group.kill();
                 let _ = child.kill().await;
                 break (None, true);
             }
@@ -434,6 +514,8 @@ async fn run_command(
             }
         }
     };
+    // A child that the run left behind dies now too.
+    drop(group);
     if timed_out {
         let mut file = tokio::fs::OpenOptions::new()
             .append(true)
@@ -445,37 +527,149 @@ async fn run_command(
             .await
             .map_err(|e| format!("cannot write run.log: {e}"))?;
     }
-    let text = std::fs::read_to_string(log_path).unwrap_or_default();
     Ok(TrainRun {
         exit_code,
         timed_out,
-        log_tail: crate::summary::tail(&text, TAIL_LINES),
+        log_tail: tail_of(log_path, TAIL_BYTES),
     })
 }
 
-/// Kill the process group of `child`. A no-op off Unix, where the kill of
-/// the child alone must do.
-fn kill_group(child: &tokio::process::Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child
-        .id()
-        .and_then(|id| i32::try_from(id).ok())
-        .and_then(rustix::process::Pid::from_raw)
-    {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+/// The process group of a run. It dies when the guard drops. Off Unix, the
+/// guard does nothing, and the kill of the child alone must do.
+struct Group(Option<i32>);
+
+impl Group {
+    fn of(child: &tokio::process::Child) -> Self {
+        Self(child.id().and_then(|id| i32::try_from(id).ok()))
     }
+
+    fn kill(&self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.and_then(rustix::process::Pid::from_raw) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// The lock file of the command trainer.
+///
+/// The run gets the locked file as its stdin, and each child inherits it.
+/// So the lock stays held while any process of the run lives, even after
+/// the runner dies. The next run tries the lock. When the lock is held,
+/// the file names the group of a run that outlived its runner, and the next
+/// run kills that group first. A free lock proves that no run lives, so a
+/// stale group id is never used.
+struct Lock(std::fs::File);
+
+impl Lock {
+    /// How long a run waits for a killed group to let go of the lock.
+    const WAIT: Duration = Duration::from_secs(10);
+
+    async fn take(state: &Path) -> Result<Self, String> {
+        let path = state.join(TRAINER_LOCK);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        let lock = Self(file);
+        let deadline = tokio::time::Instant::now() + Self::WAIT;
+        let mut killed = false;
+        while !lock.try_lock()? {
+            if !killed {
+                lock.kill_holder();
+                killed = true;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return Err("a training run from an earlier process still holds the GPU".into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Ok(lock)
+    }
+
+    #[cfg(unix)]
+    fn try_lock(&self) -> Result<bool, String> {
+        use rustix::fs::{FlockOperation, flock};
+        match flock(&self.0, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(true),
+            Err(rustix::io::Errno::WOULDBLOCK) => Ok(false),
+            Err(e) => Err(format!("cannot lock the trainer: {e}")),
+        }
+    }
+
     #[cfg(not(unix))]
-    let _ = child;
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    fn try_lock(&self) -> Result<bool, String> {
+        Ok(true)
+    }
+
+    /// Kill the group that the file names.
+    fn kill_holder(&self) {
+        let mut text = String::new();
+        let _ = (&self.0).read_to_string(&mut text);
+        let group = Group(text.trim().parse().ok());
+        group.kill();
+    }
+
+    /// A copy of the locked file, for the stdin of the run.
+    fn stdin(&self) -> Result<Stdio, String> {
+        self.0
+            .try_clone()
+            .map(Stdio::from)
+            .map_err(|e| format!("cannot share the trainer lock: {e}"))
+    }
+
+    /// Write the group of the run into the file. The run holds the lock
+    /// through its stdin, so this handle can close.
+    fn hold(self, group: Option<u32>) -> Result<(), String> {
+        use std::io::Write as _;
+        let mut file = self.0;
+        file.set_len(0)
+            .and_then(|()| file.seek(SeekFrom::Start(0)).map(drop))
+            .and_then(|()| writeln!(file, "{}", group.unwrap_or(0)))
+            .map_err(|e| format!("cannot write the trainer lock: {e}"))
+    }
+}
+
+/// The end of the log at `path`: at most `bytes` bytes and [`TAIL_LINES`]
+/// lines, as lossy UTF-8. A carriage return counts as a line end, so a
+/// progress line that redraws itself reads as its last state.
+fn tail_of(path: &Path, bytes: u64) -> String {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let len = file.metadata().map_or(0, |meta| meta.len());
+    let mut buffer = Vec::new();
+    if file
+        .seek(SeekFrom::Start(len.saturating_sub(bytes)))
+        .is_err()
+        || file.take(bytes).read_to_end(&mut buffer).is_err()
+    {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&buffer).replace('\r', "\n");
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n")
 }
 
 /// The last non-empty line of `path`, for a heartbeat.
 fn last_line(path: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    text.lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string)
+    tail_of(path, 4 * 1024)
+        .lines()
+        .next_back()
+        .map(|line| line.trim().to_string())
 }
 
 #[cfg(test)]
@@ -569,6 +763,18 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
     }
 
     #[test]
+    fn valid_python_values_are_not_syntax_errors() {
+        // The same setting scores the same, up to the noise of the text.
+        let underscores = UPSTREAM_BLOCK.replace("2**19", "524_288");
+        let delta = (bpb(&underscores).unwrap() - bpb(UPSTREAM_BLOCK).unwrap()).abs();
+        assert!(delta < 0.0005, "{delta}");
+        let flag = format!("{UPSTREAM_BLOCK}USE_FLASH = True\n");
+        assert_eq!(simulate(&flag).exit_code, 0);
+        let expression = UPSTREAM_BLOCK.replace("DEPTH = 8 ", "DEPTH = 4 * 2 ");
+        assert_eq!(simulate(&expression).exit_code, 0);
+    }
+
+    #[test]
     fn a_deleted_setting_falls_back_to_its_default() {
         let shorter = UPSTREAM_BLOCK.replace(
             "WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup\n",
@@ -583,9 +789,11 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("train.py"), UPSTREAM_BLOCK).unwrap();
         let mut lines = 0;
-        let run = run(&TrainerSpec::default(), dir.path(), |_| lines += 1)
-            .await
-            .unwrap();
+        let run = run(&TrainerSpec::default(), dir.path(), dir.path(), |_| {
+            lines += 1;
+        })
+        .await
+        .unwrap();
         assert_eq!(run.exit_code, Some(0));
         assert!(!run.timed_out);
         assert!(run.log_tail.contains("val_bpb:"));
@@ -607,7 +815,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             ],
             timeout_secs: 30,
         };
-        let run = run(&spec, dir.path(), |_| {}).await.unwrap();
+        let run = run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
         assert_eq!(run.exit_code, Some(0));
         let summary = summary::parse(&run.log_tail).unwrap();
         assert_eq!(summary.val_bpb, 0.99);
@@ -623,7 +831,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             timeout_secs: 1,
         };
         let started = std::time::Instant::now();
-        let run = run(&spec, dir.path(), |_| {}).await.unwrap();
+        let run = run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
         assert!(run.timed_out);
         assert_eq!(run.exit_code, None);
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -641,10 +849,112 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             args: vec!["-c".into(), script],
             timeout_secs: 1,
         };
-        let run = run(&spec, dir.path(), |_| {}).await.unwrap();
+        let run = run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
         assert!(run.timed_out);
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(!marker.exists(), "the child of the run outlived the kill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_run_kills_its_whole_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("child-survived");
+        let script = format!("(sleep 2; touch '{}') & wait", marker.display());
+        let spec = TrainerSpec::Command {
+            program: "sh".into(),
+            args: vec!["-c".into(), script],
+            timeout_secs: 60,
+        };
+        // The runner drops the activity, as Ctrl-C does.
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(500),
+            run(&spec, dir.path(), dir.path(), |_| {}),
+        )
+        .await;
+        assert!(dropped.is_err());
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(!marker.exists(), "a child of the dropped run lived on");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_next_run_kills_a_run_that_outlived_its_runner() {
+        use std::io::Write as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        // A run from a runner that died: it holds the lock through its
+        // stdin, and the file names its group.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.path().join(TRAINER_LOCK))
+            .unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let mut orphan = std::process::Command::new("sleep")
+            .arg("60")
+            .stdin(lock.try_clone().unwrap())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        writeln!(&lock, "{}", orphan.id()).unwrap();
+        drop(lock);
+
+        let spec = TrainerSpec::Command {
+            program: "sh".into(),
+            args: vec!["-c".into(), "echo fresh".into()],
+            timeout_secs: 30,
+        };
+        let fresh = run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
+        assert_eq!(fresh.exit_code, Some(0));
+        let status = orphan.wait().unwrap();
+        assert!(!status.success(), "the old run was killed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_planted_run_log_symlink_is_replaced_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("train.py"), UPSTREAM_BLOCK).unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "keep me").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join(RUN_LOG)).unwrap();
+        run(&TrainerSpec::default(), dir.path(), dir.path(), |_| {})
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep me");
+        assert!(!dir.path().join(RUN_LOG).is_symlink());
+    }
+
+    #[test]
+    fn secrets_stay_out_of_the_run() {
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "HF_TOKEN",
+            "aws_secret_access_key",
+            "DB_PASSWORD",
+        ] {
+            assert!(is_secret(name), "{name}");
+        }
+        for name in ["PATH", "HOME", "CUDA_VISIBLE_DEVICES", "UV_CACHE_DIR"] {
+            assert!(!is_secret(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_log_tail_is_bounded_in_bytes_and_reads_a_redrawn_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join(RUN_LOG);
+        let redraw = "\rstep 00042".repeat(100_000);
+        std::fs::write(&log, format!("{redraw}\n---\nval_bpb: 0.99\n")).unwrap();
+        let tail = tail_of(&log, TAIL_BYTES);
+        assert!(tail.len() <= usize::try_from(TAIL_BYTES).unwrap());
+        assert!(tail.ends_with("val_bpb: 0.99"));
+        assert_eq!(last_line(&log).as_deref(), Some("val_bpb: 0.99"));
+        assert!(tail.lines().count() <= TAIL_LINES);
     }
 
     #[tokio::test]
@@ -655,6 +965,6 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             args: Vec::new(),
             timeout_secs: 5,
         };
-        assert!(run(&spec, dir.path(), |_| {}).await.is_err());
+        assert!(run(&spec, dir.path(), dir.path(), |_| {}).await.is_err());
     }
 }

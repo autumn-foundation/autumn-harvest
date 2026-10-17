@@ -14,6 +14,10 @@
 //! | `edit_train` | write | approval after `read_paper` (flow rule) |
 //! | `rewind` | write | always approval |
 //! | anything else | | denied |
+//!
+//! A tool call in flight at a crash runs again. `edit_train` keys each edit
+//! on the run, the step and the call id, so the re-run changes nothing.
+//! `rewind` resets to a fixed commit, so a re-run is harmless.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -29,7 +33,6 @@ use autumn_harvest_agent::{
 use serde_json::{Value, json};
 
 use crate::lab::Lab;
-use crate::rules::Status;
 use crate::stores::{DirPayloadStore, FileDelivery, FileMemoryStore, ResultsPrecheck};
 
 /// The researcher reads and edits. The marker tells a scripted model its role.
@@ -90,7 +93,7 @@ pub fn tools(labs: &[Lab]) -> Vec<Arc<dyn Tool>> {
             READ_FILE,
             "Read one lab file: train.py, prepare.py, program.md, results.tsv, README.md or run.log.",
             schema(json!({"path": {"type": "string"}}), &["path"]),
-            |lab, input| {
+            |lab, input, _| {
                 let path = text(&input, "path")?;
                 Ok(json!({"path": path, "content": lab.read(&path)?}))
             },
@@ -102,7 +105,7 @@ pub fn tools(labs: &[Lab]) -> Vec<Arc<dyn Tool>> {
             READ_PAPER,
             "Read one note from papers/, by name without .md. Its text comes from outside the lab.",
             schema(json!({"name": {"type": "string"}}), &["name"]),
-            |lab, input| {
+            |lab, input, _| {
                 let name = text(&input, "name")?;
                 Ok(json!({"name": name, "content": lab.read_paper(&name)?}))
             },
@@ -115,7 +118,7 @@ pub fn tools(labs: &[Lab]) -> Vec<Arc<dyn Tool>> {
             SHOW_DIFF,
             "Show the diff of train.py against the last commit.",
             schema(json!({}), &[]),
-            |lab, _| Ok(json!({"diff": lab.diff_train()?})),
+            |lab, _, _| Ok(json!({"diff": lab.diff_train()?})),
         )
         .effect(ToolEffect::ReadOnly)
         .shared(),
@@ -127,8 +130,9 @@ pub fn tools(labs: &[Lab]) -> Vec<Arc<dyn Tool>> {
                 json!({"old": {"type": "string"}, "new": {"type": "string"}}),
                 &["old", "new"],
             ),
-            |lab, input| {
-                lab.edit_train(&text(&input, "old")?, &text(&input, "new")?)?;
+            |lab, input, ctx| {
+                let call = format!("{}/{}/{}", ctx.run_id.as_str(), ctx.step, ctx.call_id);
+                lab.edit_train_once(&text(&input, "old")?, &text(&input, "new")?, &call)?;
                 Ok(json!({"ok": true, "diff": lab.diff_train()?}))
             },
         )
@@ -142,13 +146,15 @@ pub fn tools(labs: &[Lab]) -> Vec<Arc<dyn Tool>> {
                 json!({"commit": {"type": "string"}, "reason": {"type": "string"}}),
                 &["commit"],
             ),
-            |lab, input| {
+            |lab, input, _| {
                 let commit = text(&input, "commit")?;
                 let kept = lab
-                    .rows()?
-                    .into_iter()
-                    .find(|row| row.status == Status::Keep && row.commit == commit)
+                    .kept(&commit)?
                     .ok_or_else(|| format!("{commit} is not a kept commit in results.tsv"))?;
+                // A kept commit of another session in the lab is on another
+                // branch. Only an earlier commit of this branch is a rewind.
+                lab.git(&["merge-base", "--is-ancestor", &commit, "HEAD"])
+                    .map_err(|_| format!("{commit} is not an earlier commit of this branch"))?;
                 lab.reset_to(&commit)?;
                 Ok(json!({"ok": true, "rewound_to": commit, "val_bpb": kept.val_bpb}))
             },
@@ -164,12 +170,13 @@ fn lab_tool(
     name: &str,
     description: &str,
     schema: Value,
-    body: fn(&Lab, Value) -> Result<Value, String>,
+    body: fn(&Lab, Value, &ToolContext) -> Result<Value, String>,
 ) -> FnTool {
     let labs = Arc::clone(labs);
     FnTool::with_context(name, description, schema, move |input, ctx: ToolContext| {
-        let result = lab_for(&labs, &ctx)
-            .and_then(|lab| body(lab, input).map_err(|e| AgentError::new(ErrorKind::Tool, e)));
+        let result = lab_for(&labs, &ctx).and_then(|lab| {
+            body(lab, input, &ctx).map_err(|e| AgentError::new(ErrorKind::Tool, e))
+        });
         std::future::ready(result)
     })
 }
@@ -178,14 +185,12 @@ fn lab_tool(
 /// process does not serve, is refused.
 fn lab_for<'a>(labs: &'a [Lab], ctx: &ToolContext) -> Result<&'a Lab, AgentError> {
     let session = ctx.session_id.as_ref().map(SessionId::as_str);
-    labs.iter()
-        .find(|lab| lab.root().to_str().is_some() && lab.root().to_str() == session)
-        .ok_or_else(|| {
-            AgentError::new(
-                ErrorKind::Config,
-                format!("the run names lab {session:?}, which this process does not serve"),
-            )
-        })
+    Lab::serving(labs, session).ok_or_else(|| {
+        AgentError::new(
+            ErrorKind::Config,
+            format!("the run names lab {session:?}, which this process does not serve"),
+        )
+    })
 }
 
 /// The string argument `key` of a tool call.
@@ -267,7 +272,8 @@ pub fn heartbeat_task(lab: &Path) -> HeartbeatTask {
 #[must_use]
 pub fn report_task(lab: &str, tag: &str) -> AgentTask {
     AgentTask::new(format!(
-        "The session autoresearch/{tag} has ended. Write the morning report."
+        "The session {}{tag} has ended. Write the morning report.",
+        crate::lab::BRANCH_PREFIX
     ))
     .system(REPORTER_SYSTEM)
     .session(SessionId::new(lab))
@@ -389,6 +395,26 @@ mod tests {
             )
             .await;
         assert_eq!(parts.labs[0].read("prepare.py").unwrap(), prepare);
+    }
+
+    #[tokio::test]
+    async fn an_edit_call_that_runs_again_changes_nothing() {
+        let (_dir, parts) = parts();
+        let tools = tools(&parts.labs);
+        let edit = tool(&tools, EDIT_TRAIN);
+        let ctx = context(&parts.labs[0]);
+        let insert = json!({"old": "DEPTH = 8", "new": "DEPTH = 8\nEXTRA_KNOB = 1"});
+        edit.execute(insert.clone(), &ctx).await.unwrap();
+        // The same call after a crash.
+        edit.execute(insert.clone(), &ctx).await.unwrap();
+        let train = parts.labs[0].read("train.py").unwrap();
+        assert_eq!(train.matches("EXTRA_KNOB").count(), 1);
+        // The same call id in a later step is a new call.
+        let mut later = ctx.clone();
+        later.step = 1;
+        edit.execute(insert, &later).await.unwrap();
+        let train = parts.labs[0].read("train.py").unwrap();
+        assert_eq!(train.matches("EXTRA_KNOB").count(), 2);
     }
 
     #[test]

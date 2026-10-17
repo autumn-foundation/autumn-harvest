@@ -1,9 +1,9 @@
 //! File-backed stores for the agent: memory, delivery, the heartbeat
 //! precheck, and the blobs of the response cache.
 //!
-//! Each store writes under the state directory. A write goes to a scratch
-//! file and then a rename. So a crash leaves the old file or the new one,
-//! never half of one.
+//! Each store writes under the state directory. A write goes to a synced
+//! scratch file and then a rename. So a crash or a power cut leaves the old
+//! file or the new one, never half of one.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -21,14 +21,8 @@ use sha2::{Digest, Sha256};
 
 use crate::lab::Lab;
 
-/// The lab that a session id names, among `labs`.
-fn lab_of<'a>(labs: &'a [Lab], session: Option<&str>) -> Option<&'a Lab> {
-    let session = session?;
-    labs.iter().find(|lab| lab.root().to_str() == Some(session))
-}
-
 /// A file name for any key: its SHA-256 in hex.
-fn hashed(key: &str) -> String {
+pub(crate) fn hashed(key: &str) -> String {
     hex(&Sha256::digest(key.as_bytes()))
 }
 
@@ -192,7 +186,7 @@ impl FileDelivery {
 
     fn write(&self, report: &Report) -> Result<(), AgentError> {
         let session = report.session_id.as_ref().map(SessionId::as_str);
-        let lab = lab_of(&self.labs, session).ok_or_else(|| {
+        let lab = Lab::serving(&self.labs, session).ok_or_else(|| {
             AgentError::new(
                 ErrorKind::Config,
                 "the report names no lab that this process serves",
@@ -235,14 +229,12 @@ impl ResultsPrecheck {
             labs: Arc::new(labs),
         }
     }
-}
 
-impl ResultsPrecheck {
     /// Compare the rows with the count that the last tick saw, and store
     /// the new count. An unreadable lab skips the tick.
     fn check(&self, task: &HeartbeatTask) -> bool {
         let session = task.session_id.as_ref().map(SessionId::as_str);
-        let Some(lab) = lab_of(&self.labs, session) else {
+        let Some(lab) = Lab::serving(&self.labs, session) else {
             return false;
         };
         let (Ok(rows), Ok(state)) = (lab.rows(), lab.state_dir()) else {
@@ -336,24 +328,47 @@ impl PayloadStore for DirPayloadStore {
 
 /// Write `bytes` to `path` through a scratch file and a rename.
 ///
+/// The scratch file is new: an old file or a symlink at its name is removed
+/// first, so a planted link cannot redirect the write. The data is synced
+/// before the rename, and the directory after it.
+///
 /// # Errors
 ///
 /// Returns an error when a write or the rename fails.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Two threads of one process get two scratch names.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
         .ok_or_else(|| format!("{} has no file name", path.display()))?;
     let scratch = path.with_file_name(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{}.tmp",
         name.to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::write(&scratch, bytes)
-        .map_err(|e| format!("cannot write {}: {e}", scratch.display()))?;
-    std::fs::rename(&scratch, path).map_err(|e| {
+    let failed = |e: std::io::Error| {
         let _ = std::fs::remove_file(&scratch);
-        format!("cannot replace {}: {e}", path.display())
-    })
+        format!("cannot write {}: {e}", path.display())
+    };
+    let _ = std::fs::remove_file(&scratch);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&scratch)
+        .map_err(failed)?;
+    file.write_all(bytes).map_err(failed)?;
+    file.sync_all().map_err(failed)?;
+    drop(file);
+    std::fs::rename(&scratch, path).map_err(failed)?;
+    if let Some(dir) = path.parent()
+        && let Ok(dir) = std::fs::File::open(dir)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -452,13 +467,16 @@ mod tests {
         let precheck = ResultsPrecheck::new(vec![lab.clone()]);
         let tick = crate::agent::heartbeat_task(lab.root());
         assert!(!precheck.should_run(&tick).await, "no rows yet");
-        lab.record(&ResultRow {
-            commit: "aaaaaaa".into(),
-            val_bpb: 1.0,
-            memory_gb: 1.0,
-            status: Status::Keep,
-            description: "baseline".into(),
-        })
+        lab.record(
+            &ResultRow {
+                commit: "aaaaaaa".into(),
+                val_bpb: 1.0,
+                memory_gb: 1.0,
+                status: Status::Keep,
+                description: "baseline".into(),
+            },
+            "k1",
+        )
         .unwrap();
         assert!(precheck.should_run(&tick).await, "a new row");
         assert!(!precheck.should_run(&tick).await, "the same rows");
@@ -474,6 +492,24 @@ mod tests {
         store.delete(&key).await.unwrap();
         assert!(store.get(&key).await.is_err());
         assert!(store.get("../escape").await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_atomic_write_does_not_follow_a_planted_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "keep me").unwrap();
+        let path = dir.path().join("f.json");
+        // A link at a scratch name that an older build used.
+        let scratch = dir
+            .path()
+            .join(format!(".f.json.{}.0.tmp", std::process::id()));
+        std::os::unix::fs::symlink(&victim, scratch).unwrap();
+        write_atomic(&path, b"new").unwrap();
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me");
+        assert!(!path.is_symlink());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
     }
 
     #[test]

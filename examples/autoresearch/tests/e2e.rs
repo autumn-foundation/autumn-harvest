@@ -39,11 +39,39 @@ fn hint(rt: &mut autumn_harvest_sqlite::SqliteRuntime, tag: &str, text: &str, ke
         rt,
         key,
         &Command::Hint {
-            session: session_id(tag),
+            tag: tag.into(),
             text: text.into(),
         },
     )
     .unwrap();
+}
+
+/// Drive `exec` to its end and approve each gated call on the way. Returns
+/// the gated calls in order.
+async fn run_approving(
+    rt: &mut autumn_harvest_sqlite::SqliteRuntime,
+    mut exec: autumn_harvest_sqlite::ExecutionId,
+) -> Vec<runtime::Pending> {
+    let mut asked = Vec::new();
+    for _ in 0..10_000 {
+        match runtime::drive(rt, exec).await.unwrap() {
+            Step::Done(_) => return asked,
+            Step::Continued(next) => exec = next,
+            Step::Waiting => tokio::time::sleep(Duration::from_millis(20)).await,
+            Step::Approval(pending) => {
+                let token = pending.token.clone();
+                asked.push(pending);
+                runtime::apply(
+                    rt,
+                    &format!("a{}", asked.len()),
+                    &Command::Approve { token },
+                )
+                .unwrap();
+            }
+            Step::Failed(error) => panic!("the session failed: {error}"),
+        }
+    }
+    panic!("the session did not end")
 }
 
 fn experiment_outputs(rt: &autumn_harvest_sqlite::SqliteRuntime) -> Vec<ExperimentOutcome> {
@@ -162,16 +190,7 @@ async fn a_restart_resumes_without_paying_for_a_turn_or_a_run_twice() {
     let mut rt = control.open(&control_model);
     let exec = runtime::start(&mut rt, &control.config("r", 2)).unwrap();
     hint(&mut rt, "r", "paper:warmdown", "h1");
-    let pending = run_to_approval(&mut rt, exec).await;
-    runtime::apply(
-        &mut rt,
-        "a1",
-        &Command::Approve {
-            token: pending.token,
-        },
-    )
-    .unwrap();
-    run_to_end(&mut rt, exec).await;
+    let control_asked = run_approving(&mut rt, exec).await;
     let total_calls = control_model.calls();
     let control_rows = control.lab().rows().unwrap();
     drop(rt);
@@ -188,8 +207,9 @@ async fn a_restart_resumes_without_paying_for_a_turn_or_a_run_twice() {
     };
     let second = model();
     let mut rt = fx.open(&second);
-    runtime::apply(&mut rt, "a1", &Command::Approve { token }).unwrap();
-    run_to_end(&mut rt, exec).await;
+    runtime::apply(&mut rt, "first", &Command::Approve { token }).unwrap();
+    let asked = run_approving(&mut rt, exec).await;
+    assert_eq!(asked.len() + 1, control_asked.len());
 
     // AC16: no model turn is paid for twice.
     assert_eq!(first.calls() + second.calls(), total_calls);
@@ -240,6 +260,11 @@ async fn an_edit_after_a_paper_waits_and_a_deny_changes_nothing() {
 
     let rows = fx.lab().rows().unwrap();
     assert!(rows[1].description.starts_with("no change"), "{rows:?}");
+    // A row with no run holds the numbers of its base, not zeros.
+    assert_eq!(
+        (rows[1].val_bpb, rows[1].memory_gb),
+        (rows[0].val_bpb, rows[0].memory_gb)
+    );
     assert_eq!(fx.lab().read("train.py").unwrap(), before);
     // The injected order in the paper never reached `train.py`.
     assert!(!fx.lab().read("train.py").unwrap().contains("4096"));
@@ -268,7 +293,12 @@ async fn an_approved_rewind_moves_the_base_to_an_older_kept_commit() {
         },
     )
     .unwrap();
-    run_to_end(&mut rt, exec).await;
+    // The paper taints the rest of the session, so each later edit asks.
+    let later = run_approving(&mut rt, exec).await;
+    assert!(
+        later.iter().all(|p| p.tool == agent::EDIT_TRAIN),
+        "{later:?}"
+    );
 
     let outputs = experiment_outputs(&rt);
     assert_eq!(outputs[1].row.status, Status::Keep, "{:?}", outputs[1]);
@@ -349,12 +379,11 @@ async fn signals_a_query_and_an_update_steer_a_live_session() {
         min_improvement: 0.0005,
         ..KeepPolicy::default()
     };
-    let session = session_id("live");
     runtime::apply(
         &mut rt,
         "p1",
         &Command::Policy {
-            session: session.clone(),
+            tag: "live".into(),
             policy: tighter,
         },
     )
@@ -364,7 +393,7 @@ async fn signals_a_query_and_an_update_steer_a_live_session() {
         &mut rt,
         "s1",
         &Command::Stop {
-            session,
+            tag: "live".into(),
             reason: "morning".into(),
         },
     )
@@ -534,15 +563,14 @@ async fn the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up() {
 
     // Three crashes in a row: the next tick speaks.
     for commit in ["c000001", "c000002", "c000003"] {
-        fx.lab()
-            .record(&autoresearch::results::ResultRow {
-                commit: commit.into(),
-                val_bpb: 0.0,
-                memory_gb: 0.0,
-                status: Status::Crash,
-                description: "broken".into(),
-            })
-            .unwrap();
+        let row = autoresearch::results::ResultRow {
+            commit: commit.into(),
+            val_bpb: 0.0,
+            memory_gb: 0.0,
+            status: Status::Crash,
+            description: "broken".into(),
+        };
+        fx.lab().record(&row, commit).unwrap();
     }
     *clock.lock().unwrap() = at(18, 0, 2);
     rt.poll_once_as_of(at(18, 0, 2)).await.unwrap();
@@ -589,7 +617,7 @@ async fn eval_names_the_first_turn_where_a_new_program_differs() {
     let mut rt = fx.open(&model);
     let exec = runtime::start(&mut rt, &fx.config("eval", 1)).unwrap();
     run_to_end(&mut rt, exec).await;
-    let proposal = runtime::proposals(&rt).unwrap()[0];
+    let proposal = runtime::latest_proposal(&rt).unwrap().unwrap();
     let program = include_str!("../program.md");
 
     // AC19: the same program does not diverge.
@@ -673,7 +701,7 @@ async fn the_inbox_delivers_a_command_once() {
     let inbox = Inbox::new(&fx.state).unwrap();
     let id = inbox
         .post(&Command::Hint {
-            session: session_id("inbox"),
+            tag: "inbox".into(),
             text: "try a longer warmdown".into(),
         })
         .unwrap();
@@ -774,4 +802,163 @@ fn the_workflows_register_on_a_postgres_builder_with_an_llm_budget() {
             .is_some()
     );
     assert_eq!(built.workflow_schedules().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paper_taints_every_later_run_of_the_session() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let exec = runtime::start(&mut rt, &fx.config("taint", 2)).unwrap();
+    hint(&mut rt, "taint", "paper:muon", "h1");
+    let before = fx.lab().read("train.py").unwrap();
+
+    // AC6: a person denies the edit after the paper. The memory note of
+    // that run still lands.
+    let first = run_to_approval(&mut rt, exec).await;
+    let deny = |token: String| Command::Deny {
+        token,
+        reason: "papers are not trusted tonight".into(),
+    };
+    runtime::apply(&mut rt, "d1", &deny(first.token)).unwrap();
+
+    // The next experiment has no hint and reads no paper. It still asks,
+    // because its memory and its prompt hold text from the paper.
+    let second = run_to_approval(&mut rt, exec).await;
+    assert_eq!(second.tool, agent::EDIT_TRAIN);
+    runtime::apply(&mut rt, "d2", &deny(second.token)).unwrap();
+    run_to_end(&mut rt, exec).await;
+
+    assert_eq!(fx.lab().read("train.py").unwrap(), before);
+    let outputs = experiment_outputs(&rt);
+    let label = autumn_harvest_agent::flow::labels::UNTRUSTED_INPUT;
+    assert!(
+        outputs[0].flow_labels.is_empty(),
+        "the baseline reads nothing"
+    );
+    assert!(outputs[1..].iter().all(|o| o.flow_labels.contains(label)));
+    let agents = runs_of(&rt, "agent_loop");
+    let labelled = agents
+        .iter()
+        .filter(|exec| {
+            input_of(&rt, **exec)["flow_labels"]
+                .as_array()
+                .is_some_and(|labels| labels.contains(&json!(label)))
+        })
+        .count();
+    assert!(labelled >= 1, "the second proposal starts with the label");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_sessions_in_one_lab_take_turns_on_their_own_branches() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let exec_a = runtime::start(&mut rt, &fx.config("a", 2)).unwrap();
+    let exec_b = runtime::start(&mut rt, &fx.config("b", 2)).unwrap();
+    for _ in 0..400 {
+        rt.run_until_idle().await.unwrap();
+        let done = |exec| !matches!(rt.outcome(exec).unwrap(), ExecutionOutcome::Running);
+        if done(exec_a) && done(exec_b) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    for exec in [exec_a, exec_b] {
+        assert!(
+            matches!(rt.outcome(exec).unwrap(), ExecutionOutcome::Completed(_)),
+            "{:?}",
+            rt.outcome(exec)
+        );
+    }
+    // AC27: each experiment committed on its own branch, and the lab is
+    // clean. A kept commit is on its branch. A discarded one is on none.
+    assert_eq!(fx.lab().rows().unwrap().len(), 6);
+    assert_eq!(fx.lab().git(&["status", "--porcelain"]).unwrap(), "");
+    for exec in runs_of(&rt, EXPERIMENT) {
+        let input = input_of(&rt, exec);
+        let branch = input["branch"].as_str().unwrap().to_string();
+        let ExecutionOutcome::Completed(output) = rt.outcome(exec).unwrap() else {
+            panic!("an experiment did not complete");
+        };
+        let outcome: ExperimentOutcome = serde_json::from_value(output).unwrap();
+        let on = |b: &str| {
+            fx.lab()
+                .git(&["merge-base", "--is-ancestor", &outcome.row.commit, b])
+                .is_ok()
+        };
+        match outcome.row.status {
+            Status::Keep => assert!(on(&branch), "{outcome:?} on {branch}"),
+            _ if !input["baseline"].as_bool().unwrap() && outcome.fixes == 0 => {
+                if outcome.row.description.starts_with("no change") {
+                    continue;
+                }
+                assert!(
+                    !on("autoresearch/a") && !on("autoresearch/b"),
+                    "{outcome:?}"
+                );
+            }
+            _ => {}
+        }
+    }
+    // The sessions held the lab mutex for each experiment.
+    let lab_key = format!("lab:{}", fx.lab().root().display());
+    for exec in [exec_a, exec_b] {
+        let grants = rt
+            .load_history(exec)
+            .unwrap()
+            .into_iter()
+            .filter(|e| matches!(e, WorkflowEvent::MutexGranted { key, .. } if *key == lab_key))
+            .count();
+        assert_eq!(grants, 3, "the baseline and two experiments");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_nightly_session_takes_commands_by_its_tag() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let clock = Arc::new(std::sync::Mutex::new(
+        Utc.with_ymd_and_hms(2026, 10, 17, 22, 0, 0).unwrap(),
+    ));
+    let read = Arc::clone(&clock);
+    rt.set_clock(move || *read.lock().unwrap());
+    // Zero experiments: the night runs until a stop.
+    rt.upsert_schedule(&runtime::nightly(&fx.config("", 0)).unwrap())
+        .unwrap();
+    let slot = Utc.with_ymd_and_hms(2026, 10, 17, 23, 0, 30).unwrap();
+    *clock.lock().unwrap() = slot;
+    rt.poll_once_as_of(slot).await.unwrap();
+    let first = runs_of(&rt, SESSION)[0];
+    let night = drive_a_little(&mut rt, first).await;
+
+    // AC28: the engine picked the workflow id, and the tag still reaches it.
+    let (found, id) = runtime::find_session(&rt, "oct17-2300").unwrap().unwrap();
+    assert_eq!(found, night);
+    assert!(!id.starts_with("autoresearch/"), "{id}");
+    let stop = Command::Stop {
+        tag: "oct17-2300".into(),
+        reason: "morning".into(),
+    };
+    runtime::apply(&mut rt, "s1", &stop).unwrap();
+    let report = run_to_end(&mut rt, night).await;
+    assert_eq!(report.stopped.as_deref(), Some("morning"));
+    // A command for a tag that no session runs can never land.
+    assert!(matches!(
+        runtime::apply(&mut rt, "s2", &stop),
+        Err(runtime::Refused::Permanent(_))
+    ));
+}
+
+/// Drive a night that has no end for a few drives. Returns its run now.
+async fn drive_a_little(
+    rt: &mut autumn_harvest_sqlite::SqliteRuntime,
+    mut exec: autumn_harvest_sqlite::ExecutionId,
+) -> autumn_harvest_sqlite::ExecutionId {
+    for _ in 0..5 {
+        match runtime::drive(rt, exec).await.unwrap() {
+            Step::Waiting => tokio::time::sleep(Duration::from_millis(20)).await,
+            Step::Continued(next) => exec = next,
+            other => panic!("the night ended early: {other:?}"),
+        }
+    }
+    exec
 }

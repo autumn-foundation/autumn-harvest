@@ -7,6 +7,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 
+use std::collections::BTreeSet;
+
 use autoresearch::results::ResultRow;
 use autoresearch::rules::{Best, KeepPolicy, Status, Verdict};
 use autoresearch::scripted::FIX_MODE;
@@ -20,6 +22,7 @@ use autumn_harvest::testing::WorkflowTestEnv;
 use autumn_harvest::testing::sim::{FaultPlan, SimOutcome, SimStatus};
 use autumn_harvest::{always, sometimes};
 use autumn_harvest_agent::AgentTask;
+use autumn_harvest_agent::flow::labels::UNTRUSTED_INPUT;
 use serde_json::{Value, json};
 
 /// Enough seeds to reach each target, few enough for every CI run.
@@ -59,6 +62,7 @@ fn experiment_input(baseline: bool) -> ExperimentInput {
     ExperimentInput {
         lab: "/lab".into(),
         tag: "t".into(),
+        branch: "autoresearch/t".into(),
         session: "autoresearch/t".into(),
         gpu: "gpu0".into(),
         trainer: autoresearch::trainer::TrainerSpec::default(),
@@ -71,6 +75,7 @@ fn experiment_input(baseline: bool) -> ExperimentInput {
         recent: Vec::new(),
         program: "# program".into(),
         agent: autoresearch::workflows::AgentSettings::default(),
+        flow_labels: BTreeSet::new(),
     }
 }
 
@@ -263,7 +268,8 @@ async fn a_baseline_trains_head_with_no_proposal() {
 }
 
 /// A deterministic experiment: a crash every fourth, a keep every fourth,
-/// and a discard otherwise. A hint shows in the description.
+/// and a discard otherwise. A hint shows in the description. A `paper:`
+/// hint adds the untrusted-input label, as a real paper read does.
 fn mock_experiment(input: Value) -> Result<Value, String> {
     let input: ExperimentInput = serde_json::from_value(input).map_err(|e| e.to_string())?;
     let best = input.best.clone().unwrap_or_else(base);
@@ -306,6 +312,10 @@ fn mock_experiment(input: Value) -> Result<Value, String> {
     } else {
         best
     };
+    let mut flow_labels = input.flow_labels.clone();
+    if input.hint.is_some_and(|h| h.text.starts_with("paper:")) {
+        flow_labels.insert(UNTRUSTED_INPUT.to_string());
+    }
     Ok(serde_json::to_value(ExperimentOutcome {
         row,
         best: Some(new_best),
@@ -316,6 +326,7 @@ fn mock_experiment(input: Value) -> Result<Value, String> {
         },
         rewound: false,
         fixes: 0,
+        flow_labels,
     })
     .unwrap())
 }
@@ -357,6 +368,21 @@ fn check_session(run: &SimOutcome) {
     always!(hinted <= 1, "a hint reaches at most one experiment");
     if hinted == 1 {
         sometimes!(true, "a hint reaches an experiment");
+    }
+    if let Some(at) = inputs.iter().position(|i| i.hint.is_some()) {
+        always!(
+            inputs[..=at].iter().all(|i| i.flow_labels.is_empty()),
+            "no experiment carries a label before the paper"
+        );
+        always!(
+            inputs[at + 1..]
+                .iter()
+                .all(|i| i.flow_labels.contains(UNTRUSTED_INPUT)),
+            "every experiment after the paper carries its label"
+        );
+        if at + 1 < inputs.len() {
+            sometimes!(true, "a paper taints a later experiment");
+        }
     }
     let mut last = f64::INFINITY;
     for input in &inputs {
@@ -432,13 +458,11 @@ async fn a_session_holds_its_invariants_under_signals_and_faults() {
     };
     env.simulation()
         .seeds(SEEDS)
-        .signal(
-            "hint",
-            json!({"text": "try a longer warmdown", "from": "human"}),
-        )
+        .signal("hint", json!({"text": "paper:warmdown", "from": "human"}))
         .signal("policy", serde_json::to_value(tighter).unwrap())
         .signal("stop", json!({"reason": "bed time"}))
         .faults(FaultPlan::new().transient("setup", 1, 2))
+        .require_reached("a paper taints a later experiment")
         .sweep(
             research_session_info().handler,
             serde_json::to_value(SessionInput {
@@ -465,6 +489,7 @@ async fn a_continued_session_finishes_from_its_carry() {
         hints: vec![autoresearch::workflows::Hint {
             text: "carried idea".into(),
             from: "human".into(),
+            labels: BTreeSet::new(),
         }],
         policy: KeepPolicy::default(),
         counts: Counts {
@@ -473,6 +498,7 @@ async fn a_continued_session_finishes_from_its_carry() {
             crashed: 1,
         },
         runs: 1,
+        flow_labels: BTreeSet::new(),
     };
     env.simulation()
         .seeds(SEEDS)
