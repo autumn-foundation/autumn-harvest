@@ -2635,8 +2635,8 @@ mod tests {
         let can = meta(crate::types::StartProvenance::continued_from(
             ExecutionId::new(),
         ));
-        assert!(key(&api) == key(&again));
-        assert!(key(&api) != key(&can));
+        assert_eq!(key(&api), key(&again));
+        assert_ne!(key(&api), key(&can));
     }
 
     #[tokio::test]
