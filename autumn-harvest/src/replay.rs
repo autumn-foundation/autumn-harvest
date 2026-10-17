@@ -1292,16 +1292,18 @@ impl HistoryMatcher {
         race_reserved_signal_events
     }
 
-    /// Returns the IDs of all updates that were admitted but have not completed or failed
-    /// up to the specified event index.
-    #[must_use]
-    pub fn unfinished_update_handlers_at_index(&self, index: usize) -> Vec<UpdateId> {
+    /// Returns the update ids admitted but not yet completed or failed, up to
+    /// the specified event index.
+    ///
+    /// `unfinished_update_handlers_at_index`, `unfinished_update_handler_count_at_index`
+    /// and `all_handlers_finished_at_index` each reshape this one scan.
+    fn active_update_handlers_at_index(&self, index: usize) -> HashSet<UpdateId> {
         let events_slice = &self.events[..index];
         let has_updates = events_slice
             .iter()
             .any(|event| matches!(event, WorkflowEvent::UpdateAdmitted { .. }));
         if !has_updates {
-            return Vec::new();
+            return HashSet::new();
         }
 
         let mut active = HashSet::new();
@@ -1317,7 +1319,16 @@ impl HistoryMatcher {
                 _ => {}
             }
         }
-        active.into_iter().collect()
+        active
+    }
+
+    /// Returns the IDs of all updates that were admitted but have not completed or failed
+    /// up to the specified event index.
+    #[must_use]
+    pub fn unfinished_update_handlers_at_index(&self, index: usize) -> Vec<UpdateId> {
+        self.active_update_handlers_at_index(index)
+            .into_iter()
+            .collect()
     }
 
     /// Returns the IDs of all updates that were admitted but have not completed or failed.
@@ -1335,28 +1346,7 @@ impl HistoryMatcher {
     /// Returns the number of unfinished update handlers up to the specified index.
     #[must_use]
     pub fn unfinished_update_handler_count_at_index(&self, index: usize) -> usize {
-        let events_slice = &self.events[..index];
-        let has_updates = events_slice
-            .iter()
-            .any(|event| matches!(event, WorkflowEvent::UpdateAdmitted { .. }));
-        if !has_updates {
-            return 0;
-        }
-
-        let mut active = HashSet::new();
-        for event in events_slice {
-            match event {
-                WorkflowEvent::UpdateAdmitted { update_id, .. } => {
-                    active.insert(*update_id);
-                }
-                WorkflowEvent::UpdateCompleted { update_id, .. }
-                | WorkflowEvent::UpdateFailed { update_id, .. } => {
-                    active.remove(update_id);
-                }
-                _ => {}
-            }
-        }
-        active.len()
+        self.active_update_handlers_at_index(index).len()
     }
 
     /// Returns the number of unfinished update handlers.
@@ -1374,28 +1364,7 @@ impl HistoryMatcher {
     /// Returns `true` if all admitted update handlers have completed or failed up to the specified index.
     #[must_use]
     pub fn all_handlers_finished_at_index(&self, index: usize) -> bool {
-        let events_slice = &self.events[..index];
-        let has_updates = events_slice
-            .iter()
-            .any(|event| matches!(event, WorkflowEvent::UpdateAdmitted { .. }));
-        if !has_updates {
-            return true;
-        }
-
-        let mut active = HashSet::new();
-        for event in events_slice {
-            match event {
-                WorkflowEvent::UpdateAdmitted { update_id, .. } => {
-                    active.insert(*update_id);
-                }
-                WorkflowEvent::UpdateCompleted { update_id, .. }
-                | WorkflowEvent::UpdateFailed { update_id, .. } => {
-                    active.remove(update_id);
-                }
-                _ => {}
-            }
-        }
-        active.is_empty()
+        self.active_update_handlers_at_index(index).is_empty()
     }
 
     /// Returns `true` if all admitted update handlers have completed or failed.
