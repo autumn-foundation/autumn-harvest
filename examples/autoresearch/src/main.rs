@@ -81,7 +81,7 @@ struct ModelArgs {
 /// The options of a session.
 #[derive(Debug, clap::Args)]
 struct SessionArgs {
-    /// The run tag. The default is the date, such as `oct17`.
+    /// The run tag. The default is the date, such as `20261017`.
     #[arg(long)]
     tag: Option<String>,
     /// Experiments after the baseline. Zero runs until `stop`.
@@ -104,6 +104,10 @@ struct SessionArgs {
     /// The chance, in percent, of a bolder idea.
     #[arg(long, default_value_t = 10)]
     explore: u8,
+    /// Another environment variable to pass to the command trainer. Repeat
+    /// it for each name. The run gets a fixed list and these, nothing else.
+    #[arg(long = "pass-env", value_name = "NAME")]
+    pass_env: Vec<String>,
     /// A data directory that must exist, such as `~/.cache/autoresearch`.
     #[arg(long)]
     data_dir: Option<String>,
@@ -354,7 +358,20 @@ fn config(lab: &Lab, args: &SessionArgs, tag: String) -> SessionConfig {
         TrainerKind::Sim => TrainerSpec::Simulated {
             seconds: args.train_seconds,
         },
-        TrainerKind::Command => TrainerSpec::upstream(),
+        TrainerKind::Command => match TrainerSpec::upstream() {
+            TrainerSpec::Command {
+                program,
+                args: command,
+                timeout_secs,
+                ..
+            } => TrainerSpec::Command {
+                program,
+                args: command,
+                timeout_secs,
+                pass_env: args.pass_env.clone(),
+            },
+            simulated @ TrainerSpec::Simulated { .. } => simulated,
+        },
     };
     config.gpu.clone_from(&args.gpu);
     config.explore_percent = args.explore.min(100);
@@ -382,7 +399,7 @@ fn pick_session(
     // a night that crossed midnight.
     match runtime::running_sessions(rt)?.as_slice() {
         [] => {
-            let tag = chrono::Utc::now().format("%b%d").to_string().to_lowercase();
+            let tag = chrono::Utc::now().format("%Y%m%d").to_string();
             start_session(rt, lab, session, &tag)
         }
         [(exec, tag)] => {

@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::agent::{
     EDIT_TRAIN, READ_FILE, READ_PAPER, REPORTER_ROLE, REVIEWER, REVIEWER_ROLE, REWIND, SHOW_DIFF,
-    WATCHER_ROLE,
+    SUMMARY_MARKER, WATCHER_ROLE,
 };
 use crate::lab::{RESULTS, TRAIN};
 use crate::rules::Status;
@@ -191,7 +191,7 @@ pub fn respond(request: &ChatRequest) -> ChatResponse {
     } else if system.contains(WATCHER_ROLE) {
         watch(&done)
     } else if system.contains(REPORTER_ROLE) {
-        report(&done)
+        report(&input)
     } else if input.contains(FIX_MODE) {
         fix(&input, &done)
     } else {
@@ -530,27 +530,14 @@ fn watch(done: &[Exchange]) -> Reply {
     }
 }
 
-fn report(done: &[Exchange]) -> Reply {
-    if last(done, READ_FILE).is_none() {
-        return Reply::Calls(vec![(READ_FILE, json!({"path": "results.tsv"}))]);
-    }
-    let rows = rows_from(done).unwrap_or_default();
-    let kept: Vec<_> = rows.iter().filter(|r| r.status == Status::Keep).collect();
-    let best = kept.iter().min_by(|a, b| a.val_bpb.total_cmp(&b.val_bpb));
-    let best = best.map_or_else(
-        || "No run was kept.".to_string(),
-        |r| {
-            format!(
-                "Best val_bpb {:.6} at {} ({}).",
-                r.val_bpb, r.commit, r.description
-            )
-        },
-    );
-    Reply::Text(format!(
-        "Morning report: {} runs, {} kept. {best}",
-        rows.len(),
-        kept.len()
-    ))
+/// The morning report: the summary line of the task, as the session wrote
+/// it. The reporter reads no file.
+fn report(input: &str) -> Reply {
+    let summary = input
+        .lines()
+        .find_map(|line| line.strip_prefix(SUMMARY_MARKER))
+        .unwrap_or("the session left no summary.");
+    Reply::Text(format!("Morning report: {summary}"))
 }
 
 #[cfg(test)]
@@ -880,18 +867,18 @@ mod tests {
     }
 
     #[test]
-    fn the_reporter_names_the_best_result() {
-        let tsv = "commit\tval_bpb\tmemory_gb\tstatus\tdescription\n\
-                   a1b2c3d\t0.997900\t44.0\tkeep\tbaseline\n\
-                   b2c3d4e\t0.993200\t44.2\tkeep\traise MATRIX_LR: 0.04 -> 0.05\n\
-                   c3d4e5f\t1.005000\t44.0\tdiscard\tdeeper\n";
-        let mut chat = Chat::new(REPORTER_ROLE, "Write the morning report.");
-        let first = chat.answer();
-        chat.reply(&first, &[file(tsv)]);
+    fn the_reporter_reports_the_summary_of_its_own_session() {
+        let task = format!(
+            "The session autoresearch/t has ended.\n{SUMMARY_MARKER}3 experiments, 2 kept, \
+             best val_bpb 0.993200 at b2c3d4e."
+        );
+        let chat = Chat::new(REPORTER_ROLE, &task);
         let report = text(&chat.answer());
-        assert!(report.contains("0.993200"), "{report}");
-        assert!(report.contains("b2c3d4e"));
-        assert!(report.contains("3 runs"), "{report}");
+        assert!(
+            report.starts_with("Morning report: 3 experiments"),
+            "{report}"
+        );
+        assert!(report.contains("0.993200 at b2c3d4e"), "{report}");
     }
 
     #[test]

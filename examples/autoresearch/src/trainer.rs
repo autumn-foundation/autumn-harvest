@@ -38,8 +38,43 @@ pub const TAIL_BYTES: u64 = 16 * 1024;
 /// the process group of the run in flight.
 pub const TRAINER_LOCK: &str = "trainer.lock";
 
-/// Parts of an environment variable name that mark a secret. The command
-/// trainer does not pass such a variable to the run.
+/// The environment variables that a training run gets.
+///
+/// The list holds the shell basics, the locale, and the settings of CUDA,
+/// `PyTorch`, Python, uv and Hugging Face. An entry that ends in `_` is a
+/// prefix, and so is `PYTHON`. The run gets nothing else, so a secret such
+/// as a database URL stays out of code that the model wrote.
+pub const PASSED_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LANGUAGE",
+    "TZ",
+    "TERM",
+    "TMPDIR",
+    "LD_LIBRARY_PATH",
+    "VIRTUAL_ENV",
+    "SYSTEMROOT",
+    "LC_",
+    "XDG_",
+    "CUDA_",
+    "NVIDIA_",
+    "NCCL_",
+    "TORCH_",
+    "PYTORCH_",
+    "TRITON_",
+    "OMP_",
+    "MKL_",
+    "PYTHON",
+    "UV_",
+    "HF_",
+];
+
+/// Parts of a variable name that mark a secret. A variable of
+/// [`PASSED_ENV`] with such a name stays out too, such as `HF_TOKEN`.
 const SECRET_MARKS: &[&str] = &["API_KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"];
 
 /// The memory of one H100, in MB. A simulated run above it is out of memory.
@@ -64,6 +99,10 @@ pub enum TrainerSpec {
         args: Vec<String>,
         /// The run is killed after this many seconds.
         timeout_secs: u64,
+        /// More environment variables to pass to the run, by name. The
+        /// run gets [`PASSED_ENV`] and these, and nothing else.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pass_env: Vec<String>,
     },
 }
 
@@ -81,6 +120,7 @@ impl TrainerSpec {
             program: "uv".into(),
             args: vec!["run".into(), "train.py".into()],
             timeout_secs: 600,
+            pass_env: Vec::new(),
         }
     }
 }
@@ -407,11 +447,13 @@ pub async fn run(
             program,
             args,
             timeout_secs,
+            pass_env,
         } => {
             let run = Run {
                 program,
                 args,
                 timeout_secs: *timeout_secs,
+                pass_env,
                 lab,
                 state,
                 log_path: &log_path,
@@ -431,10 +473,21 @@ fn new_log(path: &Path) -> Result<(), String> {
     }
 }
 
-/// `true` for the name of an environment variable that holds a secret.
-fn is_secret(name: &str) -> bool {
+/// `true` when a training run gets the variable `name`: a name of
+/// [`PASSED_ENV`] that marks no secret, or a name that `extra` lists.
+fn passes(name: &str, extra: &[String]) -> bool {
+    if extra.iter().any(|e| e == name) {
+        return true;
+    }
     let upper = name.to_ascii_uppercase();
-    SECRET_MARKS.iter().any(|mark| upper.contains(mark))
+    let listed = PASSED_ENV.iter().any(|entry| {
+        if entry.ends_with('_') || *entry == "PYTHON" {
+            upper.starts_with(entry)
+        } else {
+            upper == *entry
+        }
+    });
+    listed && !SECRET_MARKS.iter().any(|mark| upper.contains(mark))
 }
 
 /// One command run.
@@ -442,6 +495,7 @@ struct Run<'a> {
     program: &'a str,
     args: &'a [String],
     timeout_secs: u64,
+    pass_env: &'a [String],
     lab: &'a Path,
     state: &'a Path,
     log_path: &'a Path,
@@ -456,6 +510,7 @@ async fn run_command(
         program,
         args,
         timeout_secs,
+        pass_env,
         lab,
         state,
         log_path,
@@ -478,9 +533,10 @@ async fn run_command(
         .stdout(log)
         .stderr(errors)
         .kill_on_drop(true);
-    for (name, _) in std::env::vars_os() {
-        if is_secret(&name.to_string_lossy()) {
-            command.env_remove(&name);
+    command.env_clear();
+    for (name, value) in std::env::vars_os() {
+        if passes(&name.to_string_lossy(), pass_env) {
+            command.env(name, value);
         }
     }
     // A new process group, so a kill reaches the children of the run too.
@@ -814,6 +870,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
                     .into(),
             ],
             timeout_secs: 30,
+            pass_env: Vec::new(),
         };
         let run = run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
         assert_eq!(run.exit_code, Some(0));
@@ -829,6 +886,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             program: "sh".into(),
             args: vec!["-c".into(), "echo started; sleep 30".into()],
             timeout_secs: 1,
+            pass_env: Vec::new(),
         };
         let started = std::time::Instant::now();
         let run = run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
@@ -848,6 +906,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             program: "sh".into(),
             args: vec!["-c".into(), script],
             timeout_secs: 1,
+            pass_env: Vec::new(),
         };
         let run = run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
         assert!(run.timed_out);
@@ -865,6 +924,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             program: "sh".into(),
             args: vec!["-c".into(), script],
             timeout_secs: 60,
+            pass_env: Vec::new(),
         };
         // The runner drops the activity, as Ctrl-C does.
         let dropped = tokio::time::timeout(
@@ -907,6 +967,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             program: "sh".into(),
             args: vec!["-c".into(), "echo fresh".into()],
             timeout_secs: 30,
+            pass_env: Vec::new(),
         };
         let fresh = run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
         assert_eq!(fresh.exit_code, Some(0));
@@ -930,18 +991,30 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
     }
 
     #[test]
-    fn secrets_stay_out_of_the_run() {
+    fn a_run_gets_only_the_listed_environment() {
+        let none: [String; 0] = [];
+        for name in [
+            "PATH",
+            "HOME",
+            "LC_ALL",
+            "CUDA_VISIBLE_DEVICES",
+            "UV_CACHE_DIR",
+            "PYTHONPATH",
+        ] {
+            assert!(passes(name, &none), "{name}");
+        }
         for name in [
             "ANTHROPIC_API_KEY",
+            "DATABASE_URL",
+            "REDIS_URL",
+            "AWS_ACCESS_KEY_ID",
             "HF_TOKEN",
-            "aws_secret_access_key",
-            "DB_PASSWORD",
+            "UV_PUBLISH_TOKEN",
         ] {
-            assert!(is_secret(name), "{name}");
+            assert!(!passes(name, &none), "{name}");
         }
-        for name in ["PATH", "HOME", "CUDA_VISIBLE_DEVICES", "UV_CACHE_DIR"] {
-            assert!(!is_secret(name), "{name}");
-        }
+        // A person can pass a variable by name.
+        assert!(passes("DATABASE_URL", &["DATABASE_URL".to_string()]));
     }
 
     #[test]
@@ -964,6 +1037,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             program: "autoresearch-no-such-program".into(),
             args: Vec::new(),
             timeout_secs: 5,
+            pass_env: Vec::new(),
         };
         assert!(run(&spec, dir.path(), dir.path(), |_| {}).await.is_err());
     }

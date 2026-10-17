@@ -373,6 +373,7 @@ mod tests {
                 program: "sh".into(),
                 args: vec!["-c".into(), script],
                 timeout_secs: 30,
+                pass_env: Vec::new(),
             },
             commit: lab.head().unwrap(),
         };

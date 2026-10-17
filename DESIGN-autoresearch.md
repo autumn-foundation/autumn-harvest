@@ -90,7 +90,10 @@ The crate is `examples/autoresearch`. The guide is its `README.md`.
 | R16 | Two sessions share one lab, and one commits or resets on the branch of the other. | A mutex per lab for each experiment. Each write step names its branch and refuses another one. |
 | R17 | A training run outlives its runner and shares the GPU with the next run. | The process group dies on every exit path. A lock file finds a group that a dead runner left, and the next run kills it. |
 | R18 | A tool call or an activity runs again after a crash and writes twice. | Each write is keyed: a commit by its trailer, an edit by its tool call, a row and a run by the activity idempotency key. |
-| R19 | Code that the model wrote reads the API key or plants a git hook. | The run gets no secret variable. Git runs with hooks off. The README says that the command trainer is not a sandbox. |
+| R19 | Code that the model wrote reads a secret or plants a git hook. | The run gets a fixed list of environment variables, and more only by name. Git runs with hooks off. The README says that the command trainer is not a sandbox. |
+| R22 | A heartbeat tick fails, and its crash rows are never checked again. | The precheck reads and writes nothing. Only a delivered alert marks the rows. |
+| R23 | The morning report counts the rows of another session in the lab. | The report reads the session's own summary, not `results.tsv`. |
+| R24 | A nightly tag repeats a year later and reuses the old branch. | A derived tag holds the year. |
 | R20 | `hint` or `stop` misses a nightly session, and the command is lost. | Commands find a session by tag. A command that can never land moves to `inbox/rejected`. |
 | R21 | The Claude model drops thinking blocks in a tool loop. | The model keeps each raw turn by hash and sends it back unchanged. |
 
@@ -135,7 +138,7 @@ schedule "0 23 * * *" ─► research_session  (parent, continue-as-new every N)
                           │     └─ activity record (results.tsv)
                           ├─► signal_external_workflow_by_id: sibling sessions
                           └─► detached agent_loop: the morning report
-schedule every 30m ─► agent_heartbeat (precheck: new rows) ─► delivery
+schedule every 30m ─► agent_heartbeat (precheck: a new crash streak) ─► delivery
 ```
 
 The keep rule is one pure function. With `gain = best - val_bpb` and
@@ -170,7 +173,7 @@ over 0.002. Equal or worse is a discard, as upstream.
 | AC12 | A kept idea reaches sibling sessions through an external signal by workflow id. An unknown sibling does not fail the session. |
 | AC13 | Each session has search attributes (`tag`, `phase`, `experiments`, `best_bpb`, `best_commit`) and a memo. `status` lists the sessions with their tags. |
 | AC14 | A nightly schedule starts a session. A heartbeat agent with a precheck delivers a report only when it has something to say. |
-| AC15 | A detached agent child writes the morning report when a session ends. |
+| AC15 | A detached agent child writes the morning report of the session, from the session's own summary, when it ends. |
 | AC16 | A restart mid-session resumes by replay. No completed model call or training run runs again. |
 | AC17 | Every SQLite history of the example replays on the core `WorkflowReplayer`. |
 | AC18 | DST: seeded sweeps of `experiment` and `research_session` hold the invariants under reordering, faults, crashes, signals and replay. Each `sometimes!` target is reached. |
@@ -243,8 +246,8 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC11 | `e2e::the_session_continues_as_new_and_carries_its_best`: three runs, the carried count and best. `sim::a_session_hands_off_its_carry_past_a_failed_experiment`: the count, the best, each hint and the labels. `sim::a_continued_session_finishes_from_its_carry`. |
 | AC12 | `e2e::two_sessions_share_one_gpu_and_a_kept_idea`: the hint reaches B, and the unknown sibling fails only its own signal. |
 | AC13 | `e2e::a_night_of_research_keeps_only_improvements`: the attributes, the memo, and a list by the `tag` attribute. |
-| AC14 | `e2e::the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up`. `stores::tests::the_precheck_runs_a_tick_only_for_new_rows`. |
-| AC15 | `e2e::a_finished_night_leaves_a_morning_report`. |
+| AC14 | `e2e::the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up`. `stores::tests::the_precheck_runs_a_tick_only_for_a_new_crash_streak`. |
+| AC15 | `e2e::a_finished_night_leaves_a_morning_report`, `scripted::tests::the_reporter_reports_the_summary_of_its_own_session`. |
 | AC16 | `e2e::a_restart_resumes_without_paying_for_a_turn_or_a_run_twice`: the model calls and the trainings across two processes equal one process. |
 | AC17 | `e2e::a_night_of_research_keeps_only_improvements` and `e2e::the_session_continues_as_new_and_carries_its_best` run `verify`. The CI demo runs `verify`. |
 | AC18 | `sim::*`: eight sweeps. Each seed runs twice, replays, and runs again with a crash. Each target is required. |

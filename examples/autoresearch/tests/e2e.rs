@@ -580,7 +580,7 @@ async fn the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up() {
         panic!("the scheduled night did not complete");
     };
     let report: SessionReport = serde_json::from_value(output).unwrap();
-    assert_eq!(report.tag, "oct17-2300");
+    assert_eq!(report.tag, "20261017-2300");
 
     // A tick with nothing wrong stays silent. The interval counts from the
     // last fire, so the ticks land at 23:31 and at 00:02.
@@ -685,7 +685,8 @@ async fn the_response_cache_serves_an_identical_report_turn() {
     run_to_end(&mut rt, exec).await;
 
     // AC20: two report runs over the same results send the same requests.
-    let task: AgentTask = agent::report_task(&fx.lab().root().display().to_string(), "cache");
+    let lab = fx.lab().root().display().to_string();
+    let task: AgentTask = agent::report_task(&lab, "cache", "1 experiments, 1 kept");
     let first = sqlite::start(&mut rt, &task).unwrap();
     rt.run_until_blocked(first).await.unwrap();
     let calls = model.calls();
@@ -759,6 +760,7 @@ async fn the_command_trainer_runs_a_real_command_per_commit() {
                 .into(),
         ],
         timeout_secs: 30,
+        pass_env: Vec::new(),
     };
     let exec = runtime::start(&mut rt, &config).unwrap();
     run_to_end(&mut rt, exec).await;
@@ -960,11 +962,13 @@ async fn a_nightly_session_takes_commands_by_its_tag() {
     let night = drive_a_little(&mut rt, first).await;
 
     // AC30: the engine picked the workflow id, and the tag still reaches it.
-    let (found, id) = runtime::find_session(&rt, "oct17-2300").unwrap().unwrap();
+    let (found, id) = runtime::find_session(&rt, "20261017-2300")
+        .unwrap()
+        .unwrap();
     assert_eq!(found, night);
     assert!(!id.starts_with("autoresearch/"), "{id}");
     let stop = Command::Stop {
-        tag: "oct17-2300".into(),
+        tag: "20261017-2300".into(),
         reason: "morning".into(),
     };
     runtime::apply(&mut rt, "s1", &stop).unwrap();

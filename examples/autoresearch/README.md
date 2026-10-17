@@ -63,7 +63,7 @@ kept commits only. `results.tsv` and a morning report sit in the lab.
 | Fix a dumb crash, or log `crash` | One fix proposal as a child `agent_loop`, then a `crash` row. |
 | `results.tsv`, untracked | The `record` activity appends one row per experiment, keyed on its idempotency key. Git excludes the file. |
 | NEVER STOP | `continue_as_new` every N experiments, so the history stays small. A `stop` signal ends the night. |
-| "You wake up to a log of experiments" | A nightly schedule, a detached report agent, and a heartbeat that speaks only on trouble. |
+| "You wake up to a log of experiments" | A nightly schedule, a detached report agent with the session's own summary, and a heartbeat that speaks only on trouble. |
 | Several GPUs, several branches | A workflow mutex per GPU. A kept idea goes to sibling sessions as a signal. |
 | Rewind "very very sparingly" | The `rewind` tool waits for a person's approval. It only goes back along the branch. |
 | The simplicity criterion | The keep rule charges each added line. A `reviewer` peer reads each diff. |
@@ -132,7 +132,12 @@ cargo run -p autoresearch -- stop --lab /tmp/ar-lab --tag demo
 ```
 
 The commands find a running session by its tag. A nightly session gets a tag
-from its start time, such as `oct17-2300`, and `status` prints it.
+from its start time, such as `20261017-2300`, and `status` prints it. The
+year keeps the night of a later year off an old branch.
+
+The heartbeat runs a model call only for a new streak of three crashes. Its
+check reads the rows and writes nothing. Only a delivered alert marks the
+rows, so a tick that fails leaves them for the next tick.
 
 A hint of the form `paper:<name>` makes the agent read `papers/<name>.md`.
 That text comes from outside the lab, so a flow rule makes the next edit wait
@@ -236,10 +241,12 @@ experiment set the search attribute `status`, which the engine reserves.
   on a fixed landscape, so the loop is testable offline.
 - **The scripted researcher is not Claude.** It tries a fixed list of ideas.
 - **The command trainer is not a sandbox.** It runs code that the model wrote,
-  as your user. It gets no environment variable that looks like a secret,
-  and git runs with hooks off. The code can still read your files, write
-  `.git` and `.autoresearch`, and escape the kill with `setsid`. Run it in a
-  container, or as a user with no other rights.
+  as your user. Its environment is a fixed list. The list holds the shell
+  basics, the locale, and the CUDA, PyTorch, Python, uv and Hugging Face
+  settings. A name that looks like a secret stays out. Pass another with
+  `--pass-env NAME`. Git runs with hooks off. The code can still read your
+  files, write `.git` and `.autoresearch`, and escape the kill with
+  `setsid`. Run it in a container, or as a user with no other rights.
 - **The score is what `train.py` prints.** As upstream, the last `val_bpb:`
   line counts. An edit can print a false score. Read each kept diff.
 - **Activity inputs are trusted.** The lab path and the trainer command come

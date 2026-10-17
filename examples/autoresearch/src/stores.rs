@@ -14,7 +14,7 @@ use autumn_harvest::payload_store::{PayloadStore, PayloadStoreError, PayloadStor
 use autumn_harvest_agent::memory::{MemoryOp, apply_op};
 use autumn_harvest_agent::{
     AgentError, BoxFuture, Delivery, EditKey, ErrorKind, HeartbeatTask, MemoryBlock, MemoryScope,
-    MemoryStore, Precheck, Report, SessionId,
+    MemoryStore, Precheck, Report, ReportSource, SessionId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -204,7 +204,13 @@ impl FileDelivery {
             report.stop,
             report.text.trim()
         );
-        write_atomic(&path, text.as_bytes()).map_err(|e| AgentError::new(ErrorKind::Unavailable, e))
+        write_atomic(&path, text.as_bytes())
+            .map_err(|e| AgentError::new(ErrorKind::Unavailable, e))?;
+        // A heartbeat speaks only to alert, so the alert holds these rows.
+        if report.source == ReportSource::Heartbeat {
+            mark_alerted(lab).map_err(|e| AgentError::new(ErrorKind::Unavailable, e))?;
+        }
+        Ok(())
     }
 }
 
@@ -214,12 +220,24 @@ impl Delivery for FileDelivery {
     }
 }
 
-/// A [`Precheck`] that runs a heartbeat tick only when `results.tsv` has
-/// rows that the last tick did not see.
+/// A [`Precheck`] that runs a heartbeat tick only when the newest
+/// [`CRASH_STREAK`] rows of `results.tsv` are crashes, and no alert holds the
+/// newest row yet.
+///
+/// The check is a pure read, as the [`Precheck`] contract asks. The mark
+/// moves only when [`FileDelivery`] delivers a heartbeat alert. So a tick
+/// whose model call fails leaves the rows for the next tick.
 #[derive(Debug, Clone)]
 pub struct ResultsPrecheck {
     labs: Arc<Vec<Lab>>,
 }
+
+/// The crashes in a row that a heartbeat speaks up about.
+pub const CRASH_STREAK: usize = 3;
+
+/// The file in the state directory that holds the row count at the last
+/// delivered heartbeat alert.
+const ALERTED: &str = "heartbeat.alerted";
 
 impl ResultsPrecheck {
     /// A precheck for `labs`.
@@ -230,8 +248,8 @@ impl ResultsPrecheck {
         }
     }
 
-    /// Compare the rows with the count that the last tick saw, and store
-    /// the new count. An unreadable lab skips the tick.
+    /// `true` when a new crash streak waits for an alert. An unreadable lab
+    /// skips the tick.
     fn check(&self, task: &HeartbeatTask) -> bool {
         let session = task.session_id.as_ref().map(SessionId::as_str);
         let Some(lab) = Lab::serving(&self.labs, session) else {
@@ -240,16 +258,24 @@ impl ResultsPrecheck {
         let (Ok(rows), Ok(state)) = (lab.rows(), lab.state_dir()) else {
             return false;
         };
-        let seen_path = state.join("heartbeat.seen");
-        let seen: usize = std::fs::read_to_string(&seen_path)
+        let alerted: usize = std::fs::read_to_string(state.join(ALERTED))
             .ok()
             .and_then(|text| text.trim().parse().ok())
             .unwrap_or(0);
-        if rows.len() <= seen {
-            return false;
-        }
-        write_atomic(&seen_path, rows.len().to_string().as_bytes()).is_ok()
+        let streak = rows.len() >= CRASH_STREAK
+            && rows
+                .iter()
+                .rev()
+                .take(CRASH_STREAK)
+                .all(|row| row.status == crate::rules::Status::Crash);
+        streak && rows.len() > alerted
     }
+}
+
+/// Record that a heartbeat alert holds the rows of `lab` up to now.
+fn mark_alerted(lab: &Lab) -> Result<(), String> {
+    let rows = lab.rows()?.len();
+    write_atomic(&lab.state_dir()?.join(ALERTED), rows.to_string().as_bytes())
 }
 
 impl Precheck for ResultsPrecheck {
@@ -461,25 +487,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_precheck_runs_a_tick_only_for_new_rows() {
+    async fn the_precheck_runs_a_tick_only_for_a_new_crash_streak() {
         let dir = tempfile::tempdir().unwrap();
         let lab = Lab::init(dir.path().join("lab")).unwrap();
         let precheck = ResultsPrecheck::new(vec![lab.clone()]);
         let tick = crate::agent::heartbeat_task(lab.root());
-        assert!(!precheck.should_run(&tick).await, "no rows yet");
-        lab.record(
-            &ResultRow {
+        let row = |status: Status, key: &str| {
+            let row = ResultRow {
                 commit: "aaaaaaa".into(),
                 val_bpb: 1.0,
                 memory_gb: 1.0,
-                status: Status::Keep,
-                description: "baseline".into(),
-            },
-            "k1",
-        )
-        .unwrap();
-        assert!(precheck.should_run(&tick).await, "a new row");
-        assert!(!precheck.should_run(&tick).await, "the same rows");
+                status,
+                description: key.into(),
+            };
+            lab.record(&row, key).unwrap();
+        };
+        assert!(!precheck.should_run(&tick).await, "no rows yet");
+        row(Status::Keep, "k1");
+        for key in ["c1", "c2"] {
+            row(Status::Crash, key);
+        }
+        assert!(!precheck.should_run(&tick).await, "two crashes");
+        row(Status::Crash, "c3");
+        assert!(precheck.should_run(&tick).await, "three crashes");
+        // The check has no side effect: a tick that failed runs again.
+        assert!(
+            precheck.should_run(&tick).await,
+            "the same streak, no alert yet"
+        );
+        let alert = Report {
+            source: ReportSource::Heartbeat,
+            ..report(&lab, 0)
+        };
+        FileDelivery::new(vec![lab.clone()])
+            .deliver(&alert)
+            .await
+            .unwrap();
+        assert!(
+            !precheck.should_run(&tick).await,
+            "the alert holds the rows"
+        );
+        row(Status::Crash, "c4");
+        assert!(
+            precheck.should_run(&tick).await,
+            "a new crash in the streak"
+        );
     }
 
     #[tokio::test]

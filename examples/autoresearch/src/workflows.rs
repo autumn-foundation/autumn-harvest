@@ -92,7 +92,8 @@ impl Default for AgentSettings {
 pub struct SessionConfig {
     /// The lab path.
     pub lab: String,
-    /// The run tag. Empty means "derive it from the start time".
+    /// The run tag. Empty means "derive it from the start time", such as
+    /// `20261017-2300`.
     pub tag: String,
     /// The GPU that the session trains on. It names the mutex.
     pub gpu: String,
@@ -400,7 +401,7 @@ pub async fn research_session(
     show(&view, &carry, "done");
     publish(ctx, &carry, "done")?;
     let report_run = if config.report {
-        let task = report_task(&config.lab, &carry.tag);
+        let task = report_task(&config.lab, &carry.tag, &summary(&carry));
         let run = ctx
             .spawn_child_workflow_detached(&agent_loop_info(), &task, ParentClosePolicy::Abandon)
             .map_err(|e| format!("cannot start the report agent: {e}"))?;
@@ -425,8 +426,10 @@ async fn first_run(
     config: &SessionConfig,
     view: &Arc<Mutex<StatusView>>,
 ) -> Result<Carry, String> {
+    // A derived tag holds the year, so a nightly slot never meets the branch
+    // of the same slot a year before.
     let tag = if config.tag.trim().is_empty() {
-        ctx.now().format("%b%d-%H%M").to_string().to_lowercase()
+        ctx.now().format("%Y%m%d-%H%M").to_string()
     } else {
         config.tag.clone()
     };
@@ -1148,6 +1151,24 @@ async fn finish(
         fixes,
         flow_labels: labels,
     })
+}
+
+/// The account of a finished session for its morning report. The first
+/// line holds the counts and the best result. The last rows follow.
+fn summary(carry: &Carry) -> String {
+    let Counts {
+        kept,
+        discarded,
+        crashed,
+    } = carry.counts;
+    format!(
+        "{} experiments, {kept} kept, {discarded} discarded, {crashed} crashed, \
+         best val_bpb {:.6} at {}.\n\nThe last rows of the session:\n\n{}",
+        carry.done,
+        carry.best.val_bpb,
+        carry.best.commit,
+        table(&carry.recent)
+    )
 }
 
 /// The first line of an agent answer, cut to 200 characters.

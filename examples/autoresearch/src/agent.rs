@@ -70,8 +70,12 @@ three runs in a row crashed.";
 
 /// The system prompt of the morning report writer.
 const REPORTER_SYSTEM: &str = "ROLE: reporter\n\
-You write the morning report of one night of research. Read results.tsv. \
-Name the number of experiments, the kept ones and the best result.";
+You write the morning report of one night of research from the summary in \
+the task. Name the number of experiments, the kept ones and the best result. \
+results.tsv also holds the rows of other sessions, so do not use it.";
+
+/// The line of a report task that starts the session summary.
+pub const SUMMARY_MARKER: &str = "SUMMARY: ";
 
 /// The parts that a harness needs beside the model.
 #[derive(Debug, Clone)]
@@ -269,10 +273,14 @@ pub fn heartbeat_task(lab: &Path) -> HeartbeatTask {
 }
 
 /// The detached agent that writes the morning report of a session.
+///
+/// `summary` is the session's own account: its counts, its best result and
+/// its last rows. Another session can share the lab and its `results.tsv`,
+/// so the report reads the summary, not the file.
 #[must_use]
-pub fn report_task(lab: &str, tag: &str) -> AgentTask {
+pub fn report_task(lab: &str, tag: &str, summary: &str) -> AgentTask {
     AgentTask::new(format!(
-        "The session {}{tag} has ended. Write the morning report.",
+        "The session {}{tag} has ended. Write the morning report.\n{SUMMARY_MARKER}{summary}",
         crate::lab::BRANCH_PREFIX
     ))
     .system(REPORTER_SYSTEM)
@@ -462,7 +470,7 @@ mod tests {
 
     #[test]
     fn the_report_and_heartbeat_tasks_are_read_only_and_name_their_lab() {
-        let task = report_task("/labs/a", "oct17");
+        let task = report_task("/labs/a", "oct17", "2 experiments, 1 kept");
         assert!(task.read_only && task.deliver);
         assert_eq!(task.session_id.unwrap().as_str(), "/labs/a");
         let tick = heartbeat_task(Path::new("/labs/a"));
