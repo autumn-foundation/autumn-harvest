@@ -2,13 +2,14 @@
 //!
 //! - Each command kind that `SQLite` accepts has a scenario that compares it
 //!   with Postgres.
-//! - Each command kind that `SQLite` rejects has a rejection scenario.
+//! - Each command kind that `SQLite` rejects has a rejection scenario. So
+//!   does each kind that it rejects when the last cycle does not await it.
 //! - Each named rejection in the `SQLite` source has a rejection scenario, or
 //!   a reason in [`UNREACHABLE_REJECTIONS`].
 
 use std::collections::BTreeSet;
 
-use crate::commands::{ALL, CommandKind, Support, support};
+use crate::commands::{ALL, CommandKind, REJECTED_IN_LAST_CYCLE, Support, support};
 use crate::scenario::Expect;
 
 /// The `SQLite` runtime source. Its rejection messages name each feature.
@@ -45,7 +46,9 @@ fn named_rejections() -> BTreeSet<String> {
         let name = &rest[..dash];
         let valid = !name.is_empty()
             && name.chars().next().is_some_and(char::is_uppercase)
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_');
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_');
         if valid {
             out.insert(name.to_owned());
         }
@@ -83,7 +86,7 @@ fn every_accepted_command_has_a_conformance_scenario() {
     let missing: Vec<CommandKind> = ALL
         .iter()
         .copied()
-        .filter(|k| matches!(support(*k), Support::Accepted { .. }) && !covered.contains(k))
+        .filter(|k| support(*k) == Support::Accepted && !covered.contains(k))
         .collect();
     assert!(
         missing.is_empty(),
@@ -98,7 +101,7 @@ fn every_rejected_command_has_a_rejection_scenario() {
         .iter()
         .copied()
         .filter(|k| {
-            matches!(support(*k), Support::Rejected)
+            (support(*k) == Support::Rejected || REJECTED_IN_LAST_CYCLE.contains(k))
                 && !rejected.contains(format!("{k:?}").as_str())
         })
         .collect();
@@ -119,8 +122,7 @@ fn every_named_rejection_has_a_scenario_or_a_reason() {
     let missing: Vec<&String> = named
         .iter()
         .filter(|n| {
-            !rejected.contains(n.as_str())
-                && !UNREACHABLE_REJECTIONS.iter().any(|(u, _)| u == n)
+            !rejected.contains(n.as_str()) && !UNREACHABLE_REJECTIONS.iter().any(|(u, _)| u == n)
         })
         .collect();
     assert!(
@@ -140,4 +142,36 @@ fn every_scenario_name_is_unique() {
     let names: Vec<&str> = crate::scenarios().iter().map(|(n, _)| *n).collect();
     let unique: BTreeSet<&str> = names.iter().copied().collect();
     assert_eq!(names.len(), unique.len(), "two scenarios share a name");
+}
+
+/// The body of `persist_terminal_pending_commands` in the `SQLite` runtime.
+fn terminal_drain_source() -> &'static str {
+    let start = SQLITE_RUNTIME
+        .find("fn persist_terminal_pending_commands")
+        .expect("the terminal drain exists");
+    let rest = &SQLITE_RUNTIME[start..];
+    let end = rest.find("\n}\n").expect("the terminal drain ends");
+    &rest[..end]
+}
+
+#[test]
+fn the_last_cycle_rejection_list_matches_the_terminal_drain() {
+    let body = terminal_drain_source();
+    for kind in ALL
+        .iter()
+        .copied()
+        .filter(|k| support(*k) == Support::Accepted)
+    {
+        let arm = format!("WorkflowCommand::{kind:?}");
+        // The executor turns a continue-as-new into an outcome, so the drain
+        // never sees the command.
+        let outcome = kind == CommandKind::ContinueAsNew;
+        let listed = REJECTED_IN_LAST_CYCLE.contains(&kind);
+        assert!(
+            outcome || body.contains(&arm) != listed,
+            "{kind:?}: the terminal drain {} an arm for it, but REJECTED_IN_LAST_CYCLE {} it",
+            if body.contains(&arm) { "has" } else { "has no" },
+            if listed { "lists" } else { "does not list" },
+        );
+    }
 }

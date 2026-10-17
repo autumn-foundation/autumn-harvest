@@ -346,12 +346,13 @@
 //! `WorkflowCommand` variant is a compile error in this backend, forcing an
 //! explicit supported / unsupported decision rather than a silent `"Unknown"`.
 //!
-//! Six commands append no `WorkflowEvent` and gate no control flow:
-//! `SetCurrentDetails` (issue #593), `PublishProgress`,
-//! `PublishDurableProgress`, `RecordLog`, a re-park `WaitForActivity` and
-//! `WaitForSignal`. Postgres appends no event for them either. The cycle-start
-//! ingest records a signal, not the wait. The cross-backend conformance suite
-//! (issue #2030) checks each one against Postgres.
+//! Six commands append no `WorkflowEvent`: `SetCurrentDetails`
+//! (`ctx.set_current_details`, the operator status breadcrumb, issue #593),
+//! `PublishProgress`, `PublishDurableProgress`, `RecordLog`, a re-park
+//! `WaitForActivity` and `WaitForSignal`. Postgres appends no event for them
+//! either. `WaitForSignal` only names the wait. The cycle-start ingest
+//! records the signal. The cross-backend conformance suite (issue #2030)
+//! checks each one against Postgres.
 //!
 //! **No `ScheduleActivity` field is silently dropped** (issue #1069 P2). Every
 //! author-declared field on the core `ScheduleActivity` command is either HONORED

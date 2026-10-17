@@ -1,9 +1,12 @@
 //! Runs one scenario on both backends and checks the conformance rules.
 
+use std::collections::BTreeSet;
+
+use autumn_harvest::debugger::ReplayDebugger;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 
-use crate::commands::{Support, support};
+use crate::commands::NOT_SEEN_IN_REPLAY;
 use crate::compare::{Execution, Outcome, Run, differences, event_type};
 use crate::scenario::{Expect, Scenario};
 use crate::{pg, sqlite};
@@ -23,7 +26,7 @@ async fn check_same(scenario: &Scenario) {
     let mut problems = differences(&pg, &sqlite);
     problems.extend(replay_problems(scenario, &pg, &sqlite).await);
     for (backend, run) in [("postgres", &pg), ("sqlite", &sqlite)] {
-        problems.extend(witness_problems(scenario, backend, run));
+        problems.extend(coverage_problems(scenario, backend, run).await);
     }
     assert!(
         problems.is_empty(),
@@ -35,8 +38,7 @@ async fn check_same(scenario: &Scenario) {
 
 /// The replay verdict of one history on the core `WorkflowReplayer`.
 ///
-/// The verdict leaves out the execution id and the event index text, so two
-/// backends can compare it.
+/// The verdict leaves out the execution id, so two backends can compare it.
 async fn verdict(scenario: &Scenario, execution: &Execution) -> String {
     let infos = (scenario.workflows)()
         .into_iter()
@@ -47,12 +49,20 @@ async fn verdict(scenario: &Scenario, execution: &Execution) -> String {
         .updates((scenario.updates)())
         .replay_from_events(execution.events.clone())
         .await;
-    match &report.status {
+    match report.status {
         ReplayStatus::ReplaySucceeded => "ReplaySucceeded".to_owned(),
-        ReplayStatus::NonDeterminismDetected { kind, .. } => {
-            format!("NonDeterminismDetected({kind}): {report}")
+        ReplayStatus::NonDeterminismDetected {
+            kind,
+            expected,
+            actual,
+            event_index,
+        } => format!(
+            "NonDeterminismDetected kind={kind} index={event_index} \
+             expected={expected} actual={actual}"
+        ),
+        ReplayStatus::WorkflowFailed { error, event_index } => {
+            format!("WorkflowFailed index={event_index} error={error}")
         }
-        ReplayStatus::WorkflowFailed { .. } => format!("WorkflowFailed: {report}"),
     }
 }
 
@@ -60,7 +70,7 @@ async fn verdict(scenario: &Scenario, execution: &Execution) -> String {
 ///
 /// The core replayer does not model either. It reports a mismatch at the
 /// `WorkflowCancelled` event on both backends.
-fn ends_by_operator(events: &[WorkflowEvent]) -> bool {
+const fn ends_by_operator(events: &[WorkflowEvent]) -> bool {
     matches!(events.last(), Some(WorkflowEvent::WorkflowCancelled { .. }))
 }
 
@@ -70,9 +80,8 @@ async fn replay_problems(scenario: &Scenario, pg: &Run, sqlite: &Run) -> Vec<Str
     let mut out = Vec::new();
     for (p, s) in pg.executions.iter().zip(&sqlite.executions) {
         let (pv, sv) = (verdict(scenario, p).await, verdict(scenario, s).await);
-        let kind = |v: &str| v.split(':').next().unwrap_or_default().to_owned();
         if ends_by_operator(&p.events) && ends_by_operator(&s.events) {
-            if kind(&pv) != kind(&sv) {
+            if pv != sv {
                 out.push(format!(
                     "{} replay verdicts differ: postgres {pv}, sqlite {sv}",
                     p.role
@@ -89,25 +98,63 @@ async fn replay_problems(scenario: &Scenario, pg: &Run, sqlite: &Run) -> Vec<Str
     out
 }
 
-/// Each covered command with a witness event must leave that event.
-fn witness_problems(scenario: &Scenario, backend: &str, run: &Run) -> Vec<String> {
-    let types: Vec<String> = run
-        .executions
-        .iter()
-        .flat_map(|e| e.events.iter().map(event_type))
-        .collect();
-    scenario
-        .covers
-        .iter()
-        .filter_map(|kind| match support(*kind) {
-            Support::Accepted {
-                witness: Some(event),
-            } if !types.iter().any(|t| t == event) => Some(format!(
+/// The command kinds that the code emits while it replays `execution`.
+///
+/// The debugger replays each prefix of the history and records the pending
+/// commands at each step. The kind names match [`crate::commands::CommandKind`].
+pub async fn observed_commands(scenario: &Scenario, execution: &Execution) -> BTreeSet<String> {
+    let Some(info) = (scenario.workflows)()
+        .into_iter()
+        .find(|i| i.name == execution.workflow)
+    else {
+        return BTreeSet::new();
+    };
+    let snapshot = serde_json::json!({
+        "workflow_name": execution.workflow,
+        "execution_id": uuid::Uuid::nil(),
+        "events": execution.events,
+    });
+    let trace = ReplayDebugger::new()
+        .register_fn(info.name, info.handler)
+        .updates((scenario.updates)())
+        .trace_json(&snapshot.to_string())
+        .await;
+    trace
+        .map(|t| {
+            t.steps
+                .iter()
+                .flat_map(|s| s.commands.iter().map(|c| c.kind.to_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Rule C1: the code emits each covered command on this backend.
+///
+/// The check replays every execution of the run with the debugger. A
+/// scenario cannot claim a command that its workflow never emits. A kind in
+/// [`NOT_SEEN_IN_REPLAY`] needs its event instead, if it has one.
+async fn coverage_problems(scenario: &Scenario, backend: &str, run: &Run) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut events = BTreeSet::new();
+    for execution in &run.executions {
+        seen.extend(observed_commands(scenario, execution).await);
+        events.extend(execution.events.iter().map(event_type));
+    }
+    let mut out = Vec::new();
+    for kind in scenario.covers {
+        let problem = match NOT_SEEN_IN_REPLAY.iter().find(|(k, _, _)| k == kind) {
+            Some((_, Some(event), _)) if !events.contains(*event) => Some(format!(
                 "{backend}: the scenario covers {kind:?}, but no {event} event is in its history"
             )),
+            None if !seen.contains(&format!("{kind:?}")) => Some(format!(
+                "{backend}: the scenario covers {kind:?}, but the code never emits it: {seen:?}"
+            )),
             _ => None,
-        })
-        .collect()
+        };
+        out.extend(problem);
+    }
+    out
 }
 
 async fn check_rejected(scenario: &Scenario, feature: &str) {
@@ -141,7 +188,7 @@ async fn check_rejected(scenario: &Scenario, feature: &str) {
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     assert!(
-        named.starts_with(feature),
+        named == feature,
         "scenario `{}`: the failure must name `{feature}`, but it names `{named}`: {error}",
         scenario.name
     );

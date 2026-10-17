@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
-use autumn_harvest::fan_out::FanOutOptions;
+use autumn_harvest::fan_out::{FanOutItem, FanOutOptions};
 use autumn_harvest::prelude::*;
 use autumn_harvest::types::ParentClosePolicy;
 use serde_json::{Value, json};
@@ -58,14 +58,25 @@ pub async fn broken(_ctx: &ActivityContext, _n: i64) -> Result<i64, String> {
 /// Fails once with a typed, non-retryable failure.
 #[activity(retry = RetryPolicy::fixed(3, Duration::ZERO))]
 pub async fn declined(_ctx: &ActivityContext, _n: i64) -> Result<i64, String> {
-    Err(ActivityFailure::non_retryable("PaymentDeclined", "card declined")
-        .with_details(json!({ "code": 51 }))
-        .into_error_payload())
+    Err(
+        ActivityFailure::non_retryable("PaymentDeclined", "card declined")
+            .with_details(json!({ "code": 51 }))
+            .into_error_payload(),
+    )
 }
 
 /// Fails the first attempt. The retry waits two seconds.
 #[activity(retry = RetryPolicy::fixed(2, Duration::from_secs(2)))]
 pub async fn slow_retry(ctx: &ActivityContext, n: i64) -> Result<i64, String> {
+    if ctx.info().attempt == 1 {
+        return Err("first attempt fails".to_owned());
+    }
+    Ok(n)
+}
+
+/// Fails the first attempt. The retry waits a minute, so a race loses it.
+#[activity(retry = RetryPolicy::fixed(2, Duration::from_secs(60)))]
+pub async fn very_slow_retry(ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     if ctx.info().attempt == 1 {
         return Err("first attempt fails".to_owned());
     }
@@ -85,6 +96,7 @@ fn shared_activities() -> Vec<ActivityInfo> {
         broken_info(),
         declined_info(),
         slow_retry_info(),
+        very_slow_retry_info(),
         local_double_info(),
     ]
 }
@@ -245,14 +257,33 @@ pub async fn waits_for_go(ctx: &WorkflowContext, _n: i64) -> Result<Value, Strin
     ctx.wait_for_signal("go").await.map_err(err)
 }
 
+/// Records a marker, then waits for `go`.
+///
+/// The marker commits with the first cycle. A script that awaits it reaches
+/// a run that is parked on the wait.
+#[workflow]
+pub async fn marks_then_waits(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let _ = ctx.patched("parked");
+    ctx.wait_for_signal("go").await.map_err(err)
+}
+
+/// The script waits until the first cycle commits.
+const fn parked() -> Step {
+    Step::AwaitEvent {
+        event: "MarkerRecorded",
+        count: 1,
+    }
+}
+
 /// A blocking wait receives a signal sent after the run parks.
 pub fn signal_wait() -> Scenario {
     Scenario::new(
         "signal_wait",
-        "waits_for_go",
-        || vec![waits_for_go_info()],
-        &[K::WaitForSignal],
+        "marks_then_waits",
+        || vec![marks_then_waits_info()],
+        &[K::WaitForSignal, K::RecordMarker],
     )
+    .step(parked())
     .step(Step::Signals(vec![("go", json!({ "k": 1 }))]))
 }
 
@@ -341,12 +372,49 @@ pub fn signal_handler() -> Scenario {
 }
 
 #[workflow]
+pub async fn drain_loop(ctx: &WorkflowContext, want: usize) -> Result<Vec<Value>, String> {
+    let mut seen = Vec::new();
+    let mut tick = 0;
+    loop {
+        seen.extend(ctx.drain_signals_raw("x").map_err(err)?);
+        if seen.len() >= want {
+            return Ok(seen);
+        }
+        tick += 1;
+        ctx.timer(&format!("tick-{tick}"), 1).await.map_err(err)?;
+    }
+}
+
+/// Issue #2020, case 1, as a loop: signals arrive across several cycles.
+pub fn signal_drain_loop() -> Scenario {
+    Scenario::new(
+        "signal_drain_loop",
+        "drain_loop",
+        || vec![drain_loop_info()],
+        &[K::StartTimer],
+    )
+    .input(json!(3))
+    .step(Step::AwaitEvent {
+        event: "TimerStarted",
+        count: 1,
+    })
+    .step(Step::Signals(vec![("x", json!("a"))]))
+    .step(Step::AwaitEvent {
+        event: "TimerStarted",
+        count: 2,
+    })
+    .step(Step::Signals(vec![("x", json!("b")), ("x", json!("c"))]))
+}
+
+#[workflow]
 pub async fn waits_with_deadline(ctx: &WorkflowContext, secs: u64) -> Result<Value, String> {
     let got = ctx
         .wait_for_signal_timeout("go", Duration::from_secs(secs))
         .await
         .map_err(err)?;
-    Ok(got.unwrap_or_else(|| json!("deadline")))
+    // Work after the race, so the race cleanup runs in a cycle that goes on.
+    let after: i64 = ctx.execute_activity(&double_info(), 1).await.map_err(err)?;
+    Ok(json!({ "got": got.unwrap_or_else(|| json!("deadline")), "after": after }))
 }
 
 /// The signal wins its race against a long deadline.
@@ -358,6 +426,7 @@ pub fn signal_beats_deadline() -> Scenario {
         &[K::StartTimer, K::WaitForSignal, K::CancelRaceLosers],
     )
     .input(json!(60))
+    .activities(shared_activities)
     .step(Step::AwaitEvent {
         event: "TimerStarted",
         count: 1,
@@ -374,10 +443,12 @@ pub fn deadline_beats_signal() -> Scenario {
         &[K::StartTimer],
     )
     .input(json!(1))
+    .activities(shared_activities)
 }
 
 #[workflow]
 pub async fn waits_for_match(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let _ = ctx.patched("parked");
     let hit = ctx
         .wait_for_signal_matching("x", |v| v.as_i64() == Some(2))
         .await
@@ -394,6 +465,7 @@ pub fn signal_matching() -> Scenario {
         || vec![waits_for_match_info()],
         &[K::WaitForSignal],
     )
+    .step(parked())
     .step(Step::Signals(vec![("x", json!(1)), ("x", json!(2))]))
 }
 
@@ -420,6 +492,26 @@ pub fn cancellable_timers() -> Scenario {
 }
 
 #[workflow]
+pub async fn resets_then_sleeps(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
+    let mut gate = ctx.start_timer("gate", 600);
+    gate.reset(1).map_err(err)?;
+    let fired = gate.await_fire().await.map_err(err)?;
+    let wake = ctx.now() + chrono::Duration::seconds(1);
+    ctx.sleep_until("wake", wake).await.map_err(err)?;
+    Ok(format!("{fired:?}"))
+}
+
+/// A cancellable timer is reset to a short one. A `sleep_until` follows.
+pub fn timer_reset_and_sleep_until() -> Scenario {
+    Scenario::new(
+        "timer_reset_and_sleep_until",
+        "resets_then_sleeps",
+        || vec![resets_then_sleeps_info()],
+        &[K::ArmTimer, K::CancelTimer, K::StartTimer],
+    )
+}
+
+#[workflow]
 pub async fn races_activity_and_timer(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
     let winner = ctx
         .race()
@@ -428,7 +520,65 @@ pub async fn races_activity_and_timer(ctx: &WorkflowContext, n: i64) -> Result<S
         .run()
         .await
         .map_err(err)?;
-    Ok(format!("{winner:?}"))
+    // Work after the race, so the race cleanup runs in a cycle that goes on.
+    let after: i64 = ctx.execute_activity(&double_info(), 1).await.map_err(err)?;
+    Ok(format!("{winner:?} then {after}"))
+}
+
+#[workflow]
+pub async fn timer_beats_activity(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
+    let winner = ctx
+        .race()
+        .activity(&very_slow_retry_info(), n)
+        .timer(Duration::from_secs(1))
+        .run()
+        .await
+        .map_err(err)?;
+    let after: i64 = ctx.execute_activity(&double_info(), 1).await.map_err(err)?;
+    Ok(format!("{winner:?} then {after}"))
+}
+
+/// A timer wins a race. The race cancels the activity that lost.
+pub fn race_timer_wins() -> Scenario {
+    Scenario::new(
+        "race_timer_wins",
+        "timer_beats_activity",
+        || vec![timer_beats_activity_info()],
+        &[K::ScheduleActivity, K::StartTimer, K::CancelRaceLosers],
+    )
+    .input(json!(3))
+    .activities(shared_activities)
+}
+
+#[workflow]
+pub async fn fans_out(ctx: &WorkflowContext, n: i64) -> Result<Vec<i64>, String> {
+    let calls = (0..3)
+        .map(|i| ("double".to_owned(), json!(n + i), "default".to_owned()))
+        .collect();
+    let results = ctx
+        .execute_activity_fan_out_raw_with(calls, &FanOutOptions::new())
+        .await
+        .map_err(err)?;
+    Ok(results
+        .into_items()
+        .into_iter()
+        .filter_map(|item| match item {
+            FanOutItem::Value(v) => v.as_i64(),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Three activities run in parallel. The results keep their order.
+pub fn activity_fan_out() -> Scenario {
+    Scenario::new(
+        "activity_fan_out",
+        "fans_out",
+        || vec![fans_out_info()],
+        &[K::ScheduleActivity],
+    )
+    .input(json!(10))
+    .activities(shared_activities)
 }
 
 /// An activity wins a race against a long timer.
@@ -509,9 +659,14 @@ pub fn bookkeeping() -> Scenario {
 #[workflow]
 pub async fn locks_once(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     let guard = ctx.mutex("k").acquire().await.map_err(err)?;
-    let out = ctx.execute_activity(&double_info(), n).await.map_err(err)?;
+    let out: i64 = ctx.execute_activity(&double_info(), n).await.map_err(err)?;
     guard.release();
-    Ok(out)
+    // Work after the release, so the release runs in a cycle that goes on.
+    let again: i64 = ctx
+        .execute_activity(&double_info(), out)
+        .await
+        .map_err(err)?;
+    Ok(again)
 }
 
 /// A workflow mutex is acquired, held over an activity and released.
@@ -533,8 +688,18 @@ pub async fn add_one(_ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
     Ok(n + 1)
 }
 
+/// Fails on a negative input.
+#[update(workflow = "takes_updates")]
+pub async fn refuse_negative(_ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    if n < 0 {
+        return Err(format!("{n} is negative"));
+    }
+    Ok(n)
+}
+
 #[workflow]
 pub async fn takes_updates(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let _ = ctx.patched("parked");
     ctx.wait_for_signal("done").await.map_err(err)
 }
 
@@ -546,15 +711,47 @@ pub fn update() -> Scenario {
         || vec![takes_updates_info()],
         &[K::RecordUpdateResult, K::WaitForSignal],
     )
-    .updates(|| vec![add_one_info()])
+    .updates(|| vec![add_one_info(), refuse_negative_info()])
+    .step(parked())
     .step(Step::Update {
         name: "add_one",
         input: json!(41),
+    })
+    .step(Step::Update {
+        name: "refuse_negative",
+        input: json!(-1),
     })
     .step(Step::Signals(vec![("done", json!("bye"))]))
 }
 
 // ── Composition ──────────────────────────────────────────────────────────────
+
+#[workflow]
+pub async fn child_declines(_ctx: &WorkflowContext, _n: i64) -> Result<i64, WorkflowFailure> {
+    Err(WorkflowFailure::new("PaymentDeclined", "card declined")
+        .with_details(json!({ "code": 51 })))
+}
+
+#[workflow]
+pub async fn reports_child_failure(ctx: &WorkflowContext, n: i64) -> Result<String, String> {
+    match ctx
+        .spawn_child_workflow_raw("child_declines", json!(n))
+        .await
+    {
+        Ok(v) => Ok(format!("unexpected {v}")),
+        Err(e) => Ok(format!("child failed: {e}")),
+    }
+}
+
+/// An awaited child fails with a typed failure. The parent catches it.
+pub fn child_failure() -> Scenario {
+    Scenario::new(
+        "child_failure",
+        "reports_child_failure",
+        || vec![reports_child_failure_info(), child_declines_info()],
+        &[K::StartChildWorkflow],
+    )
+}
 
 #[workflow]
 pub async fn child_doubles(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
@@ -673,14 +870,11 @@ pub fn continue_as_new() -> Scenario {
 pub fn cancel_parked_run() -> Scenario {
     Scenario::new(
         "cancel_parked_run",
-        "waits_for_go",
-        || vec![waits_for_go_info()],
+        "marks_then_waits",
+        || vec![marks_then_waits_info()],
         &[],
     )
-    .step(Step::AwaitEvent {
-        event: "WorkflowStarted",
-        count: 1,
-    })
+    .step(parked())
     .step(Step::Cancel("operator stop"))
 }
 
@@ -688,14 +882,11 @@ pub fn cancel_parked_run() -> Scenario {
 pub fn terminate_parked_run() -> Scenario {
     Scenario::new(
         "terminate_parked_run",
-        "waits_for_go",
-        || vec![waits_for_go_info()],
+        "marks_then_waits",
+        || vec![marks_then_waits_info()],
         &[],
     )
-    .step(Step::AwaitEvent {
-        event: "WorkflowStarted",
-        count: 1,
-    })
+    .step(parked())
     .step(Step::Terminate("operator kill"))
 }
 
@@ -786,7 +977,6 @@ pub fn fan_out_result_writer_needs_a_store() -> Scenario {
     .activities(shared_activities)
 }
 
-
 #[workflow]
 pub async fn acquires_beside_timer(ctx: &WorkflowContext, _n: i64) -> Result<(), String> {
     let (guard, nap) = tokio::join!(ctx.mutex("k").acquire(), ctx.timer("nap", 1));
@@ -833,12 +1023,7 @@ pub fn rejects_local_activity_beside_timer() -> Scenario {
 
 #[workflow]
 pub async fn abandons_an_activity(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
-    // Poll the activity once, so its command joins the last batch.
-    let mut pending = std::pin::pin!(ctx.execute_activity_raw("double", json!(n), "default"));
-    let _ = std::future::Future::poll(
-        pending.as_mut(),
-        &mut std::task::Context::from_waker(std::task::Waker::noop()),
-    );
+    poll_once(ctx.execute_activity_raw("double", json!(n), "default"));
     Ok(n)
 }
 
@@ -854,11 +1039,72 @@ pub fn rejects_unawaited_activity_in_last_cycle() -> Scenario {
     .rejected("ScheduleActivity")
 }
 
+/// Poll `future` once, so its command joins the batch, and drop it.
+fn poll_once<F: std::future::Future>(future: F) {
+    let mut future = std::pin::pin!(future);
+    let _ = future
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+}
+
+#[workflow]
+pub async fn abandons_a_timer(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    poll_once(ctx.timer("left", 60));
+    Ok(n)
+}
+
+/// A run that returns while a timer it started is not awaited.
+pub fn rejects_unawaited_timer_in_last_cycle() -> Scenario {
+    Scenario::new(
+        "rejects_unawaited_timer_in_last_cycle",
+        "abandons_a_timer",
+        || vec![abandons_a_timer_info()],
+        &[],
+    )
+    .rejected("StartTimer")
+}
+
+#[workflow]
+pub async fn abandons_a_signal_wait(ctx: &WorkflowContext, n: i64) -> Result<i64, String> {
+    poll_once(ctx.wait_for_signal("never"));
+    Ok(n)
+}
+
+/// A run that returns while a signal wait it started is not awaited.
+pub fn rejects_unawaited_signal_wait_in_last_cycle() -> Scenario {
+    Scenario::new(
+        "rejects_unawaited_signal_wait_in_last_cycle",
+        "abandons_a_signal_wait",
+        || vec![abandons_a_signal_wait_info()],
+        &[],
+    )
+    .rejected("WaitForSignal")
+}
+
 // ── Known Postgres defects ───────────────────────────────────────────────────
 //
 // Each scenario below fails on Postgres in some runs. `SQLite` gives the
 // expected result each time. `main.rs` marks each test `#[ignore]` with the
 // reason. Run them with `--ignored` to reproduce.
+
+/// A signal alone resumes a run that is parked in `await_condition`.
+///
+/// The run emits no command while it waits. Postgres fails such a run with
+/// "workflow suspended without emitted commands". `SQLite` keeps it and
+/// resumes it when the signal arrives.
+pub fn signal_handler_wakes_a_parked_condition() -> Scenario {
+    Scenario::new(
+        "signal_handler_wakes_a_parked_condition",
+        "handler_gate",
+        || vec![handler_gate_info()],
+        &[K::StartTimer],
+    )
+    .step(Step::AwaitEvent {
+        event: "TimerFired",
+        count: 1,
+    })
+    .step(Step::Signals(vec![("go", json!("late"))]))
+}
 
 #[workflow]
 pub async fn signals_child_in_spawn_cycle(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
@@ -885,7 +1131,10 @@ pub fn same_cycle_signal_to_new_child() -> Scenario {
 }
 
 #[workflow]
-pub async fn cancels_child_in_spawn_cycle(ctx: &WorkflowContext, _n: i64) -> Result<String, String> {
+pub async fn cancels_child_in_spawn_cycle(
+    ctx: &WorkflowContext,
+    _n: i64,
+) -> Result<String, String> {
     let child = ctx
         .spawn_child_workflow_detached_raw("waits_for_go", json!(0), ParentClosePolicy::Abandon)
         .map_err(err)?;

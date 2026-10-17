@@ -15,8 +15,8 @@ mod sqlite;
 
 /// Make one test per scenario, and the list that the coverage guard reads.
 ///
-/// A scenario in `defects` reproduces a known Postgres defect. Its test is
-/// `#[ignore]`d with the reason, and the coverage guard does not count it.
+/// A scenario in `defects` reproduces a known Postgres defect. Its test
+/// carries `#[ignore]` with the reason. The coverage guard does not count it.
 macro_rules! corpus {
     (
         scenarios { $($name:ident),* $(,)? }
@@ -59,16 +59,21 @@ corpus! {
         signal_drain,
         signal_try_receive,
         signal_handler,
+        signal_drain_loop,
         signal_beats_deadline,
         deadline_beats_signal,
         signal_matching,
         cancellable_timers,
+        timer_reset_and_sleep_until,
         race_activity_wins,
+        race_timer_wins,
+        activity_fan_out,
         side_effects_and_markers,
         bookkeeping,
         mutex,
         update,
         child_workflow,
+        child_failure,
         detached_child_signal_and_await,
         detached_child_cancel,
         continue_as_new,
@@ -81,11 +86,15 @@ corpus! {
         rejects_acquire_beside_timer,
         rejects_local_activity_beside_timer,
         rejects_unawaited_activity_in_last_cycle,
+        rejects_unawaited_timer_in_last_cycle,
+        rejects_unawaited_signal_wait_in_last_cycle,
     }
     defects {
         same_cycle_signal_to_new_child =>
             "Postgres can deliver a signal twice to a child spawned in the same cycle",
         same_cycle_cancel_of_new_child =>
             "Postgres can record a cancel twice for a child spawned in the same cycle",
+        signal_handler_wakes_a_parked_condition =>
+            "Postgres fails a run that waits with no command, such as a lone await_condition",
     }
 }

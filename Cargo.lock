@@ -480,7 +480,6 @@ dependencies = [
  "deadpool",
  "diesel",
  "diesel-async",
- "serde",
  "serde_json",
  "testcontainers",
  "testcontainers-modules",

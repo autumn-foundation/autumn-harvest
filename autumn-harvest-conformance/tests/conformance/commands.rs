@@ -1,7 +1,7 @@
 //! Every `WorkflowCommand`, and what the `SQLite` backend does with it.
 //!
-//! [`kind_of`] matches every variant with no wildcard arm. A new variant is
-//! therefore a compile error here, so its author must classify it.
+//! [`kind_of`] and [`support`] match every variant with no wildcard arm. A new
+//! variant is therefore a compile error here, so its author must classify it.
 
 use autumn_harvest::context::WorkflowCommand;
 
@@ -90,18 +90,13 @@ pub const fn kind_of(command: &WorkflowCommand) -> CommandKind {
 /// What the `SQLite` backend does with a command kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Support {
-    /// `SQLite` runs it. The suite must show the same result as Postgres.
-    ///
-    /// `witness` is the event type that the command writes on both backends.
-    /// A scenario that covers the kind must hold that event in both
-    /// histories. `None` means the command writes no event. Such a command
-    /// is covered by the outcome alone.
-    Accepted { witness: Option<&'static str> },
+    /// `SQLite` runs it. A scenario must emit it on both backends and give
+    /// the same result.
+    Accepted,
     /// `SQLite` fails the run with `UnsupportedFeature`. A rejection scenario
     /// must show it.
     Rejected,
-    /// No `WorkflowContext` method emits it. The executor turns a return
-    /// value into a terminal outcome, not into this command.
+    /// No `WorkflowContext` method emits it.
     NotEmitted,
 }
 
@@ -110,37 +105,59 @@ pub enum Support {
 /// The match has no wildcard arm, so a new kind is a compile error here.
 pub const fn support(kind: CommandKind) -> Support {
     use CommandKind as K;
-    const fn accepted(witness: &'static str) -> Support {
-        Support::Accepted {
-            witness: Some(witness),
-        }
-    }
-    const NO_EVENT: Support = Support::Accepted { witness: None };
     match kind {
-        K::ScheduleActivity => accepted("ActivityScheduled"),
-        K::StartTimer | K::ArmTimer => accepted("TimerStarted"),
-        K::StartChildWorkflow => accepted("ChildWorkflowStarted"),
-        K::RecordMarker => accepted("MarkerRecorded"),
-        K::RecordSideEffect => accepted("SideEffectRecorded"),
-        K::WaitForSignal => accepted("SignalReceived"),
-        K::ContinueAsNew => accepted("WorkflowContinuedAsNew"),
-        K::RunLocalActivity => accepted("LocalActivityCompleted"),
-        K::RecordUpdateResult => accepted("UpdateCompleted"),
-        K::SpawnDetachedChildWorkflow => accepted("ChildWorkflowSpawnedDetached"),
-        K::SignalExternalWorkflow => accepted("ExternalSignalRequested"),
-        K::RequestCancelExternalWorkflow => accepted("ExternalCancelRequested"),
-        K::AwaitExternalWorkflow => accepted("ExternalAwaitRequested"),
-        K::CancelTimer => accepted("TimerCancelled"),
-        K::AcquireMutex => accepted("MutexGranted"),
-        K::WaitForActivity
+        K::ScheduleActivity
+        | K::WaitForActivity
+        | K::StartTimer
+        | K::StartChildWorkflow
+        | K::RecordMarker
+        | K::RecordSideEffect
+        | K::WaitForSignal
+        | K::ContinueAsNew
+        | K::RunLocalActivity
+        | K::RecordUpdateResult
         | K::UpsertSearchAttributes
         | K::SetCurrentDetails
         | K::PublishProgress
         | K::PublishDurableProgress
         | K::RecordLog
+        | K::SpawnDetachedChildWorkflow
+        | K::SignalExternalWorkflow
+        | K::RequestCancelExternalWorkflow
+        | K::AwaitExternalWorkflow
         | K::CancelRaceLosers
-        | K::ReleaseMutex => NO_EVENT,
+        | K::ArmTimer
+        | K::CancelTimer
+        | K::AcquireMutex
+        | K::ReleaseMutex => Support::Accepted,
         K::ScheduleExternalActivity => Support::Rejected,
         K::Complete | K::Fail => Support::NotEmitted,
     }
 }
+
+/// The accepted kinds that `SQLite` rejects when the last cycle starts them
+/// and the run returns without an await.
+///
+/// `persist_terminal_pending_commands` has no arm for them. Each one needs a
+/// rejection scenario. A guard checks this list against that function.
+pub const REJECTED_IN_LAST_CYCLE: &[CommandKind] = &[
+    CommandKind::ScheduleActivity,
+    CommandKind::StartTimer,
+    CommandKind::WaitForSignal,
+];
+
+/// The accepted kinds that a replay does not emit, so the debugger cannot
+/// see them. Each entry names the event that shows the command instead, if
+/// one exists, and the reason.
+pub const NOT_SEEN_IN_REPLAY: &[(CommandKind, Option<&str>, &str)] = &[
+    (
+        CommandKind::RecordLog,
+        None,
+        "The logger skips a line while it replays. The line writes no event.",
+    ),
+    (
+        CommandKind::RecordUpdateResult,
+        Some("UpdateCompleted"),
+        "An update handler runs outside the replay of the workflow body.",
+    ),
+];

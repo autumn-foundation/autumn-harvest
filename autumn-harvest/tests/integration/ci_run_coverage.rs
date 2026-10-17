@@ -951,13 +951,13 @@ fn standalone_runner_test_targets_have_a_running_row() {
 }
 
 /// Issue #2030. The cross-backend conformance suite runs from a `linux` row,
-/// so it runs on every PR that changes code. The scan above reads only the
+/// so it runs on every PR that changes code. The live-DB scan reads only the
 /// core and plugin tests, so a deleted row would go unseen.
 #[test]
 fn conformance_suite_has_a_running_row() {
     let rows = parse_manifest();
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../autumn-harvest-conformance/Cargo.toml");
+    let manifest =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../autumn-harvest-conformance/Cargo.toml");
     let toml = std::fs::read_to_string(&manifest)
         .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
     assert!(

@@ -24,7 +24,7 @@ use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
-use crate::compare::{Execution, Outcome, Run, children};
+use crate::compare::{Execution, Outcome, Run, children, event_type};
 use crate::scenario::{Scenario, Step};
 
 /// The longest a script step or the final wait may take.
@@ -179,7 +179,12 @@ async fn send_batch(conn: &mut AsyncPgConnection, exec: ExecutionId, batch: &[(&
 }
 
 /// Admit an update, wake the run, and wait for its result event.
-async fn update(conn: &mut AsyncPgConnection, exec: ExecutionId, name: &str, input: Value) -> Value {
+async fn update(
+    conn: &mut AsyncPgConnection,
+    exec: ExecutionId,
+    name: &str,
+    input: Value,
+) -> Value {
     let update_id = UpdateId::new();
     store::admit_update_event(conn, exec, update_id, name.to_owned(), input, None)
         .await
@@ -190,12 +195,15 @@ async fn update(conn: &mut AsyncPgConnection, exec: ExecutionId, name: &str, inp
     let deadline = Deadline::new(format!("the result of update {name}"));
     loop {
         let found = history(conn, exec).await.into_iter().find_map(|e| match e {
-            WorkflowEvent::UpdateCompleted { update_id: id, output } if id == update_id => {
-                Some(output)
-            }
-            WorkflowEvent::UpdateFailed { update_id: id, error, .. } if id == update_id => {
-                Some(serde_json::json!({ "update_failed": error }))
-            }
+            WorkflowEvent::UpdateCompleted {
+                update_id: id,
+                output,
+            } if id == update_id => Some(output),
+            WorkflowEvent::UpdateFailed {
+                update_id: id,
+                error,
+                ..
+            } if id == update_id => Some(serde_json::json!({ "update_failed": error })),
             _ => None,
         });
         if let Some(result) = found {
@@ -203,6 +211,53 @@ async fn update(conn: &mut AsyncPgConnection, exec: ExecutionId, name: &str, inp
         }
         deadline.tick().await;
     }
+}
+
+/// Wait until the root history holds `count` events of type `event`.
+async fn await_event(conn: &mut AsyncPgConnection, root: ExecutionId, event: &str, count: usize) {
+    let deadline = Deadline::new(format!("{count} {event} events"));
+    loop {
+        let events = history(conn, root).await;
+        if events.iter().filter(|e| event_type(e) == event).count() >= count {
+            return;
+        }
+        if deadline.passed() {
+            let row = execution_row(conn, root).await;
+            panic!(
+                "postgres: timed out waiting for {count} {event} events. \
+                 State {}, error {:?}, history {:?}",
+                row.state,
+                row.error,
+                events.iter().map(event_type).collect::<Vec<_>>()
+            );
+        }
+        deadline.tick().await;
+    }
+}
+
+/// Run the script against `root`. Return the result of each update.
+async fn run_steps(conn: &mut AsyncPgConnection, root: ExecutionId, steps: &[Step]) -> Vec<Value> {
+    let mut update_results = Vec::new();
+    for step in steps {
+        match step {
+            Step::Signals(batch) => send_batch(conn, root, batch).await,
+            Step::AwaitEvent { event, count } => await_event(conn, root, event, *count).await,
+            Step::Update { name, input } => {
+                update_results.push(update(conn, root, name, input.clone()).await);
+            }
+            Step::Cancel(reason) => {
+                execution::cancel_workflow_execution(conn, root, reason, &NoOpMetrics)
+                    .await
+                    .expect("cancel the run");
+            }
+            Step::Terminate(reason) => {
+                execution::terminate_workflow_execution(conn, root, reason, &NoOpMetrics)
+                    .await
+                    .expect("terminate the run");
+            }
+        }
+    }
+    update_results
 }
 
 /// Run `scenario` on a fresh Postgres and return what the backend did.
@@ -230,98 +285,41 @@ pub async fn run(scenario: &Scenario) -> Run {
         send_batch(&mut conn, root, &scenario.initial_signals).await;
     }
 
-    let registry = Arc::new(
-        HandlerRegistry::new((scenario.workflows)(), (scenario.activities)()).with_handler_infos(
-            Vec::new(),
-            (scenario.updates)(),
-            Vec::new(),
-        ),
-    );
+    let registry =
+        Arc::new(
+            HandlerRegistry::new((scenario.workflows)(), (scenario.activities)())
+                .with_handler_infos(Vec::new(), (scenario.updates)(), Vec::new()),
+        );
     let worker = Arc::new(Worker::new(worker_config(queue), registry).expect("build the worker"));
     let pool = pool(&db.url);
     let handle = tokio::spawn({
         let worker = Arc::clone(&worker);
         async move { worker.run(&pool).await }
     });
+    let guard = StopOnDrop(Arc::clone(&worker));
 
-    let mut update_results = Vec::new();
-    for step in &scenario.steps {
-        match step {
-            Step::Signals(batch) => send_batch(&mut conn, root, batch).await,
-            Step::AwaitEvent { event, count } => {
-                let deadline = Deadline::new(format!("{count} {event} events"));
-                loop {
-                    let events = history(&mut conn, root).await;
-                    let seen = events
-                        .iter()
-                        .filter(|e| crate::compare::event_type(e) == *event)
-                        .count();
-                    if seen >= *count {
-                        break;
-                    }
-                    if deadline.passed() {
-                        let row = execution_row(&mut conn, root).await;
-                        panic!(
-                            "postgres: timed out waiting for {count} {event} events. \
-                             State {}, error {:?}, history {:?}",
-                            row.state,
-                            row.error,
-                            events.iter().map(crate::compare::event_type).collect::<Vec<_>>()
-                        );
-                    }
-                    deadline.tick().await;
-                }
-            }
-            Step::Update { name, input } => {
-                update_results.push(update(&mut conn, root, name, input.clone()).await);
-            }
-            Step::Cancel(reason) => {
-                execution::cancel_workflow_execution(&mut conn, root, reason, &NoOpMetrics)
-                    .await
-                    .expect("cancel the run");
-            }
-            Step::Terminate(reason) => {
-                execution::terminate_workflow_execution(&mut conn, root, reason, &NoOpMetrics)
-                    .await
-                    .expect("terminate the run");
-            }
-        }
-    }
+    let update_results = run_steps(&mut conn, root, &scenario.steps).await;
 
     let chain = follow_chain(&mut conn, root).await;
-    let mut executions = Vec::new();
-    for (i, id) in chain.iter().enumerate() {
-        executions.push(Execution {
-            role: if i == 0 {
-                "root".to_owned()
-            } else {
-                format!("successor {i}")
-            },
-            workflow: scenario.workflow.to_owned(),
-            events: history(&mut conn, *id).await,
-        });
-    }
-    // Each child must end too. Read them in order of first mention.
-    let mut next = 0;
-    while next < executions.len() {
-        for (child, workflow) in children(&executions[next].events) {
-            wait_for_end(&mut conn, child).await;
-            let n = executions.iter().filter(|e| e.role.starts_with("child")).count() + 1;
-            executions.push(Execution {
-                role: format!("child {n}"),
-                workflow,
-                events: history(&mut conn, child).await,
-            });
-        }
-        next += 1;
-    }
-    worker.shutdown();
+    let ids = executions_of(&mut conn, &chain, scenario.workflow).await;
+
+    // Stop the worker before the final read. A late write after a terminal
+    // event then shows up in the history, as defect E6 does.
+    drop(guard);
     let _ = handle.await;
 
+    let mut executions = Vec::new();
+    for (id, role, workflow) in ids {
+        executions.push(Execution {
+            role,
+            workflow,
+            events: history(&mut conn, id).await,
+        });
+    }
     let last = chain[chain.len() - 1];
     let row = execution_row(&mut conn, last).await;
     let outcome = match row.state.as_str() {
-        "COMPLETED" => Outcome::Completed(row.output.map(Into::into).unwrap_or(Value::Null)),
+        "COMPLETED" => Outcome::Completed(row.output.unwrap_or(Value::Null)),
         "FAILED" => Outcome::Failed(row.error.unwrap_or_default()),
         other => Outcome::Ended(other.to_owned()),
     };
@@ -332,13 +330,67 @@ pub async fn run(scenario: &Scenario) -> Run {
     }
 }
 
+/// Every execution of the run: the chain, then each child in order of first
+/// mention. Wait until each child ends.
+async fn executions_of(
+    conn: &mut AsyncPgConnection,
+    chain: &[ExecutionId],
+    workflow: &str,
+) -> Vec<(ExecutionId, String, String)> {
+    let mut ids: Vec<(ExecutionId, String, String)> = chain
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            let role = if i == 0 {
+                "root".to_owned()
+            } else {
+                format!("successor {i}")
+            };
+            (*id, role, workflow.to_owned())
+        })
+        .collect();
+    let mut next = 0;
+    while next < ids.len() {
+        for (child, child_workflow) in children(&history(conn, ids[next].0).await) {
+            wait_for_end(conn, child).await;
+            let n = ids
+                .iter()
+                .filter(|(_, r, _)| r.starts_with("child"))
+                .count()
+                + 1;
+            ids.push((child, format!("child {n}"), child_workflow));
+        }
+        next += 1;
+    }
+    ids
+}
+
+/// Stops the worker when it drops, also when a wait panics.
+///
+/// A worker that outlives a failed test can claim the tasks of the next test
+/// on a shared `HARVEST_TEST_DATABASE_URL` database.
+struct StopOnDrop(Arc<Worker>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
 /// Wait until `exec` is terminal. Return its state.
 async fn wait_for_end(conn: &mut AsyncPgConnection, exec: ExecutionId) -> String {
     let deadline = Deadline::new(format!("execution {exec} to end"));
     loop {
-        let state = execution_row(conn, exec).await.state;
-        if is_terminal(&state) {
-            return state;
+        let row = execution_row(conn, exec).await;
+        if is_terminal(&row.state) {
+            return row.state;
+        }
+        if deadline.passed() {
+            let events: Vec<String> = history(conn, exec).await.iter().map(event_type).collect();
+            panic!(
+                "postgres: execution {exec} did not end. State {}, history {events:?}",
+                row.state
+            );
         }
         deadline.tick().await;
     }
@@ -352,10 +404,13 @@ async fn follow_chain(conn: &mut AsyncPgConnection, root: ExecutionId) -> Vec<Ex
         if wait_for_end(conn, current).await != "CONTINUED_AS_NEW" {
             return chain;
         }
-        let next = history(conn, current).await.into_iter().find_map(|e| match e {
-            WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(new_exec_id),
-            _ => None,
-        });
+        let next = history(conn, current)
+            .await
+            .into_iter()
+            .find_map(|e| match e {
+                WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(new_exec_id),
+                _ => None,
+            });
         match next {
             Some(id) => chain.push(id),
             None => return chain,

@@ -4,11 +4,15 @@
 //! rule with its reason. A new relaxation needs a new rule here and a line in
 //! `README.md`.
 
+use std::collections::HashMap;
+use std::fmt::Write as _;
+
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::types::ExecutionId;
 use serde_json::Value;
 
 /// The terminal result of a run, as both backends store it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Completed(Value),
     Failed(String),
@@ -49,7 +53,7 @@ pub fn event_type(event: &WorkflowEvent) -> String {
 }
 
 /// The children that `events` start, in order of first mention.
-pub fn children(events: &[WorkflowEvent]) -> Vec<(autumn_harvest::types::ExecutionId, String)> {
+pub fn children(events: &[WorkflowEvent]) -> Vec<(ExecutionId, String)> {
     events
         .iter()
         .filter_map(|e| match e {
@@ -75,12 +79,11 @@ pub fn children(events: &[WorkflowEvent]) -> Vec<(autumn_harvest::types::Executi
 /// matcher skips the event, so it never changes a replay.
 const BACKEND_ONLY_EVENTS: &[&str] = &["ActivityStarted"];
 
-/// Rule N2: mask the values that each backend mints for itself.
+/// Rule N2: mask the instants in the event schema.
 ///
-/// An execution id, an activity id or an instant differs between two runs of
-/// one script. The comparison keeps the key and masks the value. Every key
-/// that ends in `_at` is an instant too.
-const VOLATILE_KEYS: &[&str] = &["activity_id", "target", "timestamp", "update_id"];
+/// The rule masks `timestamp` and each key that ends in `_at`, at the top of
+/// an event's data. A key inside a user payload stays.
+const INSTANT_KEYS: &[&str] = &["timestamp"];
 
 /// Rule N3: mask the value of a side effect that the runtime mints.
 ///
@@ -88,14 +91,40 @@ const VOLATILE_KEYS: &[&str] = &["activity_id", "target", "timestamp", "update_i
 /// clock. The `kind` and the `name` stay. A `Custom` value stays.
 const MINTED_SIDE_EFFECTS: &[&str] = &["Uuid", "Random", "Now"];
 
-/// Rule N4: inside one cycle, the backends may order command events of
-/// different kinds differently.
+/// Rule N4: inside one run of command events, Postgres writes the external
+/// requests first.
 ///
 /// Postgres writes a cycle's external signal, cancel and await requests in a
 /// phase of their own, before the cycle's other command events. `SQLite`
 /// keeps command order. The core matcher reads each kind with its own
-/// cursor, so the order across kinds does not change a replay. Events of one
-/// kind keep their order.
+/// cursor, so this move does not change a replay. The rule moves these three
+/// types to the front of each run. Every other event keeps its place.
+const EXTERNAL_REQUESTS: &[&str] = &[
+    "ExternalAwaitRequested",
+    "ExternalCancelRequested",
+    "ExternalSignalRequested",
+];
+
+/// Rule N5: inside one run of activity results, the order follows the
+/// activity, not the clock.
+///
+/// Postgres runs parallel activities on several worker slots, so their
+/// results land in any order. `SQLite` runs them in scheduling order. The
+/// matcher finds each result by its activity id, so the order does not change
+/// a replay. The rule sorts each run of `ActivityCompleted` events by
+/// activity alias.
+const PARALLEL_RESULTS: &str = "ActivityCompleted";
+
+/// Rule N6: Postgres writes a cycle's race-loser cancellations after the
+/// cycle's other command events.
+///
+/// `SQLite` keeps command order. The matcher reads each kind with its own
+/// cursor, so the move does not change a replay. The rule moves each
+/// cancellation to the end of its run. The core names a race loser with this
+/// error text, on both backends.
+const RACE_LOSER_ERROR: &str = "lost race to a sibling branch";
+
+/// The event types that a decision cycle writes from its own commands.
 const COMMAND_EVENTS: &[&str] = &[
     "ActivityScheduled",
     "ChildWorkflowSpawnedDetached",
@@ -110,8 +139,80 @@ const COMMAND_EVENTS: &[&str] = &[
     "TimerStarted",
 ];
 
-/// `event` as JSON, with rules N2 and N3 applied.
-pub fn normalize(event: &WorkflowEvent) -> Value {
+/// Rule N2 also gives each UUID an alias by first appearance in one run.
+///
+/// Each backend mints its own ids. An alias keeps the relations: a signal to
+/// the second child still names the second child, as `<id2>`.
+#[derive(Default)]
+pub struct Aliases {
+    seen: HashMap<String, usize>,
+}
+
+impl Aliases {
+    /// `text` with each hyphenated UUID replaced by its alias.
+    fn rewrite(&mut self, text: &str) -> String {
+        const LEN: usize = 36;
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while i < text.len() {
+            let candidate = text
+                .get(i..i + LEN)
+                .filter(|c| uuid::Uuid::try_parse(c).is_ok());
+            if let Some(id) = candidate {
+                let next = self.seen.len() + 1;
+                let n = *self.seen.entry(id.to_ascii_lowercase()).or_insert(next);
+                let _ = write!(out, "<id{n}>");
+                i += LEN;
+            } else {
+                let ch = text[i..].chars().next().unwrap_or_default();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        out
+    }
+
+    /// Alias every UUID inside `value`, in place.
+    fn alias(&mut self, value: &mut Value) {
+        match value {
+            Value::Object(map) => map.values_mut().for_each(|v| self.alias(v)),
+            Value::Array(items) => items.iter_mut().for_each(|v| self.alias(v)),
+            Value::String(text) => *text = self.rewrite(text),
+            _ => {}
+        }
+    }
+
+    /// `outcome` with every UUID inside it aliased.
+    pub fn outcome(&mut self, outcome: &Outcome) -> Outcome {
+        match outcome {
+            Outcome::Completed(v) => {
+                let mut v = v.clone();
+                self.alias(&mut v);
+                Outcome::Completed(v)
+            }
+            Outcome::Failed(e) => Outcome::Failed(self.rewrite(e)),
+            other => other.clone(),
+        }
+    }
+}
+
+fn is_instant_key(key: &str) -> bool {
+    INSTANT_KEYS.contains(&key) || key.ends_with("_at")
+}
+
+/// Mask the instant keys at the top of an event's data. Every instant in
+/// the event schema is there. A key inside a user payload stays.
+fn mask_instants(data: &mut Value) {
+    let Value::Object(map) = data else { return };
+    for (key, inner) in map.iter_mut() {
+        if is_instant_key(key) && !inner.is_null() {
+            *inner = Value::String("<instant>".to_owned());
+        }
+    }
+}
+
+/// `event` as JSON, with rule N3 and the instant mask of rule N2 applied.
+fn normalize(event: &WorkflowEvent) -> Value {
     let mut value = serde_json::to_value(event).unwrap_or(Value::Null);
     let minted = value["type"] == "SideEffectRecorded"
         && value["data"]["kind"]
@@ -120,80 +221,83 @@ pub fn normalize(event: &WorkflowEvent) -> Value {
     if minted {
         value["data"]["value"] = Value::String("<minted>".to_owned());
     }
-    mask(&mut value);
+    if let Some(data) = value.get_mut("data") {
+        mask_instants(data);
+    }
     value
 }
 
-/// Mask volatile keys and every UUID inside a string, in place.
-pub fn mask(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, inner) in map.iter_mut() {
-                let volatile = VOLATILE_KEYS.contains(&key.as_str()) || key.ends_with("_at");
-                if volatile && !inner.is_null() {
-                    *inner = Value::String("<volatile>".to_owned());
-                } else {
-                    mask(inner);
-                }
-            }
+fn type_of(value: &Value) -> &str {
+    value["type"].as_str().unwrap_or_default()
+}
+
+/// Whether `value` is the cancellation of a race loser (rule N6).
+fn is_race_loser(value: &Value) -> bool {
+    matches!(type_of(value), "ActivityFailed" | "ChildWorkflowFailed")
+        && value["data"]["error"].as_str() == Some(RACE_LOSER_ERROR)
+}
+
+/// Sort each maximal run of events that `member` selects with `key`. The sort
+/// is stable, so events with one key keep their order.
+fn sort_runs<K: Ord>(
+    events: &mut [Value],
+    member: impl Fn(&Value) -> bool,
+    key: impl Fn(&Value) -> K,
+) {
+    let mut start = 0;
+    while start < events.len() {
+        let len = events[start..].iter().take_while(|v| member(v)).count();
+        if len > 1 {
+            events[start..start + len].sort_by_key(|v| key(v));
         }
-        Value::Array(items) => items.iter_mut().for_each(mask),
-        Value::String(text) => *text = mask_uuids(text),
-        _ => {}
+        start += len.max(1);
     }
 }
 
-/// `text` with every hyphenated UUID replaced by `<uuid>`.
-fn mask_uuids(text: &str) -> String {
-    const LEN: usize = 36;
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let candidate = text.get(i..i + LEN);
-        if let Some(c) = candidate.filter(|c| uuid::Uuid::try_parse(c).is_ok() && c.contains('-')) {
-            out.push_str("<uuid>");
-            i += c.len();
+/// Apply rules N4 and N6.
+fn reorder_cycle_events(events: &mut [Value]) {
+    let in_cycle = |v: &Value| COMMAND_EVENTS.contains(&type_of(v)) || is_race_loser(v);
+    // N4 and N6: requests to the front, loser cancellations to the end.
+    sort_runs(events, in_cycle, |v| {
+        if EXTERNAL_REQUESTS.contains(&type_of(v)) {
+            0
+        } else if is_race_loser(v) {
+            2
         } else {
-            let ch = text[i..].chars().next().unwrap_or_default();
-            out.push(ch);
-            i += ch.len_utf8().max(1);
+            1
         }
-    }
-    out
+    });
+}
+
+/// Apply rule N5. It sorts by alias, so it runs after the aliases.
+fn reorder_parallel_results(events: &mut [Value]) {
+    sort_runs(
+        events,
+        |v| type_of(v) == PARALLEL_RESULTS,
+        |v| {
+            v["data"]["activity_id"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned()
+        },
+    );
 }
 
 /// The comparable form of a history, with every rule applied.
-pub fn comparable(events: &[WorkflowEvent]) -> Vec<Value> {
+///
+/// The aliases come after the reorder, so both backends alias in one order.
+pub fn comparable(events: &[WorkflowEvent], aliases: &mut Aliases) -> Vec<Value> {
     let mut out: Vec<Value> = events
         .iter()
         .filter(|e| !BACKEND_ONLY_EVENTS.contains(&event_type(e).as_str()))
         .map(normalize)
         .collect();
-    // Rule N4: a stable sort by type inside each run of command events.
-    let is_command = |v: &Value| v["type"].as_str().is_some_and(|t| COMMAND_EVENTS.contains(&t));
-    let mut start = 0;
-    while start < out.len() {
-        let len = out[start..].iter().take_while(|v| is_command(v)).count();
-        if len > 1 {
-            out[start..start + len].sort_by(|a, b| a["type"].as_str().cmp(&b["type"].as_str()));
-        }
-        start += len.max(1);
+    reorder_cycle_events(&mut out);
+    for v in &mut out {
+        aliases.alias(v);
     }
+    reorder_parallel_results(&mut out);
     out
-}
-
-/// `outcome` with every UUID inside it masked.
-fn comparable_outcome(outcome: &Outcome) -> Outcome {
-    match outcome {
-        Outcome::Completed(v) => {
-            let mut v = v.clone();
-            mask(&mut v);
-            Outcome::Completed(v)
-        }
-        Outcome::Failed(e) => Outcome::Failed(mask_uuids(e)),
-        other => other.clone(),
-    }
 }
 
 /// Every difference between the Postgres run and the `SQLite` run.
@@ -201,18 +305,6 @@ fn comparable_outcome(outcome: &Outcome) -> Outcome {
 /// An empty list means the two runs conform.
 pub fn differences(pg: &Run, sqlite: &Run) -> Vec<String> {
     let mut out = Vec::new();
-    if comparable_outcome(&pg.outcome) != comparable_outcome(&sqlite.outcome) {
-        out.push(format!(
-            "outcome: postgres {:?}, sqlite {:?}",
-            pg.outcome, sqlite.outcome
-        ));
-    }
-    if pg.update_results != sqlite.update_results {
-        out.push(format!(
-            "update results: postgres {:?}, sqlite {:?}",
-            pg.update_results, sqlite.update_results
-        ));
-    }
     let roles = |run: &Run| -> Vec<String> {
         run.executions
             .iter()
@@ -226,8 +318,13 @@ pub fn differences(pg: &Run, sqlite: &Run) -> Vec<String> {
             roles(sqlite)
         ));
     }
+    // Each backend aliases its own ids, in role order, then the outcome.
+    let (mut pa, mut sa) = (Aliases::default(), Aliases::default());
     for (p, s) in pg.executions.iter().zip(&sqlite.executions) {
-        let (pe, se) = (comparable(&p.events), comparable(&s.events));
+        let (pe, se) = (
+            comparable(&p.events, &mut pa),
+            comparable(&s.events, &mut sa),
+        );
         if pe != se {
             out.push(format!(
                 "{} history differs:\n{}",
@@ -235,6 +332,18 @@ pub fn differences(pg: &Run, sqlite: &Run) -> Vec<String> {
                 history_diff(&pe, &se)
             ));
         }
+    }
+    if pa.outcome(&pg.outcome) != sa.outcome(&sqlite.outcome) {
+        out.push(format!(
+            "outcome: postgres {:?}, sqlite {:?}",
+            pg.outcome, sqlite.outcome
+        ));
+    }
+    if pg.update_results != sqlite.update_results {
+        out.push(format!(
+            "update results: postgres {:?}, sqlite {:?}",
+            pg.update_results, sqlite.update_results
+        ));
     }
     out
 }
@@ -244,7 +353,9 @@ fn history_diff(pg: &[Value], sqlite: &[Value]) -> String {
     let mut lines = Vec::new();
     for i in 0..pg.len().max(sqlite.len()) {
         let p = pg.get(i).map_or_else(|| "-".to_owned(), Value::to_string);
-        let s = sqlite.get(i).map_or_else(|| "-".to_owned(), Value::to_string);
+        let s = sqlite
+            .get(i)
+            .map_or_else(|| "-".to_owned(), Value::to_string);
         let mark = if p == s { "  " } else { "!=" };
         lines.push(format!(
             "  {mark} [{i}]\n      postgres: {p}\n      sqlite:   {s}"
