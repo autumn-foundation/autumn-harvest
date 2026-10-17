@@ -378,6 +378,10 @@ places this feature does not sweep:
   cover workflow and activity task rows. The coverage table in
   `docs/security-posture.md` names each column that stays clear. Harvest
   writes no envelope to any other column.
+- **Buffers and arrays.** An event batch buffer holds one envelope for each
+  element. The census counts a buffer row once for each key. One swap converts
+  every envelope element. A buffer with an element that does not decode stays
+  as it is, and the pass does not complete.
 - **Rows from before issue #2043.** A clear value written before that issue
   can have the shape of an envelope. The census counts it and the sweep
   converts it. A retired codec id makes that cell unresolved. Wait for task

@@ -1409,6 +1409,34 @@ A stored value that does not decode never starts work on ciphertext:
   backs off. After its last attempt, it moves to the dead-letter queue with the
   stored body. A redrive sends the body after an operator restores the key.
 
+**Buffers, specs, schedules and headers (issue #2043).** Four more groups hold
+payload copies. The engine encodes them too.
+
+- An event batch stores one envelope for each buffered input. The SQL append
+  and the element count still work. The immediate flush and the timed fire
+  decode each element before the start. The byte cap of a batch counts the
+  stored bytes, so ciphertext reaches the cap sooner than plaintext.
+- A cross-shard child spec is one envelope. It holds the child input and its
+  headers. The relay decodes it before it creates the child.
+- A schedule input is one envelope. Registration and the schedule API encode
+  it. The reconciler compares the decoded value, so a new nonce is not drift.
+  The tick, a manual trigger and a backfill decode it before the start. The
+  schedule API and the UI show the stored envelope.
+- The context headers of an execution and of an activity row are one envelope
+  each. The start path, a retry, a rerun, the workflow worker and the activity
+  worker decode them. The start options of a debounce, throttle or batch row
+  hold the headers as an envelope too.
+
+A value that does not decode never starts work without it:
+
+- A workflow run whose headers do not decode fails. An activity attempt fails
+  with `PayloadDecodeFailed`. A workflow retry is skipped.
+- A batch, debounce or throttle row moves back and stays. A cross-shard child
+  stays pending. A due schedule stays due. A backfill slot counts as failed.
+- An export includes the headers only for a caller who may decode. The
+  retention archive never decodes, so it leaves an encoded header map out of
+  the archived document. Plaintext headers never reach cold storage.
+
 Every worker needs every key that can read a row. A worker without the key
 fails an attempt that a peer could run.
 
@@ -1428,7 +1456,8 @@ retire a key.
 
 **Erasure.** Erasure (issue #495) does not reach the task rows or the outbox.
 They stay until task retention or the relay removes them. Their ciphertext is
-not readable without the key.
+not readable without the key. Erasure replaces an encoded cross-shard child
+spec with a tombstone, and it needs no key.
 
 **Behavior change for API clients.** Before column encoding, the output
 column was always plaintext, so every caller of `GET /workflows/{id}/result`
