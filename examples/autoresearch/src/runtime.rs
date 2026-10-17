@@ -499,7 +499,8 @@ fn model_flags(label: &str) -> String {
 }
 
 /// `word` as one shell word: as it is, or in single quotes.
-fn shell_word(word: &str) -> String {
+#[must_use]
+pub fn shell_word(word: &str) -> String {
     let plain = !word.is_empty()
         && word
             .chars()
@@ -509,6 +510,15 @@ fn shell_word(word: &str) -> String {
     } else {
         format!("'{}'", word.replace('\'', "'\\''"))
     }
+}
+
+/// The `approve` and `deny` commands that decide `token` in `lab`. Each
+/// word is quoted for a POSIX shell, so a command works as printed.
+#[must_use]
+pub fn decision_commands(lab: &std::path::Path, token: &str) -> [String; 2] {
+    let lab = shell_word(&lab.display().to_string());
+    let token = shell_word(token);
+    ["approve", "deny"].map(|verb| format!("autoresearch {verb} --lab {lab} {token}"))
 }
 
 /// Fail when an unfinished run has another model than `model`.
@@ -1084,6 +1094,29 @@ mod tests {
     /// The commands in a refusal must work as printed. They name the
     /// database, the model and the tag of the other session. A session with
     /// no tag yet gets no tag.
+    /// A lab path can hold a space, a quote or shell syntax. The printed
+    /// `approve` and `deny` commands still pass each word as it is.
+    #[cfg(unix)]
+    #[test]
+    fn the_decision_commands_work_as_printed() {
+        let lab = std::path::Path::new("/tmp/my lab/it's $(touch x)");
+        let token = "0192-abc/tool_approval:0:1:call 'x'";
+        for command in decision_commands(lab, token) {
+            let words = command.replacen("autoresearch", "printf '%s\\n'", 1);
+            let out = std::process::Command::new("sh")
+                .args(["-c", &words])
+                .output()
+                .unwrap();
+            let got = String::from_utf8(out.stdout).unwrap();
+            let got: Vec<&str> = got.lines().collect();
+            assert_eq!(
+                got[1..],
+                ["--lab", "/tmp/my lab/it's $(touch x)", token],
+                "{command}"
+            );
+        }
+    }
+
     #[test]
     fn a_refusal_names_commands_that_work_as_printed() {
         let lab = std::path::Path::new("/labs/my lab");

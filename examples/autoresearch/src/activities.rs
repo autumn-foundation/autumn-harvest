@@ -290,12 +290,19 @@ pub async fn find_kept(_ctx: &ActivityContext, input: CommitRef) -> Result<Optio
 const TRAIN_MARGIN: Duration = Duration::from_secs(60);
 
 /// Fail unless a run of `trainer` ends well inside the budget of [`train`].
-/// A longer run would time out the activity, and its retry too.
+/// A longer run would time out the activity, and its retry too. Off Unix
+/// it fails too, because the train activity refuses there.
 ///
 /// # Errors
 ///
 /// Returns an error that names the run time and the budget.
 pub fn check_trainer(trainer: &TrainerSpec) -> Result<(), String> {
+    // Off Unix the train activity refuses. Say so before the session starts.
+    if cfg!(not(unix)) {
+        return Err(
+            "training needs a Unix worker, because two deliveries of a train call take turns on flock".into(),
+        );
+    }
     let budget = train_info().default_start_to_close.unwrap_or(Duration::MAX);
     let run = Duration::from_secs(trainer.longest_secs());
     if run.saturating_add(TRAIN_MARGIN) <= budget {
@@ -310,30 +317,50 @@ pub fn check_trainer(trainer: &TrainerSpec) -> Result<(), String> {
     }
 }
 
+/// How long a call waits for its lock. Another delivery of the call holds
+/// it for one run at most, and a run ends inside the budget of [`train`].
+const CALL_LOCK_WAIT: Duration = Duration::from_secs(16 * 60);
+
 /// Hold an exclusive lock on the lock file beside `saved` until the file
 /// drops. Two deliveries of one call that run at once take turns. A run can
 /// plant a link or a pipe at the lock file, and the open refuses both.
 async fn call_lock(saved: &Path) -> Result<std::fs::File, String> {
-    let path = saved.with_extension("lock");
-    blocking(move || {
-        let file = crate::stores::open_lock(&path)?;
-        lock_exclusive(&file, &path)?;
-        Ok(file)
-    })
-    .await
+    call_lock_within(saved, CALL_LOCK_WAIT).await
 }
 
-/// Wait for an exclusive `flock` on `file`.
+/// [`call_lock`] that waits at most `wait`. A process that a run left can
+/// hold the lock, so the call fails in time and parks no thread for good.
+async fn call_lock_within(saved: &Path, wait: Duration) -> Result<std::fs::File, String> {
+    let path = saved.with_extension("lock");
+    let opened = path.clone();
+    let file = blocking(move || crate::stores::open_lock(&opened)).await?;
+    let deadline = tokio::time::Instant::now() + wait;
+    while !try_lock_exclusive(&file, &path)? {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{} stays locked. Another delivery of the call runs, or a process that a run left holds it",
+                path.display()
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(file)
+}
+
+/// Take an exclusive `flock` on `file` when it is free.
 #[cfg(unix)]
-fn lock_exclusive(file: &std::fs::File, path: &Path) -> Result<(), String> {
-    rustix::fs::flock(file, rustix::fs::FlockOperation::LockExclusive)
-        .map_err(|e| format!("cannot lock {}: {e}", path.display()))
+fn try_lock_exclusive(file: &std::fs::File, path: &Path) -> Result<bool, String> {
+    match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(true),
+        Err(rustix::io::Errno::WOULDBLOCK) => Ok(false),
+        Err(e) => Err(format!("cannot lock {}: {e}", path.display())),
+    }
 }
 
 /// Off Unix no lock serializes two deliveries of one call. Both could
 /// train, so the call refuses to train.
 #[cfg(not(unix))]
-fn lock_exclusive(_file: &std::fs::File, _path: &Path) -> Result<(), String> {
+fn try_lock_exclusive(_file: &std::fs::File, _path: &Path) -> Result<bool, String> {
     Err(fatal(
         UNSUPPORTED,
         "the train activity needs a Unix worker, because it serializes the deliveries of a call with flock",
@@ -849,6 +876,27 @@ mod tests {
         // A reader frees an open that blocks, so a failure cannot hang the test.
         let _reader = rustix::fs::open(&lock, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty());
         assert!(matches!(locked, Ok(Err(_))), "{locked:?}");
+    }
+
+    /// A process that a run left can hold the lock of a call. The call must
+    /// fail in time, not park the runner for good.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_held_call_lock_fails_the_call_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = dir.path().join("call.json");
+        let held = crate::stores::open_lock(&saved.with_extension("lock")).unwrap();
+        rustix::fs::flock(&held, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let locked = tokio::time::timeout(
+            Duration::from_secs(5),
+            call_lock_within(&saved, Duration::from_millis(300)),
+        )
+        .await;
+        assert!(matches!(locked, Ok(Err(_))), "{locked:?}");
+        drop(held);
+        call_lock_within(&saved, Duration::from_millis(300))
+            .await
+            .unwrap();
     }
 
     /// The stash is only a backup. A lab that git cannot stash, such as one

@@ -267,7 +267,8 @@ experiment set the search attribute `status`, which the engine reserves.
   settings. A name that looks like a secret stays out, and so does a URL
   with login details, such as a private package index. Pass another with
   `--pass-env NAME`. On Linux the runner is not dumpable, so a run cannot
-  read the Claude key from the runner. A shell that exported the key can
+  read the Claude key from the runner. The command trainer sets this before
+  each run, so it holds on a Postgres worker too. A shell that exported the key can
   still leak it, so set the key for the runner alone:
   `ANTHROPIC_API_KEY=... autoresearch run ...`. Git runs with hooks off and
   with the list of the run, so a command that a run puts in `.git/config`
@@ -336,7 +337,8 @@ experiment set the search attribute `status`, which the engine reserves.
   or let it end at its own time budget.
 - **Training needs a Unix worker.** Two deliveries of one train call take
   turns on a `flock`, and so do two runs of the command trainer. Off Unix
-  no such lock exists, so the train activity refuses to train.
+  no such lock exists, so a session refuses to start, and the train
+  activity refuses to train.
 - **Off Linux, the next run kills no run that outlived its runner.** It
   cannot read the start time that tells the group of that run from a group
   that reused its id. It waits and fails in the same way.

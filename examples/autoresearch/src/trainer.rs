@@ -559,6 +559,9 @@ async fn run_command(
         state,
         log_path,
     } = *run;
+    // A run must not read the Claude key from this process, whatever
+    // started the runner: the CLI, a SQLite registration or Postgres.
+    hide_runner()?;
     let lock = Lock::take(state).await?;
     new_log(log_path)?;
     // The run can put a symlink at `run.log`. The runner reads and appends
@@ -1008,6 +1011,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
         assert!(lines > 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_command_trainer_captures_the_summary() {
         let dir = tempfile::tempdir().unwrap();
@@ -1029,6 +1033,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
         assert_eq!(summary.peak_vram_mb, 1024.0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_command_trainer_kills_a_run_at_its_timeout() {
         let dir = tempfile::tempdir().unwrap();

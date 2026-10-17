@@ -161,7 +161,7 @@ impl AgentModel for ClaudeModel {
             let body: Value = serde_json::from_str(&text)
                 .map_err(|e| AgentError::new(ErrorKind::Decode, format!("not JSON: {e}")))?;
             let response = parse_response(&body)?;
-            if let Some((key, raw)) = replayable(&wire_messages(request), &body) {
+            if let Some((key, raw)) = replayable(&turn_context(request), &body) {
                 self.turns.put(key, raw)?;
             }
             Ok(response)
@@ -216,8 +216,8 @@ impl Turns {
     }
 }
 
-/// The key of a turn: the hash of the messages `before` it, as
-/// [`wire_messages`] gives them, and of its text and tool-call blocks.
+/// The key of a turn: the hash of the context `before` it, as
+/// [`turn_context`] gives it, and of its text and tool-call blocks.
 fn turn_key(before: &[Value], visible: &[Value]) -> String {
     crate::stores::hashed(&json!([before, visible]).to_string())
 }
@@ -260,7 +260,7 @@ fn visible(blocks: &[Value]) -> Vec<Value> {
 /// The key and the raw blocks of a response that holds more than text and
 /// tool calls, such as a thinking block. `None` when nothing needs a replay.
 ///
-/// `before` is the [`wire_messages`] of the request that got the response.
+/// `before` is the [`turn_context`] of the request that got the response.
 #[must_use]
 pub fn replayable(before: &[Value], body: &Value) -> Option<(String, Vec<Value>)> {
     let blocks = turn_blocks(body);
@@ -268,9 +268,33 @@ pub fn replayable(before: &[Value], body: &Value) -> Option<(String, Vec<Value>)
     (blocks.len() > shown.len()).then(|| (turn_key(before, &shown), blocks))
 }
 
+/// What a turn key hashes before a turn: the system prompt, then the
+/// messages as [`wire_messages`] gives them. `eval` swaps the system prompt,
+/// so each prompt keeps its own raw blocks.
+#[must_use]
+pub fn turn_context(request: &ChatRequest) -> Vec<Value> {
+    std::iter::once(json!({"system": system_text(request)}))
+        .chain(wire_messages(request))
+        .collect()
+}
+
+/// The system prompt of `request`: its system text parts, in order.
+fn system_text(request: &ChatRequest) -> Vec<&str> {
+    request
+        .messages
+        .iter()
+        .filter(|m| m.role == ChatRole::System)
+        .flat_map(|m| &m.content)
+        .filter_map(|part| match part {
+            ContentPart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The messages of `request` as the API takes them, with no system message
-/// and no raw blocks. A turn key hashes them, so a key does not change when
-/// a later request replays a turn.
+/// and no raw blocks. So a turn key does not change when a later request
+/// replays a turn.
 #[must_use]
 pub fn wire_messages(request: &ChatRequest) -> Vec<Value> {
     request
@@ -306,26 +330,19 @@ pub fn wire_messages(request: &ChatRequest) -> Vec<Value> {
 }
 
 /// The JSON body of one Messages API request. `replay` returns the raw
-/// blocks of an assistant turn from the messages before it and its text and
-/// tool-call blocks.
+/// blocks of an assistant turn from the [`turn_context`] before it and its
+/// text and tool-call blocks.
 #[must_use]
 pub fn request_body(
     request: &ChatRequest,
     model: &str,
     replay: impl Fn(&[Value], &[Value]) -> Option<Vec<Value>>,
 ) -> Value {
-    let system: Vec<&str> = request
-        .messages
-        .iter()
-        .filter(|m| m.role == ChatRole::System)
-        .flat_map(|m| &m.content)
-        .filter_map(|part| match part {
-            ContentPart::Text(text) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    let wire = wire_messages(request);
-    let messages: Vec<Value> = wire
+    let system = system_text(request);
+    // The first entry is the system prompt, so a message at `index` of the
+    // wire has the context `keyed[..=index]` before it.
+    let keyed = turn_context(request);
+    let messages: Vec<Value> = keyed[1..]
         .iter()
         .enumerate()
         .map(|(index, message)| {
@@ -333,7 +350,7 @@ pub fn request_body(
                 return message.clone();
             }
             let shown = message["content"].as_array().cloned().unwrap_or_default();
-            replay(&wire[..index], &shown).map_or_else(
+            replay(&keyed[..=index], &shown).map_or_else(
                 || message.clone(),
                 |raw| json!({"role": "assistant", "content": raw}),
             )
@@ -536,7 +553,7 @@ mod tests {
         // The request that got the response held the messages before it.
         let mut asked = request();
         asked.messages.truncate(2);
-        let (key, raw) = replayable(&wire_messages(&asked), &response).unwrap();
+        let (key, raw) = replayable(&turn_context(&asked), &response).unwrap();
         turns.put(key, raw).unwrap();
         // The adapter replays the turn as text and a tool call. The request
         // finds the raw turn and sends the thinking block first.
@@ -574,11 +591,50 @@ mod tests {
                 ],
                 "usage": {"input_tokens": 1, "output_tokens": 1}
             });
-            let (key, raw) = replayable(&wire_messages(&conversation(task)), &response).unwrap();
+            let (key, raw) = replayable(&turn_context(&conversation(task)), &response).unwrap();
             turns.put(key, raw).unwrap();
         }
         for (task, signature) in [("Run experiment 1.", "one"), ("Run experiment 2.", "two")] {
             let mut next = conversation(task);
+            next.messages
+                .push(ChatMessage::text(ChatRole::Assistant, "Done."));
+            next.messages
+                .push(ChatMessage::text(ChatRole::User, "And now?"));
+            let body = request_body(&next, DEFAULT_MODEL, |before, visible| {
+                turns.get(before, visible)
+            });
+            assert_eq!(body["messages"][1]["content"][0]["signature"], signature);
+        }
+    }
+
+    /// `eval` asks again under a candidate `program.md`, with the same
+    /// messages. Each system prompt gets its own thinking block back.
+    #[test]
+    fn a_turn_under_another_system_prompt_keeps_its_own_block() {
+        let turns = Turns::default();
+        let conversation = |system: &str| ChatRequest {
+            messages: vec![
+                ChatMessage::text(ChatRole::System, system),
+                ChatMessage::text(ChatRole::User, "Run experiment 1."),
+            ],
+            ..request()
+        };
+        let prompts = [("Program A.", "a"), ("Program B.", "b")];
+        for (system, signature) in prompts {
+            let response = json!({
+                "type": "message",
+                "stop_reason": "end_turn",
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": signature},
+                    {"type": "text", "text": "Done."}
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            });
+            let (key, raw) = replayable(&turn_context(&conversation(system)), &response).unwrap();
+            turns.put(key, raw).unwrap();
+        }
+        for (system, signature) in prompts {
+            let mut next = conversation(system);
             next.messages
                 .push(ChatMessage::text(ChatRole::Assistant, "Done."));
             next.messages

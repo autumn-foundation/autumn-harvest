@@ -239,7 +239,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC3 | `rules::tests` (seven cases and three property tests, one against an oracle from the README). `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row` checks the zero crash row. |
 | AC4 | `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row`. The sim targets "a fix recovers a crash", "a run crashes for good", "a run passes its time budget" and "a run fails after its summary". |
 | AC5 | `agent::tests::edit_train_writes_train_py_only`, `the_policy_gates_rewind_and_denies_unknown_tools`, `lab::tests::the_agent_reads_only_known_files_and_papers`. |
-| AC6 | `e2e::an_edit_after_a_paper_waits_and_a_deny_changes_nothing`, `e2e::a_paper_taints_every_later_run_of_the_session`, `e2e::an_approved_rewind_moves_the_base_to_an_older_kept_commit`, `lab::tests::a_short_id_names_one_commit_of_the_branch`, `a_rewind_stays_inside_its_own_session`, `kept_refuses_a_row_whose_id_names_two_commits`, `e2e::a_late_approval_never_releases_the_call`. |
+| AC6 | `e2e::an_edit_after_a_paper_waits_and_a_deny_changes_nothing`, `e2e::a_paper_taints_every_later_run_of_the_session`, `e2e::an_approved_rewind_moves_the_base_to_an_older_kept_commit`, `lab::tests::a_short_id_names_one_commit_of_the_branch`, `a_rewind_stays_inside_its_own_session`, `kept_refuses_a_row_whose_id_names_two_commits`, `e2e::a_late_approval_never_releases_the_call`. `runtime::tests::the_decision_commands_work_as_printed`: the printed `approve` and `deny` commands quote the lab and the token. |
 | AC7 | `scripted::tests::the_researcher_reads_edits_asks_the_reviewer_and_answers`, `agent::tests::the_reviewer_is_read_only_with_two_tools`. The e2e nights delegate in every proposal. |
 | AC8 | `e2e::memory_notes_survive_a_restart`, `stores::tests::memory_survives_a_new_store_and_dedupes_a_key`. |
 | AC9 | `e2e::signals_a_query_and_an_update_steer_a_live_session`. `sim::a_session_holds_its_invariants_under_signals_and_faults` requires the hint, policy and stop targets. `sim::a_stop_at_the_hand_off_ends_the_night` requires a stop that meets the hand-off. `e2e::a_command_lands_before_the_next_experiment` and `cli::a_stop_posted_mid_night_lands_before_the_next_experiment`: a command lands in the pause before the next experiment. |
@@ -255,7 +255,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC19 | `e2e::eval_names_the_first_turn_where_a_new_program_differs`, `cli::eval_and_purge_work_on_a_finished_night`. |
 | AC20 | `e2e::the_response_cache_serves_an_identical_report_turn`: the second report turn runs in a new process and asks no model. |
 | AC21 | `e2e::the_inbox_delivers_a_command_once`, `cli::inbox_commands_queue_for_the_runner`, `inbox::tests`. |
-| AC22 | `e2e::the_command_trainer_runs_a_real_command_per_commit`, `trainer::tests::the_command_trainer_*`. `trainer::tests::the_runner_reads_the_log_the_run_wrote_not_a_symlink`, `the_timeout_note_does_not_follow_a_symlink`. `lab::tests::git_runs_with_the_trainer_environment`, `a_diff_runs_no_external_program`, `a_planted_symlink_is_refused_and_never_copied`. `stores::tests::a_read_refuses_a_symlink_and_a_pipe`, `the_stores_refuse_a_planted_link`. `inbox::tests::a_planted_link_is_set_aside`. `trainer::tests::a_planted_link_or_pipe_at_the_lock_is_refused`. `activities::tests::a_planted_pipe_at_a_call_lock_is_refused`. `stores::tests::a_lock_file_opens_as_a_plain_file`. |
+| AC22 | `e2e::the_command_trainer_runs_a_real_command_per_commit`, `trainer::tests::the_command_trainer_*`. `trainer::tests::the_runner_reads_the_log_the_run_wrote_not_a_symlink`, `the_timeout_note_does_not_follow_a_symlink`. `lab::tests::git_runs_with_the_trainer_environment`, `a_diff_runs_no_external_program`, `a_planted_symlink_is_refused_and_never_copied`. `stores::tests::a_read_refuses_a_symlink_and_a_pipe`, `the_stores_refuse_a_planted_link`. `inbox::tests::a_planted_link_is_set_aside`. `trainer::tests::a_planted_link_or_pipe_at_the_lock_is_refused`. `activities::tests::a_planted_pipe_at_a_call_lock_is_refused`, `a_held_call_lock_fails_the_call_in_time`. `stores::tests::a_lock_file_opens_as_a_plain_file` (a hard link too). `e2e::a_command_run_hides_the_runner`. |
 | AC23 | `claude::tests` (nine cases). |
 | AC24 | `e2e::the_workflows_register_on_a_postgres_builder_with_an_llm_budget`. `e2e::the_schedules_name_the_lab_by_its_canonical_path`: the registration names the lab by its canonical path. |
 | AC25 | `e2e::purge_removes_old_finished_runs`, `e2e::a_purge_refuses_to_remove_a_session_whose_report_runs`, `cli::eval_and_purge_work_on_a_finished_night`: the tag of a purged night stays used. |
@@ -266,7 +266,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC30 | `e2e::a_nightly_session_takes_commands_by_its_tag`, `e2e::a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag`, `e2e::a_command_waits_for_a_session_that_has_no_tag_yet`, `cli::run_with_no_tag_resumes_the_one_running_session`, which also refuses a resume with another model. `e2e::a_session_resumes_only_with_its_own_model`, `serve_checks_the_model_of_each_unfinished_agent_run`, `run_refuses_while_a_report_of_another_model_is_unfinished`, `a_report_whose_session_was_purged_does_not_block_serve`. |
 | AC31 | `lab::tests::a_commit_is_made_once_per_key`, `an_edit_runs_once_per_call`, `an_edit_whose_write_was_lost_runs_on_its_retry`, `a_row_is_recorded_once_per_key`, `a_row_whose_write_was_lost_lands_on_its_retry`. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`, `two_deliveries_at_once_train_once`. `agent::tests::an_edit_call_that_runs_again_changes_nothing`. |
 | AC32 | `trainer::tests::a_dropped_run_kills_its_whole_group`, `the_next_run_kills_a_run_that_outlived_its_runner`, `a_timeout_kills_the_children_of_the_run_too`, `a_finished_run_names_no_group`, `a_free_lock_forgets_the_group_of_an_earlier_run`, `a_stale_lock_spares_a_group_that_reused_its_id`. |
-| AC33 | `claude::tests::a_thinking_block_goes_back_unchanged_in_the_next_request`, `a_turn_with_the_same_text_in_another_conversation_keeps_its_own_block`, `a_turn_survives_in_the_turn_directory`, `the_key_stays_out_of_debug_output`. |
+| AC33 | `claude::tests::a_thinking_block_goes_back_unchanged_in_the_next_request`, `a_turn_with_the_same_text_in_another_conversation_keeps_its_own_block`, `a_turn_under_another_system_prompt_keeps_its_own_block`, `a_turn_survives_in_the_turn_directory`, `the_key_stays_out_of_debug_output`. |
 
 ---
 
@@ -457,6 +457,23 @@ Codex reviewed the same commit. The fixes:
   memory store, the cache and the inbox. A test commits an LFS pointer and
   checks the content on disk. `purge` refuses, and the docs now say so.
   The record of the fifth round now counts its findings right.
+
+A seventh review checked the lock files, the refusal off Unix, `status`
+and the docs, from two angles, with a skeptic per finding. Two findings
+held, and none was refuted. Codex reviewed the same commits. The fixes:
+
+- **Security.** A run could plant a hard link at a lock file, for example
+  to the writer lock of the database. A resumed call then waited for good
+  on its own lock, and the trainer lock could truncate `harvest.db`. A lock
+  file must now have one name. A call waits for its lock with a deadline,
+  so a process that a run left cannot park the runner.
+- **Codex.** The command trainer makes the runner not dumpable before each
+  run. Before, only the CLI did that, so a Postgres worker could leak the
+  key. A raw Claude turn is keyed by the system prompt too, so `eval` under
+  another `program.md` keeps its own thinking blocks. The printed `approve`
+  and `deny` commands quote the lab and the token.
+- **Off Unix.** A session refuses to start, with the reason, before setup.
+  Before, the reason was lost in a baseline crash.
 
 One mutant cannot fail a test on SQLite: a GPU mutex released before the
 training. The release writes no event, and one activity runs at a time.

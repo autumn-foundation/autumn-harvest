@@ -819,6 +819,32 @@ async fn the_command_trainer_runs_a_real_command_per_commit() {
     assert_eq!(rows[1].status, Status::Keep);
 }
 
+/// A command run is model-written code. Whatever started the runner, the
+/// run must not read the key from `/proc/<runner>/environ`. This binary
+/// never runs the CLI, so only the trainer can hide the runner here.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_run_hides_the_runner() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let mut config = fx.config("hidden", 1);
+    config.trainer = TrainerSpec::Command {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            "echo '---'; echo 'val_bpb:          1.000000'; echo 'peak_vram_mb:     2048.0'".into(),
+        ],
+        timeout_secs: 30,
+        pass_env: Vec::new(),
+    };
+    let exec = runtime::start(&mut rt, &config).unwrap();
+    run_to_end(&mut rt, exec).await;
+    assert_eq!(
+        rustix::process::dumpable_behavior().unwrap(),
+        rustix::process::DumpableBehavior::NotDumpable
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn setup_refuses_missing_data_and_a_tag_in_use() {
     let fx = Fixture::new();

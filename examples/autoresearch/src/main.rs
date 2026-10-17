@@ -601,20 +601,14 @@ async fn run(args: &LabArgs, session: &SessionArgs) -> Result<(), String> {
 
 /// Print a gated call and the two commands that decide it.
 fn ask(lab: &Lab, pending: &runtime::Pending) {
-    let lab_arg = lab.root().display();
     println!(
         "waiting for a person: {} {}",
         pending.tool,
         printable(&pending.arguments.to_string())
     );
-    println!(
-        "  approve: autoresearch approve --lab {lab_arg} '{}'",
-        pending.token
-    );
-    println!(
-        "  deny:    autoresearch deny --lab {lab_arg} '{}'",
-        pending.token
-    );
+    let [approve, deny] = runtime::decision_commands(lab.root(), &pending.token);
+    println!("  approve: {}", printable(&approve));
+    println!("  deny:    {}", printable(&deny));
 }
 
 /// `text` with each control, format and bidirectional character shown as

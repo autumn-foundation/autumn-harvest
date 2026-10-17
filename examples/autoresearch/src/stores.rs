@@ -521,9 +521,10 @@ pub fn open_regular(path: &Path) -> std::io::Result<Option<std::fs::File>> {
 
 /// Open the lock file at `path`, and make it when it is missing.
 ///
-/// It must be a regular file. A run can plant a link there, and a write
-/// must not reach the target of the link. A pipe must not hang the runner,
-/// so the open does not block. The file blocks as usual after the open,
+/// It must be a regular file with one name. A run can plant a symlink or a
+/// hard link there. A lock or a write must not reach another file, such as
+/// the writer lock of the database. A pipe must not hang the runner, so
+/// the open does not block. The file blocks as usual after the open,
 /// because the trainer lock becomes the stdin of a run.
 ///
 /// # Errors
@@ -549,8 +550,18 @@ pub fn open_lock(path: &Path) -> Result<std::fs::File, String> {
         .truncate(false)
         .open(path);
     let file = opened.map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
-        return Err(format!("{} is not a regular file", path.display()));
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    let one_name = std::os::unix::fs::MetadataExt::nlink(&meta) == 1;
+    #[cfg(not(unix))]
+    let one_name = true;
+    if !meta.is_file() || !one_name {
+        return Err(format!(
+            "{} is not a regular file with one name",
+            path.display()
+        ));
     }
     #[cfg(unix)]
     rustix::fs::fcntl_setfl(&file, rustix::fs::OFlags::empty())
@@ -892,6 +903,10 @@ mod tests {
         assert!(!flags.contains(rustix::fs::OFlags::NONBLOCK), "{flags:?}");
         std::os::unix::fs::symlink(dir.path().join("a.lock"), dir.path().join("b.lock")).unwrap();
         assert!(open_lock(&dir.path().join("b.lock")).is_err());
+        // A hard link would send a lock or a write to another file of the
+        // runner, such as the writer lock of the database.
+        std::fs::hard_link(dir.path().join("a.lock"), dir.path().join("c.lock")).unwrap();
+        assert!(open_lock(&dir.path().join("c.lock")).is_err());
     }
 
     #[tokio::test]
