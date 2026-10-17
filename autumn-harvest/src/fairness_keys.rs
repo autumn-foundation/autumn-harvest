@@ -296,6 +296,11 @@ pub async fn prune_fairness_state(
     // real rows unlocked, so a claim never waits for a preview.
     let ended = conn
         .transaction::<(), PreviewEnd, _>(async move |conn| {
+            // One snapshot for the row copy and the pending-key reads, so the
+            // count equals a live prune at one instant.
+            diesel::sql_query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(conn)
+                .await?;
             diesel::sql_query(format!(
                 "CREATE TEMP TABLE {PREVIEW_TABLE} \
                  (LIKE {STATE_TABLE} INCLUDING INDEXES) ON COMMIT DROP"
@@ -404,12 +409,19 @@ async fn delete_prune_batches(
 /// pending backlog once per row.
 const PRUNE_VICTIMS_SQL: &str = "\
     clock AS ( \
-        SELECT queue_name, MAX(updated_at) AS last_charge, \
-               (ARRAY_AGG(fairness_key ORDER BY last_start DESC, fairness_key DESC))[1] \
-                   AS clock_key \
-        FROM @state@ \
-        WHERE $3::TEXT IS NULL OR queue_name = $3 \
-        GROUP BY queue_name \
+        SELECT g.queue_name, g.last_charge, k.fairness_key AS clock_key \
+        FROM ( \
+            SELECT queue_name, MAX(updated_at) AS last_charge \
+            FROM @state@ \
+            WHERE $3::TEXT IS NULL OR queue_name = $3 \
+            GROUP BY queue_name \
+        ) g \
+        CROSS JOIN LATERAL ( \
+            SELECT c.fairness_key FROM @state@ c \
+            WHERE c.queue_name = g.queue_name \
+            ORDER BY c.last_start DESC, c.fairness_key DESC \
+            LIMIT 1 \
+        ) k \
     ), \
     active AS MATERIALIZED ( \
         SELECT DISTINCT t.queue_name, COALESCE(t.fairness_key, '') AS fairness_key \
@@ -462,7 +474,7 @@ mod tests {
     #[test]
     fn prune_keeps_the_clock_row_and_active_keys() {
         assert!(PRUNE_VICTIMS_SQL.contains("s.fairness_key <> c.clock_key"));
-        assert!(PRUNE_VICTIMS_SQL.contains("ORDER BY last_start DESC, fairness_key DESC"));
+        assert!(PRUNE_VICTIMS_SQL.contains("ORDER BY c.last_start DESC, c.fairness_key DESC"));
         assert!(PRUNE_VICTIMS_SQL.contains("SKIP LOCKED"));
         assert!(PRUNE_VICTIMS_SQL.contains("t.state = 'PENDING'"));
         assert!(PRUNE_VICTIMS_SQL.contains("active AS MATERIALIZED"));
