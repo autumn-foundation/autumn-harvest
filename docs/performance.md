@@ -2540,3 +2540,7 @@ standalone note rather than part of the claim-path attribution table above:
   It writes 17 rows per job with a regular activity and 10 with a local
   activity. A bare task row writes 3, and a modelled standalone job 6.
   [ADR 0007](adr/0007-standalone-activity.md) records the decision.
+* [`docs/performance-audit-chain-verify.md`](performance-audit-chain-verify.md)
+  — `ChainVerifier::push` in the audit-export chain check recomputed the keyed
+  HMAC state for every row. It now sets each key up once and streams the
+  canonical row into the MAC (instructions -21.3%, allocation blocks -77.8%).
