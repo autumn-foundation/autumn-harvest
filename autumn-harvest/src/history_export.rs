@@ -290,6 +290,26 @@ pub enum HistoryExportError {
     },
 }
 
+/// The headers an export document carries for a stored header cell
+/// (issue #2043).
+///
+/// A clear map reads as it always did. A codec envelope decodes only when the
+/// caller passes a decoder, which is the read-path gate of issue #608. With no
+/// decoder, or with a cell the decoder cannot read, the document carries no
+/// headers. Plaintext headers never reach an export that a caller may not
+/// decode, and never reach cold storage.
+#[must_use]
+pub fn export_headers(
+    stored: Option<&Value>,
+    decoder: Option<&crate::payload_codec::PayloadCodecs>,
+) -> Option<HashMap<String, String>> {
+    let stored = stored?;
+    if crate::payload_codec::is_codec_envelope(stored) {
+        return decoder.and_then(|codecs| codecs.decode_headers(stored).ok());
+    }
+    serde_json::from_value(stored.clone()).ok()
+}
+
 /// Build a replay-compatible history export document.
 ///
 /// # Errors
@@ -1924,6 +1944,37 @@ mod tests {
             "codec_id": "fixed-plaintext",
             "data": base64::engine::general_purpose::STANDARD.encode(vec![b'x'; encoded_len]),
         })
+    }
+
+    // --- issue #2043: header cells in an export.
+
+    #[test]
+    fn export_headers_reads_a_clear_map() {
+        let stored = serde_json::json!({"x-tenant": "acme"});
+        let headers = export_headers(Some(&stored), None).expect("a clear map");
+        assert_eq!(headers.get("x-tenant").map(String::as_str), Some("acme"));
+        assert!(export_headers(None, None).is_none());
+    }
+
+    #[test]
+    fn export_headers_leaves_an_envelope_out_without_a_decoder() {
+        let stored = fixed_plaintext_envelope(8);
+        assert!(export_headers(Some(&stored), None).is_none());
+    }
+
+    #[test]
+    fn export_headers_decodes_an_envelope_for_a_decoder() {
+        let stored = fixed_plaintext_envelope(8);
+        let decoder = fixed_plaintext_registry(r#"{"x-tenant":"acme"}"#);
+        let headers = export_headers(Some(&stored), Some(&decoder)).expect("decoded");
+        assert_eq!(headers.get("x-tenant").map(String::as_str), Some("acme"));
+    }
+
+    #[test]
+    fn export_headers_leaves_out_an_envelope_the_decoder_cannot_read() {
+        let stored = fixed_plaintext_envelope(8);
+        let identity_only = PayloadCodecs::default();
+        assert!(export_headers(Some(&stored), Some(&identity_only)).is_none());
     }
 
     fn envelope_export_request(envelope: Value, max_bytes: usize) -> HistoryExportRequest {
