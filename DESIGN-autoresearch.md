@@ -246,7 +246,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC10 | `e2e::two_sessions_share_one_gpu_and_a_kept_idea`: every training takes `gpu:gpu0`, and each grant has its own fencing token. The sim checks one grant per training. |
 | AC11 | `e2e::the_session_continues_as_new_and_carries_its_best`: three runs, the carried count and best. `sim::a_session_hands_off_its_carry_past_a_failed_experiment`: the count, the best, each hint and the labels. `sim::a_continued_session_finishes_from_its_carry`. |
 | AC12 | `e2e::two_sessions_share_one_gpu_and_a_kept_idea`: the hint reaches B, and the unknown sibling fails only its own signal. |
-| AC13 | `e2e::a_night_of_research_keeps_only_improvements`: the attributes, the memo, and a list by the `tag` attribute. |
+| AC13 | `e2e::a_night_of_research_keeps_only_improvements`: the attributes, the memo, and a list by the `tag` attribute. `e2e::status_shows_each_session_once`: a chain of runs shows once. |
 | AC14 | `e2e::the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up`. `stores::tests::the_precheck_runs_a_tick_only_for_a_new_crash_streak`, `a_redelivered_alert_marks_its_rows`. The drive ends at each pause (`e2e::a_command_lands_before_the_next_experiment`), and `serve` polls its schedules after each drive. `cli::serve_names_a_night_that_ends_once`: `serve` drives a night that `run` left and names its end once. `e2e::each_ended_session_is_named_once`: a failed night is named too. |
 | AC15 | `e2e::a_finished_night_leaves_a_morning_report`: the report lands, and driving it moves no other session. `e2e::a_failed_report_run_is_an_error`. `scripted::tests::the_reporter_reports_the_summary_of_its_own_session`. |
 | AC16 | `e2e::a_restart_resumes_without_paying_for_a_turn_or_a_run_twice`: the model calls across two processes equal those of one process, and each row has one `train` activity. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`: a train call that runs again does not train again. `stores::tests::the_cache_index_survives_a_new_process_and_evicts_the_oldest`: a model call that runs again in a new process gets the stored answer. `activities::tests::a_call_that_comes_again_after_a_stopped_run_puts_the_lab_back`: a run that a stop cut puts the lab back and trains again, and `git stash list` keeps the uncommitted changes that it put back. `a_resume_puts_back_a_lab_that_git_cannot_stash`: a lab on an unborn branch goes back too. |
@@ -451,7 +451,8 @@ Codex reviewed the same commit. The fixes:
   not train, because the runner cannot check its files. The lock file of
   each train call opens as the trainer lock does: no link, no pipe, and no
   wait. Off Unix no `flock` serializes two deliveries of one call, so the
-  train activity refuses to train there.
+  train activity refuses to train there. `status` shows each session once,
+  by the newest run of its chain.
 - **Tests and docs.** New tests plant a link at the real paths of the
   memory store, the cache and the inbox. A test commits an LFS pointer and
   checks the content on disk. `purge` refuses, and the docs now say so.

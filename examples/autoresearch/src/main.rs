@@ -23,9 +23,9 @@ use autoresearch::rules::KeepPolicy;
 use autoresearch::runtime::{self, Refused, Step, session_id};
 use autoresearch::scripted::ScriptedResearcher;
 use autoresearch::trainer::TrainerSpec;
-use autoresearch::workflows::{SESSION, SessionConfig, SessionReport};
+use autoresearch::workflows::{SessionConfig, SessionReport};
 use autumn_harvest_agent::{AgentHarness, AgentModel};
-use autumn_harvest_sqlite::{ExecutionFilter, ExecutionId, SqliteReader, SqliteRuntime};
+use autumn_harvest_sqlite::{ExecutionId, SqliteReader, SqliteRuntime};
 use clap::{Parser, Subcommand, ValueEnum};
 
 /// The trainer to use.
@@ -777,10 +777,8 @@ fn status(args: &LabArgs) -> Result<(), String> {
     let (lab, _, db) = open_lab(args)?;
     if db.exists() {
         let reader = SqliteReader::open(&db).map_err(|e| e.to_string())?;
-        let page = reader
-            .list_executions(&ExecutionFilter::new().workflow_name(SESSION).limit(20))
-            .map_err(|e| e.to_string())?;
-        for run in &page.executions {
+        let sessions = runtime::latest_sessions(|filter| reader.list_executions(filter), 20)?;
+        for run in &sessions {
             let id = run.workflow_id.clone().into_value().unwrap_or_default();
             let state = run.state.clone().into_value().unwrap_or_default();
             let attrs = run
@@ -802,7 +800,7 @@ fn status(args: &LabArgs) -> Result<(), String> {
                 field("best_commit")
             );
         }
-        if page.executions.is_empty() {
+        if sessions.is_empty() {
             println!("no sessions yet");
         }
     } else {

@@ -509,6 +509,38 @@ async fn two_sessions_share_one_gpu_and_a_kept_idea() {
     }
 }
 
+/// `continue_as_new` gives a session a chain of runs with one workflow id.
+/// `status` shows each session once, by the newest run of its chain, so a
+/// long session cannot crowd another one out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_shows_each_session_once() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let other = runtime::start(&mut rt, &fx.config("other", 1)).unwrap();
+    run_to_end(&mut rt, other).await;
+    let mut config = fx.config("chain", 5);
+    config.experiments_per_run = 2;
+    let first = runtime::start(&mut rt, &config).unwrap();
+    run_to_end(&mut rt, first).await;
+    let sessions = runtime::latest_sessions(|filter| rt.list_executions(filter), 2).unwrap();
+    let shown: Vec<(String, String)> = sessions
+        .iter()
+        .map(|run| {
+            (
+                run.workflow_id.clone().into_value().unwrap_or_default(),
+                run.state.clone().into_value().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        vec![
+            ("autoresearch/chain".to_string(), "COMPLETED".to_string()),
+            ("autoresearch/other".to_string(), "COMPLETED".to_string()),
+        ]
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_session_continues_as_new_and_carries_its_best() {
     let fx = Fixture::new();

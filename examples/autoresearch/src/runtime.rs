@@ -27,8 +27,8 @@ use autumn_harvest_agent::heartbeat;
 use autumn_harvest_agent::workflow::agent_loop_info;
 use autumn_harvest_agent::{AgentHarness, Approval, ModelTurn, agent_heartbeat_info, sqlite};
 use autumn_harvest_sqlite::{
-    ExecutionFilter, ExecutionId, ExecutionOutcome, RunState, SqliteError, SqliteRuntime,
-    StartOptions,
+    ExecutionFilter, ExecutionId, ExecutionOutcome, ExecutionPage, ExecutionSummary, RunState,
+    SqliteError, SqliteResult, SqliteRuntime, StartOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -660,6 +660,39 @@ fn root_of(rt: &SqliteRuntime, exec: ExecutionId) -> Result<ExecutionId, String>
         }
     }
     Ok(run)
+}
+
+/// The newest run of each of the `limit` newest sessions, newest first.
+///
+/// `continue_as_new` gives a session a chain of runs with one workflow id.
+/// Only the newest run of a chain stands for its session, so a long session
+/// cannot crowd another one out. `list` reads one page, as
+/// `SqliteReader::list_executions` does.
+///
+/// # Errors
+///
+/// Returns an error when a page cannot be read.
+pub fn latest_sessions(
+    list: impl Fn(&ExecutionFilter) -> SqliteResult<ExecutionPage>,
+    limit: usize,
+) -> Result<Vec<ExecutionSummary>, String> {
+    let mut seen = HashSet::new();
+    let mut sessions = Vec::new();
+    let mut filter = ExecutionFilter::new().workflow_name(SESSION).limit(100);
+    while sessions.len() < limit {
+        let page = list(&filter).map_err(|e| e.to_string())?;
+        for run in page.executions {
+            let id = run.workflow_id.clone().into_value().unwrap_or_default();
+            if sessions.len() < limit && seen.insert(id) {
+                sessions.push(run);
+            }
+        }
+        let Some(cursor) = page.next else {
+            break;
+        };
+        filter = filter.before(cursor);
+    }
+    Ok(sessions)
 }
 
 /// How a session ended.
