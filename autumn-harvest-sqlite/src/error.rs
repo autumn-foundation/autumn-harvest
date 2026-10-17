@@ -222,6 +222,22 @@ pub enum SqliteError {
         cap_bytes: u64,
     },
 
+    /// A caller-supplied payload nests deeper than
+    /// [`MAX_PAYLOAD_DEPTH`](crate::MAX_PAYLOAD_DEPTH) at an ingress boundary
+    /// (issue #2157).
+    ///
+    /// `serde_json` writes any depth but refuses to read past 128 levels. The
+    /// payload is refused before it is stored, so a later drive never fails on
+    /// a value it cannot read back. `kind` names the boundary
+    /// (`"workflow_input"`, `"memo"`, `"signal_payload"` or `"update_input"`).
+    #[error("payload too deep: {kind} nests more than {cap_depth} levels")]
+    PayloadTooDeep {
+        /// The ingress boundary that was violated.
+        kind: &'static str,
+        /// The deepest nesting that ingress accepts.
+        cap_depth: usize,
+    },
+
     /// A start carrying the [`RejectDuplicate`](autumn_harvest::WorkflowIdReusePolicy::RejectDuplicate)
     /// reuse policy collided with an existing, non-sealed execution for the same
     /// `(workflow_name, workflow_id)` key (issue #1068). Mirrors the Postgres core
