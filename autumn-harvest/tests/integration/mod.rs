@@ -428,6 +428,9 @@ mod workflow_pause_claim_recheck_tests;
 mod workflow_reachability_samples_tests;
 mod workflow_retry_tests;
 mod workflow_schema_contract_tests;
+mod workflow_sim_ingest_tests;
+#[cfg(feature = "testing")]
+mod workflow_sim_tests;
 mod workflow_task_timeout_tests;
 #[cfg(feature = "testing")]
 mod workflow_test_env_mid_run_tests;
