@@ -270,10 +270,21 @@ pub fn apply(rt: &mut SqliteRuntime, id: &str, command: &Command) -> Result<Stri
             return decide(rt, token, &reject);
         }
     };
-    let session = find_session(rt, tag)
-        .map_err(Refused::Transient)?
-        .map(|(_, workflow_id)| workflow_id)
-        .ok_or_else(|| Refused::Permanent(format!("no running session has the tag {tag}")))?;
+    let Some((_, session)) = find_session(rt, tag).map_err(Refused::Transient)? else {
+        // A scheduled session publishes its tag in its first cycle. A process
+        // that died before that cycle leaves a running session with no tag.
+        // It can be the one, so the command waits.
+        let untagged = running_sessions(rt)
+            .map_err(Refused::Transient)?
+            .iter()
+            .any(|(_, tag)| tag.is_empty());
+        let why = format!("no running session has the tag {tag}");
+        return Err(if untagged {
+            Refused::Transient(format!("{why} yet: a session has no tag so far"))
+        } else {
+            Refused::Permanent(why)
+        });
+    };
     // The inbox id is the key: a resend after a crash is not staged twice.
     let delivery = rt
         .send_signal_by_workflow_id(SESSION, &session, name, payload, Some(id))

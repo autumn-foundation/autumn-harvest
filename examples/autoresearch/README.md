@@ -126,7 +126,9 @@ nothing is a discard row with the numbers of its base.
 `run` and `serve` hold the database as its one writer. The other commands
 write a file to the inbox, and the runner turns it into a keyed signal. A
 resend after a crash does not deliver twice. A command that can never land,
-such as a stop for a session that ended, moves to `inbox/rejected`.
+such as a stop for a session that ended, moves to `inbox/rejected`. While a
+session runs that has not published its tag yet, a command for an unknown
+tag waits.
 
 ```bash
 cargo run -p autoresearch -- hint --lab /tmp/ar-lab --tag demo "paper:warmdown"

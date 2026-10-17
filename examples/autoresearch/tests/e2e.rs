@@ -1036,6 +1036,41 @@ async fn a_nightly_session_takes_commands_by_its_tag() {
     ));
 }
 
+/// A run that the schedule started, and that has not run its first cycle,
+/// has no tag yet. A process that dies there leaves it so. A command for
+/// its tag waits, and lands once the session publishes the tag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_waits_for_a_session_that_has_no_tag_yet() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let slot = Utc.with_ymd_and_hms(2026, 10, 17, 23, 0, 30).unwrap();
+    rt.set_clock(move || slot);
+    let input = serde_json::to_value(autoresearch::workflows::SessionInput {
+        config: fx.config("", 0),
+        carry: None,
+    })
+    .unwrap();
+    let started = rt
+        .start_workflow_with_options(
+            SESSION,
+            input,
+            autumn_harvest_sqlite::StartOptions::new().workflow_id("sched:nightly:1"),
+        )
+        .unwrap();
+    let stop = Command::Stop {
+        tag: "20261017-2300".into(),
+        reason: "morning".into(),
+    };
+    assert!(matches!(
+        runtime::apply(&mut rt, "s1", &stop),
+        Err(runtime::Refused::Transient(_))
+    ));
+    let night = drive_a_little(&mut rt, started.exec_id).await;
+    runtime::apply(&mut rt, "s1", &stop).unwrap();
+    let report = run_to_end(&mut rt, night).await;
+    assert_eq!(report.stopped.as_deref(), Some("morning"));
+}
+
 /// Drive a night that has no end for a few drives. Returns its run now.
 async fn drive_a_little(
     rt: &mut autumn_harvest_sqlite::SqliteRuntime,
