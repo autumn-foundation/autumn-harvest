@@ -1491,7 +1491,7 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_debounce.start_options` | Clear | Start configuration, not payload. |
 | `harvest_start_throttle.input` | Covered | The deferred start input. The fire path decodes it before the start. |
 | `harvest_start_throttle.start_options` | Clear | Start configuration, not payload. |
-| `harvest_event_batches.buffered_payloads` | Clear | SQL appends to the array and counts its elements, and the sweep reads one envelope at the cell root. The array holds each buffered input in clear until the batch fires. |
+| `harvest_event_batches.buffered_payloads` | Covered | One envelope for each buffered input. The SQL append and the element count still work. The fire path and the immediate flush decode each element before the start. |
 | `harvest_event_batches.start_options` | Clear | Start configuration, not payload. |
 | `harvest_completion_deliveries.event_filter` | Clear | Callback configuration, not payload. |
 | `harvest_completion_deliveries.payload` | Covered | The webhook body. The scanner decodes it before it signs and sends the body. |
