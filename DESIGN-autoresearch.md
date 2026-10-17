@@ -235,7 +235,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC | Evidence |
 |----|----------|
 | AC1 | `e2e::a_night_of_research_keeps_only_improvements`: setup, a baseline and six experiments, seven rows, the upstream header. `cli::a_night_runs_offline_from_one_command`. |
-| AC2 | The same test: `HEAD` is the best commit, the branch holds only the kept commits, the tree is clean. `sim::an_experiment_holds_its_invariants_on_every_seed`: a discard or a crash resets to the base last. `activities::tests::a_run_that_changes_the_lab_is_a_crash_and_the_lab_is_restored`. `lab::tests::a_reset_and_a_restore_keep_a_change_to_program_md`. |
+| AC2 | The same test: `HEAD` is the best commit, the branch holds only the kept commits, the tree is clean. `sim::an_experiment_holds_its_invariants_on_every_seed`: a discard or a crash resets to the base last. `activities::tests::a_run_that_changes_the_lab_is_a_crash_and_the_lab_is_restored` (a moved branch, a commit, a change to `train.py`). `lab::tests::a_reset_and_a_restore_keep_a_change_to_program_md`, `a_reset_and_a_restore_put_back_prepare_py`. |
 | AC3 | `rules::tests` (seven cases and three property tests, one against an oracle from the README). `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row` checks the zero crash row. |
 | AC4 | `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row`. The sim targets "a fix recovers a crash", "a run crashes for good", "a run passes its time budget" and "a run fails after its summary". |
 | AC5 | `agent::tests::edit_train_writes_train_py_only`, `the_policy_gates_rewind_and_denies_unknown_tools`, `lab::tests::the_agent_reads_only_known_files_and_papers`. |
@@ -247,23 +247,23 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC11 | `e2e::the_session_continues_as_new_and_carries_its_best`: three runs, the carried count and best. `sim::a_session_hands_off_its_carry_past_a_failed_experiment`: the count, the best, each hint and the labels. `sim::a_continued_session_finishes_from_its_carry`. |
 | AC12 | `e2e::two_sessions_share_one_gpu_and_a_kept_idea`: the hint reaches B, and the unknown sibling fails only its own signal. |
 | AC13 | `e2e::a_night_of_research_keeps_only_improvements`: the attributes, the memo, and a list by the `tag` attribute. |
-| AC14 | `e2e::the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up`. `stores::tests::the_precheck_runs_a_tick_only_for_a_new_crash_streak`, `a_redelivered_alert_marks_its_rows`. The drive ends at each pause, so `serve` fires the heartbeat between experiments (`e2e::a_command_lands_before_the_next_experiment`). `e2e::each_ended_session_is_named_once`: `serve` names a night that fails. |
+| AC14 | `e2e::the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up`. `stores::tests::the_precheck_runs_a_tick_only_for_a_new_crash_streak`, `a_redelivered_alert_marks_its_rows`. The drive ends at each pause (`e2e::a_command_lands_before_the_next_experiment`), and `serve` polls its schedules after each drive. `cli::serve_names_a_night_that_ends_once`: `serve` drives a night that `run` left and names its end once. `e2e::each_ended_session_is_named_once`: a failed night is named too. |
 | AC15 | `e2e::a_finished_night_leaves_a_morning_report`: the report lands, and driving it moves no other session. `e2e::a_failed_report_run_is_an_error`. `scripted::tests::the_reporter_reports_the_summary_of_its_own_session`. |
-| AC16 | `e2e::a_restart_resumes_without_paying_for_a_turn_or_a_run_twice`: the model calls across two processes equal those of one process, and each row has one `train` activity. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`: a train call that runs again does not train again. `stores::tests::the_cache_index_survives_a_new_process_and_evicts_the_oldest`: a model call that runs again in a new process gets the stored answer. |
-| AC17 | `e2e::a_night_of_research_keeps_only_improvements` and `e2e::the_session_continues_as_new_and_carries_its_best` run `verify`. The CI demo runs `verify`. `cli::a_missing_database_is_an_error_not_a_new_file`: `verify` does not pass on an empty database. |
+| AC16 | `e2e::a_restart_resumes_without_paying_for_a_turn_or_a_run_twice`: the model calls across two processes equal those of one process, and each row has one `train` activity. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`: a train call that runs again does not train again. `stores::tests::the_cache_index_survives_a_new_process_and_evicts_the_oldest`: a model call that runs again in a new process gets the stored answer. `activities::tests::a_call_that_comes_again_after_a_stopped_run_puts_the_lab_back`: a run that a stop cut puts the lab back and trains again. |
+| AC17 | `e2e::a_night_of_research_keeps_only_improvements` and `e2e::the_session_continues_as_new_and_carries_its_best` run `verify`. The CI demo runs `verify`. `cli::a_missing_database_is_an_error_not_a_new_file`: `verify` refuses a missing database, so a mistyped `--db` fails. |
 | AC18 | `sim::*`: nine sweeps. Each seed runs twice, replays, and runs again with a crash. Each target is required. The mocks give full commit ids, so a sweep sees a short id where a full one belongs. |
 | AC19 | `e2e::eval_names_the_first_turn_where_a_new_program_differs`, `cli::eval_and_purge_work_on_a_finished_night`. |
 | AC20 | `e2e::the_response_cache_serves_an_identical_report_turn`: the second report turn runs in a new process and asks no model. |
 | AC21 | `e2e::the_inbox_delivers_a_command_once`, `cli::inbox_commands_queue_for_the_runner`, `inbox::tests`. |
-| AC22 | `e2e::the_command_trainer_runs_a_real_command_per_commit`, `trainer::tests::the_command_trainer_*`. `trainer::tests::the_runner_reads_the_log_the_run_wrote_not_a_symlink`, `the_timeout_note_does_not_follow_a_symlink`. `lab::tests::git_runs_with_the_trainer_environment`. |
+| AC22 | `e2e::the_command_trainer_runs_a_real_command_per_commit`, `trainer::tests::the_command_trainer_*`. `trainer::tests::the_runner_reads_the_log_the_run_wrote_not_a_symlink`, `the_timeout_note_does_not_follow_a_symlink`. `lab::tests::git_runs_with_the_trainer_environment`, `a_diff_runs_no_external_program`, `a_planted_symlink_is_refused_and_never_copied`. |
 | AC23 | `claude::tests` (nine cases). |
 | AC24 | `e2e::the_workflows_register_on_a_postgres_builder_with_an_llm_budget`. |
 | AC25 | `e2e::purge_removes_old_finished_runs`, `cli::eval_and_purge_work_on_a_finished_night`: the tag of a purged night stays used. |
 | AC26 | `cli::*` and the CI demo step. |
 | AC27 | `ci.yml`: the test step, the demo step and the clippy step. `dst-nightly.yml`: the `autoresearch` job. |
 | AC28 | `docs/audits/comment-hygiene.py --base origin/trunk-dev` passes. |
-| AC29 | `e2e::two_sessions_in_one_lab_take_turns_on_their_own_branches`, `lab::tests::checkout_moves_back_to_the_session_branch_only_when_clean`, `two_sessions_never_share_a_commit`, `a_tag_that_another_session_used_is_refused`, `activities::tests::train_refuses_a_moved_branch_and_a_change_no_commit_holds`, `setup_refuses_a_tag_that_another_session_used`. One runner drives a database: `cli::a_new_session_waits_until_the_running_one_ends`, `e2e::a_drive_names_the_mutex_that_a_session_waits_for`. |
-| AC30 | `e2e::a_nightly_session_takes_commands_by_its_tag`, `e2e::a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag`, `e2e::a_command_waits_for_a_session_that_has_no_tag_yet`, `cli::run_with_no_tag_resumes_the_one_running_session`, which also refuses a resume with another model. `e2e::a_session_resumes_only_with_its_own_model`. |
+| AC29 | `e2e::two_sessions_in_one_lab_take_turns_on_their_own_branches`, `lab::tests::checkout_moves_back_to_the_session_branch_only_when_clean`, `two_sessions_never_share_a_commit`, `a_tag_that_another_session_used_is_refused`, `activities::tests::train_refuses_a_moved_branch_and_a_change_no_commit_holds`, `setup_refuses_a_tag_that_another_session_used`. One runner drives a database: `cli::a_new_session_waits_until_the_running_one_ends`, `e2e::a_drive_names_the_mutex_that_a_session_waits_for`, `runtime::tests::a_refusal_names_commands_that_work_as_printed`. |
+| AC30 | `e2e::a_nightly_session_takes_commands_by_its_tag`, `e2e::a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag`, `e2e::a_command_waits_for_a_session_that_has_no_tag_yet`, `cli::run_with_no_tag_resumes_the_one_running_session`, which also refuses a resume with another model. `e2e::a_session_resumes_only_with_its_own_model`, `serve_checks_the_model_of_each_unfinished_agent_run`. |
 | AC31 | `lab::tests::a_commit_is_made_once_per_key`, `an_edit_runs_once_per_call`, `an_edit_whose_write_was_lost_runs_on_its_retry`, `a_row_is_recorded_once_per_key`, `a_row_whose_write_was_lost_lands_on_its_retry`. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`, `two_deliveries_at_once_train_once`. `agent::tests::an_edit_call_that_runs_again_changes_nothing`. |
 | AC32 | `trainer::tests::a_dropped_run_kills_its_whole_group`, `the_next_run_kills_a_run_that_outlived_its_runner`, `a_timeout_kills_the_children_of_the_run_too`, `a_finished_run_names_no_group`, `a_free_lock_forgets_the_group_of_an_earlier_run`, `a_stale_lock_spares_a_group_that_reused_its_id`. |
 | AC33 | `claude::tests::a_thinking_block_goes_back_unchanged_in_the_next_request`, `a_turn_survives_in_the_turn_directory`, `the_key_stays_out_of_debug_output`. |
@@ -362,6 +362,31 @@ reviewed again. The fixes:
 
 One finding was refuted: a deleted line earns the credit that an added
 line costs, as the README states. Its wording is now exact.
+
+A fourth review checked the fixes of the third, from the same four angles,
+with a skeptic per angle. Codex reviewed the same commit. The fixes:
+
+- **Security.** The runner refused a symlink only at `run.log`. A run
+  could link `results.tsv` or the state file of the rows to
+  `/proc/self/environ`, and the runner copied what it read back into the
+  lab. Each read of the lab and the state directory now opens without
+  following a symlink, and checks the open handle.
+- **Durability.** A stop in the middle of a run left the lab as the run
+  changed it, and the next delivery of the call failed for good. A mark
+  per call now says that a run began. The next delivery stops what is
+  left and puts the lab back before it trains again. A reset is a hard
+  reset again that keeps only the text of `program.md`, so a change that
+  a run makes to `prepare.py` does not stay.
+- **One runner.** `serve` refuses to start while an unfinished report
+  agent or heartbeat run has another model. A refusal of `run` prints
+  commands that work as printed: with the database, the model and the tag
+  of the other session. Two sessions that wait for each other get the
+  stop first.
+- **Tests and docs.** The tests now cover each trigger of the check after
+  a run, the text conversion of a diff, a stop with no further experiment,
+  and `serve` itself. The evidence rows say only what the tests show.
+
+Three findings were refuted. Two are covered by the fixes above anyway.
 
 One mutant cannot fail a test on SQLite: a GPU mutex released before the
 training. The release writes no event, and one activity runs at a time.

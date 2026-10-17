@@ -1230,3 +1230,34 @@ async fn a_session_resumes_only_with_its_own_model() {
     let old = runtime::start(&mut rt, &fx.config("old", 1)).unwrap();
     runtime::check_model(&rt, old, "scripted").unwrap();
 }
+
+/// `serve` drives every unfinished run with its own model. A report agent
+/// whose session ended is checked against the model of that session. A
+/// heartbeat run is checked against the model of the `serve` that started
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_checks_the_model_of_each_unfinished_agent_run() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let mut config = fx.config("night", 1);
+    config.report = true;
+    config.model = "claude:claude-x".into();
+    let exec = runtime::start(&mut rt, &config).unwrap();
+    let report = run_to_end(&mut rt, exec).await;
+    assert!(report.report_run.is_some(), "the report agent waits");
+    let refused = runtime::check_agents(&rt, "scripted", None).unwrap_err();
+    assert!(refused.contains("claude:claude-x"), "{refused}");
+    runtime::check_agents(&rt, "claude:claude-x", None).unwrap();
+
+    // A heartbeat run that an earlier `serve` started and did not finish.
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let schedule = runtime::heartbeat(fx.labs[0].root()).unwrap();
+    rt.start_workflow(&schedule.workflow_name, schedule.input.clone())
+        .unwrap();
+    let refused = runtime::check_agents(&rt, "claude:claude-x", Some("scripted")).unwrap_err();
+    assert!(refused.contains("scripted"), "{refused}");
+    runtime::check_agents(&rt, "scripted", Some("scripted")).unwrap();
+    // A database from before the record: nothing to check against.
+    runtime::check_agents(&rt, "claude:claude-x", None).unwrap();
+}

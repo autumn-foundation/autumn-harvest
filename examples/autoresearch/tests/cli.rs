@@ -112,6 +112,7 @@ fn a_stop_posted_mid_night_lands_before_the_next_experiment() {
     let mut night = Command::new(env!("CARGO_BIN_EXE_autoresearch"))
         .args(["run", "--lab", &lab, "--tag", "mid", "--experiments", "0"])
         .args(["--per-run", "50", "--train-seconds", "1", "--tick-ms", "50"])
+        .args(["--pace", "3"])
         .args(["--approval-timeout", "1", "--no-report"])
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("AUTORESEARCH_LAB")
@@ -145,8 +146,8 @@ fn a_stop_posted_mid_night_lands_before_the_next_experiment() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(ended, "the night ended: {stdout}");
     assert!(stdout.contains("stopped"), "{stdout}");
-    // The experiment in flight ends. No other starts after the pause.
-    assert!(rows() <= at_stop + 1, "{} rows after {at_stop}", rows());
+    // The stop lands in the pause, so no experiment starts after it.
+    assert_eq!(rows(), at_stop, "{} rows after {at_stop}", rows());
 }
 
 #[test]
@@ -414,6 +415,82 @@ fn a_new_session_waits_until_the_running_one_ends() {
         "--no-report",
     ]);
     assert!(out.contains("done: autoresearch/w"), "{out}");
+}
+
+/// `serve` drives a night that a stopped `run` left, and names its end. A
+/// night that ended before `serve` started is not news.
+#[test]
+fn serve_names_a_night_that_ends_once() {
+    use std::io::BufRead as _;
+    let dir = tempfile::tempdir().unwrap();
+    let lab = lab_arg(&dir.path().join("lab"));
+    ok(&["init", &lab]);
+    ok(&[
+        "run",
+        "--lab",
+        &lab,
+        "--tag",
+        "old",
+        "--experiments",
+        "1",
+        "--no-report",
+    ]);
+    let mut first = Command::new(env!("CARGO_BIN_EXE_autoresearch"))
+        .args(["run", "--lab", &lab, "--tag", "night", "--experiments", "1"])
+        .args(["--train-seconds", "2", "--no-report"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("AUTORESEARCH_LAB")
+        .env_remove("AUTORESEARCH_DB")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let running = (0..300).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let status = autoresearch(&["status", "--lab", &lab]);
+        String::from_utf8_lossy(&status.stdout).contains("autoresearch/night  RUNNING")
+    });
+    first.kill().unwrap();
+    first.wait().unwrap();
+    assert!(running, "the night started");
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_autoresearch"))
+        .args(["serve", "--lab", &lab])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("AUTORESEARCH_LAB")
+        .env_remove("AUTORESEARCH_DB")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (lines, seen) = std::sync::mpsc::channel();
+    let stdout = serve.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut out = String::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while std::time::Instant::now() < deadline && !out.contains("done: autoresearch/night") {
+        if let Ok(line) = seen.recv_timeout(std::time::Duration::from_millis(200)) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    // A last look for a second report of the same end.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    out.extend(seen.try_iter().map(|line| line + "\n"));
+    serve.kill().unwrap();
+    serve.wait().unwrap();
+    assert!(
+        out.contains("done: autoresearch/night: 1 experiments"),
+        "{out}"
+    );
+    assert_eq!(out.matches("done: autoresearch/night").count(), 1, "{out}");
+    assert!(!out.contains("autoresearch/old"), "{out}");
 }
 
 #[test]

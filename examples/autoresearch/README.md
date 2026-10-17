@@ -134,10 +134,15 @@ tag waits.
 
 Before each experiment, the session pauses on a durable timer, one second by
 default (`--pace`). The pause ends the drive, so a command lands before the
-next experiment, and `serve` fires its heartbeat. Only one runner can drive a
-database. So `run` refuses a new session while another one runs, and it
-names the command that finishes the other one. History records the model, and
-a resume needs the same `--model`.
+next experiment, and `serve` fires its heartbeat. With `--pace 0` there is no
+pause, and a command lands only when the session waits or continues as new.
+An `approve` or a `deny` lands on the next tick of the runner.
+
+Only one runner can drive a database. So `run` refuses a new session while
+another one runs, and it prints the commands that finish or stop the other
+one. History records the model, and a resume needs the same `--model`.
+`serve` refuses to start while an unfinished run, such as a report agent or a
+heartbeat, has another model.
 
 ```bash
 cargo run -p autoresearch -- hint --lab /tmp/ar-lab --tag demo "paper:warmdown"
@@ -267,14 +272,19 @@ experiment set the search attribute `status`, which the engine reserves.
   `ANTHROPIC_API_KEY=... autoresearch run ...`. Git runs with hooks off and
   with the list of the run, so a command that a run puts in `.git/config`
   cannot read the key either. The runner reads `run.log` through its own
-  handle, so a symlink there cannot send the read to another file. A run
-  that moves the branch or `HEAD`, or changes `train.py`, is a crash, and the
-  lab goes back. The code can still read your files, write `.git` and
+  handle. It refuses a symlink at `results.tsv`, `train.py`, the files that
+  the agent reads and its state files. So a link cannot send a read to another
+  file, such as `/proc/self/environ`. A run that moves the branch or `HEAD`,
+  or changes `train.py`, is a crash, and the lab goes back. After a stop in
+  the middle of a run, the train call puts the lab back before it trains
+  again. The code can still read your files, write `.git` and
   `.autoresearch`, and escape the kill with `setsid`. Run it in a container,
   or as a user with no other rights.
-- **A reset puts back `train.py` only.** A discard, a crash and a rewind
-  reset the branch and `train.py`. A change to another file, such as an edit
-  to `program.md` for the next night, stays.
+- **A reset keeps `program.md`.** A discard, a crash and a rewind reset the
+  branch and each tracked file, but keep the text of `program.md`. So an edit
+  for the next night stays. A change that a run makes there stays too, so
+  read `program.md` before a night. A file that git does not track stays as
+  it is.
 - **The score is what `train.py` prints.** As upstream, the last `val_bpb:`
   line counts. An edit can print a false score. Read each kept diff. Unlike
   upstream, a run that exits with an error is a crash, even after a summary.

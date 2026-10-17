@@ -373,6 +373,9 @@ fn open_runtime(db: &Path, harness: AgentHarness) -> Result<SqliteRuntime, Strin
     Ok(rt)
 }
 
+/// The file in the state directory that names the model of `serve`.
+const SERVE_MODEL: &str = "serve-model";
+
 /// The model as history records it, such as `claude:<model id>`.
 fn model_label(args: &ModelArgs) -> String {
     match args.model {
@@ -419,6 +422,7 @@ fn config(lab: &Lab, args: &SessionArgs, tag: String) -> SessionConfig {
 fn pick_session(
     rt: &mut SqliteRuntime,
     lab: &Lab,
+    db: Option<&Path>,
     session: &SessionArgs,
 ) -> Result<ExecutionId, String> {
     if let Some(tag) = &session.tag {
@@ -431,7 +435,7 @@ fn pick_session(
         // running session. A new one would wait for its lab for good.
         let running = runtime::running_sessions(rt)?;
         if !running.is_empty() {
-            return Err(only_runner(lab, &running));
+            return Err(only_runner(rt, lab, db, &running, None));
         }
         return start_session(rt, lab, session, tag);
     }
@@ -457,31 +461,25 @@ fn pick_session(
     }
 }
 
-/// Why `run` cannot go on while the sessions in `running` wait for a runner.
-fn only_runner(lab: &Lab, running: &[(ExecutionId, String)]) -> String {
-    let names: Vec<String> = running
+/// Why `run` cannot go on while the sessions in `running` wait for a
+/// runner. See [`runtime::finish_first`].
+fn only_runner(
+    rt: &SqliteRuntime,
+    lab: &Lab,
+    db: Option<&Path>,
+    running: &[(ExecutionId, String)],
+    waiting_for: Option<&str>,
+) -> String {
+    let others: Vec<(String, String)> = running
         .iter()
-        .map(|(_, tag)| {
-            if tag.is_empty() {
-                "a session with no tag yet".to_string()
-            } else {
-                format!("the session tagged {tag:?}")
-            }
+        .map(|(exec, tag)| {
+            let model = runtime::session_config(rt, *exec)
+                .map(|config| config.model)
+                .unwrap_or_default();
+            (tag.clone(), model)
         })
         .collect();
-    let tag = running
-        .iter()
-        .map(|(_, tag)| tag.as_str())
-        .find(|tag| !tag.is_empty())
-        .unwrap_or("<tag>");
-    let lab = lab.root().display();
-    format!(
-        "{} is running, and only one runner can drive this database. \
-         Finish it first with `autoresearch run --lab {lab} --tag {tag}`. \
-         To end it after its experiment, run `autoresearch stop --lab {lab} --tag {tag}` \
-         before that. `autoresearch serve` drives every session.",
-        names.join(", ")
-    )
+    runtime::finish_first(lab.root(), db, &others, waiting_for)
 }
 
 fn start_session(
@@ -519,7 +517,7 @@ async fn shutdown() {
 async fn run(args: &LabArgs, session: &SessionArgs) -> Result<(), String> {
     let (lab, state, db) = open_lab(args)?;
     let mut rt = open_runtime(&db, harness(&lab, &state, &session.model)?)?;
-    let mut exec = pick_session(&mut rt, &lab, session)?;
+    let mut exec = pick_session(&mut rt, &lab, args.db.as_deref(), session)?;
     let inbox = Inbox::new(&state)?;
     let mut rows = Rows::from_now(&lab);
     let mut asked = HashSet::new();
@@ -574,9 +572,12 @@ async fn run(args: &LabArgs, session: &SessionArgs) -> Result<(), String> {
                 // A holder that ended frees the mutex. A running one waits
                 // for a runner, and this runner drives one session.
                 if !others.is_empty() {
-                    return Err(format!(
-                        "the session waits for {key}. {}",
-                        only_runner(&lab, &others)
+                    return Err(only_runner(
+                        &rt,
+                        &lab,
+                        args.db.as_deref(),
+                        &others,
+                        Some(&key),
                     ));
                 }
                 tokio::time::sleep(tick).await;
@@ -705,11 +706,15 @@ fn print_report(report: &SessionReport) {
 async fn serve(args: &LabArgs, session: &SessionArgs) -> Result<(), String> {
     let (lab, state, db) = open_lab(args)?;
     let mut rt = open_runtime(&db, harness(&lab, &state, &session.model)?)?;
-    // `serve` drives every session with its own model.
-    for (exec, tag) in runtime::running_sessions(&rt)? {
-        runtime::check_model(&rt, exec, &model_label(&session.model))
-            .map_err(|why| format!("the session tagged {tag:?}: {why}"))?;
-    }
+    // `serve` drives every unfinished run with its own model. A heartbeat
+    // run has the model of the `serve` that started it, kept in a file.
+    let label = model_label(&session.model);
+    let marker = state.join(SERVE_MODEL);
+    let started = autoresearch::stores::read_regular(&marker)
+        .map_err(|e| format!("cannot read {}: {e}", marker.display()))?
+        .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string());
+    runtime::check_agents(&rt, &label, started.as_deref())?;
+    autoresearch::stores::write_atomic(&marker, label.as_bytes())?;
     let base = config(&lab, session, String::new());
     rt.upsert_schedule(&runtime::nightly(&base)?)
         .map_err(|e| e.to_string())?;
@@ -807,7 +812,13 @@ fn status(args: &LabArgs) -> Result<(), String> {
 fn post(args: &LabArgs, command: &Command) -> Result<(), String> {
     let (_, state, _) = open_lab(args)?;
     let id = Inbox::new(&state)?.post(command)?;
-    println!("queued {id}: the runner delivers it in the pause before the next experiment");
+    // A decision lands on the next tick. A command for the session lands in
+    // its pause, which a session with `--pace 0` does not have.
+    let when = match command {
+        Command::Approve { .. } | Command::Deny { .. } => "on its next tick",
+        _ => "in the pause before the next experiment",
+    };
+    println!("queued {id}: the runner delivers it {when}");
     Ok(())
 }
 

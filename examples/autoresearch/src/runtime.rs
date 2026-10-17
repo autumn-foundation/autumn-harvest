@@ -415,6 +415,155 @@ pub fn check_model(rt: &SqliteRuntime, exec: ExecutionId, model: &str) -> Result
     }
 }
 
+/// Why `run` cannot go on while `others`, as `(tag, model)`, wait for a
+/// runner, with the commands that free it. Only one runner can drive a
+/// database, so no other runner can finish them.
+///
+/// `waiting_for` names the mutex that the session of `run` waits for. Two
+/// sessions that wait for each other take turns, one experiment for each
+/// `run`, so the message then puts the stop first. Each command works as
+/// printed: it has the database, the model and the tag of the session.
+#[must_use]
+pub fn finish_first(
+    lab: &std::path::Path,
+    db: Option<&std::path::Path>,
+    others: &[(String, String)],
+    waiting_for: Option<&str>,
+) -> String {
+    let names: Vec<String> = others
+        .iter()
+        .map(|(tag, _)| {
+            if tag.is_empty() {
+                "a session with no tag yet".to_string()
+            } else {
+                format!("the session tagged {tag:?}")
+            }
+        })
+        .collect();
+    let (tag, model) = others
+        .iter()
+        .find(|(tag, _)| !tag.is_empty())
+        .or_else(|| others.first())
+        .map_or(("", ""), |(tag, model)| (tag.as_str(), model.as_str()));
+    let lab = shell_word(&lab.display().to_string());
+    let db = db.map_or_else(String::new, |db| {
+        format!(" --db {}", shell_word(&db.display().to_string()))
+    });
+    let model = model
+        .strip_prefix("claude:")
+        .map_or_else(String::new, |id| {
+            format!(" --model claude --claude-model {}", shell_word(id))
+        });
+    let tag_flag = if tag.is_empty() {
+        String::new()
+    } else {
+        format!(" --tag {}", shell_word(tag))
+    };
+    let resume = format!("`autoresearch run --lab {lab}{db}{model}{tag_flag}`");
+    let serve = format!("`autoresearch serve --lab {lab}{db}{model}` drives every session.");
+    let head = format!(
+        "{} is running, and only one runner can drive this database.",
+        names.join(", ")
+    );
+    if tag.is_empty() {
+        return format!("{head} Resume it first with {resume}. {serve}");
+    }
+    let stop = format!("`autoresearch stop --lab {lab}{tag_flag}`");
+    waiting_for.map_or_else(
+        || {
+            format!(
+                "{head} Finish it first with {resume}. To end it after its experiment, \
+                 post {stop} before that. {serve}"
+            )
+        },
+        |key| {
+            format!(
+                "The session waits for {key}. {head} The two would take turns, one \
+                 experiment for each `run`. End it first: post {stop}, then run {resume}. \
+                 It ends after its experiment. {serve}"
+            )
+        },
+    )
+}
+
+/// `word` as one shell word: as it is, or in single quotes.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._-:=+@%,".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
+}
+
+/// Fail when an unfinished run would go on with another model than `model`.
+///
+/// `serve` drives every unfinished run. A run of an agent belongs to a
+/// session or to a heartbeat. A session records its model, and its report
+/// agent can run on after the session ends. A heartbeat run has the model
+/// of the `serve` that started it, `heartbeat_model`, when one is known.
+///
+/// # Errors
+///
+/// Returns an error that names the run and both models when they differ,
+/// or when the backend fails.
+pub fn check_agents(
+    rt: &SqliteRuntime,
+    model: &str,
+    heartbeat_model: Option<&str>,
+) -> Result<(), String> {
+    let filter = ExecutionFilter::new().state("RUNNING").limit(1000);
+    let page = rt.list_executions(&filter).map_err(|e| e.to_string())?;
+    let mut checked = HashSet::new();
+    for run in &page.executions {
+        let Some(exec) = run.execution_id() else {
+            continue;
+        };
+        let root = root_of(rt, exec)?;
+        if !checked.insert(root) {
+            continue;
+        }
+        let name = rt
+            .describe(root)
+            .map_err(|e| e.to_string())?
+            .summary
+            .workflow_name
+            .into_value()
+            .unwrap_or_default();
+        if name == SESSION {
+            check_model(rt, root, model).map_err(|why| {
+                let id = run.workflow_id.clone().into_value().unwrap_or_default();
+                format!("the run {id} is not finished, and {why}")
+            })?;
+        } else if name == heartbeat::HEARTBEAT_WORKFLOW_NAME
+            && let Some(started) = heartbeat_model
+            && started != model
+        {
+            return Err(format!(
+                "a heartbeat run that `serve --model {started}` started is not finished. \
+                 Serve with the same --model and --claude-model until it ends"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The top run above `exec`: the run that no other run started.
+fn root_of(rt: &SqliteRuntime, exec: ExecutionId) -> Result<ExecutionId, String> {
+    let mut run = exec;
+    // A session, an experiment and two agent runs nest at most four deep.
+    for _ in 0..16 {
+        match rt.parent_execution(run).map_err(|e| e.to_string())? {
+            Some(parent) => run = parent,
+            None => return Ok(run),
+        }
+    }
+    Ok(run)
+}
+
 /// How a session ended.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ended {
@@ -786,5 +935,50 @@ mod tests {
             kinds,
             ["ActivityStarted", "ActivityHeartbeat", "ActivityCompleted"]
         );
+    }
+
+    /// The commands in a refusal must work as printed. They name the
+    /// database, the model and the tag of the other session. A session with
+    /// no tag yet gets no tag.
+    #[test]
+    fn a_refusal_names_commands_that_work_as_printed() {
+        let lab = std::path::Path::new("/labs/my lab");
+        let db = std::path::Path::new("/dbs/night.db");
+        let claude = vec![("y".to_string(), "claude:claude-x".to_string())];
+        let text = finish_first(lab, Some(db), &claude, None);
+        assert!(text.contains("tagged \"y\""), "{text}");
+        assert!(
+            text.contains(
+                "autoresearch run --lab '/labs/my lab' --db /dbs/night.db --model claude \
+                 --claude-model claude-x --tag y"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("autoresearch stop --lab '/labs/my lab' --tag y"),
+            "{text}"
+        );
+        assert!(
+            text.contains("autoresearch serve --lab '/labs/my lab' --db"),
+            "{text}"
+        );
+
+        // A session with no tag yet resumes with no tag, and no stop names it.
+        let untagged = vec![(String::new(), "scripted".to_string())];
+        let text = finish_first(lab, None, &untagged, None);
+        assert!(!text.contains("<tag>") && !text.contains("--tag"), "{text}");
+        assert!(
+            text.contains("autoresearch run --lab '/labs/my lab'`"),
+            "{text}"
+        );
+
+        // Two sessions that wait for each other take turns one experiment at
+        // a time, so the stop comes first.
+        let scripted = vec![("b".to_string(), "scripted".to_string())];
+        let text = finish_first(lab, None, &scripted, Some("lab:/labs/my lab"));
+        let stop = text.find("autoresearch stop").unwrap();
+        let run = text.find("autoresearch run").unwrap();
+        assert!(stop < run, "{text}");
+        assert!(text.contains("lab:/labs/my lab"), "{text}");
     }
 }
