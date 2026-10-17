@@ -159,11 +159,14 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
 - The management API, DAGs, worker sessions, sharding.
-- Child workflows, external signals/cancels, and a continue-as-new to a
-  different workflow type
-  (`continue_as_new_as_type`) — a workflow reaching one of these is
-  rejected **loudly, by name**, never silently dropped. The run then ends
+- External activities and a continue-as-new to a different workflow type
+  (`continue_as_new_as_type`) — a workflow reaching one of these is rejected
+  **loudly, by name**, never silently dropped. The run then ends
   `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).
+
+Since issue #2026, the backend supports child workflows and signal, cancel and
+await between runs. See
+[§9 of the docs guide](../docs/sqlite-backend.md#9-child-workflows-and-commands-between-runs).
 
 ## Learn more
 

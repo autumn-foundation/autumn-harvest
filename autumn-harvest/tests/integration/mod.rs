@@ -189,6 +189,8 @@ mod hot_code_swap_tests;
 #[cfg(feature = "testing")]
 mod idempotency_tests;
 mod integration_e2e;
+#[cfg(feature = "db")]
+mod late_signal_completion_tests;
 mod legal_hold_tests;
 #[cfg(feature = "db")]
 mod lifecycle_model_props;
@@ -428,6 +430,9 @@ mod workflow_pause_claim_recheck_tests;
 mod workflow_reachability_samples_tests;
 mod workflow_retry_tests;
 mod workflow_schema_contract_tests;
+mod workflow_sim_ingest_tests;
+#[cfg(feature = "testing")]
+mod workflow_sim_tests;
 mod workflow_task_timeout_tests;
 #[cfg(feature = "testing")]
 mod workflow_test_env_mid_run_tests;

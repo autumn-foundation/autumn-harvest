@@ -244,6 +244,17 @@ Rules:
   `query` still reads the final state.
 - `env.run(handler, input)` is `env.start(handler, input).finish().await`.
 
+### Seeded delivery orders
+
+`env.run` lands every result of a suspension in one task, in command order.
+Production can land the same results across many tasks, in any order. A
+`ctx.race()` winner and a signal-or-timer race can then change.
+
+`env.simulation().sweep(...)` runs your workflow against seeded, legal
+orders. It checks each seed with `always!` and `sometimes!`, replays each
+history, and prints a one-line replay command on failure. See
+[the workflow simulation guide](../testing/workflow-simulation.md).
+
 ---
 
 [← Operating the service](10-operations.md) · [Index](README.md)

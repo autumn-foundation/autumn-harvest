@@ -98,10 +98,11 @@ A native primitive stays at rank 13, behind customer pull.
   is `(workflow_name, workflow_id, key)`, so it holds across runs.
 - An op has no reply. A caller reads the state with a query. A
   request/response call is future work.
-- An op that arrives during the decision that runs a delete can be lost. The
-  run completes, and the engine does not re-check new signals at completion.
-  A retry with the same idempotency key then dedupes against the completed
-  run. Send a delete only when no client still sends to the key.
+- An op that arrives during the decision that runs a delete is not lost
+  (issue #2079). The engine checks for unconsumed signals before it seals a
+  run. If one exists, it discards the decision and runs the task again. The
+  loop then sees the new op and goes on. A delete that meets a waiting op
+  resets the state and does not end the run.
 - The idempotency dedupe holds while the earlier runs are retained. A key
   used before a delete also dedupes after it, so use unique keys.
 - The checkpoint input holds the whole state. A state larger than the

@@ -3220,6 +3220,11 @@ pub struct WorkflowContext {
     /// clock when it runs (issue #1991).
     #[cfg(any(test, feature = "testing"))]
     timer_clock_elapsed_secs: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// `Some` in a workflow simulation run (issue #2033): a seeded generator
+    /// and the virtual time in milliseconds. A live built-in side effect then
+    /// reads them, so a seed replays.
+    #[cfg(any(test, feature = "testing"))]
+    side_effect_rng: Option<Arc<(Mutex<crate::dst::SplitMix64>, i64)>>,
     /// Metrics recorder for user-emitted custom business metrics (issue #532).
     /// Defaults to [`NoOpMetrics`](crate::telemetry::NoOpMetrics) when the
     /// worker has no telemetry configured.  Workflow metrics are replay-safe:
@@ -3768,6 +3773,8 @@ impl WorkflowContext {
             scheduled_time,
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
+            #[cfg(any(test, feature = "testing"))]
+            side_effect_rng: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
             start_provenance: StartProvenance::default(),
@@ -3957,6 +3964,8 @@ impl WorkflowContext {
             scheduled_time: None,
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
+            #[cfg(any(test, feature = "testing"))]
+            side_effect_rng: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
             start_provenance: StartProvenance::default(),
@@ -4036,6 +4045,8 @@ impl WorkflowContext {
             scheduled_time: None,
             #[cfg(any(test, feature = "testing"))]
             timer_clock_elapsed_secs: None,
+            #[cfg(any(test, feature = "testing"))]
+            side_effect_rng: None,
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             parent_execution_id: None,
             start_provenance: StartProvenance::default(),
@@ -4054,6 +4065,57 @@ impl WorkflowContext {
     pub fn with_advancing_timer_clock(mut self) -> Self {
         self.timer_clock_elapsed_secs = Some(Arc::new(std::sync::atomic::AtomicU64::new(0)));
         self
+    }
+
+    /// Draw live built-in side effects from a generator seeded with `seed`
+    /// (issue #2033, test harness only).
+    ///
+    /// `new_uuid`, the `random_*` helpers and the `system_*` clock reads then
+    /// give the same value on each run of a simulation seed. A clock read
+    /// returns `now`, the virtual time of the cycle. Production leaves it unset.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub(crate) fn with_seeded_side_effects(mut self, seed: u64, now: DateTime<Utc>) -> Self {
+        let rng = Mutex::new(crate::dst::SplitMix64::new(seed));
+        self.side_effect_rng = Some(Arc::new((rng, now.timestamp_millis())));
+        self
+    }
+
+    /// The next seeded draw and the virtual time of a simulation run.
+    ///
+    /// It returns `None` outside a run, so each caller keeps its live source.
+    #[cfg_attr(
+        not(any(test, feature = "testing")),
+        allow(clippy::unused_self, clippy::missing_const_for_fn)
+    )]
+    fn seeded_draw(&self) -> Option<(u64, i64)> {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(seeded) = &self.side_effect_rng {
+            let mut rng = seeded
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            return Some((rng.next_u64(), seeded.1));
+        }
+        None
+    }
+
+    /// The live value of a clock read: the virtual time in a simulation run.
+    fn live_now_millis(&self) -> i64 {
+        self.seeded_draw()
+            .map_or_else(|| Utc::now().timestamp_millis(), |(_, now)| now)
+    }
+
+    /// The live value of `new_uuid`. In a simulation run it is a seeded v7
+    /// UUID at the virtual time, so its time order still holds.
+    fn live_uuid(&self) -> uuid::Uuid {
+        self.seeded_draw()
+            .map_or_else(uuid::Uuid::now_v7, |(bits, now)| {
+                let mut random = [0_u8; 10];
+                random[..8].copy_from_slice(&bits.to_be_bytes());
+                let millis = u64::try_from(now).unwrap_or_default();
+                uuid::Builder::from_unix_timestamp_millis(millis, &random).into_uuid()
+            })
     }
 
     /// Advance the virtual timer clock by `duration_secs` (no-op in production).
@@ -5636,9 +5698,8 @@ impl WorkflowContext {
     /// Panics if the internal matcher or commands mutex is poisoned.
     #[must_use]
     pub fn system_now(&self) -> DateTime<Utc> {
-        let millis = self.capture_builtin(crate::event::SideEffectKind::Now, || {
-            Utc::now().timestamp_millis()
-        });
+        let millis =
+            self.capture_builtin(crate::event::SideEffectKind::Now, || self.live_now_millis());
         DateTime::from_timestamp_millis(millis).unwrap_or(self.start_time)
     }
 
@@ -5653,9 +5714,8 @@ impl WorkflowContext {
     /// Panics if the internal matcher or commands mutex is poisoned.
     #[must_use]
     pub fn system_time_now(&self) -> std::time::SystemTime {
-        let millis = self.capture_builtin(crate::event::SideEffectKind::Now, || {
-            Utc::now().timestamp_millis()
-        });
+        let millis =
+            self.capture_builtin(crate::event::SideEffectKind::Now, || self.live_now_millis());
         let millis_u64 = u64::try_from(millis.max(0)).unwrap_or(0);
         std::time::UNIX_EPOCH + std::time::Duration::from_millis(millis_u64)
     }
@@ -5673,7 +5733,7 @@ impl WorkflowContext {
     /// Panics if the internal matcher or commands mutex is poisoned.
     #[must_use]
     pub fn new_uuid(&self) -> uuid::Uuid {
-        self.capture_builtin(crate::event::SideEffectKind::Uuid, uuid::Uuid::now_v7)
+        self.capture_builtin(crate::event::SideEffectKind::Uuid, || self.live_uuid())
     }
 
     /// Deterministic random `u64`, captured once and replayed verbatim.
@@ -5688,7 +5748,8 @@ impl WorkflowContext {
     #[must_use]
     pub fn random_u64(&self) -> u64 {
         self.capture_builtin(crate::event::SideEffectKind::Random, || {
-            rand::random::<u64>()
+            self.seeded_draw()
+                .map_or_else(rand::random::<u64>, |(bits, _)| bits)
         })
     }
 
@@ -5708,7 +5769,14 @@ impl WorkflowContext {
         self.capture_builtin_validated(
             crate::event::SideEffectKind::Random,
             |v: &f64| (0.0..1.0).contains(v),
-            rand::random::<f64>,
+            || {
+                // The top 53 bits give a uniform value in [0, 1).
+                #[allow(clippy::cast_precision_loss)]
+                self.seeded_draw()
+                    .map_or_else(rand::random::<f64>, |(bits, _)| {
+                        (bits >> 11) as f64 / (1_u64 << 53) as f64
+                    })
+            },
         )
     }
 
@@ -5783,7 +5851,13 @@ impl WorkflowContext {
                             .to_string(),
                     );
                 }
-                let result = rand::Rng::gen_range(&mut rand::thread_rng(), range);
+                let result = match self.seeded_draw() {
+                    Some((seed, _)) => rand::Rng::gen_range(
+                        &mut <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed),
+                        range,
+                    ),
+                    None => rand::Rng::gen_range(&mut rand::thread_rng(), range),
+                };
                 let value = serde_json::to_value(&result)
                     .expect("built-in side-effect value must serialise");
                 self.push_command(WorkflowCommand::RecordSideEffect {
