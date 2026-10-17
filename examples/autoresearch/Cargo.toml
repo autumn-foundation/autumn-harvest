@@ -1,0 +1,39 @@
+[package]
+name = "autoresearch"
+description = "Karpathy's autoresearch loop as durable Harvest workflows: a capstone example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "autoresearch"
+path = "src/main.rs"
+
+[dependencies]
+# The backend-neutral core only: no Diesel, no Postgres.
+autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", default-features = false }
+autumn-harvest-sqlite = { version = "0.7.0", path = "../../autumn-harvest-sqlite" }
+# `sqlite` registers the agent loop on the embedded backend. `eval` re-drives
+# a recorded proposal with a candidate `program.md`.
+autumn-harvest-agent = { version = "0.7.0", path = "../../autumn-harvest-agent", features = ["sqlite", "eval"] }
+chrono = { workspace = true }
+clap = { version = "4.5", features = ["derive", "env"] }
+futures = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Content addresses for the blobs of the response cache.
+sha2 = "0.11"
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# `testing` adds `WorkflowTestEnv` and the seeded simulation (issue #2033).
+autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", default-features = false, features = ["testing"] }
+proptest = { workspace = true }
+tempfile = "3"
+
+[lints]
+workspace = true

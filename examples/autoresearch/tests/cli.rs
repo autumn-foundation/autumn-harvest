@@ -1,0 +1,109 @@
+//! The binary, as a reader runs it: `init`, `run`, `status`, the inbox
+//! commands, `verify`, `eval` and `purge`. Offline, with the defaults.
+
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::path::Path;
+use std::process::{Command, Output};
+
+fn autoresearch(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_autoresearch"))
+        .args(args)
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("AUTORESEARCH_LAB")
+        .env_remove("AUTORESEARCH_DB")
+        .output()
+        .unwrap()
+}
+
+fn ok(args: &[&str]) -> String {
+    let out = autoresearch(args);
+    assert!(
+        out.status.success(),
+        "{args:?} failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn lab_arg(lab: &Path) -> String {
+    lab.display().to_string()
+}
+
+#[test]
+fn a_night_runs_offline_from_one_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let lab = dir.path().join("lab");
+    let lab = lab_arg(&lab);
+
+    let out = ok(&["init", &lab]);
+    assert!(out.contains("autoresearch run --lab"), "{out}");
+    // A second init refuses the used directory.
+    assert!(!autoresearch(&["init", &lab]).status.success());
+
+    let out = ok(&["run", "--lab", &lab, "--tag", "demo", "--experiments", "3"]);
+    assert!(out.contains("baseline"), "{out}");
+    assert!(out.contains("best"), "{out}");
+    let results = std::fs::read_to_string(Path::new(&lab).join("results.tsv")).unwrap();
+    assert_eq!(results.lines().count(), 1 + 4, "{results}");
+
+    let status = ok(&["status", "--lab", &lab]);
+    assert!(status.contains("autoresearch/demo"), "{status}");
+    assert!(status.contains("COMPLETED"), "{status}");
+
+    let verify = ok(&["verify", "--lab", &lab]);
+    assert!(verify.contains("0 failed"), "{verify}");
+
+    // A run with the same tag resumes nothing and refuses the tag.
+    let again = autoresearch(&["run", "--lab", &lab, "--tag", "demo", "--experiments", "1"]);
+    assert!(!again.status.success());
+}
+
+#[test]
+fn inbox_commands_queue_for_the_runner() {
+    let dir = tempfile::tempdir().unwrap();
+    let lab = lab_arg(&dir.path().join("lab"));
+    ok(&["init", &lab]);
+    ok(&["hint", "--lab", &lab, "--tag", "t", "paper:warmdown"]);
+    ok(&["stop", "--lab", &lab, "--tag", "t"]);
+    let inbox = Path::new(&lab).join(".autoresearch").join("inbox");
+    let queued = std::fs::read_dir(&inbox)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().path().is_file())
+        .count();
+    assert_eq!(queued, 2);
+    // The runner delivers both: the hint goes to the first experiment, and
+    // the stop ends the session after it.
+    let out = ok(&["run", "--lab", &lab, "--tag", "t", "--experiments", "0", "--approval-timeout", "1"]);
+    assert!(out.contains("stopped"), "{out}");
+    let queued = std::fs::read_dir(&inbox)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().path().is_file())
+        .count();
+    assert_eq!(queued, 0);
+}
+
+#[test]
+fn eval_and_purge_work_on_a_finished_night() {
+    let dir = tempfile::tempdir().unwrap();
+    let lab = lab_arg(&dir.path().join("lab"));
+    ok(&["init", &lab]);
+    ok(&["run", "--lab", &lab, "--tag", "e", "--experiments", "1", "--no-report"]);
+    let candidate = dir.path().join("candidate.md");
+    std::fs::write(&candidate, "# program\nPrefer simplifications.\n").unwrap();
+    let out = ok(&["eval", "--lab", &lab, "--candidate", candidate.to_str().unwrap()]);
+    assert!(out.contains("first divergence"), "{out}");
+    let out = ok(&["purge", "--lab", &lab, "--older-than-days", "30"]);
+    assert!(out.contains("removed 0"), "{out}");
+}
+
+#[test]
+fn claude_needs_a_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let lab = lab_arg(&dir.path().join("lab"));
+    ok(&["init", &lab]);
+    let out = autoresearch(&["run", "--lab", &lab, "--tag", "k", "--model", "claude"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("ANTHROPIC_API_KEY"));
+}
