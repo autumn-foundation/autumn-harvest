@@ -1033,6 +1033,7 @@ impl WorkflowReplayer {
             context_headers: self.context_headers.clone(),
             execution_timeout: self.execution_timeout,
             parent_execution_id: self.parent_execution_id,
+            start_provenance: self.start_provenance,
             workflow_id: self.workflow_id.clone(),
             queue_name: self.queue_name.clone(),
             build_id: self.build_id.clone(),
@@ -3988,6 +3989,8 @@ struct FixtureReplayDefaults {
     context_headers: HashMap<String, String>,
     execution_timeout: Option<chrono::Duration>,
     parent_execution_id: Option<ExecutionId>,
+    /// Fallback start provenance for a fixture that omits it (issue #2082).
+    start_provenance: crate::types::StartProvenance,
     workflow_id: Option<String>,
     queue_name: Option<String>,
     /// The **candidate** build id (issue #798).
@@ -4954,8 +4957,8 @@ fn fixture_replayer(
         // still wins, so a deadline-aware fixture is validated either way.
         execution_timeout: defaults.execution_timeout,
         parent_execution_id: defaults.parent_execution_id,
-        // A fixture holds no row, so the verifier replays with an unknown source.
-        start_provenance: crate::types::StartProvenance::default(),
+        // A snapshot that omits the value falls back to the configured one.
+        start_provenance: defaults.start_provenance,
         workflow_id: defaults.workflow_id.clone(),
         // Issue #798 fallback: a snapshot carrying its own `queue_name` still
         // wins, so an exported fixture is validated against its real queue.
@@ -7804,6 +7807,20 @@ mod tests {
     use chrono::Utc;
     use std::future::Future;
     use std::pin::Pin;
+
+    /// Issue #2082: a bundle replay falls back to the configured provenance
+    /// when a fixture omits it.
+    #[test]
+    fn a_bundle_replayer_keeps_the_configured_start_provenance() {
+        let provenance =
+            crate::types::StartProvenance::fresh(crate::types::StartSource::SignalWithStart);
+        let defaults = FixtureReplayDefaults {
+            start_provenance: provenance,
+            ..FixtureReplayDefaults::default()
+        };
+        let replayer = fixture_replayer(&HashMap::new(), empty_shared_state(), &defaults);
+        assert_eq!(replayer.start_provenance, provenance);
+    }
 
     /// Issue #1974: two cycles that offer the same offset keep the first
     /// chunk, as the store's `ON CONFLICT DO NOTHING` does.
