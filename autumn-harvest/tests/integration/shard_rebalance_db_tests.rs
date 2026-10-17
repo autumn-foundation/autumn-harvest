@@ -826,7 +826,11 @@ async fn activation_copies_late_stream_chunks_over_a_terminated_target() {
         .into_iter()
         .map(|row| row.stream_offset)
         .collect();
-    assert_eq!(offsets, vec![0], "the terminated target must keep the chunk");
+    assert_eq!(
+        offsets,
+        vec![0],
+        "the terminated target must keep the chunk"
+    );
 }
 
 /// Issue #2128: erasure between terminate and activation must win. Activation

@@ -3061,6 +3061,26 @@ mod db {
                 .await
                 .map_err(database_error)?;
 
+                // Late chunks are not gated on `activated` (issue #2128). An
+                // operator can terminate the staged copy before activation.
+                // A terminated copy is not erased, and its durable stream
+                // reader must still see every chunk. The row lock waits for
+                // an erasure in flight. The check then reads the committed
+                // input, so activation never restores erased output.
+                let target_input: Option<TargetInputRow> = diesel::sql_query(
+                    "SELECT input FROM harvest_workflow_executions \
+                      WHERE id = $1 FOR UPDATE",
+                )
+                .bind::<SqlUuid, _>(exec_id.as_uuid())
+                .get_result(&mut *conn)
+                .await
+                .optional_row()?;
+                if target_input
+                    .is_some_and(|row| !crate::erase::execution_input_is_erased(&row.input))
+                {
+                    insert_stream_chunk_pages(&mut *conn, &late_chunk_pages).await?;
+                }
+
                 // Gated on `activated > 0` (issue #1596 review, finding
                 // 1). Termination is an operator override with no
                 // state-precondition filter. It can seal this copy
@@ -3077,13 +3097,6 @@ mod db {
                 // already has the task from the original transaction.
                 // Gating here never loses legitimate work.
                 if activated > 0 {
-                    // Gated like the task: an operator can terminate the
-                    // staged copy, and erasure can then scrub it, before this
-                    // runs. Copying then would restore erased author output.
-                    // The chunks stay on the sealed source, where erasure
-                    // also reaches them.
-                    insert_stream_chunk_pages(&mut *conn, &late_chunk_pages).await?;
-
                     // `jsonb_populate_record` over a NULL base turns a missing
                     // key into NULL, and the column DEFAULT does not apply.
                     // A row staged before a NOT NULL column existed, or by a
@@ -4611,6 +4624,12 @@ mod db {
         chain.retain(|shard| seen.insert(*shard));
         chain.push(live);
         Ok(chain)
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct TargetInputRow {
+        #[diesel(sql_type = Jsonb)]
+        input: Value,
     }
 
     #[derive(diesel::QueryableByName)]
