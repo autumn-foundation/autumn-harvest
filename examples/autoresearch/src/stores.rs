@@ -461,6 +461,88 @@ impl PayloadStore for DirPayloadStore {
     }
 }
 
+/// Open `path` to read, and refuse anything but a regular file.
+///
+/// A run is code that the model wrote, and it can put a symlink in the lab
+/// or the state directory. The open does not follow a symlink at `path`, so
+/// the runner cannot read a file that the link names, such as
+/// `/proc/self/environ`. The check uses the open handle, not the path, so
+/// no swap can come between the two. Off Unix, a symlink is refused before
+/// the open. Returns `None` when `path` does not exist.
+///
+/// # Errors
+///
+/// Returns an error when `path` is a symlink or not a regular file, or the
+/// open fails.
+pub fn open_regular(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    #[cfg(unix)]
+    let opened = {
+        use rustix::fs::{Mode, OFlags};
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map(std::fs::File::from)
+        .map_err(std::io::Error::from)
+    };
+    #[cfg(not(unix))]
+    let opened = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a symlink",
+        )),
+        Ok(_) => std::fs::File::open(path),
+        Err(e) => Err(e),
+    };
+    let file = match opened {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(not_regular(path, &e)),
+    };
+    if file.metadata()?.is_file() {
+        Ok(Some(file))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        ))
+    }
+}
+
+/// The error of an open that [`open_regular`] refused. A symlink at the
+/// path fails with `ELOOP`, and the message says so.
+fn not_regular(path: &Path, error: &std::io::Error) -> std::io::Error {
+    #[cfg(unix)]
+    if error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+        return std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is a symlink, which the runner does not follow",
+                path.display()
+            ),
+        );
+    }
+    std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+}
+
+/// The bytes of the regular file at `path`, or `None` when it does not
+/// exist. See [`open_regular`].
+///
+/// # Errors
+///
+/// Returns an error when `path` is a symlink or not a regular file, or a
+/// read fails.
+pub fn read_regular(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let Some(mut file) = open_regular(path)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
 /// Write `bytes` to `path` through a scratch file and a rename.
 ///
 /// The scratch file is new: an old file or a symlink at its name is removed

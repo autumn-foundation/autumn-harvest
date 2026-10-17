@@ -513,9 +513,8 @@ impl Lab {
         })
     }
 
-    /// Put `branch` at `commit`, check it out, and put back `train.py`.
-    /// The branch is made again when it is gone. A change to another file
-    /// stays, as [`Lab::reset_to`] keeps it.
+    /// Put `branch` at `commit`, check it out, and reset as
+    /// [`Lab::reset_to`] does. The branch is made again when it is gone.
     ///
     /// # Errors
     ///
@@ -526,8 +525,13 @@ impl Lab {
         self.reset_to(commit)
     }
 
-    /// Reset the branch and `train.py` to `commit`. A change to another
-    /// tracked file stays in the work tree.
+    /// Reset the branch and each tracked file to `commit`, but keep the
+    /// text of `program.md`.
+    ///
+    /// `program.md` is the file that a person edits, maybe for the next
+    /// night while this one runs. Every other tracked file goes back, so a
+    /// change to `prepare.py`, the fixed evaluation, does not stay for later
+    /// runs. A `program.md` that is not a regular file is not kept.
     ///
     /// # Errors
     ///
@@ -539,10 +543,18 @@ impl Lab {
             "--quiet",
             &format!("{commit}^{{commit}}"),
         ])?;
-        // `program.md` is the file that a person edits, maybe while a night
-        // runs. So only `train.py` goes back with `HEAD`.
-        self.git(&["reset", "--quiet", "--mixed", &target])?;
-        self.git(&["checkout", "--quiet", &target, "--", TRAIN])?;
+        let program = self.root.join(PROGRAM);
+        let kept = crate::stores::read_regular(&program).ok().flatten();
+        self.git(&["reset", "--quiet", "--hard", &target])?;
+        if let Some(text) = kept
+            && crate::stores::read_regular(&program)
+                .ok()
+                .flatten()
+                .as_ref()
+                != Some(&text)
+        {
+            crate::stores::write_atomic(&program, &text)?;
+        }
         Ok(())
     }
 
@@ -644,8 +656,8 @@ impl Lab {
         private_dir(&dir)?;
         let marker = dir.join(crate::stores::hashed(call));
         let before = crate::stores::hashed(&text);
-        if let Ok(saved) = std::fs::read_to_string(&marker)
-            && saved.lines().next() != Some(before.as_str())
+        if let Ok(Some(saved)) = crate::stores::read_regular(&marker)
+            && String::from_utf8_lossy(&saved).lines().next() != Some(before.as_str())
         {
             return Ok(());
         }
@@ -832,18 +844,21 @@ fn data_lines(text: &str) -> impl Iterator<Item = &str> {
         .filter(|line| !line.trim().is_empty() && *line != HEADER)
 }
 
-/// The text of `path`, or an empty text when it does not exist.
+/// The text of `path`, or an empty text when it does not exist. A symlink
+/// is refused, as [`crate::stores::open_regular`] states.
 fn read_or_empty(path: &Path) -> Result<String, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+    match crate::stores::read_regular(path) {
+        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes.unwrap_or_default()).into_owned()),
         Err(e) => Err(format!("cannot read {}: {e}", path.display())),
     }
 }
 
-/// The text of `train.py`.
+/// The text of `train.py`. A symlink is refused.
 fn read_train(path: &Path) -> Result<String, String> {
-    std::fs::read_to_string(path).map_err(|e| format!("cannot read {TRAIN}: {e}"))
+    let bytes = crate::stores::read_regular(path)
+        .map_err(|e| format!("cannot read {TRAIN}: {e}"))?
+        .ok_or_else(|| format!("cannot read {TRAIN}: it does not exist"))?;
+    String::from_utf8(bytes).map_err(|e| format!("cannot read {TRAIN}: {e}"))
 }
 
 /// `text` with the one occurrence of `old` replaced by `new`.
@@ -867,16 +882,16 @@ fn replace_once(text: &str, old: &str, new: &str) -> Result<String, String> {
 /// send a file from outside the lab to the model.
 fn read_capped(path: &Path) -> Result<Option<String>, String> {
     let name = path.display();
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("cannot read {name}: {e}")),
+    let Some(mut file) =
+        crate::stores::open_regular(path).map_err(|e| format!("cannot read {name}: {e}"))?
+    else {
+        return Ok(None);
     };
-    if !meta.is_file() {
-        return Err(format!("{name} is not a regular file"));
-    }
-    let mut file = std::fs::File::open(path).map_err(|e| format!("cannot read {name}: {e}"))?;
-    let skip = meta.len().saturating_sub(MAX_READ);
+    let len = file
+        .metadata()
+        .map_err(|e| format!("cannot read {name}: {e}"))?
+        .len();
+    let skip = len.saturating_sub(MAX_READ);
     file.seek(SeekFrom::Start(skip))
         .map_err(|e| format!("cannot read {name}: {e}"))?;
     let mut bytes = Vec::new();
@@ -1467,6 +1482,15 @@ mod tests {
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         lab.git(&["config", "diff.external", &script.display().to_string()])
             .unwrap();
+        lab.git(&[
+            "config",
+            "diff.probe.textconv",
+            &script.display().to_string(),
+        ])
+        .unwrap();
+        let attributes = lab.root().join(".git").join("info").join("attributes");
+        std::fs::create_dir_all(attributes.parent().unwrap()).unwrap();
+        std::fs::write(&attributes, "train.py diff=probe\n").unwrap();
         lab.start_branch("t1", "s1").unwrap();
         let base = lab.head().unwrap();
         lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
@@ -1474,5 +1498,73 @@ mod tests {
         let info = lab.commit_train("deeper", "k-1", &base).unwrap();
         assert_eq!((info.lines_added, info.lines_removed), (1, 1));
         assert!(!seen.exists(), "git ran the external diff");
+    }
+
+    /// A run can put a symlink at a file that the runner reads and writes
+    /// back, such as `results.tsv`. The runner refuses the link, so it never
+    /// copies the target, such as `/proc/self/environ`, into the lab.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_is_refused_and_never_copied() {
+        let (dir, lab) = lab();
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "DEPTH = 8\nKEY=hunter2\n").unwrap();
+        let state = lab.state_dir().unwrap();
+        let plant = |link: &Path| {
+            let _ = std::fs::remove_file(link);
+            std::os::unix::fs::symlink(&secret, link).unwrap();
+        };
+        for link in [lab.root().join(RESULTS), state.join(RECORDED)] {
+            plant(&link);
+            assert!(lab.record(&row("abc1234"), "k-1").is_err(), "{link:?}");
+            assert!(link.is_symlink(), "{link:?} stays a link");
+            std::fs::remove_file(&link).unwrap();
+        }
+        let train = lab.root().join(TRAIN);
+        plant(&train);
+        assert!(lab.edit_train("DEPTH = 8", "DEPTH = 9").is_err());
+        assert!(
+            lab.edit_train_once("DEPTH = 8", "DEPTH = 9", "c-1")
+                .is_err()
+        );
+        assert!(lab.read(TRAIN).is_err());
+        assert!(train.is_symlink(), "train.py stays a link");
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "DEPTH = 8\nKEY=hunter2\n"
+        );
+        for file in [lab.root().join(RESULTS), state.join(RECORDED)] {
+            let text = std::fs::read_to_string(&file).unwrap_or_default();
+            assert!(!text.contains("hunter2"), "{file:?}: {text}");
+        }
+    }
+
+    /// `prepare.py` holds the fixed evaluation. A run that changes it, or
+    /// commits a change to it, must not leave the change for later runs,
+    /// where no kept diff shows it. A reset and a restore put it back.
+    #[test]
+    fn a_reset_and_a_restore_put_back_prepare_py() {
+        let (_dir, lab) = lab();
+        lab.start_branch("t1", "s1").unwrap();
+        let base = lab.head().unwrap();
+        let prepare = lab.root().join(PREPARE);
+        let fixed = std::fs::read_to_string(&prepare).unwrap();
+        std::fs::write(&prepare, format!("{fixed}\nTAMPERED = 1\n")).unwrap();
+        lab.reset_to(&base).unwrap();
+        assert_eq!(std::fs::read_to_string(&prepare).unwrap(), fixed);
+
+        // A run committed the change on another branch.
+        lab.git(&["checkout", "--quiet", "-b", "elsewhere"])
+            .unwrap();
+        std::fs::write(&prepare, format!("{fixed}\nTAMPERED = 1\n")).unwrap();
+        lab.git(&["commit", "--quiet", "-am", "tamper"]).unwrap();
+        lab.restore("autoresearch/t1", &base).unwrap();
+        lab.require_head(&base).unwrap();
+        assert_eq!(std::fs::read_to_string(&prepare).unwrap(), fixed);
+        assert_eq!(
+            lab.git(&["status", "--porcelain", "--untracked-files=no"])
+                .unwrap(),
+            ""
+        );
     }
 }

@@ -374,6 +374,18 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
     {
         return Ok(run);
     }
+    // The mark says that a delivery of this call began a run. With no saved
+    // run, its runner stopped. The checks passed before that run, so each
+    // change since then is the run's: stop what is left, and put it back.
+    let started = saved.with_extension("started");
+    let marked = crate::stores::open_regular(&started)
+        .map_err(|e| format!("cannot read {}: {e}", started.display()))?
+        .is_some();
+    if marked {
+        crate::trainer::reap(&state).await?;
+        let (back, branch, commit) = (lab.clone(), input.branch.clone(), input.commit.clone());
+        blocking(move || back.restore(&branch, &commit)).await?;
+    }
     let (checked, branch, commit) = (lab.clone(), input.branch.clone(), input.commit.clone());
     blocking(move || {
         checked
@@ -385,6 +397,7 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
             .map_err(|e| fatal(DIRTY_TREE, e))
     })
     .await?;
+    crate::stores::write_atomic(&started, b"")?;
     let (lines, mut progress) = tokio::sync::mpsc::unbounded_channel::<String>();
     let run = crate::trainer::run(&input.trainer, lab.root(), &state, move |line| {
         let _ = lines.send(line.to_string());
@@ -401,6 +414,8 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
     let run = blocking(move || after_run(&lab, &input.branch, &input.commit, run)).await?;
     let bytes = serde_json::to_vec(&run).map_err(|e| e.to_string())?;
     crate::stores::write_atomic(&saved, &bytes)?;
+    // The saved run answers each later delivery, so the mark has no use.
+    let _ = std::fs::remove_file(&started);
     Ok(run)
 }
 
@@ -574,27 +589,35 @@ mod tests {
     /// `HEAD` or `train.py` is a crash, and the lab goes back as it was.
     #[tokio::test]
     async fn a_run_that_changes_the_lab_is_a_crash_and_the_lab_is_restored() {
-        let (_dir, mut input, _counter) = lab_with_counter();
-        input.trainer = TrainerSpec::Command {
-            program: "sh".into(),
-            args: vec![
-                "-c".into(),
-                "echo 'DEPTH = 99' >> train.py; git checkout -q -b elsewhere; \
-                 echo ---; echo 'val_bpb: 0.5'"
-                    .into(),
-            ],
-            timeout_secs: 30,
-            pass_env: Vec::new(),
-        };
-        let run = train(&ActivityContext::new_test(), input.clone())
-            .await
-            .unwrap();
-        assert_eq!(run.exit_code, None, "{run:?}");
-        assert!(run.log_tail.contains("changed the lab"), "{run:?}");
-        let lab = Lab::open(&input.lab).unwrap();
-        lab.require_branch(&input.branch).unwrap();
-        lab.require_head(&input.commit).unwrap();
-        lab.require_clean_train().unwrap();
+        let changes = [
+            "git checkout -q -b elsewhere",
+            "echo '# x' >> train.py; git -c user.name=r -c user.email=r@r commit -qam x",
+            "echo 'DEPTH = 99' >> train.py",
+        ];
+        for change in changes {
+            let (_dir, mut input, _counter) = lab_with_counter();
+            input.trainer = TrainerSpec::Command {
+                program: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    format!("{change}; echo ---; echo 'val_bpb: 0.5'"),
+                ],
+                timeout_secs: 30,
+                pass_env: Vec::new(),
+            };
+            let run = train(&ActivityContext::new_test(), input.clone())
+                .await
+                .unwrap();
+            assert_eq!(run.exit_code, None, "{change}: {run:?}");
+            assert!(
+                run.log_tail.contains("changed the lab"),
+                "{change}: {run:?}"
+            );
+            let lab = Lab::open(&input.lab).unwrap();
+            lab.require_branch(&input.branch).unwrap();
+            lab.require_head(&input.commit).unwrap();
+            lab.require_clean_train().unwrap();
+        }
     }
 
     /// A worker that lost its lease can run on while the call is delivered
@@ -621,6 +644,41 @@ mod tests {
         };
         let (first, second) = tokio::join!(train(&ctx, input.clone()), again);
         assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            1
+        );
+    }
+
+    /// A runner that stops mid-run, as on Ctrl-C, drops the run before the
+    /// checks after it. The call comes again on resume. It finds the lab as
+    /// the run left it, puts it back, and trains again.
+    #[tokio::test]
+    async fn a_call_that_comes_again_after_a_stopped_run_puts_the_lab_back() {
+        let (_dir, input, counter) = lab_with_counter();
+        let ctx = ActivityContext::new_test();
+        let mut stopped = input.clone();
+        stopped.trainer = TrainerSpec::Command {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "git checkout -q -b elsewhere; echo '# scratch' >> train.py; sleep 30".into(),
+            ],
+            timeout_secs: 60,
+            pass_env: Vec::new(),
+        };
+        let cut = tokio::time::timeout(Duration::from_millis(1500), train(&ctx, stopped)).await;
+        assert!(cut.is_err(), "the runner stopped mid-run");
+        let lab = Lab::open(&input.lab).unwrap();
+        assert!(
+            lab.require_branch(&input.branch).is_err(),
+            "the run moved it"
+        );
+        let run = train(&ctx, input.clone()).await.unwrap();
+        assert_eq!(run.exit_code, Some(0), "{run:?}");
+        lab.require_branch(&input.branch).unwrap();
+        lab.require_head(&input.commit).unwrap();
+        lab.require_clean_train().unwrap();
         assert_eq!(
             std::fs::read_to_string(&counter).unwrap().lines().count(),
             1

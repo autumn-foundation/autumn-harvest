@@ -679,6 +679,18 @@ impl Drop for Group {
 /// nothing. It waits [`Lock::WAIT`] and fails, and the activity retries.
 struct Lock(std::fs::File);
 
+/// Kill a run that an earlier runner left behind, and wait until it lets
+/// go of the lock. A train call that comes again after its runner stopped
+/// does this before it puts the lab back.
+///
+/// # Errors
+///
+/// Returns an error when the lock file cannot be opened, or a run holds
+/// the lock past the wait.
+pub async fn reap(state: &Path) -> Result<(), String> {
+    Lock::take(state).await.map(drop)
+}
+
 impl Lock {
     /// How long a run waits for a killed group to let go of the lock.
     const WAIT: Duration = Duration::from_secs(10);
