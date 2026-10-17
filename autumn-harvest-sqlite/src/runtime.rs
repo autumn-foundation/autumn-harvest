@@ -5855,9 +5855,16 @@ mod tests {
             &serde_json::json!(0),
         )
         .unwrap();
-        let changed =
-            super::apply_cancel_race_losers(&conn, parent, &[], &[ExecutionId::new()], &[], 0)
-                .unwrap();
+        let changed = super::apply_cancel_race_losers(
+            &conn,
+            parent,
+            super::LoserCancelReason::RaceLoser,
+            &[],
+            &[ExecutionId::new()],
+            &[],
+            0,
+        )
+        .unwrap();
         assert!(!changed);
         assert!(store::load_history(&conn, parent).unwrap().is_empty());
     }
