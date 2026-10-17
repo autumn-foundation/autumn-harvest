@@ -475,6 +475,40 @@ partitions. `history_with_codecs` decodes payload fields with your codec keys.
 
 ---
 
+## Orphaned payload blobs (issue #2123)
+
+A write uploads its offloaded payloads before it opens its transaction. If the
+transaction rolls back, the blobs stay in the store with no
+`harvest_payload_refs` row. Retention finds blobs only through those rows, so
+it never deletes them.
+
+The orphan sweep deletes them. It is off by default. Turn it on with
+`RetentionConfig::with_payload_orphan_grace(grace)`.
+
+- The sweep deletes a blob only when the blob is older than the grace period.
+  The grace period must be longer than any write transaction. The minimum is
+  one hour.
+- The sweep deletes a blob only when no shard references it. It checks every
+  database.
+- A failed reference check stops the sweep. It deletes nothing on a guess.
+- Each tick reads at most 100 pages from the store and resumes where it
+  stopped.
+- `dry_run` counts orphans in the log, deletes nothing and records no metric.
+
+The sweep needs a `PayloadStore` that implements `list`. A store without it
+turns the sweep off, and the log says so once. `list` must report the time of
+the latest `put` of a key. A `put` of an existing key must refresh that time.
+
+Use a store that holds only harvest blobs. The sweep deletes every old blob
+that no execution references. Do not share the store with the agent response
+cache or with another writer.
+
+Give each retention process the full shard list. The sweep checks only the
+databases in its own pool set. A reference on an unlisted database is
+invisible, and the sweep deletes that blob.
+
+---
+
 ## Operations & Debugging
 
 ### Telemetry

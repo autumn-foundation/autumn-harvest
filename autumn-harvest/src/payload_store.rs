@@ -95,6 +95,8 @@ pub struct PayloadStoreError(pub String);
 /// - [`get`](PayloadStore::get) returns the bytes previously stored under `key`.
 /// - [`delete`](PayloadStore::delete) removes the blob; called by the retention
 ///   sweep once no execution references the key.
+/// - [`list`](PayloadStore::list) is optional. A store that implements it lets
+///   retention delete blobs that a rolled-back write left behind (issue #2123).
 pub trait PayloadStore: Send + Sync + 'static {
     /// A stable identifier for this store, recorded in every reference envelope
     /// so a read can tell which backend a blob lives in. Defaults to
@@ -112,6 +114,56 @@ pub trait PayloadStore: Send + Sync + 'static {
 
     /// Delete the blob stored under `key`.
     fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()>;
+
+    /// List one page of blobs whose key starts with `prefix` and whose
+    /// [`StoredBlob::created_at`] is before `created_before` (issue #2123).
+    ///
+    /// Return `None` when the store cannot list. That is the default, and it
+    /// turns the orphan sweep off for the store. Otherwise return the page
+    /// that follows `cursor`, or the first page when `cursor` is `None`. Set
+    /// [`BlobPage::next`] to `None` on the last page.
+    ///
+    /// `created_at` must be the time of the latest [`put`](PayloadStore::put)
+    /// of the key. A content-addressed `put` of an existing key must refresh
+    /// it. Otherwise the sweep can delete a blob that a writer just reused.
+    /// The sweep also checks the time itself, so a backend that ignores
+    /// `created_before` stays safe.
+    ///
+    /// Return each key exactly as [`put`](PayloadStore::put) returned it, and
+    /// list only the blobs that harvest wrote. A key in another form never
+    /// matches a reference, so the sweep would delete the blob.
+    ///
+    /// The store must hold only blobs that harvest wrote. The sweep deletes
+    /// every old blob that no execution references. Do not share the store
+    /// with another user of the same keys, for example the agent response
+    /// cache.
+    fn list(
+        &self,
+        prefix: &str,
+        created_before: chrono::DateTime<chrono::Utc>,
+        cursor: Option<&str>,
+    ) -> Option<PayloadStoreFuture<'_, BlobPage>> {
+        let _ = (prefix, created_before, cursor);
+        None
+    }
+}
+
+/// A blob that [`PayloadStore::list`] found (issue #2123).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBlob {
+    /// The key that [`PayloadStore::put`] returned.
+    pub key: String,
+    /// The time of the latest write of the key.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One page of a [`PayloadStore::list`] result (issue #2123).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlobPage {
+    /// The blobs on this page.
+    pub blobs: Vec<StoredBlob>,
+    /// The cursor for the next page, or `None` on the last page.
+    pub next: Option<String>,
 }
 
 /// The number of blob uploads that one counting offloader starts.
@@ -159,6 +211,15 @@ impl PayloadStore for CountingStore {
 
     fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()> {
         self.inner.delete(key)
+    }
+
+    fn list(
+        &self,
+        prefix: &str,
+        created_before: chrono::DateTime<chrono::Utc>,
+        cursor: Option<&str>,
+    ) -> Option<PayloadStoreFuture<'_, BlobPage>> {
+        self.inner.list(prefix, created_before, cursor)
     }
 }
 
@@ -513,6 +574,12 @@ mod tests {
     #[allow(clippy::needless_pass_by_value)]
     fn event_with_output(output: Value) -> Value {
         serde_json::json!({ "type": "WorkflowCompleted", "data": { "output": output } })
+    }
+
+    #[test]
+    fn a_store_cannot_list_by_default() {
+        let store = MemStore::new();
+        assert!(store.list("", chrono::Utc::now(), None).is_none());
     }
 
     /// A counting copy counts the blobs it uploads and nothing else.

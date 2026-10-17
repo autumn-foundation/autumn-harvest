@@ -76,9 +76,9 @@ use crate::telemetry::{
     METRIC_LOAD_SHED_ACTIVE, METRIC_LOAD_SHED_REJECTED, METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD,
     METRIC_MUTEX_WAIT, METRIC_NOTIFY_QUEUE_USAGE, METRIC_NOTIFY_SEND_FAILURES,
     METRIC_PAYLOAD_BYTES, METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED,
-    METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
-    METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_PAUSED, METRIC_QUEUE_SCHEDULE_TO_START,
-    METRIC_QUOTA_REJECTED, METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED,
+    METRIC_PAYLOAD_ORPHANS, METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH,
+    METRIC_QUEUE_DISPATCHED, METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_PAUSED,
+    METRIC_QUEUE_SCHEDULE_TO_START, METRIC_QUOTA_REJECTED, METRIC_QUOTA_SUPERSEDE_CREDIT_NOT_SHED,
     METRIC_RATE_LIMIT_BUCKETS_DELETED, METRIC_RATE_LIMIT_REFILL_RATE, METRIC_RATE_LIMIT_THROTTLED,
     METRIC_RATE_LIMIT_TOKENS_AVAILABLE, METRIC_RETENTION_DELETED, METRIC_RETRY_BUDGET_AVAILABLE,
     METRIC_RETRY_BUDGET_EXHAUSTED, METRIC_SAGA_COMPENSATED, METRIC_SAGA_COMPENSATION_FAILED,
@@ -781,6 +781,15 @@ impl MetricsRecorder for MetricsRsRecorder {
         counter!(
             METRIC_TERMINAL_TASKS_DELETED,
             METRIC_LABEL_STATE => state.to_owned(),
+        )
+        .increment(count);
+    }
+
+    fn record_payload_orphans(&self, store_id: &str, outcome: &str, count: u64) {
+        counter!(
+            METRIC_PAYLOAD_ORPHANS,
+            "store.id" => store_id.to_owned(),
+            "outcome" => outcome.to_owned(),
         )
         .increment(count);
     }
@@ -1898,6 +1907,13 @@ mod tests {
              series the tick increments, so a first-iteration wedge is visible \
              to rate() == 0"
         );
+    }
+
+    #[test]
+    fn record_payload_orphans_does_not_panic() {
+        let rec = MetricsRsRecorder;
+        rec.record_payload_orphans("s3", "found", 3);
+        rec.record_payload_orphans("s3", "deleted", 0);
     }
 
     #[test]

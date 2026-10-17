@@ -607,6 +607,10 @@ pub const METRIC_RATE_LIMIT_BUCKETS_DELETED: &str = "harvest.retention.rate_limi
 /// Real deletes only, never a `dry_run` preview.
 pub const METRIC_TERMINAL_TASKS_DELETED: &str = "harvest.retention.terminal_tasks_deleted";
 
+/// Counter of payload blobs the orphan sweep handled (issue #2123), labeled
+/// `store.id` and `outcome` (`found` / `deleted` / `failed`).
+pub const METRIC_PAYLOAD_ORPHANS: &str = "harvest.retention.payload_orphans";
+
 /// Histogram: wall-clock latency of query handler invocations (seconds).
 ///
 /// Labelled with `query.name` (low-cardinality handler name registered by the
@@ -3391,6 +3395,15 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (state, count);
     }
 
+    /// Number of orphaned payload blobs one sweep tick handled, per outcome
+    /// (issue #2123).
+    ///
+    /// Maps to [`METRIC_PAYLOAD_ORPHANS`]. `outcome` is `found`, `deleted` or
+    /// `failed`. Real deletes only: a dry run records nothing.
+    fn record_payload_orphans(&self, store_id: &str, outcome: &str, count: u64) {
+        let _ = (store_id, outcome, count);
+    }
+
     /// Current number of RUNNING tasks for a concurrency group key.
     ///
     /// Emitted by the concurrency sampler on every sample interval. The value
@@ -4938,6 +4951,7 @@ mod tests {
             METRIC_TERMINAL_TASKS_DELETED,
             "harvest.retention.terminal_tasks_deleted"
         );
+        assert_eq!(METRIC_PAYLOAD_ORPHANS, "harvest.retention.payload_orphans");
         // issue #618: exempt-by-design start producers increment this counter.
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
         assert_eq!(METRIC_LABEL_PRODUCER, "producer");
