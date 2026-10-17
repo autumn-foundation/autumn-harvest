@@ -17,7 +17,7 @@ use autumn_harvest::models::TaskQueueItem;
 use autumn_harvest::schema::{harvest_task_queue, harvest_workflow_executions};
 use autumn_harvest::telemetry::NoOpMetrics;
 use autumn_harvest::types::ExecutionId;
-use autumn_harvest::worker::HandlerRegistry;
+use autumn_harvest::worker::{HandlerRegistry, Worker};
 use autumn_harvest::{HarvestError, WorkflowContext, cancel_workflow_execution};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -28,8 +28,9 @@ use testcontainers_modules::postgres::Postgres;
 use crate::integration_e2e::{
     build_runtime_worker, build_test_pool, enqueue_started_workflow_task,
     insert_workflow_execution, load_child_executions_from_url, load_execution_from_url,
-    load_history_from_url, load_timers_for_execution_from_url, setup_test_database_url_or_env,
-    spawn_test_worker, wait_for_execution_state, wait_for_execution_state_with_timeout,
+    load_history_from_url, load_timers_for_execution_from_url, runtime_config,
+    setup_test_database_url_or_env, spawn_test_worker, wait_for_execution_state,
+    wait_for_execution_state_with_timeout,
 };
 
 type WfFuture<'a> = Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
@@ -219,6 +220,19 @@ fn shield_then_deadlock_wf(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_>
             .map_err(|e| e.to_string())?;
         std::future::pending::<()>().await;
         Ok(json!("unreachable"))
+    })
+}
+
+/// Cleanup in a block, then a panic in the same cycle that closes it.
+fn shield_then_panic_wf(ctx: &WorkflowContext, _input: Value) -> WfFuture<'_> {
+    Box::pin(async move {
+        let cleaned = ctx
+            .non_cancellable(ctx.execute_activity_raw("gated_cleanup", Value::Null, "default"))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        assert!(cleaned.is_null(), "the code after the cleanup panics");
+        Ok(cleaned)
     })
 }
 
@@ -837,6 +851,54 @@ async fn deferred_cancel_ends_a_run_that_deadlocks_after_its_block() {
         vec![act_info("gated_cleanup", gated_cleanup)],
     ));
     let worker = build_runtime_worker("worker-1984-shield-deadlock", 4, 2, reg);
+    let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&database_url));
+
+    wait_for_event(&database_url, exec_id, "the cleanup start", |e| {
+        matches!(e, WorkflowEvent::ActivityStarted { .. })
+    })
+    .await;
+    let cancelled = cancel_workflow_execution(&mut conn, exec_id, "operator abort", &NoOpMetrics)
+        .await
+        .expect("cancel");
+    assert!(cancelled.deferred, "an open block defers the cancel");
+
+    CLEANUP_GATE.store(true, Ordering::SeqCst);
+    let execution = wait_for_execution_state_with_timeout(
+        &database_url,
+        exec_id,
+        "CANCELLED",
+        std::time::Duration::from_secs(20),
+    )
+    .await;
+    worker.shutdown();
+    handle.await.expect("join");
+
+    assert_eq!(execution.error.as_deref(), Some("operator abort"));
+}
+
+/// A deferred cancel ends a run that panics after its block. The panic
+/// budget never runs out here, so only the cancel can end the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deferred_cancel_ends_a_run_that_panics_after_its_block() {
+    CLEANUP_GATE.store(false, Ordering::SeqCst);
+    let (database_url, _guard) = setup_test_database_url_or_env().await;
+    let mut conn = AsyncPgConnection::establish(&database_url)
+        .await
+        .expect("connect");
+    let exec_id = insert_workflow_execution(&mut conn).await;
+    enqueue_started_workflow_task(&mut conn, exec_id, Value::Null).await;
+    let reg = Arc::new(HandlerRegistry::new(
+        vec![wf_info("e2e_test_workflow", shield_then_panic_wf)],
+        vec![act_info("gated_cleanup", gated_cleanup)],
+    ));
+    let mut config = runtime_config(
+        "worker-1984-shield-panic",
+        4,
+        2,
+        std::time::Duration::from_secs(10),
+    );
+    config.workflow_panic_max_attempts = 1_000;
+    let worker = Arc::new(Worker::new(config, reg).expect("worker should build"));
     let handle = spawn_test_worker(Arc::clone(&worker), build_test_pool(&database_url));
 
     wait_for_event(&database_url, exec_id, "the cleanup start", |e| {

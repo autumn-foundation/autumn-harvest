@@ -27353,18 +27353,38 @@ async fn process_workflow_task(
     // its retry keeps a deferred cancel waiting without end. The run is
     // cancelled instead, as a failing cycle is. The deadlocked cycle's
     // commands are still not trusted, so none of them persist.
+    //
+    // A panicked cycle is cancelled for the same reason. Its retry discards
+    // the close of the block too. The panic budget is local to the process,
+    // so a restart resets it and the cancel can wait without end.
+    let cancel_is_deferred = crate::execution::DeferredCancelState::of(&history_events)
+        .requested
+        .is_some();
     let outcome = match outcome {
-        WorkflowOutcome::TaskFailed { error }
-            if crate::execution::DeferredCancelState::of(&history_events)
-                .requested
-                .is_some() =>
-        {
+        WorkflowOutcome::TaskFailed { error } if cancel_is_deferred => {
             pending_cmds.clear();
             WorkflowOutcome::Failed {
                 error,
                 non_deterministic_details: None,
                 handler_panic: false,
                 unhandled_signals: std::collections::BTreeMap::new(),
+            }
+        }
+        WorkflowOutcome::Failed {
+            error,
+            non_deterministic_details,
+            handler_panic: true,
+            unhandled_signals,
+        } if cancel_is_deferred => {
+            telemetry
+                .metrics
+                .record_workflow_panic(&prepared.execution.workflow_name, &task.queue_name);
+            pending_cmds.clear();
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details,
+                handler_panic: false,
+                unhandled_signals,
             }
         }
         other => other,
