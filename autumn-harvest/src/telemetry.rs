@@ -607,6 +607,22 @@ pub const METRIC_RATE_LIMIT_BUCKETS_DELETED: &str = "harvest.retention.rate_limi
 /// Real deletes only, never a `dry_run` preview.
 pub const METRIC_TERMINAL_TASKS_DELETED: &str = "harvest.retention.terminal_tasks_deleted";
 
+/// Counter: orphaned payload blobs that the orphan sweep found (issue #2123).
+///
+/// An orphan is an old blob that no `harvest_payload_refs` row names. A
+/// `dry_run` counts it too.
+pub const METRIC_ORPHAN_BLOBS_FOUND: &str = "harvest.retention.orphan_blobs_found";
+
+/// Counter: orphaned payload blobs that the orphan sweep deleted (issue #2123).
+///
+/// Real deletes only, never a `dry_run` preview.
+pub const METRIC_ORPHAN_BLOBS_DELETED: &str = "harvest.retention.orphan_blobs_deleted";
+
+/// Counter: orphaned payload blobs that the orphan sweep could not delete
+/// (issue #2123). The next pass retries them.
+pub const METRIC_ORPHAN_BLOB_DELETE_FAILURES: &str =
+    "harvest.retention.orphan_blob_delete_failures";
+
 /// Histogram: wall-clock latency of query handler invocations (seconds).
 ///
 /// Labelled with `query.name` (low-cardinality handler name registered by the
@@ -3391,6 +3407,15 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (state, count);
     }
 
+    /// Result of one orphan-blob sweep page (issue #2123).
+    ///
+    /// Maps to [`METRIC_ORPHAN_BLOBS_FOUND`], [`METRIC_ORPHAN_BLOBS_DELETED`]
+    /// and [`METRIC_ORPHAN_BLOB_DELETE_FAILURES`]. `deleted` is zero in a
+    /// `dry_run`.
+    fn record_orphan_blob_sweep(&self, found: u64, deleted: u64, delete_failures: u64) {
+        let _ = (found, deleted, delete_failures);
+    }
+
     /// Current number of RUNNING tasks for a concurrency group key.
     ///
     /// Emitted by the concurrency sampler on every sample interval. The value
@@ -4938,6 +4963,18 @@ mod tests {
             METRIC_TERMINAL_TASKS_DELETED,
             "harvest.retention.terminal_tasks_deleted"
         );
+        assert_eq!(
+            METRIC_ORPHAN_BLOBS_FOUND,
+            "harvest.retention.orphan_blobs_found"
+        );
+        assert_eq!(
+            METRIC_ORPHAN_BLOBS_DELETED,
+            "harvest.retention.orphan_blobs_deleted"
+        );
+        assert_eq!(
+            METRIC_ORPHAN_BLOB_DELETE_FAILURES,
+            "harvest.retention.orphan_blob_delete_failures"
+        );
         // issue #618: exempt-by-design start producers increment this counter.
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
         assert_eq!(METRIC_LABEL_PRODUCER, "producer");
@@ -5809,6 +5846,7 @@ mod tests {
         rec.record_summary_deleted("onboarding", 50);
         rec.record_rate_limit_buckets_deleted("dyn-rate", 12);
         rec.record_terminal_tasks_deleted("COMPLETED", 12);
+        rec.record_orphan_blob_sweep(3, 2, 1);
         rec.record_workflow_non_determinism("onboarding", "v1.0.0");
         rec.record_workflow_nondeterministic_block("onboarding", "default");
         rec.record_workflow_history_bloat("onboarding");

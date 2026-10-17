@@ -75,6 +75,7 @@ use crate::telemetry::{
     METRIC_LABEL_TRIGGER, METRIC_LABEL_WORKFLOW, METRIC_LABEL_WORKFLOW_TYPE,
     METRIC_LOAD_SHED_ACTIVE, METRIC_LOAD_SHED_REJECTED, METRIC_MUTEX_CONTENTION, METRIC_MUTEX_HELD,
     METRIC_MUTEX_WAIT, METRIC_NOTIFY_QUEUE_USAGE, METRIC_NOTIFY_SEND_FAILURES,
+    METRIC_ORPHAN_BLOB_DELETE_FAILURES, METRIC_ORPHAN_BLOBS_DELETED, METRIC_ORPHAN_BLOBS_FOUND,
     METRIC_PAYLOAD_BYTES, METRIC_PAYLOAD_OFFLOAD_FETCH_DURATION, METRIC_PAYLOAD_OFFLOADED,
     METRIC_PAYLOAD_REJECTED, METRIC_QUERY_DURATION, METRIC_QUEUE_DEPTH, METRIC_QUEUE_DISPATCHED,
     METRIC_QUEUE_OLDEST_PENDING_AGE, METRIC_QUEUE_PAUSED, METRIC_QUEUE_SCHEDULE_TO_START,
@@ -783,6 +784,12 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_STATE => state.to_owned(),
         )
         .increment(count);
+    }
+
+    fn record_orphan_blob_sweep(&self, found: u64, deleted: u64, delete_failures: u64) {
+        counter!(METRIC_ORPHAN_BLOBS_FOUND).increment(found);
+        counter!(METRIC_ORPHAN_BLOBS_DELETED).increment(deleted);
+        counter!(METRIC_ORPHAN_BLOB_DELETE_FAILURES).increment(delete_failures);
     }
 
     fn record_payload_offloaded(&self, field: &str, store_id: &str, byte_len: u64) {
@@ -1906,6 +1913,14 @@ mod tests {
         let rec = MetricsRsRecorder;
         rec.record_terminal_tasks_deleted("COMPLETED", 5);
         rec.record_terminal_tasks_deleted("FAILED", 0);
+    }
+
+    #[test]
+    fn record_orphan_blob_sweep_does_not_panic() {
+        // Orphan-blob sweep counter bridge (issue #2123).
+        let rec = MetricsRsRecorder;
+        rec.record_orphan_blob_sweep(3, 2, 1);
+        rec.record_orphan_blob_sweep(0, 0, 0);
     }
 
     #[test]

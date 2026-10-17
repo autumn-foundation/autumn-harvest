@@ -410,6 +410,9 @@ pub mod metrics_rs_adapter;
 pub mod migrate;
 /// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
 pub mod mutex;
+/// Sweep of payload blobs that a rolled-back write uploaded (issue #2123).
+#[cfg(feature = "db")]
+pub(crate) mod orphan_blob_sweep;
 pub mod partition;
 /// Export of aged event partitions to object storage (issue #2009).
 pub mod partition_archive;

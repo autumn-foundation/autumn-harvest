@@ -227,6 +227,7 @@ mod mutex_tests;
 mod nd_block_tests;
 #[cfg(feature = "db")]
 mod notify_post_commit_tests;
+mod orphan_blob_sweep_db_tests;
 mod otel_semconv_docs;
 mod otel_workflow_semconv_docs;
 mod panic_containment_tests;
