@@ -891,10 +891,11 @@ impl SqliteRuntime {
     /// # Errors
     ///
     /// Returns [`SqliteError::UnknownWorkflow`] if `workflow_name` has no
-    /// registered handler, [`SqliteError::PayloadTooLarge`] if `input` exceeds the
-    /// workflow-input cap, or [`SqliteError::Sqlite`]/[`SqliteError::Json`] on a
-    /// persistence failure. (Under `AllowDuplicate` it never returns
-    /// [`SqliteError::AlreadyExists`] — that is only for
+    /// registered handler. Returns [`SqliteError::PayloadTooLarge`] if `input`
+    /// exceeds the workflow-input cap. Returns [`SqliteError::PayloadTooDeep`] if
+    /// it nests past [`MAX_PAYLOAD_DEPTH`]. Returns [`SqliteError::Sqlite`] or
+    /// [`SqliteError::Json`] on a persistence failure. (Under `AllowDuplicate`
+    /// it never returns [`SqliteError::AlreadyExists`] — that is only for
     /// [`RejectDuplicate`](WorkflowIdReusePolicy::RejectDuplicate).)
     pub fn start_workflow_with_id(
         &mut self,
@@ -928,7 +929,8 @@ impl SqliteRuntime {
     /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy).
     /// Returns [`SqliteError::InvalidSearchAttribute`] for a search attribute
     /// that is not a JSON primitive. Returns [`SqliteError::PayloadTooLarge`]
-    /// for a memo over the workflow-input cap.
+    /// for a memo over the workflow-input cap, and
+    /// [`SqliteError::PayloadTooDeep`] for a memo nested past [`MAX_PAYLOAD_DEPTH`].
     pub fn start_workflow_with_options(
         &mut self,
         workflow_name: &str,
@@ -955,6 +957,7 @@ impl SqliteRuntime {
         // The memo shares the workflow-input cap. Postgres stores it in the
         // same row, beside the input.
         if let Some(memo) = &memo {
+            check_depth("memo", memo)?;
             let observed = serde_json::to_string(memo)?.len() as u64;
             if DEFAULT_MAX_WORKFLOW_INPUT_BYTES > 0 && observed > DEFAULT_MAX_WORKFLOW_INPUT_BYTES {
                 return Err(SqliteError::PayloadTooLarge {
@@ -1021,9 +1024,11 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::AlreadyExists`] when `policy` is
     /// [`RejectDuplicate`](WorkflowIdReusePolicy::RejectDuplicate) and a non-sealed
-    /// prior exists; [`SqliteError::UnknownWorkflow`] for an unregistered workflow;
-    /// [`SqliteError::PayloadTooLarge`] for an oversized `input`; or
-    /// [`SqliteError::Sqlite`]/[`SqliteError::Json`] on a persistence failure.
+    /// prior exists. Returns [`SqliteError::UnknownWorkflow`] for an unregistered
+    /// workflow. Returns [`SqliteError::PayloadTooLarge`] for an oversized `input`
+    /// and [`SqliteError::PayloadTooDeep`] for one nested past
+    /// [`MAX_PAYLOAD_DEPTH`]. Returns [`SqliteError::Sqlite`] or
+    /// [`SqliteError::Json`] on a persistence failure.
     pub fn start_workflow_with_reuse_policy(
         &mut self,
         workflow_name: &str,
@@ -1116,8 +1121,9 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id and
     /// [`SqliteError::WorkflowNotRunning`] for a terminal execution. Returns
-    /// [`SqliteError::PayloadTooLarge`] for an oversized payload. Returns a
-    /// persistence error if the signal row cannot be written.
+    /// [`SqliteError::PayloadTooLarge`] for an oversized payload and
+    /// [`SqliteError::PayloadTooDeep`] for one nested past [`MAX_PAYLOAD_DEPTH`].
+    /// Returns a persistence error if the signal row cannot be written.
     // Owned-value ingress API: callers hand over a `serde_json::Value` payload
     // that is serialized into durable storage; `store::stage_signal` only borrows
     // it at the leaf, so taking it by value keeps the call site ergonomic
@@ -1291,6 +1297,7 @@ impl SqliteRuntime {
     /// - [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
     /// - [`SqliteError::AlreadyExists`] for a `RejectDuplicate` collision.
     /// - [`SqliteError::PayloadTooLarge`] for an oversized input or payload.
+    /// - [`SqliteError::PayloadTooDeep`] for an input or payload nested too deep.
     /// - [`SqliteError::InvalidSignal`] for a broken key rule.
     /// - A persistence error.
     pub fn signal_with_start(
@@ -1584,6 +1591,8 @@ impl SqliteRuntime {
     /// - [`SqliteError::ExecutionNotFound`] for an unknown id.
     /// - [`SqliteError::WorkflowNotRunning`] for a terminal run.
     /// - [`SqliteError::UnknownWorkflow`] if the workflow is not registered.
+    /// - [`SqliteError::PayloadTooDeep`] if `input` nests past
+    ///   [`MAX_PAYLOAD_DEPTH`].
     /// - [`SqliteError::UpdateInputInvalid`] if `input` fails the arg schema
     ///   of a declarative handler.
     /// - [`SqliteError::UpdateRejected`] if the validator rejects `input` or
@@ -1602,6 +1611,7 @@ impl SqliteRuntime {
     /// - [`SqliteError::UpdateFailed`] if the handler returns an error or
     ///   panics. History records `WorkflowEvent::UpdateFailed`.
     /// - A persistence error if the history cannot be read or written.
+    #[allow(clippy::too_many_lines)] // one linear admission sequence
     pub async fn update(
         &mut self,
         exec: ExecutionId,
@@ -1610,6 +1620,7 @@ impl SqliteRuntime {
     ) -> SqliteResult<Value> {
         self.seal_if_overdue(exec)?;
         refuse_unless_running(&self.conn, exec)?;
+        check_depth("update_input", &input)?;
         let workflow_name = store::workflow_name_of(&self.conn, exec)?;
         let handler = *self
             .workflows
@@ -4334,8 +4345,70 @@ fn start_in_tx(
     }
 }
 
+/// The deepest nesting that ingress accepts in a payload (issue #2157).
+///
+/// `serde_json` reads at most 128 levels. Event storage wraps a payload in a
+/// few more levels. The cap leaves room for that wrapping.
+pub const MAX_PAYLOAD_DEPTH: usize = 100;
+
+/// The children of a JSON container, as one iterator type.
+enum Children<'a> {
+    Array(std::slice::Iter<'a, Value>),
+    Object(serde_json::map::Values<'a>),
+}
+
+impl<'a> Iterator for Children<'a> {
+    type Item = &'a Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Array(items) => items.next(),
+            Self::Object(values) => values.next(),
+        }
+    }
+}
+
+/// The children of `value`, or `None` for a scalar.
+fn children(value: &Value) -> Option<Children<'_>> {
+    match value {
+        Value::Array(items) => Some(Children::Array(items.iter())),
+        Value::Object(map) => Some(Children::Object(map.values())),
+        _ => None,
+    }
+}
+
+/// Returns `Ok` only when `value` has at most [`MAX_PAYLOAD_DEPTH`] open
+/// arrays and objects on any path.
+///
+/// The walk keeps one iterator per open container. A recursive walk would
+/// overflow the call stack on the input it must refuse. Memory use is bound
+/// by the cap, not by the width of the value.
+///
+/// Call it before any code that recurses over the value, such as a schema check
+/// or a settlement decoder.
+fn check_depth(kind: &'static str, value: &Value) -> SqliteResult<()> {
+    let mut open: Vec<Children<'_>> = children(value).into_iter().collect();
+    while let Some(top) = open.last_mut() {
+        let Some(child) = top.next() else {
+            open.pop();
+            continue;
+        };
+        if let Some(inner) = children(child) {
+            if open.len() >= MAX_PAYLOAD_DEPTH {
+                return Err(SqliteError::PayloadTooDeep {
+                    kind,
+                    cap_depth: MAX_PAYLOAD_DEPTH,
+                });
+            }
+            open.push(inner);
+        }
+    }
+    Ok(())
+}
+
 /// Returns `Ok` only when `input` fits the workflow-input cap.
 fn check_input_cap(input: &Value) -> SqliteResult<()> {
+    check_depth("workflow_input", input)?;
     // Enforce the workflow-input cap BEFORE any write (issue #252). The Postgres
     // start path rejects an oversized input with `PayloadTooLarge` before it
     // persists anything. Without this check, this backend stores and replays an
@@ -4380,6 +4453,10 @@ fn signal_key<'a>(
     idempotency_key: Option<&'a str>,
 ) -> SqliteResult<Option<&'a str>> {
     let key = idempotency_key.filter(|key| !key.is_empty());
+    // The settlement decoder below recurses. Check the depth first.
+    if name.starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX) {
+        check_depth("signal_payload", payload)?;
+    }
     autumn_harvest::durable_promise::settlement_idempotency_key(name, payload, key)
         .map_err(|e| SqliteError::InvalidSignal(e.to_string()))
 }
@@ -4438,6 +4515,7 @@ fn stage_keyed(
     // an oversized signal to a terminal run differs only in its error kind.
     // Both backends refuse it and stage no row. The size is the
     // serialized-JSON byte length, as in the core.
+    check_depth("signal_payload", payload)?;
     if DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES > 0 {
         let observed = serde_json::to_string(payload).map_or(0, |s| s.len() as u64);
         if observed > DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES {
@@ -5741,10 +5819,11 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        command_name, persist_scheduled_activity, persist_started_timer,
-        unsupported_activity_feature,
+        MAX_PAYLOAD_DEPTH, check_depth, command_name, persist_scheduled_activity,
+        persist_started_timer, unsupported_activity_feature,
     };
-    use crate::{queue, schema, store};
+    use crate::{SqliteError, queue, schema, store};
+    use serde_json::Value;
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -6137,6 +6216,34 @@ mod tests {
 
         assert!(store::load_history(&conn, exec).unwrap().is_empty());
         assert!(!queue::has_unfired_timer(&conn, exec).unwrap());
+    }
+
+    /// A value of `depth` nested one-element arrays.
+    fn nested(depth: usize) -> Value {
+        let mut value = Value::Null;
+        for _ in 0..depth {
+            value = Value::Array(vec![value]);
+        }
+        value
+    }
+
+    /// Take a nested value apart from the inside out. A plain drop recurses.
+    fn tear_down(mut value: Value) {
+        while let Value::Array(mut items) = value {
+            value = items.pop().unwrap_or(Value::Null);
+        }
+    }
+
+    #[test]
+    fn check_depth_walks_a_huge_value_without_recursion() {
+        // A recursive walk overflows the call stack long before this depth.
+        let deep = nested(100_000);
+        let err = check_depth("memo", &deep).unwrap_err();
+        assert!(matches!(
+            err,
+            SqliteError::PayloadTooDeep { kind: "memo", cap_depth } if cap_depth == MAX_PAYLOAD_DEPTH
+        ));
+        tear_down(deep);
     }
 }
 

@@ -189,6 +189,8 @@ mod hot_code_swap_tests;
 #[cfg(feature = "testing")]
 mod idempotency_tests;
 mod integration_e2e;
+#[cfg(feature = "db")]
+mod late_signal_completion_tests;
 mod legal_hold_tests;
 #[cfg(feature = "db")]
 mod lifecycle_model_props;

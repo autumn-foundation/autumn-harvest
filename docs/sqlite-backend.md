@@ -258,6 +258,10 @@ cross-backend-identical).
 An oversized start input (over the 2 MiB default cap) is rejected with
 `SqliteError::PayloadTooLarge` before anything is persisted, matching the core.
 
+A start input, memo, signal payload or update input nested over
+`MAX_PAYLOAD_DEPTH` (100) levels is rejected with `SqliteError::PayloadTooDeep` before anything is
+persisted. Postgres has no such cap.
+
 ---
 
 ## 7. The drive model
