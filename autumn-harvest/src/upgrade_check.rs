@@ -175,7 +175,7 @@ impl StructureManifest {
     /// errors of [`StructureManifest::parse`].
     pub fn load(path: &std::path::Path) -> Result<Self, UpgradeCheckError> {
         let text = std::fs::read_to_string(path).map_err(|source| UpgradeCheckError::Io {
-            path: path.display().to_string(),
+            path: shown_path(path),
             source,
         })?;
         Self::parse(&text)
@@ -1025,9 +1025,9 @@ fn build_finding(run_build: Option<&str>, baseline_build: Option<&str>) -> Optio
     let run_build = run_build?;
     match baseline_build {
         Some(baseline) if baseline == run_build => None,
-        Some(baseline) => Some(Finding::new(
+        Some(_) => Some(Finding::new(
             FindingKind::StructureUnavailable,
-            format!("the run is assigned to build `{run_build}`, not the baseline `{baseline}`"),
+            format!("the run is assigned to build `{run_build}`, not the named baseline build"),
         )),
         None => Some(Finding::new(
             FindingKind::StructureUnavailable,
@@ -1813,8 +1813,18 @@ from an environment variable, so the URL stays out of the process list.
 Exit codes: 0 every run migrates, 1 a run needs review or pin, 2 incomplete or bad input.";
 
 /// Stands in for a token that might hold a password.
-#[cfg(feature = "db")]
 const HIDDEN: &str = "<hidden>";
+
+/// Returns `path` for an error line when it holds only path-safe characters, else [`HIDDEN`].
+///
+/// An operator can mistype a database address as a file path. A password in it stays out of the error.
+fn shown_path(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    let safe = text
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '+' | '~' | ' '));
+    if safe { text } else { HIDDEN.to_string() }
+}
 
 /// Returns `token` when it is a plain word, else [`HIDDEN`].
 ///
@@ -1827,23 +1837,6 @@ fn plain(token: &str) -> &str {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
     if word { token } else { HIDDEN }
-}
-
-/// Refuses a value that is not a plain file path or name.
-///
-/// Later errors and reports echo these values. A mistyped database address would reach them.
-/// A listed set of characters is safe. Any other character, such as `:`, `@` or `=`, fails.
-#[cfg(feature = "db")]
-fn plain_path(flag: &str, value: String) -> Result<String, UpgradeCheckError> {
-    let plain = value
-        .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '+' | '~' | ' '));
-    if plain {
-        return Ok(value);
-    }
-    Err(UpgradeCheckError::Usage(format!(
-        "{flag} takes a name or file made of letters, digits and _-./+~"
-    )))
 }
 
 #[cfg(feature = "db")]
@@ -1877,12 +1870,10 @@ impl CommandArgs {
                     })?;
                     out.database_urls.push(url);
                 }
-                "--baseline-structure" => out.baseline = Some(plain_path(&flag, value()?)?.into()),
-                "--candidate-structure" => {
-                    out.candidate = Some(plain_path(&flag, value()?)?.into());
-                }
-                "--workflow-name" => out.workflow_name = Some(plain_path(&flag, value()?)?),
-                "--baseline-build" => out.baseline_build = Some(plain_path(&flag, value()?)?),
+                "--baseline-structure" => out.baseline = Some(value()?.into()),
+                "--candidate-structure" => out.candidate = Some(value()?.into()),
+                "--workflow-name" => out.workflow_name = Some(value()?),
+                "--baseline-build" => out.baseline_build = Some(value()?),
                 "--limit" => {
                     let raw = value()?;
                     out.limit = Some(raw.parse().map_err(|_| {
@@ -2117,49 +2108,56 @@ mod tests {
     }
 
     #[test]
-    fn a_url_given_to_a_name_or_file_flag_is_refused() {
-        let refused = |args: &[&str]| {
-            let Err(err) = parse(args) else {
-                panic!("expected a refusal for {args:?}");
-            };
-            let text = err.to_string();
-            assert!(text.contains("takes a name or file"), "{text}");
-            assert!(!text.contains("SECRETPW"), "{text}");
-        };
-        for flag in [
-            "--baseline-structure",
-            "--candidate-structure",
-            "--baseline-build",
-            "--workflow-name",
+    fn a_manifest_error_does_not_echo_a_mistyped_address() {
+        for path in [
+            "postgres://u:SECRETPW@h/db",
+            "postgres:/u:SECRETPW@h/db",
+            "u:SECRETPW@h",
+            "host=h user=u password = SECRETPW",
         ] {
-            refused(&[flag, SECRET_URL]);
-            refused(&[&format!("{flag}={SECRET_URL}")]);
-            refused(&[flag, "host=h user=u PassWord=SECRETPW"]);
-            refused(&[flag, "host=h user=u password = SECRETPW"]);
-            refused(&[flag, "postgres:/u:SECRETPW@h/db"]);
-            refused(&[flag, "u:SECRETPW@h"]);
-            refused(&[flag, "h?pw%3DSECRETPW"]);
-            refused(&[flag, "host=h user=u password\t=\tSECRETPW"]);
-            refused(&[&format!("{flag}=password=SECRETPW")]);
+            let Err(err) = StructureManifest::load(std::path::Path::new(path)) else {
+                panic!("expected a read error for {path}");
+            };
+            assert!(!err.to_string().contains("SECRETPW"), "{err}");
         }
     }
 
     #[test]
-    fn a_plain_file_or_build_name_is_accepted() {
+    fn a_manifest_error_names_a_plain_path() {
+        let path = std::path::Path::new("/no-such-dir-2119/old.structure.json");
+        let Err(err) = StructureManifest::load(path) else {
+            panic!("expected a read error");
+        };
+        assert!(
+            err.to_string()
+                .contains("/no-such-dir-2119/old.structure.json"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_build_finding_does_not_echo_the_baseline_build() {
+        let finding =
+            super::build_finding(Some("v2"), Some("postgres://u:SECRETPW@h/db")).expect("finding");
+        assert!(!finding.detail.contains("SECRETPW"), "{}", finding.detail);
+    }
+
+    #[test]
+    fn a_path_and_a_free_text_build_id_are_accepted() {
         let args = parse(&[
             "--database-url",
             "x",
             "--baseline-structure",
-            "/tmp/.tmpAb12/old file.structure.json",
+            r"C:\manifests\old.json",
             "--candidate-structure",
-            "out/new-structure_2.json",
+            "out/new structure.json",
             "--baseline-build",
-            "v1.2+abc",
+            "sha256:abc",
             "--workflow-name",
             "order",
         ])
         .expect("parses");
-        assert_eq!(args.baseline_build.as_deref(), Some("v1.2+abc"));
+        assert_eq!(args.baseline_build.as_deref(), Some("sha256:abc"));
     }
 
     #[test]
