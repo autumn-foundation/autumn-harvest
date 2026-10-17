@@ -20787,6 +20787,7 @@ pub async fn apply_race_loser_cancellations(
 
     for cmd in commands {
         let WorkflowCommand::CancelRaceLosers {
+            reason,
             activities,
             children,
             timers,
@@ -20801,11 +20802,12 @@ pub async fn apply_race_loser_cancellations(
             // terminal event already exists (or is about to be appended by
             // that in-flight completion write) and must not be duplicated.
             if let Some((activity_name, queue_name)) =
-                queue::cancel_activity_task(conn, *activity_id).await?
+                queue::cancel_activity_task_with_reason(conn, *activity_id, reason.message())
+                    .await?
             {
                 synthetic_events.push(WorkflowEvent::ActivityFailed {
                     activity_id: *activity_id,
-                    error: "lost race to a sibling branch".to_string(),
+                    error: reason.message().to_string(),
                     attempt: 1,
                     error_type: "Error".to_string(),
                     non_retryable: true,
@@ -20855,7 +20857,7 @@ pub async fn apply_race_loser_cancellations(
             match crate::execution::cancel_workflow_execution_collect(
                 conn,
                 *child_id,
-                "lost race to a sibling branch",
+                reason.message(),
                 Some(metrics.as_ref()),
             )
             .await
@@ -24449,6 +24451,9 @@ enum WorkflowPersistFlow {
         /// action it pre-computed for a plain `ContinuedAsNew`, using this
         /// flag, once this arm is reached.
         continue_as_new_redirected_to_failure: bool,
+        /// `true` when a deferred cancel (issue #1984) ended the run in place
+        /// of this cycle's failure or continue-as-new outcome.
+        deferred_cancel_ended_run: bool,
     },
 }
 
@@ -24519,6 +24524,17 @@ async fn run_deferred_schedule_counter(
     }
 }
 
+/// How a terminal cycle with commands ends its run.
+#[derive(Clone, Copy)]
+enum TerminalSeal<'a> {
+    /// Persist the outcome that the workflow returned.
+    Outcome,
+    /// A deferred cancel takes the cycle over (issue #1984). The cycle's
+    /// commands persist as for its outcome. The run then ends cancelled
+    /// with this reason, and the outcome is dropped.
+    DeferredCancel(&'a str),
+}
+
 /// Persist a terminal (or continue-as-new) outcome that also carries pending
 /// pre-suspension commands (update results, search-attr patches, detached
 /// children, fan-out markers).
@@ -24550,6 +24566,7 @@ async fn persist_terminal_outcome_commands(
     // `persist_workflow_outcome` — see either's identical parameter doc
     // (issue #1263 items 11/15/17).
     resolved_router: Option<&crate::shard::ShardRouter>,
+    seal: TerminalSeal<'_>,
 ) -> HarvestResult<(
     bool,
     Vec<(ExecutionId, Option<String>)>,
@@ -24617,8 +24634,13 @@ async fn persist_terminal_outcome_commands(
     // keyed `workflow_id = child_id.to_string()`. That is an opaque id
     // minted fresh for that spawn, never the predecessor's own
     // `workflow_id`, so it can never collide with the successor's slot.
-    let continue_as_new_verdict =
-        resolve_continue_as_new_verdict_for_outcome(conn, registry, execution, &outcome).await?;
+    // A deferred cancel ends the run, so it starts no successor.
+    let continue_as_new_verdict = match seal {
+        TerminalSeal::Outcome => {
+            resolve_continue_as_new_verdict_for_outcome(conn, registry, execution, &outcome).await?
+        }
+        TerminalSeal::DeferredCancel(_) => None,
+    };
     let will_redirect_to_failure = matches!(
         continue_as_new_verdict,
         Some(ContinueAsNewVerdict::Redirect(_))
@@ -24669,7 +24691,7 @@ async fn persist_terminal_outcome_commands(
     // function in. The returned starts are NOT spawned here — the caller
     // must only spawn them after that outer transaction commits (see
     // `apply_race_loser_cancellations`'s doc comment).
-    let (race_deferred_triggers, _race_loser_events) = apply_race_loser_cancellations(
+    let (mut race_deferred_triggers, _race_loser_events) = apply_race_loser_cancellations(
         conn,
         persistence.exec_id,
         pending_cmds,
@@ -24688,6 +24710,23 @@ async fn persist_terminal_outcome_commands(
         resolved_router,
     )
     .await?;
+
+    if let TerminalSeal::DeferredCancel(reason) = seal {
+        let (_, starts, checks, terminal_metric) =
+            crate::execution::cancel_workflow_execution_collect_now(
+                conn,
+                persistence.exec_id,
+                reason,
+                Some(registry.telemetry().metrics.as_ref()),
+            )
+            .await?;
+        pending_cancel_metrics.extend(terminal_metric.map(|(workflow_name, queue_name)| {
+            crate::execution::StartCancelledRun::terminated(workflow_name, queue_name)
+        }));
+        race_deferred_triggers.extend(starts);
+        let checks = checks.into_iter().map(|(id, name)| (id, Some(name)));
+        return Ok((false, checks.collect(), race_deferred_triggers));
+    }
 
     // `persist_search_attrs_from_commands` above wrote the UpsertSearchAttributes
     // patch to the DB, but `execution` is the row loaded before that update. A
@@ -25402,6 +25441,52 @@ impl HistoryCapBreach {
     }
 }
 
+/// End a run with a deferred cancel at the history hard cap (issue #1984).
+///
+/// An accepted deferred cancel wins over the cap, as on SQLite. The cap stops
+/// the cleanup, and the run ends cancelled instead of failed. Returns `None`
+/// when no cancel is pending, so the caller fails the run.
+async fn cancel_deferred_at_history_cap(
+    conn: &mut AsyncPgConnection,
+    telemetry: &crate::telemetry::TelemetryConfig,
+    execution: &WorkflowExecution,
+    exec_id: ExecutionId,
+    breach: HistoryCapBreach,
+) -> HarvestResult<Option<Vec<crate::completion_trigger::DeferredTriggerStart>>> {
+    let history = store::load_history_undecoded(conn, exec_id).await?;
+    let Some(reason) = crate::execution::DeferredCancelState::of(&history.events).requested else {
+        return Ok(None);
+    };
+    tracing::warn!(
+        exec_id = %exec_id,
+        workflow = %execution.workflow_name,
+        breach = ?breach,
+        "workflow history reached a hard cap with a deferred cancel; cancelling the run"
+    );
+    let (_, starts, checks, terminal_metric) =
+        crate::execution::cancel_workflow_execution_collect_now(
+            conn,
+            exec_id,
+            &reason,
+            Some(telemetry.metrics.as_ref()),
+        )
+        .await?;
+    let cancel_metrics: Vec<_> = terminal_metric
+        .map(|(workflow_name, queue_name)| {
+            crate::execution::StartCancelledRun::terminated(workflow_name, queue_name)
+        })
+        .into_iter()
+        .collect();
+    crate::execution::emit_start_cancel_metrics(&*telemetry.metrics, &cancel_metrics);
+    check_and_report_unfinished_handlers_batch_for_worker(
+        conn,
+        &checks,
+        Some(telemetry.metrics.as_ref()),
+    )
+    .await;
+    Ok(Some(starts))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fail_workflow_for_history_cap(
     conn: &mut AsyncPgConnection,
@@ -25418,6 +25503,13 @@ async fn fail_workflow_for_history_cap(
     // Issue #1815: the cap failure fails this workflow task terminally.
     cycle_failure: &CycleFailure,
 ) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
+    // Issue #1984: an accepted deferred cancel wins over the cap.
+    if let Some(starts) =
+        cancel_deferred_at_history_cap(conn, telemetry, execution, exec_id, breach).await?
+    {
+        return Ok(starts);
+    }
+
     // Issue #1833: the cap failure is a terminal decision, so it ends with a
     // boundary when boundaries are on.
     let boundary =
@@ -27257,6 +27349,46 @@ async fn process_workflow_task(
     //
     // The requeue is fenced by the claim. The cycle ran for at least
     // `DEADLOCK_TIMEOUT`, so a reclaim can have moved the row meanwhile.
+    // Issue #1984: a deadlocked cycle cannot record the close of a block, so
+    // its retry keeps a deferred cancel waiting without end. The run is
+    // cancelled instead, as a failing cycle is. The deadlocked cycle's
+    // commands are still not trusted, so none of them persist.
+    //
+    // A panicked cycle is cancelled for the same reason. Its retry discards
+    // the close of the block too. The panic budget is local to the process,
+    // so a restart resets it and the cancel can wait without end.
+    let cancel_is_deferred = crate::execution::DeferredCancelState::of(&history_events)
+        .requested
+        .is_some();
+    let outcome = match outcome {
+        WorkflowOutcome::TaskFailed { error } if cancel_is_deferred => {
+            pending_cmds.clear();
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details: None,
+                handler_panic: false,
+                unhandled_signals: std::collections::BTreeMap::new(),
+            }
+        }
+        WorkflowOutcome::Failed {
+            error,
+            non_deterministic_details,
+            handler_panic: true,
+            unhandled_signals,
+        } if cancel_is_deferred => {
+            telemetry
+                .metrics
+                .record_workflow_panic(&prepared.execution.workflow_name, &task.queue_name);
+            pending_cmds.clear();
+            WorkflowOutcome::Failed {
+                error,
+                non_deterministic_details,
+                handler_panic: false,
+                unhandled_signals,
+            }
+        }
+        other => other,
+    };
     if let WorkflowOutcome::TaskFailed { error } = &outcome {
         clear_panic_strike(workflow_panic_strikes, prepared.exec_id.as_uuid());
         let strikes = workflow_deadlock_strikes.record(prepared.exec_id.as_uuid());
@@ -27830,6 +27962,23 @@ async fn process_workflow_task(
     // failure must never roll back the persisted decision).
     let is_terminal_with_commands =
         !pending_cmds.is_empty() && !matches!(&outcome, WorkflowOutcome::Suspended { .. });
+    // Issue #1984: a cancel that an open non-cancellable block deferred. The
+    // request is in the history that this cycle replayed. A request that
+    // lands later makes this cycle's event ids collide, so the cycle retries
+    // and then sees it.
+    let deferred_cancel_reason =
+        crate::execution::DeferredCancelState::of(&history_events).requested;
+    // A run that stays running completes the cancel once no block is open.
+    let check_deferred_cancel =
+        deferred_cancel_reason.is_some() && matches!(&outcome, WorkflowOutcome::Suspended { .. });
+    // A run that would fail or continue as new is cancelled instead, so a
+    // retry or a successor run cannot drop the cancel.
+    let deferred_cancel_ends_run = deferred_cancel_reason.filter(|_| {
+        matches!(
+            &outcome,
+            WorkflowOutcome::Failed { .. } | WorkflowOutcome::ContinuedAsNew { .. }
+        )
+    });
     let counter_action = schedule_counter_action(&outcome);
     // Issue #684: collect update.completed/failed metric data now, while
     // `history_events`, `outcome`, and `pending_cmds` are all still in scope
@@ -27991,11 +28140,42 @@ async fn process_workflow_task(
                 }
 
                 let mut pending_cancel_metrics = Vec::new();
+                if let Some(reason) = &deferred_cancel_ends_run {
+                    // The cycle's commands persist as for a terminal cycle:
+                    // update results, race-loser teardown, detached children,
+                    // search attributes, details, logs and progress. The run
+                    // then ends cancelled instead of with its outcome.
+                    let mut redirected = false;
+                    let (_, deferred_checks, race_deferred_triggers) =
+                        persist_terminal_outcome_commands(
+                            conn,
+                            registry,
+                            execution_ref,
+                            persistence,
+                            outcome,
+                            &pending_cmds,
+                            &recorded_dispatches,
+                            &execute_span,
+                            &mut pending_cancel_metrics,
+                            &mut redirected,
+                            resolved_router.as_ref(),
+                            TerminalSeal::DeferredCancel(reason),
+                        )
+                        .await?;
+                    return Ok(WorkflowPersistFlow::Persisted {
+                        retry_scheduled: false,
+                        deferred_checks,
+                        race_deferred_triggers,
+                        pending_cancel_metrics,
+                        continue_as_new_redirected_to_failure: false,
+                        deferred_cancel_ended_run: true,
+                    });
+                }
                 // Issue #1161: `false` unless the ContinuedAsNew outcome below
                 // (reached via either branch) redirects to a terminal failure —
                 // see `persist_workflow_outcome`'s parameter doc.
                 let mut continue_as_new_redirected_to_failure = false;
-                let (retry_scheduled, deferred_checks, race_deferred_triggers) =
+                let (retry_scheduled, mut deferred_checks, mut race_deferred_triggers) =
                     if is_terminal_with_commands {
                         persist_terminal_outcome_commands(
                             conn,
@@ -28009,6 +28189,7 @@ async fn process_workflow_task(
                             &mut pending_cancel_metrics,
                             &mut continue_as_new_redirected_to_failure,
                             resolved_router.as_ref(),
+                            TerminalSeal::Outcome,
                         )
                         .await?
                     } else {
@@ -28046,6 +28227,30 @@ async fn process_workflow_task(
                     build_id,
                 )
                 .await?;
+                // Issue #1984: a cancel is pending. When no block is open after
+                // this cycle, cancel the run in this same transaction.
+                let mut deferred_cancel_ended_run = false;
+                if check_deferred_cancel
+                    && let Some((_, starts, checks, terminal_metric)) =
+                        crate::execution::complete_deferred_cancel(
+                            conn,
+                            prepared.exec_id,
+                            Some(telemetry.metrics.as_ref()),
+                        )
+                        .await?
+                {
+                    deferred_cancel_ended_run = true;
+                    race_deferred_triggers.extend(starts);
+                    deferred_checks.extend(checks.into_iter().map(|(id, name)| (id, Some(name))));
+                    if let Some((workflow_name, queue_name)) = terminal_metric {
+                        pending_cancel_metrics.push(
+                            crate::execution::StartCancelledRun::terminated(
+                                workflow_name,
+                                queue_name,
+                            ),
+                        );
+                    }
+                }
                 // Chaos: kill/delay inside the persist transaction, after the
                 // outcome is written but before the outer commit — the #367 window
                 // (worker dies after claim, before the terminal is durable). A kill
@@ -28058,6 +28263,7 @@ async fn process_workflow_task(
                     race_deferred_triggers,
                     pending_cancel_metrics,
                     continue_as_new_redirected_to_failure,
+                    deferred_cancel_ended_run,
                 })
             })
             .await
@@ -28082,7 +28288,15 @@ async fn process_workflow_task(
             race_deferred_triggers,
             pending_cancel_metrics,
             continue_as_new_redirected_to_failure,
+            deferred_cancel_ended_run,
         }) => {
+            // Issue #1984: the cycle cancelled the run instead of its own
+            // outcome. `pending_cancel_metrics` carries the terminal metric.
+            if deferred_cancel_ended_run {
+                pending_workflow_metrics.status = WorkflowStatus::Suspended;
+                pending_workflow_metrics.is_continued_as_new = false;
+                pending_workflow_metrics.terminal = TerminalMetricsKind::Suspended;
+            }
             // Issue #1161 (Codex P2 on PR #1399): a ContinuedAsNew outcome
             // redirected internally to a terminal failure. Correct the
             // metrics and schedule-failure-counter action this cycle
@@ -28132,7 +28346,7 @@ async fn process_workflow_task(
             store_cache_entry(
                 &workflow_cache,
                 prepared.exec_id.as_uuid(),
-                pending_cache_update,
+                cache_update_after_persist(pending_cache_update, deferred_cancel_ended_run),
                 crate::cache::CachedWorkflowState {
                     events: std::mem::take(&mut history_events),
                     next_event_id,
@@ -28181,7 +28395,7 @@ async fn process_workflow_task(
             // `counter_action` was pre-computed as `None` for the ORIGINAL
             // `ContinuedAsNew` outcome. That is wrong once this cycle's real
             // persisted result was a terminal failure.
-            let effective_counter = if retry_scheduled {
+            let effective_counter = if retry_scheduled || deferred_cancel_ended_run {
                 None
             } else if continue_as_new_redirected_to_failure {
                 Some(true)
@@ -28362,6 +28576,20 @@ async fn process_workflow_task(
 /// An entry that the update displaces drops after the lock is released.
 /// Dropping a resident workflow frees its future, its context and a copy of
 /// the history, which other tasks must not wait for (issue #1798).
+/// The cache update for a persisted cycle (issue #1984).
+///
+/// A deferred cancel ends a run whose own outcome is `Suspended`. The run is
+/// then terminal, so the cache evicts it instead of keeping it warm.
+const fn cache_update_after_persist(
+    pending: Option<bool>,
+    deferred_cancel_ended_run: bool,
+) -> Option<bool> {
+    match pending {
+        Some(_) if deferred_cancel_ended_run => Some(false),
+        other => other,
+    }
+}
+
 async fn store_cache_entry(
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
@@ -28383,6 +28611,27 @@ async fn store_cache_entry(
         }
     };
     drop(displaced);
+}
+
+#[cfg(test)]
+mod cache_update_after_persist_tests {
+    use super::cache_update_after_persist;
+
+    #[test]
+    fn a_deferred_cancel_evicts_a_suspended_run() {
+        assert_eq!(cache_update_after_persist(Some(true), true), Some(false));
+    }
+
+    #[test]
+    fn a_plain_cycle_keeps_its_cache_update() {
+        assert_eq!(cache_update_after_persist(Some(true), false), Some(true));
+        assert_eq!(cache_update_after_persist(Some(false), false), Some(false));
+    }
+
+    #[test]
+    fn sticky_routing_off_never_touches_the_cache() {
+        assert_eq!(cache_update_after_persist(None, true), None);
+    }
 }
 
 /// What a dispatch actually did, so the poll loop can tell a task this worker
@@ -45912,6 +46161,7 @@ mod tests {
                 details: serde_json::json!(0),
             },
             WorkflowCommand::CancelRaceLosers {
+                reason: crate::context::LoserCancelReason::RaceLoser,
                 activities: vec![crate::types::ActivityExecId::new()],
                 children: vec![],
                 timers: vec![],
@@ -45929,6 +46179,7 @@ mod tests {
                 details: serde_json::json!(2),
             },
             WorkflowCommand::CancelRaceLosers {
+                reason: crate::context::LoserCancelReason::RaceLoser,
                 activities: vec![crate::types::ActivityExecId::new()],
                 children: vec![],
                 timers: vec![],
@@ -45984,6 +46235,7 @@ mod tests {
     fn extract_all_activity_waits_tolerates_cancel_race_losers() {
         let commands = vec![
             WorkflowCommand::CancelRaceLosers {
+                reason: crate::context::LoserCancelReason::RaceLoser,
                 activities: vec![crate::types::ActivityExecId::new()],
                 children: vec![],
                 timers: vec![],
@@ -45999,6 +46251,7 @@ mod tests {
     #[test]
     fn workflow_command_name_covers_cancel_race_losers() {
         let cmd = WorkflowCommand::CancelRaceLosers {
+            reason: crate::context::LoserCancelReason::RaceLoser,
             activities: vec![],
             children: vec![],
             timers: vec![],
@@ -46039,6 +46292,7 @@ mod tests {
         }];
         commands.extend(child_timeout_batch());
         commands.push(WorkflowCommand::CancelRaceLosers {
+            reason: crate::context::LoserCancelReason::RaceLoser,
             activities: vec![],
             children: vec![],
             timers: vec![],
@@ -46343,6 +46597,7 @@ mod tests {
                 details: serde_json::json!(2u64),
             },
             WorkflowCommand::CancelRaceLosers {
+                reason: crate::context::LoserCancelReason::RaceLoser,
                 activities: vec![crate::types::ActivityExecId::new()],
                 children: vec![],
                 timers: vec![],
@@ -46941,6 +47196,7 @@ mod tests {
         let loser_activity_id = crate::types::ActivityExecId::new();
         let commands = vec![
             WorkflowCommand::CancelRaceLosers {
+                reason: crate::context::LoserCancelReason::RaceLoser,
                 activities: vec![loser_activity_id],
                 children: Vec::new(),
                 timers: vec![crate::types::TimerId::new("loser-timer")],
@@ -46970,7 +47226,7 @@ mod tests {
         assert!(
             matches!(
                 batch.race_loser_commands.as_slice(),
-                [WorkflowCommand::CancelRaceLosers { activities, children, timers }]
+                [WorkflowCommand::CancelRaceLosers { activities, children, timers, .. }]
                     if activities == &[loser_activity_id]
                         && children.is_empty()
                         && timers.len() == 1
@@ -53006,6 +53262,7 @@ mod tests {
             (
                 "CancelRaceLosers",
                 WorkflowCommand::CancelRaceLosers {
+                    reason: crate::context::LoserCancelReason::RaceLoser,
                     activities: Vec::new(),
                     children: Vec::new(),
                     timers: Vec::new(),

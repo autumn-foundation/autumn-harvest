@@ -162,6 +162,14 @@ pub enum WorkflowEvent {
         /// The reason given for cancellation.
         reason: String,
     },
+    /// A cancel arrived while a non-cancellable block was open (issue #1984).
+    ///
+    /// The run keeps running. The engine cancels it when the last open block
+    /// closes. Replay skips this event: no workflow command matches it.
+    WorkflowCancelRequested {
+        /// The reason given for cancellation.
+        reason: String,
+    },
 
     // ── Activities ────────────────────────────────────────────────
     /// An activity was requested by the workflow.
@@ -1040,6 +1048,7 @@ impl WorkflowEvent {
             Self::WorkflowCompleted { .. } => "WorkflowCompleted",
             Self::WorkflowFailed { .. } => "WorkflowFailed",
             Self::WorkflowCancelled { .. } => "WorkflowCancelled",
+            Self::WorkflowCancelRequested { .. } => "WorkflowCancelRequested",
             Self::ActivityScheduled { .. } => "ActivityScheduled",
             Self::ActivityStarted { .. } => "ActivityStarted",
             Self::ActivityCompleted { .. } => "ActivityCompleted",

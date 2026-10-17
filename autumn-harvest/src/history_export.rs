@@ -585,6 +585,7 @@ impl MermaidExporter {
                 | WorkflowEvent::WorkflowCompleted { .. }
                 | WorkflowEvent::WorkflowFailed { .. }
                 | WorkflowEvent::WorkflowCancelled { .. }
+                | WorkflowEvent::WorkflowCancelRequested { .. }
                 | WorkflowEvent::WorkflowContinuedAsNew { .. }
                 | WorkflowEvent::WorkflowResetFork { .. }
                 | WorkflowEvent::WorkflowResetTerminated { .. }
@@ -676,6 +677,13 @@ impl MermaidExporter {
                 writeln!(
                     self.out,
                     "    Note over WF: Workflow Cancelled: {safe_reason}"
+                )?;
+            }
+            WorkflowEvent::WorkflowCancelRequested { reason } => {
+                let safe_reason = reason.replace('\n', " ").replace('"', "'");
+                writeln!(
+                    self.out,
+                    "    Note over WF: Cancel Requested: {safe_reason}"
                 )?;
             }
             WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => {

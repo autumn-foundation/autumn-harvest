@@ -4133,3 +4133,48 @@ async fn test_business_day_env_is_hermetic_across_all_seven_weekdays() {
         );
     }
 }
+
+// ── Cancellation scopes (issue #1984) ────────────────────────────────────────
+
+/// A timer cancels a scope whose body waits for a signal that never comes.
+/// The harness fires every classic timer in one iteration, so the body
+/// waits on a signal instead of a longer timer.
+fn scope_deadline_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let scope = ctx.cancellation_scope();
+        let (waited, ()) = tokio::join!(scope.run(ctx.wait_for_signal("approval")), async {
+            let _ = ctx.timer("deadline", 5).await;
+            scope.cancel();
+        });
+        match waited {
+            Err(HarvestError::Cancelled(_)) => Ok(json!("cancelled")),
+            Ok(_) => Ok(json!("completed")),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_scope_cancel_stops_a_waiting_body_and_replays_cleanly() {
+    let outcome = WorkflowTestEnv::new()
+        .run(scope_deadline_workflow, json!(null))
+        .await;
+
+    assert_eq!(outcome.result, Ok(json!("cancelled")));
+    assert!(
+        outcome.events().iter().any(|e| matches!(
+            e,
+            WorkflowEvent::MarkerRecorded { name, .. } if name == "cancel_scope:1"
+        )),
+        "the cancel decision is recorded: {:?}",
+        outcome.events()
+    );
+    let report = outcome.replay_check(scope_deadline_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "replay self-check failed:\n{report}"
+    );
+}

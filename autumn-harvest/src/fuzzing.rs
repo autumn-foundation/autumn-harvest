@@ -2454,6 +2454,7 @@ fn mirror_external(event: &WorkflowEvent) -> Option<Op> {
         | WorkflowEvent::WorkflowContinuedAsNew { .. }
         | WorkflowEvent::WorkflowStarted { .. }
         | WorkflowEvent::WorkflowCancelled { .. }
+        | WorkflowEvent::WorkflowCancelRequested { .. }
         | WorkflowEvent::ActivityStarted { .. }
         | WorkflowEvent::ActivityCompleted { .. }
         | WorkflowEvent::ActivityFailed { .. }
