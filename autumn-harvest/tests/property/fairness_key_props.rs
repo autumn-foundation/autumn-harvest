@@ -271,7 +271,7 @@ proptest! {
         prop_assert_eq!(clock.vclock().to_bits(), v_before.to_bits());
         if !last_weight.is_empty() {
             prop_assert!(
-                (0..8).any(|k| clock.state(&key(k)).is_some_and(|p| p.last_start == v_before)),
+                (0..8).any(|k| clock.state(&key(k)).is_some_and(|p| p.last_start.to_bits() == v_before.to_bits())),
                 "the clock row must survive"
             );
         }
