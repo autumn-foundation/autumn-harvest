@@ -31775,24 +31775,6 @@ pub(crate) async fn schedule_backfill_inner(
                 // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
                 // the execution lands on the default shard, same as tick_one_workflow_schedule.
                 let exec_id = ExecutionId::new();
-                // A stored input that does not decode never starts a run
-                // (issue #2043).
-                let input = match schedule.workflow_input.as_ref() {
-                    Some(stored) => {
-                        let Ok(plain) = runtime.registry.payload_codecs().decode_column(stored)
-                        else {
-                            shard_failures.push(BackfillShardFailure {
-                                shard_id: 0,
-                                reason: "stored schedule input could not be decoded".to_string(),
-                            });
-                            failed += 1;
-                            continue;
-                        };
-                        plain
-                    }
-                    None => serde_json::Value::Null,
-                };
-
                 let Ok(mut conn) = acquire_conn(wf_shard_pool).await else {
                     shard_failures.push(BackfillShardFailure {
                         shard_id: 0,
@@ -31837,6 +31819,25 @@ pub(crate) async fn schedule_backfill_inner(
                         continue;
                     }
                 }
+
+                // A stored input that does not decode never starts a run. A
+                // slot that already ran needs no input, so the prior-run check
+                // above comes first (issue #2043).
+                let input = match schedule.workflow_input.as_ref() {
+                    Some(stored) => {
+                        let Ok(plain) = runtime.registry.payload_codecs().decode_column(stored)
+                        else {
+                            shard_failures.push(BackfillShardFailure {
+                                shard_id: 0,
+                                reason: "stored schedule input could not be decoded".to_string(),
+                            });
+                            failed += 1;
+                            continue;
+                        };
+                        plain
+                    }
+                    None => serde_json::Value::Null,
+                };
 
                 let (
                     owner,
