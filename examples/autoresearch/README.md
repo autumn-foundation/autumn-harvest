@@ -245,7 +245,8 @@ experiment set the search attribute `status`, which the engine reserves.
 - **The command trainer is not a sandbox.** It runs code that the model wrote,
   as your user. Its environment is a fixed list. The list holds the shell
   basics, the locale, and the CUDA, PyTorch, Python, uv and Hugging Face
-  settings. A name that looks like a secret stays out. Pass another with
+  settings. A name that looks like a secret stays out, and so does a URL
+  with login details, such as a private package index. Pass another with
   `--pass-env NAME`. Git runs with hooks off. The code can still read your
   files, write `.git` and `.autoresearch`, and escape the kill with
   `setsid`. Run it in a container, or as a user with no other rights.

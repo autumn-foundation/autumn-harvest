@@ -43,7 +43,8 @@ pub const TRAINER_LOCK: &str = "trainer.lock";
 /// The list holds the shell basics, the locale, and the settings of CUDA,
 /// `PyTorch`, Python, uv and Hugging Face. An entry that ends in `_` is a
 /// prefix, and so is `PYTHON`. The run gets nothing else, so a secret such
-/// as a database URL stays out of code that the model wrote.
+/// as a database URL stays out of code that the model wrote. A listed
+/// variable whose value is a URL with login details stays out too.
 pub const PASSED_ENV: &[&str] = &[
     "PATH",
     "HOME",
@@ -473,9 +474,12 @@ fn new_log(path: &Path) -> Result<(), String> {
     }
 }
 
-/// `true` when a training run gets the variable `name`: a name of
-/// [`PASSED_ENV`] that marks no secret, or a name that `extra` lists.
-fn passes(name: &str, extra: &[String]) -> bool {
+/// `true` when a training run gets the variable `name` with `value`.
+///
+/// A run gets a name that `extra` lists. It also gets a name of
+/// [`PASSED_ENV`] that marks no secret, with a value that holds no login
+/// details.
+fn passes(name: &str, value: &str, extra: &[String]) -> bool {
     if extra.iter().any(|e| e == name) {
         return true;
     }
@@ -487,7 +491,19 @@ fn passes(name: &str, extra: &[String]) -> bool {
             upper == *entry
         }
     });
-    listed && !SECRET_MARKS.iter().any(|mark| upper.contains(mark))
+    listed && !SECRET_MARKS.iter().any(|mark| upper.contains(mark)) && !has_login(value)
+}
+
+/// `true` when `value` holds a URL with login details, such as
+/// `https://user:token@host`. A private package index is set this way.
+fn has_login(value: &str) -> bool {
+    value.split("://").skip(1).any(|rest| {
+        let authority = rest
+            .split(['/', '?', '#', ' ', '\t', '\n'])
+            .next()
+            .unwrap_or("");
+        authority.contains('@')
+    })
 }
 
 /// One command run.
@@ -535,7 +551,7 @@ async fn run_command(
         .kill_on_drop(true);
     command.env_clear();
     for (name, value) in std::env::vars_os() {
-        if passes(&name.to_string_lossy(), pass_env) {
+        if passes(&name.to_string_lossy(), &value.to_string_lossy(), pass_env) {
             command.env(name, value);
         }
     }
@@ -1024,7 +1040,7 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             "UV_CACHE_DIR",
             "PYTHONPATH",
         ] {
-            assert!(passes(name, &none), "{name}");
+            assert!(passes(name, "/x", &none), "{name}");
         }
         for name in [
             "ANTHROPIC_API_KEY",
@@ -1034,10 +1050,52 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
             "HF_TOKEN",
             "UV_PUBLISH_TOKEN",
         ] {
-            assert!(!passes(name, &none), "{name}");
+            assert!(!passes(name, "/x", &none), "{name}");
         }
-        // A person can pass a variable by name.
-        assert!(passes("DATABASE_URL", &["DATABASE_URL".to_string()]));
+        // A listed name can hold a secret in its value: login details in a
+        // URL, as a private package index has.
+        for value in [
+            "https://__token__:pypi-AgEI@pypi.corp/simple",
+            "https://ghp_abc@github.com/org/repo",
+            "http://pypi.corp/simple https://u:p@mirror/simple",
+        ] {
+            assert!(!passes("UV_INDEX_URL", value, &none), "{value}");
+        }
+        assert!(passes("UV_INDEX_URL", "https://pypi.corp/simple", &none));
+        assert!(passes("HF_ENDPOINT", "https://hf.co/a@b", &none));
+        // A person can pass a variable by name, value and all.
+        let named = ["DATABASE_URL".to_string(), "UV_INDEX_URL".to_string()];
+        assert!(passes("DATABASE_URL", "postgres://u:p@db/x", &named));
+        assert!(passes(
+            "UV_INDEX_URL",
+            "https://u:p@pypi.corp/simple",
+            &named
+        ));
+    }
+
+    /// The run starts with a clear environment. Cargo gives each test
+    /// process its `CARGO_` variables, and the run must not see them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_sees_no_variable_off_the_list() {
+        assert!(
+            std::env::vars().any(|(name, _)| name.starts_with("CARGO_")),
+            "cargo sets CARGO_ variables for a test"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let spec = TrainerSpec::Command {
+            program: "sh".into(),
+            args: vec!["-c".into(), "env".into()],
+            timeout_secs: 30,
+            pass_env: Vec::new(),
+        };
+        run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
+        let seen = std::fs::read_to_string(dir.path().join(RUN_LOG)).unwrap();
+        assert!(seen.lines().any(|line| line.starts_with("PATH=")), "{seen}");
+        assert!(
+            !seen.lines().any(|line| line.starts_with("CARGO_")),
+            "{seen}"
+        );
     }
 
     #[test]
