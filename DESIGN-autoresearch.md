@@ -236,9 +236,9 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC1 | `e2e::a_night_of_research_keeps_only_improvements`: setup, a baseline and six experiments, seven rows, the upstream header. `cli::a_night_runs_offline_from_one_command`. |
 | AC2 | The same test: `HEAD` is the best commit, the branch holds only the kept commits, the tree is clean. `sim::an_experiment_holds_its_invariants_on_every_seed`: a discard or a crash resets to the base last. |
 | AC3 | `rules::tests` (seven cases and three property tests, one against an oracle from the README). `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row` checks the zero crash row. |
-| AC4 | `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row`. The sim targets "a fix recovers a crash", "a run crashes for good" and "a run passes its time budget". |
+| AC4 | `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row`. The sim targets "a fix recovers a crash", "a run crashes for good", "a run passes its time budget" and "a run fails after its summary". |
 | AC5 | `agent::tests::edit_train_writes_train_py_only`, `the_policy_gates_rewind_and_denies_unknown_tools`, `lab::tests::the_agent_reads_only_known_files_and_papers`. |
-| AC6 | `e2e::an_edit_after_a_paper_waits_and_a_deny_changes_nothing`, `e2e::a_paper_taints_every_later_run_of_the_session`, `e2e::an_approved_rewind_moves_the_base_to_an_older_kept_commit`, `lab::tests::a_short_id_names_one_commit_of_the_branch`, `kept_refuses_a_row_whose_id_names_two_commits`, `e2e::a_late_approval_never_releases_the_call`. |
+| AC6 | `e2e::an_edit_after_a_paper_waits_and_a_deny_changes_nothing`, `e2e::a_paper_taints_every_later_run_of_the_session`, `e2e::an_approved_rewind_moves_the_base_to_an_older_kept_commit`, `lab::tests::a_short_id_names_one_commit_of_the_branch`, `a_rewind_stays_inside_its_own_session`, `kept_refuses_a_row_whose_id_names_two_commits`, `e2e::a_late_approval_never_releases_the_call`. |
 | AC7 | `scripted::tests::the_researcher_reads_edits_asks_the_reviewer_and_answers`, `agent::tests::the_reviewer_is_read_only_with_two_tools`. The e2e nights delegate in every proposal. |
 | AC8 | `e2e::memory_notes_survive_a_restart`, `stores::tests::memory_survives_a_new_store_and_dedupes_a_key`. |
 | AC9 | `e2e::signals_a_query_and_an_update_steer_a_live_session`. `sim::a_session_holds_its_invariants_under_signals_and_faults` requires the hint, policy and stop targets. `sim::a_stop_at_the_hand_off_ends_the_night` requires a stop that meets the hand-off. |
@@ -306,7 +306,10 @@ The fixes:
   While a running session has no tag yet, a command for an unknown tag
   waits in the inbox and is not rejected. A session refuses a keep policy
   that a policy signal could not carry. `verify` drops the heartbeats of
-  an activity in flight with its start.
+  an activity in flight with its start. A run that exits with an error is a
+  crash, even after a summary. A rewind stays inside its session: at its
+  start commit or later, and never in the commits of a session it started
+  on.
   A trainer whose run cannot end inside the budget of a `train` activity
   is refused at start, at the schedule and in the session.
 - **Steering.** Commands by tag, `run` resumes across midnight, rejected

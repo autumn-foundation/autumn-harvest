@@ -153,8 +153,9 @@ pub fn tools(labs: &[Lab]) -> Vec<Arc<dyn Tool>> {
             ),
             |lab, input, _| {
                 let commit = text(&input, "commit")?;
-                // A kept commit of another session in the lab is on another
-                // branch. Only an earlier commit of this branch is a rewind.
+                // Only a commit of this session is a rewind: its start commit
+                // or a later one. A session can start on the branch of
+                // another, so an older commit may belong to that session.
                 let full = lab.on_branch(&commit)?;
                 let kept = lab
                     .kept(&full)?

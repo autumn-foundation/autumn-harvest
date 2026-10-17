@@ -356,16 +356,27 @@ impl Lab {
         self.full("HEAD")
     }
 
+    /// The start commit of the session at `HEAD`: the newest commit with a
+    /// [`SESSION_TRAILER`]. `None` for a branch that no session started.
+    fn session_start(&self) -> Result<Option<String>, String> {
+        let grep = format!("--grep=^{SESSION_TRAILER}: ");
+        let start = self.git(&["log", "-1", "--format=%H", &grep, "HEAD"])?;
+        Ok((!start.is_empty()).then_some(start))
+    }
+
     /// The full id of `rev`.
     fn full(&self, rev: &str) -> Result<String, String> {
         self.git(&["rev-parse", "--verify", rev])
     }
 
-    /// The full id of the one commit of the branch whose id starts with
-    /// `prefix`. Only `HEAD` and its ancestors count.
+    /// The full id of the one commit of the session whose id starts with
+    /// `prefix`. Only the start commit of the session, and its descendants
+    /// up to `HEAD`, count.
     ///
     /// Git looks for the prefix in the whole object store, with each reset
-    /// commit and each other branch. The branch holds far fewer commits.
+    /// commit and each other branch. The session holds far fewer commits. A
+    /// session can start on the branch of another session, so the commits
+    /// of that session are ancestors too, and they do not count.
     ///
     /// # Errors
     ///
@@ -376,13 +387,16 @@ impl Lab {
         if prefix.len() < 4 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(format!("{prefix:?} is not a commit id"));
         }
-        let ids = self.git(&["rev-list", "HEAD"])?;
+        let range = self
+            .session_start()?
+            .map_or_else(|| "HEAD".to_string(), |start| format!("{start}^..HEAD"));
+        let ids = self.git(&["rev-list", &range])?;
         let mut found = ids.lines().filter(|id| id.starts_with(&prefix));
         match (found.next(), found.next()) {
             (Some(id), None) => Ok(id.to_string()),
-            (None, _) => Err(format!("{prefix} is not a commit of this branch")),
+            (None, _) => Err(format!("{prefix} is not a commit of this session")),
             (Some(_), Some(_)) => Err(format!(
-                "{prefix} names more than one commit of this branch"
+                "{prefix} names more than one commit of this session"
             )),
         }
     }
@@ -901,6 +915,25 @@ mod tests {
             assert!(lab.start_branch(bad, "s2").is_err(), "{bad}");
         }
         assert!(check_tag("Oct17-a_1.b").is_ok());
+    }
+
+    /// Session B started while the lab was on the branch of session A, so
+    /// the commits of A are ancestors of the start of B. A rewind of B stays
+    /// at or after its own start commit.
+    #[test]
+    fn a_rewind_stays_inside_its_own_session() {
+        let (_dir, lab) = lab();
+        lab.start_branch("a", "s1").unwrap();
+        lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
+        let a = lab
+            .commit_train("deeper", "k-1", &lab.head().unwrap())
+            .unwrap()
+            .commit;
+        lab.start_branch("b", "s2").unwrap();
+        let b = lab.head().unwrap();
+        assert_eq!(lab.git(&["rev-parse", &format!("{b}^")]).unwrap(), a);
+        assert_eq!(lab.on_branch(&short(&b)).unwrap(), b);
+        assert!(lab.on_branch(&short(&a)).is_err(), "a commit of session a");
     }
 
     #[test]

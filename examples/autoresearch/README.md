@@ -259,7 +259,8 @@ experiment set the search attribute `status`, which the engine reserves.
   files, write `.git` and `.autoresearch`, and escape the kill with
   `setsid`. Run it in a container, or as a user with no other rights.
 - **The score is what `train.py` prints.** As upstream, the last `val_bpb:`
-  line counts. An edit can print a false score. Read each kept diff.
+  line counts. An edit can print a false score. Read each kept diff. Unlike
+  upstream, a run that exits with an error is a crash, even after a summary.
 - **Activity inputs are trusted.** The lab path and the trainer command come
   from the workflow input. On Postgres, let only people you trust with a
   shell on the GPU host start a session.

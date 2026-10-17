@@ -966,8 +966,9 @@ async fn measure<'a>(
     loop {
         let run = train_once(ctx, input, &commit).await?;
         // Upstream: a run past its time budget is a failure, even when it
-        // printed a summary before the kill.
-        let summary: Option<Summary> = if run.timed_out {
+        // printed a summary before the kill. So is a run that exits with an
+        // error, or that a signal ended.
+        let summary: Option<Summary> = if run.timed_out || run.exit_code != Some(0) {
             None
         } else {
             ctx.execute_local_activity(&parse_summary_info(), run.log_tail.clone())

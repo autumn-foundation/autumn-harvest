@@ -150,6 +150,8 @@ fn experiment_env() -> WorkflowTestEnv {
                                 "log_tail": "torch.OutOfMemoryError: CUDA out of memory.\n"}),
                 // Killed at the budget after it printed a summary.
                 25..32 => json!({"exit_code": null, "timed_out": true, "log_tail": summary_log(bpb)}),
+                // Failed after it printed a summary, such as at its teardown.
+                32..38 => json!({"exit_code": 1, "timed_out": false, "log_tail": summary_log(bpb)}),
                 _ => json!({"exit_code": 0, "timed_out": false, "log_tail": summary_log(bpb)}),
             })
         })
@@ -228,16 +230,7 @@ fn check_experiment(run: &SimOutcome) {
         out.row.status == out.verdict.status,
         "the row has the verdict"
     );
-    let timed_out = completed(events, "train")
-        .last()
-        .is_some_and(|run| run["timed_out"] == json!(true));
-    if timed_out {
-        always!(
-            out.row.status == Status::Crash,
-            "a run past its budget is a crash"
-        );
-        sometimes!(true, "a run passes its time budget");
-    }
+    check_last_run(completed(events, "train").last().copied(), &out);
     if out.rewound {
         sometimes!(true, "an approved rewind moves the base");
     }
@@ -296,6 +289,7 @@ async fn an_experiment_holds_its_invariants_on_every_seed() {
         .require_reached("a run crashes for good")
         .require_reached("a fix recovers a crash")
         .require_reached("a run passes its time budget")
+        .require_reached("a run fails after its summary")
         .require_reached("an approved rewind moves the base")
         .require_reached("an agent proposes no change")
         .require_reached("an experiment fails for good")
@@ -502,6 +496,33 @@ fn experiment_outcomes(events: &[WorkflowEvent]) -> Vec<Option<ExperimentOutcome
             _ => None,
         })
         .collect()
+}
+
+/// A last run past its budget, or one that exits with an error, is a crash,
+/// even when it printed a summary.
+fn check_last_run(last: Option<&Value>, out: &ExperimentOutcome) {
+    let Some(run) = last else {
+        return;
+    };
+    if run["timed_out"] == json!(true) {
+        always!(
+            out.row.status == Status::Crash,
+            "a run past its budget is a crash"
+        );
+        sometimes!(true, "a run passes its time budget");
+    }
+    if run["exit_code"].as_i64().is_some_and(|code| code != 0) {
+        always!(
+            out.row.status == Status::Crash,
+            "a run that exits with an error is a crash, with a summary too"
+        );
+        if run["log_tail"]
+            .as_str()
+            .is_some_and(|log| log.contains("val_bpb"))
+        {
+            sometimes!(true, "a run fails after its summary");
+        }
+    }
 }
 
 /// The index of the first event that matches `pick`, or the end.
