@@ -382,14 +382,14 @@ async fn a_baseline_trains_head_with_no_proposal() {
 }
 
 /// A deterministic experiment: a crash every fourth, a keep every fourth,
-/// and a discard otherwise. Experiment 3 fails. A hint shows in the
+/// and a discard otherwise. Experiment 2 fails. A hint shows in the
 /// description. A `paper:` hint adds the untrusted-input label, as a real
 /// paper read does.
 fn mock_experiment(input: Value) -> Result<Value, String> {
     let input: ExperimentInput = serde_json::from_value(input).map_err(|e| e.to_string())?;
     let best = input.best.clone().unwrap_or_else(base);
     let n = input.number;
-    if n % 5 == 3 {
+    if n % 5 == 2 {
         return Err("git broke".into());
     }
     let description = input
@@ -511,7 +511,8 @@ fn signals(events: &[WorkflowEvent], name: &str, before: usize) -> usize {
         .count()
 }
 
-fn check_session(run: &SimOutcome) {
+/// Check a session run whose config hands off after `per_run` experiments.
+fn check_session(run: &SimOutcome, per_run: u32) {
     let events = run.events();
     let inputs = experiment_inputs(events);
     let outcomes = experiment_outcomes(events);
@@ -522,8 +523,11 @@ fn check_session(run: &SimOutcome) {
         "the session records one crash row per failed experiment"
     );
     let used = inputs.iter().filter(|i| i.hint.is_some()).count();
-    always!(used <= 1, "a hint reaches at most one experiment");
-    if used == 1 {
+    always!(
+        used <= signals(events, "hint", events.len()),
+        "an experiment uses only a hint that arrived"
+    );
+    if used > 0 {
         sometimes!(true, "a hint reaches an experiment");
     }
     match run.status() {
@@ -546,12 +550,17 @@ fn check_session(run: &SimOutcome) {
             );
             // A stop that lands at the hand-off wins over `continue_as_new`.
             always!(
-                report.experiments <= 3,
+                report.experiments <= per_run,
                 "a stop comes no later than the hand-off"
             );
             sometimes!(true, "a stop ends the night early");
+            if report.experiments == per_run {
+                sometimes!(true, "a stop at the hand-off ends the night");
+            }
         }
-        SimStatus::ContinuedAsNew => check_hand_off(events, best.as_ref(), tainted, used),
+        SimStatus::ContinuedAsNew => {
+            check_hand_off(events, best.as_ref(), tainted, used, per_run);
+        }
         other => {
             always!(
                 other == SimStatus::Completed,
@@ -613,7 +622,13 @@ fn check_experiments(
 }
 
 /// Check what the hand-off carries.
-fn check_hand_off(events: &[WorkflowEvent], best: Option<&Best>, tainted: bool, used: usize) {
+fn check_hand_off(
+    events: &[WorkflowEvent],
+    best: Option<&Best>,
+    tainted: bool,
+    used: usize,
+    per_run: u32,
+) {
     let hand_off = first(events, |e| {
         matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })
     });
@@ -625,7 +640,7 @@ fn check_hand_off(events: &[WorkflowEvent], best: Option<&Best>, tainted: bool, 
     });
     let carry = carry.and_then(|input| input.carry);
     always!(
-        carry.as_ref().is_some_and(|c| c.done == 3),
+        carry.as_ref().is_some_and(|c| c.done == per_run),
         "the hand-off carries the count"
     );
     always!(
@@ -642,6 +657,9 @@ fn check_hand_off(events: &[WorkflowEvent], best: Option<&Best>, tainted: bool, 
             .is_some_and(|c| used + c.hints.len() == signals(events, "hint", hand_off)),
         "each hint is used or carried"
     );
+    if carry.as_ref().is_some_and(|c| !c.hints.is_empty()) {
+        sometimes!(true, "a hint is carried across the hand-off");
+    }
     always!(
         carry
             .as_ref()
@@ -675,14 +693,48 @@ async fn a_session_holds_its_invariants_under_signals_and_faults() {
                 carry: None,
             })
             .unwrap(),
-            check_session,
+            |run| check_session(run, 3),
         )
         .await
         .unwrap_or_else(|failure| panic!("{failure}"));
 }
 
-/// With no stop, the first run reaches the hand-off. Experiment 3 fails on
-/// the way, so the sweep checks the crash row, the taint and the carry.
+/// With one experiment per run, a stop that lands during that experiment
+/// meets the hand-off. The stop must win.
+///
+/// A signal alone lands at the first boundary, where nothing else waits.
+/// Signals arrive in call order, so four policy signals that change nothing
+/// go first and spread the stop over later tasks.
+#[tokio::test]
+async fn a_stop_at_the_hand_off_ends_the_night() {
+    let mut config = session_config();
+    config.experiments_per_run = 1;
+    let same = serde_json::to_value(KeepPolicy::default()).unwrap();
+    session_env()
+        .simulation()
+        .seeds(SEEDS)
+        .signal("policy", same.clone())
+        .signal("policy", same.clone())
+        .signal("policy", same.clone())
+        .signal("policy", same)
+        .signal("stop", json!({"reason": "bed time"}))
+        .require_reached("a stop at the hand-off ends the night")
+        .sweep(
+            research_session_info().handler,
+            serde_json::to_value(SessionInput {
+                config,
+                carry: None,
+            })
+            .unwrap(),
+            |run| check_session(run, 1),
+        )
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+}
+
+/// With no stop, the first run reaches the hand-off. Experiment 2 fails on
+/// the way, so the sweep checks the crash row, the taint and the carry. Four
+/// hints for three experiments leave one to carry.
 #[tokio::test]
 async fn a_session_hands_off_its_carry_past_a_failed_experiment() {
     let tighter = KeepPolicy {
@@ -692,10 +744,26 @@ async fn a_session_hands_off_its_carry_past_a_failed_experiment() {
     session_env()
         .simulation()
         .seeds(SEEDS)
-        .signal("hint", json!({"text": "paper:warmdown", "from": "human"}))
+        .signal(
+            "hint",
+            json!({"text": "try a longer warmdown", "from": "human"}),
+        )
+        .signal(
+            "hint",
+            json!({"text": "try a deeper model", "from": "human"}),
+        )
+        .signal(
+            "hint",
+            json!({"text": "try a lower weight decay", "from": "human"}),
+        )
+        .signal(
+            "hint",
+            json!({"text": "try a smaller batch", "from": "human"}),
+        )
         .signal("policy", serde_json::to_value(tighter).unwrap())
         .require_reached("a failed experiment becomes a crash row")
         .require_reached("a paper or a failure taints a later experiment")
+        .require_reached("a hint is carried across the hand-off")
         .require_reached("the session continues as new")
         .sweep(
             research_session_info().handler,
@@ -709,7 +777,7 @@ async fn a_session_hands_off_its_carry_past_a_failed_experiment() {
                     run.status() == SimStatus::ContinuedAsNew,
                     "with no stop, the first run hands off"
                 );
-                check_session(run);
+                check_session(run, 3);
             },
         )
         .await

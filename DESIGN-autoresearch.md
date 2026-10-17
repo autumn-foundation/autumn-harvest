@@ -241,7 +241,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC6 | `e2e::an_edit_after_a_paper_waits_and_a_deny_changes_nothing`, `e2e::a_paper_taints_every_later_run_of_the_session`, `e2e::an_approved_rewind_moves_the_base_to_an_older_kept_commit`, `e2e::a_late_approval_never_releases_the_call`. |
 | AC7 | `scripted::tests::the_researcher_reads_edits_asks_the_reviewer_and_answers`, `agent::tests::the_reviewer_is_read_only_with_two_tools`. The e2e nights delegate in every proposal. |
 | AC8 | `e2e::memory_notes_survive_a_restart`, `stores::tests::memory_survives_a_new_store_and_dedupes_a_key`. |
-| AC9 | `e2e::signals_a_query_and_an_update_steer_a_live_session`. `sim::a_session_holds_its_invariants_under_signals_and_faults` requires the hint, policy and stop targets. |
+| AC9 | `e2e::signals_a_query_and_an_update_steer_a_live_session`. `sim::a_session_holds_its_invariants_under_signals_and_faults` requires the hint, policy and stop targets. `sim::a_stop_at_the_hand_off_ends_the_night` requires a stop that meets the hand-off. |
 | AC10 | `e2e::two_sessions_share_one_gpu_and_a_kept_idea`: every training takes `gpu:gpu0`, and each grant has its own fencing token. The sim checks one grant per training. |
 | AC11 | `e2e::the_session_continues_as_new_and_carries_its_best`: three runs, the carried count and best. `sim::a_session_hands_off_its_carry_past_a_failed_experiment`: the count, the best, each hint and the labels. `sim::a_continued_session_finishes_from_its_carry`. |
 | AC12 | `e2e::two_sessions_share_one_gpu_and_a_kept_idea`: the hint reaches B, and the unknown sibling fails only its own signal. |
@@ -250,7 +250,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC15 | `e2e::a_finished_night_leaves_a_morning_report`, `scripted::tests::the_reporter_reports_the_summary_of_its_own_session`. |
 | AC16 | `e2e::a_restart_resumes_without_paying_for_a_turn_or_a_run_twice`: the model calls and the trainings across two processes equal one process. |
 | AC17 | `e2e::a_night_of_research_keeps_only_improvements` and `e2e::the_session_continues_as_new_and_carries_its_best` run `verify`. The CI demo runs `verify`. |
-| AC18 | `sim::*`: eight sweeps. Each seed runs twice, replays, and runs again with a crash. Each target is required. |
+| AC18 | `sim::*`: nine sweeps. Each seed runs twice, replays, and runs again with a crash. Each target is required. |
 | AC19 | `e2e::eval_names_the_first_turn_where_a_new_program_differs`, `cli::eval_and_purge_work_on_a_finished_night`. |
 | AC20 | `e2e::the_response_cache_serves_an_identical_report_turn`. |
 | AC21 | `e2e::the_inbox_delivers_a_command_once`, `cli::inbox_commands_queue_for_the_runner`, `inbox::tests`. |
@@ -298,7 +298,8 @@ The fixes:
   stop lost at the hand-off, a crash that moved the base, a lost carried
   best, and lost hints. The sweeps now check the base, the carry, the
   hints, the stop, the policy and the taint on every seed. A no-stop sweep
-  reaches the hand-off. Seed-driven mocks take the rewind, no-change,
+  reaches the hand-off and carries a hint. A sweep with one experiment per
+  run lands a stop at the hand-off. Seed-driven mocks take the rewind, no-change,
   time-out and failure paths. The review also found a product bug: a run
   past its budget was scored. It is a crash now.
 
