@@ -3179,6 +3179,31 @@ fn queue_fairness_rejects_url_dot_segment_names() {
     }
 }
 
+#[test]
+fn queue_fairness_accepts_percent_spelled_keys() {
+    // The core validator accepts these keys as literals. `path_segment`
+    // encodes `%`, so the route receives them intact (issue #2097).
+    for (key, encoded) in [
+        ("%2e", "%252e"),
+        ("%2E", "%252E"),
+        (".%2e", ".%252e"),
+        ("%2e.", "%252e."),
+        ("%2e%2e", "%252e%252e"),
+    ] {
+        for verb in ["set", "clear"] {
+            let mut args = vec!["harvest", "queue", "fairness", verb, "q", key];
+            if verb == "set" {
+                args.extend(["--weight", "2"]);
+            }
+            let request = Cli::try_parse_from(args)
+                .expect("queue fairness args should parse")
+                .api_request()
+                .unwrap_or_else(|e| panic!("key {key:?} must build for {verb}: {e}"));
+            assert_eq!(request.path, format!("/admin/queues/q/fairness/{encoded}"));
+        }
+    }
+}
+
 // ── Per-activity-type pause/resume (issue #807) ───────────────────────────────
 
 #[test]

@@ -349,9 +349,10 @@ async fn override_cap_is_1000_per_queue() {
     );
 }
 
-/// Prune deletes only idle rows without debt that do not set `V`.
+/// Prune keeps the clock row and every key with a pending task. It deletes
+/// the other old rows, and forgives the debt of an idle key (issue #2097).
 #[tokio::test]
-async fn prune_deletes_only_rows_the_claim_cannot_tell_apart() {
+async fn prune_keeps_the_clock_row_and_active_keys() {
     let (mut conn, _container) = connect().await;
     let queue_name = fresh_queue("prune");
     diesel::sql_query(format!(
@@ -373,11 +374,11 @@ async fn prune_deletes_only_rows_the_claim_cannot_tell_apart() {
     let preview = prune_fairness_state(&mut conn, Some(&queue_name), cutoff, 100, true)
         .await
         .unwrap();
-    assert_eq!(preview, 1, "preview counts only the idle row");
+    assert_eq!(preview, 2, "preview counts the idle and the idle debt row");
     let deleted = prune_fairness_state(&mut conn, Some(&queue_name), cutoff, 100, false)
         .await
         .unwrap();
-    assert_eq!(deleted, 1);
+    assert_eq!(deleted, 2);
 
     let mut left: Vec<String> = list_fairness_state(&mut conn, &queue_name)
         .await
@@ -386,7 +387,67 @@ async fn prune_deletes_only_rows_the_claim_cannot_tell_apart() {
         .map(|s| s.fairness_key)
         .collect();
     left.sort();
-    assert_eq!(left, ["busy", "clock", "debt", "fresh"]);
+    assert_eq!(left, ["busy", "clock", "fresh"]);
+}
+
+/// A queue that never drains must not keep a row per one-shot key.
+///
+/// Each new key starts at `V`, so its charge never moves `V`. No row has
+/// `last_start < V`, and the idle reset never runs. Prune must still leave
+/// one row: the one that defines `V`.
+#[tokio::test]
+async fn prune_bounds_one_shot_keys_on_a_queue_that_never_drains() {
+    let (mut conn, _container) = connect().await;
+    let queue_name = fresh_queue("never-drains");
+    let rows: Vec<String> = (0..1_000)
+        .map(|i| format!("('{queue_name}', 'once-{i:04}', 1, 0, NOW() - INTERVAL '30 minutes')"))
+        .collect();
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_fairness_state (queue_name, fairness_key, pass, last_start, updated_at) \
+         VALUES {}",
+        rows.join(", ")
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed state");
+    enqueue_keyed(
+        &mut conn,
+        &queue_name,
+        Some("waiting"),
+        Duration::seconds(1),
+    )
+    .await;
+
+    let cutoff = Utc::now() - Duration::minutes(10);
+    let deleted = prune_fairness_state(&mut conn, Some(&queue_name), cutoff, 500, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 999);
+    let left = list_fairness_state(&mut conn, &queue_name).await.unwrap();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0].fairness_key, "once-0999", "the greatest key stays");
+    assert!(left[0].last_start.abs() < 1e-9, "V holds");
+}
+
+/// A key with a pending task keeps its debt, even when its row is old.
+#[tokio::test]
+async fn prune_keeps_the_debt_of_a_key_with_a_pending_task() {
+    let (mut conn, _container) = connect().await;
+    let queue_name = fresh_queue("pending-debt");
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_fairness_state (queue_name, fairness_key, pass, last_start, updated_at) VALUES \
+         ('{queue_name}', 'a', 1, 0, NOW() - INTERVAL '30 minutes'), \
+         ('{queue_name}', 'b', 1, 0, NOW() - INTERVAL '30 minutes')"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed state");
+    enqueue_keyed(&mut conn, &queue_name, Some("a"), Duration::seconds(1)).await;
+    let cutoff = Utc::now() - Duration::minutes(10);
+    let deleted = prune_fairness_state(&mut conn, Some(&queue_name), cutoff, 100, false)
+        .await
+        .unwrap();
+    assert_eq!(deleted, 0, "a has a task, and b defines V");
 }
 
 /// A queue with no pending task and no recent charge forgets its state.
@@ -555,6 +616,114 @@ async fn prune_preview_matches_the_live_count_across_batches() {
         .unwrap();
     assert_eq!(live, 101);
     assert_eq!(preview, live);
+}
+
+/// A preview must not hold a row lock that a claim can wait on.
+///
+/// A second connection probes every state row with `NOWAIT` while the
+/// preview runs. A held lock makes the probe fail with SQLSTATE 55P03.
+#[tokio::test]
+async fn a_preview_takes_no_lock_on_the_state_rows() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connect to the test database");
+    let mut probe = AsyncPgConnection::establish(&url)
+        .await
+        .expect("open a probe connection");
+    let queue_name = fresh_queue("preview-lock");
+    diesel::sql_query(format!(
+        "INSERT INTO harvest_fairness_state (queue_name, fairness_key, pass, last_start, updated_at) \
+         SELECT '{queue_name}', 'k' || g, 1, 0, NOW() - INTERVAL '30 minutes' \
+         FROM generate_series(1, 10000) g"
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("seed state");
+
+    let cutoff = Utc::now() - Duration::minutes(10);
+    let name = queue_name.clone();
+    let preview = tokio::spawn(async move {
+        let n = prune_fairness_state(&mut conn, Some(&name), cutoff, 1_000, true)
+            .await
+            .unwrap();
+        (n, conn)
+    });
+    let mut probes = 0u32;
+    while !preview.is_finished() {
+        diesel::sql_query(format!(
+            "SELECT 1 FROM harvest_fairness_state \
+             WHERE queue_name = '{queue_name}' FOR UPDATE NOWAIT"
+        ))
+        .execute(&mut probe)
+        .await
+        .expect("a preview must not lock the state rows");
+        probes += 1;
+    }
+    let (counted, mut conn) = preview.await.unwrap();
+    assert!(probes > 0, "the probe ran during the preview");
+    assert_eq!(counted, 9_999, "the preview still counts the live victims");
+    assert_eq!(
+        list_fairness_state(&mut conn, &queue_name)
+            .await
+            .unwrap()
+            .len(),
+        10_000,
+        "a preview deletes nothing"
+    );
+}
+
+/// A fair claim on a name the weight API cannot address fails first.
+#[tokio::test]
+async fn a_fair_claim_refuses_an_unaddressable_queue_name() {
+    let (mut conn, _container) = connect().await;
+    for bad in [" q ", "..", ".", ""] {
+        let err = queue::claim_task_with_fairness(
+            &mut conn,
+            &[bad.to_owned()],
+            "fair-test-worker",
+            "",
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            ClaimFairness::Keys,
+        )
+        .await
+        .expect_err("a fair claim must refuse the queue name");
+        assert!(
+            matches!(err, autumn_harvest::error::HarvestError::Config(_)),
+            "{bad:?}: {err:?}"
+        );
+        let err = queue::claim_task_by_id_with_fairness(
+            &mut conn,
+            Uuid::new_v4(),
+            &[bad.to_owned()],
+            "fair-test-worker",
+            "",
+            None,
+            &[],
+            &[],
+            None,
+            ClaimFairness::Keys,
+        )
+        .await
+        .expect_err("a fair by-id claim must refuse the queue name");
+        assert!(
+            matches!(err, autumn_harvest::error::HarvestError::Config(_)),
+            "{bad:?}: {err:?}"
+        );
+        assert!(
+            list_fairness_state(&mut conn, bad)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{bad:?} wrote state"
+        );
+    }
+    // The plain claim keeps its old contract.
+    claim(&mut conn, " q ", ClaimFairness::Off).await;
 }
 
 /// A claim without fairness keys writes no state.

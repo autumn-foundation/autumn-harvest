@@ -147,6 +147,29 @@ pub const MAX_FAIRNESS_OVERRIDES_PER_QUEUE: usize = 1000;
 /// It equals the quota key cap, so a valid quota key fits as a fairness key.
 pub const MAX_FAIRNESS_KEY_LEN: usize = 256;
 
+/// Check a queue name for fair claims.
+///
+/// The weight routes carry the queue in a URL path segment, and URL parsing
+/// removes `.` and `..`. A fair claim on such a name would charge state that
+/// the weight API cannot address. The worker config and both public fair
+/// claims use this one check.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Config`] when [`crate::queue_pause::validate_queue_name`]
+/// rejects the name, or when it is `.` or `..`.
+pub fn validate_fairness_queue_name(queue: &str) -> HarvestResult<()> {
+    crate::queue_pause::validate_queue_name(queue)
+        .map_err(|e| HarvestError::Config(format!("fairness_keys: queue {queue:?}: {e}")))?;
+    if queue == "." || queue == ".." {
+        return Err(HarvestError::Config(format!(
+            "fairness_keys: queue {queue:?} is a URL dot segment, \
+             which the weight API cannot address"
+        )));
+    }
+    Ok(())
+}
+
 /// Check a fairness key that a caller supplies.
 ///
 /// # Errors
@@ -319,17 +342,26 @@ impl FairClock {
         next
     }
 
-    /// Delete the state of idle keys that the claim cannot tell apart from
-    /// no state. Returns the number of keys deleted.
+    /// Delete the state of idle keys. Returns the number of keys deleted.
     ///
-    /// A key goes when three things hold. `is_active` is false. Its `pass` is
-    /// at most `V`, so it has no debt. Its `last_start` is below `V`, so it
-    /// does not set `V`. Such a key starts at `V` with or without its row.
+    /// A key goes when `is_active` is false and it is not the clock key. The
+    /// clock key has the greatest `(last_start, key)`. It defines `V`, so it
+    /// stays, and `V` never falls. A pruned key starts at `V` afterwards.
+    /// It loses its debt, which is at most `1 / weight`: after a charge,
+    /// `pass - V <= 1 / weight`. A key with no debt loses nothing.
     pub fn prune(&mut self, is_active: impl Fn(&str) -> bool) -> usize {
-        let v = self.vclock();
+        let clock_key = self
+            .keys
+            .iter()
+            .max_by(|a, b| {
+                a.1.last_start
+                    .total_cmp(&b.1.last_start)
+                    .then_with(|| a.0.cmp(b.0))
+            })
+            .map(|(k, _)| k.clone());
         let before = self.keys.len();
         self.keys
-            .retain(|k, p| is_active(k) || p.pass > v || p.last_start >= v);
+            .retain(|k, _| is_active(k) || clock_key.as_deref() == Some(k.as_str()));
         before - self.keys.len()
     }
 
@@ -338,8 +370,8 @@ impl FairClock {
     ///
     /// This is the idle rule of start-time fair queuing. With no backlog, no
     /// key is behind another, so every debt is forgiven. Keys that claim once
-    /// never move `V`. Without this rule [`FairClock::prune`] never deletes
-    /// them, and the state grows with each new key.
+    /// never move `V`. [`FairClock::prune`] keeps one row, so this rule clears
+    /// the last one.
     pub fn reset_if_idle(&mut self, any_active: bool) -> usize {
         if any_active {
             return 0;

@@ -9,7 +9,8 @@
 //! 2. Two backlogged keys stay within `1/w_i + 1/w_j` in `served / weight`.
 //! 3. The queue clock `V` never decreases, whatever key is charged.
 //! 4. With one key, the claim order is the due order.
-//! 5. Prune changes no start tag and does not move `V`.
+//! 5. Prune never moves `V`, never touches an active key, and forgives at
+//!    most `1/w` of debt per key (issue #2097).
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -245,15 +246,18 @@ proptest! {
         prop_assert_eq!(order, sorted);
     }
 
-    /// Property 5: prune changes no start tag and does not move `V`.
+    /// Property 5: prune never moves `V` and never touches an active key.
+    /// A pruned key loses at most `1/w` of debt, and starts at `V` after.
     #[test]
-    fn prune_is_invisible_to_the_claim(
+    fn prune_forgives_at_most_one_claim_of_debt(
         ops in proptest::collection::vec((0usize..8, weight()), 0..200),
         active in proptest::collection::vec(any::<bool>(), 8),
     ) {
         let mut clock = FairClock::default();
+        let mut last_weight: BTreeMap<String, f64> = BTreeMap::new();
         for (k, w) in ops {
             clock.charge(&key(k), w);
+            last_weight.insert(key(k), w);
         }
         let before: Vec<f64> = (0..8).map(|k| clock.start_tag(&key(k))).collect();
         let v_before = clock.vclock();
@@ -264,9 +268,23 @@ proptest! {
         });
         let after: Vec<f64> = (0..8).map(|k| clock.start_tag(&key(k))).collect();
         prop_assert_eq!(clock.vclock().to_bits(), v_before.to_bits());
-        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
-        prop_assert_eq!(bits(&before), bits(&after));
-        prop_assert!(pruned <= 8);
+        let mut gone = 0usize;
+        for k in 0..8 {
+            let name = key(k);
+            if active[k] {
+                prop_assert_eq!(before[k].to_bits(), after[k].to_bits(), "{} is active", name);
+            }
+            if clock.state(&name).is_none() && last_weight.contains_key(&name) {
+                gone += 1;
+                prop_assert_eq!(after[k].to_bits(), v_before.to_bits(), "{} starts at V", name);
+                let forgiven = before[k] - after[k];
+                prop_assert!(
+                    forgiven <= 1.0 / last_weight[&name] + 1e-9,
+                    "{name} lost {forgiven} of debt"
+                );
+            }
+        }
+        prop_assert_eq!(pruned, gone);
     }
 }
 
@@ -297,18 +315,33 @@ proptest! {
     }
 }
 
-/// Keys that claim once never move `V`. Their rows keep a debt, so the plain
-/// prune keeps them all. The idle reset bounds the state.
+/// Keys that claim once never move `V`. On a queue that never drains, the
+/// idle reset never runs, so prune alone must bound the state (issue #2097).
 #[test]
-fn one_shot_keys_grow_the_state_until_the_queue_is_idle() {
+fn one_shot_keys_leave_one_row_on_a_queue_that_never_drains() {
     let mut clock = FairClock::default();
     for k in 0..100 {
         clock.charge(&format!("once-{k}"), 1.0);
     }
     assert_eq!(clock.vclock().to_bits(), 0f64.to_bits(), "V never moves");
-    assert_eq!(clock.prune(|_| false), 0, "every key keeps a debt");
-    assert_eq!(clock.reset_if_idle(false), 100);
+    assert_eq!(clock.prune(|k| k == "pending"), 99, "all but the clock row");
+    assert!(
+        clock.state("once-99").is_some(),
+        "the greatest key defines V"
+    );
     assert!(clock.state("once-0").is_none());
+    assert_eq!(clock.vclock().to_bits(), 0f64.to_bits());
+}
+
+/// With a tie at `V`, the greatest key stays, so concurrent pruners agree.
+#[test]
+fn prune_keeps_the_greatest_key_among_ties_at_the_clock() {
+    let mut clock = FairClock::default();
+    for k in ["b", "c", "a"] {
+        clock.charge(k, 1.0);
+    }
+    assert_eq!(clock.prune(|_| false), 2);
+    assert!(clock.state("c").is_some());
 }
 
 /// A flood of 1,000 rows from tenant A cannot delay tenant B by more than one

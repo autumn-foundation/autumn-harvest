@@ -255,23 +255,23 @@ pub const MAX_PRUNE_BATCHES: usize = 10;
 /// A row goes when no claim wrote it since `cutoff` and one of two cases
 /// holds:
 ///
-/// - **An idle key.** No `PENDING` task of its queue has its key. Its `pass`
-///   is at most the queue clock `V`, so it holds no debt. Its `last_start` is
-///   below `V`, so it does not set `V`. Such a key starts at `V` with or
-///   without its row, so prune changes no claim. The property test
-///   `prune_is_invisible_to_the_claim` proves that on the model.
+/// - **An idle key.** No `PENDING` task of its queue has its key, and the row
+///   is not the clock row. The clock row has the greatest
+///   `(last_start, fairness_key)` of its queue, and it defines `V`. Prune
+///   keeps it, so `V` never falls. The key restarts at `V`, so it loses its
+///   debt. That debt is at most `1 / weight`, one claim. The property test
+///   `prune_forgives_at_most_one_claim_of_debt` proves that on the model.
 /// - **An idle queue.** The queue has no `PENDING` task, and no claim charged
-///   any of its keys since `cutoff`. Every row of the queue goes. The rows
-///   that set `V` go only after every lower row, in a later pass, so `V`
-///   holds until the last row. This is the idle rule of start-time fair
-///   queuing: with no backlog, every debt is forgiven. See
-///   [`crate::queue_fairness::FairClock::reset_if_idle`].
+///   any of its keys since `cutoff`. Its last row, the clock row, goes. This
+///   is the idle rule of start-time fair queuing: with no backlog, every debt
+///   is forgiven. See [`crate::queue_fairness::FairClock::reset_if_idle`].
 ///
 /// Rows are locked `SKIP LOCKED`, so prune never waits for a claim.
 ///
 /// Prune deletes in batches of `batch_size`, up to [`MAX_PRUNE_BATCHES`]
 /// batches, and stops at the first short batch. With `preview`, nothing is
-/// deleted, and the count is what one call would delete. With `queue_name`,
+/// deleted, and the count is what one call would delete. A preview takes no
+/// lock on the real rows. With `queue_name`,
 /// only that queue is pruned. Returns the number of rows.
 ///
 /// # Errors
@@ -287,14 +287,29 @@ pub async fn prune_fairness_state(
     let batch = i64::try_from(batch_size).unwrap_or(i64::MAX).max(1);
     let queue = queue_name.map(str::to_owned);
     if !preview {
-        return Ok(delete_prune_batches(conn, queue.as_deref(), cutoff, batch).await?);
+        return Ok(delete_prune_batches(conn, STATE_TABLE, queue.as_deref(), cutoff, batch).await?);
     }
-    // A preview runs the live batches, then rolls them back. A one-pass
-    // count would miss rows that qualify only in a later batch, such as the
-    // clock rows of an idle queue.
+    // A preview runs the live batches on a temp copy of the state rows, then
+    // rolls back. A one-pass count would miss rows that qualify only in a
+    // later batch, such as the last row of an idle queue. The copy keeps the
+    // real rows unlocked, so a claim never waits for a preview.
     let ended = conn
         .transaction::<(), PreviewEnd, _>(async move |conn| {
-            let n = delete_prune_batches(conn, queue.as_deref(), cutoff, batch).await?;
+            diesel::sql_query(format!(
+                "CREATE TEMP TABLE {PREVIEW_TABLE} \
+                 (LIKE {STATE_TABLE} INCLUDING INDEXES) ON COMMIT DROP"
+            ))
+            .execute(conn)
+            .await?;
+            diesel::sql_query(format!(
+                "INSERT INTO {PREVIEW_TABLE} SELECT * FROM {STATE_TABLE} \
+                 WHERE $1::TEXT IS NULL OR queue_name = $1"
+            ))
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(queue.as_deref())
+            .execute(conn)
+            .await?;
+            let n =
+                delete_prune_batches(conn, PREVIEW_TABLE, queue.as_deref(), cutoff, batch).await?;
             Err(PreviewEnd::Count(n))
         })
         .await;
@@ -304,6 +319,12 @@ pub async fn prune_fairness_state(
         Ok(()) => Ok(0),
     }
 }
+
+/// The state table.
+const STATE_TABLE: &str = "harvest_fairness_state";
+
+/// The temp copy that a preview prunes.
+const PREVIEW_TABLE: &str = "harvest_fairness_preview";
 
 /// How a preview transaction ends. It always rolls back, so the count
 /// leaves the transaction as its error.
@@ -318,11 +339,12 @@ impl From<diesel::result::Error> for PreviewEnd {
     }
 }
 
-/// Delete prune victims in batches of `batch` rows, up to
+/// Delete prune victims from `state` in batches of `batch` rows, up to
 /// [`MAX_PRUNE_BATCHES`] batches. Stops at the first short batch. Returns
 /// the number of rows deleted.
 async fn delete_prune_batches(
     conn: &mut AsyncPgConnection,
+    state: &str,
     queue_name: Option<&str>,
     cutoff: DateTime<Utc>,
     batch: i64,
@@ -332,9 +354,10 @@ async fn delete_prune_batches(
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         n: i64,
     }
+    let victims = PRUNE_VICTIMS_SQL.replace("@state@", state);
     let sql = format!(
-        "WITH {PRUNE_VICTIMS_SQL}, gone AS ( \
-             DELETE FROM harvest_fairness_state d USING victims v \
+        "WITH {victims}, gone AS ( \
+             DELETE FROM {state} d USING victims v \
              WHERE d.queue_name = v.queue_name AND d.fairness_key = v.fairness_key \
              RETURNING 1 \
          ) SELECT COUNT(*) AS n FROM gone"
@@ -356,29 +379,31 @@ async fn delete_prune_batches(
 }
 
 /// The rows that [`prune_fairness_state`] may delete. Binds `$1` cutoff,
-/// `$2` row limit and `$3` queue (`NULL` for every queue).
+/// `$2` row limit and `$3` queue (`NULL` for every queue). `@state@` stands
+/// for the state table.
 ///
 /// A row goes in one of two cases:
 ///
-/// - The claim cannot tell it from no row. Its key has no pending task and
-///   no debt, and it does not set `V`.
-/// - Its queue is idle: no pending task and no charge since the cutoff. This
-///   is the idle rule of start-time fair queuing. With no backlog, no key is
-///   behind another, so every debt is forgiven. Keys that claim once never
-///   move `V`, so without this rule their rows would never go.
+/// - Its key has no pending task, and it is not the clock row. The clock row
+///   has the greatest `(last_start, fairness_key)` of its queue. Concurrent
+///   pruners thus keep the same row, and `V` never falls. The key loses its
+///   debt, at most `1 / weight`.
+/// - It is the last row of an idle queue: no pending task and no charge since
+///   the cutoff. With no backlog, no key is behind another, so every debt is
+///   forgiven.
 ///
-/// A row that sets `V` goes only when no row of its queue has a lower
-/// `last_start`. A row that another pruner holds still counts, so a partial
-/// or rolled-back reset never lowers `V`. The rows that set `V` thus go in a
-/// later pass than the rest.
+/// A row that another pruner holds still counts as a row of the queue. A
+/// partial or rolled-back reset thus never lowers `V`.
 ///
 /// `active` reads the pending keys of the pruned queues once. The planner
 /// can then hash it for the anti-join. A probe per state row would scan the
 /// pending backlog once per row.
 const PRUNE_VICTIMS_SQL: &str = "\
     clock AS ( \
-        SELECT queue_name, MAX(last_start) AS v, MAX(updated_at) AS last_charge \
-        FROM harvest_fairness_state \
+        SELECT queue_name, MAX(updated_at) AS last_charge, \
+               (ARRAY_AGG(fairness_key ORDER BY last_start DESC, fairness_key DESC))[1] \
+                   AS clock_key \
+        FROM @state@ \
         WHERE $3::TEXT IS NULL OR queue_name = $3 \
         GROUP BY queue_name \
     ), \
@@ -390,13 +415,12 @@ const PRUNE_VICTIMS_SQL: &str = "\
     ), \
     victims AS ( \
         SELECT s.queue_name, s.fairness_key \
-        FROM harvest_fairness_state s \
+        FROM @state@ s \
         JOIN clock c ON c.queue_name = s.queue_name \
         WHERE s.updated_at < $1 \
           AND ( \
               ( \
-                  s.pass <= c.v \
-                  AND s.last_start < c.v \
+                  s.fairness_key <> c.clock_key \
                   AND NOT EXISTS ( \
                       SELECT 1 FROM active a \
                       WHERE a.queue_name = s.queue_name \
@@ -408,13 +432,10 @@ const PRUNE_VICTIMS_SQL: &str = "\
                   AND NOT EXISTS ( \
                       SELECT 1 FROM active a WHERE a.queue_name = s.queue_name \
                   ) \
-                  AND ( \
-                      s.last_start < c.v \
-                      OR NOT EXISTS ( \
-                          SELECT 1 FROM harvest_fairness_state o \
-                          WHERE o.queue_name = s.queue_name \
-                            AND o.last_start < c.v \
-                      ) \
+                  AND NOT EXISTS ( \
+                      SELECT 1 FROM @state@ o \
+                      WHERE o.queue_name = s.queue_name \
+                        AND o.fairness_key <> s.fairness_key \
                   ) \
               ) \
           ) \
@@ -435,23 +456,26 @@ mod tests {
     }
 
     #[test]
-    fn prune_keeps_debt_and_the_clock_row() {
-        assert!(PRUNE_VICTIMS_SQL.contains("s.pass <= c.v"));
-        assert!(PRUNE_VICTIMS_SQL.contains("s.last_start < c.v"));
+    fn prune_keeps_the_clock_row_and_active_keys() {
+        assert!(PRUNE_VICTIMS_SQL.contains("s.fairness_key <> c.clock_key"));
+        assert!(PRUNE_VICTIMS_SQL.contains("ORDER BY last_start DESC, fairness_key DESC"));
         assert!(PRUNE_VICTIMS_SQL.contains("SKIP LOCKED"));
         assert!(PRUNE_VICTIMS_SQL.contains("t.state = 'PENDING'"));
         assert!(PRUNE_VICTIMS_SQL.contains("active AS MATERIALIZED"));
     }
 
     #[test]
-    fn prune_resets_an_idle_queue_in_last_start_order() {
+    fn prune_resets_an_idle_queue_at_its_last_row() {
         assert!(PRUNE_VICTIMS_SQL.contains("c.last_charge < $1"));
         assert!(
             PRUNE_VICTIMS_SQL.contains("SELECT 1 FROM active a WHERE a.queue_name = s.queue_name")
         );
-        assert!(PRUNE_VICTIMS_SQL.contains("ORDER BY s.last_start, s.updated_at"));
-        // A clock row waits for every lower row, even one another pruner
-        // holds.
-        assert!(PRUNE_VICTIMS_SQL.contains("AND o.last_start < c.v"));
+        // A row that another pruner holds still counts.
+        assert!(PRUNE_VICTIMS_SQL.contains("o.fairness_key <> s.fairness_key"));
+    }
+
+    #[test]
+    fn prune_reads_the_state_table_only_through_the_placeholder() {
+        assert!(!PRUNE_VICTIMS_SQL.contains("harvest_fairness_state"));
     }
 }

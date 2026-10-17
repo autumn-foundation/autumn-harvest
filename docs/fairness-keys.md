@@ -120,7 +120,9 @@ checks that the SQL claim follows the model step by step.
   flood of any size cannot delay it more.
 - Two keys with work stay within `1/w_i + 1/w_j` of each other in
   claims divided by weight.
-- Idle time earns no credit. A key that comes back gets no burst.
+- Idle time earns no credit. A key that comes back gets no burst. A key
+  that stays idle past the prune window loses at most `1/w` of debt, one
+  claim at its weight.
 - New keys take only the claims they need. While they arrive more slowly
   than the queue drains, a backlogged key gets every other claim.
 
@@ -155,12 +157,17 @@ runs only while the rate-limit bucket GC is on. Call
 `fairness_keys::prune_fairness_state` to run it by hand. A row goes in two
 cases:
 
-- **An idle key.** The claim cannot tell the row from no row: its key has no
-  pending task and no debt, and it does not set the clock `V`.
+- **An idle key.** Its key has no pending task, and it is not the clock row.
+  The clock row has the greatest `(last_start, key)` of its queue and defines
+  `V`. Prune keeps it, so `V` never falls. The key loses its debt. After a
+  charge, `pass - V <= 1/w`, so the loss is at most one claim at its weight.
 - **An idle queue.** The queue has no pending task, and no claim charged it
-  inside the window. All its rows go, so all debts are forgiven. This is the
-  idle rule of start-time fair queuing. Keys that claim once never move `V`,
-  so without it their rows would stay.
+  inside the window. Its last row goes, so all debts are forgiven. This is
+  the idle rule of start-time fair queuing.
+
+A queue that never drains, with one new key per request, thus keeps one row
+plus its active keys. A preview (`preview = true`) counts on a temp copy of
+the rows. It takes no lock on the real rows, so a claim never waits for it.
 
 ## Limits
 

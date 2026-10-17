@@ -395,15 +395,7 @@ impl WorkerRuntimeConfig {
         // parsing removes `.` and `..` there, so those names are refused too.
         if self.fairness_keys {
             for queue in &self.queues {
-                crate::queue_pause::validate_queue_name(queue).map_err(|e| {
-                    HarvestError::Config(format!("fairness_keys: queue {queue:?}: {e}"))
-                })?;
-                if queue == "." || queue == ".." {
-                    return Err(HarvestError::Config(format!(
-                        "fairness_keys: queue {queue:?} is a URL dot segment, \
-                         which the weight API cannot address"
-                    )));
-                }
+                crate::queue_fairness::validate_fairness_queue_name(queue)?;
             }
         }
         // A degenerate band (min_slots > max_slots, or a configured value
