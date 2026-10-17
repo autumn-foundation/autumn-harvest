@@ -61,12 +61,17 @@ const AUTHOR: [&str; 4] = [
     "-c",
     "user.email=autoresearch@localhost",
 ];
-/// Git settings that keep code in the lab from running through git.
-const SAFE_GIT: [&str; 4] = [
+/// Git settings for every call. Hooks and the file system monitor are off:
+/// they close two common ways for code in the lab to run through git. They
+/// do not make git safe from code that can write `.git/config`. Signing is
+/// off, so a signer in the global config cannot prompt and hang a night.
+const SAFE_GIT: [&str; 6] = [
     "-c",
     "core.hooksPath=/dev/null",
     "-c",
     "core.fsmonitor=false",
+    "-c",
+    "commit.gpgsign=false",
 ];
 
 /// The bundled lab template. `autoresearch init` writes these files.
@@ -639,10 +644,7 @@ pub fn check_tag(tag: &str) -> Result<(), String> {
     }
 }
 
-/// Run git in `dir` with the example's author and safe settings.
-///
-/// The settings turn off hooks and the file system monitor. Code that the
-/// agent writes runs in the lab, so it could plant either one.
+/// Run git in `dir` with the example's author and [`SAFE_GIT`].
 fn git_in(dir: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
         .args(AUTHOR)

@@ -79,42 +79,76 @@ fn experiment_input(baseline: bool) -> ExperimentInput {
     }
 }
 
-/// Git, the trainer and the agent as mocks. A seed picks each run: about a
-/// quarter crash out of memory, the rest land near the base.
+/// An older kept commit that a rewind can move the base to.
+const KEPT: &str = "k000001";
+
+fn kept() -> Best {
+    Best {
+        commit: KEPT.into(),
+        val_bpb: 0.9985,
+        memory_gb: 44.0,
+    }
+}
+
+/// Git, the trainer and the agent as mocks. A seed picks each path:
+///
+/// - After the proposal, `HEAD` is the base, an older kept commit (an
+///   approved rewind), or a commit that `results.tsv` does not keep.
+/// - A proposal commit sometimes holds no change.
+/// - A run crashes out of memory, runs past its time budget after its
+///   summary, or lands near the base.
+/// - The agent of experiment 3 fails.
 fn experiment_env() -> WorkflowTestEnv {
     WorkflowTestEnv::new()
         .mock_child_workflow("agent_loop", |input| {
             let task: AgentTask = serde_json::from_value(input).map_err(|e| e.to_string())?;
+            if task.input.contains("experiment 3 ") {
+                return Err("the model is down".into());
+            }
             Ok(if task.input.contains(FIX_MODE) {
                 report("fix: DEVICE_BATCH_SIZE 128 -> 64")
             } else {
                 report("raise MATRIX_LR: 0.04 -> 0.05")
             })
         })
-        .mock_activity("head", |_| Ok(json!(BASE)))
-        .mock_activity_seeded("commit", |_, mock| {
-            let call = mock.call();
-            let parent = if call == 1 {
-                BASE.to_string()
+        .mock_activity_seeded("head", |_, mock| {
+            if mock.call() == 1 {
+                return Ok(json!(BASE));
+            }
+            Ok(match mock.rng().below(100) {
+                0..10 => json!(KEPT),
+                10..14 => json!("x000001"),
+                _ => json!(BASE),
+            })
+        })
+        .mock_activity("find_kept", |input| {
+            Ok(if input["commit"] == KEPT {
+                serde_json::to_value(kept()).unwrap()
             } else {
-                format!("c{:06}", call - 1)
-            };
+                Value::Null
+            })
+        })
+        .mock_activity_seeded("commit", |input, mock| {
+            let call = mock.call();
+            let changed = !(call == 1 && mock.rng().below(100) < 10);
             Ok(json!({
-                "commit": format!("c{call:06}"),
-                "parent": parent,
-                "changed": true,
-                "lines_added": 1,
-                "lines_removed": 1
+                "commit": if changed { format!("c{call:06}") } else { input["parent"].as_str().unwrap_or(BASE).to_string() },
+                "parent": input["parent"],
+                "changed": changed,
+                "lines_added": u32::from(changed),
+                "lines_removed": u32::from(changed)
             }))
         })
         .mock_activity_seeded("train", |_, mock| {
             let roll = mock.rng().below(100);
-            let log = if roll < 25 {
-                "torch.OutOfMemoryError: CUDA out of memory.\n".to_string()
-            } else {
-                summary_log(0.9900 + f64::from(u32::try_from(roll).unwrap()) / 10_000.0)
-            };
-            Ok(json!({"exit_code": 0, "timed_out": false, "log_tail": log}))
+            let bpb = 0.9900 + f64::from(u32::try_from(roll).unwrap()) / 10_000.0;
+            Ok(match roll {
+                0..25 => json!({"exit_code": 1, "timed_out": false,
+                                "log_tail": "torch.OutOfMemoryError: CUDA out of memory.\n"}),
+                // Killed at the budget after it printed a summary.
+                25..32 => json!({"exit_code": null, "timed_out": true, "log_tail": summary_log(bpb)}),
+                _ => json!({"exit_code": 0, "timed_out": false, "log_tail": summary_log(bpb)}),
+            })
         })
         .mock_activity("parse_summary", |input| {
             Ok(json!(autoresearch::summary::parse(
@@ -123,7 +157,6 @@ fn experiment_env() -> WorkflowTestEnv {
         })
         .mock_activity("reset", |input| Ok(input["commit"].clone()))
         .mock_activity("record", |_| Ok(json!(true)))
-        .mock_activity("find_kept", |_| Ok(Value::Null))
 }
 
 fn scheduled<'a>(events: &'a [WorkflowEvent], name: &'a str) -> impl Iterator<Item = &'a Value> {
@@ -133,20 +166,51 @@ fn scheduled<'a>(events: &'a [WorkflowEvent], name: &'a str) -> impl Iterator<It
     })
 }
 
+/// The outputs of each completed activity named `name`, in order.
+fn completed<'a>(events: &'a [WorkflowEvent], name: &str) -> Vec<&'a Value> {
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityScheduled {
+                activity_id,
+                name: n,
+                ..
+            } if n == name => Some(*activity_id),
+            _ => None,
+        })
+        .collect();
+    events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityCompleted {
+                activity_id,
+                output,
+                ..
+            } if ids.contains(activity_id) => Some(output),
+            _ => None,
+        })
+        .collect()
+}
+
 fn check_experiment(run: &SimOutcome) {
+    let events = run.events();
     let Ok(output) = run.result() else {
-        // An activity can exhaust its attempts under the fault lane. The
-        // run then fails, and the sweep still checks replay and crashes.
+        // A step failed for good. The session resets and logs the crash.
+        always!(
+            completed(events, "record").is_empty(),
+            "a failed experiment records no row"
+        );
+        sometimes!(true, "an experiment fails for good");
         return;
     };
     let out: ExperimentOutcome = serde_json::from_value(output.clone()).unwrap();
-    let events = run.events();
     let trains = scheduled(events, "train").count();
     let resets: Vec<&Value> = scheduled(events, "reset").collect();
     let grants = events
         .iter()
         .filter(|e| matches!(e, WorkflowEvent::MutexGranted { key, .. } if key == "gpu:gpu0"))
         .count();
+    let base = if out.rewound { kept() } else { base() };
 
     always!(
         scheduled(events, "record").count() == 1,
@@ -156,11 +220,32 @@ fn check_experiment(run: &SimOutcome) {
         trains <= 1 + MAX_FIXES as usize,
         "a crash gets at most one fix"
     );
-    always!(grants >= trains, "each training holds the GPU mutex");
+    always!(grants == trains, "each training takes the GPU mutex");
     always!(
         out.row.status == out.verdict.status,
         "the row has the verdict"
     );
+    let timed_out = completed(events, "train")
+        .last()
+        .is_some_and(|run| run["timed_out"] == json!(true));
+    if timed_out {
+        always!(
+            out.row.status == Status::Crash,
+            "a run past its budget is a crash"
+        );
+        sometimes!(true, "a run passes its time budget");
+    }
+    if out.rewound {
+        sometimes!(true, "an approved rewind moves the base");
+    }
+    if out.row.description.starts_with("no change") {
+        always!(trains == 0, "no change trains nothing");
+        always!(
+            (out.row.val_bpb, out.row.memory_gb) == (base.val_bpb, base.memory_gb),
+            "a no-change row holds the numbers of its base"
+        );
+        sometimes!(true, "an agent proposes no change");
+    }
     match out.row.status {
         Status::Keep => {
             always!(resets.is_empty(), "a keep resets nothing");
@@ -168,15 +253,16 @@ fn check_experiment(run: &SimOutcome) {
                 out.best.as_ref().map(|b| b.commit.as_str()) == Some(out.row.commit.as_str()),
                 "a keep is the new base"
             );
-            always!(out.row.val_bpb < BASE_BPB, "a kept run beats the base");
+            always!(out.row.val_bpb < base.val_bpb, "a kept run beats the base");
             sometimes!(true, "a change is kept");
         }
         Status::Discard | Status::Crash => {
             always!(
-                resets.last().map(|input| input["commit"].as_str()) == Some(Some(BASE)),
+                resets.last().and_then(|input| input["commit"].as_str())
+                    == Some(base.commit.as_str()),
                 "a discard or a crash resets to the base last"
             );
-            always!(out.best == Some(base()), "the base stays");
+            always!(out.best == Some(base), "the base stays");
             if out.row.status == Status::Crash {
                 always!(
                     out.row.val_bpb == 0.0 && out.row.memory_gb == 0.0,
@@ -204,6 +290,10 @@ async fn an_experiment_holds_its_invariants_on_every_seed() {
         .require_reached("a change is discarded")
         .require_reached("a run crashes for good")
         .require_reached("a fix recovers a crash")
+        .require_reached("a run passes its time budget")
+        .require_reached("an approved rewind moves the base")
+        .require_reached("an agent proposes no change")
+        .require_reached("an experiment fails for good")
         .sweep(
             experiment_info().handler,
             serde_json::to_value(experiment_input(false)).unwrap(),
@@ -211,8 +301,32 @@ async fn an_experiment_holds_its_invariants_on_every_seed() {
         )
         .await
         .unwrap_or_else(|failure| panic!("{failure}"));
-    // The nightly job overrides the count, so check that each seed replayed.
-    assert_eq!(report.replayed, report.seeds);
+    assert!(report.seeds > 0);
+}
+
+#[tokio::test]
+async fn an_experiment_whose_agent_fails_changes_nothing() {
+    let input = ExperimentInput {
+        number: 3,
+        ..experiment_input(false)
+    };
+    experiment_env()
+        .simulation()
+        .seeds(SEEDS)
+        .sweep(
+            experiment_info().handler,
+            serde_json::to_value(input).unwrap(),
+            |run| {
+                always!(run.result().is_err(), "the experiment fails");
+                always!(
+                    scheduled(run.events(), "commit").count() == 0
+                        && scheduled(run.events(), "train").count() == 0,
+                    "it commits and trains nothing"
+                );
+            },
+        )
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
 }
 
 #[tokio::test]
@@ -268,12 +382,16 @@ async fn a_baseline_trains_head_with_no_proposal() {
 }
 
 /// A deterministic experiment: a crash every fourth, a keep every fourth,
-/// and a discard otherwise. A hint shows in the description. A `paper:`
-/// hint adds the untrusted-input label, as a real paper read does.
+/// and a discard otherwise. Experiment 3 fails. A hint shows in the
+/// description. A `paper:` hint adds the untrusted-input label, as a real
+/// paper read does.
 fn mock_experiment(input: Value) -> Result<Value, String> {
     let input: ExperimentInput = serde_json::from_value(input).map_err(|e| e.to_string())?;
     let best = input.best.clone().unwrap_or_else(base);
     let n = input.number;
+    if n % 5 == 3 {
+        return Err("git broke".into());
+    }
     let description = input
         .hint
         .as_ref()
@@ -338,6 +456,8 @@ fn session_env() -> WorkflowTestEnv {
         })
         .mock_child_workflow("experiment", mock_experiment)
         .mock_child_workflow("agent_loop", |_| Ok(report("Morning report.")))
+        .mock_activity("reset", |input| Ok(input["commit"].clone()))
+        .mock_activity("record", |_| Ok(json!(true)))
 }
 
 fn session_config() -> SessionConfig {
@@ -362,45 +482,50 @@ fn experiment_inputs(events: &[WorkflowEvent]) -> Vec<ExperimentInput> {
         .collect()
 }
 
+/// The outcome of each experiment child in order. `None` for a child that
+/// failed. The session awaits each child, so the order is the start order.
+fn experiment_outcomes(events: &[WorkflowEvent]) -> Vec<Option<ExperimentOutcome>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ChildWorkflowCompleted { output, .. } => {
+                serde_json::from_value::<ExperimentOutcome>(output.clone())
+                    .ok()
+                    .map(Some)
+            }
+            WorkflowEvent::ChildWorkflowFailed { .. } => Some(None),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The index of the first event that matches `pick`, or the end.
+fn first(events: &[WorkflowEvent], pick: impl Fn(&WorkflowEvent) -> bool) -> usize {
+    events.iter().position(pick).unwrap_or(events.len())
+}
+
+fn signals(events: &[WorkflowEvent], name: &str, before: usize) -> usize {
+    events[..before]
+        .iter()
+        .filter(|e| matches!(e, WorkflowEvent::SignalReceived { signal_name, .. } if signal_name == name))
+        .count()
+}
+
 fn check_session(run: &SimOutcome) {
-    let inputs = experiment_inputs(run.events());
-    let hinted = inputs.iter().filter(|i| i.hint.is_some()).count();
-    always!(hinted <= 1, "a hint reaches at most one experiment");
-    if hinted == 1 {
+    let events = run.events();
+    let inputs = experiment_inputs(events);
+    let outcomes = experiment_outcomes(events);
+    let (best, tainted) = check_experiments(&inputs, &outcomes);
+    let failures = outcomes.iter().filter(|o| o.is_none()).count();
+    always!(
+        completed(events, "record").len() == failures,
+        "the session records one crash row per failed experiment"
+    );
+    let used = inputs.iter().filter(|i| i.hint.is_some()).count();
+    always!(used <= 1, "a hint reaches at most one experiment");
+    if used == 1 {
         sometimes!(true, "a hint reaches an experiment");
     }
-    if let Some(at) = inputs.iter().position(|i| i.hint.is_some()) {
-        always!(
-            inputs[..=at].iter().all(|i| i.flow_labels.is_empty()),
-            "no experiment carries a label before the paper"
-        );
-        always!(
-            inputs[at + 1..]
-                .iter()
-                .all(|i| i.flow_labels.contains(UNTRUSTED_INPUT)),
-            "every experiment after the paper carries its label"
-        );
-        if at + 1 < inputs.len() {
-            sometimes!(true, "a paper taints a later experiment");
-        }
-    }
-    let mut last = f64::INFINITY;
-    for input in &inputs {
-        if let Some(best) = &input.best {
-            always!(best.val_bpb <= last, "the base never gets worse");
-            last = best.val_bpb;
-        }
-    }
-    let tighter = KeepPolicy {
-        min_improvement: 0.0005,
-        ..KeepPolicy::default()
-    };
-    always!(
-        inputs
-            .iter()
-            .all(|i| i.policy == KeepPolicy::default() || i.policy == tighter),
-        "an experiment gets the old policy or the new one"
-    );
     match run.status() {
         SimStatus::Completed => {
             let report: SessionReport =
@@ -415,6 +540,10 @@ fn check_session(run: &SimOutcome) {
                 "every experiment and the baseline count once"
             );
             always!(report.stopped.is_some(), "only a stop ends the first run");
+            always!(
+                Some(&report.best) == best.as_ref(),
+                "the report has the best"
+            );
             // A stop that lands at the hand-off wins over `continue_as_new`.
             always!(
                 report.experiments <= 3,
@@ -422,24 +551,7 @@ fn check_session(run: &SimOutcome) {
             );
             sometimes!(true, "a stop ends the night early");
         }
-        SimStatus::ContinuedAsNew => {
-            let carry = run.events().iter().find_map(|event| match event {
-                WorkflowEvent::WorkflowContinuedAsNew { input, .. } => {
-                    serde_json::from_value::<SessionInput>(input.clone()).ok()
-                }
-                _ => None,
-            });
-            let carry = carry.and_then(|input| input.carry);
-            always!(
-                carry.as_ref().is_some_and(|c| c.done == 3),
-                "the hand-off carries the count"
-            );
-            always!(
-                carry.as_ref().is_some_and(|c| c.best.val_bpb <= BASE_BPB),
-                "the hand-off carries the best"
-            );
-            sometimes!(true, "the session continues as new");
-        }
+        SimStatus::ContinuedAsNew => check_hand_off(events, best.as_ref(), tainted, used),
         other => {
             always!(
                 other == SimStatus::Completed,
@@ -447,6 +559,96 @@ fn check_session(run: &SimOutcome) {
             );
         }
     }
+}
+
+/// Check the base, the policy and the labels of each experiment. Returns
+/// the best result and the taint after the last one.
+fn check_experiments(
+    inputs: &[ExperimentInput],
+    outcomes: &[Option<ExperimentOutcome>],
+) -> (Option<Best>, bool) {
+    // The base of each experiment is the best after the one before it. A
+    // crash or a failure never moves it.
+    let mut best = inputs.first().and_then(|i| i.best.clone());
+    let mut tainted = inputs.first().is_some_and(|i| !i.flow_labels.is_empty());
+    let mut tighter_seen = false;
+    for (i, input) in inputs.iter().enumerate() {
+        if i > 0 {
+            always!(input.best == best, "each base is the best so far");
+            always!(
+                input.flow_labels.contains(UNTRUSTED_INPUT) == tainted,
+                "an experiment carries a label after a paper or a failure, and only then"
+            );
+            if tainted {
+                sometimes!(true, "a paper or a failure taints a later experiment");
+            }
+        }
+        let tighter = input.policy != KeepPolicy::default();
+        always!(!tighter_seen || tighter, "a new policy stays in force");
+        tighter_seen |= tighter;
+        if tighter {
+            sometimes!(true, "a policy reaches an experiment");
+        }
+        match outcomes.get(i) {
+            Some(Some(out)) => {
+                if out.best.is_some() {
+                    best.clone_from(&out.best);
+                }
+            }
+            Some(None) => {
+                tainted = true;
+                sometimes!(true, "a failed experiment becomes a crash row");
+            }
+            None => {}
+        }
+        if input
+            .hint
+            .as_ref()
+            .is_some_and(|h| h.text.starts_with("paper:"))
+        {
+            tainted = true;
+        }
+    }
+    (best, tainted)
+}
+
+/// Check what the hand-off carries.
+fn check_hand_off(events: &[WorkflowEvent], best: Option<&Best>, tainted: bool, used: usize) {
+    let hand_off = first(events, |e| {
+        matches!(e, WorkflowEvent::WorkflowContinuedAsNew { .. })
+    });
+    let carry = events.iter().find_map(|event| match event {
+        WorkflowEvent::WorkflowContinuedAsNew { input, .. } => {
+            serde_json::from_value::<SessionInput>(input.clone()).ok()
+        }
+        _ => None,
+    });
+    let carry = carry.and_then(|input| input.carry);
+    always!(
+        carry.as_ref().is_some_and(|c| c.done == 3),
+        "the hand-off carries the count"
+    );
+    always!(
+        carry.as_ref().map(|c| &c.best) == best,
+        "the hand-off carries the best"
+    );
+    always!(
+        signals(events, "stop", hand_off) == 0,
+        "a stop before the hand-off ends the night"
+    );
+    always!(
+        carry
+            .as_ref()
+            .is_some_and(|c| used + c.hints.len() == signals(events, "hint", hand_off)),
+        "each hint is used or carried"
+    );
+    always!(
+        carry
+            .as_ref()
+            .is_some_and(|c| c.flow_labels.contains(UNTRUSTED_INPUT) == tainted),
+        "the hand-off carries the labels"
+    );
+    sometimes!(true, "the session continues as new");
 }
 
 #[tokio::test]
@@ -462,7 +664,10 @@ async fn a_session_holds_its_invariants_under_signals_and_faults() {
         .signal("policy", serde_json::to_value(tighter).unwrap())
         .signal("stop", json!({"reason": "bed time"}))
         .faults(FaultPlan::new().transient("setup", 1, 2))
-        .require_reached("a paper taints a later experiment")
+        .require_reached("a paper or a failure taints a later experiment")
+        .require_reached("a policy reaches an experiment")
+        .require_reached("a hint reaches an experiment")
+        .require_reached("a stop ends the night early")
         .sweep(
             research_session_info().handler,
             serde_json::to_value(SessionInput {
@@ -471,6 +676,41 @@ async fn a_session_holds_its_invariants_under_signals_and_faults() {
             })
             .unwrap(),
             check_session,
+        )
+        .await
+        .unwrap_or_else(|failure| panic!("{failure}"));
+}
+
+/// With no stop, the first run reaches the hand-off. Experiment 3 fails on
+/// the way, so the sweep checks the crash row, the taint and the carry.
+#[tokio::test]
+async fn a_session_hands_off_its_carry_past_a_failed_experiment() {
+    let tighter = KeepPolicy {
+        min_improvement: 0.0005,
+        ..KeepPolicy::default()
+    };
+    session_env()
+        .simulation()
+        .seeds(SEEDS)
+        .signal("hint", json!({"text": "paper:warmdown", "from": "human"}))
+        .signal("policy", serde_json::to_value(tighter).unwrap())
+        .require_reached("a failed experiment becomes a crash row")
+        .require_reached("a paper or a failure taints a later experiment")
+        .require_reached("the session continues as new")
+        .sweep(
+            research_session_info().handler,
+            serde_json::to_value(SessionInput {
+                config: session_config(),
+                carry: None,
+            })
+            .unwrap(),
+            |run| {
+                always!(
+                    run.status() == SimStatus::ContinuedAsNew,
+                    "with no stop, the first run hands off"
+                );
+                check_session(run);
+            },
         )
         .await
         .unwrap_or_else(|failure| panic!("{failure}"));

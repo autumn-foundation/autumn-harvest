@@ -951,10 +951,15 @@ async fn measure<'a>(
     let mut fixes = 0;
     loop {
         let run = train_once(ctx, input, &commit).await?;
-        let summary: Option<Summary> = ctx
-            .execute_local_activity(&parse_summary_info(), run.log_tail.clone())
-            .await
-            .map_err(|e| format!("cannot parse run.log: {e}"))?;
+        // Upstream: a run past its time budget is a failure, even when it
+        // printed a summary before the kill.
+        let summary: Option<Summary> = if run.timed_out {
+            None
+        } else {
+            ctx.execute_local_activity(&parse_summary_info(), run.log_tail.clone())
+                .await
+                .map_err(|e| format!("cannot parse run.log: {e}"))?
+        };
         let crashed = Measured {
             val_bpb: None,
             memory_gb: 0.0,

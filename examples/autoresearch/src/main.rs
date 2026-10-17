@@ -19,6 +19,7 @@ use autoresearch::claude::ClaudeModel;
 use autoresearch::inbox::{Command, Inbox};
 use autoresearch::lab::Lab;
 use autoresearch::results::ResultRow;
+use autoresearch::rules::KeepPolicy;
 use autoresearch::runtime::{self, Refused, Step, session_id};
 use autoresearch::scripted::ScriptedResearcher;
 use autoresearch::trainer::TrainerSpec;
@@ -153,6 +154,23 @@ enum Cmd {
         /// The idea, such as `paper:muon` or `rewind:<commit>`.
         text: String,
     },
+    /// Replace the keep rule of a running session.
+    Policy {
+        #[command(flatten)]
+        lab: LabArgs,
+        /// The session tag.
+        #[arg(long)]
+        tag: String,
+        /// The adjusted gain must be larger than this.
+        #[arg(long, default_value_t = KeepPolicy::default().min_improvement)]
+        min_improvement: f64,
+        /// The cost of each added line, in `val_bpb`.
+        #[arg(long, default_value_t = KeepPolicy::default().line_cost)]
+        line_cost: f64,
+        /// A run above this peak memory is a discard.
+        #[arg(long, default_value_t = KeepPolicy::default().max_memory_gb)]
+        max_memory_gb: f64,
+    },
     /// End a session after the experiment in flight.
     Stop {
         #[command(flatten)]
@@ -247,6 +265,21 @@ async fn dispatch(command: Cmd) -> Result<(), String> {
         Cmd::Status { lab } => status(&lab),
         Cmd::Hint { lab, tag, text } => post(&lab, &Command::Hint { tag, text }),
         Cmd::Stop { lab, tag, reason } => post(&lab, &Command::Stop { tag, reason }),
+        Cmd::Policy {
+            lab,
+            tag,
+            min_improvement,
+            line_cost,
+            max_memory_gb,
+        } => {
+            let policy = KeepPolicy {
+                min_improvement,
+                line_cost,
+                max_memory_gb,
+            };
+            policy.validate()?;
+            post(&lab, &Command::Policy { tag, policy })
+        }
         Cmd::Approve { lab, token } => post(&lab, &Command::Approve { token }),
         Cmd::Deny { lab, token, reason } => post(&lab, &Command::Deny { token, reason }),
         Cmd::Eval {

@@ -171,9 +171,9 @@ async fn a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row() {
     let rows = fx.lab().rows().unwrap();
     assert!(rows[2].to_line().contains("\t0.000000\t0.0\tcrash\t"));
     // A crash resets to the base.
-    if oom.row.status == Status::Discard {
-        assert_eq!(fx.lab().head().unwrap(), base);
-    }
+    // The fixed run lands, and the scripted night discards it.
+    assert_eq!(oom.row.status, Status::Discard, "{oom:?}");
+    assert_eq!(fx.lab().head().unwrap(), base);
     assert!(
         !fx.lab()
             .read("train.py")
@@ -304,7 +304,8 @@ async fn an_approved_rewind_moves_the_base_to_an_older_kept_commit() {
     assert_eq!(outputs[1].row.status, Status::Keep, "{:?}", outputs[1]);
     let second = &outputs[2];
     assert!(second.rewound, "{second:?}");
-    if second.row.status == Status::Keep {
+    assert_eq!(second.row.status, Status::Keep, "{second:?}");
+    {
         // The kept commit sits on the baseline, not on the first keep.
         let parent = fx
             .lab()
@@ -318,16 +319,23 @@ async fn an_approved_rewind_moves_the_base_to_an_older_kept_commit() {
 async fn a_late_approval_never_releases_the_call() {
     let fx = Fixture::new();
     let mut rt = fx.open(&model());
-    let mut config = fx.config("late", 1);
-    config.agent.approval_timeout_secs = 1;
-    let exec = runtime::start(&mut rt, &config).unwrap();
+    let clock = Arc::new(std::sync::Mutex::new(Utc::now()));
+    let read = Arc::clone(&clock);
+    rt.set_clock(move || *read.lock().unwrap());
+    let exec = runtime::start(&mut rt, &fx.config("late", 1)).unwrap();
     hint(&mut rt, "late", "paper:muon", "h1");
     let before = fx.lab().read("train.py").unwrap();
     let pending = run_to_approval(&mut rt, exec).await;
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    // The deadline passes: 120 seconds in this fixture.
+    *clock.lock().unwrap() += chrono::Duration::seconds(121);
     run_to_end(&mut rt, exec).await;
 
-    // The deadline passed, so the call did not run.
+    // The call did not run, and the agent read that no approval came.
+    let rows = fx.lab().rows().unwrap();
+    assert!(
+        rows[1].description.starts_with("no change") && rows[1].description.contains("no approval"),
+        "{rows:?}"
+    );
     assert_eq!(fx.lab().read("train.py").unwrap(), before);
     // A decision after the deadline is refused or stays unread.
     let late = runtime::apply(
@@ -486,7 +494,8 @@ async fn two_sessions_share_one_gpu_and_a_kept_idea() {
     let delivered = history
         .iter()
         .any(|e| matches!(e, WorkflowEvent::ExternalSignalDelivered { .. }));
-    if delivered {
+    assert!(delivered, "the hint reached B");
+    {
         let hints = signals_of(&rt, exec_b, "hint");
         assert!(
             hints.iter().any(|h| h["from"] == json!(session_id("a"))),
@@ -511,6 +520,26 @@ async fn the_session_continues_as_new_and_carries_its_best() {
     assert!(rt.successor(third).unwrap().is_none());
     let carried = |exec| input_of(&rt, exec)["carry"]["done"].as_u64().unwrap();
     assert_eq!((carried(second), carried(third)), (2, 4));
+    // Each hand-off carries the best after its experiments: the last keep.
+    let rows = fx.lab().rows().unwrap();
+    let best_after = |done: usize| {
+        rows[..=done]
+            .iter()
+            .rev()
+            .find(|row| row.status == Status::Keep)
+            .unwrap()
+            .commit
+            .clone()
+    };
+    let carried_best = |exec| {
+        input_of(&rt, exec)["carry"]["best"]["commit"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(carried_best(second), best_after(2));
+    assert_eq!(carried_best(third), best_after(4));
+    assert_eq!(report.best.commit, best_after(5));
     assert_eq!(
         runtime::find_session(&rt, "chain").unwrap(),
         None,

@@ -8,7 +8,9 @@
 #   loop, the resident path, timers and the scheduler fire claim on
 #   Postgres. Four shards run 250 seeds each.
 # - `autoresearch`: the seeded simulation sweeps (issue #2033) of the
-#   autoresearch example, widened from 64 seeds to 5000 per sweep.
+#   autoresearch example, widened from 64 seeds to 5000 per sweep. It has
+#   its own seed space: its base is run_number * 5000, and it ignores the
+#   `seeds` input.
 # - `alert`: a failed scheduled run opens an issue, or comments on the open
 #   one. GitHub tells only the last editor of a cron about a failure.
 #

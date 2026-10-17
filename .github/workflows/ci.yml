@@ -91,8 +91,13 @@ jobs:
           # Same carve-out for the API contract and the OpenAPI document
           # generated from it. Both live under `docs/`, so without this a
           # contract-only PR skips the tests that compare them.
+          #
+          # The autoresearch example compiles its `program.md` and the
+          # markdown of its lab template into the binary, and its tests read
+          # them. A change to one of them is a code change.
           if echo "$changed" | grep -qvE '^(docs/|.*\.md$)' \
-            || echo "$changed" | grep -qxE 'docs/(workflow-schema-contract|api-contract|openapi)\.json'; then
+            || echo "$changed" | grep -qxE 'docs/(workflow-schema-contract|api-contract|openapi)\.json' \
+            || echo "$changed" | grep -qE '^examples/autoresearch/(program\.md|lab/)'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"

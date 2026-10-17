@@ -302,6 +302,41 @@ mod tests {
 
     proptest! {
         #[test]
+        fn the_verdict_matches_the_rule_as_the_readme_states_it(
+            base in 0.5_f64..2.0,
+            delta in -0.05_f64..0.05,
+            added in 0_u32..50,
+            removed in 0_u32..50,
+            memory in 0.0_f64..120.0,
+            line_cost in 0.0_f64..0.001,
+            min_improvement in 0.0_f64..0.002,
+            cap in 40.0_f64..100.0,
+        ) {
+            // An oracle written from the README, apart from `decide`. It
+            // keeps the formula as the README states it.
+            #[allow(clippy::suboptimal_flops)]
+            let score = |gain: f64, net: f64| gain - line_cost * net;
+            let policy = KeepPolicy { min_improvement, line_cost, max_memory_gb: cap };
+            let mut measured = ran(base + delta, added, removed);
+            measured.memory_gb = memory;
+            let gain = base - (base + delta);
+            let net = f64::from(added) - f64::from(removed);
+            let expected = if memory > cap {
+                Status::Discard
+            } else if score(gain, net) > min_improvement {
+                Status::Keep
+            } else {
+                Status::Discard
+            };
+            let verdict = decide(&policy, Some(&best(base)), &measured);
+            // Skip the knife edge, where the two float orders can differ.
+            let edge = (score(gain, net) - min_improvement).abs() < 1e-12;
+            if !edge {
+                prop_assert_eq!(verdict.status, expected);
+            }
+        }
+
+        #[test]
         fn a_keep_always_has_a_score_over_the_threshold(
             base in 0.5_f64..2.0,
             delta in -0.05_f64..0.05,

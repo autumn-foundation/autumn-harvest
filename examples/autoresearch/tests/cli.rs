@@ -67,6 +67,8 @@ fn inbox_commands_queue_for_the_runner() {
     ok(&["init", &lab]);
     ok(&["hint", "--lab", &lab, "--tag", "t", "paper:warmdown"]);
     ok(&["stop", "--lab", &lab, "--tag", "t"]);
+    let refused = autoresearch(&["policy", "--lab", &lab, "--tag", "t", "--line-cost", "-1"]);
+    assert!(!refused.status.success(), "a negative line cost is refused");
     let inbox = Path::new(&lab).join(".autoresearch").join("inbox");
     let queued = std::fs::read_dir(&inbox)
         .unwrap()
