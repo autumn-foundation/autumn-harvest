@@ -1111,9 +1111,9 @@ fn check_of(workflow: autumn_harvest::info::WorkflowHandlerFn) -> UpgradeCheck {
 }
 
 #[tokio::test]
-async fn the_replay_uses_the_candidate_history_policy() {
-    // The run has two events. Under a threshold of one, the candidate
-    // checkpoints instead of the recorded `reserve`.
+async fn the_replay_ignores_the_history_policy_at_a_recorded_position() {
+    // Issue #2080: the run recorded `reserve` with no checkpoint decision.
+    // A threshold of one must not turn the replayed answer into `true`.
     let blind = check_of(order_by_policy_wf)
         .check_snapshot(snapshot(reserving()))
         .await;
@@ -1124,8 +1124,7 @@ async fn the_replay_uses_the_candidate_history_policy() {
         .with_history_policy(policy)
         .check_snapshot(snapshot(reserving()))
         .await;
-    assert_eq!(run.verdict, Verdict::Pin, "{run:#?}");
-    assert_eq!(kinds(&run), [FindingKind::Nondeterminism]);
+    assert_eq!(run.verdict, Verdict::Migrate, "{run:#?}");
 }
 
 #[tokio::test]

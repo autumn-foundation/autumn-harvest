@@ -509,7 +509,7 @@ fn checkpoint_due(
         return Ok(true);
     }
     let policy = ctx.history_policy();
-    let by_engine = ctx.should_continue_as_new();
+    let by_engine = ctx.continue_as_new_hint();
     let events = ctx.history_event_count();
     let by_events = events.saturating_add(run.ops) > policy.continue_as_new_threshold();
     let by_bytes = match policy.byte_hard_cap() {
@@ -657,8 +657,7 @@ mod tests {
         })
     }
 
-    /// A loop that calls `should_continue_as_new()` directly. It shows the
-    /// replay hazard that the entity avoids.
+    /// A loop that calls `should_continue_as_new()` directly.
     fn naive_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
         Box::pin(async move {
             let mut count = input.as_i64().unwrap_or_default();
@@ -675,6 +674,9 @@ mod tests {
                     ctx.continue_as_new(json!(count))
                         .await
                         .map_err(|e| e.to_string())?;
+                }
+                if add == 0 {
+                    return Ok(json!(count));
                 }
             }
         })
@@ -1144,8 +1146,8 @@ mod tests {
     }
 
     /// A replay with a larger loaded history keeps the recorded decisions.
-    /// A naive loop over `should_continue_as_new()` diverges on the same
-    /// history.
+    /// A naive loop over `should_continue_as_new()` replays clean on the
+    /// same history (issue #2080).
     #[tokio::test]
     async fn the_checkpoint_decision_is_stable_when_history_grows() {
         let small_threshold = WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
@@ -1164,26 +1166,19 @@ mod tests {
             "{report}"
         );
 
-        let added = |n: i64| WorkflowEvent::SideEffectRecorded {
-            kind: SideEffectKind::Custom,
-            name: Some("naive.add".to_string()),
-            value: json!(n),
-        };
-        let naive = vec![
-            started(json!(0)),
-            signal(json!(1)),
-            added(1),
-            signal(json!(2)),
-            added(2),
-        ];
+        // The run finishes, so a call never sits at the end of its history.
+        let outcome = env_with(&[json!(1), json!(2), json!(3), json!(0)])
+            .run(naive_counter, json!(0))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(6)));
         let report = WorkflowReplayer::new()
             .with_history_policy(small_threshold)
             .register_fn("naive_counter", naive_counter)
-            .replay_from_events(naive)
+            .replay_from_events(outcome.events().to_vec())
             .await;
         assert!(
-            matches!(report.status, ReplayStatus::NonDeterminismDetected { .. }),
-            "a naive loop must diverge here: {report}"
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "a naive loop must replay clean: {report}"
         );
     }
 

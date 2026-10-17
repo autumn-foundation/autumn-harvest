@@ -18,8 +18,9 @@ follow-up plan for the checkpoint budget and the error bound (issue #2049) is
     signal already in history, but not yet taken by the body, stays on the
     sealed run and is lost.
   - `should_continue_as_new()` reads the size of the loaded history. That
-    size grows from task to task. In a loop, a replay can answer `true` at an
-    earlier iteration than the live run did, and the replay then diverges.
+    size grows from task to task. Before issue #2080, a replay in a loop could
+    answer `true` at an earlier iteration than the live run did, and the replay
+    then diverged. The engine now records each answer.
 - Issue #1964 ranks keyed state P1. Issue #1965 ranks it 13, behind customer
   pull.
 
