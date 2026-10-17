@@ -2453,6 +2453,35 @@ fn secret_spec() -> autumn_harvest::cross_shard_child::CrossShardChildSpec {
     }
 }
 
+/// A codec whose encode always fails, as a key service that is down would.
+struct FailingEncodeCodec;
+
+impl autumn_harvest::payload_codec::PayloadCodec for FailingEncodeCodec {
+    fn codec_id(&self) -> &'static str {
+        "failing-encode"
+    }
+
+    fn encode(&self, _raw: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        Err(autumn_harvest::payload_codec::CodecError(
+            "the key service is down".to_string(),
+        ))
+    }
+
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        Ok(encoded.to_vec())
+    }
+}
+
+fn failing_encoder() -> autumn_harvest::payload_codec::PayloadCodecs {
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    codecs
+        .register_key("down", std::sync::Arc::new(FailingEncodeCodec))
+        .expect("register");
+    codecs.set_active_key("down").expect("activate");
+    codecs.set_column_encoding(true);
+    codecs
+}
+
 async fn stored_spec(pool: &ShardedDbPool, child_id: ExecutionId) -> Value {
     let mut conn = shard_conn(pool, PARENT_SHARD).await;
     harvest_cross_shard_children::table
@@ -2461,6 +2490,56 @@ async fn stored_spec(pool: &ShardedDbPool, child_id: ExecutionId) -> Value {
         .first(&mut *conn)
         .await
         .expect("outbox row")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recording_an_existing_child_is_a_no_op_while_the_encoder_is_down() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+    let parent = start_parent(&sharded, "child_echo", "spec-idem-1").await;
+    let existing = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        existing,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &aead_codecs(),
+    )
+    .await
+    .expect("record");
+    let before = stored_spec(&sharded, existing).await;
+
+    // A retried decision emits the same child again. The encoder is down.
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        existing,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &failing_encoder(),
+    )
+    .await
+    .expect("an existing child needs no encode");
+    assert_eq!(stored_spec(&sharded, existing).await, before);
+
+    // A new child still needs the encoder, so it fails instead of storing clear.
+    let fresh = ExecutionId::new_for_shard(ShardId::new(1));
+    let refused = autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        fresh,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &failing_encoder(),
+    )
+    .await;
+    assert!(refused.is_err(), "a new child is never stored in clear");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

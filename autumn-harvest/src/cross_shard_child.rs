@@ -345,9 +345,13 @@ pub async fn record_cross_shard_child(
 /// [`record_cross_shard_child`], storing the spec through `codecs`
 /// (issue #2043).
 ///
+/// A child that is already recorded stays a no-op, even while the encoder
+/// fails. A retried decision re-emits its children, and no new payload needs
+/// to be written for one that exists.
+///
 /// # Errors
 ///
-/// Propagates database errors.
+/// Propagates database errors. Returns the encoder error when the child is new.
 pub async fn record_cross_shard_child_with_codecs(
     conn: &mut AsyncPgConnection,
     parent_exec_id: ExecutionId,
@@ -357,6 +361,15 @@ pub async fn record_cross_shard_child_with_codecs(
     spec: &CrossShardChildSpec,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<()> {
+    let recorded: bool = diesel::select(diesel::dsl::exists(
+        harvest_cross_shard_children::table.find(child_exec_id.as_uuid()),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    if recorded {
+        return Ok(());
+    }
     // The whole spec is one cell. It holds the child input and its headers
     // (issue #2043).
     let spec_json = serde_json::to_value(spec).map_err(HarvestError::Serialization)?;
