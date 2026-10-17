@@ -127,7 +127,8 @@ pub fn table(rows: &[ResultRow]) -> String {
 /// `text` on one line: each control, format or bidirectional character
 /// becomes a space. Model text then cannot add a column, move a terminal
 /// cursor, or show text in an order other than its byte order.
-fn one_line(text: &str) -> String {
+#[must_use]
+pub fn one_line(text: &str) -> String {
     text.chars()
         .map(|c| if hidden(c) { ' ' } else { c })
         .collect::<String>()

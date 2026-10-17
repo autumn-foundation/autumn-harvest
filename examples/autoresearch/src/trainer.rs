@@ -562,9 +562,10 @@ async fn run_command(
         .spawn()
         .map_err(|e| format!("cannot start {program}: {e}"))?;
     drop(command);
-    // The group dies when this guard drops, on every path out.
+    // The group dies when this guard drops, on every path out. The lock
+    // drops after it and clears the file.
     let group = Group::of(&child);
-    lock.hold(child.id())?;
+    lock.name(child.id().unwrap_or(0))?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let mut beat = tokio::time::interval(Duration::from_secs(5));
     let (exit_code, timed_out) = loop {
@@ -637,11 +638,12 @@ impl Drop for Group {
 /// the file names the group of a run that outlived its runner, and the next
 /// run kills that group first.
 ///
-/// A free lock proves that no run lives. Its group id can name another
-/// group by now, so the run that takes the lock clears it first. A runner
-/// that dies between the start of its run and the write of the group
-/// leaves zero in the file. The next run then kills nothing. It waits
-/// [`Lock::WAIT`] and fails, and the activity retries.
+/// A group id in the file can name another group once its run ends. So a
+/// run writes zero when it ends, on every path out, and the run that takes
+/// a free lock writes zero first. A child that left the group can keep the
+/// lock after its run. A runner that dies between the start of its run and
+/// the write of the group leaves zero too. In both cases the next run kills
+/// nothing. It waits [`Lock::WAIT`] and fails, and the activity retries.
 struct Lock(std::fs::File);
 
 impl Lock {
@@ -706,12 +708,6 @@ impl Lock {
             .map_err(|e| format!("cannot share the trainer lock: {e}"))
     }
 
-    /// Write the group of the run into the file. The run holds the lock
-    /// through its stdin, so this handle can close.
-    fn hold(self, group: Option<u32>) -> Result<(), String> {
-        self.name(group.unwrap_or(0))
-    }
-
     /// Write `group` into the file. Zero names no group.
     fn name(&self, group: u32) -> Result<(), String> {
         use std::io::Write as _;
@@ -720,6 +716,13 @@ impl Lock {
             .and_then(|()| file.seek(SeekFrom::Start(0)).map(drop))
             .and_then(|()| writeln!(file, "{group}"))
             .map_err(|e| format!("cannot write the trainer lock: {e}"))
+    }
+}
+
+impl Drop for Lock {
+    /// The run has ended, so its group is dead. The file names no group.
+    fn drop(&mut self) {
+        let _ = self.name(0);
     }
 }
 
@@ -1000,6 +1003,24 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
         assert_eq!(fresh.exit_code, Some(0));
         let status = orphan.wait().unwrap();
         assert!(!status.success(), "the old run was killed");
+    }
+
+    /// A run that ended leaves no group id in the lock file. A child that
+    /// left the group can keep the lock, and the old id can name another
+    /// group by then.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_finished_run_names_no_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = TrainerSpec::Command {
+            program: "sh".into(),
+            args: vec!["-c".into(), "true".into()],
+            timeout_secs: 30,
+            pass_env: Vec::new(),
+        };
+        run(&spec, dir.path(), dir.path(), |_| {}).await.unwrap();
+        let text = std::fs::read_to_string(dir.path().join(TRAINER_LOCK)).unwrap();
+        assert_eq!(text.trim(), "0");
     }
 
     #[cfg(unix)]

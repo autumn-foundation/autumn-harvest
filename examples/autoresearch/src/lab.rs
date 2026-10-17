@@ -411,7 +411,8 @@ impl Lab {
         if status.is_empty() {
             return self.describe_head(false);
         }
-        let message = format!("{}\n\n{trailer}", message.trim());
+        // The message is model text, and `git log` shows it in a terminal.
+        let message = format!("{}\n\n{trailer}", crate::results::one_line(message));
         self.git(&["commit", "--quiet", "-m", &message, "--", TRAIN])?;
         self.describe_head(true)
     }
@@ -978,6 +979,24 @@ mod tests {
         std::fs::write(lab.root().join("run.log"), "x").unwrap();
         lab.state_dir().unwrap();
         assert_eq!(lab.git(&["status", "--porcelain"]).unwrap(), "");
+    }
+
+    /// The message is model text. Git stores it as it is, and `git log`
+    /// sends it to a terminal.
+    #[test]
+    fn a_commit_message_loses_terminal_and_bidirectional_controls() {
+        let (_dir, lab) = lab();
+        lab.start_branch("t1", "s1").unwrap();
+        let base = lab.head().unwrap();
+        lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
+        let message = "deeper \u{1b}]8;;http://evil\u{1b}\\docs\u{1b}]8;;\u{1b}\\ \u{202e}model";
+        lab.commit_train(message, "k-1", &base).unwrap();
+        let stored = lab.git(&["log", "-1", "--format=%B"]).unwrap();
+        assert!(
+            !stored.contains('\u{1b}') && !stored.contains('\u{202e}'),
+            "{stored:?}"
+        );
+        assert!(stored.starts_with("deeper"), "{stored:?}");
     }
 
     #[test]

@@ -264,7 +264,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC29 | `e2e::two_sessions_in_one_lab_take_turns_on_their_own_branches`, `lab::tests::checkout_moves_back_to_the_session_branch_only_when_clean`, `two_sessions_never_share_a_commit`, `a_tag_that_another_session_used_is_refused`, `activities::tests::train_refuses_a_moved_branch_and_a_change_no_commit_holds`, `setup_refuses_a_tag_that_another_session_used`. |
 | AC30 | `e2e::a_nightly_session_takes_commands_by_its_tag`, `e2e::a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag`. |
 | AC31 | `lab::tests::a_commit_is_made_once_per_key`, `an_edit_runs_once_per_call`, `an_edit_whose_write_was_lost_runs_on_its_retry`, `a_row_is_recorded_once_per_key`, `a_row_whose_write_was_lost_lands_on_its_retry`. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`. `agent::tests::an_edit_call_that_runs_again_changes_nothing`. |
-| AC32 | `trainer::tests::a_dropped_run_kills_its_whole_group`, `the_next_run_kills_a_run_that_outlived_its_runner`, `a_timeout_kills_the_children_of_the_run_too`, `a_free_lock_forgets_the_group_of_an_earlier_run`. |
+| AC32 | `trainer::tests::a_dropped_run_kills_its_whole_group`, `the_next_run_kills_a_run_that_outlived_its_runner`, `a_timeout_kills_the_children_of_the_run_too`, `a_finished_run_names_no_group`, `a_free_lock_forgets_the_group_of_an_earlier_run`. |
 | AC33 | `claude::tests::a_thinking_block_goes_back_unchanged_in_the_next_request`, `a_turn_survives_in_the_turn_directory`, `the_key_stays_out_of_debug_output`. |
 
 ---
@@ -291,7 +291,8 @@ The fixes:
   the hints, the report and the `best_commit` attribute. A rewind resolves a short id on
   the session branch only. A row of `results.tsv` whose short id names two
   commits is refused, so a lookup never gives the score of the wrong
-  commit. A free trainer lock clears the old group id. A
+  commit. A trainer run clears its group id from the lock file when it
+  ends, and a free lock clears an old one. A
   redelivered heartbeat alert marks its rows. Each session starts with an
   empty commit that holds the key of its setup. So two sessions in one lab
   never share a commit, and setup refuses a branch that another session
@@ -302,7 +303,9 @@ The fixes:
 - **Security.** Flow labels follow the session. No secrets in the trainer
   environment. Git hooks off. Symlinks refused and reads capped. The state
   directory is private. Model text loses control and bidirectional
-  characters. The Claude key is redacted.
+  characters in `results.tsv`, the console and each commit message. A URL
+  with login details stays out of the trainer environment. The Claude key
+  is redacted.
 - **Claude client.** Thinking blocks go back unchanged. A timeout, a body
   cap, automatic caching, and retries on 408 and 409.
 - **Tests.** The tests review ran mutants. Several survived every test: a
