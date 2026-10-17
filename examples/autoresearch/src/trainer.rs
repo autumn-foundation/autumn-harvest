@@ -114,6 +114,15 @@ impl Default for TrainerSpec {
 }
 
 impl TrainerSpec {
+    /// The longest one run can take, in seconds.
+    #[must_use]
+    pub const fn longest_secs(&self) -> u64 {
+        match self {
+            Self::Simulated { seconds } => *seconds,
+            Self::Command { timeout_secs, .. } => *timeout_secs,
+        }
+    }
+
     /// The upstream command: `uv run train.py`, killed after ten minutes.
     #[must_use]
     pub fn upstream() -> Self {

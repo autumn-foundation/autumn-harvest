@@ -267,6 +267,31 @@ pub async fn find_kept(_ctx: &ActivityContext, input: CommitRef) -> Result<Optio
     }))
 }
 
+/// The time that the runner needs around one run: to start it, to kill it,
+/// and to save its log.
+const TRAIN_MARGIN: Duration = Duration::from_secs(60);
+
+/// Fail unless a run of `trainer` ends well inside the budget of [`train`].
+/// A longer run would time out the activity, and its retry too.
+///
+/// # Errors
+///
+/// Returns an error that names the run time and the budget.
+pub fn check_trainer(trainer: &TrainerSpec) -> Result<(), String> {
+    let budget = train_info().default_start_to_close.unwrap_or(Duration::MAX);
+    let run = Duration::from_secs(trainer.longest_secs());
+    if run.saturating_add(TRAIN_MARGIN) <= budget {
+        Ok(())
+    } else {
+        Err(format!(
+            "a run of {}s does not fit the {}s budget of a train activity with {}s to spare. Use a shorter run",
+            run.as_secs(),
+            budget.as_secs(),
+            TRAIN_MARGIN.as_secs()
+        ))
+    }
+}
+
 /// Train the commit at `HEAD`. Each progress line is a heartbeat.
 ///
 /// A crash or a timeout is a result. Only a run that cannot start is an
@@ -477,5 +502,20 @@ mod tests {
             .unwrap();
         assert_eq!(best.commit, head);
         assert_eq!(best.val_bpb, 0.99);
+    }
+
+    #[test]
+    fn a_trainer_must_fit_the_train_budget() {
+        assert!(check_trainer(&TrainerSpec::upstream()).is_ok());
+        assert!(check_trainer(&TrainerSpec::Simulated { seconds: 840 }).is_ok());
+        let long = check_trainer(&TrainerSpec::Simulated { seconds: 841 }).unwrap_err();
+        assert!(long.contains("budget"), "{long}");
+        let command = TrainerSpec::Command {
+            program: "uv".into(),
+            args: Vec::new(),
+            timeout_secs: 3600,
+            pass_env: Vec::new(),
+        };
+        assert!(check_trainer(&command).is_err());
     }
 }

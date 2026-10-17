@@ -329,6 +329,8 @@ pub async fn research_session(
     input: SessionInput,
 ) -> Result<SessionReport, String> {
     let SessionInput { config, carry } = input;
+    // A run that cannot fit its activity would crash each experiment.
+    crate::activities::check_trainer(&config.trainer)?;
     let view = Arc::new(Mutex::new(StatusView {
         tag: carry.as_ref().map_or_else(String::new, |c| c.tag.clone()),
         phase: "setup".into(),

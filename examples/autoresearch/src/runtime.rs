@@ -73,6 +73,7 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
 pub fn start(rt: &mut SqliteRuntime, config: &SessionConfig) -> Result<ExecutionId, String> {
     let tag = config.tag.trim();
     crate::lab::check_tag(tag)?;
+    crate::activities::check_trainer(&config.trainer)?;
     let mut config = config.clone();
     config.tag = tag.to_string();
     let input = SessionInput {
@@ -333,6 +334,7 @@ pub fn running_sessions(rt: &SqliteRuntime) -> Result<Vec<(ExecutionId, String)>
 ///
 /// Returns an error when the config does not encode.
 pub fn nightly(config: &SessionConfig) -> Result<WorkflowSchedule, String> {
+    crate::activities::check_trainer(&config.trainer)?;
     let mut config = config.clone();
     config.tag.clear();
     let input = SessionInput {

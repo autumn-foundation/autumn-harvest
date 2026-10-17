@@ -146,6 +146,24 @@ fn eval_and_purge_work_on_a_finished_night() {
 }
 
 #[test]
+fn a_run_longer_than_the_train_budget_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let lab = lab_arg(&dir.path().join("lab"));
+    ok(&["init", &lab]);
+    let out = autoresearch(&[
+        "run",
+        "--lab",
+        &lab,
+        "--tag",
+        "slow",
+        "--train-seconds",
+        "2000",
+    ]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("budget"));
+}
+
+#[test]
 fn claude_needs_a_key() {
     let dir = tempfile::tempdir().unwrap();
     let lab = lab_arg(&dir.path().join("lab"));

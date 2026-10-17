@@ -93,7 +93,8 @@ struct SessionArgs {
     /// The trainer.
     #[arg(long, value_enum, default_value_t = TrainerKind::Sim)]
     trainer: TrainerKind,
-    /// Seconds of wall time per simulated run.
+    /// Seconds of wall time per simulated run. A run must end inside the
+    /// 15-minute budget of a train activity, with a minute to spare.
     #[arg(long, default_value_t = 0)]
     train_seconds: u64,
     #[command(flatten)]

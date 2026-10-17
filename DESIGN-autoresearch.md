@@ -298,6 +298,8 @@ The fixes:
   never share a commit, and setup refuses a branch that another session
   started, such as one that `purge` left. A scheduled session publishes its
   tag before it waits for its lab, so commands reach it from the start.
+  A trainer whose run cannot end inside the budget of a `train` activity
+  is refused at start, at the schedule and in the session.
 - **Steering.** Commands by tag, `run` resumes across midnight, rejected
   commands kept, one decision per approval wait.
 - **Security.** Flow labels follow the session. No secrets in the trainer
