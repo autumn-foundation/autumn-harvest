@@ -4578,10 +4578,10 @@ async fn two_databases_in_one_process_keep_separate_column_cursors() {
     codecs_b.set_active_key("k2").expect("flip b");
 
     // Alternate the two shard-0 sweeps, as two runtimes in one process do.
-    // Each converts its cells at 3 per tick, so 12 ticks each suffice
+    // Each converts its cells at 3 per tick, so this many ticks each suffice
     // when neither reuses the other's cursor.
     let (mut total_a, mut total_b) = (0, 0);
-    for _ in 0..12 {
+    for _ in 0..(2 * CELLS_PER_SEED).div_ceil(3) {
         total_a += sweep_codec_reencryption_once(&mut conn_a, 0, &codecs_a, 3, &NoOpMetrics)
             .await
             .expect("sweep a");
@@ -4628,10 +4628,10 @@ async fn two_schemas_in_one_database_keep_separate_column_cursors() {
     codecs_a.set_active_key("k2").expect("flip a");
     codecs_b.set_active_key("k2").expect("flip b");
 
-    // At 3 per tick, 12 ticks each convert every cell when neither sweep
-    // reuses the cursor of the other.
+    // At 3 per tick, this many ticks each convert every cell when neither
+    // sweep reuses the cursor of the other.
     let (mut total_a, mut total_b) = (0, 0);
-    for _ in 0..12 {
+    for _ in 0..(2 * CELLS_PER_SEED).div_ceil(3) {
         total_a += sweep_codec_reencryption_once(&mut conn_a, 0, &codecs_a, 3, &NoOpMetrics)
             .await
             .expect("sweep a");
