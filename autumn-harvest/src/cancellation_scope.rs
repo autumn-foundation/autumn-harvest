@@ -2544,6 +2544,62 @@ mod tests {
         }
     }
 
+    /// A held child dispatch does not resolve its placement again. A replay
+    /// whose router no longer holds the pinned shard still replays the cancel.
+    #[tokio::test]
+    async fn a_removed_pin_does_not_fail_a_replayed_dispatch() {
+        use crate::shard::{ChildPlacement, ShardRouter};
+        use crate::types::ShardId;
+        async fn dispatch(ctx: &WorkflowContext, kind: usize) {
+            let pin = ChildPlacement::Shard(ShardId::new(1));
+            let children = vec![("placed".to_string(), json!(1))];
+            let _ = match kind {
+                0 => {
+                    ctx.spawn_child_workflow_raw_placed("placed", json!(1), &pin)
+                        .await
+                }
+                1 => ctx
+                    .spawn_child_workflow_timeout_placed(
+                        "placed",
+                        json!(1),
+                        Duration::from_secs(60),
+                        &pin,
+                    )
+                    .await
+                    .map(|_| Value::Null),
+                2 => ctx
+                    .spawn_child_workflow_fan_out_raw_placed(children, &pin)
+                    .await
+                    .map(|_| Value::Null),
+                _ => ctx
+                    .spawn_child_workflow_fan_out_collect_raw_placed(children, &pin)
+                    .await
+                    .map(|_| Value::Null),
+            };
+        }
+        let router =
+            |shards: Vec<ShardId>| ShardRouter::new(shards.clone(), shards, ShardId::new(0));
+        for kind in 0..4 {
+            let live = WorkflowContext::new_test()
+                .with_shard_router(router(vec![ShardId::new(0), ShardId::new(1)]));
+            let result = bounded(run_then_cancel(&live, dispatch(&live, kind))).await;
+            assert!(
+                matches!(result, Err(HarvestError::Cancelled(_))),
+                "kind={kind}: {result:?}"
+            );
+            let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+            let replay = replay_of(details).with_shard_router(router(vec![ShardId::new(0)]));
+            let result = bounded(run_then_cancel(&replay, dispatch(&replay, kind))).await;
+            assert!(
+                matches!(result, Err(HarvestError::Cancelled(_))),
+                "kind={kind}: {result:?}"
+            );
+            let nd = replay.take_nd_details();
+            assert!(nd.is_none(), "kind={kind}: {nd:?}");
+        }
+    }
+
     /// Phase two of a patch replaces `patched` with `deprecate_patch`. The
     /// captured `patch:` marker is dropped, whether the deprecation runs
     /// before the scope or inside its body.

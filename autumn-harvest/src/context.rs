@@ -8602,7 +8602,9 @@ impl WorkflowContext {
         placement: &crate::shard::ChildPlacement,
         workflow_name: &str,
     ) -> HarvestResult<()> {
-        if placement.is_parent_shard() {
+        // Issue #1984: a scope that replays its cancel holds this dispatch.
+        // The placement resolved when the cancelling cycle made it.
+        if placement.is_parent_shard() || self.replays_a_scope_cancel() {
             return Ok(());
         }
         // The key is irrelevant to every failure mode this is checking for; a
@@ -8654,7 +8656,9 @@ impl WorkflowContext {
         let parent_shard = self
             .current_shard_id
             .unwrap_or_else(|| self.exec_id.shard());
-        if placement.is_parent_shard() {
+        // Issue #1984: a scope that replays its cancel discards this id with
+        // the held command. The router can have changed since the cancel.
+        if placement.is_parent_shard() || self.replays_a_scope_cancel() {
             return Ok(ExecutionId::new_for_shard(parent_shard));
         }
         let key = crate::shard::child_placement_key(self.exec_id, seq);
