@@ -350,9 +350,13 @@
 //! `WorkflowCommand` variant is a compile error in this backend, forcing an
 //! explicit supported / unsupported decision rather than a silent `"Unknown"`.
 //!
-//! Two benign bookkeeping commands are instead silently **no-ops** (they append no
-//! `WorkflowEvent` and gate no control flow): `ctx.set_current_details(...)` (the
-//! operator status breadcrumb, issue #593) and a re-park `WaitForActivity`.
+//! Six commands append no `WorkflowEvent`: `SetCurrentDetails`
+//! (`ctx.set_current_details`, the operator status breadcrumb, issue #593),
+//! `PublishProgress`, `PublishDurableProgress`, `RecordLog`, a re-park
+//! `WaitForActivity` and `WaitForSignal`. Postgres appends no event for them
+//! either. `WaitForSignal` only names the wait. The cycle-start ingest
+//! records the signal. The cross-backend conformance suite (issue #2030)
+//! checks each one against Postgres.
 //!
 //! **No `ScheduleActivity` field is silently dropped** (issue #1069 P2). Every
 //! author-declared field on the core `ScheduleActivity` command is either HONORED
