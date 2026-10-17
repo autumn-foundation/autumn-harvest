@@ -132,6 +132,10 @@ A native primitive stays at rank 13, behind customer pull.
   counters. `Entity::trust_start_input` restores the old behavior. A run with
   no recorded source is an entity from before the engine recorded it, so it
   keeps its input.
+- Declare the workflow input as `serde_json::Value` and build the loop with
+  `Entity::from_input`. It decodes the input only when the run keeps it. A
+  typed `EntityCheckpoint<S>` input decodes before `Entity::run`, so a
+  malformed client input fails the start.
 - The gate has three known limits. A reset or a re-run copies the stored
   input of the source run. An admin who resets or re-runs a run that a client
   started with a forged input keeps that input. Workflow code that passes

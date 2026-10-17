@@ -47,15 +47,15 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use autumn_harvest::entity::{Entity, EntityCheckpoint};
+//! use autumn_harvest::entity::Entity;
 //! use autumn_harvest::prelude::*;
 //!
 //! #[workflow]
 //! async fn counter(
 //!     ctx: &WorkflowContext,
-//!     input: EntityCheckpoint<u64>,
+//!     input: serde_json::Value,
 //! ) -> Result<u64, String> {
-//!     Entity::new(ctx, input)
+//!     Entity::<u64>::from_input(ctx, input)
 //!         .run(|count, add: u64| async move { Ok(count + add) })
 //!         .await
 //!         .map_err(|e| e.to_string())
@@ -69,7 +69,7 @@
 //! use autumn_harvest::TypedSignalWithStartOptions;
 //!
 //! CounterStub::signal_with_start(
-//!     conn, &client, "counter-42", EntityCheckpoint::<u64>::default(),
+//!     conn, &client, "counter-42", serde_json::json!({}),
 //!     ENTITY_OP_SIGNAL, EntityMessage::op(5_u64),
 //!     TypedSignalWithStartOptions { idempotency_key: Some(op_id), ..Default::default() },
 //! ).await?;
@@ -254,6 +254,7 @@ pub struct Entity<'a, S> {
     max_ops_per_run: Option<u64>,
     initial_state: Option<S>,
     trust_start_input: bool,
+    raw_input: Option<Value>,
 }
 
 impl<'a, S> Entity<'a, S>
@@ -269,6 +270,25 @@ where
             max_ops_per_run: None,
             initial_state: None,
             trust_start_input: false,
+            raw_input: None,
+        }
+    }
+
+    /// A loop for the run that `ctx` drives, from the raw start `input`.
+    ///
+    /// Prefer this to [`new`](Self::new). The run decodes `input` only when it
+    /// keeps it. A run that a caller started drops the input first, so a
+    /// malformed client input cannot fail the start (issue #2082). Declare the
+    /// workflow input as `serde_json::Value`. A typed `EntityCheckpoint<S>`
+    /// input decodes before this call.
+    ///
+    /// [`run`](Self::run) returns [`HarvestError::Serialization`] when it keeps
+    /// an input that does not decode.
+    #[must_use]
+    pub fn from_input(ctx: &'a WorkflowContext, input: Value) -> Self {
+        Self {
+            raw_input: Some(input),
+            ..Self::new(ctx, EntityCheckpoint::default())
         }
     }
 
@@ -344,11 +364,17 @@ where
             max_ops_per_run,
             initial_state,
             trust_start_input,
+            raw_input,
         } = self;
+        let drops_input = !trust_start_input && ctx.start_source().carries_caller_input();
+        // Decode the raw input only when the run keeps it.
+        if let Some(raw) = raw_input.filter(|_| !drops_input) {
+            checkpoint = serde_json::from_value(raw)?;
+        }
         // A caller chose the input of a fresh start, so drop it (issue #2082).
         // A run with no recorded source keeps its input: it can be an entity
         // that started before the engine recorded the source.
-        if !trust_start_input && ctx.start_source().carries_caller_input() {
+        if drops_input {
             checkpoint = EntityCheckpoint::with_state(initial_state.unwrap_or_default());
         }
         // A kept input is trusted, but its error must obey the bound too.
@@ -1527,7 +1553,7 @@ mod tests {
         let carried: EntityCheckpoint<i64> =
             serde_json::from_value(outcome.result.expect("checkpoint")).unwrap();
         assert_eq!(carried.state, 2);
-        assert!(carried.pending.is_empty());
+        assert_eq!(carried.pending, Vec::<Value>::new());
         assert_eq!(carried.stats.applied, 2);
     }
 
@@ -1609,6 +1635,51 @@ mod tests {
                 .map_err(|e| e.to_string())?;
             Ok(json!(state))
         })
+    }
+
+    /// A counter entity that decodes its raw start input after the gate.
+    fn raw_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::<i64>::from_input(ctx, input)
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    #[tokio::test]
+    async fn a_malformed_client_input_does_not_fail_a_fresh_start() {
+        let outcome = env_with(&[op(1), delete()])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(raw_counter, json!({"state": "wrong-type"}))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(1)));
+    }
+
+    #[tokio::test]
+    async fn a_kept_input_that_does_not_decode_fails_the_run() {
+        let outcome = env_with(&[delete()])
+            .with_start_provenance(StartProvenance::continued_from(ExecutionId::new()))
+            .run(raw_counter, json!({"state": "wrong-type"}))
+            .await;
+        assert!(outcome.result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_raw_input_follows_the_same_gate_as_a_typed_one() {
+        let dropped = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::SignalWithStart))
+            .run(raw_counter, forged())
+            .await;
+        assert_eq!(dropped.result, Ok(json!(0)));
+        let kept = env_with(&[delete()])
+            .with_start_provenance(StartProvenance::continued_from(ExecutionId::new()))
+            .run(raw_counter, forged())
+            .await;
+        assert_eq!(kept.result, Ok(json!(57)));
+        let legacy = env_with(&[delete()]).run(raw_counter, forged()).await;
+        assert_eq!(legacy.result, Ok(json!(57)));
     }
 
     #[tokio::test]

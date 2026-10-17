@@ -9,7 +9,9 @@ recorded source reports `StartSource::Unknown`.
 starts from `S::default()`. A continue-as-new, reset or re-run keeps its
 checkpoint, and so does a run with an unknown source. `Entity::initial_state`
 seeds a fresh entity from code. `Entity::trust_start_input` restores the old
-behavior.
+behavior. `Entity::from_input` takes the raw start input and decodes it only
+when the run keeps it. A typed `EntityCheckpoint<S>` workflow input decodes
+first, so a malformed client input fails the start.
 
 **Design.** No new `WorkflowEvent` field and no migration. The test harness and
 the replayer take `with_start_provenance`, so `replay_check` matches the live
