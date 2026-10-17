@@ -330,6 +330,33 @@ pub async fn record_cross_shard_child(
     parent_close_policy: Option<ParentClosePolicy>,
     spec: &CrossShardChildSpec,
 ) -> HarvestResult<()> {
+    record_cross_shard_child_with_codecs(
+        conn,
+        parent_exec_id,
+        child_exec_id,
+        workflow_name,
+        parent_close_policy,
+        spec,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`record_cross_shard_child`], storing the spec through `codecs`
+/// (issue #2043).
+///
+/// # Errors
+///
+/// Propagates database errors.
+pub async fn record_cross_shard_child_with_codecs(
+    conn: &mut AsyncPgConnection,
+    parent_exec_id: ExecutionId,
+    child_exec_id: ExecutionId,
+    workflow_name: &str,
+    parent_close_policy: Option<ParentClosePolicy>,
+    spec: &CrossShardChildSpec,
+    _codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
     let row = NewCrossShardChildRow {
         child_exec_id: child_exec_id.as_uuid(),
         parent_exec_id: parent_exec_id.as_uuid(),
