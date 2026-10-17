@@ -22,7 +22,7 @@ use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use crate::results::{HEADER, ResultRow};
+use crate::results::{HEADER, ResultRow, short};
 
 /// The file that the agent edits.
 pub const TRAIN: &str = "train.py";
@@ -90,9 +90,9 @@ pub const TEMPLATE: &[(&str, &str)] = &[
 /// One commit of `train.py`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitInfo {
-    /// The short hash of the commit, or of `HEAD` when nothing changed.
+    /// The full id of the commit, or of `HEAD` when nothing changed.
     pub commit: String,
-    /// The short hash of the parent: the reset target.
+    /// The full id of the parent: the reset target.
     pub parent: String,
     /// `false` when `train.py` had no change, so no commit was made.
     pub changed: bool,
@@ -322,21 +322,44 @@ impl Lab {
             .map_err(|e| format!("cannot write {}: {e}", path.display()))
     }
 
-    /// The short hash of `HEAD`: its first seven hex digits.
+    /// The full id of `HEAD`.
     ///
     /// # Errors
     ///
     /// Returns an error when git fails.
     pub fn head(&self) -> Result<String, String> {
-        self.short("HEAD")
+        self.full("HEAD")
     }
 
-    /// The first seven hex digits of `rev`. Git's own short form grows
-    /// when a prefix becomes ambiguous, so a hash could change length
-    /// during a session. This form never does.
-    fn short(&self, rev: &str) -> Result<String, String> {
-        let full = self.git(&["rev-parse", "--verify", rev])?;
-        Ok(full.chars().take(7).collect())
+    /// The full id of `rev`.
+    fn full(&self, rev: &str) -> Result<String, String> {
+        self.git(&["rev-parse", "--verify", rev])
+    }
+
+    /// The full id of the one commit of the branch whose id starts with
+    /// `prefix`. Only `HEAD` and its ancestors count.
+    ///
+    /// Git looks for the prefix in the whole object store, with each reset
+    /// commit and each other branch. The branch holds far fewer commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `prefix` is not 4 or more hex digits, or when
+    /// it names no commit of the branch, or more than one.
+    pub fn on_branch(&self, prefix: &str) -> Result<String, String> {
+        let prefix = prefix.trim().to_ascii_lowercase();
+        if prefix.len() < 4 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("{prefix:?} is not a commit id"));
+        }
+        let ids = self.git(&["rev-list", "HEAD"])?;
+        let mut found = ids.lines().filter(|id| id.starts_with(&prefix));
+        match (found.next(), found.next()) {
+            (Some(id), None) => Ok(id.to_string()),
+            (None, _) => Err(format!("{prefix} is not a commit of this branch")),
+            (Some(_), Some(_)) => Err(format!(
+                "{prefix} names more than one commit of this branch"
+            )),
+        }
     }
 
     /// Commit `train.py` on `parent` with `message` and a [`KEY_TRAILER`] of
@@ -410,7 +433,7 @@ impl Lab {
                 lines_removed: 0,
             });
         }
-        let parent = self.short("HEAD^")?;
+        let parent = self.full("HEAD^")?;
         // `--numstat` prints "<added> <removed> <path>".
         let stat = self.git(&["diff", "--numstat", "HEAD^", "HEAD", "--", TRAIN])?;
         let mut numbers = stat
@@ -603,12 +626,13 @@ impl Lab {
             .collect())
     }
 
-    /// The newest kept row of `commit`, if any.
+    /// The newest kept row of `commit`, a full id or its short form.
     ///
     /// # Errors
     ///
     /// Returns an error when `results.tsv` cannot be read.
     pub fn kept(&self, commit: &str) -> Result<Option<ResultRow>, String> {
+        let commit = short(commit);
         Ok(self
             .rows()?
             .into_iter()
@@ -749,6 +773,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+    use crate::results::short;
     use crate::rules::Status;
 
     fn lab() -> (tempfile::TempDir, Lab) {
@@ -774,7 +799,11 @@ mod tests {
             assert!(lab.root().join(name).is_file(), "{name}");
         }
         assert_eq!(lab.git(&["rev-list", "--count", "HEAD"]).unwrap(), "1");
-        assert_eq!(lab.head().unwrap().len(), 7);
+        let head = lab.head().unwrap();
+        assert!(
+            head.len() >= 40 && head.bytes().all(|b| b.is_ascii_hexdigit()),
+            "HEAD is a full object id: {head}"
+        );
         assert!(
             Lab::init(lab.root()).is_err(),
             "init refuses a used directory"
@@ -1054,5 +1083,61 @@ mod tests {
         std::fs::write(&path, text).unwrap();
         assert!(lab.record(&row("bbbbbbb"), "k2").unwrap());
         assert_eq!(lab.rows().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn kept_finds_a_row_by_the_full_id_of_its_commit() {
+        let (_dir, lab) = lab();
+        let head = lab.head().unwrap();
+        lab.record(&row(&short(&head)), "k1").unwrap();
+        assert_eq!(lab.kept(&head).unwrap(), Some(row(&short(&head))));
+        assert_eq!(lab.kept(&short(&head)).unwrap(), Some(row(&short(&head))));
+    }
+
+    /// Two commits whose ids share a prefix: one on the branch, one not.
+    /// Git cannot resolve the prefix. The branch can.
+    #[test]
+    fn a_short_id_names_one_commit_of_the_branch() {
+        let (dir, lab) = lab();
+        lab.start_branch("t1").unwrap();
+        let base = lab.head().unwrap();
+        let tree = lab.git(&["rev-parse", "HEAD:"]).unwrap();
+        let objects = dir.path().join("objects");
+        std::fs::create_dir(&objects).unwrap();
+        let paths: Vec<String> = (0..2000)
+            .map(|n| {
+                let path = objects.join(n.to_string());
+                let body = format!(
+                    "tree {tree}\nparent {base}\nauthor a <a@b> 0 +0000\n\
+                     committer a <a@b> 0 +0000\n\ncandidate {n}\n"
+                );
+                std::fs::write(&path, body).unwrap();
+                path.display().to_string()
+            })
+            .collect();
+        let mut args = vec!["hash-object", "-t", "commit", "-w"];
+        args.extend(paths.iter().map(String::as_str));
+        let ids = lab.git(&args).unwrap();
+        let mut seen = std::collections::HashMap::new();
+        let (on, off) = ids
+            .lines()
+            .find_map(|id| {
+                seen.insert(&id[..4], id)
+                    .map(|other| (id.to_string(), other.to_string()))
+            })
+            .unwrap();
+        lab.git(&["reset", "--quiet", "--hard", &on]).unwrap();
+        let prefix = &on[..4];
+        assert!(
+            lab.git(&["rev-parse", "--verify", &format!("{prefix}^{{commit}}")])
+                .is_err(),
+            "git finds two commits for {prefix}"
+        );
+        assert_eq!(lab.on_branch(prefix).unwrap(), on);
+        assert_eq!(lab.on_branch(&short(&on)).unwrap(), on);
+        assert_eq!(lab.on_branch(&base).unwrap(), base);
+        assert!(lab.on_branch(&short(&off)).is_err(), "not on the branch");
+        assert!(lab.on_branch("ab").is_err(), "too short");
+        assert!(lab.on_branch("HEAD~1").is_err(), "not hex");
     }
 }

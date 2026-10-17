@@ -16,6 +16,7 @@ use std::time::Duration;
 use autoresearch::agent;
 use autoresearch::inbox::{Command, Inbox};
 use autoresearch::lab::RESULTS;
+use autoresearch::results::short;
 use autoresearch::rules::{KeepPolicy, Status};
 use autoresearch::runtime::{self, Step, session_id};
 use autoresearch::scripted::{PREFER_SIMPLER, ScriptedResearcher};
@@ -277,14 +278,15 @@ async fn an_approved_rewind_moves_the_base_to_an_older_kept_commit() {
     let exec = runtime::start(&mut rt, &fx.config("rw", 2)).unwrap();
     let baseline = fx.lab().head().unwrap();
     hint(&mut rt, "rw", "paper:warmdown", "h1");
-    hint(&mut rt, "rw", &format!("rewind:{baseline}"), "h2");
+    // A person copies the short form from results.tsv.
+    hint(&mut rt, "rw", &format!("rewind:{}", short(&baseline)), "h2");
 
     let edit = run_to_approval(&mut rt, exec).await;
     assert_eq!(edit.tool, agent::EDIT_TRAIN);
     runtime::apply(&mut rt, "a1", &Command::Approve { token: edit.token }).unwrap();
     let rewind = run_to_approval(&mut rt, exec).await;
     assert_eq!(rewind.tool, agent::REWIND);
-    assert_eq!(rewind.arguments["commit"], json!(baseline));
+    assert_eq!(rewind.arguments["commit"], json!(short(&baseline)));
     runtime::apply(
         &mut rt,
         "a2",
@@ -307,10 +309,9 @@ async fn an_approved_rewind_moves_the_base_to_an_older_kept_commit() {
     assert_eq!(second.row.status, Status::Keep, "{second:?}");
     {
         // The kept commit sits on the baseline, not on the first keep.
-        let parent = fx
-            .lab()
-            .git(&["rev-parse", "--short=7", &format!("{}^", second.row.commit)])
-            .unwrap();
+        let kept = &second.best.as_ref().unwrap().commit;
+        assert_eq!(short(kept), second.row.commit);
+        let parent = fx.lab().git(&["rev-parse", &format!("{kept}^")]).unwrap();
         assert_eq!(parent, baseline);
     }
 }
@@ -537,9 +538,10 @@ async fn the_session_continues_as_new_and_carries_its_best() {
             .unwrap()
             .to_string()
     };
-    assert_eq!(carried_best(second), best_after(2));
-    assert_eq!(carried_best(third), best_after(4));
-    assert_eq!(report.best.commit, best_after(5));
+    // The carry holds the full id. The rows hold its short form.
+    assert_eq!(short(&carried_best(second)), best_after(2));
+    assert_eq!(short(&carried_best(third)), best_after(4));
+    assert_eq!(short(&report.best.commit), best_after(5));
     assert_eq!(
         runtime::find_session(&rt, "chain").unwrap(),
         None,
@@ -636,7 +638,7 @@ async fn a_finished_night_leaves_a_morning_report() {
         .collect();
     assert_eq!(texts.len(), 1);
     assert!(texts[0].contains("Morning report"), "{texts:?}");
-    assert!(texts[0].contains(&report.best.commit));
+    assert!(texts[0].contains(&short(&report.best.commit)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

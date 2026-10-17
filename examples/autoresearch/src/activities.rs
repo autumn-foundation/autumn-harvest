@@ -65,7 +65,7 @@ pub struct SetupInput {
 pub struct SetupReport {
     /// The research branch.
     pub branch: String,
-    /// The short hash of its head.
+    /// The full id of its head.
     pub head: String,
     /// The text of `program.md` at the start of the session.
     pub program: String,
@@ -100,7 +100,7 @@ pub struct CommitRef {
     pub lab: String,
     /// The session branch. [`find_kept`] does not read it.
     pub branch: String,
-    /// A short commit hash.
+    /// The full id of a commit.
     pub commit: String,
 }
 
@@ -163,7 +163,7 @@ fn setup_lab(input: &SetupInput) -> Result<SetupReport, String> {
     })
 }
 
-/// The short hash of the head of the session branch.
+/// The full id of the head of the session branch.
 ///
 /// The session releases the lab between experiments, so another session in
 /// the lab can check out its own branch. This step checks the session
@@ -240,9 +240,10 @@ pub async fn reset(_ctx: &ActivityContext, input: CommitRef) -> Result<String, S
 /// Returns an error when `results.tsv` cannot be read.
 #[activity(start_to_close = "1m", retry = RetryPolicy::exponential(3, Duration::from_secs(1)))]
 pub async fn find_kept(_ctx: &ActivityContext, input: CommitRef) -> Result<Option<Best>, String> {
+    let commit = input.commit.clone();
     let row = blocking(move || Lab::open(&input.lab)?.kept(&input.commit)).await?;
     Ok(row.map(|row| Best {
-        commit: row.commit,
+        commit,
         val_bpb: row.val_bpb,
         memory_gb: row.memory_gb,
     }))

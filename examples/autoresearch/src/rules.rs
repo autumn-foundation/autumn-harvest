@@ -92,7 +92,7 @@ impl KeepPolicy {
 /// The best kept result so far: the base of the next experiment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Best {
-    /// The short commit hash.
+    /// The full id of the commit. `results.tsv` shows its short form.
     pub commit: String,
     /// The validation bits per byte.
     pub val_bpb: f64,

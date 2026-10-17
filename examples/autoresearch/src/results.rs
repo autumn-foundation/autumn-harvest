@@ -13,6 +13,15 @@ use crate::rules::Status;
 /// The header line of `results.tsv`.
 pub const HEADER: &str = "commit\tval_bpb\tmemory_gb\tstatus\tdescription";
 
+/// The form of `commit` in `results.tsv`: its first 7 hex digits.
+///
+/// Workflow state keeps the full id. A prefix that is unique today can
+/// become ambiguous as the lab grows, and git then refuses it.
+#[must_use]
+pub fn short(commit: &str) -> String {
+    commit.chars().take(7).collect()
+}
+
 /// One row of `results.tsv`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResultRow {

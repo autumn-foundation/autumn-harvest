@@ -38,7 +38,7 @@ use crate::activities::{
 };
 use crate::agent::{RESEARCHER_ROLE, REVIEWER, report_task};
 use crate::lab::CommitInfo;
-use crate::results::{ResultRow, table};
+use crate::results::{ResultRow, short, table};
 use crate::rules::{Best, KeepPolicy, Measured, Status, Verdict, decide, memory_gb};
 use crate::scripted::{EXPLORE, FIX_MODE, GIVE_UP, HINT as HINT_LINE};
 use crate::summary::Summary;
@@ -662,7 +662,7 @@ async fn failed_experiment(
         .as_ref()
         .map_or_else(String::new, |h| format!(" (hint: {})", h.text));
     let row = ResultRow {
-        commit: base.commit.clone(),
+        commit: short(&base.commit),
         val_bpb: 0.0,
         memory_gb: 0.0,
         status: Status::Crash,
@@ -779,7 +779,10 @@ fn publish(ctx: &WorkflowContext, carry: &Carry, phase: &str) -> Result<(), Stri
         ("phase".to_string(), Some(json!(phase))),
         ("experiments".to_string(), Some(json!(carry.done))),
         ("best_bpb".to_string(), Some(json!(carry.best.val_bpb))),
-        ("best_commit".to_string(), Some(json!(carry.best.commit))),
+        (
+            "best_commit".to_string(),
+            Some(json!(short(&carry.best.commit))),
+        ),
     ])
     .map_err(|e| e.to_string())
 }
@@ -820,7 +823,7 @@ pub async fn experiment(
     let verdict = decide(&input.policy, proposal.base.as_ref(), &measured);
     let crashed = verdict.status == Status::Crash;
     let row = ResultRow {
-        commit,
+        commit: short(&commit),
         val_bpb: if crashed {
             0.0
         } else {
@@ -841,6 +844,7 @@ pub async fn experiment(
         ctx,
         &input,
         Ended {
+            commit,
             row,
             verdict,
             base,
@@ -1081,7 +1085,7 @@ async fn no_change(
     labels: BTreeSet<String>,
 ) -> Result<ExperimentOutcome, String> {
     let row = ResultRow {
-        commit: idle.base.commit.clone(),
+        commit: short(&idle.base.commit),
         val_bpb: idle.base.val_bpb,
         memory_gb: idle.base.memory_gb,
         status: Status::Discard,
@@ -1089,6 +1093,7 @@ async fn no_change(
     };
     reset(ctx, input, &idle.base.commit).await?;
     let ended = Ended {
+        commit: idle.base.commit.clone(),
         row,
         verdict: Verdict {
             status: Status::Discard,
@@ -1105,6 +1110,8 @@ async fn no_change(
 
 /// How an experiment ended.
 struct Ended {
+    /// The full id of the commit that the row names.
+    commit: String,
     row: ResultRow,
     verdict: Verdict,
     base: Option<Best>,
@@ -1120,6 +1127,7 @@ async fn finish(
     ended: Ended,
 ) -> Result<ExperimentOutcome, String> {
     let Ended {
+        commit,
         row,
         verdict,
         base,
@@ -1136,7 +1144,7 @@ async fn finish(
     .map_err(|e| e.to_string())?;
     let best = if verdict.status == Status::Keep {
         Some(Best {
-            commit: row.commit.clone(),
+            commit,
             val_bpb: row.val_bpb,
             memory_gb: row.memory_gb,
         })
@@ -1166,7 +1174,7 @@ fn summary(carry: &Carry) -> String {
          best val_bpb {:.6} at {}.\n\nThe last rows of the session:\n\n{}",
         carry.done,
         carry.best.val_bpb,
-        carry.best.commit,
+        short(&carry.best.commit),
         table(&carry.recent)
     )
 }
@@ -1188,7 +1196,7 @@ fn answer_line(report: &AgentReport) -> String {
 fn system_prompt(input: &ExperimentInput) -> String {
     let best = input.best.as_ref().map_or_else(
         || "none yet".to_string(),
-        |b| format!("val_bpb {:.6} at commit {}", b.val_bpb, b.commit),
+        |b| format!("val_bpb {:.6} at commit {}", b.val_bpb, short(&b.commit)),
     );
     format!(
         "{}\n\n{CONTEXT_MARKER}\n{RESEARCHER_ROLE}\n\n## Session\n\n\

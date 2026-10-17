@@ -18,7 +18,7 @@ use autoresearch::agent::{self, HarnessParts};
 use autoresearch::claude::ClaudeModel;
 use autoresearch::inbox::{Command, Inbox};
 use autoresearch::lab::Lab;
-use autoresearch::results::ResultRow;
+use autoresearch::results::{ResultRow, short};
 use autoresearch::rules::KeepPolicy;
 use autoresearch::runtime::{self, Refused, Step, session_id};
 use autoresearch::scripted::ScriptedResearcher;
@@ -603,7 +603,7 @@ fn print_report(report: &SessionReport) {
         report.branch,
         report.experiments,
         report.best.val_bpb,
-        report.best.commit,
+        short(&report.best.commit),
         counts.kept,
         counts.discarded,
         counts.crashed

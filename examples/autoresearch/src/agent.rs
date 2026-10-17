@@ -152,15 +152,14 @@ pub fn tools(labs: &[Lab]) -> Vec<Arc<dyn Tool>> {
             ),
             |lab, input, _| {
                 let commit = text(&input, "commit")?;
-                let kept = lab
-                    .kept(&commit)?
-                    .ok_or_else(|| format!("{commit} is not a kept commit in results.tsv"))?;
                 // A kept commit of another session in the lab is on another
                 // branch. Only an earlier commit of this branch is a rewind.
-                lab.git(&["merge-base", "--is-ancestor", &commit, "HEAD"])
-                    .map_err(|_| format!("{commit} is not an earlier commit of this branch"))?;
-                lab.reset_to(&commit)?;
-                Ok(json!({"ok": true, "rewound_to": commit, "val_bpb": kept.val_bpb}))
+                let full = lab.on_branch(&commit)?;
+                let kept = lab
+                    .kept(&full)?
+                    .ok_or_else(|| format!("{commit} is not a kept commit in results.tsv"))?;
+                lab.reset_to(&full)?;
+                Ok(json!({"ok": true, "rewound_to": kept.commit, "val_bpb": kept.val_bpb}))
             },
         )
         .effect(ToolEffect::Write)

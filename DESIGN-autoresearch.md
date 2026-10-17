@@ -238,7 +238,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC3 | `rules::tests` (seven cases and three property tests, one against an oracle from the README). `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row` checks the zero crash row. |
 | AC4 | `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row`. The sim targets "a fix recovers a crash", "a run crashes for good" and "a run passes its time budget". |
 | AC5 | `agent::tests::edit_train_writes_train_py_only`, `the_policy_gates_rewind_and_denies_unknown_tools`, `lab::tests::the_agent_reads_only_known_files_and_papers`. |
-| AC6 | `e2e::an_edit_after_a_paper_waits_and_a_deny_changes_nothing`, `e2e::a_paper_taints_every_later_run_of_the_session`, `e2e::an_approved_rewind_moves_the_base_to_an_older_kept_commit`, `e2e::a_late_approval_never_releases_the_call`. |
+| AC6 | `e2e::an_edit_after_a_paper_waits_and_a_deny_changes_nothing`, `e2e::a_paper_taints_every_later_run_of_the_session`, `e2e::an_approved_rewind_moves_the_base_to_an_older_kept_commit`, `lab::tests::a_short_id_names_one_commit_of_the_branch`, `e2e::a_late_approval_never_releases_the_call`. |
 | AC7 | `scripted::tests::the_researcher_reads_edits_asks_the_reviewer_and_answers`, `agent::tests::the_reviewer_is_read_only_with_two_tools`. The e2e nights delegate in every proposal. |
 | AC8 | `e2e::memory_notes_survive_a_restart`, `stores::tests::memory_survives_a_new_store_and_dedupes_a_key`. |
 | AC9 | `e2e::signals_a_query_and_an_update_steer_a_live_session`. `sim::a_session_holds_its_invariants_under_signals_and_faults` requires the hint, policy and stop targets. `sim::a_stop_at_the_hand_off_ends_the_night` requires a stop that meets the hand-off. |
@@ -285,7 +285,10 @@ The fixes:
   the tool call. A saved run per train call. The process group dies with the
   run. A mutex per lab and a branch on each write step. A `train.py` change
   that no commit holds is refused. No execution timeout on `experiment`,
-  because it counted the downtime of the runner.
+  because it counted the downtime of the runner. Workflow state keeps full
+  commit ids. A short id can become ambiguous as the lab grows, so only
+  `results.tsv` and the console show it. A rewind resolves a short id on
+  the session branch only.
 - **Steering.** Commands by tag, `run` resumes across midnight, rejected
   commands kept, one decision per approval wait.
 - **Security.** Flow labels follow the session. No secrets in the trainer
