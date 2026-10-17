@@ -676,9 +676,7 @@ async fn fire_due_on_conn(
                 );
                 crate::execution::emit_start_cancel_metrics(m, &cancel_metrics);
             }
-        } else if moved_back.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            continue;
-        } else {
+        } else if !moved_back.swap(false, std::sync::atomic::Ordering::SeqCst) {
             break;
         }
     }
