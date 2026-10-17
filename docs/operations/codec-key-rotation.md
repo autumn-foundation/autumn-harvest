@@ -378,6 +378,9 @@ places this feature does not sweep:
   cover workflow and activity task rows. The coverage table in
   `docs/security-posture.md` names each column that stays clear. Harvest
   writes no envelope to any other column.
+- **Start options.** The `start_options` of a debounce, throttle or batch row
+  hold the headers and the memo as two envelopes. The census and the sweep
+  cover both keys. The other keys stay as they are.
 - **Buffers and arrays.** An event batch buffer holds one envelope for each
   element. The census counts a buffer row once for each key. One swap converts
   every envelope element. A buffer with an element that does not decode stays

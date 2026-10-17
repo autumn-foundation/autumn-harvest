@@ -886,10 +886,11 @@ async fn workflow_registration_is_converged(
         return Ok(false);
     }
 
-    Ok(workflow_schedule_row_is_converged(
-        &schedule_row_with_plain_input(&existing, codecs),
+    Ok(workflow_schedule_row_is_converged_with(
+        &existing,
         ws,
         Utc::now(),
+        |stored| stored_schedule_input_matches(stored, existing.id, &ws.input, codecs),
     ))
 }
 
@@ -2377,10 +2378,26 @@ async fn find_or_insert_workflow_schedule(
 /// `every_written_column_is_compared` mutates each column in turn and asserts
 /// convergence flips, so a column added to the changeset without being added
 /// here is caught.
+#[cfg(test)]
 fn workflow_schedule_row_is_converged(
     existing: &HarvestSchedule,
     ws: &WorkflowSchedule,
     now: DateTime<Utc>,
+) -> bool {
+    workflow_schedule_row_is_converged_with(existing, ws, now, |stored| stored == Some(&ws.input))
+}
+
+/// [`workflow_schedule_row_is_converged`], with the stored input compared by
+/// `input_matches` (issue #2043).
+///
+/// The stored input is an envelope, and each encode makes a new nonce. The
+/// caller decodes it inside `input_matches`. The decode runs last, so a row
+/// that already drifted in a cheap field costs no decrypt.
+fn workflow_schedule_row_is_converged_with(
+    existing: &HarvestSchedule,
+    ws: &WorkflowSchedule,
+    now: DateTime<Utc>,
+    input_matches: impl FnOnce(Option<&serde_json::Value>) -> bool,
 ) -> bool {
     let expr = schedule_expr(Some(&ws.schedule));
     // A cadence change forces a `next_run_at` recompute, which is by definition
@@ -2461,7 +2478,6 @@ fn workflow_schedule_row_is_converged(
         && existing.catchup == desired_catchup
         && existing.max_active_runs == i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)
         && existing.workflow_name.as_deref() == Some(ws.workflow_name.as_str())
-        && existing.workflow_input.as_ref() == Some(&ws.input)
         && existing.queue_name.as_deref() == Some(ws.queue_name.as_str())
         && existing.jitter_secs == i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX)
         && existing.overlap_policy == ws.overlap_policy.as_str()
@@ -2476,7 +2492,8 @@ fn workflow_schedule_row_is_converged(
         && existing.max_runs == ws.max_runs.map(|n| i32::try_from(n).unwrap_or(i32::MAX))
         && existing.catchup_policy.as_deref() == desired_catchup_policy
         && existing.catchup_window_secs == desired_catchup_window
-        && existing.retry_policy == desired_retry_policy;
+        && existing.retry_policy == desired_retry_policy
+        && input_matches(existing.workflow_input.as_ref());
     if !converged {
         return false;
     }
@@ -2594,22 +2611,47 @@ fn schedule_for_storage(
     Ok(stored)
 }
 
-/// A copy of `row` whose input is plaintext, for the convergence probe
-/// (issue #2043).
+/// Whether the stored schedule input equals the configured one (issue #2043).
 ///
-/// Each encode makes a new nonce, so the probe cannot compare stored bytes.
-/// An input that does not decode becomes `None`. The row then reads as drifted,
-/// and registration writes it again.
-fn schedule_row_with_plain_input(
-    row: &HarvestSchedule,
+/// Each encode makes a new nonce, so the probe cannot compare stored bytes. It
+/// decodes the stored cell and compares the plaintext.
+///
+/// A cell that does not decode reads as drift. Registration then writes the
+/// configured input over it. That heals a row whose key is gone. It also
+/// replaces the stored input, so the function logs a warning with no payload
+/// text.
+///
+/// With column encoding on and a codec that encrypts, an input stored in clear
+/// reads as drift too. Registration then stores it encoded. The sweep never
+/// does that.
+fn stored_schedule_input_matches(
+    stored: Option<&serde_json::Value>,
+    schedule_id: uuid::Uuid,
+    configured: &serde_json::Value,
     codecs: &crate::payload_codec::PayloadCodecs,
-) -> HarvestSchedule {
-    let mut plain = row.clone();
-    plain.workflow_input = row
-        .workflow_input
-        .as_ref()
-        .and_then(|stored| codecs.decode_column(stored).ok());
-    plain
+) -> bool {
+    let Some(stored) = stored else {
+        return false;
+    };
+    // The identity codec stores a value in clear, so it never drifts.
+    let encrypts = codecs.column_encoding()
+        && codecs
+            .active_codec_id()
+            .is_some_and(|codec_id| codec_id != "identity");
+    if encrypts && !crate::payload_codec::is_codec_envelope(stored) {
+        return false;
+    }
+    match codecs.decode_column(stored) {
+        Ok(value) => value == *configured,
+        Err(error) => {
+            tracing::warn!(
+                schedule_id = %schedule_id,
+                error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                "schedule input could not be decoded; registration replaces it"
+            );
+            false
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2624,11 +2666,9 @@ async fn upsert_workflow_schedule(
     // Issue #1157, defect 3: a row that already says exactly what registration
     // would write needs no write. This also covers the public/API entry points
     // (`register_workflow_schedules`), not just the tick.
-    if workflow_schedule_row_is_converged(
-        &schedule_row_with_plain_input(&existing, codecs),
-        ws,
-        Utc::now(),
-    ) {
+    if workflow_schedule_row_is_converged_with(&existing, ws, Utc::now(), |stored| {
+        stored_schedule_input_matches(stored, existing.id, &ws.input, codecs)
+    }) {
         return Ok(existing);
     }
     match apply_workflow_schedule_update(conn, &stored_ws, &existing, false).await? {

@@ -8227,12 +8227,13 @@ pub async fn rerun_workflow_execution_with_codecs(
             // than degrading the re-run, matching the repo's fail-loud posture.
             let rerun_context_headers = match source.context_headers.clone() {
                 None => None,
-                // The start path encodes the headers again (issue #2043).
+                // The start path encodes the headers again (issue #2043). The
+                // error text names no value, because the value is plaintext.
                 Some(v) => Some(serde_json::from_value(codecs.decode_column(&v)?).map_err(
-                    |e| {
+                    |_| {
                         HarvestError::Config(format!(
                             "source execution {source_exec_id} has an unparseable stored \
-                             `context_headers` value ({e}); re-run cannot faithfully clone it"
+                             `context_headers` value; re-run cannot faithfully clone it"
                         ))
                     },
                 )?),

@@ -2796,6 +2796,66 @@ async fn a_schedule_input_that_cannot_decode_never_starts_a_run() {
         1,
         "the slot stays due, so a restored key fires it"
     );
+
+    // Positive control: with the key restored, the same row fires.
+    autumn_harvest::scheduler::tick_once(
+        build_pool(&url),
+        registry(vec![wf_info(static_name, wf_noop, None)], vec![], &codecs),
+        Arc::new(autumn_harvest::DagCatalog::new()),
+        Arc::new(vec![]),
+        autumn_harvest::SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("tick with the key");
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
+             WHERE workflow_name = $1",
+            &name,
+        )
+        .await,
+        1,
+        "a restored key starts the run"
+    );
+}
+
+#[tokio::test]
+async fn a_schedule_input_stored_in_clear_becomes_ciphertext_at_the_next_registration() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let name = format!("cc_sched_legacy_{}", Uuid::new_v4().simple());
+    let ws = secret_schedule(&name);
+    // A row from before the upgrade: the identity registry stores it in clear.
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&ws),
+        &aead_codecs(false),
+    )
+    .await
+    .expect("register in clear");
+    let (clear, _) = schedule_cell(&mut conn, &name).await;
+    assert_eq!(
+        clear,
+        json!({"ssn": SCHEDULE_SECRET}),
+        "the old row is clear"
+    );
+
+    // Column encoding is on now. The registration pass converts the row.
+    let codecs = aead_codecs(true);
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&ws),
+        &codecs,
+    )
+    .await
+    .expect("register encoded");
+    let (stored, _) = schedule_cell(&mut conn, &name).await;
+    assert_ciphertext(&stored, SCHEDULE_SECRET, "the converted schedule input");
+    assert_eq!(
+        codecs.decode_column(&stored).expect("decode one layer"),
+        json!({"ssn": SCHEDULE_SECRET})
+    );
 }
 
 #[tokio::test]
@@ -3146,13 +3206,18 @@ async fn an_activity_that_cannot_decode_its_headers_fails_the_attempt_and_never_
     );
 }
 
-#[tokio::test]
-async fn a_workflow_whose_headers_cannot_decode_fails_and_never_runs() {
+/// Start a run whose stored headers name a key that no registry holds. Return
+/// its final state and the number of retry runs.
+async fn fail_a_run_with_corrupt_headers(
+    workflow_name: &'static str,
+    policy: Option<RetryPolicy>,
+) -> (String, i64) {
     let (url, _c) = setup_test_database_url_or_env().await;
     let queue: &'static str = Box::leak(format!("cc-{}", Uuid::new_v4().simple()).into_boxed_str());
     let codecs = aead_codecs(true);
     let mut conn = connect(&url).await;
-    let exec_id = start_with_headers(&mut conn, &codecs, "cc_headers_guarded", queue, None).await;
+    let exec_id =
+        start_with_headers(&mut conn, &codecs, workflow_name, queue, policy.clone()).await;
     // History still decodes. Only the headers name a key that no registry holds.
     diesel::sql_query("UPDATE harvest_workflow_executions SET context_headers = $2 WHERE id = $1")
         .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
@@ -3168,7 +3233,7 @@ async fn a_workflow_whose_headers_cannot_decode_fails_and_never_runs() {
     let worker = worker(
         queue,
         registry(
-            vec![wf_info("cc_headers_guarded", wf_headers_guarded, None)],
+            vec![wf_info(workflow_name, wf_headers_guarded, policy)],
             Vec::new(),
             &codecs,
         ),
@@ -3197,11 +3262,42 @@ async fn a_workflow_whose_headers_cannot_decode_fails_and_never_runs() {
         0,
         "the handler never runs without its headers"
     );
+    let retries = count_rows(
+        &mut conn,
+        "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
+         WHERE retry_of_exec_id::TEXT = $1",
+        &exec_id.as_uuid().to_string(),
+    )
+    .await;
+    (state, retries)
+}
+
+#[tokio::test]
+async fn a_workflow_whose_headers_cannot_decode_fails_and_never_runs() {
+    let (state, _) = fail_a_run_with_corrupt_headers("cc_headers_guarded", None).await;
+    assert_eq!(state, "FAILED");
+}
+
+#[tokio::test]
+async fn a_workflow_retry_is_skipped_when_the_headers_cannot_decode() {
+    let policy = RetryPolicy {
+        max_attempts: 3,
+        initial_interval: Duration::from_millis(10),
+        backoff_coefficient: 1.0,
+        max_interval: Duration::from_millis(10),
+        non_retryable_errors: vec![],
+        jitter: JitterPolicy::None,
+    };
+    let (state, retries) =
+        fail_a_run_with_corrupt_headers("cc_headers_guarded_retry", Some(policy)).await;
+    assert_eq!(state, "FAILED");
+    assert_eq!(retries, 0, "no retry starts without the headers");
 }
 
 fn header_start_options() -> autumn_harvest::debounce::DebounceStartOptions {
     autumn_harvest::debounce::DebounceStartOptions {
         context_headers: Some(secret_headers()),
+        memo: Some(json!({"account": MEMO_SECRET})),
         ..Default::default()
     }
 }
@@ -3212,13 +3308,25 @@ async fn stored_start_options_headers(
     where_sql: &str,
     bind: &str,
 ) -> Value {
+    stored_start_option(conn, table, where_sql, bind, "context_headers").await
+}
+
+/// One key of a stored `start_options` object. The table, the filter and the
+/// key are constants of the calling test.
+async fn stored_start_option(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    where_sql: &str,
+    bind: &str,
+    key: &str,
+) -> Value {
     #[derive(diesel::QueryableByName)]
     struct Cell {
         #[diesel(sql_type = diesel::sql_types::Jsonb)]
         value: Value,
     }
     let cell: Cell = diesel::sql_query(format!(
-        "SELECT start_options -> 'context_headers' AS value FROM {table} WHERE {where_sql}"
+        "SELECT start_options -> '{key}' AS value FROM {table} WHERE {where_sql}"
     ))
     .bind::<diesel::sql_types::Text, _>(bind)
     .get_result(conn)
@@ -3265,6 +3373,15 @@ async fn buffered_start_headers_are_ciphertext_and_the_fire_starts_with_plaintex
     )
     .await;
     assert_ciphertext(&stored, HEADER_SECRET, "debounce start_options headers");
+    let memo = stored_start_option(
+        &mut conn,
+        "harvest_debounce",
+        "workflow_name = 'cc_hdr_debounce_wf' AND debounce_key = $1",
+        &key,
+        "memo",
+    )
+    .await;
+    assert_ciphertext(&memo, MEMO_SECRET, "debounce start_options memo");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     fire_due_debounced_starts_with_codecs(
@@ -3282,6 +3399,13 @@ async fn buffered_start_headers_are_ciphertext_and_the_fire_starts_with_plaintex
     assert_eq!(
         codecs.decode_column(&cell).expect("decode one layer"),
         json!({"x-tenant": HEADER_SECRET})
+    );
+    let run_memo = started.memo.expect("the run keeps the memo");
+    assert_ciphertext(&run_memo, MEMO_SECRET, "the started run memo");
+    assert_eq!(
+        codecs.decode_column(&run_memo).expect("decode one layer"),
+        json!({"account": MEMO_SECRET}),
+        "the memo decodes once, with no second layer"
     );
 }
 
@@ -3491,5 +3615,279 @@ async fn a_debounce_row_whose_headers_cannot_decode_moves_back_and_never_starts(
         .await,
         0,
         "no run starts without its headers"
+    );
+}
+
+/// A stored header envelope under a key that no registry holds.
+fn gone_key_envelope() -> Value {
+    json!({
+        autumn_harvest::payload_codec::CODEC_ENVELOPE_KEY:
+            {"codec_id": "aes-256-gcm", "kid": "cc-gone", "data": "AAAA"}
+    })
+}
+
+#[tokio::test]
+async fn a_batch_append_needs_no_key_for_the_headers() {
+    use autumn_harvest::event_batch::admit_batched_start_with_codecs;
+    let _serial = BATCH_FIRE_LOCK.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let name = format!("cc_hdr_append_{}", Uuid::new_v4().simple());
+
+    let mut first = batch_params(&name, &key, "cc-hdr-append-1", json!({"n": 1}), 10);
+    first.max_wait = Duration::from_secs(3600);
+    first.start_options = header_start_options();
+    admit_batched_start_with_codecs(&mut conn, first, None, &codecs)
+        .await
+        .expect("admit")
+        .expect("admitted");
+    diesel::sql_query(
+        "UPDATE harvest_event_batches \
+         SET start_options = jsonb_set(start_options, '{context_headers}', $2) \
+         WHERE batch_key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&key)
+    .bind::<diesel::sql_types::Jsonb, _>(&gone_key_envelope())
+    .execute(&mut conn)
+    .await
+    .expect("corrupt the headers");
+
+    // An admission that only appends never reads the headers.
+    let mut second = batch_params(&name, &key, "cc-hdr-append-2", json!({"n": 2}), 10);
+    second.max_wait = Duration::from_secs(3600);
+    second.start_options = header_start_options();
+    admit_batched_start_with_codecs(&mut conn, second, None, &codecs)
+        .await
+        .expect("a later admission still appends")
+        .expect("admitted");
+    assert_eq!(batch_cells(&mut conn, &key).await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_batch_row_that_cannot_decode_does_not_hold_up_the_next_due_row() {
+    use autumn_harvest::event_batch::{
+        admit_batched_start_with_codecs, fire_due_event_batches_with_codecs,
+    };
+    let _serial = BATCH_FIRE_LOCK.lock().await;
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let bad_name = format!("cc_hdr_bad_{}", Uuid::new_v4().simple());
+    let good_name = format!("cc_hdr_good_{}", Uuid::new_v4().simple());
+    let bad_key = format!("k-{}", Uuid::new_v4().simple());
+    let good_key = format!("k-{}", Uuid::new_v4().simple());
+    for (name, key, workflow_id) in [
+        (&bad_name, &bad_key, "cc-hdr-bad"),
+        (&good_name, &good_key, "cc-hdr-good"),
+    ] {
+        let mut params = batch_params(name, key, workflow_id, json!({}), 10);
+        params.start_options = header_start_options();
+        admit_batched_start_with_codecs(&mut conn, params, None, &codecs)
+            .await
+            .expect("admit")
+            .expect("admitted");
+    }
+    // The bad row is due first. Its headers name a key that no registry holds.
+    diesel::sql_query(
+        "UPDATE harvest_event_batches \
+         SET start_options = jsonb_set(start_options, '{context_headers}', $2), \
+             fire_at = now() - interval '2 minutes' \
+         WHERE batch_key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&bad_key)
+    .bind::<diesel::sql_types::Jsonb, _>(&gone_key_envelope())
+    .execute(&mut conn)
+    .await
+    .expect("corrupt the first row");
+    diesel::sql_query(
+        "UPDATE harvest_event_batches SET fire_at = now() - interval '1 minute' \
+         WHERE batch_key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&good_key)
+    .execute(&mut conn)
+    .await
+    .expect("make the second row due");
+
+    fire_due_event_batches_with_codecs(
+        &mut conn,
+        &None,
+        &[],
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &codecs,
+    )
+    .await
+    .expect("a bad row never fails the scan");
+
+    started_execution(&mut conn, &good_name, "cc-hdr-good").await;
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
+             WHERE workflow_name = $1",
+            &bad_name,
+        )
+        .await,
+        0,
+        "the bad row starts nothing"
+    );
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_event_batches \
+             WHERE batch_key = $1 AND fire_at > now() + interval '10 seconds'",
+            &bad_key,
+        )
+        .await,
+        1,
+        "the bad row moves back and stays"
+    );
+}
+
+#[tokio::test]
+async fn a_throttle_row_whose_headers_cannot_decode_moves_back_and_never_starts() {
+    use autumn_harvest::throttle::{
+        AdmitThrottleParams, ThrottleAdmission, fire_due_throttled_starts_with_codecs,
+        reserve_or_defer_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let key = format!("k-{}", Uuid::new_v4().simple());
+    let name = format!("cc_hdr_tstuck_{}", Uuid::new_v4().simple());
+    let workflow_id = format!("cc-hdr-tstuck-{key}");
+    let mut defer = async |id: &str| {
+        reserve_or_defer_with_codecs(
+            &mut conn,
+            AdmitThrottleParams {
+                workflow_name: &name,
+                throttle_key: &key,
+                workflow_id: id,
+                queue_name: "default",
+                input: json!({}),
+                start_options: header_start_options(),
+                refill_per_sec: 0.001,
+                burst: 1.0,
+                schedule_to_start: None,
+                shard_id: 0,
+            },
+            &codecs,
+        )
+        .await
+        .expect("admit")
+    };
+    assert!(matches!(
+        defer("cc-hdr-tstuck-first").await,
+        ThrottleAdmission::Reserved { .. }
+    ));
+    assert!(matches!(
+        defer(&workflow_id).await,
+        ThrottleAdmission::Deferred(_)
+    ));
+    // Admission encodes the input too. Put it back in clear, so only the
+    // headers and the memo can fail the decode.
+    diesel::sql_query(
+        "UPDATE harvest_start_throttle SET input = '{}'::jsonb WHERE workflow_id = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&workflow_id)
+    .execute(&mut conn)
+    .await
+    .expect("clear the input");
+    diesel::sql_query(
+        "UPDATE harvest_rate_limit_buckets SET tokens = 5, last_refilled_at = NOW() \
+         WHERE key IN (SELECT bucket_key FROM harvest_start_throttle WHERE workflow_id = $1)",
+    )
+    .bind::<diesel::sql_types::Text, _>(&workflow_id)
+    .execute(&mut conn)
+    .await
+    .expect("refill the bucket");
+    autumn_harvest::admission_gate::set_global_admission_gate_cache(None);
+
+    fire_due_throttled_starts_with_codecs(
+        &mut conn,
+        &None,
+        &[],
+        &autumn_harvest::telemetry::NoOpMetrics,
+        &reader_without_the_key(),
+    )
+    .await
+    .expect("a bad row never fails the scan");
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_start_throttle \
+             WHERE workflow_id = $1 AND deferred_at > now() + interval '10 seconds'",
+            &workflow_id,
+        )
+        .await,
+        1,
+        "the row moves back and stays"
+    );
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
+             WHERE workflow_name = $1",
+            &name,
+        )
+        .await,
+        0,
+        "no run starts without its headers"
+    );
+}
+
+#[tokio::test]
+async fn a_rerun_keeps_the_headers_one_layer_deep_and_fails_on_a_cell_it_cannot_read() {
+    use autumn_harvest::execution::{RerunRequest, rerun_workflow_execution_with_codecs};
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let source = start_with_headers(&mut conn, &codecs, "cc_headers_rerun", "default", None).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = now() \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(source.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("fail the source");
+    let request = || RerunRequest {
+        input_override: None,
+        workflow_id_override: None,
+        started_by: None,
+        concurrency_key: None,
+        concurrency_limit: None,
+        concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+        max_workflow_input_bytes: 0,
+        max_execution_timeout_ceiling: None,
+        max_workflow_chain_timeout_ceiling: None,
+        max_workflow_attempts_ceiling: None,
+        trace_context: None,
+    };
+
+    // A registry without the key cannot clone the headers. The rerun fails.
+    let refused = rerun_workflow_execution_with_codecs(
+        &mut conn,
+        source,
+        request(),
+        None,
+        &reader_without_the_key(),
+    )
+    .await;
+    assert!(refused.is_err(), "a rerun never drops the headers");
+
+    let outcome = rerun_workflow_execution_with_codecs(&mut conn, source, request(), None, &codecs)
+        .await
+        .expect("rerun");
+    let cell = load_execution(&mut conn, outcome.exec_id.as_uuid())
+        .await
+        .context_headers
+        .expect("the rerun keeps the headers");
+    assert_ciphertext(&cell, HEADER_SECRET, "the rerun headers");
+    assert_eq!(
+        codecs.decode_column(&cell).expect("decode one layer"),
+        json!({"x-tenant": HEADER_SECRET}),
+        "the rerun cell decodes once, with no second layer"
     );
 }

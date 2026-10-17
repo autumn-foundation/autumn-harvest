@@ -118,11 +118,15 @@ pub struct CodecColumn {
 
 /// Where the envelopes sit inside one codec-column cell (issue #2043).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CellShape {
     /// One envelope at the cell root.
     Cell,
     /// A JSON array. Each element is its own envelope or a clear value.
     Elements,
+    /// A JSON object. One key holds the envelope, and the other keys are
+    /// configuration. The start options of a buffered start use this shape.
+    Field(&'static str),
 }
 
 impl CodecColumn {
@@ -299,6 +303,48 @@ pub const CODEC_COLUMNS: &[CodecColumn] = &[
         shape: CellShape::Cell,
     },
     CodecColumn {
+        table: "harvest_debounce",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("context_headers"),
+    },
+    CodecColumn {
+        table: "harvest_debounce",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("memo"),
+    },
+    CodecColumn {
+        table: "harvest_start_throttle",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("context_headers"),
+    },
+    CodecColumn {
+        table: "harvest_start_throttle",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("memo"),
+    },
+    CodecColumn {
+        table: "harvest_event_batches",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("context_headers"),
+    },
+    CodecColumn {
+        table: "harvest_event_batches",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("memo"),
+    },
+    CodecColumn {
         table: "harvest_workflow_executions",
         id_column: "id",
         column: "context_headers",
@@ -405,7 +451,8 @@ pub fn reencrypt_column_value_under(
 /// For [`CellShape::Elements`], each envelope element moves to the target key
 /// and a clear element stays as it is. The result is the whole new array. An
 /// element that does not decode fails the cell, so the sweep never writes a
-/// half-converted buffer.
+/// half-converted buffer. For [`CellShape::Field`], only the named key moves.
+/// The other keys stay as they are.
 ///
 /// # Errors
 ///
@@ -437,6 +484,22 @@ pub fn reencrypt_column_cell_under(
                 }
             }
             Ok(changed.then_some(Value::Array(converted)))
+        }
+        CellShape::Field(key) => {
+            if !codecs.has_keyed_codecs() {
+                return Ok(None);
+            }
+            let Some(field) = value.get(key) else {
+                return Ok(None);
+            };
+            match reencrypt_field_under(codecs, target_key_id, field)? {
+                FieldStep::Reencrypted(candidate) => {
+                    let mut converted = value.clone();
+                    converted[key] = candidate;
+                    Ok(Some(converted))
+                }
+                _ => Ok(None),
+            }
         }
     }
 }
@@ -772,6 +835,11 @@ mod db {
                 "CROSS JOIN LATERAL (SELECT t.{}) AS f(value)",
                 column.column
             ),
+            // The key is a compile-time constant of `CODEC_COLUMNS`.
+            CellShape::Field(key) => format!(
+                "CROSS JOIN LATERAL (SELECT t.{col} -> '{key}') AS f(value)",
+                col = column.column,
+            ),
             CellShape::Elements => format!(
                 "CROSS JOIN LATERAL jsonb_array_elements( \
                      CASE WHEN jsonb_typeof(t.{col}) = 'array' THEN t.{col} ELSE '[]'::jsonb END \
@@ -947,7 +1015,7 @@ mod db {
         for column in CODEC_COLUMNS {
             // A buffer row counts once per key, not once per element.
             let count = match column.shape {
-                CellShape::Cell => "COUNT(*)".to_string(),
+                CellShape::Cell | CellShape::Field(_) => "COUNT(*)".to_string(),
                 CellShape::Elements => format!("COUNT(DISTINCT t.{})", column.id_column),
             };
             sources.push(format!(
@@ -1481,7 +1549,7 @@ mod db {
             // The identifiers come from the compile-time `CODEC_COLUMNS` list.
             // A buffer row with several pending elements matches once per element.
             let distinct = match column.shape {
-                CellShape::Cell => "",
+                CellShape::Cell | CellShape::Field(_) => "",
                 CellShape::Elements => "DISTINCT ",
             };
             let sql = format!(
@@ -3684,6 +3752,7 @@ mod tests {
             "admit_batched_start(",
             "fire_due_event_batches(",
             "enforce_completion_triggers_outbox(",
+            "rerun_workflow_execution(",
         ];
         // No engine call may use a plain variant (issue #2043). A pinned
         // count here could only go down.

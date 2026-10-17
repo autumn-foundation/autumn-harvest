@@ -241,5 +241,5 @@ drift. A header map that does not decode fails the run, and it never means
 no headers. An export decodes headers only for a caller who may decode. The
 archive leaves an encoded header map out.
 
-**What stays clear.** Only configuration and identifiers. The coverage table
+**What stays clear.** Configuration and identifiers only. The coverage table
 gives the reason for each clear column.

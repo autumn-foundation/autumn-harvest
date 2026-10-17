@@ -1425,7 +1425,8 @@ payload copies. The engine encodes them too.
 - The context headers of an execution and of an activity row are one envelope
   each. The start path, a retry, a rerun, the workflow worker and the activity
   worker decode them. The start options of a debounce, throttle or batch row
-  hold the headers as an envelope too.
+  hold the headers and the memo as an envelope too. The rotation census and
+  sweep cover those two keys.
 
 A value that does not decode never starts work without it:
 
@@ -1517,11 +1518,11 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_completion_trigger_outbox.priority` | Clear | Scheduling, not payload. |
 | `harvest_cross_shard_children.child_spec` | Covered | The whole spec is one envelope. It holds the child input and its headers. The relay decodes it before it starts the child. Erasure replaces an encoded cell with a tombstone and needs no key. |
 | `harvest_debounce.last_input` | Covered | The buffered start input. The fire path decodes it before the start. |
-| `harvest_debounce.start_options` | Clear | Start configuration, not payload. |
+| `harvest_debounce.start_options` | Covered | The `context_headers` and `memo` keys each hold an envelope. The other keys are start configuration. The fire path decodes both keys before the start. |
 | `harvest_start_throttle.input` | Covered | The deferred start input. The fire path decodes it before the start. |
-| `harvest_start_throttle.start_options` | Clear | Start configuration, not payload. |
+| `harvest_start_throttle.start_options` | Covered | The `context_headers` and `memo` keys each hold an envelope. The other keys are start configuration. The fire path decodes both keys before the start. |
 | `harvest_event_batches.buffered_payloads` | Covered | One envelope for each buffered input. The SQL append and the element count still work. The fire path and the immediate flush decode each element before the start. |
-| `harvest_event_batches.start_options` | Clear | Start configuration, not payload. |
+| `harvest_event_batches.start_options` | Covered | The `context_headers` and `memo` keys each hold an envelope. The other keys are start configuration. The fire path decodes both keys before the start. |
 | `harvest_completion_deliveries.event_filter` | Clear | Callback configuration, not payload. |
 | `harvest_completion_deliveries.payload` | Covered | The webhook body. The scanner decodes it before it signs and sends the body. |
 | `harvest_completion_deliveries.retry_policy` | Clear | Callback configuration, not payload. |

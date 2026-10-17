@@ -3757,6 +3757,8 @@ const COLUMN_BATCH_BUFFER: &str = "column-batch-buffer";
 const COLUMN_CHILD_SPEC: &str = "column-child-spec";
 const COLUMN_SCHEDULE: &str = "column-schedule";
 const COLUMN_EXEC_HEADERS: &str = "column-exec-headers";
+const COLUMN_START_HEADERS: &str = "column-start-headers";
+const COLUMN_START_MEMO: &str = "column-start-memo";
 const COLUMN_TASK_HEADERS: &str = "column-task-headers";
 
 /// The cells one [`seed_codec_columns`] call writes. A workflow task row and
@@ -3764,7 +3766,7 @@ const COLUMN_TASK_HEADERS: &str = "column-task-headers";
 /// also holds a heartbeat. The event batch buffer holds one element, and the
 /// census counts its row once. Every other swept column holds one cell.
 /// `the_seed_covers_every_codec_column` pins this to `CODEC_COLUMNS`.
-const CELLS_PER_SEED: usize = 21;
+const CELLS_PER_SEED: usize = 27;
 
 /// Write one envelope under `key_id` into every swept codec column.
 async fn seed_codec_columns(
@@ -3850,6 +3852,15 @@ async fn seed_short_lived_columns(
 ) {
     use diesel::sql_types::{Jsonb, Text, Uuid as SqlUuid};
     let cell = |plain: &str| encode_under(codecs, key_id, &json!(plain));
+    // The start options of a buffered start. Two keys hold an envelope, and
+    // the third is configuration that the sweep must leave as it is.
+    let start_options = || {
+        json!({
+            "context_headers": cell(COLUMN_START_HEADERS),
+            "memo": cell(COLUMN_START_MEMO),
+            "reuse_policy": "reject_duplicate",
+        })
+    };
 
     diesel::sql_query(
         "INSERT INTO harvest_task_queue \
@@ -3885,11 +3896,12 @@ async fn seed_short_lived_columns(
         "INSERT INTO harvest_debounce \
          (id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, \
           effective_fire_at, max_fire_at) \
-         VALUES ($1, 'column_rotation', $2, 'wf', 'default', $3, '{}'::jsonb, now(), now())",
+         VALUES ($1, 'column_rotation', $2, 'wf', 'default', $3, $4, now(), now())",
     )
     .bind::<SqlUuid, _>(Uuid::new_v4())
     .bind::<Text, _>(Uuid::new_v4().to_string())
     .bind::<Jsonb, _>(cell(COLUMN_DEBOUNCE))
+    .bind::<Jsonb, _>(start_options())
     .execute(conn)
     .await
     .expect("insert debounce row");
@@ -3898,12 +3910,13 @@ async fn seed_short_lived_columns(
         "INSERT INTO harvest_start_throttle \
          (id, workflow_name, throttle_key, bucket_key, workflow_id, queue_name, input, \
           start_options) \
-         VALUES ($1, 'column_rotation', $2, 'bucket', $3, 'default', $4, '{}'::jsonb)",
+         VALUES ($1, 'column_rotation', $2, 'bucket', $3, 'default', $4, $5)",
     )
     .bind::<SqlUuid, _>(Uuid::new_v4())
     .bind::<Text, _>(Uuid::new_v4().to_string())
     .bind::<Text, _>(Uuid::new_v4().to_string())
     .bind::<Jsonb, _>(cell(COLUMN_THROTTLE))
+    .bind::<Jsonb, _>(start_options())
     .execute(conn)
     .await
     .expect("insert throttle row");
@@ -3933,7 +3946,7 @@ async fn seed_short_lived_columns(
     .await
     .expect("insert batch job");
 
-    insert_batch_buffer(conn, &[cell(COLUMN_BATCH_BUFFER)]).await;
+    insert_batch_buffer(conn, &[cell(COLUMN_BATCH_BUFFER)], &start_options()).await;
 
     diesel::sql_query(
         "INSERT INTO harvest_cross_shard_children \
@@ -3960,18 +3973,23 @@ async fn seed_short_lived_columns(
 }
 
 /// Insert one event batch row that buffers `elements` (issue #2043).
-async fn insert_batch_buffer(conn: &mut AsyncPgConnection, elements: &[Value]) {
+async fn insert_batch_buffer(
+    conn: &mut AsyncPgConnection,
+    elements: &[Value],
+    start_options: &Value,
+) {
     use diesel::sql_types::{Jsonb, Text, Uuid as SqlUuid};
     diesel::sql_query(
         "INSERT INTO harvest_event_batches \
          (id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, \
           start_options, fire_at, max_size, shard_id, created_at, updated_at) \
-         VALUES ($1, 'column_rotation', $2, 'wf', 'default', $3, '{}'::jsonb, \
+         VALUES ($1, 'column_rotation', $2, 'wf', 'default', $3, $4, \
                  now() + interval '1 day', 100, 0, now(), now())",
     )
     .bind::<SqlUuid, _>(Uuid::new_v4())
     .bind::<Text, _>(Uuid::new_v4().to_string())
     .bind::<Jsonb, _>(Value::Array(elements.to_vec()))
+    .bind::<Jsonb, _>(start_options.clone())
     .execute(conn)
     .await
     .expect("insert batch buffer");
@@ -4022,6 +4040,18 @@ async fn codec_cells(conn: &mut AsyncPgConnection) -> Vec<(String, Value)> {
              FROM harvest_workflow_executions WHERE context_headers IS NOT NULL \
            UNION ALL SELECT 19, id::TEXT, 'task_headers', context_headers \
              FROM harvest_task_queue WHERE context_headers IS NOT NULL \
+           UNION ALL SELECT 20, id::TEXT, 'debounce_headers', start_options -> 'context_headers' \
+             FROM harvest_debounce \
+           UNION ALL SELECT 21, id::TEXT, 'debounce_memo', start_options -> 'memo' \
+             FROM harvest_debounce \
+           UNION ALL SELECT 22, id::TEXT, 'throttle_headers', start_options -> 'context_headers' \
+             FROM harvest_start_throttle \
+           UNION ALL SELECT 23, id::TEXT, 'throttle_memo', start_options -> 'memo' \
+             FROM harvest_start_throttle \
+           UNION ALL SELECT 24, id::TEXT, 'batch_headers', start_options -> 'context_headers' \
+             FROM harvest_event_batches \
+           UNION ALL SELECT 25, id::TEXT, 'batch_memo', start_options -> 'memo' \
+             FROM harvest_event_batches \
          ) c ORDER BY ord, row_id",
     )
     .load(conn)
@@ -4335,8 +4365,6 @@ async fn the_column_sweep_converts_activity_task_rows() {
     assert_eq!(by_key.get("k1").copied().unwrap_or(0), 0);
 }
 
-/// The seed must reach every swept column. A new `CODEC_COLUMNS` entry then
-/// fails here until the seed, and so the sweep tests, cover it.
 /// One batch row holds several elements, each under its own key. The census
 /// counts the row once per key, and the sweep converts every envelope element
 /// in one swap. A clear element stays clear (issue #2043).
@@ -4350,7 +4378,7 @@ async fn the_sweep_re_encrypts_each_element_of_a_batch_buffer() {
         encode_under(&codecs, "k1", &json!("buffer-b")),
         json!("buffer-clear"),
     ];
-    insert_batch_buffer(&mut conn, &elements).await;
+    insert_batch_buffer(&mut conn, &elements, &json!({})).await;
 
     let by_key = autumn_harvest::codec_rotation::count_rows_by_key_id(&mut conn)
         .await
@@ -4398,6 +4426,7 @@ async fn an_undecodable_batch_element_blocks_completion() {
     insert_batch_buffer(
         &mut conn,
         &[encode_under(&codecs, "k1", &json!("buffer-a")), orphan],
+        &json!({}),
     )
     .await;
     codecs.set_active_key("k2").expect("flip");
@@ -4416,6 +4445,67 @@ async fn an_undecodable_batch_element_blocks_completion() {
     );
 }
 
+/// The start options of a debounce, throttle or batch row hold two payload
+/// keys. The sweep moves both to the active key and leaves the configuration
+/// keys as they are (issue #2043).
+#[tokio::test]
+async fn the_sweep_re_encrypts_the_payload_keys_of_start_options_and_nothing_else() {
+    #[derive(diesel::QueryableByName)]
+    struct Options {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        value: Value,
+    }
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_aead_key_registry();
+    seed_codec_columns(&mut conn, &codecs, "k1").await;
+    codecs.set_active_key("k2").expect("flip");
+
+    for _ in 0..24 {
+        let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("sweep");
+        if rewritten == 0 {
+            break;
+        }
+    }
+    for table in [
+        "harvest_debounce",
+        "harvest_start_throttle",
+        "harvest_event_batches",
+    ] {
+        let options: Options = diesel::sql_query(format!(
+            "SELECT start_options AS value FROM {table} WHERE workflow_name = 'column_rotation'"
+        ))
+        .get_result(&mut conn)
+        .await
+        .expect("load start options");
+        for (key, plain) in [
+            ("context_headers", COLUMN_START_HEADERS),
+            ("memo", COLUMN_START_MEMO),
+        ] {
+            let cell = &options.value[key];
+            assert_eq!(
+                autumn_harvest::payload_codec::codec_envelope_key_id(cell),
+                Some("k2"),
+                "{table}.{key} is on the active key"
+            );
+            assert_eq!(codecs.decode_column(cell).expect("decode"), json!(plain));
+        }
+        assert_eq!(
+            options.value["reuse_policy"],
+            json!("reject_duplicate"),
+            "{table}: the sweep leaves a configuration key as it is"
+        );
+    }
+    let by_key = autumn_harvest::codec_rotation::count_rows_by_key_id(&mut conn)
+        .await
+        .expect("census");
+    assert_eq!(by_key.get("k1").copied().unwrap_or(0), 0);
+}
+
+/// The seed must reach every swept column. A new `CODEC_COLUMNS` entry then
+/// fails here until the seed, and so the sweep tests, cover it.
 #[tokio::test]
 async fn the_seed_covers_every_codec_column() {
     #[derive(diesel::QueryableByName)]
@@ -4429,10 +4519,15 @@ async fn the_seed_covers_every_codec_column() {
     seed_codec_columns(&mut conn, &codecs, "k1").await;
     for column in autumn_harvest::codec_rotation::CODEC_COLUMNS {
         // The identifiers come from the compile-time `CODEC_COLUMNS` list.
+        let present = match column.shape() {
+            autumn_harvest::codec_rotation::CellShape::Field(key) => {
+                format!("t.{} -> '{key}' IS NOT NULL", column.column())
+            }
+            _ => format!("t.{} IS NOT NULL", column.column()),
+        };
         let sql = format!(
-            "SELECT COUNT(*)::BIGINT AS n FROM {table} t WHERE {rows} AND t.{col} IS NOT NULL",
+            "SELECT COUNT(*)::BIGINT AS n FROM {table} t WHERE {rows} AND {present}",
             table = column.table(),
-            col = column.column(),
             rows = column.rows(),
         );
         let count: Count = diesel::sql_query(sql)

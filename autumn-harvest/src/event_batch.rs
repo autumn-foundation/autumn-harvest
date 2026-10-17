@@ -260,10 +260,42 @@ pub async fn admit_batched_start_with_codecs(
                 .await
                 .map_err(crate::error::database_error)?;
 
-            let opts: DebounceStartOptions = serde_json::from_value(
-                crate::debounce::decode_stored_start_options(codecs, row.start_options.clone())?,
-            )
-            .unwrap_or_default();
+            // Only a flush reads the payload keys and the buffered elements.
+            // An admission that only appends needs no key (issue #2043). A flush
+            // that does not decode stays buffered, and the scanner then moves
+            // the row back.
+            let flush_inputs = if row.current_size >= row.max_size {
+                let decoded = crate::debounce::decode_stored_start_options(
+                    codecs,
+                    row.start_options.clone(),
+                )
+                .and_then(|options| {
+                    let payloads = row
+                        .buffered_payloads
+                        .as_ref()
+                        .map(|stored| decode_buffered_payloads(codecs, stored))
+                        .transpose()?;
+                    Ok((options, payloads))
+                });
+                match decoded {
+                    Ok(inputs) => Some(inputs),
+                    Err(error) => {
+                        tracing::warn!(
+                            batch_id = %row.id,
+                            error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                            "batch flush skipped: a payload or header could not be decoded"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let opts_json = flush_inputs.as_ref().map_or_else(
+                || crate::debounce::without_payload_start_options(row.start_options.clone()),
+                |(options, _)| options.clone(),
+            );
+            let opts: DebounceStartOptions = serde_json::from_value(opts_json).unwrap_or_default();
 
             let max_allowed_bytes = opts.max_workflow_input_bytes.unwrap_or(10 * 1024 * 1024);
             if u64::from(row.buffered_bytes.cast_unsigned()) > max_allowed_bytes {
@@ -276,9 +308,9 @@ pub async fn admit_batched_start_with_codecs(
                 });
             }
 
-            let is_flushed = row.current_size >= row.max_size;
+            let is_flushed = flush_inputs.is_some();
             let (flushed_execution_id, pending_deferred, deferred_checks, cancel_metrics) =
-                if is_flushed {
+                if let Some((_, buffered_payloads)) = flush_inputs {
                     let exec_id =
                         ExecutionId::new_for_shard(crate::types::ShardId::new(row.shard_id));
                     let crate::debounce::DeferredAdmissionFields {
@@ -312,11 +344,6 @@ pub async fn admit_batched_start_with_codecs(
                     // mirrors `harvest_event_batches`' own
                     // first-admission-wins rule for every other captured
                     // start option.
-                    let buffered_payloads = row
-                        .buffered_payloads
-                        .as_ref()
-                        .map(|stored| decode_buffered_payloads(codecs, stored))
-                        .transpose()?;
                     let quota_key_input_override: Option<serde_json::Value> = buffered_payloads
                         .as_ref()
                         .and_then(|v| v.as_array())
@@ -561,6 +588,9 @@ async fn fire_due_on_conn(
         "
     };
 
+    // Set when a row that does not decode moves back. The scan then goes on to
+    // the next due row, so a bad row cannot hold up a healthy one (issue #2043).
+    let moved_back = std::sync::atomic::AtomicBool::new(false);
     loop {
         let now = Utc::now();
         let processed: Option<(
@@ -587,7 +617,7 @@ async fn fire_due_on_conn(
             };
 
             if let Some(row) = due_rows.into_iter().next() {
-                match fire_claimed_batch_row(conn, row, metrics, codecs).await {
+                match fire_claimed_batch_row(conn, row, metrics, codecs, &moved_back).await {
                     Ok(Some((exec_id, deferred, checks, cancel_metrics))) => {
                         Ok(Some((exec_id, deferred, checks, cancel_metrics)))
                     }
@@ -619,6 +649,8 @@ async fn fire_due_on_conn(
                 );
                 crate::execution::emit_start_cancel_metrics(m, &cancel_metrics);
             }
+        } else if moved_back.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            continue;
         } else {
             break;
         }
@@ -633,6 +665,7 @@ async fn fire_claimed_batch_row(
     row: FireDueBatchRow,
     metrics: Option<&(dyn crate::telemetry::MetricsRecorder + Send + Sync)>,
     codecs: &crate::payload_codec::PayloadCodecs,
+    moved_back: &std::sync::atomic::AtomicBool,
 ) -> HarvestResult<
     Option<(
         String,
@@ -660,6 +693,7 @@ async fn fire_claimed_batch_row(
                 "batch payload or headers could not be decoded; the row moves back"
             );
             redefer_event_batch_row(conn, row.id, Utc::now() + UNDECODABLE_REDEFER_BACKOFF).await?;
+            moved_back.store(true, std::sync::atomic::Ordering::SeqCst);
             return Ok(None);
         }
     };

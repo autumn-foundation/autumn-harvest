@@ -1338,8 +1338,11 @@ async fn start_child_on_target(
 
     // A spec that does not decode never starts a child. The error leaves the
     // row pending, so a restored key lets it start (issue #2043).
+    // The error text names no value, because the value is plaintext.
     let spec: CrossShardChildSpec = serde_json::from_value(codecs.decode_column(&row.child_spec)?)
-        .map_err(HarvestError::Serialization)?;
+        .map_err(|_| {
+            HarvestError::Config("the stored child spec is not a valid spec".to_string())
+        })?;
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
     let parent_exec_id = ExecutionId::from_uuid(row.parent_exec_id);
     let child_workflow_id = child_exec_id.to_string();

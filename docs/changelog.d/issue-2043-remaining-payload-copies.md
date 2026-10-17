@@ -9,8 +9,8 @@ encodes them. No payload column stays clear now.
   - `harvest_cross_shard_children.child_spec`. The whole spec is one envelope.
   - `harvest_schedules.workflow_input`.
   - `context_headers` on `harvest_workflow_executions` and
-    `harvest_task_queue`, and the headers inside the start options of the
-    debounce, throttle and batch rows.
+    `harvest_task_queue`, and the `context_headers` and `memo` keys inside the
+    `start_options` of the debounce, throttle and batch rows.
 - **Readers first.** This release always decodes these columns. Turn column
   encoding on only after every worker and every API node runs this release.
 - **Engine reads.** These paths decode first:
@@ -29,20 +29,25 @@ encodes them. No payload column stays clear now.
   encodes a new input and keeps a stored one.
 - **Exports.** An export includes the headers only for a caller who may decode.
   The retention archive never decodes, so it leaves an encoded header map out
-  of the archived document. Plaintext headers never reach cold storage.
+  of the archived document. Plaintext headers never reach cold storage. A
+  header-branching workflow that you replay from the archive sees no headers.
+- **Rows from before the upgrade.** The sweep re-keys envelopes only. A header
+  map, a child spec or a buffered element stored in clear stays in clear. A
+  clear schedule input becomes an envelope at the next registration.
 - **Erasure.** Erasure replaces an encoded cross-shard child spec with a
   tombstone. It needs no key.
 - **Rotation.** `codec_rotation::CODEC_COLUMNS` lists each new column, with a
   cell shape. The census counts a buffer row once for each key. One swap
-  converts every envelope element of a buffer.
+  converts every envelope element of a buffer. A `Field` shape converts one key
+  of a start options object and leaves the other keys as they are.
 - **New APIs.**
   - `PayloadCodecs::encode_headers`, `decode_headers` and `decode_headers_opt`.
   - `register_workflow_schedules_with_codecs`,
-    `scheduler::update_workflow_schedule_with_codecs` and
-    `scheduler::register_workflow_schedules_for_shard_with_codecs`.
+    and `scheduler::update_workflow_schedule_with_codecs`.
   - `cross_shard_child::record_cross_shard_child_with_codecs`.
   - `history_export::export_headers`.
-  - `codec_rotation::CellShape` and `reencrypt_column_cell_under`.
+  - `codec_rotation::CellShape` (`#[non_exhaustive]`), `CodecColumn::shape` and
+    `reencrypt_column_cell_under`.
 - **Breaking.**
   - With column encoding on, the schedule API and the UI show the stored
     envelope for a schedule input.
