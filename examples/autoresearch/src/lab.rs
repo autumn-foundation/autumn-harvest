@@ -22,7 +22,7 @@ use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 
-use crate::results::{HEADER, ResultRow, short};
+use crate::results::{HEADER, ResultRow};
 
 /// The file that the agent edits.
 pub const TRAIN: &str = "train.py";
@@ -653,16 +653,44 @@ impl Lab {
 
     /// The newest kept row of `commit`, a full id or its short form.
     ///
+    /// A row names its commit by a prefix: the first 7 hex digits, as
+    /// upstream. When another commit in the lab has that prefix too, the row
+    /// cannot tell the two apart. The lookup then fails, so it never gives
+    /// the score of the wrong commit.
+    ///
     /// # Errors
     ///
-    /// Returns an error when `results.tsv` cannot be read.
+    /// Returns an error when `results.tsv` cannot be read, git fails, or
+    /// the prefix of the row names more than one commit.
     pub fn kept(&self, commit: &str) -> Result<Option<ResultRow>, String> {
-        let commit = short(commit);
-        Ok(self
-            .rows()?
-            .into_iter()
-            .rev()
-            .find(|row| row.status == crate::rules::Status::Keep && row.commit == commit))
+        let Some(row) = self.rows()?.into_iter().rev().find(|row| {
+            row.status == crate::rules::Status::Keep
+                && row.commit.len() >= 4
+                && commit.starts_with(&row.commit)
+        }) else {
+            return Ok(None);
+        };
+        let named = self.commits_named(&row.commit)?;
+        if named > 1 {
+            return Err(format!(
+                "{named} commits have the id {}, so results.tsv cannot tell their rows apart",
+                row.commit
+            ));
+        }
+        Ok(Some(row))
+    }
+
+    /// The number of commits in the object store whose id starts with
+    /// `prefix`, which has 4 or more hex digits.
+    fn commits_named(&self, prefix: &str) -> Result<usize, String> {
+        let objects = self.git(&["rev-parse", &format!("--disambiguate={prefix}")])?;
+        let mut commits = 0;
+        for id in objects.lines() {
+            if self.git(&["cat-file", "-t", id])? == "commit" {
+                commits += 1;
+            }
+        }
+        Ok(commits)
     }
 }
 
@@ -1158,15 +1186,11 @@ mod tests {
         assert_eq!(lab.kept(&short(&head)).unwrap(), Some(row(&short(&head))));
     }
 
-    /// Two commits whose ids share a prefix: one on the branch, one not.
-    /// Git cannot resolve the prefix. The branch can.
-    #[test]
-    fn a_short_id_names_one_commit_of_the_branch() {
-        let (dir, lab) = lab();
-        lab.start_branch("t1", "s1").unwrap();
+    /// Two commits on `HEAD` whose ids share their first 4 hex digits.
+    fn colliding(dir: &Path, lab: &Lab) -> (String, String) {
         let base = lab.head().unwrap();
         let tree = lab.git(&["rev-parse", "HEAD:"]).unwrap();
-        let objects = dir.path().join("objects");
+        let objects = dir.join("objects");
         std::fs::create_dir(&objects).unwrap();
         let paths: Vec<String> = (0..2000)
             .map(|n| {
@@ -1183,13 +1207,22 @@ mod tests {
         args.extend(paths.iter().map(String::as_str));
         let ids = lab.git(&args).unwrap();
         let mut seen = std::collections::HashMap::new();
-        let (on, off) = ids
-            .lines()
+        ids.lines()
             .find_map(|id| {
                 seen.insert(&id[..4], id)
                     .map(|other| (id.to_string(), other.to_string()))
             })
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Two commits whose ids share a prefix: one on the branch, one not.
+    /// Git cannot resolve the prefix. The branch can.
+    #[test]
+    fn a_short_id_names_one_commit_of_the_branch() {
+        let (dir, lab) = lab();
+        lab.start_branch("t1", "s1").unwrap();
+        let base = lab.head().unwrap();
+        let (on, off) = colliding(dir.path(), &lab);
         lab.git(&["reset", "--quiet", "--hard", &on]).unwrap();
         let prefix = &on[..4];
         assert!(
@@ -1203,5 +1236,23 @@ mod tests {
         assert!(lab.on_branch(&short(&off)).is_err(), "not on the branch");
         assert!(lab.on_branch("ab").is_err(), "too short");
         assert!(lab.on_branch("HEAD~1").is_err(), "not hex");
+    }
+
+    /// A row names its commit by a prefix. When two commits share it, the
+    /// row cannot tell them apart, so the lookup fails. It never gives the
+    /// score of the wrong commit.
+    #[test]
+    fn kept_refuses_a_row_whose_id_names_two_commits() {
+        let (dir, lab) = lab();
+        lab.start_branch("t1", "s1").unwrap();
+        let (on, _off) = colliding(dir.path(), &lab);
+        lab.git(&["reset", "--quiet", "--hard", &on]).unwrap();
+        lab.record(&row(&on[..4]), "k1").unwrap();
+        assert!(
+            lab.kept(&on).is_err(),
+            "two commits share the id of the row"
+        );
+        lab.record(&row(&short(&on)), "k2").unwrap();
+        assert_eq!(lab.kept(&on).unwrap(), Some(row(&short(&on))));
     }
 }
