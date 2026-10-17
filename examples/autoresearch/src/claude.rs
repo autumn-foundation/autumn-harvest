@@ -8,10 +8,11 @@
 //!
 //! The adapter's `ChatMessage` carries text, tool calls and tool results. It
 //! has no place for a thinking block, and the API wants each thinking block
-//! back unchanged in a tool loop. So the model keeps each raw assistant turn,
-//! keyed by the hash of its text and tool calls. The next request finds the
-//! turn by the same hash and sends the raw blocks. With a turn directory,
-//! the turns survive a restart.
+//! back unchanged in a tool loop. So the model keeps each raw assistant turn.
+//! Its key is the hash of the messages before it and of its own text and
+//! tool calls. Two turns with the same text in two conversations then keep
+//! their own blocks. The next request finds the turn by the same hash and
+//! sends the raw blocks. With a turn directory, the turns survive a restart.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -133,7 +134,9 @@ impl AgentModel for ClaudeModel {
         request: &'a ChatRequest,
     ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
         Box::pin(async move {
-            let body = request_body(request, &self.model, |visible| self.turns.get(visible));
+            let body = request_body(request, &self.model, |before, visible| {
+                self.turns.get(before, visible)
+            });
             let mut call = self
                 .client
                 .post(ENDPOINT)
@@ -158,7 +161,7 @@ impl AgentModel for ClaudeModel {
             let body: Value = serde_json::from_str(&text)
                 .map_err(|e| AgentError::new(ErrorKind::Decode, format!("not JSON: {e}")))?;
             let response = parse_response(&body)?;
-            if let Some((key, raw)) = replayable(&body) {
+            if let Some((key, raw)) = replayable(&wire_messages(request), &body) {
                 self.turns.put(key, raw)?;
             }
             Ok(response)
@@ -198,8 +201,8 @@ impl Turns {
         Ok(())
     }
 
-    fn get(&self, visible: &[Value]) -> Option<Vec<Value>> {
-        let key = turn_key(visible);
+    fn get(&self, before: &[Value], visible: &[Value]) -> Option<Vec<Value>> {
+        let key = turn_key(before, visible);
         if let Some(raw) = self
             .memory
             .lock()
@@ -213,9 +216,10 @@ impl Turns {
     }
 }
 
-/// The key of a turn: the hash of its text and tool-call blocks.
-fn turn_key(visible: &[Value]) -> String {
-    crate::stores::hashed(&serde_json::to_string(visible).unwrap_or_default())
+/// The key of a turn: the hash of the messages `before` it, as
+/// [`wire_messages`] gives them, and of its text and tool-call blocks.
+fn turn_key(before: &[Value], visible: &[Value]) -> String {
+    crate::stores::hashed(&json!([before, visible]).to_string())
 }
 
 /// The blocks of a response that go back to the API.
@@ -255,32 +259,21 @@ fn visible(blocks: &[Value]) -> Vec<Value> {
 
 /// The key and the raw blocks of a response that holds more than text and
 /// tool calls, such as a thinking block. `None` when nothing needs a replay.
+///
+/// `before` is the [`wire_messages`] of the request that got the response.
 #[must_use]
-pub fn replayable(body: &Value) -> Option<(String, Vec<Value>)> {
+pub fn replayable(before: &[Value], body: &Value) -> Option<(String, Vec<Value>)> {
     let blocks = turn_blocks(body);
     let shown = visible(&blocks);
-    (blocks.len() > shown.len()).then(|| (turn_key(&shown), blocks))
+    (blocks.len() > shown.len()).then(|| (turn_key(before, &shown), blocks))
 }
 
-/// The JSON body of one Messages API request. `replay` returns the raw
-/// blocks of an assistant turn from its text and tool-call blocks.
+/// The messages of `request` as the API takes them, with no system message
+/// and no raw blocks. A turn key hashes them, so a key does not change when
+/// a later request replays a turn.
 #[must_use]
-pub fn request_body(
-    request: &ChatRequest,
-    model: &str,
-    replay: impl Fn(&[Value]) -> Option<Vec<Value>>,
-) -> Value {
-    let system: Vec<&str> = request
-        .messages
-        .iter()
-        .filter(|m| m.role == ChatRole::System)
-        .flat_map(|m| &m.content)
-        .filter_map(|part| match part {
-            ContentPart::Text(text) => Some(text.as_str()),
-            _ => None,
-        })
-        .collect();
-    let messages: Vec<Value> = request
+pub fn wire_messages(request: &ChatRequest) -> Vec<Value> {
+    request
         .messages
         .iter()
         .filter(|m| m.role != ChatRole::System)
@@ -307,12 +300,43 @@ pub fn request_body(
                     } => json!({"type": "tool_result", "tool_use_id": tool_call_id, "content": content}),
                 })
                 .collect();
-            let content = if message.role == ChatRole::Assistant {
-                replay(&content).unwrap_or(content)
-            } else {
-                content
-            };
             json!({"role": role, "content": content})
+        })
+        .collect()
+}
+
+/// The JSON body of one Messages API request. `replay` returns the raw
+/// blocks of an assistant turn from the messages before it and its text and
+/// tool-call blocks.
+#[must_use]
+pub fn request_body(
+    request: &ChatRequest,
+    model: &str,
+    replay: impl Fn(&[Value], &[Value]) -> Option<Vec<Value>>,
+) -> Value {
+    let system: Vec<&str> = request
+        .messages
+        .iter()
+        .filter(|m| m.role == ChatRole::System)
+        .flat_map(|m| &m.content)
+        .filter_map(|part| match part {
+            ContentPart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let wire = wire_messages(request);
+    let messages: Vec<Value> = wire
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            if message["role"] != "assistant" {
+                return message.clone();
+            }
+            let shown = message["content"].as_array().cloned().unwrap_or_default();
+            replay(&wire[..index], &shown).map_or_else(
+                || message.clone(),
+                |raw| json!({"role": "assistant", "content": raw}),
+            )
         })
         .collect();
     let tools: Vec<Value> = request
@@ -464,7 +488,7 @@ mod tests {
 
     #[test]
     fn the_request_body_maps_roles_tools_and_settings() {
-        let body = request_body(&request(), DEFAULT_MODEL, |_| None);
+        let body = request_body(&request(), DEFAULT_MODEL, |_, _| None);
         assert_eq!(body["model"], DEFAULT_MODEL);
         assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
         assert_eq!(body["system"], "You are a researcher.");
@@ -488,7 +512,7 @@ mod tests {
 
     #[test]
     fn another_model_gets_no_effort_and_no_fallback() {
-        let body = request_body(&request(), "claude-haiku-5-5", |_| None);
+        let body = request_body(&request(), "claude-haiku-5-5", |_, _| None);
         assert!(body.get("output_config").is_none());
         assert!(body.get("fallbacks").is_none());
         assert_eq!(model_id("claude-haiku-5-5"), "claude-haiku-5-5");
@@ -509,18 +533,61 @@ mod tests {
             "usage": {"input_tokens": 1, "output_tokens": 1}
         });
         let turns = Turns::default();
-        let (key, raw) = replayable(&response).unwrap();
+        // The request that got the response held the messages before it.
+        let mut asked = request();
+        asked.messages.truncate(2);
+        let (key, raw) = replayable(&wire_messages(&asked), &response).unwrap();
         turns.put(key, raw).unwrap();
         // The adapter replays the turn as text and a tool call. The request
         // finds the raw turn and sends the thinking block first.
-        let body = request_body(&request(), DEFAULT_MODEL, |visible| turns.get(visible));
+        let body = request_body(&request(), DEFAULT_MODEL, |before, visible| {
+            turns.get(before, visible)
+        });
         let assistant = &body["messages"][1]["content"];
         assert_eq!(assistant[0]["type"], "thinking");
         assert_eq!(assistant[0]["signature"], "sig");
         assert_eq!(assistant[2]["id"], "toolu_1");
         // A turn with text and tool calls only needs no replay.
         let plain = json!({"type": "message", "content": [{"type": "text", "text": "x"}]});
-        assert!(replayable(&plain).is_none());
+        assert!(replayable(&[], &plain).is_none());
+    }
+
+    /// Two conversations can end a turn with the same text and different
+    /// thinking. Each conversation gets its own thinking block back.
+    #[test]
+    fn a_turn_with_the_same_text_in_another_conversation_keeps_its_own_block() {
+        let turns = Turns::default();
+        let conversation = |task: &str| ChatRequest {
+            messages: vec![
+                ChatMessage::text(ChatRole::System, "You are a researcher."),
+                ChatMessage::text(ChatRole::User, task),
+            ],
+            ..request()
+        };
+        for (task, signature) in [("Run experiment 1.", "one"), ("Run experiment 2.", "two")] {
+            let response = json!({
+                "type": "message",
+                "stop_reason": "end_turn",
+                "content": [
+                    {"type": "thinking", "thinking": "", "signature": signature},
+                    {"type": "text", "text": "Done."}
+                ],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            });
+            let (key, raw) = replayable(&wire_messages(&conversation(task)), &response).unwrap();
+            turns.put(key, raw).unwrap();
+        }
+        for (task, signature) in [("Run experiment 1.", "one"), ("Run experiment 2.", "two")] {
+            let mut next = conversation(task);
+            next.messages
+                .push(ChatMessage::text(ChatRole::Assistant, "Done."));
+            next.messages
+                .push(ChatMessage::text(ChatRole::User, "And now?"));
+            let body = request_body(&next, DEFAULT_MODEL, |before, visible| {
+                turns.get(before, visible)
+            });
+            assert_eq!(body["messages"][1]["content"][0]["signature"], signature);
+        }
     }
 
     #[test]
@@ -532,12 +599,12 @@ mod tests {
         };
         let raw = vec![json!({"type": "thinking", "thinking": "", "signature": "s"})];
         let shown = vec![json!({"type": "text", "text": "a"})];
-        turns.put(turn_key(&shown), raw.clone()).unwrap();
+        turns.put(turn_key(&[], &shown), raw.clone()).unwrap();
         let restarted = Turns {
             dir: Some(dir.path().to_path_buf()),
             ..Turns::default()
         };
-        assert_eq!(restarted.get(&shown), Some(raw));
+        assert_eq!(restarted.get(&[], &shown), Some(raw));
     }
 
     #[test]
