@@ -9026,6 +9026,9 @@ impl WorkflowContext {
     where
         I: serde::Serialize,
     {
+        // Issue #1984: reject before the input serializes. A scope cancel
+        // replays this call, and a rejected spawn must not run a serializer.
+        self.reject_in_cancellable_scope("ctx.spawn_child_workflow_detached")?;
         let json_input = serde_json::to_value(input).map_err(HarvestError::Serialization)?;
         self.spawn_child_workflow_detached_raw_placed(
             info.name,
@@ -27756,6 +27759,38 @@ mod tests {
             error_schema: None,
             retry_policy: None,
         }
+    }
+
+    /// A typed detached spawn in a scope fails before its input serializes
+    /// (issue #1984).
+    #[tokio::test]
+    async fn a_typed_detached_spawn_in_a_scope_does_not_serialize() {
+        struct Counted<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl serde::Serialize for Counted<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                s.serialize_unit()
+            }
+        }
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let ctx = WorkflowContext::new_test();
+        let info = make_workflow_info("audit_trail");
+        let spawned = ctx
+            .cancellation_scope()
+            .run(async {
+                ctx.spawn_child_workflow_detached(
+                    &info,
+                    Counted(&calls),
+                    crate::ParentClosePolicy::Abandon,
+                )
+            })
+            .await
+            .expect("the scope completes");
+        assert!(
+            matches!(spawned, Err(HarvestError::Config(_))),
+            "{spawned:?}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
