@@ -353,3 +353,63 @@ pub fn all() -> Vec<ActivityInfo> {
         record_info(),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    fn lab_with_counter() -> (tempfile::TempDir, TrainInput, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let lab = Lab::init(dir.path().join("lab")).unwrap();
+        let branch = lab.start_branch("t").unwrap();
+        let counter = dir.path().join("runs");
+        let script = format!("echo run >> '{}'; echo 'val_bpb: 0.99'", counter.display());
+        let input = TrainInput {
+            lab: lab.root().display().to_string(),
+            branch,
+            trainer: TrainerSpec::Command {
+                program: "sh".into(),
+                args: vec!["-c".into(), script],
+                timeout_secs: 30,
+            },
+            commit: lab.head().unwrap(),
+        };
+        (dir, input, counter)
+    }
+
+    #[tokio::test]
+    async fn a_train_call_that_runs_again_returns_its_saved_run() {
+        let (_dir, input, counter) = lab_with_counter();
+        let ctx = ActivityContext::new_test();
+        let first = train(&ctx, input.clone()).await.unwrap();
+        // The same call after a crash: the run is not trained again.
+        let again = train(&ctx, input.clone()).await.unwrap();
+        assert_eq!(first, again);
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            1
+        );
+        // A new call trains.
+        train(&ActivityContext::new_test(), input).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn train_refuses_a_moved_branch_and_a_change_no_commit_holds() {
+        let (_dir, input, counter) = lab_with_counter();
+        let lab = Lab::open(&input.lab).unwrap();
+        lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
+        let dirty = train(&ActivityContext::new_test(), input.clone()).await;
+        assert!(dirty.unwrap_err().contains(DIRTY_TREE));
+        lab.git(&["checkout", "--", "train.py"]).unwrap();
+        lab.start_branch("other").unwrap();
+        let moved = train(&ActivityContext::new_test(), input).await;
+        assert!(moved.unwrap_err().contains(BRANCH_MOVED));
+        assert!(!counter.exists(), "nothing trained");
+    }
+}

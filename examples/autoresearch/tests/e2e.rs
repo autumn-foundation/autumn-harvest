@@ -898,7 +898,7 @@ async fn two_sessions_in_one_lab_take_turns_on_their_own_branches() {
             rt.outcome(exec)
         );
     }
-    // AC27: each experiment committed on its own branch, and the lab is
+    // AC29: each experiment committed on its own branch, and the lab is
     // clean. A kept commit is on its branch. A discarded one is on none.
     assert_eq!(fx.lab().rows().unwrap().len(), 6);
     assert_eq!(fx.lab().git(&["status", "--porcelain"]).unwrap(), "");
@@ -959,7 +959,7 @@ async fn a_nightly_session_takes_commands_by_its_tag() {
     let first = runs_of(&rt, SESSION)[0];
     let night = drive_a_little(&mut rt, first).await;
 
-    // AC28: the engine picked the workflow id, and the tag still reaches it.
+    // AC30: the engine picked the workflow id, and the tag still reaches it.
     let (found, id) = runtime::find_session(&rt, "oct17-2300").unwrap().unwrap();
     assert_eq!(found, night);
     assert!(!id.starts_with("autoresearch/"), "{id}");
