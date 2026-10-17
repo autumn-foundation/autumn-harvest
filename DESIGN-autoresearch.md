@@ -258,7 +258,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC22 | `e2e::the_command_trainer_runs_a_real_command_per_commit`, `trainer::tests::the_command_trainer_*`. `trainer::tests::the_runner_reads_the_log_the_run_wrote_not_a_symlink`, `the_timeout_note_does_not_follow_a_symlink`. `lab::tests::git_runs_with_the_trainer_environment`, `a_diff_runs_no_external_program`, `a_planted_symlink_is_refused_and_never_copied`. `stores::tests::a_read_refuses_a_symlink_and_a_pipe`. |
 | AC23 | `claude::tests` (nine cases). |
 | AC24 | `e2e::the_workflows_register_on_a_postgres_builder_with_an_llm_budget`. |
-| AC25 | `e2e::purge_removes_old_finished_runs`, `cli::eval_and_purge_work_on_a_finished_night`: the tag of a purged night stays used. |
+| AC25 | `e2e::purge_removes_old_finished_runs`, `e2e::a_purge_waits_for_a_report_whose_session_ended`, `cli::eval_and_purge_work_on_a_finished_night`: the tag of a purged night stays used. |
 | AC26 | `cli::*` and the CI demo step. |
 | AC27 | `ci.yml`: the test step, the demo step and the clippy step. `dst-nightly.yml`: the `autoresearch` job. |
 | AC28 | `docs/audits/comment-hygiene.py --base origin/trunk-dev` passes. |
@@ -417,7 +417,8 @@ fixes:
 - **Durability.** Before a resume puts the lab back, it keeps the changes
   in `git stash list`, so a hand edit is not lost. A reset unstages a
   staged new file first, so the file stays on disk. A report agent whose
-  session was purged no longer blocks `serve`.
+  session was purged no longer blocks `serve`. Codex found that path, and
+  `purge` now waits while a report agent runs on after its session ended.
 - **Docs and messages.** A crash note names each changed file once. The
   heartbeat refusal names the model options. `post` names `--pace 0`. The
   README names `uv.lock`, `__pycache__`, `.venv` and `git status

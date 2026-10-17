@@ -221,7 +221,7 @@ raw turn in `.autoresearch/claude-turns` and sends it back unchanged.
 | `approve`, `deny` | Queue a decision for a gated tool call. |
 | `eval --candidate <file>` | Re-drive the newest recorded proposal with a new `program.md`. Prints the first turn that differs. |
 | `verify` | Replay every stored history with this build. Run it before a deploy. |
-| `purge --older-than-days <n>` | Remove old finished runs from the database. |
+| `purge --older-than-days <n>` | Remove old finished runs from the database. It waits while a report agent runs on after its session ended: let `serve` finish it first. |
 
 The database is `<lab>/.autoresearch/harvest.db` unless `--db` names one.
 The memory notes, the response cache, the inbox and the reports stay in

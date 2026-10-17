@@ -1294,6 +1294,25 @@ async fn run_refuses_while_a_report_of_another_model_is_unfinished() {
     );
 }
 
+/// A purge would remove an ended session while its report agent runs on, and
+/// with the session the model that the report needs. So `purge` waits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_purge_waits_for_a_report_whose_session_ended() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let mut config = fx.config("night", 1);
+    config.report = true;
+    let exec = runtime::start(&mut rt, &config).unwrap();
+    let reporter = run_to_end(&mut rt, exec)
+        .await
+        .report_run
+        .expect("the report agent waits");
+    let refusal = runtime::check_purge(&rt).unwrap_err();
+    assert!(refusal.contains("autoresearch serve"), "{refusal}");
+    runtime::drive_report(&mut rt, &reporter).await.unwrap();
+    runtime::check_purge(&rt).unwrap();
+}
+
 /// `purge` can remove a session while its detached report agent runs on.
 /// The model of that report is then unknown, and the check must not fail
 /// for good on the gone parent.

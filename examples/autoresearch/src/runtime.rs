@@ -584,6 +584,41 @@ pub fn check_agents(
     Ok(())
 }
 
+/// Why `purge` must wait for an agent run.
+///
+/// A detached report agent runs on after its session ends. A purge removes
+/// the ended session, and with it the model that the report needs. Then
+/// `run` and `serve` can no longer check that model.
+///
+/// # Errors
+///
+/// Returns an error that names the unfinished run, or a backend error.
+pub fn check_purge(rt: &SqliteRuntime) -> Result<(), String> {
+    let filter = ExecutionFilter::new().state("RUNNING").limit(1000);
+    let page = rt.list_executions(&filter).map_err(|e| e.to_string())?;
+    for run in &page.executions {
+        let Some(exec) = run.execution_id() else {
+            continue;
+        };
+        let root = root_of(rt, exec)?;
+        if root == exec
+            || matches!(
+                rt.outcome(root).map_err(|e| e.to_string())?,
+                ExecutionOutcome::Running
+            )
+        {
+            continue;
+        }
+        let id = run.workflow_id.clone().into_value().unwrap_or_default();
+        return Err(format!(
+            "the agent run {id} is not finished, and the run that started it ended. \
+             Let `autoresearch serve` finish it with the same --model and \
+             --claude-model, then purge"
+        ));
+    }
+    Ok(())
+}
+
 /// The top run above `exec`: the run that no other run started.
 ///
 /// `purge` can remove a terminal parent while its detached child runs on.
