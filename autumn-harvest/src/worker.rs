@@ -25441,6 +25441,52 @@ impl HistoryCapBreach {
     }
 }
 
+/// End a run with a deferred cancel at the history hard cap (issue #1984).
+///
+/// An accepted deferred cancel wins over the cap, as on SQLite. The cap stops
+/// the cleanup, and the run ends cancelled instead of failed. Returns `None`
+/// when no cancel is pending, so the caller fails the run.
+async fn cancel_deferred_at_history_cap(
+    conn: &mut AsyncPgConnection,
+    telemetry: &crate::telemetry::TelemetryConfig,
+    execution: &WorkflowExecution,
+    exec_id: ExecutionId,
+    breach: HistoryCapBreach,
+) -> HarvestResult<Option<Vec<crate::completion_trigger::DeferredTriggerStart>>> {
+    let history = store::load_history_undecoded(conn, exec_id).await?;
+    let Some(reason) = crate::execution::DeferredCancelState::of(&history.events).requested else {
+        return Ok(None);
+    };
+    tracing::warn!(
+        exec_id = %exec_id,
+        workflow = %execution.workflow_name,
+        breach = ?breach,
+        "workflow history reached a hard cap with a deferred cancel; cancelling the run"
+    );
+    let (_, starts, checks, terminal_metric) =
+        crate::execution::cancel_workflow_execution_collect_now(
+            conn,
+            exec_id,
+            &reason,
+            Some(telemetry.metrics.as_ref()),
+        )
+        .await?;
+    let cancel_metrics: Vec<_> = terminal_metric
+        .map(|(workflow_name, queue_name)| {
+            crate::execution::StartCancelledRun::terminated(workflow_name, queue_name)
+        })
+        .into_iter()
+        .collect();
+    crate::execution::emit_start_cancel_metrics(&*telemetry.metrics, &cancel_metrics);
+    check_and_report_unfinished_handlers_batch_for_worker(
+        conn,
+        &checks,
+        Some(telemetry.metrics.as_ref()),
+    )
+    .await;
+    Ok(Some(starts))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fail_workflow_for_history_cap(
     conn: &mut AsyncPgConnection,
@@ -25457,6 +25503,13 @@ async fn fail_workflow_for_history_cap(
     // Issue #1815: the cap failure fails this workflow task terminally.
     cycle_failure: &CycleFailure,
 ) -> HarvestResult<Vec<crate::completion_trigger::DeferredTriggerStart>> {
+    // Issue #1984: an accepted deferred cancel wins over the cap.
+    if let Some(starts) =
+        cancel_deferred_at_history_cap(conn, telemetry, execution, exec_id, breach).await?
+    {
+        return Ok(starts);
+    }
+
     // Issue #1833: the cap failure is a terminal decision, so it ends with a
     // boundary when boundaries are on.
     let boundary =
