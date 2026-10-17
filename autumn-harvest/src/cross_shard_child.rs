@@ -1349,6 +1349,19 @@ async fn start_child_on_target(
 ) -> HarvestResult<()> {
     let mut conn = target_conn(pool, row, acquire_bound).await?;
 
+    // A retry after a crash finds the child already created. It needs no spec,
+    // so it needs no key either. The transaction below checks again for a race
+    // (issue #2043).
+    let created: bool = diesel::select(diesel::dsl::exists(
+        harvest_workflow_executions::table.find(row.child_exec_id),
+    ))
+    .get_result(&mut *conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    if created {
+        return Ok(());
+    }
+
     // A spec that does not decode never starts a child. The error leaves the
     // row pending, so a restored key lets it start (issue #2043).
     // The error text names no value, because the value is plaintext.

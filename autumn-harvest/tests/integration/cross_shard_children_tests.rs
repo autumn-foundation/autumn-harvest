@@ -2680,6 +2680,75 @@ async fn an_undecodable_spec_stays_pending_and_creates_no_child() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_for_an_existing_child_needs_no_key() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+    let codecs = aead_codecs();
+    let parent = start_parent(&sharded, "child_echo", "spec-idem-2").await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &codecs,
+    )
+    .await
+    .expect("record");
+    let started = std::time::Instant::now();
+    loop {
+        let progressed = autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+            &mut conn,
+            &Some(sharded.clone()),
+            &codecs,
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .expect("relay sweep");
+        if progressed > 0 {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "no child");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The relay crashed before it marked the row. The next sweep retries it.
+    diesel::update(harvest_cross_shard_children::table.find(child_id.as_uuid()))
+        .set((
+            harvest_cross_shard_children::status.eq("PENDING_START"),
+            harvest_cross_shard_children::attempts.eq(0),
+            harvest_cross_shard_children::last_attempt_at.eq(None::<chrono::DateTime<Utc>>),
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("reset the row");
+    let keyless = autumn_harvest::payload_codec::PayloadCodecs::default();
+    autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+        &mut conn,
+        &Some(sharded.clone()),
+        &keyless,
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("a retry never fails the sweep");
+    let status: String = harvest_cross_shard_children::table
+        .find(child_id.as_uuid())
+        .select(harvest_cross_shard_children::status)
+        .first(&mut *conn)
+        .await
+        .expect("outbox row");
+    assert_ne!(
+        status, "PENDING_START",
+        "the row advances without a key, because the child exists"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn erasing_a_parent_replaces_an_encoded_spec_with_a_tombstone() {
     let (urls, _container) = setup_shard_databases(&SHARDS).await;
     let sharded = build_sharded_pool(&urls);
