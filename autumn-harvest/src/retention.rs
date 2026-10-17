@@ -90,6 +90,22 @@ pub const DEFAULT_TERMINAL_TASK_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 /// same lease-lost result for a deleted row as for a finished one.
 pub const MIN_TERMINAL_TASK_RETENTION: Duration = Duration::from_secs(60 * 60);
 
+/// Default grace period of the orphan-blob sweep (issue #2123): 1 day.
+///
+/// A write uploads its blobs before it opens its transaction. The sweep skips a
+/// blob younger than the grace period, so it never deletes a blob that an
+/// in-flight write is about to reference. The sweep runs only when the payload
+/// store can list. [`RetentionConfig::without_orphan_blob_sweep`] turns it off.
+pub const DEFAULT_ORPHAN_BLOB_GRACE_SECS: u64 = 24 * 60 * 60;
+
+/// Shortest configurable grace period of the orphan-blob sweep (issue #2123):
+/// 1 hour.
+///
+/// The floor must stay longer than any write transaction. A shorter grace
+/// period lets the sweep delete a blob that an open transaction still
+/// references.
+pub const MIN_ORPHAN_BLOB_GRACE: Duration = Duration::from_secs(60 * 60);
+
 /// Default byte cap for an opt-in captured summary payload (issue #752).
 ///
 /// A `result`/`error` value larger than this is replaced with a typed
@@ -461,6 +477,14 @@ pub struct RetentionConfig {
     /// It is independent of history retention, which is off by default.
     /// Defaults to [`DEFAULT_TERMINAL_TASK_RETENTION_SECS`].
     pub terminal_task_retention_secs: Option<u64>,
+    /// Grace period of the orphan-blob sweep (issue #2123). `None` disables it.
+    ///
+    /// A write that rolls back after its upload leaves blobs that no
+    /// `harvest_payload_refs` row names. The sweep deletes a blob when it is
+    /// older than this period and no shard references it. It runs only when
+    /// the payload store implements `list`. Defaults to
+    /// [`DEFAULT_ORPHAN_BLOB_GRACE_SECS`].
+    pub orphan_blob_grace_secs: Option<u64>,
     /// Partition maintenance for the opt-in partitioned `harvest_events`
     /// layout (issue #958).
     ///
@@ -570,6 +594,7 @@ impl Default for RetentionConfig {
             summary: None,
             rate_limit_bucket_retention_secs: Some(DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS),
             terminal_task_retention_secs: Some(DEFAULT_TERMINAL_TASK_RETENTION_SECS),
+            orphan_blob_grace_secs: Some(DEFAULT_ORPHAN_BLOB_GRACE_SECS),
             partitions: PartitionMaintenanceConfig::default(),
         }
     }
@@ -817,6 +842,38 @@ impl RetentionConfig {
         self.terminal_task_retention_secs.is_some()
     }
 
+    /// Set the grace period of the orphan-blob sweep (issue #2123).
+    ///
+    /// `validate` rejects a period below [`MIN_ORPHAN_BLOB_GRACE`] or above
+    /// `MAX_MAX_AGE`.
+    #[must_use]
+    pub const fn with_orphan_blob_grace(mut self, grace: Duration) -> Self {
+        self.orphan_blob_grace_secs = Some(grace.as_secs());
+        self
+    }
+
+    /// Disable the orphan-blob sweep (issue #2123).
+    ///
+    /// Blobs from rolled-back writes then stay in the store.
+    #[must_use]
+    pub const fn without_orphan_blob_sweep(mut self) -> Self {
+        self.orphan_blob_grace_secs = None;
+        self
+    }
+
+    /// The orphan-blob sweep's grace period, or `None` when it is off (issue
+    /// #2123).
+    #[must_use]
+    pub fn orphan_blob_grace(&self) -> Option<Duration> {
+        self.orphan_blob_grace_secs.map(Duration::from_secs)
+    }
+
+    /// Whether the orphan-blob sweep runs this tick (issue #2123).
+    #[must_use]
+    pub const fn orphan_blob_sweep_active(&self) -> bool {
+        self.orphan_blob_grace_secs.is_some()
+    }
+
     /// Safely unpacks the raw configuration integer into a standard rust [`Duration`], gracefully
     /// handling systems where the feature is entirely turned off.
     #[must_use]
@@ -1001,6 +1058,17 @@ impl RetentionConfig {
                 MAX_MAX_AGE.as_secs()
             ));
         }
+        // The orphan-blob sweep has its own floor (issue #2123). The grace
+        // period must outlast any write transaction.
+        if let Some(grace) = self.orphan_blob_grace()
+            && !(MIN_ORPHAN_BLOB_GRACE..=MAX_MAX_AGE).contains(&grace)
+        {
+            return Err(format!(
+                "orphan_blob_grace must be between {}s and {}s",
+                MIN_ORPHAN_BLOB_GRACE.as_secs(),
+                MAX_MAX_AGE.as_secs()
+            ));
+        }
         // `EnableOptions::validate` (issue #958) rejects a zero lookahead at
         // enable time for exactly this reason: it leaves every append landing
         // in the DEFAULT partition. `PartitionMaintenanceConfig` must refuse
@@ -1040,6 +1108,8 @@ impl RetentionConfig {
             // A bounded summary policy spawns the janitor so its GC pass runs
             // even if the history horizon was later removed (issue #752).
             || self.summary_gc_active()
+            // The orphan-blob sweep is work in its own right (issue #2123).
+            || self.orphan_blob_sweep_active()
             // Partition maintenance is work in its own right, not a rider on
             // history retention (issue #958). Without this, a deployment that
             // turned every retention horizon off — `audit_retention_days = 0`,
@@ -5617,7 +5687,46 @@ mod tests {
             config.enabled(),
             "the task janitor alone must spawn the runtime"
         );
-        assert!(!config.without_terminal_task_gc().enabled());
+        assert!(
+            !config
+                .without_terminal_task_gc()
+                .without_orphan_blob_sweep()
+                .enabled()
+        );
+    }
+
+    #[test]
+    fn orphan_blob_sweep_is_on_by_default_at_one_day() {
+        let config = RetentionConfig::default();
+        assert_eq!(DEFAULT_ORPHAN_BLOB_GRACE_SECS, 24 * 60 * 60);
+        assert_eq!(
+            config.orphan_blob_grace(),
+            Some(Duration::from_secs(DEFAULT_ORPHAN_BLOB_GRACE_SECS))
+        );
+        assert!(config.orphan_blob_sweep_active());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn orphan_blob_sweep_grace_is_configurable_and_disablable() {
+        let two_hours = Duration::from_secs(2 * 60 * 60);
+        let config = RetentionConfig::default().with_orphan_blob_grace(two_hours);
+        assert_eq!(config.orphan_blob_grace(), Some(two_hours));
+        let off = config.without_orphan_blob_sweep();
+        assert_eq!(off.orphan_blob_grace(), None);
+        assert!(!off.orphan_blob_sweep_active());
+    }
+
+    #[test]
+    fn orphan_blob_sweep_validate_bounds_the_grace_period() {
+        let too_short = RetentionConfig::default()
+            .with_orphan_blob_grace(MIN_ORPHAN_BLOB_GRACE - Duration::from_secs(1));
+        assert!(too_short.validate().is_err());
+        let too_long = RetentionConfig::default()
+            .with_orphan_blob_grace(MAX_MAX_AGE + Duration::from_secs(1));
+        assert!(too_long.validate().is_err());
+        let at_floor = RetentionConfig::default().with_orphan_blob_grace(MIN_ORPHAN_BLOB_GRACE);
+        assert!(at_floor.validate().is_ok());
     }
 
     #[test]

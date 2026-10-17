@@ -41,6 +41,7 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -80,6 +81,24 @@ pub type PayloadStoreFuture<'a, T> =
 #[error("payload store error: {0}")]
 pub struct PayloadStoreError(pub String);
 
+/// One blob that a [`PayloadStore`] lists (issue #2123).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBlob {
+    /// The key that [`PayloadStore::put`] returned.
+    pub key: String,
+    /// When the store last wrote the blob.
+    pub created_at: DateTime<Utc>,
+}
+
+/// One page of a [`PayloadStore::list`] result (issue #2123).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlobPage {
+    /// The blobs of this page, in key order.
+    pub blobs: Vec<StoredBlob>,
+    /// The cursor for the next page, or `None` at the end of the listing.
+    pub next: Option<String>,
+}
+
 /// An embedder-supplied content-addressed blob store for offloaded payloads.
 ///
 /// Implementations provide durable external storage (S3, GCS, a filesystem,
@@ -95,6 +114,8 @@ pub struct PayloadStoreError(pub String);
 /// - [`get`](PayloadStore::get) returns the bytes previously stored under `key`.
 /// - [`delete`](PayloadStore::delete) removes the blob; called by the retention
 ///   sweep once no execution references the key.
+/// - [`list`](PayloadStore::list) is optional. It lets the retention sweep find
+///   blobs that a rolled-back write uploaded (issue #2123).
 pub trait PayloadStore: Send + Sync + 'static {
     /// A stable identifier for this store, recorded in every reference envelope
     /// so a read can tell which backend a blob lives in. Defaults to
@@ -112,6 +133,28 @@ pub trait PayloadStore: Send + Sync + 'static {
 
     /// Delete the blob stored under `key`.
     fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()>;
+
+    /// List blobs older than `created_before`, for the orphan sweep (issue #2123).
+    ///
+    /// Return at most `limit` blobs in key order, after the key `after`. Set
+    /// [`BlobPage::next`] to the cursor for the next page. Return `Ok(None)`
+    /// when the store cannot list. The sweep is then off. The default does so.
+    ///
+    /// Two rules keep the sweep safe:
+    /// - Return only blobs that [`put`](PayloadStore::put) wrote. The sweep
+    ///   deletes any listed blob that no run references.
+    /// - A `put` of an existing key must reset its creation time. Otherwise
+    ///   the sweep can delete a blob that a writer has just uploaded again.
+    ///   A store that uses a new key for each upload meets this rule.
+    fn list(
+        &self,
+        after: Option<&str>,
+        created_before: DateTime<Utc>,
+        limit: usize,
+    ) -> PayloadStoreFuture<'_, Option<BlobPage>> {
+        let _ = (after, created_before, limit);
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// The number of blob uploads that one counting offloader starts.
@@ -159,6 +202,15 @@ impl PayloadStore for CountingStore {
 
     fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()> {
         self.inner.delete(key)
+    }
+
+    fn list(
+        &self,
+        after: Option<&str>,
+        created_before: DateTime<Utc>,
+        limit: usize,
+    ) -> PayloadStoreFuture<'_, Option<BlobPage>> {
+        self.inner.list(after, created_before, limit)
     }
 }
 
@@ -513,6 +565,44 @@ mod tests {
     #[allow(clippy::needless_pass_by_value)]
     fn event_with_output(output: Value) -> Value {
         serde_json::json!({ "type": "WorkflowCompleted", "data": { "output": output } })
+    }
+
+    /// A store that does not override `list` cannot list (issue #2123).
+    #[tokio::test]
+    async fn a_store_cannot_list_by_default() {
+        let store = MemStore::new();
+        let page = store.list(None, Utc::now(), 10).await.expect("list");
+        assert_eq!(page, None);
+    }
+
+    /// A counting copy passes `list` to the inner store (issue #2123).
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn a_counting_copy_passes_list_through() {
+        struct Lister;
+        impl PayloadStore for Lister {
+            fn put(&self, _: &[u8]) -> PayloadStoreFuture<'_, String> {
+                Box::pin(async { Ok("k".to_string()) })
+            }
+            fn get(&self, _: &str) -> PayloadStoreFuture<'_, Vec<u8>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn delete(&self, _: &str) -> PayloadStoreFuture<'_, ()> {
+                Box::pin(async { Ok(()) })
+            }
+            fn list(
+                &self,
+                _: Option<&str>,
+                _: DateTime<Utc>,
+                _: usize,
+            ) -> PayloadStoreFuture<'_, Option<BlobPage>> {
+                Box::pin(async { Ok(Some(BlobPage::default())) })
+            }
+        }
+        let off = PayloadOffloader::new(Arc::new(Lister), 16, Arc::new(crate::telemetry::NoOpMetrics));
+        let (counting, _) = off.counting_uploads();
+        let page = counting.store().list(None, Utc::now(), 1).await.unwrap();
+        assert_eq!(page, Some(BlobPage::default()));
     }
 
     /// A counting copy counts the blobs it uploads and nothing else.

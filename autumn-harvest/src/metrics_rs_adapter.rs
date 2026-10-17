@@ -87,6 +87,7 @@ use crate::telemetry::{
     METRIC_SCHEDULE_MANUAL_TRIGGER, METRIC_SCHEDULE_OVERDUE, METRIC_SCHEDULE_RUNS,
     METRIC_SCHEDULE_SKIPPED, METRIC_SESSION_ACQUISITION, METRIC_SIGNAL_RECEIVED,
     METRIC_SIGNAL_UNHANDLED, METRIC_SUMMARY_DELETED, METRIC_TASK_CAPABILITY_MISS,
+    METRIC_ORPHAN_BLOB_DELETE_FAILURES, METRIC_ORPHAN_BLOBS_DELETED, METRIC_ORPHAN_BLOBS_FOUND,
     METRIC_TASK_QUARANTINED, METRIC_TERMINAL_TASKS_DELETED, METRIC_TIMER_DURATION,
     METRIC_TIMER_STARTED, METRIC_UPDATE_ADMITTED, METRIC_UPDATE_COMPLETED, METRIC_UPDATE_DURATION,
     METRIC_UPDATE_FAILED, METRIC_UPDATE_REJECTED, METRIC_WEBHOOK_RECEIVED, METRIC_WEBHOOK_REJECTED,
@@ -783,6 +784,12 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_STATE => state.to_owned(),
         )
         .increment(count);
+    }
+
+    fn record_orphan_blob_sweep(&self, found: u64, deleted: u64, delete_failures: u64) {
+        counter!(METRIC_ORPHAN_BLOBS_FOUND).increment(found);
+        counter!(METRIC_ORPHAN_BLOBS_DELETED).increment(deleted);
+        counter!(METRIC_ORPHAN_BLOB_DELETE_FAILURES).increment(delete_failures);
     }
 
     fn record_payload_offloaded(&self, field: &str, store_id: &str, byte_len: u64) {
@@ -1906,6 +1913,14 @@ mod tests {
         let rec = MetricsRsRecorder;
         rec.record_terminal_tasks_deleted("COMPLETED", 5);
         rec.record_terminal_tasks_deleted("FAILED", 0);
+    }
+
+    #[test]
+    fn record_orphan_blob_sweep_does_not_panic() {
+        // Orphan-blob sweep counter bridge (issue #2123).
+        let rec = MetricsRsRecorder;
+        rec.record_orphan_blob_sweep(3, 2, 1);
+        rec.record_orphan_blob_sweep(0, 0, 0);
     }
 
     #[test]
