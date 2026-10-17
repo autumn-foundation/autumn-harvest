@@ -2429,6 +2429,11 @@ impl WorkflowHandle {
                 .parent_id
                 .map(crate::types::ExecutionId::from_uuid),
         )
+        // #2082: the query replays the body, so it needs the row's start source.
+        .with_start_provenance(crate::types::StartProvenance::from_row(
+            execution.start_source.as_deref(),
+            execution.continued_from_exec_id,
+        ))
         // #698: thread the workflow type name / business `workflow_id` from the
         // loaded execution row so `ctx.info().workflow_type` / `workflow_id` are the
         // real values (not "") for a query handler running against this run.

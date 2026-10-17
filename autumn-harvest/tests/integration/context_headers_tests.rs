@@ -106,6 +106,7 @@ async fn history_snapshot_context_headers_round_trips() {
         context_headers: Some(headers.clone()),
         execution_timeout: None,
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: None,
         workflow_id: None,
         queue_name: None,

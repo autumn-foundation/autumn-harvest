@@ -26028,6 +26028,12 @@ async fn process_workflow_task(
             // execution row so a child workflow can read it via `ctx.info()` /
             // `ctx.parent_execution_id()`. `None` for a top-level run.
             parent_execution_id: prepared.execution.parent_id.map(ExecutionId::from_uuid),
+            // Issue #2082: read the start source and predecessor from the row.
+            // A keyed entity uses them to tell a client start from a checkpoint.
+            start_provenance: crate::types::StartProvenance::from_row(
+                prepared.execution.start_source.as_deref(),
+                prepared.execution.continued_from_exec_id,
+            ),
             // Issue #2021: Postgres records a cancel as an event in the history.
             cancellation_reason: None,
         };
@@ -53939,6 +53945,7 @@ mod tests {
                 context_headers: None,
                 execution_timeout: None,
                 deadline_at: None,
+                start_provenance: None,
                 parent_execution_id: None,
                 workflow_id: None,
                 queue_name: None,
