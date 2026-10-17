@@ -727,6 +727,7 @@ async fn activation_copies_stream_chunks_written_after_verification() {
         chunk: json!({ "token": offset }),
     };
     // Offset 1 failed to serialize in its first run, so the stream has a hole.
+    // The append path never fills it later (issue #2083).
     store::append_stream_chunks(&mut source, exec_id, &[chunk(0), chunk(2)], 100)
         .await
         .expect("chunks before staging");
@@ -741,9 +742,9 @@ async fn activation_copies_stream_chunks_written_after_verification() {
         .await
         .expect("verify");
 
-    // An eventless decision on the source after verification. Its re-run
-    // fills the hole at offset 1 and adds offset 3.
-    store::append_stream_chunks(&mut source, exec_id, &[chunk(1), chunk(3)], 100)
+    // An eventless decision on the source after verification adds offsets 3
+    // and 4. Activation copies both, and the hole at offset 1 stays empty.
+    store::append_stream_chunks(&mut source, exec_id, &[chunk(3), chunk(4)], 100)
         .await
         .expect("chunks after verification");
 
@@ -765,8 +766,8 @@ async fn activation_copies_stream_chunks_written_after_verification() {
         .collect();
     assert_eq!(
         offsets,
-        vec![0, 1, 2, 3],
-        "the target must miss no chunk, also one below its highest offset"
+        vec![0, 2, 3, 4],
+        "the target must miss no chunk that the source stored"
     );
 }
 
