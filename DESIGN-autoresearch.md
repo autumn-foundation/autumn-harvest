@@ -248,7 +248,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC13 | `e2e::a_night_of_research_keeps_only_improvements`: the attributes, the memo, and a list by the `tag` attribute. |
 | AC14 | `e2e::the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up`. `stores::tests::the_precheck_runs_a_tick_only_for_a_new_crash_streak`, `a_redelivered_alert_marks_its_rows`. |
 | AC15 | `e2e::a_finished_night_leaves_a_morning_report`, `scripted::tests::the_reporter_reports_the_summary_of_its_own_session`. |
-| AC16 | `e2e::a_restart_resumes_without_paying_for_a_turn_or_a_run_twice`: the model calls and the trainings across two processes equal one process. |
+| AC16 | `e2e::a_restart_resumes_without_paying_for_a_turn_or_a_run_twice`: the model calls across two processes equal those of one process, and each row has one `train` activity. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`: a train call that runs again does not train again. |
 | AC17 | `e2e::a_night_of_research_keeps_only_improvements` and `e2e::the_session_continues_as_new_and_carries_its_best` run `verify`. The CI demo runs `verify`. |
 | AC18 | `sim::*`: nine sweeps. Each seed runs twice, replays, and runs again with a crash. Each target is required. |
 | AC19 | `e2e::eval_names_the_first_turn_where_a_new_program_differs`, `cli::eval_and_purge_work_on_a_finished_night`. |
@@ -287,7 +287,8 @@ The fixes:
   that no commit holds is refused. No execution timeout on `experiment`,
   because it counted the downtime of the runner. Workflow state keeps full
   commit ids. A short id can become ambiguous as the lab grows, so only
-  `results.tsv` and the console show it. A rewind resolves a short id on
+  people and the model see it: `results.tsv`, the console, the prompts,
+  the hints, the report and the `best_commit` attribute. A rewind resolves a short id on
   the session branch only. A row of `results.tsv` whose short id names two
   commits is refused, so a lookup never gives the score of the wrong
   commit. A free trainer lock clears the old group id. A

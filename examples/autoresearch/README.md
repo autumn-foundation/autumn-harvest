@@ -37,6 +37,7 @@ started autoresearch/demo on branch autoresearch/demo
   #7   keep    0.983772   68.8 GB  8c38a11  halve TOTAL_BATCH_SIZE: 2**19 -> 2**18
   #8   discard 0.985371   68.8 GB  f4227e1  full attention: "SSSL" -> "L"
 done: autoresearch/demo: 8 experiments, best val_bpb 0.983772 at 8c38a11 (6 kept, 2 discarded, 1 crashed)
+report: /tmp/ar-lab/.autoresearch/reports
 ```
 
 `--explore 100` makes each experiment try its boldest idea first, so the
@@ -87,7 +88,7 @@ schedule "0 23 * * *" ─► research_session  (continue-as-new every N)
                           │     └─ activity record (results.tsv)
                           ├─► signal_external_workflow_by_id: sibling sessions
                           └─► detached agent_loop: the morning report
-schedule every 30m ─► agent_heartbeat (precheck: new rows) ─► delivery
+schedule every 30m ─► agent_heartbeat (precheck: a new crash streak) ─► delivery
 ```
 
 - [`src/workflows.rs`](src/workflows.rs): `research_session` and `experiment`.
@@ -148,7 +149,9 @@ the paper taints the rest of its session: each later edit asks too. A new
 session starts clean.
 
 A hint of the form `rewind:<commit>` asks for a rewind, which always waits.
-The runner prints the call and its token:
+
+The runner prints each call that waits, and its token. An edit after a paper
+prints:
 
 ```text
 waiting for a person: edit_train {"new":"WARMDOWN_RATIO = 0.7","old":"WARMDOWN_RATIO = 0.5"}
