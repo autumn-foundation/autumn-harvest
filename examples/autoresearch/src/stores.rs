@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use autumn_harvest::payload_store::{PayloadStore, PayloadStoreError, PayloadStoreFuture};
 use autumn_harvest_agent::memory::{MemoryOp, apply_op};
 use autumn_harvest_agent::{
-    AgentError, BoxFuture, Delivery, EditKey, ErrorKind, HeartbeatTask, MemoryBlock, MemoryScope,
-    MemoryStore, Precheck, Report, ReportSource, SessionId,
+    AgentError, BoxFuture, CacheIndex, CacheKey, Delivery, EditKey, ErrorKind, HeartbeatTask,
+    MemoryBlock, MemoryScope, MemoryStore, Precheck, Report, ReportSource, SessionId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -284,6 +284,115 @@ impl Precheck for ResultsPrecheck {
     }
 }
 
+/// A [`CacheIndex`] in one directory, so it outlives the process.
+///
+/// A model call whose result a crash lost runs again with the same request.
+/// The index on disk then finds the stored answer. So the call is not paid
+/// twice, and its answer does not change. Each entry is a file named by its
+/// key. It holds an order number and the blob key. When the index is full, a
+/// new entry evicts the oldest one.
+#[derive(Debug)]
+pub struct FileCacheIndex {
+    dir: PathBuf,
+    capacity: usize,
+    /// The order number of the next entry.
+    next: Mutex<u64>,
+}
+
+impl FileCacheIndex {
+    /// An index in `dir` that holds at most `capacity` entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `dir` cannot be created or read.
+    pub fn new(dir: impl Into<PathBuf>, capacity: usize) -> Result<Self, String> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let index = Self {
+            dir,
+            capacity: capacity.max(1),
+            next: Mutex::new(0),
+        };
+        let next = index.entries()?.last().map_or(0, |(order, ..)| order + 1);
+        *index.next.lock().unwrap_or_else(PoisonError::into_inner) = next;
+        Ok(index)
+    }
+
+    /// Each entry, oldest first: its order number, its file and its blob.
+    /// A scratch file of a write is not an entry.
+    fn entries(&self) -> Result<Vec<(u64, PathBuf, String)>, String> {
+        let list = std::fs::read_dir(&self.dir)
+            .map_err(|e| format!("cannot read {}: {e}", self.dir.display()))?;
+        let mut entries: Vec<_> = list
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+            })
+            .filter_map(|path| read_entry(&path).map(|(order, blob)| (order, path, blob)))
+            .collect();
+        entries.sort();
+        Ok(entries)
+    }
+
+    fn get_now(&self, key: &CacheKey) -> Option<String> {
+        read_entry(&self.dir.join(key.as_str())).map(|(_, blob)| blob)
+    }
+
+    fn put_now(&self, key: &CacheKey, blob: &str) -> Result<Vec<String>, String> {
+        let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = self.dir.join(key.as_str());
+        let mut dropped: Vec<String> = read_entry(&path)
+            .map(|(_, old)| old)
+            .filter(|old| old != blob)
+            .into_iter()
+            .collect();
+        write_atomic(&path, format!("{}\n{blob}\n", *next).as_bytes())?;
+        *next += 1;
+        drop(next);
+        let entries = self.entries()?;
+        let extra = entries.len().saturating_sub(self.capacity);
+        for (_, oldest, old) in entries.into_iter().take(extra) {
+            // Another write can evict the same entry first.
+            match std::fs::remove_file(&oldest) {
+                Ok(()) => dropped.push(old),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("cannot remove {}: {e}", oldest.display())),
+            }
+        }
+        Ok(dropped)
+    }
+}
+
+/// The order number and the blob key in the entry file at `path`.
+fn read_entry(path: &Path) -> Option<(u64, String)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let (order, blob) = text.split_once('\n')?;
+    Some((order.parse().ok()?, blob.trim().to_string()))
+}
+
+impl CacheIndex for FileCacheIndex {
+    fn get<'a>(&'a self, key: &'a CacheKey) -> BoxFuture<'a, Result<Option<String>, AgentError>> {
+        Box::pin(std::future::ready(Ok(self.get_now(key))))
+    }
+
+    fn put<'a>(
+        &'a self,
+        key: &'a CacheKey,
+        blob: String,
+    ) -> BoxFuture<'a, Result<Vec<String>, AgentError>> {
+        let result = self
+            .put_now(key, &blob)
+            .map_err(|e| AgentError::new(ErrorKind::Unavailable, e));
+        Box::pin(std::future::ready(result))
+    }
+}
+
 /// A content-addressed [`PayloadStore`] in one directory, for the response
 /// cache. The key is the SHA-256 of the bytes.
 #[derive(Debug, Clone)]
@@ -412,6 +521,61 @@ mod tests {
             block: "memory".into(),
             text: text.into(),
         }
+    }
+
+    /// A cache over the blobs and the index in `dir`, as a new process
+    /// builds it.
+    fn disk_cache(dir: &Path, capacity: usize) -> autumn_harvest_agent::ResponseCache {
+        autumn_harvest_agent::ResponseCache::new(
+            Arc::new(DirPayloadStore::new(dir.join("blobs")).unwrap()),
+            Arc::new(FileCacheIndex::new(dir.join("index"), capacity).unwrap()),
+            autumn_harvest::payload_codec::PayloadCodecs::default(),
+        )
+    }
+
+    fn chat(
+        text: &str,
+    ) -> (
+        autumn_harvest_agent::ChatRequest,
+        autumn_harvest_agent::ChatResponse,
+    ) {
+        use autumn_harvest_agent::{ChatMessage, ChatRole, ContentPart, StopReason, TokenUsage};
+        (
+            autumn_harvest_agent::ChatRequest {
+                messages: vec![ChatMessage::text(ChatRole::User, text)],
+                tools: Vec::new(),
+                max_tokens: Some(64),
+                temperature: None,
+            },
+            autumn_harvest_agent::ChatResponse {
+                content: vec![ContentPart::Text(format!("answer to {text}"))],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::new(10, 5),
+            },
+        )
+    }
+
+    /// A model call whose result a crash lost runs again in a new process.
+    /// The index on disk finds the stored answer.
+    #[tokio::test]
+    async fn the_cache_index_survives_a_new_process_and_evicts_the_oldest() {
+        use autumn_harvest_agent::KeyTenant;
+        let dir = tempfile::tempdir().unwrap();
+        let first = disk_cache(dir.path(), 2);
+        let (ask, answer) = chat("one");
+        let one = first.key(KeyTenant::None, "m", &ask).unwrap();
+        first.store(&one, &answer).await.unwrap();
+        let again = disk_cache(dir.path(), 2);
+        assert_eq!(again.lookup(&one).await.unwrap(), Some(answer));
+        // Two more entries: the oldest goes, and so does its blob.
+        for text in ["two", "three"] {
+            let (ask, answer) = chat(text);
+            let key = again.key(KeyTenant::None, "m", &ask).unwrap();
+            again.store(&key, &answer).await.unwrap();
+        }
+        assert_eq!(again.lookup(&one).await.unwrap(), None);
+        let blobs = std::fs::read_dir(dir.path().join("blobs")).unwrap().count();
+        assert_eq!(blobs, 2);
     }
 
     #[tokio::test]

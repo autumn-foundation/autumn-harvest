@@ -18,7 +18,7 @@ night, offline by default: a simulated trainer and a scripted researcher.
 - The agent harness has five lab tools and a policy that gates `rewind`. A
   flow rule gates a write after untrusted input, and the labels follow the
   session. It has a `reviewer` peer, file memory, file delivery, a heartbeat
-  precheck and the response cache.
+  precheck and a response cache with its index on disk.
 - Each write is idempotent across a crash. A commit is keyed by its
   trailer, and an edit by its tool call. A row and a training run are keyed
   by the activity idempotency key. The process group of a run dies with it.

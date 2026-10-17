@@ -27,13 +27,14 @@ use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest_agent::flow::{effect_label, labels};
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentModel, AgentTask, ErrorKind, FlowRules, FnTool, HeartbeatTask,
-    InMemoryCacheIndex, Peer, ResponseCache, Rule, SessionId, Tool, ToolContext, ToolEffect,
-    ToolRules,
+    Peer, ResponseCache, Rule, SessionId, Tool, ToolContext, ToolEffect, ToolRules,
 };
 use serde_json::{Value, json};
 
 use crate::lab::Lab;
-use crate::stores::{DirPayloadStore, FileDelivery, FileMemoryStore, ResultsPrecheck};
+use crate::stores::{
+    DirPayloadStore, FileCacheIndex, FileDelivery, FileMemoryStore, ResultsPrecheck,
+};
 
 /// The researcher reads and edits. The marker tells a scripted model its role.
 pub const RESEARCHER_ROLE: &str = "ROLE: researcher";
@@ -231,13 +232,10 @@ pub fn harness(model: Arc<dyn AgentModel>, parts: &HarnessParts) -> Result<Agent
     let memory = FileMemoryStore::new(parts.state_dir.join("memory"))?;
     let blobs = DirPayloadStore::new(parts.state_dir.join("cache"))?;
     // An identical request within a day gets the stored answer. The index
-    // lives in memory, so a restart starts it empty.
-    let cache = ResponseCache::new(
-        Arc::new(blobs),
-        Arc::new(InMemoryCacheIndex::new(1_024)),
-        PayloadCodecs::default(),
-    )
-    .max_age(Duration::from_secs(24 * 3_600));
+    // is on disk, so a call whose result a crash lost is not paid twice.
+    let index = FileCacheIndex::new(parts.state_dir.join("cache-index"), 1_024)?;
+    let cache = ResponseCache::new(Arc::new(blobs), Arc::new(index), PayloadCodecs::default())
+        .max_age(Duration::from_secs(24 * 3_600));
     Ok(AgentHarness::new(model)
         .tools(tools(&parts.labs))
         .policy(Arc::new(policy()))

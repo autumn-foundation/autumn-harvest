@@ -275,9 +275,12 @@ experiment set the search attribute `status`, which the engine reserves.
   builds that registration with a budget on `agent_loop`.
 - **`purge` cleans the database only.** The response cache, the memory notes,
   the reports, the saved runs and the Claude turns stay in `.autoresearch`.
-  Delete `.autoresearch/cache` when no process runs.
-- **The response cache index lives in memory.** A restart starts it empty.
-  The blobs stay on disk.
+  Delete `.autoresearch/cache` and `.autoresearch/cache-index` when no
+  process runs.
+- **The response cache outlives a process.** An identical model request
+  within a day gets the stored answer, across restarts too. So a model call
+  whose result a crash lost is not paid twice, and its answer does not
+  change.
 - **A runner killed as its run starts leaves the run alive.** The lock file
   then names no group, so the next run cannot kill it. That run waits ten
   seconds and fails, and the activity retries. Stop the old run by hand,

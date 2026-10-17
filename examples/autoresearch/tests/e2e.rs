@@ -686,16 +686,20 @@ fn with_program_keeps_the_session_context() {
 async fn the_response_cache_serves_an_identical_report_turn() {
     let fx = Fixture::new();
     let model = model();
-    let mut rt = fx.open(&model);
-    let exec = runtime::start(&mut rt, &fx.config("cache", 1)).unwrap();
-    run_to_end(&mut rt, exec).await;
-
-    // AC20: two report runs over the same results send the same requests.
     let lab = fx.lab().root().display().to_string();
     let task: AgentTask = agent::report_task(&lab, "cache", "1 experiments, 1 kept");
-    let first = sqlite::start(&mut rt, &task).unwrap();
-    rt.run_until_blocked(first).await.unwrap();
-    let calls = model.calls();
+    let calls = {
+        let mut rt = fx.open(&model);
+        let exec = runtime::start(&mut rt, &fx.config("cache", 1)).unwrap();
+        run_to_end(&mut rt, exec).await;
+        // AC20: two report runs over the same results send the same requests.
+        let first = sqlite::start(&mut rt, &task).unwrap();
+        rt.run_until_blocked(first).await.unwrap();
+        model.calls()
+    };
+    // A new process: a turn whose result was lost in a crash asks again,
+    // and the cache on disk answers it.
+    let mut rt = fx.open(&model);
     let second = sqlite::start(&mut rt, &task).unwrap();
     rt.run_until_blocked(second).await.unwrap();
     assert_eq!(model.calls(), calls, "the second run asked no model");

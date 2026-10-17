@@ -248,11 +248,11 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC13 | `e2e::a_night_of_research_keeps_only_improvements`: the attributes, the memo, and a list by the `tag` attribute. |
 | AC14 | `e2e::the_nightly_schedule_starts_a_session_and_the_heartbeat_speaks_up`. `stores::tests::the_precheck_runs_a_tick_only_for_a_new_crash_streak`, `a_redelivered_alert_marks_its_rows`. |
 | AC15 | `e2e::a_finished_night_leaves_a_morning_report`, `scripted::tests::the_reporter_reports_the_summary_of_its_own_session`. |
-| AC16 | `e2e::a_restart_resumes_without_paying_for_a_turn_or_a_run_twice`: the model calls across two processes equal those of one process, and each row has one `train` activity. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`: a train call that runs again does not train again. |
+| AC16 | `e2e::a_restart_resumes_without_paying_for_a_turn_or_a_run_twice`: the model calls across two processes equal those of one process, and each row has one `train` activity. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`: a train call that runs again does not train again. `stores::tests::the_cache_index_survives_a_new_process_and_evicts_the_oldest`: a model call that runs again in a new process gets the stored answer. |
 | AC17 | `e2e::a_night_of_research_keeps_only_improvements` and `e2e::the_session_continues_as_new_and_carries_its_best` run `verify`. The CI demo runs `verify`. |
 | AC18 | `sim::*`: nine sweeps. Each seed runs twice, replays, and runs again with a crash. Each target is required. The mocks give full commit ids, so a sweep sees a short id where a full one belongs. |
 | AC19 | `e2e::eval_names_the_first_turn_where_a_new_program_differs`, `cli::eval_and_purge_work_on_a_finished_night`. |
-| AC20 | `e2e::the_response_cache_serves_an_identical_report_turn`. |
+| AC20 | `e2e::the_response_cache_serves_an_identical_report_turn`: the second report turn runs in a new process and asks no model. |
 | AC21 | `e2e::the_inbox_delivers_a_command_once`, `cli::inbox_commands_queue_for_the_runner`, `inbox::tests`. |
 | AC22 | `e2e::the_command_trainer_runs_a_real_command_per_commit`, `trainer::tests::the_command_trainer_*`. |
 | AC23 | `claude::tests` (nine cases). |
@@ -294,7 +294,8 @@ The fixes:
   commit. A trainer run clears its group id from the lock file when it
   ends, and a free lock clears an old one. On Linux the file holds the
   start time of the group leader, and a kill needs it to match. A
-  redelivered heartbeat alert marks its rows. Each session starts with an
+  redelivered heartbeat alert marks its rows. The response cache index is
+  on disk, so a model call whose result a crash lost is not paid twice. Each session starts with an
   empty commit that holds the key of its setup. So two sessions in one lab
   never share a commit, and setup refuses a branch that another session
   started, such as one that `purge` left. A scheduled session publishes its

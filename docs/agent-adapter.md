@@ -786,7 +786,8 @@ experiment. It uses a mandate with a reviewer peer, a flow rule, approvals,
 memory, delivery, a heartbeat with a precheck, the response cache and
 `eval`. Its runs share a memory scope, so each run starts with the flow
 labels of the runs before it. Its `edit_train` tool keys each edit on the
-run, the step and the call id.
+run, the step and the call id. Its `FileCacheIndex` implements `CacheIndex`
+on disk, so a model call whose result a crash lost is not paid twice.
 
 ## 14. Agent mesh
 
