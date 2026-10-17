@@ -10525,7 +10525,7 @@ fn resolve_trigger_params(
             // The engine reads the stored input strictly (issue #2043).
             let input = match row.workflow_input.as_ref() {
                 Some(stored) => runtime
-                    .registry
+                    .registry()
                     .payload_codecs()
                     .decode_column(stored)
                     .map_err(|_| "stored schedule input could not be decoded".to_string())?,
