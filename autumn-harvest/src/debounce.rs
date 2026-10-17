@@ -127,7 +127,10 @@ pub fn compute_fire_deadline(
 /// Serialised start options stored alongside the last qualifying input.
 ///
 /// Persisted as opaque JSONB in `harvest_debounce.start_options` so the
-/// schema stays stable even as `StartWorkflowParams` grows.
+/// schema stays stable even as `StartWorkflowParams` grows. The stored
+/// `context_headers` key holds an envelope when column encoding is on
+/// (issue #2043). [`encode_stored_start_options`] and
+/// [`decode_stored_start_options`] convert between the two forms.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct DebounceStartOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -410,6 +413,13 @@ pub async fn admit_debounced_start_with_codecs(
     let new_id = uuid::Uuid::new_v4();
     let start_options_json = serde_json::to_value(&params.start_options)
         .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+    // The row stores the headers in the column form. A gated admission rolls
+    // back, so it drops them and needs no encode (issue #2043).
+    let start_options_json = if gate_active {
+        without_context_headers(start_options_json)
+    } else {
+        encode_stored_start_options(codecs, start_options_json)?
+    };
 
     // Upsert: insert on first request, update deadline + last-input on collision.
     // effective_fire_at is LEAST(now + window, existing max_fire_at) so the cap
@@ -600,16 +610,20 @@ async fn decode_due_rows(
 ) -> crate::error::HarvestResult<Vec<FireDueRow>> {
     let mut decodable = Vec::with_capacity(rows.len());
     for mut row in rows {
-        match codecs.decode_column(&row.last_input) {
-            Ok(plain) => {
+        match codecs.decode_column(&row.last_input).and_then(|plain| {
+            let options = decode_stored_start_options(codecs, row.start_options.clone())?;
+            Ok((plain, options))
+        }) {
+            Ok((plain, options)) => {
                 row.last_input = plain;
+                row.start_options = options;
                 decodable.push(row);
             }
             Err(error) => {
                 tracing::warn!(
                     debounce_id = %row.id,
                     error_kind = crate::codec_rotation::sweep_error_kind(&error),
-                    "debounce input could not be decoded; the row moves back"
+                    "debounce input or headers could not be decoded; the row moves back"
                 );
                 let target =
                     redefer_target(now, row.max_fire_at, now + UNDECODABLE_REDEFER_BACKOFF);
@@ -618,6 +632,51 @@ async fn decode_due_rows(
         }
     }
     Ok(decodable)
+}
+
+/// Replace the plain `context_headers` of stored start options with the column
+/// form (issue #2043). The headers can carry a tenant, so a buffered start
+/// keeps them as ciphertext until it fires.
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError`] when the headers do not encode.
+pub(crate) fn encode_stored_start_options(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    mut options: serde_json::Value,
+) -> crate::error::HarvestResult<serde_json::Value> {
+    if let Some(cell) = options.get_mut("context_headers")
+        && !cell.is_null()
+    {
+        *cell = codecs.encode_column(cell)?;
+    }
+    Ok(options)
+}
+
+/// Undo [`encode_stored_start_options`]. A cell in clear passes through
+/// unchanged, so a row from before the change still reads.
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError`] when the cell does not decode. Never a guess.
+pub(crate) fn decode_stored_start_options(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    mut options: serde_json::Value,
+) -> crate::error::HarvestResult<serde_json::Value> {
+    if let Some(cell) = options.get_mut("context_headers")
+        && !cell.is_null()
+    {
+        *cell = codecs.decode_column(cell)?;
+    }
+    Ok(options)
+}
+
+/// Remove the headers from start options that a rolled-back write binds.
+fn without_context_headers(mut options: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = options.as_object_mut() {
+        map.remove("context_headers");
+    }
+    options
 }
 
 /// Fire all pending debounce records whose `effective_fire_at` has elapsed.

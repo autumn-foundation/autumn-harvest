@@ -171,6 +171,9 @@ pub async fn admit_batched_start_with_codecs(
     let new_id = uuid::Uuid::new_v4();
     let start_options_json = serde_json::to_value(&params.start_options)
         .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+    // The headers take the column form too (issue #2043).
+    let start_options_json =
+        crate::debounce::encode_stored_start_options(codecs, start_options_json)?;
 
     let sql = "
         INSERT INTO harvest_event_batches
@@ -257,8 +260,10 @@ pub async fn admit_batched_start_with_codecs(
                 .await
                 .map_err(crate::error::database_error)?;
 
-            let opts: DebounceStartOptions =
-                serde_json::from_value(row.start_options.clone()).unwrap_or_default();
+            let opts: DebounceStartOptions = serde_json::from_value(
+                crate::debounce::decode_stored_start_options(codecs, row.start_options.clone())?,
+            )
+            .unwrap_or_default();
 
             let max_allowed_bytes = opts.max_workflow_input_bytes.unwrap_or(10 * 1024 * 1024);
             if u64::from(row.buffered_bytes.cast_unsigned()) > max_allowed_bytes {
@@ -638,22 +643,28 @@ async fn fire_claimed_batch_row(
 > {
     use diesel_async::RunQueryDsl;
 
-    // A payload that does not decode never starts a run (issue #2043). The
-    // row moves back and stays, so a restored key lets it start.
-    let buffered_payloads = match decode_buffered_payloads(codecs, &row.buffered_payloads) {
-        Ok(plain) => plain,
+    // A payload or header that does not decode never starts a run
+    // (issue #2043). The row moves back and stays, so a restored key lets it
+    // start.
+    let decoded = decode_buffered_payloads(codecs, &row.buffered_payloads).and_then(|payloads| {
+        let options =
+            crate::debounce::decode_stored_start_options(codecs, row.start_options.clone())?;
+        Ok((payloads, options))
+    });
+    let (buffered_payloads, start_options) = match decoded {
+        Ok(decoded) => decoded,
         Err(error) => {
             tracing::warn!(
                 batch_id = %row.id,
                 error_kind = crate::codec_rotation::sweep_error_kind(&error),
-                "batch payload could not be decoded; the row moves back"
+                "batch payload or headers could not be decoded; the row moves back"
             );
             redefer_event_batch_row(conn, row.id, Utc::now() + UNDECODABLE_REDEFER_BACKOFF).await?;
             return Ok(None);
         }
     };
 
-    let opts: DebounceStartOptions = serde_json::from_value(row.start_options).unwrap_or_default();
+    let opts: DebounceStartOptions = serde_json::from_value(start_options).unwrap_or_default();
 
     let shard = crate::types::ShardId::new(row.shard_id);
     let exec_id = crate::types::ExecutionId::new_for_shard(shard);

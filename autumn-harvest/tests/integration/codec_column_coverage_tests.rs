@@ -3431,7 +3431,6 @@ async fn a_debounce_row_whose_headers_cannot_decode_moves_back_and_never_starts(
             debounce_key: &key,
             workflow_id: &format!("cc-hdr-stuck-{key}"),
             queue_name: "default",
-            // Clear input, so only the headers can fail the decode.
             last_input: json!({}),
             start_options: header_start_options(),
             window: Duration::from_millis(1),
@@ -3444,6 +3443,15 @@ async fn a_debounce_row_whose_headers_cannot_decode_moves_back_and_never_starts(
     .await
     .expect("admit")
     .expect("admitted");
+    // Admission encodes the input too. Put it back in clear, so only the
+    // headers can fail the decode.
+    diesel::sql_query(
+        "UPDATE harvest_debounce SET last_input = '{}'::jsonb WHERE debounce_key = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&key)
+    .execute(&mut conn)
+    .await
+    .expect("clear the input");
     tokio::time::sleep(Duration::from_millis(100)).await;
     fire_due_debounced_starts_with_codecs(
         &mut conn,

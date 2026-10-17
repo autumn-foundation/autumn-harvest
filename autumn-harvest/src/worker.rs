@@ -6439,7 +6439,8 @@ async fn workflow_execution_transition_error(
         )
 }
 
-/// The input and memo a workflow retry starts with, decoded (issue #1979).
+/// The input, memo and headers a workflow retry starts with, decoded
+/// (issue #1979, issue #2043).
 ///
 /// The start path encodes them again. A value this registry cannot decode
 /// returns `None`, so the run fails without a retry. A missing key must not
@@ -6447,20 +6448,31 @@ async fn workflow_execution_transition_error(
 fn decode_retry_payload(
     codecs: &crate::payload_codec::PayloadCodecs,
     execution: &WorkflowExecution,
-) -> Option<(serde_json::Value, Option<serde_json::Value>)> {
+) -> Option<RetryPayload> {
     let decoded = codecs.decode_column(&execution.input).and_then(|input| {
-        codecs
-            .decode_column_opt(execution.memo.as_ref())
-            .map(|memo| (input, memo))
+        let memo = codecs.decode_column_opt(execution.memo.as_ref())?;
+        let headers = execution
+            .context_headers
+            .as_ref()
+            .map(|stored| codecs.decode_headers(stored))
+            .transpose()?;
+        Ok((input, memo, headers))
     });
     if decoded.is_err() {
         tracing::warn!(
             exec_id = %execution.id,
-            "workflow retry skipped: the stored input or memo could not be decoded"
+            "workflow retry skipped: the stored input, memo or headers could not be decoded"
         );
     }
     decoded.ok()
 }
+
+/// What [`decode_retry_payload`] returns: input, memo and headers.
+type RetryPayload = (
+    serde_json::Value,
+    Option<serde_json::Value>,
+    Option<std::collections::HashMap<String, String>>,
+);
 
 /// Seal the execution row `COMPLETED` with `output`, which is the stored
 /// form. The caller encodes it with [`PayloadCodecs::encode_column`]
@@ -9766,7 +9778,8 @@ pub async fn persist_workflow_failure(
             if let (Some(exec_ref), Some((rid, policy, attempt, fire_at, start_delay))) =
                 (exec_ref, retry_fire_info)
                 && attempt < policy.max_attempts
-                && let Some((retry_input, retry_memo)) = decode_retry_payload(codecs, exec_ref)
+                && let Some((retry_input, retry_memo, retry_headers)) =
+                    decode_retry_payload(codecs, exec_ref)
             {
                 let retry_workflow_id = rid.to_string();
                 let retry_params = crate::execution::StartWorkflowParams {
@@ -9791,10 +9804,7 @@ pub async fn persist_workflow_failure(
                     owner: exec_ref.owner.as_deref(),
                     runbook_url: exec_ref.runbook_url.as_deref(),
                     severity: exec_ref.severity.as_deref(),
-                    context_headers: exec_ref
-                        .context_headers
-                        .clone()
-                        .and_then(|v| serde_json::from_value(v).ok()),
+                    context_headers: retry_headers,
                     sla: exec_ref.sla,
                     schedule_id: exec_ref.schedule_id,
                     scheduled_for: exec_ref.scheduled_for,
@@ -11213,48 +11223,72 @@ struct ActivityEnqueuePlan {
 /// reserved header. A row with the result writer gets the header. The header
 /// rides in the row's existing `context_headers` column, so it needs no
 /// migration.
+///
+/// `stored` is the execution cell and `inherited` is the same cell decoded.
+/// A row that adds or removes nothing copies the stored cell, so it spends no
+/// new nonce and nests no second layer (issue #2043).
+///
+/// # Errors
+///
+/// [`HarvestError`] when the changed map does not encode.
 fn activity_row_context_headers(
-    context_headers: Option<&serde_json::Value>,
+    stored: Option<&serde_json::Value>,
+    inherited: Option<&std::collections::HashMap<String, String>>,
     result_writer: bool,
-) -> Option<serde_json::Value> {
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<Option<serde_json::Value>> {
     let key = crate::fan_out::RESULT_WRITER_HEADER;
-    let inherited = context_headers.and_then(serde_json::Value::as_object);
     if !result_writer && !inherited.is_some_and(|headers| headers.contains_key(key)) {
-        return context_headers.cloned();
+        return Ok(stored.cloned());
     }
     let mut headers = inherited.cloned().unwrap_or_default();
     headers.remove(key);
     if result_writer {
-        headers.insert(key.to_string(), serde_json::Value::from("1"));
+        headers.insert(key.to_string(), "1".to_string());
     }
-    Some(serde_json::Value::Object(headers))
+    codecs.encode_headers(&headers).map(Some)
 }
 
 #[cfg(test)]
 mod result_writer_header_tests {
     use super::activity_row_context_headers;
     use crate::fan_out::RESULT_WRITER_HEADER;
+    use crate::payload_codec::PayloadCodecs;
     use serde_json::json;
+    use std::collections::HashMap;
+
+    fn map(value: &serde_json::Value) -> HashMap<String, String> {
+        serde_json::from_value(value.clone()).expect("a string map")
+    }
 
     #[test]
     fn a_plain_row_keeps_the_execution_headers() {
+        let codecs = PayloadCodecs::default();
         let headers = json!({ "tenant": "a" });
+        let inherited = map(&headers);
         assert_eq!(
-            activity_row_context_headers(Some(&headers), false),
+            activity_row_context_headers(Some(&headers), Some(&inherited), false, &codecs)
+                .expect("no encode"),
             Some(headers)
         );
-        assert_eq!(activity_row_context_headers(None, false), None);
+        assert_eq!(
+            activity_row_context_headers(None, None, false, &codecs).expect("no encode"),
+            None
+        );
     }
 
     #[test]
     fn a_writer_row_adds_the_header() {
+        let codecs = PayloadCodecs::default();
         let headers = json!({ "tenant": "a" });
+        let inherited = map(&headers);
         assert_eq!(
-            activity_row_context_headers(Some(&headers), true),
+            activity_row_context_headers(Some(&headers), Some(&inherited), true, &codecs)
+                .expect("encode"),
             Some(json!({ "tenant": "a", RESULT_WRITER_HEADER: "1" }))
         );
         assert_eq!(
-            activity_row_context_headers(None, true),
+            activity_row_context_headers(None, None, true, &codecs).expect("encode"),
             Some(json!({ RESULT_WRITER_HEADER: "1" }))
         );
     }
@@ -11263,21 +11297,30 @@ mod result_writer_header_tests {
     /// reserved header, so a caller cannot turn on the writer.
     #[test]
     fn a_plain_row_drops_a_caller_supplied_writer_header() {
+        let codecs = PayloadCodecs::default();
         let headers = json!({ "tenant": "a", RESULT_WRITER_HEADER: "1" });
+        let inherited = map(&headers);
         assert_eq!(
-            activity_row_context_headers(Some(&headers), false),
+            activity_row_context_headers(Some(&headers), Some(&inherited), false, &codecs)
+                .expect("encode"),
             Some(json!({ "tenant": "a" }))
         );
     }
 }
 
 /// Whether the task row asks the worker to write the result (issue #1986).
-fn task_writes_result(task: &TaskQueueItem) -> bool {
-    task.context_headers
-        .as_ref()
-        .and_then(|headers| headers.get(crate::fan_out::RESULT_WRITER_HEADER))
-        .and_then(serde_json::Value::as_str)
-        == Some("1")
+///
+/// The marker rides inside the header cell, so the cell is decoded first
+/// (issue #2043). A cell that does not decode is not a writer row. The
+/// attempt fails on that cell before it reaches a place that matters.
+fn task_writes_result(task: &TaskQueueItem, codecs: &crate::payload_codec::PayloadCodecs) -> bool {
+    codecs
+        .decode_headers_opt(task.context_headers.as_ref())
+        .is_ok_and(|headers| {
+            headers
+                .get(crate::fan_out::RESULT_WRITER_HEADER)
+                .is_some_and(|value| value == "1")
+        })
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -11297,6 +11340,10 @@ fn build_activity_enqueue_plan(
     let mut activity_events: Vec<WorkflowEvent> = Vec::with_capacity(scheduled_activities.len());
     let mut enqueued = Vec::with_capacity(scheduled_activities.len());
     let mut decoded_input: Option<serde_json::Value> = None;
+    // Decode the execution headers once for the whole decision (issue #2043).
+    let inherited_headers = context_headers
+        .map(|stored| registry.payload_codecs().decode_headers(stored))
+        .transpose()?;
     // Dynamic per-key rate-limit buckets (issue #699) to lazily register inside
     // the enqueue transaction: `(bucket_key, refill_rate, burst)`. Deduped so a
     // fan-out of N activities sharing one resolved tenant key ensures the bucket
@@ -11576,8 +11623,12 @@ fn build_activity_enqueue_plan(
             { ATTR_QUEUE } = %queue_name,
         )
         .in_scope(|| registry.telemetry().capture_trace_context());
-        params.context_headers =
-            activity_row_context_headers(context_headers, scheduled.result_writer);
+        params.context_headers = activity_row_context_headers(
+            context_headers,
+            inherited_headers.as_ref(),
+            scheduled.result_writer,
+            registry.payload_codecs(),
+        )?;
         enqueued.push(params);
     }
 
@@ -16275,7 +16326,7 @@ async fn handle_activity_result(
         // as a reference, so it fails instead (compare issue #1758).
         Ok(output)
             if stored.is_none()
-                && task_writes_result(task)
+                && task_writes_result(task, codecs)
                 && output.get(crate::fan_out::STORED_RESULT_KEY).is_some() =>
         {
             use crate::failure::IntoActivityErrorString as _;
@@ -19307,9 +19358,10 @@ async fn process_activity_task(
     let codecs = registry.payload_codecs();
     let decoded = codecs.decode_column(&task.input).and_then(|input| {
         let checkpoint = codecs.decode_column_opt(task.heartbeat_details.as_ref())?;
-        Ok((input, checkpoint))
+        let headers = codecs.decode_headers_opt(task.context_headers.as_ref())?;
+        Ok((input, checkpoint, headers))
     });
-    let (handler_input, previous_checkpoint) = match decoded {
+    let (handler_input, previous_checkpoint, activity_headers) = match decoded {
         Ok(decoded) => decoded,
         Err(error) => {
             use crate::failure::IntoActivityErrorString as _;
@@ -19320,7 +19372,7 @@ async fn process_activity_task(
             );
             let payload = crate::failure::ActivityFailure::retryable(
                 crate::failure::ERROR_TYPE_PAYLOAD_DECODE_FAILED,
-                "the stored activity input or checkpoint could not be decoded",
+                "the stored activity input, checkpoint or headers could not be decoded",
             )
             .into_error_payload();
             return fail_attempt_before_handler(
@@ -19364,22 +19416,7 @@ async fn process_activity_task(
         .trace_context
         .as_ref()
         .and_then(TraceContextCarrier::from_json);
-    let activity_context_headers = task
-        .context_headers
-        .as_ref()
-        .and_then(|v| {
-            match serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to deserialize activity context headers; propagating empty map");
-                    None
-                }
-            }
-        })
-        .map_or_else(
-            || std::sync::Arc::new(std::collections::HashMap::new()),
-            std::sync::Arc::new,
-        );
+    let activity_context_headers = std::sync::Arc::new(activity_headers);
     // Issue #783: identity is resolved from the row `append_activity_started_if_pending`
     // already locked (no extra query) plus the claimed task row.
     let activity_identity = ActivityIdentity::new(
@@ -19440,7 +19477,7 @@ async fn process_activity_task(
             activity_id,
             claim: activity_claim.clone(),
             max_result_bytes: effective_result_cap,
-            result_writer: task_writes_result(task),
+            result_writer: task_writes_result(task, registry.payload_codecs()),
             offloader: registry.payload_offloader_arc(),
         });
 
@@ -19766,9 +19803,9 @@ async fn process_activity_task(
         Ok(output) if effective_result_cap > 0 => {
             let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
             // Issue #1986: the result writer moves every result to the store.
-            let offload_applies = registry
-                .payload_offloader()
-                .is_some_and(|o| observed > o.threshold() || task_writes_result(task));
+            let offload_applies = registry.payload_offloader().is_some_and(|o| {
+                observed > o.threshold() || task_writes_result(task, registry.payload_codecs())
+            });
             if observed > effective_result_cap && !offload_applies {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
@@ -20382,15 +20419,17 @@ async fn write_activity_result(
     // safe. A lost claim leaves one blob without a reference row, as a
     // rolled-back offload does.
     let stored = match (activity_result, registry.payload_offloader()) {
-        (Ok(output), Some(offloader)) if task_writes_result(task) => Some(
-            crate::fan_out::StoredResult::write(
-                offloader.store().as_ref(),
-                registry.payload_codecs(),
-                activity_id,
-                output,
+        (Ok(output), Some(offloader)) if task_writes_result(task, registry.payload_codecs()) => {
+            Some(
+                crate::fan_out::StoredResult::write(
+                    offloader.store().as_ref(),
+                    registry.payload_codecs(),
+                    activity_id,
+                    output,
+                )
+                .await?,
             )
-            .await?,
-        ),
+        }
         _ => None,
     };
     let mut attempt = 1;
@@ -25986,20 +26025,19 @@ async fn process_workflow_task(
             .filter(|h| h.workflow == wf_name)
             .collect();
 
-        let exec_context_headers = prepared
-            .execution
-            .context_headers
-            .as_ref()
-            .and_then(|v| {
-                match serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()) {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to deserialize workflow execution context headers; propagating empty map");
-                        None
-                    }
-                }
-            })
-            .unwrap_or_default();
+        // A header can carry a tenant or a trace. A missing key fails the run,
+        // like a history that cannot be decoded. It never runs without the
+        // headers (issue #2043).
+        let exec_context_headers = fail_execution_on_error(
+            conn,
+            task,
+            worker_id,
+            registry
+                .payload_codecs()
+                .decode_headers_opt(prepared.execution.context_headers.as_ref()),
+            registry.payload_codecs(),
+        )
+        .await?;
 
         // Issue #967 (R&D spike, `hot-code-swap` feature): a module-hosted
         // workflow's handler is the `hot_swap::module_workflow_handler`
