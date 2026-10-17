@@ -1036,8 +1036,10 @@ pub enum StartSource {
     /// caller's own domain write.
     Transactional,
     /// Provenance is unknown (a NULL / pre-upgrade column, or an unrecognized
-    /// stored value). This is the default.
+    /// stored value). This is the default. A source from a newer version
+    /// decodes to this variant too.
     #[default]
+    #[serde(other)]
     Unknown,
 }
 
@@ -1891,6 +1893,18 @@ mod tests {
             let deserialized: Priority = serde_json::from_str(&json).unwrap();
             assert_eq!(deserialized, priority);
         }
+    }
+
+    #[test]
+    fn an_unrecognized_serialized_source_decodes_to_unknown() {
+        let source: StartSource = serde_json::from_value(serde_json::json!("from_the_future"))
+            .expect("an unknown source must not fail");
+        assert_eq!(source, StartSource::Unknown);
+        let provenance: StartProvenance = serde_json::from_value(
+            serde_json::json!({"source": "from_the_future", "continued_from": null}),
+        )
+        .expect("an unknown source must not fail a snapshot");
+        assert_eq!(provenance.source, StartSource::Unknown);
     }
 
     #[test]
