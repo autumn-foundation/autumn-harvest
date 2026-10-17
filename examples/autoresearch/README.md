@@ -287,6 +287,9 @@ experiment set the search attribute `status`, which the engine reserves.
   then names no group, so the next run cannot kill it. That run waits ten
   seconds and fails, and the activity retries. Stop the old run by hand,
   or let it end at its own time budget.
+- **Off Linux, the next run kills no run that outlived its runner.** It
+  cannot read the start time that tells the group of that run from a group
+  that reused its id. It waits and fails in the same way.
 - **A heartbeat alert holds the rows at its delivery.** Crash rows that land
   while the alert is written get no alert of their own. The next crash
   alerts again.

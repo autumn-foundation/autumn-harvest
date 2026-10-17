@@ -1036,6 +1036,31 @@ async fn a_nightly_session_takes_commands_by_its_tag() {
     ));
 }
 
+/// A keep policy that a signal could not carry cannot start a session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_refuses_an_invalid_keep_policy() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    let mut config = fx.config("bad", 1);
+    config.policy.line_cost = -1.0;
+    assert!(runtime::start(&mut rt, &config).is_err());
+    // A caller that starts the workflow itself meets the same check.
+    let input = serde_json::to_value(autoresearch::workflows::SessionInput {
+        config,
+        carry: None,
+    })
+    .unwrap();
+    let started = rt
+        .start_workflow_with_options(SESSION, input, autumn_harvest_sqlite::StartOptions::new())
+        .unwrap();
+    let step = runtime::drive(&mut rt, started.exec_id).await.unwrap();
+    assert!(matches!(step, Step::Failed(_)), "{step:?}");
+    assert!(
+        activities_of(&rt, started.exec_id).is_empty(),
+        "no setup ran"
+    );
+}
+
 /// A report run that fails is an error, so `run` does not print a report
 /// that was never written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

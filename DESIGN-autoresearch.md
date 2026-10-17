@@ -292,8 +292,9 @@ The fixes:
   the session branch only. A row of `results.tsv` whose short id names two
   commits is refused, so a lookup never gives the score of the wrong
   commit. A trainer run clears its group id from the lock file when it
-  ends, and a free lock clears an old one. On Linux the file holds the
-  start time of the group leader, and a kill needs it to match. A
+  ends, and a free lock clears an old one. The file holds the start time
+  of the group leader, and a kill needs it to match. Off Linux no start
+  time can be read, so no group is killed. A
   redelivered heartbeat alert marks its rows. The response cache index is
   on disk, so a model call whose result a crash lost is not paid twice.
   `run` drives only the report agent of its session at the end, not every
@@ -303,7 +304,9 @@ The fixes:
   started, such as one that `purge` left. A scheduled session publishes its
   tag before it waits for its lab, so commands reach it from the start.
   While a running session has no tag yet, a command for an unknown tag
-  waits in the inbox and is not rejected.
+  waits in the inbox and is not rejected. A session refuses a keep policy
+  that a policy signal could not carry. `verify` drops the heartbeats of
+  an activity in flight with its start.
   A trainer whose run cannot end inside the budget of a `train` activity
   is refused at start, at the schedule and in the session.
 - **Steering.** Commands by tag, `run` resumes across midnight, rejected

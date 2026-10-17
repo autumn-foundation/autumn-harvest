@@ -664,9 +664,10 @@ impl Drop for Group {
 /// So the lock stays held while any process of the run lives, even after
 /// the runner dies. The next run tries the lock. When the lock is held,
 /// the file names the group of a run that outlived its runner, and the next
-/// run kills that group first. On Linux the file also holds the start time
-/// of the group leader. The next run kills the group only when that time
-/// still matches, so a group that reused the id lives on.
+/// run kills that group first. The file also holds the start time of the
+/// group leader. The next run kills the group only when that time still
+/// matches, so a group that reused the id lives on. Off Linux no start time
+/// can be read, so the next run kills nothing. It waits and fails instead.
 ///
 /// A group id in the file can name another group once its run ends. So a
 /// run writes zero when it ends, on every path out, and the run that takes
@@ -724,8 +725,9 @@ impl Lock {
 
     /// Kill the group that the file names, when it is still that group.
     ///
-    /// On Linux, the start time of the group leader must match the file, so
-    /// a group that reused the id lives on. Elsewhere the id alone counts.
+    /// The start time of the group leader must match the file, so a group
+    /// that reused the id lives on. Off Linux no start time can be read, so
+    /// no group is killed.
     fn kill_holder(&self) {
         let mut text = String::new();
         let _ = (&self.0).read_to_string(&mut text);
@@ -734,7 +736,7 @@ impl Lock {
             return;
         };
         let start = fields.next().and_then(|f| f.parse::<u64>().ok());
-        if cfg!(target_os = "linux") && (start.is_none() || group_start(id) != start) {
+        if start.is_none() || group_start(id) != start {
             return;
         }
         Group(i32::try_from(id).ok()).kill();
@@ -1022,7 +1024,8 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
         assert!(!marker.exists(), "a child of the dropped run lived on");
     }
 
-    #[cfg(unix)]
+    /// The kill needs the start time from `/proc`, so it runs on Linux only.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_next_run_kills_a_run_that_outlived_its_runner() {
         use std::io::Write as _;
@@ -1120,6 +1123,13 @@ DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
         std::fs::write(&path, format!("{id} {}\n", start + 1)).unwrap();
         open().kill_holder();
         assert!(other.try_wait().unwrap().is_none(), "the other group lives");
+        // No start time, as off Linux: the group cannot be checked.
+        std::fs::write(&path, format!("{id} 0\n")).unwrap();
+        open().kill_holder();
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "an unchecked group lives"
+        );
         std::fs::write(&path, format!("{id} {start}\n")).unwrap();
         open().kill_holder();
         assert!(

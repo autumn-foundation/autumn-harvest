@@ -74,6 +74,7 @@ pub fn start(rt: &mut SqliteRuntime, config: &SessionConfig) -> Result<Execution
     let tag = config.tag.trim();
     crate::lab::check_tag(tag)?;
     crate::activities::check_trainer(&config.trainer)?;
+    config.policy.validate()?;
     let mut config = config.clone();
     config.tag = tag.to_string();
     let input = SessionInput {
@@ -384,6 +385,7 @@ pub fn running_sessions(rt: &SqliteRuntime) -> Result<Vec<(ExecutionId, String)>
 /// Returns an error when the config does not encode.
 pub fn nightly(config: &SessionConfig) -> Result<WorkflowSchedule, String> {
     crate::activities::check_trainer(&config.trainer)?;
+    config.policy.validate()?;
     let mut config = config.clone();
     config.tag.clear();
     let input = SessionInput {
@@ -513,6 +515,26 @@ pub async fn verify(runs: Vec<StoredRun>) -> VerifyReport {
     report
 }
 
+/// Drop the progress events of each activity in flight: its start and its
+/// heartbeats. Such an activity has no end, and the matcher does not consume
+/// its progress at the frontier.
+fn trim_frontier(history: &mut Vec<WorkflowEvent>) {
+    let ended: HashSet<_> = history
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::ActivityCompleted { activity_id, .. }
+            | WorkflowEvent::ActivityFailed { activity_id, .. }
+            | WorkflowEvent::ActivityTimedOut { activity_id, .. } => Some(*activity_id),
+            _ => None,
+        })
+        .collect();
+    history.retain(|event| match event {
+        WorkflowEvent::ActivityStarted { activity_id, .. }
+        | WorkflowEvent::ActivityHeartbeat { activity_id, .. } => ended.contains(activity_id),
+        _ => true,
+    });
+}
+
 /// Replay one history. A run that has not ended replays as the deploy
 /// canary does: it may stop at its frontier.
 async fn replay_one(replayer: &WorkflowReplayer, run: StoredRun) -> Result<(), String> {
@@ -526,21 +548,7 @@ async fn replay_one(replayer: &WorkflowReplayer, run: StoredRun) -> Result<(), S
     } = run;
     let running = state == "RUNNING";
     if running {
-        // An activity in flight has a start and no end. The matcher does not
-        // consume such a start at the frontier.
-        let ended: HashSet<_> = history
-            .iter()
-            .filter_map(|event| match event {
-                WorkflowEvent::ActivityCompleted { activity_id, .. }
-                | WorkflowEvent::ActivityFailed { activity_id, .. }
-                | WorkflowEvent::ActivityTimedOut { activity_id, .. } => Some(*activity_id),
-                _ => None,
-            })
-            .collect();
-        history.retain(|event| match event {
-            WorkflowEvent::ActivityStarted { activity_id, .. } => ended.contains(activity_id),
-            _ => true,
-        });
+        trim_frontier(&mut history);
     }
     let recorded_failure = history.iter().rev().find_map(|event| match event {
         WorkflowEvent::WorkflowFailed { error, .. } => Some(error.clone()),
@@ -639,4 +647,50 @@ pub async fn eval(
     evaluate(history, &candidate)
         .await
         .map_err(|e| format!("cannot evaluate the run: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use autumn_harvest::types::{ActivityExecId, WorkerId};
+    use serde_json::Value;
+
+    use super::*;
+
+    /// An activity in flight has a start and heartbeats, and no end. The
+    /// canary stops at it, so neither may stay in the history.
+    #[test]
+    fn the_frontier_loses_each_event_of_an_activity_in_flight() {
+        let (done, open) = (ActivityExecId::new(), ActivityExecId::new());
+        let worker = WorkerId::new("w");
+        let mut history = vec![
+            WorkflowEvent::ActivityStarted {
+                activity_id: done,
+                worker_id: worker.clone(),
+            },
+            WorkflowEvent::ActivityHeartbeat {
+                activity_id: done,
+                details: Value::Null,
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: done,
+                output: Value::Null,
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: open,
+                worker_id: worker,
+            },
+            WorkflowEvent::ActivityHeartbeat {
+                activity_id: open,
+                details: Value::Null,
+            },
+        ];
+        trim_frontier(&mut history);
+        let kinds: Vec<&str> = history.iter().map(WorkflowEvent::type_name).collect();
+        assert_eq!(
+            kinds,
+            ["ActivityStarted", "ActivityHeartbeat", "ActivityCompleted"]
+        );
+    }
 }
