@@ -2787,3 +2787,69 @@ async fn a_schedule_input_that_cannot_decode_never_starts_a_run() {
         "the slot stays due, so a restored key fires it"
     );
 }
+
+#[tokio::test]
+async fn a_schedule_patch_encodes_a_new_input_and_keeps_a_stored_one() {
+    use autumn_harvest::scheduler::{
+        ScheduleUpdateOutcome, WorkflowSchedulePatch, update_workflow_schedule_with_codecs,
+    };
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let name = format!("cc_sched_patch_{}", Uuid::new_v4().simple());
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        &[secret_schedule(&name)],
+        &codecs,
+    )
+    .await
+    .expect("register");
+    #[derive(diesel::QueryableByName)]
+    struct Id {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+    let id: Id = diesel::sql_query("SELECT id FROM harvest_schedules WHERE workflow_name = $1")
+        .bind::<diesel::sql_types::Text, _>(&name)
+        .get_result(&mut conn)
+        .await
+        .expect("schedule id");
+    let (before, _) = schedule_cell(&mut conn, &name).await;
+
+    // A patch without an input keeps the stored bytes.
+    let outcome = update_workflow_schedule_with_codecs(
+        &mut conn,
+        id.id,
+        &WorkflowSchedulePatch {
+            max_active_runs: Some(3),
+            ..Default::default()
+        },
+        &codecs,
+    )
+    .await
+    .expect("patch without input");
+    assert!(matches!(outcome, ScheduleUpdateOutcome::Updated(_)));
+    let (kept, _) = schedule_cell(&mut conn, &name).await;
+    assert_eq!(before, kept, "the stored envelope is not re-encoded");
+
+    // A patch with an input stores a new envelope.
+    let new_secret = "cc-schedule-patched-ssn-888";
+    let outcome = update_workflow_schedule_with_codecs(
+        &mut conn,
+        id.id,
+        &WorkflowSchedulePatch {
+            input: Some(json!({"ssn": new_secret})),
+            ..Default::default()
+        },
+        &codecs,
+    )
+    .await
+    .expect("patch with input");
+    assert!(matches!(outcome, ScheduleUpdateOutcome::Updated(_)));
+    let (patched, _) = schedule_cell(&mut conn, &name).await;
+    assert_ciphertext(&patched, new_secret, "the patched schedule input");
+    assert_eq!(
+        codecs.decode_column(&patched).expect("decode one layer"),
+        json!({"ssn": new_secret})
+    );
+}

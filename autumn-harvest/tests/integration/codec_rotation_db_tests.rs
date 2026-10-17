@@ -3755,13 +3755,14 @@ const COLUMN_OUTBOX: &str = "column-outbox";
 const COLUMN_BATCH: &str = "column-batch";
 const COLUMN_BATCH_BUFFER: &str = "column-batch-buffer";
 const COLUMN_CHILD_SPEC: &str = "column-child-spec";
+const COLUMN_SCHEDULE: &str = "column-schedule";
 
 /// The cells one [`seed_codec_columns`] call writes. A workflow task row and
 /// an activity task row each hold an input and an output. The activity row
 /// also holds a heartbeat. The event batch buffer holds one element, and the
 /// census counts its row once. Every other swept column holds one cell.
 /// `the_seed_covers_every_codec_column` pins this to `CODEC_COLUMNS`.
-const CELLS_PER_SEED: usize = 18;
+const CELLS_PER_SEED: usize = 19;
 
 /// Write one envelope under `key_id` into every swept codec column.
 async fn seed_codec_columns(
@@ -3939,6 +3940,17 @@ async fn seed_short_lived_columns(
     .execute(conn)
     .await
     .expect("insert child spec");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_schedules (id, workflow_name, workflow_input) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind::<SqlUuid, _>(Uuid::new_v4())
+    .bind::<Text, _>(format!("column_rotation_{}", Uuid::new_v4().simple()))
+    .bind::<Jsonb, _>(cell(COLUMN_SCHEDULE))
+    .execute(conn)
+    .await
+    .expect("insert schedule");
 }
 
 /// Insert one event batch row that buffers `elements` (issue #2043).
@@ -3998,6 +4010,8 @@ async fn codec_cells(conn: &mut AsyncPgConnection) -> Vec<(String, Value)> {
              CROSS JOIN LATERAL jsonb_array_elements(b.buffered_payloads) e(value) \
            UNION ALL SELECT 16, child_exec_id::TEXT, 'child_spec', child_spec \
              FROM harvest_cross_shard_children \
+           UNION ALL SELECT 17, id::TEXT, 'schedule', workflow_input \
+             FROM harvest_schedules WHERE workflow_input IS NOT NULL \
          ) c ORDER BY ord, row_id",
     )
     .load(conn)

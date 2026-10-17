@@ -10522,13 +10522,16 @@ fn resolve_trigger_params(
     match (row.workflow_name.as_deref(), row.dag_name.as_deref()) {
         (Some(wf), _) => {
             let q = row.queue_name.as_deref().unwrap_or("default").to_string();
-            Ok((
-                wf.to_string(),
-                row.workflow_input
-                    .clone()
-                    .unwrap_or(serde_json::Value::Null),
-                q,
-            ))
+            // The engine reads the stored input strictly (issue #2043).
+            let input = match row.workflow_input.as_ref() {
+                Some(stored) => runtime
+                    .registry
+                    .payload_codecs()
+                    .decode_column(stored)
+                    .map_err(|_| "stored schedule input could not be decoded".to_string())?,
+                None => serde_json::Value::Null,
+            };
+            Ok((wf.to_string(), input, q))
         }
         (None, Some(dag)) => {
             let q = runtime

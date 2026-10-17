@@ -105,7 +105,7 @@ use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
     ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowSchedulePatch,
     ensure_dag_schedule, parse_schedule_from_expr_pub, plan_backfill_timestamps,
-    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule,
+    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule_with_codecs,
 };
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
@@ -28285,7 +28285,15 @@ async fn upsert_workflow_schedule_and_read_back(
     registry: Option<&HandlerRegistry>,
 ) -> Result<ScheduleEntry, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    autumn_harvest::register_workflow_schedules(conn, std::slice::from_ref(ws))
+    // The registry holds the write codec (issue #2043).
+    let identity_codecs;
+    let codecs = if let Some(registry) = registry {
+        registry.payload_codecs()
+    } else {
+        identity_codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+        &identity_codecs
+    };
+    autumn_harvest::register_workflow_schedules_with_codecs(conn, std::slice::from_ref(ws), codecs)
         .await
         .map_err(map_error)?;
     let row: autumn_harvest::models::HarvestSchedule = dsl::harvest_schedules
@@ -29241,7 +29249,13 @@ async fn update_schedule_handler(
         retry_policy: request.retry_policy.clone(),
     };
 
-    match update_workflow_schedule(&mut conn, id, &patch).await {
+    // The registry holds the write codec. The API mirror serves the read path
+    // (issue #2043).
+    let write_codecs = api_state.runtime().map_or_else(
+        |_| api_state.payload_codecs(),
+        |rt| rt.registry.payload_codecs().clone(),
+    );
+    match update_workflow_schedule_with_codecs(&mut conn, id, &patch, &write_codecs).await {
         Ok(ScheduleUpdateOutcome::Updated(row)) => {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -30137,10 +30151,15 @@ async fn trigger_schedule_now(
         schedule.dag_name.as_deref(),
     ) {
         (Some(wf_name), _) => {
-            let input = schedule
-                .workflow_input
-                .clone()
-                .unwrap_or(serde_json::Value::Null);
+            // The engine reads the stored input strictly (issue #2043).
+            let input = match schedule.workflow_input.as_ref() {
+                Some(stored) => runtime
+                    .registry
+                    .payload_codecs()
+                    .decode_column(stored)
+                    .map_err(map_error)?,
+                None => serde_json::Value::Null,
+            };
             let queue = schedule
                 .queue_name
                 .as_deref()
@@ -31762,10 +31781,22 @@ pub(crate) async fn schedule_backfill_inner(
                 // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
                 // the execution lands on the default shard, same as tick_one_workflow_schedule.
                 let exec_id = ExecutionId::new();
-                let input = schedule
-                    .workflow_input
-                    .clone()
-                    .unwrap_or(serde_json::Value::Null);
+                // A stored input that does not decode never starts a run
+                // (issue #2043).
+                let input = match schedule.workflow_input.as_ref() {
+                    Some(stored) => match runtime.registry.payload_codecs().decode_column(stored) {
+                        Ok(plain) => plain,
+                        Err(_) => {
+                            shard_failures.push(BackfillShardFailure {
+                                shard_id: 0,
+                                reason: "stored schedule input could not be decoded".to_string(),
+                            });
+                            failed += 1;
+                            continue;
+                        }
+                    },
+                    None => serde_json::Value::Null,
+                };
 
                 let Ok(mut conn) = acquire_conn(wf_shard_pool).await else {
                     shard_failures.push(BackfillShardFailure {
