@@ -1036,6 +1036,24 @@ async fn a_nightly_session_takes_commands_by_its_tag() {
     ));
 }
 
+/// A report run that fails is an error, so `run` does not print a report
+/// that was never written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_report_run_is_an_error() {
+    let fx = Fixture::new();
+    let mut rt = fx.open(&model());
+    // An input that does not decode fails the run at once.
+    let broken = rt
+        .start_workflow_with_options(
+            EXPERIMENT,
+            json!({"not": "an experiment"}),
+            autumn_harvest_sqlite::StartOptions::new(),
+        )
+        .unwrap();
+    let failed = runtime::drive_report(&mut rt, &broken.exec_id.to_string()).await;
+    assert!(failed.is_err(), "{failed:?}");
+}
+
 /// A run that the schedule started, and that has not run its first cycle,
 /// has no tag yet. A process that dies there leaves it so. A command for
 /// its tag waits, and lands once the session publishes the tag.

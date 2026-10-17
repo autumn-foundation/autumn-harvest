@@ -129,24 +129,34 @@ pub enum Step {
 ///
 /// # Errors
 ///
-/// Returns an error when `run` is not a run id, the backend fails, or the
-/// run waits on a person.
+/// Returns an error when `run` is not a run id, or the backend fails. Also
+/// returns one when the run waits on a person, or ends with no report.
 pub async fn drive_report(rt: &mut SqliteRuntime, run: &str) -> Result<(), String> {
-    let exec = ExecutionId::from_str(run).map_err(|e| format!("{run} is not a run id: {e}"))?;
+    let mut exec = ExecutionId::from_str(run).map_err(|e| format!("{run} is not a run id: {e}"))?;
     loop {
         let state = rt
             .run_until_blocked(exec)
             .await
             .map_err(|e| format!("cannot drive the report {run}: {e}"))?;
         match state {
-            // A retry waits on a timer, or a peer holds a mutex.
-            RunState::WaitingTimer | RunState::WaitingMutex(_) | RunState::InProgress => {
+            RunState::Completed(_) => return Ok(()),
+            RunState::ContinuedAsNew(next) => exec = next,
+            // A retry waits on a timer, a peer holds a mutex, or a child waits.
+            RunState::WaitingTimer
+            | RunState::WaitingMutex(_)
+            | RunState::WaitingWorkflow(_)
+            | RunState::InProgress => {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             RunState::WaitingSignal(signal) => {
                 return Err(format!("the report {run} waits on {signal}"));
             }
-            _ => return Ok(()),
+            RunState::Failed(why)
+            | RunState::Cancelled(why)
+            | RunState::TimedOut(why)
+            | RunState::Terminated(why) => {
+                return Err(format!("the report {run} wrote no report: {why}"));
+            }
         }
     }
 }
