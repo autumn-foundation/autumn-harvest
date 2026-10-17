@@ -636,6 +636,7 @@ async fn decode_due_rows(
 
 /// The start option keys that hold payload (issue #2043). A buffered start
 /// stores each one in the column form. The rotation list names the same keys.
+#[cfg(feature = "db")]
 const PAYLOAD_START_OPTION_KEYS: [&str; 2] = ["context_headers", "memo"];
 
 /// Replace the plain payload keys of stored start options with the column form
@@ -645,6 +646,7 @@ const PAYLOAD_START_OPTION_KEYS: [&str; 2] = ["context_headers", "memo"];
 /// # Errors
 ///
 /// [`crate::error::HarvestError`] when a value does not encode.
+#[cfg(feature = "db")]
 pub(crate) fn encode_stored_start_options(
     codecs: &crate::payload_codec::PayloadCodecs,
     mut options: serde_json::Value,
@@ -666,6 +668,7 @@ pub(crate) fn encode_stored_start_options(
 ///
 /// [`crate::error::HarvestError`] when a cell does not decode. The function
 /// never returns a partial result.
+#[cfg(feature = "db")]
 pub(crate) fn decode_stored_start_options(
     codecs: &crate::payload_codec::PayloadCodecs,
     mut options: serde_json::Value,
@@ -682,6 +685,7 @@ pub(crate) fn decode_stored_start_options(
 
 /// Remove the payload keys from start options that a rolled-back write binds,
 /// or that a reader needs only for the configuration.
+#[cfg(feature = "db")]
 pub(crate) fn without_payload_start_options(mut options: serde_json::Value) -> serde_json::Value {
     if let Some(map) = options.as_object_mut() {
         for key in PAYLOAD_START_OPTION_KEYS {
