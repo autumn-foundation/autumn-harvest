@@ -29,6 +29,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Kill the whole process group of a training run at its timeout, so a
+# `python` child of `uv` dies with it.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
 [dev-dependencies]
 # `testing` adds `WorkflowTestEnv` and the seeded simulation (issue #2033).
 autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", default-features = false, features = ["testing"] }

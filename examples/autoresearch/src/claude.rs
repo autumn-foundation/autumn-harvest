@@ -11,8 +11,11 @@
 //! thinking blocks, and the model plans each turn again. To replay thinking
 //! verbatim, see `examples/claude-agent-daemon`.
 
-use autumn_harvest_agent::{AgentError, AgentModel, BoxFuture, ChatRequest, ChatResponse, ErrorKind};
-use serde_json::Value;
+use autumn_harvest_agent::{
+    AgentError, AgentModel, BoxFuture, ChatRequest, ChatResponse, ChatRole, ContentPart, ErrorKind,
+    StopReason, TokenUsage,
+};
+use serde_json::{Value, json};
 
 /// The default model.
 pub const DEFAULT_MODEL: &str = "claude-opus-5-5";
@@ -55,9 +58,40 @@ impl ClaudeModel {
 }
 
 impl AgentModel for ClaudeModel {
-    fn chat<'a>(&'a self, request: &'a ChatRequest) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
-        let _ = (request, &self.api_key, &self.effort, &self.client);
-        unimplemented!("green phase")
+    fn chat<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+    ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        Box::pin(async move {
+            let body = request_body(request, &self.model, &self.effort);
+            let response = self
+                .client
+                .post(ENDPOINT)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", API_VERSION)
+                .header("anthropic-beta", FALLBACK_BETA)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| {
+                    AgentError::new(ErrorKind::Transport, format!("request failed: {e}"))
+                })?;
+            let status = response.status().as_u16();
+            let text = response.text().await.map_err(|e| {
+                AgentError::new(ErrorKind::Transport, format!("response lost: {e}"))
+            })?;
+            if !(200..300).contains(&status) {
+                // The body names the error. It holds no secret: the key is a header.
+                let detail: String = text.chars().take(500).collect();
+                return Err(AgentError::new(
+                    error_kind(status),
+                    format!("HTTP {status}: {detail}"),
+                ));
+            }
+            let body: Value = serde_json::from_str(&text)
+                .map_err(|e| AgentError::new(ErrorKind::Decode, format!("not JSON: {e}")))?;
+            parse_response(&body)
+        })
     }
 
     fn model_id(&self) -> Option<&str> {
@@ -68,8 +102,73 @@ impl AgentModel for ClaudeModel {
 /// The JSON body of one Messages API request.
 #[must_use]
 pub fn request_body(request: &ChatRequest, model: &str, effort: &str) -> Value {
-    let _ = (request, model, effort);
-    unimplemented!("green phase")
+    let system: Vec<&str> = request
+        .messages
+        .iter()
+        .filter(|m| m.role == ChatRole::System)
+        .flat_map(|m| &m.content)
+        .filter_map(|part| match part {
+            ContentPart::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let messages: Vec<Value> = request
+        .messages
+        .iter()
+        .filter(|m| m.role != ChatRole::System)
+        .map(|message| {
+            // Tool results go back in a user turn.
+            let role = if message.role == ChatRole::Assistant {
+                "assistant"
+            } else {
+                "user"
+            };
+            let content: Vec<Value> = message
+                .content
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text(text) => json!({"type": "text", "text": text}),
+                    ContentPart::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => json!({"type": "tool_use", "id": id, "name": name, "input": arguments}),
+                    ContentPart::ToolResult {
+                        tool_call_id,
+                        content,
+                    } => json!({"type": "tool_result", "tool_use_id": tool_call_id, "content": content}),
+                })
+                .collect();
+            json!({"role": role, "content": content})
+        })
+        .collect();
+    let tools: Vec<Value> = request
+        .tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect();
+    // No `temperature`: the current models refuse sampling settings. No
+    // `thinking`: the model default is adaptive thinking.
+    let mut body = json!({
+        "model": model,
+        "max_tokens": request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        "messages": messages,
+        "output_config": {"effort": effort},
+        "fallbacks": "default",
+    });
+    if !system.is_empty() {
+        body["system"] = json!(system.join("\n\n"));
+    }
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+    }
+    body
 }
 
 /// Map one Messages API response body to a [`ChatResponse`].
@@ -79,15 +178,68 @@ pub fn request_body(request: &ChatRequest, model: &str, effort: &str) -> Value {
 /// A `refusal` stop is a `Provider` error, so the run fails and says why.
 /// A body that is not a message is a `Decode` error.
 pub fn parse_response(body: &Value) -> Result<ChatResponse, AgentError> {
-    let _ = body;
-    unimplemented!("green phase")
+    if body["type"] != "message" {
+        return Err(AgentError::new(
+            ErrorKind::Decode,
+            "the response is not a message",
+        ));
+    }
+    let stop_reason = match body["stop_reason"].as_str() {
+        Some("end_turn" | "stop_sequence") => StopReason::EndTurn,
+        Some("tool_use") => StopReason::ToolUse,
+        Some("max_tokens") => StopReason::MaxTokens,
+        Some("refusal") => {
+            let category = body["stop_details"]["category"]
+                .as_str()
+                .unwrap_or("unknown");
+            return Err(AgentError::new(
+                ErrorKind::Provider,
+                format!("the model declined the request (category: {category})"),
+            ));
+        }
+        _ => StopReason::Unknown,
+    };
+    // Thinking and fallback blocks have no `ChatMessage` part. See the
+    // module docs.
+    let content = body["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| match block["type"].as_str() {
+            Some("text") => Some(ContentPart::Text(block["text"].as_str()?.to_string())),
+            Some("tool_use") => Some(ContentPart::ToolCall {
+                id: block["id"].as_str()?.to_string(),
+                name: block["name"].as_str()?.to_string(),
+                arguments: block["input"].clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    let count =
+        |key: &str| u32::try_from(body["usage"][key].as_u64().unwrap_or(0)).unwrap_or(u32::MAX);
+    // The adapter counts the whole prompt, cached tokens included.
+    let input = count("input_tokens")
+        .saturating_add(count("cache_read_input_tokens"))
+        .saturating_add(count("cache_creation_input_tokens"));
+    let mut usage = TokenUsage::new(input, count("output_tokens"));
+    usage.cache_read_tokens = count("cache_read_input_tokens");
+    usage.cache_write_tokens = count("cache_creation_input_tokens");
+    Ok(ChatResponse {
+        content,
+        stop_reason,
+        usage,
+    })
 }
 
 /// The error kind of an HTTP status. A rate limit and a server fault retry.
 #[must_use]
 pub const fn error_kind(status: u16) -> ErrorKind {
-    let _ = status;
-    ErrorKind::Provider
+    match status {
+        429 => ErrorKind::RateLimited,
+        401 | 403 => ErrorKind::Authentication,
+        500..=599 => ErrorKind::Unavailable,
+        _ => ErrorKind::Provider,
+    }
 }
 
 #[cfg(test)]
@@ -174,7 +326,11 @@ mod tests {
         });
         let response = parse_response(&body).unwrap();
         assert_eq!(response.stop_reason, StopReason::ToolUse);
-        assert_eq!(response.content.len(), 2, "thinking is not a ChatMessage part");
+        assert_eq!(
+            response.content.len(),
+            2,
+            "thinking is not a ChatMessage part"
+        );
         assert!(matches!(&response.content[1],
             ContentPart::ToolCall { name, .. } if name == "edit_train"));
         // The adapter counts the whole prompt in `input_tokens`.
@@ -189,9 +345,18 @@ mod tests {
                    "content": [{"type": "text", "text": "x"}],
                    "usage": {"input_tokens": 1, "output_tokens": 1}})
         };
-        assert_eq!(parse_response(&body("end_turn")).unwrap().stop_reason, StopReason::EndTurn);
-        assert_eq!(parse_response(&body("max_tokens")).unwrap().stop_reason, StopReason::MaxTokens);
-        assert_eq!(parse_response(&body("pause_turn")).unwrap().stop_reason, StopReason::Unknown);
+        assert_eq!(
+            parse_response(&body("end_turn")).unwrap().stop_reason,
+            StopReason::EndTurn
+        );
+        assert_eq!(
+            parse_response(&body("max_tokens")).unwrap().stop_reason,
+            StopReason::MaxTokens
+        );
+        assert_eq!(
+            parse_response(&body("pause_turn")).unwrap().stop_reason,
+            StopReason::Unknown
+        );
         let refused = parse_response(&body("refusal")).unwrap_err();
         assert_eq!(refused.kind(), ErrorKind::Provider);
         let junk = parse_response(&json!({"type": "error"})).unwrap_err();

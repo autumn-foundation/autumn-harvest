@@ -8,6 +8,8 @@
 //! signal and the delete cannot deliver a command twice.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -65,8 +67,10 @@ impl Inbox {
     ///
     /// Returns an error when the directory cannot be created.
     pub fn new(state_dir: &Path) -> Result<Self, String> {
-        let _ = state_dir;
-        unimplemented!("green phase")
+        let dir = state_dir.join("inbox");
+        std::fs::create_dir_all(dir.join("rejected"))
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        Ok(Self { dir })
     }
 
     /// Post a command. Returns its id: the file name and the signal key.
@@ -75,8 +79,22 @@ impl Inbox {
     ///
     /// Returns an error when the file cannot be written.
     pub fn post(&self, command: &Command) -> Result<String, String> {
-        let _ = (command, &self.dir);
-        unimplemented!("green phase")
+        // Time first, so the names sort in posting order. The process id and
+        // a counter keep two posts in one microsecond apart.
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| format!("the clock is before 1970: {e}"))?
+            .as_micros();
+        let id = format!(
+            "{micros:020}-{}-{:04}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed) % 10_000
+        );
+        let bytes =
+            serde_json::to_vec_pretty(command).map_err(|e| format!("cannot encode: {e}"))?;
+        crate::stores::write_atomic(&self.dir.join(format!("{id}.json")), &bytes)?;
+        Ok(id)
     }
 
     /// Every posted command, oldest first. A file that does not parse is
@@ -86,7 +104,36 @@ impl Inbox {
     ///
     /// Returns an error when the directory cannot be read.
     pub fn pending(&self) -> Result<Vec<(String, Command)>, String> {
-        unimplemented!("green phase")
+        let mut names: Vec<String> = std::fs::read_dir(&self.dir)
+            .map_err(|e| format!("cannot read {}: {e}", self.dir.display()))?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| {
+                Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                    && !name.starts_with('.')
+            })
+            .collect();
+        names.sort();
+        let mut commands = Vec::new();
+        for name in names {
+            let path = self.dir.join(&name);
+            let parsed = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Command>(&bytes).ok());
+            match parsed {
+                Some(command) => {
+                    let id = name.trim_end_matches(".json").to_string();
+                    commands.push((id, command));
+                }
+                None => {
+                    let _ = std::fs::rename(&path, self.dir.join("rejected").join(&name));
+                }
+            }
+        }
+        Ok(commands)
     }
 
     /// Remove a command that the runner delivered.
@@ -95,8 +142,11 @@ impl Inbox {
     ///
     /// Returns an error when the file exists and cannot be removed.
     pub fn done(&self, id: &str) -> Result<(), String> {
-        let _ = id;
-        unimplemented!("green phase")
+        match std::fs::remove_file(self.dir.join(format!("{id}.json"))) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("cannot remove inbox entry {id}: {e}")),
+        }
     }
 }
 
@@ -112,8 +162,14 @@ pub fn token(exec: &str, signal: &str) -> String {
 ///
 /// Returns an error when the token has no `/` or an empty part.
 pub fn parse_token(token: &str) -> Result<(String, String), String> {
-    let _ = token;
-    unimplemented!("green phase")
+    match token.split_once('/') {
+        Some((exec, signal)) if !exec.is_empty() && !signal.is_empty() => {
+            Ok((exec.to_string(), signal.to_string()))
+        }
+        _ => Err(format!(
+            "{token:?} is not a token: expected <execution id>/<signal name>"
+        )),
+    }
 }
 
 #[cfg(test)]

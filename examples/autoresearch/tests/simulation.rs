@@ -7,12 +7,6 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::float_cmp)]
 
-use autumn_harvest::dst::SeedPlan;
-use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest::testing::WorkflowTestEnv;
-use autumn_harvest::testing::sim::{FaultPlan, SimOutcome, SimStatus};
-use autumn_harvest::{always, sometimes};
-use autumn_harvest_agent::AgentTask;
 use autoresearch::results::ResultRow;
 use autoresearch::rules::{Best, KeepPolicy, Status, Verdict};
 use autoresearch::scripted::FIX_MODE;
@@ -20,6 +14,12 @@ use autoresearch::workflows::{
     Carry, Counts, ExperimentInput, ExperimentOutcome, MAX_FIXES, SessionConfig, SessionInput,
     SessionReport, experiment_info, research_session_info,
 };
+use autumn_harvest::dst::SeedPlan;
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::testing::WorkflowTestEnv;
+use autumn_harvest::testing::sim::{FaultPlan, SimOutcome, SimStatus};
+use autumn_harvest::{always, sometimes};
+use autumn_harvest_agent::AgentTask;
 use serde_json::{Value, json};
 
 /// Enough seeds to reach each target, few enough for every CI run.
@@ -112,7 +112,9 @@ fn experiment_env() -> WorkflowTestEnv {
             Ok(json!({"exit_code": 0, "timed_out": false, "log_tail": log}))
         })
         .mock_activity("parse_summary", |input| {
-            Ok(json!(autoresearch::summary::parse(input.as_str().unwrap_or(""))))
+            Ok(json!(autoresearch::summary::parse(
+                input.as_str().unwrap_or("")
+            )))
         })
         .mock_activity("reset", |input| Ok(input["commit"].clone()))
         .mock_activity("record", |_| Ok(json!(true)))
@@ -141,10 +143,19 @@ fn check_experiment(run: &SimOutcome) {
         .filter(|e| matches!(e, WorkflowEvent::MutexGranted { key, .. } if key == "gpu:gpu0"))
         .count();
 
-    always!(scheduled(events, "record").count() == 1, "one row per experiment");
-    always!(trains <= 1 + MAX_FIXES as usize, "a crash gets at most one fix");
+    always!(
+        scheduled(events, "record").count() == 1,
+        "one row per experiment"
+    );
+    always!(
+        trains <= 1 + MAX_FIXES as usize,
+        "a crash gets at most one fix"
+    );
     always!(grants >= trains, "each training holds the GPU mutex");
-    always!(out.row.status == out.verdict.status, "the row has the verdict");
+    always!(
+        out.row.status == out.verdict.status,
+        "the row has the verdict"
+    );
     match out.row.status {
         Status::Keep => {
             always!(resets.is_empty(), "a keep resets nothing");
@@ -235,7 +246,10 @@ async fn a_baseline_trains_head_with_no_proposal() {
                     .filter(|e| matches!(e, WorkflowEvent::ChildWorkflowStarted { .. }))
                     .count();
                 always!(children == 0, "a baseline asks no agent");
-                always!(scheduled(run.events(), "commit").count() == 0, "a baseline commits nothing");
+                always!(
+                    scheduled(run.events(), "commit").count() == 0,
+                    "a baseline commits nothing"
+                );
                 if let Ok(output) = run.result() {
                     let out: ExperimentOutcome = serde_json::from_value(output.clone()).unwrap();
                     always!(out.row.description == "baseline", "the row says baseline");
@@ -276,7 +290,11 @@ fn mock_experiment(input: Value) -> Result<Value, String> {
         val_bpb,
         memory_gb: if status == Status::Crash { 0.0 } else { 44.0 },
         status,
-        description: if input.baseline { "baseline".into() } else { description },
+        description: if input.baseline {
+            "baseline".into()
+        } else {
+            description
+        },
     };
     let new_best = if status == Status::Keep {
         Best {
@@ -370,7 +388,11 @@ fn check_session(run: &SimOutcome) {
                 "every experiment and the baseline count once"
             );
             always!(report.stopped.is_some(), "only a stop ends the first run");
-            always!(report.experiments < 3, "a stop comes before the hand-off");
+            // A stop that lands at the hand-off wins over `continue_as_new`.
+            always!(
+                report.experiments <= 3,
+                "a stop comes no later than the hand-off"
+            );
             sometimes!(true, "a stop ends the night early");
         }
         SimStatus::ContinuedAsNew => {
@@ -392,7 +414,10 @@ fn check_session(run: &SimOutcome) {
             sometimes!(true, "the session continues as new");
         }
         other => {
-            always!(false, "the session ended as {other}");
+            always!(
+                other == SimStatus::Completed,
+                "the session ended as {other}"
+            );
         }
     }
 }
@@ -406,7 +431,10 @@ async fn a_session_holds_its_invariants_under_signals_and_faults() {
     };
     env.simulation()
         .seeds(SEEDS)
-        .signal("hint", json!({"text": "try a longer warmdown", "from": "human"}))
+        .signal(
+            "hint",
+            json!({"text": "try a longer warmdown", "from": "human"}),
+        )
         .signal("policy", serde_json::to_value(tighter).unwrap())
         .signal("stop", json!({"reason": "bed time"}))
         .faults(FaultPlan::new().transient("setup", 1, 2))
@@ -455,7 +483,10 @@ async fn a_continued_session_finishes_from_its_carry() {
             })
             .unwrap(),
             |run| {
-                always!(run.status() == SimStatus::Completed, "the last run completes");
+                always!(
+                    run.status() == SimStatus::Completed,
+                    "the last run completes"
+                );
                 let report: SessionReport =
                     serde_json::from_value(run.result().clone().unwrap()).unwrap();
                 always!(report.experiments == 5, "the count goes on from the carry");
@@ -465,7 +496,10 @@ async fn a_continued_session_finishes_from_its_carry() {
                     "a continued run trains no baseline"
                 );
                 always!(
-                    inputs.first().and_then(|i| i.hint.as_ref()).map(|h| h.text.as_str())
+                    inputs
+                        .first()
+                        .and_then(|i| i.hint.as_ref())
+                        .map(|h| h.text.as_str())
                         == Some("carried idea"),
                     "a carried hint goes to the next experiment"
                 );

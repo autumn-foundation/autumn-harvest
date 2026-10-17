@@ -4,6 +4,8 @@
 //! `memory_gb`, `status` and `description`. A crash logs `0.000000` and
 //! `0.0`. The file stays untracked by git.
 
+use std::fmt::Write as _;
+
 use serde::{Deserialize, Serialize};
 
 use crate::rules::Status;
@@ -33,8 +35,14 @@ impl ResultRow {
     /// always has five columns.
     #[must_use]
     pub fn to_line(&self) -> String {
-        let _ = self;
-        unimplemented!("green phase")
+        format!(
+            "{}\t{:.6}\t{:.1}\t{}\t{}",
+            self.commit,
+            self.val_bpb,
+            self.memory_gb,
+            self.status.as_str(),
+            one_line(&self.description)
+        )
     }
 
     /// Parse one TSV line.
@@ -43,8 +51,33 @@ impl ResultRow {
     ///
     /// Returns an error when the line does not have five valid columns.
     pub fn parse_line(line: &str) -> Result<Self, String> {
-        let _ = line;
-        unimplemented!("green phase")
+        let columns: Vec<&str> = line.splitn(5, '\t').collect();
+        let [commit, val_bpb, memory_gb, status, description] = columns[..] else {
+            return Err(format!(
+                "expected 5 tab-separated columns, got {}",
+                columns.len()
+            ));
+        };
+        let number = |name: &str, text: &str| {
+            text.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| format!("{name} is not a number: {text:?}"))
+        };
+        let status = match status.trim() {
+            "keep" => Status::Keep,
+            "discard" => Status::Discard,
+            "crash" => Status::Crash,
+            other => return Err(format!("status is not keep, discard or crash: {other:?}")),
+        };
+        Ok(Self {
+            commit: commit.trim().to_string(),
+            val_bpb: number("val_bpb", val_bpb)?,
+            memory_gb: number("memory_gb", memory_gb)?,
+            status,
+            description: description.trim().to_string(),
+        })
     }
 }
 
@@ -55,15 +88,41 @@ impl ResultRow {
 ///
 /// Returns the first line that does not parse, with its line number.
 pub fn parse(text: &str) -> Result<Vec<ResultRow>, String> {
-    let _ = text;
-    unimplemented!("green phase")
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty() && *line != HEADER)
+        .map(|(index, line)| {
+            ResultRow::parse_line(line).map_err(|error| format!("line {}: {error}", index + 1))
+        })
+        .collect()
 }
 
 /// Render rows as a short Markdown table for a prompt or a report.
 #[must_use]
 pub fn table(rows: &[ResultRow]) -> String {
-    let _ = rows;
-    unimplemented!("green phase")
+    if rows.is_empty() {
+        return "(no results yet)".into();
+    }
+    let mut text = String::from(
+        "| commit | val_bpb | memory_gb | status | description |\n|---|---|---|---|---|\n",
+    );
+    for row in rows {
+        let _ = writeln!(
+            text,
+            "| {} | {:.6} | {:.1} | {} | {} |",
+            row.commit,
+            row.val_bpb,
+            row.memory_gb,
+            row.status.as_str(),
+            one_line(&row.description).replace('|', "/")
+        );
+    }
+    text
+}
+
+/// `text` on one line: each tab and line break becomes a space.
+fn one_line(text: &str) -> String {
+    text.replace(['\t', '\r', '\n'], " ").trim().to_string()
 }
 
 #[cfg(test)]

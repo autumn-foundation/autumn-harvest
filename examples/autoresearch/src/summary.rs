@@ -32,16 +32,31 @@ pub struct Summary {
 /// log with `val_bpb` and no `peak_vram_mb` reports zero memory.
 #[must_use]
 pub fn parse(log: &str) -> Option<Summary> {
-    let _ = log;
-    unimplemented!("green phase")
+    let last = |key: &str| {
+        log.lines()
+            .rev()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix(':'))
+            .and_then(|value| value.trim().parse::<f64>().ok())
+    };
+    let val_bpb = last("val_bpb").filter(|value| value.is_finite())?;
+    Some(Summary {
+        val_bpb,
+        peak_vram_mb: last("peak_vram_mb").unwrap_or(0.0),
+        training_seconds: last("training_seconds"),
+        num_steps: log
+            .lines()
+            .rev()
+            .find_map(|line| line.strip_prefix("num_steps:"))
+            .and_then(|value| value.trim().parse::<u64>().ok()),
+    })
 }
 
 /// The last `lines` lines of `text`, as upstream reads a crash with
 /// `tail -n 50 run.log`.
 #[must_use]
 pub fn tail(text: &str, lines: usize) -> String {
-    let _ = (text, lines);
-    unimplemented!("green phase")
+    let all: Vec<&str> = text.lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
 }
 
 #[cfg(test)]

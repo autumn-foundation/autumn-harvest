@@ -59,8 +59,20 @@ impl KeepPolicy {
     ///
     /// Returns the name of the first field that is not valid.
     pub fn validate(&self) -> Result<(), String> {
-        let _ = self;
-        unimplemented!("green phase")
+        let fields = [
+            ("min_improvement", self.min_improvement),
+            ("line_cost", self.line_cost),
+            ("max_memory_gb", self.max_memory_gb),
+        ];
+        match fields
+            .iter()
+            .find(|(_, value)| !value.is_finite() || *value < 0.0)
+        {
+            Some((name, value)) => Err(format!(
+                "{name} must be finite and not negative, not {value}"
+            )),
+            None => Ok(()),
+        }
     }
 }
 
@@ -108,15 +120,45 @@ pub struct Verdict {
 /// - Else: discard.
 #[must_use]
 pub fn decide(policy: &KeepPolicy, best: Option<&Best>, measured: &Measured) -> Verdict {
-    let _ = (policy, best, measured);
-    unimplemented!("green phase")
+    let verdict = |status, score, reason: String| Verdict {
+        status,
+        score,
+        reason,
+    };
+    let Some(val_bpb) = measured.val_bpb else {
+        return verdict(Status::Crash, 0.0, "the run produced no val_bpb".into());
+    };
+    let Some(best) = best else {
+        return verdict(Status::Keep, 0.0, "the baseline sets the bar".into());
+    };
+    if measured.memory_gb > policy.max_memory_gb {
+        let reason = format!(
+            "peak memory {:.1} GB is over the cap of {:.1} GB",
+            measured.memory_gb, policy.max_memory_gb
+        );
+        return verdict(Status::Discard, 0.0, reason);
+    }
+    let net = f64::from(measured.lines_added) - f64::from(measured.lines_removed);
+    let score = policy.line_cost.mul_add(-net, best.val_bpb - val_bpb);
+    if score > policy.min_improvement {
+        let reason = format!(
+            "adjusted gain {score:.6} beats {:.6}",
+            policy.min_improvement
+        );
+        verdict(Status::Keep, score, reason)
+    } else {
+        let reason = format!(
+            "adjusted gain {score:.6} does not beat {:.6}",
+            policy.min_improvement
+        );
+        verdict(Status::Discard, score, reason)
+    }
 }
 
 /// Convert `peak_vram_mb` to GB, rounded to one decimal as upstream does.
 #[must_use]
 pub fn memory_gb(peak_vram_mb: f64) -> f64 {
-    let _ = peak_vram_mb;
-    unimplemented!("green phase")
+    (peak_vram_mb / 1024.0 * 10.0).round() / 10.0
 }
 
 #[cfg(test)]
@@ -146,7 +188,11 @@ mod tests {
 
     #[test]
     fn a_lower_val_bpb_with_no_new_lines_is_a_keep() {
-        let verdict = decide(&KeepPolicy::default(), Some(&best(0.9979)), &ran(0.9932, 1, 1));
+        let verdict = decide(
+            &KeepPolicy::default(),
+            Some(&best(0.9979)),
+            &ran(0.9932, 1, 1),
+        );
         assert_eq!(verdict.status, Status::Keep);
         assert!(verdict.score > 0.0);
     }
@@ -191,7 +237,11 @@ mod tests {
     fn a_small_gain_that_adds_twenty_lines_is_a_discard() {
         // Upstream: "A 0.001 val_bpb improvement that adds 20 lines of hacky
         // code? Probably not worth it."
-        let verdict = decide(&KeepPolicy::default(), Some(&best(0.9979)), &ran(0.9969, 20, 0));
+        let verdict = decide(
+            &KeepPolicy::default(),
+            Some(&best(0.9979)),
+            &ran(0.9969, 20, 0),
+        );
         assert_eq!(verdict.status, Status::Discard);
     }
 
@@ -199,7 +249,11 @@ mod tests {
     fn an_equal_result_from_less_code_is_a_keep() {
         // Upstream: "removing something and getting equal or better results
         // is a great outcome".
-        let verdict = decide(&KeepPolicy::default(), Some(&best(0.9979)), &ran(0.9979, 0, 3));
+        let verdict = decide(
+            &KeepPolicy::default(),
+            Some(&best(0.9979)),
+            &ran(0.9979, 0, 3),
+        );
         assert_eq!(verdict.status, Status::Keep);
     }
 

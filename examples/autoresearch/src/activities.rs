@@ -5,15 +5,18 @@
 //! run on SQLite and on a Postgres worker. Each body is idempotent, because
 //! execution is at least once.
 
+use std::path::Path;
 use std::time::Duration;
 
+use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::lab::CommitInfo;
+use crate::lab::{CommitInfo, Lab, PROGRAM};
 use crate::results::ResultRow;
 use crate::rules::Best;
+use crate::rules::Status;
 use crate::summary::Summary;
 use crate::trainer::{TrainRun, TrainerSpec};
 
@@ -21,6 +24,22 @@ use crate::trainer::{TrainRun, TrainerSpec};
 pub const DATA_MISSING: &str = "DataMissing";
 /// The error type of a train call whose branch moved under it.
 pub const BRANCH_MOVED: &str = "BranchMoved";
+/// The error type of a tag that cannot name a branch.
+pub const BAD_TAG: &str = "BadTag";
+
+/// A failure that no retry can fix.
+fn fatal(error_type: &str, message: impl Into<String>) -> String {
+    ActivityFailure::non_retryable(error_type, message).into_error_payload()
+}
+
+/// Run blocking lab work, such as git and file calls, off the async workers.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("the lab call did not finish: {e}"))?
+}
 
 /// The input of [`setup`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,8 +116,31 @@ pub struct RecordInput {
 /// Fails with [`DATA_MISSING`], not retryable, when `data_dir` is missing.
 #[activity(start_to_close = "1m", retry = RetryPolicy::exponential(3, Duration::from_secs(1)))]
 pub async fn setup(_ctx: &ActivityContext, input: SetupInput) -> Result<SetupReport, String> {
-    let _ = input;
-    Err("green phase".into())
+    blocking(move || setup_lab(&input)).await
+}
+
+fn setup_lab(input: &SetupInput) -> Result<SetupReport, String> {
+    let lab = Lab::open(&input.lab)?;
+    if let Some(dir) = &input.data_dir
+        && !Path::new(dir).is_dir()
+    {
+        return Err(fatal(
+            DATA_MISSING,
+            format!("the data directory {dir} does not exist: run `uv run prepare.py` first"),
+        ));
+    }
+    let branch = lab.start_branch(&input.tag).map_err(|e| {
+        if e.contains("the tag") {
+            fatal(BAD_TAG, e)
+        } else {
+            e
+        }
+    })?;
+    Ok(SetupReport {
+        branch,
+        head: lab.head()?,
+        program: lab.read(PROGRAM)?,
+    })
 }
 
 /// The short hash of `HEAD`.
@@ -108,8 +150,7 @@ pub async fn setup(_ctx: &ActivityContext, input: SetupInput) -> Result<SetupRep
 /// Returns an error when git fails.
 #[activity(start_to_close = "1m", retry = RetryPolicy::exponential(3, Duration::from_secs(1)))]
 pub async fn head(_ctx: &ActivityContext, input: LabInput) -> Result<String, String> {
-    let _ = input;
-    Err("green phase".into())
+    blocking(move || Lab::open(&input.lab)?.head()).await
 }
 
 /// Commit `train.py`. The activity idempotency key is the commit key, so a
@@ -120,8 +161,11 @@ pub async fn head(_ctx: &ActivityContext, input: LabInput) -> Result<String, Str
 /// Returns an error when git fails.
 #[activity(start_to_close = "1m", retry = RetryPolicy::exponential(3, Duration::from_secs(1)))]
 pub async fn commit(ctx: &ActivityContext, input: CommitInput) -> Result<CommitInfo, String> {
-    let _ = (ctx, input);
-    Err("green phase".into())
+    let key = ctx
+        .idempotency_key()
+        .map_err(|e| e.to_string())?
+        .to_string();
+    blocking(move || Lab::open(&input.lab)?.commit_train(&input.message, &key)).await
 }
 
 /// Reset the branch to a commit. The saga compensation of [`commit`].
@@ -131,8 +175,11 @@ pub async fn commit(ctx: &ActivityContext, input: CommitInput) -> Result<CommitI
 /// Returns an error when git fails.
 #[activity(start_to_close = "1m", retry = RetryPolicy::exponential(3, Duration::from_secs(1)))]
 pub async fn reset(_ctx: &ActivityContext, input: CommitRef) -> Result<String, String> {
-    let _ = input;
-    Err("green phase".into())
+    blocking(move || {
+        Lab::open(&input.lab)?.reset_to(&input.commit)?;
+        Ok(input.commit)
+    })
+    .await
 }
 
 /// The kept row of a commit in `results.tsv`, as a [`Best`].
@@ -142,8 +189,17 @@ pub async fn reset(_ctx: &ActivityContext, input: CommitRef) -> Result<String, S
 /// Returns an error when `results.tsv` does not parse.
 #[activity(start_to_close = "1m", retry = RetryPolicy::exponential(3, Duration::from_secs(1)))]
 pub async fn find_kept(_ctx: &ActivityContext, input: CommitRef) -> Result<Option<Best>, String> {
-    let _ = input;
-    Err("green phase".into())
+    let lab = input.lab.clone();
+    let rows = blocking(move || Lab::open(&lab)?.rows()).await?;
+    Ok(rows
+        .into_iter()
+        .rev()
+        .find(|row| row.status == Status::Keep && row.commit == input.commit)
+        .map(|row| Best {
+            commit: row.commit,
+            val_bpb: row.val_bpb,
+            memory_gb: row.memory_gb,
+        }))
 }
 
 /// Train the commit at `HEAD`. Each progress line is a heartbeat.
@@ -157,8 +213,32 @@ pub async fn find_kept(_ctx: &ActivityContext, input: CommitRef) -> Result<Optio
 /// commit. Returns an error when the trainer cannot start.
 #[activity(start_to_close = "15m", retry = RetryPolicy::exponential(2, Duration::from_secs(5)))]
 pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun, String> {
-    let _ = (ctx, input);
-    Err("green phase".into())
+    let path = input.lab.clone();
+    let (lab, head) = blocking(move || {
+        let lab = Lab::open(&path)?;
+        let head = lab.head()?;
+        Ok((lab, head))
+    })
+    .await?;
+    if head != input.commit {
+        return Err(fatal(
+            BRANCH_MOVED,
+            format!("HEAD is {head}, not {}: the branch moved", input.commit),
+        ));
+    }
+    let (lines, mut progress) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let run = crate::trainer::run(&input.trainer, lab.root(), move |line| {
+        let _ = lines.send(line.to_string());
+    });
+    // Each progress line is a heartbeat. The loop ends when the run drops
+    // the sender.
+    let beat = async {
+        while let Some(line) = progress.recv().await {
+            let _ = ctx.heartbeat(serde_json::json!({ "line": line })).await;
+        }
+    };
+    let (run, ()) = tokio::join!(run, beat);
+    run
 }
 
 /// Parse the summary from the end of `run.log`. A local activity: it is cheap
@@ -168,9 +248,12 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
 ///
 /// None in practice. The signature matches the activity contract.
 #[activity(local = true)]
-pub async fn parse_summary(_ctx: &ActivityContext, log_tail: String) -> Result<Option<Summary>, String> {
-    let _ = log_tail;
-    Err("green phase".into())
+#[allow(clippy::unused_async)] // The activity macro needs an async fn.
+pub async fn parse_summary(
+    _ctx: &ActivityContext,
+    log_tail: String,
+) -> Result<Option<Summary>, String> {
+    Ok(crate::summary::parse(&log_tail))
 }
 
 /// Append one row to `results.tsv`. Returns `false` for a row it holds.
@@ -180,8 +263,7 @@ pub async fn parse_summary(_ctx: &ActivityContext, log_tail: String) -> Result<O
 /// Returns an error when the file cannot be written.
 #[activity(start_to_close = "1m", retry = RetryPolicy::exponential(3, Duration::from_secs(1)))]
 pub async fn record(_ctx: &ActivityContext, input: RecordInput) -> Result<bool, String> {
-    let _ = input;
-    Err("green phase".into())
+    blocking(move || Lab::open(&input.lab)?.record(&input.row)).await
 }
 
 /// Every activity of the example, for registration.

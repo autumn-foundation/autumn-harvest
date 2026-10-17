@@ -6,14 +6,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use autumn_harvest::event::WorkflowEvent;
-use autumn_harvest_agent::AgentHarness;
-use autumn_harvest_sqlite::{ExecutionFilter, ExecutionId, SqliteRuntime};
 use autoresearch::agent::{self, HarnessParts};
 use autoresearch::lab::Lab;
 use autoresearch::runtime::{self, Pending, Step};
 use autoresearch::scripted::ScriptedResearcher;
 use autoresearch::workflows::{SessionConfig, SessionReport};
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest_agent::AgentHarness;
+use autumn_harvest_sqlite::{ExecutionFilter, ExecutionId, SqliteRuntime};
 use serde_json::Value;
 
 /// A temporary directory with one or more labs and one database.

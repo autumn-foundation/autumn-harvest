@@ -75,7 +75,17 @@ fn inbox_commands_queue_for_the_runner() {
     assert_eq!(queued, 2);
     // The runner delivers both: the hint goes to the first experiment, and
     // the stop ends the session after it.
-    let out = ok(&["run", "--lab", &lab, "--tag", "t", "--experiments", "0", "--approval-timeout", "1"]);
+    let out = ok(&[
+        "run",
+        "--lab",
+        &lab,
+        "--tag",
+        "t",
+        "--experiments",
+        "0",
+        "--approval-timeout",
+        "1",
+    ]);
     assert!(out.contains("stopped"), "{out}");
     let queued = std::fs::read_dir(&inbox)
         .unwrap()
@@ -89,10 +99,25 @@ fn eval_and_purge_work_on_a_finished_night() {
     let dir = tempfile::tempdir().unwrap();
     let lab = lab_arg(&dir.path().join("lab"));
     ok(&["init", &lab]);
-    ok(&["run", "--lab", &lab, "--tag", "e", "--experiments", "1", "--no-report"]);
+    ok(&[
+        "run",
+        "--lab",
+        &lab,
+        "--tag",
+        "e",
+        "--experiments",
+        "1",
+        "--no-report",
+    ]);
     let candidate = dir.path().join("candidate.md");
     std::fs::write(&candidate, "# program\nPrefer simplifications.\n").unwrap();
-    let out = ok(&["eval", "--lab", &lab, "--candidate", candidate.to_str().unwrap()]);
+    let out = ok(&[
+        "eval",
+        "--lab",
+        &lab,
+        "--candidate",
+        candidate.to_str().unwrap(),
+    ]);
     assert!(out.contains("first divergence"), "{out}");
     let out = ok(&["purge", "--lab", &lab, "--older-than-days", "30"]);
     assert!(out.contains("removed 0"), "{out}");
