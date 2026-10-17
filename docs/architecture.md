@@ -68,6 +68,7 @@ autumn-harvest/          <- workspace root
   autumn-harvest-cli/    <- `harvest` operator CLI over the management API
   autumn-harvest-redis/  <- optional Redis Streams dispatch channel (issue #1312)
   autumn-harvest-sqlite/ <- optional SQLite storage backend
+  autumn-harvest-conformance/ <- test-only: one corpus on Postgres and SQLite (issue #2030)
   autumn-harvest-agent/  <- durable agent loop: model and tool calls as activities (issue #1973)
   autumn-harvest-verify/ <- semantic (MIR-level) determinism analyzer (issue #962)
   autumn-harvest-sandbox-guest/ <- guest agent: process 1 of each sandbox microVM

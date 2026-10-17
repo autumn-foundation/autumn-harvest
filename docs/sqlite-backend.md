@@ -1215,9 +1215,18 @@ under issue #1068. It is no longer a non-goal. Child workflows and commands
 between runs (see [§9](#9-child-workflows-and-commands-between-runs)) shipped
 under issue #2026.
 
-Two benign bookkeeping commands are silently no-ops (they append no event and
-gate no control flow): `ctx.set_current_details(...)` and a re-park
-`WaitForActivity`.
+Six commands append no event and gate no control flow: `SetCurrentDetails`,
+`PublishProgress`, `PublishDurableProgress`, `RecordLog`, a re-park
+`WaitForActivity` and `WaitForSignal`. Postgres appends no event for them
+either. This backend does not keep the progress chunks or the log lines.
+
+### Parity with Postgres (issue #2030)
+
+The `autumn-harvest-conformance` crate runs one corpus of workflows on both
+backends. Each scenario must give the same outcome and a replay-equivalent
+history. Each primitive in the list above must fail loudly, by name. A guard
+fails when a command that this backend accepts has no scenario. See
+[`autumn-harvest-conformance/README.md`](../autumn-harvest-conformance/README.md).
 
 ---
 
