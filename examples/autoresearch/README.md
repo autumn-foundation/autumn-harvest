@@ -275,19 +275,23 @@ experiment set the search attribute `status`, which the engine reserves.
   handle. It refuses a symlink at `results.tsv`, `train.py`, the files that
   the agent reads and its state files. So a link cannot send a read to another
   file, such as `/proc/self/environ`. A run that moves the branch or `HEAD`,
-  or changes a tracked file other than `program.md`, such as `train.py` or
-  the fixed `prepare.py`, is a crash, and the lab goes back. The check reads
-  the bytes on disk, so a git filter cannot hide a change. `uv.lock` counts
-  too, so run `uv run prepare.py` once first, as step 1 says. After a stop in
+  or changes a fixed file, such as `train.py` or `prepare.py`, is a crash,
+  and the lab goes back. The check reads the bytes on disk, so a git filter
+  cannot hide a change. `uv.lock` counts too, so run `uv run prepare.py` once
+  first, as step 1 says. After a stop in
   the middle of a run, the train call puts the lab back before it trains
   again. The code can still read your files, write `.git` and
   `.autoresearch`, and escape the kill with `setsid`. Run it in a container,
   or as a user with no other rights.
-- **A reset keeps `program.md`.** A discard, a crash and a rewind reset the
-  branch and each tracked file, but keep the text of `program.md`. So an edit
-  for the next night stays. A change that a run makes there stays too, so
-  read `program.md` before a night. A file that git does not track stays as
-  it is.
+- **Fixed files and free files.** A free file is tracked Markdown, a
+  notebook or an image, such as `program.md` or `progress.png`. Each other
+  tracked file is fixed. A run trains only when each fixed file holds the
+  bytes of its commit, so a score belongs to that commit. A hand edit of
+  `prepare.py` during a night is refused: commit it first. A discard, a crash
+  and a rewind reset the branch and each fixed file, and keep each free file.
+  So an edit of `program.md` for the next night stays. A change that a run
+  makes there stays too, so read `program.md` before a night. A file that git
+  does not track stays as it is.
 - **The score is what `train.py` prints.** As upstream, the last `val_bpb:`
   line counts. An edit can print a false score. Read each kept diff. Unlike
   upstream, a run that exits with an error is a crash, even after a summary.

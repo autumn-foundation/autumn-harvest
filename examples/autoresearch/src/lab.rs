@@ -514,7 +514,8 @@ impl Lab {
         })
     }
 
-    /// A mark for the bytes of each tracked file but `program.md`.
+    /// A mark for the bytes of each fixed file: each tracked file but the
+    /// free ones, such as `program.md`, that [`FREE`] lists.
     ///
     /// Two snapshots differ when a file changed between them, such as
     /// `prepare.py`, the fixed evaluation. The bytes are read as they are on
@@ -528,7 +529,7 @@ impl Lab {
         let list = self.git(&["ls-files", "-z"])?;
         Ok(list
             .split('\0')
-            .filter(|path| !path.is_empty() && *path != PROGRAM)
+            .filter(|path| !path.is_empty() && !is_free(path))
             .map(|path| {
                 let mark = match crate::stores::read_regular(&self.root.join(path)) {
                     Ok(Some(bytes)) => crate::stores::hashed_bytes(&bytes),
@@ -538,6 +539,62 @@ impl Lab {
                 (path.to_string(), mark)
             })
             .collect())
+    }
+
+    /// Fail unless each fixed file holds the bytes that `commit` holds.
+    ///
+    /// A fixed file is each tracked file but the free ones. A score
+    /// must belong to the files of its commit. So a change that no commit
+    /// holds, such as a hand edit of `prepare.py`, is refused. The bytes on
+    /// disk are hashed with no git filter. A file that is gone, or is not a
+    /// regular file, is a change too.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error that names each changed file, or when git fails.
+    pub fn require_fixed_files(&self, commit: &str) -> Result<(), String> {
+        let tree = self.git(&["ls-tree", "-r", "-z", "--full-tree", commit])?;
+        let mut changed = Vec::new();
+        let mut present = Vec::new();
+        for entry in tree.split('\0').filter(|entry| !entry.is_empty()) {
+            let Some((meta, path)) = entry.split_once('\t') else {
+                continue;
+            };
+            let mut fields = meta.split(' ');
+            let (Some(mode), Some(kind), Some(id)) = (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            // A link that git tracks, a submodule and a free file may change.
+            if kind != "blob" || mode == "120000" || is_free(path) {
+                continue;
+            }
+            match std::fs::symlink_metadata(self.root.join(path)) {
+                Ok(meta) if meta.is_file() => present.push((path, id)),
+                _ => changed.push(path),
+            }
+        }
+        if !present.is_empty() {
+            let mut args = vec!["hash-object", "--no-filters", "--"];
+            args.extend(present.iter().map(|(path, _)| *path));
+            let ids = self.git(&args)?;
+            changed.extend(
+                present
+                    .iter()
+                    .zip(ids.lines())
+                    .filter(|((_, want), got)| want != got)
+                    .map(|((path, _), _)| *path),
+            );
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{} has a change that no commit holds. Commit it, or discard it with \
+             `git checkout -- {}`",
+            changed.join(", "),
+            changed.join(" ")
+        ))
     }
 
     /// Put `branch` at `commit`, check it out, and reset as
@@ -553,12 +610,12 @@ impl Lab {
     }
 
     /// Reset the branch and each tracked file to `commit`, but keep the
-    /// text of `program.md`.
+    /// bytes of each free file, such as `program.md`.
     ///
-    /// `program.md` is the file that a person edits, maybe for the next
-    /// night while this one runs. Every other tracked file goes back, so a
-    /// change to `prepare.py`, the fixed evaluation, does not stay for later
-    /// runs. A `program.md` that is not a regular file is not kept.
+    /// A person edits a free file, maybe for the next night while this one
+    /// runs. Each fixed file goes back, so a change to `prepare.py`, the
+    /// fixed evaluation, does not stay for later runs. A free file that is
+    /// not a regular file is not kept.
     ///
     /// # Errors
     ///
@@ -570,17 +627,26 @@ impl Lab {
             "--quiet",
             &format!("{commit}^{{commit}}"),
         ])?;
-        let program = self.root.join(PROGRAM);
-        let kept = crate::stores::read_regular(&program).ok().flatten();
+        let tracked = self.git(&["ls-files", "-z"])?;
+        let kept: Vec<(PathBuf, Vec<u8>)> = tracked
+            .split('\0')
+            .filter(|path| !path.is_empty() && is_free(path))
+            .filter_map(|path| {
+                let file = self.root.join(path);
+                let bytes = crate::stores::read_regular(&file).ok().flatten()?;
+                Some((file, bytes))
+            })
+            .collect();
         self.git(&["reset", "--quiet", "--hard", &target])?;
-        if let Some(text) = kept
-            && crate::stores::read_regular(&program)
-                .ok()
-                .flatten()
-                .as_ref()
-                != Some(&text)
-        {
-            crate::stores::write_atomic(&program, &text)?;
+        for (file, bytes) in kept {
+            let now = crate::stores::read_regular(&file).ok().flatten();
+            if now.as_ref() != Some(&bytes) {
+                if let Some(parent) = file.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+                }
+                crate::stores::write_atomic(&file, &bytes)?;
+            }
         }
         Ok(())
     }
@@ -863,6 +929,19 @@ fn private_dir(dir: &Path) -> Result<(), String> {
             .map_err(|e| format!("cannot protect {}: {e}", dir.display()))?;
     }
     Ok(())
+}
+
+/// The kinds of tracked file that a person edits or makes while a night
+/// runs. They are prose such as `program.md`, a notebook, and its images.
+const FREE: &[&str] = &["md", "ipynb", "png", "jpg", "jpeg", "gif", "svg", "pdf"];
+
+/// `true` for a free file, as [`FREE`] lists. Each other tracked file is
+/// fixed: a run must not change it, and a score must belong to its commit.
+fn is_free(path: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| FREE.iter().any(|free| ext.eq_ignore_ascii_case(free)))
 }
 
 /// The lines of a `results.tsv` text that can hold a row.
@@ -1435,12 +1514,19 @@ mod tests {
         let base = lab.head().unwrap();
         let program = lab.root().join(PROGRAM);
         std::fs::write(&program, "# my next program\n").unwrap();
+        let notes = lab.root().join("README.md");
+        std::fs::write(&notes, "# notes of the night\n").unwrap();
         lab.edit_train("DEPTH = 8", "DEPTH = 9").unwrap();
         lab.commit_train("deeper", "k-1", &base).unwrap();
         lab.edit_train("DEPTH = 9", "DEPTH = 10").unwrap();
         lab.reset_to(&base).unwrap();
         lab.require_head(&base).unwrap();
         lab.require_clean_train().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&notes).unwrap(),
+            "# notes of the night\n",
+            "each free file stays"
+        );
         assert_eq!(
             std::fs::read_to_string(&program).unwrap(),
             "# my next program\n"
@@ -1592,6 +1678,41 @@ mod tests {
             lab.git(&["status", "--porcelain", "--untracked-files=no"])
                 .unwrap(),
             ""
+        );
+    }
+
+    /// Each tracked file but the Markdown prose must hold the bytes of its
+    /// commit. A changed, gone or replaced file is named.
+    #[cfg(unix)]
+    #[test]
+    fn the_fixed_files_must_match_their_commit() {
+        let (dir, lab) = lab();
+        lab.start_branch("t1", "s1").unwrap();
+        let head = lab.head().unwrap();
+        lab.require_fixed_files(&head).unwrap();
+        // Prose may change.
+        let program = lab.root().join(PROGRAM);
+        let text = std::fs::read_to_string(&program).unwrap();
+        std::fs::write(&program, format!("{text}\nA note.\n")).unwrap();
+        lab.require_fixed_files(&head).unwrap();
+        let prepare = lab.root().join(PREPARE);
+        let fixed = std::fs::read(&prepare).unwrap();
+        std::fs::write(&prepare, b"TAMPERED = 1\n").unwrap();
+        let why = lab.require_fixed_files(&head).unwrap_err();
+        assert!(why.contains(PREPARE), "{why}");
+        std::fs::remove_file(&prepare).unwrap();
+        assert!(
+            lab.require_fixed_files(&head)
+                .unwrap_err()
+                .contains(PREPARE)
+        );
+        let copy = dir.path().join("copy");
+        std::fs::write(&copy, &fixed).unwrap();
+        std::os::unix::fs::symlink(&copy, &prepare).unwrap();
+        assert!(
+            lab.require_fixed_files(&head)
+                .unwrap_err()
+                .contains(PREPARE)
         );
     }
 }

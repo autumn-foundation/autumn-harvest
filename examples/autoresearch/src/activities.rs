@@ -416,6 +416,7 @@ pub async fn train(ctx: &ActivityContext, input: TrainInput) -> Result<TrainRun,
             .map_err(|e| fatal(BRANCH_MOVED, e))?;
         checked
             .require_clean_train()
+            .and_then(|()| checked.require_fixed_files(&commit))
             .map_err(|e| fatal(DIRTY_TREE, e))
     })
     .await?;
@@ -547,6 +548,33 @@ mod tests {
         let moved = train(&ActivityContext::new_test(), input).await;
         assert!(moved.unwrap_err().contains(BRANCH_MOVED));
         assert!(!counter.exists(), "nothing trained");
+    }
+
+    /// A change to the fixed evaluation that no commit holds, such as a hand
+    /// edit of `prepare.py` between two experiments, is refused before the
+    /// run. A score must belong to the files of its commit. Prose, such as
+    /// `program.md`, may change.
+    #[tokio::test]
+    async fn train_refuses_a_change_to_a_fixed_file_that_no_commit_holds() {
+        let (_dir, input, counter) = lab_with_counter();
+        let lab = Lab::open(&input.lab).unwrap();
+        let prepare = lab.root().join(crate::lab::PREPARE);
+        let fixed = std::fs::read_to_string(&prepare).unwrap();
+        std::fs::write(&prepare, format!("{fixed}TAMPERED = 1\n")).unwrap();
+        let dirty = train(&ActivityContext::new_test(), input.clone()).await;
+        let why = dirty.unwrap_err();
+        assert!(
+            why.contains(DIRTY_TREE) && why.contains("prepare.py"),
+            "{why}"
+        );
+        assert!(!counter.exists(), "nothing trained");
+        std::fs::write(&prepare, fixed).unwrap();
+        for prose in [PROGRAM, "README.md"] {
+            let path = lab.root().join(prose);
+            let text = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, format!("{text}\nA note.\n")).unwrap();
+        }
+        train(&ActivityContext::new_test(), input).await.unwrap();
     }
 
     #[tokio::test]

@@ -235,7 +235,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC | Evidence |
 |----|----------|
 | AC1 | `e2e::a_night_of_research_keeps_only_improvements`: setup, a baseline and six experiments, seven rows, the upstream header. `cli::a_night_runs_offline_from_one_command`. |
-| AC2 | The same test: `HEAD` is the best commit, the branch holds only the kept commits, the tree is clean. `sim::an_experiment_holds_its_invariants_on_every_seed`: a discard or a crash resets to the base last. `activities::tests::a_run_that_changes_the_lab_is_a_crash_and_the_lab_is_restored` (a moved branch, a commit, a change to `train.py`, a change to `prepare.py`, a removed `prepare.py`). `lab::tests::a_reset_and_a_restore_keep_a_change_to_program_md`, `a_reset_and_a_restore_put_back_prepare_py`. |
+| AC2 | The same test: `HEAD` is the best commit, the branch holds only the kept commits, the tree is clean. `sim::an_experiment_holds_its_invariants_on_every_seed`: a discard or a crash resets to the base last. `activities::tests::a_run_that_changes_the_lab_is_a_crash_and_the_lab_is_restored` (a moved branch, a commit, a change to `train.py`, a change to `prepare.py`, a removed `prepare.py`). `lab::tests::a_reset_and_a_restore_keep_a_change_to_program_md`, `a_reset_and_a_restore_put_back_prepare_py`, `the_fixed_files_must_match_their_commit`. `activities::tests::train_refuses_a_change_to_a_fixed_file_that_no_commit_holds`. |
 | AC3 | `rules::tests` (seven cases and three property tests, one against an oracle from the README). `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row` checks the zero crash row. |
 | AC4 | `e2e::a_crash_gets_one_fix_and_a_broken_idea_logs_a_crash_row`. The sim targets "a fix recovers a crash", "a run crashes for good", "a run passes its time budget" and "a run fails after its summary". |
 | AC5 | `agent::tests::edit_train_writes_train_py_only`, `the_policy_gates_rewind_and_denies_unknown_tools`, `lab::tests::the_agent_reads_only_known_files_and_papers`. |
@@ -379,8 +379,12 @@ with a skeptic per angle. Codex reviewed the same commit. The fixes:
   a run makes to `prepare.py` does not stay.
 - **Codex.** A run that changed `prepare.py` and printed a good score was
   kept, and a keep runs no reset. The check after a run now compares the
-  bytes of each tracked file but `program.md` with those from before the
-  run. A change is a crash, and the lab goes back.
+  bytes of each fixed file with those from before the run. A change is a
+  crash, and the lab goes back. A fixed file is each tracked file but the
+  free ones: Markdown, notebooks and images, which a person edits or makes
+  during a night. Codex then found that a hand edit of `prepare.py` between
+  two experiments passed both snapshots. A run now trains only when each
+  fixed file holds the bytes of its commit, so a score belongs to it.
 - **One runner.** `serve` refuses to start while an unfinished report
   agent or heartbeat run has another model. A refusal of `run` prints
   commands that work as printed: with the database, the model and the tag
