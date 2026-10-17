@@ -851,6 +851,21 @@ async fn workflow_registration_is_converged(
     ws: &WorkflowSchedule,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
+    Ok(find_converged_workflow_schedule(conn, ws, codecs)
+        .await?
+        .is_some())
+}
+
+/// The row registration would land on, when it is already converged
+/// (issue #2043).
+///
+/// The read needs no encode. A caller that finds the row can skip the write
+/// and the encode, so an encoder that is down fails no idempotent request.
+async fn find_converged_workflow_schedule(
+    conn: &mut AsyncPgConnection,
+    ws: &WorkflowSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<Option<HarvestSchedule>> {
     use crate::schema::harvest_schedules::dsl;
 
     // The row registration would land on.
@@ -870,7 +885,7 @@ async fn workflow_registration_is_converged(
     }
     .map_err(crate::error::database_error)?;
     let Some(existing) = existing else {
-        return Ok(false);
+        return Ok(None);
     };
 
     // Any other row holding this `workflow_name` — a legacy workflow-only row
@@ -883,15 +898,13 @@ async fn workflow_registration_is_converged(
         .optional()
         .map_err(crate::error::database_error)?;
     if holder != Some(existing.id) {
-        return Ok(false);
+        return Ok(None);
     }
 
-    Ok(workflow_schedule_row_is_converged_with(
-        &existing,
-        ws,
-        Utc::now(),
-        |stored| stored_schedule_input_matches(stored, existing.id, &ws.input, codecs),
-    ))
+    let converged = workflow_schedule_row_is_converged_with(&existing, ws, Utc::now(), |stored| {
+        stored_schedule_input_matches(stored, existing.id, &ws.input, codecs)
+    });
+    Ok(converged.then_some(existing))
 }
 
 /// Upsert the durable schedule rows for the provided workflow schedules.
@@ -2611,6 +2624,22 @@ fn schedule_for_storage(
     Ok(stored)
 }
 
+/// Fail before any destructive step when the stored input cannot decode
+/// (issue #2043).
+///
+/// The overlap policies that cancel or terminate a run do so before the new run
+/// starts. A fire whose input does not decode starts nothing, so it must also
+/// disturb nothing.
+fn ensure_schedule_input_decodes(
+    schedule: &HarvestSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    schedule
+        .workflow_input
+        .as_ref()
+        .map_or(Ok(()), |stored| codecs.decode_column(stored).map(drop))
+}
+
 /// Whether the stored schedule input equals the configured one (issue #2043).
 ///
 /// Each encode makes a new nonce, so the probe cannot compare stored bytes. It
@@ -2661,6 +2690,10 @@ async fn upsert_workflow_schedule(
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<HarvestSchedule> {
     let expr = schedule_expr(Some(&ws.schedule));
+    // A converged row needs no write and so no encode (issue #2043).
+    if let Some(converged) = find_converged_workflow_schedule(conn, ws, codecs).await? {
+        return Ok(converged);
+    }
     let stored_ws = schedule_for_storage(ws, codecs)?;
     let existing = find_or_insert_workflow_schedule(conn, &stored_ws, expr.as_deref()).await?;
     // Issue #1157, defect 3: a row that already says exactly what registration
@@ -4587,6 +4620,7 @@ async fn tick_one_workflow_schedule(
                 return Ok(());
             }
             OverlapAction::CancelAndProceed => {
+                ensure_schedule_input_decodes(schedule, registry.payload_codecs())?;
                 // Cancel only the oldest scheduled runs needed to free one slot,
                 // then fall through to dispatch. Subtract the cancelled count so
                 // the dispatch loop sees the correct remaining capacity.
@@ -4604,6 +4638,7 @@ async fn tick_one_workflow_schedule(
                 running -= i64::from(cancelled);
             }
             OverlapAction::TerminateAndProceed => {
+                ensure_schedule_input_decodes(schedule, registry.payload_codecs())?;
                 // Terminate only the minimum needed to free one slot.
                 let needed =
                     u32::try_from(running.saturating_sub(i64::from(schedule.max_active_runs)) + 1)

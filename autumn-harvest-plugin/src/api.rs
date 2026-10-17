@@ -34973,6 +34973,13 @@ async fn replay_diagnosis(
                 }
             }
         }
+        // The replay below decodes the header cell too. The audit counts it,
+        // so a run whose payloads are all offloaded still leaves a record
+        // (issue #2043).
+        if let Some(cell) = execution.context_headers.as_ref() {
+            let mut cell = cell.clone();
+            outcome = outcome.merged(codecs.decode_value_lossy(&mut cell));
+        }
         let target = exec_id.to_string();
         // Reuse the handler's own (execution-shard) connection, mirroring the
         // history-export audit — a second pool acquire while it is live can

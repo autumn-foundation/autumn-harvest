@@ -16322,6 +16322,8 @@ async fn handle_activity_result(
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Issue #1986: whether the row asks for a result writer.
+    result_writer: bool,
     // Issue #1986: the result writer's reference, written before the call.
     stored: Option<&crate::fan_out::StoredResult>,
     // Issue #1996: the LLM calls a completion writes with its event.
@@ -16333,7 +16335,7 @@ async fn handle_activity_result(
         // as a reference, so it fails instead (compare issue #1758).
         Ok(output)
             if stored.is_none()
-                && task_writes_result(task, codecs)
+                && result_writer
                 && output.get(crate::fan_out::STORED_RESULT_KEY).is_some() =>
         {
             use crate::failure::IntoActivityErrorString as _;
@@ -16508,6 +16510,7 @@ pub async fn write_activity_result_for_task(
         &crate::telemetry::NoOpMetrics,
         crate::builder::DEFAULT_RETRY_AFTER_CEILING,
         codecs,
+        task_writes_result(task, codecs),
         None,
         &[],
     )
@@ -19326,6 +19329,8 @@ async fn process_activity_task(
         worker_id,
         activity_name,
         llm_calls: &[],
+        // A failure written before the handler runs stores no result.
+        result_writer: false,
     };
     if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
         opened_at,
@@ -19423,6 +19428,10 @@ async fn process_activity_task(
         .trace_context
         .as_ref()
         .and_then(TraceContextCarrier::from_json);
+    // Read the writer marker from the decoded headers, once for the attempt.
+    let result_writer = activity_headers
+        .get(crate::fan_out::RESULT_WRITER_HEADER)
+        .is_some_and(|value| value == "1");
     let activity_context_headers = std::sync::Arc::new(activity_headers);
     // Issue #783: identity is resolved from the row `append_activity_started_if_pending`
     // already locked (no extra query) plus the claimed task row.
@@ -19484,7 +19493,7 @@ async fn process_activity_task(
             activity_id,
             claim: activity_claim.clone(),
             max_result_bytes: effective_result_cap,
-            result_writer: task_writes_result(task, registry.payload_codecs()),
+            result_writer,
             offloader: registry.payload_offloader_arc(),
         });
 
@@ -19810,9 +19819,9 @@ async fn process_activity_task(
         Ok(output) if effective_result_cap > 0 => {
             let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
             // Issue #1986: the result writer moves every result to the store.
-            let offload_applies = registry.payload_offloader().is_some_and(|o| {
-                observed > o.threshold() || task_writes_result(task, registry.payload_codecs())
-            });
+            let offload_applies = registry
+                .payload_offloader()
+                .is_some_and(|o| observed > o.threshold() || result_writer);
             if observed > effective_result_cap && !offload_applies {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
@@ -20179,6 +20188,7 @@ async fn process_activity_task(
         worker_id,
         activity_name,
         llm_calls: &llm_calls,
+        result_writer,
     };
     let finalized = write_activity_result(
         pool,
@@ -20378,6 +20388,11 @@ struct ActivityAttempt<'a> {
     /// The LLM calls the attempt recorded (issue #1996). A completion
     /// writes them with its event. A failure drops them.
     llm_calls: &'a [crate::llm_ledger::LlmCall],
+    /// Whether the row asks the worker to write the result (issue #1986).
+    /// The attempt decodes the headers once and carries the answer here. A
+    /// later decode that fails cannot turn a writer row into a plain one
+    /// (issue #2043).
+    result_writer: bool,
 }
 
 /// Write the result of an activity attempt that has started (issue #1788).
@@ -20412,6 +20427,7 @@ async fn write_activity_result(
         worker_id,
         activity_name,
         llm_calls,
+        result_writer,
     } = *attempt_of;
     let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
     // A handler failure and an inline output upload nothing. The count
@@ -20426,17 +20442,15 @@ async fn write_activity_result(
     // safe. A lost claim leaves one blob without a reference row, as a
     // rolled-back offload does.
     let stored = match (activity_result, registry.payload_offloader()) {
-        (Ok(output), Some(offloader)) if task_writes_result(task, registry.payload_codecs()) => {
-            Some(
-                crate::fan_out::StoredResult::write(
-                    offloader.store().as_ref(),
-                    registry.payload_codecs(),
-                    activity_id,
-                    output,
-                )
-                .await?,
+        (Ok(output), Some(offloader)) if result_writer => Some(
+            crate::fan_out::StoredResult::write(
+                offloader.store().as_ref(),
+                registry.payload_codecs(),
+                activity_id,
+                output,
             )
-        }
+            .await?,
+        ),
         _ => None,
     };
     let mut attempt = 1;
@@ -20455,6 +20469,7 @@ async fn write_activity_result(
             registry.telemetry().metrics.as_ref(),
             registry.retry_after_ceiling,
             registry.payload_codecs(),
+            result_writer,
             stored.as_ref(),
             llm_calls,
         )

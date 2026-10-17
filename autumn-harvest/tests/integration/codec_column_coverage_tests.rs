@@ -3953,3 +3953,180 @@ async fn a_rerun_keeps_the_headers_one_layer_deep_and_fails_on_a_cell_it_cannot_
         "the rerun cell decodes once, with no second layer"
     );
 }
+
+// ── a down encoder and the overlap policies (issue #2043) ────────────────────
+
+/// A codec whose encode always fails, as a key service that is down would.
+struct DownEncoder;
+
+impl PayloadCodec for DownEncoder {
+    fn codec_id(&self) -> &'static str {
+        "down-encoder"
+    }
+
+    fn encode(&self, _raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+        Err(CodecError("the key service is down".to_string()))
+    }
+
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+        Ok(encoded.to_vec())
+    }
+}
+
+/// The test key still decodes. The active key cannot encode.
+fn encoder_down() -> PayloadCodecs {
+    let codecs = aead_codecs(true);
+    codecs
+        .register_key("down", Arc::new(DownEncoder))
+        .expect("register");
+    codecs.set_active_key("down").expect("activate");
+    codecs
+}
+
+#[tokio::test]
+async fn a_converged_schedule_registers_again_while_the_encoder_is_down() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let name = format!("cc_sched_down_{}", Uuid::new_v4().simple());
+    let ws = secret_schedule(&name);
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&ws),
+        &aead_codecs(true),
+    )
+    .await
+    .expect("register");
+    let (before, updated_before) = schedule_cell(&mut conn, &name).await;
+
+    // An idempotent request needs no write, so it needs no encode.
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&ws),
+        &encoder_down(),
+    )
+    .await
+    .expect("a converged schedule needs no encoder");
+    let (after, updated_after) = schedule_cell(&mut conn, &name).await;
+    assert_eq!(before, after);
+    assert_eq!(updated_before, updated_after, "nothing is written");
+
+    // A change still needs the encoder, so it fails instead of storing clear.
+    let mut changed = ws;
+    changed.input = json!({"ssn": "cc-schedule-new-input-999"});
+    let refused = autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&changed),
+        &encoder_down(),
+    )
+    .await;
+    assert!(refused.is_err(), "a changed input is never stored in clear");
+    let (kept, _) = schedule_cell(&mut conn, &name).await;
+    assert_eq!(kept, before, "the stored input is unchanged");
+}
+
+#[tokio::test]
+async fn an_overlap_policy_disturbs_no_run_when_the_schedule_input_cannot_decode() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let codecs = aead_codecs(true);
+    let mut conn = connect(&url).await;
+    let name = format!("cc_sched_overlap_{}", Uuid::new_v4().simple());
+    let static_name: &'static str = Box::leak(name.clone().into_boxed_str());
+    let mut ws = secret_schedule(&name);
+    ws.overlap_policy = autumn_harvest::OverlapPolicy::TerminateOther;
+    ws.max_active_runs = 1;
+    autumn_harvest::register_workflow_schedules_with_codecs(
+        &mut conn,
+        std::slice::from_ref(&ws),
+        &codecs,
+    )
+    .await
+    .expect("register");
+
+    #[derive(diesel::QueryableByName)]
+    struct Id {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: Uuid,
+    }
+    let schedule: Id =
+        diesel::sql_query("SELECT id FROM harvest_schedules WHERE workflow_name = $1")
+            .bind::<diesel::sql_types::Text, _>(&name)
+            .get_result(&mut conn)
+            .await
+            .expect("schedule id");
+
+    // One scheduled run is in flight and fills the only slot.
+    let in_flight = autumn_harvest::execution::start_or_load_workflow_execution_with_codecs(
+        &mut conn,
+        StartWorkflowParams {
+            schedule_id: Some(schedule.id),
+            scheduled_for: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+            ..StartWorkflowParams::new(
+                static_name,
+                "cc-sched-in-flight",
+                ExecutionId::new_for_shard(ShardId::new(0)),
+                json!({}),
+                "default",
+            )
+        },
+        None,
+        &codecs,
+    )
+    .await
+    .expect("start the in-flight run")
+    .exec_id;
+    diesel::sql_query(
+        "UPDATE harvest_schedules SET next_run_at = now() - interval '1 minute' \
+         WHERE workflow_name = $1",
+    )
+    .bind::<diesel::sql_types::Text, _>(&name)
+    .execute(&mut conn)
+    .await
+    .expect("make it due");
+
+    // No key: the input cannot decode. The overlap step must not run first.
+    autumn_harvest::scheduler::tick_once(
+        build_pool(&url),
+        registry(
+            vec![wf_info(static_name, wf_noop, None)],
+            vec![],
+            &reader_without_the_key(),
+        ),
+        Arc::new(autumn_harvest::DagCatalog::new()),
+        Arc::new(vec![]),
+        autumn_harvest::SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("a bad row never fails the tick");
+    assert_eq!(
+        load_execution(&mut conn, in_flight.as_uuid()).await.state,
+        "RUNNING",
+        "the in-flight run is left alone"
+    );
+
+    // Positive control: with the key, the policy terminates it and starts the new run.
+    autumn_harvest::scheduler::tick_once(
+        build_pool(&url),
+        registry(vec![wf_info(static_name, wf_noop, None)], vec![], &codecs),
+        Arc::new(autumn_harvest::DagCatalog::new()),
+        Arc::new(vec![]),
+        autumn_harvest::SchedulerMonitor::offline(),
+    )
+    .await
+    .expect("tick with the key");
+    assert_ne!(
+        load_execution(&mut conn, in_flight.as_uuid()).await.state,
+        "RUNNING",
+        "the policy replaces the in-flight run"
+    );
+    assert_eq!(
+        count_rows(
+            &mut conn,
+            "SELECT COUNT(*)::BIGINT AS n FROM harvest_workflow_executions \
+             WHERE workflow_name = $1",
+            &name,
+        )
+        .await,
+        2,
+        "the replacement run started"
+    );
+}
