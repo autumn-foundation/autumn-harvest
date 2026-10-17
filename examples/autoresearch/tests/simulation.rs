@@ -509,6 +509,45 @@ fn first(events: &[WorkflowEvent], pick: impl Fn(&WorkflowEvent) -> bool) -> usi
     events.iter().position(pick).unwrap_or(events.len())
 }
 
+/// The index of the start event of each experiment child, in order.
+fn experiment_starts(events: &[WorkflowEvent]) -> Vec<usize> {
+    events
+        .iter()
+        .enumerate()
+        .filter_map(|(k, event)| match event {
+            WorkflowEvent::ChildWorkflowStarted { workflow_name, .. }
+                if workflow_name == "experiment" =>
+            {
+                Some(k)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The payload of the last signal named `name` before event `before`.
+fn last_signal<'a>(events: &'a [WorkflowEvent], name: &str, before: usize) -> Option<&'a Value> {
+    events[..before].iter().rev().find_map(|e| match e {
+        WorkflowEvent::SignalReceived {
+            signal_name,
+            payload,
+        } if signal_name == name => Some(payload),
+        _ => None,
+    })
+}
+
+/// The first experiment that a hint with labels reaches. The session takes
+/// the labels when it takes the hint, before its next experiment.
+fn labelled_from(events: &[WorkflowEvent]) -> Option<usize> {
+    let signal = events.iter().position(|e| {
+        matches!(e, WorkflowEvent::SignalReceived { signal_name, payload }
+            if signal_name == "hint" && payload["labels"].as_array().is_some_and(|l| !l.is_empty()))
+    })?;
+    experiment_starts(events)
+        .iter()
+        .position(|&start| start > signal)
+}
+
 fn signals(events: &[WorkflowEvent], name: &str, before: usize) -> usize {
     events[..before]
         .iter()
@@ -521,12 +560,27 @@ fn check_session(run: &SimOutcome, per_run: u32) {
     let events = run.events();
     let inputs = experiment_inputs(events);
     let outcomes = experiment_outcomes(events);
-    let (best, tainted) = check_experiments(&inputs, &outcomes);
+    let (best, tainted) = check_experiments(&inputs, &outcomes, labelled_from(events));
     let failures = outcomes.iter().filter(|o| o.is_none()).count();
     always!(
         completed(events, "record").len() == failures,
         "the session records one crash row per failed experiment"
     );
+    // A failed child can leave its commit at `HEAD`.
+    let bases: Vec<&str> = inputs
+        .iter()
+        .zip(&outcomes)
+        .filter(|(_, out)| out.is_none())
+        .filter_map(|(input, _)| input.best.as_ref().map(|b| b.commit.as_str()))
+        .collect();
+    let resets: Vec<&str> = scheduled(events, "reset")
+        .filter_map(|input| input["commit"].as_str())
+        .collect();
+    always!(
+        resets == bases,
+        "a failed experiment resets the branch to its base"
+    );
+    check_shared(events, &inputs);
     let used = inputs.iter().filter(|i| i.hint.is_some()).count();
     always!(
         used <= signals(events, "hint", events.len()),
@@ -580,6 +634,7 @@ fn check_session(run: &SimOutcome, per_run: u32) {
 fn check_experiments(
     inputs: &[ExperimentInput],
     outcomes: &[Option<ExperimentOutcome>],
+    labelled_from: Option<usize>,
 ) -> (Option<Best>, bool) {
     // The base of each experiment is the best after the one before it. A
     // crash or a failure never moves it.
@@ -587,6 +642,10 @@ fn check_experiments(
     let mut tainted = inputs.first().is_some_and(|i| !i.flow_labels.is_empty());
     let mut tighter_seen = false;
     for (i, input) in inputs.iter().enumerate() {
+        if labelled_from == Some(i) {
+            tainted = true;
+            sometimes!(true, "the labels of a sibling reach a later experiment");
+        }
         if i > 0 {
             always!(input.best == best, "each base is the best so far");
             always!(
@@ -626,6 +685,39 @@ fn check_experiments(
     (best, tainted)
 }
 
+/// Check that each idea the session shares carries the labels of the
+/// session. A sibling that takes the hint must also take its taint.
+fn check_shared(events: &[WorkflowEvent], inputs: &[ExperimentInput]) {
+    let starts = experiment_starts(events);
+    for (k, event) in events.iter().enumerate() {
+        let WorkflowEvent::ExternalSignalRequested {
+            signal_name,
+            payload,
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if signal_name != "hint" {
+            continue;
+        }
+        let labels: BTreeSet<String> =
+            serde_json::from_value(payload["labels"].clone()).unwrap_or_default();
+        let Some(i) = starts.iter().rposition(|&start| start < k) else {
+            continue;
+        };
+        always!(
+            inputs
+                .get(i)
+                .is_some_and(|input| input.flow_labels.is_subset(&labels)),
+            "a shared idea carries the labels of its session"
+        );
+        if labels.contains(UNTRUSTED_INPUT) {
+            sometimes!(true, "a tainted session shares its labels");
+        }
+    }
+}
+
 /// Check what the hand-off carries.
 fn check_hand_off(
     events: &[WorkflowEvent],
@@ -656,6 +748,16 @@ fn check_hand_off(
         signals(events, "stop", hand_off) == 0,
         "a stop before the hand-off ends the night"
     );
+    if let Some(policy) = last_signal(events, "policy", hand_off) {
+        let policy: KeepPolicy = serde_json::from_value(policy.clone()).unwrap();
+        always!(
+            carry.as_ref().is_some_and(|c| c.policy == policy),
+            "the hand-off carries the policy"
+        );
+        if policy != KeepPolicy::default() {
+            sometimes!(true, "a new policy crosses the hand-off");
+        }
+    }
     always!(
         carry
             .as_ref()
@@ -746,9 +848,18 @@ async fn a_session_hands_off_its_carry_past_a_failed_experiment() {
         min_improvement: 0.0005,
         ..KeepPolicy::default()
     };
+    // A sibling shares a kept idea from a paper, so its hint has the taint.
+    let sibling = json!({
+        "text": "autoresearch/other kept a smaller batch",
+        "from": "autoresearch/other",
+        "labels": [UNTRUSTED_INPUT],
+    });
+    let mut config = session_config();
+    config.siblings = vec!["autoresearch/other".into()];
     session_env()
         .simulation()
         .seeds(SEEDS)
+        .signal("hint", sibling)
         .signal(
             "hint",
             json!({"text": "try a longer warmdown", "from": "human"}),
@@ -761,19 +872,18 @@ async fn a_session_hands_off_its_carry_past_a_failed_experiment() {
             "hint",
             json!({"text": "try a lower weight decay", "from": "human"}),
         )
-        .signal(
-            "hint",
-            json!({"text": "try a smaller batch", "from": "human"}),
-        )
         .signal("policy", serde_json::to_value(tighter).unwrap())
         .require_reached("a failed experiment becomes a crash row")
         .require_reached("a paper or a failure taints a later experiment")
+        .require_reached("the labels of a sibling reach a later experiment")
+        .require_reached("a tainted session shares its labels")
         .require_reached("a hint is carried across the hand-off")
+        .require_reached("a new policy crosses the hand-off")
         .require_reached("the session continues as new")
         .sweep(
             research_session_info().handler,
             serde_json::to_value(SessionInput {
-                config: session_config(),
+                config,
                 carry: None,
             })
             .unwrap(),

@@ -1205,9 +1205,11 @@ mod tests {
         assert_eq!(lab.kept(&short(&head)).unwrap(), Some(row(&short(&head))));
     }
 
-    /// Two commits on `HEAD` whose ids share their first 4 hex digits.
+    /// Two commits on `HEAD` whose ids share their first 4 hex digits, and
+    /// no more than 6. No commit of the branch has those 4 digits.
     fn colliding(dir: &Path, lab: &Lab) -> (String, String) {
         let base = lab.head().unwrap();
+        let branch = lab.git(&["rev-list", "HEAD"]).unwrap();
         let tree = lab.git(&["rev-parse", "HEAD:"]).unwrap();
         let objects = dir.join("objects");
         std::fs::create_dir(&objects).unwrap();
@@ -1227,8 +1229,10 @@ mod tests {
         let ids = lab.git(&args).unwrap();
         let mut seen = std::collections::HashMap::new();
         ids.lines()
+            .filter(|id| !branch.lines().any(|b| b[..4] == id[..4]))
             .find_map(|id| {
                 seen.insert(&id[..4], id)
+                    .filter(|other| other[..7] != id[..7])
                     .map(|other| (id.to_string(), other.to_string()))
             })
             .unwrap()

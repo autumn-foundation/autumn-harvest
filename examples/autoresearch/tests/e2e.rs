@@ -302,7 +302,7 @@ async fn an_approved_rewind_moves_the_base_to_an_older_kept_commit() {
     // The paper taints the rest of the session, so each later edit asks.
     let later = run_approving(&mut rt, exec).await;
     assert!(
-        later.iter().all(|p| p.tool == agent::EDIT_TRAIN),
+        !later.is_empty() && later.iter().all(|p| p.tool == agent::EDIT_TRAIN),
         "{later:?}"
     );
 

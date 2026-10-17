@@ -262,7 +262,7 @@ Test names are in `examples/autoresearch`. `e2e::` is `tests/e2e.rs`,
 | AC27 | `ci.yml`: the test step, the demo step and the clippy step. `dst-nightly.yml`: the `autoresearch` job. |
 | AC28 | `docs/audits/comment-hygiene.py --base origin/trunk-dev` passes. |
 | AC29 | `e2e::two_sessions_in_one_lab_take_turns_on_their_own_branches`, `lab::tests::checkout_moves_back_to_the_session_branch_only_when_clean`, `two_sessions_never_share_a_commit`, `a_tag_that_another_session_used_is_refused`, `activities::tests::train_refuses_a_moved_branch_and_a_change_no_commit_holds`, `setup_refuses_a_tag_that_another_session_used`. |
-| AC30 | `e2e::a_nightly_session_takes_commands_by_its_tag`, `e2e::a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag`. |
+| AC30 | `e2e::a_nightly_session_takes_commands_by_its_tag`, `e2e::a_nightly_session_that_waits_for_its_lab_takes_commands_by_its_tag`, `cli::run_with_no_tag_resumes_the_one_running_session`. |
 | AC31 | `lab::tests::a_commit_is_made_once_per_key`, `an_edit_runs_once_per_call`, `an_edit_whose_write_was_lost_runs_on_its_retry`, `a_row_is_recorded_once_per_key`, `a_row_whose_write_was_lost_lands_on_its_retry`. `activities::tests::a_train_call_that_runs_again_returns_its_saved_run`. `agent::tests::an_edit_call_that_runs_again_changes_nothing`. |
 | AC32 | `trainer::tests::a_dropped_run_kills_its_whole_group`, `the_next_run_kills_a_run_that_outlived_its_runner`, `a_timeout_kills_the_children_of_the_run_too`, `a_finished_run_names_no_group`, `a_free_lock_forgets_the_group_of_an_earlier_run`, `a_stale_lock_spares_a_group_that_reused_its_id`. |
 | AC33 | `claude::tests::a_thinking_block_goes_back_unchanged_in_the_next_request`, `a_turn_survives_in_the_turn_directory`, `the_key_stays_out_of_debug_output`. |
@@ -316,7 +316,9 @@ The fixes:
   stop lost at the hand-off, a crash that moved the base, a lost carried
   best, and lost hints. The sweeps now check the base, the carry, the
   hints, the stop, the policy and the taint on every seed. A no-stop sweep
-  reaches the hand-off and carries a hint. A sweep with one experiment per
+  reaches the hand-off and carries a hint and a new policy. A failed
+  experiment must reset the branch to its base. A sibling's hint carries
+  its labels in, and a shared idea carries the session's labels out. A sweep with one experiment per
   run lands a stop at the hand-off. Seed-driven mocks take the rewind, no-change,
   time-out and failure paths. The review also found a product bug: a run
   past its budget was scored. It is a crash now.

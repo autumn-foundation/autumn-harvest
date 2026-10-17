@@ -67,8 +67,14 @@ fn inbox_commands_queue_for_the_runner() {
     ok(&["init", &lab]);
     ok(&["hint", "--lab", &lab, "--tag", "t", "paper:warmdown"]);
     ok(&["stop", "--lab", &lab, "--tag", "t"]);
-    let refused = autoresearch(&["policy", "--lab", &lab, "--tag", "t", "--line-cost", "-1"]);
+    // `=` keeps clap from reading `-1` as a flag, so the policy check runs.
+    let refused = autoresearch(&["policy", "--lab", &lab, "--tag", "t", "--line-cost=-1"]);
     assert!(!refused.status.success(), "a negative line cost is refused");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("line_cost"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
     let inbox = Path::new(&lab).join(".autoresearch").join("inbox");
     let queued = std::fs::read_dir(&inbox)
         .unwrap()
@@ -209,6 +215,42 @@ fn a_run_cannot_read_the_environment_of_the_runner() {
     assert!(
         !String::from_utf8_lossy(&leak).contains("hunter2"),
         "the run read the runner's environment"
+    );
+}
+
+/// A runner that died mid-night is back with the same command and no tag,
+/// as after a night that crossed midnight. It resumes the one running
+/// session.
+#[test]
+fn run_with_no_tag_resumes_the_one_running_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let lab = lab_arg(&dir.path().join("lab"));
+    ok(&["init", &lab]);
+    let mut first = Command::new(env!("CARGO_BIN_EXE_autoresearch"))
+        .args(["run", "--lab", &lab, "--tag", "night", "--experiments", "1"])
+        .args(["--train-seconds", "2", "--no-report"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("AUTORESEARCH_LAB")
+        .env_remove("AUTORESEARCH_DB")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let running = (0..300).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let status = autoresearch(&["status", "--lab", &lab]);
+        String::from_utf8_lossy(&status.stdout).contains("RUNNING")
+    });
+    first.kill().unwrap();
+    first.wait().unwrap();
+    assert!(running, "the night started");
+    let out = ok(&["run", "--lab", &lab, "--no-report"]);
+    assert!(
+        out.contains("resuming the session with the tag \"night\""),
+        "{out}"
+    );
+    assert!(
+        out.contains("done: autoresearch/night: 1 experiments"),
+        "{out}"
     );
 }
 
