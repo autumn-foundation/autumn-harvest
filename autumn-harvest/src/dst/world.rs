@@ -19,6 +19,10 @@
 //! A run has two phases. The fault phase can stall or crash a worker. The
 //! drain phase injects no fault, and it ends when all work is complete.
 //! [`WorldInvariant::Converges`] fails a run whose work does not finish.
+//!
+//! `Converges` is a liveness property, so it holds only under a fair
+//! scheduler. The drain phase is weakly fair (issue #2217). An action that
+//! stays enabled for [`FAIR_STEPS`] steps without a run runs next.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -30,6 +34,9 @@ use crate::event::WorkflowEvent;
 
 /// The length of one clock tick, in seconds: one day.
 pub const TICK_SECS: u64 = 86_400;
+
+/// In the drain phase, an enabled action waits at most this many steps.
+pub const FAIR_STEPS: usize = 60;
 
 /// The planted defect: `none` (the default) or `foreign-state`.
 pub const PLANT_VAR: &str = "HARVEST_DST_WORLD_PLANT";
@@ -240,7 +247,7 @@ impl WorldConfig {
 }
 
 /// One action of one actor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WorldAction {
     /// Move the clock one tick forward.
     Advance,
@@ -822,6 +829,8 @@ struct Driver<'a, W> {
     held: Vec<bool>,
     fired_slots: BTreeSet<u64>,
     seen: BTreeMap<String, Seen>,
+    /// The step from which each enabled action waits for a run.
+    waiting: BTreeMap<WorldAction, usize>,
     report: WorldReport,
 }
 
@@ -844,6 +853,7 @@ impl<'a, W: World> Driver<'a, W> {
             held: vec![false; config.schedulers],
             fired_slots: BTreeSet::new(),
             seen: BTreeMap::new(),
+            waiting: BTreeMap::new(),
             report: WorldReport {
                 config: config.clone(),
                 trace: Vec::new(),
@@ -882,7 +892,7 @@ impl<'a, W: World> Driver<'a, W> {
         if self.report.violation.is_none() && !self.report.converged {
             self.report.converged = self.done();
             if !self.report.converged {
-                let detail = format!("work remains after {limit} steps");
+                let detail = format!("work remains after {limit} steps: {}", self.remaining());
                 self.fail(vec![(WorldInvariant::Converges, detail)]);
             }
         }
@@ -903,6 +913,30 @@ impl<'a, W: World> Driver<'a, W> {
                 .executions
                 .iter()
                 .all(|exec| !ACTIVE_STATES.contains(&exec.status.as_str()) && !exec.blocked)
+    }
+
+    /// The work that keeps [`Self::done`] false, as a comma list.
+    fn remaining(&self) -> String {
+        let last = &self.report.last;
+        let mut open: Vec<String> = last
+            .executions
+            .iter()
+            .filter(|exec| ACTIVE_STATES.contains(&exec.status.as_str()) || exec.blocked)
+            .map(|exec| {
+                let blocked = if exec.blocked { " blocked" } else { "" };
+                format!("{} {}{blocked}", exec.label, exec.status)
+            })
+            .collect();
+        let unsent = self
+            .signalled
+            .iter()
+            .enumerate()
+            .filter(|(_, sent)| !**sent);
+        open.extend(unsent.map(|(i, _)| format!("signal c{i}")));
+        if !last.schedules_done {
+            open.push("schedule".to_string());
+        }
+        open.join(", ")
     }
 
     fn worker_id(&self, w: usize) -> String {
@@ -960,9 +994,46 @@ impl<'a, W: World> Driver<'a, W> {
     fn choose(&mut self) -> WorldAction {
         self.wake_stalled();
         let actions = self.enabled();
+        self.track_waits(&actions);
+        let action = self
+            .overdue(&actions)
+            .unwrap_or_else(|| self.draw(&actions));
+        self.waiting.remove(&action);
+        action
+    }
+
+    /// Start the wait of each newly enabled action. Drop each disabled one.
+    fn track_waits(&mut self, actions: &[(u64, WorldAction)]) {
+        let enabled: BTreeSet<WorldAction> = actions.iter().map(|(_, action)| *action).collect();
+        self.waiting.retain(|action, _| enabled.contains(action));
+        for action in enabled {
+            self.waiting.entry(action).or_insert(self.step);
+        }
+    }
+
+    /// In the drain phase, the action that waited longest, if it waited
+    /// [`FAIR_STEPS`] steps. A tie goes to the first action in `actions`.
+    ///
+    /// A weighted draw alone can skip a rare action for the whole drain. In
+    /// issue #2217, a drain of 400 steps ran no reclaimer pass. This rule
+    /// needs no draw, so a run with no overdue action keeps its trace.
+    fn overdue(&self, actions: &[(u64, WorldAction)]) -> Option<WorldAction> {
+        if !self.draining() {
+            return None;
+        }
+        actions
+            .iter()
+            .filter_map(|(_, action)| Some((*action, *self.waiting.get(action)?)))
+            .filter(|(_, since)| self.step - since >= FAIR_STEPS)
+            .min_by_key(|(_, since)| *since)
+            .map(|(action, _)| action)
+    }
+
+    /// One weighted draw from `actions`.
+    fn draw(&mut self, actions: &[(u64, WorldAction)]) -> WorldAction {
         let total: u64 = actions.iter().map(|(weight, _)| weight).sum();
         let mut pick = self.rng.below(total);
-        for (weight, action) in actions {
+        for &(weight, action) in actions {
             if pick < weight {
                 return action;
             }

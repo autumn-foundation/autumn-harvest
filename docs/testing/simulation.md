@@ -223,6 +223,15 @@ of reach.
 A run has a fault phase of 120 steps. A drain phase of up to 400 steps
 follows. It has no fault, and it ends when all work is complete.
 
+The drain phase is weakly fair (issue #2217). An action that stays enabled
+for 60 steps (`FAIR_STEPS`) without a run runs next, with no draw. The
+longest wait goes first. `Converges` is a liveness check, and it needs this
+rule. A weighted draw alone can skip a rare actor, such as the reclaimer,
+for the whole drain. Seed 52000000302 did this. Its last open task was a
+claim of a dead worker, and only the reclaimer requeues it.
+
+A `Converges` failure names the work that remains, such as `s2 RUNNING`.
+
 ### The clock
 
 The clock moves in ticks of one day. A shift subtracts an interval from
