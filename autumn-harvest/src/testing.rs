@@ -7229,7 +7229,15 @@ impl WorkflowTestEnv {
     /// local activity. Used to gate cancellable-timer auto-firing in the harness
     /// so it only fires on the bookkeeping-only `await_fire` path, matching the
     /// real worker (Codex P2, issue #768).
-    const fn is_competing_suspension(cmd: &WorkflowCommand) -> bool {
+    fn is_competing_suspension(cmd: &WorkflowCommand) -> bool {
+        // No body awaits a drop release (issue #2193).
+        if matches!(
+            cmd,
+            WorkflowCommand::ScheduleActivity { name, .. }
+                if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+        ) {
+            return false;
+        }
         matches!(
             cmd,
             WorkflowCommand::ScheduleActivity { .. }
@@ -7819,7 +7827,9 @@ impl WorkflowTestEnv {
         if name == crate::context::SESSION_ACQUIRE_ACTIVITY_NAME {
             return Ok(Ok(serde_json::json!(TEST_SESSION_HOST_WORKER_ID)));
         }
-        if name == crate::context::SESSION_RELEASE_ACTIVITY_NAME {
+        if name == crate::context::SESSION_RELEASE_ACTIVITY_NAME
+            || name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+        {
             return Ok(Ok(Value::Null));
         }
         Err(format!(
