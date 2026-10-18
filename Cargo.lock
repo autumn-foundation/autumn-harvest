@@ -365,6 +365,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "autoresearch"
+version = "0.7.0"
+dependencies = [
+ "autumn-harvest",
+ "autumn-harvest-agent",
+ "autumn-harvest-sqlite",
+ "chrono",
+ "clap",
+ "futures",
+ "proptest",
+ "reqwest",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "autumn-harvest"
 version = "0.7.0"
 dependencies = [
@@ -468,6 +490,23 @@ dependencies = [
  "tokio-postgres",
  "tokio-postgres-rustls",
  "url",
+]
+
+[[package]]
+name = "autumn-harvest-conformance"
+version = "0.7.0"
+dependencies = [
+ "autumn-harvest",
+ "autumn-harvest-sqlite",
+ "chrono",
+ "deadpool",
+ "diesel",
+ "diesel-async",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

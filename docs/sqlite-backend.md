@@ -1219,9 +1219,20 @@ under issue #1068. It is no longer a non-goal. Child workflows and commands
 between runs (see [§9](#9-child-workflows-and-commands-between-runs)) shipped
 under issue #2026.
 
-Two benign bookkeeping commands are silently no-ops (they append no event and
-gate no control flow): `ctx.set_current_details(...)` and a re-park
-`WaitForActivity`.
+Six commands append no event: `SetCurrentDetails`
+(`ctx.set_current_details`), `PublishProgress`, `PublishDurableProgress`,
+`RecordLog`, a re-park `WaitForActivity` and `WaitForSignal`. Postgres
+appends no event for them either. `WaitForSignal` only names the wait. This
+backend does not keep the current details, the durable progress chunks or
+the log lines.
+
+### Parity with Postgres (issue #2030)
+
+The `autumn-harvest-conformance` crate runs one corpus of workflows on both
+backends. Each scenario must give the same outcome and a replay-equivalent
+history. Each primitive that this backend rejects must fail loudly, by name.
+A guard fails when a command that this backend accepts has no scenario. See
+[`autumn-harvest-conformance/README.md`](../autumn-harvest-conformance/README.md).
 
 ---
 
@@ -1254,6 +1265,17 @@ gate no control flow): `ctx.set_current_details(...)` and a re-park
 
   ```text
   cargo run -p claude-agent-daemon -- serve --workspace /tmp/agent-demo
+  ```
+
+- **[`examples/autoresearch/`](../examples/autoresearch/)** — Karpathy's
+  autoresearch loop on this backend: a session parent, one experiment child per
+  idea, and an agent child per proposal ([§9](#9-child-workflows-and-commands-between-runs)).
+  It also uses a saga, mutexes, signals, a query, an update, schedules,
+  continue-as-new and search attributes. It runs offline.
+
+  ```text
+  cargo run -p autoresearch -- init /tmp/ar-lab
+  cargo run -p autoresearch -- run --lab /tmp/ar-lab --tag demo --experiments 8 --explore 100
   ```
 
 For the full API/contract reference, run

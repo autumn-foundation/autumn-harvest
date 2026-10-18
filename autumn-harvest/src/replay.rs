@@ -449,6 +449,27 @@ pub enum SideEffectNowMatch {
 /// `Now` under this name.
 pub const DEADLINE_PROBE_SIDE_EFFECT_NAME: &str = "__harvest_deadline_probe";
 
+/// Reserved side-effect name for a live `should_continue_as_new()` history-size
+/// decision (issue #2080).
+///
+/// Each call records its answer, `true` or `false`. A replay reads the record at
+/// the same position, so the answer is the same however large the loaded
+/// history has grown.
+pub const CONTINUE_AS_NEW_SIDE_EFFECT_NAME: &str = "__harvest_continue_as_new";
+
+/// The replayed state of a `should_continue_as_new()` history-size decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinueAsNewMatch {
+    /// The cursor holds a recorded `true` decision, or a checkpoint from a
+    /// history that predates the record. The answer is `true`.
+    True,
+    /// The cursor holds a recorded `false` decision, or other events from a
+    /// history that predates the record. The answer is `false`.
+    False,
+    /// The cursor is past the recorded history. The caller decides live.
+    Frontier,
+}
+
 /// Marker name recorded by `ctx.patched(patch_id)` (issue #687).
 pub(crate) fn patch_marker_name(patch_id: &str) -> String {
     format!("patch:{patch_id}")
@@ -1659,7 +1680,7 @@ impl HistoryMatcher {
     /// they are skipped during activity/timer/signal/child-workflow matching
     /// and are consumed by the `match_update` / `drain_admitted_updates` APIs.
     /// `WorkflowResetFork` is informational and likewise has no workflow
-    /// command counterpart.
+    /// command counterpart. So are the two fork events of issue #2000.
     const fn is_update_event(event: &WorkflowEvent) -> bool {
         matches!(
             event,
@@ -1667,6 +1688,8 @@ impl HistoryMatcher {
                 | WorkflowEvent::UpdateCompleted { .. }
                 | WorkflowEvent::UpdateFailed { .. }
                 | WorkflowEvent::WorkflowResetFork { .. }
+                | WorkflowEvent::WorkflowForked { .. }
+                | WorkflowEvent::ForkActivityResultOverridden { .. }
         )
     }
 
@@ -5909,6 +5932,66 @@ impl HistoryMatcher {
             // and a user `Now` is left for its own strict read to consume.
             _ => SideEffectNowMatch::NotRecorded,
         }
+    }
+
+    /// Replay a `should_continue_as_new()` history-size decision (issue #2080).
+    ///
+    /// Reads the cursor, never the loaded event count, so the answer does not
+    /// change when the loaded history grows.
+    ///
+    /// - A recorded decision is consumed and gives its value.
+    /// - A `WorkflowContinuedAsNew` event is a checkpoint from a history that
+    ///   predates the record. It is left in place and reads as `true`. A
+    ///   deadline probe clock read before it does not change that.
+    /// - Any other event is a history that predates the record. It reads as
+    ///   `false`, with the cursor untouched.
+    /// - A cursor past the end is the live frontier.
+    #[must_use]
+    pub fn match_continue_as_new_decision(&mut self) -> ContinueAsNewMatch {
+        if !self.prepare_match() {
+            return ContinueAsNewMatch::Frontier;
+        }
+        match &self.events[self.cursor] {
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some(name),
+                value: Value::Bool(decision),
+            } if name == CONTINUE_AS_NEW_SIDE_EFFECT_NAME => {
+                let decision = *decision;
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                if decision {
+                    ContinueAsNewMatch::True
+                } else {
+                    ContinueAsNewMatch::False
+                }
+            }
+            WorkflowEvent::WorkflowContinuedAsNew { .. } => ContinueAsNewMatch::True,
+            // A legacy run with an execution timeout reads its deadline clock
+            // before the checkpoint. Look past that one event.
+            probe if Self::is_deadline_probe_event(probe) => {
+                let mut next = self.cursor + 1;
+                while self.is_consumed(next) {
+                    next += 1;
+                }
+                match self.events.get(next) {
+                    Some(WorkflowEvent::WorkflowContinuedAsNew { .. }) => ContinueAsNewMatch::True,
+                    _ => ContinueAsNewMatch::False,
+                }
+            }
+            _ => ContinueAsNewMatch::False,
+        }
+    }
+
+    fn is_deadline_probe_event(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Now,
+                name: Some(name),
+                ..
+            } if name == DEADLINE_PROBE_SIDE_EFFECT_NAME
+        )
     }
 
     /// Match a local activity command against history.

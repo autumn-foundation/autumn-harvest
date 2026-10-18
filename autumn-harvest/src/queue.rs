@@ -901,7 +901,9 @@ pub const NEW_START_HANDICAP_SECS: u32 = 30;
 /// Every other task is a continuation. That includes an activity task and a
 /// woken workflow task. It also includes the first task of a child, a
 /// continue-as-new, a reset fork, a workflow retry or a DLQ redrive. Each of
-/// these extends admitted work. The admission gate uses a similar split.
+/// these extends admitted work. The admission gate uses a similar split. A
+/// non-destructive fork (issue #2000) is admitted as a fresh start, so its
+/// first task is a new start.
 ///
 /// A new start sorts as if it were due [`NEW_START_HANDICAP_SECS`] later. So
 /// at equal priority, a continuation goes first under a backlog. The
@@ -2187,7 +2189,9 @@ pub enum ClaimFairness {
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
+/// Returns [`crate::error::HarvestError::Database`] on query failure. With
+/// [`ClaimFairness::Keys`], it returns [`crate::error::HarvestError::Config`]
+/// for a queue name that the weight API cannot address, before any statement.
 /// The queues of a fair claim, each once, in first-seen order.
 ///
 /// The fair claim polls the queues in a random order. A name listed twice
@@ -2211,6 +2215,11 @@ pub async fn claim_task_with_fairness(
     kind: Option<TaskType>,
     fairness: ClaimFairness,
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    if fairness == ClaimFairness::Keys {
+        for queue in queues {
+            crate::queue_fairness::validate_fairness_queue_name(queue)?;
+        }
+    }
     if fairness == ClaimFairness::Keys && queues.len() > 1 {
         use rand::seq::SliceRandom as _;
         let mut order = distinct_queues(queues);
@@ -3098,7 +3107,9 @@ pub async fn claim_task_by_id_on_shard(
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on query failure.
+/// Returns [`crate::error::HarvestError::Database`] on query failure. With
+/// [`ClaimFairness::Keys`], it returns [`crate::error::HarvestError::Config`]
+/// for a queue name that the weight API cannot address, before any statement.
 #[allow(clippy::too_many_arguments)]
 pub async fn claim_task_by_id_with_fairness(
     conn: &mut AsyncPgConnection,
@@ -3112,6 +3123,11 @@ pub async fn claim_task_by_id_with_fairness(
     shard: Option<crate::types::ShardId>,
     fairness: ClaimFairness,
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    if fairness == ClaimFairness::Keys {
+        for queue in queues {
+            crate::queue_fairness::validate_fairness_queue_name(queue)?;
+        }
+    }
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
     let mut tx = conn.build_transaction().read_committed();
@@ -4868,6 +4884,9 @@ pub async fn cancel_open_tasks_for_execution(
 /// is still open (`PENDING`/`RUNNING`) — the loser-cancellation primitive for
 /// `ctx.race()` (issue #600).
 ///
+/// A loser that a recorded fork holds is already `CANCELLED` with the hold
+/// mark of issue #2000. It counts as open here.
+///
 /// Returns `Some((activity_name, queue_name))` if a still-open row was
 /// transitioned to `CANCELLED` (the caller should then record a synthetic
 /// terminal event for it so replay never re-observes it as in-progress, and
@@ -4910,7 +4929,11 @@ pub async fn cancel_activity_task_with_reason(
     let cancelled = diesel::update(
         dsl::harvest_task_queue
             .filter(dsl::activity_id.eq(Some(activity_id.as_uuid())))
-            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+            .filter(
+                dsl::state.eq_any(["PENDING", "RUNNING"]).or(dsl::state
+                    .eq("CANCELLED")
+                    .and(dsl::error.eq(Some(crate::fork::FORK_HOLD_ERROR)))),
+            ),
     )
     .set((
         dsl::state.eq("CANCELLED"),
@@ -8625,15 +8648,24 @@ const TERMINAL_TASK_CURSOR: &str = "AND (t.completed_at, t.id) > ($3, $4) ";
 ///   takes its entry, so the row goes 7 days after the cutoff. The grace is
 ///   at most [`crate::worker::MAX_CANCELLATION_GRACE_PERIOD`], so a live
 ///   owner always takes its entry first.
+/// - **Fork hold.** A race loser that a recorded fork holds stays while its
+///   execution is live (issue #2000). The race finds the hold mark when its
+///   winner fires. A timer winner can fire after the window.
 #[must_use]
 fn terminal_task_predicates() -> String {
     let terminal = crate::erase::sql_literal_list(TERMINAL_TASK_STATES);
     let execution_terminal = crate::erase::sql_literal_list(crate::erase::TERMINAL_STATES);
+    let hold = crate::erase::sql_literal_list(&[crate::fork::FORK_HOLD_ERROR]);
     format!(
         "t.state IN ({terminal}) \
          AND t.completed_at < $1 \
          AND (COALESCE(cardinality(t.timed_out_claims), 0) = 0 \
               OR t.completed_at < $1 - INTERVAL '7 days') \
+         AND (t.error IS DISTINCT FROM {hold} OR NOT EXISTS ( \
+             SELECT 1 FROM harvest_workflow_executions e \
+              WHERE e.id = t.workflow_exec_id \
+                AND e.state NOT IN ({execution_terminal}) \
+         )) \
          AND (t.task_type = 'activity' OR ( \
              NOT EXISTS ( \
                  SELECT 1 FROM harvest_workflow_executions e \
@@ -12423,6 +12455,16 @@ mod tests {
             assert!(!sql.contains(live), "{live} must not appear: {sql}");
         }
         assert!(sql.contains("t.completed_at < $1"));
+    }
+
+    #[test]
+    fn terminal_task_predicates_keep_a_live_fork_hold() {
+        let sql = terminal_task_predicates();
+        let hold = format!(
+            "t.error IS DISTINCT FROM '{}'",
+            crate::fork::FORK_HOLD_ERROR
+        );
+        assert!(sql.contains(&hold), "{sql}");
     }
 
     #[test]

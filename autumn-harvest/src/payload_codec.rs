@@ -1809,6 +1809,53 @@ impl PayloadCodecs {
         value.map(|v| self.decode_column(v)).transpose()
     }
 
+    /// [`PayloadCodecs::encode_column`] for a context header map
+    /// (issue #2043). The whole map is one cell.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::encode_column`].
+    pub fn encode_headers(
+        &self,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> HarvestResult<Value> {
+        self.encode_column(&serde_json::to_value(headers).map_err(HarvestError::Serialization)?)
+    }
+
+    /// Decode a stored header cell into a header map (issue #2043).
+    ///
+    /// A codec failure is an error, never an empty map. A header can carry a
+    /// tenant or a trace, so a missing key must not drop it without a sound.
+    /// A decoded value that is not a string map reads as no headers. That is
+    /// the contract for a row from before column encoding.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::decode_column`].
+    pub fn decode_headers(
+        &self,
+        stored: &Value,
+    ) -> HarvestResult<std::collections::HashMap<String, String>> {
+        let plain = self.decode_column(stored)?;
+        Ok(serde_json::from_value(plain).unwrap_or_default())
+    }
+
+    /// [`PayloadCodecs::decode_headers`] for an optional cell. No cell means
+    /// no headers.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::decode_headers`].
+    pub fn decode_headers_opt(
+        &self,
+        stored: Option<&Value>,
+    ) -> HarvestResult<std::collections::HashMap<String, String>> {
+        stored.map_or_else(
+            || Ok(std::collections::HashMap::new()),
+            |v| self.decode_headers(v),
+        )
+    }
+
     /// Re-encode a stored column value for a copy into a new row (issue #2065).
     ///
     /// A retry, a continue-as-new successor and a reset fork are new writes.

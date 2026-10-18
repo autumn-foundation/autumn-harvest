@@ -164,6 +164,9 @@ Two attribution details:
   rows. The surfaces above decode them under the same rules. A
   non-admin caller, and the undecoded list surfaces, see the envelopes. See
   the column coverage table in `docs/security-posture.md`.
+- The schedule API and the UI show the stored envelope for a schedule input
+  (issue #2043). A history export decodes context headers only when the caller
+  may decode. Without that, the export document carries no headers.
 - A column write can wrap the whole value in one envelope: the column codec,
   or an identity escape while the switch is off. A column read removes that
   layer first, then applies the walk below. So a decoded column shows the

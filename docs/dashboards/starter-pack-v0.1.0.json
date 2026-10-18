@@ -4126,6 +4126,55 @@
           "description": "Terminal harvest_task_queue rows deleted by the terminal-task janitor (issue #1811), by task state. A flat zero while the table grows means the janitor is off (terminal_task_retention_secs = null) or the role lacks DELETE. GET /admin/retention reports the per-shard outcome and any error."
         },
         {
+          "id": 479100,
+          "type": "timeseries",
+          "title": "Payload store \u2014 orphaned blobs (issue #2123)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 108
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (outcome) (rate(harvest_retention_payload_orphans_total[$__rate_interval]))",
+              "legendFormat": "{{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Payload blobs the orphan sweep handled (issue #2123), by outcome: found, deleted or failed. A rolled-back write leaves such blobs. A flat zero means the sweep is off (payload_orphan_grace_secs = null) or the store cannot list. A rising failed count means store deletes fail."
+        },
+        {
           "id": 931,
           "type": "timeseries",
           "title": "Dispatch rate by shard",

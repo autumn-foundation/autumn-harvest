@@ -1622,6 +1622,8 @@ impl ReplayDebugger {
         // here keeps this new replay path aligned with the worker, the
         // replayer, and the query-hydration paths (issues #698, #772).
         .with_parent_execution_id(snapshot.parent_execution_id)
+        // Issue #2082: the row's start source decides an entity's branch.
+        .with_start_provenance(snapshot.start_provenance.unwrap_or_default())
         .with_execution_timeout(snapshot.execution_timeout)
         .with_deadline(snapshot.deadline_at)
         // Configured via `ReplayDebugger::history_policy`; without this the
@@ -1672,6 +1674,7 @@ impl ReplayDebugger {
                 queries: &queries,
                 updates: &updates,
                 router: None,
+                start_provenance: snapshot.start_provenance.unwrap_or_default(),
             },
         );
 
@@ -2121,6 +2124,7 @@ const ENGINE_MINTED_ID_FIELDS: &[&str] = &[
     "cancel_id",
     "child_id",
     "dead_letter_id",
+    "forked_from_exec_id",
     "new_exec_id",
     "reset_from_exec_id",
     "reset_to_exec_id",

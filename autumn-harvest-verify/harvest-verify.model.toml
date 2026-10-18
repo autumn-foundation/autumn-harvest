@@ -1167,7 +1167,7 @@ reason = "context.rs:7041; calls `push_command` directly. Every argument is reco
 [[sink]]
 path = "should_continue_as_new"
 receiver = "WorkflowContext"
-reason = "context.rs:4361 -> `deadline_fraction_reached` (4382) -> `deadline_clock_read` (4478), which pushes `RecordSideEffect{Now, DEADLINE_PROBE}` at the live frontier. DUAL ROLE (see `[[sanctioned]]`): the doc at context.rs:4335-4360 states the replay-safety contract (\"when this returns true the workflow must call continue_as_new\")."
+reason = "context.rs:4361 -> `deadline_fraction_reached` (4382) -> `deadline_clock_read` (4478), which pushes `RecordSideEffect{Now, DEADLINE_PROBE}` at the live frontier. Each live call also pushes `RecordSideEffect{Custom, __harvest_continue_as_new}`. DUAL ROLE (see `[[sanctioned]]`): the doc at context.rs:4335-4360 states the replay-safety contract (\"when this returns true the workflow must call continue_as_new\")."
 [[sink]]
 path = "side_effect"
 receiver = "WorkflowContext"
@@ -1500,6 +1500,10 @@ path = "check_cancellation"
 receiver = "WorkflowContext"
 reason = "context.rs:4728; returns `Err(Cancelled)` from the same recorded field. No command."
 [[non_sink]]
+path = "continued_from"
+receiver = "WorkflowContext"
+reason = "context.rs:4600; run-identity metadata from the execution row, fixed at start and identical on every replay and every worker."
+[[non_sink]]
 path = "drain_commands"
 receiver = "WorkflowContext"
 reason = "context.rs:13299 \"Called by the worker after the workflow task\" - engine-facing, never inside a `#[workflow]` body. Present in the examples only in hand-rolled driver code."
@@ -1640,6 +1644,10 @@ path = "set_current_details"
 receiver = "WorkflowContext"
 reason = "context.rs:13164. Pushes `SetCurrentDetails`, but returns at the top when `is_replaying()` (context.rs:13165-13167), so the command never participates in history matching. Modelling it as a sink would turn 13 of the 310 real `ctx.` call sites in this repo's examples into findings."
 [[non_sink]]
+path = "start_source"
+receiver = "WorkflowContext"
+reason = "context.rs:4594; run-identity metadata from the execution row, fixed at start and identical on every replay and every worker."
+[[non_sink]]
 path = "state"
 receiver = "WorkflowContext"
 reason = "context.rs:4669; typed shared state injected by the worker builder. Whether that state is deterministic is a property of the injected value, tracked by the ambient-root rules, not of this accessor."
@@ -1743,6 +1751,10 @@ reason = "context.rs:3779; builder-style setter called by the worker/test harnes
 path = "with_shard_router"
 receiver = "WorkflowContext"
 reason = "context.rs:7260; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_start_provenance"
+receiver = "WorkflowContext"
+reason = "context.rs:4281; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
 [[non_sink]]
 path = "with_workflow_id"
 receiver = "WorkflowContext"

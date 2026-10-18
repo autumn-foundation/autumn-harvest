@@ -176,6 +176,7 @@ pub(crate) struct ResidentKey {
     execution_timeout: Option<chrono::Duration>,
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     parent_execution_id: Option<ExecutionId>,
+    start_provenance: crate::types::StartProvenance,
     context_headers: HashMap<String, String>,
 }
 
@@ -198,6 +199,7 @@ impl ResidentKey {
             execution_timeout: span_meta.and_then(|m| m.execution_timeout),
             deadline_at: span_meta.and_then(|m| m.deadline_at),
             parent_execution_id: span_meta.and_then(|m| m.parent_execution_id),
+            start_provenance: span_meta.map(|m| m.start_provenance).unwrap_or_default(),
             context_headers: context_headers.clone(),
         }
     }
@@ -216,6 +218,7 @@ impl PartialEq for ResidentKey {
             && self.execution_timeout == other.execution_timeout
             && self.deadline_at == other.deadline_at
             && self.parent_execution_id == other.parent_execution_id
+            && self.start_provenance == other.start_provenance
             && self.context_headers == other.context_headers
     }
 }
@@ -1732,6 +1735,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            start_provenance: crate::types::StartProvenance::default(),
             cancellation_reason: None,
         };
         let key = ResidentKey::new(one_activity_workflow, Some(&meta), &HashMap::new());
@@ -2595,11 +2599,44 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            start_provenance: crate::types::StartProvenance::default(),
             cancellation_reason: None,
         };
         let key = ResidentKey::new(pair_then_c_workflow, Some(&meta), &HashMap::new());
         let declined = resident.resume_with(&delta, Some(&key), Some(&meta)).await;
         assert_eq!(declined.err(), Some(ResumeDeclined::KeyChanged));
+    }
+
+    #[test]
+    fn keys_differ_when_only_the_start_provenance_differs() {
+        let meta = |provenance| crate::executor::WorkflowExecuteSpanMeta {
+            workflow_name: "wf".into(),
+            workflow_id: String::new(),
+            shard_id: 0,
+            queue_name: String::new(),
+            is_replay: false,
+            link_traceparent: None,
+            build_id: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            start_provenance: provenance,
+            cancellation_reason: None,
+        };
+        let key = |m: &crate::executor::WorkflowExecuteSpanMeta| {
+            ResidentKey::new(pair_then_c_workflow, Some(m), &HashMap::new())
+        };
+        let api = meta(crate::types::StartProvenance::fresh(
+            crate::types::StartSource::Api,
+        ));
+        let again = meta(crate::types::StartProvenance::fresh(
+            crate::types::StartSource::Api,
+        ));
+        let can = meta(crate::types::StartProvenance::continued_from(
+            ExecutionId::new(),
+        ));
+        assert_eq!(key(&api), key(&again));
+        assert_ne!(key(&api), key(&can));
     }
 
     #[tokio::test]
