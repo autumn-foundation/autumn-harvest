@@ -1,0 +1,3 @@
+## Phase — PAUSED-run index for the claim gate (issue #2212)
+
+Migration `20261018053859` adds `idx_harvest_we_paused ON harvest_workflow_executions (id) WHERE state = 'PAUSED'`. The claim's PAUSED-run gate read one primary-key page chain per candidate. With more than 32 paused-run tasks at a queue head it read every PAUSED row. Claim buffers (EXPLAIN, total) fall 21% to 34% with 10 paused heads, and 80% to 90% with 50 paused heads at 100k to 1M executions. The claimed ids are identical before and after. The migration takes `SHARE` on `harvest_workflow_executions` for the build and has an out-of-band `CONCURRENTLY` recipe. Harness and numbers: `docs/perf-artifacts/claim-paused-gate/`.

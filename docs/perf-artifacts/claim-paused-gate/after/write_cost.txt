@@ -1,0 +1,6 @@
+== without index
+wal_running_to_completed_5000|wal_completed_to_paused_5000|wal_paused_to_running
+82430680|10280960|11763712
+== with index
+wal_running_to_completed_5000|wal_completed_to_paused_5000|wal_paused_to_running
+82448848|10731520|10592256
