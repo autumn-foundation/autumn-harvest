@@ -11272,17 +11272,19 @@ async fn fail_activities_for_broken_sessions(
         if settled.contains(&scheduled.activity_id) {
             continue;
         }
-        // A drop release (issue #2193) has no awaiter. The host handler
-        // ignores a session that is not `ACTIVE`, so it needs no failure.
-        if scheduled.name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME {
-            continue;
-        }
         let Some(session_uuid) = scheduled.session_id.map(|id| id.as_uuid()) else {
             continue;
         };
         let Some(reason) = broken.get(&session_uuid) else {
             continue;
         };
+        // A drop release (issue #2193) has no awaiter. Its task is pinned to
+        // a host that may be gone, so nothing would claim it. Fail the task
+        // row and record no failure event. The run needs no wake.
+        if scheduled.name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME {
+            queue::fail_task(conn, *activity_task_id, reason).await?;
+            continue;
+        }
         let failed_event = WorkflowEvent::ActivityFailed {
             activity_id: scheduled.activity_id,
             error: reason.clone(),

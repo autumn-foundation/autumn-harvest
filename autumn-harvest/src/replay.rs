@@ -2124,7 +2124,7 @@ impl HistoryMatcher {
     ///
     /// A record is the `ActivityScheduled` event of the reserved name and every
     /// later event with the same activity id.
-    fn drop_release_indices(events: &[WorkflowEvent]) -> Vec<usize> {
+    pub(crate) fn drop_release_indices(events: &[WorkflowEvent]) -> Vec<usize> {
         let mut releases: HashSet<ActivityExecId> = HashSet::new();
         let mut indices = Vec::new();
         for (i, event) in events.iter().enumerate() {
