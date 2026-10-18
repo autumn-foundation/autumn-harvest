@@ -17,7 +17,7 @@
 //! | Edge | Transition | Dedupe key |
 //! |---|---|---|
 //! | Child start | `PENDING_START` → `STARTED` | the child's `ExecutionId` is the PK on the target shard |
-//! | Cancel | `cancel_requested` → cleared | `cancel_workflow_execution` is idempotent on a terminal target |
+//! | Cancel | `cancel_requested` and `cancel_reason` → cleared | `cancel_workflow_execution` is idempotent on a terminal target |
 //! | Terminal notify | row deleted | the append + delete commit together on the parent's shard |
 //! | Close cascade | row deleted | the cascade only acts on a `RUNNING`/`PAUSED` child |
 //!
@@ -405,9 +405,8 @@ pub async fn record_cross_shard_child_with_codecs(
 
 /// Durably request cancellation of a cross-shard child.
 ///
-/// Called inside whatever parent-side transaction decided to cancel (a race
-/// loser, an over-deadline child, an operator cancel), so the request commits
-/// with that decision. The relay delivers it to the target shard on its next
+/// Called inside the parent-side transaction that decided to cancel, so the
+/// request commits with that decision. The relay delivers it to the target shard on its next
 /// sweep; delivery is idempotent, so an at-least-once redelivery is harmless.
 ///
 /// Clears `last_attempt_at` so a row that had backed off after an earlier
@@ -416,7 +415,8 @@ pub async fn record_cross_shard_child_with_codecs(
 ///
 /// `reason` is the text for the child's `WorkflowCancelled` event (issue #2194).
 /// The first stored reason wins, as the first cancel of a same-shard child does.
-/// `None` stores no reason, and the relay uses [`CROSS_SHARD_CANCEL_REASON`].
+/// `None` adds no reason, and a reason stored earlier stays. With no reason, the
+/// relay uses [`CROSS_SHARD_CANCEL_REASON`].
 ///
 /// Returns the number of rows flagged — `0` means the child is not (or is no
 /// longer) a tracked cross-shard child, which the caller treats as "nothing to
@@ -1406,14 +1406,22 @@ async fn start_child_on_target(
     // transaction's own commit. It runs on `parent_conn`'s own connection,
     // held in no transaction of its own, so it never blocks on the target
     // shard's work below.
-    let cancel_requested: bool = harvest_cross_shard_children::table
-        .find(row.child_exec_id)
-        .select(harvest_cross_shard_children::cancel_requested)
-        .first(parent_conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?
-        .unwrap_or(row.cancel_requested);
+    let (cancel_requested, cancel_reason): (bool, Option<String>) =
+        harvest_cross_shard_children::table
+            .find(row.child_exec_id)
+            .select((
+                harvest_cross_shard_children::cancel_requested,
+                harvest_cross_shard_children::cancel_reason,
+            ))
+            .first(parent_conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?
+            .unwrap_or_else(|| (row.cancel_requested, row.cancel_reason.clone()));
+    // A stored reason (issue #2194) wins over the born-cancelled text.
+    let born_cancelled_reason = cancel_reason
+        .as_deref()
+        .unwrap_or(CROSS_SHARD_BORN_CANCELLED_REASON);
 
     // The child's queue task is written inside this transaction, so it raises a
     // dispatch hint (issue #1312). The buffering scope holds the hint until the
@@ -1566,7 +1574,7 @@ async fn start_child_on_target(
                         &[
                             started_event,
                             WorkflowEvent::WorkflowCancelled {
-                                reason: CROSS_SHARD_BORN_CANCELLED_REASON.to_string(),
+                                reason: born_cancelled_reason.to_string(),
                             },
                         ],
                         0,
@@ -1606,7 +1614,7 @@ async fn start_child_on_target(
                     .set((
                         harvest_workflow_executions::state.eq("CANCELLED"),
                         harvest_workflow_executions::error
-                            .eq(Some(CROSS_SHARD_BORN_CANCELLED_REASON)),
+                            .eq(Some(born_cancelled_reason)),
                         harvest_workflow_executions::completed_at.eq(Some(created_at)),
                     ))
                     .execute(conn)

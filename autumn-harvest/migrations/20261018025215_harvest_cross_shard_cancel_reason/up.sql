@@ -6,8 +6,8 @@
 --
 -- No `WorkflowEvent` variant, no change to `harvest_events`, no replay impact.
 --
--- A nullable column with no default needs no table rewrite. The table is not
--- hot, but a held lock still fails the migration after 5 s.
+-- A nullable column with no default needs no table rewrite.
+-- A held lock fails the migration after 5 s.
 SET LOCAL lock_timeout = '5s';
 
 ALTER TABLE harvest_cross_shard_children
