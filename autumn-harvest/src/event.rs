@@ -1235,6 +1235,7 @@ impl WorkflowEvent {
             | Self::TimerFired { .. }
             | Self::TimerStarted { .. }
             | Self::UpdateFailed { .. }
+            | Self::WorkflowCancelRequested { .. }
             | Self::WorkflowCancelled { .. }
             | Self::WorkflowExecutionPaused { .. }
             | Self::WorkflowExecutionResumed { .. }
@@ -1362,6 +1363,7 @@ impl WorkflowEvent {
             | Self::ExternalAwaitRequested { .. }
             | Self::MutexGranted { .. }
             | Self::DecisionCommitted { .. }
+            | Self::WorkflowCancelRequested { .. }
             | Self::WorkflowForked { .. } => None,
         }
     }
