@@ -493,6 +493,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-harvest-conformance"
+version = "0.7.0"
+dependencies = [
+ "autumn-harvest",
+ "autumn-harvest-sqlite",
+ "chrono",
+ "deadpool",
+ "diesel",
+ "diesel-async",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "autumn-harvest-macros"
 version = "0.7.0"
 dependencies = [

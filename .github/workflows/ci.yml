@@ -2071,6 +2071,10 @@ jobs:
         run: cargo clippy -p autumn-harvest-cli --all-targets -- -D warnings
       - name: Clippy autumn-harvest-sqlite
         run: cargo clippy -p autumn-harvest-sqlite --all-targets -- -D warnings
+      # Issue #2030. The issue #962 rule applies. `--no-deps` lints only this
+      # crate. The core and the SQLite crate have their own steps.
+      - name: Clippy autumn-harvest-conformance (issue #2030)
+        run: cargo clippy -p autumn-harvest-conformance --all-targets --no-deps -- -D warnings
       # Issue #1973. `--no-deps`: the core crate without `db` has dead-code
       # warnings of its own, which the core's own clippy step owns.
       - name: Clippy autumn-harvest-agent (issue #1973)

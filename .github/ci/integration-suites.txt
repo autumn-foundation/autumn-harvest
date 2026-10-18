@@ -25,7 +25,7 @@
 #     <(grep    -E '^[[:space:]]*#' .github/ci/integration-suites.txt) \
 #     <(grep -vE '^[[:space:]]*(#|$)' .github/ci/integration-suites.txt | LC_ALL=C sort -u)
 #   LC_ALL=C sort -o .github/ci/integration-suites.txt \
-#   crate    = autumn-harvest | autumn-harvest-plugin | autumn-harvest-redis | standalone-runner
+#   crate    = autumn-harvest | autumn-harvest-conformance | autumn-harvest-plugin | autumn-harvest-redis | standalone-runner
 #   features = comma-list passed as `--features <v>`, or `-`.
 #   filter   = positional filter after `--`, or `-` for the whole target. A
 #   osclass   crate                    target       features            filter
@@ -272,6 +272,7 @@ linux        autumn-harvest         integration                      testing    
 linux        autumn-harvest         integration                      testing                    worker_session_tests
 linux        autumn-harvest         integration                      testing                    workflow_sim_ingest_tests
 linux        autumn-harvest         integration                      wasm-activities            wasm_activities_tests
+linux        autumn-harvest-conformance  conformance                  -                          -
 linux        autumn-harvest-plugin  activity_info_api_integration    -                          -
 linux        autumn-harvest-plugin  admission_gate_authoritative_localpg  -                          -
 linux        autumn-harvest-plugin  api_rate_limit_integration       -                          -
