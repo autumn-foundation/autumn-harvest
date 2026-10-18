@@ -3162,6 +3162,144 @@ mod tests {
         event
     }
 
+    /// A codec column of the given shape. The sweep never reads the names.
+    const fn column(shape: CellShape) -> CodecColumn {
+        CodecColumn {
+            table: "t",
+            id_column: "id",
+            column: "c",
+            rows: ALL_ROWS,
+            shape,
+        }
+    }
+
+    /// The envelope of `input` under `key_id`.
+    fn envelope_under(codecs: &PayloadCodecs, key_id: &str, input: Value) -> Value {
+        event_under(codecs, key_id, input)["data"]["input"].clone()
+    }
+
+    fn key_of(envelope: &Value) -> &str {
+        envelope[CODEC_ENVELOPE_KID_KEY].as_str().expect("key id")
+    }
+
+    #[test]
+    fn a_cell_shape_cell_moves_to_the_target_key() {
+        let codecs = rotated_registry();
+        let cell = envelope_under(&codecs, "k1", json!({"a": 1}));
+
+        let out = reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Cell), &cell)
+            .expect("sweep")
+            .expect("changed");
+
+        assert_eq!(key_of(&out), "k2");
+    }
+
+    #[test]
+    fn the_shape_accessor_returns_the_shape() {
+        assert_eq!(column(CellShape::Elements).shape(), CellShape::Elements);
+        assert_eq!(column(CellShape::Field("k")).shape(), CellShape::Field("k"));
+    }
+
+    #[test]
+    fn an_elements_cell_converts_each_envelope_and_keeps_a_clear_element() {
+        let codecs = rotated_registry();
+        let cell = json!([
+            envelope_under(&codecs, "k1", json!("one")),
+            json!("clear"),
+            envelope_under(&codecs, "k2", json!("two")),
+        ]);
+
+        let out = reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Elements), &cell)
+            .expect("sweep")
+            .expect("changed");
+
+        assert_eq!(key_of(&out[0]), "k2");
+        assert_eq!(out[1], json!("clear"));
+        assert_eq!(out[2], cell[2], "an active element stays as it was");
+    }
+
+    #[test]
+    fn an_elements_cell_with_nothing_to_move_is_a_no_op() {
+        let codecs = rotated_registry();
+        let cell = json!([json!("clear"), envelope_under(&codecs, "k2", json!(1))]);
+
+        let out = reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Elements), &cell)
+            .expect("sweep");
+
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn an_elements_cell_that_is_not_an_array_is_a_no_op() {
+        let codecs = rotated_registry();
+        let cell = envelope_under(&codecs, "k1", json!(1));
+
+        let out = reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Elements), &cell)
+            .expect("sweep");
+
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn an_undecodable_element_fails_the_whole_cell() {
+        let writer = PayloadCodecs::default();
+        writer
+            .register_key("k3", Arc::new(XorCodec(0x33)))
+            .expect("register k3");
+        writer.set_active_key("k3").expect("activate k3");
+        let lost = envelope_under(&writer, "k3", json!("lost"));
+        let codecs = rotated_registry();
+        let cell = json!([envelope_under(&codecs, "k1", json!("one")), lost]);
+
+        let out = reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Elements), &cell);
+
+        assert!(out.is_err(), "no half-converted buffer");
+    }
+
+    #[test]
+    fn a_field_shape_moves_only_the_named_key() {
+        let codecs = rotated_registry();
+        let cell = json!({
+            "memo": envelope_under(&codecs, "k1", json!({"m": 1})),
+            "mode": "fast",
+        });
+
+        let out =
+            reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Field("memo")), &cell)
+                .expect("sweep")
+                .expect("changed");
+
+        assert_eq!(key_of(&out["memo"]), "k2");
+        assert_eq!(out["mode"], "fast");
+    }
+
+    #[test]
+    fn a_field_shape_without_the_key_or_with_a_clear_field_is_a_no_op() {
+        let codecs = rotated_registry();
+        let shape = column(CellShape::Field("memo"));
+
+        let missing = reencrypt_column_cell_under(&codecs, "k2", &shape, &json!({"mode": 1}));
+        let clear = reencrypt_column_cell_under(&codecs, "k2", &shape, &json!({"memo": "x"}));
+        let active = json!({"memo": envelope_under(&codecs, "k2", json!(1))});
+        let done = reencrypt_column_cell_under(&codecs, "k2", &shape, &active);
+
+        assert_eq!(missing.expect("missing"), None);
+        assert_eq!(clear.expect("clear"), None);
+        assert_eq!(done.expect("active"), None);
+    }
+
+    #[test]
+    fn every_shape_is_a_no_op_without_a_keyed_codec() {
+        let codecs = PayloadCodecs::default();
+        let value = json!([{"x": 1}]);
+
+        for shape in [CellShape::Cell, CellShape::Elements, CellShape::Field("x")] {
+            let out =
+                reencrypt_column_cell_under(&codecs, "k2", &column(shape), &value).expect("sweep");
+            assert_eq!(out, None, "{shape:?}");
+        }
+    }
+
     #[test]
     fn reencrypts_a_field_carrying_a_non_active_key_id() {
         let codecs = rotated_registry();
