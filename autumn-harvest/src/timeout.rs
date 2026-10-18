@@ -524,7 +524,7 @@ const fn task_timeout_scans() -> [(TimeoutReason, &'static str); 4] {
 /// The text must match the index expression, or Postgres cannot use it.
 const LIVE_ROW_KEY: &str = "COALESCE(created_at, TIMESTAMPTZ '1970-01-01 00:00:00+00')";
 
-/// One refill of a task-timeout queue (issue #1795).
+/// One refill of the task-timeout queues of `group` (issues #1795, #2126).
 ///
 /// The refill reads one page of live rows in `(key, id)` order, where the
 /// key is [`LIVE_ROW_KEY`]. A live row is `PENDING` or `RUNNING`. The page
@@ -532,13 +532,17 @@ const LIVE_ROW_KEY: &str = "COALESCE(created_at, TIMESTAMPTZ '1970-01-01 00:00:0
 /// applies that bound and the keyset bound itself. So the page reads at most
 /// `LIMIT` index entries, and rows created later are never visited.
 ///
+/// `group` holds the lanes that read this page, in scan order. They share one
+/// cursor and one sweep clock. So one read of the page serves all of them.
+///
 /// The page holds the columns the predicates read. Each predicate then reads
-/// the page, not the table, so no predicate can fall back to its own index and scan past the
-/// page. A row is left to an earlier reason only when that reason's lane can
-/// still claim it. The query returns the expired ids, oldest first. It also returns the
-/// key and id of the last row of the page, and the number of rows read. So
-/// the work of a refill does not grow with the backlog. One sweep reads once
-/// each row that was live at its start.
+/// the page, not the table, so no predicate can fall back to its own index
+/// and scan past the page. A row is left to an earlier reason only when that
+/// reason's lane can still claim it. The query returns the expired ids with
+/// their lanes, oldest first in each lane. It also returns the key and id of
+/// the last row of the page, and the number of rows read. So the work of a
+/// refill does not grow with the backlog. One sweep reads once each row that
+/// was live at its start.
 ///
 /// Each predicate compares against the sweep's clock, not `NOW()`. So the
 /// sweep queues only rows that had expired when it started. The predicate
@@ -546,20 +550,31 @@ const LIVE_ROW_KEY: &str = "COALESCE(created_at, TIMESTAMPTZ '1970-01-01 00:00:0
 ///
 /// With `after`, `$1` and `$2` are the key and id of the last row of the
 /// previous page. Then `$3` is the page size and `$4` is the sweep's clock.
-/// Without it, `$1` is the page size and `$2` is the clock. The next four
-/// params describe the earlier lanes. They hold the clocks, the cursor keys,
-/// the cursor ids, and the ids that the lanes hold.
+/// Without it, `$1` is the page size and `$2` is the clock. The next five
+/// params describe each lane before the last lane of `group`, in lane order.
+/// They hold the clocks, the cursor keys, the cursor ids, the ids that the
+/// lanes hold, and the lane of each held id.
 ///
 /// An earlier lane matches each row at its own clock. A row ahead of its
 /// cursor is left to it. A row that it holds is left to it whatever it
 /// matches, because the row can have moved there after that clock. A row
 /// that it has already passed goes to this lane.
-fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String {
+///
+/// An earlier lane of `group` has the same clock and has just read the page.
+/// So a later lane leaves to it each row that it matches or holds. Each lane
+/// of `group` tests its predicate once, in its own `m<lane>` CTE. A second
+/// test of the costly schedule-to-start predicate can raise the plan cost of
+/// a full page over the JIT inline threshold. JIT then makes a refill take
+/// seconds.
+fn timeout_refill_query(group: &[usize], after: bool) -> String {
     use std::fmt::Write as _;
 
+    // The row comparison implies the plain key bound. The planner cannot
+    // estimate the row comparison. Without the plain bound, it can sort a
+    // bitmap scan of every later row, and not stop at the page.
     let (keyset, limit, clock, first) = if after {
         (
-            format!(" AND ({LIVE_ROW_KEY}, id) > ($1, $2)"),
+            format!(" AND {LIVE_ROW_KEY} >= $1 AND ({LIVE_ROW_KEY}, id) > ($1, $2)"),
             "$3",
             "$4",
             5,
@@ -567,41 +582,61 @@ fn timeout_refill_query(predicate: &str, higher: &[&str], after: bool) -> String
     } else {
         (String::new(), "$1", "$2", 3)
     };
-    let [clocks, keys, ids, held] = std::array::from_fn::<_, 4, _>(|i| format!("${}", first + i));
+    let [clocks, keys, ids, held, owners] =
+        std::array::from_fn::<_, 5, _>(|i| format!("${}", first + i));
+    let predicates = task_timeout_scans().map(|(_, predicate)| predicate);
     let on_page = |sql: &str, at: &str| on_refill_page(sql).replace("NOW()", at);
-    // `EXCEPT` leaves a row to an earlier reason. A set operation stays near
-    // linear in the page. A correlated `NOT EXISTS` on the page can run as a
-    // nested loop, because the planner cannot estimate the page's rows.
-    let mut expired = format!(
-        "SELECT q.id, q.row_key FROM ({}) q",
-        on_page(predicate, clock)
-    );
-    for (index, earlier) in higher.iter().enumerate() {
-        let k = index + 1;
-        let at = format!("({clocks})[{k}]");
+    let mut matches = String::new();
+    let mut due = Vec::with_capacity(group.len());
+    for &lane in group {
         let _ = write!(
-            expired,
-            " EXCEPT SELECT h.id, h.row_key FROM ({}) h WHERE h.row_key <= {at} \
-             AND (({keys})[{k}] IS NULL OR (h.row_key, h.id) > (({keys})[{k}], ({ids})[{k}]))",
-            on_page(earlier, &at)
+            matches,
+            "m{lane} AS (SELECT q.id, q.row_key FROM ({}) q), ",
+            on_page(predicates[lane], clock)
         );
-    }
-    if !higher.is_empty() {
-        let _ = write!(
-            expired,
-            " EXCEPT SELECT p.id, p.row_key FROM page p \
-             WHERE p.id IN (SELECT u.id FROM unnest({held}) AS u(id))"
-        );
+        // `EXCEPT` leaves a row to an earlier reason. A set operation stays
+        // near linear in the page. A correlated `NOT EXISTS` on the page can
+        // run as a nested loop, because the planner cannot estimate the
+        // page's rows.
+        let mut expired = format!("SELECT id, row_key FROM m{lane}");
+        for (index, earlier) in predicates[..lane].iter().enumerate() {
+            if group.contains(&index) {
+                let _ = write!(expired, " EXCEPT SELECT id, row_key FROM m{index}");
+                continue;
+            }
+            let k = index + 1;
+            let at = format!("({clocks})[{k}]");
+            let _ = write!(
+                expired,
+                " EXCEPT SELECT h.id, h.row_key FROM ({}) h WHERE h.row_key <= {at} \
+                 AND (({keys})[{k}] IS NULL OR (h.row_key, h.id) > (({keys})[{k}], ({ids})[{k}]))",
+                on_page(earlier, &at)
+            );
+        }
+        if lane > 0 {
+            let _ = write!(
+                expired,
+                " EXCEPT SELECT p.id, p.row_key FROM page p \
+                 WHERE p.id IN (SELECT u.id FROM unnest({held}, {owners}) AS u(id, lane) \
+                 WHERE u.lane < {lane})"
+            );
+        }
+        due.push(format!(
+            "SELECT {lane} AS lane, e.id, e.row_key FROM ({expired}) e"
+        ));
     }
     format!(
         "WITH page AS MATERIALIZED (SELECT {TIMEOUT_PAGE_COLUMNS}, {LIVE_ROW_KEY} AS row_key \
          FROM harvest_task_queue \
          WHERE state IN ('PENDING', 'RUNNING') AND {LIVE_ROW_KEY} <= {clock}{keyset} \
          ORDER BY {LIVE_ROW_KEY}, id LIMIT {limit}), \
-         tail AS (SELECT row_key, id FROM page ORDER BY row_key DESC, id DESC LIMIT 1) \
+         tail AS (SELECT row_key, id FROM page ORDER BY row_key DESC, id DESC LIMIT 1), \
+         {matches}due AS ({}) \
          SELECT (SELECT row_key FROM tail) AS last_key, (SELECT id FROM tail) AS last_id, \
          (SELECT COUNT(*) FROM page) AS rows_read, \
-         ARRAY(SELECT e.id FROM ({expired}) e ORDER BY e.row_key, e.id) AS expired"
+         ARRAY(SELECT d.lane FROM due d ORDER BY d.lane, d.row_key, d.id) AS lanes, \
+         ARRAY(SELECT d.id FROM due d ORDER BY d.lane, d.row_key, d.id) AS expired",
+        due.join(" UNION ALL ")
     )
 }
 
@@ -681,18 +716,40 @@ impl TimeoutScanLane {
             clock: as_of,
             // A lane on its last page has read every row of its sweep.
             read_to: as_of.map(|as_of| self.after.unwrap_or((as_of, uuid::Uuid::max()))),
-            held: self
-                .queued
-                .iter()
-                .chain(&self.moved)
-                .copied()
-                .chain(self.retry.iter().map(|(id, _)| *id))
-                .collect(),
+            held: self.held_ids().collect(),
         }
+    }
+
+    /// What this lane shows a later lane of its shared refill (issue #2126).
+    ///
+    /// The refill leaves to this lane each page row that this lane matches,
+    /// through its match CTE. So the refill reads only the held ids of this
+    /// claim, not its clock or cursor. The queue is empty before a refill,
+    /// so the held ids are the moved and retried ones.
+    fn page_claim(&self) -> LaneClaim {
+        LaneClaim {
+            clock: self.as_of,
+            read_to: None,
+            held: self.held_ids().collect(),
+        }
+    }
+
+    /// The ids in this lane's queue, moved list and retry list.
+    fn held_ids(&self) -> impl Iterator<Item = uuid::Uuid> + '_ {
+        self.queued
+            .iter()
+            .chain(&self.moved)
+            .copied()
+            .chain(self.retry.iter().map(|(id, _)| *id))
+    }
+
+    /// Whether this lane starts a new sweep in this pass.
+    fn starts_sweep(&self) -> bool {
+        self.queued.is_empty() && self.after.is_none()
     }
 }
 
-/// Batches of live rows that one refill reads, per timeout reason.
+/// Batches of live rows in one refill page.
 ///
 /// A refill reads one page of live rows and queues the expired ones. A
 /// larger page means fewer refills per sweep. Each refill still reads a
@@ -837,6 +894,12 @@ impl TimeoutScanLane {
 /// Each refill reads at most one page of index entries, and each pass loads
 /// at most one batch. So the work of a pass does not grow with the backlog.
 ///
+/// Lanes at one clock and one position read their page in one refill (issue
+/// #2126). Lanes that start a sweep in one pass take one clock. So lanes that
+/// start in step stay in step while no lane has a backlog, and a pass reads
+/// the page once. A lane that falls behind refills on its own. On a sweep of
+/// one page it joins the others again at its next sweep.
+///
 /// A row that fails to enforce is tried again first in the next batch, for
 /// at most three passes in a row. So a leader that fails on it keeps failing
 /// until it gives up its lease. After that, the row waits for the next sweep,
@@ -876,15 +939,27 @@ const fn timeout_lane(reason: &TimeoutReason) -> usize {
     }
 }
 
-/// The refills of one pass, as groups of lanes (issue #2126).
-#[cfg_attr(not(test), allow(dead_code))]
+/// The refills of one pass, as groups of lanes in scan order (issue #2126).
+///
+/// A lane with an empty queue refills. Lanes at one sweep clock and one
+/// cursor read the same page, so one refill serves them. A lane that does
+/// not refill can sit between them. Its claim does not change in the pass.
+///
+/// A lane that refills at another position ends the group. A later lane
+/// needs that lane's claim after its refill, and the group reads first.
 fn refill_groups(lanes: &[TimeoutScanLane; 4]) -> Vec<Vec<usize>> {
-    lanes
-        .iter()
-        .enumerate()
-        .filter(|(_, lane)| lane.queued.is_empty())
-        .map(|(index, _)| vec![index])
-        .collect()
+    let at = |lane: &TimeoutScanLane| (lane.as_of, lane.after);
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (index, lane) in lanes.iter().enumerate() {
+        if !lane.queued.is_empty() {
+            continue;
+        }
+        match groups.last_mut() {
+            Some(group) if at(&lanes[group[0]]) == at(lane) => group.push(index),
+            _ => groups.push(vec![index]),
+        }
+    }
+    groups
 }
 
 #[derive(diesel::QueryableByName)]
@@ -901,33 +976,56 @@ struct Refill {
     last_id: Option<uuid::Uuid>,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     rows_read: i64,
+    /// The lane of each id in `expired`.
+    #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Integer>)]
+    lanes: Vec<i32>,
     #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Uuid>)]
     expired: Vec<uuid::Uuid>,
 }
 
-/// Reads the next page of `lane`'s sweep and queues its expired rows.
+/// Reads the next page for the lanes of `group`, and queues their expired
+/// rows (issue #2126).
 ///
-/// `claims` describes the earlier lanes, in scan order.
-async fn refill_lane(
+/// The lanes of `group` share one cursor and one clock. `claims` describes
+/// the lanes before the first of them, in scan order. `limit` is the batch
+/// limit, for the claims of the queued lanes between group members.
+async fn refill_lanes(
     conn: &mut AsyncPgConnection,
-    lane: &mut TimeoutScanLane,
-    predicate: &str,
-    higher: &[&str],
+    lanes: &mut [TimeoutScanLane; 4],
+    group: &[usize],
     claims: &[LaneClaim],
+    limit: usize,
     page_rows: i64,
 ) -> HarvestResult<()> {
-    use diesel::sql_types::{Array, BigInt, Nullable, Timestamptz, Uuid};
+    use diesel::sql_types::{Array, BigInt, Integer, Nullable, Timestamptz, Uuid};
 
-    let Some(as_of) = lane.as_of else {
+    let (Some(&first), Some(&last)) = (group.first(), group.last()) else {
         return Ok(());
     };
-    let clocks: Vec<_> = claims.iter().map(|c| c.clock.unwrap_or(as_of)).collect();
-    let keys: Vec<_> = claims.iter().map(|c| c.read_to.map(|r| r.0)).collect();
-    let ids: Vec<_> = claims.iter().map(|c| c.read_to.map(|r| r.1)).collect();
-    let held: Vec<uuid::Uuid> = claims.iter().flat_map(|c| c.held.iter().copied()).collect();
-    let refill: Vec<Refill> = match lane.after {
+    let Some(as_of) = lanes[first].as_of else {
+        return Ok(());
+    };
+    // The claims of the lanes between the first and the last of the group.
+    let between: Vec<LaneClaim> = (first..last)
+        .map(|lane| {
+            if group.contains(&lane) {
+                lanes[lane].page_claim()
+            } else {
+                lanes[lane].claim(limit)
+            }
+        })
+        .collect();
+    let earlier = || claims[..first].iter().chain(&between);
+    let clocks: Vec<_> = earlier().map(|c| c.clock.unwrap_or(as_of)).collect();
+    let keys: Vec<_> = earlier().map(|c| c.read_to.map(|r| r.0)).collect();
+    let ids: Vec<_> = earlier().map(|c| c.read_to.map(|r| r.1)).collect();
+    let (held, owners): (Vec<uuid::Uuid>, Vec<i32>) = (0_i32..)
+        .zip(earlier())
+        .flat_map(|(lane, c)| c.held.iter().map(move |id| (*id, lane)))
+        .unzip();
+    let refill: Vec<Refill> = match lanes[first].after {
         Some((after_key, after_id)) => {
-            diesel::sql_query(timeout_refill_query(predicate, higher, true))
+            diesel::sql_query(timeout_refill_query(group, true))
                 .bind::<Timestamptz, _>(after_key)
                 .bind::<Uuid, _>(after_id)
                 .bind::<BigInt, _>(page_rows)
@@ -936,17 +1034,19 @@ async fn refill_lane(
                 .bind::<Array<Nullable<Timestamptz>>, _>(&keys)
                 .bind::<Array<Nullable<Uuid>>, _>(&ids)
                 .bind::<Array<Uuid>, _>(&held)
+                .bind::<Array<Integer>, _>(&owners)
                 .load(conn)
                 .await
         }
         None => {
-            diesel::sql_query(timeout_refill_query(predicate, higher, false))
+            diesel::sql_query(timeout_refill_query(group, false))
                 .bind::<BigInt, _>(page_rows)
                 .bind::<Timestamptz, _>(as_of)
                 .bind::<Array<Timestamptz>, _>(&clocks)
                 .bind::<Array<Nullable<Timestamptz>>, _>(&keys)
                 .bind::<Array<Nullable<Uuid>>, _>(&ids)
                 .bind::<Array<Uuid>, _>(&held)
+                .bind::<Array<Integer>, _>(&owners)
                 .load(conn)
                 .await
         }
@@ -954,11 +1054,23 @@ async fn refill_lane(
     .map_err(crate::error::database_error)?;
     let refill = refill.into_iter().next();
     // A full page moves the position. A short page ends the sweep.
-    lane.after = refill
+    let next = refill
         .as_ref()
         .filter(|r| r.rows_read >= page_rows)
         .and_then(|r| r.last_key.zip(r.last_id));
-    lane.queue_refill(refill.into_iter().flat_map(|r| r.expired));
+    let mut expired: [Vec<uuid::Uuid>; 4] = Default::default();
+    for (lane, id) in refill
+        .into_iter()
+        .flat_map(|r| r.lanes.into_iter().zip(r.expired))
+    {
+        if let Some(ids) = usize::try_from(lane).ok().and_then(|l| expired.get_mut(l)) {
+            ids.push(id);
+        }
+    }
+    for &lane in group {
+        lanes[lane].after = next;
+        lanes[lane].queue_refill(std::mem::take(&mut expired[lane]));
+    }
     Ok(())
 }
 
@@ -1018,27 +1130,32 @@ pub async fn find_timed_out_tasks_batch(
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 
-    let scans = task_timeout_scans();
-    let predicates = scans.clone().map(|(_, predicate)| predicate);
     let take = usize::try_from(limit).unwrap_or(usize::MAX);
-    // What each lane already done in this pass can still claim.
+    // A new sweep fixes its clock. Lanes that start a sweep in one pass take
+    // one clock, so they read one page together (issue #2126).
+    if cursor.lanes.iter().any(TimeoutScanLane::starts_sweep) {
+        let start: Vec<SweepStart> = diesel::sql_query(TIMEOUT_SWEEP_START_SQL)
+            .load(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        let as_of = start.into_iter().next().map(|r| r.as_of);
+        for lane in cursor.lanes.iter_mut().filter(|lane| lane.starts_sweep()) {
+            lane.as_of = as_of;
+        }
+    }
+    let mut groups = refill_groups(&cursor.lanes).into_iter().peekable();
+    // What each lane done in this pass can still claim.
     let mut claims: Vec<LaneClaim> = Vec::with_capacity(4);
     // Rows whose queued reason lapsed, with the lane of a reason that
     // matches now. They join that lane's queue after the pass.
     let mut moves: Vec<Move> = Vec::new();
-    for (index, (lane, (reason, predicate))) in cursor.lanes.iter_mut().zip(scans).enumerate() {
-        let higher = &predicates[..index];
-        if lane.queued.is_empty() && lane.after.is_none() {
-            // A new sweep: fix its clock.
-            let start: Vec<SweepStart> = diesel::sql_query(TIMEOUT_SWEEP_START_SQL)
-                .load(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-            lane.as_of = start.into_iter().next().map(|r| r.as_of);
+    for (index, (reason, predicate)) in task_timeout_scans().into_iter().enumerate() {
+        // A group refills at the turn of its first lane, before any of its
+        // lanes loads a batch.
+        if let Some(group) = groups.next_if(|group| group.starts_with(&[index])) {
+            refill_lanes(conn, &mut cursor.lanes, &group, &claims, take, page_rows).await?;
         }
-        if lane.queued.is_empty() {
-            refill_lane(conn, lane, predicate, higher, &claims, page_rows).await?;
-        }
+        let lane = &cursor.lanes[index];
         claims.push(lane.claim(take));
 
         let batch = lane.next_batch(take);
@@ -1107,17 +1224,8 @@ fn admit_moves(lanes: &mut [TimeoutScanLane; 4], moves: Vec<Move>, limit: usize)
     if moves.is_empty() {
         return;
     }
-    let mut held: Vec<HashSet<uuid::Uuid>> = lanes
-        .iter()
-        .map(|lane| {
-            lane.queued
-                .iter()
-                .chain(&lane.moved)
-                .copied()
-                .chain(lane.retry.iter().map(|(id, _)| *id))
-                .collect()
-        })
-        .collect();
+    let mut held: Vec<HashSet<uuid::Uuid>> =
+        lanes.iter().map(|lane| lane.held_ids().collect()).collect();
     let mut deferred: [Vec<uuid::Uuid>; 4] = Default::default();
     for Move { from, to, id } in moves {
         if held[to].contains(&id) {
@@ -7419,9 +7527,9 @@ mod tests {
 
     #[test]
     fn refill_query_reads_one_bounded_page_of_live_rows() {
-        let predicate = start_to_close_timeout_query();
+        let predicate = heartbeat_timeout_query();
         // The first page of a sweep is bounded only by the clock.
-        let first = timeout_refill_query(predicate, &[], false);
+        let first = timeout_refill_query(&[0], false);
         assert!(first.starts_with(&format!(
             "WITH page AS MATERIALIZED (SELECT {TIMEOUT_PAGE_COLUMNS}, {LIVE_ROW_KEY} AS row_key \
              FROM harvest_task_queue WHERE state IN ('PENDING', 'RUNNING') \
@@ -7430,18 +7538,22 @@ mod tests {
         assert!(!first.contains("$3"));
         // A later page starts after the last row of the previous one. Both
         // bounds are on the index key, so the index scan applies them.
-        let next = timeout_refill_query(predicate, &[], true);
+        let next = timeout_refill_query(&[0], true);
         assert!(next.contains(&format!(
-            "AND {LIVE_ROW_KEY} <= $4 AND ({LIVE_ROW_KEY}, id) > ($1, $2) \
-             ORDER BY {LIVE_ROW_KEY}, id LIMIT $3)"
+            "AND {LIVE_ROW_KEY} <= $4 AND {LIVE_ROW_KEY} >= $1 \
+             AND ({LIVE_ROW_KEY}, id) > ($1, $2) ORDER BY {LIVE_ROW_KEY}, id LIMIT $3)"
         )));
         // The predicate reads the page, not the table.
         let on_page = on_refill_page(predicate).replace("NOW()", "$4");
         assert!(next.contains(&format!(
-            "ARRAY(SELECT e.id FROM (SELECT q.id, q.row_key FROM ({on_page}) q) e"
+            "m0 AS (SELECT q.id, q.row_key FROM ({on_page}) q)"
         )));
-        // The queue keeps the page's order, oldest first.
-        assert!(next.contains("ORDER BY e.row_key, e.id) AS expired"));
+        assert!(
+            next.contains("SELECT 0 AS lane, e.id, e.row_key FROM (SELECT id, row_key FROM m0) e")
+        );
+        // Each lane's queue keeps the page's order, oldest first.
+        assert!(next.contains("ORDER BY d.lane, d.row_key, d.id) AS lanes"));
+        assert!(next.contains("ORDER BY d.lane, d.row_key, d.id) AS expired"));
         assert!(next.contains("AS last_key"));
         assert!(next.contains("AS last_id"));
         assert!(next.contains("(SELECT COUNT(*) FROM page) AS rows_read"));
@@ -7477,7 +7589,7 @@ mod tests {
     fn the_refill_page_holds_only_the_columns_its_predicates_read() {
         let columns = task_queue_columns();
         assert!(columns.len() > 20, "{columns:?}");
-        let sql = timeout_refill_query(start_to_close_timeout_query(), &[], true);
+        let sql = timeout_refill_query(&[0, 1, 2, 3], true);
         let page = &sql[..sql.find("), tail AS").expect("the page CTE")];
         // Payload columns such as `input` and `context_headers` stay out of
         // the page. The bounded batch query loads whole rows.
@@ -7524,11 +7636,11 @@ mod tests {
 
     #[test]
     fn refill_query_tests_expiry_against_the_sweep_clock() {
-        // Every reason, with all its earlier reasons as exclusions.
-        let predicates = task_timeout_scans().map(|(_, predicate)| predicate);
-        for (index, predicate) in predicates.iter().enumerate() {
+        // Every reason alone and all of them together, with all earlier
+        // reasons as exclusions.
+        for group in [&[0][..], &[1], &[2], &[3], &[0, 1, 2, 3]] {
             for after in [false, true] {
-                let sql = timeout_refill_query(predicate, &predicates[..index], after);
+                let sql = timeout_refill_query(group, after);
                 assert!(
                     !sql.contains("NOW()"),
                     "a refill must not use the live clock: {sql}"
@@ -7545,7 +7657,7 @@ mod tests {
     #[test]
     fn refill_query_leaves_a_row_to_the_first_reason_it_matches() {
         let higher = heartbeat_timeout_query();
-        let sql = timeout_refill_query(start_to_close_timeout_query(), &[higher], true);
+        let sql = timeout_refill_query(&[1], true);
         // The earlier reason is tested at its own lane's clock, and only for
         // rows ahead of that lane's cursor.
         let higher = on_refill_page(higher).replace("NOW()", "($5)[1]");
@@ -7553,14 +7665,56 @@ mod tests {
             " EXCEPT SELECT h.id, h.row_key FROM ({higher}) h WHERE h.row_key <= ($5)[1] \
              AND (($6)[1] IS NULL OR (h.row_key, h.id) > (($6)[1], ($7)[1]))"
         )));
-        // A row that an earlier lane holds is left to it, whatever it matches.
+        // A row that an earlier lane holds is left to it, whatever it
+        // matches. A later lane's held rows do not count.
         assert!(sql.contains(
             " EXCEPT SELECT p.id, p.row_key FROM page p \
-             WHERE p.id IN (SELECT u.id FROM unnest($8) AS u(id))"
+             WHERE p.id IN (SELECT u.id FROM unnest($8, $9) AS u(id, lane) \
+             WHERE u.lane < 1)"
         ));
         // A first lane has no earlier lane, so it binds no lane params.
-        let first = timeout_refill_query(heartbeat_timeout_query(), &[], true);
+        let first = timeout_refill_query(&[0], true);
         assert!(!first.contains("$5") && !first.contains("EXCEPT"));
+    }
+
+    #[test]
+    fn a_shared_refill_reads_the_task_queue_once() {
+        let sql = timeout_refill_query(&[0, 1, 2, 3], true);
+        assert_eq!(sql.matches("harvest_task_queue").count(), 1, "{sql}");
+        // Each lane tests its own reason against the one page, and leaves
+        // to an earlier lane the rows that lane holds.
+        for lane in 0..4 {
+            assert!(
+                sql.contains(&format!("SELECT {lane} AS lane, e.id")),
+                "{sql}"
+            );
+        }
+        for lane in 1..4 {
+            assert!(sql.contains(&format!("WHERE u.lane < {lane})")), "{sql}");
+        }
+        // An earlier lane of the group is left its match set. Its predicate
+        // is not tested again, so the costly schedule-to-start subqueries
+        // appear once and the plan stays below the JIT inline threshold.
+        assert!(
+            sql.contains("FROM m2 EXCEPT SELECT id, row_key FROM m0"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("FROM m3 EXCEPT SELECT id, row_key FROM m0"),
+            "{sql}"
+        );
+        assert!(!sql.contains("($5)[1]"), "{sql}");
+        assert_eq!(sql.matches("harvest_queue_pauses").count(), 1, "{sql}");
+    }
+
+    #[test]
+    fn a_lane_outside_the_group_keeps_its_own_clock_and_cursor() {
+        // Lane 1 has a queue. Lanes 2 and 3 test it at its claim's clock and
+        // cursor, and test lane 0 through its match set.
+        let sql = timeout_refill_query(&[0, 2, 3], true);
+        let lane_1 = on_refill_page(start_to_close_timeout_query()).replace("NOW()", "($5)[2]");
+        assert_eq!(sql.matches(&lane_1).count(), 2, "{sql}");
+        assert!(!sql.contains("m1 AS"), "{sql}");
     }
 
     #[test]
@@ -7881,6 +8035,18 @@ mod tests {
         let mut lanes = lanes_in_step();
         lanes[1].as_of = lanes[0].as_of.map(|t| t - chrono::Duration::seconds(1));
         assert_eq!(refill_groups(&lanes), [vec![0], vec![1], vec![2, 3]]);
+    }
+
+    #[test]
+    fn a_refill_group_can_start_after_lane_0() {
+        let mut lanes = lanes_in_step();
+        lanes[0].queued.push_back(uuid::Uuid::new_v4());
+        assert_eq!(refill_groups(&lanes), [vec![1, 2, 3]]);
+        // Lanes that all have a queue do not refill.
+        for lane in &mut lanes {
+            lane.queued.push_back(uuid::Uuid::new_v4());
+        }
+        assert_eq!(refill_groups(&lanes), Vec::<Vec<usize>>::new());
     }
 
     #[test]
