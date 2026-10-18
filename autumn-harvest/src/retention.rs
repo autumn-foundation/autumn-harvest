@@ -3545,7 +3545,7 @@ async fn run_shard_tick(
                     // re-check found `staging_vacated_state` set and aborted
                     // the delete. A redrive that reopened the run after the
                     // scan is handled the same way. So is a recorded fork made
-                    // after the scan (issue #2122). Treat exactly like a
+                    // after the gate (issue #2122). Treat exactly like a
                     // routine skip, for the same reason as `SkippedHeld` above.
                     routine_skip_candidate(
                         &mut conn,
@@ -3644,8 +3644,8 @@ enum CandidateDeleteOutcome {
     /// scan. The delete was aborted and NOTHING was touched, for the same
     /// reason as [`Self::SkippedHeld`].
     SkippedNotTerminal,
-    /// A non-terminal recorded fork has the row in its fork lineage under
-    /// the delete-tx row lock (issue #2122). The delete was aborted and
+    /// An open recorded fork has the row in its fork lineage under the
+    /// delete-tx row lock (issue #2122). The delete was aborted and
     /// NOTHING was touched, for the same reason as [`Self::SkippedHeld`].
     SkippedForkSource,
 }
@@ -3810,7 +3810,11 @@ async fn delete_candidate_execution(
 ) -> HarvestResult<CandidateDeleteOutcome> {
     // Copy the policy into the transaction closure (it is `Copy`).
     let summary = summary.copied();
-    Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+    // The fork re-check below must see a fork that committed during the row
+    // lock wait (issue #2122). A `REPEATABLE READ` session default would read
+    // an older snapshot, so the level is pinned on the `BEGIN`.
+    let mut tx = conn.build_transaction().read_committed();
+    Box::pin(tx.run::<_, HarvestError, _>(async |conn| {
         // Issue #1823: the delete asserts the fence in its own transaction.
         // A bump then waits for it, even when the tick's guard session ends
         // first. The legal-hold read below is still in this transaction.
@@ -3939,11 +3943,12 @@ async fn delete_candidate_execution(
             if !RETENTION_CANDIDATE_STATES.contains(&state.as_str()) {
                 return Ok(CandidateDeleteOutcome::SkippedNotTerminal);
             }
-            // A fork made after the scan keeps its lineage too (issue #2122).
-            // Each new lineage member locks this row `FOR SHARE`. So it
-            // committed before the lock above, or it waits for this delete.
-            // This is a new statement, so under `READ COMMITTED` it sees a
-            // fork that committed while the lock waited.
+            // A fork made after the gate keeps its lineage too (issue #2122).
+            // Each new lineage member locks this row, `FOR SHARE` or `FOR
+            // UPDATE`. A fork that holds that lock commits before the lock
+            // above is granted. A later fork waits for this delete. This is a
+            // new statement, and the transaction is `READ COMMITTED`. So it
+            // sees a fork that committed during the wait.
             let exec_id = crate::types::ExecutionId::from_uuid(candidate_id);
             if crate::fork::is_pinned_by_recorded_fork(conn, exec_id).await? {
                 return Ok(CandidateDeleteOutcome::SkippedForkSource);
@@ -4531,7 +4536,7 @@ async fn should_skip_candidate(
         return Ok(true);
     }
 
-    // A recorded fork reads its fork lineage while it runs (issue #2122).
+    // An open recorded fork reads its fork lineage (issue #2122).
     let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
     if crate::fork::is_pinned_by_recorded_fork(conn, exec_id).await? {
         return Ok(true);

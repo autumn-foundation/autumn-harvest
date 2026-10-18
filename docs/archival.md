@@ -327,6 +327,9 @@ let retention_config = RetentionConfig::with_max_age(Duration::from_secs(7 * 24 
 - **Alone.** A tenant override alone turns on history retention. Runs of
   other tenants are then never deleted.
 - **Legal hold wins.** A held run is never deleted.
+- **A recorded fork keeps its lineage.** A run stays while an open recorded
+  fork has it in its fork lineage (issue #2122). See the
+  [fork runbook](runbooks/fork-a-run.md).
 - **Bounds.** The age has the type-override bounds, 1 s to 10 years. The key
   is 1 to 128 bytes of visible ASCII, with no spaces. Anything else makes
   `try_build()` return `HarvestBuilderError::InvalidRetention`. The builder
