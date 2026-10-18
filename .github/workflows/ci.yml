@@ -2567,6 +2567,17 @@ jobs:
             harvest-verify -p autumn-harvest --all-examples \
             --no-default-features --features testing \
             --allowlist harvest-verify.allow.toml --report
+      # The autoresearch capstone is a workspace member, not an `examples/`
+      # target of `autumn-harvest`. The gate above does not see its two
+      # workflows, so this step analyzes them. Non-strict, like the gate above:
+      # a `nondeterminism-found` fails the job. It needs no allowlist entry, so
+      # it passes no allowlist. Its own target directory keeps its units apart
+      # from the examples gate.
+      - name: harvest-verify gate over the autoresearch capstone (non-strict)
+        run: |
+          time cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- \
+            harvest-verify -p autoresearch --lib --report \
+            --target-dir target/harvest-verify/autoresearch
 
   # Issue #962, AC6's *second* corpus: "the repo's own examples/ + test workflow
   # corpus". The job above covers `examples/`. This one covers
