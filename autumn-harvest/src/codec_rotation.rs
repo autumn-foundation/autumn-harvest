@@ -3178,12 +3178,21 @@ mod tests {
         event_under(codecs, key_id, input)["data"]["input"].clone()
     }
 
+    /// The decoded bytes of an envelope.
+    fn plain_of(codecs: &PayloadCodecs, envelope: &Value) -> Vec<u8> {
+        codecs
+            .decode_payload_bytes(envelope)
+            .expect("decode")
+            .expect("envelope")
+    }
+
+    /// The key id of an envelope.
     fn key_of(envelope: &Value) -> &str {
         envelope[CODEC_ENVELOPE_KID_KEY].as_str().expect("key id")
     }
 
     #[test]
-    fn a_cell_shape_cell_moves_to_the_target_key() {
+    fn a_cell_shape_moves_the_whole_cell_to_the_target_key() {
         let codecs = rotated_registry();
         let cell = envelope_under(&codecs, "k1", json!({"a": 1}));
 
@@ -3192,6 +3201,25 @@ mod tests {
             .expect("changed");
 
         assert_eq!(key_of(&out), "k2");
+        assert_eq!(plain_of(&codecs, &out), plain_of(&codecs, &cell));
+    }
+
+    #[test]
+    fn a_cell_shape_cell_keeps_plaintext_active_tombstone_and_offload_as_they_are() {
+        let codecs = rotated_registry();
+        let shape = column(CellShape::Cell);
+        let offload = json!({"_harvest_offload_envelope": 1, "store_id": "m", "key": "b"});
+        let cells = [
+            json!("clear"),
+            envelope_under(&codecs, "k2", json!(1)),
+            crate::erase::erasure_tombstone(),
+            offload,
+        ];
+
+        for cell in cells {
+            let out = reencrypt_column_cell_under(&codecs, "k2", &shape, &cell).expect("sweep");
+            assert_eq!(out, None, "{cell}");
+        }
     }
 
     #[test]
@@ -3213,9 +3241,33 @@ mod tests {
             .expect("sweep")
             .expect("changed");
 
+        assert_eq!(out.as_array().map(Vec::len), Some(3));
         assert_eq!(key_of(&out[0]), "k2");
+        assert_eq!(plain_of(&codecs, &out[0]), plain_of(&codecs, &cell[0]));
         assert_eq!(out[1], json!("clear"));
         assert_eq!(out[2], cell[2], "an active element stays as it was");
+    }
+
+    #[test]
+    fn an_elements_cell_keeps_tombstone_and_offload_elements_and_an_empty_array() {
+        let codecs = rotated_registry();
+        let shape = column(CellShape::Elements);
+        let offload = json!({"_harvest_offload_envelope": 1, "store_id": "m", "key": "b"});
+        let cell = json!([
+            crate::erase::erasure_tombstone(),
+            offload,
+            envelope_under(&codecs, "k1", json!(1)),
+        ]);
+
+        let out = reencrypt_column_cell_under(&codecs, "k2", &shape, &cell)
+            .expect("sweep")
+            .expect("changed");
+        let empty = reencrypt_column_cell_under(&codecs, "k2", &shape, &json!([]));
+
+        assert_eq!(out[0], cell[0]);
+        assert_eq!(out[1], cell[1]);
+        assert_eq!(key_of(&out[2]), "k2");
+        assert_eq!(empty.expect("empty"), None);
     }
 
     #[test]
@@ -3253,7 +3305,10 @@ mod tests {
 
         let out = reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Elements), &cell);
 
-        assert!(out.is_err(), "no half-converted buffer");
+        assert!(
+            matches!(out, Err(HarvestError::UnknownCodecKey { .. })),
+            "{out:?}"
+        );
     }
 
     #[test]
@@ -3270,7 +3325,13 @@ mod tests {
                 .expect("changed");
 
         assert_eq!(key_of(&out["memo"]), "k2");
-        assert_eq!(out["mode"], "fast");
+        assert_eq!(
+            plain_of(&codecs, &out["memo"]),
+            plain_of(&codecs, &cell["memo"])
+        );
+        let mut rest = out.clone();
+        rest["memo"] = cell["memo"].clone();
+        assert_eq!(rest, cell, "only the named key changes");
     }
 
     #[test]
@@ -3282,6 +3343,8 @@ mod tests {
         let clear = reencrypt_column_cell_under(&codecs, "k2", &shape, &json!({"memo": "x"}));
         let active = json!({"memo": envelope_under(&codecs, "k2", json!(1))});
         let done = reencrypt_column_cell_under(&codecs, "k2", &shape, &active);
+        let flat = reencrypt_column_cell_under(&codecs, "k2", &shape, &json!("memo"));
+        assert_eq!(flat.expect("non-object"), None);
 
         assert_eq!(missing.expect("missing"), None);
         assert_eq!(clear.expect("clear"), None);
@@ -3290,13 +3353,52 @@ mod tests {
 
     #[test]
     fn every_shape_is_a_no_op_without_a_keyed_codec() {
-        let codecs = PayloadCodecs::default();
-        let value = json!([{"x": 1}]);
+        let keyed = rotated_registry();
+        let envelope = envelope_under(&keyed, "k1", json!(1));
+        let empty = PayloadCodecs::default();
+        let cases = [
+            (CellShape::Cell, envelope.clone()),
+            (CellShape::Elements, json!([envelope.clone()])),
+            (CellShape::Field("x"), json!({"x": envelope})),
+        ];
 
-        for shape in [CellShape::Cell, CellShape::Elements, CellShape::Field("x")] {
-            let out =
-                reencrypt_column_cell_under(&codecs, "k2", &column(shape), &value).expect("sweep");
-            assert_eq!(out, None, "{shape:?}");
+        for (shape, value) in cases {
+            let moved = reencrypt_column_cell_under(&keyed, "k2", &column(shape), &value);
+            assert!(matches!(moved, Ok(Some(_))), "{shape:?} moves with a key");
+            let out = reencrypt_column_cell_under(&empty, "k2", &column(shape), &value);
+            assert_eq!(out.expect("sweep"), None, "{shape:?}");
+        }
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn sweep_error_kind_names_each_error_class() {
+        let cases = [
+            (
+                HarvestError::UnknownCodecKey {
+                    key_id: "k".into(),
+                    codec_id: "c".into(),
+                },
+                "unknown_key",
+            ),
+            (
+                HarvestError::UnknownPayloadCodec { id: "c".into() },
+                "unknown_codec",
+            ),
+            (
+                HarvestError::Serialization(
+                    serde_json::from_str::<Value>("{").expect_err("invalid json"),
+                ),
+                "invalid_json",
+            ),
+            (HarvestError::Database("d".into()), "database"),
+            (HarvestError::Codec("c".into()), "codec_error"),
+            (HarvestError::Config("c".into()), "codec_error"),
+            (HarvestError::Dispatch("d".into()), "other"),
+        ];
+
+        for (error, kind) in cases {
+            assert_eq!(sweep_error_kind(&error), kind, "{error}");
         }
     }
 
