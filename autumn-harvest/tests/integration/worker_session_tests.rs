@@ -938,30 +938,6 @@ mod db_tests {
         .expect("engine pool")
     }
 
-    #[derive(diesel::QueryableByName)]
-    struct StateRow {
-        #[diesel(sql_type = Text)]
-        state: String,
-    }
-
-    async fn task_state(conn: &mut AsyncPgConnection, task_id: Uuid) -> String {
-        diesel::sql_query("SELECT state FROM harvest_task_queue WHERE id = $1")
-            .bind::<SqlUuid, _>(task_id)
-            .get_result::<StateRow>(conn)
-            .await
-            .expect("read the task state")
-            .state
-    }
-
-    async fn session_state(conn: &mut AsyncPgConnection, session_id: Uuid) -> String {
-        diesel::sql_query("SELECT state FROM harvest_sessions WHERE id = $1")
-            .bind::<SqlUuid, _>(session_id)
-            .get_result::<StateRow>(conn)
-            .await
-            .expect("read the session state")
-            .state
-    }
-
     /// An `ACTIVE` session that `w-1` hosts.
     async fn host_session(
         conn: &mut AsyncPgConnection,
