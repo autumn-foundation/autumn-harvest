@@ -2353,6 +2353,8 @@ standalone note rather than part of the claim-path attribution table above:
   correctness bug, caught by review before it shipped.
 * [`docs/performance-dag-graph.md`](performance-dag-graph.md) — hoisting a
   per-node rebuild out of `GET /dag-run-graph` (issue #690).
+* [`docs/performance-dag-build-simulate.md`](performance-dag-build-simulate.md) —
+  `DagBuilder::build` and `DagSimulator::run`; a negative result.
 * [`docs/performance-dlq-aggregate.md`](performance-dlq-aggregate.md) — DLQ
   aggregate grouping (issue #385/#613); a measured fix that was reverted after
   review found a regressing input shape — a negative result.
