@@ -3544,8 +3544,8 @@ async fn run_shard_tick(
                     // (issue #1317 review, P1): the delete-tx FOR UPDATE
                     // re-check found `staging_vacated_state` set and aborted
                     // the delete. A redrive that reopened the run after the
-                    // scan is handled the same way, and so is a recorded fork
-                    // made after the scan (issue #2122). Treat exactly like a
+                    // scan is handled the same way. So is a recorded fork made
+                    // after the scan (issue #2122). Treat exactly like a
                     // routine skip, for the same reason as `SkippedHeld` above.
                     routine_skip_candidate(
                         &mut conn,
