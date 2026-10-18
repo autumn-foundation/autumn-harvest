@@ -1557,6 +1557,15 @@ fn helpers_parse_their_inputs() {
         code_lines("#!/bin/sh\n  # note\n\n  run x  \n"),
         vec!["run x"]
     );
+    let doc: Value = serde_yaml::from_str("p: [a, 1, b]").expect("valid YAML");
+    assert_eq!(strings(&doc, "p"), vec!["a".to_owned(), "b".to_owned()]);
+    assert!(is_requirement_level(&Value::from("opt_in")));
+    assert!(!is_requirement_level(&Value::from("optional")));
+}
+
+#[test]
+fn link_and_heading_helpers_parse_their_inputs() {
+    let sha = "331541c4057c53d133c32efadaa7b656636eda77";
     assert_eq!(
         pinned_sha(&format!("community_commit=\"{sha}\""), "community_commit"),
         Some(sha)
@@ -1591,8 +1600,4 @@ fn helpers_parse_their_inputs() {
     assert_eq!(next_heading(doc_md, "## B"), Some("### B1"));
     assert_eq!(next_heading(doc_md, "#### B2"), None);
     assert_eq!(heading_level("### B1"), 3);
-    let doc: Value = serde_yaml::from_str("p: [a, 1, b]").expect("valid YAML");
-    assert_eq!(strings(&doc, "p"), vec!["a".to_owned(), "b".to_owned()]);
-    assert!(is_requirement_level(&Value::from("opt_in")));
-    assert!(!is_requirement_level(&Value::from("optional")));
 }

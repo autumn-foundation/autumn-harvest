@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Run the upstream OpenTelemetry policy checks on the workflow model (issue #2015).
+# Also check the draft against the files of the upstream process.
 #
 # The script mirrors the `make check-policies` recipe of the upstream
 # `semantic-conventions` repository. It pins one upstream commit. It reads the
@@ -14,10 +15,11 @@
 #    ran the package policies.
 #
 # Before Weaver, the script checks the files of the upstream process:
-# - The semconv issue form for new conventions has the area and the field
+# - The upstream issue form for new conventions has the area and the field
 #   that section 9 of the draft names.
 # - The project proposal has each required section of the community
-#   `project-template.md`, at a pinned community commit.
+#   `project-template.md`, at a pinned community commit. It keeps none of
+#   the guidance text of the template. A copy without one section must fail.
 #
 # SEMCONV_LATEST=1 replaces the pins with upstream `main`, the latest
 # release and community `main`. A weekly job uses it to find upstream
@@ -32,8 +34,8 @@ model="${root}/docs/otel-workflow-semconv/model/workflow"
 proposal="${root}/docs/otel-workflow-semconv/project-proposal.md"
 
 # Upstream `main` on 2026-10-15, and the latest release on that day. To move
-# the pins, change both values and run this script. Then update section 10 of
-# docs/otel-workflow-semconv/README.md.
+# the pins, change these values and `community_commit` below, and run this
+# script. Then update sections 9 and 10 of docs/otel-workflow-semconv/README.md.
 semconv_commit="331541c4057c53d133c32efadaa7b656636eda77"
 baseline_tag="v1.44.0"
 semconv_repo="https://github.com/open-telemetry/semantic-conventions.git"
@@ -69,26 +71,52 @@ clone_at "${semconv_repo}" "${semconv_commit}" "${semconv}"
 clone_at "${semconv_repo}" "refs/tags/${baseline_tag}" "${work}/baseline"
 clone_at "${community_repo}" "${community_commit}" "${work}/community"
 
+echo "Community ${community_commit}"
 echo "Check: the issue form has the area and the field of section 9."
 form="${semconv}/.github/ISSUE_TEMPLATE/new-conventions.yaml"
 for line in "- area:new" "label: Propose new conventions"; do
-  grep -qF -- "${line}" "${form}" || {
-    echo "error: the upstream issue form lacks '${line}'" >&2
+  grep -qxE "[[:space:]]*${line}[[:space:]]*" "${form}" || {
+    echo "error: the upstream issue form lacks the line '${line}'" >&2
     exit 1
   }
 done
 
 echo "Check: the proposal has each required section of the project template."
+[ -r "${proposal}" ] || {
+  echo "error: there is no project proposal at ${proposal}" >&2
+  exit 1
+}
+template="${work}/community/project-template.md"
 # A required section is a heading that is not Optional or Post-Approval.
-required="$(grep -E '^#{2,4} ' "${work}/community/project-template.md" |
+required="$(grep -E '^#{2,4} ' "${template}" |
   grep -vE '\((Optional|Post-Approval)\)$' || true)"
 if [ -z "${required}" ]; then
   echo "error: the project template has no required section" >&2
   exit 1
 fi
-missing="$(grep -vxF -f "${proposal}" <<<"${required}" || true)"
+# The guidance text is each template line that is not a heading or blank.
+guidance="$(grep -vE '^(#|[[:space:]]*$)' "${template}" | sed 's/\r$//; s/[[:space:]]*$//')"
+
+# missing_sections <file>: print each required section that the file lacks,
+# and each guidance line that the file keeps.
+missing_sections() {
+  local clean
+  clean="$(sed 's/\r$//; s/[[:space:]]*$//' "$1")"
+  grep -vxF -f <(printf '%s\n' "${clean}") <<<"${required}" || [ $? -eq 1 ]
+  grep -xF -f <(printf '%s\n' "${guidance}") <<<"${clean}" || [ $? -eq 1 ]
+}
+
+missing="$(missing_sections "${proposal}")"
 if [ -n "${missing}" ]; then
-  printf 'error: the project proposal lacks these sections:\n%s\n' "${missing}" >&2
+  printf 'error: the project proposal lacks or keeps these lines:\n%s\n' "${missing}" >&2
+  exit 1
+fi
+# A negative control: a copy without the first required section must fail.
+first="$(head -n 1 <<<"${required}")"
+sed 's/\r$//; s/[[:space:]]*$//' "${proposal}" |
+  grep -vxF -- "${first}" >"${work}/proposal-broken.md" || true
+if [ -z "$(missing_sections "${work}/proposal-broken.md")" ]; then
+  echo "error: the section check passed a proposal without '${first}'" >&2
   exit 1
 fi
 

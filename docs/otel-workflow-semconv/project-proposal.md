@@ -1,9 +1,9 @@
 # Durable Workflow Semantic Conventions
 
-> **Draft for `open-telemetry/community`.** This page follows
-> `project-template.md` at community commit `9c30b48`. Issue #2015 tracks
-> it. Section 10 of the [conventions draft](README.md#10-submission) says
-> when to file it. Delete this note before you file.
+> **Draft for `open-telemetry/community`.** This page follows the community
+> `project-template.md` at the commit that section 10 of the conventions
+> draft names. Issue #2015 tracks it. Section 10 says when to file it.
+> Delete this note before you file.
 
 ## Background and description
 
@@ -13,8 +13,16 @@ records the steps of a run in a history. After a crash, the engine replays
 the history to rebuild the run.
 
 OpenTelemetry has no conventions for these engines. The attribute registry
-has no `workflow` namespace. A [draft proposal](README.md) and its Weaver
-model exist. The model passes the upstream policy checks.
+has no `workflow` namespace. A
+[conventions draft](https://github.com/autumn-foundation/autumn-harvest/tree/<commit>/docs/otel-workflow-semconv)
+holds a Weaver model. The model passes the upstream policy checks. The
+issue `<issue>` asks for co-owners from other engines.
+
+`open-telemetry/semantic-conventions#1688` proposes general `workflow.*`
+attributes for tasks, pipelines and jobs. It uses `workflow.name` and
+`workflow.run.id`, and the conventions draft uses the same names. This
+project adds what durable engines need: the spans of the core operations
+and a rule for replay.
 
 ### Current challenges
 
@@ -42,12 +50,17 @@ Goals:
 Requirements:
 
 - The conventions use no name that is specific to one engine.
+- The names agree with the general `workflow.*` attributes of
+  `open-telemetry/semantic-conventions#1688`.
 - Each group starts at the `development` stability level.
 - The model passes the upstream Weaver policy checks.
 
-Why now: Dapr contributors began workflow conventions in 2026, in
-`dapr/dapr#9213`. Engines that start now can share one model before each
-one ships its own.
+Why now: in November 2025, Dapr contributors opened `dapr/dapr#9213`. It
+adds a Weaver model with Dapr workflow conventions. It closed as stale in
+April 2026 and did not merge. An
+[OpenTelemetry blog post](https://opentelemetry.io/blog/2026/dapr-workflow-observability/)
+says that Dapr is adopting Weaver. Engines that start now can share one
+model before each one ships its own.
 
 Benefits for OpenTelemetry:
 
@@ -57,16 +70,16 @@ Benefits for OpenTelemetry:
 
 ## Deliverables
 
-1. An issue in `open-telemetry/semantic-conventions` that finds co-owners.
-2. A `workflow` area: a Weaver model in `model/workflow/` and a page in
-   `docs/workflow/`. The draft holds the model now.
-3. Prototypes in two engines, in two different languages. Autumn Harvest
+1. Prototypes in two engines, in two different languages. Autumn Harvest
    gives a Rust prototype. A second engine gives one in another language,
    such as Go or Java.
-4. A decision on each open question in section 8 of the draft.
+2. A `workflow` area: a Weaver model in `model/workflow/` and a page in
+   `docs/workflow/`. The conventions draft holds the model now.
+3. A decision on each open question in section 8 of the conventions draft.
 
 Autumn Harvest emits its own `harvest.*` names today. Section 7 of the
-draft lists [where Harvest does not conform](README.md#7-mapping-from-harvest).
+conventions draft lists
+[where Harvest does not conform](https://github.com/autumn-foundation/autumn-harvest/blob/<commit>/docs/otel-workflow-semconv/README.md#7-mapping-from-harvest).
 Its prototype must close those gaps.
 
 ## Staffing / Help Wanted
@@ -76,36 +89,41 @@ The project needs people who build or instrument durable workflow engines.
 ### Industry outreach (Optional)
 
 - Dapr: the authors of `dapr/dapr#9213`. Not contacted yet.
+- The authors of `open-telemetry/semantic-conventions#1688` and the CI/CD
+  SIG. Not contacted yet.
 - Temporal, Restate and DBOS: their maintainers. Not contacted yet.
 
 The upstream issue is the first contact.
 
 ### SIG
 
-Open. The project asks the semantic convention maintainers to host it. It
-proposes a new `Semantic Conventions: Workflow` area with its own
-approvers.
+A new SIG: Semantic Conventions: Workflow. Its approvers own the new
+`workflow` area.
 
 ### Required staffing
 
 #### Project Leads(s)
 
-Open. The Autumn Harvest maintainers offer one lead. The project needs a
-second lead from another engine.
+Open. The project needs leads from at least two engines. The leads become
+the approvers of the new SIG.
 
 #### Other Staffing
 
 Open. The project needs these people:
 
 - One engineer for each prototype.
-- Approvers from the semantic conventions SIG to review the prototypes.
+- Maintainers or approvers of the language SIGs of the prototypes, to
+  review them.
 
 ### Sponsorship
 
 #### TC Sponsor
 
-Open. A semantic convention maintainer can act as sponsor. A TC
-escalation sponsor then supports the project.
+Open. The project needs a TC Escalation Sponsor.
+
+#### Delegated TC Sponsor (Optional)
+
+Open. A maintainer of the Semantic Conventions SIG can sponsor the project.
 
 #### GC Liaison
 
@@ -115,14 +133,17 @@ Open.
 
 The timeline starts at the approval:
 
-- Month 1: the leads decide the open questions of the draft.
-- Month 2: a pull request adds the model and the page at `development`.
-- Months 2 to 4: two engines build their prototypes.
-- Month 5: the project reports the results and asks for feedback.
+- Month 1: the leads decide the open questions of the conventions draft.
+- Months 1 to 3: two engines build their prototypes.
+- Month 3: a pull request adds the model and the page at `development`.
+  It links the prototypes.
+- Month 4: the project reports the results and asks for feedback.
 
 ## Labels (Optional)
 
-`area:workflow` for the issues and pull requests of the project.
+`area:workflow` in `open-telemetry/semantic-conventions`. The `areas.yaml`
+entry of the project creates it. Its name follows the decision on the
+namespace.
 
 ## GitHub Project (Post-Approval)
 
