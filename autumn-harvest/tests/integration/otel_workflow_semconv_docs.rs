@@ -1148,8 +1148,8 @@ fn the_page_records_the_weaver_check() {
     let baseline = pin(&script, "baseline_tag")
         .unwrap_or_else(|| panic!("{WEAVER_SCRIPT} must pin a baseline"));
     let community = pinned_sha(&script, "community_commit")
-        .map(|sha| format!("`{}`", &sha[..7]))
         .unwrap_or_else(|| panic!("{WEAVER_SCRIPT} must pin a community commit"));
+    let community = format!("`{}`", &community[..7]);
     let submission = page_section(&page, SUBMISSION_SECTION);
     let link = format!("../../{WEAVER_SCRIPT}");
     for (text, what) in [

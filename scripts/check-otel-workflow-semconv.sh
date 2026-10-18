@@ -13,8 +13,15 @@
 #    the upstream naming policy. This proves that run 1 read the model and
 #    ran the package policies.
 #
-# SEMCONV_LATEST=1 replaces the pins with upstream `main` and the latest
-# release. A weekly job uses it to find upstream changes before a pin moves.
+# Before Weaver, the script checks the files of the upstream process:
+# - The semconv issue form for new conventions has the area and the field
+#   that section 9 of the draft names.
+# - The project proposal has each required section of the community
+#   `project-template.md`, at a pinned community commit.
+#
+# SEMCONV_LATEST=1 replaces the pins with upstream `main`, the latest
+# release and community `main`. A weekly job uses it to find upstream
+# changes before a pin moves.
 #
 # WEAVER_REGISTRY names the image registry. The default is `mirror.gcr.io`, a
 # Docker Hub mirror. The digest pins the content.
@@ -22,6 +29,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 model="${root}/docs/otel-workflow-semconv/model/workflow"
+proposal="${root}/docs/otel-workflow-semconv/project-proposal.md"
 
 # Upstream `main` on 2026-10-15, and the latest release on that day. To move
 # the pins, change both values and run this script. Then update section 10 of
@@ -29,6 +37,9 @@ model="${root}/docs/otel-workflow-semconv/model/workflow"
 semconv_commit="331541c4057c53d133c32efadaa7b656636eda77"
 baseline_tag="v1.44.0"
 semconv_repo="https://github.com/open-telemetry/semantic-conventions.git"
+# Community `main` on 2026-10-18. Move it with the pins above.
+community_commit="9c30b48354004ef818bcf3661ece2b32ca4dd787"
+community_repo="https://github.com/open-telemetry/community.git"
 registry="${WEAVER_REGISTRY:-mirror.gcr.io}"
 
 command -v docker >/dev/null || {
@@ -40,6 +51,7 @@ if [ "${SEMCONV_LATEST:-0}" = "1" ]; then
   semconv_commit="$(git ls-remote "${semconv_repo}" refs/heads/main | cut -f1)"
   baseline_tag="$(git ls-remote --tags --refs "${semconv_repo}" 'v*' |
     sed 's#.*refs/tags/##' | sort -V | tail -n 1)"
+  community_commit="$(git ls-remote "${community_repo}" refs/heads/main | cut -f1)"
 fi
 
 work="$(mktemp -d)"
@@ -55,6 +67,30 @@ clone_at() {
 semconv="${work}/semconv"
 clone_at "${semconv_repo}" "${semconv_commit}" "${semconv}"
 clone_at "${semconv_repo}" "refs/tags/${baseline_tag}" "${work}/baseline"
+clone_at "${community_repo}" "${community_commit}" "${work}/community"
+
+echo "Check: the issue form has the area and the field of section 9."
+form="${semconv}/.github/ISSUE_TEMPLATE/new-conventions.yaml"
+for line in "- area:new" "label: Propose new conventions"; do
+  grep -qF -- "${line}" "${form}" || {
+    echo "error: the upstream issue form lacks '${line}'" >&2
+    exit 1
+  }
+done
+
+echo "Check: the proposal has each required section of the project template."
+# A required section is a heading that is not Optional or Post-Approval.
+required="$(grep -E '^#{2,4} ' "${work}/community/project-template.md" |
+  grep -vE '\((Optional|Post-Approval)\)$' || true)"
+if [ -z "${required}" ]; then
+  echo "error: the project template has no required section" >&2
+  exit 1
+fi
+missing="$(grep -vxF -f "${proposal}" <<<"${required}" || true)"
+if [ -n "${missing}" ]; then
+  printf 'error: the project proposal lacks these sections:\n%s\n' "${missing}" >&2
+  exit 1
+fi
 
 image="$(awk '$4 == "weaver" { print $2 }' "${semconv}/dependencies.Dockerfile")"
 case "${image}" in

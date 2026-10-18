@@ -13,6 +13,8 @@ The model files use the upstream Weaver format:
   the attributes.
 - [`model/workflow/spans.yaml`](model/workflow/spans.yaml) defines the
   spans.
+- [`project-proposal.md`](project-proposal.md) drafts the project
+  proposal that the community process needs.
 
 The `otel_workflow_semconv_docs` guard suite keeps this page, the model and
 ADR 0001 in agreement. A script runs the upstream Weaver policy checks on
@@ -33,8 +35,10 @@ own span names and attributes. A dashboard for one engine does not work for
 another.
 
 In October 2026, OpenTelemetry has no workflow conventions. The attribute
-registry has no `workflow` namespace. Dapr began to codify its own
-telemetry with Weaver in 2026, in `dapr/dapr#9213`.
+registry has no `workflow` namespace. Dapr contributors opened
+`dapr/dapr#9213` to add workflow conventions to Dapr. That pull request
+closed as stale in April 2026 and did not merge. An OTel blog post says
+that Dapr is adopting Weaver for its conventions.
 
 Durable engines share a hazard that other areas do not have: replay. A
 replay re-runs workflow code against recorded history. Naive instrumentation
@@ -221,9 +225,13 @@ Harvest does not yet conform to every rule of this draft:
 
 ## 9. Upstream issue text
 
-A maintainer files this text as a new issue in
-`open-telemetry/semantic-conventions`. Check that each link is public
-first. Replace `<commit>` with the commit that holds the reviewed draft.
+A maintainer files this text in `open-telemetry/semantic-conventions`.
+Use the upstream issue form for new conventions, `new-conventions.yaml`.
+In the "Area(s)" field, pick `area:new`. Paste the text into the
+"Propose new conventions" field.
+
+Check that each link is public first. Replace `<commit>` with the commit
+that holds the reviewed draft.
 
 ```markdown
 ### Proposal: semantic conventions for durable workflow engines
@@ -261,7 +269,8 @@ The model passes the upstream `make check-policies` policies at
 semantic-conventions commit `331541c`.
 
 Autumn Harvest emits these spans under its own `harvest.*` names. Its
-draft lists where it does not yet conform.
+draft lists where it does not yet conform. The same link holds a draft
+project proposal for `open-telemetry/community`.
 
 #### Open questions
 
@@ -276,29 +285,45 @@ draft lists where it does not yet conform.
 
 #### Group
 
-The proposal needs co-owners from other engines. The Dapr maintainers
-began similar work in dapr/dapr#9213.
+The proposal needs co-owners from other engines. Dapr contributors began
+similar work in dapr/dapr#9213. That pull request closed unmerged in April
+2026. The OTel blog describes the Dapr work:
+https://opentelemetry.io/blog/2026/dapr-workflow-observability/
 ```
 
 ## 10. Submission
 
+The upstream process has two gates. The issue comes first. It finds
+co-owners from other engines. A project proposal in
+`open-telemetry/community` comes next. A majority of the GC must approve
+it before the work on the conventions starts. The
+[project proposal](project-proposal.md) drafts it from the community
+`project-template.md` at commit `9c30b48`.
+
 The steps to submit:
 
-1. Review this draft and the model.
-2. Confirm the Dapr facts in `dapr/dapr#9213`. Ask the Dapr maintainers to
-   co-propose. Upstream asks for a group of owners for a new area.
-3. Read the project process in the `open-telemetry/community` repository.
-   A new area can need a project and a sponsor.
-4. Move the pins in `check-otel-workflow-semconv.sh` to upstream `main`
-   and the latest release. Run the script. Then update the commit and the
+1. Review this draft, the model and the project proposal.
+2. Move the pins in `check-otel-workflow-semconv.sh` to upstream `main`
+   and the latest release. Run the script. Then update the commits and the
    release below and in section 9.
-5. Replace `<commit>` in the section 9 link with a merged commit or a tag.
-   Then file the text in `open-telemetry/semantic-conventions`.
-6. Put the issue link in the status paragraph. Change `pending` to
+3. Check each row of the facts table below again. Update its date.
+4. Replace `<commit>` in the section 9 link with a merged commit or a tag.
+   Then file the text with the `new-conventions.yaml` form in
+   `open-telemetry/semantic-conventions`.
+5. Put the issue link in the status paragraph. Change `pending` to
    `submitted`.
+6. On the issue, invite the authors of `dapr/dapr#9213` and other engines
+   to co-own the area.
+7. When two leads and a sponsor agree, fill the open slots of the
+   [project proposal](project-proposal.md). Then open it as a pull request
+   in `open-telemetry/community`, with the label `area/project-proposal`.
+8. After the GC approves the project, open the upstream pull request with
+   the files below.
 
 If the project decides not to submit, change `pending` to `declined` and
-give the reason in the same paragraph.
+give the reason in the same paragraph. The model can then ship as an own
+Weaver registry in this repository. Weaver work on such registries is in
+`open-telemetry/weaver#215`.
 
 The guard suite checks the model shape and the names.
 [`check-otel-workflow-semconv.sh`](../../scripts/check-otel-workflow-semconv.sh)
@@ -308,13 +333,30 @@ the Weaver image that upstream pins at that commit. The model passes, and
 Weaver reports no warning for it. A copy with a namespace collision fails
 on the upstream naming policy.
 
+The script also checks the process files. At upstream commit `331541c`,
+the issue form must offer `area:new` and the "Propose new conventions"
+field. At community commit `9c30b48`, the project proposal must have each
+required section of `project-template.md`.
+
 The `otel-semconv.yml` workflow runs the script on a ready pull request
 that changes the draft. A weekly job runs it against upstream `main`.
 
-The script mirrors the policy check only. The upstream pull request that
-follows the issue needs more files, and upstream CI checks each one:
+The script runs these checks only. The upstream pull request that follows
+the project approval needs more files, and upstream CI checks each one:
 
 - A `docs/workflow/` page that holds the generated span tables.
 - The generated attribute registry page and the issue template changes.
 - A `.chloggen` entry.
 - An `areas.yaml` entry, an `AREAS.md` row and `CODEOWNERS` lines.
+
+### Facts checked
+
+Each row records an external fact that this page relies on. Each link in
+section 9 needs a row. Check each row again before the filing.
+
+| Source | Fact | Checked |
+|--------|------|---------|
+| `dapr/dapr#9213` | A pull request that adds Dapr workflow conventions. It closed as stale on 2026-04-23 and did not merge. | 2026-10-18 |
+| https://opentelemetry.io/blog/2026/dapr-workflow-observability/ | Dapr is adopting Weaver. The proposed span kinds are not in Dapr yet. | 2026-10-18 |
+| `open-telemetry/semantic-conventions` issues | No issue proposes conventions for workflow engines. | 2026-10-18 |
+| `open-telemetry/community` `project-management.md` | New conventions need a project proposal. A majority of the GC must approve it. | 2026-10-18 |
