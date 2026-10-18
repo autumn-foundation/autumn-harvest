@@ -21031,7 +21031,7 @@ pub async fn apply_race_loser_cancellations(
                 && crate::cross_shard_child::request_cross_shard_cancel(
                     conn,
                     *child_id,
-                    Some("lost race to a sibling branch"),
+                    Some(reason.message()),
                 )
                 .await?
                     > 0

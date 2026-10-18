@@ -1068,6 +1068,78 @@ async fn a_blank_cancel_reason_counts_as_none() {
     assert_eq!(later.as_deref(), Some("scope"));
 }
 
+/// **Issue #2194.** The relay reads the reason again before it delivers, so a
+/// reason stored after a sweep loaded the row still reaches the child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_relay_rereads_a_reason_stored_after_the_sweep_loaded_the_row() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+
+    let parent = start_parent(&sharded, "child_echo", "cancel-reason-12").await;
+    let child_id = ExecutionId::new_for_shard(ShardId::new(1));
+    let spec = autumn_harvest::cross_shard_child::CrossShardChildSpec {
+        input: json!({}),
+        queue_name: "default".to_string(),
+        assigned_build_id: None,
+        context_headers: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        sla_secs: None,
+        execution_timeout_secs: None,
+        chain_execution_timeout_secs: None,
+        retry_policy: None,
+        quota_key: None,
+        quota: None,
+        concurrency_key: None,
+        max_concurrent: None,
+        trace_context: None,
+        fairness_key: None,
+        tenant: None,
+    };
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &spec,
+    )
+    .await
+    .expect("record cross-shard child");
+    autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id, None)
+        .await
+        .expect("request cancel without a reason");
+
+    // The sweep loads the row while it holds no reason.
+    let loaded: autumn_harvest::models::CrossShardChildRow = harvest_cross_shard_children::table
+        .find(child_id.as_uuid())
+        .select(autumn_harvest::models::CrossShardChildRow::as_select())
+        .first(&mut *conn)
+        .await
+        .expect("load the row");
+    assert_eq!(loaded.cancel_reason, None);
+
+    // A later caller stores a reason before the relay delivers.
+    autumn_harvest::cross_shard_child::request_cross_shard_cancel(
+        &mut conn,
+        child_id,
+        Some("cancelled by its cancellation scope"),
+    )
+    .await
+    .expect("request cancel with a reason");
+
+    let current = autumn_harvest::cross_shard_child::current_cancel_reason(&mut conn, &loaded)
+        .await
+        .expect("read the current reason");
+    assert_eq!(
+        current.as_deref(),
+        Some("cancelled by its cancellation scope")
+    );
+}
+
 /// **Issue #2194.** A child that the parent cancels before creation is born
 /// cancelled with the stored reason. A race loser usually takes this path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
