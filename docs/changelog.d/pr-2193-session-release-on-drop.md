@@ -11,13 +11,15 @@ idempotent.
 
 **No new `WorkflowEvent` variant. No new `WorkflowCommand` variant. No
 migration.** Replay treats each record of the new name as transparent, so it
-never shifts a positional match. The release is recorded once: `Drop` issues
+never shifts a positional match. The release is recorded once. `Drop` issues
 nothing when history already holds a release for the session. A drop also
-issues nothing in a suspending cycle, and after `complete()` has dispatched.
+issues nothing in a suspending cycle, while a panic unwinds, and after
+`complete()` has dispatched.
 
-Limits: a run that ends first keeps the broken-session scanner as its
-cleanup. Deploy the new build to every worker before a workflow drops a
-session. An older build cannot run the new name.
+Limits: a run that ends first still relies on the broken-session scanner to
+reap its session. Deploy the new build to every worker before a workflow
+drops a session. An older build cannot run the new name. See the 0.8.0
+upgrade guide, section 1.11.
 
 Design record, with brainstorm, reverse brainstorm and six hats: `DESIGN-2193.md`.
 

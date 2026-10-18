@@ -10279,6 +10279,49 @@ mod tests {
         assert!(!matcher.has_non_lifecycle_unconsumed());
     }
 
+    /// Issue #2193: a retried, timed-out or beating release stays transparent.
+    #[test]
+    fn every_record_shape_of_a_drop_release_is_transparent() {
+        let session = uuid::Uuid::new_v4();
+        let extra: [fn(ActivityExecId) -> WorkflowEvent; 3] = [
+            |activity_id| WorkflowEvent::ActivityHeartbeat {
+                activity_id,
+                details: Value::Null,
+            },
+            |activity_id| WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: "host gone".into(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: false,
+            },
+            |activity_id| WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: crate::error::TimeoutType::StartToClose,
+            },
+        ];
+        for make in extra {
+            let mut events = drop_release_history(session);
+            let release_id = match &events[1] {
+                WorkflowEvent::ActivityScheduled { activity_id, .. } => *activity_id,
+                other => panic!("expected the release, got {other:?}"),
+            };
+            events.insert(4, make(release_id));
+            let mut matcher = HistoryMatcher::new(events);
+            assert!(
+                matcher.is_consumed(4),
+                "the extra record must be transparent"
+            );
+            matcher.advance(); // past WorkflowStarted
+            assert!(matches!(
+                matcher.match_activity("charge"),
+                HistoryMatch::Matched { .. }
+            ));
+            assert!(!matcher.has_non_lifecycle_unconsumed());
+        }
+    }
+
     /// Issue #2193: the matcher reports which sessions history already
     /// released, so a replayed drop issues nothing.
     #[test]
@@ -10286,9 +10329,9 @@ mod tests {
         let session = uuid::Uuid::new_v4();
         let matcher = HistoryMatcher::new(drop_release_history(session));
         assert!(matcher.has_drop_release(crate::types::SessionId::from_uuid(session)));
-        assert!(!matcher.has_drop_release(crate::types::SessionId::from_uuid(
-            uuid::Uuid::new_v4()
-        )));
+        assert!(
+            !matcher.has_drop_release(crate::types::SessionId::from_uuid(uuid::Uuid::new_v4()))
+        );
     }
 
     /// Issue #952 x #510: a redrive REOPENS the run, so the abandoned-dispatch

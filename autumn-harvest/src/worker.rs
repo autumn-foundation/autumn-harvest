@@ -2419,6 +2419,32 @@ fn is_drop_release(cmd: &WorkflowCommand) -> bool {
     )
 }
 
+/// Drops the release of a dropped session from a suspension that has a
+/// dedicated persist path (issue #2193).
+///
+/// An inline local activity, a mutex acquire and an external activity each
+/// refuse a batch that holds another activity. The release is a cleanup, so
+/// the cycle discards it. The workflow wakes and replays the body. The
+/// dropped session drops again, and the next suspension issues the release.
+fn discard_drop_release_for_dedicated_shape(outcome: WorkflowOutcome) -> WorkflowOutcome {
+    match outcome {
+        WorkflowOutcome::Suspended { mut commands }
+            if commands.iter().any(|c| {
+                matches!(
+                    c,
+                    WorkflowCommand::RunLocalActivity { .. }
+                        | WorkflowCommand::AcquireMutex { .. }
+                        | WorkflowCommand::ScheduleExternalActivity { .. }
+                )
+            }) =>
+        {
+            commands.retain(|c| !is_drop_release(c));
+            WorkflowOutcome::Suspended { commands }
+        }
+        other => other,
+    }
+}
+
 /// The terminal-cycle policy for `cmd` — see [`TerminalCommandPolicy`].
 ///
 /// Exhaustive by construction (no `_` arm): this is the AC4 audit of issue #952
@@ -3485,7 +3511,6 @@ pub fn suspension_batch_is_persistable(commands: &[WorkflowCommand]) -> bool {
 /// already refuses to claim a batch containing one (issue #691), so such a batch
 /// never reaches here — it falls through to the fail-loud generic path instead.
 fn local_activity_batch_conflict(commands: &[WorkflowCommand]) -> Option<String> {
-    // A drop release (issue #2193) is no durable await, so it never conflicts.
     if !commands
         .iter()
         .any(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. }))
@@ -3495,7 +3520,6 @@ fn local_activity_batch_conflict(commands: &[WorkflowCommand]) -> Option<String>
 
     let mut conflicts: Vec<&'static str> = commands
         .iter()
-        .filter(|cmd| !is_drop_release(cmd))
         .filter(|cmd| {
             matches!(
                 cmd,
@@ -3780,11 +3804,6 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
             cmd @ WorkflowCommand::CancelRaceLosers { .. } => {
                 race_loser_commands.push(cmd);
             }
-            // A drop release (issue #2193) is not persisted in this cycle. The
-            // inline re-drive replays the body, the dropped session drops
-            // again, and the release goes out with the next suspension.
-            WorkflowCommand::ScheduleActivity { ref name, .. }
-                if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME => {}
             // Every other kind is a durable awaitable, a terminal outcome, or
             // an external-workflow command. local_activity_batch_conflict (or
             // the dispatch arm's AcquireMutex guard, or
@@ -11253,6 +11272,11 @@ async fn fail_activities_for_broken_sessions(
         if settled.contains(&scheduled.activity_id) {
             continue;
         }
+        // A drop release (issue #2193) has no awaiter. The host handler
+        // ignores a session that is not `ACTIVE`, so it needs no failure.
+        if scheduled.name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME {
+            continue;
+        }
         let Some(session_uuid) = scheduled.session_id.map(|id| id.as_uuid()) else {
             continue;
         };
@@ -18435,7 +18459,8 @@ async fn handle_session_acquire(
 
 /// Handle the internal session-release activity (issue #606), dispatched by
 /// [`crate::context::Session::complete`] and hard-pinned to the session's
-/// host worker.
+/// host worker. A dropped [`crate::context::Session`] dispatches the same
+/// handler under another name (issue #2193).
 ///
 /// Marks the `harvest_sessions` row `COMPLETED` and frees the in-process
 /// slot before completing the task normally.
@@ -18462,8 +18487,18 @@ async fn handle_session_release(
     };
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
 
+    // No body awaits a drop release (issue #2193). A permanent error fails the
+    // task only, so a failed cleanup cannot fail a healthy run.
+    let best_effort =
+        task.activity_name.as_deref() == Some(crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME);
+
     let Some(session_id) = session_id_of_input(&task.input, codecs) else {
         let error = "session-release task input is not a valid SessionId".to_string();
+        if best_effort {
+            return fail_task_only(&mut conn, task.id, &error)
+                .await
+                .map(|()| None);
+        }
         fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
     };
@@ -18475,6 +18510,11 @@ async fn handle_session_release(
             return Err(error);
         }
         let msg = error.to_string();
+        if best_effort {
+            return fail_task_only(&mut conn, task.id, &msg)
+                .await
+                .map(|()| None);
+        }
         fail_task_and_execution(&mut conn, task, worker_id, &msg, codecs).await?;
         return Err(error);
     }
@@ -26361,6 +26401,7 @@ async fn process_workflow_task(
             .await;
         }
 
+        let run_outcome = discard_drop_release_for_dedicated_shape(run_outcome);
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
                 if commands
@@ -43683,6 +43724,11 @@ mod tests {
                 .activities
                 .contains_key(crate::context::SESSION_RELEASE_ACTIVITY_NAME)
         );
+        assert!(
+            registry
+                .activities
+                .contains_key(crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME)
+        );
     }
 
     #[test]
@@ -43691,6 +43737,7 @@ mod tests {
         for name in [
             crate::context::SESSION_ACQUIRE_ACTIVITY_NAME,
             crate::context::SESSION_RELEASE_ACTIVITY_NAME,
+            crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME,
         ] {
             let info = registry
                 .activities
@@ -46964,27 +47011,46 @@ mod tests {
         );
     }
 
-    /// Issue #2193: a drop release is no durable await. It must not fail a
-    /// batch that holds a local activity, and extraction must not panic on it.
+    /// Issue #2193: a batch with a dedicated persist path drops the release.
+    /// Every other batch keeps it. An ordinary activity is never dropped.
     #[test]
-    fn a_drop_release_does_not_conflict_with_a_local_activity() {
-        let release = || {
-            schedule_activity_cmd(crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME)
+    fn a_dedicated_shape_discards_the_drop_release() {
+        let release = || schedule_activity_cmd(crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME);
+        let names = |outcome: WorkflowOutcome| -> Vec<&'static str> {
+            let WorkflowOutcome::Suspended { commands } = outcome else {
+                panic!("expected a suspension");
+            };
+            commands.iter().map(workflow_command_name).collect()
         };
-        let batch = vec![release(), run_local_cmd("format_data")];
-        assert!(local_activity_batch_conflict(&batch).is_none());
 
-        let extracted = extract_run_local_activity(batch);
-        assert_eq!(extracted.run.name, "format_data");
+        let local = discard_drop_release_for_dedicated_shape(WorkflowOutcome::Suspended {
+            commands: vec![release(), run_local_cmd("format_data")],
+        });
+        assert_eq!(names(local), ["RunLocalActivity"]);
 
-        let with_ordinary = vec![
-            release(),
-            schedule_activity_cmd("charge"),
-            run_local_cmd("format_data"),
-        ];
-        let reason = local_activity_batch_conflict(&with_ordinary)
-            .expect("an ordinary activity still conflicts");
-        assert!(reason.contains("ScheduleActivity"), "{reason}");
+        let external = discard_drop_release_for_dedicated_shape(WorkflowOutcome::Suspended {
+            commands: vec![
+                release(),
+                WorkflowCommand::AcquireMutex {
+                    key: "k".to_string(),
+                    result_tx: tokio::sync::oneshot::channel().0,
+                },
+            ],
+        });
+        assert_eq!(names(external), ["AcquireMutex"]);
+
+        let kept = discard_drop_release_for_dedicated_shape(WorkflowOutcome::Suspended {
+            commands: vec![release(), schedule_activity_cmd("charge")],
+        });
+        assert_eq!(names(kept), ["ScheduleActivity", "ScheduleActivity"]);
+
+        let ordinary = discard_drop_release_for_dedicated_shape(WorkflowOutcome::Suspended {
+            commands: vec![
+                schedule_activity_cmd("charge"),
+                run_local_cmd("format_data"),
+            ],
+        });
+        assert_eq!(names(ordinary), ["ScheduleActivity", "RunLocalActivity"]);
     }
 
     #[test]

@@ -27,7 +27,7 @@ change.** One new reserved activity name carries the release.
 - `HistoryMatcher::new` already marks classes of event transparent.
 - A `ScheduleActivity` whose receiver is closed does not park the cycle. The
   worker still persists it. A `Completed` or `ContinuedAsNew` cycle discards
-  it. A `Failed` cycle records an abandoned pair for it.
+  it. Before this change, a `Failed` cycle recorded an abandoned pair for it.
 - The broken-session scanner already reaps the sessions of a terminal run.
 - The ids of an activity come from a counter that moves only on a live miss.
 - A resident cycle with a closed-receiver `ScheduleActivity` is not captured.
@@ -65,13 +65,16 @@ change.** One new reserved activity name carries the release.
 | R5 | A completed run replays with a drop but no record, and strict replay reports drift. | `is_replay_significant_command` ignores the new name. |
 | R6 | A failing run records an abandoned pair for the release. | `abandoned_dispatch_events` returns nothing for the name. The counters skip it. |
 | R7 | A completed run logs a warning for the discarded release. | `abandoned_dispatch_event_count` skips the name. |
-| R8 | A release in a batch with a local activity fails the run with `Config`, or panics in extraction. | The conflict check and the extraction skip the release. The inline re-drive replays the body, and the next suspension issues it again. A test covers it. |
-| R9 | The new name falls into the default retry and timeout floors. | The name joins `is_reserved_session_activity_name`. |
+| R8 | A release in a batch with a local activity, a mutex acquire or an external activity fails the run or panics. | The cycle discards the release before shape dispatch. The next replay drops the session again. A test covers it. |
+| R9 | The new name gets the default retry and timeout floors. | The worker skips the floors for each name that `is_reserved_session_activity_name` accepts, and the name joins it. A test covers the function. |
 | R10 | A deployment without sessions requires a worker for the new name. | The same function excludes it from the required queues. |
 | R11 | The test harness fails with "no mock registered". | `resolve_activity` resolves the name to `Null`. |
 | R12 | A release for a `COMPLETED` or `BROKEN` session fails the task. | The failure record is transparent by name. The workflow wakes once. |
 | R13 | The release completion wakes the workflow and costs a cold replay. | Accepted. A drop is rare. |
-| R14 | A panic unwinds through `Drop`. | `push_command` has the same exposure in `MutexGuard`. The lock is never held across user code. |
+| R14 | A panic unwinds through `Drop` and a poisoned lock aborts the process. | `Drop` returns while a panic unwinds. A test covers it. |
+| R17 | A failing cleanup fails a healthy run. | The host handler fails the release task only. |
+| R18 | A release for an inactive session writes a failure and wakes the run. | The broken-session check skips the name. |
+| R19 | The test harness stops auto-firing a timer because of the release. | The harness predicate ignores the name. |
 | R15 | An older worker cannot find the name. | Listed in section 2. |
 | R16 | The fuzz mirror maps the record to an ordinary operation. | The mirror skips transparent records. |
 
@@ -79,15 +82,15 @@ change.** One new reserved activity name carries the release.
 
 - **White (facts).** Section 0.1. Replay already has transparency. The worker
   already persists a closed-receiver activity. The host release is idempotent.
-- **Red (feelings).** A hidden command in `Drop` feels risky. It is not: the
-  same pattern ships in `MutexGuard`, and every other path stays unchanged.
+- **Red (feelings).** A hidden command in `Drop` feels risky. `MutexGuard`
+  ships the same pattern. Every other path stays unchanged.
 - **Black (risks).** Section 0.3. The main risks are a double release, a
   replay drift and a batch conflict. Each has a test.
 - **Yellow (benefits).** Scopes, race losers and `select!` all release their
   session with no change to their code. Future drop sites need no work.
-- **Green (ideas).** A `Session::release()` that is explicit and awaited. A
-  `ReleaseSession` command if the reuse becomes too fragile. A metric for
-  drop releases.
+- **Green (ideas).** Add an explicit, awaited `Session::release()`. Add a
+  `ReleaseSession` command if the reuse becomes too fragile. Add a metric for
+  drop releases. Add a version gate for a mixed fleet.
 - **Blue (process).** Red tests, then green code, then refactor. Then a
   review from several angles.
 
@@ -130,11 +133,20 @@ change.** One new reserved activity name carries the release.
   cold. The release completion wakes the workflow once more.
 - A release for a session that is not `ACTIVE` records a transparent failure
   and wakes the workflow once.
-- A worker of an older build cannot run the name. It releases the task, and
-  the run waits for a newer worker. Deploy the new build to every worker
-  before a workflow drops a session.
+- A worker of an older build cannot run the name. A session task has no other
+  worker, so a host of an older build fails the run. Deploy the new build to
+  every worker before a workflow drops a session.
 - An older build does not treat the record as transparent. Replay of such a
-  history on an older build reports non-determinism.
+  history on an older build reports non-determinism. No version gate exists.
+- A cycle that holds an inline local activity, a mutex acquire or an external
+  activity discards the release. The next replay drops the session again, and
+  the next suspension issues the release.
+- A `complete()` future that drops after its own release started also issues a
+  drop release. The host handler is idempotent, so the cost is one activity.
+- A permanent error in the host handler fails the release task only. The run
+  lives, and the lease reaps the slot.
+- The host handler ignores a release for a session that is not `ACTIVE`. The
+  worker records no failure for it.
 - The SQLite backend has no sessions, so `Drop` never issues a release there.
 
 ---
@@ -149,8 +161,15 @@ change.** One new reserved activity name carries the release.
 | A suspending cycle does not release. | `a_suspending_cycle_issues_no_drop_release` |
 | History with a record causes no second release. | `a_recorded_drop_release_is_not_issued_again` |
 | The record never shifts a positional match. | `a_drop_release_record_is_transparent_to_the_matcher` |
-| A completed run replays without drift. | `a_completed_run_with_a_dropped_session_replays_strictly` |
+| A completed run replays without drift. | `a_completed_run_with_a_dropped_session_replays_strictly` and `a_drop_release_is_not_a_replay_significant_command` |
 | A failing run records no abandoned pair for the release. | `a_failed_cycle_records_nothing_for_a_drop_release` |
-| A release does not conflict with a local activity. | `a_drop_release_does_not_conflict_with_a_local_activity` |
+| A dedicated persist shape discards the release. | `a_dedicated_shape_discards_the_drop_release` |
 | The test harness resolves the name. | `the_test_env_resolves_a_drop_release` |
-| The host frees the slot for the new name. | DB test `a_dropped_session_frees_its_host_slot` |
+| Two sessions get two releases. | `two_sessions_dropped_in_one_cycle_get_two_releases` |
+| A park does not release a held session. | `a_session_held_across_a_park_is_not_released` and `a_session_dropped_before_a_park_is_released` |
+| A panic does not release. | `a_panic_that_unwinds_a_session_issues_no_drop_release` |
+| Every record shape stays transparent. | `every_record_shape_of_a_drop_release_is_transparent` |
+| The name is reserved and registered. | `the_drop_release_is_a_reserved_name` and `handler_registry_always_registers_reserved_session_activities` |
+
+The host handler is shared with `complete()`. A Postgres test for the new
+name needs a container, so the CI session suite covers it.

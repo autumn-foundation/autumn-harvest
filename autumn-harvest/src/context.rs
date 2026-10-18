@@ -2373,16 +2373,18 @@ pub(crate) const SESSION_DROP_RELEASE_ACTIVITY_NAME: &str = "__harvest_session_d
 /// activity names (issue #606): `__harvest_session_acquire`,
 /// `__harvest_session_release` or `__harvest_session_drop_release` (#2193).
 ///
-/// Both are always registered in `HandlerRegistry::activities` (so the
-/// enqueue-time handler lookup never hard-fails on them) with
-/// `default_queue: None`, but they are dispatched on the *caller-supplied*
-/// session queue (`SessionOptions::queue`) at the point `create_session`/
-/// `Session::complete` is called, never on a fixed queue of their own. A
-/// preflight/readiness check deriving "queues this deployment needs a
-/// worker listening on" from every registered activity's
-/// `default_queue.unwrap_or("default")` must exclude these two names —
-/// otherwise a deployment with no session-based workflow at all is
-/// spuriously reported as requiring a worker on `"default"`.
+/// All three are always registered in `HandlerRegistry::activities`. The
+/// enqueue-time handler lookup then never hard-fails on them. Each has
+/// `default_queue: None`. Each is dispatched on the *caller-supplied* session
+/// queue (`SessionOptions::queue`) at the point `create_session`,
+/// `Session::complete` or a session drop runs. None uses a fixed queue of its
+/// own.
+///
+/// A preflight or readiness check can derive the queues that a deployment
+/// needs a worker on. It reads `default_queue.unwrap_or("default")` from every
+/// registered activity. That check must exclude these three names. Otherwise a
+/// deployment with no session-based workflow is wrongly reported as requiring
+/// a worker on `"default"`.
 #[must_use]
 pub fn is_reserved_session_activity_name(name: &str) -> bool {
     name == SESSION_ACQUIRE_ACTIVITY_NAME
@@ -2676,6 +2678,11 @@ impl Default for SessionOptions {
 /// Borrows the owning [`WorkflowContext`] for its lifetime, mirroring
 /// [`RaceBuilder`]'s shape — a session cannot outlive the workflow function
 /// invocation that created it.
+///
+/// Dropping a session without [`Self::complete`] releases its host slot
+/// (issue #2193). This covers a cancelled future, a race loser and a
+/// `select!` branch. The release runs at the next suspension. A run that ends
+/// first leaves the session to the broken-session scanner.
 pub struct Session<'a> {
     ctx: &'a WorkflowContext,
     id: SessionId,
@@ -2691,21 +2698,22 @@ impl Drop for Session<'_> {
     /// The release is an activity that no body awaits. It does nothing when:
     ///
     /// - [`Self::complete`] already dispatched the release;
+    /// - a panic is unwinding, because the cycle discards its commands;
     /// - the cycle is suspending, because the executor drops the handler
     ///   future at each park and the session stays open;
     /// - history already holds a drop release for the session.
     fn drop(&mut self) {
+        // A panicking cycle discards its commands. A lock that the panic
+        // poisoned must not abort the process from inside the unwind.
         if self.settled
+            || std::thread::panicking()
             || self.ctx.is_suspending()
             || self.ctx.history_released_session(self.id)
         {
             return;
         }
-        self.ctx.push_drop_release(
-            self.id,
-            self.host_worker_id.clone(),
-            self.queue.clone(),
-        );
+        self.ctx
+            .push_drop_release(self.id, self.host_worker_id.clone(), self.queue.clone());
     }
 }
 
@@ -2839,6 +2847,10 @@ impl Session<'_> {
     /// Returns [`HarvestError::SessionBroken`] if the host worker died or
     /// drained before release could complete — the slot is still reclaimed
     /// by the broken-session scanner in that case.
+    ///
+    /// Dropping the returned future before the dispatch returns releases the
+    /// session on drop (issue #2193). Any result of the dispatch, an error
+    /// included, settles the session.
     pub async fn complete(mut self) -> HarvestResult<()> {
         let released = self
             .ctx
@@ -31258,6 +31270,57 @@ mod tests {
         drop(session);
 
         assert!(drop_releases(&ctx.drain_commands()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_panic_that_unwinds_a_session_issues_no_drop_release() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), open_session_history(session_uuid));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = session;
+            panic!("workflow panic");
+        }));
+
+        assert!(unwound.is_err());
+        assert!(drop_releases(&ctx.drain_commands()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_complete_future_after_its_release_was_scheduled_still_releases() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let release_id = ActivityExecId::new();
+        let mut events = open_session_history(session_uuid);
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: SESSION_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::from(session_uuid.to_string()),
+            queue: "gpu-workers".to_string(),
+        });
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(20), session.complete()).await;
+        assert!(result.is_err(), "the release has no result yet");
+
+        // The host handler is idempotent, so a second release is safe.
+        assert_eq!(drop_releases(&ctx.drain_commands()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_drop_release_is_a_reserved_name() {
+        assert!(is_reserved_session_activity_name(
+            SESSION_DROP_RELEASE_ACTIVITY_NAME
+        ));
     }
 
     #[tokio::test]

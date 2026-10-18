@@ -487,6 +487,9 @@ pub enum QueryReplayOutcome {
 ///   completing path doesn't call this function at all any more, so the
 ///   question doesn't arise there — every command past the frontier is
 ///   tolerated, bookkeeping or not.)
+/// - A drop release (issue #2193): the `ScheduleActivity` that a dropped
+///   `Session` issues. A run that ends first never records it, so a replay of
+///   that run must not flag it.
 ///
 /// This is the **single source of truth** for two callers that must agree, so
 /// the command classification is never re-enumerated by hand:
@@ -502,8 +505,8 @@ pub enum QueryReplayOutcome {
 ///   command-less cold park such as `await_condition` that suspends immediately
 ///   (case 3 → [`Suspended`](QueryReplayOutcome::Suspended)).
 pub(crate) fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool {
-    // A drop release (issue #2193) is not recorded for a run that ends first,
-    // so a replay of that run issues it as a new command.
+    // A run that ends first never records a drop release (issue #2193).
+    // A replay of that run issues it as a new command.
     if matches!(
         cmd,
         WorkflowCommand::ScheduleActivity { name, .. }
@@ -4378,6 +4381,58 @@ mod tests {
             scheduled_names(&outcome),
             [crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME, "next"]
         );
+    }
+
+    /// Opens two sessions, drops both, then schedules `next`.
+    fn drop_two_sessions_then_step_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let first = ctx
+                .create_session(crate::context::SessionOptions::new("gpu"))
+                .await
+                .map_err(|e| e.to_string())?;
+            let second = ctx
+                .create_session(crate::context::SessionOptions::new("gpu"))
+                .await
+                .map_err(|e| e.to_string())?;
+            drop(first);
+            drop(second);
+            ctx.execute_activity_raw("next", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Issue #2193: each dropped session gets its own release.
+    #[tokio::test]
+    async fn two_sessions_dropped_in_one_cycle_get_two_releases() {
+        let mut events = open_session_events();
+        let second_acquire = ActivityExecId::new();
+        events.push(WorkflowEvent::MarkerRecorded {
+            name: "session:2".into(),
+            details: Value::from(uuid::Uuid::new_v4().to_string()),
+        });
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: second_acquire,
+            name: crate::context::SESSION_ACQUIRE_ACTIVITY_NAME.into(),
+            input: Value::Null,
+            queue: "gpu".into(),
+        });
+        events.push(WorkflowEvent::ActivityCompleted {
+            activity_id: second_acquire,
+            output: serde_json::json!("worker-1"),
+        });
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            events,
+            drop_two_sessions_then_step_workflow,
+            Value::Null,
+        )
+        .await;
+        let release = crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME;
+        assert_eq!(scheduled_names(&outcome), [release, release, "next"]);
     }
 
     /// Issue #2193: the executor drops the handler future at each park. That
