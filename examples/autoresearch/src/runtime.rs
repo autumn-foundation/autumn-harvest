@@ -998,6 +998,7 @@ async fn replay_one(replayer: &WorkflowReplayer, run: StoredRun) -> Result<(), S
         execution_timeout: None,
         deadline_at: None,
         parent_execution_id: parent,
+        start_provenance: None,
         workflow_id: Some(workflow_id),
         queue_name: None,
     };
