@@ -491,6 +491,9 @@ The orphan sweep deletes them. It is off by default. Turn it on with
 - The sweep deletes a blob only when no shard references it. It checks every
   database.
 - A failed reference check stops the sweep. It deletes nothing on a guess.
+- Each store call has the `archival_timeout` (30 seconds by default). A call
+  that takes longer ends the sweep after that one timeout, so a hung store
+  cannot hold the retention tick. The next tick starts again from the top.
 - Each tick reads at most 100 pages from the store and resumes where it
   stopped.
 - `dry_run` counts orphans in the log, deletes nothing and records no metric.

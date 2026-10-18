@@ -15,6 +15,8 @@
 //! - It deletes a blob only when no shard references it. It checks every
 //!   physical database.
 //! - A failed reference check stops the sweep. It never deletes on a guess.
+//! - Each store call has a timeout. A hung store ends the sweep after one
+//!   timeout, so it cannot hold the retention tick or its fence guards.
 //! - The store must hold only harvest blobs. See [`PayloadStore::list`].
 //!
 //! **Limits.**
@@ -33,8 +35,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 
-use crate::error::HarvestResult;
-use crate::payload_store::{PayloadStore, StoredBlob};
+use crate::error::{HarvestError, HarvestResult};
+use crate::payload_store::{PayloadStore, PayloadStoreError, PayloadStoreFuture, StoredBlob};
 use crate::shard::ShardedDbPool;
 
 /// Settings for one [`sweep_orphaned_blobs`] call.
@@ -48,7 +50,8 @@ pub struct OrphanSweepOptions {
     pub dry_run: bool,
     /// Where the previous call stopped, or `None` to start from the top.
     pub cursor: Option<String>,
-    /// The longest one store call may take. RED PHASE: not enforced yet.
+    /// The longest one store call may take. A call that takes longer ends the
+    /// sweep with an error. Shutdown also ends a pending call.
     pub call_timeout: Duration,
 }
 
@@ -105,18 +108,34 @@ pub async fn sweep_orphaned_blobs(
         let Some(listing) = store.list("", cutoff, report.next_cursor.as_deref()) else {
             return OrphanSweep::Unsupported;
         };
-        let page = match listing.await {
-            Ok(page) => page,
-            Err(error) => {
+        let page = match bounded(listing, options.call_timeout, shutdown).await {
+            Ok(Ok(page)) => page,
+            Ok(Err(error)) => {
                 report.error = Some(error.to_string());
                 return OrphanSweep::Swept(report);
             }
+            Err(CallEnd::Shutdown) => return OrphanSweep::Swept(report),
+            Err(CallEnd::TimedOut) => {
+                report.error = Some(timeout_message(options));
+                return OrphanSweep::Swept(report);
+            }
         };
-        if let Err(error) =
-            sweep_page(store, pools, cutoff, &page.blobs, options, &mut report).await
+        if let Err(error) = sweep_page(
+            store,
+            pools,
+            cutoff,
+            &page.blobs,
+            (options, shutdown),
+            &mut report,
+        )
+        .await
         {
             report.error = Some(error.to_string());
             return OrphanSweep::Swept(report);
+        }
+        // A page that shutdown cut short keeps its cursor.
+        if shutdown.is_cancelled() {
+            break;
         }
         report.next_cursor = page.next;
         if report.next_cursor.is_none() {
@@ -133,7 +152,7 @@ async fn sweep_page(
     pools: &ShardedDbPool,
     cutoff: DateTime<Utc>,
     blobs: &[StoredBlob],
-    options: &OrphanSweepOptions,
+    (options, shutdown): (&OrphanSweepOptions, &CancellationToken),
     report: &mut OrphanSweepReport,
 ) -> HarvestResult<()> {
     let old: Vec<String> = blobs
@@ -149,16 +168,24 @@ async fn sweep_page(
         }
         // A conditional delete skips a blob that a writer re-uploaded after
         // the listing. A store without one falls back to a plain delete.
-        let outcome = match store.delete_if_older(key, cutoff) {
-            Some(delete) => delete.await,
-            None => store.delete(key).await.map(|()| true),
-        };
-        match outcome {
-            Ok(true) => report.deleted += 1,
-            Ok(false) => {}
-            Err(error) => {
+        let delete: PayloadStoreFuture<'_, bool> =
+            store.delete_if_older(key, cutoff).unwrap_or_else(|| {
+                let plain = store.delete(key);
+                Box::pin(async move { plain.await.map(|()| true) })
+            });
+        match bounded(delete, options.call_timeout, shutdown).await {
+            Ok(Ok(true)) => report.deleted += 1,
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => {
                 report.failed += 1;
                 tracing::warn!(blob_key = %key, error = %error, "harvest orphan blob delete failed");
+            }
+            // Shutdown is not a store failure. The caller keeps the cursor.
+            Err(CallEnd::Shutdown) => return Ok(()),
+            // A hung store would cost one timeout for each blob. Stop here.
+            Err(CallEnd::TimedOut) => {
+                report.failed += 1;
+                return Err(HarvestError::PayloadOffload(timeout_message(options)));
             }
         }
     }
@@ -181,4 +208,31 @@ async fn referenced_on_any_shard(
         referenced.extend(crate::store::batch_blob_keys_still_referenced(&mut conn, keys).await?);
     }
     Ok(referenced)
+}
+
+/// Why a bounded store call ended without an answer.
+enum CallEnd {
+    /// The process is shutting down.
+    Shutdown,
+    /// The store did not answer in time.
+    TimedOut,
+}
+
+/// Run a store call. It ends on timeout and on shutdown.
+async fn bounded<T>(
+    call: PayloadStoreFuture<'_, T>,
+    timeout: Duration,
+    shutdown: &CancellationToken,
+) -> Result<Result<T, PayloadStoreError>, CallEnd> {
+    tokio::select! {
+        () = shutdown.cancelled() => Err(CallEnd::Shutdown),
+        result = tokio::time::timeout(timeout, call) => result.map_err(|_| CallEnd::TimedOut),
+    }
+}
+
+fn timeout_message(options: &OrphanSweepOptions) -> String {
+    format!(
+        "a store call timed out after {}s",
+        options.call_timeout.as_secs_f32()
+    )
 }
