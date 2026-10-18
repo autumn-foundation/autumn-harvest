@@ -98,6 +98,25 @@ fn decode_allocates_less_than_from_value() {
 }
 
 #[test]
+fn decode_moves_the_payload_tree_instead_of_rebuilding_it() {
+    let codecs = PayloadCodecs::default();
+    let mut counts = Vec::new();
+    for n in [1, 50, 500] {
+        let wire = codecs
+            .encode_event(&completed(document(n)))
+            .expect("encode");
+        let (event, allocs) = allocs_during(|| codecs.decode_event(wire).expect("decode"));
+        drop(event);
+        counts.push(allocs);
+    }
+    // A rebuilt tree costs allocations in proportion to its size.
+    assert!(
+        counts.windows(2).all(|pair| pair[0] == pair[1]),
+        "decode_event allocations grew with payload size: {counts:?}"
+    );
+}
+
+#[test]
 fn decode_round_trips_an_encoded_event() {
     let codecs = PayloadCodecs::default();
     let original = completed(document(2));

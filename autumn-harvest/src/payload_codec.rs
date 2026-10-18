@@ -855,7 +855,15 @@ impl std::fmt::Debug for PayloadCodecs {
 /// Any other shape takes the plain `from_value` path, so every error message
 /// stays the same. That covers a non-object root, a missing `type`, and extra
 /// keys.
+///
+/// Serde also rebuilds a `Value` field node by node, even from a `Value`. So
+/// the tagged path lifts each non-null payload field out first, leaving
+/// null. Serde then reads a small event, and each tree moves into its field.
+/// Every payload field is a `Value` or an `Option<Value>`, which accepts any
+/// JSON. The lift therefore changes no error. A null reads as `None` either way.
 fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_json::Error> {
+    use crate::event::PayloadSlot;
+    use crate::payload_store::PAYLOAD_FIELD_KEYS;
     use serde::de::IntoDeserializer;
     use serde::de::value::MapDeserializer;
 
@@ -868,11 +876,33 @@ fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_js
         return serde_json::from_value(Value::Object(map));
     }
     let tag = map.remove("type").unwrap_or_default();
-    let data = map.remove("data");
+    let mut data = map.remove("data");
+    let mut lifted: [Option<Value>; PAYLOAD_FIELD_KEYS.len()] = Default::default();
+    if let Some(Value::Object(fields)) = data.as_mut() {
+        for (slot, key) in lifted.iter_mut().zip(PAYLOAD_FIELD_KEYS) {
+            if let Some(field) = fields.get_mut(key)
+                && !field.is_null()
+            {
+                *slot = Some(std::mem::take(field));
+            }
+        }
+    }
     let pairs = std::iter::once(("type", tag)).chain(data.map(|data| ("data", data)));
     let de: MapDeserializer<'_, _, serde_json::Error> =
         MapDeserializer::new(pairs.map(|(key, value)| (key.into_deserializer(), value)));
-    serde::Deserialize::deserialize(de)
+    let mut event: crate::event::WorkflowEvent = serde::Deserialize::deserialize(de)?;
+    for (payload, key) in lifted.into_iter().zip(PAYLOAD_FIELD_KEYS) {
+        let Some(payload) = payload else {
+            continue;
+        };
+        match event.payload_slot_mut(key) {
+            Some(PayloadSlot::Required(field)) => *field = payload,
+            Some(PayloadSlot::Optional(field)) => *field = Some(payload),
+            // Serde ignores a key that the variant does not have.
+            None => {}
+        }
+    }
+    Ok(event)
 }
 
 /// Validate an operator-supplied codec key id (issue #948).
@@ -2379,6 +2409,227 @@ mod tests {
         };
         let encoded = codecs.encode_event(&event).expect("encode");
         assert_eq!(encoded["data"]["output"], serde_json::json!({"a": 1}));
+    }
+
+    /// One event of each variant that carries a payload field.
+    ///
+    /// Each `Option` payload is `Some`, so every payload key is on the wire.
+    #[allow(clippy::too_many_lines)]
+    fn every_payload_bearing_event() -> Vec<crate::event::WorkflowEvent> {
+        use crate::event::{SideEffectKind, WorkflowEvent};
+        use crate::types::{
+            ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalSignalId,
+            ExternalTarget, ParentClosePolicy, UpdateId,
+        };
+
+        let some = || Some(json!(0));
+        vec![
+            WorkflowEvent::WorkflowStarted {
+                input: json!(0),
+                timestamp: chrono::Utc::now(),
+                last_completion_result: some(),
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::WorkflowCompleted { output: json!(0) },
+            WorkflowEvent::WorkflowFailed {
+                error: "e".into(),
+                error_type: None,
+                details: some(),
+                non_retryable: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "a".into(),
+                input: json!(0),
+                queue: "q".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: json!(0),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: ActivityExecId::new(),
+                error: "e".into(),
+                attempt: 1,
+                error_type: "E".into(),
+                non_retryable: false,
+                details: some(),
+            },
+            WorkflowEvent::ActivityHeartbeat {
+                activity_id: ActivityExecId::new(),
+                details: json!(0),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "s".into(),
+                payload: json!(0),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: ExecutionId::new(),
+                workflow_name: "w".into(),
+                input: json!(0),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: ExecutionId::new(),
+                output: json!(0),
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: ExecutionId::new(),
+                error: "e".into(),
+                error_type: None,
+                details: some(),
+                non_retryable: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: json!(0),
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: ExecutionId::new(),
+                input: json!(0),
+                new_workflow_type: None,
+            },
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "l".into(),
+                input: json!(0),
+                resolved: true,
+                retry_policy: None,
+                start_to_close_nanos: None,
+            },
+            WorkflowEvent::LocalActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: json!(0),
+            },
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id: ActivityExecId::new(),
+                token: ExternalActivityToken::new(),
+                name: "a".into(),
+                input: json!(0),
+                queue: "q".into(),
+                schedule_to_close_secs: 1,
+            },
+            WorkflowEvent::ActivityCompletedExternally {
+                activity_id: ActivityExecId::new(),
+                token: ExternalActivityToken::new(),
+                output: json!(0),
+            },
+            WorkflowEvent::UpdateAdmitted {
+                update_id: UpdateId::new(),
+                name: "u".into(),
+                input: json!(0),
+                timestamp: chrono::Utc::now(),
+            },
+            WorkflowEvent::UpdateCompleted {
+                update_id: UpdateId::new(),
+                output: json!(0),
+            },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: ExternalSignalId::new(),
+                target: ExternalTarget::ExecutionId(ExecutionId::new()),
+                signal_name: "s".into(),
+                payload: json!(0),
+                idempotency_key: None,
+            },
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id: ExecutionId::new(),
+                workflow_name: "w".into(),
+                input: json!(0),
+                parent_close_policy: ParentClosePolicy::Abandon,
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: None,
+                value: json!(0),
+            },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id: ExternalAwaitId::new(),
+                output: json!(0),
+            },
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id: ExternalAwaitId::new(),
+                reason_code: "r".into(),
+                message: None,
+                error_type: None,
+                details: some(),
+                non_retryable: None,
+            },
+            WorkflowEvent::ForkActivityResultOverridden {
+                activity_name: "a".into(),
+                occurrence: 1,
+                output: json!(0),
+            },
+        ]
+    }
+
+    /// The lifted decode in `event_from_wire` must match serde's own decode.
+    ///
+    /// A payload key without a slot reads back as null. So this checks
+    /// every payload key of every payload-bearing variant.
+    #[test]
+    fn lifted_decode_matches_serde_for_every_payload_field() {
+        let codecs = PayloadCodecs::default();
+        let mut fields = 0;
+        for event in every_payload_bearing_event() {
+            let mut stored = serde_json::to_value(&event).expect("serialize");
+            let data = stored["data"].as_object_mut().expect("data object");
+            for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
+                if let Some(field) = data.get_mut(key) {
+                    *field = json!({"key": key, "tree": [1, {"x": "y"}]});
+                    fields += 1;
+                }
+            }
+
+            let mut decoded = codecs.decode_event(stored.clone()).expect("decode");
+            for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
+                if stored["data"].get(key).is_some() {
+                    assert!(
+                        decoded.payload_slot_mut(key).is_some(),
+                        "{} has no payload slot for `{key}`",
+                        event.type_name()
+                    );
+                }
+            }
+            let plain: crate::event::WorkflowEvent =
+                serde_json::from_value(stored.clone()).expect("serde decode");
+            let decoded = serde_json::to_value(&decoded).expect("serialize");
+            assert_eq!(decoded, serde_json::to_value(&plain).expect("serialize"));
+            assert_eq!(decoded, stored, "{}", event.type_name());
+        }
+        assert_eq!(fields, 26, "one field per payload slot");
+    }
+
+    /// A null payload and a key that the variant lacks both read as serde
+    /// reads them.
+    #[test]
+    fn lifted_decode_keeps_null_and_unknown_payload_keys() {
+        let codecs = PayloadCodecs::default();
+
+        let failed = json!({
+            "type": "WorkflowFailed",
+            "data": {"error": "e", "details": null}
+        });
+        match codecs.decode_event(failed).expect("decode") {
+            crate::event::WorkflowEvent::WorkflowFailed { details, .. } => {
+                assert_eq!(details, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let stray = json!({
+            "type": "WorkflowCompleted",
+            "data": {"output": {"a": 1}, "input": {"stray": true}}
+        });
+        let decoded = codecs.decode_event(stray.clone()).expect("decode");
+        let plain: crate::event::WorkflowEvent = serde_json::from_value(stray).expect("serde");
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("serialize"),
+            serde_json::to_value(&plain).expect("serialize")
+        );
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("serialize"),
+            json!({"type": "WorkflowCompleted", "data": {"output": {"a": 1}}})
+        );
     }
 
     #[test]
