@@ -3329,7 +3329,7 @@ mod tests {
             plain_of(&codecs, &out["memo"]),
             plain_of(&codecs, &cell["memo"])
         );
-        let mut rest = out.clone();
+        let mut rest = out;
         rest["memo"] = cell["memo"].clone();
         assert_eq!(rest, cell, "only the named key changes");
     }
