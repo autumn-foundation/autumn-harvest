@@ -14866,6 +14866,8 @@ impl WorkflowContext {
     /// - **Offset**: the 0-based ordinal of this call in the workflow body.
     ///   The SSE `id:` carries it. A re-drive gives a chunk the same offset,
     ///   and the store keeps the first copy.
+    ///   The store never fills an offset below the highest stored offset. A
+    ///   chunk after a failed call can therefore be lost to a reader.
     /// - **Determinism**: the content can change between runs. The number and
     ///   order of calls must be deterministic, as for any workflow code.
     /// - **Replay-neutral**: during replay the call claims its offset and

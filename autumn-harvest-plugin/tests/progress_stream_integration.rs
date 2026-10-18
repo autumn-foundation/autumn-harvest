@@ -809,6 +809,62 @@ async fn durable_stream_resume_has_no_gap_and_no_duplicate() {
     );
 }
 
+/// Issue #2083: a re-run can offer an offset below a reader's cursor, after a
+/// serialization failure in the first run. The reader holds its cursor across
+/// the re-run. The store drops the late offset, so a fresh reader finds no
+/// chunk that the first reader missed.
+#[tokio::test]
+async fn durable_stream_stores_no_chunk_below_a_live_readers_cursor() {
+    let (url, _guard) = setup_database().await;
+    let pool = build_pool(&url);
+    let app = build_app(&pool, &url);
+    let mut conn = pool.get().await.unwrap();
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    start_or_load_workflow_execution(
+        &mut conn,
+        start_params_named(exec_id, "durable_stream_wf", "durable-below-cursor"),
+        None,
+    )
+    .await
+    .unwrap();
+    let chunk = |offset: i64| autumn_harvest::store::DurableStreamChunk {
+        offset,
+        chunk: json!({"token": offset}),
+    };
+    // The first run failed to serialize offset 0, so a reader got offset 1.
+    autumn_harvest::store::append_stream_chunks(&mut conn, exec_id, &[chunk(1)], 100)
+        .await
+        .expect("first run");
+    let resp = durable_response(&app, exec_id, "", Some("1")).await;
+    let reader = tokio::spawn(read_sse(resp, Duration::from_secs(20)));
+
+    // The cold re-drive offers offsets 0 to 2. Offset 0 now serializes.
+    autumn_harvest::store::append_stream_chunks(
+        &mut conn,
+        exec_id,
+        &[chunk(0), chunk(1), chunk(2)],
+        100,
+    )
+    .await
+    .expect("re-run");
+    diesel::update(harvest_workflow_executions::table.find(exec_id.as_uuid()))
+        .set(harvest_workflow_executions::state.eq("COMPLETED"))
+        .execute(&mut conn)
+        .await
+        .unwrap();
+    let (cursor_frames, _) = reader.await.expect("reader task");
+    assert_eq!(durable_progress(&cursor_frames), expected_tokens(2..3));
+
+    let resp = durable_response(&app, exec_id, "", None).await;
+    let (fresh_frames, _) = read_sse(resp, Duration::from_secs(20)).await;
+    assert_eq!(
+        durable_progress(&fresh_frames),
+        expected_tokens(1..3),
+        "no chunk sits below the cursor of the first reader: {fresh_frames:#?}"
+    );
+}
+
 /// The `LISTEN` wake delivers a live chunk long before the keepalive tick.
 /// The tick also reads the table, so with a short keepalive a broken wake
 /// would go unseen.
