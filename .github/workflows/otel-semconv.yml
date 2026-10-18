@@ -4,12 +4,14 @@
 # The `otel_workflow_semconv_docs` guards in the `lint` job check the model
 # shape. This workflow runs scripts/check-otel-workflow-semconv.sh. The
 # script runs the upstream Weaver policies on the model, at a pinned upstream
-# commit. It pulls an image and clones three trees, so the `pinned` job runs
-# only when the draft, the script or this file changes.
+# commit. It also checks the upstream issue form, and it checks the project
+# proposal against the community template. It pulls an image and clones four
+# trees, so the `pinned` job runs only when the draft, the script or this
+# file changes.
 #
-# The weekly `latest` job runs the script against upstream `main` and the
-# latest release. A failure there shows that the pins cannot move as they
-# are. It does not block a pull request.
+# The weekly `latest` job runs the script against upstream `main`, the
+# latest release and community `main`. A failure there shows that the pins
+# cannot move as they are. It does not block a pull request.
 #
 # `otel_workflow_semconv_docs::the_weaver_check_runs_when_the_model_changes`
 # guards this file.
