@@ -1018,15 +1018,6 @@ impl ForkEffects {
     }
 }
 
-/// One payload field of a [`WorkflowEvent`], as
-/// [`WorkflowEvent::payload_slot_mut`] returns it.
-pub(crate) enum PayloadSlot<'a> {
-    /// A field that is always present.
-    Required(&'a mut serde_json::Value),
-    /// A field that null or absence stores as `None`.
-    Optional(&'a mut Option<serde_json::Value>),
-}
-
 impl WorkflowEvent {
     /// Forward-compatible constructor for [`WorkflowEvent::WorkflowStarted`] that
     /// defaults the carryover (#488) and scheduled-time (#508) additive fields to
@@ -1368,7 +1359,7 @@ impl WorkflowEvent {
 }
 
 /// A payload field of a [`WorkflowEvent`], as [`WorkflowEvent::payload_slot`]
-/// returns it.
+/// and [`WorkflowEvent::payload_slot_mut`] return it.
 pub(crate) enum PayloadSlot<'a> {
     /// A field typed `Value`. A JSON `null` decodes to `Value::Null`.
     Required(&'a mut serde_json::Value),
