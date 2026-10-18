@@ -133,7 +133,7 @@ const INTERNED_LABEL_CAP: usize = 4096;
 /// A set of interned label values.
 ///
 /// A lookup hashes the value on every sample. `foldhash` costs a fraction of
-/// SipHash on these short keys, and a per-process seed still resists
+/// `SipHash` on these short keys, and a per-process seed still resists
 /// flooding. See `docs/performance-metrics-rs-labels.md`.
 type LabelSet = HashSet<&'static str, foldhash::fast::RandomState>;
 
@@ -181,10 +181,13 @@ fn intern_label(value: &str) -> Option<&'static str> {
     if INTERNED_LABELS_FULL.load(Ordering::Relaxed) {
         return None;
     }
-    let mut labels = INTERNED_LABELS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let interned = intern_into(&mut labels, value, INTERNED_LABEL_CAP);
+    let interned = intern_into(
+        &mut INTERNED_LABELS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+        value,
+        INTERNED_LABEL_CAP,
+    );
     if interned.is_none() {
         INTERNED_LABELS_FULL.store(true, Ordering::Relaxed);
     }
@@ -193,11 +196,7 @@ fn intern_label(value: &str) -> Option<&'static str> {
 
 /// The copy of `value` in `labels`. A new value is leaked and added while
 /// `labels` holds fewer than `cap` values. Otherwise the result is `None`.
-fn intern_into(
-    labels: &mut LabelSet,
-    value: &str,
-    cap: usize,
-) -> Option<&'static str> {
+fn intern_into(labels: &mut LabelSet, value: &str, cap: usize) -> Option<&'static str> {
     if let Some(&interned) = labels.get(value) {
         return Some(interned);
     }
