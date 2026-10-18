@@ -1212,6 +1212,18 @@ mod tests {
                 false,
             ),
             (
+                "WorkflowForked",
+                "reason",
+                WorkflowEvent::WorkflowForked {
+                    forked_from_exec_id: ExecutionId::new(),
+                    fork_event_id: 1,
+                    effects: crate::event::ForkEffects::Recorded,
+                    reason: msg(),
+                    operator_id: "op".into(),
+                },
+                false,
+            ),
+            (
                 "WorkflowResetTerminated",
                 "reason",
                 WorkflowEvent::WorkflowResetTerminated {

@@ -4330,6 +4330,53 @@ async fn a_reset_fork_of_a_legacy_row_encodes_input_and_memo() {
     );
 }
 
+/// A non-destructive fork is a new write too (issue #2000). It encodes a
+/// clear legacy input and memo, as a reset fork does.
+#[tokio::test]
+async fn a_fork_of_a_legacy_row_encodes_input_and_memo() {
+    let (url, _c) = setup_test_database_url_or_env().await;
+    let queue = format!("cc-{}", Uuid::new_v4().simple());
+    let mut conn = connect(&url).await;
+    let exec_id = start(
+        &mut conn,
+        &aead_codecs(false),
+        "cc_fork_legacy",
+        &queue,
+        None,
+    )
+    .await;
+    let source = load_execution(&mut conn, exec_id.as_uuid()).await;
+    assert_eq!(source.input, json!({"ssn": INPUT_SECRET}));
+
+    let codecs = aead_codecs(true);
+    let reg = registry(
+        vec![wf_info("cc_fork_legacy", wf_signal_echo, None)],
+        Vec::new(),
+        &codecs,
+    );
+    let result = autumn_harvest::fork::fork_workflow_execution(
+        &mut conn,
+        exec_id,
+        autumn_harvest::fork::WorkflowForkRequest::default(),
+        Some(&reg),
+    )
+    .await
+    .expect("fork");
+    let fork = load_execution(&mut conn, result.new_exec_id.as_uuid()).await;
+
+    assert_ciphertext(&fork.input, INPUT_SECRET, "the fork input");
+    let memo = fork.memo.expect("the fork keeps the memo");
+    assert_ciphertext(&memo, MEMO_SECRET, "the fork memo");
+    assert_eq!(
+        codecs.decode_column(&fork.input).expect("decode input"),
+        json!({"ssn": INPUT_SECRET})
+    );
+    assert_eq!(
+        codecs.decode_column(&memo).expect("decode memo"),
+        json!({"account": MEMO_SECRET})
+    );
+}
+
 #[tokio::test]
 async fn a_reset_fork_of_an_encoded_row_wraps_once() {
     let (url, _c) = setup_test_database_url_or_env().await;

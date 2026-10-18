@@ -56,7 +56,7 @@ use autumn_harvest::audit::{
     TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
     deny_readonly_mutation,
 };
-use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
+use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START, OP_WORKFLOW_FORK};
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
     BatchSubmission, BatchTargetSample,
@@ -80,6 +80,9 @@ use autumn_harvest::executor::{
     history_reached_terminal_seal,
 };
 use autumn_harvest::external_task;
+use autumn_harvest::fork::{
+    ForkEffects, WorkflowForkError, WorkflowForkRequest, fork_workflow_execution_audited,
+};
 use autumn_harvest::history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HistoryExportDocument, HistoryExportError,
     HistoryExportRequest, HistoryPayloadPolicy, export_history_decoded,
@@ -4994,6 +4997,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/workflows/{id}/rerun",
             post(rerun_workflow).route_layer(require_admin.clone()),
         )
+        // Issue #2000: a fork starts a new run. A live fork runs effects for
+        // real, so the route is admin-only, as rerun is.
+        .route(
+            "/workflows/{id}/fork",
+            post(fork_workflow).route_layer(require_admin.clone()),
+        )
         .route(
             "/workflows/{id}/erase-payloads",
             post(erase_workflow_payloads_handler).route_layer(require_admin.clone()),
@@ -7045,6 +7054,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "/workflows/{id}/completion-deliveries/{delivery_id}/redrive",
         ),
         ("POST", "/workflows/{id}/reset"),
+        ("POST", "/workflows/{id}/fork"),
         ("POST", "/workflows/{id}/signal/{signal_name}"),
         ("GET", "/workflows/{id}/queries"),
         ("GET", "/workflows/{id}/query/{query_name}"),
@@ -7393,6 +7403,19 @@ pub const fn management_api_request_fields()
                 "reason",
                 "operator_id",
                 "signal_reapply",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/fork",
+            Some(&[
+                "fork_point",
+                "reason",
+                "operator_id",
+                "effects",
+                "workflow_id",
+                "input",
+                "activity_overrides",
             ]),
         ),
         ("POST", "/workflows/{id}/signal/{signal_name}", None), // free-form
@@ -8206,6 +8229,18 @@ pub const fn management_api_response_fields()
                 "source_timers_removed",
                 "source_signals_dropped",
                 "source_signals_buffered",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/fork",
+            Some(&[
+                "new_exec_id",
+                "workflow_id",
+                "forked_from_exec_id",
+                "fork_event_id",
+                "events_carried_over",
+                "effects",
             ]),
         ),
         (
@@ -25772,6 +25807,270 @@ async fn reset_workflow(
     }
 }
 
+/// `POST /workflows/{id}/fork` — non-destructive fork of a run (issue #2000).
+///
+/// The source stays unchanged. The fork defaults to recorded effects, so it
+/// never runs an effect for real unless the body sets `"effects": "live"`.
+/// Each outcome writes one `workflow.fork` audit row.
+async fn fork_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    request: Result<Json<WorkflowForkRequest>, JsonRejection>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let context = audit_context(&headers, &api_state);
+    // Before the source shard resolves, a refusal is audited on the default
+    // shard, as for a reset.
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            let _ =
+                audit_fork_on_default(&api_state, &context, &id, Some("malformed execution id"))
+                    .await;
+            return e.into_response();
+        }
+    };
+    let exec_id_str = exec_id.to_string();
+    // The handler unwraps the body itself, so a rejected body is audited too.
+    // The response keeps the status of the extractor.
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            let failure = format!("invalid request body: {}", rejection.body_text());
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return rejection.into_response();
+        }
+    };
+    // Fail closed in the boot window. With no runtime there are no payload
+    // codecs, so an override would land in plaintext.
+    let runtime = match api_state.runtime() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            let failure = e.to_string();
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return map_error(e).into_response();
+        }
+    };
+    // The exact resolver never stands the default shard in for the source
+    // shard. A source shard that this node has no pool for answers `503`, not a
+    // false `404` from the wrong database.
+    let mut conn = match db_conn_for_execution_exact(&api_state, exec_id).await {
+        Ok(Some(conn)) => conn,
+        Ok(None) => {
+            let error = HarvestError::NotFound(format!("workflow execution {exec_id_str}"));
+            let failure = error.to_string();
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return map_error(error).into_response();
+        }
+        Err(e) => {
+            let failure = e.to_string();
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return e.into_response();
+        }
+    };
+    if request.effects == ForkEffects::Live
+        && let Some(response) =
+            reject_inadmissible_fork_callbacks(&api_state, &mut conn, &context, exec_id).await
+    {
+        return response;
+    }
+    // The fork commits on the source shard, with its success audit row in
+    // the same transaction. A fork leaves its source as it was, so a retry
+    // makes another fork. So a failed audit insert must roll the fork back,
+    // not report a retryable error for a fork that exists.
+    let result = fork_workflow_execution_audited(
+        &mut conn,
+        exec_id,
+        request,
+        Some(runtime.registry().as_ref()),
+        &fork_audit_record(&context, &exec_id_str, None),
+    )
+    .await;
+
+    match result {
+        Ok(result) => (axum::http::StatusCode::CREATED, Json(result)).into_response(),
+        Err(error) => {
+            let failure = error.to_string();
+            let _ = audit_fork(&mut conn, &context, &exec_id_str, Some(&failure)).await;
+            fork_error_response(error)
+        }
+    }
+}
+
+/// Refuse a live fork whose inherited callback targets fail the SSRF policy.
+///
+/// A live fork sends the completion callbacks of its source. The terminal
+/// path checks each target against the current policy and skips a rejected
+/// one in silence. So the route checks the targets first and refuses the fork
+/// with `422`, as a rerun does. The targets are fixed at start, so the check
+/// before the fork transaction sees the targets that the fork copies.
+///
+/// Returns the refusal response, or `None` when the fork can go on.
+async fn reject_inadmissible_fork_callbacks(
+    api_state: &HarvestApiState,
+    conn: &mut AsyncPgConnection,
+    context: &(String, String, Option<String>),
+    exec_id: ExecutionId,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse as _;
+
+    let exec_id_str = exec_id.to_string();
+    // A missing source is left to the fork, which refuses it with `404`.
+    let stored: Option<Option<Value>> = match harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::completion_callbacks)
+        .first(conn)
+        .await
+        .optional()
+    {
+        Ok(stored) => stored,
+        Err(e) => {
+            let error = autumn_harvest::error::database_error(e);
+            let failure = error.to_string();
+            let _ = audit_fork(conn, context, &exec_id_str, Some(&failure)).await;
+            return Some(map_error(error).into_response());
+        }
+    };
+    // A source with no callback targets has nothing to check.
+    let raw = stored.flatten()?;
+    let targets: Vec<autumn_harvest::completion_callback::CallbackTarget> =
+        match serde_json::from_value(raw) {
+            Ok(targets) => targets,
+            Err(e) => {
+                let failure = "malformed stored completion_callbacks";
+                let _ = audit_fork(conn, context, &exec_id_str, Some(failure)).await;
+                return Some(
+                    AutumnError::bad_request_msg(format!(
+                        "source execution {exec_id} has an unparseable stored \
+                     completion_callbacks value ({e}); a live fork cannot send them"
+                    ))
+                    .into_response(),
+                );
+            }
+        };
+    let policy = api_state.completion_callback_ssrf_policy();
+    for target in &targets {
+        if let Err(rejection) =
+            autumn_harvest::completion_callback::validate_target_url(&target.url, &policy)
+        {
+            let failure = "completion callback target no longer admissible";
+            let _ = audit_fork(conn, context, &exec_id_str, Some(failure)).await;
+            return Some(
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "completion callback target rejected",
+                        "url": target.url,
+                        "rejection": rejection,
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
+}
+
+/// Write one `workflow.fork` audit row on the default shard.
+async fn audit_fork_on_default(
+    api_state: &HarvestApiState,
+    context: &(String, String, Option<String>),
+    target_id: &str,
+    failure: Option<&str>,
+) -> Result<(), String> {
+    let pool = api_state.storage_pool().map_err(|e| e.to_string())?;
+    let mut conn = acquire_conn(pool.default_pool())
+        .await
+        .map_err(|e| e.to_string())?;
+    audit_fork(&mut conn, context, target_id, failure).await
+}
+
+/// Write one `workflow.fork` audit row on `conn`.
+///
+/// `failure` is the error summary of a refused fork, or `None` on success.
+async fn audit_fork(
+    conn: &mut AsyncPgConnection,
+    context: &(String, String, Option<String>),
+    target_id: &str,
+    failure: Option<&str>,
+) -> Result<(), String> {
+    audit::insert_audit(conn, &fork_audit_record(context, target_id, failure))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// The `workflow.fork` audit row of one request.
+fn fork_audit_record<'a>(
+    (actor, source, request_id): &'a (String, String, Option<String>),
+    target_id: &'a str,
+    failure: Option<&'a str>,
+) -> NewAuditRecord<'a> {
+    NewAuditRecord {
+        actor,
+        operation: OP_WORKFLOW_FORK,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(target_id),
+        route_or_command: "POST /workflows/{id}/fork",
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status: if failure.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        error_summary: failure,
+        shard_id: None,
+        source,
+    }
+}
+
+fn fork_error_response(error: WorkflowForkError) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let status = match error {
+        WorkflowForkError::InvalidPoint(invalid) => return reset_invalid_point_response(invalid),
+        // A fork is a fresh admission (issue #2000), so a gate answers as it
+        // does for a start or a rerun.
+        WorkflowForkError::Harvest(HarvestError::AdmissionBlocked { gate_id, reason }) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
+        WorkflowForkError::Harvest(error) => return map_error(error).into_response(),
+        WorkflowForkError::ContinueAsNew | WorkflowForkError::InvalidOverride { .. } => {
+            axum::http::StatusCode::BAD_REQUEST
+        }
+        // As for a rerun: the fork would fail on every worker.
+        WorkflowForkError::WorkflowNotRegistered { .. } => axum::http::StatusCode::NOT_FOUND,
+        WorkflowForkError::ErasedSource { .. }
+        | WorkflowForkError::UnservableEffect { .. }
+        | WorkflowForkError::CarriedMutex { .. }
+        | WorkflowForkError::WorkflowIdInUse { .. }
+        | WorkflowForkError::LineageTooDeep { .. }
+        | WorkflowForkError::LineageGap { .. }
+        | WorkflowForkError::LineageMalformed { .. }
+        | WorkflowForkError::HistoryCapReached { .. }
+        | WorkflowForkError::ShardRefused { .. } => axum::http::StatusCode::CONFLICT,
+    };
+    (
+        status,
+        Json(ResetErrorResponse {
+            message: error.to_string(),
+        }),
+    )
+        .into_response()
+}
+
 fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
@@ -25817,6 +26116,25 @@ fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
                 message: format!(
                     "workflow execution {exec_id} had its payloads erased (issue #495); a fork \
                      would resume on tombstones, so start a fresh run instead"
+                ),
+            }),
+        )
+            .into_response(),
+        // A reset of a fork that could never run one task (issue #2000).
+        WorkflowResetError::HistoryCapReached { .. } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!("{error}; reset at an earlier point"),
+            }),
+        )
+            .into_response(),
+        // A reset of a fork walks its lineage as a fork does (issue #2000).
+        WorkflowResetError::ForkLineage { exec_id, reason } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "the fork lineage of workflow execution {exec_id} cannot be checked for \
+                     erasure ({reason}); start a fresh run instead"
                 ),
             }),
         )

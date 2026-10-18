@@ -781,12 +781,16 @@ pub async fn insert_payload_refs(
             byte_len: i64::try_from(r.byte_len).unwrap_or(i64::MAX),
         })
         .collect();
-    diesel::insert_into(harvest_payload_refs::table)
-        .values(&rows)
-        .on_conflict_do_nothing()
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    // Each row binds four parameters. Chunks keep a statement far below the
+    // Postgres limit of 65,535, so a long fork prefix still inserts.
+    for chunk in rows.chunks(1_000) {
+        diesel::insert_into(harvest_payload_refs::table)
+            .values(chunk)
+            .on_conflict_do_nothing()
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
     Ok(())
 }
 
@@ -807,6 +811,44 @@ pub async fn load_payload_refs(
         .map_err(crate::error::database_error)?;
     Ok(rows
         .into_iter()
+        .map(
+            |(blob_key, store_id, byte_len)| crate::payload_store::OffloadedRef {
+                blob_key,
+                store_id,
+                byte_len: byte_len.max(0).cast_unsigned(),
+            },
+        )
+        .collect())
+}
+
+/// One reference to each of `keys` that any execution on this shard holds.
+///
+/// A copied history can name a blob that its direct source does not
+/// reference. A reset from before issue #2000 copied envelopes without
+/// references, for example. The rows are locked `FOR SHARE`. Retention then
+/// cannot drop the last reference to a blob before the caller commits its own.
+#[cfg(feature = "db")]
+pub async fn load_payload_refs_for_keys(
+    conn: &mut AsyncPgConnection,
+    keys: &[String],
+) -> HarvestResult<Vec<crate::payload_store::OffloadedRef>> {
+    use crate::schema::harvest_payload_refs::dsl;
+
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let rows: Vec<(String, String, i64)> = dsl::harvest_payload_refs
+        .filter(dsl::blob_key.eq_any(wanted))
+        .select((dsl::blob_key, dsl::store_id, dsl::byte_len))
+        .for_share()
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(rows
+        .into_iter()
+        .filter(|(blob_key, _, _)| seen.insert(blob_key.clone()))
         .map(
             |(blob_key, store_id, byte_len)| crate::payload_store::OffloadedRef {
                 blob_key,
