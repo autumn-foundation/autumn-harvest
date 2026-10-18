@@ -202,6 +202,11 @@ impl CacheIndex for InMemoryCacheIndex {
 ///
 /// Clones share the store, the index and the codec registry.
 ///
+/// Give the cache its own store. The cache tracks its blobs in the index, not in
+/// `harvest_payload_refs`. The orphan sweep of the engine store (issue #2123)
+/// deletes old blobs that no execution references, so a shared store loses its
+/// cache entries.
+///
 /// ```
 /// # fn demo(
 /// #     model: std::sync::Arc<dyn autumn_harvest_agent::AgentModel>,
