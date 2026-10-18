@@ -35,13 +35,14 @@ a PAUSED run.
 
 ## Write cost
 
-5,000-row bulk updates, WAL bytes (`write_cost.sql`, 300k executions):
+Bulk updates, WAL bytes (`write_cost.sql`, 300k executions). The first two move 5,000 rows each.
+The last moves 5,300: the fixture starts with 300 PAUSED runs, and the script pauses 5,000 more.
 
 | transition | without index | with index |
 |:--|--:|--:|
 | RUNNING to COMPLETED | 82,430,680 | 82,448,848 |
 | COMPLETED to PAUSED | 10,280,960 | 10,731,520 |
-| PAUSED to RUNNING | 11,763,712 | 10,592,256 |
+| PAUSED to RUNNING (5,300 rows) | 11,763,712 | 10,592,256 |
 
 The first update after a checkpoint pays full-page writes, so read the columns as a comparison
 and not as a per-row cost.
