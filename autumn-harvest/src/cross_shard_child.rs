@@ -84,6 +84,17 @@ const POLL_BATCH: i64 = 1_000;
 const DUE_PREDICATE: &str = "(last_attempt_at IS NULL OR last_attempt_at < NOW() - \
      (LEAST(attempts, 6) * INTERVAL '5 seconds'))";
 
+diesel::define_sql_function! {
+    /// SQL `COALESCE` over two nullable text values.
+    fn coalesce(
+        first: diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        second: diesel::sql_types::Nullable<diesel::sql_types::Text>,
+    ) -> diesel::sql_types::Nullable<diesel::sql_types::Text>;
+}
+
+/// The `WorkflowCancelled` reason when the parent stored none (issue #2194).
+const CROSS_SHARD_CANCEL_REASON: &str = "parent requested cancellation";
+
 /// Recorded as the `WorkflowCancelled` reason for a child born cancelled
 /// (issue #1263 item 13). See [`start_child_on_target`]'s cancellation arm.
 const CROSS_SHARD_BORN_CANCELLED_REASON: &str =
@@ -403,6 +414,10 @@ pub async fn record_cross_shard_child_with_codecs(
 /// failure is picked up on the very next sweep — a cancel is latency-sensitive
 /// in a way a routine poll is not.
 ///
+/// `reason` is the text for the child's `WorkflowCancelled` event (issue #2194).
+/// The first stored reason wins, as the first cancel of a same-shard child does.
+/// `None` stores no reason, and the relay uses [`CROSS_SHARD_CANCEL_REASON`].
+///
 /// Returns the number of rows flagged — `0` means the child is not (or is no
 /// longer) a tracked cross-shard child, which the caller treats as "nothing to
 /// do here".
@@ -413,10 +428,15 @@ pub async fn record_cross_shard_child_with_codecs(
 pub async fn request_cross_shard_cancel(
     conn: &mut AsyncPgConnection,
     child_exec_id: ExecutionId,
+    reason: Option<&str>,
 ) -> HarvestResult<usize> {
     diesel::update(harvest_cross_shard_children::table.find(child_exec_id.as_uuid()))
         .set((
             harvest_cross_shard_children::cancel_requested.eq(true),
+            harvest_cross_shard_children::cancel_reason.eq(coalesce(
+                harvest_cross_shard_children::cancel_reason,
+                reason,
+            )),
             harvest_cross_shard_children::last_attempt_at.eq(None::<DateTime<Utc>>),
             harvest_cross_shard_children::attempts.eq(0),
         ))
@@ -1152,6 +1172,7 @@ async fn apply_action(
                 diesel::update(harvest_cross_shard_children::table.find(row.child_exec_id))
                     .set((
                         harvest_cross_shard_children::cancel_requested.eq(false),
+                        harvest_cross_shard_children::cancel_reason.eq(None::<String>),
                         harvest_cross_shard_children::last_error.eq(None::<String>),
                         harvest_cross_shard_children::attempts.eq(0),
                     ))
@@ -1714,7 +1735,9 @@ async fn cancel_child_on_target(
     let result = crate::execution::cancel_workflow_execution(
         &mut conn,
         child_exec_id,
-        "parent requested cancellation",
+        row.cancel_reason
+            .as_deref()
+            .unwrap_or(CROSS_SHARD_CANCEL_REASON),
         metrics,
     )
     .await;

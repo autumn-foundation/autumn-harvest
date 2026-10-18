@@ -1541,6 +1541,8 @@ pub struct CrossShardChildRow {
     pub attempts: i32,
     pub last_error: Option<String>,
     pub last_attempt_at: Option<DateTime<Utc>>,
+    /// The reason that the parent gave its cancel. `None` = the generic text.
+    pub cancel_reason: Option<String>,
 }
 
 /// Insertable form of [`CrossShardChildRow`], written inside the parent's own
