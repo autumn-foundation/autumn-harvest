@@ -1043,6 +1043,31 @@ async fn a_later_reason_fills_an_empty_one() {
     );
 }
 
+/// **Issue #2194.** A stored reason is trimmed, as a same-shard cancel trims it,
+/// whether the child is created first or born cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_cancel_reason_is_trimmed() {
+    let started = cancel_child(&[Some("  scope  ")], false, "cancel-reason-7").await;
+    assert_eq!(started.as_deref(), Some("scope"));
+    let born = cancel_child(&[Some("  scope  ")], true, "cancel-reason-8").await;
+    assert_eq!(born.as_deref(), Some("scope"));
+}
+
+/// **Issue #2194.** A blank reason counts as no reason, so it neither blocks a
+/// later reason nor reaches the child's event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blank_cancel_reason_counts_as_none() {
+    let started = cancel_child(&[Some("   ")], false, "cancel-reason-9").await;
+    assert_eq!(started.as_deref(), Some("parent requested cancellation"));
+    let born = cancel_child(&[Some("")], true, "cancel-reason-10").await;
+    assert_eq!(
+        born.as_deref(),
+        Some("parent requested cancellation before the relay created this child")
+    );
+    let later = cancel_child(&[Some(" "), Some("scope")], false, "cancel-reason-11").await;
+    assert_eq!(later.as_deref(), Some("scope"));
+}
+
 /// **Issue #2194.** A child that the parent cancels before creation is born
 /// cancelled with the stored reason. A race loser usually takes this path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -415,8 +415,9 @@ pub async fn record_cross_shard_child_with_codecs(
 ///
 /// `reason` is the text for the child's `WorkflowCancelled` event (issue #2194).
 /// The first stored reason wins, as the first cancel of a same-shard child does.
-/// `None` adds no reason, and a reason stored earlier stays. With no reason, the
-/// relay uses [`CROSS_SHARD_CANCEL_REASON`].
+/// `None` adds no reason, and a reason stored earlier stays. A blank reason
+/// counts as `None`, and the relay trims any other reason, as a same-shard
+/// cancel does. With no reason, the relay uses [`CROSS_SHARD_CANCEL_REASON`].
 ///
 /// Returns the number of rows flagged — `0` means the child is not (or is no
 /// longer) a tracked cross-shard child, which the caller treats as "nothing to
@@ -430,6 +431,7 @@ pub async fn request_cross_shard_cancel(
     child_exec_id: ExecutionId,
     reason: Option<&str>,
 ) -> HarvestResult<usize> {
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
     diesel::update(harvest_cross_shard_children::table.find(child_exec_id.as_uuid()))
         .set((
             harvest_cross_shard_children::cancel_requested.eq(true),
