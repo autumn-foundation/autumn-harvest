@@ -9,7 +9,7 @@
 use autumn_harvest::prelude::*;
 
 /// What one experiment did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum Status {
     /// Kept the change.
     Keep,
