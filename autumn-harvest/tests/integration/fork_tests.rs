@@ -2407,3 +2407,328 @@ async fn a_reset_keeps_the_quota_key_of_its_source() {
         Some("tenant-a")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Retention keeps the source of a recorded fork (issue #2122).
+// ---------------------------------------------------------------------------
+
+/// The age past which the retention tests delete a run of their tenant.
+const RETENTION_AGE: Duration = Duration::from_secs(86_400);
+
+/// Put `exec` in `tenant` and make it older than [`RETENTION_AGE`].
+///
+/// Only the runs of a unique tenant are candidates, so a tick leaves the
+/// rows of other tests alone. A fork takes the tenant of its source.
+async fn age_into_tenant(conn: &mut AsyncPgConnection, exec: ExecutionId, tenant: &str) {
+    diesel::update(harvest_workflow_executions::table.find(exec.as_uuid()))
+        .set((
+            harvest_workflow_executions::tenant.eq(Some(tenant)),
+            harvest_workflow_executions::completed_at
+                .eq(Some(Utc::now() - chrono::Duration::days(30))),
+        ))
+        .execute(conn)
+        .await
+        .expect("age the run into the tenant");
+}
+
+/// A completed source in a unique tenant, older than [`RETENTION_AGE`].
+async fn aged_source(url: &str, pool: &DbPool, label: &str) -> (ExecutionId, String) {
+    let queue = unique(label);
+    let source = completed_source(url, pool, &queue, &queue).await;
+    age_into_tenant(&mut connect(url).await, source, &queue).await;
+    (source, queue)
+}
+
+/// Run one retention tick that deletes only the old runs of `tenant`.
+async fn retention_tick(
+    pool: &DbPool,
+    tenant: &str,
+    archiver: Option<Arc<dyn autumn_harvest::HistoryArchiver>>,
+) -> autumn_harvest::retention::RetentionTickResult {
+    let config = autumn_harvest::retention::RetentionConfig {
+        max_age_secs: None,
+        audit_retention_days: 0,
+        schedule_decision_retention_days: 0,
+        ..autumn_harvest::retention::RetentionConfig::default()
+    }
+    .with_tenant_override(tenant, RETENTION_AGE);
+    let runtime = autumn_harvest::retention::RetentionRuntime::spawn(
+        autumn_harvest::shard::ShardedDbPool::single(pool.clone()),
+        config,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+        archiver,
+        None,
+    )
+    .expect("a tenant override turns retention on");
+    runtime.run_now();
+    let mut result = None;
+    for _ in 0..400 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(tick) = runtime
+            .monitor()
+            .snapshot()
+            .per_shard
+            .into_iter()
+            .find(|tick| tick.shard == 0 && tick.ran_at.is_some())
+        {
+            result = Some(tick);
+            break;
+        }
+    }
+    runtime.shutdown();
+    let tick = result.expect("the retention tick reports in time");
+    assert_eq!(tick.last_error, None, "the retention tick must not fail");
+    tick
+}
+
+async fn exists(conn: &mut AsyncPgConnection, exec: ExecutionId) -> bool {
+    harvest_workflow_executions::table
+        .find(exec.as_uuid())
+        .count()
+        .get_result::<i64>(conn)
+        .await
+        .expect("count the run")
+        == 1
+}
+
+async fn end_run(conn: &mut AsyncPgConnection, exec: ExecutionId) {
+    autumn_harvest::execution::terminate_workflow_execution(
+        conn,
+        exec,
+        "done",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("terminate the run");
+}
+
+/// AC1: retention keeps a terminal source while a recorded fork runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_the_source_of_a_live_recorded_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "pin").await;
+    // No worker polls the queue, so the fork stays `RUNNING`.
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+
+    let archiver = Arc::new(ForkRaceArchiver::new(&url, None));
+    retention_tick(&pool, &tenant, Some(archiver.clone() as _)).await;
+
+    let mut conn = connect(&url).await;
+    assert!(exists(&mut conn, source).await, "the fork reads the source");
+    assert!(exists(&mut conn, forked).await);
+    assert!(
+        archiver.archived().is_empty(),
+        "a kept source is not archived"
+    );
+}
+
+/// AC2: the source is a candidate again once each recorded fork has ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_deletes_the_source_once_its_recorded_forks_end() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "unpin").await;
+    let first = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let second = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let mut conn = connect(&url).await;
+
+    end_run(&mut conn, first).await;
+    retention_tick(&pool, &tenant, None).await;
+    assert!(exists(&mut conn, source).await, "one fork still runs");
+
+    end_run(&mut conn, second).await;
+    let tick = retention_tick(&pool, &tenant, None).await;
+    assert!(!exists(&mut conn, source).await, "no fork reads the source");
+    assert_eq!(tick.deleted_count, 1, "only the source is old enough");
+}
+
+/// AC3: a live fork does not read its source, so it does not keep it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_does_not_keep_the_source_of_a_live_mode_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "live").await;
+    let forked = fork(&url, source, request(ForkEffects::Live)).await;
+
+    retention_tick(&pool, &tenant, None).await;
+
+    let mut conn = connect(&url).await;
+    assert!(!exists(&mut conn, source).await, "a live fork pins nothing");
+    assert!(exists(&mut conn, forked).await);
+}
+
+/// A recorded fork keeps its whole fork lineage. A reset or a new fork of
+/// it walks that lineage and refuses a gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_the_lineage_of_a_recorded_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "lineage").await;
+    let first = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let mut conn = connect(&url).await;
+    end_run(&mut conn, first).await;
+    age_into_tenant(&mut conn, first, &tenant).await;
+    let second = fork(&url, first, request(ForkEffects::Recorded)).await;
+
+    retention_tick(&pool, &tenant, None).await;
+    assert!(exists(&mut conn, source).await, "the lineage root stays");
+    assert!(exists(&mut conn, first).await, "the record source stays");
+
+    // The lineage stays usable: a new fork of the live fork walks it.
+    fork(&url, second, request(ForkEffects::Recorded)).await;
+}
+
+/// A reset of a recorded fork names the sealed fork as its source. Its
+/// marker names the original source, which it reads. Both stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_the_lineage_of_a_reset_of_a_recorded_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "reset-pin").await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let mut conn = connect(&url).await;
+    let reset = reset_workflow_execution(&mut conn, forked, reset_request(), Some(&registry()))
+        .await
+        .expect("reset the fork");
+    age_into_tenant(&mut conn, forked, &tenant).await;
+
+    retention_tick(&pool, &tenant, None).await;
+    assert!(exists(&mut conn, source).await, "the reset reads the source");
+    assert!(exists(&mut conn, forked).await, "the sealed fork stays");
+    assert!(exists(&mut conn, reset.new_exec_id).await);
+}
+
+/// An archiver that records each archived run. When `fork_on` names the run,
+/// it forks that run from inside `archive()`. The fork then commits after the
+/// candidate scan and before the delete.
+///
+/// With `hold_open`, the fork runs in a transaction that locks the source
+/// `FOR SHARE` first and commits later. `archive()` returns once the lock is
+/// held, so the delete waits on the fork.
+struct ForkRaceArchiver {
+    url: String,
+    fork_on: Option<ExecutionId>,
+    hold_open: bool,
+    archived: Mutex<Vec<ExecutionId>>,
+    forks: Mutex<Vec<tokio::task::JoinHandle<ExecutionId>>>,
+}
+
+impl ForkRaceArchiver {
+    fn new(url: &str, fork_on: Option<ExecutionId>) -> Self {
+        Self {
+            url: url.to_string(),
+            fork_on,
+            hold_open: false,
+            archived: Mutex::default(),
+            forks: Mutex::default(),
+        }
+    }
+
+    fn archived(&self) -> Vec<ExecutionId> {
+        self.archived.lock().expect("archived lock").clone()
+    }
+
+    async fn forks(&self) -> Vec<ExecutionId> {
+        let handles = std::mem::take(&mut *self.forks.lock().expect("forks lock"));
+        let mut forks = Vec::new();
+        for handle in handles {
+            forks.push(handle.await.expect("the fork task must not panic"));
+        }
+        forks
+    }
+}
+
+/// Fork `source` in a transaction that holds the source lock for a while.
+async fn fork_held_open(
+    url: String,
+    source: ExecutionId,
+    locked: tokio::sync::oneshot::Sender<()>,
+) -> ExecutionId {
+    let mut conn = connect(&url).await;
+    conn.transaction::<_, diesel::result::Error, _>(async |conn| {
+        harvest_workflow_executions::table
+            .find(source.as_uuid())
+            .for_share()
+            .select(harvest_workflow_executions::id)
+            .first::<Uuid>(conn)
+            .await?;
+        locked.send(()).expect("the archiver waits for the lock");
+        // The delete reaches its row lock in this window and waits.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        Ok(
+            fork_workflow_execution(conn, source, request(ForkEffects::Recorded), Some(&registry()))
+                .await
+                .expect("the fork commits inside the open transaction")
+                .new_exec_id,
+        )
+    })
+    .await
+    .expect("commit the held fork")
+}
+
+impl autumn_harvest::HistoryArchiver for ForkRaceArchiver {
+    fn archive(
+        &self,
+        doc: &autumn_harvest::history_export::HistoryExportDocument,
+    ) -> autumn_harvest::ArchiverFuture<'_> {
+        let exec = doc.execution_id;
+        Box::pin(async move {
+            self.archived.lock().expect("archived lock").push(exec);
+            if self.fork_on != Some(exec) {
+                return Ok(());
+            }
+            let handle = if self.hold_open {
+                let (locked, held) = tokio::sync::oneshot::channel();
+                let handle = tokio::spawn(fork_held_open(self.url.clone(), exec, locked));
+                held.await.expect("the fork takes the source lock");
+                handle
+            } else {
+                let forked = fork(&self.url, exec, request(ForkEffects::Recorded)).await;
+                tokio::spawn(async move { forked })
+            };
+            self.forks.lock().expect("forks lock").push(handle);
+            Ok(())
+        })
+    }
+}
+
+/// AC4: a fork that commits after the candidate scan still keeps the source.
+/// The delete re-checks under its row lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_committed_after_the_scan_keeps_the_source() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "race").await;
+
+    let archiver = Arc::new(ForkRaceArchiver::new(&url, Some(source)));
+    retention_tick(&pool, &tenant, Some(archiver.clone() as _)).await;
+
+    assert_eq!(archiver.archived(), vec![source], "the scan chose the source");
+    let forks = archiver.forks().await;
+    assert_eq!(forks.len(), 1, "the archiver forked the source");
+    let mut conn = connect(&url).await;
+    assert!(exists(&mut conn, source).await, "the delete saw the new fork");
+}
+
+/// AC4: a fork that holds the source lock when the delete reaches it still
+/// keeps the source. The re-check runs after the lock wait, so it sees the
+/// fork that committed in that wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_in_flight_at_the_delete_keeps_the_source() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "in-flight").await;
+
+    let archiver = Arc::new(ForkRaceArchiver {
+        hold_open: true,
+        ..ForkRaceArchiver::new(&url, Some(source))
+    });
+    retention_tick(&pool, &tenant, Some(archiver.clone() as _)).await;
+
+    let forks = archiver.forks().await;
+    assert_eq!(forks.len(), 1, "the held fork committed");
+    let mut conn = connect(&url).await;
+    assert!(exists(&mut conn, source).await, "the delete saw the held fork");
+    assert!(exists(&mut conn, forks[0]).await);
+}
