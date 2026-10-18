@@ -340,10 +340,10 @@ The steps to submit:
 7. Invite co-owners on the issue and in `#otel-semantic-conventions` on
    the CNCF Slack. Ask the authors of `dapr/dapr#9213` and of
    `open-telemetry/semantic-conventions#1688`.
-8. When the leads, a TC Escalation Sponsor, a delegated sponsor and a GC
-   liaison agree, fill the open slots of the
-   [project proposal](project-proposal.md). Add the issue link and delete
-   the note at the top. Then open a pull request in
+8. When the leads, a TC Escalation Sponsor and a GC liaison agree, fill
+   their slots in the [project proposal](project-proposal.md). The
+   delegated sponsor slot is optional, so it can stay open. Add the issue
+   link and delete the note at the top. Then open a pull request in
    `open-telemetry/community` that adds it to `projects/`. Ask for the
    label `area/project-proposal`.
 9. After the TC review and the GC approval, set up the project. It needs
