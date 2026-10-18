@@ -211,6 +211,9 @@ pub enum QuiescenceBlocker {
     /// would not see them and would fail closed. A reset of a fork reads the
     /// source of the fork it resets. So every run in the lineage stays until
     /// each live fork is terminal.
+    ///
+    /// A `FAILED` fork with a dead letter counts as live, because a redrive
+    /// can reopen it (issue #2122).
     LiveFork,
 }
 
@@ -723,30 +726,39 @@ mod db {
         resolve_forward_chain,
     };
 
-    /// The fork lineage of every live fork, as `lineage.source_ref` rows (issue
-    /// #2000). It starts at the source of each non-terminal fork. It then
-    /// follows `start_source_ref` up while the row is a fork, for at most 64
-    /// links. A reset of a fork names the sealed fork as its source, but its
+    /// The fork lineage of every open fork, as `lineage.source_ref` rows (issue
+    /// #2000). It starts at the source of each open fork. It then follows
+    /// `start_source_ref` up while the row is a fork, for at most 65 links. A reset of a fork names the sealed fork as its source, but its
     /// marker names the original source. So the walk must reach past the
     /// sealed fork. A macro, so both predicates use one literal.
     ///
     /// The partial index `idx_harvest_we_fork_source` serves the seed, so it
     /// reads only fork rows. The step joins on the primary key. A reference
     /// that is not a UUID ends the walk instead of failing the cast.
+    ///
+    /// Retention reads the same open-fork predicate and link bound (issue
+    /// #2122). A `FAILED` fork with a dead letter is open, because a redrive
+    /// can reopen it.
     macro_rules! live_fork_lineage_sql {
         () => {
-            "WITH RECURSIVE lineage(source_ref, depth) AS ( \
+            concat!(
+                "WITH RECURSIVE lineage(source_ref, depth) AS ( \
                 SELECT f.start_source_ref, 1 FROM harvest_workflow_executions f \
                  WHERE f.start_source = 'fork' \
-                   AND f.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED') \
+                   AND ",
+                crate::fork::open_fork_sql!(),
+                " \
                 UNION \
                 SELECT p.start_source_ref, l.depth + 1 FROM lineage l \
                   JOIN harvest_workflow_executions p ON p.id = CASE \
                     WHEN l.source_ref ~* \
                       '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
                     THEN l.source_ref::uuid END \
-                 WHERE p.start_source = 'fork' AND l.depth < 64 \
+                 WHERE p.start_source = 'fork' AND l.depth < ",
+                crate::fork::max_stored_fork_links_sql!(),
+                " \
              ) SELECT 1 FROM lineage l WHERE l.source_ref = e.id::text"
+            )
         };
     }
 

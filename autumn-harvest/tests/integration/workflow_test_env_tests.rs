@@ -2784,6 +2784,83 @@ async fn test_worker_session_pipeline_auto_resolves_reserved_activities() {
     );
 }
 
+/// Opens a session, drops it with no `complete()`, then runs one activity.
+fn dropped_session_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .map_err(|e| e.to_string())?;
+        drop(session);
+        ctx.execute_activity_raw("after_drop", json!(null), "default")
+            .await
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Issue #2193: the harness resolves the drop release with no mock, and the
+/// recorded history replays without a positional shift.
+#[tokio::test]
+async fn the_test_env_resolves_a_drop_release() {
+    let outcome = WorkflowTestEnv::new()
+        .mock_activity("after_drop", |_| Ok(json!("done")))
+        .run(dropped_session_workflow, json!(null))
+        .await;
+
+    assert_eq!(outcome.result, Ok(json!("done")), "{:?}", outcome.result);
+    assert!(
+        outcome.events().iter().any(|e| matches!(
+            e,
+            WorkflowEvent::ActivityScheduled { name, .. }
+                if name == "__harvest_session_drop_release"
+        )),
+        "expected ActivityScheduled for the drop release"
+    );
+
+    let report = outcome.replay_check(dropped_session_workflow).await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a dropped session must replay deterministically:\n{report}"
+    );
+}
+
+/// Opens a session and drops it, then returns. No cycle suspends after the
+/// drop, so the engine discards the release.
+fn dropped_session_then_return_workflow<'a>(
+    ctx: &'a WorkflowContext,
+    _input: Value,
+) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+    Box::pin(async move {
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .map_err(|e| e.to_string())?;
+        drop(session);
+        Ok(json!("done"))
+    })
+}
+
+/// Issue #2193: a run that ends right after a drop never records the
+/// release. Strict replay must still pass.
+#[tokio::test]
+async fn a_completed_run_with_a_dropped_session_replays_strictly() {
+    let outcome = WorkflowTestEnv::new()
+        .run(dropped_session_then_return_workflow, json!(null))
+        .await;
+    assert_eq!(outcome.result, Ok(json!("done")), "{:?}", outcome.result);
+
+    let report = outcome
+        .replay_check(dropped_session_then_return_workflow)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "a completed run with a dropped session must replay strictly:\n{report}"
+    );
+}
+
 #[tokio::test]
 async fn test_worker_session_auto_resolved_host_is_stable_across_replay() {
     // Run once to get recorded history, then replay it directly and confirm

@@ -914,6 +914,9 @@ impl HistoryMatcher {
             }
         }
         let race_reserved_signal_events = Self::build_race_reserved_signal_events(&events);
+        // A drop release has no awaiter (issue #2193). Its records never
+        // shift a positional match.
+        transparent_events.extend(Self::drop_release_indices(&events));
 
         Self {
             events,
@@ -2067,6 +2070,53 @@ impl HistoryMatcher {
             || !self.pending_external_signals.is_empty()
             || !self.pending_external_cancels.is_empty()
             || !self.pending_external_awaits.is_empty()
+    }
+
+    /// Whether history holds a drop release for `session` (issue #2193).
+    ///
+    /// This scans history. A field would grow every workflow future that
+    /// embeds the matcher past the large-future lint limit.
+    #[must_use]
+    pub(crate) fn has_drop_release(&self, session: crate::types::SessionId) -> bool {
+        let wanted = session.to_string();
+        self.events.iter().any(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ActivityScheduled { name, input, .. }
+                    if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+                        && input.as_str() == Some(wanted.as_str())
+            )
+        })
+    }
+
+    /// Indices of the records of each drop release in `events` (issue #2193).
+    ///
+    /// A record is the `ActivityScheduled` event of the reserved name and every
+    /// later event with the same activity id.
+    pub(crate) fn drop_release_indices(events: &[WorkflowEvent]) -> Vec<usize> {
+        let mut releases: HashSet<ActivityExecId> = HashSet::new();
+        let mut indices = Vec::new();
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                WorkflowEvent::ActivityScheduled {
+                    activity_id, name, ..
+                } if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME => {
+                    releases.insert(*activity_id);
+                    indices.push(i);
+                }
+                WorkflowEvent::ActivityStarted { activity_id, .. }
+                | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
+                | WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                    if releases.contains(activity_id) =>
+                {
+                    indices.push(i);
+                }
+                _ => {}
+            }
+        }
+        indices
     }
 
     /// Number of events loaded into this replay matcher.
@@ -10126,6 +10176,124 @@ mod tests {
         assert!(
             matcher.is_consumed(1) && matcher.is_consumed(2),
             "the #510 redrive-anchored transparency is unchanged"
+        );
+    }
+
+    /// A history with one drop release of `session` and an activity `charge`
+    /// after it. The release has a started and a completed event.
+    fn drop_release_history(session: uuid::Uuid) -> Vec<WorkflowEvent> {
+        let release_id = ActivityExecId::new();
+        let charge_id = ActivityExecId::new();
+        vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: release_id,
+                name: crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME.into(),
+                input: Value::from(session.to_string()),
+                queue: "gpu".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: charge_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: release_id,
+                worker_id: crate::types::WorkerId::new("w"),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: release_id,
+                output: Value::Null,
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: charge_id,
+                output: Value::from("ok"),
+            },
+        ]
+    }
+
+    /// Issue #2193: a drop release has no awaiter, so replay passes over its
+    /// records. The next activity still matches at its own position.
+    #[test]
+    fn a_drop_release_record_is_transparent_to_the_matcher() {
+        let session = uuid::Uuid::new_v4();
+        let mut matcher = HistoryMatcher::new(drop_release_history(session));
+        for idx in [1, 3, 4] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} of the drop release must be transparent"
+            );
+        }
+        assert!(!matcher.is_consumed(2), "an ordinary activity stays opaque");
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_activity("charge"),
+            HistoryMatch::Matched {
+                output: Value::from("ok")
+            }
+        );
+        assert!(!matcher.has_non_lifecycle_unconsumed());
+    }
+
+    /// Issue #2193: a retried, timed-out or beating release stays transparent.
+    #[test]
+    fn every_record_shape_of_a_drop_release_is_transparent() {
+        let session = uuid::Uuid::new_v4();
+        let extra: [fn(ActivityExecId) -> WorkflowEvent; 3] = [
+            |activity_id| WorkflowEvent::ActivityHeartbeat {
+                activity_id,
+                details: Value::Null,
+            },
+            |activity_id| WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: "host gone".into(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: false,
+            },
+            |activity_id| WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: crate::error::TimeoutType::StartToClose,
+            },
+        ];
+        for make in extra {
+            let mut events = drop_release_history(session);
+            let release_id = match &events[1] {
+                WorkflowEvent::ActivityScheduled { activity_id, .. } => *activity_id,
+                other => panic!("expected the release, got {other:?}"),
+            };
+            events.insert(4, make(release_id));
+            let mut matcher = HistoryMatcher::new(events);
+            assert!(
+                matcher.is_consumed(4),
+                "the extra record must be transparent"
+            );
+            matcher.advance(); // past WorkflowStarted
+            assert!(matches!(
+                matcher.match_activity("charge"),
+                HistoryMatch::Matched { .. }
+            ));
+            assert!(!matcher.has_non_lifecycle_unconsumed());
+        }
+    }
+
+    /// Issue #2193: the matcher reports which sessions history already
+    /// released, so a replayed drop issues nothing.
+    #[test]
+    fn the_matcher_reports_a_session_that_history_released() {
+        let session = uuid::Uuid::new_v4();
+        let matcher = HistoryMatcher::new(drop_release_history(session));
+        assert!(matcher.has_drop_release(crate::types::SessionId::from_uuid(session)));
+        assert!(
+            !matcher.has_drop_release(crate::types::SessionId::from_uuid(uuid::Uuid::new_v4()))
         );
     }
 

@@ -844,6 +844,7 @@ impl HandlerRegistry {
         for name in [
             crate::context::SESSION_ACQUIRE_ACTIVITY_NAME,
             crate::context::SESSION_RELEASE_ACTIVITY_NAME,
+            crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME,
         ] {
             activities.insert(name.to_string(), session_internal_activity_info(name));
         }
@@ -2409,11 +2410,55 @@ impl TerminalCommandPolicy {
     }
 }
 
+/// Whether `cmd` is the release of a dropped session (issue #2193).
+fn is_drop_release(cmd: &WorkflowCommand) -> bool {
+    matches!(
+        cmd,
+        WorkflowCommand::ScheduleActivity { name, .. }
+            if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+    )
+}
+
+/// Drops the release of a dropped session from a suspension that has a
+/// dedicated persist path (issue #2193).
+///
+/// An inline local activity, a mutex acquire and an external activity each
+/// refuse a batch that holds another activity. The release is a cleanup, so
+/// the cycle discards it. The workflow wakes and replays the body. The
+/// dropped session drops again, and the next suspension issues the release.
+fn discard_drop_release_for_dedicated_shape(outcome: WorkflowOutcome) -> WorkflowOutcome {
+    match outcome {
+        WorkflowOutcome::Suspended { mut commands }
+            if commands.iter().any(|c| {
+                matches!(
+                    c,
+                    WorkflowCommand::RunLocalActivity { .. }
+                        | WorkflowCommand::AcquireMutex { .. }
+                        | WorkflowCommand::ScheduleExternalActivity { .. }
+                )
+            }) =>
+        {
+            commands.retain(|c| !is_drop_release(c));
+            WorkflowOutcome::Suspended { commands }
+        }
+        other => other,
+    }
+}
+
 /// The terminal-cycle policy for `cmd` — see [`TerminalCommandPolicy`].
 ///
 /// Exhaustive by construction (no `_` arm): this is the AC4 audit of issue #952
 /// as a compile-time invariant rather than a comment that can rot.
-pub(crate) const fn terminal_command_policy(cmd: &WorkflowCommand) -> TerminalCommandPolicy {
+pub(crate) fn terminal_command_policy(cmd: &WorkflowCommand) -> TerminalCommandPolicy {
+    // A dropped session's release (issue #2193) is a `ScheduleActivity` that
+    // no body awaits. The match below stays exhaustive for every other command.
+    if is_drop_release(cmd) {
+        return TerminalCommandPolicy::NoRecord(
+            "no body awaits a drop release, and the broken-session scanner reaps the \
+             session of a run that ends. A suspension records it. A terminal cycle \
+             would only add an abandoned pair that replay must skip",
+        );
+    }
     match cmd {
         // ── Recorded as pre-terminal events, in command-emission order ──────
         WorkflowCommand::RecordMarker { .. }
@@ -11233,6 +11278,13 @@ async fn fail_activities_for_broken_sessions(
         let Some(reason) = broken.get(&session_uuid) else {
             continue;
         };
+        // A drop release (issue #2193) has no awaiter. Its task is pinned to
+        // a host that may be gone, so nothing would claim it. Fail the task
+        // row and record no failure event. The run needs no wake.
+        if scheduled.name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME {
+            queue::fail_task(conn, *activity_task_id, reason).await?;
+            continue;
+        }
         let failed_event = WorkflowEvent::ActivityFailed {
             activity_id: scheduled.activity_id,
             error: reason.clone(),
@@ -15007,78 +15059,84 @@ async fn finalize_activity_completion_write(
 
     let result = Box::pin(
         conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
-            let mut output = output.clone();
-            let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
-            if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
-                return Ok(queue::ClaimWrite::LeaseLost);
-            }
-            // A lost lease is a no-op, not an error (issue #1789). The later
-            // claim owns the outcome of this activity.
-            if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
-                log_lease_lost(task, "activity completion");
-                return Ok(queue::ClaimWrite::LeaseLost);
-            }
-            // The blob is already in the store (issue #1986). Its reference
-            // row commits with the event, so retention can delete the blob.
-            if let Some(stored) = stored {
-                store::insert_payload_refs(
+            // Issue #2125: the event and the wake stage once, with the stamp
+            // of the event insert.
+            crate::notify::coalesced(conn, async |conn| {
+                let mut output = output.clone();
+                let history =
+                    lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
+                if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
+                    return Ok(queue::ClaimWrite::LeaseLost);
+                }
+                // A lost lease is a no-op, not an error (issue #1789). The later
+                // claim owns the outcome of this activity.
+                if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
+                    log_lease_lost(task, "activity completion");
+                    return Ok(queue::ClaimWrite::LeaseLost);
+                }
+                // The blob is already in the store (issue #1986). Its reference
+                // row commits with the event, so retention can delete the blob.
+                if let Some(stored) = stored {
+                    store::insert_payload_refs(
+                        conn,
+                        exec_id,
+                        &[crate::payload_store::OffloadedRef {
+                            blob_key: stored.key.clone(),
+                            store_id: stored.store_id.clone(),
+                            byte_len: stored.len,
+                        }],
+                    )
+                    .await?;
+                    output = stored.to_recorded_value();
+                }
+                let completion_event = WorkflowEvent::ActivityCompleted {
+                    activity_id,
+                    output: output.clone(),
+                };
+                // A stored reference is already out of line. Ordinary offload
+                // would upload it again under a low threshold.
+                let offloader = offloader.filter(|_| stored.is_none());
+                store::append_events_offloaded_with_codecs(
                     conn,
                     exec_id,
-                    &[crate::payload_store::OffloadedRef {
-                        blob_key: stored.key.clone(),
-                        store_id: stored.store_id.clone(),
-                        byte_len: stored.len,
-                    }],
+                    &[completion_event],
+                    history.next_event_id,
+                    offloader,
+                    codecs,
                 )
                 .await?;
-                output = stored.to_recorded_value();
-            }
-            let completion_event = WorkflowEvent::ActivityCompleted {
-                activity_id,
-                output: output.clone(),
-            };
-            // A stored reference is already out of line. Ordinary offload
-            // would upload it again under a low threshold.
-            let offloader = offloader.filter(|_| stored.is_none());
-            store::append_events_offloaded_with_codecs(
-                conn,
-                exec_id,
-                &[completion_event],
-                history.next_event_id,
-                offloader,
-                codecs,
-            )
-            .await?;
-            crate::llm_ledger::insert_ledger_rows(
-                conn,
-                exec_id,
-                history.next_event_id,
-                activity_name,
-                llm_calls,
-            )
-            .await?;
-            let row_output = encoded_row_output.clone().unwrap_or_else(|| output.clone());
-            queue::complete_claimed_task(conn, &claim_of_task(task)?, row_output)
-                .await?
-                .require_applied(task.id)?;
-            // Worker sessions (issue #606): a session member activity's
-            // completion pushes the session's lease forward, so a
-            // long-running but still-legitimate pipeline isn't reclaimed by
-            // the broken-session scanner's `expires_at < NOW()` check just
-            // because its steps individually outlast one sticky-timeout
-            // window. `task.session_id` is `None` for both ordinary
-            // activities and the reserved acquire/release activities
-            // themselves (neither is dispatched through `Session::
-            // execute_activity`), so this is scoped to genuine members only.
-            if let Some(session_uuid) = task.session_id {
-                crate::sessions::refresh_session_lease(
+                crate::llm_ledger::insert_ledger_rows(
                     conn,
-                    crate::types::SessionId::from_uuid(session_uuid),
+                    exec_id,
+                    history.next_event_id,
+                    activity_name,
+                    llm_calls,
                 )
                 .await?;
-            }
-            queue::wake_workflow_task(conn, exec_id).await?;
-            Ok(queue::ClaimWrite::Applied)
+                let row_output = encoded_row_output.clone().unwrap_or_else(|| output.clone());
+                queue::complete_claimed_task(conn, &claim_of_task(task)?, row_output)
+                    .await?
+                    .require_applied(task.id)?;
+                // Worker sessions (issue #606): a session member activity's
+                // completion pushes the session's lease forward, so a
+                // long-running but still-legitimate pipeline isn't reclaimed by
+                // the broken-session scanner's `expires_at < NOW()` check just
+                // because its steps individually outlast one sticky-timeout
+                // window. `task.session_id` is `None` for both ordinary
+                // activities and the reserved acquire/release activities
+                // themselves (neither is dispatched through `Session::
+                // execute_activity`), so this is scoped to genuine members only.
+                if let Some(session_uuid) = task.session_id {
+                    crate::sessions::refresh_session_lease(
+                        conn,
+                        crate::types::SessionId::from_uuid(session_uuid),
+                    )
+                    .await?;
+                }
+                queue::wake_workflow_task(conn, exec_id).await?;
+                Ok(queue::ClaimWrite::Applied)
+            })
+            .await
         }),
     )
     .await;
@@ -15153,43 +15211,49 @@ async fn finalize_activity_failure_write(
     // workflow propagates the error.
     let result = Box::pin(
         conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
-            let error = error.to_string();
-            let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
-            if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
-                return Ok(queue::ClaimWrite::LeaseLost);
-            }
-            // A lost lease is a no-op, not an error (issue #1789).
-            if let queue::ClaimLock::Lost { state } = lock_activity_claim(conn, task).await? {
-                log_lease_lost(task, "activity failure");
-                // If the task reached COMPLETED before the handler returned
-                // (e.g. via run_transactional) and the handler then returned
-                // Err, the error is discarded — the workflow already observed
-                // ActivityCompleted.  Emit a warning so the misuse is visible.
-                if state.as_deref() == Some("COMPLETED") {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        activity_name = %activity_name,
-                        "activity handler returned Err but task is already COMPLETED \
-                         (run_transactional committed it); the error is discarded and \
-                         the workflow observes ActivityCompleted — run_transactional \
-                         must be the final expression in the activity handler"
-                    );
+            // Issue #2125: the event and the wake stage once, with the stamp
+            // of the event insert.
+            crate::notify::coalesced(conn, async |conn| {
+                let error = error.to_string();
+                let history =
+                    lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
+                if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
+                    return Ok(queue::ClaimWrite::LeaseLost);
                 }
-                return Ok(queue::ClaimWrite::LeaseLost);
-            }
-            store::append_events_with_codecs(
-                conn,
-                exec_id,
-                &[failed_event],
-                history.next_event_id,
-                codecs,
-            )
-            .await?;
-            queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
-                .await?
-                .require_applied(task.id)?;
-            queue::wake_workflow_task(conn, exec_id).await?;
-            Ok(queue::ClaimWrite::Applied)
+                // A lost lease is a no-op, not an error (issue #1789).
+                if let queue::ClaimLock::Lost { state } = lock_activity_claim(conn, task).await? {
+                    log_lease_lost(task, "activity failure");
+                    // If the task reached COMPLETED before the handler returned
+                    // (e.g. via run_transactional) and the handler then returned
+                    // Err, the error is discarded — the workflow already observed
+                    // ActivityCompleted.  Emit a warning so the misuse is visible.
+                    if state.as_deref() == Some("COMPLETED") {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            activity_name = %activity_name,
+                            "activity handler returned Err but task is already COMPLETED \
+                             (run_transactional committed it); the error is discarded and \
+                             the workflow observes ActivityCompleted — run_transactional \
+                             must be the final expression in the activity handler"
+                        );
+                    }
+                    return Ok(queue::ClaimWrite::LeaseLost);
+                }
+                store::append_events_with_codecs(
+                    conn,
+                    exec_id,
+                    &[failed_event],
+                    history.next_event_id,
+                    codecs,
+                )
+                .await?;
+                queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
+                    .await?
+                    .require_applied(task.id)?;
+                queue::wake_workflow_task(conn, exec_id).await?;
+                Ok(queue::ClaimWrite::Applied)
+            })
+            .await
         }),
     )
     .await;
@@ -18409,7 +18473,8 @@ async fn handle_session_acquire(
 
 /// Handle the internal session-release activity (issue #606), dispatched by
 /// [`crate::context::Session::complete`] and hard-pinned to the session's
-/// host worker.
+/// host worker. A dropped [`crate::context::Session`] dispatches the same
+/// handler under another name (issue #2193).
 ///
 /// Marks the `harvest_sessions` row `COMPLETED` and frees the in-process
 /// slot before completing the task normally.
@@ -18436,8 +18501,18 @@ async fn handle_session_release(
     };
     let activity_id = ActivityExecId::from_uuid(activity_uuid);
 
+    // No body awaits a drop release (issue #2193). A permanent error fails the
+    // task only, so a failed cleanup cannot fail a healthy run.
+    let best_effort =
+        task.activity_name.as_deref() == Some(crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME);
+
     let Some(session_id) = session_id_of_input(&task.input, codecs) else {
         let error = "session-release task input is not a valid SessionId".to_string();
+        if best_effort {
+            return fail_task_only(&mut conn, task.id, &error)
+                .await
+                .map(|()| None);
+        }
         fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
     };
@@ -18449,6 +18524,11 @@ async fn handle_session_release(
             return Err(error);
         }
         let msg = error.to_string();
+        if best_effort {
+            return fail_task_only(&mut conn, task.id, &msg)
+                .await
+                .map(|()| None);
+        }
         fail_task_and_execution(&mut conn, task, worker_id, &msg, codecs).await?;
         return Err(error);
     }
@@ -18996,7 +19076,9 @@ async fn process_activity_task(
             )
             .await,
         )
-    } else if activity_name == crate::context::SESSION_RELEASE_ACTIVITY_NAME {
+    } else if activity_name == crate::context::SESSION_RELEASE_ACTIVITY_NAME
+        || activity_name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+    {
         Some(
             handle_session_release(
                 pool,
@@ -26339,6 +26421,7 @@ async fn process_workflow_task(
             .await;
         }
 
+        let run_outcome = discard_drop_release_for_dedicated_shape(run_outcome);
         match run_outcome {
             WorkflowOutcome::Suspended { commands }
                 if commands
@@ -43661,6 +43744,11 @@ mod tests {
                 .activities
                 .contains_key(crate::context::SESSION_RELEASE_ACTIVITY_NAME)
         );
+        assert!(
+            registry
+                .activities
+                .contains_key(crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME)
+        );
     }
 
     #[test]
@@ -43669,6 +43757,7 @@ mod tests {
         for name in [
             crate::context::SESSION_ACQUIRE_ACTIVITY_NAME,
             crate::context::SESSION_RELEASE_ACTIVITY_NAME,
+            crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME,
         ] {
             let info = registry
                 .activities
@@ -46940,6 +47029,48 @@ mod tests {
             rejected.contains("AwaitExternalWorkflow"),
             "the typed error must name the dropped sibling command: {rejected}"
         );
+    }
+
+    /// Issue #2193: a batch with a dedicated persist path drops the release.
+    /// Every other batch keeps it. An ordinary activity is never dropped.
+    #[test]
+    fn a_dedicated_shape_discards_the_drop_release() {
+        let release = || schedule_activity_cmd(crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME);
+        let names = |outcome: WorkflowOutcome| -> Vec<&'static str> {
+            let WorkflowOutcome::Suspended { commands } = outcome else {
+                panic!("expected a suspension");
+            };
+            commands.iter().map(workflow_command_name).collect()
+        };
+
+        let local = discard_drop_release_for_dedicated_shape(WorkflowOutcome::Suspended {
+            commands: vec![release(), run_local_cmd("format_data")],
+        });
+        assert_eq!(names(local), ["RunLocalActivity"]);
+
+        let external = discard_drop_release_for_dedicated_shape(WorkflowOutcome::Suspended {
+            commands: vec![
+                release(),
+                WorkflowCommand::AcquireMutex {
+                    key: "k".to_string(),
+                    result_tx: tokio::sync::oneshot::channel().0,
+                },
+            ],
+        });
+        assert_eq!(names(external), ["AcquireMutex"]);
+
+        let kept = discard_drop_release_for_dedicated_shape(WorkflowOutcome::Suspended {
+            commands: vec![release(), schedule_activity_cmd("charge")],
+        });
+        assert_eq!(names(kept), ["ScheduleActivity", "ScheduleActivity"]);
+
+        let ordinary = discard_drop_release_for_dedicated_shape(WorkflowOutcome::Suspended {
+            commands: vec![
+                schedule_activity_cmd("charge"),
+                run_local_cmd("format_data"),
+            ],
+        });
+        assert_eq!(names(ordinary), ["ScheduleActivity", "RunLocalActivity"]);
     }
 
     #[test]
@@ -53493,6 +53624,26 @@ mod tests {
             .len(),
             2
         );
+    }
+
+    /// Issue #2193: no body awaits a drop release, so a failing cycle records
+    /// no abandoned pair for it and no counter includes it.
+    #[test]
+    fn a_failed_cycle_records_nothing_for_a_drop_release() {
+        let plan = AbandonedDispatchPlan::with_started_children([]);
+        let release = abandoned_activity_cmd(
+            crate::types::ActivityExecId::new(),
+            crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME,
+        );
+        assert_eq!(
+            terminal_command_policy(&release).kind(),
+            "no-record",
+            "the drop release is not an abandoned dispatch"
+        );
+        assert!(abandoned_dispatch_events(&release, &plan).is_empty());
+        let batch = [release];
+        assert_eq!(abandoned_dispatch_event_count(&batch), 0);
+        assert_eq!(abandoned_dispatch_event_count_for_plan(&batch, &plan), 0);
     }
 
     #[test]

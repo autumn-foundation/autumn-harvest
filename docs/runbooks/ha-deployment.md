@@ -234,6 +234,12 @@ Each pass then loads one batch by primary key and checks it again. So the
 work of a pass does not grow with the backlog, and one sweep reads each live
 row once. The next sweep starts again with the oldest row.
 
+Reasons at the same sweep clock and cursor share one refill (issue #2126).
+The refill reads the page once and tests each reason against it. Reasons that
+start a sweep in the same pass take the same clock. Reasons that start in step
+stay in step while none has a backlog, so a pass reads the page once, not four
+times. A reason that falls behind refills on its own.
+
 A sweep reads only the rows created before it started, and queues only those
 that had expired by then. A row created later, or that expires later, waits
 for the next sweep. The index scan applies the creation bound itself, so a
