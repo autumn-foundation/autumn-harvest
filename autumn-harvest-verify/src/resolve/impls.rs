@@ -430,6 +430,14 @@ impl SourceIndex {
         }
     }
 
+    /// Do the sources declare a type whose last path segment is `name`?
+    #[must_use]
+    pub fn declares_type_named(&self, name: &str) -> bool {
+        self.type_paths
+            .iter()
+            .any(|path| path.rsplit("::").next() == Some(name))
+    }
+
     /// Record the type `name`, declared in `module`.
     fn declare(&mut self, module: &[String], name: &syn::Ident) {
         let mut path = module.to_vec();

@@ -269,6 +269,20 @@ pub fn values_joined(map: &HashMap<String, u32>) -> String {
         .join(",")
 }
 
+/// A `fold` over hash order into a string. Concatenation is not commutative,
+/// so the result follows the iteration order.
+#[must_use]
+pub fn keys_folded(map: &HashMap<String, u32>) -> String {
+    map.keys().fold(String::new(), |acc, key| acc + key)
+}
+
+/// A first-party fn named like the std `count` reduction. Its body reads the
+/// clock, which the `count` row knows nothing about.
+#[must_use]
+pub fn count(items: &[u64]) -> u64 {
+    u64::try_from(items.len()).unwrap_or(u64::MAX) ^ deep::fine_stamp()
+}
+
 /// Invokes a caller-supplied thunk. Used to move a closure's body across the
 /// crate boundary.
 pub fn apply<F>(f: F) -> u32

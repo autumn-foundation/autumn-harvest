@@ -70,6 +70,29 @@ thing that noticed. Fixed here, and written up as
 `docs/rnd/determinism-static-analysis.md` §A measured instance of coverage rot;
 it is the most useful result the prototype has produced.
 
+## Since the audited revision
+
+Proving the autoresearch capstone on `rustc 1.99.0` found three soundness bugs,
+each now fixed and pinned by a seeded corpus case that the audited build got
+wrong:
+
+* **An `async fn` helper dropped its arguments.** A call to an `async fn`
+  resolves to its coroutine, and the call's arguments were seeded onto the
+  coroutine's parameters by position. A clock value passed as the third
+  argument was lost (`wf_async_helper_argument`).
+* **The `[[reduction]] path = "fold"` row was live.** It was kept as a
+  "documented non-rule", but with no receiver it cleared hash order through
+  every `fold` (`wf_hashmap_keys_fold`).
+* **A bare sanitizer or reduction row shadowed a first-party fn.** A helper
+  named `count` was summarized by the `count` row, and its body was never read
+  (`wf_helper_named_count`).
+
+Recursion is now solved as a bounded fixpoint rather than cut
+(`wf_recursive_relay`). Six analyzer gaps that made correct code `unknown` are
+closed, each with a clean corpus case: a `const` argument, a std method on a
+trimmed parameter, an inherent float method, a derived `ne`/`lt`, a trusted
+`async fn` future, and a char literal that holds a bracket.
+
 ## Layout
 
 | Path | What it is |
