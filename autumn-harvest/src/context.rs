@@ -2369,9 +2369,9 @@ pub(crate) const SESSION_RELEASE_ACTIVITY_NAME: &str = "__harvest_session_releas
 /// shifts a positional match.
 pub(crate) const SESSION_DROP_RELEASE_ACTIVITY_NAME: &str = "__harvest_session_drop_release";
 
-/// Returns `true` when `name` is one of the two reserved worker-session
-/// internal activity names (issue #606): `__harvest_session_acquire` or
-/// `__harvest_session_release`.
+/// Returns `true` when `name` is one of the reserved worker-session internal
+/// activity names (issue #606): `__harvest_session_acquire`,
+/// `__harvest_session_release` or `__harvest_session_drop_release` (#2193).
 ///
 /// Both are always registered in `HandlerRegistry::activities` (so the
 /// enqueue-time handler lookup never hard-fails on them) with
@@ -2385,7 +2385,9 @@ pub(crate) const SESSION_DROP_RELEASE_ACTIVITY_NAME: &str = "__harvest_session_d
 /// spuriously reported as requiring a worker on `"default"`.
 #[must_use]
 pub fn is_reserved_session_activity_name(name: &str) -> bool {
-    name == SESSION_ACQUIRE_ACTIVITY_NAME || name == SESSION_RELEASE_ACTIVITY_NAME
+    name == SESSION_ACQUIRE_ACTIVITY_NAME
+        || name == SESSION_RELEASE_ACTIVITY_NAME
+        || name == SESSION_DROP_RELEASE_ACTIVITY_NAME
 }
 
 /// Default session acquisition timeout.
@@ -2679,6 +2681,32 @@ pub struct Session<'a> {
     id: SessionId,
     host_worker_id: String,
     queue: String,
+    /// Set when [`Self::complete`] has dispatched the release (issue #2193).
+    settled: bool,
+}
+
+impl Drop for Session<'_> {
+    /// Releases the session when its owner drops it (issue #2193).
+    ///
+    /// The release is an activity that no body awaits. It does nothing when:
+    ///
+    /// - [`Self::complete`] already dispatched the release;
+    /// - the cycle is suspending, because the executor drops the handler
+    ///   future at each park and the session stays open;
+    /// - history already holds a drop release for the session.
+    fn drop(&mut self) {
+        if self.settled
+            || self.ctx.is_suspending()
+            || self.ctx.history_released_session(self.id)
+        {
+            return;
+        }
+        self.ctx.push_drop_release(
+            self.id,
+            self.host_worker_id.clone(),
+            self.queue.clone(),
+        );
+    }
 }
 
 impl Session<'_> {
@@ -2811,8 +2839,9 @@ impl Session<'_> {
     /// Returns [`HarvestError::SessionBroken`] if the host worker died or
     /// drained before release could complete — the slot is still reclaimed
     /// by the broken-session scanner in that case.
-    pub async fn complete(self) -> HarvestResult<()> {
-        self.ctx
+    pub async fn complete(mut self) -> HarvestResult<()> {
+        let released = self
+            .ctx
             .execute_activity_raw_full(
                 SESSION_RELEASE_ACTIVITY_NAME,
                 Value::from(self.id.to_string()),
@@ -2824,8 +2853,10 @@ impl Session<'_> {
                 None,
                 false,
             )
-            .await
-            .map_err(|err| self.broken_session_error(err))?;
+            .await;
+        // A drop of this future before this point releases the session.
+        self.settled = true;
+        released.map_err(|err| self.broken_session_error(err))?;
         Ok(())
     }
 }
@@ -13484,7 +13515,42 @@ impl WorkflowContext {
             id: session_id,
             host_worker_id,
             queue: options.queue,
+            settled: false,
         })
+    }
+
+    /// Whether history already holds a drop release for `session` (issue
+    /// #2193).
+    ///
+    /// This reads the matcher directly. The read moves no cursor and runs no
+    /// signal handler.
+    fn history_released_session(&self, session: SessionId) -> bool {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .has_drop_release(session)
+    }
+
+    /// Push the release of a dropped [`Session`] (issue #2193).
+    ///
+    /// The command is hard-pinned to the host, like any session activity. Its
+    /// receiver is closed, so no body awaits the result.
+    fn push_drop_release(&self, session: SessionId, host_worker_id: String, queue: String) {
+        let (result_tx, result_rx) = oneshot::channel();
+        drop(result_rx);
+        self.push_command(WorkflowCommand::ScheduleActivity {
+            activity_id: self.next_activity_id(),
+            name: SESSION_DROP_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::from(session.to_string()),
+            queue,
+            retry_policy_override: None,
+            start_to_close_override: None,
+            session_id: Some(session),
+            session_worker_id: Some(host_worker_id),
+            schedule_to_start_override: None,
+            result_writer: false,
+            result_tx,
+        });
     }
 
     /// Dispatch the internal session-acquire activity and resolve it to a

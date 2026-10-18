@@ -673,6 +673,8 @@ pub struct HistoryMatcher {
     /// they have no workflow-command counterpart and must never flag
     /// non-determinism, so every scan loop skips them via [`Self::is_consumed`].
     transparent_events: HashSet<usize>,
+    /// Sessions whose drop release history records (issue #2193).
+    drop_released_sessions: HashSet<crate::types::SessionId>,
     /// Event indices of the exact `SignalReceived` events that lost a
     /// signal-or-deadline race (issue #476): for each race whose `TimerFired`
     /// precedes a matching signal, the **first** such signal event is the
@@ -914,6 +916,13 @@ impl HistoryMatcher {
             }
         }
         let race_reserved_signal_events = Self::build_race_reserved_signal_events(&events);
+        // A drop release has no awaiter (issue #2193). Its records never
+        // shift a positional match.
+        let mut drop_released_sessions = HashSet::new();
+        transparent_events.extend(Self::drop_release_indices(
+            &events,
+            &mut drop_released_sessions,
+        ));
 
         Self {
             events,
@@ -925,6 +934,7 @@ impl HistoryMatcher {
             pending_external_cancels: Vec::new(),
             pending_external_awaits: Vec::new(),
             transparent_events,
+            drop_released_sessions,
             late_race_signal_events: HashSet::new(),
             race_reserved_signal_events,
             deprecated_patches: HashMap::new(),
@@ -2102,8 +2112,48 @@ impl HistoryMatcher {
 
     /// Whether history holds a drop release for `session` (issue #2193).
     #[must_use]
-    pub(crate) fn has_drop_release(&self, _session: crate::types::SessionId) -> bool {
-        false
+    pub(crate) fn has_drop_release(&self, session: crate::types::SessionId) -> bool {
+        self.drop_released_sessions.contains(&session)
+    }
+
+    /// Indices of the records of each drop release in `events` (issue #2193).
+    ///
+    /// A record is the `ActivityScheduled` event of the reserved name and every
+    /// later event with the same activity id. The session of each release goes
+    /// into `sessions`.
+    fn drop_release_indices(
+        events: &[WorkflowEvent],
+        sessions: &mut HashSet<crate::types::SessionId>,
+    ) -> Vec<usize> {
+        let mut releases: HashSet<ActivityExecId> = HashSet::new();
+        let mut indices = Vec::new();
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                WorkflowEvent::ActivityScheduled {
+                    activity_id,
+                    name,
+                    input,
+                    ..
+                } if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME => {
+                    releases.insert(*activity_id);
+                    indices.push(i);
+                    if let Some(session) = input.as_str().and_then(|raw| raw.parse().ok()) {
+                        sessions.insert(session);
+                    }
+                }
+                WorkflowEvent::ActivityStarted { activity_id, .. }
+                | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
+                | WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                    if releases.contains(activity_id) =>
+                {
+                    indices.push(i);
+                }
+                _ => {}
+            }
+        }
+        indices
     }
 
     /// Number of events loaded into this replay matcher.
@@ -10193,8 +10243,7 @@ mod tests {
             },
             WorkflowEvent::ActivityStarted {
                 activity_id: release_id,
-                attempt: 1,
-                worker_id: "w".into(),
+                worker_id: crate::types::WorkerId::new("w"),
             },
             WorkflowEvent::ActivityCompleted {
                 activity_id: release_id,

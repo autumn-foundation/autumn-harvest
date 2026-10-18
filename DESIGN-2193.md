@@ -65,7 +65,7 @@ change.** One new reserved activity name carries the release.
 | R5 | A completed run replays with a drop but no record, and strict replay reports drift. | `is_replay_significant_command` ignores the new name. |
 | R6 | A failing run records an abandoned pair for the release. | `abandoned_dispatch_events` returns nothing for the name. The counters skip it. |
 | R7 | A completed run logs a warning for the discarded release. | `abandoned_dispatch_event_count` skips the name. |
-| R8 | A release in a batch with a local activity fails the run with `Config`. | The batch checks skip a closed-receiver release. A test covers it. |
+| R8 | A release in a batch with a local activity fails the run with `Config`, or panics in extraction. | The conflict check and the extraction skip the release. The inline re-drive replays the body, and the next suspension issues it again. A test covers it. |
 | R9 | The new name falls into the default retry and timeout floors. | The name joins `is_reserved_session_activity_name`. |
 | R10 | A deployment without sessions requires a worker for the new name. | The same function excludes it from the required queues. |
 | R11 | The test harness fails with "no mock registered". | `resolve_activity` resolves the name to `Null`. |
@@ -103,8 +103,8 @@ change.** One new reserved activity name carries the release.
 2. `Session` gets a `settled` flag. `complete()` sets it after its dispatch
    returns, with either result.
 3. `Drop for Session` returns when `settled` is set, when the context is
-   suspending, when the context already issued a release for the session, or
-   when the matcher holds a record for it. Otherwise it mints an activity id
+   suspending, or when the matcher holds a record for the session. Otherwise
+   it mints an activity id
    and pushes `ScheduleActivity` for the new name. The command carries the
    session id and the host worker id, and its receiver is closed.
 4. `HistoryMatcher::new` marks each `ActivityScheduled` of the new name

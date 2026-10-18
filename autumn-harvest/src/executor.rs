@@ -501,7 +501,16 @@ pub enum QueryReplayOutcome {
 ///   deadline (case 2 → [`TimedOut`](QueryReplayOutcome::TimedOut)) or a
 ///   command-less cold park such as `await_condition` that suspends immediately
 ///   (case 3 → [`Suspended`](QueryReplayOutcome::Suspended)).
-pub(crate) const fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool {
+pub(crate) fn is_replay_significant_command(cmd: &WorkflowCommand) -> bool {
+    // A drop release (issue #2193) is not recorded for a run that ends first,
+    // so a replay of that run issues it as a new command.
+    if matches!(
+        cmd,
+        WorkflowCommand::ScheduleActivity { name, .. }
+            if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+    ) {
+        return false;
+    }
     !matches!(
         cmd,
         WorkflowCommand::UpsertSearchAttributes { .. }

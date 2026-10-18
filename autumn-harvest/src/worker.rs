@@ -844,6 +844,7 @@ impl HandlerRegistry {
         for name in [
             crate::context::SESSION_ACQUIRE_ACTIVITY_NAME,
             crate::context::SESSION_RELEASE_ACTIVITY_NAME,
+            crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME,
         ] {
             activities.insert(name.to_string(), session_internal_activity_info(name));
         }
@@ -2409,11 +2410,29 @@ impl TerminalCommandPolicy {
     }
 }
 
+/// Whether `cmd` is the release of a dropped session (issue #2193).
+fn is_drop_release(cmd: &WorkflowCommand) -> bool {
+    matches!(
+        cmd,
+        WorkflowCommand::ScheduleActivity { name, .. }
+            if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+    )
+}
+
 /// The terminal-cycle policy for `cmd` — see [`TerminalCommandPolicy`].
 ///
 /// Exhaustive by construction (no `_` arm): this is the AC4 audit of issue #952
 /// as a compile-time invariant rather than a comment that can rot.
-pub(crate) const fn terminal_command_policy(cmd: &WorkflowCommand) -> TerminalCommandPolicy {
+pub(crate) fn terminal_command_policy(cmd: &WorkflowCommand) -> TerminalCommandPolicy {
+    // A dropped session's release (issue #2193) is a `ScheduleActivity` that
+    // no body awaits. The match below stays exhaustive for every other command.
+    if is_drop_release(cmd) {
+        return TerminalCommandPolicy::NoRecord(
+            "no body awaits a drop release, and the broken-session scanner reaps the \
+             session of a run that ends. A suspension records it. A terminal cycle \
+             would only add an abandoned pair that replay must skip",
+        );
+    }
     match cmd {
         // ── Recorded as pre-terminal events, in command-emission order ──────
         WorkflowCommand::RecordMarker { .. }
@@ -3466,6 +3485,7 @@ pub fn suspension_batch_is_persistable(commands: &[WorkflowCommand]) -> bool {
 /// already refuses to claim a batch containing one (issue #691), so such a batch
 /// never reaches here — it falls through to the fail-loud generic path instead.
 fn local_activity_batch_conflict(commands: &[WorkflowCommand]) -> Option<String> {
+    // A drop release (issue #2193) is no durable await, so it never conflicts.
     if !commands
         .iter()
         .any(|c| matches!(c, WorkflowCommand::RunLocalActivity { .. }))
@@ -3475,6 +3495,7 @@ fn local_activity_batch_conflict(commands: &[WorkflowCommand]) -> Option<String>
 
     let mut conflicts: Vec<&'static str> = commands
         .iter()
+        .filter(|cmd| !is_drop_release(cmd))
         .filter(|cmd| {
             matches!(
                 cmd,
@@ -3759,6 +3780,11 @@ fn extract_run_local_activity(commands: Vec<WorkflowCommand>) -> LocalActivityCo
             cmd @ WorkflowCommand::CancelRaceLosers { .. } => {
                 race_loser_commands.push(cmd);
             }
+            // A drop release (issue #2193) is not persisted in this cycle. The
+            // inline re-drive replays the body, the dropped session drops
+            // again, and the release goes out with the next suspension.
+            WorkflowCommand::ScheduleActivity { ref name, .. }
+                if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME => {}
             // Every other kind is a durable awaitable, a terminal outcome, or
             // an external-workflow command. local_activity_batch_conflict (or
             // the dispatch arm's AcquireMutex guard, or
@@ -18996,7 +19022,9 @@ async fn process_activity_task(
             )
             .await,
         )
-    } else if activity_name == crate::context::SESSION_RELEASE_ACTIVITY_NAME {
+    } else if activity_name == crate::context::SESSION_RELEASE_ACTIVITY_NAME
+        || activity_name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+    {
         Some(
             handle_session_release(
                 pool,
@@ -46934,6 +46962,29 @@ mod tests {
             rejected.contains("AwaitExternalWorkflow"),
             "the typed error must name the dropped sibling command: {rejected}"
         );
+    }
+
+    /// Issue #2193: a drop release is no durable await. It must not fail a
+    /// batch that holds a local activity, and extraction must not panic on it.
+    #[test]
+    fn a_drop_release_does_not_conflict_with_a_local_activity() {
+        let release = || {
+            schedule_activity_cmd(crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME)
+        };
+        let batch = vec![release(), run_local_cmd("format_data")];
+        assert!(local_activity_batch_conflict(&batch).is_none());
+
+        let extracted = extract_run_local_activity(batch);
+        assert_eq!(extracted.run.name, "format_data");
+
+        let with_ordinary = vec![
+            release(),
+            schedule_activity_cmd("charge"),
+            run_local_cmd("format_data"),
+        ];
+        let reason = local_activity_batch_conflict(&with_ordinary)
+            .expect("an ordinary activity still conflicts");
+        assert!(reason.contains("ScheduleActivity"), "{reason}");
     }
 
     #[test]

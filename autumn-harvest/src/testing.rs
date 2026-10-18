@@ -7819,7 +7819,9 @@ impl WorkflowTestEnv {
         if name == crate::context::SESSION_ACQUIRE_ACTIVITY_NAME {
             return Ok(Ok(serde_json::json!(TEST_SESSION_HOST_WORKER_ID)));
         }
-        if name == crate::context::SESSION_RELEASE_ACTIVITY_NAME {
+        if name == crate::context::SESSION_RELEASE_ACTIVITY_NAME
+            || name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+        {
             return Ok(Ok(Value::Null));
         }
         Err(format!(
