@@ -2324,6 +2324,7 @@ fn render_command(command: &WorkflowCommand) -> CommandSnapshot {
             activities,
             children,
             timers,
+            ..
         } => (
             "CancelRaceLosers",
             format!(
@@ -2484,10 +2485,12 @@ fn command_payload(command: &WorkflowCommand) -> Option<Value> {
             Err(reason) => serde_json::json!({ "err": reason }),
         }),
         WorkflowCommand::CancelRaceLosers {
+            reason,
             activities,
             children,
             timers,
         } => Some(serde_json::json!({
+            "reason": reason.message(),
             "activities": activities.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "children": children.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "timers": timers.iter().map(ToString::to_string).collect::<Vec<_>>(),

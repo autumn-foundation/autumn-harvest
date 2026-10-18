@@ -1581,6 +1581,7 @@ impl<'a, 'env> SimRun<'a, 'env> {
                 activities,
                 children,
                 timers,
+                ..
             } => {
                 for id in activities {
                     self.drop_held(&DeliveryKey::Activity(*id));

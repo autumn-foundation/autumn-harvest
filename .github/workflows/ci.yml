@@ -855,6 +855,11 @@ jobs:
         env:
           SEMAPHORE_SHARD_COUNT: "4"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
+          # Each test target maps the large `autumn_harvest` rlib while it
+          # links. On Windows, many links at once exhaust the commit charge
+          # (os error 1455, "the paging file is too small"). Two jobs keep the
+          # peak inside it. The other OSes keep the default.
+          CARGO_BUILD_JOBS: ${{ runner.os == 'Windows' && '2' || 'default' }}
         run: bash .github/ci/run-suites.sh compile
       - name: Run all-OS manifest suites (no live DB)
         if: needs.changes.outputs.code == 'true'
