@@ -187,6 +187,18 @@ in `autumn-harvest-sqlite/src/schema.rs`. It has no sanctioned writer, so it
 refuses every `UPDATE`, and an `INSERT OR REPLACE` over a stored event. A
 test fixture calls `autumn_harvest_sqlite::append_only::with_guard_off`.
 
+## Performance Agents
+
+Do not profile the strict replay path again (`WorkflowReplayer::replay_from_events`,
+`benches/replay_profile.rs`). Repeated runs found nothing addressable. About 88%
+of the instructions are the harness building its own history and payloads, and
+the freeing of owned events. The strict matching code is spread over many
+functions, each under 6%. `docs/performance-replay.md` records the one fix that
+was available. That harness never runs the non-strict `match_activity` path that
+ordinary workers use, so that path stays unmeasured. Pick a different path, and
+check `docs/performance-*.md` first so you do not repeat one that is already
+measured.
+
 ## Project Documentation
 
 `CLAUDE.md` holds agent instructions and engine invariants only. Do not park
