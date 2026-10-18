@@ -2188,6 +2188,97 @@ async fn a_cross_shard_race_loser_is_cancelled_on_its_own_shard() {
     let _ = handle.await;
 }
 
+/// **Issue #2194.** A scope cancel gives a cross-shard child the scope reason,
+/// as it gives a same-shard child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scope_cancel_gives_a_cross_shard_child_the_scope_reason() {
+    fn scoped_parent<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let scope = ctx.cancellation_scope();
+            let placement = ChildPlacement::Shard(ShardId::new(2));
+            let (child, ()) = tokio::join!(
+                scope.run(ctx.spawn_child_workflow_raw_placed(
+                    "child_forever",
+                    json!(1),
+                    &placement,
+                )),
+                async {
+                    let _ = ctx.wait_for_signal("abort").await;
+                    scope.cancel();
+                }
+            );
+            Ok(json!({ "cancelled": child.is_err() }))
+        })
+    }
+
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            wf_info("child_forever", child_forever),
+            wf_info("scoped_parent", scoped_parent),
+        ])
+        .worker(
+            WorkerConfig::default().with_shard_assignments(SHARDS.iter().map(|s| ShardId::new(*s))),
+        )
+        .build();
+    let (registry, _d, _s, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id = "w-scope".to_string();
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.shutdown_timeout = Duration::from_secs(2);
+    runtime_config.sharded_pool = Some(sharded.clone());
+    let worker = Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker builds"));
+
+    let default_pool = sharded
+        .exact_pool_for(ShardId::new(PARENT_SHARD))
+        .expect("shard 0 pool")
+        .clone();
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&default_pool).await });
+
+    let parent = start_parent(&sharded, "scoped_parent", "scope-1").await;
+
+    // Wait for the child to run on its own shard, then cancel the scope.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let child = loop {
+        let ids = started_child_ids(&sharded, PARENT_SHARD, parent).await;
+        if let Some(id) = ids.into_iter().next()
+            && execution_state(&sharded, 2, id).await.as_deref() == Some("RUNNING")
+        {
+            break id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cross-shard child never started"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    {
+        let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+        autumn_harvest::signal::send_signal(&mut conn, parent, "abort", Value::Null)
+            .await
+            .expect("send abort");
+    }
+
+    assert!(
+        wait_for_state(&sharded, 2, child, "CANCELLED", Duration::from_secs(60)).await,
+        "the scope cancel never reached the cross-shard child"
+    );
+    assert_eq!(
+        cancelled_reason(&sharded, 2, child).await.as_deref(),
+        Some("cancelled by its cancellation scope")
+    );
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
 // ── Regression: a re-park must not double-record a cross-shard child ─────────
 
 /// **Regression (review finding).** A parent that wakes on a *sibling* while a
