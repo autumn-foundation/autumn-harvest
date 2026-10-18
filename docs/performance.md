@@ -2541,6 +2541,11 @@ standalone note rather than part of the claim-path attribution table above:
   `derive_timeline` behind `GET /workflows/{id}/timeline` (PR #1894);
   replaced by a manual impl that writes one 128-bit value (instructions
   -8.3%, callgrind).
+* [`docs/performance-metrics-rs-labels.md`](performance-metrics-rs-labels.md)
+  — two per-attempt string allocations. `MetricsRsRecorder` label values are
+  interned as `&'static str` (instructions -10.97%, allocation blocks
+  -66.65%). `CircuitBreakerRegistry` seeds its states, so its hot paths
+  allocate no key (instructions -16.41%, allocation blocks -99.90%).
 * [`docs/performance-standalone-activity-overhead.md`](performance-standalone-activity-overhead.md)
   — the cost of a one-step workflow against a bare activity (issue #1987).
   It writes 17 rows per job with a regular activity and 10 with a local
