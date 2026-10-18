@@ -6770,6 +6770,9 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
 
 /// The result of the prelude that `harvest partition enable|maintain|disable`
 /// share (issue #2221).
+// One value exists per shard and the caller moves it out at once. A box
+// would add an allocation and no benefit.
+#[allow(clippy::large_enum_variant)]
 enum PartitionShardPrep {
     /// The shard is ready for its mutation.
     Ready {
