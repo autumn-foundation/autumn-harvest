@@ -266,8 +266,9 @@ An activity result nested over the same cap is not stored. It becomes a
 non-retryable `ActivityFailed` with `error_type = "PayloadTooDeep"`, as an
 oversized result becomes `PayloadTooLarge`. A result that is too deep and too
 large fails as `PayloadTooDeep`. A local activity fails with the same message
-and ends on its first attempt with `LocalActivityExhausted`. The workflow sees
-the failure and can handle it. A heartbeat nested over the cap is dropped with
+and ends on its first attempt with `LocalActivityExhausted`. A local failure
+keeps no error type, so the workflow sees `Error` and the message. The workflow
+sees the failure and can handle it. A heartbeat nested over the cap is dropped with
 a warning, and the last good checkpoint stays.
 
 ---

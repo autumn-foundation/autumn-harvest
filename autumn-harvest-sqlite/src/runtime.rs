@@ -346,6 +346,9 @@ pub const UNSUPPORTED_FEATURE_ERROR_TYPE: &str = "UnsupportedFeature";
 
 /// The `error_type` of the activity failure that replaces a result nested past
 /// [`MAX_PAYLOAD_DEPTH`] (issue #2216). The failure is non-retryable.
+///
+/// A local activity failure keeps only its message, as every local failure
+/// does. So the workflow sees the error type `Error` for a local activity.
 pub const PAYLOAD_TOO_DEEP_ERROR_TYPE: &str = "PayloadTooDeep";
 
 /// The time limit for the replay that rebuilds update handlers, and the

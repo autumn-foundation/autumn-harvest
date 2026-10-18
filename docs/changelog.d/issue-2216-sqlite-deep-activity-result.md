@@ -3,8 +3,9 @@
 An activity result nested past `MAX_PAYLOAD_DEPTH` (100) is no longer stored.
 The SQLite worker turns it into a non-retryable `ActivityFailed` with
 `error_type = "PayloadTooDeep"`, the new `PAYLOAD_TOO_DEEP_ERROR_TYPE`. A local
-activity ends on its first attempt with `LocalActivityExhausted`. The workflow
-sees the failure and can handle it.
+activity ends on its first attempt with `LocalActivityExhausted`. It keeps only
+the message, as every local failure does. The workflow sees the failure and can
+handle it.
 
 Before this fix, a result nested 126 levels or more was stored. Then every
 drive of the run failed with "recursion limit exceeded", and `run_until_idle`

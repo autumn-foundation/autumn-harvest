@@ -124,9 +124,9 @@
 //!   anything is persisted. The run stays live and the driver stays healthy.
 //!   An activity result that nests too deep becomes a non-retryable
 //!   [`PAYLOAD_TOO_DEEP_ERROR_TYPE`] failure, for a remote or a local activity.
-//!   The workflow sees the failure. A heartbeat that nests too deep is dropped,
-//!   and the last good checkpoint stays. A too-deep result or heartbeat is never
-//!   stored.
+//!   The workflow sees the failure. A local failure keeps only its message. A
+//!   heartbeat that nests too deep is dropped, and the last good checkpoint stays.
+//!   A too-deep result or heartbeat is never stored.
 //! - **Payload-size caps are enforced at every boundary, matching the core** (issue
 //!   #252). A caller-supplied payload that exceeds its byte cap is refused before it
 //!   can enter `harvest_events`, so this backend never stores an unbounded history
