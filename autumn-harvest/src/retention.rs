@@ -3537,13 +3537,15 @@ async fn run_shard_tick(
                 }
                 Ok(
                     CandidateDeleteOutcome::SkippedStaging
-                    | CandidateDeleteOutcome::SkippedNotTerminal,
+                    | CandidateDeleteOutcome::SkippedNotTerminal
+                    | CandidateDeleteOutcome::SkippedForkSource,
                 ) => {
                     // A shard-rebalance staging vacate landed after selection
                     // (issue #1317 review, P1): the delete-tx FOR UPDATE
                     // re-check found `staging_vacated_state` set and aborted
                     // the delete. A redrive that reopened the run after the
-                    // scan is handled the same way. Treat exactly like a
+                    // scan is handled the same way, and so is a recorded fork
+                    // made after the scan (issue #2122). Treat exactly like a
                     // routine skip, for the same reason as `SkippedHeld` above.
                     routine_skip_candidate(
                         &mut conn,
@@ -3642,6 +3644,10 @@ enum CandidateDeleteOutcome {
     /// scan. The delete was aborted and NOTHING was touched, for the same
     /// reason as [`Self::SkippedHeld`].
     SkippedNotTerminal,
+    /// A non-terminal recorded fork has the row in its fork lineage under
+    /// the delete-tx row lock (issue #2122). The delete was aborted and
+    /// NOTHING was touched, for the same reason as [`Self::SkippedHeld`].
+    SkippedForkSource,
 }
 
 /// The execution states the retention candidate scan selects.
@@ -3932,6 +3938,15 @@ async fn delete_candidate_execution(
             // under the lock.
             if !RETENTION_CANDIDATE_STATES.contains(&state.as_str()) {
                 return Ok(CandidateDeleteOutcome::SkippedNotTerminal);
+            }
+            // A fork made after the scan keeps its lineage too (issue #2122).
+            // Each new lineage member locks this row `FOR SHARE`. So it
+            // committed before the lock above, or it waits for this delete.
+            // This is a new statement, so under `READ COMMITTED` it sees a
+            // fork that committed while the lock waited.
+            let exec_id = crate::types::ExecutionId::from_uuid(candidate_id);
+            if crate::fork::is_pinned_by_recorded_fork(conn, exec_id).await? {
+                return Ok(CandidateDeleteOutcome::SkippedForkSource);
             }
             let was_ever_migrated_here = migrated_from_shards
                 .as_ref()
@@ -4513,6 +4528,12 @@ async fn should_skip_candidate(
         .count;
 
     if active_parent_ref_count > 0 {
+        return Ok(true);
+    }
+
+    // A recorded fork reads its fork lineage while it runs (issue #2122).
+    let exec_id = crate::types::ExecutionId::from_uuid(candidate.id);
+    if crate::fork::is_pinned_by_recorded_fork(conn, exec_id).await? {
         return Ok(true);
     }
 

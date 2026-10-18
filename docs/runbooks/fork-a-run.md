@@ -49,11 +49,12 @@ each target against the current SSRF policy first. A target that the policy
 no longer admits refuses the fork with `422`. Use a recorded fork, or allow
 the host again.
 
-A recorded fork reads its source while it runs. Retention does not wait for
-it. If retention deletes the source first, each later activity has no record
-and fails closed with `ForkEffectUnavailable`. Fork a run well inside its
-retention window, or hold the source with `POST /workflows/{id}/legal-hold`
-(issue #747) while the fork runs.
+A recorded fork reads its source while it runs. Retention keeps each run in
+the fork lineage of a non-terminal recorded fork, so the source stays past its
+retention window (issue #2122). The source becomes a candidate again when each
+such fork is terminal. This also covers forks made before the upgrade. A live
+fork reads no source, so it keeps nothing. To keep the source of a live fork,
+hold it with `POST /workflows/{id}/legal-hold` (issue #747).
 
 Under build routing, a fork at point 0 takes the build of a fresh start under
 the current policy of its queue. A fork with a carried prefix keeps the source

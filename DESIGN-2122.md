@@ -123,6 +123,7 @@ DB tests in `tests/integration/fork_tests.rs`:
 - `retention_keeps_the_source_of_a_live_recorded_fork`
 - `retention_deletes_the_source_once_its_recorded_forks_end`
 - `retention_does_not_keep_the_source_of_a_live_mode_fork`
+- `retention_keeps_the_lineage_of_a_recorded_fork`
 - `retention_keeps_the_lineage_of_a_reset_of_a_recorded_fork`
 - `a_fork_committed_after_the_scan_keeps_the_source`
 - `a_fork_in_flight_at_the_delete_keeps_the_source`

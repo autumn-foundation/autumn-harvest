@@ -733,12 +733,17 @@ mod db {
     /// The partial index `idx_harvest_we_fork_source` serves the seed, so it
     /// reads only fork rows. The step joins on the primary key. A reference
     /// that is not a UUID ends the walk instead of failing the cast.
+    ///
+    /// Retention reads the same live states (issue #2122).
     macro_rules! live_fork_lineage_sql {
         () => {
-            "WITH RECURSIVE lineage(source_ref, depth) AS ( \
+            concat!(
+                "WITH RECURSIVE lineage(source_ref, depth) AS ( \
                 SELECT f.start_source_ref, 1 FROM harvest_workflow_executions f \
                  WHERE f.start_source = 'fork' \
-                   AND f.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED') \
+                   AND f.state IN (",
+                crate::fork::live_fork_states_sql!(),
+                ") \
                 UNION \
                 SELECT p.start_source_ref, l.depth + 1 FROM lineage l \
                   JOIN harvest_workflow_executions p ON p.id = CASE \
@@ -747,6 +752,7 @@ mod db {
                     THEN l.source_ref::uuid END \
                  WHERE p.start_source = 'fork' AND l.depth < 64 \
              ) SELECT 1 FROM lineage l WHERE l.source_ref = e.id::text"
+            )
         };
     }
 

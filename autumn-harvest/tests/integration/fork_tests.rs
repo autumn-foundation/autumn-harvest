@@ -2594,7 +2594,10 @@ async fn retention_keeps_the_lineage_of_a_reset_of_a_recorded_fork() {
     age_into_tenant(&mut conn, forked, &tenant).await;
 
     retention_tick(&pool, &tenant, None).await;
-    assert!(exists(&mut conn, source).await, "the reset reads the source");
+    assert!(
+        exists(&mut conn, source).await,
+        "the reset reads the source"
+    );
     assert!(exists(&mut conn, forked).await, "the sealed fork stays");
     assert!(exists(&mut conn, reset.new_exec_id).await);
 }
@@ -2656,12 +2659,15 @@ async fn fork_held_open(
         locked.send(()).expect("the archiver waits for the lock");
         // The delete reaches its row lock in this window and waits.
         tokio::time::sleep(Duration::from_millis(1_500)).await;
-        Ok(
-            fork_workflow_execution(conn, source, request(ForkEffects::Recorded), Some(&registry()))
-                .await
-                .expect("the fork commits inside the open transaction")
-                .new_exec_id,
+        Ok(fork_workflow_execution(
+            conn,
+            source,
+            request(ForkEffects::Recorded),
+            Some(&registry()),
         )
+        .await
+        .expect("the fork commits inside the open transaction")
+        .new_exec_id)
     })
     .await
     .expect("commit the held fork")
@@ -2704,11 +2710,18 @@ async fn a_fork_committed_after_the_scan_keeps_the_source() {
     let archiver = Arc::new(ForkRaceArchiver::new(&url, Some(source)));
     retention_tick(&pool, &tenant, Some(archiver.clone() as _)).await;
 
-    assert_eq!(archiver.archived(), vec![source], "the scan chose the source");
+    assert_eq!(
+        archiver.archived(),
+        vec![source],
+        "the scan chose the source"
+    );
     let forks = archiver.forks().await;
     assert_eq!(forks.len(), 1, "the archiver forked the source");
     let mut conn = connect(&url).await;
-    assert!(exists(&mut conn, source).await, "the delete saw the new fork");
+    assert!(
+        exists(&mut conn, source).await,
+        "the delete saw the new fork"
+    );
 }
 
 /// AC4: a fork that holds the source lock when the delete reaches it still
@@ -2729,6 +2742,9 @@ async fn a_fork_in_flight_at_the_delete_keeps_the_source() {
     let forks = archiver.forks().await;
     assert_eq!(forks.len(), 1, "the held fork committed");
     let mut conn = connect(&url).await;
-    assert!(exists(&mut conn, source).await, "the delete saw the held fork");
+    assert!(
+        exists(&mut conn, source).await,
+        "the delete saw the held fork"
+    );
     assert!(exists(&mut conn, forks[0]).await);
 }

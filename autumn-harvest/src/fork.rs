@@ -757,6 +757,75 @@ fn fork_tail(
 /// Most fork links that a lineage check follows.
 const MAX_FORK_LINEAGE: usize = 64;
 
+/// The states of a non-terminal fork, as a SQL list (issue #2122).
+///
+/// Retention and the `LiveFork` rebalance guard read this one list. So both
+/// mean the same "live fork". It is a macro, so `concat!` can take it.
+macro_rules! live_fork_states_sql {
+    () => {
+        "'RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED'"
+    };
+}
+pub(crate) use live_fork_states_sql;
+
+/// Whether a non-terminal recorded fork has `$1` in its fork lineage.
+///
+/// The walk goes down from `$1` through fork rows, for at most `$2` links.
+/// Each step probes the partial index `idx_harvest_we_fork_source`. The last
+/// `WorkflowForked` marker of a fork sets its mode. A fork with no marker
+/// fails safe, as recorded.
+const PINNED_BY_RECORDED_FORK_SQL: &str = concat!(
+    "WITH RECURSIVE descendant(id, depth) AS ( \
+        SELECT f.id, 1 FROM harvest_workflow_executions f \
+         WHERE f.start_source = 'fork' AND f.start_source_ref = $1 \
+        UNION \
+        SELECT f.id, d.depth + 1 FROM descendant d \
+          JOIN harvest_workflow_executions f \
+            ON f.start_source = 'fork' AND f.start_source_ref = d.id::text \
+         WHERE d.depth < $2 \
+     ) SELECT EXISTS ( \
+        SELECT 1 FROM descendant d \
+          JOIN harvest_workflow_executions f ON f.id = d.id \
+         WHERE f.state IN (",
+    live_fork_states_sql!(),
+    ") \
+           AND (SELECT m.event_data -> 'data' ->> 'effects' FROM harvest_events m \
+                 WHERE m.workflow_exec_id = f.id AND m.event_type = 'WorkflowForked' \
+                 ORDER BY m.event_id DESC LIMIT 1) IS DISTINCT FROM 'live' \
+     ) AS pinned"
+);
+
+#[derive(QueryableByName)]
+struct PinnedRow {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    pinned: bool,
+}
+
+/// Whether a non-terminal recorded fork has `exec_id` in its fork lineage
+/// (issue #2122). Retention keeps such a run.
+///
+/// A recorded fork reads its record source while it runs. A reset or a new
+/// fork of it walks its whole lineage and refuses a gap. So each run in the
+/// lineage stays until the fork is terminal. A live fork reads no source, so
+/// it keeps nothing.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] when the read fails.
+pub(crate) async fn is_pinned_by_recorded_fork(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<bool> {
+    let max_links = i32::try_from(MAX_FORK_LINEAGE).unwrap_or(i32::MAX);
+    Ok(diesel::sql_query(PINNED_BY_RECORDED_FORK_SQL)
+        .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+        .bind::<diesel::sql_types::Integer, _>(max_links)
+        .get_result::<PinnedRow>(conn)
+        .await
+        .map_err(database_error)?
+        .pinned)
+}
+
 /// The first erased run in the fork lineage above `source`, if any.
 ///
 /// It follows `start_source_ref` while the row is a fork. Each ancestor row
@@ -2238,6 +2307,20 @@ mod tests {
             ForkResolution::Serve(WorkflowEvent::ActivityFailed { error_type, non_retryable: true, .. })
                 if error_type == ERROR_TYPE_FORK_EFFECT_UNAVAILABLE
         )
+    }
+
+    /// A live fork state is never a terminal state, so retention and the
+    /// rebalance guard cannot call an ended fork live (issue #2122).
+    #[test]
+    fn live_fork_states_are_not_terminal() {
+        let states: Vec<&str> = live_fork_states_sql!()
+            .split(", ")
+            .map(|state| state.trim_matches('\''))
+            .collect();
+        assert_eq!(states, ["RUNNING", "PAUSED", "MIGRATING", "MIGRATED"]);
+        for state in states {
+            assert!(!crate::erase::TERMINAL_STATES_WITHOUT_MIGRATED.contains(&state));
+        }
     }
 
     #[test]
