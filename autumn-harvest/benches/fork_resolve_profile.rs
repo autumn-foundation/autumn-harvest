@@ -79,14 +79,24 @@ fn main() {
     let fork_ids: Vec<_> = (0..n).map(|_| ActivityExecId::new()).collect();
 
     let mut source = vec![started()];
-    source.extend(source_ids.iter().enumerate().map(|(i, id)| scheduled(*id, i)));
-    source.extend(source_ids.iter().enumerate().map(|(i, id)| {
-        WorkflowEvent::ActivityCompleted {
-            activity_id: *id,
-            output: payload(i),
-        }
-    }));
-    source.push(WorkflowEvent::WorkflowCompleted { output: json!("done") });
+    source.extend(
+        source_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| scheduled(*id, i)),
+    );
+    source.extend(
+        source_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| WorkflowEvent::ActivityCompleted {
+                activity_id: *id,
+                output: payload(i),
+            }),
+    );
+    source.push(WorkflowEvent::WorkflowCompleted {
+        output: json!("done"),
+    });
 
     let mut fork = vec![
         started(),
