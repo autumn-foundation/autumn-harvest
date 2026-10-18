@@ -192,6 +192,21 @@ path = "tests/dst/main.rs"
 name = "metrics_noop"
 harness = false
 
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for the label values `MetricsRsRecorder` builds on every activity attempt.
+# See `benches/metrics_rs_labels_profile.rs`.
+[[bench]]
+name = "metrics_rs_labels_profile"
+required-features = ["metrics-rs"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for the four `CircuitBreakerRegistry` calls the worker makes per attempt.
+# See `benches/circuit_breaker_dispatch_profile.rs`.
+[[bench]]
+name = "circuit_breaker_dispatch_profile"
+harness = false
+
 # End-to-end benchmark suite (issue #941). `harness = false`: every scenario is
 # destructive and stateful, so libtest/criterion's repeat-the-closure model would
 # end up timing an empty queue. Needs `db` for the three engine scenarios and
