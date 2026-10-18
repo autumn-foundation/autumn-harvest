@@ -55,3 +55,11 @@ than naming a number. `docs/harvest-verify.md` §Limitations describes the
 fixpoint.
 
 No migration. No `WorkflowEvent` change.
+
+## Fix — the library compiles again after a parallel merge
+
+PR #2071 added the `WorkflowCancelRequested` event. PR #2205 made
+`payload_slot` and `payload_slot_mut` name every event variant, so that a new
+variant does not compile until someone sorts it. The two merged without a
+conflict, and `trunk-dev` failed with E0004. The new event carries only a
+reason string, so both matches return `None` for it.
