@@ -2544,3 +2544,7 @@ standalone note rather than part of the claim-path attribution table above:
   — `ChainVerifier::push` in the audit-export chain check recomputed the keyed
   HMAC state for every row. It now sets each key up once and streams the
   canonical row into the MAC (instructions -21.3%, allocation blocks -77.8%).
+* [`docs/performance-timeout-refill-shared-page.md`](performance-timeout-refill-shared-page.md)
+  — before issue #2126, the four task-timeout lanes read one page of live
+  rows four times per pass. Lanes at one position now share one refill
+  statement (refill buffers -75% at 100,000 live rows, `pg_stat_statements`).

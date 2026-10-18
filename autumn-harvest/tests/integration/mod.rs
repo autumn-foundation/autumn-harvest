@@ -386,6 +386,8 @@ mod throttle_bucket_prelock_batch_perf;
 mod throttle_tests;
 #[cfg(feature = "db")]
 mod throwaway_db;
+#[cfg(feature = "db")]
+mod timeout_refill_shared_page_perf;
 // The recorder is used by the chaos suite only. Its unit tests run in
 // every build, so the exporter is checked on each PR (issue #2003).
 #[cfg_attr(not(feature = "chaos"), allow(dead_code))]

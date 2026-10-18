@@ -1,0 +1,20 @@
+-- before: live=1000, 8 passes, limit 500
+calls=8 buffers=448 temp_written=0 exec_ms=1.1 jit_inlined=0 | SELECT q.* FROM (SELECT t.* FROM harvest_task_queue t WHERE t.state = $2 AND t.schedule_to_start IS NOT NULL AND t.sched
+calls=8 buffers=304 temp_written=0 exec_ms=8.1 jit_inlined=0 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, start
+calls=8 buffers=304 temp_written=0 exec_ms=9.7 jit_inlined=0 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, start
+calls=8 buffers=304 temp_written=0 exec_ms=10.4 jit_inlined=0 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, start
+calls=8 buffers=304 temp_written=0 exec_ms=12.0 jit_inlined=0 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, start
+calls=8 buffers=248 temp_written=0 exec_ms=0.8 jit_inlined=0 | SELECT q.* FROM (SELECT * FROM harvest_task_queue WHERE state = $2 AND start_to_close IS NOT NULL AND started_at + start
+calls=32 buffers=0 temp_written=0 exec_ms=0.1 jit_inlined=0 | SELECT NOW() AS as_of
+-- before: live=100000, 8 passes, limit 500
+calls=8 buffers=11526 temp_written=0 exec_ms=42.9 jit_inlined=0 | SELECT q.* FROM (SELECT t.* FROM harvest_task_queue t WHERE t.state = $2 AND t.schedule_to_start IS NOT NULL AND t.sched
+calls=8 buffers=8672 temp_written=0 exec_ms=24.3 jit_inlined=0 | SELECT q.* FROM (SELECT * FROM harvest_task_queue WHERE state = $2 AND start_to_close IS NOT NULL AND started_at + start
+calls=6 buffers=7832 temp_written=5558 exec_ms=260.3 jit_inlined=0 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, start
+calls=6 buffers=7832 temp_written=5558 exec_ms=251.8 jit_inlined=0 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, start
+calls=6 buffers=7832 temp_written=5558 exec_ms=624.7 jit_inlined=6 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, start
+calls=6 buffers=7832 temp_written=5558 exec_ms=738.5 jit_inlined=6 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, start
+calls=2 buffers=7300 temp_written=4373 exec_ms=165.3 jit_inlined=0 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, start
+calls=2 buffers=7300 temp_written=4374 exec_ms=154.7 jit_inlined=0 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, start
+calls=2 buffers=7300 temp_written=4226 exec_ms=312.3 jit_inlined=2 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, start
+calls=2 buffers=7300 temp_written=4178 exec_ms=363.0 jit_inlined=2 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled_at, start
+calls=8 buffers=0 temp_written=0 exec_ms=0.0 jit_inlined=0 | SELECT NOW() AS as_of
