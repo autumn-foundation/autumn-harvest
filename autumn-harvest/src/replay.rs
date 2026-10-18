@@ -2100,6 +2100,12 @@ impl HistoryMatcher {
             || !self.pending_external_awaits.is_empty()
     }
 
+    /// Whether history holds a drop release for `session` (issue #2193).
+    #[must_use]
+    pub(crate) fn has_drop_release(&self, _session: crate::types::SessionId) -> bool {
+        false
+    }
+
     /// Number of events loaded into this replay matcher.
     #[must_use]
     pub fn event_count(&self) -> u64 {
@@ -10158,6 +10164,82 @@ mod tests {
             matcher.is_consumed(1) && matcher.is_consumed(2),
             "the #510 redrive-anchored transparency is unchanged"
         );
+    }
+
+    /// A history with one drop release of `session` and an activity `charge`
+    /// after it. The release has a started and a completed event.
+    fn drop_release_history(session: uuid::Uuid) -> Vec<WorkflowEvent> {
+        let release_id = ActivityExecId::new();
+        let charge_id = ActivityExecId::new();
+        vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: release_id,
+                name: crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME.into(),
+                input: Value::from(session.to_string()),
+                queue: "gpu".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: charge_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: release_id,
+                attempt: 1,
+                worker_id: "w".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: release_id,
+                output: Value::Null,
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: charge_id,
+                output: Value::from("ok"),
+            },
+        ]
+    }
+
+    /// Issue #2193: a drop release has no awaiter, so replay passes over its
+    /// records. The next activity still matches at its own position.
+    #[test]
+    fn a_drop_release_record_is_transparent_to_the_matcher() {
+        let session = uuid::Uuid::new_v4();
+        let mut matcher = HistoryMatcher::new(drop_release_history(session));
+        for idx in [1, 3, 4] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} of the drop release must be transparent"
+            );
+        }
+        assert!(!matcher.is_consumed(2), "an ordinary activity stays opaque");
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_activity("charge"),
+            HistoryMatch::Matched {
+                output: Value::from("ok")
+            }
+        );
+        assert!(!matcher.has_non_lifecycle_unconsumed());
+    }
+
+    /// Issue #2193: the matcher reports which sessions history already
+    /// released, so a replayed drop issues nothing.
+    #[test]
+    fn the_matcher_reports_a_session_that_history_released() {
+        let session = uuid::Uuid::new_v4();
+        let matcher = HistoryMatcher::new(drop_release_history(session));
+        assert!(matcher.has_drop_release(crate::types::SessionId::from_uuid(session)));
+        assert!(!matcher.has_drop_release(crate::types::SessionId::from_uuid(
+            uuid::Uuid::new_v4()
+        )));
     }
 
     /// Issue #952 x #510: a redrive REOPENS the run, so the abandoned-dispatch

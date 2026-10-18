@@ -2362,6 +2362,13 @@ pub(crate) const SESSION_ACQUIRE_ACTIVITY_NAME: &str = "__harvest_session_acquir
 /// like a member activity, so only the host frees its own in-process slot.
 pub(crate) const SESSION_RELEASE_ACTIVITY_NAME: &str = "__harvest_session_release";
 
+/// Reserved activity name for the release that a dropped [`Session`] issues
+/// (issue #2193).
+///
+/// No body awaits it. Replay treats its records as transparent, so it never
+/// shifts a positional match.
+pub(crate) const SESSION_DROP_RELEASE_ACTIVITY_NAME: &str = "__harvest_session_drop_release";
+
 /// Returns `true` when `name` is one of the two reserved worker-session
 /// internal activity names (issue #606): `__harvest_session_acquire` or
 /// `__harvest_session_release`.
@@ -31046,6 +31053,167 @@ mod tests {
             }
             other => panic!("expected ScheduleActivity, got {other:?}"),
         }
+    }
+
+    // ── Release on drop (issue #2193) ────────────────────────────────────
+
+    /// History of a run that holds one open session on `gpu-workers`.
+    fn open_session_history(session_uuid: uuid::Uuid) -> Vec<WorkflowEvent> {
+        let acquire_id = ActivityExecId::new();
+        vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: acquire_id,
+                name: SESSION_ACQUIRE_ACTIVITY_NAME.to_string(),
+                input: Value::Null,
+                queue: "gpu-workers".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: acquire_id,
+                output: serde_json::json!("worker-42"),
+            },
+        ]
+    }
+
+    /// The drop releases among `commands`.
+    fn drop_releases(commands: &[WorkflowCommand]) -> Vec<&WorkflowCommand> {
+        commands
+            .iter()
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    WorkflowCommand::ScheduleActivity { name, .. }
+                        if name == SESSION_DROP_RELEASE_ACTIVITY_NAME
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_issues_one_pinned_release() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), open_session_history(session_uuid));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        drop(session);
+
+        let commands = ctx.drain_commands();
+        let releases = drop_releases(&commands);
+        assert_eq!(releases.len(), 1, "one release per dropped session");
+        let WorkflowCommand::ScheduleActivity {
+            queue,
+            input,
+            session_id,
+            session_worker_id,
+            ..
+        } = releases[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(queue, "gpu-workers");
+        assert_eq!(input, &Value::from(session_uuid.to_string()));
+        assert_eq!(*session_id, Some(SessionId::from_uuid(session_uuid)));
+        assert_eq!(session_worker_id.as_deref(), Some("worker-42"));
+        assert!(
+            !releases[0].awaits_result(),
+            "no body awaits a drop release"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_session_issues_no_drop_release() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let release_id = ActivityExecId::new();
+        let mut events = open_session_history(session_uuid);
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: SESSION_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::from(session_uuid.to_string()),
+            queue: "gpu-workers".to_string(),
+        });
+        events.push(WorkflowEvent::ActivityCompleted {
+            activity_id: release_id,
+            output: Value::Null,
+        });
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        session.complete().await.unwrap();
+
+        assert!(drop_releases(&ctx.drain_commands()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_complete_future_releases_the_session() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), open_session_history(session_uuid));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(20), session.complete()).await;
+        assert!(result.is_err(), "complete() must still be waiting");
+
+        let commands = ctx.drain_commands();
+        assert_eq!(drop_releases(&commands).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_suspending_cycle_issues_no_drop_release() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), open_session_history(session_uuid));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        ctx.set_suspending(true);
+        drop(session);
+
+        assert!(drop_releases(&ctx.drain_commands()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_recorded_drop_release_is_not_issued_again() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let release_id = ActivityExecId::new();
+        let mut events = open_session_history(session_uuid);
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: SESSION_DROP_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::from(session_uuid.to_string()),
+            queue: "gpu-workers".to_string(),
+        });
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        drop(session);
+
+        assert!(drop_releases(&ctx.drain_commands()).is_empty());
     }
 
     #[tokio::test]

@@ -53489,6 +53489,26 @@ mod tests {
         );
     }
 
+    /// Issue #2193: no body awaits a drop release, so a failing cycle records
+    /// no abandoned pair for it and no counter includes it.
+    #[test]
+    fn a_failed_cycle_records_nothing_for_a_drop_release() {
+        let plan = AbandonedDispatchPlan::with_started_children([]);
+        let release = abandoned_activity_cmd(
+            crate::types::ActivityExecId::new(),
+            crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME,
+        );
+        assert_eq!(
+            terminal_command_policy(&release).kind(),
+            "no-record",
+            "the drop release is not an abandoned dispatch"
+        );
+        assert!(abandoned_dispatch_events(&release, &plan).is_empty());
+        let batch = [release];
+        assert_eq!(abandoned_dispatch_event_count(&batch), 0);
+        assert_eq!(abandoned_dispatch_event_count_for_plan(&batch, &plan), 0);
+    }
+
     #[test]
     fn abandoned_activity_dispatch_records_scheduled_then_synthetic_terminal() {
         let activity_id = crate::types::ActivityExecId::new();

@@ -4285,6 +4285,127 @@ mod tests {
         assert_eq!(names, ["dropped", "send_email"], "got {outcome:?}");
     }
 
+    /// History with a started run and one acquired session on `gpu`.
+    fn open_session_events() -> Vec<WorkflowEvent> {
+        let acquire_id = ActivityExecId::new();
+        vec![
+            started(),
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(uuid::Uuid::new_v4().to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: acquire_id,
+                name: crate::context::SESSION_ACQUIRE_ACTIVITY_NAME.into(),
+                input: Value::Null,
+                queue: "gpu".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: acquire_id,
+                output: serde_json::json!("worker-1"),
+            },
+        ]
+    }
+
+    /// Opens the session, drops it, then schedules `next`.
+    fn drop_session_then_step_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let session = ctx
+                .create_session(crate::context::SessionOptions::new("gpu"))
+                .await
+                .map_err(|e| e.to_string())?;
+            drop(session);
+            ctx.execute_activity_raw("next", Value::Null, "default")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// Opens the session, then waits on a member activity with it live.
+    fn hold_session_across_park_workflow<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let session = ctx
+                .create_session(crate::context::SessionOptions::new("gpu"))
+                .await
+                .map_err(|e| e.to_string())?;
+            session
+                .execute_activity_raw("member", Value::Null, "gpu")
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    fn scheduled_names(outcome: &WorkflowOutcome) -> Vec<&str> {
+        let WorkflowOutcome::Suspended { commands } = outcome else {
+            panic!("expected a suspension, got {outcome:?}");
+        };
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::ScheduleActivity { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Issue #2193: a session that the body drops mid-run is released in the
+    /// same cycle that parks.
+    #[tokio::test]
+    async fn a_session_dropped_before_a_park_is_released() {
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            open_session_events(),
+            drop_session_then_step_workflow,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(
+            scheduled_names(&outcome),
+            [crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME, "next"]
+        );
+    }
+
+    /// Issue #2193: the executor drops the handler future at each park. That
+    /// drop must not release a session that the body still holds.
+    #[tokio::test]
+    async fn a_session_held_across_a_park_is_not_released() {
+        let outcome = run_workflow(
+            ExecutionId::new(),
+            open_session_events(),
+            hold_session_across_park_workflow,
+            Value::Null,
+        )
+        .await;
+        assert_eq!(scheduled_names(&outcome), ["member"]);
+    }
+
+    /// Issue #2193: a completed run never records the release, so replay must
+    /// not count it as a new command.
+    #[test]
+    fn a_drop_release_is_not_a_replay_significant_command() {
+        let (result_tx, _rx) = tokio::sync::oneshot::channel();
+        let release = WorkflowCommand::ScheduleActivity {
+            activity_id: ActivityExecId::new(),
+            name: crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::Null,
+            queue: "gpu".to_string(),
+            retry_policy_override: None,
+            start_to_close_override: None,
+            session_id: None,
+            session_worker_id: None,
+            schedule_to_start_override: None,
+            result_writer: false,
+            result_tx,
+        };
+        assert!(!is_replay_significant_command(&release));
+    }
+
     /// Waits on a foreign step, then panics.
     fn panic_after_foreign_wait_workflow<'a>(
         _ctx: &'a WorkflowContext,
