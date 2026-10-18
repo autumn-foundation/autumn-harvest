@@ -1117,9 +1117,16 @@ async fn the_drain_phase_reclaims_an_abandoned_decision() {
     assert!(report.converged, "{}", report.trace_tail(TAIL_LINES));
     let drain_requeue = report.trace.iter().any(|line| {
         let step: usize = line[..4].parse().expect("a step number");
-        step >= config.fault_steps && line.contains("reclaimer pass -> requeued 1")
+        let requeued = line.split_once("reclaimer pass -> requeued ");
+        let rows = requeued.and_then(|(_, rows)| rows.parse::<u64>().ok());
+        step >= config.fault_steps && rows.is_some_and(|rows| rows > 0)
     });
-    assert!(drain_requeue, "{}", report.trace.join("\n"));
+    assert!(
+        drain_requeue,
+        "no drain pass requeued a row. If the planner changed, pick a seed \
+         that abandons a claim late in the fault phase.\n{}",
+        report.trace.join("\n")
+    );
 }
 
 /// Two runs of one seed, each on a fresh database, give equal reports.

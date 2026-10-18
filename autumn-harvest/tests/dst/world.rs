@@ -477,13 +477,19 @@ async fn the_drain_phase_runs_each_enabled_action_within_the_fair_bound() {
         "sched1 scan",
         "sched2 scan",
     ];
-    // Overdue actions run one per step. A toy drain enables at most 15
-    // actions, so a wait can pass the bound by 15 steps.
-    let bound = world::FAIR_STEPS + 15;
     for seed in 0..32 {
         let config = toy_config(seed);
+        // A drain enables an advance, the reclaimer and the sweeper. Each
+        // worker adds a poll and a beat. Each scheduler adds a scan and a
+        // fire. Each unsent signal adds one action.
+        let enabled = 1 + 2 * config.workers + config.workflows + 2 * config.schedulers + 2;
+        // Overdue actions run one per step, so the other overdue actions can
+        // delay one action by up to `enabled - 1` steps.
+        let bound = world::FAIR_STEPS + enabled - 1;
         // The stuck workflow keeps the drain running to its step limit.
         let report = run_toy(&config, Bug::Stuck).await;
+        let violation = report.violation.as_ref().map(|v| v.invariant);
+        assert_eq!(violation, Some(WorldInvariant::Converges), "seed {seed}");
         let end = config.fault_steps + config.drain_steps;
         for kind in kinds {
             // The first step at which the action waits again.
@@ -502,7 +508,7 @@ async fn the_drain_phase_runs_each_enabled_action_within_the_fair_bound() {
             worst = worst.max((end - 1).saturating_sub(since));
             assert!(
                 worst <= bound,
-                "seed {seed}: {kind} waited {worst} drain steps, bound {bound}"
+                "seed {seed}: {kind} waited {worst} steps, bound {bound}"
             );
         }
     }
