@@ -876,6 +876,17 @@ const fn timeout_lane(reason: &TimeoutReason) -> usize {
     }
 }
 
+/// The refills of one pass, as groups of lanes (issue #2126).
+#[cfg_attr(not(test), allow(dead_code))]
+fn refill_groups(lanes: &[TimeoutScanLane; 4]) -> Vec<Vec<usize>> {
+    lanes
+        .iter()
+        .enumerate()
+        .filter(|(_, lane)| lane.queued.is_empty())
+        .map(|(index, _)| vec![index])
+        .collect()
+}
+
 #[derive(diesel::QueryableByName)]
 struct SweepStart {
     #[diesel(sql_type = diesel::sql_types::Timestamptz)]
@@ -7834,6 +7845,42 @@ mod tests {
         // A replica back from standby starts again with a new clock.
         cursor.resume(false);
         assert_eq!(cursor, TimeoutScanCursor::default());
+    }
+
+    /// Lanes that each need a refill at one sweep clock and one cursor.
+    fn lanes_in_step() -> [TimeoutScanLane; 4] {
+        let lane = TimeoutScanLane {
+            as_of: Some(chrono::Utc::now()),
+            ..TimeoutScanLane::default()
+        };
+        std::array::from_fn(|_| lane.clone())
+    }
+
+    #[test]
+    fn lanes_at_one_position_share_a_refill() {
+        assert_eq!(refill_groups(&lanes_in_step()), [vec![0, 1, 2, 3]]);
+    }
+
+    #[test]
+    fn a_lane_with_a_queue_does_not_split_a_refill() {
+        // Lane 1 needs no refill. Its claim is known before the refill, so
+        // lanes 2 and 3 can still join lane 0.
+        let mut lanes = lanes_in_step();
+        lanes[1].queued.push_back(uuid::Uuid::new_v4());
+        assert_eq!(refill_groups(&lanes), [vec![0, 2, 3]]);
+    }
+
+    #[test]
+    fn a_lane_at_another_position_ends_a_refill_group() {
+        // Lane 2 refills at another cursor. Its claim is known only after
+        // its own refill, so lane 3 cannot join lane 0 across it.
+        let mut lanes = lanes_in_step();
+        lanes[2].after = Some((chrono::Utc::now(), uuid::Uuid::new_v4()));
+        assert_eq!(refill_groups(&lanes), [vec![0, 1], vec![2], vec![3]]);
+        // A lane with another sweep clock is at another position too.
+        let mut lanes = lanes_in_step();
+        lanes[1].as_of = lanes[0].as_of.map(|t| t - chrono::Duration::seconds(1));
+        assert_eq!(refill_groups(&lanes), [vec![0], vec![1], vec![2, 3]]);
     }
 
     #[test]
