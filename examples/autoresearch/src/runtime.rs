@@ -1000,6 +1000,7 @@ async fn replay_one(replayer: &WorkflowReplayer, run: StoredRun) -> Result<(), S
         parent_execution_id: parent,
         workflow_id: Some(workflow_id),
         queue_name: None,
+        start_provenance: None,
     };
     let result = if running {
         replayer.replay_canary_snapshot(snapshot).await
