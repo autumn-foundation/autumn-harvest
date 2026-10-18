@@ -2523,6 +2523,12 @@ standalone note rather than part of the claim-path attribution table above:
   `serde_json::Value` clone eliminated by taking the field by value
   (`std::mem::take`) instead of borrowing it from the event tree the caller
   already owns (instructions -36.89%, allocation blocks -52.05%).
+* [`docs/performance-decode-event-payload-move.md`](performance-decode-event-payload-move.md)
+  — `PayloadCodecs::decode_event` moves each payload tree into its field
+  instead of letting serde rebuild it (issue #2136). `decode_event` drops
+  54.3% of its instructions in `payload_codec_profile`. The note also
+  records the allocator and `preserve_order` alternatives measured for that
+  issue.
 * [`docs/performance-parent-close-cascade-unfinished-handlers.md`](performance-parent-close-cascade-unfinished-handlers.md)
   — the per-child `harvest_events` N+1 in
   `check_and_report_unfinished_handlers`'s parent-close-cascade callers,
