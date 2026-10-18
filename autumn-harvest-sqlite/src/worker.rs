@@ -709,6 +709,34 @@ fn payload_too_large_activity_envelope(activity_name: &str, observed: u64, cap: 
     .into_error_payload()
 }
 
+/// Encode a too-deep activity result as a non-retryable `PayloadTooDeep`
+/// failure envelope (issue #2216).
+fn payload_too_deep_activity_envelope(activity_name: &str) -> String {
+    use autumn_harvest::failure::IntoActivityErrorString as _;
+    autumn_harvest::failure::ActivityFailure::non_retryable(
+        "PayloadTooDeep",
+        format!(
+            "activity '{activity_name}' result nests more than {} levels",
+            crate::MAX_PAYLOAD_DEPTH
+        ),
+    )
+    .into_error_payload()
+}
+
+/// Turn a successful result nested past the cap into a failure (issue #2216).
+///
+/// `serde_json` reads at most 128 levels. A stored result past that point
+/// fails every later drive of the run. The workflow sees this failure in its
+/// place. Other results pass unchanged.
+fn refuse_deep_result(activity_name: &str, result: Result<Value, String>) -> Result<Value, String> {
+    match result {
+        Ok(output) if crate::runtime::nests_past_cap(&output) => {
+            Err(payload_too_deep_activity_envelope(activity_name))
+        }
+        other => other,
+    }
+}
+
 /// The signal name of a `wait_for_signal_timeout` / `receive_signal_timeout`
 /// race deadline timer, or `None` if `timer_id` is not one.
 ///
@@ -939,7 +967,9 @@ pub fn finalize_within_tx(
     // override (like the input cap, which uses the global), so the GLOBAL
     // `DEFAULT_MAX_ACTIVITY_RESULT_BYTES` (2 MiB) is the faithful cap — the same
     // constant the core resolves each activity's cap against. A zero cap = uncapped.
-    let result = match result {
+    // A result nested past the cap fails the same way (issue #2216). Check
+    // the depth first: it allocates nothing.
+    let result = match refuse_deep_result(&task.name, result) {
         Ok(output) if DEFAULT_MAX_ACTIVITY_RESULT_BYTES > 0 => {
             let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
             if observed > DEFAULT_MAX_ACTIVITY_RESULT_BYTES {
@@ -1400,7 +1430,7 @@ pub fn local_attempt_events(
     result: Result<Value, String>,
 ) -> (Vec<WorkflowEvent>, Option<std::time::Duration>) {
     let activity_id = run.activity_id;
-    let error = match result {
+    let error = match refuse_deep_result(&run.name, result) {
         Ok(output) => {
             return (
                 vec![WorkflowEvent::LocalActivityCompleted {
@@ -1508,10 +1538,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        IngestBudget, SignalIngest, attempt_deadline, commands_open_activity_race, drain_ready,
-        finalize_within_tx, fire_timer, fire_timer_within_tx, handler_panic_activity_envelope,
-        history_has_unsettled_activity_race, payload_too_large_activity_envelope,
-        schedule_to_close_exceeded, signal_timeout_name, start_to_close_exceeded,
+        IngestBudget, LocalRun, SignalIngest, attempt_deadline, commands_open_activity_race,
+        drain_ready, finalize_within_tx, fire_timer, fire_timer_within_tx,
+        handler_panic_activity_envelope, history_has_unsettled_activity_race, local_attempt_events,
+        payload_too_large_activity_envelope, schedule_to_close_exceeded, signal_timeout_name,
+        start_to_close_exceeded,
     };
     use crate::queue::{self, ClaimedTask};
     use crate::runtime::ActivitySpec;
@@ -2377,6 +2408,108 @@ mod tests {
             ),
             "an under-cap result completes normally"
         );
+    }
+
+    /// A value of `depth` nested one-element arrays.
+    fn nested(depth: usize) -> serde_json::Value {
+        let mut value = serde_json::json!(1);
+        for _ in 0..depth {
+            value = serde_json::Value::Array(vec![value]);
+        }
+        value
+    }
+
+    // Issue #2216: a result nested past the cap is stored but unreadable. So
+    // it becomes a non-retryable `PayloadTooDeep` failure, as an oversized
+    // result does. The audit row holds the failure too.
+    #[test]
+    fn finalize_deep_result_records_non_retryable_payload_too_deep_terminal() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        let task = seed_running_task(&conn, exec, "act");
+        let deep = nested(crate::MAX_PAYLOAD_DEPTH + 1);
+
+        let produced =
+            super::finalize_activity_result(&mut conn, exec, &task, 3, 0, 0, Ok(deep)).unwrap();
+        assert!(produced, "a deep result is a terminal event, not a retry");
+
+        let history = store::load_history(&conn, exec).unwrap();
+        assert_eq!(history.len(), 1, "exactly one terminal event");
+        match &history[0] {
+            autumn_harvest::WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                error,
+                ..
+            } => {
+                assert_eq!(error_type, "PayloadTooDeep");
+                assert!(*non_retryable, "must be non-retryable");
+                assert!(error.contains("'act'"), "names the activity: {error}");
+            }
+            other => panic!("expected a PayloadTooDeep ActivityFailed, got {other:?}"),
+        }
+        assert_eq!(
+            queue::task_state(&conn, &task.task_id).unwrap().as_deref(),
+            Some("DONE"),
+            "the task is terminal, not requeued"
+        );
+        let attempts = store::load_attempts(&conn, exec, "act").unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert!(
+            attempts[0].result.is_err(),
+            "the audit row holds the failure"
+        );
+    }
+
+    /// A local run of `act` that allows `max_attempts` attempts.
+    fn local_run(max_attempts: u32) -> LocalRun {
+        LocalRun {
+            activity_id: ActivityExecId::new(),
+            name: "act".to_string(),
+            input: serde_json::json!(null),
+            start_to_close: None,
+            retry_policy: Some(RetryPolicy::fixed(max_attempts, Duration::ZERO)),
+            failed_attempts: 0,
+            last_error: None,
+        }
+    }
+
+    // Issue #2216: a local result nested past the cap ends the activity on
+    // the first attempt. It is not stored as `LocalActivityCompleted`.
+    #[test]
+    fn a_deep_local_result_ends_the_activity_on_the_first_attempt() {
+        let run = local_run(3);
+        let deep = nested(crate::MAX_PAYLOAD_DEPTH + 1);
+        let (events, backoff) = local_attempt_events(ExecutionId::new(), &run, 1, Ok(deep));
+        assert!(backoff.is_none(), "no retry follows");
+        match events.as_slice() {
+            [
+                autumn_harvest::WorkflowEvent::LocalActivityFailed { error, .. },
+                autumn_harvest::WorkflowEvent::LocalActivityExhausted { attempt: 1, .. },
+            ] => assert!(error.contains("'act'"), "names the activity: {error}"),
+            other => panic!("expected a failed and exhausted pair, got {other:?}"),
+        }
+    }
+
+    // Issue #2216: a local result at the cap completes unchanged.
+    #[test]
+    fn a_local_result_at_the_cap_completes() {
+        let capped = nested(crate::MAX_PAYLOAD_DEPTH);
+        let (events, backoff) =
+            local_attempt_events(ExecutionId::new(), &local_run(1), 1, Ok(capped.clone()));
+        assert!(backoff.is_none());
+        assert!(matches!(
+            events.as_slice(),
+            [autumn_harvest::WorkflowEvent::LocalActivityCompleted { output, .. }] if *output == capped
+        ));
     }
 
     // Codex #1069 P2 (`worker.rs:211`): a body that SUCCEEDS but whose FINALIZE clock

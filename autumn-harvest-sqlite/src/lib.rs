@@ -121,6 +121,9 @@
 //!   128 levels. A start input, memo, signal payload or update input that nests deeper than
 //!   [`MAX_PAYLOAD_DEPTH`] is refused with [`SqliteError::PayloadTooDeep`] before
 //!   anything is persisted. The run stays live and the driver stays healthy.
+//!   An activity result that nests too deep becomes a non-retryable
+//!   `PayloadTooDeep` failure, for a remote or a local activity (issue #2216).
+//!   The workflow sees the failure. Nothing too deep is stored.
 //! - **Payload-size caps are enforced at every boundary, matching the core** (issue
 //!   #252). A caller-supplied payload that exceeds its byte cap is refused before it
 //!   can enter `harvest_events`, so this backend never stores an unbounded history

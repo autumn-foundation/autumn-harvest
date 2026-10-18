@@ -4383,8 +4383,8 @@ fn children(value: &Value) -> Option<Children<'_>> {
     }
 }
 
-/// Returns `Ok` only when `value` has at most [`MAX_PAYLOAD_DEPTH`] open
-/// arrays and objects on any path.
+/// Returns `true` when `value` has more than [`MAX_PAYLOAD_DEPTH`] open
+/// arrays and objects on a path.
 ///
 /// The walk keeps one iterator per open container. A recursive walk would
 /// overflow the call stack on the input it must refuse. Memory use is bound
@@ -4392,7 +4392,7 @@ fn children(value: &Value) -> Option<Children<'_>> {
 ///
 /// Call it before any code that recurses over the value, such as a schema check
 /// or a settlement decoder.
-fn check_depth(kind: &'static str, value: &Value) -> SqliteResult<()> {
+pub fn nests_past_cap(value: &Value) -> bool {
     let mut open: Vec<Children<'_>> = children(value).into_iter().collect();
     while let Some(top) = open.last_mut() {
         let Some(child) = top.next() else {
@@ -4401,13 +4401,22 @@ fn check_depth(kind: &'static str, value: &Value) -> SqliteResult<()> {
         };
         if let Some(inner) = children(child) {
             if open.len() >= MAX_PAYLOAD_DEPTH {
-                return Err(SqliteError::PayloadTooDeep {
-                    kind,
-                    cap_depth: MAX_PAYLOAD_DEPTH,
-                });
+                return true;
             }
             open.push(inner);
         }
+    }
+    false
+}
+
+/// Returns `Ok` only when `value` nests at most [`MAX_PAYLOAD_DEPTH`] levels.
+/// `kind` names the ingress boundary in the error.
+fn check_depth(kind: &'static str, value: &Value) -> SqliteResult<()> {
+    if nests_past_cap(value) {
+        return Err(SqliteError::PayloadTooDeep {
+            kind,
+            cap_depth: MAX_PAYLOAD_DEPTH,
+        });
     }
     Ok(())
 }
