@@ -620,3 +620,11 @@ workspace = true
 [[bench]]
 name = "audit_chain_verify_profile"
 harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `DagBuilder::build` and `DagSimulator::run`. See
+# `benches/dag_simulator_profile.rs`.
+[[bench]]
+name = "dag_simulator_profile"
+required-features = ["testing"]
+harness = false
