@@ -889,6 +889,9 @@ diesel::table! {
         attempts -> Integer,
         last_error -> Nullable<Text>,
         last_attempt_at -> Nullable<Timestamptz>,
+        /// The reason that the parent gave its cancel (issue #2194).
+        /// NULL = use the generic parent-cancel text.
+        cancel_reason -> Nullable<Text>,
     }
 }
 

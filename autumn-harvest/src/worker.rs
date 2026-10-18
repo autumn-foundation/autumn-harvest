@@ -20944,7 +20944,13 @@ pub async fn apply_race_loser_cancellations(
             // inline exactly as it was before this feature existed, touching no
             // new table.
             if crate::worker::parent_is_on_another_shard(conn, exec_id, *child_id).await?
-                && crate::cross_shard_child::request_cross_shard_cancel(conn, *child_id).await? > 0
+                && crate::cross_shard_child::request_cross_shard_cancel(
+                    conn,
+                    *child_id,
+                    Some("lost race to a sibling branch"),
+                )
+                .await?
+                    > 0
             {
                 continue;
             }
