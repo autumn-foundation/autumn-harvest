@@ -417,6 +417,9 @@ pub mod partition;
 /// Export of aged event partitions to object storage (issue #2009).
 pub mod partition_archive;
 pub mod payload_codec;
+/// Sweep of payload blobs that no execution references (issue #2123).
+#[cfg(feature = "db")]
+pub mod payload_orphans;
 pub mod payload_store;
 /// The connection transport a DSN's `sslmode` selects, with TLS through
 /// rustls.
@@ -514,6 +517,9 @@ pub mod tx_retry;
 mod shuttle_sync;
 /// Signal handler registry for push-based reactive signal handling (issue #546).
 pub mod signal_handler;
+/// `always!` and `sometimes!` for workflow code (issue #2033).
+#[doc(hidden)]
+pub mod sim_probe;
 pub mod simulator;
 /// Adaptive worker dispatch-slot tuner (issue #548).
 pub mod slot_tuner;
@@ -757,9 +763,9 @@ pub use policy::{
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{
-    ChildOrTimerMatch, DEADLINE_PROBE_SIDE_EFFECT_NAME, HistoryMatch, HistoryMatcher,
-    MutexGrantMatch, PatchMarkerMatch, SagaMarkerMatch, SideEffectNowMatch, SignalOrTimerMatch,
-    TimerFireMatch,
+    CONTINUE_AS_NEW_SIDE_EFFECT_NAME, ChildOrTimerMatch, ContinueAsNewMatch,
+    DEADLINE_PROBE_SIDE_EFFECT_NAME, HistoryMatch, HistoryMatcher, MutexGrantMatch,
+    PatchMarkerMatch, SagaMarkerMatch, SideEffectNowMatch, SignalOrTimerMatch, TimerFireMatch,
 };
 #[cfg(feature = "db")]
 pub use reset::{
@@ -787,7 +793,8 @@ pub use schedule_decision::record_decision_graceful;
 #[cfg(feature = "db")]
 pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
-    register_schedules, register_workflow_schedules, tick_once, trigger_unified_dag,
+    register_schedules, register_workflow_schedules, register_workflow_schedules_with_codecs,
+    tick_once, trigger_unified_dag,
 };
 pub use schema_contract::{
     AcknowledgedBreakingChange, ActivitySchemaEntry, ChangeKind, CompatibilityRules,
@@ -843,8 +850,8 @@ pub use trace_export::export_chrome_trace;
 pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalAwaitId,
     ExternalCancelId, ExternalSignalId, ExternalTarget, ParentClosePolicy, Priority, SessionId,
-    ShardId, StartSource, TimerId, UpdateId, WorkerId, WorkflowId, WorkflowIdConflictPolicy,
-    WorkflowIdReusePolicy,
+    ShardId, StartProvenance, StartSource, TimerId, UpdateId, WorkerId, WorkflowId,
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;
 #[cfg(feature = "db")]

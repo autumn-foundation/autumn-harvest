@@ -239,8 +239,8 @@ fn allowlisted(key: &str) -> bool {
 struct SuiteRow {
     /// `linux` | `linuxpart` | `allos` | `compileonly`.
     osclass: String,
-    /// `autumn-harvest` | `autumn-harvest-plugin` | `autumn-harvest-redis` |
-    /// `standalone-runner`.
+    /// `autumn-harvest` | `autumn-harvest-conformance` | `autumn-harvest-plugin`
+    /// | `autumn-harvest-redis` | `standalone-runner`.
     krate: String,
     /// The `--test <target>` binary (core suites use `integration`).
     target: String,
@@ -295,6 +295,8 @@ fn parse_manifest() -> Vec<SuiteRow> {
     const VALID_OSCLASS: &[&str] = &["linux", "linuxpart", "allos", "compileonly"];
     const VALID_CRATE: &[&str] = &[
         "autumn-harvest",
+        // Issue #2030: the cross-backend conformance suite.
+        "autumn-harvest-conformance",
         "autumn-harvest-plugin",
         "autumn-harvest-redis",
         // Issue #1615: the example's live-Postgres acceptance suite.
@@ -946,6 +948,29 @@ fn standalone_runner_test_targets_have_a_running_row() {
             "examples/standalone-runner/tests/{target}.rs needs a `linux standalone-runner {target}` row"
         );
     }
+}
+
+/// Issue #2030. The cross-backend conformance suite runs from a `linux` row,
+/// so it runs on every PR that changes code. The live-DB scan reads only the
+/// core and plugin tests, so a deleted row would go unseen.
+#[test]
+fn conformance_suite_has_a_running_row() {
+    let rows = parse_manifest();
+    let manifest =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../autumn-harvest-conformance/Cargo.toml");
+    let toml = std::fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+    assert!(
+        toml.contains("name = \"conformance\""),
+        "the conformance crate declares its `conformance` test target"
+    );
+    assert!(
+        rows.iter().any(|r| r.krate == "autumn-harvest-conformance"
+            && r.target == "conformance"
+            && r.osclass == "linux"
+            && r.filter == "-"),
+        "the conformance suite needs a `linux autumn-harvest-conformance conformance - -` row"
+    );
 }
 
 /// Issue #1978: the auth suites need no database, so the live-DB sweep skips

@@ -414,6 +414,9 @@ pub struct WorkflowExecuteSpanMeta {
     /// execution row's `parent_id` column so a child workflow can identify its
     /// spawner via `ctx.info()` / `ctx.parent_execution_id()`.
     pub parent_execution_id: Option<ExecutionId>,
+    /// How this run started and its predecessor (issue #2082). The worker reads
+    /// it from the `start_source` and `continued_from_exec_id` columns.
+    pub start_provenance: crate::types::StartProvenance,
     /// A cancel request that is not yet in the history (issue #2021).
     ///
     /// The SQLite backend stores a cooperative cancel outside the event log.
@@ -1131,6 +1134,9 @@ pub struct ReplayDeclarativeHandlers<'a> {
     /// The candidate worker's shard router. `None` leaves the context on the
     /// process-global router, as before.
     pub router: Option<&'a crate::shard::ShardRouter>,
+    /// How the replayed run started (issue #2082). The row holds it, not the
+    /// history, so a replay needs it to reach the same branch as the live run.
+    pub start_provenance: crate::types::StartProvenance,
 }
 
 /// The **candidate** worker's payload limits, applied to a replay context.
@@ -1263,6 +1269,7 @@ pub async fn run_workflow_strict(
         .with_execution_timeout(execution_timeout)
         .with_deadline(deadline_at)
         .with_parent_execution_id(parent_execution_id)
+        .with_start_provenance(declarative_handlers.start_provenance)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
         .with_queue_name(queue_name.unwrap_or_default())
@@ -1334,6 +1341,7 @@ pub(crate) async fn run_workflow_strict_advancing_clock(
         .with_execution_timeout(execution_timeout)
         .with_deadline(deadline_at)
         .with_parent_execution_id(parent_execution_id)
+        .with_start_provenance(declarative_handlers.start_provenance)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
         .with_queue_name(queue_name.unwrap_or_default())
@@ -1655,6 +1663,7 @@ pub(crate) async fn run_workflow_canary(
         .with_execution_timeout(execution_timeout)
         .with_deadline(deadline_at)
         .with_parent_execution_id(parent_execution_id)
+        .with_start_provenance(declarative_handlers.start_provenance)
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id.unwrap_or_default())
         .with_queue_name(queue_name.unwrap_or_default())
@@ -1992,6 +2001,7 @@ pub(crate) fn advancing_clock_context(
     // Issue #698: thread the spawning parent's execution id so a child workflow
     // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
+    .with_start_provenance(span_meta.map(|m| m.start_provenance).unwrap_or_default())
     // Issue #798: thread the worker build id (mirrors the caps sibling
     // `run_workflow_with_state_history_policy_and_caps`, which already does) so a
     // `WorkflowTestEnv::with_build_id` run can exercise a build-gated workflow.
@@ -2187,6 +2197,7 @@ pub(crate) fn build_task_context(
     // Issue #698: thread the spawning parent's execution id so a child workflow
     // can read it via `ctx.info()` / `ctx.parent_execution_id()`.
     .with_parent_execution_id(span_meta.and_then(|m| m.parent_execution_id))
+    .with_start_provenance(span_meta.map(|m| m.start_provenance).unwrap_or_default())
     // Issue #2021: a cancel request the history does not hold yet.
     .with_pending_cancellation(span_meta.and_then(|m| m.cancellation_reason.clone()))
     .with_payload_caps(
@@ -3530,6 +3541,7 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            start_provenance: crate::types::StartProvenance::default(),
             cancellation_reason: None,
         }
     }

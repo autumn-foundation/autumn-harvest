@@ -56,6 +56,10 @@ use crate::executor::{
 use crate::info::{WorkflowHandlerFn, WorkflowInfo};
 use crate::types::{ActivityExecId, ExecutionId, ParentClosePolicy, WorkerId};
 
+pub mod sim;
+
+use sim::MockCall;
+
 // ---------------------------------------------------------------------------
 // NonDeterminismKind
 // ---------------------------------------------------------------------------
@@ -292,6 +296,7 @@ impl std::fmt::Display for ReplayReport {
 ///     execution_timeout: None,
 ///     deadline_at: None,
 ///     parent_execution_id: None,
+///     start_provenance: None,
 ///     workflow_id: None,
 ///     queue_name: None,
 /// };
@@ -350,6 +355,14 @@ pub struct HistorySnapshot {
     /// replayer's global parent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_execution_id: Option<ExecutionId>,
+    /// How the run started (issue #2082), sourced from the `start_source` and
+    /// `continued_from_exec_id` columns. Like
+    /// [`parent_execution_id`](Self::parent_execution_id), no `WorkflowEvent`
+    /// holds it. When `Some`, it wins over the replayer-wide
+    /// [`with_start_provenance`](WorkflowReplayer::with_start_provenance). `None`
+    /// is a legacy snapshot, and it falls back to the replayer value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_provenance: Option<crate::types::StartProvenance>,
     /// The business-level workflow identifier (issue #698), sourced from the
     /// `harvest_workflow_executions.workflow_id` column. Like
     /// [`parent_execution_id`](Self::parent_execution_id), it lives in no
@@ -436,6 +449,11 @@ pub struct WorkflowReplayer {
     /// A [`HistorySnapshot`] that carries its own `parent_execution_id` overrides
     /// this global. `None` (the default) models a top-level run.
     parent_execution_id: Option<ExecutionId>,
+    /// How the replayed run started (issue #2082). It lives in the execution
+    /// row, not in a `WorkflowEvent`. Set it with
+    /// [`with_start_provenance`](Self::with_start_provenance) so a workflow that
+    /// branches on `ctx.info().start_source` replays like the live run.
+    start_provenance: crate::types::StartProvenance,
     /// Effective business-level `workflow_id` threaded into the replayed
     /// `WorkflowContext` (issue #698). `workflow_id` lives in no `WorkflowEvent`, so
     /// a raw-events fixture cannot recover it; set it with
@@ -555,6 +573,7 @@ struct DeclarativeHandlerRefs<'a> {
     queries: Vec<&'a crate::info::QueryHandlerInfo>,
     updates: Vec<&'a crate::info::UpdateHandlerInfo>,
     router: Option<&'a crate::shard::ShardRouter>,
+    start_provenance: crate::types::StartProvenance,
 }
 
 impl<'a> DeclarativeHandlerRefs<'a> {
@@ -564,6 +583,7 @@ impl<'a> DeclarativeHandlerRefs<'a> {
             queries: &self.queries,
             updates: &self.updates,
             router: self.router,
+            start_provenance: self.start_provenance,
         }
     }
 }
@@ -598,6 +618,9 @@ struct SampledExecution {
     // replay so a workflow that branches on `ctx.queue_name()` does not
     // false-report non-determinism.
     queue_name: String,
+    // Issue #2082: the sampled row's start source and predecessor, so a canary
+    // replay of a keyed entity takes the same branch as the live run.
+    start_provenance: crate::types::StartProvenance,
 }
 
 impl WorkflowReplayer {
@@ -613,6 +636,7 @@ impl WorkflowReplayer {
             metrics: std::sync::Arc::new(crate::telemetry::NoOpMetrics),
             execution_timeout: None,
             parent_execution_id: None,
+            start_provenance: crate::types::StartProvenance::default(),
             workflow_id: None,
             queue_name: None,
             build_id: None,
@@ -676,6 +700,25 @@ impl WorkflowReplayer {
     #[must_use]
     pub const fn with_parent_execution_id(mut self, parent: Option<ExecutionId>) -> Self {
         self.parent_execution_id = parent;
+        self
+    }
+
+    /// Set how the replayed run started (issue #2082).
+    ///
+    /// The `start_source` and `continued_from_exec_id` row columns hold it, and
+    /// no `WorkflowEvent` does. A workflow that branches on
+    /// `ctx.info().start_source` needs it to replay like the live run. The
+    /// default is an unknown source with no predecessor.
+    ///
+    /// A [`HistorySnapshot`] holds no provenance. The verifier, the debugger and
+    /// a fixture replay therefore use this value, and `replay_from_db` and the
+    /// canary read the row.
+    #[must_use]
+    pub const fn with_start_provenance(
+        mut self,
+        provenance: crate::types::StartProvenance,
+    ) -> Self {
+        self.start_provenance = provenance;
         self
     }
 
@@ -827,6 +870,7 @@ impl WorkflowReplayer {
             queries: self.declarative_queries.iter().collect(),
             updates: self.declarative_updates.iter().collect(),
             router: self.shard_router.as_ref(),
+            start_provenance: self.start_provenance,
         }
     }
 
@@ -994,6 +1038,7 @@ impl WorkflowReplayer {
             context_headers: self.context_headers.clone(),
             execution_timeout: self.execution_timeout,
             parent_execution_id: self.parent_execution_id,
+            start_provenance: self.start_provenance,
             workflow_id: self.workflow_id.clone(),
             queue_name: self.queue_name.clone(),
             build_id: self.build_id.clone(),
@@ -1123,6 +1168,8 @@ impl WorkflowReplayer {
             .queue_name
             .clone()
             .or_else(|| self.queue_name.clone());
+        // Issue #2082: prefer the snapshot's own provenance; fall back to the global.
+        let start_provenance = snapshot.start_provenance.unwrap_or(self.start_provenance);
         self.replay_from_snapshot_effective(
             snapshot,
             execution_timeout,
@@ -1130,6 +1177,7 @@ impl WorkflowReplayer {
             parent_execution_id,
             workflow_id,
             queue_name,
+            start_provenance,
         )
         .await
     }
@@ -1141,7 +1189,7 @@ impl WorkflowReplayer {
     /// [`replay_from_db`](Self::replay_from_db) passes the loaded execution row's
     /// own values.
     // One linear setup per replay mode. A split would only move the lines.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn replay_from_snapshot_effective(
         &self,
         snapshot: HistorySnapshot,
@@ -1152,6 +1200,7 @@ impl WorkflowReplayer {
         // Issue #798: the execution's task queue, so a workflow branching on
         // `ctx.queue_name()` does not replay under `""`.
         queue_name: Option<String>,
+        start_provenance: crate::types::StartProvenance,
     ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
@@ -1171,7 +1220,8 @@ impl WorkflowReplayer {
 
         // Issue #798 (Codex round 21): borrow the candidate's declarative
         // handlers for the duration of the executor call.
-        let declarative = self.declarative_handlers();
+        let mut declarative = self.declarative_handlers();
+        declarative.start_provenance = start_provenance;
         let exec_id = snapshot.execution_id;
         // Issue #698: the workflow type name (mechanism 1 — the handler-lookup key)
         // applied to the replayed context via `.with_workflow_name(...)`.
@@ -1210,6 +1260,7 @@ impl WorkflowReplayer {
                     parent_execution_id,
                     workflow_id,
                     queue_name,
+                    start_provenance,
                 )
                 .await;
         }
@@ -1319,6 +1370,8 @@ impl WorkflowReplayer {
             .queue_name
             .clone()
             .or_else(|| self.queue_name.clone());
+        // Issue #2082: prefer the snapshot's own provenance; fall back to the global.
+        let start_provenance = snapshot.start_provenance.unwrap_or(self.start_provenance);
         self.replay_canary_snapshot_effective(
             snapshot,
             execution_timeout,
@@ -1326,6 +1379,7 @@ impl WorkflowReplayer {
             parent_execution_id,
             workflow_id,
             queue_name,
+            start_provenance,
         )
         .await
     }
@@ -1333,6 +1387,7 @@ impl WorkflowReplayer {
     /// Canary snapshot replay with an explicit per-execution `execution_timeout`
     /// / live `deadline_at` (issue #772) / spawning-parent id (issue #698) /
     /// task queue (issue #798).
+    #[allow(clippy::too_many_arguments)]
     async fn replay_canary_snapshot_effective(
         &self,
         snapshot: HistorySnapshot,
@@ -1341,6 +1396,7 @@ impl WorkflowReplayer {
         parent_execution_id: Option<ExecutionId>,
         workflow_id: Option<String>,
         queue_name: Option<String>,
+        start_provenance: crate::types::StartProvenance,
     ) -> ReplayReport {
         let Some(&handler) = self.handlers.get(&snapshot.workflow_name) else {
             return ReplayReport {
@@ -1360,7 +1416,8 @@ impl WorkflowReplayer {
 
         // Issue #798 (Codex round 21): borrow the candidate's declarative
         // handlers for the duration of the executor call.
-        let declarative = self.declarative_handlers();
+        let mut declarative = self.declarative_handlers();
+        declarative.start_provenance = start_provenance;
         let exec_id = snapshot.execution_id;
         // Issue #698: the workflow type name (mechanism 1 — the handler-lookup key).
         let workflow_name = snapshot.workflow_name.clone();
@@ -1709,6 +1766,7 @@ impl WorkflowReplayer {
                 meta.parent_execution_id,
                 workflow_id,
                 queue_name,
+                meta.start_provenance,
             )
             .await)
     }
@@ -1772,6 +1830,7 @@ impl WorkflowReplayer {
                 meta.parent_execution_id,
                 workflow_id,
                 queue_name,
+                meta.start_provenance,
             )
             .await)
     }
@@ -1812,6 +1871,8 @@ impl WorkflowReplayer {
             // Issue #698: the row's own spawning-parent id, so a parent-aware
             // child replays deterministically from the store.
             parent_execution_id: meta.parent_execution_id,
+            // Issue #2082: the row's own start source and predecessor.
+            start_provenance: Some(meta.start_provenance),
             // Issue #698: the row's own business `workflow_id`.
             workflow_id: Some(meta.workflow_id.clone()),
             // Issue #798: the row's own task queue.
@@ -1849,8 +1910,19 @@ impl WorkflowReplayer {
 
         let mut all_executions = Vec::new();
         for (shard_id, executions) in query_results {
-            for (id, name, created, headers, exec_timeout, deadline_at, parent_id, wf_id, queue) in
-                executions
+            for (
+                id,
+                name,
+                created,
+                headers,
+                exec_timeout,
+                deadline_at,
+                parent_id,
+                wf_id,
+                queue,
+                start_source,
+                continued_from,
+            ) in executions
             {
                 all_executions.push(SampledExecution {
                     shard_id,
@@ -1867,6 +1939,11 @@ impl WorkflowReplayer {
                     workflow_id: wf_id,
                     // Issue #798: the sampled row's task queue.
                     queue_name: queue,
+                    // Issue #2082: the sampled row's start source and predecessor.
+                    start_provenance: crate::types::StartProvenance::from_row(
+                        start_source.as_deref(),
+                        continued_from,
+                    ),
                 });
             }
         }
@@ -1894,20 +1971,21 @@ impl WorkflowReplayer {
                     Ok(_permit) => {
                         let load_and_replay = async {
                             let snapshot = {
-                                let mut conn = shard_pool
-                                    .get()
-                                    .await
-                                    .map_err(|e| crate::error::HarvestError::Database(e.to_string()))?;
+                                let mut conn = shard_pool.get().await.map_err(|e| {
+                                    crate::error::HarvestError::Database(e.to_string())
+                                })?;
 
-                                let history = crate::store::load_history(&mut conn, exec.execution_id).await?;
-                                let headers = exec.context_headers.clone().and_then(|v| {
-                                    serde_json::from_value::<std::collections::HashMap<String, String>>(v)
-                                        .map_err(|e| {
-                                            tracing::warn!(error = %e, "replay canary: failed to deserialize context headers");
-                                            e
-                                        })
-                                        .ok()
-                                });
+                                let history =
+                                    crate::store::load_history(&mut conn, exec.execution_id)
+                                        .await?;
+                                // Decode with the registry that loaded the history. A cell
+                                // this registry cannot read fails the replay. It never runs
+                                // without its headers (issue #2043).
+                                let headers = exec
+                                    .context_headers
+                                    .as_ref()
+                                    .map(|v| crate::store::DEFAULT_PAYLOAD_CODECS.decode_headers(v))
+                                    .transpose()?;
                                 HistorySnapshot {
                                     workflow_name: exec.workflow_name.clone(),
                                     execution_id: exec.execution_id,
@@ -1917,6 +1995,8 @@ impl WorkflowReplayer {
                                     deadline_at: exec.deadline_at,
                                     // Issue #698: the sampled row's own parent id.
                                     parent_execution_id: exec.parent_execution_id,
+                                    // Issue #2082: the sampled row's own provenance.
+                                    start_provenance: Some(exec.start_provenance),
                                     // Issue #698: the sampled row's own business id.
                                     workflow_id: Some(exec.workflow_id.clone()),
                                     // Issue #798: the sampled row's own task queue.
@@ -1938,6 +2018,7 @@ impl WorkflowReplayer {
                                     exec.parent_execution_id,
                                     Some(exec.workflow_id.clone()),
                                     Some(exec.queue_name.clone()),
+                                    exec.start_provenance,
                                 )
                                 .await;
                             Ok::<_, crate::error::HarvestError>(report)
@@ -2069,11 +2150,14 @@ async fn query_running_executions(
         Option<uuid::Uuid>,
         String,
         String,
+        Option<String>,
+        Option<uuid::Uuid>,
     )>,
 > {
     use crate::schema::harvest_workflow_executions::dsl::{
-        context_headers, created_at, deadline_at, execution_timeout, harvest_workflow_executions,
-        id, parent_id, queue_name, state, workflow_id, workflow_name,
+        context_headers, continued_from_exec_id, created_at, deadline_at, execution_timeout,
+        harvest_workflow_executions, id, parent_id, queue_name, start_source, state, workflow_id,
+        workflow_name,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
@@ -2105,6 +2189,9 @@ async fn query_running_executions(
             // Issue #798: thread the execution's task queue, so a canary replay of
             // a workflow branching on `ctx.queue_name()` does not run under "".
             queue_name,
+            // Issue #2082: thread the start source and predecessor.
+            start_source,
+            continued_from_exec_id,
         ))
         .order((created_at.desc(), id.desc()))
         .limit(i64::try_from(options.sample_size).unwrap_or(i64::MAX))
@@ -2118,6 +2205,8 @@ async fn query_running_executions(
             Option<uuid::Uuid>,
             String,
             String,
+            Option<String>,
+            Option<uuid::Uuid>,
         )>(conn)
         .await
         .map_err(crate::error::database_error)?;
@@ -2239,6 +2328,8 @@ struct DbReplayMeta {
     // Issue #798: the row's `queue_name` column, so `replay_from_db` reports the
     // real `ctx.queue_name()` instead of "".
     queue_name: String,
+    // Issue #2082: the row's start source and predecessor.
+    start_provenance: crate::types::StartProvenance,
 }
 
 #[cfg(feature = "db")]
@@ -2252,17 +2343,28 @@ async fn load_workflow_name_and_headers(
 ) -> crate::error::HarvestResult<DbReplayMeta> {
     use crate::error::{HarvestError, database_error};
     use crate::schema::harvest_workflow_executions::dsl::{
-        context_headers as context_headers_col, deadline_at as deadline_at_col,
-        execution_timeout as execution_timeout_col, harvest_workflow_executions, id as id_col,
-        parent_id as parent_id_col, queue_name as queue_name_col, workflow_id as workflow_id_col,
-        workflow_name,
+        context_headers as context_headers_col, continued_from_exec_id as continued_from_col,
+        deadline_at as deadline_at_col, execution_timeout as execution_timeout_col,
+        harvest_workflow_executions, id as id_col, parent_id as parent_id_col,
+        queue_name as queue_name_col, start_source as start_source_col,
+        workflow_id as workflow_id_col, workflow_name,
     };
     use diesel::prelude::*;
     use diesel_async::RunQueryDsl;
 
     let exec_uuid = exec_id.as_uuid();
 
-    let (name, raw_headers, execution_timeout, deadline_at, parent_uuid, workflow_id, queue_name): (
+    let (
+        name,
+        raw_headers,
+        execution_timeout,
+        deadline_at,
+        parent_uuid,
+        workflow_id,
+        queue_name,
+        start_source,
+        continued_from,
+    ): (
         String,
         Option<serde_json::Value>,
         Option<chrono::Duration>,
@@ -2270,6 +2372,8 @@ async fn load_workflow_name_and_headers(
         Option<uuid::Uuid>,
         String,
         String,
+        Option<String>,
+        Option<uuid::Uuid>,
     ) = harvest_workflow_executions
         .filter(id_col.eq(exec_uuid))
         .select((
@@ -2281,6 +2385,9 @@ async fn load_workflow_name_and_headers(
             workflow_id_col,
             // Issue #798: the row's task queue.
             queue_name_col,
+            // Issue #2082: the row's start source and predecessor.
+            start_source_col,
+            continued_from_col,
         ))
         .first(conn)
         .await
@@ -2289,16 +2396,9 @@ async fn load_workflow_name_and_headers(
             other => database_error(other),
         })?;
 
-    let headers = raw_headers
-        .and_then(|v| {
-            serde_json::from_value::<std::collections::HashMap<String, String>>(v)
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "replay_from_db: failed to deserialize context headers");
-                    e
-                })
-                .ok()
-        })
-        .unwrap_or_default();
+    // The history loads through the default registry, so the headers decode
+    // through it too. A cell it cannot read fails the replay (issue #2043).
+    let headers = crate::store::DEFAULT_PAYLOAD_CODECS.decode_headers_opt(raw_headers.as_ref())?;
 
     Ok(DbReplayMeta {
         workflow_name: name,
@@ -2311,6 +2411,11 @@ async fn load_workflow_name_and_headers(
         workflow_id,
         // Issue #798: the row's task queue.
         queue_name,
+        // Issue #2082: the row's start source and predecessor.
+        start_provenance: crate::types::StartProvenance::from_row(
+            start_source.as_deref(),
+            continued_from,
+        ),
     })
 }
 
@@ -2384,6 +2489,8 @@ fn timed_out_prefix(
         execution_timeout: None,
         deadline_at: None,
         parent_execution_id: None,
+        // The caller falls back to the replayer value (issue #2082).
+        start_provenance: None,
         workflow_id,
         queue_name,
     }
@@ -3881,6 +3988,8 @@ struct FixtureReplayDefaults {
     context_headers: HashMap<String, String>,
     execution_timeout: Option<chrono::Duration>,
     parent_execution_id: Option<ExecutionId>,
+    /// Fallback start provenance for a fixture that omits it (issue #2082).
+    start_provenance: crate::types::StartProvenance,
     workflow_id: Option<String>,
     queue_name: Option<String>,
     /// The **candidate** build id (issue #798).
@@ -4847,6 +4956,8 @@ fn fixture_replayer(
         // still wins, so a deadline-aware fixture is validated either way.
         execution_timeout: defaults.execution_timeout,
         parent_execution_id: defaults.parent_execution_id,
+        // A snapshot that omits the value falls back to the configured one.
+        start_provenance: defaults.start_provenance,
         workflow_id: defaults.workflow_id.clone(),
         // Issue #798 fallback: a snapshot carrying its own `queue_name` still
         // wins, so an exported fixture is validated against its real queue.
@@ -5189,6 +5300,8 @@ pub struct TestRunOutcome {
     /// reported as a FALSE non-determinism. `None` (the default) models a
     /// top-level run.
     parent_execution_id: Option<ExecutionId>,
+    /// How the producing run started (issue #2082). `replay_check` re-applies it.
+    start_provenance: crate::types::StartProvenance,
     /// The logical workflow type name carried from the producing `WorkflowTestEnv`
     /// (issue #698, Codex P2). `replay_check` uses it for BOTH the replay
     /// snapshot's `workflow_name` AND the handler-registration key — otherwise the
@@ -5393,6 +5506,12 @@ impl TestRunOutcome {
     /// deadline-disabled context, leave that probe unconsumed, and report a
     /// FALSE non-determinism.
     pub async fn replay_check(&self, handler: WorkflowHandlerFn) -> ReplayReport {
+        let (replayer, snapshot) = self.replay_parts(handler);
+        replayer.replay_from_snapshot(snapshot).await
+    }
+
+    /// The replayer and the snapshot that [`replay_check`](Self::replay_check) uses.
+    fn replay_parts(&self, handler: WorkflowHandlerFn) -> (WorkflowReplayer, HistorySnapshot) {
         let snapshot = crate::testing::HistorySnapshot {
             // Issue #698 (Codex P2): use the producing env's configured workflow
             // type name for BOTH the snapshot `workflow_name` (so the replay
@@ -5415,6 +5534,8 @@ impl TestRunOutcome {
             // parent-aware child self-checks deterministically (matches the live
             // run, which received it via span_meta).
             parent_execution_id: self.parent_execution_id,
+            // Issue #2082: the live run saw this provenance via span_meta.
+            start_provenance: Some(self.start_provenance),
             // Issue #698 (Codex P2): carry the producing env's business
             // `workflow_id` so a workflow recording `ctx.info().workflow_id`
             // (e.g. in an activity input) self-checks deterministically. `None`
@@ -5445,6 +5566,8 @@ impl TestRunOutcome {
         if let Some(execution_timeout) = self.execution_timeout {
             replayer = replayer.with_execution_timeout(execution_timeout);
         }
+        // Issue #2082: the live run saw this provenance via span_meta.
+        replayer = replayer.with_start_provenance(self.start_provenance);
         // Issue #798: carry the producing env's build id. Unlike `workflow_id` /
         // `queue_name` above this rides the *replayer*, not the snapshot, because
         // `HistorySnapshot` deliberately carries no build id (a fixture-sourced
@@ -5459,7 +5582,7 @@ impl TestRunOutcome {
         replayer = replayer
             .queries(self.declarative_queries.clone())
             .updates(self.declarative_updates.clone());
-        replayer.replay_from_snapshot(snapshot).await
+        (replayer, snapshot)
     }
 }
 
@@ -5538,10 +5661,9 @@ pub struct WorkflowTestRun<'env> {
     exec_id: ExecutionId,
     start_time: DateTime<Utc>,
     history: Vec<WorkflowEvent>,
-    call_counts: HashMap<String, u32>,
     /// Signals not yet in history. The next cycle ingests them at task-prep.
     pending_signals: Vec<(String, Value)>,
-    retry_sequences: HashMap<String, std::collections::VecDeque<Vec<Result<Value, String>>>>,
+    mocks: RunMocks,
     side_output: RecordedSideOutput,
     /// History length at the last `Blocked`. A drive with no new event and
     /// no pending signal returns `Blocked` again without running the body.
@@ -5628,12 +5750,10 @@ impl WorkflowTestRun<'_> {
 
             match outcome {
                 WorkflowOutcome::Suspended { commands } => {
-                    match self.env.process_suspension(
-                        commands,
-                        &mut self.history,
-                        &mut self.call_counts,
-                        &mut self.retry_sequences,
-                    ) {
+                    match self
+                        .env
+                        .process_suspension(commands, &mut self.history, &mut self.mocks)
+                    {
                         Ok(true) => {}
                         Ok(false) => {
                             self.blocked_at = Some(self.history.len());
@@ -5949,11 +6069,16 @@ pub struct WorkflowTestEnv {
     /// and each result is emitted as a separate `ActivityFailed` (with
     /// incrementing `attempt` numbers) or a terminal `ActivityCompleted`.
     retry_sequences: HashMap<String, std::collections::VecDeque<Vec<Result<Value, String>>>>,
+    /// Mocks that get a seeded generator and the virtual clock (issue #2033).
+    seeded_mocks: HashMap<String, sim::SeededMockFn>,
     /// Child-workflow stubs: workflow name → closure(input) → result.
     child_mocks: HashMap<String, MockFn>,
     /// Simulated wall-clock time.  Used as the `WorkflowStarted` timestamp so
     /// `ctx.now()` inside the workflow function is deterministic.
     simulated_now: DateTime<Utc>,
+    /// Whether [`with_frozen_anchor`](Self::with_frozen_anchor) set the
+    /// clock. A simulation run otherwise starts at a fixed time (issue #2033).
+    anchor_frozen: bool,
     /// Signals pre-queued for delivery when the workflow calls `wait_for_signal`.
     queued_signals: Vec<(String, Value)>,
     /// If `Some`, a `WorkflowCancelled` event is prepended to the history so
@@ -6003,6 +6128,9 @@ pub struct WorkflowTestEnv {
     /// (issue #698) so a no-DB test can prove `ctx.info().parent_execution_id` /
     /// `ctx.parent_execution_id()`. `None` (the default) models a top-level run.
     parent_execution_id: Option<ExecutionId>,
+    /// How the run under test started (issue #2082). The default is an unknown
+    /// source with no predecessor.
+    start_provenance: crate::types::StartProvenance,
     /// Canned `await_external_workflow` outcomes (issue #757): target → the
     /// target's `COMPLETED` output. An awaited target present here resolves to
     /// `Ok(output)`.
@@ -6052,8 +6180,10 @@ impl WorkflowTestEnv {
             activity_mocks: HashMap::new(),
             attempt_results: HashMap::new(),
             retry_sequences: HashMap::new(),
+            seeded_mocks: HashMap::new(),
             child_mocks: HashMap::new(),
             simulated_now: Utc::now(),
+            anchor_frozen: false,
             queued_signals: Vec::new(),
             build_id: None,
             cancellation_reason: None,
@@ -6068,6 +6198,7 @@ impl WorkflowTestEnv {
             execution_timeout: None,
             workflow_log_policy: None,
             parent_execution_id: None,
+            start_provenance: crate::types::StartProvenance::default(),
             external_await_results: HashMap::new(),
             external_await_failures: HashMap::new(),
             mutex_contended: HashSet::new(),
@@ -6092,7 +6223,9 @@ impl WorkflowTestEnv {
     where
         F: Fn(Value) -> Result<Value, String> + Send + Sync + 'static,
     {
-        self.activity_mocks.insert(name.into(), Arc::new(mock));
+        let name = name.into();
+        self.seeded_mocks.remove(&name);
+        self.activity_mocks.insert(name, Arc::new(mock));
         self
     }
 
@@ -6324,6 +6457,7 @@ impl WorkflowTestEnv {
     #[must_use]
     pub const fn with_frozen_anchor(mut self, anchor: DateTime<Utc>) -> Self {
         self.simulated_now = anchor;
+        self.anchor_frozen = true;
         self
     }
 
@@ -6453,6 +6587,20 @@ impl WorkflowTestEnv {
         self
     }
 
+    /// Set how the run under test started (issue #2082).
+    ///
+    /// Threaded into `ctx.info().start_source` and `ctx.info().continued_from`.
+    /// `replay_check` replays under the same value. The default is an unknown
+    /// source with no predecessor.
+    #[must_use]
+    pub const fn with_start_provenance(
+        mut self,
+        provenance: crate::types::StartProvenance,
+    ) -> Self {
+        self.start_provenance = provenance;
+        self
+    }
+
     /// Set the effective `execution_timeout` budget for the contexts this env
     /// builds (issue #772), so `ctx.deadline()` /
     /// `ctx.should_continue_as_new()` can reason about deadline-aware
@@ -6579,9 +6727,8 @@ impl WorkflowTestEnv {
             exec_id: ExecutionId::new(),
             start_time: self.simulated_now,
             history,
-            call_counts: HashMap::new(),
             pending_signals: self.queued_signals.clone(),
-            retry_sequences: self.retry_sequences.clone(),
+            mocks: self.run_mocks(0, self.simulated_now),
             // Issue #790: the durable log lines this run would have persisted,
             // accumulated across every decision cycle and de-duplicated by `seq`
             // exactly the way the store's unique index does.
@@ -6602,6 +6749,7 @@ impl WorkflowTestEnv {
             && self.queue_name.is_empty()
             && self.execution_timeout.is_none()
             && self.parent_execution_id.is_none()
+            && self.start_provenance == crate::types::StartProvenance::default()
             // Issue #798: without this a `with_build_id`-only env falls into the
             // `None` arm and the configured build never reaches the live context,
             // so `ctx.build_id()` reports `None` on both sides — self-consistent,
@@ -6633,6 +6781,7 @@ impl WorkflowTestEnv {
             // Issue #698: thread the configured parent so `ctx.info()` /
             // `ctx.parent_execution_id()` report it inside the test run.
             parent_execution_id: self.parent_execution_id,
+            start_provenance: self.start_provenance,
             // `with_cancellation` records the cancel as an event.
             cancellation_reason: None,
         })
@@ -6706,6 +6855,7 @@ impl WorkflowTestEnv {
             execution_timeout: self.execution_timeout,
             // Issue #698: carry the spawning-parent id for replay_check.
             parent_execution_id: self.parent_execution_id,
+            start_provenance: self.start_provenance,
             // Issue #698: carry the configured workflow type and business id
             // for replay_check.
             workflow_name: self.workflow_name.clone(),
@@ -6868,7 +7018,12 @@ impl WorkflowTestEnv {
                     children,
                     timers: _,
                 } => {
+                    // A loser that never started needs no terminal, as in
+                    // `worker::apply_race_loser_cancellations`.
                     for activity_id in activities {
+                        if !Self::activity_is_open(history, *activity_id) {
+                            continue;
+                        }
                         history.push(WorkflowEvent::ActivityFailed {
                             activity_id: *activity_id,
                             error: "lost race to a sibling branch".to_string(),
@@ -6879,6 +7034,9 @@ impl WorkflowTestEnv {
                         });
                     }
                     for child_id in children {
+                        if !Self::child_is_open(history, *child_id) {
+                            continue;
+                        }
                         history.push(WorkflowEvent::child_workflow_failed(
                             *child_id,
                             "lost race to a sibling branch".to_string(),
@@ -6930,12 +7088,79 @@ impl WorkflowTestEnv {
         &self,
         commands: Vec<WorkflowCommand>,
         history: &mut Vec<WorkflowEvent>,
-        call_counts: &mut HashMap<String, u32>,
-        retry_sequences: &mut HashMap<
-            String,
-            std::collections::VecDeque<Vec<Result<Value, String>>>,
-        >,
+        mocks: &mut RunMocks,
     ) -> Result<bool, String> {
+        let flags = BatchFlags::of(&commands);
+        let mut made_progress = false;
+        let mut deferred = Vec::new();
+        for cmd in commands {
+            made_progress |= self.process_command(cmd, &flags, history, &mut deferred, mocks)?;
+        }
+        history.extend(deferred.into_iter().flat_map(|d| d.events));
+        Ok(made_progress)
+    }
+
+    /// The fresh mock state of one run (issue #2033).
+    pub(crate) fn run_mocks(&self, seed: u64, start: DateTime<Utc>) -> RunMocks {
+        RunMocks {
+            call_counts: HashMap::new(),
+            retry_sequences: self.retry_sequences.clone(),
+            seed,
+            start,
+        }
+    }
+}
+
+/// Mock state that lasts for one run (issue #2033).
+pub(crate) struct RunMocks {
+    /// Activity name to the number of calls so far.
+    pub(crate) call_counts: HashMap<String, u32>,
+    /// The retry sequences that no call has used yet.
+    pub(crate) retry_sequences:
+        HashMap<String, std::collections::VecDeque<Vec<Result<Value, String>>>>,
+    /// The seed that a seeded mock derives its generator from.
+    pub(crate) seed: u64,
+    /// The start time of the run, which anchors the virtual clock.
+    pub(crate) start: DateTime<Utc>,
+}
+
+/// What a deferred delivery resolves (issue #2033).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeliveryKey {
+    /// The terminal of an activity, with its attempts.
+    Activity(ActivityExecId),
+    /// The terminal of a child workflow.
+    Child(ExecutionId),
+    /// The fire of a timer.
+    Timer(crate::types::TimerId),
+    /// Events that land in the same task, such as a race loser's terminal.
+    Now,
+}
+
+/// The events that one command defers to the end of its batch.
+pub(crate) struct Deferred {
+    pub(crate) key: DeliveryKey,
+    pub(crate) events: Vec<WorkflowEvent>,
+}
+
+impl Deferred {
+    const fn new(key: DeliveryKey, events: Vec<WorkflowEvent>) -> Self {
+        Self { key, events }
+    }
+}
+
+/// Facts about a whole suspension batch that steer its commands.
+pub(crate) struct BatchFlags {
+    /// The batch also waits on an activity, a signal, a child or a classic timer.
+    pub(crate) competing_suspension: bool,
+    /// The batch is a child-versus-deadline race (issue #779).
+    pub(crate) child_timeout_race: bool,
+    /// The smallest deadline of the awaited cancellable timers in the batch.
+    pub(crate) min_await_deadline_secs: Option<u64>,
+}
+
+impl BatchFlags {
+    pub(crate) fn of(commands: &[WorkflowCommand]) -> Self {
         // Whether this batch also carries a genuine non-timer suspension
         // (activity/signal/child-workflow/classic timer). In production the
         // worker records an `ArmTimer` and leaves the workflow parked on that
@@ -6945,7 +7170,9 @@ impl WorkflowTestEnv {
         // synthesise impossible history such as
         // `[TimerStarted, ActivityScheduled, TimerFired, ActivityCompleted]`
         // (Codex P2, issue #768).
-        let batch_has_competing_suspension = commands.iter().any(Self::is_competing_suspension);
+        let batch_has_competing_suspension = commands
+            .iter()
+            .any(WorkflowTestEnv::is_competing_suspension);
 
         // Deadline-ordered firing for concurrent awaited cancellable timers
         // (issue #768, Codex P2 round 15). Production inserts every
@@ -6986,24 +7213,15 @@ impl WorkflowTestEnv {
             )
         });
 
-        let mut made_progress = false;
-        let mut deferred_events = Vec::new();
-        for cmd in commands {
-            made_progress |= self.process_command(
-                cmd,
-                batch_has_competing_suspension,
-                batch_is_child_timeout_race,
-                min_await_deadline_secs,
-                history,
-                &mut deferred_events,
-                call_counts,
-                retry_sequences,
-            )?;
+        Self {
+            competing_suspension: batch_has_competing_suspension,
+            child_timeout_race: batch_is_child_timeout_race,
+            min_await_deadline_secs,
         }
-        history.extend(deferred_events);
-        Ok(made_progress)
     }
+}
 
+impl WorkflowTestEnv {
     /// Whether a command is a genuine non-timer suspension that would keep the
     /// workflow parked on an external event (activity result, signal, child
     /// result, or a classic `ctx.timer` fire) — as opposed to author-controlled
@@ -7028,20 +7246,14 @@ impl WorkflowTestEnv {
     /// Returns `Ok(true)` when a command produced progress, `Ok(false)` when
     /// the command was a no-op, or `Err(msg)` when a mock/stub lookup failed
     /// (harness configuration error — the test must be fixed, not the workflow).
-    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-    fn process_command(
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn process_command(
         &self,
         cmd: WorkflowCommand,
-        batch_has_competing_suspension: bool,
-        batch_is_child_timeout_race: bool,
-        min_await_deadline_secs: Option<u64>,
+        flags: &BatchFlags,
         history: &mut Vec<WorkflowEvent>,
-        deferred_events: &mut Vec<WorkflowEvent>,
-        call_counts: &mut HashMap<String, u32>,
-        retry_sequences: &mut HashMap<
-            String,
-            std::collections::VecDeque<Vec<Result<Value, String>>>,
-        >,
+        deferred: &mut Vec<Deferred>,
+        mocks: &mut RunMocks,
     ) -> Result<bool, String> {
         match cmd {
             WorkflowCommand::ScheduleActivity {
@@ -7061,15 +7273,19 @@ impl WorkflowTestEnv {
                 // Increment the per-name call counter regardless so that any
                 // subsequent workflow-level calls for the same activity name see
                 // the correct call number when resolved against per-call mocks.
-                let call_num = Self::next_call_count(call_counts, &name);
-                if let Some(seq) = retry_sequences.get_mut(&name)
+                let call_num = Self::next_call_count(&mut mocks.call_counts, &name);
+                let mut events = Vec::new();
+                if let Some(seq) = mocks.retry_sequences.get_mut(&name)
                     && let Some(attempts) = seq.pop_front()
                 {
-                    Self::push_activity_retry_sequence(deferred_events, activity_id, attempts);
-                    return Ok(true);
+                    Self::push_activity_retry_sequence(&mut events, activity_id, attempts);
+                } else {
+                    let now = virtual_now(mocks.start, history);
+                    let mock = MockCall::new(&name, call_num, 1, now, mocks.seed);
+                    let result = self.resolve_activity(&mock, act_input)?;
+                    Self::push_activity_terminal(&mut events, activity_id, result);
                 }
-                let result = self.resolve_activity(&name, act_input, call_num)?;
-                Self::push_activity_terminal(deferred_events, activity_id, result);
+                deferred.push(Deferred::new(DeliveryKey::Activity(activity_id), events));
                 Ok(true)
             }
 
@@ -7081,8 +7297,10 @@ impl WorkflowTestEnv {
                 start_to_close,
                 ..
             } => {
-                let call_num = Self::next_call_count(call_counts, &name);
-                let result = self.resolve_activity(&name, act_input.clone(), call_num)?;
+                let call_num = Self::next_call_count(&mut mocks.call_counts, &name);
+                let now = virtual_now(mocks.start, history);
+                let mock = MockCall::new(&name, call_num, 1, now, mocks.seed);
+                let result = self.resolve_activity(&mock, act_input.clone())?;
                 history.push(WorkflowEvent::LocalActivityScheduled {
                     activity_id,
                     name: name.clone(),
@@ -7097,7 +7315,9 @@ impl WorkflowTestEnv {
                     start_to_close_nanos: start_to_close
                         .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)),
                 });
-                Self::push_local_activity_terminal(deferred_events, activity_id, result);
+                let mut events = Vec::new();
+                Self::push_local_activity_terminal(&mut events, activity_id, result);
+                deferred.push(Deferred::new(DeliveryKey::Now, events));
                 Ok(true)
             }
 
@@ -7112,11 +7332,20 @@ impl WorkflowTestEnv {
                 // #775 Codex P2), so a signal that should win the race already
                 // resolved the select synchronously without ever suspending. When
                 // the timer genuinely suspends, it fires (timer wins).
+                //
+                // A timer that is still running emits `StartTimer` again on
+                // each replay. The worker dedups it by id. The harness does the same.
+                if Self::timer_is_active_in_history(history, &timer_id) {
+                    return Ok(false);
+                }
                 history.push(WorkflowEvent::TimerStarted {
                     timer_id: timer_id.clone(),
                     duration_secs,
                 });
-                deferred_events.push(WorkflowEvent::TimerFired { timer_id });
+                deferred.push(Deferred::new(
+                    DeliveryKey::Timer(timer_id.clone()),
+                    vec![WorkflowEvent::TimerFired { timer_id }],
+                ));
                 Ok(true)
             }
 
@@ -7141,6 +7370,13 @@ impl WorkflowTestEnv {
                 input: child_input,
                 ..
             } => {
+                // A running child emits `StartChildWorkflow` again on each
+                // replay. The worker dedups it by id. The harness does the same.
+                if history.iter().any(|e| {
+                    matches!(e, WorkflowEvent::ChildWorkflowStarted { child_id: id, .. } if *id == child_id)
+                }) {
+                    return Ok(false);
+                }
                 let result = match self.resolve_child(&workflow_name, child_input.clone()) {
                     Ok(result) => result,
                     // A child-timeout race (issue #779) with no registered mock:
@@ -7149,7 +7385,7 @@ impl WorkflowTestEnv {
                     // to the timeout branch instead of failing on the missing
                     // mock. The `StartTimer` in the same batch supplies progress.
                     Err(harness_err) => {
-                        if batch_is_child_timeout_race {
+                        if flags.child_timeout_race {
                             history.push(WorkflowEvent::ChildWorkflowStarted {
                                 child_id,
                                 workflow_name,
@@ -7165,11 +7401,8 @@ impl WorkflowTestEnv {
                     workflow_name,
                     input: child_input,
                 });
-                match result {
-                    Ok(output) => {
-                        deferred_events
-                            .push(WorkflowEvent::ChildWorkflowCompleted { child_id, output });
-                    }
+                let terminal = match result {
+                    Ok(output) => WorkflowEvent::ChildWorkflowCompleted { child_id, output },
                     Err(error) => {
                         // Decode the child mock's error so a typed
                         // `WorkflowFailure` envelope surfaces the child's
@@ -7178,11 +7411,10 @@ impl WorkflowTestEnv {
                         // `wake_parent_for_child_failure`. A plain string decodes
                         // to all-None typed fields (unchanged legacy behaviour).
                         let decoded = crate::failure::decode_workflow_failure(&error);
-                        deferred_events.push(WorkflowEvent::child_workflow_failed_typed(
-                            child_id, &decoded,
-                        ));
+                        WorkflowEvent::child_workflow_failed_typed(child_id, &decoded)
                     }
-                }
+                };
+                deferred.push(Deferred::new(DeliveryKey::Child(child_id), vec![terminal]));
                 Ok(true)
             }
 
@@ -7312,9 +7544,20 @@ impl WorkflowTestEnv {
             } => {
                 // A timer-only cancel appends no event. The child-timeout race
                 // emits one on every replay, so it is not progress (issue #1991).
+                // A loser that never started needs no terminal, as in
+                // `worker::apply_race_loser_cancellations`.
+                let activities: Vec<_> = activities
+                    .into_iter()
+                    .filter(|id| Self::activity_is_open(history, *id))
+                    .collect();
+                let children: Vec<_> = children
+                    .into_iter()
+                    .filter(|id| Self::child_is_open(history, *id))
+                    .collect();
                 let made_progress = !activities.is_empty() || !children.is_empty();
+                let mut events = Vec::new();
                 for activity_id in activities {
-                    deferred_events.push(WorkflowEvent::ActivityFailed {
+                    events.push(WorkflowEvent::ActivityFailed {
                         activity_id,
                         error: "lost race to a sibling branch".to_string(),
                         attempt: 1,
@@ -7324,11 +7567,12 @@ impl WorkflowTestEnv {
                     });
                 }
                 for child_id in children {
-                    deferred_events.push(WorkflowEvent::child_workflow_failed(
+                    events.push(WorkflowEvent::child_workflow_failed(
                         child_id,
                         "lost race to a sibling branch".to_string(),
                     ));
                 }
+                deferred.push(Deferred::new(DeliveryKey::Now, events));
                 Ok(made_progress)
             }
 
@@ -7354,15 +7598,14 @@ impl WorkflowTestEnv {
                 for_await,
             } => {
                 if for_await {
-                    let fire_already_deferred = deferred_events.iter().any(|e| {
-                        matches!(e, WorkflowEvent::TimerFired { timer_id: id } if *id == timer_id)
-                    });
+                    let key = DeliveryKey::Timer(timer_id.clone());
+                    let fire_already_deferred = deferred.iter().any(|d| d.key == key);
                     if fire_already_deferred {
                         // Another `await_fire` re-arm for this id already deferred
                         // the fire this batch — idempotent no-op.
                         return Ok(false);
                     }
-                    if batch_has_competing_suspension {
+                    if flags.competing_suspension {
                         // Awaited alongside a genuine non-timer suspension: parked,
                         // fires on a later bookkeeping-only cycle.
                         return Ok(false);
@@ -7373,10 +7616,16 @@ impl WorkflowTestEnv {
                     // bookkeeping-only cycle re-arms it against the (now smaller) set
                     // of remaining awaits — matching production's min-`fires_at`
                     // reschedule + deadline-ordered ingest.
-                    if min_await_deadline_secs.is_some_and(|min| duration_secs > min) {
+                    if flags
+                        .min_await_deadline_secs
+                        .is_some_and(|min| duration_secs > min)
+                    {
                         return Ok(false);
                     }
-                    deferred_events.push(WorkflowEvent::TimerFired { timer_id });
+                    deferred.push(Deferred::new(
+                        key,
+                        vec![WorkflowEvent::TimerFired { timer_id }],
+                    ));
                     return Ok(true);
                 }
                 // Fresh arm: record TimerStarted (dedup by active-in-history), never
@@ -7395,9 +7644,8 @@ impl WorkflowTestEnv {
             // TimerCancelled and drop the deferred TimerFired for this id so the
             // timer never fires — the cancelled branch is taken deterministically.
             WorkflowCommand::CancelTimer { timer_id } => {
-                deferred_events.retain(
-                    |e| !matches!(e, WorkflowEvent::TimerFired { timer_id: id } if *id == timer_id),
-                );
+                let key = DeliveryKey::Timer(timer_id.clone());
+                deferred.retain(|d| d.key != key);
                 history.push(WorkflowEvent::TimerCancelled { timer_id });
                 Ok(true)
             }
@@ -7451,11 +7699,58 @@ impl WorkflowTestEnv {
                 history.push(WorkflowEvent::MutexGranted {
                     key,
                     lock_seq,
-                    acquired_at: self.simulated_now,
+                    acquired_at: mocks.start,
                 });
                 Ok(true)
             }
         }
+    }
+
+    /// Whether `history` scheduled the activity and holds no terminal for it.
+    fn activity_is_open(history: &[WorkflowEvent], activity_id: ActivityExecId) -> bool {
+        let mut open = false;
+        for event in history {
+            match event {
+                WorkflowEvent::ActivityScheduled {
+                    activity_id: id, ..
+                } if *id == activity_id => {
+                    open = true;
+                }
+                WorkflowEvent::ActivityCompleted {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityFailed {
+                    activity_id: id, ..
+                }
+                | WorkflowEvent::ActivityTimedOut {
+                    activity_id: id, ..
+                } if *id == activity_id => {
+                    open = false;
+                }
+                _ => {}
+            }
+        }
+        open
+    }
+
+    /// Whether `history` started the child and holds no terminal for it.
+    fn child_is_open(history: &[WorkflowEvent], child_id: ExecutionId) -> bool {
+        let mut open = false;
+        for event in history {
+            match event {
+                WorkflowEvent::ChildWorkflowStarted { child_id: id, .. } if *id == child_id => {
+                    open = true;
+                }
+                WorkflowEvent::ChildWorkflowCompleted { child_id: id, .. }
+                | WorkflowEvent::ChildWorkflowFailed { child_id: id, .. }
+                    if *id == child_id =>
+                {
+                    open = false;
+                }
+                _ => {}
+            }
+        }
+        open
     }
 
     /// Whether `timer_id` has an active (unfired, uncancelled) `TimerStarted`
@@ -7498,17 +7793,20 @@ impl WorkflowTestEnv {
     /// is the mock's success/failure value), or `Err(harness_error)` when no
     /// mock is registered — a harness configuration problem that must be fixed
     /// in the test, not handled as a workflow-level failure.
-    fn resolve_activity(
+    pub(crate) fn resolve_activity(
         &self,
-        name: &str,
+        call: &MockCall<'_>,
         input: Value,
-        call_num: u32,
     ) -> Result<Result<Value, String>, String> {
+        let (name, call_num) = (call.name, call.call);
         if let Some(result) = self.attempt_results.get(&(name.to_string(), call_num)) {
             return Ok(result.clone());
         }
         if let Some(mock) = self.activity_mocks.get(name) {
             return Ok(mock(input));
+        }
+        if let Some(mock) = self.seeded_mocks.get(name) {
+            return Ok(mock(input, &mut call.context()));
         }
         // Worker sessions (issue #606): the internal acquire/release
         // activities have no registered handler in production either -- the
@@ -7668,6 +7966,20 @@ mod tests {
     use chrono::Utc;
     use std::future::Future;
     use std::pin::Pin;
+
+    /// Issue #2082: a bundle replay falls back to the configured provenance
+    /// when a fixture omits it.
+    #[test]
+    fn a_bundle_replayer_keeps_the_configured_start_provenance() {
+        let provenance =
+            crate::types::StartProvenance::fresh(crate::types::StartSource::SignalWithStart);
+        let defaults = FixtureReplayDefaults {
+            start_provenance: provenance,
+            ..FixtureReplayDefaults::default()
+        };
+        let replayer = fixture_replayer(&HashMap::new(), empty_shared_state(), &defaults);
+        assert_eq!(replayer.start_provenance, provenance);
+    }
 
     /// Issue #1974: two cycles that offer the same offset keep the first
     /// chunk, as the store's `ON CONFLICT DO NOTHING` does.
@@ -7908,6 +8220,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -8351,6 +8664,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -8393,6 +8707,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -8430,6 +8745,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,

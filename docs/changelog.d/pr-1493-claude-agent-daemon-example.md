@@ -64,5 +64,5 @@ socket. CI gains a clippy step and a Linux-only test step (issue #962: a new
 workspace member gets no coverage without its own steps; the control surface
 is a Unix domain socket, hence the OS gate).
 
-Cross-linked from the root `README.md`, `docs/sqlite-backend.md` §12, and the
+Cross-linked from the root `README.md`, `docs/sqlite-backend.md` §13, and the
 backend crate README.

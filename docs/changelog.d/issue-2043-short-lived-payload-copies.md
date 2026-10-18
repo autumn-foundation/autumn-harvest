@@ -14,12 +14,12 @@ change encodes them.
     `harvest_completion_trigger_outbox.target_input`.
   - `harvest_batch_jobs.signal_payload`. Only a signal job stores a payload. A
     cancel or terminate job stores none.
-- **Columns that stay clear.** The coverage table in
-  `docs/security-posture.md` gives a reason for each:
-  `harvest_event_batches.buffered_payloads`,
-  `harvest_cross_shard_children.child_spec`, `harvest_schedules.workflow_input`
-  and `context_headers` on executions and tasks. A session task keeps its
-  session id in clear, because the id is not payload.
+- **Columns that stay clear.** The event batch buffer, the cross-shard child
+  spec, the schedule input and the context headers are encoded by the
+  `issue-2043-remaining-payload-copies` change. Configuration columns stay
+  clear, and the coverage table in `docs/security-posture.md` gives a reason
+  for each. A session task keeps its session id in clear, because the id is
+  not payload.
 - **Readers first.** This release always decodes these columns. An older
   worker runs an activity on the envelope. An older scanner sends the envelope
   to a webhook, starts a run on it, or sends it as a signal. Turn column

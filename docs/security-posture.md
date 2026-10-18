@@ -427,6 +427,8 @@ needs I/O implements `HarvestAuthorizer` directly and returns a boxed future.
 | `tenant_key` | The verified tenant, when the credential carries one (issue #1977). Otherwise the `x-harvest-tenant` header, trimmed. A repeated header, a blank value, a non-ASCII byte or more than 128 bytes gets `400`. |
 | `tenant_verified` | `true` when `tenant_key` is the verified tenant. `false` when it is the header. Do not grant access on an unverified tenant. |
 | `shard` | Only a source the route's handler uses. See the table below. |
+| `workflow_id` | The body business key on `start`, `signal-with-start` and `update-with-start`. `None` on every other route. See [Body key](#body-key-issue-2081). |
+| `start_input_present` | `true` when the body carries start input. `false` on every other route. |
 | `method`, `path`, `extensions` | The request. |
 
 | Route | Shard source |
@@ -450,6 +452,43 @@ shard, it calls it once with `shard: None`. `None` means Harvest cannot name
 the shard before the handler runs. A list route then reads every shard. A by-id
 route (`/workflows/by-id/...`) and a start with no placement each reach one
 shard by hash. To confine a caller to some shards, deny `None` too.
+
+### Body key (issue #2081)
+
+The business key is in the JSON body on `POST /workflows/{name}/start`,
+`/signal-with-start` and `/update-with-start`. Harvest reads it before the hook
+runs and sets `workflow_id`. It never gives the body to the hook.
+
+- `workflow_id` is the raw value. The handler does not trim it.
+- A key nested in the input is not the business key.
+- `None` means the body has no usable key. On the two with-start routes, the
+  handler rejects such a body. On `start`, `None` can also mean an
+  auto-generated id.
+- `start_input_present` is `input` on `start`, and `start_input` on the
+  with-start routes. A `null` value counts as absent.
+- A `start` with an idempotency key replays the first run for that key. The
+  replay ignores the body `workflow_id`, so the hook cannot see the id of the
+  run it returns. A tenant-bound caller cannot replay another tenant's run. Treat
+  an idempotency key as a secret within one tenant. Signal-with-start and
+  update-with-start do not have this path.
+- The hook runs on the management API only. A webhook or connector binding
+  calls the handler directly, so the hook does not see it.
+
+To confine a caller to its own keys, check `workflow_id` on the three routes
+and deny `None` there:
+
+```rust
+.with_authorizer(|req: &AuthzRequest<'_>| {
+    let keyed = req.method == Method::POST
+        && (req.path.ends_with("/start") || req.path.ends_with("-with-start"));
+    match req.workflow_id {
+        _ if !keyed => AuthzDecision::Allow,
+        Some(id) if id.starts_with("acme/") => AuthzDecision::Allow,
+        Some(_) => AuthzDecision::deny("key is out of scope"),
+        None => AuthzDecision::deny("no key"),
+    }
+})
+```
 
 ### Rules
 
@@ -970,7 +1009,7 @@ credential is *tenant-bound*. Harvest then confines it without an authorizer.
 - **The embedder's own principal.** In the auth middleware that wraps the
   Harvest router, insert
   `autumn_harvest_plugin::tenant::VerifiedTenant::new(tenant)?` as a request
-  extension.
+  extension. A raw `harvest_api_router` mount needs no other step.
 
 A request with a token tenant and an embedder tenant that differ gets `403`.
 
@@ -1120,20 +1159,27 @@ route and no table.
   one of them for an entity type may create an entity under any key. That
   caller may also send any operation to it, a delete included. Cancel,
   terminate and reset end or rewind an entity like any workflow.
-- **The start input is trusted.** Signal-with-start passes `start_input` to a
-  new run as its checkpoint. A caller can set the first state and pending
-  operations that way. Validate state in the handler if callers are not
-  trusted.
+- **A start route or signal-with-start cannot set the first state.**
+  `Entity::run` drops the input of a start that a caller chose. It keeps the
+  checkpoint for a continue-as-new, reset or re-run, and for a run with no
+  recorded start source. `Entity::trust_start_input` turns the drop off. Do it
+  only when every caller that can start the entity is trusted (issue #2082).
+  Three cases still keep a caller input:
+  - An admin resets or re-runs a run that a client started. The new run copies
+    the stored input.
+  - Workflow code passes caller data to `continue_as_new_as` for an entity
+    type. Workflow code is trusted.
+  - The SQLite backend records no start source, so it keeps every input.
 - **Reads are not admin-gated.** The by-id query route
   `GET /workflows/by-id/{name}/{key}/query/harvest.entity.state` returns the
   full state. It is a read route like `GET /workflows/{id}`, and it is not
   audited. Outside the `dev` profile, mount the API behind your own auth, for
   example `api_with_auth`. A key is guessable.
-- **The authorizer hook sees the path, not the body.** It can check the key
-  on the by-id query and signal routes. On signal-with-start the key is in
-  the body, so the hook cannot see it. To confine a caller to its own keys,
-  deny signal-with-start in the hook and send ops through the by-id signal
-  route. Or check the body in your own middleware.
+- **The authorizer hook sees the key on the keyed-entity routes.** It reads
+  the key from the path on the by-id query and signal routes. On signal-with-start and
+  update-with-start, it reads `AuthzRequest::workflow_id` from the body (see
+  [Body key](#body-key-issue-2081)). Check the key there, and deny `None`.
+  `start_input_present` shows whether a caller sets the first state.
 - **The key is a business id, not a secret.** A key appears in requests,
   audit rows and logs. Do not put a secret or a customer name in it.
 - **State is stored in clear unless you encrypt it.** Each operation is a
@@ -1415,6 +1461,35 @@ A stored value that does not decode never starts work on ciphertext:
   backs off. After its last attempt, it moves to the dead-letter queue with the
   stored body. A redrive sends the body after an operator restores the key.
 
+**Buffers, specs, schedules and headers (issue #2043).** Four more groups hold
+payload copies. The engine encodes them too.
+
+- An event batch stores one envelope for each buffered input. The SQL append
+  and the element count still work. The immediate flush and the timed fire
+  decode each element before the start. The byte cap of a batch counts the
+  stored bytes, so ciphertext reaches the cap sooner than plaintext.
+- A cross-shard child spec is one envelope. It holds the child input and its
+  headers. The relay decodes it before it creates the child.
+- A schedule input is one envelope. Registration and the schedule API encode
+  it. The reconciler compares the decoded value, so a new nonce is not drift.
+  The tick, a manual trigger and a backfill decode it before the start. The
+  schedule API and the UI show the stored envelope.
+- The context headers of an execution and of an activity row are one envelope
+  each. The start path, a retry, a rerun, the workflow worker and the activity
+  worker decode them. The start options of a debounce, throttle or batch row
+  hold the headers and the memo as an envelope too. The rotation census and
+  sweep cover those two keys.
+
+A value that does not decode never starts work without it:
+
+- A workflow run whose headers do not decode fails. An activity attempt fails
+  with `PayloadDecodeFailed`. A workflow retry is skipped.
+- A batch, debounce or throttle row moves back and stays. A cross-shard child
+  stays pending. A due schedule stays due. A backfill slot counts as failed.
+- An export includes the headers only for a caller who may decode. The
+  retention archive never decodes, so it leaves an encoded header map out of
+  the archived document. Plaintext headers never reach cold storage.
+
 Every worker needs every key that can read a row. A worker without the key
 fails an attempt that a peer could run.
 
@@ -1449,7 +1524,8 @@ again.
 
 **Erasure.** Erasure (issue #495) does not reach the task rows or the outbox.
 They stay until task retention or the relay removes them. Their ciphertext is
-not readable without the key.
+not readable without the key. Erasure replaces an encoded cross-shard child
+spec with a tombstone, and it needs no key.
 
 **Behavior change for API clients.** Before column encoding, the output
 column was always plaintext, so every caller of `GET /workflows/{id}/result`
@@ -1476,7 +1552,7 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_workflow_executions.output` | Covered | The workflow result. |
 | `harvest_workflow_executions.memo` | Covered | Operator notes can hold PII. No query reads into them. |
 | `harvest_workflow_executions.search_attrs` | Clear | Visibility queries filter on it. Do not put PII in it. |
-| `harvest_workflow_executions.context_headers` | Clear | The worker, the replay export, the archive and the history export read the headers as a string map with no codec. An unreadable value means no headers. Do not put PII in a header. |
+| `harvest_workflow_executions.context_headers` | Covered | The whole header map is one envelope. The worker, the retry and the rerun decode it, and a failure stops the run. An export decodes it only for a caller who may decode. The archive leaves it out. |
 | `harvest_workflow_executions.workflow_retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_workflow_executions.completion_callbacks` | Clear | Callback targets, not payload. |
 | `harvest_workflow_executions.migrated_from_shards` | Clear | Shard bookkeeping, not payload. |
@@ -1486,8 +1562,8 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_task_queue.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_task_queue.trace_context` | Clear | Trace ids, not payload. |
 | `harvest_task_queue.required_capabilities` | Clear | Routing labels, not payload. |
-| `harvest_task_queue.context_headers` | Clear | A copy of the execution headers. The worker reads them as a string map. |
-| `harvest_schedules.workflow_input` | Clear | An operator template that the schedule API lists and edits. The reconciler compares it by value on each tick, and each encode makes a new nonce. |
+| `harvest_task_queue.context_headers` | Covered | A copy of the execution cell, which an activity row can extend with the result-writer marker. The activity worker decodes it, and a failure fails the attempt. |
+| `harvest_schedules.workflow_input` | Covered | The input of every scheduled run. Registration and the schedule API encode it. The reconciler compares the decoded value, so a new nonce is not drift. The tick decodes it before the start. |
 | `harvest_schedules.buffered_runs` | Clear | Fire times only. |
 | `harvest_schedules.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_signals.payload` | Covered | The signal payload. Signal ingest decodes it before it records `SignalReceived`. |
@@ -1507,13 +1583,13 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_completion_triggers.condition` | Clear | Trigger configuration, not payload. |
 | `harvest_completion_trigger_outbox.target_input` | Covered | The input of a deferred trigger start. The relay decodes it before the target start. |
 | `harvest_completion_trigger_outbox.priority` | Clear | Scheduling, not payload. |
-| `harvest_cross_shard_children.child_spec` | Clear | Erasure rewrites the `input` field inside the spec, and the sweep reads one envelope at the cell root. The spec holds the child input in clear until erasure or retirement. |
+| `harvest_cross_shard_children.child_spec` | Covered | The whole spec is one envelope. It holds the child input and its headers. The relay decodes it before it starts the child. Erasure replaces an encoded cell with a tombstone and needs no key. |
 | `harvest_debounce.last_input` | Covered | The buffered start input. The fire path decodes it before the start. |
-| `harvest_debounce.start_options` | Clear | Start configuration, not payload. |
+| `harvest_debounce.start_options` | Covered | The `context_headers` and `memo` keys each hold an envelope. The other keys are start configuration. The fire path decodes both keys before the start. |
 | `harvest_start_throttle.input` | Covered | The deferred start input. The fire path decodes it before the start. |
-| `harvest_start_throttle.start_options` | Clear | Start configuration, not payload. |
-| `harvest_event_batches.buffered_payloads` | Clear | SQL appends to the array and counts its elements, and the sweep reads one envelope at the cell root. The array holds each buffered input in clear until the batch fires. |
-| `harvest_event_batches.start_options` | Clear | Start configuration, not payload. |
+| `harvest_start_throttle.start_options` | Covered | The `context_headers` and `memo` keys each hold an envelope. The other keys are start configuration. The fire path decodes both keys before the start. |
+| `harvest_event_batches.buffered_payloads` | Covered | One envelope for each buffered input. The SQL append and the element count still work. The fire path and the immediate flush decode each element before the start. |
+| `harvest_event_batches.start_options` | Covered | The `context_headers` and `memo` keys each hold an envelope. The other keys are start configuration. The fire path decodes both keys before the start. |
 | `harvest_completion_deliveries.event_filter` | Clear | Callback configuration, not payload. |
 | `harvest_completion_deliveries.payload` | Covered | The webhook body. The scanner decodes it before it signs and sends the body. |
 | `harvest_completion_deliveries.retry_policy` | Clear | Callback configuration, not payload. |

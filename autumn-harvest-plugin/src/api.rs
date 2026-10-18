@@ -108,7 +108,7 @@ use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
     ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowSchedulePatch,
     ensure_dag_schedule, parse_schedule_from_expr_pub, plan_backfill_timestamps,
-    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule,
+    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule_with_codecs,
 };
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
@@ -151,6 +151,7 @@ use crate::state::HarvestDbPool;
 use crate::usage::{self, UsageParams, UsageResponse};
 use crate::version_gate_retirement::{RetirementCheckQuery, build_retirement_check_report};
 use crate::version_usage::{VersionUsageQuery, build_version_usage_report};
+use crate::visibility_query::{JsonText, number_json};
 use crate::workflow_count::{self, WorkflowCountParams, WorkflowCountResponse};
 use crate::workflow_reachability::{WorkflowReachabilityQuery, build_workflow_reachability_report};
 
@@ -3230,9 +3231,9 @@ pub(crate) enum CmpOp {
 #[derive(Debug, Clone)]
 pub(crate) enum SearchAttrPredicate {
     /// `key:eq:value` — typed equality (numeric/bool/string coercion).
-    Eq { key: String, value: Value },
+    Eq { key: String, value: JsonText },
     /// `key:ne:value` — key present and typed value differs.
-    Ne { key: String, value: Value },
+    Ne { key: String, value: JsonText },
     /// `key:{gt,gte,lt,lte}:value` — numeric comparison. `value` is the
     /// validated, trimmed numeric *text* (not an f64): it is bound and cast
     /// `::numeric` in SQL so the comparison stays exact even for integers
@@ -3243,7 +3244,7 @@ pub(crate) enum SearchAttrPredicate {
         value: String,
     },
     /// `key:in:v1,v2,…` — membership in a typed set.
-    In { key: String, values: Vec<Value> },
+    In { key: String, values: Vec<JsonText> },
     /// `key:exists` — key is present with any value.
     Exists { key: String },
 }
@@ -3473,6 +3474,12 @@ struct HistoryExportCandidate {
     // lives in no `WorkflowEvent` — same family as `context_headers` above.
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
+    // Issue #2082: the run's start source and predecessor, carried into the
+    // export document so a replay takes the same branch as the live run.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    continued_from_exec_id: Option<uuid::Uuid>,
 }
 
 /// One in-flight execution selected by the stratified sample query (issue #798).
@@ -3517,6 +3524,12 @@ struct HistorySampleCandidate {
     // a FALSE divergence.
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
+    // Issue #2082: the run's start source and predecessor, carried into the
+    // export document so a replay takes the same branch as the live run.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    continued_from_exec_id: Option<uuid::Uuid>,
     /// `COUNT(*) OVER (PARTITION BY workflow_name)` — the in-flight population
     /// of this workflow type **on this shard**. Summed across shards to give
     /// the AC2 coverage denominator.
@@ -3548,6 +3561,8 @@ impl HistorySampleCandidate {
             context_headers: self.context_headers,
             // Issue #798: likewise the queue the live run was claimed on.
             queue_name: self.queue_name,
+            start_source: self.start_source,
+            continued_from_exec_id: self.continued_from_exec_id,
         }
     }
 }
@@ -5520,6 +5535,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         // A route layer runs on a matched route only, so an unknown path
         // still answers 404. It wraps every per-route layer above.
         .route_layer(require_mutation_auth)
+        // Issue #2076: a raw mount binds the tenant too. A mount through
+        // `apply_admin_auth_layers` runs the outer copy first, and this copy
+        // then skips.
+        .layer(middleware::from_fn_with_state(
+            api_state.clone(),
+            crate::tenant::enforce_tenant_binding_once,
+        ))
         .layer(Extension(api_state))
 }
 
@@ -10846,30 +10868,28 @@ fn schema_validation_response(
 
 /// Coerce a raw predicate token to a typed JSON scalar (issue #506).
 ///
-/// A token that parses as a JSON number becomes a `Number`; the exact literals
-/// `true`/`false` become a `Bool`; everything else stays a `String`. This is the
-/// documented typed-coercion rule that lets `eq`/`ne`/`in` compare against the
-/// stored JSONB value by type (so `amount:eq:100` matches numeric `100`, not the
-/// string `"100"`).
-pub(crate) fn coerce_scalar(raw: &str) -> Value {
-    if let Ok(n) = raw.parse::<i64>() {
-        return Value::Number(n.into());
-    }
-    if let Ok(n) = raw.parse::<u64>() {
-        return Value::Number(n.into());
-    }
-    if let Some(num) = raw
-        .parse::<f64>()
-        .ok()
-        .and_then(serde_json::Number::from_f64)
-    {
-        return Value::Number(num);
+/// A token that parses as a number becomes a number with all its digits. The
+/// exact literals `true`/`false` become a `Bool`. Everything else stays a
+/// `String`. This is the documented typed-coercion rule that lets
+/// `eq`/`ne`/`in` compare against the stored JSONB value by type (so
+/// `amount:eq:100` matches numeric `100`, not the string `"100"`).
+pub(crate) fn coerce_scalar(raw: &str) -> JsonText {
+    // A number keeps every digit. One leading `+`, as in `+5`, is allowed.
+    // A second sign, as in `+-5`, makes the token a string.
+    let digits = match raw.strip_prefix('+') {
+        Some(rest) if rest.starts_with(['+', '-']) => None,
+        Some(rest) => Some(rest),
+        None => Some(raw),
+    };
+    if let Some(number) = digits.and_then(number_json) {
+        return number;
     }
     match raw {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),
         other => Value::String(other.to_string()),
     }
+    .into()
 }
 
 /// Parse a single `search_attr_filter=key:op:value` query value into a typed
@@ -10956,7 +10976,7 @@ pub(crate) fn parse_search_attr_filter(raw: &str) -> Result<SearchAttrPredicate,
         "lte" => cmp("lte", CmpOp::Lte),
         "in" => {
             let v = require_value(raw, "in")?;
-            let values: Vec<Value> = v
+            let values: Vec<JsonText> = v
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -14060,6 +14080,12 @@ pub(crate) async fn build_awaitables_report(
             }
         }
 
+        // The headers decode with the same registry as the history. A cell
+        // that does not decode degrades the report the same way (issue #2043).
+        let decoded_headers = codecs.decode_headers_opt(execution.context_headers.as_ref());
+        if decoded_headers.is_err() {
+            decode_failed = true;
+        }
         if decode_failed {
             (
                 "history_only",
@@ -14077,14 +14103,7 @@ pub(crate) async fn build_awaitables_report(
             // threads (issues #772/#698/#481) so a deadline-aware /
             // parent-aware / identity-reading / header-branching workflow
             // replays cleanly instead of spuriously degrading.
-            let context_headers = execution
-                .context_headers
-                .as_ref()
-                .and_then(|v| {
-                    serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone())
-                        .ok()
-                })
-                .unwrap_or_default();
+            let context_headers = decoded_headers.unwrap_or_default();
             let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
                 exec_id,
                 events,
@@ -14094,6 +14113,11 @@ pub(crate) async fn build_awaitables_report(
             .with_execution_timeout(execution.execution_timeout)
             .with_deadline(execution.deadline_at)
             .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))
+            // Issue #2082: the replay needs the row's start source.
+            .with_start_provenance(autumn_harvest::types::StartProvenance::from_row(
+                execution.start_source.as_deref(),
+                execution.continued_from_exec_id,
+            ))
             .with_workflow_name(execution.workflow_name.clone())
             .with_workflow_id(execution.workflow_id.clone())
             .with_context_headers(context_headers);
@@ -27031,6 +27055,8 @@ pub(crate) async fn signal_workflow(
 
 /// Hydrate a workflow context by replaying its history into the workflow
 /// handler long enough for it to register its query handlers.
+// One linear context setup. A split would only move the lines.
+#[allow(clippy::too_many_lines)]
 async fn hydrate_ctx_for_query(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
@@ -27155,6 +27181,11 @@ async fn hydrate_ctx_for_query(
     // execution row, absent from history, so this context (which sources those
     // from the row) must source parent from the row too.
     .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))
+    // Issue #2082: the query replays the body, so it needs the row's start source.
+    .with_start_provenance(autumn_harvest::types::StartProvenance::from_row(
+        execution.start_source.as_deref(),
+        execution.continued_from_exec_id,
+    ))
     // Issue #698: thread the execution row's workflow type name and business
     // `workflow_id` so a query replayed on this run reports the real values via
     // `ctx.info().workflow_type` / `ctx.info().workflow_id`. Both live on the
@@ -28603,7 +28634,10 @@ async fn upsert_workflow_schedule_and_read_back(
     registry: Option<&HandlerRegistry>,
 ) -> Result<ScheduleEntry, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    autumn_harvest::register_workflow_schedules(conn, std::slice::from_ref(ws))
+    // The registry holds the write codec (issue #2043).
+    let identity_codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    let codecs = registry.map_or(&identity_codecs, HandlerRegistry::payload_codecs);
+    autumn_harvest::register_workflow_schedules_with_codecs(conn, std::slice::from_ref(ws), codecs)
         .await
         .map_err(map_error)?;
     let row: autumn_harvest::models::HarvestSchedule = dsl::harvest_schedules
@@ -29559,7 +29593,13 @@ async fn update_schedule_handler(
         retry_policy: request.retry_policy.clone(),
     };
 
-    match update_workflow_schedule(&mut conn, id, &patch).await {
+    // The registry holds the write codec. The API mirror serves the read path
+    // (issue #2043).
+    let write_codecs = api_state.runtime().map_or_else(
+        |_| api_state.payload_codecs(),
+        |rt| rt.registry.payload_codecs().clone(),
+    );
+    match update_workflow_schedule_with_codecs(&mut conn, id, &patch, &write_codecs).await {
         Ok(ScheduleUpdateOutcome::Updated(row)) => {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -30455,10 +30495,15 @@ async fn trigger_schedule_now(
         schedule.dag_name.as_deref(),
     ) {
         (Some(wf_name), _) => {
-            let input = schedule
-                .workflow_input
-                .clone()
-                .unwrap_or(serde_json::Value::Null);
+            // The engine reads the stored input strictly (issue #2043).
+            let input = match schedule.workflow_input.as_ref() {
+                Some(stored) => runtime
+                    .registry
+                    .payload_codecs()
+                    .decode_column(stored)
+                    .map_err(map_error)?,
+                None => serde_json::Value::Null,
+            };
             let queue = schedule
                 .queue_name
                 .as_deref()
@@ -32080,11 +32125,6 @@ pub(crate) async fn schedule_backfill_inner(
                 // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
                 // the execution lands on the default shard, same as tick_one_workflow_schedule.
                 let exec_id = ExecutionId::new();
-                let input = schedule
-                    .workflow_input
-                    .clone()
-                    .unwrap_or(serde_json::Value::Null);
-
                 let Ok(mut conn) = acquire_conn(wf_shard_pool).await else {
                     shard_failures.push(BackfillShardFailure {
                         shard_id: 0,
@@ -32129,6 +32169,25 @@ pub(crate) async fn schedule_backfill_inner(
                         continue;
                     }
                 }
+
+                // A stored input that does not decode never starts a run. A
+                // slot that already ran needs no input, so the prior-run check
+                // above comes first (issue #2043).
+                let input = match schedule.workflow_input.as_ref() {
+                    Some(stored) => {
+                        let Ok(plain) = runtime.registry.payload_codecs().decode_column(stored)
+                        else {
+                            shard_failures.push(BackfillShardFailure {
+                                shard_id: 0,
+                                reason: "stored schedule input could not be decoded".to_string(),
+                            });
+                            failed += 1;
+                            continue;
+                        };
+                        plain
+                    }
+                    None => serde_json::Value::Null,
+                };
 
                 let (
                     owner,
@@ -35252,10 +35311,9 @@ async fn replay_diagnosis(
     // configured) are not offload-inflated for the count, so the audit
     // conservatively counts inline-encrypted envelopes only — a rare-combo edge
     // that under-counts, never a leak.
-    let history = if let Some(codecs) =
-        read_path_decoder(&api_state, extension_session(maybe_session)).await
-    {
-        let history = store::load_history_inflated(&mut conn, exec_id, &codecs, offloader)
+    let decode_codecs = read_path_decoder(&api_state, extension_session(maybe_session)).await;
+    let history = if let Some(codecs) = decode_codecs.as_ref() {
+        let history = store::load_history_inflated(&mut conn, exec_id, codecs, offloader)
             .await
             .map_err(map_error)?;
         let mut outcome = LossyDecodeOutcome::default();
@@ -35265,6 +35323,13 @@ async fn replay_diagnosis(
                     outcome = outcome.merged(codecs.decode_value_lossy(&mut value));
                 }
             }
+        }
+        // The replay below decodes the header cell too. The audit counts it,
+        // so a run whose payloads are all offloaded still leaves a record
+        // (issue #2043).
+        if let Some(cell) = execution.context_headers.as_ref() {
+            let mut cell = cell.clone();
+            outcome = outcome.merged(codecs.decode_value_lossy(&mut cell));
         }
         let target = exec_id.to_string();
         // Reuse the handler's own (execution-shard) connection, mirroring the
@@ -35347,9 +35412,22 @@ async fn replay_diagnosis(
     // exactly the values hydrate_ctx_for_query threads for the query path — so a
     // deadline-aware, parent-aware, or header-branching run replays cleanly instead
     // of surfacing FALSE non-determinism.
-    let context_headers = execution.context_headers.as_ref().and_then(|v| {
-        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
-    });
+    // The headers decode under the same gate as the history. A cell this
+    // caller may not decode makes the run undiagnosable. It never replays
+    // without its headers (issue #2043).
+    let context_headers = decode_codecs
+        .clone()
+        .unwrap_or_default()
+        .decode_headers_opt(execution.context_headers.as_ref())
+        .map(|headers| execution.context_headers.is_some().then_some(headers))
+        .map_err(|_| {
+            map_error(HarvestError::HistoryUnavailable {
+                exec_id,
+                reason: "payload decoding is required to diagnose this execution; \
+                         enable decode-on-read (admin)"
+                    .to_string(),
+            })
+        })?;
     let snapshot = autumn_harvest::testing::HistorySnapshot {
         workflow_name: execution.workflow_name.clone(),
         execution_id: exec_id,
@@ -35357,6 +35435,11 @@ async fn replay_diagnosis(
         context_headers,
         execution_timeout: execution.execution_timeout,
         deadline_at: execution.deadline_at,
+        // Issue #2082: carry the row's start source and predecessor.
+        start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
+            execution.start_source.as_deref(),
+            execution.continued_from_exec_id,
+        )),
         parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         workflow_id: Some(execution.workflow_id.clone()),
         queue_name: None,
@@ -44119,9 +44202,13 @@ fn export_history_for_execution(
     decoder: Option<&PayloadCodecs>,
     outcome: &mut LossyDecodeOutcome,
 ) -> Result<HistoryExportDocument, HistoryExportError> {
-    let context_headers = execution.context_headers.as_ref().and_then(|v| {
-        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
-    });
+    // A cell the caller may not decode stays out of the export (issue #2043).
+    // The Redacted policy drops the headers, so it decodes nothing.
+    let context_headers = autumn_harvest::history_export::export_headers(
+        execution.context_headers.as_ref(),
+        decoder.filter(|_| query.payload_policy != HistoryPayloadPolicy::Redacted),
+        outcome,
+    );
     export_history_decoded(
         HistoryExportRequest {
             workflow_name: execution.workflow_name.clone(),
@@ -44152,6 +44239,11 @@ fn export_history_for_execution(
             // child history round-trips its parent into the JSON / `harvest-replay`
             // replay path (mirrors `execution_timeout`/`deadline_at`; `parent_id`
             // lives in no `WorkflowEvent`). `None` for a top-level run.
+            // Issue #2082: carry the row's start source and predecessor.
+            start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
+                execution.start_source.as_deref(),
+                execution.continued_from_exec_id,
+            )),
             parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         },
         decoder,
@@ -44187,10 +44279,11 @@ fn export_history_for_candidate(
             // Issue #798: carry the execution's own ambient headers so a
             // header-branching workflow replays against what the live run saw
             // instead of an empty map (which would be a FALSE divergence).
-            context_headers: candidate.context_headers.as_ref().and_then(|value| {
-                serde_json::from_value::<std::collections::HashMap<String, String>>(value.clone())
-                    .ok()
-            }),
+            context_headers: autumn_harvest::history_export::export_headers(
+                candidate.context_headers.as_ref(),
+                decoder.filter(|_| query.payload_policy != HistoryPayloadPolicy::Redacted),
+                outcome,
+            ),
             // Issue #772: carry the deadline-aware replay metadata (the batch
             // candidate query now SELECTs `execution_timeout`/`deadline_at`) so a
             // batch-exported deadline-aware history round-trips its continue-as-new
@@ -44203,6 +44296,12 @@ fn export_history_for_candidate(
             // history round-trips its parent into the JSON / `harvest-replay`
             // replay path — parity with the single-execution export.
             parent_execution_id: candidate.parent_id.map(ExecutionId::from_uuid),
+            // Issue #2082: carry the start source and predecessor — parity with
+            // the single-execution export.
+            start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
+                candidate.start_source.as_deref(),
+                candidate.continued_from_exec_id,
+            )),
         },
         decoder,
         outcome,
@@ -44470,7 +44569,9 @@ SELECT
     w.deadline_at AS deadline_at,
     w.parent_id AS parent_id,
     w.context_headers AS context_headers,
-    w.queue_name AS queue_name
+    w.queue_name AS queue_name,
+    w.start_source AS start_source,
+    w.continued_from_exec_id AS continued_from_exec_id
 FROM harvest_workflow_executions w
 LEFT JOIN harvest_events e
     ON e.workflow_exec_id = w.id
@@ -44478,7 +44579,7 @@ WHERE ($1::TEXT IS NULL OR w.workflow_name = $1::TEXT)
   AND (cardinality($2::TEXT[]) = 0 OR w.state = ANY($2::TEXT[]))
 GROUP BY w.id, w.workflow_name, w.workflow_id, w.shard_id, w.state, w.completed_at, w.started_at,
          w.created_at, w.execution_timeout, w.deadline_at, w.parent_id, w.context_headers,
-         w.queue_name
+         w.queue_name, w.start_source, w.continued_from_exec_id
 HAVING ($3::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) >= $3::TIMESTAMPTZ)
    AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) < $4::TIMESTAMPTZ)
 ORDER BY last_history_event_at DESC, w.id DESC
@@ -44600,6 +44701,8 @@ WITH ranked AS (
         w.parent_id AS parent_id,
         w.context_headers AS context_headers,
         w.queue_name AS queue_name,
+        w.start_source AS start_source,
+        w.continued_from_exec_id AS continued_from_exec_id,
         ROW_NUMBER() OVER (
             PARTITION BY w.workflow_name
             ORDER BY w.started_at ASC, w.id ASC
@@ -44616,7 +44719,7 @@ type_count AS (
 )
 SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
        execution_timeout, deadline_at, parent_id, context_headers, queue_name,
-       in_flight_total
+       start_source, continued_from_exec_id, in_flight_total
 FROM ranked, type_count
 WHERE rn <= LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))
 ORDER BY workflow_name ASC, rn ASC
@@ -44641,6 +44744,8 @@ WITH ranked AS (
         w.parent_id AS parent_id,
         w.context_headers AS context_headers,
         w.queue_name AS queue_name,
+        w.start_source AS start_source,
+        w.continued_from_exec_id AS continued_from_exec_id,
         ROW_NUMBER() OVER (
             PARTITION BY w.workflow_name
             ORDER BY w.started_at DESC, w.id DESC
@@ -44657,7 +44762,7 @@ type_count AS (
 )
 SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
        execution_timeout, deadline_at, parent_id, context_headers, queue_name,
-       in_flight_total
+       start_source, continued_from_exec_id, in_flight_total
 FROM ranked, type_count
 WHERE rn <= LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))
 ORDER BY workflow_name ASC, rn ASC
@@ -54872,6 +54977,50 @@ mod tests {
     // ── Issue #506: typed comparison & set predicates ───────────────────────
 
     #[test]
+    fn coerce_scalar_keeps_every_digit_of_a_number() {
+        for raw in [
+            "12345678901234567890123",
+            "18446744073709551616",
+            "1.00000000000000000001",
+        ] {
+            assert_eq!(coerce_scalar(raw).to_string(), raw);
+        }
+        assert_eq!(coerce_scalar("+5").to_string(), "5");
+        assert_eq!(coerce_scalar(".5").to_string(), "0.5");
+        assert_eq!(coerce_scalar("inf"), serde_json::json!("inf"));
+    }
+
+    #[test]
+    fn legacy_search_attr_filter_keeps_every_digit() {
+        let big = "12345678901234567890123";
+        match parse_search_attr_filter(&format!("a:eq:{big}")).unwrap() {
+            SearchAttrPredicate::Eq { value, .. } => assert_eq!(value.to_string(), big),
+            other => panic!("expected eq, got {other:?}"),
+        }
+        match parse_search_attr_filter(&format!("a:ne:{big}")).unwrap() {
+            SearchAttrPredicate::Ne { value, .. } => assert_eq!(value.to_string(), big),
+            other => panic!("expected ne, got {other:?}"),
+        }
+        match parse_search_attr_filter(&format!("a:in:{big},2,x")).unwrap() {
+            SearchAttrPredicate::In { values, .. } => {
+                let texts: Vec<String> = values.iter().map(ToString::to_string).collect();
+                assert_eq!(texts, [big, "2", "\"x\""]);
+            }
+            other => panic!("expected in, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coerce_scalar_never_builds_invalid_json() {
+        // A second `+` is not a number, so the token stays a string.
+        assert_eq!(coerce_scalar("++5"), serde_json::json!("++5"));
+        assert_eq!(coerce_scalar("+-5"), serde_json::json!("+-5"));
+        // A very long number stays a string and costs no more memory.
+        let long = "1".repeat(2000);
+        assert_eq!(coerce_scalar(&long), serde_json::json!(long));
+    }
+
+    #[test]
     fn coerce_scalar_infers_number_bool_and_string() {
         assert_eq!(coerce_scalar("42"), serde_json::json!(42));
         assert_eq!(coerce_scalar("-7"), serde_json::json!(-7));
@@ -56342,6 +56491,8 @@ mod tests {
             deadline_at: Some(stale_deadline),
             parent_id: None,
             context_headers: None,
+            start_source: None,
+            continued_from_exec_id: None,
             queue_name: "default".to_string(),
         };
 
@@ -56459,6 +56610,8 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             context_headers: None,
+            start_source: None,
+            continued_from_exec_id: None,
             queue_name: "default".to_string(),
         }
     }
@@ -56521,6 +56674,8 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             context_headers: None,
+            start_source: None,
+            continued_from_exec_id: None,
             queue_name: "default".to_string(),
             in_flight_total,
         }
@@ -57294,6 +57449,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
         }
     }

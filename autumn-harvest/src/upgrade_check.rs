@@ -175,7 +175,7 @@ impl StructureManifest {
     /// errors of [`StructureManifest::parse`].
     pub fn load(path: &std::path::Path) -> Result<Self, UpgradeCheckError> {
         let text = std::fs::read_to_string(path).map_err(|source| UpgradeCheckError::Io {
-            path: path.display().to_string(),
+            path: shown_path(path),
             source,
         })?;
         Self::parse(&text)
@@ -492,6 +492,8 @@ pub struct EncodedHistory {
     pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The run's parent, when it is a child run.
     pub parent_execution_id: Option<ExecutionId>,
+    /// How the run started (issue #2082). `None` replays with an unknown source.
+    pub start_provenance: Option<crate::types::StartProvenance>,
     /// The run's `workflow_id`.
     pub workflow_id: Option<String>,
     /// The run's task queue.
@@ -796,6 +798,7 @@ impl UpgradeCheck {
             execution_timeout: history.execution_timeout,
             deadline_at: history.deadline_at,
             parent_execution_id: history.parent_execution_id,
+            start_provenance: history.start_provenance,
             workflow_id: history.workflow_id,
             queue_name: history.queue_name,
         };
@@ -1025,9 +1028,9 @@ fn build_finding(run_build: Option<&str>, baseline_build: Option<&str>) -> Optio
     let run_build = run_build?;
     match baseline_build {
         Some(baseline) if baseline == run_build => None,
-        Some(baseline) => Some(Finding::new(
+        Some(_) => Some(Finding::new(
             FindingKind::StructureUnavailable,
-            format!("the run is assigned to build `{run_build}`, not the baseline `{baseline}`"),
+            format!("the run is assigned to build `{run_build}`, not the named baseline build"),
         )),
         None => Some(Finding::new(
             FindingKind::StructureUnavailable,
@@ -1521,6 +1524,10 @@ struct InFlightRow {
     assigned_build_id: Option<String>,
     #[diesel(sql_type = diesel::sql_types::Text)]
     state: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    continued_from_exec_id: Option<uuid::Uuid>,
 }
 
 /// The columns of [`InFlightRow`]. Both row queries select them.
@@ -1528,7 +1535,8 @@ struct InFlightRow {
 macro_rules! in_flight_select {
     () => {
         "SELECT id, shard_id, workflow_name, context_headers, execution_timeout, \
-         deadline_at, parent_id, workflow_id, queue_name, assigned_build_id, state \
+         deadline_at, parent_id, workflow_id, queue_name, assigned_build_id, state, \
+         start_source, continued_from_exec_id \
          FROM harvest_workflow_executions "
     };
 }
@@ -1741,6 +1749,11 @@ impl UpgradeCheck {
             execution_timeout: row.execution_timeout,
             deadline_at: row.deadline_at,
             parent_execution_id: row.parent_id.map(ExecutionId::from_uuid),
+            // Issue #2082: the row's start source and predecessor.
+            start_provenance: Some(crate::types::StartProvenance::from_row(
+                row.start_source.as_deref(),
+                row.continued_from_exec_id,
+            )),
             workflow_id: Some(row.workflow_id.clone()),
             queue_name: Some(row.queue_name.clone()),
         })
@@ -1812,6 +1825,33 @@ Name one database per shard, in shard order. --database-url-env reads the URL
 from an environment variable, so the URL stays out of the process list.
 Exit codes: 0 every run migrates, 1 a run needs review or pin, 2 incomplete or bad input.";
 
+/// Stands in for a token that might hold a password.
+const HIDDEN: &str = "<hidden>";
+
+/// Returns `path` for an error line when it holds only path-safe characters, else [`HIDDEN`].
+///
+/// An operator can mistype a database address as a file path. A password in it stays out of the error.
+fn shown_path(path: &std::path::Path) -> String {
+    let text = path.display().to_string();
+    let safe = text
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '+' | '~' | ' '));
+    if safe { text } else { HIDDEN.to_string() }
+}
+
+/// Returns `token` when it is a plain word, else [`HIDDEN`].
+///
+/// A mistyped URL holds `:`, `/` or `@`. These characters fail the check, so an error line never shows the URL.
+/// A secret that is a plain word still shows. Callers pass tokens that are names, not secrets.
+#[cfg(feature = "db")]
+fn plain(token: &str) -> &str {
+    let word = !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if word { token } else { HIDDEN }
+}
+
 #[cfg(feature = "db")]
 impl CommandArgs {
     fn parse(args: Vec<String>) -> Result<Self, UpgradeCheckError> {
@@ -1837,7 +1877,8 @@ impl CommandArgs {
                     let name = value()?;
                     let url = std::env::var(&name).map_err(|_| {
                         UpgradeCheckError::Usage(format!(
-                            "environment variable `{name}` is not set"
+                            "environment variable `{}` is not set",
+                            plain(&name)
                         ))
                     })?;
                     out.database_urls.push(url);
@@ -1849,7 +1890,10 @@ impl CommandArgs {
                 "--limit" => {
                     let raw = value()?;
                     out.limit = Some(raw.parse().map_err(|_| {
-                        UpgradeCheckError::Usage(format!("--limit `{raw}` is not a number"))
+                        UpgradeCheckError::Usage(format!(
+                            "--limit `{}` is not a number",
+                            plain(&raw)
+                        ))
                     })?);
                 }
                 "--format" => match value()?.as_str() {
@@ -1857,13 +1901,21 @@ impl CommandArgs {
                     "json" => out.json = true,
                     other => {
                         return Err(UpgradeCheckError::Usage(format!(
-                            "--format `{other}` is not text or json"
+                            "--format `{}` is not text or json",
+                            plain(other)
                         )));
                     }
                 },
-                // The flag name only: a value can hold a password.
+                // Name a flag only. Any other argument can be a URL with a password.
                 other => {
-                    return Err(UpgradeCheckError::Usage(format!("unknown flag `{other}`")));
+                    let shown = if other.starts_with("--") {
+                        plain(other)
+                    } else {
+                        HIDDEN
+                    };
+                    return Err(UpgradeCheckError::Usage(format!(
+                        "unknown argument `{shown}`"
+                    )));
                 }
             }
         }
@@ -2043,6 +2095,107 @@ mod tests {
         let err = parse(&["--database-url", "x", "--db=postgres://u:secret@h"])
             .expect_err("unknown flag");
         assert!(!err.to_string().contains("secret"), "{err}");
+    }
+
+    const SECRET_URL: &str = "postgres://u:SECRETPW@h/db";
+
+    fn assert_no_secret(args: &[&str]) {
+        let Err(err) = parse(args) else {
+            panic!("expected a usage error for {args:?}");
+        };
+        assert!(!err.to_string().contains("SECRETPW"), "{err}");
+    }
+
+    #[test]
+    fn a_bare_url_error_does_not_echo_the_url() {
+        assert_no_secret(&[SECRET_URL]);
+        assert_no_secret(&["user=SECRETPW"]);
+        assert_no_secret(&["--postgres://u:SECRETPW@h/db"]);
+    }
+
+    #[test]
+    fn a_url_given_to_another_flag_is_not_echoed() {
+        assert_no_secret(&["--database-url-env", SECRET_URL]);
+        assert_no_secret(&["--limit", SECRET_URL]);
+        assert_no_secret(&["--format", SECRET_URL]);
+    }
+
+    #[test]
+    fn a_manifest_error_does_not_echo_a_mistyped_address() {
+        for path in [
+            "postgres://u:SECRETPW@h/db",
+            "postgres:/u:SECRETPW@h/db",
+            "u:SECRETPW@h",
+            "host=h user=u password = SECRETPW",
+        ] {
+            let Err(err) = StructureManifest::load(std::path::Path::new(path)) else {
+                panic!("expected a read error for {path}");
+            };
+            assert!(!err.to_string().contains("SECRETPW"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_error_names_a_plain_path() {
+        let path = std::path::Path::new("/no-such-dir-2119/old.structure.json");
+        let Err(err) = StructureManifest::load(path) else {
+            panic!("expected a read error");
+        };
+        assert!(
+            err.to_string()
+                .contains("/no-such-dir-2119/old.structure.json"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_build_finding_does_not_echo_the_baseline_build() {
+        let finding =
+            super::build_finding(Some("v2"), Some("postgres://u:SECRETPW@h/db")).expect("finding");
+        assert!(!finding.detail.contains("SECRETPW"), "{}", finding.detail);
+    }
+
+    #[test]
+    fn a_path_and_a_free_text_build_id_are_accepted() {
+        let args = parse(&[
+            "--database-url",
+            "x",
+            "--baseline-structure",
+            r"C:\manifests\old.json",
+            "--candidate-structure",
+            "out/new structure.json",
+            "--baseline-build",
+            "sha256:abc",
+            "--workflow-name",
+            "order",
+        ])
+        .expect("parses");
+        assert_eq!(args.baseline_build.as_deref(), Some("sha256:abc"));
+    }
+
+    #[test]
+    fn the_documented_binaries_read_argv_lossily() {
+        // `env::args()` panics on a non-UTF-8 argument and prints it, password included.
+        for (name, text) in [
+            (
+                "docs/upgrade-check.md",
+                include_str!("../../docs/upgrade-check.md"),
+            ),
+            (
+                "examples/upgrade_check.rs",
+                include_str!("../examples/upgrade_check.rs"),
+            ),
+        ] {
+            assert!(!text.contains("env::args()"), "{name} uses env::args()");
+        }
+    }
+
+    #[test]
+    fn a_plain_unknown_flag_and_env_name_stay_in_the_error() {
+        let err = parse(&["--bogus"]).expect_err("unknown flag");
+        assert!(err.to_string().contains("--bogus"), "{err}");
+        let err = parse(&["--database-url-env", "NO_SUCH_VAR_2119"]).expect_err("unset");
+        assert!(err.to_string().contains("NO_SUCH_VAR_2119"), "{err}");
     }
 
     #[test]

@@ -81,6 +81,9 @@ CREATE TABLE IF NOT EXISTS harvest_executions (
     cancel_from_seq INTEGER,               -- the history length when `cancel` stored
                                            -- the request (issue #2021). It bounds the
                                            -- events that a cleanup can add.
+    parent_exec_id      TEXT,              -- the parent run of a child (issue #2026)
+    parent_close_policy TEXT,              -- NULL for an awaited child; the policy of a
+                                           -- detached child
     started_at    INTEGER,                 -- the `WorkflowStarted` time in epoch
                                            -- microseconds (issue #2027). NULL on a row
                                            -- written before that issue.
@@ -392,6 +395,10 @@ use crate::error::SqliteResult;
 /// Current migrations:
 /// - **issue #2024** — `harvest_tasks.heartbeat_details` and
 ///   `harvest_tasks.last_error`. Both are nullable, so an old row is valid.
+/// - **issue #2026** — `harvest_executions.parent_exec_id` and
+///   `parent_close_policy` link a child to its parent. `harvest_signals.idempotency_key`
+///   holds the dedup key of an external signal. All are nullable. Their indexes
+///   are built here, after the columns exist.
 /// - **issue #1068** — `harvest_tasks.schedule_to_close_at` (the frozen absolute
 ///   total-deadline column) and `harvest_tasks.defaults_frozen` (the
 ///   resolved-defaults flag). Both are nullable/defaulted, so a pre-#1068 row is
@@ -464,6 +471,15 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "cancel_from_seq",
         "ALTER TABLE harvest_executions ADD COLUMN cancel_from_seq INTEGER",
     )?;
+    // issue #2026: the parent link of a child run.
+    for column in ["parent_exec_id", "parent_close_policy"] {
+        add_column_if_absent(
+            conn,
+            "harvest_executions",
+            column,
+            &format!("ALTER TABLE harvest_executions ADD COLUMN {column} TEXT"),
+        )?;
+    }
     // issue #2027: the columns that list and describe read.
     for (column, sql) in [
         (
@@ -511,15 +527,25 @@ pub fn migrate(conn: &Connection) -> SqliteResult<()> {
         "ALTER TABLE harvest_executions ADD COLUMN schedule_name TEXT",
     )?;
     conn.execute_batch(SCHEDULE_AND_RETENTION_INDEXES)?;
-    // issue #2028: the signal idempotency key. The back-fill runs only when the
-    // column is new. So the column, the index and the back-fill share one
-    // transaction: a crash after the column must not skip the back-fill.
+    add_signal_key(conn)
+}
+
+/// Issue #2028: the signal idempotency key. The back-fill runs only when the
+/// column is new. So the column, the index and the back-fill share one
+/// transaction: a crash after the column must not skip the back-fill.
+fn add_signal_key(conn: &Connection) -> SqliteResult<()> {
     let tx = conn.unchecked_transaction()?;
     let key_added = add_column_if_absent(
         &tx,
         "harvest_signals",
         "idempotency_key",
         "ALTER TABLE harvest_signals ADD COLUMN idempotency_key TEXT",
+    )?;
+    // An index on a new column must follow its `ADD COLUMN`. In `SCHEMA` it
+    // would fail on an old file, which still lacks the column (issue #2026).
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_harvest_executions_parent \
+             ON harvest_executions (parent_exec_id);",
     )?;
     tx.execute_batch(SIGNAL_KEY_INDEX)?;
     if key_added {
@@ -860,6 +886,8 @@ mod tests {
         assert!(!column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
         assert!(!column_exists(&conn, "harvest_tasks", "defaults_frozen").unwrap());
 
+        // An open applies `SCHEMA` first. It keeps the old `harvest_tasks`.
+        conn.execute_batch(SCHEMA).unwrap();
         migrate(&conn).unwrap();
 
         assert!(column_exists(&conn, "harvest_tasks", "schedule_to_close_at").unwrap());
@@ -910,5 +938,50 @@ mod tests {
         fresh.execute_batch(SCHEMA).unwrap();
         assert!(column_exists(&fresh, "harvest_tasks", "heartbeat_details").unwrap());
         assert!(column_exists(&fresh, "harvest_tasks", "last_error").unwrap());
+    }
+
+    // The pre-#2026 `harvest_executions` and `harvest_signals` shapes.
+    const OLD_COMPOSITION_DDL: &str = "\
+        CREATE TABLE harvest_executions (\
+            exec_id TEXT PRIMARY KEY, workflow_name TEXT NOT NULL, \
+            workflow_id TEXT NOT NULL DEFAULT '', input_json TEXT NOT NULL, \
+            state TEXT NOT NULL, output_json TEXT, error TEXT);\
+        CREATE TABLE harvest_signals (\
+            signal_seq INTEGER PRIMARY KEY AUTOINCREMENT, exec_id TEXT NOT NULL, \
+            name TEXT NOT NULL, payload_json TEXT NOT NULL, \
+            delivered INTEGER NOT NULL DEFAULT 0, received_at INTEGER NOT NULL DEFAULT 0);\
+        INSERT INTO harvest_executions (exec_id, workflow_name, input_json, state) \
+            VALUES ('e1', 'wf', '{}', 'RUNNING');";
+
+    // Issue #2026: an old file gains the parent link and the signal key. Its
+    // rows survive, and a pre-#2026 run reads as top-level.
+    #[test]
+    fn migrate_adds_composition_columns_to_an_old_file() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(OLD_COMPOSITION_DDL).unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        assert!(!column_exists(&conn, "harvest_executions", "parent_exec_id").unwrap());
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        for (table, column) in [
+            ("harvest_executions", "parent_exec_id"),
+            ("harvest_executions", "parent_close_policy"),
+            ("harvest_signals", "idempotency_key"),
+        ] {
+            assert!(
+                column_exists(&conn, table, column).unwrap(),
+                "{table}.{column}"
+            );
+        }
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_exec_id FROM harvest_executions WHERE exec_id = 'e1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent, None);
     }
 }

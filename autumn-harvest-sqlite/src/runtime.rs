@@ -30,7 +30,9 @@ use crate::lock::WriterLock;
 use crate::query::{DEFAULT_QUERY_TIMEOUT, QueryReplay};
 use crate::schedule::ScheduleSummary;
 use crate::visibility::{ExecutionDescription, ExecutionFilter, ExecutionPage, ListCursor};
-use crate::{lock, mutex, queue, retention, schedule, schema, store, update, visibility, worker};
+use crate::{
+    composition, lock, mutex, queue, retention, schedule, schema, store, update, visibility, worker,
+};
 
 /// A synchronous activity body, keyed by name.
 ///
@@ -132,11 +134,36 @@ impl ActivitySpec {
 }
 
 /// The timeout and retry declarations of a registered workflow (issue #2029).
-struct WorkflowPolicy {
+pub struct WorkflowPolicy {
     /// `#[workflow(execution_timeout = ..)]`.
     execution_timeout: Option<std::time::Duration>,
     /// `#[workflow(retry = ..)]`.
     retry_policy: Option<autumn_harvest::policy::RetryPolicy>,
+}
+
+/// The [`store::RunConfig`] of a fresh run that starts at `now`, from its
+/// type's `policy` (issue #2029). A start and a child start share it.
+pub fn fresh_run_config(
+    policy: Option<&WorkflowPolicy>,
+    now: i64,
+) -> SqliteResult<store::RunConfig> {
+    // Round up, so a sub-millisecond timeout never fires at once.
+    let timeout_ms = policy
+        .and_then(|p| p.execution_timeout)
+        .map(duration_to_millis_ceil);
+    let retry_policy_json = policy
+        .and_then(|p| p.retry_policy.as_ref())
+        .map(serde_json::to_string)
+        .transpose()?;
+    Ok(store::RunConfig {
+        execution_timeout_ms: timeout_ms,
+        deadline_at: timeout_ms.map(|ms| now.saturating_add(ms)),
+        start_at: None,
+        attempt: 1,
+        retry_policy_json,
+        retry_of: None,
+        local_retry_at: None,
+    })
 }
 
 /// The status of an execution after a driver step.
@@ -167,6 +194,16 @@ pub enum RunState {
     /// The run continued as new (issue #2023). It is sealed
     /// `CONTINUED_AS_NEW`. Drive the successor with this id.
     ContinuedAsNew(ExecutionId),
+    /// Blocked awaiting another run that is not terminal (issue #2026).
+    ///
+    /// The id names the run this run waits on directly: an awaited child or an
+    /// `await_external_workflow` target. That run can wait on another run in
+    /// turn. Call `run_until_blocked` on it to find the run that needs input.
+    ///
+    /// This state wins over the other waits, because the runtime can drive
+    /// that run itself. The run can also wait on a timer, such as a child
+    /// deadline. Drive it again after the deadline.
+    WaitingWorkflow(ExecutionId),
 }
 
 /// The stored, non-driving outcome of an execution — a pure read accessor.
@@ -185,7 +222,7 @@ pub enum ExecutionOutcome {
     /// #2021). A `continue_as_new` (issue #2023) or a reuse-policy replace
     /// (issue #1068) writes `CONTINUED_AS_NEW`. [`SqliteRuntime::successor`]
     /// tells those two apart. A drive returns the cancel or terminate reason in
-    /// [`RunState`].
+    /// [`RunState`]. Another run can also cancel a run (issue #2026).
     /// The payload is the RAW stored state name (e.g. `"CONTINUED_AS_NEW"`) so a
     /// caller can distinguish which terminal it is. Reporting these terminally —
     /// rather than as [`Self::Running`] — keeps `outcome()` consistent with the
@@ -364,6 +401,10 @@ pub struct SqliteRuntime {
     /// The history caps and the soft continue-as-new threshold (issue #2023).
     /// The defaults match the Postgres worker.
     history_policy: WorkflowHistoryPolicy,
+    /// The waited-on runs that one `run_until_blocked` call found blocked
+    /// (issue #2026). The call clears it at its start and end. Any progress
+    /// also clears it, because progress can unblock a run.
+    drive_blocked: HashSet<ExecutionId>,
     /// The time limit of one query replay (issue #2022).
     query_timeout: std::time::Duration,
 }
@@ -475,6 +516,7 @@ impl SqliteRuntime {
             now_fn: std::sync::Arc::new(Utc::now),
             writer_lock,
             history_policy: WorkflowHistoryPolicy::default(),
+            drive_blocked: HashSet::new(),
             query_timeout: DEFAULT_QUERY_TIMEOUT,
         })
     }
@@ -849,10 +891,11 @@ impl SqliteRuntime {
     /// # Errors
     ///
     /// Returns [`SqliteError::UnknownWorkflow`] if `workflow_name` has no
-    /// registered handler, [`SqliteError::PayloadTooLarge`] if `input` exceeds the
-    /// workflow-input cap, or [`SqliteError::Sqlite`]/[`SqliteError::Json`] on a
-    /// persistence failure. (Under `AllowDuplicate` it never returns
-    /// [`SqliteError::AlreadyExists`] — that is only for
+    /// registered handler. Returns [`SqliteError::PayloadTooLarge`] if `input`
+    /// exceeds the workflow-input cap. Returns [`SqliteError::PayloadTooDeep`] if
+    /// it nests past [`MAX_PAYLOAD_DEPTH`]. Returns [`SqliteError::Sqlite`] or
+    /// [`SqliteError::Json`] on a persistence failure. (Under `AllowDuplicate`
+    /// it never returns [`SqliteError::AlreadyExists`] — that is only for
     /// [`RejectDuplicate`](WorkflowIdReusePolicy::RejectDuplicate).)
     pub fn start_workflow_with_id(
         &mut self,
@@ -886,7 +929,8 @@ impl SqliteRuntime {
     /// [`start_workflow_with_reuse_policy`](Self::start_workflow_with_reuse_policy).
     /// Returns [`SqliteError::InvalidSearchAttribute`] for a search attribute
     /// that is not a JSON primitive. Returns [`SqliteError::PayloadTooLarge`]
-    /// for a memo over the workflow-input cap.
+    /// for a memo over the workflow-input cap, and
+    /// [`SqliteError::PayloadTooDeep`] for a memo nested past [`MAX_PAYLOAD_DEPTH`].
     pub fn start_workflow_with_options(
         &mut self,
         workflow_name: &str,
@@ -913,6 +957,7 @@ impl SqliteRuntime {
         // The memo shares the workflow-input cap. Postgres stores it in the
         // same row, beside the input.
         if let Some(memo) = &memo {
+            check_depth("memo", memo)?;
             let observed = serde_json::to_string(memo)?.len() as u64;
             if DEFAULT_MAX_WORKFLOW_INPUT_BYTES > 0 && observed > DEFAULT_MAX_WORKFLOW_INPUT_BYTES {
                 return Err(SqliteError::PayloadTooLarge {
@@ -979,9 +1024,11 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::AlreadyExists`] when `policy` is
     /// [`RejectDuplicate`](WorkflowIdReusePolicy::RejectDuplicate) and a non-sealed
-    /// prior exists; [`SqliteError::UnknownWorkflow`] for an unregistered workflow;
-    /// [`SqliteError::PayloadTooLarge`] for an oversized `input`; or
-    /// [`SqliteError::Sqlite`]/[`SqliteError::Json`] on a persistence failure.
+    /// prior exists. Returns [`SqliteError::UnknownWorkflow`] for an unregistered
+    /// workflow. Returns [`SqliteError::PayloadTooLarge`] for an oversized `input`
+    /// and [`SqliteError::PayloadTooDeep`] for one nested past
+    /// [`MAX_PAYLOAD_DEPTH`]. Returns [`SqliteError::Sqlite`] or
+    /// [`SqliteError::Json`] on a persistence failure.
     pub fn start_workflow_with_reuse_policy(
         &mut self,
         workflow_name: &str,
@@ -1038,30 +1085,16 @@ impl SqliteRuntime {
             },
         )?;
         tx.commit()?;
+        // A replaced prior closes, and its cascade can seal descendants
+        // (issue #2026).
+        self.forget_sealed_strikes()?;
         Ok(outcome)
     }
 
     /// The [`store::RunConfig`] of a fresh run of `workflow_name` that starts
     /// at `now` (issue #2029).
     fn start_config(&self, workflow_name: &str, now: i64) -> SqliteResult<store::RunConfig> {
-        let policy = self.workflow_policies.get(workflow_name);
-        // Round up, so a sub-millisecond timeout never fires at once.
-        let timeout_ms = policy
-            .and_then(|p| p.execution_timeout)
-            .map(duration_to_millis_ceil);
-        let retry_policy_json = policy
-            .and_then(|p| p.retry_policy.as_ref())
-            .map(serde_json::to_string)
-            .transpose()?;
-        Ok(store::RunConfig {
-            execution_timeout_ms: timeout_ms,
-            deadline_at: timeout_ms.map(|ms| now.saturating_add(ms)),
-            start_at: None,
-            attempt: 1,
-            retry_policy_json,
-            retry_of: None,
-            local_retry_at: None,
-        })
+        fresh_run_config(self.workflow_policies.get(workflow_name), now)
     }
 
     /// The checks of a plain start, before any write: a registered workflow
@@ -1088,8 +1121,9 @@ impl SqliteRuntime {
     ///
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id and
     /// [`SqliteError::WorkflowNotRunning`] for a terminal execution. Returns
-    /// [`SqliteError::PayloadTooLarge`] for an oversized payload. Returns a
-    /// persistence error if the signal row cannot be written.
+    /// [`SqliteError::PayloadTooLarge`] for an oversized payload and
+    /// [`SqliteError::PayloadTooDeep`] for one nested past [`MAX_PAYLOAD_DEPTH`].
+    /// Returns a persistence error if the signal row cannot be written.
     // Owned-value ingress API: callers hand over a `serde_json::Value` payload
     // that is serialized into durable storage; `store::stage_signal` only borrows
     // it at the leaf, so taking it by value keeps the call site ergonomic
@@ -1263,6 +1297,7 @@ impl SqliteRuntime {
     /// - [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
     /// - [`SqliteError::AlreadyExists`] for a `RejectDuplicate` collision.
     /// - [`SqliteError::PayloadTooLarge`] for an oversized input or payload.
+    /// - [`SqliteError::PayloadTooDeep`] for an input or payload nested too deep.
     /// - [`SqliteError::InvalidSignal`] for a broken key rule.
     /// - A persistence error.
     pub fn signal_with_start(
@@ -1402,10 +1437,11 @@ impl SqliteRuntime {
         refuse_unless_running(&self.conn, exec)?;
         let reason = reason_or(reason, DEFAULT_TERMINATE_REASON);
         let tx = self.conn.transaction()?;
-        seal_with_cancel_event(&tx, exec, TERMINATED_STATE, &reason)?;
+        let now = (self.now_fn)().timestamp_millis();
+        seal_with_cancel_event(&tx, exec, TERMINATED_STATE, &reason, now)?;
         tx.commit()?;
-        self.workflow_panic_strikes.remove(&exec);
-        Ok(())
+        // The cascade can seal detached descendants too (issue #2026).
+        self.forget_sealed_strikes()
     }
 
     /// End `exec` `TIMED_OUT` when its deadline has passed (issue #2029).
@@ -1469,6 +1505,7 @@ impl SqliteRuntime {
         exec: ExecutionId,
         reason: &str,
         batch: Option<CancelBatch<'_>>,
+        now: i64,
     ) -> SqliteResult<RunState> {
         if let Some(batch) = batch {
             let caps = CapCheck {
@@ -1478,11 +1515,24 @@ impl SqliteRuntime {
             };
             let tx = self.conn.transaction()?;
             batch.ingest.apply(&tx, exec)?;
-            persist_terminal_pending_commands(&tx, exec, batch.pending)?;
-            if batch.caps.reached(&tx, exec)?.is_none() {
+            let history = store::load_history(&tx, exec)?;
+            let drain = TerminalDrain {
+                registry: composition::Registry {
+                    workflows: &self.workflows,
+                    policies: &self.workflow_policies,
+                },
+                history: &history,
+                cycle: TerminalCycle::Completing,
+                now,
+            };
+            persist_terminal_pending_commands(&tx, &drain, exec, batch.pending)?;
+            // The seal writes one cascade event per detached child it closes.
+            // Both checks count them, as the terminal arms do (issue #2026).
+            let cascade = composition::cascade_event_count(&tx, exec)?;
+            if batch.caps.reached_with(&tx, exec, cascade)?.is_none() {
                 fail_dropped_tasks(&tx, exec, &self.activities)?;
-                if caps.reached(&tx, exec)?.is_none() {
-                    seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
+                if caps.reached_with(&tx, exec, cascade)?.is_none() {
+                    seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason, now)?;
                     tx.commit()?;
                     return Ok(RunState::Cancelled(reason.to_string()));
                 }
@@ -1497,14 +1547,15 @@ impl SqliteRuntime {
         };
         let tx = self.conn.transaction()?;
         fail_dropped_tasks(&tx, exec, &self.activities)?;
-        if caps.reached(&tx, exec)?.is_some() {
+        let cascade = composition::cascade_event_count(&tx, exec)?;
+        if caps.reached_with(&tx, exec, cascade)?.is_some() {
             drop(tx);
             let tx = self.conn.transaction()?;
-            seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
+            seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason, now)?;
             tx.commit()?;
             return Ok(RunState::Cancelled(reason.to_string()));
         }
-        seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason)?;
+        seal_with_cancel_event(&tx, exec, CANCELLED_STATE, reason, now)?;
         tx.commit()?;
         Ok(RunState::Cancelled(reason.to_string()))
     }
@@ -1540,6 +1591,8 @@ impl SqliteRuntime {
     /// - [`SqliteError::ExecutionNotFound`] for an unknown id.
     /// - [`SqliteError::WorkflowNotRunning`] for a terminal run.
     /// - [`SqliteError::UnknownWorkflow`] if the workflow is not registered.
+    /// - [`SqliteError::PayloadTooDeep`] if `input` nests past
+    ///   [`MAX_PAYLOAD_DEPTH`].
     /// - [`SqliteError::UpdateInputInvalid`] if `input` fails the arg schema
     ///   of a declarative handler.
     /// - [`SqliteError::UpdateRejected`] if the validator rejects `input` or
@@ -1558,6 +1611,7 @@ impl SqliteRuntime {
     /// - [`SqliteError::UpdateFailed`] if the handler returns an error or
     ///   panics. History records `WorkflowEvent::UpdateFailed`.
     /// - A persistence error if the history cannot be read or written.
+    #[allow(clippy::too_many_lines)] // one linear admission sequence
     pub async fn update(
         &mut self,
         exec: ExecutionId,
@@ -1566,6 +1620,7 @@ impl SqliteRuntime {
     ) -> SqliteResult<Value> {
         self.seal_if_overdue(exec)?;
         refuse_unless_running(&self.conn, exec)?;
+        check_depth("update_input", &input)?;
         let workflow_name = store::workflow_name_of(&self.conn, exec)?;
         let handler = *self
             .workflows
@@ -1657,14 +1712,9 @@ impl SqliteRuntime {
         store::append_event(&tx, exec, &admitted)?;
         store::append_event(&tx, exec, &outcome)?;
         if let Some(reason) = caps.reached(&tx, exec)? {
-            // Roll the update back, then end the run as a drive does. A
-            // pending cancel wins over the cap (issue #2021).
+            // Roll the update back, then end the run as a drive does.
             drop(tx);
-            if let Some((cancel, _)) = store::cancel_request(&self.conn, exec)? {
-                self.seal_cancelled(exec, &cancel, None)?;
-            } else {
-                self.fail_for_history_cap(exec, &reason, now.timestamp_millis())?;
-            }
+            self.end_run_at_cap(exec, &reason, now.timestamp_millis())?;
             return Err(SqliteError::UpdateHistoryCapReached {
                 execution_id: exec,
                 name: name.to_string(),
@@ -1705,6 +1755,8 @@ impl SqliteRuntime {
         // The body sees a pending cancel here, as on the next drive (issue
         // #2021).
         let cancel_reason = store::cancel_request(&self.conn, exec)?.map(|(reason, _)| reason);
+        // A child sees its parent here, as on a drive (issue #2026).
+        let parent = store::parent_link(&self.conn, exec)?.map(|(parent, _)| parent);
         // The drive's deadline, so `ctx.deadline()` replays the same branch
         // (issue #2029).
         let (timeout, deadline) = store::run_config(&self.conn, exec)?.context_deadline();
@@ -1718,6 +1770,7 @@ impl SqliteRuntime {
         )
         .with_workflow_name(workflow_name)
         .with_workflow_id(workflow_id)
+        .with_parent_execution_id(parent)
         .with_pending_cancellation(cancel_reason)
         .with_execution_timeout(timeout)
         .with_deadline(deadline);
@@ -1795,6 +1848,20 @@ impl SqliteRuntime {
             return Err(SqliteError::ExecutionNotFound(exec));
         }
         Ok(rows)
+    }
+
+    /// The parent of `exec`, or `None` for a top-level run (issue #2026). A pure
+    /// read. It matches `ctx.info().parent_execution_id` inside the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id, or a
+    /// persistence error.
+    pub fn parent_execution(&self, exec: ExecutionId) -> SqliteResult<Option<ExecutionId>> {
+        if !store::execution_exists(&self.conn, exec)? {
+            return Err(SqliteError::ExecutionNotFound(exec));
+        }
+        Ok(store::parent_link(&self.conn, exec)?.map(|(parent, _)| parent))
     }
 
     /// The stored, non-driving outcome of `exec` (a pure read; does not advance
@@ -2061,11 +2128,18 @@ impl SqliteRuntime {
     /// its true arm instant, so a `timer(1s)` following a 2s activity waits ~1s
     /// from when it was armed instead of firing immediately (issue #1069 P2).
     ///
+    /// This call also drives each `RUNNING` child or await target that the run
+    /// waits on (issue #2026). When every such target blocks, this returns
+    /// [`RunState::WaitingWorkflow`] naming one of them.
+    ///
     /// # Errors
     ///
     /// Returns [`SqliteError::ExecutionNotFound`] for an unknown id. Returns
     /// [`SqliteError::Stuck`] if the run makes no progress and cannot be
-    /// classified. Returns [`SqliteError::Unsupported`] for an unsupported
+    /// classified. An error from a waited-on run also returns here, unless
+    /// that run is now terminal. Such an error can name another run, or no
+    /// run, so it does not always concern `exec`. Returns
+    /// [`SqliteError::Unsupported`] for an unsupported
     /// command, after it seals the run `FAILED` (issue #1834). Returns
     /// [`SqliteError::UnknownWorkflow`] for an unregistered workflow.
     /// Returns [`SqliteError::UnregisteredActivity`] for an unregistered activity.
@@ -2088,14 +2162,10 @@ impl SqliteRuntime {
         // it does not borrow `self` across the `&mut self` cycle call).
         let now_fn = self.now_fn.clone();
         let failure_now = move || now_fn().timestamp_millis();
-        for _ in 0..MAX_ITERATIONS {
-            let now = (self.now_fn)().timestamp_millis();
-            match self.drive_one_cycle(exec, now, &failure_now).await? {
-                RunState::InProgress => {}
-                terminal_or_blocked => return Ok(terminal_or_blocked),
-            }
-        }
-        Err(SqliteError::Stuck(exec))
+        let now_fn = self.now_fn.clone();
+        let cycle_now = move || now_fn().timestamp_millis();
+        self.drive_until_blocked(exec, &cycle_now, &failure_now)
+            .await
     }
 
     /// Like [`run_until_blocked`](Self::run_until_blocked) but with an injected
@@ -2133,13 +2203,103 @@ impl SqliteRuntime {
         // so a policy retry's backoff anchor is byte-identical to a wall-clock cycle
         // with an instant body — deterministic, sleep-free (Codex #1069 P2).
         let failure_now = move || now;
-        for _ in 0..MAX_ITERATIONS {
-            match self.drive_one_cycle(exec, now, &failure_now).await? {
-                RunState::InProgress => {}
-                terminal_or_blocked => return Ok(terminal_or_blocked),
+        self.drive_until_blocked(exec, &failure_now, &failure_now)
+            .await
+    }
+
+    /// Drive `root` until it is terminal or blocked, and drive in the same call
+    /// each run it waits on (issue #2026).
+    ///
+    /// A cycle that parks on a `RUNNING` child or await target returns
+    /// [`RunState::WaitingWorkflow`]. That run is local work, not an external
+    /// input, so it goes on a stack and is driven next. When it ends, its
+    /// waiter is driven again and sees the result.
+    ///
+    /// A waited-on run that blocks is marked and popped. Its waiter is driven
+    /// again and picks another unmarked run, so a sibling that needs no input
+    /// still runs. A waiter whose every waited-on run is blocked is blocked
+    /// too. Progress clears the marks, because it can unblock a run. A run on
+    /// the stack is never pushed again, so a mutual wait blocks instead of
+    /// spinning.
+    ///
+    /// Each run gets its own budget of [`MAX_ITERATIONS`] cycles. A run that
+    /// spends it returns [`SqliteError::Stuck`] naming that run.
+    ///
+    /// An error from the root returns at once. An error from a waited-on run
+    /// returns too, unless that run is now terminal. A sealed run is terminal,
+    /// and its waiter records the typed failure, so the drive goes on.
+    async fn drive_until_blocked(
+        &mut self,
+        root: ExecutionId,
+        cycle_now: &(dyn Fn() -> i64 + Send + Sync),
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> SqliteResult<RunState> {
+        self.drive_blocked.clear();
+        let result = self.drive_stack(root, cycle_now, failure_now).await;
+        self.drive_blocked.clear();
+        result
+    }
+
+    /// The loop of [`drive_until_blocked`](Self::drive_until_blocked).
+    async fn drive_stack(
+        &mut self,
+        root: ExecutionId,
+        cycle_now: &(dyn Fn() -> i64 + Send + Sync),
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> SqliteResult<RunState> {
+        let mut stack = vec![root];
+        let mut cycles: HashMap<ExecutionId, usize> = HashMap::new();
+        while let Some(&exec) = stack.last() {
+            let spent = cycles.entry(exec).or_insert(0);
+            *spent += 1;
+            if *spent > MAX_ITERATIONS {
+                return Err(SqliteError::Stuck(exec));
+            }
+            let is_root = stack.len() == 1;
+            let result = self.drive_one_cycle(exec, cycle_now(), failure_now).await;
+            match result {
+                Ok(RunState::InProgress) => self.drive_blocked.clear(),
+                Ok(RunState::WaitingWorkflow(target))
+                    if !stack.contains(&target) && !self.drive_blocked.contains(&target) =>
+                {
+                    stack.push(target);
+                }
+                Ok(
+                    state @ (RunState::Completed(_)
+                    | RunState::Failed(_)
+                    | RunState::Cancelled(_)
+                    | RunState::Terminated(_)
+                    | RunState::ContinuedAsNew(_)),
+                ) => {
+                    if is_root {
+                        return Ok(state);
+                    }
+                    stack.pop();
+                    self.drive_blocked.clear();
+                }
+                Ok(blocked) => {
+                    if is_root {
+                        return Ok(blocked);
+                    }
+                    self.drive_blocked.insert(exec);
+                    stack.pop();
+                }
+                Err(err) => {
+                    let state = store::execution_state(&self.conn, exec)?;
+                    if is_root || !autumn_harvest::erase::is_terminal_state(&state) {
+                        return Err(err);
+                    }
+                    tracing::warn!(
+                        execution_id = %exec,
+                        error = %err,
+                        "a waited-on run ended with an error; its waiter records the failure"
+                    );
+                    stack.pop();
+                    self.drive_blocked.clear();
+                }
             }
         }
-        Err(SqliteError::Stuck(exec))
+        Err(SqliteError::Stuck(root))
     }
 
     /// Drive every non-terminal execution one cycle, using the real wall clock
@@ -2150,8 +2310,8 @@ impl SqliteRuntime {
     /// still drives every other execution.
     ///
     /// [`run_until_blocked`](Self::run_until_blocked) targets ONE execution
-    /// the caller already knows, so it stays fail-fast on error. This call
-    /// drives many UNRELATED executions, so one failure must not silently
+    /// the caller already knows, plus each run it waits on, so it stays
+    /// fail-fast on error. This call drives many UNRELATED executions, so one failure must not silently
     /// starve the rest.
     ///
     /// The pass first fires each due schedule (issue #2031). A fire that
@@ -2219,7 +2379,10 @@ impl SqliteRuntime {
             let now = (self.now_fn)().timestamp_millis();
             match self.drive_one_cycle(exec, now, &failure_now).await {
                 Ok(
-                    RunState::WaitingSignal(_) | RunState::WaitingTimer | RunState::WaitingMutex(_),
+                    RunState::WaitingSignal(_)
+                    | RunState::WaitingTimer
+                    | RunState::WaitingWorkflow(_)
+                    | RunState::WaitingMutex(_),
                 ) => {}
                 Ok(_) => progress = true,
                 Err(err) => {
@@ -2251,7 +2414,10 @@ impl SqliteRuntime {
         for exec in store::running_executions(&self.conn)? {
             match self.drive_one_cycle(exec, now, &failure_now).await {
                 Ok(
-                    RunState::WaitingSignal(_) | RunState::WaitingTimer | RunState::WaitingMutex(_),
+                    RunState::WaitingSignal(_)
+                    | RunState::WaitingTimer
+                    | RunState::WaitingWorkflow(_)
+                    | RunState::WaitingMutex(_),
                 ) => {}
                 Ok(_) => progress = true,
                 Err(err) => record_fleet_error(exec, err, &mut first_error),
@@ -2392,8 +2558,27 @@ impl SqliteRuntime {
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
     ) -> SqliteResult<RunState> {
         let result = self.drive_one_cycle_inner(exec, now, failure_now).await;
+        let result = self.seal_after_error(exec, result, now, failure_now);
+        // The cycle, or a seal after it, can seal other runs too, such as a
+        // cancel target or a detached child (issue #2026). No drive reaches a
+        // sealed run again, so forget their strikes after the last seal.
+        self.forget_sealed_strikes()?;
+        result
+    }
+
+    /// Seal a run whose cycle ended in an error that every drive would repeat.
+    ///
+    /// The drive's error still returns to the caller, so the drive that seals
+    /// the run reports why.
+    fn seal_after_error(
+        &mut self,
+        exec: ExecutionId,
+        result: SqliteResult<RunState>,
+        now: i64,
+        failure_now: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> SqliteResult<RunState> {
         if let Err(SqliteError::Unsupported(message)) = &result
-            && let Err(seal_error) = self.seal_unsupported(exec, message, now)
+            && let Err(seal_error) = self.seal_unsupported(exec, message, now, failure_now())
         {
             // Keep the reason the caller needs. The run stays `RUNNING`, so
             // the next drive meets the feature again and retries the seal.
@@ -2411,9 +2596,99 @@ impl SqliteRuntime {
             && let Some((reason, _)) = store::cancel_request(&self.conn, exec)?
         {
             tracing::warn!(%exec, ?error, "a pending cancel ends a run the drive cannot advance");
-            return self.seal_cancelled(exec, &reason, None);
+            return self.seal_cancelled(exec, &reason, None, failure_now());
         }
         result
+    }
+
+    /// End a failing terminal cycle in one transaction.
+    ///
+    /// The planned signals and the cycle's bookkeeping come first, then
+    /// `failure.terminal`. The run closes at `clock.decided_at` (issue #2026).
+    /// A cycle that reaches a history cap rolls back and fails for the cap.
+    ///
+    /// A run with a retry does not close (issue #2029). Its successor starts in
+    /// the same transaction. Its detached children keep running, as on
+    /// Postgres, so the cap check counts no cascade events.
+    fn fail_cycle(
+        &mut self,
+        exec: ExecutionId,
+        failure: &CycleFailure<'_>,
+        pending: &[&WorkflowCommand],
+        clock: CycleClock,
+    ) -> SqliteResult<RunState> {
+        let tx = self.conn.transaction()?;
+        failure.ingest.apply(&tx, exec)?;
+        let drain = TerminalDrain {
+            registry: composition::Registry {
+                workflows: &self.workflows,
+                policies: &self.workflow_policies,
+            },
+            history: failure.history,
+            cycle: TerminalCycle::Failing,
+            now: clock.decided_at,
+        };
+        persist_terminal_pending_commands(&tx, &drain, exec, pending.iter().copied())?;
+        let cascade = if failure.retry.is_some() {
+            0
+        } else {
+            composition::cascade_event_count(&tx, exec)?
+        };
+        if let Some(reason) = failure.caps.reached_with(&tx, exec, cascade)? {
+            drop(tx);
+            return self.fail_for_history_cap(exec, &reason, clock.now, clock.decided_at);
+        }
+        store::append_event(&tx, exec, &failure.terminal)?;
+        store::set_failed(&tx, exec, &failure.message)?;
+        if let Some(retry) = &failure.retry {
+            start_retry(
+                &tx,
+                exec,
+                retry.workflow_name,
+                retry.config.clone(),
+                &retry.plan,
+            )?;
+        } else {
+            composition::close_execution(&tx, exec, &failure.terminal, clock.decided_at)?;
+        }
+        tx.commit()?;
+        Ok(RunState::Failed(failure.message.clone()))
+    }
+
+    /// End `exec` at a history cap outside a drive cycle.
+    ///
+    /// A pending cancel wins over the cap (issue #2021). The close can cascade,
+    /// so the strikes of every sealed run go too (issue #2026).
+    fn end_run_at_cap(
+        &mut self,
+        exec: ExecutionId,
+        reason: &HistoryCapReason,
+        now: i64,
+    ) -> SqliteResult<()> {
+        if let Some((cancel, _)) = store::cancel_request(&self.conn, exec)? {
+            self.seal_cancelled(exec, &cancel, None, now)?;
+        } else {
+            self.fail_for_history_cap(exec, reason, now, now)?;
+        }
+        self.forget_sealed_strikes()
+    }
+
+    /// Drop the panic strikes of each run that is no longer `RUNNING` (issue
+    /// #2026). The map holds only runs with a recent panic, so it stays small.
+    fn forget_sealed_strikes(&mut self) -> SqliteResult<()> {
+        if self.workflow_panic_strikes.is_empty() {
+            return Ok(());
+        }
+        let mut sealed = Vec::new();
+        for exec in self.workflow_panic_strikes.keys() {
+            if composition::state_of(&self.conn, *exec)?.as_deref() != Some("RUNNING") {
+                sealed.push(*exec);
+            }
+        }
+        for exec in sealed {
+            self.workflow_panic_strikes.remove(&exec);
+        }
+        Ok(())
     }
 
     /// The history policy of a cycle (issue #2021). Under a pending cancel,
@@ -2434,13 +2709,14 @@ impl SqliteRuntime {
     ///
     /// The `WorkflowFailed` event carries [`UNSUPPORTED_FEATURE_ERROR_TYPE`]
     /// and `non_retryable = true`. A retry would meet the same feature again.
-    /// `details.feature` is a stable token, such as `StartChildWorkflow` or
+    /// `details.feature` is a stable token, such as `RunLocalActivity` or
     /// `ScheduleActivity.session_id`. `details.message` holds the full text.
     fn seal_unsupported(
         &mut self,
         exec: ExecutionId,
         unsupported: &str,
         now: i64,
+        closed_at: i64,
     ) -> SqliteResult<()> {
         let feature = unsupported
             .split(" — ")
@@ -2454,7 +2730,7 @@ impl SqliteRuntime {
             details: Some(serde_json::json!({ "feature": feature, "message": unsupported })),
             non_retryable: Some(true),
         };
-        self.seal_failed(exec, &event, &message, now)
+        self.seal_failed(exec, &event, &message, now, closed_at)
     }
 
     /// End `exec` `TIMED_OUT` at its `deadline` (issue #2029).
@@ -2478,21 +2754,21 @@ impl SqliteRuntime {
         .to_string();
         let at = |ms: i64| DateTime::from_timestamp_millis(ms).unwrap_or_default();
         let tx = self.conn.transaction()?;
-        store::append_event(
-            &tx,
-            exec,
-            &WorkflowEvent::WorkflowExecutionTimedOut {
-                deadline: at(deadline),
-                timed_out_at: at(now),
-            },
-        )?;
+        let event = WorkflowEvent::WorkflowExecutionTimedOut {
+            deadline: at(deadline),
+            timed_out_at: at(now),
+        };
+        store::append_event(&tx, exec, &event)?;
         store::set_terminal_with_reason(&tx, exec, TIMED_OUT_STATE, &error)?;
         // A late signal or update seals without a drive, so no reclaim ran.
         // A drive dropped mid-body can leave a `RUNNING` row with no owner.
         queue::reclaim_running_for_execution(&tx, exec)?;
         delete_open_rows(&tx, exec)?;
+        // The run closes like any terminal run (issue #2026). A parent sees the
+        // timeout, and the detached children get their policy, as on Postgres.
+        composition::close_execution(&tx, exec, &event, now)?;
         tx.commit()?;
-        self.workflow_panic_strikes.remove(&exec);
+        self.forget_sealed_strikes()?;
         tracing::warn!(%exec, %error, "workflow passed its execution_timeout");
         Ok(RunState::TimedOut(error))
     }
@@ -2507,11 +2783,12 @@ impl SqliteRuntime {
         exec: ExecutionId,
         reason: &HistoryCapReason,
         now: i64,
+        closed_at: i64,
     ) -> SqliteResult<RunState> {
         let error = reason.to_string();
         tracing::warn!(%exec, %error, "workflow history reached a hard cap; failing the run");
         let event = WorkflowEvent::workflow_failed(error.clone());
-        self.seal_failed(exec, &event, &error, now)?;
+        self.seal_failed(exec, &event, &error, now, closed_at)?;
         Ok(RunState::Failed(error))
     }
 
@@ -2531,12 +2808,16 @@ impl SqliteRuntime {
 
     /// Append `event`, set `exec` `FAILED` with `error`, and remove its pending
     /// tasks, unfired timers and unkeyed staged signals, in one transaction.
+    ///
+    /// `now` is the cycle clock, which the signal plan uses. `closed_at` is
+    /// the instant of the close (issue #2026).
     fn seal_failed(
         &mut self,
         exec: ExecutionId,
         event: &WorkflowEvent,
         error: &str,
         now: i64,
+        closed_at: i64,
     ) -> SqliteResult<()> {
         let tx = self.conn.transaction()?;
         // The failed cycle replayed the staged signals, and its transaction
@@ -2556,6 +2837,7 @@ impl SqliteRuntime {
         // age out (issue #2031). So remove the work no one can use any more
         // now, as the `TerminateIfRunning` seal does.
         delete_open_rows(&tx, exec)?;
+        composition::close_execution(&tx, exec, event, closed_at)?;
         tx.commit()?;
         self.workflow_panic_strikes.remove(&exec);
         Ok(())
@@ -2578,6 +2860,7 @@ impl SqliteRuntime {
     ///
     /// The successor keeps the timeout and the retry policy (issue #2029). Its
     /// deadline counts from `now`, and its retry attempt is 1, as on Postgres.
+    // The inputs of one hand-off. A struct would only rename them.
     #[allow(clippy::too_many_arguments)]
     fn continue_as_new(
         &mut self,
@@ -2601,8 +2884,19 @@ impl SqliteRuntime {
         let successor = ExecutionId::new();
         let tx = self.conn.transaction()?;
         ingest.apply(&tx, exec)?;
+        let history = store::load_history(&tx, exec)?;
+        let drain = TerminalDrain {
+            registry: composition::Registry {
+                workflows: &self.workflows,
+                policies: &self.workflow_policies,
+            },
+            history: &history,
+            cycle: TerminalCycle::Completing,
+            now,
+        };
         persist_terminal_pending_commands(
             &tx,
+            &drain,
             exec,
             pending.iter().filter(|cmd| !is_dispatch(cmd)),
         )?;
@@ -2709,7 +3003,7 @@ impl SqliteRuntime {
             // A retry that has not started yet has no work to clean up, so a
             // pending cancel ends it at once.
             if let Some((reason, _)) = store::cancel_request(&self.conn, exec)? {
-                return self.seal_cancelled(exec, &reason, None);
+                return self.seal_cancelled(exec, &reason, None, now);
             }
             return Ok(RunState::WaitingTimer);
         }
@@ -2738,7 +3032,7 @@ impl SqliteRuntime {
         if let Some((reason, from)) = &cancel
             && history.len().saturating_sub(*from) >= CANCEL_CLEANUP_EVENT_BUDGET
         {
-            return self.seal_cancelled(exec, reason, None);
+            return self.seal_cancelled(exec, reason, None, now);
         }
         let (cancel_reason, budget_end) = cancel.map_or((None, None), |(reason, from)| {
             (
@@ -2780,7 +3074,9 @@ impl SqliteRuntime {
         // dedicated parameter on this entry point — the core reads it ONLY from
         // `span_meta.workflow_id`, so build a minimal meta carrying it (see
         // [`drive_span_meta`]).
-        let mut span_meta = drive_span_meta(&workflow_name, &workflow_id, cancel_reason.clone());
+        let parent = store::parent_link(&self.conn, exec)?.map(|(parent, _)| parent);
+        let mut span_meta =
+            drive_span_meta(&workflow_name, &workflow_id, cancel_reason.clone(), parent);
         // Issue #2029: `ctx.deadline()` reports the stored deadline.
         (span_meta.execution_timeout, span_meta.deadline_at) = config.context_deadline();
         let declarative = self.declarative_updates(&workflow_name);
@@ -2817,6 +3113,11 @@ impl SqliteRuntime {
                 None,
             )
             .await;
+        // Read the clock again once the body returns (issue #2026). The body
+        // can take time. Each write that another run reads by time uses this
+        // instant. A close checks the parent's child deadlines at it. A signal
+        // to another run gets it as its arrival time. Postgres uses `NOW()`.
+        let decided_at = failure_now();
 
         // Issue #2029: the body can run past the deadline. Its outcome then
         // does not commit, and the run ends `TIMED_OUT`. The as-of drive keeps
@@ -2827,6 +3128,17 @@ impl SqliteRuntime {
                 return self.seal_timed_out(exec, deadline, after);
             }
         }
+
+        // Issue #2023: the #1804 caps. Each arm that writes checks them inside
+        // its transaction, before its terminal event. The final panic strike
+        // checks them too. Issue #2021: under a pending cancel the cleanup
+        // budget is one more event cap. A suspending batch and a final batch
+        // both stop at it.
+        let caps = CapCheck {
+            policy: self.cancel_policy(budget_end),
+            start_bytes: history_bytes.saturating_add(ingest.bytes()),
+            workflow_type: &workflow_name,
+        };
 
         // Contained workflow-handler panic gate (issue #782 analog), BEFORE any
         // terminal side effect and beside the non-determinism gate below. A
@@ -2849,19 +3161,10 @@ impl SqliteRuntime {
             ..
         } = &outcome
         {
-            return self.contain_workflow_panic(exec, &ingest, error);
+            let clock = CycleClock { now, decided_at };
+            return self.contain_workflow_panic(exec, &ingest, error, &caps, clock);
         }
         self.workflow_panic_strikes.remove(&exec);
-
-        // Issue #2023: the #1804 caps. Each arm that writes checks them inside
-        // its transaction, before its terminal event. Issue #2021: under a
-        // pending cancel the cleanup budget is one more event cap. A
-        // suspending batch and a final batch both stop at it.
-        let caps = CapCheck {
-            policy: self.cancel_policy(budget_end),
-            start_bytes: history_bytes.saturating_add(ingest.bytes()),
-            workflow_type: &workflow_name,
-        };
 
         // Issue #2021: a pending cancel request ends the run here.
         // - A body that returns `Ok` or `Err` has done its cleanup. Its
@@ -2885,9 +3188,11 @@ impl SqliteRuntime {
                 | WorkflowOutcome::Failed {
                     non_deterministic_details: None,
                     ..
-                } => return self.seal_cancelled(exec, reason, Some(batch(&pending))),
+                } => {
+                    return self.seal_cancelled(exec, reason, Some(batch(&pending)), decided_at);
+                }
                 WorkflowOutcome::Failed { .. } | WorkflowOutcome::TaskFailed { .. } => {
-                    return self.seal_cancelled(exec, reason, Some(batch(&[])));
+                    return self.seal_cancelled(exec, reason, Some(batch(&[])), decided_at);
                 }
                 WorkflowOutcome::Suspended { .. } => {}
             }
@@ -2900,19 +3205,27 @@ impl SqliteRuntime {
                 // Persist terminal-cycle bookkeeping (issue #1068) BEFORE the
                 // terminal event, in command order, inside the SAME transaction —
                 // mirroring the Postgres `persist_terminal_outcome_commands`.
-                persist_terminal_pending_commands(&tx, exec, &pending)?;
-                if let Some(reason) = caps.reached(&tx, exec)? {
-                    drop(tx);
-                    return self.fail_for_history_cap(exec, &reason, now);
-                }
-                store::append_event(
-                    &tx,
-                    exec,
-                    &WorkflowEvent::WorkflowCompleted {
-                        output: output.clone(),
+                let drain = TerminalDrain {
+                    registry: composition::Registry {
+                        workflows: &self.workflows,
+                        policies: &self.workflow_policies,
                     },
-                )?;
+                    history: &history,
+                    cycle: TerminalCycle::Completing,
+                    now: decided_at,
+                };
+                persist_terminal_pending_commands(&tx, &drain, exec, &pending)?;
+                let cascade = composition::cascade_event_count(&tx, exec)?;
+                if let Some(reason) = caps.reached_with(&tx, exec, cascade)? {
+                    drop(tx);
+                    return self.fail_for_history_cap(exec, &reason, now, decided_at);
+                }
+                let terminal = WorkflowEvent::WorkflowCompleted {
+                    output: output.clone(),
+                };
+                store::append_event(&tx, exec, &terminal)?;
                 store::set_completed(&tx, exec, &output)?;
+                composition::close_execution(&tx, exec, &terminal, decided_at)?;
                 tx.commit()?;
                 Ok(RunState::Completed(output))
             }
@@ -2960,24 +3273,43 @@ impl SqliteRuntime {
                 let decoded = autumn_harvest::failure::decode_workflow_failure(&error);
                 // The delay counts from the failure, after the body ran.
                 let retry = retry_plan(&config, &decoded, exec, failure_now())?;
-                let tx = self.conn.transaction()?;
-                ingest.apply(&tx, exec)?;
-                persist_terminal_pending_commands(&tx, exec, &pending)?;
-                if let Some(reason) = caps.reached(&tx, exec)? {
-                    drop(tx);
-                    return self.fail_for_history_cap(exec, &reason, now);
-                }
-                store::append_event(&tx, exec, &WorkflowEvent::workflow_failed_typed(&decoded))?;
-                store::set_failed(&tx, exec, &decoded.message)?;
-                // Issue #2029: the retry starts in the same transaction.
-                if let Some(plan) = retry {
-                    start_retry(&tx, exec, &workflow_name, config, &plan)?;
-                }
-                tx.commit()?;
-                Ok(RunState::Failed(decoded.message))
+                let failure = CycleFailure {
+                    ingest: &ingest,
+                    history: &history,
+                    caps: &caps,
+                    terminal: WorkflowEvent::workflow_failed_typed(&decoded),
+                    message: decoded.message,
+                    retry: retry.map(|plan| RetryStart {
+                        workflow_name: &workflow_name,
+                        config,
+                        plan,
+                    }),
+                };
+                let all: Vec<&WorkflowCommand> = pending.iter().collect();
+                self.fail_cycle(exec, &failure, &all, CycleClock { now, decided_at })
             }
             // Issue #2023. A continuing run is exempt from the caps: its
             // successor starts a new history.
+            // A child cannot continue as new, as on Postgres (issue #2026). A new
+            // run would orphan the parent's wait. The child fails instead, and
+            // an awaiting parent records the failure.
+            // The cycle's bookkeeping persists, as for any failing cycle. Its
+            // dispatches drop, as a continue-as-new drops them.
+            WorkflowOutcome::ContinuedAsNew { .. }
+                if store::parent_link(&self.conn, exec)?.is_some() =>
+            {
+                let failure = CycleFailure {
+                    ingest: &ingest,
+                    history: &history,
+                    caps: &caps,
+                    terminal: WorkflowEvent::workflow_failed(CHILD_CONTINUE_AS_NEW_ERROR),
+                    message: CHILD_CONTINUE_AS_NEW_ERROR.to_string(),
+                    retry: None,
+                };
+                let kept: Vec<&WorkflowCommand> =
+                    pending.iter().filter(|cmd| !is_dispatch(cmd)).collect();
+                self.fail_cycle(exec, &failure, &kept, CycleClock { now, decided_at })
+            }
             WorkflowOutcome::ContinuedAsNew {
                 input,
                 new_workflow_type: None,
@@ -3018,7 +3350,7 @@ impl SqliteRuntime {
                     &history,
                     &commands,
                     &caps,
-                    now,
+                    CycleClock { now, decided_at },
                     failure_now,
                     cancel_reason.as_deref(),
                 )
@@ -3050,11 +3382,12 @@ impl SqliteRuntime {
         history: &[WorkflowEvent],
         commands: &[WorkflowCommand],
         caps: &CapCheck<'_>,
-        now: i64,
+        clock: CycleClock,
         failure_now: &(dyn Fn() -> i64 + Send + Sync),
         cancel_reason: Option<&str>,
     ) -> SqliteResult<RunState> {
-        let applied = match self.apply_commands(exec, ingest, history, commands, caps, now)? {
+        let now = clock.now;
+        let applied = match self.apply_commands(exec, ingest, history, commands, caps, clock)? {
             // Issue #2029: run the local activity now, then replay again.
             Applied::Committed {
                 local: Some(run), ..
@@ -3069,11 +3402,16 @@ impl SqliteRuntime {
                 // Issue #2021: a pending cancel wins over a cap that its
                 // cleanup reaches. The seal adds only `WorkflowCancelled`.
                 if let Some(cancel) = cancel_reason {
-                    return self.seal_cancelled(exec, cancel, None);
+                    return self.seal_cancelled(exec, cancel, None, clock.decided_at);
                 }
-                return self.fail_for_history_cap(exec, &reason, now);
+                return self.fail_for_history_cap(exec, &reason, now, clock.decided_at);
             }
         };
+        // The batch sealed this run (issue #2026). Run none of its work. The
+        // next cycle reports the terminal state.
+        if store::execution_state(&self.conn, exec)? != "RUNNING" {
+            return Ok(RunState::InProgress);
+        }
         let settle_after_first_terminal = worker::activity_race_in_flight(history, commands);
         let deadline = store::run_config(&self.conn, exec)?.deadline_at;
         let drain = worker::drain_ready(
@@ -3106,7 +3444,8 @@ impl SqliteRuntime {
         if let Some(reason) = cancel_reason
             && !queue::has_pending_activity(&self.conn, exec)?
         {
-            return self.seal_cancelled(exec, reason, None);
+            // The drain can take time, so read the clock again for the close.
+            return self.seal_cancelled(exec, reason, None, failure_now());
         }
         self.classify_block(exec, commands)
     }
@@ -3129,6 +3468,7 @@ impl SqliteRuntime {
     ///
     /// The cap check (issue #2023) runs after the appends and before the
     /// commit. A breach drops the transaction, so the decision rolls back.
+    #[allow(clippy::too_many_lines)] // one arm per `WorkflowCommand` variant
     fn apply_commands(
         &mut self,
         exec: ExecutionId,
@@ -3136,8 +3476,9 @@ impl SqliteRuntime {
         history: &[WorkflowEvent],
         commands: &[WorkflowCommand],
         caps: &CapCheck<'_>,
-        now: i64,
+        clock: CycleClock,
     ) -> SqliteResult<Applied> {
+        let now = clock.now;
         check_batch_shape(commands)?;
         let tx = self.conn.transaction()?;
         // A body that no longer awaits a key gives up its queue place.
@@ -3293,8 +3634,30 @@ impl SqliteRuntime {
                     children,
                     timers,
                 } => {
-                    if apply_cancel_race_losers(&tx, exec, activities, children, timers)? {
+                    let at = clock.decided_at;
+                    if apply_cancel_race_losers(&tx, exec, activities, children, timers, at)? {
                         produced = true;
+                    }
+                }
+                // Composition (issue #2026). The `composition` module resolves
+                // each of these in this cycle transaction.
+                cmd @ (WorkflowCommand::StartChildWorkflow { .. }
+                | WorkflowCommand::SpawnDetachedChildWorkflow { .. }
+                | WorkflowCommand::SignalExternalWorkflow { .. }
+                | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+                | WorkflowCommand::AwaitExternalWorkflow { .. }) => {
+                    let at = clock.decided_at;
+                    let registry = composition::Registry {
+                        workflows: &self.workflows,
+                        policies: &self.workflow_policies,
+                    };
+                    if composition::apply_command(&tx, &registry, exec, history, cmd, at)? {
+                        produced = true;
+                    }
+                    // A cancel can reach this run through a parent-close cascade.
+                    // A sealed run applies no more of its batch.
+                    if store::execution_state(&tx, exec)? != "RUNNING" {
+                        break;
                     }
                 }
                 // Cancellable timers (issue #2029, #768), in command order.
@@ -3316,9 +3679,8 @@ impl SqliteRuntime {
                     produced = true;
                 }
                 // Reject every OTHER unsupported command BY NAME via
-                // `command_name`. Examples are child workflows, external
-                // activities, external signals and cancels, and detached
-                // children. No current variant is an
+                // `command_name`. Examples are external activities and worker
+                // sessions. No current variant is an
                 // opaque `"Unknown"` (Codex #1069 P2, `runtime.rs:840`). Dropping
                 // the uncommitted `tx` rolls back the whole batch. So an
                 // unsupported command after a supported one persists NEITHER the
@@ -3407,9 +3769,14 @@ impl SqliteRuntime {
                     store::append_event(&tx, exec, first)?;
                     tx.commit()?;
                 }
+                // The attempt ran, so the close reads the clock again (issue
+                // #2026).
+                let closed_at = failure_now();
                 return match cancel_reason {
-                    Some(cancel) => self.seal_cancelled(exec, cancel, None).map(Some),
-                    None => self.fail_for_history_cap(exec, &reason, now).map(Some),
+                    Some(cancel) => self.seal_cancelled(exec, cancel, None, closed_at).map(Some),
+                    None => self
+                        .fail_for_history_cap(exec, &reason, now, closed_at)
+                        .map(Some),
                 };
             }
             tx.commit()?;
@@ -3422,8 +3789,9 @@ impl SqliteRuntime {
 
     /// Classify why a no-progress cycle is blocked.
     ///
-    /// A no-progress `Suspended` cycle is a legitimate *wait* for one of two
-    /// reasons: an undelivered signal, or a not-yet-due durable timer. Each is
+    /// A no-progress `Suspended` cycle is a legitimate *wait* for one of three
+    /// reasons. They are a `RUNNING` child or await target (issue #2026), an
+    /// undelivered signal, and a not-yet-due durable timer. Each is
     /// checked against ground truth: a `WaitForSignal` command names the awaited
     /// signal, and an armed-but-unfired row in `harvest_timers` proves a pending
     /// timer (`drain_ready` already fired every *due* timer this cycle, so any
@@ -3437,6 +3805,18 @@ impl SqliteRuntime {
         exec: ExecutionId,
         commands: &[WorkflowCommand],
     ) -> SqliteResult<RunState> {
+        // A wait on another run comes first: the driver can drive that run
+        // itself (issue #2026). The other waits need input from outside.
+        // The driver marks a run it found blocked. Prefer a run not yet marked,
+        // so each waited-on run gets driven.
+        let running = composition::awaited_running_runs(&self.conn, commands)?;
+        if let Some(target) = running
+            .iter()
+            .find(|run| !self.drive_blocked.contains(run))
+            .or_else(|| running.first())
+        {
+            return Ok(RunState::WaitingWorkflow(*target));
+        }
         for cmd in commands {
             match cmd {
                 WorkflowCommand::WaitForSignal { signal_name, .. } => {
@@ -3484,6 +3864,8 @@ impl SqliteRuntime {
         exec: ExecutionId,
         ingest: &worker::SignalIngest,
         error: &str,
+        caps: &CapCheck<'_>,
+        clock: CycleClock,
     ) -> SqliteResult<RunState> {
         let strikes = {
             let count = self.workflow_panic_strikes.entry(exec).or_insert(0);
@@ -3506,11 +3888,20 @@ impl SqliteRuntime {
             // The sealing strike replayed the planned signals. Record them, so
             // the terminal history holds the input that caused the panic.
             ingest.apply(&tx, exec)?;
-            store::append_event(&tx, exec, &WorkflowEvent::workflow_failed_typed(&decoded))?;
+            // The close writes one cascade event per detached child. The check
+            // counts them, as the failure arm does (issue #2026).
+            let cascade = composition::cascade_event_count(&tx, exec)?;
+            if let Some(reason) = caps.reached_with(&tx, exec, cascade)? {
+                drop(tx);
+                return self.fail_for_history_cap(exec, &reason, clock.now, clock.decided_at);
+            }
+            let event = WorkflowEvent::workflow_failed_typed(&decoded);
+            store::append_event(&tx, exec, &event)?;
             store::set_failed(&tx, exec, &decoded.message)?;
             // The plan can stop at the cap room. No drive reads the rest, so
             // remove it, as `seal_failed` does.
             queue::delete_undelivered_signals_for_execution(&tx, exec)?;
+            composition::close_execution(&tx, exec, &event, clock.decided_at)?;
             tx.commit()?;
             Ok(RunState::Failed(decoded.message))
         } else {
@@ -3754,14 +4145,11 @@ fn cancel_and_seal_prior(
     prior_state: &str,
     reason: &str,
 ) -> SqliteResult<()> {
-    if prior_state == "RUNNING" {
-        store::append_event(
-            conn,
-            prior_exec,
-            &WorkflowEvent::WorkflowCancelled {
-                reason: reason.to_string(),
-            },
-        )?;
+    let cancelled = (prior_state == "RUNNING").then(|| WorkflowEvent::WorkflowCancelled {
+        reason: reason.to_string(),
+    });
+    if let Some(event) = &cancelled {
+        store::append_event(conn, prior_exec, event)?;
         queue::delete_pending_tasks_for_execution(conn, prior_exec)?;
         queue::delete_unfired_timers_for_execution(conn, prior_exec)?;
     }
@@ -3769,6 +4157,11 @@ fn cancel_and_seal_prior(
     // a prior that reached COMPLETED/FAILED on its own, not only a cancelled one.
     queue::delete_undelivered_signals_for_execution(conn, prior_exec)?;
     store::seal_execution(conn, prior_exec, SEALED_STATE)?;
+    // A RUNNING prior closes here, so settle its parent and its detached
+    // children (issue #2026). A terminal prior settled them when it ended.
+    if let Some(event) = &cancelled {
+        composition::close_execution(conn, prior_exec, event, Utc::now().timestamp_millis())?;
+    }
     Ok(())
 }
 
@@ -3952,8 +4345,70 @@ fn start_in_tx(
     }
 }
 
+/// The deepest nesting that ingress accepts in a payload (issue #2157).
+///
+/// `serde_json` reads at most 128 levels. Event storage wraps a payload in a
+/// few more levels. The cap leaves room for that wrapping.
+pub const MAX_PAYLOAD_DEPTH: usize = 100;
+
+/// The children of a JSON container, as one iterator type.
+enum Children<'a> {
+    Array(std::slice::Iter<'a, Value>),
+    Object(serde_json::map::Values<'a>),
+}
+
+impl<'a> Iterator for Children<'a> {
+    type Item = &'a Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Array(items) => items.next(),
+            Self::Object(values) => values.next(),
+        }
+    }
+}
+
+/// The children of `value`, or `None` for a scalar.
+fn children(value: &Value) -> Option<Children<'_>> {
+    match value {
+        Value::Array(items) => Some(Children::Array(items.iter())),
+        Value::Object(map) => Some(Children::Object(map.values())),
+        _ => None,
+    }
+}
+
+/// Returns `Ok` only when `value` has at most [`MAX_PAYLOAD_DEPTH`] open
+/// arrays and objects on any path.
+///
+/// The walk keeps one iterator per open container. A recursive walk would
+/// overflow the call stack on the input it must refuse. Memory use is bound
+/// by the cap, not by the width of the value.
+///
+/// Call it before any code that recurses over the value, such as a schema check
+/// or a settlement decoder.
+fn check_depth(kind: &'static str, value: &Value) -> SqliteResult<()> {
+    let mut open: Vec<Children<'_>> = children(value).into_iter().collect();
+    while let Some(top) = open.last_mut() {
+        let Some(child) = top.next() else {
+            open.pop();
+            continue;
+        };
+        if let Some(inner) = children(child) {
+            if open.len() >= MAX_PAYLOAD_DEPTH {
+                return Err(SqliteError::PayloadTooDeep {
+                    kind,
+                    cap_depth: MAX_PAYLOAD_DEPTH,
+                });
+            }
+            open.push(inner);
+        }
+    }
+    Ok(())
+}
+
 /// Returns `Ok` only when `input` fits the workflow-input cap.
 fn check_input_cap(input: &Value) -> SqliteResult<()> {
+    check_depth("workflow_input", input)?;
     // Enforce the workflow-input cap BEFORE any write (issue #252). The Postgres
     // start path rejects an oversized input with `PayloadTooLarge` before it
     // persists anything. Without this check, this backend stores and replays an
@@ -3998,6 +4453,10 @@ fn signal_key<'a>(
     idempotency_key: Option<&'a str>,
 ) -> SqliteResult<Option<&'a str>> {
     let key = idempotency_key.filter(|key| !key.is_empty());
+    // The settlement decoder below recurses. Check the depth first.
+    if name.starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX) {
+        check_depth("signal_payload", payload)?;
+    }
     autumn_harvest::durable_promise::settlement_idempotency_key(name, payload, key)
         .map_err(|e| SqliteError::InvalidSignal(e.to_string()))
 }
@@ -4056,6 +4515,7 @@ fn stage_keyed(
     // an oversized signal to a terminal run differs only in its error kind.
     // Both backends refuse it and stage no row. The size is the
     // serialized-JSON byte length, as in the core.
+    check_depth("signal_payload", payload)?;
     if DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES > 0 {
         let observed = serde_json::to_string(payload).map_or(0, |s| s.len() as u64);
         if observed > DEFAULT_MAX_SIGNAL_PAYLOAD_BYTES {
@@ -4104,6 +4564,11 @@ const UNREGISTERED_ACTIVITY_ERROR_TYPE: &str = "UnregisteredActivity";
 /// The `error_type` of the `ActivityFailed` that a cancel seal records for a
 /// registered activity that it drops (issue #2021).
 const CANCEL_SEALED_ERROR_TYPE: &str = "CancelSealed";
+
+/// The failure text of a child that continues as new. It matches the Postgres
+/// worker (issue #2026).
+const CHILD_CONTINUE_AS_NEW_ERROR: &str =
+    "continue_as_new is not supported in child workflows in this release";
 
 /// The state a cooperative cancel seals (issue #2021).
 const CANCELLED_STATE: &str = "CANCELLED";
@@ -4175,16 +4640,17 @@ fn seal_with_cancel_event(
     exec: ExecutionId,
     state: &str,
     reason: &str,
+    now: i64,
 ) -> SqliteResult<()> {
-    store::append_event(
-        conn,
-        exec,
-        &WorkflowEvent::WorkflowCancelled {
-            reason: reason.to_string(),
-        },
-    )?;
+    let event = WorkflowEvent::WorkflowCancelled {
+        reason: reason.to_string(),
+    };
+    store::append_event(conn, exec, &event)?;
     store::set_terminal_with_reason(conn, exec, state, reason)?;
-    delete_open_rows(conn, exec)
+    delete_open_rows(conn, exec)?;
+    // Settle the parent and the detached children of the closed run (issue
+    // #2026).
+    composition::close_execution(conn, exec, &event, now)
 }
 
 /// Delete the pending tasks, unfired timers and staged signals of a sealed
@@ -4755,6 +5221,64 @@ async fn settle_update_context(
     }
 }
 
+/// A failing terminal cycle (issue #2026).
+struct CycleFailure<'a> {
+    /// The signals that the cycle replayed.
+    ingest: &'a worker::SignalIngest,
+    /// The history that the cycle replayed.
+    history: &'a [WorkflowEvent],
+    /// The history caps of the cycle.
+    caps: &'a CapCheck<'a>,
+    /// The `WorkflowFailed` event that ends the run.
+    terminal: WorkflowEvent,
+    /// The error text that the run row stores.
+    message: String,
+    /// The workflow retry that replaces the run, if its policy allows one.
+    retry: Option<RetryStart<'a>>,
+}
+
+/// A workflow retry that starts in the failure transaction (issue #2029).
+struct RetryStart<'a> {
+    /// The workflow type of the failed run.
+    workflow_name: &'a str,
+    /// The stored settings of the failed run.
+    config: store::RunConfig,
+    /// The attempt and the backoff of the successor.
+    plan: RetryPlan,
+}
+
+/// The two clock readings of one decision cycle (issue #2026).
+#[derive(Debug, Clone, Copy)]
+struct CycleClock {
+    /// The start of the cycle. Timers and activity tasks use it.
+    now: i64,
+    /// The instant the body returned. A write that another run reads by time
+    /// uses it, such as a signal to another run or a close.
+    decided_at: i64,
+}
+
+/// How a terminal cycle ends. Only a failing cycle records an abandoned child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalCycle {
+    /// The workflow returned `Ok`.
+    Completing,
+    /// The workflow returned `Err`.
+    Failing,
+}
+
+/// The context that a terminal drain needs to start or record a child (issue
+/// #2026).
+struct TerminalDrain<'a> {
+    /// The registered workflows. A detached spawn reads its type here.
+    registry: composition::Registry<'a>,
+    /// The history that the cycle replayed.
+    history: &'a [WorkflowEvent],
+    /// How the cycle ends.
+    cycle: TerminalCycle,
+    /// The clock of the cycle, in epoch milliseconds.
+    now: i64,
+}
+
 /// Persist a terminal cycle's drained bookkeeping commands (issue #1068).
 ///
 /// A `RecordSideEffect`/`RecordMarker` emitted in the SAME decision cycle a
@@ -4774,11 +5298,53 @@ async fn settle_update_context(
 /// far this cycle. It is never silently dropped.
 fn persist_terminal_pending_commands<'c>(
     conn: &Connection,
+    drain: &TerminalDrain<'_>,
     exec: ExecutionId,
     pending: impl IntoIterator<Item = &'c WorkflowCommand>,
 ) -> SqliteResult<()> {
     for cmd in pending {
         match cmd {
+            // A detached spawn in the terminal cycle starts its child before the
+            // parent's terminal event, as on Postgres (issue #2026). The close
+            // then applies the child's parent-close policy.
+            WorkflowCommand::SpawnDetachedChildWorkflow {
+                child_id,
+                workflow_name,
+                input,
+                parent_close_policy,
+            } => {
+                composition::start_child(
+                    conn,
+                    &drain.registry,
+                    exec,
+                    drain.history,
+                    *child_id,
+                    workflow_name,
+                    input,
+                    Some(*parent_close_policy),
+                    drain.now,
+                )?;
+            }
+            // A failing cycle that dropped a fresh child dispatch records it as
+            // abandoned (issue #952). A completing cycle, or a re-park of a
+            // started child, records nothing.
+            WorkflowCommand::StartChildWorkflow {
+                child_id,
+                workflow_name,
+                input,
+                ..
+            } => {
+                if drain.cycle == TerminalCycle::Failing {
+                    composition::record_abandoned_child(
+                        conn,
+                        exec,
+                        drain.history,
+                        *child_id,
+                        workflow_name,
+                        input,
+                    )?;
+                }
+            }
             WorkflowCommand::RecordMarker { name, details } => {
                 store::append_event(
                     conn,
@@ -4823,12 +5389,17 @@ fn persist_terminal_pending_commands<'c>(
                 children,
                 timers,
             } => {
-                apply_cancel_race_losers(conn, exec, activities, children, timers)?;
+                apply_cancel_race_losers(conn, exec, activities, children, timers, drain.now)?;
             }
             // Benign bookkeeping — appends no event, gates no control flow.
             // `PublishProgress` (issue #791) is an ephemeral Postgres-only
             // LISTEN/NOTIFY side channel — a benign NO-OP on this backend.
-            WorkflowCommand::WaitForActivity { .. }
+            // The cycle never ran an outbound signal, cancel or await, so it
+            // records none of them (issue #2026). Postgres does the same.
+            WorkflowCommand::SignalExternalWorkflow { .. }
+            | WorkflowCommand::RequestCancelExternalWorkflow { .. }
+            | WorkflowCommand::AwaitExternalWorkflow { .. }
+            | WorkflowCommand::WaitForActivity { .. }
             | WorkflowCommand::SetCurrentDetails { .. }
             | WorkflowCommand::PublishProgress { .. }
             // Durable streams (issue #1974): Postgres-only, a NO-OP here.
@@ -4881,25 +5452,27 @@ fn persist_terminal_pending_commands<'c>(
 ///   future replay resolves that branch to a terminal instead of looping on
 ///   `ActivityInProgress`. An activity that genuinely completed first is `DONE`,
 ///   is left untouched, and keeps its real `ActivityCompleted`.
-/// - `children`: child-workflow races are OUT of the single-writer subset
-///   (`StartChildWorkflow` is [`SqliteError::Unsupported`]), so a child race can
-///   never have been dispatched on this backend and `children` is always empty. A
-///   non-empty `children` is rejected LOUDLY rather than silently dropping a loser
-///   the core would have cancelled.
+/// - `children`: cancel each still-`RUNNING` losing child (issue #2026). The
+///   child ends `CANCELLED`, and this parent records `ChildWorkflowFailed` with
+///   the text `child workflow cancelled: lost race to a sibling branch`.
 fn apply_cancel_race_losers(
     conn: &Connection,
     exec: ExecutionId,
     activities: &[ActivityExecId],
     children: &[ExecutionId],
     timers: &[TimerId],
+    now: i64,
 ) -> SqliteResult<bool> {
-    if !children.is_empty() {
-        return Err(SqliteError::Unsupported(
-            "CancelRaceLosers.children — child-workflow races are outside the sqlite subset"
-                .to_string(),
-        ));
-    }
     let mut changed = false;
+    // Cancel a losing child, as Postgres does (issue #2026). Its close then
+    // writes the untyped `ChildWorkflowFailed` to this parent. A loser that
+    // never started has no row, and Postgres skips it too.
+    for child in children {
+        if composition::state_of(conn, *child)?.as_deref() == Some("RUNNING") {
+            composition::cancel_execution(conn, *child, composition::RACE_LOSER_REASON, now)?;
+            changed = true;
+        }
+    }
     for timer_id in timers {
         if queue::delete_pending_timer(conn, exec, &timer_id.to_string())? {
             changed = true;
@@ -4963,19 +5536,20 @@ fn duration_to_millis_ceil(d: std::time::Duration) -> i64 {
 /// `StartWorkflowParams.workflow_id` — a silent divergence on a documented core
 /// surface.
 ///
-/// Every field OTHER than `workflow_id`/`workflow_name` is set to the exact value
-/// the prior `None` produced (`queue ""`, build/timeout/deadline/parent `None`,
-/// `is_replay = false`), so the ONLY behavioral change is a non-empty
-/// `ctx.info().workflow_id`. Issue #2021 adds `cancel_reason`, a pending cancel
-/// request that `ctx.cancellation_reason()` reports. `parent_execution_id` stays `None` because this
-/// backend rejects child-workflow commands as Unsupported (see [`command_name`]),
-/// so every `SQLite` run is top-level by design and `ctx.info().parent_execution_id`
-/// is correctly always `None`. The recorded span fields are inert here (no `OTel`
-/// worker/subscriber on this backend).
+/// Every other field is set to the exact value the prior `None` produced
+/// (`queue ""`, build/timeout/deadline `None`, `is_replay = false`).
+/// Issue #2021 adds `cancel_reason`, a pending cancel request that
+/// `ctx.cancellation_reason()` reports.
+///
+/// `parent_execution_id` is the stored parent link of a child (issue #2026).
+/// It is `None` for a top-level run. The Postgres worker sets the same value,
+/// so `ctx.info().parent_execution_id` agrees on both backends. The recorded
+/// span fields are inert here (no `OTel` worker/subscriber on this backend).
 fn drive_span_meta(
     workflow_name: &str,
     workflow_id: &str,
     cancel_reason: Option<String>,
+    parent_execution_id: Option<ExecutionId>,
 ) -> WorkflowExecuteSpanMeta {
     WorkflowExecuteSpanMeta {
         workflow_name: workflow_name.to_string(),
@@ -4987,7 +5561,9 @@ fn drive_span_meta(
         build_id: None,
         execution_timeout: None,
         deadline_at: None,
-        parent_execution_id: None,
+        parent_execution_id,
+        // This backend does not record a start source (issue #2082).
+        start_provenance: autumn_harvest::types::StartProvenance::default(),
         cancellation_reason: cancel_reason,
     }
 }
@@ -5245,15 +5821,73 @@ mod tests {
     use rusqlite::Connection;
 
     use super::{
-        command_name, persist_scheduled_activity, persist_started_timer,
-        unsupported_activity_feature,
+        MAX_PAYLOAD_DEPTH, check_depth, command_name, persist_scheduled_activity,
+        persist_started_timer, unsupported_activity_feature,
     };
-    use crate::{queue, schema, store};
+    use crate::{SqliteError, queue, schema, store};
+    use serde_json::Value;
 
     fn open() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(schema::SCHEMA).unwrap();
+        schema::migrate(&conn).unwrap();
         conn
+    }
+
+    // Issue #2026: a race can name a losing child it never started. That child
+    // has no row. The teardown skips it, as Postgres does, and changes nothing.
+    #[test]
+    fn a_race_loser_child_with_no_row_is_skipped() {
+        let conn = open();
+        let parent = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            parent,
+            "wf",
+            &parent.to_string(),
+            &serde_json::json!(0),
+        )
+        .unwrap();
+        let changed =
+            super::apply_cancel_race_losers(&conn, parent, &[], &[ExecutionId::new()], &[], 0)
+                .unwrap();
+        assert!(!changed);
+        assert!(store::load_history(&conn, parent).unwrap().is_empty());
+    }
+
+    // Issue #2026: a dropped drive can leave an activity task `RUNNING`. A
+    // hard cancel from another run ends the run, so no drive reclaims that
+    // row later. The seal removes it with the pending ones.
+    #[test]
+    fn a_hard_cancel_removes_a_stranded_running_task() {
+        let conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(&conn, exec, "wf", &exec.to_string(), &serde_json::json!(0))
+            .unwrap();
+        queue::enqueue_activity(
+            &conn,
+            exec,
+            ActivityExecId::new(),
+            "work",
+            &serde_json::json!(0),
+            "default",
+            0,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        conn.execute("UPDATE harvest_tasks SET state = 'RUNNING'", [])
+            .unwrap();
+
+        crate::composition::cancel_execution(&conn, exec, "ops", 0).unwrap();
+
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM harvest_tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "the stranded task row must go");
     }
 
     // ── unsupported_activity_feature audit (Codex #1069 P2, runtime.rs:39) ────────
@@ -5585,6 +6219,34 @@ mod tests {
         assert!(store::load_history(&conn, exec).unwrap().is_empty());
         assert!(!queue::has_unfired_timer(&conn, exec).unwrap());
     }
+
+    /// A value of `depth` nested one-element arrays.
+    fn nested(depth: usize) -> Value {
+        let mut value = Value::Null;
+        for _ in 0..depth {
+            value = Value::Array(vec![value]);
+        }
+        value
+    }
+
+    /// Take a nested value apart from the inside out. A plain drop recurses.
+    fn tear_down(mut value: Value) {
+        while let Value::Array(mut items) = value {
+            value = items.pop().unwrap_or(Value::Null);
+        }
+    }
+
+    #[test]
+    fn check_depth_walks_a_huge_value_without_recursion() {
+        // A recursive walk overflows the call stack long before this depth.
+        let deep = nested(100_000);
+        let err = check_depth("memo", &deep).unwrap_err();
+        assert!(matches!(
+            err,
+            SqliteError::PayloadTooDeep { kind: "memo", cap_depth } if cap_depth == MAX_PAYLOAD_DEPTH
+        ));
+        tear_down(deep);
+    }
 }
 
 /// Pure-function coverage for [`unsupported_workflow_feature`] — the registration
@@ -5885,6 +6547,174 @@ mod feature_gate_tests {
         assert!(
             matches!(err, super::SqliteError::WorkflowNotRunning { .. }),
             "got {err:?}"
+        );
+    }
+}
+
+/// The panic strike map forgets a run that another run seals (issue #2026).
+#[cfg(test)]
+// The `#[workflow]` macro references the input param through its expansion.
+#[allow(clippy::used_underscore_binding, clippy::unused_async)]
+mod panic_strike_tests {
+    use autumn_harvest::ParentClosePolicy;
+    use autumn_harvest::prelude::*;
+    use serde_json::{Value, json};
+
+    use super::{RunState, SqliteError, SqliteRuntime};
+
+    #[workflow]
+    async fn always_panics(_ctx: &WorkflowContext, _n: i64) -> Result<i64, String> {
+        panic!("kaboom")
+    }
+
+    #[workflow]
+    async fn cancels_target(ctx: &WorkflowContext, target: ExecutionId) -> Result<(), String> {
+        ctx.request_cancel_external_workflow(target)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn a_run_cancelled_by_another_run_loses_its_strikes() {
+        let mut rt = SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&always_panics_info());
+        rt.register_workflow(&cancels_target_info());
+        let target = rt.start_workflow("always_panics", json!(0)).unwrap();
+        let err = rt.run_until_blocked(target).await.unwrap_err();
+        assert!(
+            matches!(err, SqliteError::WorkflowPanicked { .. }),
+            "{err:?}"
+        );
+        assert_eq!(rt.workflow_panic_strikes.get(&target), Some(&1));
+
+        let canceller = rt.start_workflow("cancels_target", json!(target)).unwrap();
+        let state = rt.run_until_blocked(canceller).await.unwrap();
+
+        assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+        assert!(
+            rt.workflow_panic_strikes.is_empty(),
+            "the sealed run is forgotten"
+        );
+    }
+
+    /// Spawns `always_panics` detached under `request_cancel`, then waits.
+    #[workflow]
+    async fn spawns_panicker(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+        ctx.spawn_child_workflow_detached_raw(
+            "always_panics",
+            json!(0),
+            ParentClosePolicy::RequestCancel,
+        )
+        .map_err(|e| e.to_string())?;
+        ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn a_terminate_cascade_forgets_the_strikes_of_descendants() {
+        let mut rt = SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&always_panics_info());
+        rt.register_workflow(&spawns_panicker_info());
+        let parent = rt.start_workflow("spawns_panicker", json!(0)).unwrap();
+        rt.run_until_blocked(parent).await.unwrap();
+        strike_detached_child(&mut rt, parent).await;
+
+        rt.terminate(parent, "ops").unwrap();
+
+        assert!(
+            rt.workflow_panic_strikes.is_empty(),
+            "the cascade is forgotten"
+        );
+    }
+
+    /// Give the detached child of `parent` one panic strike.
+    async fn strike_detached_child(rt: &mut SqliteRuntime, parent: ExecutionId) {
+        let child = rt
+            .load_history(parent)
+            .unwrap()
+            .iter()
+            .find_map(|e| match e {
+                WorkflowEvent::ChildWorkflowSpawnedDetached { child_id, .. } => Some(*child_id),
+                _ => None,
+            })
+            .unwrap();
+        rt.run_until_blocked(child).await.unwrap_err();
+        assert_eq!(rt.workflow_panic_strikes.get(&child), Some(&1));
+    }
+
+    /// Spawns `always_panics` detached under `request_cancel`, waits for
+    /// `go`, then schedules an unsupported external activity.
+    #[workflow]
+    async fn spawns_then_unsupported(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+        ctx.spawn_child_workflow_detached_raw(
+            "always_panics",
+            json!(0),
+            ParentClosePolicy::RequestCancel,
+        )
+        .map_err(|e| e.to_string())?;
+        ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+        ctx.execute_activity_external("external", json!(0), "default", 60)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_seal_forgets_the_strikes_of_descendants() {
+        let mut rt = SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&always_panics_info());
+        rt.register_workflow(&spawns_then_unsupported_info());
+        let parent = rt
+            .start_workflow("spawns_then_unsupported", json!(0))
+            .unwrap();
+        rt.run_until_blocked(parent).await.unwrap();
+        strike_detached_child(&mut rt, parent).await;
+
+        rt.send_signal(parent, "go", json!(1)).unwrap();
+        let err = rt.run_until_blocked(parent).await.unwrap_err();
+
+        assert!(matches!(err, SqliteError::Unsupported(_)), "{err:?}");
+        assert!(
+            rt.workflow_panic_strikes.is_empty(),
+            "the cascade is forgotten"
+        );
+    }
+
+    /// Spawns `always_panics` detached under `request_cancel`, then waits on
+    /// an activity that no one registers.
+    #[workflow]
+    async fn spawns_then_waits_on_missing(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+        ctx.spawn_child_workflow_detached_raw(
+            "always_panics",
+            json!(0),
+            ParentClosePolicy::RequestCancel,
+        )
+        .map_err(|e| e.to_string())?;
+        ctx.execute_activity_raw("missing", json!(0), "default")
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    #[tokio::test]
+    async fn an_error_path_cancel_forgets_the_strikes_of_descendants() {
+        let mut rt = SqliteRuntime::open_in_memory().unwrap();
+        rt.register_workflow(&always_panics_info());
+        rt.register_workflow(&spawns_then_waits_on_missing_info());
+        let parent = rt
+            .start_workflow("spawns_then_waits_on_missing", json!(0))
+            .unwrap();
+        let err = rt.run_until_blocked(parent).await.unwrap_err();
+        assert!(
+            matches!(err, SqliteError::UnregisteredActivity(_)),
+            "{err:?}"
+        );
+        strike_detached_child(&mut rt, parent).await;
+
+        rt.cancel(parent, "ops").unwrap();
+        let state = rt.run_until_blocked(parent).await.unwrap();
+
+        assert!(matches!(state, RunState::Cancelled(_)), "{state:?}");
+        assert!(
+            rt.workflow_panic_strikes.is_empty(),
+            "the cascade is forgotten"
         );
     }
 }

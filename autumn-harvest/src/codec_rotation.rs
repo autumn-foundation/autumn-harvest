@@ -113,6 +113,20 @@ pub struct CodecColumn {
     column: &'static str,
     /// A SQL predicate on the table alias `t` that selects the encoded rows.
     rows: &'static str,
+    shape: CellShape,
+}
+
+/// Where the envelopes sit inside one codec-column cell (issue #2043).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CellShape {
+    /// One envelope at the cell root.
+    Cell,
+    /// A JSON array. Each element is its own envelope or a clear value.
+    Elements,
+    /// A JSON object. One key holds the envelope, and the other keys are
+    /// configuration. The start options of a buffered start use this shape.
+    Field(&'static str),
 }
 
 impl CodecColumn {
@@ -139,6 +153,12 @@ impl CodecColumn {
     #[must_use]
     pub const fn rows(&self) -> &'static str {
         self.rows
+    }
+
+    /// Where the envelopes sit inside the cell.
+    #[must_use]
+    pub const fn shape(&self) -> CellShape {
+        self.shape
     }
 }
 
@@ -168,84 +188,175 @@ pub const CODEC_COLUMNS: &[CodecColumn] = &[
         id_column: "id",
         column: "input",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_workflow_executions",
         id_column: "id",
         column: "output",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_workflow_executions",
         id_column: "id",
         column: "memo",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_signals",
         id_column: "id",
         column: "payload",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_dead_letters",
         id_column: "id",
         column: "input",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_execution_summaries",
         id_column: "execution_id",
         column: "result",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_task_queue",
         id_column: "id",
         column: "input",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_task_queue",
         id_column: "id",
         column: "output",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_task_queue",
         id_column: "id",
         column: "heartbeat_details",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_completion_deliveries",
         id_column: "id",
         column: "payload",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_debounce",
         id_column: "id",
         column: "last_input",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_start_throttle",
         id_column: "id",
         column: "input",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_completion_trigger_outbox",
         id_column: "id",
         column: "target_input",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_batch_jobs",
         id_column: "id",
         column: "signal_payload",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_event_batches",
+        id_column: "id",
+        column: "buffered_payloads",
+        rows: ALL_ROWS,
+        shape: CellShape::Elements,
+    },
+    CodecColumn {
+        table: "harvest_cross_shard_children",
+        id_column: "child_exec_id",
+        column: "child_spec",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_schedules",
+        id_column: "id",
+        column: "workflow_input",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_debounce",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("context_headers"),
+    },
+    CodecColumn {
+        table: "harvest_debounce",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("memo"),
+    },
+    CodecColumn {
+        table: "harvest_start_throttle",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("context_headers"),
+    },
+    CodecColumn {
+        table: "harvest_start_throttle",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("memo"),
+    },
+    CodecColumn {
+        table: "harvest_event_batches",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("context_headers"),
+    },
+    CodecColumn {
+        table: "harvest_event_batches",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("memo"),
+    },
+    CodecColumn {
+        table: "harvest_workflow_executions",
+        id_column: "id",
+        column: "context_headers",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_task_queue",
+        id_column: "id",
+        column: "context_headers",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
 ];
 
@@ -332,6 +443,64 @@ pub fn reencrypt_column_value_under(
         | FieldStep::Offloaded
         | FieldStep::Plaintext
         | FieldStep::AlreadyActive => Ok(None),
+    }
+}
+
+/// Re-encode one cell of `column` under `target_key_id` (issue #2043).
+///
+/// For [`CellShape::Elements`], each envelope element moves to the target key
+/// and a clear element stays as it is. The result is the whole new array. An
+/// element that does not decode fails the cell, so the sweep never writes a
+/// half-converted buffer. For [`CellShape::Field`], only the named key moves.
+/// The other keys stay as they are.
+///
+/// # Errors
+///
+/// As [`reencrypt_column_value_under`].
+pub fn reencrypt_column_cell_under(
+    codecs: &PayloadCodecs,
+    target_key_id: &str,
+    column: &CodecColumn,
+    value: &Value,
+) -> HarvestResult<Option<Value>> {
+    match column.shape {
+        CellShape::Cell => reencrypt_column_value_under(codecs, target_key_id, value),
+        CellShape::Elements => {
+            if !codecs.has_keyed_codecs() {
+                return Ok(None);
+            }
+            let Some(items) = value.as_array() else {
+                return Ok(None);
+            };
+            let mut converted = Vec::with_capacity(items.len());
+            let mut changed = false;
+            for item in items {
+                match reencrypt_field_under(codecs, target_key_id, item)? {
+                    FieldStep::Reencrypted(candidate) => {
+                        converted.push(candidate);
+                        changed = true;
+                    }
+                    _ => converted.push(item.clone()),
+                }
+            }
+            Ok(changed.then_some(Value::Array(converted)))
+        }
+        CellShape::Field(key) => {
+            if !codecs.has_keyed_codecs() {
+                return Ok(None);
+            }
+            let Some(field) = value.get(key) else {
+                return Ok(None);
+            };
+            match reencrypt_field_under(codecs, target_key_id, field)? {
+                FieldStep::Reencrypted(candidate) => {
+                    let mut converted = value.clone();
+                    converted[key] = candidate;
+                    Ok(Some(converted))
+                }
+                _ => Ok(None),
+            }
+        }
     }
 }
 
@@ -573,8 +742,8 @@ mod db {
     use crate::telemetry::MetricsRecorder;
 
     use super::{
-        CODEC_COLUMNS, CodecColumn, active_key_would_decrypt, has_non_active_key,
-        reencrypt_column_value_under, reencrypt_event_payload_fields_under,
+        CODEC_COLUMNS, CellShape, CodecColumn, active_key_would_decrypt, has_non_active_key,
+        reencrypt_column_cell_under, reencrypt_event_payload_fields_under,
     };
 
     /// The exact SQL mirror of
@@ -651,6 +820,33 @@ mod db {
         format!(
             "COALESCE(f.value ->> 'kid', f.value -> '_harvest_codec_envelope' ->> 'kid', {legacy})"
         )
+    }
+
+    /// The `FROM` fragment that exposes each value of a cell as `f.value`
+    /// (issue #2043). A [`CellShape::Cell`] gives one value. A
+    /// [`CellShape::Elements`] cell gives one value per array element.
+    ///
+    /// The shared envelope predicate and key expression read `f.value`.
+    /// So one fragment per shape is all the census, the sweep and the pending
+    /// probe need.
+    fn value_source(column: &CodecColumn) -> String {
+        match column.shape {
+            CellShape::Cell => format!(
+                "CROSS JOIN LATERAL (SELECT t.{}) AS f(value)",
+                column.column
+            ),
+            // The key is a compile-time constant of `CODEC_COLUMNS`.
+            CellShape::Field(key) => format!(
+                "CROSS JOIN LATERAL (SELECT t.{col} -> '{key}') AS f(value)",
+                col = column.column,
+            ),
+            CellShape::Elements => format!(
+                "CROSS JOIN LATERAL jsonb_array_elements( \
+                     CASE WHEN jsonb_typeof(t.{col}) = 'array' THEN t.{col} ELSE '[]'::jsonb END \
+                 ) AS f(value)",
+                col = column.column,
+            ),
+        }
     }
 
     #[derive(diesel::QueryableByName)]
@@ -817,14 +1013,19 @@ mod db {
         // The identifiers come from the compile-time `CODEC_COLUMNS` list,
         // never from input.
         for column in CODEC_COLUMNS {
+            // A buffer row counts once per key, not once per element.
+            let count = match column.shape {
+                CellShape::Cell | CellShape::Field(_) => "COUNT(*)".to_string(),
+                CellShape::Elements => format!("COUNT(DISTINCT t.{})", column.id_column),
+            };
             sources.push(format!(
-                "SELECT {key_id} AS key_id, COUNT(*)::BIGINT AS row_count \
+                "SELECT {key_id} AS key_id, {count}::BIGINT AS row_count \
                  FROM {table} t \
-                 CROSS JOIN LATERAL (SELECT t.{col}) AS f(value) \
+                 {source} \
                  WHERE {rows} AND f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
                  GROUP BY 1",
                 table = column.table,
-                col = column.column,
+                source = value_source(column),
                 rows = column.rows,
             ));
         }
@@ -1346,10 +1547,15 @@ mod db {
             }
             let remaining = i64::try_from(budget - examined).unwrap_or(batch_limit);
             // The identifiers come from the compile-time `CODEC_COLUMNS` list.
+            // A buffer row with several pending elements matches once per element.
+            let distinct = match column.shape {
+                CellShape::Cell | CellShape::Field(_) => "",
+                CellShape::Elements => "DISTINCT ",
+            };
             let sql = format!(
-                "SELECT t.{id} AS id, t.{col} AS value \
+                "SELECT {distinct}t.{id} AS id, t.{col} AS value \
                  FROM {table} t \
-                 CROSS JOIN LATERAL (SELECT t.{col}) AS f(value) \
+                 {source} \
                  WHERE {rows} AND f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
                    AND {key_id} <> $2 \
                    AND ($3::UUID IS NULL OR t.{id} > $3) \
@@ -1357,6 +1563,7 @@ mod db {
                 id = column.id_column,
                 col = column.column,
                 table = column.table,
+                source = value_source(column),
                 rows = column.rows,
             );
             let cells: Vec<ColumnCell> = diesel::sql_query(&sql)
@@ -1422,7 +1629,8 @@ mod db {
         cell: &ColumnCell,
         active_key_id: &str,
     ) -> HarvestResult<CellOutcome> {
-        let outcome = match reencrypt_column_value_under(codecs, active_key_id, &cell.value) {
+        let outcome = match reencrypt_column_cell_under(codecs, active_key_id, column, &cell.value)
+        {
             Ok(Some(candidate)) => {
                 if compare_and_swap_column(conn, shard, column, cell.id, &cell.value, &candidate)
                     .await?
@@ -1481,12 +1689,12 @@ mod db {
         let sql = format!(
             "SELECT EXISTS ( \
                  SELECT 1 FROM {table} t \
-                 CROSS JOIN LATERAL (SELECT t.{col}) AS f(value) \
+                 {source} \
                  WHERE t.{id} = $3 AND {rows} AND f.value IS NOT NULL \
                    AND {ENVELOPE_PREDICATE} AND {key_id} <> $2 \
              ) AS present",
             table = column.table,
-            col = column.column,
+            source = value_source(column),
             id = column.id_column,
             rows = column.rows,
         );
@@ -3537,7 +3745,14 @@ mod tests {
             "submit_batch_job(",
             "fire_due_debounced_starts(",
             "fire_due_throttled_starts(",
+            "record_cross_shard_child(",
+            "register_workflow_schedules(",
+            "register_workflow_schedules_for_shard(",
+            "update_workflow_schedule(",
+            "admit_batched_start(",
+            "fire_due_event_batches(",
             "enforce_completion_triggers_outbox(",
+            "rerun_workflow_execution(",
         ];
         // No engine call may use a plain variant (issue #2043). A pinned
         // count here could only go down.

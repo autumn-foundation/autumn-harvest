@@ -98,6 +98,7 @@ fn snapshot_json(workflow_name: &str, exec_id: ExecutionId, events: Vec<Workflow
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: None,
         workflow_id: None,
         queue_name: None,
@@ -1087,6 +1088,11 @@ fn checkpointed_snapshot_json(workflow_name: &str) -> String {
     let exec_id = ExecutionId::new();
     let events = vec![
         started_event(),
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::event::SideEffectKind::Custom,
+            name: Some(autumn_harvest::CONTINUE_AS_NEW_SIDE_EFFECT_NAME.to_string()),
+            value: serde_json::json!(true),
+        },
         WorkflowEvent::ActivityScheduled {
             activity_id: ActivityExecId::new(),
             name: "checkpoint".into(),
@@ -1123,18 +1129,15 @@ async fn bundle_replays_under_the_configured_history_policy() {
         "replaying under the deployment's own policy must be clean: {faithful}"
     );
 
-    // Same bundle, same code, default policy — the threshold is no longer met,
-    // so the workflow schedules `keep_working` and the gate sees a divergence
-    // that does not exist in production.
-    let unfaithful = ReplayVerifier::new()
+    // Issue #2080: the bundle records the decision, so the default policy
+    // replays the same path.
+    let default_policy = ReplayVerifier::new()
         .register_fn("wf", checkpointing_workflow as WorkflowHandlerFn)
         .replay_bundle(dir.path())
         .await;
-    assert_eq!(
-        unfaithful.diverged.len(),
-        1,
-        "control: the default policy must genuinely change the outcome, else \
-         this test would pass without `with_history_policy` doing anything: {unfaithful}"
+    assert!(
+        default_policy.is_clean(),
+        "a recorded decision must not depend on the policy: {default_policy}"
     );
 }
 
@@ -1284,6 +1287,7 @@ fn queue_snapshot_json(workflow_name: &str, queue: Option<&str>) -> String {
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: None,
         workflow_id: None,
         queue_name: queue.map(ToString::to_string),
@@ -2256,6 +2260,7 @@ fn build_id_snapshot_json(workflow_name: &str, recorded_input: Value, activity: 
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: None,
         workflow_id: None,
         queue_name: None,

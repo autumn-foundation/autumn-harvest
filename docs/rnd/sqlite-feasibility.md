@@ -229,7 +229,7 @@ Classification rule:
 | `shard_rebalance` | diesel, interval-sql, raw-pg-sql, raw-sql, skip-locked | (c) | Migrating quiescent executions between shards (issue #964). Coupled the same way `cross_shard_child` is: the module exists **because** there is more than one database, so under a single-file backend the whole capability has nothing to do and would be dropped wholesale rather than translated. Its syntax is Postgres-bound throughout — the copy round-trips whole rows through `to_jsonb` / `jsonb_populate_record` / `jsonb_to_recordset` (SQLite's JSON1 has no record-shaped equivalent, and the point of using them is schema-drift safety, which a hand-written column list would lose), and the cutover is one statement built from data-modifying CTEs whose `sealed` output feeds two further `UPDATE`s — SQLite's CTEs cannot contain DML at all, so the atomic seal-and-cancel would have to become several statements inside the single write lock. The rebalance-resume claim (issue #1839) adds a `SKIP LOCKED` claim and a `make_interval` grace period; a single-shard deployment has no rebalance to resume. |
 | `shared_json` | diesel, raw-sql | (b) | `Arc<serde_json::Value>` newtype that the start path shares across four structs (issue #1733). The only coupling is a `ToSql`/`FromSql` pair for the Postgres `Jsonb` type. The `raw-sql` flag is a false positive: a unit-test helper is named `assert_sql::<T>()`, which matches the `sql::<` pattern; the module issues no SQL of its own. A SQLite backend writes the same impl pair over `Text`. |
 | `start_idempotency` | diesel, to_regclass, interval-sql, raw-sql | (b) | `ON CONFLICT` upsert has a direct SQLite form. |
-| `store` | diesel, raw-pg-sql, raw-sql, row-lock, skip-locked | (c) | **Consumer of the claim invariant — issues no `SKIP LOCKED` SQL of its own.** Event append itself is (a); its TOCTOU assumption is not. The history byte cap (issue #1804) sums `pg_column_size(event_data)` with a `::bigint` cast. SQLite has no `pg_column_size`; `length(event_data)` is the nearest stand-in. |
+| `store` | diesel, advisory-lock, raw-pg-sql, raw-sql, row-lock, skip-locked | (c) | **Consumer of the claim invariant — issues no `SKIP LOCKED` SQL of its own.** Event append itself is (a); its TOCTOU assumption is not. The history byte cap (issue #1804) sums `pg_column_size(event_data)` with a `::bigint` cast. SQLite has no `pg_column_size`; `length(event_data)` is the nearest stand-in. The durable stream append (issue #2083) takes an advisory lock on the run. The single write lock subsumes it. |
 | `testing` | diesel | (a) | Test-only helpers. |
 | `throttle` | diesel, skip-locked, to_regclass, gen_random_uuid, raw-sql | (c) | Token-bucket scanner claim; the accrual formula itself (issue #945) lives behind `queue::effective_available_tokens_expr`. The pre-fire pass that sorts a claimed batch by advisory-lock id (issue #1230 Finding 2) now lives in `quota_lock_order`, which carries its `unnest($1::text[])` cast; the scanner's own SQL is the claim, the deferred-start insert and plain CRUD. |
 | `timeout` | diesel, skip-locked, row-lock, advisory-lock, raw-pg-sql, raw-sql | (c) | The scanner family; lock ordering vs the claim path is load-bearing. |
@@ -509,13 +509,13 @@ re-opened, not extended.
 
 Multi-worker/multi-process; push wakeups (polling latency floor); per-key fleet
 concurrency (#247); sticky routing (#235); poison-pill peer reclaim (#367);
-sharding; management API and Vantage UI; child workflows, external
-signal/cancel, external activities,
-worker sessions, and a cross-type continue-as-new (same-type `continue_as_new`
-shipped in #2023) — each **rejected loudly by name** at the
-command layer rather than silently ignored. Local activities, cancellable
-timers, the workflow mutex, `execution_timeout` and workflow retry shipped in
-#2029. Activity execution is
+sharding; management API and Vantage UI; external activities, worker
+sessions, and a cross-type continue-as-new (same-type `continue_as_new`
+shipped in #2023) — each **rejected loudly by name** at the command layer
+rather than silently ignored. Local activities, cancellable timers, the
+workflow mutex, `execution_timeout` and workflow retry shipped in #2029.
+Child workflows and signal, cancel and await between runs shipped in #2026.
+Activity execution is
 **at-least-once** (a crash mid-body re-runs it on resume), so bodies must be
 idempotent.
 

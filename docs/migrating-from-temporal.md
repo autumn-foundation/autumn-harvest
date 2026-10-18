@@ -93,7 +93,7 @@ Port a Temporal entity workflow to `autumn_harvest::entity`. Do not copy
 its hand-written signal loop. The library loop drains waiting signals into
 the continue-as-new input. It also records each checkpoint decision, so a
 replay takes the checkpoint at the same signal. A hand-written loop over
-`should_continue_as_new()` can lose a signal or diverge on replay. See
+`should_continue_as_new()` can lose a signal. See
 [ADR 0006](adr/0006-keyed-entity.md).
 
 `condition()` in Temporal accepts any predicate over workflow state. It is

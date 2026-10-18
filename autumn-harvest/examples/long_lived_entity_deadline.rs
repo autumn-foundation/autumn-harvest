@@ -143,15 +143,21 @@ mod tests {
 
         assert!(outcome.result.is_ok(), "run failed: {:?}", outcome.result);
 
-        // No side-effect events were recorded — with no deadline the
+        // No clock read was recorded. With no deadline the
         // should_continue_as_new() deadline branch consults no wall clock.
-        let has_side_effect = outcome
-            .events()
-            .iter()
-            .any(|e| matches!(e, WorkflowEvent::SideEffectRecorded { .. }));
+        // The history-size decision is a Custom side effect (issue #2080).
+        let has_clock_read = outcome.events().iter().any(|e| {
+            matches!(
+                e,
+                WorkflowEvent::SideEffectRecorded {
+                    kind: SideEffectKind::Now,
+                    ..
+                }
+            )
+        });
         assert!(
-            !has_side_effect,
-            "a workflow with no deadline must record zero side-effect events"
+            !has_clock_read,
+            "a workflow with no deadline must record no clock read"
         );
 
         let next: SubState = serde_json::from_value(outcome.result.clone().unwrap()).unwrap();

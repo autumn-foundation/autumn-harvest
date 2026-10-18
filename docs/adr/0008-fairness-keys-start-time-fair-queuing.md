@@ -67,10 +67,13 @@ survives.
   a new key's claim broke the pair bound on the model, so SFQ stays.
 - Each fair claim writes one state row. Concurrent claims of one key wait
   for that row. The claim benchmark measures the cost.
-- State rows grow with keys. The retention janitor prunes idle rows that
-  the claim cannot tell from no row. It also resets an idle queue, as the
-  SFQ idle rule does. Keys that claim once never move `V`, so only the
-  reset bounds them.
+- State rows grow with keys. The retention janitor deletes the old row of
+  each key with no pending task, except the clock row that defines `V`. A key
+  that was idle past the cutoff loses at most `1/w` of debt, because
+  `pass - V <= 1/w` after a charge. It then restarts at `V`, so it gets no
+  burst. The janitor also resets an idle queue, as the SFQ idle rule does.
+  One-shot keys never move `V`, so without the first rule a queue that never
+  drains would keep a row for each key.
 - Fairness is shard-local. A key bounds load, not access.
 - `claim_task_batched` ignores keys.
 - A fair claim skips the seek window of #1971 and runs the full scan, as

@@ -449,6 +449,27 @@ pub enum SideEffectNowMatch {
 /// `Now` under this name.
 pub const DEADLINE_PROBE_SIDE_EFFECT_NAME: &str = "__harvest_deadline_probe";
 
+/// Reserved side-effect name for a live `should_continue_as_new()` history-size
+/// decision (issue #2080).
+///
+/// Each call records its answer, `true` or `false`. A replay reads the record at
+/// the same position, so the answer is the same however large the loaded
+/// history has grown.
+pub const CONTINUE_AS_NEW_SIDE_EFFECT_NAME: &str = "__harvest_continue_as_new";
+
+/// The replayed state of a `should_continue_as_new()` history-size decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinueAsNewMatch {
+    /// The cursor holds a recorded `true` decision, or a checkpoint from a
+    /// history that predates the record. The answer is `true`.
+    True,
+    /// The cursor holds a recorded `false` decision, or other events from a
+    /// history that predates the record. The answer is `false`.
+    False,
+    /// The cursor is past the recorded history. The caller decides live.
+    Frontier,
+}
+
 /// Marker name recorded by `ctx.patched(patch_id)` (issue #687).
 pub(crate) fn patch_marker_name(patch_id: &str) -> String {
     format!("patch:{patch_id}")
@@ -2458,8 +2479,16 @@ impl HistoryMatcher {
     /// terminal events (delivered or failed) for any in-progress stashed signals.
     /// This ensures we resolve signals that are finished but blocked by subsequent
     /// un-fired timers or un-executed activities (mixed batch).
+    ///
+    /// A stashed await is resolved the same way (issue #2026). Its terminal
+    /// lands later than its request, often past a sibling's child or activity
+    /// events, as in `join!(await_external_workflow, spawn_child_workflow)`.
+    /// Without this scan the stashed await stays in progress and parks forever.
     fn scan_ahead_for_external_signal_terminals(&mut self) {
-        if self.pending_external_signals.is_empty() && self.pending_external_cancels.is_empty() {
+        if self.pending_external_signals.is_empty()
+            && self.pending_external_cancels.is_empty()
+            && self.pending_external_awaits.is_empty()
+        {
             return;
         }
 
@@ -2523,9 +2552,47 @@ impl HistoryMatcher {
                         self.consumed_signal_events.insert(scan_cursor);
                     }
                 }
-                _ => {}
+                event => {
+                    if let Some((id, terminal)) = Self::await_terminal_of(event)
+                        && let Some(p) = self
+                            .pending_external_awaits
+                            .iter_mut()
+                            .find(|p| p.await_id == id && p.terminal.is_none())
+                    {
+                        p.terminal = Some(terminal);
+                        self.consumed_signal_events.insert(scan_cursor);
+                    }
+                }
             }
             scan_cursor += 1;
+        }
+    }
+
+    /// The await id and stash terminal of an `ExternalAwaitResolved` or
+    /// `ExternalAwaitFailed` event, or `None` for any other event.
+    fn await_terminal_of(event: &WorkflowEvent) -> Option<(ExternalAwaitId, StashedAwaitTerminal)> {
+        match event {
+            WorkflowEvent::ExternalAwaitResolved { await_id, output } => {
+                Some((*await_id, StashedAwaitTerminal::Resolved(output.clone())))
+            }
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id,
+                reason_code,
+                message,
+                error_type,
+                details,
+                non_retryable,
+            } => Some((
+                *await_id,
+                StashedAwaitTerminal::Failed {
+                    reason_code: reason_code.clone(),
+                    message: message.clone(),
+                    error_type: error_type.clone(),
+                    details: details.clone(),
+                    non_retryable: *non_retryable,
+                },
+            )),
+            _ => None,
         }
     }
 
@@ -5854,6 +5921,66 @@ impl HistoryMatcher {
             // and a user `Now` is left for its own strict read to consume.
             _ => SideEffectNowMatch::NotRecorded,
         }
+    }
+
+    /// Replay a `should_continue_as_new()` history-size decision (issue #2080).
+    ///
+    /// Reads the cursor, never the loaded event count, so the answer does not
+    /// change when the loaded history grows.
+    ///
+    /// - A recorded decision is consumed and gives its value.
+    /// - A `WorkflowContinuedAsNew` event is a checkpoint from a history that
+    ///   predates the record. It is left in place and reads as `true`. A
+    ///   deadline probe clock read before it does not change that.
+    /// - Any other event is a history that predates the record. It reads as
+    ///   `false`, with the cursor untouched.
+    /// - A cursor past the end is the live frontier.
+    #[must_use]
+    pub fn match_continue_as_new_decision(&mut self) -> ContinueAsNewMatch {
+        if !self.prepare_match() {
+            return ContinueAsNewMatch::Frontier;
+        }
+        match &self.events[self.cursor] {
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some(name),
+                value: Value::Bool(decision),
+            } if name == CONTINUE_AS_NEW_SIDE_EFFECT_NAME => {
+                let decision = *decision;
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                if decision {
+                    ContinueAsNewMatch::True
+                } else {
+                    ContinueAsNewMatch::False
+                }
+            }
+            WorkflowEvent::WorkflowContinuedAsNew { .. } => ContinueAsNewMatch::True,
+            // A legacy run with an execution timeout reads its deadline clock
+            // before the checkpoint. Look past that one event.
+            probe if Self::is_deadline_probe_event(probe) => {
+                let mut next = self.cursor + 1;
+                while self.is_consumed(next) {
+                    next += 1;
+                }
+                match self.events.get(next) {
+                    Some(WorkflowEvent::WorkflowContinuedAsNew { .. }) => ContinueAsNewMatch::True,
+                    _ => ContinueAsNewMatch::False,
+                }
+            }
+            _ => ContinueAsNewMatch::False,
+        }
+    }
+
+    fn is_deadline_probe_event(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Now,
+                name: Some(name),
+                ..
+            } if name == DEADLINE_PROBE_SIDE_EFFECT_NAME
+        )
     }
 
     /// Match a local activity command against history.
@@ -13530,18 +13657,65 @@ mod tests {
             }
         );
 
-        // Reverse order: polling the await future first (before the concurrent
-        // activity future has scanned forward past the interleaved
-        // `ActivityScheduled`) yields `ExternalAwaitInProgress` — never a
-        // divergence — exactly like the cancel primitive. In a real
-        // `tokio::join!` re-drive the activity future settles the await's
-        // terminal on a later fresh cycle; full end-to-end resolution across
-        // randomized re-drives is covered by the `WorkflowReplayer` fixtures.
+        // Reverse order: the await future is polled first, before the activity
+        // future scans past the interleaved `ActivityScheduled`. The look-ahead
+        // still finds the await's own terminal (issue #2026). Each cycle builds
+        // a fresh matcher and polls the await first again, so an in-progress
+        // answer here would park the await permanently.
         let mut matcher2 = HistoryMatcher::new(events);
-        assert!(matches!(
+        assert_eq!(
             matcher2.match_external_await(target),
-            HistoryMatch::ExternalAwaitInProgress { .. }
-        ));
+            HistoryMatch::Matched {
+                output: serde_json::json!({"ok": true})
+            }
+        );
+        assert_eq!(
+            matcher2.match_activity("compute"),
+            HistoryMatch::Matched {
+                output: serde_json::json!(7)
+            }
+        );
+    }
+
+    #[test]
+    fn match_external_await_resolves_past_a_sibling_child() {
+        // Issue #2026: `join!(await_external_workflow, spawn_child_workflow)`.
+        // The child ends before the awaited target, so the await's terminal
+        // lands after the child's events. The await, polled first, must still
+        // resolve, and the child must still match.
+        let target = ExecutionId::new();
+        let await_id = ExternalAwaitId::new();
+        let child_id = ExecutionId::new();
+        let events = vec![
+            WorkflowEvent::ExternalAwaitRequested { await_id, target },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id,
+                workflow_name: "child".into(),
+                input: Value::Null,
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id,
+                output: serde_json::json!(4),
+            },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id,
+                output: serde_json::json!("ready"),
+            },
+        ];
+        let mut matcher = HistoryMatcher::new(events);
+        assert_eq!(
+            matcher.match_external_await(target),
+            HistoryMatch::Matched {
+                output: serde_json::json!("ready")
+            }
+        );
+        assert_eq!(
+            matcher.match_child_workflow("child", &Value::Null),
+            HistoryMatch::Matched {
+                output: serde_json::json!(4)
+            }
+        );
+        assert!(!matcher.has_non_lifecycle_unconsumed());
     }
 
     // ── Issue #1338: characterization tests for the 10 sites consolidated onto

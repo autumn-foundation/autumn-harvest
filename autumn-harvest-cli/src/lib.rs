@@ -12362,8 +12362,12 @@ fn checked_queue_segment(queue_name: &str) -> Result<String, CliError> {
 }
 
 /// Reject a fairness key that cannot survive URL path parsing intact.
+///
+/// Only the literal `.` and `..` fail. `path_segment` encodes `%`, so a key
+/// such as `%2e` reaches the route as `%252e`. The core validator accepts it
+/// (issue #2097).
 fn checked_fairness_key_segment(fairness_key: &str) -> Result<String, CliError> {
-    if is_url_dot_segment(fairness_key) {
+    if matches!(fairness_key, "." | "..") {
         return Err(CliError::FairnessKeyDotSegment {
             value: fairness_key.to_string(),
         });
