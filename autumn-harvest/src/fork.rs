@@ -773,6 +773,7 @@ pub(crate) use open_fork_states_sql;
 /// A `FAILED` run with a dead letter is open. A redrive deletes the dead
 /// letter and reopens the run in one commit, so each snapshot sees one of the
 /// two open shapes. A `CALLBACK` dead letter redrives only a delivery.
+/// Redrive matches that type in any case, so this check does too.
 ///
 /// Retention and the `LiveFork` rebalance guard read this one predicate. So
 /// both use one meaning of an open fork. It is a macro, so `concat!` can take
@@ -783,7 +784,7 @@ macro_rules! open_fork_sql {
             "(f.state IN (",
             crate::fork::open_fork_states_sql!(),
             ") OR (f.state = 'FAILED' AND EXISTS (SELECT 1 FROM harvest_dead_letters dl \
-               WHERE dl.workflow_exec_id = f.id AND dl.task_type <> 'CALLBACK')))"
+               WHERE dl.workflow_exec_id = f.id AND upper(dl.task_type) <> 'CALLBACK')))"
         )
     };
 }

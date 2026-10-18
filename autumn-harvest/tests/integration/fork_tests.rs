@@ -2630,6 +2630,41 @@ async fn retention_keeps_the_source_of_a_dead_lettered_recorded_fork() {
     assert!(!exists(&mut conn, source).await, "nothing can reopen it");
 }
 
+/// A callback dead letter redrives only a delivery, so it never reopens the
+/// fork. Redrive matches its type in any case, so the pin does too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_ignores_a_callback_dead_letter_of_a_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "dlq-callback").await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let mut conn = connect(&url).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(forked.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("seal the fork");
+    diesel::sql_query(
+        "INSERT INTO harvest_dead_letters \
+            (original_task_id, queue_name, task_type, workflow_exec_id, input, error, attempts) \
+         VALUES (gen_random_uuid(), $1, 'callback', $2, '{}'::jsonb, 'unreachable', 3)",
+    )
+    .bind::<diesel::sql_types::Text, _>(&tenant)
+    .bind::<diesel::sql_types::Uuid, _>(forked.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("dead-letter the delivery");
+
+    retention_tick(&pool, &tenant, None).await;
+    assert!(
+        !exists(&mut conn, source).await,
+        "a delivery cannot reopen it"
+    );
+}
+
 /// A recorded fork keeps its whole fork lineage. A reset or a new fork of
 /// it walks that lineage and refuses a gap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
