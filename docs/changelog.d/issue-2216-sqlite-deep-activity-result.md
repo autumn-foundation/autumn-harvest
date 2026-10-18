@@ -2,22 +2,29 @@
 
 An activity result nested past `MAX_PAYLOAD_DEPTH` (100) is no longer stored.
 The SQLite worker turns it into a non-retryable `ActivityFailed` with
-`error_type = "PayloadTooDeep"`. A local activity ends on its first attempt
-with `LocalActivityExhausted`. The workflow sees the failure and can handle it.
+`error_type = "PayloadTooDeep"`, the new `PAYLOAD_TOO_DEEP_ERROR_TYPE`. A local
+activity ends on its first attempt with `LocalActivityExhausted`. The workflow
+sees the failure and can handle it.
 
-Before this fix, a result nested 126 levels or more was stored, and then every
-drive of the run failed with "recursion limit exceeded". `run_until_idle`
+Before this fix, a result nested 126 levels or more was stored. Then every
+drive of the run failed with "recursion limit exceeded", and `run_until_idle`
 returned that error on every call. The workflow could not handle it, because
 the failure was in the driver.
 
-The check runs before the size cap and before the audit row is written. So the
-audit row holds the failure and reads back too. The depth walk uses a heap
-stack, so a very deep result cannot overflow the call stack. No migration. No
-new `WorkflowEvent` variant.
+An activity heartbeat nested past the cap is dropped with a warning. The last
+good checkpoint stays. Before this fix, a heartbeat of 128 levels or more made
+every claim of the task fail.
 
-Tests: `tests/integration/payload_depth.rs` covers a remote and a local result
-at the cap, one level over it, and far past it. Unit tests in `worker.rs` cover
-the finalize path and `local_attempt_events`.
+The depth check runs before the size cap and before the audit row is written.
+So a result that is too deep and too large fails as `PayloadTooDeep`, and the
+audit row reads back. The depth walk does not recurse, so the check itself
+cannot overflow the call stack. No migration. No new `WorkflowEvent` variant.
+
+Tests: `tests/integration/payload_depth.rs` covers a remote result at the cap,
+one level over it, at the issue depth and far past it, with arrays and
+objects. It covers a local result at the cap and over it, and a deep
+heartbeat. Unit tests in `worker.rs` cover the finalize path, the check order
+and `local_attempt_events`.
 
 Breaking: an activity result nested 101 to 125 levels used to complete. It now
 fails with `PayloadTooDeep`, as an ingress payload of that depth does since

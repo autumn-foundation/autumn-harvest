@@ -497,11 +497,23 @@ async fn run_handler(
 /// failed write logs a warning and keeps the attempt alive, as the Postgres
 /// flusher does.
 ///
+/// A payload nested past the cap is dropped with a warning (issue #2216). The
+/// next claim reads the checkpoint back, and `serde_json` cannot read that
+/// payload. So the last good checkpoint stays.
+///
 /// `try_recv` takes no Tokio coop budget, so the drain always empties the
 /// channel. A body that waits for capacity wakes when the drain frees a slot.
 fn persist_heartbeats(conn: &Connection, task_id: &str, heartbeats: &mut mpsc::Receiver<Value>) {
     let mut latest = None;
     while let Ok(details) = heartbeats.try_recv() {
+        if crate::runtime::nests_past_cap(&details) {
+            tracing::warn!(
+                task_id,
+                cap_depth = crate::MAX_PAYLOAD_DEPTH,
+                "dropped an activity heartbeat that nests past the depth cap"
+            );
+            continue;
+        }
         latest = Some(details);
     }
     if let Some(details) = latest
@@ -714,7 +726,7 @@ fn payload_too_large_activity_envelope(activity_name: &str, observed: u64, cap: 
 fn payload_too_deep_activity_envelope(activity_name: &str) -> String {
     use autumn_harvest::failure::IntoActivityErrorString as _;
     autumn_harvest::failure::ActivityFailure::non_retryable(
-        "PayloadTooDeep",
+        crate::PAYLOAD_TOO_DEEP_ERROR_TYPE,
         format!(
             "activity '{activity_name}' result nests more than {} levels",
             crate::MAX_PAYLOAD_DEPTH
@@ -967,8 +979,9 @@ pub fn finalize_within_tx(
     // override (like the input cap, which uses the global), so the GLOBAL
     // `DEFAULT_MAX_ACTIVITY_RESULT_BYTES` (2 MiB) is the faithful cap — the same
     // constant the core resolves each activity's cap against. A zero cap = uncapped.
-    // A result nested past the cap fails the same way (issue #2216). Check
-    // the depth first: it allocates nothing.
+    //
+    // A result nested past the depth cap fails the same way (issue #2216).
+    // Check the depth first, because the size check serializes the whole value.
     let result = match refuse_deep_result(&task.name, result) {
         Ok(output) if DEFAULT_MAX_ACTIVITY_RESULT_BYTES > 0 => {
             let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
@@ -2410,6 +2423,9 @@ mod tests {
         );
     }
 
+    /// The failure message of a deep result of the activity `act`.
+    const DEEP_ACT_MESSAGE: &str = "activity 'act' result nests more than 100 levels";
+
     /// A value of `depth` nested one-element arrays.
     fn nested(depth: usize) -> serde_json::Value {
         let mut value = serde_json::json!(1);
@@ -2419,9 +2435,9 @@ mod tests {
         value
     }
 
-    // Issue #2216: a result nested past the cap is stored but unreadable. So
-    // it becomes a non-retryable `PayloadTooDeep` failure, as an oversized
-    // result does. The audit row holds the failure too.
+    // Issue #2216: `serde_json` cannot read back a result past its read limit.
+    // So a result nested past the cap becomes a non-retryable `PayloadTooDeep`
+    // failure, as an oversized result does. The audit row holds the failure too.
     #[test]
     fn finalize_deep_result_records_non_retryable_payload_too_deep_terminal() {
         let mut conn = open();
@@ -2450,9 +2466,9 @@ mod tests {
                 error,
                 ..
             } => {
-                assert_eq!(error_type, "PayloadTooDeep");
+                assert_eq!(error_type, crate::PAYLOAD_TOO_DEEP_ERROR_TYPE);
                 assert!(*non_retryable, "must be non-retryable");
-                assert!(error.contains("'act'"), "names the activity: {error}");
+                assert_eq!(error, DEEP_ACT_MESSAGE);
             }
             other => panic!("expected a PayloadTooDeep ActivityFailed, got {other:?}"),
         }
@@ -2487,15 +2503,48 @@ mod tests {
     #[test]
     fn a_deep_local_result_ends_the_activity_on_the_first_attempt() {
         let run = local_run(3);
-        let deep = nested(crate::MAX_PAYLOAD_DEPTH + 1);
-        let (events, backoff) = local_attempt_events(ExecutionId::new(), &run, 1, Ok(deep));
-        assert!(backoff.is_none(), "no retry follows");
-        match events.as_slice() {
-            [
-                autumn_harvest::WorkflowEvent::LocalActivityFailed { error, .. },
-                autumn_harvest::WorkflowEvent::LocalActivityExhausted { attempt: 1, .. },
-            ] => assert!(error.contains("'act'"), "names the activity: {error}"),
-            other => panic!("expected a failed and exhausted pair, got {other:?}"),
+        for depth in [crate::MAX_PAYLOAD_DEPTH + 1, 1_000] {
+            let (events, backoff) =
+                local_attempt_events(ExecutionId::new(), &run, 1, Ok(nested(depth)));
+            assert!(backoff.is_none(), "no retry follows");
+            match events.as_slice() {
+                [
+                    autumn_harvest::WorkflowEvent::LocalActivityFailed { error, .. },
+                    autumn_harvest::WorkflowEvent::LocalActivityExhausted { attempt: 1, .. },
+                ] => assert_eq!(error, DEEP_ACT_MESSAGE),
+                other => panic!("expected a failed and exhausted pair, got {other:?}"),
+            }
+        }
+    }
+
+    // Issue #2216: the depth check runs before the size check. So a result
+    // that is too deep and too large fails as `PayloadTooDeep`.
+    #[test]
+    fn a_deep_and_oversized_result_fails_as_too_deep() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        let task = seed_running_task(&conn, exec, "act");
+        let cap = usize::try_from(autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES)
+            .expect("cap fits usize");
+        let mut value = serde_json::json!("x".repeat(cap + 1));
+        for _ in 0..=crate::MAX_PAYLOAD_DEPTH {
+            value = serde_json::Value::Array(vec![value]);
+        }
+
+        super::finalize_activity_result(&mut conn, exec, &task, 1, 0, 0, Ok(value)).unwrap();
+        match &store::load_history(&conn, exec).unwrap()[..] {
+            [autumn_harvest::WorkflowEvent::ActivityFailed { error_type, .. }] => {
+                assert_eq!(error_type, crate::PAYLOAD_TOO_DEEP_ERROR_TYPE);
+            }
+            other => panic!("expected one ActivityFailed, got {other:?}"),
         }
     }
 

@@ -344,6 +344,10 @@ pub struct SignalWithStartOutcome {
 /// which reached an unsupported feature (issue #1834).
 pub const UNSUPPORTED_FEATURE_ERROR_TYPE: &str = "UnsupportedFeature";
 
+/// The `error_type` of the activity failure that replaces a result nested past
+/// [`MAX_PAYLOAD_DEPTH`] (issue #2216). The failure is non-retryable.
+pub const PAYLOAD_TOO_DEEP_ERROR_TYPE: &str = "PayloadTooDeep";
+
 /// The time limit for the replay that rebuilds update handlers, and the
 /// default limit for an update handler (issue #2025). It matches the
 /// `WorkflowTestEnv` mid-run limit.

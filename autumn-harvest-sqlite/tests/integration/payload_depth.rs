@@ -19,9 +19,10 @@ use std::time::Duration;
 use autumn_harvest::WorkflowIdReusePolicy;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
+use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_sqlite::{
-    ActivitySpec, MAX_PAYLOAD_DEPTH, RunState, SignalWithStart, SqliteError, SqliteRuntime,
-    StartOptions, WorkflowEvent,
+    ActivitySpec, MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE, RunState, SignalWithStart,
+    SqliteError, SqliteRuntime, StartOptions, WorkflowEvent,
 };
 use serde_json::{Value, json};
 
@@ -270,18 +271,23 @@ async fn run_deep(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     }
 }
 
-/// A runtime whose `deep` activity returns `nested(depth)`. It allows three
-/// attempts and counts the bodies that ran.
-fn deep_activity_runtime(depth: usize) -> (SqliteRuntime, Arc<AtomicU32>) {
+/// The depth of the issue #2216 repro. With the event wrapper, a stored result
+/// of this depth passes the 128-level read limit of `serde_json`.
+const ISSUE_2216_DEPTH: usize = 126;
+
+/// A runtime whose `deep` activity returns `result`. It allows three attempts
+/// and counts the bodies that ran.
+fn deep_activity_runtime(result: Value) -> (SqliteRuntime, Arc<AtomicU32>) {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&run_deep_info());
+    rt.register_workflow(&echo_input_info());
     let runs = Arc::new(AtomicU32::new(0));
     let counter = Arc::clone(&runs);
     rt.register_activity_raw(
         "deep",
         ActivitySpec::new(3, move |_| {
             counter.fetch_add(1, Ordering::SeqCst);
-            Ok(nested(depth))
+            Ok(result.clone())
         }),
     );
     (rt, runs)
@@ -308,8 +314,8 @@ fn activity_failure(history: &[WorkflowEvent]) -> (String, bool, String) {
 
 #[tokio::test]
 async fn a_deep_activity_result_fails_the_activity_and_the_run_completes() {
-    // The repro of issue #2216: a result nested 126 levels made every drive fail.
-    let (mut rt, runs) = deep_activity_runtime(MAX_PAYLOAD_DEPTH + 26);
+    // The repro of issue #2216: this result made every drive fail.
+    let (mut rt, runs) = deep_activity_runtime(nested(ISSUE_2216_DEPTH));
     let exec = rt.start_workflow("run_deep", json!(0)).unwrap();
 
     let state = rt.run_until_blocked(exec).await.unwrap();
@@ -324,7 +330,7 @@ async fn a_deep_activity_result_fails_the_activity_and_the_run_completes() {
 
     let history = rt.load_history(exec).unwrap();
     let (error_type, non_retryable, error) = activity_failure(&history);
-    assert_eq!(error_type, "PayloadTooDeep");
+    assert_eq!(error_type, PAYLOAD_TOO_DEEP_ERROR_TYPE);
     assert!(non_retryable, "a deep result is not retried");
     assert!(
         error.contains("'deep'"),
@@ -341,20 +347,38 @@ async fn a_deep_activity_result_fails_the_activity_and_the_run_completes() {
     let attempts = rt.activity_attempts(exec, "deep").unwrap();
     assert_eq!(attempts.len(), 1);
     assert!(attempts[0].result.is_err());
+
+    // The history replays, and another run on the runtime still completes.
+    let report = WorkflowReplayer::new()
+        .register_fn("run_deep", run_deep_info().handler)
+        .replay_from_events(history)
+        .await;
+    assert!(
+        matches!(report.status, ReplayStatus::ReplaySucceeded),
+        "the history must replay:\n{report}"
+    );
+    let other = rt.start_workflow("echo_input", json!(7)).unwrap();
+    let state = rt.run_until_blocked(other).await.unwrap();
+    assert!(matches!(state, RunState::Completed(ref v) if v == 7));
 }
 
 #[tokio::test]
 async fn an_activity_result_one_level_over_the_cap_fails() {
-    let (mut rt, _) = deep_activity_runtime(MAX_PAYLOAD_DEPTH + 1);
-    let exec = rt.start_workflow("run_deep", json!(0)).unwrap();
-    rt.run_until_blocked(exec).await.unwrap();
-    let (error_type, ..) = activity_failure(&rt.load_history(exec).unwrap());
-    assert_eq!(error_type, "PayloadTooDeep");
+    for result in [
+        nested(MAX_PAYLOAD_DEPTH + 1),
+        nested_object(MAX_PAYLOAD_DEPTH + 1),
+    ] {
+        let (mut rt, _) = deep_activity_runtime(result);
+        let exec = rt.start_workflow("run_deep", json!(0)).unwrap();
+        rt.run_until_blocked(exec).await.unwrap();
+        let (error_type, ..) = activity_failure(&rt.load_history(exec).unwrap());
+        assert_eq!(error_type, PAYLOAD_TOO_DEEP_ERROR_TYPE);
+    }
 }
 
 #[tokio::test]
 async fn an_activity_result_at_the_cap_round_trips() {
-    let (mut rt, _) = deep_activity_runtime(MAX_PAYLOAD_DEPTH);
+    let (mut rt, _) = deep_activity_runtime(nested(MAX_PAYLOAD_DEPTH));
     let exec = rt.start_workflow("run_deep", json!(0)).unwrap();
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
@@ -367,14 +391,14 @@ async fn an_activity_result_at_the_cap_round_trips() {
 #[tokio::test]
 async fn an_activity_result_far_past_the_cap_fails() {
     // The depth walk must not recurse on a value it refuses.
-    let (mut rt, _) = deep_activity_runtime(FAR_PAST_THE_CAP);
+    let (mut rt, _) = deep_activity_runtime(nested(FAR_PAST_THE_CAP));
     let exec = rt.start_workflow("run_deep", json!(0)).unwrap();
     rt.run_until_blocked(exec).await.unwrap();
     let (error_type, ..) = activity_failure(&rt.load_history(exec).unwrap());
-    assert_eq!(error_type, "PayloadTooDeep");
+    assert_eq!(error_type, PAYLOAD_TOO_DEEP_ERROR_TYPE);
 }
 
-/// Counts the bodies of `deep_local` that ran.
+/// Counts the bodies of `deep_local` that ran. Only one test runs it.
 static DEEP_LOCAL_RUNS: AtomicU32 = AtomicU32::new(0);
 
 /// A local activity that returns a value one level over the cap.
@@ -425,7 +449,10 @@ async fn a_deep_local_activity_result_fails_without_a_retry() {
     let failed = output["failed"]
         .as_str()
         .expect("the workflow sees a failure");
-    assert!(failed.contains("nests more than"), "got {failed}");
+    assert!(
+        failed.contains("activity 'deep_local' result nests more than 100 levels"),
+        "got {failed}"
+    );
     rt.run_until_idle().await.unwrap();
 
     let history = rt.load_history(exec).unwrap();
@@ -456,6 +483,52 @@ async fn a_local_activity_result_at_the_cap_round_trips() {
     assert!(
         matches!(state, RunState::Completed(ref v) if v["output"] == nested(MAX_PAYLOAD_DEPTH)),
         "got {state:?}"
+    );
+    rt.run_until_idle().await.unwrap();
+}
+
+// ── Heartbeat details (issue #2216) ─────────────────────────────────────────
+
+/// The first attempt saves a good checkpoint, then one past the read limit of
+/// `serde_json`, and fails. The retry returns the checkpoint it resumes from.
+/// The good checkpoint is two levels under the cap, so the result is at the cap.
+#[activity(retry = RetryPolicy::fixed(2, Duration::ZERO))]
+async fn deep_heartbeat(ctx: &ActivityContext, _n: i64) -> Result<Value, String> {
+    let resumed: Option<Value> = ctx.heartbeat_details().map_err(|e| e.to_string())?;
+    if ctx.attempt() == 1 {
+        ctx.heartbeat(json!({ "good": nested(MAX_PAYLOAD_DEPTH - 2) }))
+            .await
+            .map_err(|e| e.to_string())?;
+        ctx.heartbeat(nested(FAR_PAST_THE_CAP))
+            .await
+            .map_err(|e| e.to_string())?;
+        return Err("first attempt".to_string());
+    }
+    Ok(json!({ "resumed": resumed }))
+}
+
+#[workflow]
+async fn run_deep_heartbeat(ctx: &WorkflowContext, n: i64) -> Result<Value, String> {
+    ctx.execute_activity(&deep_heartbeat_info(), n)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tokio::test]
+async fn a_deep_heartbeat_is_dropped_and_the_last_good_checkpoint_survives() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&run_deep_heartbeat_info());
+    rt.register_activity(&deep_heartbeat_info());
+    let exec = rt.start_workflow("run_deep_heartbeat", json!(0)).unwrap();
+
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(
+        matches!(
+            state,
+            RunState::Completed(ref v)
+                if v["resumed"] == json!({ "good": nested(MAX_PAYLOAD_DEPTH - 2) })
+        ),
+        "the retry resumes from the last good checkpoint, got {state:?}"
     );
     rt.run_until_idle().await.unwrap();
 }
