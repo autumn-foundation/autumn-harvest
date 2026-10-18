@@ -392,6 +392,22 @@ async fn outbox_count(pool: &ShardedDbPool, shard: i32) -> i64 {
         .expect("outbox count")
 }
 
+/// The reason on a run's `WorkflowCancelled` event, if it has one.
+async fn cancelled_reason(
+    pool: &ShardedDbPool,
+    shard: i32,
+    exec_id: ExecutionId,
+) -> Option<String> {
+    let mut conn = shard_conn(pool, shard).await;
+    let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+        .await
+        .expect("history load");
+    history.events.into_iter().find_map(|e| match e {
+        WorkflowEvent::WorkflowCancelled { reason } => Some(reason),
+        _ => None,
+    })
+}
+
 fn parent_start_params<'a>(
     exec_id: ExecutionId,
     workflow_name: &'a str,
@@ -709,7 +725,7 @@ async fn a_cross_shard_child_cancelled_before_creation_is_born_cancelled() {
 
         // The cancel arrives before the relay ever creates the child — the
         // exact race this regression covers.
-        autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id)
+        autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id, None)
             .await
             .expect("request cancel");
 
@@ -817,7 +833,7 @@ async fn a_cross_shard_child_cancelled_before_creation_bypasses_an_exceeded_quot
     )
     .await
     .expect("record cross-shard child");
-    autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id)
+    autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id, None)
         .await
         .expect("request cancel");
 
@@ -853,6 +869,140 @@ async fn a_cross_shard_child_cancelled_before_creation_bypasses_an_exceeded_quot
         state, "CANCELLED",
         "a race loser must settle into CANCELLED even over an exceeded quota"
     );
+}
+
+// ── Issue #2194: the cancel reason crosses the shard boundary ────────────────
+
+/// Create a started cross-shard child, cancel it with each reason in turn, and
+/// return the reason on the child's `WorkflowCancelled` event.
+///
+/// No worker runs, so the child stays `RUNNING` until the relay cancels it.
+async fn cancel_started_child(reasons: &[Option<&str>], workflow_id: &str) -> Option<String> {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+
+    let parent = start_parent(&sharded, "child_echo", workflow_id).await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+    let spec = autumn_harvest::cross_shard_child::CrossShardChildSpec {
+        input: json!({}),
+        queue_name: "default".to_string(),
+        assigned_build_id: None,
+        context_headers: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        sla_secs: None,
+        execution_timeout_secs: None,
+        chain_execution_timeout_secs: None,
+        retry_policy: None,
+        quota_key: None,
+        quota: None,
+        concurrency_key: None,
+        max_concurrent: None,
+        trace_context: None,
+        fairness_key: None,
+        tenant: None,
+    };
+
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &spec,
+    )
+    .await
+    .expect("record cross-shard child");
+
+    // First sweep creates the child live. The cancel comes after, so the
+    // relay delivers it to a started child, not a born-cancelled one.
+    sweep_until_progress(&mut conn, &sharded).await;
+    assert_eq!(
+        execution_state(&sharded, child_shard.as_i32(), child_id)
+            .await
+            .as_deref(),
+        Some("PENDING"),
+        "the child must exist and be live before the cancel"
+    );
+
+    for reason in reasons {
+        autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id, *reason)
+            .await
+            .expect("request cancel");
+    }
+    sweep_until_progress(&mut conn, &sharded).await;
+    assert_eq!(
+        execution_state(&sharded, child_shard.as_i32(), child_id)
+            .await
+            .as_deref(),
+        Some("CANCELLED")
+    );
+    cancelled_reason(&sharded, child_shard.as_i32(), child_id).await
+}
+
+/// Run relay sweeps until one acts on a row.
+async fn sweep_until_progress(conn: &mut AsyncPgConnection, sharded: &ShardedDbPool) {
+    let started = std::time::Instant::now();
+    loop {
+        let progressed = autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+            conn,
+            &Some(sharded.clone()),
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .expect("relay sweep");
+        if progressed > 0 {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the relay never acted on the child"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// **Issue #2194.** The relay cancels the child with the reason that the parent
+/// stored, as a same-shard cancel does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_shard_cancel_carries_the_parents_reason() {
+    let reason = cancel_started_child(
+        &[Some("cancelled by its cancellation scope")],
+        "cancel-reason-1",
+    )
+    .await;
+    assert_eq!(
+        reason.as_deref(),
+        Some("cancelled by its cancellation scope")
+    );
+}
+
+/// **Issue #2194.** A cancel with no stored reason keeps the generic text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_shard_cancel_without_a_reason_uses_the_generic_text() {
+    let reason = cancel_started_child(&[None], "cancel-reason-2").await;
+    assert_eq!(reason.as_deref(), Some("parent requested cancellation"));
+}
+
+/// **Issue #2194.** The first stored reason wins, as the first cancel of a
+/// same-shard child does. A later request neither replaces nor clears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_stored_cancel_reason_wins() {
+    let reason = cancel_started_child(
+        &[
+            Some("lost race to a sibling branch"),
+            Some("cancelled by its cancellation scope"),
+            None,
+        ],
+        "cancel-reason-3",
+    )
+    .await;
+    assert_eq!(reason.as_deref(), Some("lost race to a sibling branch"));
 }
 
 /// **Regression (issue #1263 item 10, compliance-sensitive).** Erasing a
@@ -1935,6 +2085,13 @@ async fn a_cross_shard_race_loser_is_cancelled_on_its_own_shard() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+
+    // Issue #2194: the loser gets the race reason, as a same-shard loser does.
+    let loser = started_child_ids(&sharded, PARENT_SHARD, parent).await[0];
+    assert_eq!(
+        cancelled_reason(&sharded, 2, loser).await.as_deref(),
+        Some("lost race to a sibling branch")
+    );
 
     worker.shutdown();
     let _ = handle.await;
