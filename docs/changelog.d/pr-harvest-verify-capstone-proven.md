@@ -28,7 +28,11 @@ current summary, joined with the old pass-through as a floor, and records its
 argument taint. The outer call reruns with the joined taint until a round adds
 no fact, and drops the memo entries of each unfinished round. A sink inside
 the cycle is now found (`wf_recursive_relay`, `wf_recursive_carry`). A cycle
-that does not converge in 8 rounds is still a `recursion` boundary.
+that does not converge in 8 rounds is still a `recursion` boundary. An
+activation is keyed on the body and its substitution. A recursive call that
+changes the generic instantiation can select other trait impls, so it is
+analyzed in its own right, not taken for a re-entry
+(`wf_recursive_instantiation`).
 
 Precision fixes, each with a clean corpus case:
 

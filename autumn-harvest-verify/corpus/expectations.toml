@@ -344,6 +344,14 @@ trace_contains = ["relay", "fine_stamp", "SystemTime::now"]
 
 [[workflow]]
 crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_recursive_instantiation::wf_recursive_instantiation"
+verdict = "nondeterminism-found"
+mechanism = "a generic recursive fn `chain::<Fixed>` calls `chain::<Clock>`, and only `Clock::stamp` reads the clock through `fine_stamp()`"
+launder = "fine_stamp is two crates away, past det_check's one hop. The clock read is behind a static trait call on a type parameter, and only the recursive call's substitution selects it. A cycle keyed on the body path alone solves only the outer substitution and never analyzes Clock::stamp"
+trace_contains = ["chain", "fine_stamp", "SystemTime::now"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
 workflow = "harvest_verify_corpus_seeded::wf_async_helper_argument::wf_async_helper_argument"
 verdict = "nondeterminism-found"
 mechanism = "a clock value passed as the third argument of an `async fn` helper reaches an activity argument"

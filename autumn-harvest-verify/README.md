@@ -88,7 +88,9 @@ wrong:
   (`wf_helper_named_count`).
 
 Recursion is now solved as a bounded fixpoint rather than cut
-(`wf_recursive_relay`). Six analyzer gaps that made correct code `unknown` are
+(`wf_recursive_relay`). A cycle is keyed on the body and its substitution, so
+a recursive call under another generic instantiation is analyzed in its own
+right (`wf_recursive_instantiation`). Six analyzer gaps that made correct code `unknown` are
 closed, each with a clean corpus case: a `const` argument, a std method on a
 trimmed parameter, an inherent float method, a derived `ne`/`lt`, a trusted
 `async fn` future, and a char literal that holds a bracket.

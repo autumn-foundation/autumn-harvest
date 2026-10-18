@@ -58,6 +58,7 @@ pub mod wf_process_id_payload;
 pub mod wf_rand_behind_dyn;
 pub mod wf_rand_in_helper_branch;
 pub mod wf_recursive_carry;
+pub mod wf_recursive_instantiation;
 pub mod wf_recursive_relay;
 pub mod wf_refcell_captured_state;
 pub mod wf_replay_varying_ctx_read;

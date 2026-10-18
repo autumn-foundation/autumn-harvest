@@ -308,13 +308,14 @@ pub struct Analyzer<'a> {
     /// Each memo key, in insertion order. A round of a recursive fixpoint
     /// drops the keys that the round before it inserted.
     memo_log: Vec<String>,
-    /// Body path → what re-entering it saw, while its recursive cycle is
-    /// being solved.
+    /// Activation key → what re-entering it saw, while its recursive cycle
+    /// is being solved.
     reentries: HashMap<String, Reentry>,
     /// Per-call-site classification, keyed on `body|block|substitution`.
     classes: HashMap<String, Rc<CallClasses<'a>>>,
     /// Per-call-site resolution, keyed the same way.
     targets: HashMap<String, Rc<CallTarget>>,
+    /// The activation keys of the bodies being analyzed, outermost first.
     stack: Vec<String>,
     budget: u32,
     /// The interior-mutable type names, computed on first use (issue #2010).
@@ -366,9 +367,12 @@ impl<'a> Analyzer<'a> {
         }
         // A body already on the stack is not entered again. The call returns
         // the cycle's current summary, and the outer activation iterates
-        // until that summary holds (see `solve_body`).
-        if self.stack.iter().any(|frame| frame == path) {
-            let entry = self.reentries.entry(path.to_string()).or_default();
+        // until that summary holds (see `solve_body`). The key carries the
+        // substitution. A call of the same generic body under another
+        // substitution can select other impls, so it is a new activation.
+        let activation = activation_key(path, subst);
+        if self.stack.contains(&activation) {
+            let entry = self.reentries.entry(activation).or_default();
             join_args(&mut entry.args, args);
             // The pass-through of the old cut stays as a floor, so a round
             // never returns less than the cut would have.
@@ -395,8 +399,8 @@ impl<'a> Analyzer<'a> {
             return conservative(args);
         }
         self.budget = self.budget.saturating_sub(1);
-        self.stack.push(path.to_string());
-        let outcome = self.solve_body(path, subst, args, hops);
+        self.stack.push(activation.clone());
+        let outcome = self.solve_body(path, &activation, subst, args, hops);
         self.stack.pop();
         self.memo.insert(key.clone(), outcome.clone());
         self.memo_log.push(key);
@@ -435,6 +439,7 @@ impl<'a> Analyzer<'a> {
     fn solve_body(
         &mut self,
         path: &str,
+        activation: &str,
         subst: &Substitution,
         args: &[TaintSet],
         hops: &[Hop],
@@ -443,13 +448,13 @@ impl<'a> Analyzer<'a> {
         let mut current = args.to_vec();
         let mut outcome = self.run_body(path, subst, &current, hops);
         for _ in 0..MAX_RECURSION_ROUNDS {
-            let Some(entry) = self.reentries.get_mut(path) else {
+            let Some(entry) = self.reentries.get_mut(activation) else {
                 return outcome;
             };
             let mut grew = join_args(&mut current, &entry.args);
             grew |= join_outcome(&mut entry.outcome, &outcome);
             if !grew {
-                self.reentries.remove(path);
+                self.reentries.remove(activation);
                 return outcome;
             }
             for key in self.memo_log.drain(log_start..) {
@@ -457,7 +462,7 @@ impl<'a> Analyzer<'a> {
             }
             outcome = self.run_body(path, subst, &current, hops);
         }
-        self.reentries.remove(path);
+        self.reentries.remove(activation);
         self.push_boundary(
             BoundaryKind::Recursion,
             &format!("recursive cycle at {path} did not converge in {MAX_RECURSION_ROUNDS} rounds"),
@@ -3020,6 +3025,11 @@ fn alloc_pointee(text: &str) -> Option<&str> {
 fn same_type_name(declared: &str, pointee: &str) -> bool {
     let want = crate::model::callee::TypeName::parse(pointee).name;
     !want.is_empty() && crate::model::callee::TypeName::parse(declared).name == want
+}
+
+/// The key of one activation of `path`: the body and its substitution.
+fn activation_key(path: &str, subst: &Substitution) -> String {
+    format!("{path}|{}", subst.key())
 }
 
 fn memo_key(path: &str, subst: &Substitution, args: &[TaintSet]) -> String {
