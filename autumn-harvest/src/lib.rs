@@ -790,7 +790,8 @@ pub use schedule_decision::record_decision_graceful;
 #[cfg(feature = "db")]
 pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
-    register_schedules, register_workflow_schedules, tick_once, trigger_unified_dag,
+    register_schedules, register_workflow_schedules, register_workflow_schedules_with_codecs,
+    tick_once, trigger_unified_dag,
 };
 pub use schema_contract::{
     AcknowledgedBreakingChange, ActivitySchemaEntry, ChangeKind, CompatibilityRules,

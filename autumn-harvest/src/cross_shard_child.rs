@@ -330,6 +330,49 @@ pub async fn record_cross_shard_child(
     parent_close_policy: Option<ParentClosePolicy>,
     spec: &CrossShardChildSpec,
 ) -> HarvestResult<()> {
+    record_cross_shard_child_with_codecs(
+        conn,
+        parent_exec_id,
+        child_exec_id,
+        workflow_name,
+        parent_close_policy,
+        spec,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`record_cross_shard_child`], storing the spec through `codecs`
+/// (issue #2043).
+///
+/// A child that is already recorded stays a no-op, even while the encoder
+/// fails. A retried decision re-emits its children, and no new payload needs
+/// to be written for one that exists.
+///
+/// # Errors
+///
+/// Propagates database errors. Returns the encoder error when the child is new.
+pub async fn record_cross_shard_child_with_codecs(
+    conn: &mut AsyncPgConnection,
+    parent_exec_id: ExecutionId,
+    child_exec_id: ExecutionId,
+    workflow_name: &str,
+    parent_close_policy: Option<ParentClosePolicy>,
+    spec: &CrossShardChildSpec,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    let recorded: bool = diesel::select(diesel::dsl::exists(
+        harvest_cross_shard_children::table.find(child_exec_id.as_uuid()),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    if recorded {
+        return Ok(());
+    }
+    // The whole spec is one cell. It holds the child input and its headers
+    // (issue #2043).
+    let spec_json = serde_json::to_value(spec).map_err(HarvestError::Serialization)?;
     let row = NewCrossShardChildRow {
         child_exec_id: child_exec_id.as_uuid(),
         parent_exec_id: parent_exec_id.as_uuid(),
@@ -337,7 +380,7 @@ pub async fn record_cross_shard_child(
         status: CrossShardChildStatus::PendingStart.as_db_str().to_string(),
         parent_close_policy: parent_close_policy.map(|p| p.to_string()),
         workflow_name: workflow_name.to_string(),
-        child_spec: serde_json::to_value(spec).map_err(HarvestError::Serialization)?,
+        child_spec: codecs.encode_column(&spec_json)?,
     };
     diesel::insert_into(harvest_cross_shard_children::table)
         .values(&row)
@@ -1306,8 +1349,26 @@ async fn start_child_on_target(
 ) -> HarvestResult<()> {
     let mut conn = target_conn(pool, row, acquire_bound).await?;
 
-    let spec: CrossShardChildSpec =
-        serde_json::from_value(row.child_spec.clone()).map_err(HarvestError::Serialization)?;
+    // A retry after a crash finds the child already created. It needs no spec,
+    // so it needs no key either. The transaction below checks again for a race
+    // (issue #2043).
+    let created: bool = diesel::select(diesel::dsl::exists(
+        harvest_workflow_executions::table.find(row.child_exec_id),
+    ))
+    .get_result(&mut *conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    if created {
+        return Ok(());
+    }
+
+    // A spec that does not decode never starts a child. The error leaves the
+    // row pending, so a restored key lets it start (issue #2043).
+    // The error text names no value, because the value is plaintext.
+    let spec: CrossShardChildSpec = serde_json::from_value(codecs.decode_column(&row.child_spec)?)
+        .map_err(|_| {
+            HarvestError::Config("the stored child spec is not a valid spec".to_string())
+        })?;
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
     let parent_exec_id = ExecutionId::from_uuid(row.parent_exec_id);
     let child_workflow_id = child_exec_id.to_string();
@@ -1417,7 +1478,11 @@ async fn start_child_on_target(
                     owner: spec.owner.as_deref(),
                     runbook_url: spec.runbook_url.as_deref(),
                     severity: spec.severity.as_deref(),
-                    context_headers: spec.context_headers.clone(),
+                    context_headers: spec
+                        .context_headers
+                        .as_ref()
+                        .map(|plain| codecs.encode_column(plain))
+                        .transpose()?,
                     schedule_id: None,
                     scheduled_for: None,
                     workflow_attempt: 1,

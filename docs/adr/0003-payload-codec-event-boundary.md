@@ -232,10 +232,14 @@ envelope layer. A value that does not decode never reaches a handler, a webhook
 or a start. An activity attempt fails with a retryable error. A buffer scanner
 moves the row back. The callback scanner counts a failed attempt.
 
-**What stays clear.** `harvest_event_batches.buffered_payloads`,
-`harvest_cross_shard_children.child_spec`, `harvest_schedules.workflow_input`
-and `context_headers` stay clear. SQL appends to and counts the batch array.
-Erasure rewrites a field inside the child spec. The schedule API edits the
-template, and the reconciler compares it by value. Replay, export and archive
-treat an unreadable header map as no headers. The coverage table gives each
-reason.
+**The last payload copies.** The batch buffer, the cross-shard child spec,
+the schedule input and the context headers are encoded too. The buffer keeps
+one envelope for each element, so SQL still appends to and counts the array.
+The spec is one cell, and erasure replaces it with a tombstone without a key.
+The reconciler compares the decoded schedule input, so a new nonce is not
+drift. A header map that does not decode fails the run, and it never means
+no headers. An export decodes headers only for a caller who may decode. The
+archive leaves an encoded header map out.
+
+**What stays clear.** Configuration and identifiers only. The coverage table
+gives the reason for each clear column.

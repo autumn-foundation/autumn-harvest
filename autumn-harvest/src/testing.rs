@@ -1971,20 +1971,21 @@ impl WorkflowReplayer {
                     Ok(_permit) => {
                         let load_and_replay = async {
                             let snapshot = {
-                                let mut conn = shard_pool
-                                    .get()
-                                    .await
-                                    .map_err(|e| crate::error::HarvestError::Database(e.to_string()))?;
+                                let mut conn = shard_pool.get().await.map_err(|e| {
+                                    crate::error::HarvestError::Database(e.to_string())
+                                })?;
 
-                                let history = crate::store::load_history(&mut conn, exec.execution_id).await?;
-                                let headers = exec.context_headers.clone().and_then(|v| {
-                                    serde_json::from_value::<std::collections::HashMap<String, String>>(v)
-                                        .map_err(|e| {
-                                            tracing::warn!(error = %e, "replay canary: failed to deserialize context headers");
-                                            e
-                                        })
-                                        .ok()
-                                });
+                                let history =
+                                    crate::store::load_history(&mut conn, exec.execution_id)
+                                        .await?;
+                                // Decode with the registry that loaded the history. A cell
+                                // this registry cannot read fails the replay. It never runs
+                                // without its headers (issue #2043).
+                                let headers = exec
+                                    .context_headers
+                                    .as_ref()
+                                    .map(|v| crate::store::DEFAULT_PAYLOAD_CODECS.decode_headers(v))
+                                    .transpose()?;
                                 HistorySnapshot {
                                     workflow_name: exec.workflow_name.clone(),
                                     execution_id: exec.execution_id,
@@ -2395,16 +2396,9 @@ async fn load_workflow_name_and_headers(
             other => database_error(other),
         })?;
 
-    let headers = raw_headers
-        .and_then(|v| {
-            serde_json::from_value::<std::collections::HashMap<String, String>>(v)
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "replay_from_db: failed to deserialize context headers");
-                    e
-                })
-                .ok()
-        })
-        .unwrap_or_default();
+    // The history loads through the default registry, so the headers decode
+    // through it too. A cell it cannot read fails the replay (issue #2043).
+    let headers = crate::store::DEFAULT_PAYLOAD_CODECS.decode_headers_opt(raw_headers.as_ref())?;
 
     Ok(DbReplayMeta {
         workflow_name: name,

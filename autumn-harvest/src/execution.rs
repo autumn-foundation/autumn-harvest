@@ -1456,13 +1456,20 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
     // Encode `input` and `memo` now, but hold a failure (issue #2054). A
     // duplicate start writes nothing, so a broken codec must not change its
     // result. Each branch that writes a run raises the held error first.
-    let (encoded_input, encoded_memo, encode_failure) = match codecs
+    let (encoded_input, encoded_memo, encoded_headers, encode_failure) = match codecs
         .encode_shared_column(&request.input)
-        .and_then(|input| Ok((input, codecs.encode_column_opt(request.memo.as_ref())?)))
-    {
-        Ok((input, memo)) => (input, memo, None),
+        .and_then(|input| {
+            let memo = codecs.encode_column_opt(request.memo.as_ref())?;
+            let headers = request
+                .context_headers
+                .as_ref()
+                .map(|headers| codecs.encode_headers(headers))
+                .transpose()?;
+            Ok((input, memo, headers))
+        }) {
+        Ok((input, memo, headers)) => (input, memo, headers, None),
         // The placeholder is never stored: every write path checks the held error.
-        Err(error) => (serde_json::Value::Null.into(), None, Some(error)),
+        Err(error) => (serde_json::Value::Null.into(), None, None, Some(error)),
     };
 
     if terminate_via_pre_check
@@ -1574,10 +1581,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         owner: request.owner,
         runbook_url: request.runbook_url,
         severity: request.severity,
-        context_headers: request
-            .context_headers
-            .as_ref()
-            .map(|h| serde_json::to_value(h).unwrap_or(serde_json::Value::Null)),
+        context_headers: encoded_headers,
         schedule_id: request.schedule_id,
         scheduled_for: request.scheduled_for,
         workflow_attempt: request.workflow_attempt.cast_signed(),
@@ -8223,12 +8227,16 @@ pub async fn rerun_workflow_execution_with_codecs(
             // than degrading the re-run, matching the repo's fail-loud posture.
             let rerun_context_headers = match source.context_headers.clone() {
                 None => None,
-                Some(v) => Some(serde_json::from_value(v).map_err(|e| {
-                    HarvestError::Config(format!(
-                        "source execution {source_exec_id} has an unparseable stored \
-                         `context_headers` value ({e}); re-run cannot faithfully clone it"
-                    ))
-                })?),
+                // The start path encodes the headers again (issue #2043). The
+                // error text names no value, because the value is plaintext.
+                Some(v) => Some(serde_json::from_value(codecs.decode_column(&v)?).map_err(
+                    |_| {
+                        HarvestError::Config(format!(
+                            "source execution {source_exec_id} has an unparseable stored \
+                             `context_headers` value; re-run cannot faithfully clone it"
+                        ))
+                    },
+                )?),
             };
             let rerun_retry_policy = match source.workflow_retry_policy.clone() {
                 None => None,
