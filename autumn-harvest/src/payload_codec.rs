@@ -1391,14 +1391,14 @@ impl PayloadCodecs {
     ///
     /// This lifts each decoded payload out of `data` and leaves `null` in its
     /// place. Serde then decodes a small event. Each payload moves into its
-    /// field through [`WorkflowEvent::payload_slot`]. The key set that serde
+    /// field through [`WorkflowEvent::payload_slot_mut`]. The key set that serde
     /// sees does not change, so every error stays the same.
     ///
     /// A payload with no slot is either a key that the variant does not have,
-    /// or a slot that `payload_slot` omits. The slow path puts it back and
+    /// or a slot that `payload_slot_mut` omits. The slow path puts it back and
     /// decodes again, so neither case loses data.
     ///
-    /// [`WorkflowEvent::payload_slot`]: crate::event::WorkflowEvent::payload_slot
+    /// [`WorkflowEvent::payload_slot_mut`]: crate::event::WorkflowEvent::payload_slot_mut
     fn decode_event_moving_payloads(
         &self,
         mut value: Value,
@@ -1423,7 +1423,7 @@ impl PayloadCodecs {
             let Some(payload) = slot.take() else {
                 continue;
             };
-            if let Some(field) = event.payload_slot(key) {
+            if let Some(field) = event.payload_slot_mut(key) {
                 field.fill(payload);
             } else {
                 *slot = Some(payload);
@@ -4554,7 +4554,7 @@ mod tests {
         assert_eq!(moved, rebuilt);
     }
 
-    /// Every variant takes the fast path, so `payload_slot` names every
+    /// Every variant takes the fast path, so `payload_slot_mut` names every
     /// payload field (issue #2136).
     ///
     /// The derived `Arbitrary` picks the variant from the first four bytes

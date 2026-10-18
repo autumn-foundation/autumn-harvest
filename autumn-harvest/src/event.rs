@@ -1035,6 +1035,16 @@ pub(crate) enum PayloadSlot<'a> {
     Optional(&'a mut Option<serde_json::Value>),
 }
 
+impl PayloadSlot<'_> {
+    /// Store `payload` exactly as serde would decode it into this field.
+    pub(crate) fn fill(self, payload: serde_json::Value) {
+        match self {
+            Self::Required(field) => *field = payload,
+            Self::Optional(field) => *field = (!payload.is_null()).then_some(payload),
+        }
+    }
+}
+
 impl WorkflowEvent {
     /// Forward-compatible constructor for [`WorkflowEvent::WorkflowStarted`] that
     /// defaults the carryover (#488) and scheduled-time (#508) additive fields to
@@ -1244,6 +1254,7 @@ impl WorkflowEvent {
             | Self::TimerFired { .. }
             | Self::TimerStarted { .. }
             | Self::UpdateFailed { .. }
+            | Self::WorkflowCancelRequested { .. }
             | Self::WorkflowCancelled { .. }
             | Self::WorkflowExecutionPaused { .. }
             | Self::WorkflowExecutionResumed { .. }
@@ -1284,114 +1295,6 @@ impl WorkflowEvent {
                 // never consumed by its workflow function on replay.
                 | Self::WorkflowRetryScheduled { .. }
         )
-    }
-
-    /// The payload field that `key` names on this variant, if it has one.
-    ///
-    /// `key` is one of [`crate::payload_store::PAYLOAD_FIELD_KEYS`], the wire
-    /// name of the field. `PayloadCodecs::decode_event` uses this to move a
-    /// parsed payload tree into place instead of rebuilding it.
-    ///
-    /// The match is exhaustive, so a new variant must state its payload
-    /// fields here. A missed field costs speed, not data: the decoder falls
-    /// back to a full decode when a payload finds no slot.
-    pub(crate) fn payload_slot(&mut self, key: &str) -> Option<PayloadSlot<'_>> {
-        fn named<'a>(name: &str, key: &str, slot: PayloadSlot<'a>) -> Option<PayloadSlot<'a>> {
-            (name == key).then_some(slot)
-        }
-        match self {
-            Self::WorkflowStarted {
-                input,
-                last_completion_result,
-                ..
-            } => match key {
-                "input" => Some(PayloadSlot::Required(input)),
-                "last_completion_result" => Some(PayloadSlot::Optional(last_completion_result)),
-                _ => None,
-            },
-            Self::ActivityScheduled { input, .. }
-            | Self::ChildWorkflowStarted { input, .. }
-            | Self::WorkflowContinuedAsNew { input, .. }
-            | Self::LocalActivityScheduled { input, .. }
-            | Self::ActivityAwaitingExternal { input, .. }
-            | Self::UpdateAdmitted { input, .. }
-            | Self::ChildWorkflowSpawnedDetached { input, .. } => {
-                named("input", key, PayloadSlot::Required(input))
-            }
-            Self::WorkflowCompleted { output }
-            | Self::ActivityCompleted { output, .. }
-            | Self::ChildWorkflowCompleted { output, .. }
-            | Self::LocalActivityCompleted { output, .. }
-            | Self::ActivityCompletedExternally { output, .. }
-            | Self::UpdateCompleted { output, .. }
-            | Self::ExternalAwaitResolved { output, .. }
-            | Self::ForkActivityResultOverridden { output, .. } => {
-                named("output", key, PayloadSlot::Required(output))
-            }
-            Self::ActivityHeartbeat { details, .. } | Self::MarkerRecorded { details, .. } => {
-                named("details", key, PayloadSlot::Required(details))
-            }
-            Self::WorkflowFailed { details, .. }
-            | Self::ActivityFailed { details, .. }
-            | Self::ChildWorkflowFailed { details, .. }
-            | Self::ExternalAwaitFailed { details, .. } => {
-                named("details", key, PayloadSlot::Optional(details))
-            }
-            Self::SignalReceived { payload, .. }
-            | Self::ExternalSignalRequested { payload, .. } => {
-                named("payload", key, PayloadSlot::Required(payload))
-            }
-            Self::SideEffectRecorded { value, .. } => {
-                named("value", key, PayloadSlot::Required(value))
-            }
-            Self::WorkflowCancelled { .. }
-            | Self::ActivityStarted { .. }
-            | Self::ActivityTimedOut { .. }
-            | Self::TimerStarted { .. }
-            | Self::TimerFired { .. }
-            | Self::LocalActivityFailed { .. }
-            | Self::ActivityFailedExternally { .. }
-            | Self::ActivityExternalDeadlineExtended { .. }
-            | Self::UpdateFailed { .. }
-            | Self::WorkflowResetFork { .. }
-            | Self::WorkflowResetTerminated { .. }
-            | Self::LocalActivityExhausted { .. }
-            | Self::ExternalSignalDelivered { .. }
-            | Self::ExternalSignalFailed { .. }
-            | Self::WorkflowExecutionTimedOut { .. }
-            | Self::ChildWorkflowCascadeApplied { .. }
-            | Self::WorkflowExecutionPaused { .. }
-            | Self::WorkflowExecutionResumed { .. }
-            | Self::ExternalCancelRequested { .. }
-            | Self::ExternalCancelDelivered { .. }
-            | Self::ExternalCancelFailed { .. }
-            | Self::WorkflowRedriven { .. }
-            | Self::WorkflowRetryScheduled { .. }
-            | Self::TimerCancelled { .. }
-            | Self::ExternalAwaitRequested { .. }
-            | Self::MutexGranted { .. }
-            | Self::DecisionCommitted { .. }
-            | Self::WorkflowForked { .. } => None,
-        }
-    }
-}
-
-/// A payload field of a [`WorkflowEvent`], as [`WorkflowEvent::payload_slot`]
-/// returns it.
-pub(crate) enum PayloadSlot<'a> {
-    /// A field typed `Value`. A JSON `null` decodes to `Value::Null`.
-    Required(&'a mut serde_json::Value),
-    /// A field typed `Option<Value>`. A JSON `null` decodes to `None`.
-    Optional(&'a mut Option<serde_json::Value>),
-}
-
-impl PayloadSlot<'_> {
-    /// Store `payload` exactly as serde would decode it into this field.
-    pub(crate) fn fill(self, payload: serde_json::Value) {
-        match self {
-            Self::Required(field) => *field = payload,
-            Self::Optional(field) => *field = (!payload.is_null()).then_some(payload),
-        }
     }
 }
 
