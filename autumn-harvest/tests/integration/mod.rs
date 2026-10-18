@@ -228,6 +228,7 @@ mod mutex_tests;
 mod nd_block_tests;
 #[cfg(feature = "db")]
 mod notify_post_commit_tests;
+mod notify_stage_probe_tests;
 mod otel_semconv_docs;
 mod otel_workflow_semconv_docs;
 mod panic_containment_tests;
