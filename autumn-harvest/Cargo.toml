@@ -42,7 +42,7 @@ fuzzing = ["testing", "dep:arbitrary", "chrono/arbitrary", "uuid/arbitrary"]
 # migration, no engine-runtime change. Depends on `testing` for `HistorySnapshot`
 # and the `WorkflowReplayer` handler-registration surface.
 debugger = ["testing"]
-metrics-rs = ["dep:metrics"]
+metrics-rs = ["dep:metrics", "dep:foldhash"]
 # Enables `WorkflowInfo::with_schemas::<I, O, E>()` for automatic JSON Schema
 # generation from types that derive `schemars::JsonSchema` (issue #373).
 schema = ["dep:schemars"]
@@ -151,6 +151,8 @@ tokio-postgres-rustls = { version = "0.14", optional = true }
 # reason as tokio-postgres above (a downstream lockfile shouldn't be able to
 # freshly resolve the yanked 0.24.5).
 metrics = { version = "0.24.6", optional = true }
+# Hashes the `metrics-rs` label interner. SipHash cost more than the copy it saves.
+foldhash = { version = "0.2", optional = true }
 schemars = { version = "0.8", optional = true }
 # wasmtime 48's own minimum Rust is 1.95, so the `wasm-activities` feature that
 # enables these has an effective MSRV of 1.95 (the crate's core MSRV stays 1.88).

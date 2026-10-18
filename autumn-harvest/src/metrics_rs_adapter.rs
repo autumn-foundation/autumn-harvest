@@ -130,9 +130,16 @@ const METRICS_RS_GLOBAL_SINK: usize = 1;
 /// cap is copied on every call, as it was before interning.
 const INTERNED_LABEL_CAP: usize = 4096;
 
+/// A set of interned label values.
+///
+/// A lookup hashes the value on every sample. `foldhash` costs a fraction of
+/// SipHash on these short keys, and a per-process seed still resists
+/// flooding. See `docs/performance-metrics-rs-labels.md`.
+type LabelSet = HashSet<&'static str, foldhash::fast::RandomState>;
+
 /// Every interned label value. Each one is leaked once and lives for the
 /// rest of the process.
-static INTERNED_LABELS: LazyLock<Mutex<HashSet<&'static str>>> = LazyLock::new(Mutex::default);
+static INTERNED_LABELS: LazyLock<Mutex<LabelSet>> = LazyLock::new(Mutex::default);
 
 /// Set once [`INTERNED_LABELS`] holds [`INTERNED_LABEL_CAP`] values. A miss
 /// then skips the shared lock.
@@ -141,7 +148,7 @@ static INTERNED_LABELS_FULL: AtomicBool = AtomicBool::new(false);
 thread_local! {
     /// The interned values that this thread has used. A hit takes no lock
     /// and touches no shared cache line.
-    static THREAD_LABELS: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::new());
+    static THREAD_LABELS: RefCell<LabelSet> = RefCell::default();
 }
 
 /// A label value for the per-task metric families.
@@ -187,7 +194,7 @@ fn intern_label(value: &str) -> Option<&'static str> {
 /// The copy of `value` in `labels`. A new value is leaked and added while
 /// `labels` holds fewer than `cap` values. Otherwise the result is `None`.
 fn intern_into(
-    labels: &mut HashSet<&'static str>,
+    labels: &mut LabelSet,
     value: &str,
     cap: usize,
 ) -> Option<&'static str> {
@@ -3620,7 +3627,7 @@ mod tests {
 
     #[test]
     fn intern_into_refuses_a_new_value_at_the_cap() {
-        let mut labels = HashSet::new();
+        let mut labels = LabelSet::default();
         let a = intern_into(&mut labels, "a", 2).unwrap();
         let b = intern_into(&mut labels, "b", 2).unwrap();
 
