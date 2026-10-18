@@ -925,7 +925,7 @@ async fn cancel_started_child(reasons: &[Option<&str>], workflow_id: &str) -> Op
         execution_state(&sharded, child_shard.as_i32(), child_id)
             .await
             .as_deref(),
-        Some("PENDING"),
+        Some("RUNNING"),
         "the child must exist and be live before the cancel"
     );
 
