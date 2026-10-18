@@ -68,6 +68,7 @@ const REPLAY_SECTION: &str = "## 6. Replay";
 const ISSUE_TEXT_SECTION: &str = "## 9. Upstream issue text";
 const SUBMISSION_SECTION: &str = "## 10. Submission";
 const STATUS_PREFIX: &str = "**Submission status:**";
+const SCOPE_SECTION: &str = "## 3. Scope and prior art";
 const FACTS_HEADING: &str = "### Facts checked";
 const DECLINE_PREFIX: &str = "If the project decides not to submit";
 
@@ -99,13 +100,22 @@ const PROJECT_SECTIONS: &[&str] = &[
     "## Expected Timeline",
 ];
 
-/// The proposal sections that name a person. Each one names a GitHub handle
-/// or starts with `Open.`
+/// The proposal sections that name a person. Each one links a GitHub handle,
+/// `[@name](…)`, or starts with `Open.`
 const STAFFING_SLOTS: &[&str] = &[
     "#### Project Leads(s)",
     "#### TC Sponsor",
     "#### GC Liaison",
 ];
+
+/// The open upstream issue that claims the same `workflow.*` namespace.
+const PRIOR_ISSUE: &str = "open-telemetry/semantic-conventions#1688";
+
+/// Links into this repository. They are not external facts.
+const OWN_REPO: &str = "https://github.com/autumn-foundation/autumn-harvest/";
+
+/// The phrase that precedes each copy of the community pin in the docs.
+const COMMUNITY_PIN_PREFIX: &str = "community commit `";
 
 /// Code lines of the Weaver script that must appear exactly, with the reason.
 const WEAVER_SCRIPT_LINES: &[(&str, &str)] = &[
@@ -119,6 +129,34 @@ const WEAVER_SCRIPT_LINES: &[(&str, &str)] = &[
     (
         r#"if run_weaver >"${work}/broken.log" 2>&1; then"#,
         "the broken copy must fail, so a pass is not vacuous",
+    ),
+    (
+        r#"grep -qxE "[[:space:]]*${line}[[:space:]]*" "${form}" || {"#,
+        "the form must hold each line of section 9 as a whole line",
+    ),
+    (
+        r#"[ -r "${proposal}" ] || {"#,
+        "a missing proposal must fail the script",
+    ),
+    (
+        r#"grep -vE '\((Optional|Post-Approval)\)$' || true)""#,
+        "a required section is a heading that is not Optional or Post-Approval",
+    ),
+    (
+        r#"grep -vxF -f <(printf '%s\n' "${clean}") <<<"${required}" || [ $? -eq 1 ]"#,
+        "each required heading must be a whole line of the proposal",
+    ),
+    (
+        r#"grep -xF -f <(printf '%s\n' "${guidance}") <<<"${clean}" || [ $? -eq 1 ]"#,
+        "the proposal must replace the guidance text of the template",
+    ),
+    (
+        r#"missing="$(missing_sections "${proposal}")""#,
+        "the script must check this proposal",
+    ),
+    (
+        r#"if [ -z "$(missing_sections "${work}/proposal-broken.md")" ]; then"#,
+        "a proposal without a required section must fail, so a pass is not vacuous",
     ),
 ];
 
@@ -514,27 +552,39 @@ fn pinned_sha<'a>(script: &'a str, name: &str) -> Option<&'a str> {
 
 /// The external links in `text`: each URL and each `owner/repo#N` ref.
 ///
-/// A URL that holds a `<` placeholder is not a link yet, so it is skipped.
+/// A URL may sit in a Markdown link, in angle brackets or in emphasis. A URL
+/// that holds a `<` placeholder is not a link yet, and a link into this
+/// repository is not external, so both are skipped.
 fn external_refs(text: &str) -> BTreeSet<String> {
-    text.split_whitespace()
-        .map(|token| {
-            token
-                .trim_start_matches(['(', '`'])
-                .trim_end_matches(['.', ',', ';', ':', ')', '`'])
-        })
-        .filter(|token| {
-            let url = token.starts_with("https://") && !token.contains('<');
-            let item = token.split_once('#').is_some_and(|(repo, number)| {
-                repo.split('/').count() == 2
-                    && !repo.starts_with('/')
-                    && !repo.ends_with('/')
-                    && !number.is_empty()
-                    && number.bytes().all(|b| b.is_ascii_digit())
-            });
-            url || item
-        })
-        .map(str::to_owned)
-        .collect()
+    let mut refs = BTreeSet::new();
+    for token in text.split_whitespace() {
+        let at = token.find("https://").or_else(|| token.find("http://"));
+        if let Some(at) = at {
+            let url = &token[at..];
+            let end = url
+                .find([')', '>', ']', '*', '"', '\'', '`'])
+                .unwrap_or(url.len());
+            let url = url[..end].trim_end_matches(['.', ',', ';', ':']);
+            if !url.contains('<') && !url.starts_with(OWN_REPO) {
+                refs.insert(url.to_owned());
+            }
+            continue;
+        }
+        let item = token
+            .trim_start_matches(['(', '[', '`', '*'])
+            .trim_end_matches(['.', ',', ';', ':', ')', ']', '`', '*']);
+        let is_item = item.split_once('#').is_some_and(|(repo, number)| {
+            repo.split('/').count() == 2
+                && !repo.starts_with('/')
+                && !repo.ends_with('/')
+                && !number.is_empty()
+                && number.bytes().all(|b| b.is_ascii_digit())
+        });
+        if is_item {
+            refs.insert(item.to_owned());
+        }
+    }
+    refs
 }
 
 /// Whether `text` is a date in the form `YYYY-MM-DD`.
@@ -571,13 +621,23 @@ fn heading_body<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
     Some(&body[..end])
 }
 
-/// The level of the next heading after `heading`, or 0 at the end.
-fn next_heading_level(doc: &str, heading: &str) -> usize {
+/// The next heading line after the heading line `heading`.
+fn next_heading<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
     doc.lines()
         .skip_while(|line| line.trim_end() != heading)
         .skip(1)
         .find(|line| line.starts_with('#'))
-        .map_or(0, |line| line.bytes().take_while(|b| *b == b'#').count())
+        .map(str::trim_end)
+}
+
+/// The number of `#` marks that start `heading`.
+fn heading_level(heading: &str) -> usize {
+    heading.bytes().take_while(|b| *b == b'#').count()
+}
+
+/// Whether a table cell is part of a separator row, such as `---` or `:--`.
+fn is_separator(cell: &str) -> bool {
+    !cell.is_empty() && cell.chars().all(|c| matches!(c, '-' | ':'))
 }
 
 /// The trimmed lines of a shell script that are not comments.
@@ -1150,6 +1210,17 @@ fn the_page_records_the_weaver_check() {
     let community = pinned_sha(&script, "community_commit")
         .unwrap_or_else(|| panic!("{WEAVER_SCRIPT} must pin a community commit"));
     let community = format!("`{}`", &community[..7]);
+    for (file, text) in [(PAGE, page.as_str()), (PROPOSAL, read(PROPOSAL).as_str())] {
+        for (at, _) in text.match_indices(COMMUNITY_PIN_PREFIX) {
+            let copy = text
+                .get(at + COMMUNITY_PIN_PREFIX.len() - 1..)
+                .unwrap_or_default();
+            assert!(
+                copy.starts_with(&community),
+                "each `{COMMUNITY_PIN_PREFIX}…` in {file} must name the pin {community}"
+            );
+        }
+    }
     let submission = page_section(&page, SUBMISSION_SECTION);
     let link = format!("../../{WEAVER_SCRIPT}");
     for (text, what) in [
@@ -1256,6 +1327,21 @@ fn the_issue_text_fits_the_upstream_form() {
 }
 
 #[test]
+fn the_draft_cites_the_overlapping_upstream_issue() {
+    let page = read(PAGE);
+    let issue = markdown_fence(page_section(&page, ISSUE_TEXT_SECTION)).unwrap_or_default();
+    for (text, what) in [
+        (page_section(&page, SCOPE_SECTION), SCOPE_SECTION),
+        (issue, "the issue text"),
+    ] {
+        assert!(
+            text.contains(PRIOR_ISSUE),
+            "{what} must cite {PRIOR_ISSUE}, which claims the same `workflow.*` namespace"
+        );
+    }
+}
+
+#[test]
 fn the_project_proposal_covers_the_template() {
     let proposal = read(PROPOSAL);
     assert!(
@@ -1270,28 +1356,51 @@ fn the_project_proposal_covers_the_template() {
         read(PAGE).contains("(project-proposal.md)"),
         "{PAGE} must link {PROPOSAL}"
     );
+    let mut last = 0;
     for heading in PROJECT_SECTIONS {
-        let body = heading_body(&proposal, heading)
+        let at = proposal
+            .lines()
+            .position(|line| line.trim_end() == *heading)
             .unwrap_or_else(|| panic!("{PROPOSAL} must have the template section `{heading}`"));
-        let level = heading.bytes().take_while(|b| *b == b'#').count();
         assert!(
-            !body.trim().is_empty() || next_heading_level(&proposal, heading) > level,
-            "{PROPOSAL} `{heading}` must have text or a subsection"
+            at > last,
+            "{PROPOSAL} `{heading}` must follow the template order"
+        );
+        last = at;
+        let body = heading_body(&proposal, heading).unwrap_or_default();
+        let subsection = next_heading(&proposal, heading).filter(|next| {
+            heading_level(next) > heading_level(heading)
+                && (PROJECT_SECTIONS.contains(next) || next.ends_with("(Optional)"))
+        });
+        assert!(
+            !body.trim().is_empty() || subsection.is_some(),
+            "{PROPOSAL} `{heading}` must have text or a template subsection"
         );
     }
+    let relative: Vec<&str> = proposal
+        .split("](")
+        .skip(1)
+        .filter(|target| !target.starts_with("https://") && !target.starts_with('#'))
+        .map(|target| target.split(')').next().unwrap_or_default())
+        .collect();
+    assert!(
+        relative.is_empty(),
+        "{PROPOSAL} is filed in another repository, so each link must be absolute: {relative:?}"
+    );
     for slot in STAFFING_SLOTS {
         let body = heading_body(&proposal, slot).unwrap_or_default().trim();
         assert!(
             body.starts_with("Open.") || body.contains("[@"),
-            "{PROPOSAL} `{slot}` must name a GitHub handle or start with `Open.`"
+            "{PROPOSAL} `{slot}` must link a GitHub handle or start with `Open.`"
         );
     }
 }
 
 #[test]
-fn every_issue_text_link_is_a_checked_fact() {
+fn every_cited_link_is_a_checked_fact() {
     let page = read(PAGE);
     let issue = markdown_fence(page_section(&page, ISSUE_TEXT_SECTION)).unwrap_or_default();
+    let proposal = read(PROPOSAL);
     let facts = section(
         page_section(&page, SUBMISSION_SECTION),
         FACTS_HEADING,
@@ -1301,7 +1410,7 @@ fn every_issue_text_link_is_a_checked_fact() {
     let rows: Vec<Vec<&str>> = facts
         .lines()
         .filter_map(cells)
-        .filter(|row| !row.iter().all(|cell| cell.starts_with('-')))
+        .filter(|row| !row.iter().all(|cell| is_separator(cell)))
         .skip(1)
         .collect();
     assert!(!rows.is_empty(), "`{FACTS_HEADING}` must have a table");
@@ -1313,13 +1422,15 @@ fn every_issue_text_link_is_a_checked_fact() {
     }
     let refs = external_refs(issue);
     assert!(!refs.is_empty(), "the issue text must cite its sources");
-    let unchecked: Vec<&String> = refs
-        .iter()
-        .filter(|link| !rows.iter().any(|row| row[0].contains(link.as_str())))
+    let unchecked: Vec<String> = refs
+        .into_iter()
+        .chain(external_refs(&proposal))
+        .filter(|link| !rows.iter().any(|row| external_refs(row[0]).contains(link)))
         .collect();
     assert!(
         unchecked.is_empty(),
-        "each link in the issue text needs a row in `{FACTS_HEADING}`: {unchecked:?}"
+        "each link in the issue text and the proposal needs a row in `{FACTS_HEADING}`: \
+         {unchecked:?}"
     );
 }
 
@@ -1329,29 +1440,38 @@ fn the_submission_steps_follow_the_upstream_process() {
     let submission = page_section(&page, SUBMISSION_SECTION);
     let steps = numbered_items(submission);
     let step = |needles: &[&str]| {
-        steps
+        let found: Vec<usize> = steps
             .iter()
-            .position(|step| needles.iter().all(|needle| step.contains(needle)))
+            .enumerate()
+            .filter(|(_, step)| needles.iter().all(|needle| step.contains(needle)))
+            .map(|(at, _)| at)
+            .collect();
+        match found.as_slice() {
+            [one] => *one,
+            _ => panic!("{SUBMISSION_SECTION} needs exactly one step that holds {needles:?}"),
+        }
     };
-    let check = step(&["check-otel-workflow-semconv.sh"]);
+    let check = step(&["Run the script", "check-otel-workflow-semconv.sh"]);
     let issue = step(&["file the text", ISSUE_FORM]);
     let status = step(&["`submitted`"]);
     let project = step(&["open-telemetry/community", "(project-proposal.md)"]);
+    let upstream = step(&["upstream pull request", "TC", "GC"]);
     assert!(
-        check.is_some() && issue.is_some() && status.is_some() && project.is_some(),
-        "{SUBMISSION_SECTION} needs steps that run the check, file the issue with \
-         `{ISSUE_FORM}`, set `submitted` and open the project proposal"
+        check < issue && issue < status && issue < project && project < upstream,
+        "the steps must run the check, file the issue, then set the status, open the \
+         project proposal, and open the upstream pull request after the TC and the GC"
     );
-    assert!(
-        check < issue && issue < status && issue < project,
-        "the steps must run the check, then file the issue, then set the status and \
-         open the project proposal"
-    );
+    for committee in ["Technical Committee (TC)", "Governance Committee (GC)"] {
+        assert!(
+            submission.contains(committee),
+            "{SUBMISSION_SECTION} must say that the project needs the {committee}"
+        );
+    }
     let decline = paragraph(submission, DECLINE_PREFIX)
         .unwrap_or_else(|| panic!("{SUBMISSION_SECTION} must have a `{DECLINE_PREFIX}` paragraph"));
     assert!(
         decline.contains("`declined`") && decline.contains("registry"),
-        "the decline paragraph must set `declined` and name the own-registry fallback"
+        "the decline paragraph must set `declined` and name the separate-registry fallback"
     );
 }
 
@@ -1445,7 +1565,21 @@ fn helpers_parse_their_inputs() {
         external_refs("See dapr/dapr#9213, (https://a.b/c). Not #12 or a/b#x or /a/b#1."),
         BTreeSet::from(["dapr/dapr#9213".to_owned(), "https://a.b/c".to_owned()])
     );
+    assert_eq!(
+        external_refs("[x](https://a.b/l) <https://a.b/m> **https://a.b/n** http://a.b/o"),
+        BTreeSet::from([
+            "https://a.b/l".to_owned(),
+            "https://a.b/m".to_owned(),
+            "https://a.b/n".to_owned(),
+            "http://a.b/o".to_owned(),
+        ])
+    );
     assert!(external_refs("https://x.y/tree/<commit>/z").is_empty());
+    assert!(external_refs(&format!("{OWN_REPO}tree/abc/docs")).is_empty());
+    assert!(is_separator("---"));
+    assert!(is_separator(":--:"));
+    assert!(!is_separator(""));
+    assert!(!is_separator("`a-b`"));
     assert!(is_iso_date("2026-10-18"));
     assert!(!is_iso_date("2026-1-18"));
     assert!(!is_iso_date("Oct 2026"));
@@ -1454,8 +1588,9 @@ fn helpers_parse_their_inputs() {
     assert_eq!(heading_body(doc_md, "## B").map(str::trim), Some(""));
     assert_eq!(heading_body(doc_md, "#### B2").map(str::trim), Some(""));
     assert_eq!(heading_body(doc_md, "## C"), None);
-    assert_eq!(next_heading_level(doc_md, "## B"), 3);
-    assert_eq!(next_heading_level(doc_md, "#### B2"), 0);
+    assert_eq!(next_heading(doc_md, "## B"), Some("### B1"));
+    assert_eq!(next_heading(doc_md, "#### B2"), None);
+    assert_eq!(heading_level("### B1"), 3);
     let doc: Value = serde_yaml::from_str("p: [a, 1, b]").expect("valid YAML");
     assert_eq!(strings(&doc, "p"), vec!["a".to_owned(), "b".to_owned()]);
     assert!(is_requirement_level(&Value::from("opt_in")));
