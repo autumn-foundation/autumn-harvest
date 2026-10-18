@@ -1370,7 +1370,7 @@ impl PayloadCodecs {
     /// Returns [`HarvestError`] if event serialization or codec encoding fails.
     pub fn encode_event(&self, event: &crate::event::WorkflowEvent) -> HarvestResult<Value> {
         let mut value = serde_json::to_value(event)?;
-        self.transform_event_data(&mut value, true)?;
+        self.transform_event_data(&mut value)?;
         Ok(value)
     }
 
@@ -1379,12 +1379,72 @@ impl PayloadCodecs {
     /// # Errors
     ///
     /// Returns [`HarvestError`] if codec decoding or event deserialization fails.
-    pub fn decode_event(&self, mut value: Value) -> HarvestResult<crate::event::WorkflowEvent> {
-        self.transform_event_data(&mut value, false)?;
-        Ok(event_from_wire(value)?)
+    pub fn decode_event(&self, value: Value) -> HarvestResult<crate::event::WorkflowEvent> {
+        Ok(self.decode_event_moving_payloads(value)?.0)
     }
 
-    fn transform_event_data(&self, root: &mut Value, encode: bool) -> HarvestResult<()> {
+    /// [`Self::decode_event`], plus `true` when the slow path ran.
+    ///
+    /// Serde cannot move a `Value` into a `Value` field. It visits the tree
+    /// and builds a copy, one map node and one array at a time. Payloads are
+    /// most of an event, so that copy is most of the decode cost.
+    ///
+    /// This lifts each decoded payload out of `data` and leaves `null` in its
+    /// place. Serde then decodes a small event. Each payload moves into its
+    /// field through [`WorkflowEvent::payload_slot`]. The key set that serde
+    /// sees does not change, so every error stays the same.
+    ///
+    /// A payload with no slot is either a key that the variant does not have,
+    /// or a slot that `payload_slot` omits. The slow path puts it back and
+    /// decodes again, so neither case loses data.
+    ///
+    /// [`WorkflowEvent::payload_slot`]: crate::event::WorkflowEvent::payload_slot
+    fn decode_event_moving_payloads(
+        &self,
+        mut value: Value,
+    ) -> HarvestResult<(crate::event::WorkflowEvent, bool)> {
+        use crate::payload_store::PAYLOAD_FIELD_KEYS;
+
+        let mut lifted: [Option<Value>; PAYLOAD_FIELD_KEYS.len()] = Default::default();
+        if let Some(data) = value.get_mut("data") {
+            for (slot, key) in lifted.iter_mut().zip(PAYLOAD_FIELD_KEYS) {
+                if let Some(payload) = data.get_mut(key) {
+                    let decoded = self.decode_payload_owned(std::mem::take(payload))?;
+                    if decoded.is_null() {
+                        continue;
+                    }
+                    *slot = Some(decoded);
+                }
+            }
+        }
+        let mut event = event_from_wire(value)?;
+        let mut unplaced = false;
+        for (slot, key) in lifted.iter_mut().zip(PAYLOAD_FIELD_KEYS) {
+            let Some(payload) = slot.take() else {
+                continue;
+            };
+            if let Some(field) = event.payload_slot(key) {
+                field.fill(payload);
+            } else {
+                *slot = Some(payload);
+                unplaced = true;
+            }
+        }
+        if !unplaced {
+            return Ok((event, false));
+        }
+        let mut wire = serde_json::to_value(&event)?;
+        if let Some(data) = wire.get_mut("data").and_then(Value::as_object_mut) {
+            for (slot, key) in lifted.into_iter().zip(PAYLOAD_FIELD_KEYS) {
+                if let Some(payload) = slot {
+                    data.insert(key.to_string(), payload);
+                }
+            }
+        }
+        Ok((event_from_wire(wire)?, true))
+    }
+
+    fn transform_event_data(&self, root: &mut Value) -> HarvestResult<()> {
         let Some(data) = root.get_mut("data") else {
             return Ok(());
         };
@@ -1406,20 +1466,16 @@ impl PayloadCodecs {
                 // site. `payload` is therefore already owned data, not a
                 // borrow into something a caller still needs afterward.
                 // `mem::take` moves it out, leaving `Value::Null` behind.
-                // This lets `encode_payload_owned`/`decode_payload_owned`
-                // hand the unchanged value straight back on the common
+                // This lets `encode_payload_owned` hand the unchanged
+                // value straight back on the common
                 // (non-envelope) fast path. It avoids cloning the whole
                 // JSON tree just to produce a copy of data already in
-                // hand. If encoding or decoding fails, `?` returns before
-                // the `Null` placeholder is ever observed. The caller
-                // discards the whole partially-transformed `value` along
-                // with the error (see `encode_event`/`decode_event`).
+                // hand. If encoding fails, `?` returns before the `Null`
+                // placeholder is ever observed. The caller discards the
+                // whole partially-transformed `value` along with the error
+                // (see `encode_event`).
                 let owned = std::mem::take(payload);
-                *payload = if encode {
-                    self.encode_payload_owned(owned)?
-                } else {
-                    self.decode_payload_owned(owned)?
-                };
+                *payload = self.encode_payload_owned(owned)?;
             }
         }
         Ok(())
@@ -1933,7 +1989,7 @@ impl PayloadCodecs {
 
     /// [`PayloadCodecs::decode_payload`], taking `payload` by value.
     ///
-    /// [`PayloadCodecs::transform_event_data`] already owns the whole event
+    /// [`PayloadCodecs::decode_event_moving_payloads`] already owns the whole event
     /// tree it walks. Its per-field call here hands over ownership (via
     /// `std::mem::take`) instead of borrowing. The not-an-envelope fast
     /// path below can then return the value it was already given. It
@@ -4419,5 +4475,120 @@ mod tests {
             .recode_column_for_copy(&json!({"a": 1}))
             .expect_err("the codec fails");
         assert!(err.is_codec_failure(), "{err:?}");
+    }
+
+    /// The decode that issue #2136 replaced: decode each payload in place,
+    /// then let serde rebuild the whole tree.
+    fn rebuilding_decode(codecs: &PayloadCodecs, mut wire: Value) -> HarvestResult<Value> {
+        if let Some(data) = wire.get_mut("data") {
+            for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
+                if let Some(payload) = data.get_mut(key) {
+                    *payload = codecs.decode_payload_owned(std::mem::take(payload))?;
+                }
+            }
+        }
+        let event: crate::event::WorkflowEvent = serde_json::from_value(wire)?;
+        Ok(serde_json::to_value(event)?)
+    }
+
+    /// Decode `wire` both ways and return whether the slow path ran.
+    fn assert_decodes_like_a_rebuild(codecs: &PayloadCodecs, wire: &Value) -> bool {
+        let expected = rebuilding_decode(codecs, wire.clone()).expect("rebuilding decode");
+        let (event, slow) = codecs
+            .decode_event_moving_payloads(wire.clone())
+            .expect("moving decode");
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            expected,
+            "wire: {wire}"
+        );
+        slow
+    }
+
+    #[test]
+    fn decode_moves_every_payload_kind_into_its_field() {
+        let id = crate::types::ActivityExecId::new().to_string();
+        let doc = json!({"a": [1, {"b": "c"}], "d": null});
+        let wires = [
+            json!({"type": "ActivityScheduled", "data": {
+                "activity_id": id, "name": "n", "input": doc, "queue": "q"}}),
+            json!({"type": "ActivityCompleted", "data": {"activity_id": id, "output": doc}}),
+            json!({"type": "WorkflowStarted", "data": {"input": doc,
+                "timestamp": "2026-01-01T00:00:00Z", "last_completion_result": doc}}),
+            json!({"type": "WorkflowFailed", "data": {"error": "e", "details": doc}}),
+            json!({"type": "WorkflowFailed", "data": {"error": "e", "details": null}}),
+            json!({"type": "WorkflowFailed", "data": {"error": "e"}}),
+            json!({"type": "SignalReceived", "data": {"signal_name": "s", "payload": doc}}),
+            json!({"type": "WorkflowCompleted", "data": {"output": null}}),
+        ];
+        let mut codecs = PayloadCodecs::default();
+        for wire in &wires {
+            assert!(!assert_decodes_like_a_rebuild(&codecs, wire));
+        }
+        codecs.set_default(Arc::new(XorCodec(0x5a)));
+        for wire in &wires {
+            let event: crate::event::WorkflowEvent =
+                serde_json::from_value(wire.clone()).expect("fixture");
+            let stored = codecs.encode_event(&event).expect("encode");
+            assert!(!assert_decodes_like_a_rebuild(&codecs, &stored));
+        }
+    }
+
+    #[test]
+    fn decode_keeps_ignoring_a_payload_key_the_variant_lacks() {
+        let wire = json!({"type": "WorkflowCancelled",
+            "data": {"reason": "r", "input": {"a": 1}}});
+        assert!(assert_decodes_like_a_rebuild(
+            &PayloadCodecs::default(),
+            &wire
+        ));
+    }
+
+    #[test]
+    fn decode_errors_still_name_the_bad_field() {
+        let wire = json!({"type": "ActivityCompleted",
+            "data": {"activity_id": 5, "output": {"a": 1}}});
+        let codecs = PayloadCodecs::default();
+        let moved = codecs.decode_event(wire.clone()).unwrap_err().to_string();
+        let rebuilt = rebuilding_decode(&codecs, wire).unwrap_err().to_string();
+        assert_eq!(moved, rebuilt);
+    }
+
+    /// Every variant takes the fast path, so `payload_slot` names every
+    /// payload field (issue #2136).
+    ///
+    /// The derived `Arbitrary` picks the variant from the first four bytes
+    /// as a `u32`. Four equal bytes `b` select variant `b * count / 255`, so
+    /// the sweep over `b` reaches every variant.
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn every_arbitrary_event_decodes_on_the_fast_path() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let codecs = PayloadCodecs::default();
+        let mut state: u64 = 0x2136;
+        let mut types = std::collections::BTreeSet::new();
+        for b in 0..=u8::MAX {
+            for _ in 0..16 {
+                let mut bytes = vec![b; 4];
+                bytes.extend((0..1024).map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[0]
+                }));
+                let event = crate::event::WorkflowEvent::arbitrary(&mut Unstructured::new(&bytes))
+                    .expect("1028 bytes build an event");
+                types.insert(event.type_name());
+                let stored = codecs.encode_event(&event).expect("encode");
+                assert!(
+                    !assert_decodes_like_a_rebuild(&codecs, &stored),
+                    "{} took the slow path",
+                    event.type_name()
+                );
+            }
+        }
+        // History is append-only, so no variant is ever removed. The count
+        // only grows, and this bound never needs an edit.
+        assert!(types.len() >= 53, "the sweep reached {types:?}");
     }
 }

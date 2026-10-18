@@ -89,7 +89,8 @@ fn decode_allocates_less_than_from_value() {
     drop(event);
     let (event, new) = allocs_during(|| codecs.decode_event(wire).expect("decode"));
     drop(event);
-    // Measured at 50 items: 211 with `Content` buffering, 108 type-first.
+    // Measured at 50 items: 211 with `Content` buffering, 108 type-first,
+    // and 0 once payloads move into their fields (issue #2136).
     // The test compares the two paths, so a dependency bump cannot skew it.
     assert!(
         new * 3 <= old * 2,
@@ -209,4 +210,26 @@ fn decode_matches_from_value_on_valid_fallback_shapes() {
             "input: {input}"
         );
     }
+}
+
+/// Decode moves each payload tree into its field (issue #2136).
+///
+/// Serde would rebuild the tree one map and one array at a time. So the
+/// count must not change with the payload size.
+#[test]
+fn decode_allocations_do_not_grow_with_the_payload() {
+    let codecs = PayloadCodecs::default();
+    let decode = |items: usize| {
+        let wire = codecs
+            .encode_event(&completed(document(items)))
+            .expect("encode");
+        let (event, allocs) = allocs_during(|| codecs.decode_event(wire).expect("decode"));
+        drop(event);
+        allocs
+    };
+    let (small, large) = (decode(1), decode(50));
+    assert_eq!(
+        small, large,
+        "decode made {small} allocations at 1 item and {large} at 50"
+    );
 }
