@@ -13,7 +13,8 @@
 //! repeats the `build` and `run` calls.
 //!
 //! ```text
-//! cargo bench -p autumn-harvest --bench dag_simulator_profile --no-run
+//! cargo bench -p autumn-harvest --no-default-features --features testing \
+//!   --bench dag_simulator_profile --no-run
 //! valgrind --tool=callgrind --callgrind-out-file=cg.out <binary>
 //! callgrind_annotate --inclusive=yes cg.out
 //! ```
