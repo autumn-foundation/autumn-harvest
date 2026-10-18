@@ -228,16 +228,21 @@ async fn a_re_driven_batch_at_the_cap_is_not_a_truncation() {
 #[tokio::test]
 async fn the_cap_holds_when_stored_offsets_are_not_a_prefix() {
     // A call that fails to serialize leaves its offset unused, so stored
-    // offsets can have holes. Rows inside a batch's range then still count.
+    // offsets can have holes. A hole row still counts against the cap.
     let (url, _c) = setup_database().await;
     let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
     let exec_id = ExecutionId::new();
     insert_execution(&mut conn, exec_id, "stream_cap_holes").await;
-    store::append_stream_chunks(&mut conn, exec_id, &[chunk(2, json!(2))], 2)
-        .await
-        .expect("append offset 2");
-    let batch: Vec<_> = (0..3).map(|i| chunk(i, json!(i))).collect();
-    store::append_stream_chunks(&mut conn, exec_id, &batch, 2)
+    store::append_stream_chunks(
+        &mut conn,
+        exec_id,
+        &[chunk(0, json!(0)), chunk(2, json!(2))],
+        3,
+    )
+    .await
+    .expect("append with a hole at offset 1");
+    let batch: Vec<_> = (3..5).map(|i| chunk(i, json!(i))).collect();
+    store::append_stream_chunks(&mut conn, exec_id, &batch, 3)
         .await
         .expect("append over the cap");
 
@@ -246,12 +251,161 @@ async fn the_cap_holds_when_stored_offsets_are_not_a_prefix() {
         .iter()
         .filter(|(o, _)| *o != DURABLE_STREAM_TRUNCATION_OFFSET)
         .count();
-    assert_eq!(real, 2, "never more real rows than the cap: {rows:?}");
+    assert_eq!(real, 3, "never more real rows than the cap: {rows:?}");
     assert_eq!(
         rows.last().map(|(o, _)| *o),
         Some(DURABLE_STREAM_TRUNCATION_OFFSET),
         "a dropped chunk is visible as the marker: {rows:?}"
     );
+}
+
+/// Issue #2083: a reader can hold a cursor above a hole. A later store of the
+/// hole offset would sit below that cursor, so the store drops it.
+#[tokio::test]
+async fn a_hole_behind_the_highest_stored_offset_is_never_filled() {
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "stream_hole").await;
+    store::append_stream_chunks(&mut conn, exec_id, &[chunk(1, json!(1))], 100)
+        .await
+        .expect("append offset 1");
+
+    let written = store::append_stream_chunks(&mut conn, exec_id, &[chunk(0, json!(0))], 100)
+        .await
+        .expect("append offset 0 after offset 1");
+    assert_eq!(
+        written, 0,
+        "a late chunk below the highest offset is dropped"
+    );
+
+    let written = store::append_stream_chunks(
+        &mut conn,
+        exec_id,
+        &[
+            chunk(0, json!(0)),
+            chunk(1, json!("again")),
+            chunk(2, json!(2)),
+        ],
+        100,
+    )
+    .await
+    .expect("append a re-run batch");
+    assert_eq!(written, 1, "only the offset above the highest is stored");
+    assert_eq!(
+        read_all(&mut conn, exec_id).await,
+        vec![(1, json!(1)), (2, json!(2))],
+        "the hole stays empty and the first copy stays canonical"
+    );
+}
+
+/// Issue #2083: a dropped late chunk is not a cap overflow, so it adds no
+/// truncation marker.
+#[tokio::test]
+async fn a_dropped_hole_chunk_writes_no_truncation_marker() {
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "stream_hole_marker").await;
+    store::append_stream_chunks(&mut conn, exec_id, &[chunk(2, json!(2))], 1)
+        .await
+        .expect("append offset 2 at the cap");
+    store::append_stream_chunks(&mut conn, exec_id, &[chunk(0, json!(0))], 1)
+        .await
+        .expect("append offset 0");
+    assert_eq!(read_all(&mut conn, exec_id).await, vec![(2, json!(2))]);
+}
+
+/// Issue #2083: the store compares a batch with the stored rows, not with
+/// the batch itself. A first batch in any order stores every offset.
+#[tokio::test]
+async fn an_unordered_first_batch_stores_every_offset() {
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "stream_unordered").await;
+    let written = store::append_stream_chunks(
+        &mut conn,
+        exec_id,
+        &[chunk(2, json!(2)), chunk(0, json!(0)), chunk(1, json!(1))],
+        100,
+    )
+    .await
+    .expect("append an unordered batch");
+    assert_eq!(
+        written, 3,
+        "the rule compares with stored rows, not the batch"
+    );
+    assert_eq!(
+        read_all(&mut conn, exec_id).await,
+        vec![(0, json!(0)), (1, json!(1)), (2, json!(2))]
+    );
+}
+
+/// Issue #2083: at a full cap, a batch with a late chunk and a new chunk
+/// drops both. The new chunk alone makes the marker.
+#[tokio::test]
+async fn a_mixed_batch_at_the_cap_marks_only_the_new_chunk() {
+    let (url, _c) = setup_database().await;
+    let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut conn, exec_id, "stream_mixed").await;
+    store::append_stream_chunks(&mut conn, exec_id, &[chunk(2, json!(2))], 1)
+        .await
+        .expect("append offset 2 at the cap");
+    let batch = [chunk(0, json!(0)), chunk(3, json!(3))];
+    let written = store::append_stream_chunks(&mut conn, exec_id, &batch, 1)
+        .await
+        .expect("append a mixed batch");
+    assert_eq!(written, 0);
+    let rows = read_all(&mut conn, exec_id).await;
+    assert_eq!(rows.len(), 2, "one chunk and one marker: {rows:?}");
+    assert_eq!(rows[0], (2, json!(2)));
+    assert_eq!(rows[1].0, DURABLE_STREAM_TRUNCATION_OFFSET);
+}
+
+/// Issue #2083: two overlapping appends for one run, such as a stale worker
+/// after a lease reclaim, must run one after the other. The second writer then
+/// sees the first writer's rows, so it cannot store an offset below them.
+#[tokio::test]
+async fn overlapping_appends_for_one_run_are_serialized() {
+    let (url, _c) = setup_database().await;
+    let mut first = AsyncPgConnection::establish(&url).await.expect("connect");
+    let mut second = AsyncPgConnection::establish(&url).await.expect("connect");
+    let exec_id = ExecutionId::new();
+    insert_execution(&mut first, exec_id, "stream_overlap").await;
+
+    // Hold the first writer's transaction open, so its lock stays taken.
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let holder = tokio::spawn(async move {
+        first
+            .transaction::<(), diesel::result::Error, _>(async move |c| {
+                store::append_stream_chunks(c, exec_id, &[chunk(5, json!(5))], 100)
+                    .await
+                    .expect("first writer");
+                locked_tx.send(()).expect("signal the lock");
+                release_rx.await.expect("wait for the release");
+                Ok(())
+            })
+            .await
+            .expect("first transaction");
+    });
+    locked_rx.await.expect("first writer holds the lock");
+    let late = tokio::spawn(async move {
+        let written = store::append_stream_chunks(&mut second, exec_id, &[chunk(3, json!(3))], 100)
+            .await
+            .expect("second writer");
+        (written, second)
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!late.is_finished(), "the second writer waits for the first");
+    release_tx.send(()).expect("release the first writer");
+    holder.await.expect("first writer task");
+
+    let (written, mut second) = late.await.expect("second writer task");
+    assert_eq!(written, 0, "offset 3 sits below the committed offset 5");
+    assert_eq!(read_all(&mut second, exec_id).await, vec![(5, json!(5))]);
 }
 
 #[tokio::test]

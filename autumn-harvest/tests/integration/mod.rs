@@ -170,6 +170,7 @@ mod fanout_result_writer_db_tests;
 mod fanout_tests;
 mod fanout_tolerance_tests;
 mod force_fail_tests;
+mod fork_tests;
 mod formal_models_coverage;
 mod formal_trace_coverage;
 mod fuzz_nightly_wiring;
@@ -241,6 +242,7 @@ mod payload_cap_tests;
 mod payload_offload_db_tests;
 #[cfg(feature = "testing")]
 mod payload_offload_replay_tests;
+mod payload_orphan_sweep_tests;
 mod performance_docs;
 #[cfg(feature = "db")]
 mod pg_stats_snapshot;

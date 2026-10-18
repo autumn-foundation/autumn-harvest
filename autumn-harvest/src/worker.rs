@@ -395,15 +395,7 @@ impl WorkerRuntimeConfig {
         // parsing removes `.` and `..` there, so those names are refused too.
         if self.fairness_keys {
             for queue in &self.queues {
-                crate::queue_pause::validate_queue_name(queue).map_err(|e| {
-                    HarvestError::Config(format!("fairness_keys: queue {queue:?}: {e}"))
-                })?;
-                if queue == "." || queue == ".." {
-                    return Err(HarvestError::Config(format!(
-                        "fairness_keys: queue {queue:?} is a URL dot segment, \
-                         which the weight API cannot address"
-                    )));
-                }
+                crate::queue_fairness::validate_fairness_queue_name(queue)?;
             }
         }
         // A degenerate band (min_slots > max_slots, or a configured value
@@ -6449,7 +6441,8 @@ async fn workflow_execution_transition_error(
         )
 }
 
-/// The input and memo a workflow retry starts with, decoded (issue #1979).
+/// The input, memo and headers a workflow retry starts with, decoded
+/// (issue #1979, issue #2043).
 ///
 /// The start path encodes them again. A value this registry cannot decode
 /// returns `None`, so the run fails without a retry. A missing key must not
@@ -6457,20 +6450,31 @@ async fn workflow_execution_transition_error(
 fn decode_retry_payload(
     codecs: &crate::payload_codec::PayloadCodecs,
     execution: &WorkflowExecution,
-) -> Option<(serde_json::Value, Option<serde_json::Value>)> {
+) -> Option<RetryPayload> {
     let decoded = codecs.decode_column(&execution.input).and_then(|input| {
-        codecs
-            .decode_column_opt(execution.memo.as_ref())
-            .map(|memo| (input, memo))
+        let memo = codecs.decode_column_opt(execution.memo.as_ref())?;
+        let headers = execution
+            .context_headers
+            .as_ref()
+            .map(|stored| codecs.decode_headers(stored))
+            .transpose()?;
+        Ok((input, memo, headers))
     });
     if decoded.is_err() {
         tracing::warn!(
             exec_id = %execution.id,
-            "workflow retry skipped: the stored input or memo could not be decoded"
+            "workflow retry skipped: the stored input, memo or headers could not be decoded"
         );
     }
     decoded.ok()
 }
+
+/// What [`decode_retry_payload`] returns: input, memo and headers.
+type RetryPayload = (
+    serde_json::Value,
+    Option<serde_json::Value>,
+    Option<std::collections::HashMap<String, String>>,
+);
 
 /// Seal the execution row `COMPLETED` with `output`, which is the stored
 /// form. The caller encodes it with [`PayloadCodecs::encode_column`]
@@ -9821,7 +9825,8 @@ pub async fn persist_workflow_failure(
             if let (Some(exec_ref), Some((rid, policy, attempt, fire_at, start_delay))) =
                 (exec_ref, retry_fire_info)
                 && attempt < policy.max_attempts
-                && let Some((retry_input, retry_memo)) = decode_retry_payload(codecs, exec_ref)
+                && let Some((retry_input, retry_memo, retry_headers)) =
+                    decode_retry_payload(codecs, exec_ref)
             {
                 let retry_workflow_id = rid.to_string();
                 let retry_params = crate::execution::StartWorkflowParams {
@@ -9846,10 +9851,7 @@ pub async fn persist_workflow_failure(
                     owner: exec_ref.owner.as_deref(),
                     runbook_url: exec_ref.runbook_url.as_deref(),
                     severity: exec_ref.severity.as_deref(),
-                    context_headers: exec_ref
-                        .context_headers
-                        .clone()
-                        .and_then(|v| serde_json::from_value(v).ok()),
+                    context_headers: retry_headers,
                     sla: exec_ref.sla,
                     schedule_id: exec_ref.schedule_id,
                     scheduled_for: exec_ref.scheduled_for,
@@ -11179,11 +11181,15 @@ async fn persist_activity_wait_park(
 ///
 /// Extracted from [`persist_scheduled_activities`] (issue #950) so the
 /// generalized mixed-batch path enforces the identical guarantee.
+///
+/// The check skips each activity in `settled`. A fork record settled it, so
+/// no host runs it (issue #2000).
 async fn fail_activities_for_broken_sessions(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     scheduled_activities: &[ScheduledActivityCommand],
     activity_task_ids: &[uuid::Uuid],
+    settled: &std::collections::HashSet<ActivityExecId>,
     next_event_id: &mut i32,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
@@ -11218,6 +11224,9 @@ async fn fail_activities_for_broken_sessions(
 
     let mut synthesized = false;
     for (scheduled, activity_task_id) in scheduled_activities.iter().zip(activity_task_ids.iter()) {
+        if settled.contains(&scheduled.activity_id) {
+            continue;
+        }
         let Some(session_uuid) = scheduled.session_id.map(|id| id.as_uuid()) else {
             continue;
         };
@@ -11239,6 +11248,11 @@ async fn fail_activities_for_broken_sessions(
         synthesized = true;
     }
     Ok(synthesized)
+}
+
+/// The activity ids of `scheduled`, in command order.
+fn scheduled_activity_ids(scheduled: &[ScheduledActivityCommand]) -> Vec<ActivityExecId> {
+    scheduled.iter().map(|s| s.activity_id).collect()
 }
 
 /// The pre-transaction plan for a batch of `ScheduleActivity` commands:
@@ -11268,48 +11282,72 @@ struct ActivityEnqueuePlan {
 /// reserved header. A row with the result writer gets the header. The header
 /// rides in the row's existing `context_headers` column, so it needs no
 /// migration.
+///
+/// `stored` is the execution cell and `inherited` is the same cell decoded.
+/// A row that adds or removes nothing copies the stored cell, so it spends no
+/// new nonce and nests no second layer (issue #2043).
+///
+/// # Errors
+///
+/// [`HarvestError`] when the changed map does not encode.
 fn activity_row_context_headers(
-    context_headers: Option<&serde_json::Value>,
+    stored: Option<&serde_json::Value>,
+    inherited: Option<&std::collections::HashMap<String, String>>,
     result_writer: bool,
-) -> Option<serde_json::Value> {
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<Option<serde_json::Value>> {
     let key = crate::fan_out::RESULT_WRITER_HEADER;
-    let inherited = context_headers.and_then(serde_json::Value::as_object);
     if !result_writer && !inherited.is_some_and(|headers| headers.contains_key(key)) {
-        return context_headers.cloned();
+        return Ok(stored.cloned());
     }
     let mut headers = inherited.cloned().unwrap_or_default();
     headers.remove(key);
     if result_writer {
-        headers.insert(key.to_string(), serde_json::Value::from("1"));
+        headers.insert(key.to_string(), "1".to_string());
     }
-    Some(serde_json::Value::Object(headers))
+    codecs.encode_headers(&headers).map(Some)
 }
 
 #[cfg(test)]
 mod result_writer_header_tests {
     use super::activity_row_context_headers;
     use crate::fan_out::RESULT_WRITER_HEADER;
+    use crate::payload_codec::PayloadCodecs;
     use serde_json::json;
+    use std::collections::HashMap;
+
+    fn map(value: &serde_json::Value) -> HashMap<String, String> {
+        serde_json::from_value(value.clone()).expect("a string map")
+    }
 
     #[test]
     fn a_plain_row_keeps_the_execution_headers() {
+        let codecs = PayloadCodecs::default();
         let headers = json!({ "tenant": "a" });
+        let inherited = map(&headers);
         assert_eq!(
-            activity_row_context_headers(Some(&headers), false),
+            activity_row_context_headers(Some(&headers), Some(&inherited), false, &codecs)
+                .expect("no encode"),
             Some(headers)
         );
-        assert_eq!(activity_row_context_headers(None, false), None);
+        assert_eq!(
+            activity_row_context_headers(None, None, false, &codecs).expect("no encode"),
+            None
+        );
     }
 
     #[test]
     fn a_writer_row_adds_the_header() {
+        let codecs = PayloadCodecs::default();
         let headers = json!({ "tenant": "a" });
+        let inherited = map(&headers);
         assert_eq!(
-            activity_row_context_headers(Some(&headers), true),
+            activity_row_context_headers(Some(&headers), Some(&inherited), true, &codecs)
+                .expect("encode"),
             Some(json!({ "tenant": "a", RESULT_WRITER_HEADER: "1" }))
         );
         assert_eq!(
-            activity_row_context_headers(None, true),
+            activity_row_context_headers(None, None, true, &codecs).expect("encode"),
             Some(json!({ RESULT_WRITER_HEADER: "1" }))
         );
     }
@@ -11318,21 +11356,30 @@ mod result_writer_header_tests {
     /// reserved header, so a caller cannot turn on the writer.
     #[test]
     fn a_plain_row_drops_a_caller_supplied_writer_header() {
+        let codecs = PayloadCodecs::default();
         let headers = json!({ "tenant": "a", RESULT_WRITER_HEADER: "1" });
+        let inherited = map(&headers);
         assert_eq!(
-            activity_row_context_headers(Some(&headers), false),
+            activity_row_context_headers(Some(&headers), Some(&inherited), false, &codecs)
+                .expect("encode"),
             Some(json!({ "tenant": "a" }))
         );
     }
 }
 
 /// Whether the task row asks the worker to write the result (issue #1986).
-fn task_writes_result(task: &TaskQueueItem) -> bool {
-    task.context_headers
-        .as_ref()
-        .and_then(|headers| headers.get(crate::fan_out::RESULT_WRITER_HEADER))
-        .and_then(serde_json::Value::as_str)
-        == Some("1")
+///
+/// The marker rides inside the header cell, so the cell is decoded first
+/// (issue #2043). A cell that does not decode is not a writer row. The
+/// attempt fails on that cell before it reaches a place that matters.
+fn task_writes_result(task: &TaskQueueItem, codecs: &crate::payload_codec::PayloadCodecs) -> bool {
+    codecs
+        .decode_headers_opt(task.context_headers.as_ref())
+        .is_ok_and(|headers| {
+            headers
+                .get(crate::fan_out::RESULT_WRITER_HEADER)
+                .is_some_and(|value| value == "1")
+        })
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -11352,6 +11399,10 @@ fn build_activity_enqueue_plan(
     let mut activity_events: Vec<WorkflowEvent> = Vec::with_capacity(scheduled_activities.len());
     let mut enqueued = Vec::with_capacity(scheduled_activities.len());
     let mut decoded_input: Option<serde_json::Value> = None;
+    // Decode the execution headers once for the whole decision (issue #2043).
+    let inherited_headers = context_headers
+        .map(|stored| registry.payload_codecs().decode_headers(stored))
+        .transpose()?;
     // Dynamic per-key rate-limit buckets (issue #699) to lazily register inside
     // the enqueue transaction: `(bucket_key, refill_rate, burst)`. Deduped so a
     // fan-out of N activities sharing one resolved tenant key ensures the bucket
@@ -11631,8 +11682,12 @@ fn build_activity_enqueue_plan(
             { ATTR_QUEUE } = %queue_name,
         )
         .in_scope(|| registry.telemetry().capture_trace_context());
-        params.context_headers =
-            activity_row_context_headers(context_headers, scheduled.result_writer);
+        params.context_headers = activity_row_context_headers(
+            context_headers,
+            inherited_headers.as_ref(),
+            scheduled.result_writer,
+            registry.payload_codecs(),
+        )?;
         enqueued.push(params);
     }
 
@@ -11670,6 +11725,9 @@ async fn persist_scheduled_activities(
     parent_fairness_key: Option<&str>,
     context_headers: Option<&serde_json::Value>,
     workflow_input: &serde_json::Value,
+    // Issue #2000: `true` when the run is a fork, so a recorded fork serves
+    // each activity from its record instead of running it.
+    is_fork: bool,
 ) -> HarvestResult<()> {
     let ActivityEnqueuePlan {
         activity_events,
@@ -11697,7 +11755,7 @@ async fn persist_scheduled_activities(
     // activity-completion races, this is a *fresh* dispatch (the activities
     // being scheduled here cannot have completed yet), so no other in-band
     // check exists to catch it.
-    let (deferred, had_wake_requested, synthesized_broken_session_failure) =
+    let (deferred, had_wake_requested, synthesized_outcome) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             // Cancellable/renewable timer bookkeeping (issue #768): resolve
             // the ArmTimer/CancelTimer row mutations FIRST, then build the
@@ -11756,6 +11814,18 @@ async fn persist_scheduled_activities(
             )
             .await?;
 
+            // Issue #2000: a fork resolves each activity from its record
+            // here. It runs before the session check, which skips each
+            // settled activity.
+            let fork = crate::fork::serve_recorded_activities(
+                conn,
+                exec_id,
+                is_fork,
+                &scheduled_activity_ids(scheduled_activities),
+                &mut race_next_event_id,
+                registry,
+            )
+            .await?;
             // Worker sessions (issue #606): fail any member activity whose
             // session already left ACTIVE, so the workflow observes
             // SessionBroken on its next decision cycle instead of hanging on a
@@ -11765,16 +11835,18 @@ async fn persist_scheduled_activities(
                 exec_id,
                 scheduled_activities,
                 &activity_task_ids,
+                &fork.settled,
                 &mut race_next_event_id,
                 registry.payload_codecs(),
             )
             .await?;
+            let served_from_fork = fork.served;
 
             let had_wake_requested = queue::park_workflow_task(conn, task_id, sticky).await?;
             Ok((
                 deferred,
                 had_wake_requested,
-                synthesized_broken_session_failure,
+                synthesized_broken_session_failure || served_from_fork,
             ))
         }))
         .await?;
@@ -11783,12 +11855,10 @@ async fn persist_scheduled_activities(
         start.spawn();
     }
 
-    // The synthesized SessionBroken failure(s) above are not tied to any
-    // external wake source (they were resolved entirely within this
-    // transaction), so the workflow must be woken unconditionally to
-    // observe them on its next decision cycle -- `had_wake_requested` alone
-    // would miss this case.
-    if had_wake_requested || synthesized_broken_session_failure {
+    // The transaction above resolved SessionBroken failures and fork outcomes
+    // itself. No external source wakes the workflow for them. So wake it
+    // here. `had_wake_requested` alone misses this case.
+    if had_wake_requested || synthesized_outcome {
         queue::wake_workflow_task(conn, exec_id).await?;
     }
 
@@ -12402,13 +12472,14 @@ async fn persist_all_started_child_workflows(
                     .flatten(),
                 parent_fairness_key,
             )?;
-            crate::cross_shard_child::record_cross_shard_child(
+            crate::cross_shard_child::record_cross_shard_child_with_codecs(
                 conn,
                 parent_exec_id,
                 child.child_id,
                 &child.workflow_name,
                 None, // awaited child
                 &spec,
+                registry.payload_codecs(),
             )
             .await?;
         }
@@ -13134,7 +13205,14 @@ fn cross_shard_child_spec(
         input: input.clone(),
         queue_name: parent_execution.queue_name.clone(),
         assigned_build_id: parent_execution.assigned_build_id.clone(),
-        context_headers: parent_execution.context_headers.clone(),
+        // The spec is one encoded cell. It holds the headers in plaintext, so
+        // an old-key envelope cannot hide inside it from the rotation census.
+        // The relay encodes them again for the child row (issue #2043).
+        context_headers: parent_execution
+            .context_headers
+            .as_ref()
+            .map(|stored| registry.payload_codecs().decode_column(stored))
+            .transpose()?,
         tenant: parent_execution.tenant.clone(),
         owner: defaults.owner.map(str::to_string),
         runbook_url: defaults.runbook_url.map(str::to_string),
@@ -13330,13 +13408,14 @@ async fn insert_awaited_child_execution(
             trace_context,
             parent_fairness_key,
         )?;
-        return crate::cross_shard_child::record_cross_shard_child(
+        return crate::cross_shard_child::record_cross_shard_child_with_codecs(
             conn,
             parent_exec_id,
             child.child_id,
             &child.workflow_name,
             None, // awaited child
             &spec,
+            registry.payload_codecs(),
         )
         .await;
     }
@@ -14189,18 +14268,31 @@ async fn persist_mixed_suspension_batch(
             .await?;
         }
 
+        // Issue #2000: a fork resolves each activity from its record here,
+        // before the session check, exactly as on the plain path.
+        let fork = crate::fork::serve_recorded_activities(
+            conn,
+            exec_id,
+            crate::fork::is_fork(parent_execution),
+            &scheduled_activity_ids(&batch.scheduled_activities),
+            &mut next_event_id,
+            registry,
+        )
+        .await?;
         // Worker sessions (issue #606): fail any member activity whose session
         // already left ACTIVE so the workflow observes SessionBroken on its next
         // decision cycle instead of hanging on a task pinned to a dead host.
-        let synthesized_broken_session_failure = fail_activities_for_broken_sessions(
+        let broken_session_failure = fail_activities_for_broken_sessions(
             conn,
             exec_id,
             &batch.scheduled_activities,
             &activity_task_ids,
+            &fork.settled,
             &mut next_event_id,
             registry.payload_codecs(),
         )
         .await?;
+        let synthesized_broken_session_failure = broken_session_failure || fork.served;
 
         // ── park ────────────────────────────────────────────────────────────
         let deadline = timer_fire_instants
@@ -15794,13 +15886,14 @@ async fn create_detached_child_executions(
                 .in_scope(|| registry.telemetry().capture_trace_context()),
                 parent_fairness_key,
             )?;
-            crate::cross_shard_child::record_cross_shard_child(
+            crate::cross_shard_child::record_cross_shard_child_with_codecs(
                 conn,
                 ExecutionId::from_uuid(parent_execution.id),
                 *child_id,
                 workflow_name,
                 Some(*parent_close_policy),
                 &spec,
+                registry.payload_codecs(),
             )
             .await?;
             continue;
@@ -16316,6 +16409,8 @@ async fn handle_activity_result(
     // Issue #1243: configured codecs, so this write encodes under the
     // same registry replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Issue #1986: whether the row asks for a result writer.
+    result_writer: bool,
     // Issue #1986: the result writer's reference, written before the call.
     stored: Option<&crate::fan_out::StoredResult>,
     // Issue #1996: the LLM calls a completion writes with its event.
@@ -16327,7 +16422,7 @@ async fn handle_activity_result(
         // as a reference, so it fails instead (compare issue #1758).
         Ok(output)
             if stored.is_none()
-                && task_writes_result(task)
+                && result_writer
                 && output.get(crate::fan_out::STORED_RESULT_KEY).is_some() =>
         {
             use crate::failure::IntoActivityErrorString as _;
@@ -16502,6 +16597,7 @@ pub async fn write_activity_result_for_task(
         &crate::telemetry::NoOpMetrics,
         crate::builder::DEFAULT_RETRY_AFTER_CEILING,
         codecs,
+        task_writes_result(task, codecs),
         None,
         &[],
     )
@@ -19320,6 +19416,8 @@ async fn process_activity_task(
         worker_id,
         activity_name,
         llm_calls: &[],
+        // A failure written before the handler runs stores no result.
+        result_writer: false,
     };
     if let crate::circuit_breaker::DispatchDecision::ShortCircuit {
         opened_at,
@@ -19359,9 +19457,10 @@ async fn process_activity_task(
     let codecs = registry.payload_codecs();
     let decoded = codecs.decode_column(&task.input).and_then(|input| {
         let checkpoint = codecs.decode_column_opt(task.heartbeat_details.as_ref())?;
-        Ok((input, checkpoint))
+        let headers = codecs.decode_headers_opt(task.context_headers.as_ref())?;
+        Ok((input, checkpoint, headers))
     });
-    let (handler_input, previous_checkpoint) = match decoded {
+    let (handler_input, previous_checkpoint, activity_headers) = match decoded {
         Ok(decoded) => decoded,
         Err(error) => {
             use crate::failure::IntoActivityErrorString as _;
@@ -19372,7 +19471,7 @@ async fn process_activity_task(
             );
             let payload = crate::failure::ActivityFailure::retryable(
                 crate::failure::ERROR_TYPE_PAYLOAD_DECODE_FAILED,
-                "the stored activity input or checkpoint could not be decoded",
+                "the stored activity input, checkpoint or headers could not be decoded",
             )
             .into_error_payload();
             return fail_attempt_before_handler(
@@ -19416,22 +19515,11 @@ async fn process_activity_task(
         .trace_context
         .as_ref()
         .and_then(TraceContextCarrier::from_json);
-    let activity_context_headers = task
-        .context_headers
-        .as_ref()
-        .and_then(|v| {
-            match serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to deserialize activity context headers; propagating empty map");
-                    None
-                }
-            }
-        })
-        .map_or_else(
-            || std::sync::Arc::new(std::collections::HashMap::new()),
-            std::sync::Arc::new,
-        );
+    // Read the writer marker from the decoded headers, once for the attempt.
+    let result_writer = activity_headers
+        .get(crate::fan_out::RESULT_WRITER_HEADER)
+        .is_some_and(|value| value == "1");
+    let activity_context_headers = std::sync::Arc::new(activity_headers);
     // Issue #783: identity is resolved from the row `append_activity_started_if_pending`
     // already locked (no extra query) plus the claimed task row.
     let activity_identity = ActivityIdentity::new(
@@ -19492,7 +19580,7 @@ async fn process_activity_task(
             activity_id,
             claim: activity_claim.clone(),
             max_result_bytes: effective_result_cap,
-            result_writer: task_writes_result(task),
+            result_writer,
             offloader: registry.payload_offloader_arc(),
         });
 
@@ -19820,7 +19908,7 @@ async fn process_activity_task(
             // Issue #1986: the result writer moves every result to the store.
             let offload_applies = registry
                 .payload_offloader()
-                .is_some_and(|o| observed > o.threshold() || task_writes_result(task));
+                .is_some_and(|o| observed > o.threshold() || result_writer);
             if observed > effective_result_cap && !offload_applies {
                 use crate::failure::IntoActivityErrorString as _;
                 let error = crate::failure::ActivityFailure::non_retryable(
@@ -20187,6 +20275,7 @@ async fn process_activity_task(
         worker_id,
         activity_name,
         llm_calls: &llm_calls,
+        result_writer,
     };
     let finalized = write_activity_result(
         pool,
@@ -20386,6 +20475,11 @@ struct ActivityAttempt<'a> {
     /// The LLM calls the attempt recorded (issue #1996). A completion
     /// writes them with its event. A failure drops them.
     llm_calls: &'a [crate::llm_ledger::LlmCall],
+    /// Whether the row asks the worker to write the result (issue #1986).
+    /// The attempt decodes the headers once and carries the answer here. A
+    /// later decode that fails cannot turn a writer row into a plain one
+    /// (issue #2043).
+    result_writer: bool,
 }
 
 /// Write the result of an activity attempt that has started (issue #1788).
@@ -20420,6 +20514,7 @@ async fn write_activity_result(
         worker_id,
         activity_name,
         llm_calls,
+        result_writer,
     } = *attempt_of;
     let mut conn = crate::pool::acquire_with_retries(pool, FINALIZE_ACQUIRE_ATTEMPTS).await?;
     // A handler failure and an inline output upload nothing. The count
@@ -20434,7 +20529,7 @@ async fn write_activity_result(
     // safe. A lost claim leaves one blob without a reference row, as a
     // rolled-back offload does.
     let stored = match (activity_result, registry.payload_offloader()) {
-        (Ok(output), Some(offloader)) if task_writes_result(task) => Some(
+        (Ok(output), Some(offloader)) if result_writer => Some(
             crate::fan_out::StoredResult::write(
                 offloader.store().as_ref(),
                 registry.payload_codecs(),
@@ -20461,6 +20556,7 @@ async fn write_activity_result(
             registry.telemetry().metrics.as_ref(),
             registry.retry_after_ceiling,
             registry.payload_codecs(),
+            result_writer,
             stored.as_ref(),
             llm_calls,
         )
@@ -21614,6 +21710,7 @@ async fn handle_suspended_workflow(
             context.persistence.task.fairness_key.as_deref(),
             context.execution.context_headers.as_ref(),
             &context.execution.input,
+            crate::fork::is_fork(context.execution),
         )
         .await
     } else if let Some(activity_ids) = extract_all_activity_waits(commands) {
@@ -26028,6 +26125,12 @@ async fn process_workflow_task(
             // execution row so a child workflow can read it via `ctx.info()` /
             // `ctx.parent_execution_id()`. `None` for a top-level run.
             parent_execution_id: prepared.execution.parent_id.map(ExecutionId::from_uuid),
+            // Issue #2082: read the start source and predecessor from the row.
+            // A keyed entity uses them to tell a client start from a checkpoint.
+            start_provenance: crate::types::StartProvenance::from_row(
+                prepared.execution.start_source.as_deref(),
+                prepared.execution.continued_from_exec_id,
+            ),
             // Issue #2021: Postgres records a cancel as an event in the history.
             cancellation_reason: None,
         };
@@ -26045,20 +26148,19 @@ async fn process_workflow_task(
             .filter(|h| h.workflow == wf_name)
             .collect();
 
-        let exec_context_headers = prepared
-            .execution
-            .context_headers
-            .as_ref()
-            .and_then(|v| {
-                match serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()) {
-                    Ok(h) => Some(h),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to deserialize workflow execution context headers; propagating empty map");
-                        None
-                    }
-                }
-            })
-            .unwrap_or_default();
+        // A header can carry a tenant or a trace. A missing key fails the run,
+        // like a history that cannot be decoded. It never runs without the
+        // headers (issue #2043).
+        let exec_context_headers = fail_execution_on_error(
+            conn,
+            task,
+            worker_id,
+            registry
+                .payload_codecs()
+                .decode_headers_opt(prepared.execution.context_headers.as_ref()),
+            registry.payload_codecs(),
+        )
+        .await?;
 
         // Issue #967 (R&D spike, `hot-code-swap` feature): a module-hosted
         // workflow's handler is the `hot_swap::module_workflow_handler`
@@ -26208,6 +26310,27 @@ async fn process_workflow_task(
                 &task.queue_name,
                 outcome,
             );
+        }
+
+        // Issue #2000: a recorded fork never runs an effect that it cannot
+        // serve from the record. It fails here, before any persist path.
+        if crate::fork::history_is_recorded_fork(&prepared.execution, &history_events)
+            && let Some(command) =
+                crate::fork::recorded_outcome_refusal(&run_outcome, &pending_cmds)
+        {
+            return fail_workflow_execution_clearing_strikes(
+                conn,
+                task,
+                worker_id,
+                Err::<(), _>(HarvestError::Config(format!(
+                    "recorded fork refused {command}: recorded mode cannot serve it, so \
+                     fork with effects = live to run it"
+                ))),
+                workflow_panic_strikes,
+                prepared.exec_id.as_uuid(),
+                registry.payload_codecs(),
+            )
+            .await;
         }
 
         match run_outcome {
@@ -42042,7 +42165,13 @@ mod tests {
             interval,
         );
 
-        advance_sampler_ticks(interval, 5).await;
+        // The accept is real loopback I/O, not paused time. A slow runner can
+        // land it after a fixed tick count. So the test ticks until the
+        // accept lands, under a deadline in real time.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while listener.touch_count() == 0 && std::time::Instant::now() < deadline {
+            advance_sampler_ticks(interval, 1).await;
+        }
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         listener.stop();
@@ -53939,6 +54068,7 @@ mod tests {
                 context_headers: None,
                 execution_timeout: None,
                 deadline_at: None,
+                start_provenance: None,
                 parent_execution_id: None,
                 workflow_id: None,
                 queue_name: None,

@@ -2196,11 +2196,12 @@ enum WorkflowCommand {
         /// live executions or force this sort order.
         #[arg(long = "history-bloat-min-events")]
         history_bloat_min_events: Option<u64>,
-        /// Filter by workflow-start provenance (issue #740): one of api,
+        /// Filter by workflow-start provenance (issue #740). Values: api,
         /// schedule, backfill, `signal_with_start`, `update_with_start`,
-        /// `completion_trigger`, webhook, child, batch, `continue_as_new`,
-        /// reset, outbox, or unknown (matches pre-upgrade/NULL rows). The
-        /// server rejects any other value with a 400.
+        /// `completion_trigger`, webhook, broker, child, batch,
+        /// `continue_as_new`, reset, rerun, outbox, transactional, fork.
+        /// `unknown` matches pre-upgrade/NULL rows. The server rejects any
+        /// other value with a 400.
         #[arg(long = "start-source")]
         start_source: Option<String>,
     },
@@ -12361,8 +12362,12 @@ fn checked_queue_segment(queue_name: &str) -> Result<String, CliError> {
 }
 
 /// Reject a fairness key that cannot survive URL path parsing intact.
+///
+/// Only the literal `.` and `..` fail. `path_segment` encodes `%`, so a key
+/// such as `%2e` reaches the route as `%252e`. The core validator accepts it
+/// (issue #2097).
 fn checked_fairness_key_segment(fairness_key: &str) -> Result<String, CliError> {
-    if is_url_dot_segment(fairness_key) {
+    if matches!(fairness_key, "." | "..") {
         return Err(CliError::FairnessKeyDotSegment {
             value: fairness_key.to_string(),
         });

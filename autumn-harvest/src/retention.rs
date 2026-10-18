@@ -90,6 +90,13 @@ pub const DEFAULT_TERMINAL_TASK_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 /// same lease-lost result for a deleted row as for a finished one.
 pub const MIN_TERMINAL_TASK_RETENTION: Duration = Duration::from_secs(60 * 60);
 
+/// Shortest grace period for the orphaned-blob sweep (issue #2123): 1 hour.
+///
+/// The grace period must outlast any write transaction. A writer uploads its
+/// blobs first and commits the reference later. The sweep never deletes a
+/// blob younger than the grace period.
+pub const MIN_PAYLOAD_ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
+
 /// Default byte cap for an opt-in captured summary payload (issue #752).
 ///
 /// A `result`/`error` value larger than this is replaced with a typed
@@ -461,6 +468,16 @@ pub struct RetentionConfig {
     /// It is independent of history retention, which is off by default.
     /// Defaults to [`DEFAULT_TERMINAL_TASK_RETENTION_SECS`].
     pub terminal_task_retention_secs: Option<u64>,
+    /// Grace period of the orphaned-blob sweep in seconds (issue #2123).
+    /// `None` disables the sweep. It is off by default.
+    ///
+    /// A write that rolls back after its payload upload leaves blobs with no
+    /// `harvest_payload_refs` row. The sweep deletes a blob when it is older
+    /// than this grace period and no shard references it. It needs a
+    /// [`PayloadStore`](crate::payload_store::PayloadStore) that implements
+    /// `list`, and a store that holds only harvest blobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_orphan_grace_secs: Option<u64>,
     /// Partition maintenance for the opt-in partitioned `harvest_events`
     /// layout (issue #958).
     ///
@@ -570,6 +587,7 @@ impl Default for RetentionConfig {
             summary: None,
             rate_limit_bucket_retention_secs: Some(DEFAULT_RATE_LIMIT_BUCKET_RETENTION_SECS),
             terminal_task_retention_secs: Some(DEFAULT_TERMINAL_TASK_RETENTION_SECS),
+            payload_orphan_grace_secs: None,
             partitions: PartitionMaintenanceConfig::default(),
         }
     }
@@ -804,6 +822,30 @@ impl RetentionConfig {
         self
     }
 
+    /// Turn on the orphaned-blob sweep with `grace` (issue #2123).
+    ///
+    /// Use it only with a store that implements
+    /// [`PayloadStore::list`](crate::payload_store::PayloadStore::list) and
+    /// holds only harvest blobs.
+    #[must_use]
+    pub const fn with_payload_orphan_grace(mut self, grace: Duration) -> Self {
+        self.payload_orphan_grace_secs = Some(grace.as_secs());
+        self
+    }
+
+    /// The orphaned-blob sweep's grace period, or `None` when it is off
+    /// (issue #2123).
+    #[must_use]
+    pub fn payload_orphan_grace(&self) -> Option<Duration> {
+        self.payload_orphan_grace_secs.map(Duration::from_secs)
+    }
+
+    /// Whether the orphaned-blob sweep runs this tick (issue #2123).
+    #[must_use]
+    pub const fn payload_orphan_sweep_active(&self) -> bool {
+        self.payload_orphan_grace_secs.is_some()
+    }
+
     /// The terminal-task janitor's age, or `None` when it is off (issue
     /// #1811).
     #[must_use]
@@ -1001,6 +1043,16 @@ impl RetentionConfig {
                 MAX_MAX_AGE.as_secs()
             ));
         }
+        // The orphan sweep deletes data, so its grace has a floor (issue #2123).
+        if let Some(grace) = self.payload_orphan_grace()
+            && !(MIN_PAYLOAD_ORPHAN_GRACE..=MAX_MAX_AGE).contains(&grace)
+        {
+            return Err(format!(
+                "payload_orphan_grace must be between {}s and {}s",
+                MIN_PAYLOAD_ORPHAN_GRACE.as_secs(),
+                MAX_MAX_AGE.as_secs()
+            ));
+        }
         // `EnableOptions::validate` (issue #958) rejects a zero lookahead at
         // enable time for exactly this reason: it leaves every append landing
         // in the DEFAULT partition. `PartitionMaintenanceConfig` must refuse
@@ -1024,7 +1076,8 @@ impl RetentionConfig {
     /// - bounded summary GC (issue #752);
     /// - partition maintenance (issue #958);
     /// - the idle rate-limit-bucket GC (issue #1127);
-    /// - the terminal-task janitor (issue #1811).
+    /// - the terminal-task janitor (issue #1811);
+    /// - the orphaned-blob sweep (issue #2123).
     ///
     /// Per-workflow-type overrides count as enabling workflow-history retention
     /// even when the global `max_age` is unset (issue #737), so an
@@ -1066,6 +1119,8 @@ impl RetentionConfig {
             // Without this clause, a config with every other pass off never
             // spawns the runtime, and finished task rows stay forever.
             || self.terminal_task_gc_active()
+            // Issue #2123: the orphan sweep is work in its own right.
+            || self.payload_orphan_sweep_active()
     }
 }
 
@@ -1526,6 +1581,102 @@ async fn run_terminal_task_pass(
         // Each alias reports the one database-wide pass.
         for shard in shards {
             monitor.update_terminal_tasks(shard, outcome.clone());
+        }
+    }
+}
+
+/// The most store pages one tick of the orphaned-blob sweep reads (issue
+/// #2123). The cursor carries a larger listing across ticks.
+#[cfg(feature = "db")]
+const PAYLOAD_ORPHAN_PAGES_PER_TICK: usize = 100;
+
+/// State the retention loop keeps for the orphaned-blob sweep (issue #2123).
+#[cfg(feature = "db")]
+#[derive(Debug, Default)]
+struct OrphanSweepState {
+    /// Where the previous tick stopped.
+    cursor: Option<String>,
+    /// The sweep cannot run. The loop logged why once and skips it now.
+    disabled: bool,
+}
+
+/// One orphaned-blob sweep pass (issue #2123).
+///
+/// The pass reads at most [`PAYLOAD_ORPHAN_PAGES_PER_TICK`] pages. A store
+/// that cannot list, a missing store and a grace period out of range each
+/// disable the pass. The pass logs the reason once.
+#[cfg(feature = "db")]
+async fn run_orphan_blob_pass(
+    pools: &ShardedDbPool,
+    config: &RetentionConfig,
+    offloader: Option<&Arc<crate::payload_store::PayloadOffloader>>,
+    state: &mut OrphanSweepState,
+    metrics: &dyn MetricsRecorder,
+    shutdown: &CancellationToken,
+) {
+    use crate::payload_orphans::{OrphanSweep, OrphanSweepOptions, sweep_orphaned_blobs};
+
+    let Some(grace) = config.payload_orphan_grace() else {
+        return;
+    };
+    if state.disabled {
+        return;
+    }
+    let Some(offloader) = offloader else {
+        tracing::warn!("harvest orphan blob sweep is off: no payload store is configured");
+        state.disabled = true;
+        return;
+    };
+    if !(MIN_PAYLOAD_ORPHAN_GRACE..=MAX_MAX_AGE).contains(&grace) {
+        tracing::warn!(
+            grace_secs = grace.as_secs(),
+            min_secs = MIN_PAYLOAD_ORPHAN_GRACE.as_secs(),
+            max_secs = MAX_MAX_AGE.as_secs(),
+            "harvest orphan blob sweep is off: the grace period is out of range"
+        );
+        state.disabled = true;
+        return;
+    }
+    let options = OrphanSweepOptions {
+        grace,
+        page_budget: PAYLOAD_ORPHAN_PAGES_PER_TICK,
+        dry_run: config.dry_run,
+        cursor: state.cursor.take(),
+    };
+    match sweep_orphaned_blobs(offloader.store().as_ref(), pools, &options, shutdown).await {
+        OrphanSweep::Unsupported => {
+            tracing::warn!(
+                store_id = offloader.store_id(),
+                "harvest orphan blob sweep is off: the payload store cannot list"
+            );
+            state.disabled = true;
+        }
+        OrphanSweep::Swept(report) => {
+            // A failed pass restarts from the top. The cursor may be stale.
+            state.cursor = report.next_cursor.filter(|_| report.error.is_none());
+            if !config.dry_run {
+                for (outcome, count) in [
+                    ("found", report.found),
+                    ("deleted", report.deleted),
+                    ("failed", report.failed),
+                ] {
+                    if count > 0 {
+                        metrics.record_payload_orphans(offloader.store_id(), outcome, count);
+                    }
+                }
+            }
+            if let Some(error) = &report.error {
+                tracing::warn!(error = %error, "harvest orphan blob sweep stopped early");
+            }
+            if report.found > 0 {
+                tracing::info!(
+                    found = report.found,
+                    deleted = report.deleted,
+                    failed = report.failed,
+                    dry_run = config.dry_run,
+                    "harvest orphan blob sweep pass"
+                );
+            }
         }
     }
 }
@@ -2003,6 +2154,8 @@ impl RetentionRuntime {
             // than read back from the monitor.
             let mut partition_resume_cursors: HashMap<ShardId, PartitionSweepCursor> =
                 HashMap::new();
+            // Issue #2123: local state for the orphaned-blob sweep.
+            let mut orphan_sweep = OrphanSweepState::default();
             // Issue #1270 item 5: run partition maintenance immediately
             // rather than waiting a full `tick_interval` (an hour, by
             // default). A shard that restarts after being offline longer
@@ -2419,8 +2572,9 @@ impl RetentionRuntime {
                                 }
                             }
                             // Fairness-key state upkeep (issue #1976). It uses the
-                            // same idle window. A pruned row changes no claim, so
-                            // a failure only delays upkeep to the next tick.
+                            // same idle window. A pruned key restarts at `V` and loses
+                            // at most one claim of debt. A failure only delays
+                            // upkeep to the next tick.
                             match crate::fairness_keys::prune_fairness_state(
                                 &mut conn,
                                 None,
@@ -2453,6 +2607,19 @@ impl RetentionRuntime {
                         &pools,
                         &config,
                         &monitor_task,
+                        metrics.as_ref(),
+                        &shutdown_task,
+                    )
+                    .await;
+
+                    // Orphaned-blob sweep (issue #2123). It is outside the
+                    // history-retention gate: a rolled-back write leaks
+                    // blobs whatever the history horizon is.
+                    run_orphan_blob_pass(
+                        &pools,
+                        &config,
+                        offloader.as_ref(),
+                        &mut orphan_sweep,
                         metrics.as_ref(),
                         &shutdown_task,
                     )
@@ -2582,6 +2749,12 @@ struct CandidateExecution {
     /// in no `WorkflowEvent` and the archive is its last surviving copy.
     #[diesel(sql_type = Text)]
     queue_name: String,
+    /// Start source and predecessor (issue #2082), carried into the archive
+    /// document. The archive is the last copy of them once the row is deleted.
+    #[diesel(sql_type = Nullable<Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = Nullable<SqlUuid>)]
+    continued_from_exec_id: Option<uuid::Uuid>,
     /// Stored tenant (issue #1977). It selects a per-tenant retention override.
     #[diesel(sql_type = Nullable<Text>)]
     tenant: Option<String>,
@@ -3194,10 +3367,15 @@ async fn run_shard_tick(
                             exported_at: chrono::Utc::now(),
                             payload_policy: crate::history_export::HistoryPayloadPolicy::Full,
                             max_bytes: Some(usize::MAX),
-                            context_headers: candidate
-                                .context_headers
-                                .as_ref()
-                                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                            // The archive never decodes (issue #1983), so an
+                            // encoded cell leaves the headers out of the
+                            // document. Plaintext never reaches cold storage
+                            // (issue #2043).
+                            context_headers: crate::history_export::export_headers(
+                                candidate.context_headers.as_ref(),
+                                None,
+                                &mut crate::payload_codec::LossyDecodeOutcome::default(),
+                            ),
                             // Issue #772 (Finding A): the archive is the LAST
                             // surviving copy before the row is deleted. A terminal
                             // (completed/continued) run can carry a recorded
@@ -3214,6 +3392,11 @@ async fn run_shard_tick(
                             parent_execution_id: candidate
                                 .parent_id
                                 .map(crate::types::ExecutionId::from_uuid),
+                            // Issue #2082: the archive keeps the row's start source.
+                            start_provenance: Some(crate::types::StartProvenance::from_row(
+                                candidate.start_source.as_deref(),
+                                candidate.continued_from_exec_id,
+                            )),
                         };
                         match crate::history_export::export_history(req) {
                             Ok(document) => {
@@ -3473,7 +3656,7 @@ const RETENTION_CANDIDATE_STATES: &[&str] = crate::erase::TERMINAL_STATES_WITHOU
 /// The tenant override arrays are bound last, as `$7` and `$8` (issue #1977).
 /// The tenant arm comes first in the `COALESCE`, so a tenant override wins.
 #[cfg(feature = "db")]
-const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name, tenant
+const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name, start_source, continued_from_exec_id, tenant
                  FROM harvest_workflow_executions
                  WHERE state IN ({states})
                    AND completed_at IS NOT NULL
@@ -3499,7 +3682,7 @@ const CANDIDATE_SCAN_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflo
 ///
 /// The tenant override arrays are bound last, as `$6` and `$7` (issue #1977).
 #[cfg(feature = "db")]
-const CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name, tenant
+const CANDIDATE_SCAN_NO_GLOBAL_TEMPLATE: &str = r"SELECT id, workflow_name, workflow_id, state, completed_at, context_headers, legal_hold_set_at, legal_hold_until, execution_timeout, deadline_at, parent_id, queue_name, start_source, continued_from_exec_id, tenant
                  FROM harvest_workflow_executions
                  WHERE state IN ({states})
                    AND completed_at IS NOT NULL
@@ -5546,6 +5729,147 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Orphaned-blob sweep config (issue #2123)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn payload_orphan_sweep_is_off_by_default() {
+        let config = RetentionConfig::default();
+        assert_eq!(config.payload_orphan_grace(), None);
+        assert!(!config.payload_orphan_sweep_active());
+    }
+
+    #[test]
+    fn payload_orphan_sweep_alone_spawns_the_runtime() {
+        let config = RetentionConfig {
+            audit_retention_days: 0,
+            schedule_decision_retention_days: 0,
+            partitions: PartitionMaintenanceConfig {
+                enabled: false,
+                ..PartitionMaintenanceConfig::default()
+            },
+            ..RetentionConfig::default()
+        }
+        .without_rate_limit_bucket_gc()
+        .without_terminal_task_gc();
+        assert!(!config.enabled());
+
+        let on = config.with_payload_orphan_grace(MIN_PAYLOAD_ORPHAN_GRACE);
+        assert!(on.payload_orphan_sweep_active());
+        assert!(on.enabled());
+    }
+
+    #[test]
+    fn payload_orphan_grace_validate_bounds_the_grace() {
+        let too_short = RetentionConfig::default().with_payload_orphan_grace(
+            MIN_PAYLOAD_ORPHAN_GRACE
+                .checked_sub(Duration::from_secs(1))
+                .expect("the floor is above 1s"),
+        );
+        assert!(too_short.validate().is_err());
+
+        let too_long = RetentionConfig::default()
+            .with_payload_orphan_grace(MAX_MAX_AGE + Duration::from_secs(1));
+        assert!(too_long.validate().is_err());
+
+        let floor = RetentionConfig::default().with_payload_orphan_grace(MIN_PAYLOAD_ORPHAN_GRACE);
+        assert!(floor.validate().is_ok());
+    }
+
+    /// A store that cannot list. It counts the `list` calls.
+    #[cfg(feature = "db")]
+    #[derive(Default)]
+    struct NoListStore {
+        lists: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "db")]
+    impl crate::payload_store::PayloadStore for NoListStore {
+        fn put(&self, _bytes: &[u8]) -> crate::payload_store::PayloadStoreFuture<'_, String> {
+            Box::pin(async { Ok("key".to_owned()) })
+        }
+
+        fn get(&self, _key: &str) -> crate::payload_store::PayloadStoreFuture<'_, Vec<u8>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn delete(&self, _key: &str) -> crate::payload_store::PayloadStoreFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn list(
+            &self,
+            _prefix: &str,
+            _created_before: DateTime<Utc>,
+            _cursor: Option<&str>,
+        ) -> Option<crate::payload_store::PayloadStoreFuture<'_, crate::payload_store::BlobPage>>
+        {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            None
+        }
+    }
+
+    /// Run the orphan pass `times` times over a store that cannot list.
+    #[cfg(feature = "db")]
+    async fn orphan_passes(
+        grace: Duration,
+        with_store: bool,
+        times: usize,
+    ) -> (OrphanSweepState, usize) {
+        let store = Arc::new(NoListStore::default());
+        let offloader = with_store.then(|| {
+            Arc::new(crate::payload_store::PayloadOffloader::new(
+                store.clone(),
+                1024,
+                Arc::new(crate::telemetry::NoOpMetrics),
+            ))
+        });
+        let pools = ShardedDbPool::single(test_pool("postgres://unused:unused@127.0.0.1:1/unused"));
+        let config = RetentionConfig::default().with_payload_orphan_grace(grace);
+        let mut state = OrphanSweepState::default();
+        for _ in 0..times {
+            run_orphan_blob_pass(
+                &pools,
+                &config,
+                offloader.as_ref(),
+                &mut state,
+                &crate::telemetry::NoOpMetrics,
+                &CancellationToken::new(),
+            )
+            .await;
+        }
+        let lists =
+            std::sync::atomic::AtomicUsize::load(&store.lists, std::sync::atomic::Ordering::SeqCst);
+        (state, lists)
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn orphan_pass_latches_off_after_one_unsupported_listing() {
+        let (state, lists) = orphan_passes(MIN_PAYLOAD_ORPHAN_GRACE, true, 3).await;
+        assert!(state.disabled);
+        assert_eq!(lists, 1, "later ticks must not list again");
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn orphan_pass_refuses_a_grace_out_of_range() {
+        let (state, lists) = orphan_passes(Duration::from_secs(1), true, 2).await;
+        assert!(state.disabled);
+        assert_eq!(lists, 0);
+        let (state, lists) = orphan_passes(MAX_MAX_AGE + Duration::from_secs(1), true, 1).await;
+        assert!(state.disabled);
+        assert_eq!(lists, 0);
+    }
+
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn orphan_pass_without_a_store_is_off() {
+        let (state, _) = orphan_passes(MIN_PAYLOAD_ORPHAN_GRACE, false, 2).await;
+        assert!(state.disabled);
+    }
+
+    // -----------------------------------------------------------------------
     // Terminal-task janitor config (issue #1811)
     // -----------------------------------------------------------------------
 
@@ -5729,6 +6053,8 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             queue_name: "default".to_string(),
+            start_source: None,
+            continued_from_exec_id: None,
             tenant: None,
         };
         let candidate_skip = CandidateExecution {
@@ -5744,6 +6070,8 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             queue_name: "default".to_string(),
+            start_source: None,
+            continued_from_exec_id: None,
             tenant: None,
         };
 

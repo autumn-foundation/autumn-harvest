@@ -2411,3 +2411,410 @@ async fn a_fenced_child_sweep_abandons_its_pass_on_a_busy_target_pool() {
         "the pass must stop within the fenced checkout bound, took {elapsed:?}"
     );
 }
+
+// ── Column encoding of the outbox spec (issue #2043) ─────────────────────────
+
+const SPEC_SECRET: &str = "cc-spec-input-ssn-555";
+const SPEC_HEADER: &str = "cc-spec-header-tenant-5";
+
+/// An AES-256-GCM registry with column encoding on.
+fn aead_codecs() -> autumn_harvest::payload_codec::PayloadCodecs {
+    use autumn_harvest::aead_codec::{AeadCodec, DataKey};
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    let key = DataKey::from_bytes(&[0x5a; 32]).expect("data key");
+    AeadCodec::new("cc-k1", &key)
+        .expect("aead codec")
+        .register_with(&codecs)
+        .expect("register");
+    codecs.set_column_encoding(true);
+    codecs
+}
+
+fn secret_spec() -> autumn_harvest::cross_shard_child::CrossShardChildSpec {
+    autumn_harvest::cross_shard_child::CrossShardChildSpec {
+        input: json!({ "ssn": SPEC_SECRET }),
+        queue_name: "default".to_string(),
+        assigned_build_id: None,
+        context_headers: Some(json!({ "x-tenant": SPEC_HEADER })),
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        sla_secs: None,
+        execution_timeout_secs: None,
+        chain_execution_timeout_secs: None,
+        retry_policy: None,
+        quota_key: None,
+        quota: None,
+        concurrency_key: None,
+        max_concurrent: None,
+        trace_context: None,
+        fairness_key: None,
+        tenant: None,
+    }
+}
+
+/// A codec whose encode always fails, as a key service that is down would.
+struct FailingEncodeCodec;
+
+impl autumn_harvest::payload_codec::PayloadCodec for FailingEncodeCodec {
+    fn codec_id(&self) -> &'static str {
+        "failing-encode"
+    }
+
+    fn encode(&self, _raw: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        Err(autumn_harvest::payload_codec::CodecError(
+            "the key service is down".to_string(),
+        ))
+    }
+
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        Ok(encoded.to_vec())
+    }
+}
+
+fn failing_encoder() -> autumn_harvest::payload_codec::PayloadCodecs {
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    codecs
+        .register_key("down", std::sync::Arc::new(FailingEncodeCodec))
+        .expect("register");
+    codecs.set_active_key("down").expect("activate");
+    codecs.set_column_encoding(true);
+    codecs
+}
+
+async fn stored_spec(pool: &ShardedDbPool, child_id: ExecutionId) -> Value {
+    let mut conn = shard_conn(pool, PARENT_SHARD).await;
+    harvest_cross_shard_children::table
+        .find(child_id.as_uuid())
+        .select(harvest_cross_shard_children::child_spec)
+        .first(&mut *conn)
+        .await
+        .expect("outbox row")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recording_an_existing_child_is_a_no_op_while_the_encoder_is_down() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+    let parent = start_parent(&sharded, "child_echo", "spec-idem-1").await;
+    let existing = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        existing,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &aead_codecs(),
+    )
+    .await
+    .expect("record");
+    let before = stored_spec(&sharded, existing).await;
+
+    // A retried decision emits the same child again. The encoder is down.
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        existing,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &failing_encoder(),
+    )
+    .await
+    .expect("an existing child needs no encode");
+    assert_eq!(stored_spec(&sharded, existing).await, before);
+
+    // A new child still needs the encoder, so it fails instead of storing clear.
+    let fresh = ExecutionId::new_for_shard(ShardId::new(1));
+    let refused = autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        fresh,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &failing_encoder(),
+    )
+    .await;
+    assert!(refused.is_err(), "a new child is never stored in clear");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_encoded_spec_is_ciphertext_and_the_relay_starts_the_child_on_plaintext() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+    let codecs = aead_codecs();
+    let parent = start_parent(&sharded, "child_echo", "spec-enc-1").await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &codecs,
+    )
+    .await
+    .expect("record");
+
+    let stored = stored_spec(&sharded, child_id).await;
+    assert!(
+        autumn_harvest::payload_codec::is_codec_envelope(&stored),
+        "the spec is one envelope: {stored}"
+    );
+    assert!(
+        !stored.to_string().contains(SPEC_SECRET) && !stored.to_string().contains(SPEC_HEADER),
+        "the spec must not hold the input or the headers in clear"
+    );
+
+    let started = std::time::Instant::now();
+    loop {
+        let progressed = autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+            &mut conn,
+            &Some(sharded.clone()),
+            &codecs,
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .expect("relay sweep");
+        if progressed > 0 {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "no child");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut child_conn = shard_conn(&sharded, child_shard.as_i32()).await;
+    let input: Value = harvest_workflow_executions::table
+        .find(child_id.as_uuid())
+        .select(harvest_workflow_executions::input)
+        .first(&mut *child_conn)
+        .await
+        .expect("child row");
+    assert!(
+        !input.to_string().contains(SPEC_SECRET),
+        "the child input column holds ciphertext"
+    );
+    assert_eq!(
+        codecs.decode_column(&input).expect("decode one layer"),
+        json!({ "ssn": SPEC_SECRET }),
+        "the child starts on the plaintext input"
+    );
+    let headers: Option<Value> = harvest_workflow_executions::table
+        .find(child_id.as_uuid())
+        .select(harvest_workflow_executions::context_headers)
+        .first(&mut *child_conn)
+        .await
+        .expect("child headers");
+    let headers = headers.expect("the child keeps the headers");
+    assert!(
+        autumn_harvest::payload_codec::is_codec_envelope(&headers)
+            && !headers.to_string().contains(SPEC_HEADER),
+        "the child row holds the headers as ciphertext: {headers}"
+    );
+    assert_eq!(
+        codecs.decode_column(&headers).expect("decode one layer"),
+        json!({ "x-tenant": SPEC_HEADER }),
+        "the child headers decode once, with no second layer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undecodable_spec_stays_pending_and_creates_no_child() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+    let codecs = aead_codecs();
+    let parent = start_parent(&sharded, "child_echo", "spec-enc-2").await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &codecs,
+    )
+    .await
+    .expect("record");
+    assert!(
+        autumn_harvest::payload_codec::is_codec_envelope(&stored_spec(&sharded, child_id).await),
+        "the spec is encoded"
+    );
+
+    let keyless = autumn_harvest::payload_codec::PayloadCodecs::default();
+    for _ in 0..3 {
+        autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+            &mut conn,
+            &Some(sharded.clone()),
+            &keyless,
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .expect("a bad row never fails the sweep");
+    }
+    let mut child_conn = shard_conn(&sharded, child_shard.as_i32()).await;
+    let created: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq(child_id.as_uuid()))
+        .count()
+        .get_result(&mut *child_conn)
+        .await
+        .expect("count");
+    assert_eq!(created, 0, "no child starts on ciphertext");
+    let status: String = harvest_cross_shard_children::table
+        .find(child_id.as_uuid())
+        .select(harvest_cross_shard_children::status)
+        .first(&mut *conn)
+        .await
+        .expect("outbox row");
+    assert_eq!(status, "PENDING_START", "the row stays pending");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_for_an_existing_child_needs_no_key() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+    let codecs = aead_codecs();
+    let parent = start_parent(&sharded, "child_echo", "spec-idem-2").await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &codecs,
+    )
+    .await
+    .expect("record");
+    let started = std::time::Instant::now();
+    loop {
+        let progressed = autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+            &mut conn,
+            &Some(sharded.clone()),
+            &codecs,
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .expect("relay sweep");
+        if progressed > 0 {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "no child");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The relay crashed before it marked the row. The next sweep retries it.
+    diesel::update(harvest_cross_shard_children::table.find(child_id.as_uuid()))
+        .set((
+            harvest_cross_shard_children::status.eq("PENDING_START"),
+            harvest_cross_shard_children::attempts.eq(0),
+            harvest_cross_shard_children::last_attempt_at.eq(None::<chrono::DateTime<Utc>>),
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("reset the row");
+    let keyless = autumn_harvest::payload_codec::PayloadCodecs::default();
+    autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+        &mut conn,
+        &Some(sharded.clone()),
+        &keyless,
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("a retry never fails the sweep");
+    let status: String = harvest_cross_shard_children::table
+        .find(child_id.as_uuid())
+        .select(harvest_cross_shard_children::status)
+        .first(&mut *conn)
+        .await
+        .expect("outbox row");
+    assert_ne!(
+        status, "PENDING_START",
+        "the row advances without a key, because the child exists"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn erasing_a_parent_replaces_an_encoded_spec_with_a_tombstone() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+    let codecs = aead_codecs();
+    let parent = start_parent(&sharded, "child_echo", "spec-enc-3").await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+    {
+        let mut parent_conn = shard_conn(&sharded, PARENT_SHARD).await;
+        diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
+            .set((
+                harvest_workflow_executions::state.eq("COMPLETED"),
+                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            ))
+            .execute(&mut *parent_conn)
+            .await
+            .expect("force parent terminal");
+        autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+            &mut parent_conn,
+            parent,
+            child_id,
+            "child_echo",
+            None,
+            &secret_spec(),
+            &codecs,
+        )
+        .await
+        .expect("record");
+        diesel::update(harvest_cross_shard_children::table.find(child_id.as_uuid()))
+            .set(harvest_cross_shard_children::status.eq("STARTED"))
+            .execute(&mut *parent_conn)
+            .await
+            .expect("mark started");
+    }
+    {
+        let mut child_conn = shard_conn(&sharded, child_shard.as_i32()).await;
+        start_or_load_workflow_execution(
+            &mut child_conn,
+            parent_start_params(child_id, "child_echo", "spec-enc-3-child"),
+            None,
+        )
+        .await
+        .expect("child start");
+        diesel::update(harvest_workflow_executions::table.find(child_id.as_uuid()))
+            .set((
+                harvest_workflow_executions::state.eq("COMPLETED"),
+                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            ))
+            .execute(&mut *child_conn)
+            .await
+            .expect("force child terminal");
+    }
+    let mut parent_conn = shard_conn(&sharded, PARENT_SHARD).await;
+    let outcome = autumn_harvest::erase::erase_workflow_payloads_with_pool(
+        &mut parent_conn,
+        parent,
+        "gdpr",
+        Some(&sharded),
+    )
+    .await
+    .expect("erase");
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+    let stored = stored_spec(&sharded, child_id).await;
+    assert!(
+        autumn_harvest::erase::is_erasure_tombstone(&stored),
+        "the whole encoded spec is tombstoned, got {stored}"
+    );
+}

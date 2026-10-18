@@ -1545,10 +1545,16 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         // callback config has ever been registered
         // (`completion_callback::GLOBAL_CALLBACK_CONFIG` is `None`) or when
         // no target matches this terminal state.
-        crate::completion_callback::enqueue_completion_deliveries(
-            conn, &execution, exec_id, state, codecs,
-        )
-        .await?;
+        // Issue #2000: a recorded fork must not notify an outside system or
+        // start a run, so it skips callbacks and triggers. It still releases
+        // its mutexes below.
+        let recorded_fork = crate::fork::is_recorded_fork(conn, &execution).await?;
+        if !recorded_fork {
+            crate::completion_callback::enqueue_completion_deliveries(
+                conn, &execution, exec_id, state, codecs,
+            )
+            .await?;
+        }
 
         // Durable mutex terminal auto-release (issue #691): this is the single
         // per-terminal-transition chokepoint (complete/fail/cancel/terminate/
@@ -1560,6 +1566,9 @@ pub fn evaluate_triggers_for_execution_collecting_with_codecs<'a>(
         // non-terminal nd-block path (issue #603) deliberately does NOT reach
         // this function, so a blocked holder keeps its locks.
         crate::mutex::sweep_terminal_holder_and_wake(conn, exec_id).await?;
+        if recorded_fork {
+            return Ok(deferred_starts);
+        }
 
         let triggers = triggers_dsl::harvest_completion_triggers
             .filter(triggers_dsl::source_workflow_name.eq(&execution.workflow_name))

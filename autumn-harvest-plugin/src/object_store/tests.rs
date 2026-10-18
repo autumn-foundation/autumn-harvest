@@ -34,6 +34,7 @@ fn sample_doc(execution_id: ExecutionId) -> HistoryExportDocument {
         execution_timeout: None,
         deadline_at: None,
         parent_execution_id: None,
+        start_provenance: None,
     })
     .unwrap()
 }

@@ -1555,6 +1555,7 @@ fn make_snapshot(name: &str, exec_id: ExecutionId, events: Vec<WorkflowEvent>) -
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: None,
         workflow_id: None,
         queue_name: None,
@@ -3097,6 +3098,7 @@ async fn json_replay_threads_snapshot_execution_timeout_for_deadline_history() {
         context_headers: None,
         execution_timeout: Some(chrono::Duration::seconds(30)),
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: None,
         workflow_id: None,
         queue_name: None,
@@ -3140,6 +3142,7 @@ async fn json_replay_legacy_snapshot_without_fields_falls_back_to_global_timeout
         // both fields from the JSON, producing a byte-for-byte pre-#772 export.
         execution_timeout: None,
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: None,
         workflow_id: None,
         queue_name: None,
@@ -4429,6 +4432,7 @@ async fn replay_from_json_succeeds_with_unchanged_workflow() {
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: None,
         workflow_id: None,
         queue_name: None,
@@ -4459,6 +4463,7 @@ async fn replay_from_json_detects_non_determinism() {
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: None,
         workflow_id: None,
         queue_name: None,
@@ -4654,6 +4659,7 @@ async fn replay_activity_with_changed_input_detects_non_determinism() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -6645,6 +6651,7 @@ async fn replay_detached_spawn_returns_recorded_child_id() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -6680,6 +6687,7 @@ async fn replay_detached_spawn_request_cancel_policy_succeeds() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -6708,6 +6716,7 @@ async fn replay_detached_spawn_policy_mismatch_detects_non_determinism() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -6738,6 +6747,7 @@ async fn replay_detached_spawn_then_activity_succeeds() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -6785,6 +6795,7 @@ async fn replay_reordered_detached_spawn_detects_non_determinism() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -6852,6 +6863,7 @@ async fn replay_backwards_compat_awaited_child_workflow() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -6932,6 +6944,7 @@ async fn replay_succeeds_for_recorded_side_effect() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -6981,6 +6994,7 @@ async fn replay_detects_side_effect_drift() {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -9100,6 +9114,7 @@ async fn parent_aware_child_replays_clean_through_export_document_round_trip() {
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: Some(parent),
         workflow_id: None,
         queue_name: None,
@@ -9146,6 +9161,7 @@ async fn parent_aware_child_diverges_through_export_document_without_parent() {
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: None,
         workflow_id: None,
         queue_name: None,
@@ -9277,6 +9293,7 @@ async fn workflow_type_and_id_replay_clean_through_export_document_round_trip() 
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: None,
     })
     .expect("full export should fit under the limit");
@@ -9326,6 +9343,7 @@ async fn workflow_id_diverges_through_export_document_when_id_is_dropped() {
         context_headers: None,
         execution_timeout: None,
         deadline_at: None,
+        start_provenance: None,
         parent_execution_id: None,
     })
     .expect("full export should fit under the limit");
@@ -10162,10 +10180,9 @@ fn history_policy_branch_workflow<'a>(
     })
 }
 
-/// A 4-event history recorded by the `checkpoint` branch (event count 4 > the
-/// tuned threshold of 2): `WorkflowStarted`, `ActivityScheduled(checkpoint)`,
-/// `ActivityCompleted`, `WorkflowCompleted`. Under the DEFAULT policy (large
-/// threshold) `should_continue_as_new()` never trips for this small history.
+/// A history recorded by the `checkpoint` branch: `WorkflowStarted`, the
+/// recorded `true` decision, `ActivityScheduled(checkpoint)`,
+/// `ActivityCompleted`, `WorkflowCompleted`.
 fn history_policy_checkpoint_fixture() -> Vec<WorkflowEvent> {
     let activity_id = ActivityExecId::new();
     vec![
@@ -10175,6 +10192,11 @@ fn history_policy_checkpoint_fixture() -> Vec<WorkflowEvent> {
             last_completion_result: None,
             last_error: None,
             scheduled_time: None,
+        },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::event::SideEffectKind::Custom,
+            name: Some(autumn_harvest::CONTINUE_AS_NEW_SIDE_EFFECT_NAME.to_string()),
+            value: serde_json::json!(true),
         },
         WorkflowEvent::ActivityScheduled {
             activity_id,
@@ -10193,50 +10215,25 @@ fn history_policy_checkpoint_fixture() -> Vec<WorkflowEvent> {
 }
 
 #[tokio::test]
-async fn strict_replay_default_policy_diverges_from_low_threshold_history() {
-    // Negative control: under the DEFAULT history policy (large threshold) the
-    // 4-event history never trips `should_continue_as_new()`, so the workflow
-    // schedules `keep_going` and diverges from the recorded `checkpoint`. Proves
-    // the fixture is discriminating (and that the strict-path default is
-    // unchanged for callers that never set a policy).
-    let report = WorkflowReplayer::new()
-        .register_fn("history_policy_branch", history_policy_branch_workflow)
-        .replay_from_events(history_policy_checkpoint_fixture())
-        .await;
-
-    assert!(
-        matches!(
-            report.status,
-            ReplayStatus::NonDeterminismDetected {
-                kind: NonDeterminismKind::ActivityScheduleMismatch,
-                ..
-            }
-        ),
-        "default policy must diverge (keep_going vs recorded checkpoint):\n{report}"
-    );
-}
-
-#[tokio::test]
-async fn strict_replay_honors_with_history_policy() {
-    // Issue #614 (PR #1107 Codex review): the STRICT `replay_from_events` path
-    // must honor `with_history_policy`. With threshold = 2 the 4-event history
-    // trips `should_continue_as_new()`, so the workflow schedules `checkpoint`,
-    // matching the recorded history → ReplaySucceeded. BEFORE the fix the strict
-    // path hardcoded the default policy, ignored this setter, scheduled
-    // `keep_going`, and reported NonDeterminismDetected (identical to the negative
-    // control above) — so this test is the fix's regression guard.
-    let policy =
+async fn strict_replay_follows_the_recorded_decision_under_any_policy() {
+    // Issue #2080: a replay reads the recorded `true` decision, not the loaded
+    // event count. The threshold changes nothing for a recorded position.
+    let low =
         autumn_harvest::context::WorkflowHistoryPolicy::default().with_continue_as_new_threshold(2);
-    let report = WorkflowReplayer::new()
-        .with_history_policy(policy)
-        .register_fn("history_policy_branch", history_policy_branch_workflow)
-        .replay_from_events(history_policy_checkpoint_fixture())
-        .await;
-
-    assert!(
-        matches!(report.status, ReplayStatus::ReplaySucceeded),
-        "strict replay must honor with_history_policy(threshold=2) and replay clean:\n{report}"
-    );
+    for policy in [
+        autumn_harvest::context::WorkflowHistoryPolicy::default(),
+        low,
+    ] {
+        let report = WorkflowReplayer::new()
+            .with_history_policy(policy)
+            .register_fn("history_policy_branch", history_policy_branch_workflow)
+            .replay_from_events(history_policy_checkpoint_fixture())
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "a recorded decision must replay clean:\n{report}"
+        );
+    }
 }
 
 // ===========================================================================

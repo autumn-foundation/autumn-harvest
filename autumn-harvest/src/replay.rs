@@ -449,6 +449,27 @@ pub enum SideEffectNowMatch {
 /// `Now` under this name.
 pub const DEADLINE_PROBE_SIDE_EFFECT_NAME: &str = "__harvest_deadline_probe";
 
+/// Reserved side-effect name for a live `should_continue_as_new()` history-size
+/// decision (issue #2080).
+///
+/// Each call records its answer, `true` or `false`. A replay reads the record at
+/// the same position, so the answer is the same however large the loaded
+/// history has grown.
+pub const CONTINUE_AS_NEW_SIDE_EFFECT_NAME: &str = "__harvest_continue_as_new";
+
+/// The replayed state of a `should_continue_as_new()` history-size decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinueAsNewMatch {
+    /// The cursor holds a recorded `true` decision, or a checkpoint from a
+    /// history that predates the record. The answer is `true`.
+    True,
+    /// The cursor holds a recorded `false` decision, or other events from a
+    /// history that predates the record. The answer is `false`.
+    False,
+    /// The cursor is past the recorded history. The caller decides live.
+    Frontier,
+}
+
 /// Marker name recorded by `ctx.patched(patch_id)` (issue #687).
 pub(crate) fn patch_marker_name(patch_id: &str) -> String {
     format!("patch:{patch_id}")
@@ -1271,16 +1292,18 @@ impl HistoryMatcher {
         race_reserved_signal_events
     }
 
-    /// Returns the IDs of all updates that were admitted but have not completed or failed
-    /// up to the specified event index.
-    #[must_use]
-    pub fn unfinished_update_handlers_at_index(&self, index: usize) -> Vec<UpdateId> {
+    /// Returns the update ids admitted but not yet completed or failed, up to
+    /// the specified event index.
+    ///
+    /// `unfinished_update_handlers_at_index`, `unfinished_update_handler_count_at_index`
+    /// and `all_handlers_finished_at_index` each reshape this one scan.
+    fn active_update_handlers_at_index(&self, index: usize) -> HashSet<UpdateId> {
         let events_slice = &self.events[..index];
         let has_updates = events_slice
             .iter()
             .any(|event| matches!(event, WorkflowEvent::UpdateAdmitted { .. }));
         if !has_updates {
-            return Vec::new();
+            return HashSet::new();
         }
 
         let mut active = HashSet::new();
@@ -1296,7 +1319,16 @@ impl HistoryMatcher {
                 _ => {}
             }
         }
-        active.into_iter().collect()
+        active
+    }
+
+    /// Returns the IDs of all updates that were admitted but have not completed or failed
+    /// up to the specified event index.
+    #[must_use]
+    pub fn unfinished_update_handlers_at_index(&self, index: usize) -> Vec<UpdateId> {
+        self.active_update_handlers_at_index(index)
+            .into_iter()
+            .collect()
     }
 
     /// Returns the IDs of all updates that were admitted but have not completed or failed.
@@ -1314,28 +1346,7 @@ impl HistoryMatcher {
     /// Returns the number of unfinished update handlers up to the specified index.
     #[must_use]
     pub fn unfinished_update_handler_count_at_index(&self, index: usize) -> usize {
-        let events_slice = &self.events[..index];
-        let has_updates = events_slice
-            .iter()
-            .any(|event| matches!(event, WorkflowEvent::UpdateAdmitted { .. }));
-        if !has_updates {
-            return 0;
-        }
-
-        let mut active = HashSet::new();
-        for event in events_slice {
-            match event {
-                WorkflowEvent::UpdateAdmitted { update_id, .. } => {
-                    active.insert(*update_id);
-                }
-                WorkflowEvent::UpdateCompleted { update_id, .. }
-                | WorkflowEvent::UpdateFailed { update_id, .. } => {
-                    active.remove(update_id);
-                }
-                _ => {}
-            }
-        }
-        active.len()
+        self.active_update_handlers_at_index(index).len()
     }
 
     /// Returns the number of unfinished update handlers.
@@ -1353,28 +1364,7 @@ impl HistoryMatcher {
     /// Returns `true` if all admitted update handlers have completed or failed up to the specified index.
     #[must_use]
     pub fn all_handlers_finished_at_index(&self, index: usize) -> bool {
-        let events_slice = &self.events[..index];
-        let has_updates = events_slice
-            .iter()
-            .any(|event| matches!(event, WorkflowEvent::UpdateAdmitted { .. }));
-        if !has_updates {
-            return true;
-        }
-
-        let mut active = HashSet::new();
-        for event in events_slice {
-            match event {
-                WorkflowEvent::UpdateAdmitted { update_id, .. } => {
-                    active.insert(*update_id);
-                }
-                WorkflowEvent::UpdateCompleted { update_id, .. }
-                | WorkflowEvent::UpdateFailed { update_id, .. } => {
-                    active.remove(update_id);
-                }
-                _ => {}
-            }
-        }
-        active.is_empty()
+        self.active_update_handlers_at_index(index).is_empty()
     }
 
     /// Returns `true` if all admitted update handlers have completed or failed.
@@ -1648,7 +1638,7 @@ impl HistoryMatcher {
     /// they are skipped during activity/timer/signal/child-workflow matching
     /// and are consumed by the `match_update` / `drain_admitted_updates` APIs.
     /// `WorkflowResetFork` is informational and likewise has no workflow
-    /// command counterpart.
+    /// command counterpart. So are the two fork events of issue #2000.
     const fn is_update_event(event: &WorkflowEvent) -> bool {
         matches!(
             event,
@@ -1656,6 +1646,8 @@ impl HistoryMatcher {
                 | WorkflowEvent::UpdateCompleted { .. }
                 | WorkflowEvent::UpdateFailed { .. }
                 | WorkflowEvent::WorkflowResetFork { .. }
+                | WorkflowEvent::WorkflowForked { .. }
+                | WorkflowEvent::ForkActivityResultOverridden { .. }
         )
     }
 
@@ -5898,6 +5890,66 @@ impl HistoryMatcher {
             // and a user `Now` is left for its own strict read to consume.
             _ => SideEffectNowMatch::NotRecorded,
         }
+    }
+
+    /// Replay a `should_continue_as_new()` history-size decision (issue #2080).
+    ///
+    /// Reads the cursor, never the loaded event count, so the answer does not
+    /// change when the loaded history grows.
+    ///
+    /// - A recorded decision is consumed and gives its value.
+    /// - A `WorkflowContinuedAsNew` event is a checkpoint from a history that
+    ///   predates the record. It is left in place and reads as `true`. A
+    ///   deadline probe clock read before it does not change that.
+    /// - Any other event is a history that predates the record. It reads as
+    ///   `false`, with the cursor untouched.
+    /// - A cursor past the end is the live frontier.
+    #[must_use]
+    pub fn match_continue_as_new_decision(&mut self) -> ContinueAsNewMatch {
+        if !self.prepare_match() {
+            return ContinueAsNewMatch::Frontier;
+        }
+        match &self.events[self.cursor] {
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: Some(name),
+                value: Value::Bool(decision),
+            } if name == CONTINUE_AS_NEW_SIDE_EFFECT_NAME => {
+                let decision = *decision;
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                if decision {
+                    ContinueAsNewMatch::True
+                } else {
+                    ContinueAsNewMatch::False
+                }
+            }
+            WorkflowEvent::WorkflowContinuedAsNew { .. } => ContinueAsNewMatch::True,
+            // A legacy run with an execution timeout reads its deadline clock
+            // before the checkpoint. Look past that one event.
+            probe if Self::is_deadline_probe_event(probe) => {
+                let mut next = self.cursor + 1;
+                while self.is_consumed(next) {
+                    next += 1;
+                }
+                match self.events.get(next) {
+                    Some(WorkflowEvent::WorkflowContinuedAsNew { .. }) => ContinueAsNewMatch::True,
+                    _ => ContinueAsNewMatch::False,
+                }
+            }
+            _ => ContinueAsNewMatch::False,
+        }
+    }
+
+    fn is_deadline_probe_event(event: &WorkflowEvent) -> bool {
+        matches!(
+            event,
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Now,
+                name: Some(name),
+                ..
+            } if name == DEADLINE_PROBE_SIDE_EFFECT_NAME
+        )
     }
 
     /// Match a local activity command against history.
@@ -14680,5 +14732,110 @@ mod tests {
         let _ = matcher.match_signal_where("order", &order_id_is(42));
         assert!(!matcher.has_unconsumed_signal_where("order", &order_id_is(42)));
         assert!(matcher.has_unconsumed_signal_where("order", &order_id_is(41)));
+    }
+
+    // Characterization tests for `unfinished_update_handlers_at_index`,
+    // `unfinished_update_handler_count_at_index` and
+    // `all_handlers_finished_at_index`. The three pin one scan of the event
+    // slice: the set of `UpdateAdmitted` ids with no paired `UpdateCompleted`
+    // or `UpdateFailed` before `index`.
+
+    fn update_admitted(update_id: UpdateId) -> WorkflowEvent {
+        WorkflowEvent::UpdateAdmitted {
+            update_id,
+            name: "handler".into(),
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn update_completed(update_id: UpdateId) -> WorkflowEvent {
+        WorkflowEvent::UpdateCompleted {
+            update_id,
+            output: Value::Null,
+        }
+    }
+
+    fn update_failed(update_id: UpdateId) -> WorkflowEvent {
+        WorkflowEvent::UpdateFailed {
+            update_id,
+            error: "boom".into(),
+        }
+    }
+
+    #[test]
+    fn no_events_leaves_no_unfinished_handlers() {
+        let matcher = HistoryMatcher::new(vec![]);
+        assert_eq!(matcher.unfinished_update_handlers_at_index(0), Vec::new());
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(0), 0);
+        assert!(matcher.all_handlers_finished_at_index(0));
+    }
+
+    #[test]
+    fn events_with_no_updates_leave_no_unfinished_handlers() {
+        let matcher = HistoryMatcher::new(vec![order_signal(1)]);
+        assert_eq!(matcher.unfinished_update_handlers_at_index(1), Vec::new());
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(1), 0);
+        assert!(matcher.all_handlers_finished_at_index(1));
+    }
+
+    #[test]
+    fn an_admitted_update_is_unfinished_until_it_resolves() {
+        let id = UpdateId::new();
+        let matcher = HistoryMatcher::new(vec![update_admitted(id)]);
+
+        assert_eq!(matcher.unfinished_update_handlers_at_index(1), vec![id]);
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(1), 1);
+        assert!(!matcher.all_handlers_finished_at_index(1));
+    }
+
+    #[test]
+    fn a_completed_update_is_no_longer_unfinished() {
+        let id = UpdateId::new();
+        let matcher = HistoryMatcher::new(vec![update_admitted(id), update_completed(id)]);
+
+        assert_eq!(matcher.unfinished_update_handlers_at_index(2), Vec::new());
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(2), 0);
+        assert!(matcher.all_handlers_finished_at_index(2));
+    }
+
+    #[test]
+    fn a_failed_update_is_no_longer_unfinished() {
+        let id = UpdateId::new();
+        let matcher = HistoryMatcher::new(vec![update_admitted(id), update_failed(id)]);
+
+        assert_eq!(matcher.unfinished_update_handlers_at_index(2), Vec::new());
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(2), 0);
+        assert!(matcher.all_handlers_finished_at_index(2));
+    }
+
+    #[test]
+    fn index_before_resolution_still_reports_the_handler_unfinished() {
+        let id = UpdateId::new();
+        let matcher = HistoryMatcher::new(vec![update_admitted(id), update_completed(id)]);
+
+        // At index 1, only the admit has been scanned; the completion at
+        // index 1 (exclusive end) has not, so the handler is still open.
+        assert_eq!(matcher.unfinished_update_handlers_at_index(1), vec![id]);
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(1), 1);
+        assert!(!matcher.all_handlers_finished_at_index(1));
+    }
+
+    #[test]
+    fn mixed_resolved_and_unresolved_updates_are_reported_independently() {
+        let resolved = UpdateId::new();
+        let unresolved = UpdateId::new();
+        let matcher = HistoryMatcher::new(vec![
+            update_admitted(resolved),
+            update_admitted(unresolved),
+            update_completed(resolved),
+        ]);
+
+        assert_eq!(
+            matcher.unfinished_update_handlers_at_index(3),
+            vec![unresolved]
+        );
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(3), 1);
+        assert!(!matcher.all_handlers_finished_at_index(3));
     }
 }

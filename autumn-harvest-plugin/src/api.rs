@@ -56,7 +56,7 @@ use autumn_harvest::audit::{
     TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
     deny_readonly_mutation,
 };
-use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
+use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START, OP_WORKFLOW_FORK};
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
     BatchSubmission, BatchTargetSample,
@@ -80,6 +80,9 @@ use autumn_harvest::executor::{
     history_reached_terminal_seal,
 };
 use autumn_harvest::external_task;
+use autumn_harvest::fork::{
+    ForkEffects, WorkflowForkError, WorkflowForkRequest, fork_workflow_execution_audited,
+};
 use autumn_harvest::history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HistoryExportDocument, HistoryExportError,
     HistoryExportRequest, HistoryPayloadPolicy, export_history_decoded,
@@ -105,7 +108,7 @@ use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
     ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowSchedulePatch,
     ensure_dag_schedule, parse_schedule_from_expr_pub, plan_backfill_timestamps,
-    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule,
+    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule_with_codecs,
 };
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
@@ -3471,6 +3474,12 @@ struct HistoryExportCandidate {
     // lives in no `WorkflowEvent` — same family as `context_headers` above.
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
+    // Issue #2082: the run's start source and predecessor, carried into the
+    // export document so a replay takes the same branch as the live run.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    continued_from_exec_id: Option<uuid::Uuid>,
 }
 
 /// One in-flight execution selected by the stratified sample query (issue #798).
@@ -3515,6 +3524,12 @@ struct HistorySampleCandidate {
     // a FALSE divergence.
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
+    // Issue #2082: the run's start source and predecessor, carried into the
+    // export document so a replay takes the same branch as the live run.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    continued_from_exec_id: Option<uuid::Uuid>,
     /// `COUNT(*) OVER (PARTITION BY workflow_name)` — the in-flight population
     /// of this workflow type **on this shard**. Summed across shards to give
     /// the AC2 coverage denominator.
@@ -3546,6 +3561,8 @@ impl HistorySampleCandidate {
             context_headers: self.context_headers,
             // Issue #798: likewise the queue the live run was claimed on.
             queue_name: self.queue_name,
+            start_source: self.start_source,
+            continued_from_exec_id: self.continued_from_exec_id,
         }
     }
 }
@@ -4979,6 +4996,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         .route(
             "/workflows/{id}/rerun",
             post(rerun_workflow).route_layer(require_admin.clone()),
+        )
+        // Issue #2000: a fork starts a new run. A live fork runs effects for
+        // real, so the route is admin-only, as rerun is.
+        .route(
+            "/workflows/{id}/fork",
+            post(fork_workflow).route_layer(require_admin.clone()),
         )
         .route(
             "/workflows/{id}/erase-payloads",
@@ -7031,6 +7054,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "/workflows/{id}/completion-deliveries/{delivery_id}/redrive",
         ),
         ("POST", "/workflows/{id}/reset"),
+        ("POST", "/workflows/{id}/fork"),
         ("POST", "/workflows/{id}/signal/{signal_name}"),
         ("GET", "/workflows/{id}/queries"),
         ("GET", "/workflows/{id}/query/{query_name}"),
@@ -7379,6 +7403,19 @@ pub const fn management_api_request_fields()
                 "reason",
                 "operator_id",
                 "signal_reapply",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/fork",
+            Some(&[
+                "fork_point",
+                "reason",
+                "operator_id",
+                "effects",
+                "workflow_id",
+                "input",
+                "activity_overrides",
             ]),
         ),
         ("POST", "/workflows/{id}/signal/{signal_name}", None), // free-form
@@ -8192,6 +8229,18 @@ pub const fn management_api_response_fields()
                 "source_timers_removed",
                 "source_signals_dropped",
                 "source_signals_buffered",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/fork",
+            Some(&[
+                "new_exec_id",
+                "workflow_id",
+                "forked_from_exec_id",
+                "fork_event_id",
+                "events_carried_over",
+                "effects",
             ]),
         ),
         (
@@ -14031,6 +14080,12 @@ pub(crate) async fn build_awaitables_report(
             }
         }
 
+        // The headers decode with the same registry as the history. A cell
+        // that does not decode degrades the report the same way (issue #2043).
+        let decoded_headers = codecs.decode_headers_opt(execution.context_headers.as_ref());
+        if decoded_headers.is_err() {
+            decode_failed = true;
+        }
         if decode_failed {
             (
                 "history_only",
@@ -14048,14 +14103,7 @@ pub(crate) async fn build_awaitables_report(
             // threads (issues #772/#698/#481) so a deadline-aware /
             // parent-aware / identity-reading / header-branching workflow
             // replays cleanly instead of spuriously degrading.
-            let context_headers = execution
-                .context_headers
-                .as_ref()
-                .and_then(|v| {
-                    serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone())
-                        .ok()
-                })
-                .unwrap_or_default();
+            let context_headers = decoded_headers.unwrap_or_default();
             let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
                 exec_id,
                 events,
@@ -14065,6 +14113,11 @@ pub(crate) async fn build_awaitables_report(
             .with_execution_timeout(execution.execution_timeout)
             .with_deadline(execution.deadline_at)
             .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))
+            // Issue #2082: the replay needs the row's start source.
+            .with_start_provenance(autumn_harvest::types::StartProvenance::from_row(
+                execution.start_source.as_deref(),
+                execution.continued_from_exec_id,
+            ))
             .with_workflow_name(execution.workflow_name.clone())
             .with_workflow_id(execution.workflow_id.clone())
             .with_context_headers(context_headers);
@@ -25754,6 +25807,270 @@ async fn reset_workflow(
     }
 }
 
+/// `POST /workflows/{id}/fork` — non-destructive fork of a run (issue #2000).
+///
+/// The source stays unchanged. The fork defaults to recorded effects, so it
+/// never runs an effect for real unless the body sets `"effects": "live"`.
+/// Each outcome writes one `workflow.fork` audit row.
+async fn fork_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    request: Result<Json<WorkflowForkRequest>, JsonRejection>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let context = audit_context(&headers, &api_state);
+    // Before the source shard resolves, a refusal is audited on the default
+    // shard, as for a reset.
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            let _ =
+                audit_fork_on_default(&api_state, &context, &id, Some("malformed execution id"))
+                    .await;
+            return e.into_response();
+        }
+    };
+    let exec_id_str = exec_id.to_string();
+    // The handler unwraps the body itself, so a rejected body is audited too.
+    // The response keeps the status of the extractor.
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            let failure = format!("invalid request body: {}", rejection.body_text());
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return rejection.into_response();
+        }
+    };
+    // Fail closed in the boot window. With no runtime there are no payload
+    // codecs, so an override would land in plaintext.
+    let runtime = match api_state.runtime() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            let failure = e.to_string();
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return map_error(e).into_response();
+        }
+    };
+    // The exact resolver never stands the default shard in for the source
+    // shard. A source shard that this node has no pool for answers `503`, not a
+    // false `404` from the wrong database.
+    let mut conn = match db_conn_for_execution_exact(&api_state, exec_id).await {
+        Ok(Some(conn)) => conn,
+        Ok(None) => {
+            let error = HarvestError::NotFound(format!("workflow execution {exec_id_str}"));
+            let failure = error.to_string();
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return map_error(error).into_response();
+        }
+        Err(e) => {
+            let failure = e.to_string();
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return e.into_response();
+        }
+    };
+    if request.effects == ForkEffects::Live
+        && let Some(response) =
+            reject_inadmissible_fork_callbacks(&api_state, &mut conn, &context, exec_id).await
+    {
+        return response;
+    }
+    // The fork commits on the source shard, with its success audit row in
+    // the same transaction. A fork leaves its source as it was, so a retry
+    // makes another fork. So a failed audit insert must roll the fork back,
+    // not report a retryable error for a fork that exists.
+    let result = fork_workflow_execution_audited(
+        &mut conn,
+        exec_id,
+        request,
+        Some(runtime.registry().as_ref()),
+        &fork_audit_record(&context, &exec_id_str, None),
+    )
+    .await;
+
+    match result {
+        Ok(result) => (axum::http::StatusCode::CREATED, Json(result)).into_response(),
+        Err(error) => {
+            let failure = error.to_string();
+            let _ = audit_fork(&mut conn, &context, &exec_id_str, Some(&failure)).await;
+            fork_error_response(error)
+        }
+    }
+}
+
+/// Refuse a live fork whose inherited callback targets fail the SSRF policy.
+///
+/// A live fork sends the completion callbacks of its source. The terminal
+/// path checks each target against the current policy and skips a rejected
+/// one in silence. So the route checks the targets first and refuses the fork
+/// with `422`, as a rerun does. The targets are fixed at start, so the check
+/// before the fork transaction sees the targets that the fork copies.
+///
+/// Returns the refusal response, or `None` when the fork can go on.
+async fn reject_inadmissible_fork_callbacks(
+    api_state: &HarvestApiState,
+    conn: &mut AsyncPgConnection,
+    context: &(String, String, Option<String>),
+    exec_id: ExecutionId,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse as _;
+
+    let exec_id_str = exec_id.to_string();
+    // A missing source is left to the fork, which refuses it with `404`.
+    let stored: Option<Option<Value>> = match harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::completion_callbacks)
+        .first(conn)
+        .await
+        .optional()
+    {
+        Ok(stored) => stored,
+        Err(e) => {
+            let error = autumn_harvest::error::database_error(e);
+            let failure = error.to_string();
+            let _ = audit_fork(conn, context, &exec_id_str, Some(&failure)).await;
+            return Some(map_error(error).into_response());
+        }
+    };
+    // A source with no callback targets has nothing to check.
+    let raw = stored.flatten()?;
+    let targets: Vec<autumn_harvest::completion_callback::CallbackTarget> =
+        match serde_json::from_value(raw) {
+            Ok(targets) => targets,
+            Err(e) => {
+                let failure = "malformed stored completion_callbacks";
+                let _ = audit_fork(conn, context, &exec_id_str, Some(failure)).await;
+                return Some(
+                    AutumnError::bad_request_msg(format!(
+                        "source execution {exec_id} has an unparseable stored \
+                     completion_callbacks value ({e}); a live fork cannot send them"
+                    ))
+                    .into_response(),
+                );
+            }
+        };
+    let policy = api_state.completion_callback_ssrf_policy();
+    for target in &targets {
+        if let Err(rejection) =
+            autumn_harvest::completion_callback::validate_target_url(&target.url, &policy)
+        {
+            let failure = "completion callback target no longer admissible";
+            let _ = audit_fork(conn, context, &exec_id_str, Some(failure)).await;
+            return Some(
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "completion callback target rejected",
+                        "url": target.url,
+                        "rejection": rejection,
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
+}
+
+/// Write one `workflow.fork` audit row on the default shard.
+async fn audit_fork_on_default(
+    api_state: &HarvestApiState,
+    context: &(String, String, Option<String>),
+    target_id: &str,
+    failure: Option<&str>,
+) -> Result<(), String> {
+    let pool = api_state.storage_pool().map_err(|e| e.to_string())?;
+    let mut conn = acquire_conn(pool.default_pool())
+        .await
+        .map_err(|e| e.to_string())?;
+    audit_fork(&mut conn, context, target_id, failure).await
+}
+
+/// Write one `workflow.fork` audit row on `conn`.
+///
+/// `failure` is the error summary of a refused fork, or `None` on success.
+async fn audit_fork(
+    conn: &mut AsyncPgConnection,
+    context: &(String, String, Option<String>),
+    target_id: &str,
+    failure: Option<&str>,
+) -> Result<(), String> {
+    audit::insert_audit(conn, &fork_audit_record(context, target_id, failure))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// The `workflow.fork` audit row of one request.
+fn fork_audit_record<'a>(
+    (actor, source, request_id): &'a (String, String, Option<String>),
+    target_id: &'a str,
+    failure: Option<&'a str>,
+) -> NewAuditRecord<'a> {
+    NewAuditRecord {
+        actor,
+        operation: OP_WORKFLOW_FORK,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(target_id),
+        route_or_command: "POST /workflows/{id}/fork",
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status: if failure.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        error_summary: failure,
+        shard_id: None,
+        source,
+    }
+}
+
+fn fork_error_response(error: WorkflowForkError) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let status = match error {
+        WorkflowForkError::InvalidPoint(invalid) => return reset_invalid_point_response(invalid),
+        // A fork is a fresh admission (issue #2000), so a gate answers as it
+        // does for a start or a rerun.
+        WorkflowForkError::Harvest(HarvestError::AdmissionBlocked { gate_id, reason }) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
+        WorkflowForkError::Harvest(error) => return map_error(error).into_response(),
+        WorkflowForkError::ContinueAsNew | WorkflowForkError::InvalidOverride { .. } => {
+            axum::http::StatusCode::BAD_REQUEST
+        }
+        // As for a rerun: the fork would fail on every worker.
+        WorkflowForkError::WorkflowNotRegistered { .. } => axum::http::StatusCode::NOT_FOUND,
+        WorkflowForkError::ErasedSource { .. }
+        | WorkflowForkError::UnservableEffect { .. }
+        | WorkflowForkError::CarriedMutex { .. }
+        | WorkflowForkError::WorkflowIdInUse { .. }
+        | WorkflowForkError::LineageTooDeep { .. }
+        | WorkflowForkError::LineageGap { .. }
+        | WorkflowForkError::LineageMalformed { .. }
+        | WorkflowForkError::HistoryCapReached { .. }
+        | WorkflowForkError::ShardRefused { .. } => axum::http::StatusCode::CONFLICT,
+    };
+    (
+        status,
+        Json(ResetErrorResponse {
+            message: error.to_string(),
+        }),
+    )
+        .into_response()
+}
+
 fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
@@ -25799,6 +26116,25 @@ fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
                 message: format!(
                     "workflow execution {exec_id} had its payloads erased (issue #495); a fork \
                      would resume on tombstones, so start a fresh run instead"
+                ),
+            }),
+        )
+            .into_response(),
+        // A reset of a fork that could never run one task (issue #2000).
+        WorkflowResetError::HistoryCapReached { .. } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!("{error}; reset at an earlier point"),
+            }),
+        )
+            .into_response(),
+        // A reset of a fork walks its lineage as a fork does (issue #2000).
+        WorkflowResetError::ForkLineage { exec_id, reason } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "the fork lineage of workflow execution {exec_id} cannot be checked for \
+                     erasure ({reason}); start a fresh run instead"
                 ),
             }),
         )
@@ -26719,6 +27055,8 @@ pub(crate) async fn signal_workflow(
 
 /// Hydrate a workflow context by replaying its history into the workflow
 /// handler long enough for it to register its query handlers.
+// One linear context setup. A split would only move the lines.
+#[allow(clippy::too_many_lines)]
 async fn hydrate_ctx_for_query(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
@@ -26843,6 +27181,11 @@ async fn hydrate_ctx_for_query(
     // execution row, absent from history, so this context (which sources those
     // from the row) must source parent from the row too.
     .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))
+    // Issue #2082: the query replays the body, so it needs the row's start source.
+    .with_start_provenance(autumn_harvest::types::StartProvenance::from_row(
+        execution.start_source.as_deref(),
+        execution.continued_from_exec_id,
+    ))
     // Issue #698: thread the execution row's workflow type name and business
     // `workflow_id` so a query replayed on this run reports the real values via
     // `ctx.info().workflow_type` / `ctx.info().workflow_id`. Both live on the
@@ -28291,7 +28634,10 @@ async fn upsert_workflow_schedule_and_read_back(
     registry: Option<&HandlerRegistry>,
 ) -> Result<ScheduleEntry, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    autumn_harvest::register_workflow_schedules(conn, std::slice::from_ref(ws))
+    // The registry holds the write codec (issue #2043).
+    let identity_codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    let codecs = registry.map_or(&identity_codecs, HandlerRegistry::payload_codecs);
+    autumn_harvest::register_workflow_schedules_with_codecs(conn, std::slice::from_ref(ws), codecs)
         .await
         .map_err(map_error)?;
     let row: autumn_harvest::models::HarvestSchedule = dsl::harvest_schedules
@@ -29247,7 +29593,13 @@ async fn update_schedule_handler(
         retry_policy: request.retry_policy.clone(),
     };
 
-    match update_workflow_schedule(&mut conn, id, &patch).await {
+    // The registry holds the write codec. The API mirror serves the read path
+    // (issue #2043).
+    let write_codecs = api_state.runtime().map_or_else(
+        |_| api_state.payload_codecs(),
+        |rt| rt.registry.payload_codecs().clone(),
+    );
+    match update_workflow_schedule_with_codecs(&mut conn, id, &patch, &write_codecs).await {
         Ok(ScheduleUpdateOutcome::Updated(row)) => {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -30143,10 +30495,15 @@ async fn trigger_schedule_now(
         schedule.dag_name.as_deref(),
     ) {
         (Some(wf_name), _) => {
-            let input = schedule
-                .workflow_input
-                .clone()
-                .unwrap_or(serde_json::Value::Null);
+            // The engine reads the stored input strictly (issue #2043).
+            let input = match schedule.workflow_input.as_ref() {
+                Some(stored) => runtime
+                    .registry
+                    .payload_codecs()
+                    .decode_column(stored)
+                    .map_err(map_error)?,
+                None => serde_json::Value::Null,
+            };
             let queue = schedule
                 .queue_name
                 .as_deref()
@@ -31768,11 +32125,6 @@ pub(crate) async fn schedule_backfill_inner(
                 // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
                 // the execution lands on the default shard, same as tick_one_workflow_schedule.
                 let exec_id = ExecutionId::new();
-                let input = schedule
-                    .workflow_input
-                    .clone()
-                    .unwrap_or(serde_json::Value::Null);
-
                 let Ok(mut conn) = acquire_conn(wf_shard_pool).await else {
                     shard_failures.push(BackfillShardFailure {
                         shard_id: 0,
@@ -31817,6 +32169,25 @@ pub(crate) async fn schedule_backfill_inner(
                         continue;
                     }
                 }
+
+                // A stored input that does not decode never starts a run. A
+                // slot that already ran needs no input, so the prior-run check
+                // above comes first (issue #2043).
+                let input = match schedule.workflow_input.as_ref() {
+                    Some(stored) => {
+                        let Ok(plain) = runtime.registry.payload_codecs().decode_column(stored)
+                        else {
+                            shard_failures.push(BackfillShardFailure {
+                                shard_id: 0,
+                                reason: "stored schedule input could not be decoded".to_string(),
+                            });
+                            failed += 1;
+                            continue;
+                        };
+                        plain
+                    }
+                    None => serde_json::Value::Null,
+                };
 
                 let (
                     owner,
@@ -34940,10 +35311,9 @@ async fn replay_diagnosis(
     // configured) are not offload-inflated for the count, so the audit
     // conservatively counts inline-encrypted envelopes only — a rare-combo edge
     // that under-counts, never a leak.
-    let history = if let Some(codecs) =
-        read_path_decoder(&api_state, extension_session(maybe_session)).await
-    {
-        let history = store::load_history_inflated(&mut conn, exec_id, &codecs, offloader)
+    let decode_codecs = read_path_decoder(&api_state, extension_session(maybe_session)).await;
+    let history = if let Some(codecs) = decode_codecs.as_ref() {
+        let history = store::load_history_inflated(&mut conn, exec_id, codecs, offloader)
             .await
             .map_err(map_error)?;
         let mut outcome = LossyDecodeOutcome::default();
@@ -34953,6 +35323,13 @@ async fn replay_diagnosis(
                     outcome = outcome.merged(codecs.decode_value_lossy(&mut value));
                 }
             }
+        }
+        // The replay below decodes the header cell too. The audit counts it,
+        // so a run whose payloads are all offloaded still leaves a record
+        // (issue #2043).
+        if let Some(cell) = execution.context_headers.as_ref() {
+            let mut cell = cell.clone();
+            outcome = outcome.merged(codecs.decode_value_lossy(&mut cell));
         }
         let target = exec_id.to_string();
         // Reuse the handler's own (execution-shard) connection, mirroring the
@@ -35035,9 +35412,22 @@ async fn replay_diagnosis(
     // exactly the values hydrate_ctx_for_query threads for the query path — so a
     // deadline-aware, parent-aware, or header-branching run replays cleanly instead
     // of surfacing FALSE non-determinism.
-    let context_headers = execution.context_headers.as_ref().and_then(|v| {
-        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
-    });
+    // The headers decode under the same gate as the history. A cell this
+    // caller may not decode makes the run undiagnosable. It never replays
+    // without its headers (issue #2043).
+    let context_headers = decode_codecs
+        .clone()
+        .unwrap_or_default()
+        .decode_headers_opt(execution.context_headers.as_ref())
+        .map(|headers| execution.context_headers.is_some().then_some(headers))
+        .map_err(|_| {
+            map_error(HarvestError::HistoryUnavailable {
+                exec_id,
+                reason: "payload decoding is required to diagnose this execution; \
+                         enable decode-on-read (admin)"
+                    .to_string(),
+            })
+        })?;
     let snapshot = autumn_harvest::testing::HistorySnapshot {
         workflow_name: execution.workflow_name.clone(),
         execution_id: exec_id,
@@ -35045,6 +35435,11 @@ async fn replay_diagnosis(
         context_headers,
         execution_timeout: execution.execution_timeout,
         deadline_at: execution.deadline_at,
+        // Issue #2082: carry the row's start source and predecessor.
+        start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
+            execution.start_source.as_deref(),
+            execution.continued_from_exec_id,
+        )),
         parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         workflow_id: Some(execution.workflow_id.clone()),
         queue_name: None,
@@ -43807,9 +44202,13 @@ fn export_history_for_execution(
     decoder: Option<&PayloadCodecs>,
     outcome: &mut LossyDecodeOutcome,
 ) -> Result<HistoryExportDocument, HistoryExportError> {
-    let context_headers = execution.context_headers.as_ref().and_then(|v| {
-        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
-    });
+    // A cell the caller may not decode stays out of the export (issue #2043).
+    // The Redacted policy drops the headers, so it decodes nothing.
+    let context_headers = autumn_harvest::history_export::export_headers(
+        execution.context_headers.as_ref(),
+        decoder.filter(|_| query.payload_policy != HistoryPayloadPolicy::Redacted),
+        outcome,
+    );
     export_history_decoded(
         HistoryExportRequest {
             workflow_name: execution.workflow_name.clone(),
@@ -43840,6 +44239,11 @@ fn export_history_for_execution(
             // child history round-trips its parent into the JSON / `harvest-replay`
             // replay path (mirrors `execution_timeout`/`deadline_at`; `parent_id`
             // lives in no `WorkflowEvent`). `None` for a top-level run.
+            // Issue #2082: carry the row's start source and predecessor.
+            start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
+                execution.start_source.as_deref(),
+                execution.continued_from_exec_id,
+            )),
             parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         },
         decoder,
@@ -43875,10 +44279,11 @@ fn export_history_for_candidate(
             // Issue #798: carry the execution's own ambient headers so a
             // header-branching workflow replays against what the live run saw
             // instead of an empty map (which would be a FALSE divergence).
-            context_headers: candidate.context_headers.as_ref().and_then(|value| {
-                serde_json::from_value::<std::collections::HashMap<String, String>>(value.clone())
-                    .ok()
-            }),
+            context_headers: autumn_harvest::history_export::export_headers(
+                candidate.context_headers.as_ref(),
+                decoder.filter(|_| query.payload_policy != HistoryPayloadPolicy::Redacted),
+                outcome,
+            ),
             // Issue #772: carry the deadline-aware replay metadata (the batch
             // candidate query now SELECTs `execution_timeout`/`deadline_at`) so a
             // batch-exported deadline-aware history round-trips its continue-as-new
@@ -43891,6 +44296,12 @@ fn export_history_for_candidate(
             // history round-trips its parent into the JSON / `harvest-replay`
             // replay path — parity with the single-execution export.
             parent_execution_id: candidate.parent_id.map(ExecutionId::from_uuid),
+            // Issue #2082: carry the start source and predecessor — parity with
+            // the single-execution export.
+            start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
+                candidate.start_source.as_deref(),
+                candidate.continued_from_exec_id,
+            )),
         },
         decoder,
         outcome,
@@ -44158,7 +44569,9 @@ SELECT
     w.deadline_at AS deadline_at,
     w.parent_id AS parent_id,
     w.context_headers AS context_headers,
-    w.queue_name AS queue_name
+    w.queue_name AS queue_name,
+    w.start_source AS start_source,
+    w.continued_from_exec_id AS continued_from_exec_id
 FROM harvest_workflow_executions w
 LEFT JOIN harvest_events e
     ON e.workflow_exec_id = w.id
@@ -44166,7 +44579,7 @@ WHERE ($1::TEXT IS NULL OR w.workflow_name = $1::TEXT)
   AND (cardinality($2::TEXT[]) = 0 OR w.state = ANY($2::TEXT[]))
 GROUP BY w.id, w.workflow_name, w.workflow_id, w.shard_id, w.state, w.completed_at, w.started_at,
          w.created_at, w.execution_timeout, w.deadline_at, w.parent_id, w.context_headers,
-         w.queue_name
+         w.queue_name, w.start_source, w.continued_from_exec_id
 HAVING ($3::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) >= $3::TIMESTAMPTZ)
    AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) < $4::TIMESTAMPTZ)
 ORDER BY last_history_event_at DESC, w.id DESC
@@ -44288,6 +44701,8 @@ WITH ranked AS (
         w.parent_id AS parent_id,
         w.context_headers AS context_headers,
         w.queue_name AS queue_name,
+        w.start_source AS start_source,
+        w.continued_from_exec_id AS continued_from_exec_id,
         ROW_NUMBER() OVER (
             PARTITION BY w.workflow_name
             ORDER BY w.started_at ASC, w.id ASC
@@ -44304,7 +44719,7 @@ type_count AS (
 )
 SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
        execution_timeout, deadline_at, parent_id, context_headers, queue_name,
-       in_flight_total
+       start_source, continued_from_exec_id, in_flight_total
 FROM ranked, type_count
 WHERE rn <= LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))
 ORDER BY workflow_name ASC, rn ASC
@@ -44329,6 +44744,8 @@ WITH ranked AS (
         w.parent_id AS parent_id,
         w.context_headers AS context_headers,
         w.queue_name AS queue_name,
+        w.start_source AS start_source,
+        w.continued_from_exec_id AS continued_from_exec_id,
         ROW_NUMBER() OVER (
             PARTITION BY w.workflow_name
             ORDER BY w.started_at DESC, w.id DESC
@@ -44345,7 +44762,7 @@ type_count AS (
 )
 SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
        execution_timeout, deadline_at, parent_id, context_headers, queue_name,
-       in_flight_total
+       start_source, continued_from_exec_id, in_flight_total
 FROM ranked, type_count
 WHERE rn <= LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))
 ORDER BY workflow_name ASC, rn ASC
@@ -56074,6 +56491,8 @@ mod tests {
             deadline_at: Some(stale_deadline),
             parent_id: None,
             context_headers: None,
+            start_source: None,
+            continued_from_exec_id: None,
             queue_name: "default".to_string(),
         };
 
@@ -56191,6 +56610,8 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             context_headers: None,
+            start_source: None,
+            continued_from_exec_id: None,
             queue_name: "default".to_string(),
         }
     }
@@ -56253,6 +56674,8 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             context_headers: None,
+            start_source: None,
+            continued_from_exec_id: None,
             queue_name: "default".to_string(),
             in_flight_total,
         }
@@ -57026,6 +57449,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
         }
     }

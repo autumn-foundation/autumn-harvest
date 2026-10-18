@@ -3753,12 +3753,20 @@ const COLUMN_DEBOUNCE: &str = "column-debounce";
 const COLUMN_THROTTLE: &str = "column-throttle";
 const COLUMN_OUTBOX: &str = "column-outbox";
 const COLUMN_BATCH: &str = "column-batch";
+const COLUMN_BATCH_BUFFER: &str = "column-batch-buffer";
+const COLUMN_CHILD_SPEC: &str = "column-child-spec";
+const COLUMN_SCHEDULE: &str = "column-schedule";
+const COLUMN_EXEC_HEADERS: &str = "column-exec-headers";
+const COLUMN_START_HEADERS: &str = "column-start-headers";
+const COLUMN_START_MEMO: &str = "column-start-memo";
+const COLUMN_TASK_HEADERS: &str = "column-task-headers";
 
 /// The cells one [`seed_codec_columns`] call writes. A workflow task row and
 /// an activity task row each hold an input and an output. The activity row
-/// also holds a heartbeat. Every other swept column holds one cell.
+/// also holds a heartbeat. The event batch buffer holds one element, and the
+/// census counts its row once. Every other swept column holds one cell.
 /// `the_seed_covers_every_codec_column` pins this to `CODEC_COLUMNS`.
-const CELLS_PER_SEED: usize = 16;
+const CELLS_PER_SEED: usize = 27;
 
 /// Write one envelope under `key_id` into every swept codec column.
 async fn seed_codec_columns(
@@ -3768,12 +3776,14 @@ async fn seed_codec_columns(
 ) -> SeededColumns {
     let exec_id = insert_execution(conn, "column_rotation").await;
     diesel::sql_query(
-        "UPDATE harvest_workflow_executions SET input = $1, output = $2, memo = $3 WHERE id = $4",
+        "UPDATE harvest_workflow_executions \
+         SET input = $1, output = $2, memo = $3, context_headers = $5 WHERE id = $4",
     )
     .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_INPUT)))
     .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_OUTPUT)))
     .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_MEMO)))
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Jsonb, _>(encode_under(codecs, key_id, &json!(COLUMN_EXEC_HEADERS)))
     .execute(conn)
     .await
     .expect("encode execution columns");
@@ -3842,17 +3852,28 @@ async fn seed_short_lived_columns(
 ) {
     use diesel::sql_types::{Jsonb, Text, Uuid as SqlUuid};
     let cell = |plain: &str| encode_under(codecs, key_id, &json!(plain));
+    // The start options of a buffered start. Two keys hold an envelope, and
+    // the third is configuration that the sweep must leave as it is.
+    let start_options = || {
+        json!({
+            "context_headers": cell(COLUMN_START_HEADERS),
+            "memo": cell(COLUMN_START_MEMO),
+            "reuse_policy": "reject_duplicate",
+        })
+    };
 
     diesel::sql_query(
         "INSERT INTO harvest_task_queue \
-         (id, queue_name, task_type, workflow_exec_id, input, output, heartbeat_details, state) \
-         VALUES ($1, 'default', 'activity', $2, $3, $4, $5, 'COMPLETED')",
+         (id, queue_name, task_type, workflow_exec_id, input, output, heartbeat_details, \
+          context_headers, state) \
+         VALUES ($1, 'default', 'activity', $2, $3, $4, $5, $6, 'COMPLETED')",
     )
     .bind::<SqlUuid, _>(Uuid::new_v4())
     .bind::<SqlUuid, _>(exec_id.as_uuid())
     .bind::<Jsonb, _>(cell(COLUMN_ACTIVITY_INPUT))
     .bind::<Jsonb, _>(cell(COLUMN_ACTIVITY_OUTPUT))
     .bind::<Jsonb, _>(cell(COLUMN_HEARTBEAT))
+    .bind::<Jsonb, _>(cell(COLUMN_TASK_HEADERS))
     .execute(conn)
     .await
     .expect("insert activity task");
@@ -3875,11 +3896,12 @@ async fn seed_short_lived_columns(
         "INSERT INTO harvest_debounce \
          (id, workflow_name, debounce_key, workflow_id, queue_name, last_input, start_options, \
           effective_fire_at, max_fire_at) \
-         VALUES ($1, 'column_rotation', $2, 'wf', 'default', $3, '{}'::jsonb, now(), now())",
+         VALUES ($1, 'column_rotation', $2, 'wf', 'default', $3, $4, now(), now())",
     )
     .bind::<SqlUuid, _>(Uuid::new_v4())
     .bind::<Text, _>(Uuid::new_v4().to_string())
     .bind::<Jsonb, _>(cell(COLUMN_DEBOUNCE))
+    .bind::<Jsonb, _>(start_options())
     .execute(conn)
     .await
     .expect("insert debounce row");
@@ -3888,12 +3910,13 @@ async fn seed_short_lived_columns(
         "INSERT INTO harvest_start_throttle \
          (id, workflow_name, throttle_key, bucket_key, workflow_id, queue_name, input, \
           start_options) \
-         VALUES ($1, 'column_rotation', $2, 'bucket', $3, 'default', $4, '{}'::jsonb)",
+         VALUES ($1, 'column_rotation', $2, 'bucket', $3, 'default', $4, $5)",
     )
     .bind::<SqlUuid, _>(Uuid::new_v4())
     .bind::<Text, _>(Uuid::new_v4().to_string())
     .bind::<Text, _>(Uuid::new_v4().to_string())
     .bind::<Jsonb, _>(cell(COLUMN_THROTTLE))
+    .bind::<Jsonb, _>(start_options())
     .execute(conn)
     .await
     .expect("insert throttle row");
@@ -3922,6 +3945,54 @@ async fn seed_short_lived_columns(
     .execute(conn)
     .await
     .expect("insert batch job");
+
+    insert_batch_buffer(conn, &[cell(COLUMN_BATCH_BUFFER)], &start_options()).await;
+
+    diesel::sql_query(
+        "INSERT INTO harvest_cross_shard_children \
+         (child_exec_id, parent_exec_id, target_shard, workflow_name, child_spec) \
+         VALUES ($1, $2, 1, 'column_rotation', $3)",
+    )
+    .bind::<SqlUuid, _>(Uuid::new_v4())
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .bind::<Jsonb, _>(cell(COLUMN_CHILD_SPEC))
+    .execute(conn)
+    .await
+    .expect("insert child spec");
+
+    diesel::sql_query(
+        "INSERT INTO harvest_schedules (id, workflow_name, workflow_input) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind::<SqlUuid, _>(Uuid::new_v4())
+    .bind::<Text, _>(format!("column_rotation_{}", Uuid::new_v4().simple()))
+    .bind::<Jsonb, _>(cell(COLUMN_SCHEDULE))
+    .execute(conn)
+    .await
+    .expect("insert schedule");
+}
+
+/// Insert one event batch row that buffers `elements` (issue #2043).
+async fn insert_batch_buffer(
+    conn: &mut AsyncPgConnection,
+    elements: &[Value],
+    start_options: &Value,
+) {
+    use diesel::sql_types::{Jsonb, Text, Uuid as SqlUuid};
+    diesel::sql_query(
+        "INSERT INTO harvest_event_batches \
+         (id, workflow_name, batch_key, workflow_id, queue_name, buffered_payloads, \
+          start_options, fire_at, max_size, shard_id, created_at, updated_at) \
+         VALUES ($1, 'column_rotation', $2, 'wf', 'default', $3, $4, \
+                 now() + interval '1 day', 100, 0, now(), now())",
+    )
+    .bind::<SqlUuid, _>(Uuid::new_v4())
+    .bind::<Text, _>(Uuid::new_v4().to_string())
+    .bind::<Jsonb, _>(Value::Array(elements.to_vec()))
+    .bind::<Jsonb, _>(start_options.clone())
+    .execute(conn)
+    .await
+    .expect("insert batch buffer");
 }
 
 /// Every swept codec cell on the shard, as `(column, stored value)`, in
@@ -3958,6 +4029,29 @@ async fn codec_cells(conn: &mut AsyncPgConnection) -> Vec<(String, Value)> {
              FROM harvest_completion_trigger_outbox \
            UNION ALL SELECT 14, id::TEXT, 'batch', signal_payload FROM harvest_batch_jobs \
              WHERE signal_payload IS NOT NULL \
+           UNION ALL SELECT 15, b.id::TEXT, 'batch_buffer', e.value \
+             FROM harvest_event_batches b \
+             CROSS JOIN LATERAL jsonb_array_elements(b.buffered_payloads) e(value) \
+           UNION ALL SELECT 16, child_exec_id::TEXT, 'child_spec', child_spec \
+             FROM harvest_cross_shard_children \
+           UNION ALL SELECT 17, id::TEXT, 'schedule', workflow_input \
+             FROM harvest_schedules WHERE workflow_input IS NOT NULL \
+           UNION ALL SELECT 18, id::TEXT, 'exec_headers', context_headers \
+             FROM harvest_workflow_executions WHERE context_headers IS NOT NULL \
+           UNION ALL SELECT 19, id::TEXT, 'task_headers', context_headers \
+             FROM harvest_task_queue WHERE context_headers IS NOT NULL \
+           UNION ALL SELECT 20, id::TEXT, 'debounce_headers', start_options -> 'context_headers' \
+             FROM harvest_debounce WHERE start_options -> 'context_headers' IS NOT NULL \
+           UNION ALL SELECT 21, id::TEXT, 'debounce_memo', start_options -> 'memo' \
+             FROM harvest_debounce WHERE start_options -> 'memo' IS NOT NULL \
+           UNION ALL SELECT 22, id::TEXT, 'throttle_headers', start_options -> 'context_headers' \
+             FROM harvest_start_throttle WHERE start_options -> 'context_headers' IS NOT NULL \
+           UNION ALL SELECT 23, id::TEXT, 'throttle_memo', start_options -> 'memo' \
+             FROM harvest_start_throttle WHERE start_options -> 'memo' IS NOT NULL \
+           UNION ALL SELECT 24, id::TEXT, 'batch_headers', start_options -> 'context_headers' \
+             FROM harvest_event_batches WHERE start_options -> 'context_headers' IS NOT NULL \
+           UNION ALL SELECT 25, id::TEXT, 'batch_memo', start_options -> 'memo' \
+             FROM harvest_event_batches WHERE start_options -> 'memo' IS NOT NULL \
          ) c ORDER BY ord, row_id",
     )
     .load(conn)
@@ -4271,6 +4365,145 @@ async fn the_column_sweep_converts_activity_task_rows() {
     assert_eq!(by_key.get("k1").copied().unwrap_or(0), 0);
 }
 
+/// One batch row holds several elements, each under its own key. The census
+/// counts the row once per key, and the sweep converts every envelope element
+/// in one swap. A clear element stays clear (issue #2043).
+#[tokio::test]
+async fn the_sweep_re_encrypts_each_element_of_a_batch_buffer() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_aead_key_registry();
+    let elements = vec![
+        encode_under(&codecs, "k1", &json!("buffer-a")),
+        encode_under(&codecs, "k1", &json!("buffer-b")),
+        json!("buffer-clear"),
+    ];
+    insert_batch_buffer(&mut conn, &elements, &json!({})).await;
+
+    let by_key = autumn_harvest::codec_rotation::count_rows_by_key_id(&mut conn)
+        .await
+        .expect("census");
+    assert_eq!(by_key.get("k1").copied(), Some(1), "one row, counted once");
+
+    codecs.set_active_key("k2").expect("flip");
+    let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("sweep");
+    assert_eq!(rewritten, 1, "one swap converts the whole buffer");
+
+    let cells = codec_cells(&mut conn).await;
+    assert_eq!(cells.len(), 2, "two envelope elements, one clear");
+    for (column, value) in &cells {
+        assert_eq!(column, "batch_buffer");
+        assert_eq!(
+            autumn_harvest::payload_codec::codec_envelope_key_id(value),
+            Some("k2"),
+            "each envelope element is on the active key"
+        );
+    }
+    let decoded: Vec<Value> = cells
+        .iter()
+        .map(|(_, value)| codecs.decode_column(value).expect("decode"))
+        .collect();
+    assert_eq!(decoded, vec![json!("buffer-a"), json!("buffer-b")]);
+    let by_key = autumn_harvest::codec_rotation::count_rows_by_key_id(&mut conn)
+        .await
+        .expect("census");
+    assert_eq!(by_key.get("k1").copied().unwrap_or(0), 0);
+    assert_eq!(by_key.get("k2").copied(), Some(1));
+}
+
+/// An element under a key this registry never held blocks completion. The
+/// other elements of that buffer stay as they were (issue #2043).
+#[tokio::test]
+async fn an_undecodable_batch_element_blocks_completion() {
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_aead_key_registry();
+    let orphan = json!({
+        CODEC_ENVELOPE_KEY: {"codec_id": "xor", "kid": "gone", "data": "AAAA"}
+    });
+    insert_batch_buffer(
+        &mut conn,
+        &[encode_under(&codecs, "k1", &json!("buffer-a")), orphan],
+        &json!({}),
+    )
+    .await;
+    codecs.set_active_key("k2").expect("flip");
+
+    let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+        .await
+        .expect("a per-cell failure is not an error");
+    assert_eq!(rewritten, 0, "the buffer is left whole");
+    let progress = load_shard_rotation_progress(&mut conn, 0, &codecs)
+        .await
+        .expect("progress");
+    assert_eq!(progress.rows_by_key_id.get("gone").copied(), Some(1));
+    assert!(
+        progress.cursor.and_then(|c| c.completed_at).is_none(),
+        "the pass must not complete over an unconverted element"
+    );
+}
+
+/// The start options of a debounce, throttle or batch row hold two payload
+/// keys. The sweep moves both to the active key and leaves the configuration
+/// keys as they are (issue #2043).
+#[tokio::test]
+async fn the_sweep_re_encrypts_the_payload_keys_of_start_options_and_nothing_else() {
+    #[derive(diesel::QueryableByName)]
+    struct Options {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        value: Value,
+    }
+    let (url, _c) = setup_isolated_db().await;
+    let mut conn = connect(&url).await;
+    let codecs = two_aead_key_registry();
+    seed_codec_columns(&mut conn, &codecs, "k1").await;
+    codecs.set_active_key("k2").expect("flip");
+
+    for _ in 0..24 {
+        let rewritten = sweep_codec_reencryption_once(&mut conn, 0, &codecs, 100, &NoOpMetrics)
+            .await
+            .expect("sweep");
+        if rewritten == 0 {
+            break;
+        }
+    }
+    for table in [
+        "harvest_debounce",
+        "harvest_start_throttle",
+        "harvest_event_batches",
+    ] {
+        let options: Options = diesel::sql_query(format!(
+            "SELECT start_options AS value FROM {table} WHERE workflow_name = 'column_rotation'"
+        ))
+        .get_result(&mut conn)
+        .await
+        .expect("load start options");
+        for (key, plain) in [
+            ("context_headers", COLUMN_START_HEADERS),
+            ("memo", COLUMN_START_MEMO),
+        ] {
+            let cell = &options.value[key];
+            assert_eq!(
+                autumn_harvest::payload_codec::codec_envelope_key_id(cell),
+                Some("k2"),
+                "{table}.{key} is on the active key"
+            );
+            assert_eq!(codecs.decode_column(cell).expect("decode"), json!(plain));
+        }
+        assert_eq!(
+            options.value["reuse_policy"],
+            json!("reject_duplicate"),
+            "{table}: the sweep leaves a configuration key as it is"
+        );
+    }
+    let by_key = autumn_harvest::codec_rotation::count_rows_by_key_id(&mut conn)
+        .await
+        .expect("census");
+    assert_eq!(by_key.get("k1").copied().unwrap_or(0), 0);
+}
+
 /// The seed must reach every swept column. A new `CODEC_COLUMNS` entry then
 /// fails here until the seed, and so the sweep tests, cover it.
 #[tokio::test]
@@ -4286,10 +4519,15 @@ async fn the_seed_covers_every_codec_column() {
     seed_codec_columns(&mut conn, &codecs, "k1").await;
     for column in autumn_harvest::codec_rotation::CODEC_COLUMNS {
         // The identifiers come from the compile-time `CODEC_COLUMNS` list.
+        let present = match column.shape() {
+            autumn_harvest::codec_rotation::CellShape::Field(key) => {
+                format!("t.{} -> '{key}' IS NOT NULL", column.column())
+            }
+            _ => format!("t.{} IS NOT NULL", column.column()),
+        };
         let sql = format!(
-            "SELECT COUNT(*)::BIGINT AS n FROM {table} t WHERE {rows} AND t.{col} IS NOT NULL",
+            "SELECT COUNT(*)::BIGINT AS n FROM {table} t WHERE {rows} AND {present}",
             table = column.table(),
-            col = column.column(),
             rows = column.rows(),
         );
         let count: Count = diesel::sql_query(sql)
@@ -4445,10 +4683,10 @@ async fn two_databases_in_one_process_keep_separate_column_cursors() {
     codecs_b.set_active_key("k2").expect("flip b");
 
     // Alternate the two shard-0 sweeps, as two runtimes in one process do.
-    // Each converts its cells at 3 per tick, so 12 ticks each suffice
+    // Each converts its cells at 3 per tick, so this many ticks each suffice
     // when neither reuses the other's cursor.
     let (mut total_a, mut total_b) = (0, 0);
-    for _ in 0..12 {
+    for _ in 0..(2 * CELLS_PER_SEED).div_ceil(3) {
         total_a += sweep_codec_reencryption_once(&mut conn_a, 0, &codecs_a, 3, &NoOpMetrics)
             .await
             .expect("sweep a");
@@ -4495,10 +4733,10 @@ async fn two_schemas_in_one_database_keep_separate_column_cursors() {
     codecs_a.set_active_key("k2").expect("flip a");
     codecs_b.set_active_key("k2").expect("flip b");
 
-    // At 3 per tick, 12 ticks each convert every cell when neither sweep
-    // reuses the cursor of the other.
+    // At 3 per tick, this many ticks each convert every cell when neither
+    // sweep reuses the cursor of the other.
     let (mut total_a, mut total_b) = (0, 0);
-    for _ in 0..12 {
+    for _ in 0..(2 * CELLS_PER_SEED).div_ceil(3) {
         total_a += sweep_codec_reencryption_once(&mut conn_a, 0, &codecs_a, 3, &NoOpMetrics)
             .await
             .expect("sweep a");
