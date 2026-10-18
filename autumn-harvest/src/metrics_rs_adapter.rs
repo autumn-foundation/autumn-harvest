@@ -41,7 +41,12 @@
 //!
 //! Enabled by the `metrics-rs` cargo feature.
 
-use metrics::{Key, Label, counter, gauge, histogram};
+use std::cell::RefCell;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex, PoisonError};
+
+use metrics::{Key, Label, SharedString, counter, gauge, histogram};
 
 use crate::worker_outlier::OutlierDimension;
 
@@ -121,6 +126,82 @@ pub struct MetricsRsRecorder;
 /// write to the one global `metrics` registry. A heap address is never 1.
 const METRICS_RS_GLOBAL_SINK: usize = 1;
 
+/// Most distinct label values that [`label_value`] interns. A value past the
+/// cap is copied on every call, as it was before interning.
+const INTERNED_LABEL_CAP: usize = 4096;
+
+/// Every interned label value. Each one is leaked once and lives for the
+/// rest of the process.
+static INTERNED_LABELS: LazyLock<Mutex<HashSet<&'static str>>> = LazyLock::new(Mutex::default);
+
+/// Set once [`INTERNED_LABELS`] holds [`INTERNED_LABEL_CAP`] values. A miss
+/// then skips the shared lock.
+static INTERNED_LABELS_FULL: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// The interned values that this thread has used. A hit takes no lock
+    /// and touches no shared cache line.
+    static THREAD_LABELS: RefCell<HashSet<&'static str>> = RefCell::new(HashSet::new());
+}
+
+/// A label value for the per-task metric families.
+///
+/// Those labels repeat a small set of names: the registered activities and
+/// workflows, the worker's queues and its build id. A copied `String` costs
+/// an allocation and a free on every sample. An interned value is a borrowed
+/// `&'static str`, so it costs a lookup in a thread-local set and nothing
+/// else.
+///
+/// The leak is bounded. ADR-0001 §7 keeps these labels low-cardinality, and
+/// an exporter keeps every series it has seen anyway. [`INTERNED_LABEL_CAP`]
+/// still caps the leak if a caller breaks that rule.
+fn label_value(value: &str) -> SharedString {
+    let cached = THREAD_LABELS.try_with(|labels| labels.borrow().get(value).copied());
+    if let Ok(Some(interned)) = cached {
+        return SharedString::from(interned);
+    }
+    let Some(interned) = intern_label(value) else {
+        return SharedString::from(value.to_owned());
+    };
+    // A thread that is shutting down has no local set. The value is still
+    // interned, so the next lookup only takes the shared lock again.
+    let _ = THREAD_LABELS.try_with(|labels| labels.borrow_mut().insert(interned));
+    SharedString::from(interned)
+}
+
+/// The shared copy of `value`, or `None` once the interner is full.
+fn intern_label(value: &str) -> Option<&'static str> {
+    if INTERNED_LABELS_FULL.load(Ordering::Relaxed) {
+        return None;
+    }
+    let mut labels = INTERNED_LABELS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let interned = intern_into(&mut labels, value, INTERNED_LABEL_CAP);
+    if interned.is_none() {
+        INTERNED_LABELS_FULL.store(true, Ordering::Relaxed);
+    }
+    interned
+}
+
+/// The copy of `value` in `labels`. A new value is leaked and added while
+/// `labels` holds fewer than `cap` values. Otherwise the result is `None`.
+fn intern_into(
+    labels: &mut HashSet<&'static str>,
+    value: &str,
+    cap: usize,
+) -> Option<&'static str> {
+    if let Some(&interned) = labels.get(value) {
+        return Some(interned);
+    }
+    if labels.len() >= cap {
+        return None;
+    }
+    let interned: &'static str = Box::leak(Box::from(value));
+    labels.insert(interned);
+    Some(interned)
+}
+
 impl MetricsRecorder for MetricsRsRecorder {
     fn sink_key(&self) -> Option<usize> {
         Some(METRICS_RS_GLOBAL_SINK)
@@ -129,8 +210,8 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_workflow_started(&self, workflow_name: &str, queue: &str) {
         counter!(
             METRIC_WORKFLOW_STARTED,
-            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
-            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_WORKFLOW => label_value(workflow_name),
+            METRIC_LABEL_QUEUE => label_value(queue),
         )
         .increment(1);
     }
@@ -138,8 +219,8 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_workflow_unfinished_handlers(&self, workflow_name: &str, kind: &str, count: u64) {
         counter!(
             METRIC_WORKFLOW_UNFINISHED_HANDLERS,
-            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
-            METRIC_LABEL_KIND => kind.to_owned(),
+            METRIC_LABEL_WORKFLOW => label_value(workflow_name),
+            METRIC_LABEL_KIND => label_value(kind),
         )
         .increment(count);
     }
@@ -173,10 +254,10 @@ impl MetricsRecorder for MetricsRsRecorder {
     ) {
         histogram!(
             METRIC_WORKFLOW_DURATION,
-            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
-            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_WORKFLOW => label_value(workflow_name),
+            METRIC_LABEL_QUEUE => label_value(queue),
             METRIC_LABEL_STATUS => status.as_str(),
-            METRIC_LABEL_BUILD_ID => build_id.to_owned(),
+            METRIC_LABEL_BUILD_ID => label_value(build_id),
         )
         .record(duration_secs);
     }
@@ -194,10 +275,10 @@ impl MetricsRecorder for MetricsRsRecorder {
     ) {
         counter!(
             METRIC_WORKFLOW_TERMINAL,
-            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
-            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_WORKFLOW => label_value(workflow_name),
+            METRIC_LABEL_QUEUE => label_value(queue),
             METRIC_LABEL_OUTCOME => outcome.as_str(),
-            METRIC_LABEL_BUILD_ID => build_id.to_owned(),
+            METRIC_LABEL_BUILD_ID => label_value(build_id),
         )
         .increment(1);
     }
@@ -206,7 +287,7 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_workflow_history_size(&self, workflow_name: &str, event_count: u64) {
         histogram!(
             METRIC_WORKFLOW_HISTORY_SIZE,
-            METRIC_LABEL_WORKFLOW_TYPE => workflow_name.to_owned(),
+            METRIC_LABEL_WORKFLOW_TYPE => label_value(workflow_name),
         )
         .record(event_count as f64);
     }
@@ -214,7 +295,7 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_workflow_continue_as_new(&self, workflow_name: &str) {
         counter!(
             METRIC_WORKFLOW_CONTINUE_AS_NEW,
-            METRIC_LABEL_WORKFLOW_TYPE => workflow_name.to_owned(),
+            METRIC_LABEL_WORKFLOW_TYPE => label_value(workflow_name),
         )
         .increment(1);
     }
@@ -222,8 +303,8 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_workflow_non_determinism(&self, workflow_name: &str, build_id: &str) {
         counter!(
             METRIC_WORKFLOW_NON_DETERMINISM,
-            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
-            METRIC_LABEL_BUILD_ID => build_id.to_owned(),
+            METRIC_LABEL_WORKFLOW => label_value(workflow_name),
+            METRIC_LABEL_BUILD_ID => label_value(build_id),
         )
         .increment(1);
     }
@@ -244,9 +325,9 @@ impl MetricsRecorder for MetricsRsRecorder {
     ) {
         counter!(
             METRIC_WORKFLOW_ND_BLOCKED,
-            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
-            METRIC_LABEL_QUEUE => queue.to_owned(),
-            METRIC_LABEL_BUILD_ID => build_id.to_owned(),
+            METRIC_LABEL_WORKFLOW => label_value(workflow_name),
+            METRIC_LABEL_QUEUE => label_value(queue),
+            METRIC_LABEL_BUILD_ID => label_value(build_id),
         )
         .increment(1);
     }
@@ -300,20 +381,20 @@ impl MetricsRecorder for MetricsRsRecorder {
         if let Some(error_type) = error_type {
             histogram!(
                 METRIC_ACTIVITY_DURATION,
-                METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
-                METRIC_LABEL_QUEUE => queue.to_owned(),
+                METRIC_LABEL_ACTIVITY => label_value(activity_name),
+                METRIC_LABEL_QUEUE => label_value(queue),
                 METRIC_LABEL_STATUS => status.as_str(),
-                METRIC_LABEL_ERROR_TYPE => error_type.to_owned(),
-                METRIC_LABEL_BUILD_ID => build_id.to_owned(),
+                METRIC_LABEL_ERROR_TYPE => label_value(error_type),
+                METRIC_LABEL_BUILD_ID => label_value(build_id),
             )
             .record(duration_secs);
         } else {
             histogram!(
                 METRIC_ACTIVITY_DURATION,
-                METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
-                METRIC_LABEL_QUEUE => queue.to_owned(),
+                METRIC_LABEL_ACTIVITY => label_value(activity_name),
+                METRIC_LABEL_QUEUE => label_value(queue),
                 METRIC_LABEL_STATUS => status.as_str(),
-                METRIC_LABEL_BUILD_ID => build_id.to_owned(),
+                METRIC_LABEL_BUILD_ID => label_value(build_id),
             )
             .record(duration_secs);
         }
@@ -328,10 +409,10 @@ impl MetricsRecorder for MetricsRsRecorder {
     ) {
         counter!(
             METRIC_ACTIVITY_FAILED,
-            METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
-            METRIC_LABEL_WORKFLOW_TYPE => workflow_type.to_owned(),
-            METRIC_LABEL_ERROR_TYPE => error_type.to_owned(),
-            METRIC_LABEL_NON_RETRYABLE => non_retryable.to_string(),
+            METRIC_LABEL_ACTIVITY => label_value(activity_name),
+            METRIC_LABEL_WORKFLOW_TYPE => label_value(workflow_type),
+            METRIC_LABEL_ERROR_TYPE => label_value(error_type),
+            METRIC_LABEL_NON_RETRYABLE => if non_retryable { "true" } else { "false" },
         )
         .increment(1);
     }
@@ -349,10 +430,10 @@ impl MetricsRecorder for MetricsRsRecorder {
     ) {
         counter!(
             METRIC_ACTIVITY_ATTEMPTS,
-            METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
-            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_ACTIVITY => label_value(activity_name),
+            METRIC_LABEL_QUEUE => label_value(queue),
             METRIC_LABEL_OUTCOME => outcome.as_str(),
-            METRIC_LABEL_BUILD_ID => build_id.to_owned(),
+            METRIC_LABEL_BUILD_ID => label_value(build_id),
         )
         .increment(1);
     }
@@ -360,8 +441,8 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_activity_retried(&self, activity_name: &str, queue: &str) {
         counter!(
             METRIC_ACTIVITY_RETRIES,
-            METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
-            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_ACTIVITY => label_value(activity_name),
+            METRIC_LABEL_QUEUE => label_value(queue),
         )
         .increment(1);
     }
@@ -369,8 +450,8 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_activity_panic(&self, activity_name: &str, queue: &str) {
         counter!(
             METRIC_ACTIVITY_PANIC,
-            METRIC_LABEL_ACTIVITY => activity_name.to_owned(),
-            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_ACTIVITY => label_value(activity_name),
+            METRIC_LABEL_QUEUE => label_value(queue),
         )
         .increment(1);
     }
@@ -378,8 +459,8 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_workflow_panic(&self, workflow_name: &str, queue: &str) {
         counter!(
             METRIC_WORKFLOW_PANIC,
-            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
-            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_WORKFLOW => label_value(workflow_name),
+            METRIC_LABEL_QUEUE => label_value(queue),
         )
         .increment(1);
     }
@@ -393,7 +474,7 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_queue_depth(&self, queue_name: &str, depth: u64) {
         gauge!(
             METRIC_QUEUE_DEPTH,
-            METRIC_LABEL_QUEUE => queue_name.to_owned(),
+            METRIC_LABEL_QUEUE => label_value(queue_name),
         )
         .set(depth as f64);
     }
@@ -401,7 +482,7 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_task_dispatched(&self, queue_name: &str) {
         counter!(
             METRIC_QUEUE_DISPATCHED,
-            METRIC_LABEL_QUEUE => queue_name.to_owned(),
+            METRIC_LABEL_QUEUE => label_value(queue_name),
         )
         .increment(1);
     }
@@ -409,7 +490,7 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_schedule_to_start(&self, queue_name: &str, wait_secs: f64) {
         histogram!(
             METRIC_QUEUE_SCHEDULE_TO_START,
-            METRIC_LABEL_QUEUE => queue_name.to_owned(),
+            METRIC_LABEL_QUEUE => label_value(queue_name),
         )
         .record(wait_secs);
     }
@@ -417,7 +498,7 @@ impl MetricsRecorder for MetricsRsRecorder {
     fn record_queue_oldest_pending_age(&self, queue_name: &str, age_secs: f64) {
         gauge!(
             METRIC_QUEUE_OLDEST_PENDING_AGE,
-            METRIC_LABEL_QUEUE => queue_name.to_owned(),
+            METRIC_LABEL_QUEUE => label_value(queue_name),
         )
         .set(age_secs);
     }
@@ -3512,5 +3593,48 @@ mod tests {
                 ],
             )]
         );
+    }
+
+    #[test]
+    fn a_label_value_is_interned_once_across_calls_and_threads() {
+        let value = "label-interning-test-activity";
+        let first = label_value(value);
+        let again = label_value(value);
+        let other_thread = std::thread::spawn(move || label_value(value).as_ptr() as usize)
+            .join()
+            .unwrap();
+
+        assert_eq!(&*first, value);
+        assert_eq!(
+            first.as_ptr(),
+            again.as_ptr(),
+            "a repeat call reuses the interned copy"
+        );
+        assert_eq!(
+            first.as_ptr() as usize,
+            other_thread,
+            "another thread resolves the same shared copy"
+        );
+        assert_ne!(first.as_ptr(), value.as_ptr(), "the interner owns its copy");
+    }
+
+    #[test]
+    fn intern_into_refuses_a_new_value_at_the_cap() {
+        let mut labels = HashSet::new();
+        let a = intern_into(&mut labels, "a", 2).unwrap();
+        let b = intern_into(&mut labels, "b", 2).unwrap();
+
+        assert_eq!(
+            intern_into(&mut labels, "c", 2),
+            None,
+            "a full set takes no new value"
+        );
+        assert_eq!(
+            intern_into(&mut labels, "a", 2).map(str::as_ptr),
+            Some(a.as_ptr()),
+            "a full set still resolves the values it holds"
+        );
+        assert_eq!(intern_into(&mut labels, "b", 2), Some(b));
+        assert_eq!(labels.len(), 2);
     }
 }
