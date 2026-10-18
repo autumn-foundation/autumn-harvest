@@ -1292,16 +1292,18 @@ impl HistoryMatcher {
         race_reserved_signal_events
     }
 
-    /// Returns the IDs of all updates that were admitted but have not completed or failed
-    /// up to the specified event index.
-    #[must_use]
-    pub fn unfinished_update_handlers_at_index(&self, index: usize) -> Vec<UpdateId> {
+    /// Returns the update ids admitted but not yet completed or failed, up to
+    /// the specified event index.
+    ///
+    /// `unfinished_update_handlers_at_index`, `unfinished_update_handler_count_at_index`
+    /// and `all_handlers_finished_at_index` each reshape this one scan.
+    fn active_update_handlers_at_index(&self, index: usize) -> HashSet<UpdateId> {
         let events_slice = &self.events[..index];
         let has_updates = events_slice
             .iter()
             .any(|event| matches!(event, WorkflowEvent::UpdateAdmitted { .. }));
         if !has_updates {
-            return Vec::new();
+            return HashSet::new();
         }
 
         let mut active = HashSet::new();
@@ -1317,7 +1319,16 @@ impl HistoryMatcher {
                 _ => {}
             }
         }
-        active.into_iter().collect()
+        active
+    }
+
+    /// Returns the IDs of all updates that were admitted but have not completed or failed
+    /// up to the specified event index.
+    #[must_use]
+    pub fn unfinished_update_handlers_at_index(&self, index: usize) -> Vec<UpdateId> {
+        self.active_update_handlers_at_index(index)
+            .into_iter()
+            .collect()
     }
 
     /// Returns the IDs of all updates that were admitted but have not completed or failed.
@@ -1335,28 +1346,7 @@ impl HistoryMatcher {
     /// Returns the number of unfinished update handlers up to the specified index.
     #[must_use]
     pub fn unfinished_update_handler_count_at_index(&self, index: usize) -> usize {
-        let events_slice = &self.events[..index];
-        let has_updates = events_slice
-            .iter()
-            .any(|event| matches!(event, WorkflowEvent::UpdateAdmitted { .. }));
-        if !has_updates {
-            return 0;
-        }
-
-        let mut active = HashSet::new();
-        for event in events_slice {
-            match event {
-                WorkflowEvent::UpdateAdmitted { update_id, .. } => {
-                    active.insert(*update_id);
-                }
-                WorkflowEvent::UpdateCompleted { update_id, .. }
-                | WorkflowEvent::UpdateFailed { update_id, .. } => {
-                    active.remove(update_id);
-                }
-                _ => {}
-            }
-        }
-        active.len()
+        self.active_update_handlers_at_index(index).len()
     }
 
     /// Returns the number of unfinished update handlers.
@@ -1374,28 +1364,7 @@ impl HistoryMatcher {
     /// Returns `true` if all admitted update handlers have completed or failed up to the specified index.
     #[must_use]
     pub fn all_handlers_finished_at_index(&self, index: usize) -> bool {
-        let events_slice = &self.events[..index];
-        let has_updates = events_slice
-            .iter()
-            .any(|event| matches!(event, WorkflowEvent::UpdateAdmitted { .. }));
-        if !has_updates {
-            return true;
-        }
-
-        let mut active = HashSet::new();
-        for event in events_slice {
-            match event {
-                WorkflowEvent::UpdateAdmitted { update_id, .. } => {
-                    active.insert(*update_id);
-                }
-                WorkflowEvent::UpdateCompleted { update_id, .. }
-                | WorkflowEvent::UpdateFailed { update_id, .. } => {
-                    active.remove(update_id);
-                }
-                _ => {}
-            }
-        }
-        active.is_empty()
+        self.active_update_handlers_at_index(index).is_empty()
     }
 
     /// Returns `true` if all admitted update handlers have completed or failed.
@@ -14763,5 +14732,110 @@ mod tests {
         let _ = matcher.match_signal_where("order", &order_id_is(42));
         assert!(!matcher.has_unconsumed_signal_where("order", &order_id_is(42)));
         assert!(matcher.has_unconsumed_signal_where("order", &order_id_is(41)));
+    }
+
+    // Characterization tests for `unfinished_update_handlers_at_index`,
+    // `unfinished_update_handler_count_at_index` and
+    // `all_handlers_finished_at_index`. The three pin one scan of the event
+    // slice: the set of `UpdateAdmitted` ids with no paired `UpdateCompleted`
+    // or `UpdateFailed` before `index`.
+
+    fn update_admitted(update_id: UpdateId) -> WorkflowEvent {
+        WorkflowEvent::UpdateAdmitted {
+            update_id,
+            name: "handler".into(),
+            input: Value::Null,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn update_completed(update_id: UpdateId) -> WorkflowEvent {
+        WorkflowEvent::UpdateCompleted {
+            update_id,
+            output: Value::Null,
+        }
+    }
+
+    fn update_failed(update_id: UpdateId) -> WorkflowEvent {
+        WorkflowEvent::UpdateFailed {
+            update_id,
+            error: "boom".into(),
+        }
+    }
+
+    #[test]
+    fn no_events_leaves_no_unfinished_handlers() {
+        let matcher = HistoryMatcher::new(vec![]);
+        assert_eq!(matcher.unfinished_update_handlers_at_index(0), Vec::new());
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(0), 0);
+        assert!(matcher.all_handlers_finished_at_index(0));
+    }
+
+    #[test]
+    fn events_with_no_updates_leave_no_unfinished_handlers() {
+        let matcher = HistoryMatcher::new(vec![order_signal(1)]);
+        assert_eq!(matcher.unfinished_update_handlers_at_index(1), Vec::new());
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(1), 0);
+        assert!(matcher.all_handlers_finished_at_index(1));
+    }
+
+    #[test]
+    fn an_admitted_update_is_unfinished_until_it_resolves() {
+        let id = UpdateId::new();
+        let matcher = HistoryMatcher::new(vec![update_admitted(id)]);
+
+        assert_eq!(matcher.unfinished_update_handlers_at_index(1), vec![id]);
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(1), 1);
+        assert!(!matcher.all_handlers_finished_at_index(1));
+    }
+
+    #[test]
+    fn a_completed_update_is_no_longer_unfinished() {
+        let id = UpdateId::new();
+        let matcher = HistoryMatcher::new(vec![update_admitted(id), update_completed(id)]);
+
+        assert_eq!(matcher.unfinished_update_handlers_at_index(2), Vec::new());
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(2), 0);
+        assert!(matcher.all_handlers_finished_at_index(2));
+    }
+
+    #[test]
+    fn a_failed_update_is_no_longer_unfinished() {
+        let id = UpdateId::new();
+        let matcher = HistoryMatcher::new(vec![update_admitted(id), update_failed(id)]);
+
+        assert_eq!(matcher.unfinished_update_handlers_at_index(2), Vec::new());
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(2), 0);
+        assert!(matcher.all_handlers_finished_at_index(2));
+    }
+
+    #[test]
+    fn index_before_resolution_still_reports_the_handler_unfinished() {
+        let id = UpdateId::new();
+        let matcher = HistoryMatcher::new(vec![update_admitted(id), update_completed(id)]);
+
+        // At index 1, only the admit has been scanned; the completion at
+        // index 1 (exclusive end) has not, so the handler is still open.
+        assert_eq!(matcher.unfinished_update_handlers_at_index(1), vec![id]);
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(1), 1);
+        assert!(!matcher.all_handlers_finished_at_index(1));
+    }
+
+    #[test]
+    fn mixed_resolved_and_unresolved_updates_are_reported_independently() {
+        let resolved = UpdateId::new();
+        let unresolved = UpdateId::new();
+        let matcher = HistoryMatcher::new(vec![
+            update_admitted(resolved),
+            update_admitted(unresolved),
+            update_completed(resolved),
+        ]);
+
+        assert_eq!(
+            matcher.unfinished_update_handlers_at_index(3),
+            vec![unresolved]
+        );
+        assert_eq!(matcher.unfinished_update_handler_count_at_index(3), 1);
+        assert!(!matcher.all_handlers_finished_at_index(3));
     }
 }
