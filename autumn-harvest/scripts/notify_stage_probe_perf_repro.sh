@@ -9,7 +9,8 @@
 # The server needs pg_stat_statements in shared_preload_libraries. The script
 # resets the statistics, runs the e2e throughput scenario, and writes
 # docs/perf-artifacts/notify-stage-probe/<label>.txt with the probe calls per
-# workflow and the calls ranking. Wall-clock is not recorded.
+# workflow and the calls ranking. The bench log goes to target/. Wall-clock is
+# not recorded.
 #
 # Knobs (all optional):
 #   HARVEST_BENCH_WORKFLOWS  measured completions (default 200)
@@ -20,7 +21,8 @@ LABEL="${1:?usage: $0 <label>}"
 URL="${HARVEST_TEST_DATABASE_URL:?set HARVEST_TEST_DATABASE_URL (admin URL)}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT="${NOTIFY_STAGE_PROBE_OUT:-$REPO_ROOT/docs/perf-artifacts/notify-stage-probe}"
-mkdir -p "$OUT"
+LOG="$REPO_ROOT/target/notify-stage-probe-$LABEL-bench.log"
+mkdir -p "$OUT" "$REPO_ROOT/target"
 cd "$REPO_ROOT"
 
 psql "$URL" -X -qAt -c "SELECT pg_stat_statements_reset()" >/dev/null
@@ -28,8 +30,8 @@ psql "$URL" -X -qAt -c "SELECT pg_stat_statements_reset()" >/dev/null
 HARVEST_BENCH_SCENARIOS=throughput HARVEST_BENCH_SHARDS=1 \
   HARVEST_BENCH_WORKFLOWS="${HARVEST_BENCH_WORKFLOWS:-200}" \
   cargo bench -p autumn-harvest --features db,testing --bench e2e_bench \
-  >"$OUT/$LABEL-bench.log" 2>&1 || {
-  echo "FATAL: bench failed. See $OUT/$LABEL-bench.log" >&2
+  >"$LOG" 2>&1 || {
+  echo "FATAL: bench failed. See $LOG" >&2
   exit 1
 }
 

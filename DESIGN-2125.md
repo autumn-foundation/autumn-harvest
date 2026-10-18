@@ -3,7 +3,7 @@
 Each staged NOTIFY note costs one extra round trip. The stage call reads
 `txid_current()`, `current_database()` and `pg_postmaster_start_time()` in
 its own statement. On the e2e throughput scenario that is 15 statements per
-workflow and 5.1% of all calls. This change lets the write that stages the
+workflow and 5.42% of all calls. This change lets the write that stages the
 note return those three values itself.
 
 **No new `WorkflowEvent` variant. No schema change. No replay impact.** The
@@ -18,8 +18,9 @@ post-commit gate and the transaction boundaries do not change.
 - Finding 1 of the issue (the pool recycle ping) shipped before this change.
   `pool::engine_manager` and `pool::VERIFY_IDLE_AFTER` cover it. This change
   covers finding 2 only.
-- Findings 3 to 5 are under the 5% floor or inherent. This change does not
-  touch them.
+- Finding 3 (`to_regclass` probes) is under the 5% floor. Finding 4 (the
+  foreign-key check) is Postgres work that each insert needs. Finding 5
+  found no spill. This change does not touch them.
 - `notify::stage_now` sends one probe per call. In a diesel transaction it
   reads `txid_current()`. Outside one it reads `txid_current_if_assigned()`.
 - The sender routes a note by the database fingerprint. It gates the note on
@@ -30,8 +31,8 @@ post-commit gate and the transaction boundaries do not change.
   the workflow-task transactions use it.
 - A pooled connection moves in memory between checkouts. A cache keyed by
   its address is not safe across transactions.
-- Baseline, 240 workflows with 3 activities each: 3,600 probes, 15 per
-  workflow. A statement log groups them by transaction:
+- Baseline, 240 workflows with 3 activities each (200 measured plus the
+  warmup batch): 3,600 probes, 15 per workflow. A statement log groups them by transaction:
 
 | Transaction | Per workflow | Probes each | Event insert |
 |-------------|--------------|-------------|--------------|
@@ -50,8 +51,8 @@ Each transaction that stages a note also inserts events.
 | B1 | The event `INSERT` returns the three values. The stage uses them. | **Adopted.** The write already runs. The id is the id of the same transaction. |
 | B2 | The task `INSERT` of `queue::enqueue` and `queue::enqueue_batch` returns them too. | **Adopted.** The start transaction stages a task note after its own write. |
 | B3 | A `coalesced` scope keeps the values of its first stamped write. | **Adopted.** Every note of the scope belongs to one transaction. |
-| B4 | Wrap the activity-completion transaction in `coalesced`. | **Adopted.** Its wake note then uses the values of the event insert. |
-| B5 | Wrap the start transaction in `coalesced`. | Rejected. The body has 750 lines. B2 removes its probe with a small change. |
+| B4 | Wrap the activity completion and failure transactions in `coalesced`. | **Adopted.** Their wake note then uses the values of the event insert. |
+| B5 | Wrap the start transaction in `coalesced`. | Rejected. Its body is long, so the diff is large. B2 removes its probe with a small change. |
 | B6 | Cache the values per connection. | Rejected. A connection moves between checkouts. A stale id would wake a reader before commit. |
 | B7 | Send the probe in the same pipeline as the write. | Rejected. The statement count stays the same. |
 | B8 | The caller pushes the note after `COMMIT` returns, with no gate. | Rejected. It changes the gate. A cancelled caller loses the wake after commit. |
@@ -64,13 +65,13 @@ Each transaction that stages a note also inserts events.
 | # | How to make it harmful | Mitigation |
 |---|------------------------|------------|
 | R1 | A stamp from one transaction gates a note of another. The reader wakes before commit. | The stamp is a local value of the write function. A `coalesced` scope keeps it only when the scope opens inside a diesel transaction. Then all its writes share one transaction. |
-| R2 | A role that cannot run `txid_current()` now fails a write that used to succeed. | A stamp is read only inside a diesel transaction, and only when a sender is ready. There the probe also fails the transaction today. Autocommit and raw `BEGIN` writes keep the probe. |
+| R2 | A role that cannot run `txid_current()` now fails a write that used to succeed. | A stamp is read only inside a diesel transaction, and only when a sender is ready. There the probe failed the transaction before this change too. Autocommit and raw `BEGIN` writes keep the probe. |
 | R3 | A stamp makes the fallback think a raw `BEGIN` block is open. It sends a `SAVEPOINT` outside a block. | The fallback reads the raw block state only from its own probe, never from a stamp. |
 | R4 | The insert of a write whose own transaction commits before the stage returns a stale id. | That id is committed. The gate sends the note at once, as the probe reading of `NULL` did. |
 | R5 | The note is sent before commit when its write is in a savepoint that rolls back. | `txid_current()` returns the top-level id. The gate waits for the top-level commit, as before. |
 | R6 | `RETURNING` adds bytes per row to a large event batch. | Three small values per row. The event payload is much larger. |
-| R7 | The row count changes, because `execute` becomes `get_results`. | These inserts have no `ON CONFLICT`. The count is the number of rows returned. Tests read the count. |
-| R8 | The `coalesced` wrap changes when the completion transaction stages. | The scope stages before the body returns, so before commit. The fallback merges the two notes into one statement. |
+| R7 | The row count changes, because `execute` becomes `get_results`. | These inserts have no `ON CONFLICT`. The count is the number of rows returned. |
+| R8 | The `coalesced` wrap changes when the completion transaction stages. | The scope stages before the body returns, so before commit. An early `LeaseLost` return stages no note, as before. The fallback sends the two notes in one statement. |
 | R9 | A query matcher, such as a ledger script, depends on the old insert text. | The ledger script of this change matches the probe text only. |
 
 ### 0.4 Six thinking hats
@@ -103,7 +104,8 @@ Each transaction that stages a note also inserts events.
    for itself.
 5. A `coalesced` scope that opens inside a diesel transaction keeps the first
    stamp. Its single stage at the end uses it.
-6. `finalize_activity_completion_write` runs its body in `coalesced`.
+6. `finalize_activity_completion_write` and `finalize_activity_failure_write`
+   run their bodies in `coalesced`.
 
 ---
 
@@ -129,3 +131,23 @@ Each transaction that stages a note also inserts events.
 
 The ledger script `autumn-harvest/scripts/notify_stage_probe_perf_repro.sh`
 reruns the e2e throughput capture. Section 4 has the result.
+
+---
+
+## 4. Result
+
+The e2e throughput scenario, 240 workflows, `pg_stat_statements`. The files
+are in `docs/perf-artifacts/notify-stage-probe/`.
+
+| Measure | `baseline.txt` | `after.txt` |
+|---------|----------------|-------------|
+| Stage probe calls | 3,600 | 0 |
+| Probes per workflow | 15.000 | 0.000 |
+| All calls | 66,436 | 62,595 |
+| Shared blocks | 610,690 | 591,242 |
+| WAL bytes | 13,135,457 | 13,128,071 |
+| Temp blocks written | 0 | 0 |
+
+The probe touched no buffers, so the block count barely moves. WAL does not
+change. The gain is 3,600 fewer round trips, each inside an open transaction
+that holds row locks.

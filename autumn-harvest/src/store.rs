@@ -222,7 +222,9 @@ async fn insert_event_rows(
     exec_id: ExecutionId,
     rows: &[NewHarvestEvent<'_>],
 ) -> HarvestResult<(usize, Option<crate::notify::Stamp>)> {
-    // Decide before the fence opens its own transaction (issue #2125).
+    // Decide before the fence opens a transaction (issue #2125). Inside it, an
+    // autocommit write would ask for a stamp. A failed stamp would then fail a
+    // write that the probe path lets commit.
     let stamped = crate::notify::stamp_wanted(conn);
     // Cross-region DR write-authority fence (issue #954).
     //
@@ -413,7 +415,9 @@ pub async fn append_events_offloaded_with_codecs(
     // failed ref INSERT cannot leave events with offload envelopes but no
     // corresponding harvest_payload_refs rows (which would make those blobs
     // permanently invisible to the GC sweep).
-    // Decide before the transaction below opens (issue #2125).
+    // Decide before the transaction below opens (issue #2125). Inside it, an
+    // autocommit write would ask for a stamp. A failed stamp would then fail a
+    // write that the probe path lets commit.
     let stamped = crate::notify::stamp_wanted(conn);
     let (inserted, stamp) = Box::pin(conn.transaction::<_, crate::error::HarvestError, _>(
         async |conn| {
@@ -491,7 +495,8 @@ pub(crate) async fn append_events_offloaded_with_codecs_and_patch(
     patch(&mut rows);
 
     // One transaction for the fence, the events and the refs, for the reasons
-    // `append_events_offloaded_with_codecs` gives.
+    // `append_events_offloaded_with_codecs` gives. Decide on the stamp before
+    // that transaction opens, for the same reason (issue #2125).
     let stamped = crate::notify::stamp_wanted(conn);
     let (inserted, stamp) = Box::pin(conn.transaction::<_, crate::error::HarvestError, _>(
         async |conn| {

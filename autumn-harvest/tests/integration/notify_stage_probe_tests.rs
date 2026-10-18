@@ -37,6 +37,9 @@ const ACTIVITY: &str = "stage_probe_step";
 /// Matches the stage probe, in and out of a diesel transaction.
 const PROBE_PATTERN: &str = "SELECT txid_current%AS txid, current_database()%";
 
+/// Matches a write that returns its stamp.
+const STAMPED_PATTERN: &str = "INSERT INTO%RETURNING txid_current()%";
+
 type BoxFut<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
 
 fn step(_ctx: &ActivityContext, input: Value) -> BoxFut<'_> {
@@ -164,14 +167,14 @@ struct Calls {
     calls: i64,
 }
 
-/// The stage probe calls in the current database.
-async fn probe_calls(conn: &mut AsyncPgConnection) -> i64 {
+/// The calls of statements that match `pattern` in the current database.
+async fn calls_like(conn: &mut AsyncPgConnection, pattern: &str) -> i64 {
     diesel::sql_query(
         "SELECT COALESCE(sum(calls), 0)::bigint AS calls FROM pg_stat_statements \
          WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
            AND query LIKE $1",
     )
-    .bind::<diesel::sql_types::Text, _>(PROBE_PATTERN)
+    .bind::<diesel::sql_types::Text, _>(pattern)
     .get_result::<Calls>(conn)
     .await
     .expect("pg_stat_statements must be preloaded")
@@ -224,15 +227,23 @@ async fn a_three_activity_workflow_sends_no_stage_probe() {
             .expect("start the workflow");
     }
     wait_for_execution_state(&url, exec_id, "COMPLETED").await;
+    // Read before the shutdown, so its writes stay out of the count.
+    let probes = calls_like(&mut conn, PROBE_PATTERN).await;
+    let stamped = calls_like(&mut conn, STAMPED_PATTERN).await;
     worker.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(30), handle).await;
 
-    let probes = probe_calls(&mut conn).await;
     drop(conn);
     drop(pool);
     let _ = admin
         .batch_execute(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
         .await;
+    // A stale sender also sends no probe, because the fallback runs. The
+    // stamped writes show that the sender was ready.
+    assert!(
+        stamped >= 10,
+        "the writes must return their stamps: {stamped}"
+    );
     assert_eq!(
         probes, 0,
         "each staged note must reuse the stamp of its own write"

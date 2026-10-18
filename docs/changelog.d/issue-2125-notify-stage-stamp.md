@@ -15,9 +15,10 @@ probe. The post-commit gate does not change: the sender still waits for
 recycle ping, shipped before this change.
 
 **Evidence.** `autumn-harvest/scripts/notify_stage_probe_perf_repro.sh` on
-the e2e throughput scenario, 240 workflows. Baseline in
-`docs/perf-artifacts/notify-stage-probe/`: 3,600 probe calls, 15.000 per
-workflow, 5.42% of all calls. After: see `after.txt` there. Tests:
+the e2e throughput scenario, 240 workflows (200 measured plus the warmup
+batch). Files in `docs/perf-artifacts/notify-stage-probe/`. Baseline: 3,600
+probe calls, 15.000 per workflow, 5.42% of all calls. After: 0 probe calls.
+All calls drop from 66,436 to 62,595. WAL does not change. Tests:
 `a_three_activity_workflow_sends_no_stage_probe`,
 `an_append_in_a_transaction_sends_no_stage_probe`,
 `an_enqueue_in_a_transaction_sends_no_stage_probe` and

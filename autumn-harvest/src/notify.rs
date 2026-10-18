@@ -21,9 +21,9 @@
 //! queue and one per execution. That statement writes no data, so its commit
 //! does not wait for a WAL flush and holds the NOTIFY lock only briefly.
 //!
-//! The stage needs the transaction id and the database of the write. An
-//! engine write inside a transaction returns them itself. Any other stage
-//! reads them in one extra statement (issue #2125).
+//! The stage needs the transaction id and the database of the write. An event
+//! or task insert inside a transaction returns them itself when a sender is
+//! ready. Any other stage reads them in one extra statement (issue #2125).
 //!
 //! Call a `notify_*` function after the write in the same transaction. A note
 //! staged in a savepoint that later rolls back is still sent. That costs one

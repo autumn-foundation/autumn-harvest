@@ -802,7 +802,8 @@ pub async fn enqueue_batch(
 
     let task_ids: Vec<Uuid> = params.iter().map(|_| Uuid::new_v4()).collect();
 
-    // Every chunk runs in the caller's transaction, so any stamp serves.
+    // A chunk returns a stamp only inside the caller's transaction. All chunks
+    // share that transaction, so the first stamp serves every note.
     let mut stamp = None;
     // Byte-and-row-bounded chunk boundaries, decided up front from
     // `params`' borrowed fields -- see `compute_chunk_bounds`'s doc
@@ -855,7 +856,8 @@ pub async fn enqueue_batch(
             })
             .collect();
 
-        stamp = insert_task_rows(conn, &rows).await?;
+        let chunk_stamp = insert_task_rows(conn, &rows).await?;
+        stamp = stamp.or(chunk_stamp);
     }
 
     // Sticky pin follow-up (rare -- see the doc comment above). Same shape as
