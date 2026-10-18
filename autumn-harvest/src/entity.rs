@@ -47,15 +47,15 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use autumn_harvest::entity::{Entity, EntityCheckpoint};
+//! use autumn_harvest::entity::Entity;
 //! use autumn_harvest::prelude::*;
 //!
 //! #[workflow]
 //! async fn counter(
 //!     ctx: &WorkflowContext,
-//!     input: EntityCheckpoint<u64>,
+//!     input: serde_json::Value,
 //! ) -> Result<u64, String> {
-//!     Entity::new(ctx, input)
+//!     Entity::<u64>::from_input(ctx, input)
 //!         .run(|count, add: u64| async move { Ok(count + add) })
 //!         .await
 //!         .map_err(|e| e.to_string())
@@ -69,7 +69,7 @@
 //! use autumn_harvest::TypedSignalWithStartOptions;
 //!
 //! CounterStub::signal_with_start(
-//!     conn, &client, "counter-42", EntityCheckpoint::<u64>::default(),
+//!     conn, &client, "counter-42", serde_json::json!({}),
 //!     ENTITY_OP_SIGNAL, EntityMessage::op(5_u64),
 //!     TypedSignalWithStartOptions { idempotency_key: Some(op_id), ..Default::default() },
 //! ).await?;
@@ -179,8 +179,10 @@ pub struct EntityStats {
 /// A new entity starts from `{}` or `null`. A checkpoint writes the state,
 /// the operations that still wait, and the counters.
 ///
-/// The start input is trusted. A caller who may start the workflow may set
-/// the first state and pending operations. Send `{}` from clients.
+/// [`Entity::run`] drops the input of a start that a caller chose, such as a
+/// start route or a signal-with-start (issue #2082). Only a continue-as-new run
+/// keeps its checkpoint. A run with no recorded source also keeps it. Use
+/// [`Entity::initial_state`] to seed a fresh entity from code.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(bound(serialize = "S: Serialize"))]
 pub struct EntityCheckpoint<S> {
@@ -250,6 +252,9 @@ pub struct Entity<'a, S> {
     ctx: &'a WorkflowContext,
     checkpoint: EntityCheckpoint<S>,
     max_ops_per_run: Option<u64>,
+    initial_state: Option<S>,
+    trust_start_input: bool,
+    raw_input: Option<Value>,
 }
 
 impl<'a, S> Entity<'a, S>
@@ -263,7 +268,50 @@ where
             ctx,
             checkpoint,
             max_ops_per_run: None,
+            initial_state: None,
+            trust_start_input: false,
+            raw_input: None,
         }
+    }
+
+    /// A loop for the run that `ctx` drives, from the raw start `input`.
+    ///
+    /// Prefer this to [`new`](Self::new). The run decodes `input` only when it
+    /// keeps it. A run that a caller started drops the input first, so a
+    /// malformed client input cannot fail the start (issue #2082). Declare the
+    /// workflow input as `serde_json::Value`. A typed `EntityCheckpoint<S>`
+    /// input decodes before this call.
+    ///
+    /// [`run`](Self::run) returns [`HarvestError::Serialization`] when it keeps
+    /// an input that does not decode.
+    #[must_use]
+    pub fn from_input(ctx: &'a WorkflowContext, input: Value) -> Self {
+        Self {
+            raw_input: Some(input),
+            ..Self::new(ctx, EntityCheckpoint::default())
+        }
+    }
+
+    /// Start a fresh entity from `state`, not from `S::default()`.
+    ///
+    /// The code sets this state, so it is trusted. A continue-as-new run
+    /// ignores it and keeps the state of its checkpoint. A change to `state`
+    /// changes replay, so version it.
+    #[must_use]
+    pub fn initial_state(mut self, state: S) -> Self {
+        self.initial_state = Some(state);
+        self
+    }
+
+    /// Keep the input of a fresh start as the checkpoint.
+    ///
+    /// By default a run that a caller started drops that input and starts from
+    /// [`initial_state`](Self::initial_state) or `S::default()`. Use this
+    /// only when every caller that can start the entity is trusted.
+    #[must_use]
+    pub const fn trust_start_input(mut self) -> Self {
+        self.trust_start_input = true;
+        self
     }
 
     /// Take a checkpoint after `n` operations in one run.
@@ -314,8 +362,22 @@ where
             ctx,
             mut checkpoint,
             max_ops_per_run,
+            initial_state,
+            trust_start_input,
+            raw_input,
         } = self;
-        // The start input is trusted, but its error must obey the bound too.
+        let drops_input = !trust_start_input && ctx.start_source().carries_caller_input();
+        // Decode the raw input only when the run keeps it.
+        if let Some(raw) = raw_input.filter(|_| !drops_input) {
+            checkpoint = serde_json::from_value(raw)?;
+        }
+        // A caller chose the input of a fresh start, so drop it (issue #2082).
+        // A run with no recorded source keeps its input: it can be an entity
+        // that started before the engine recorded the source.
+        if drops_input {
+            checkpoint = EntityCheckpoint::with_state(initial_state.unwrap_or_default());
+        }
+        // A kept input is trusted, but its error must obey the bound too.
         checkpoint.stats.last_error = checkpoint.stats.last_error.take().map(bound_error);
         let mut waiting: VecDeque<Value> = std::mem::take(&mut checkpoint.pending).into();
         let published = Arc::new(Mutex::new(Published::of(&checkpoint)));
@@ -571,7 +633,7 @@ mod tests {
     use crate::event::{SideEffectKind, WorkflowEvent};
     use crate::executor::{WorkflowOutcome, drive_workflow};
     use crate::testing::{ReplayStatus, WorkflowReplayer, WorkflowTestEnv};
-    use crate::types::ExecutionId;
+    use crate::types::{ExecutionId, StartProvenance, StartSource};
 
     type BoxedRun<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
 
@@ -1432,6 +1494,200 @@ mod tests {
         assert_eq!(carried.state, 2);
         assert_eq!(carried.stats.failed, 1);
         assert_eq!(carried.pending, vec![delete()]);
+    }
+
+    /// A counter entity that starts from 100 on a fresh start.
+    fn seeded_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .initial_state(100)
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// A counter entity that keeps a trusted start input.
+    fn trusting_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .trust_start_input()
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    fn forged() -> Value {
+        json!({"state": 50, "pending": [op(7)], "stats": {"applied": 9}})
+    }
+
+    fn fresh(source: StartSource) -> StartProvenance {
+        StartProvenance::fresh(source)
+    }
+
+    #[tokio::test]
+    async fn a_client_checkpoint_is_ignored_on_a_fresh_start() {
+        for source in [StartSource::Api, StartSource::SignalWithStart] {
+            let outcome = env_with(&[op(1), delete()])
+                .with_start_provenance(fresh(source))
+                .run(counter, forged())
+                .await;
+            assert_eq!(outcome.result, Ok(json!(1)), "{source:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_start_drops_the_forged_pending_ops_and_stats() {
+        let outcome = env_with(&[op(1), op(1)])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(bounded_counter, forged())
+            .await;
+        let carried: EntityCheckpoint<i64> =
+            serde_json::from_value(outcome.result.expect("checkpoint")).unwrap();
+        assert_eq!(carried.state, 2);
+        assert_eq!(carried.pending, Vec::<Value>::new());
+        assert_eq!(carried.stats.applied, 2);
+    }
+
+    #[tokio::test]
+    async fn a_continue_as_new_run_keeps_its_checkpoint() {
+        let outcome = env_with(&[delete()])
+            .with_start_provenance(StartProvenance::continued_from(ExecutionId::new()))
+            .run(counter, forged())
+            .await;
+        assert_eq!(outcome.result, Ok(json!(57)), "state 50 plus pending 7");
+    }
+
+    #[tokio::test]
+    async fn a_start_with_unknown_provenance_keeps_its_checkpoint() {
+        let outcome = env_with(&[delete()]).run(counter, forged()).await;
+        assert_eq!(outcome.result, Ok(json!(57)), "legacy runs stay valid");
+    }
+
+    #[tokio::test]
+    async fn an_operator_reset_keeps_its_checkpoint() {
+        let outcome = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::Reset))
+            .run(counter, forged())
+            .await;
+        assert_eq!(outcome.result, Ok(json!(57)));
+    }
+
+    #[tokio::test]
+    async fn the_initial_state_hook_seeds_a_fresh_start_only() {
+        let first = env_with(&[op(1), delete()])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(seeded_counter, forged())
+            .await;
+        assert_eq!(first.result, Ok(json!(101)));
+        let carried = env_with(&[delete()])
+            .with_start_provenance(StartProvenance::continued_from(ExecutionId::new()))
+            .run(seeded_counter, forged())
+            .await;
+        assert_eq!(carried.result, Ok(json!(57)));
+    }
+
+    #[tokio::test]
+    async fn trust_start_input_keeps_the_client_checkpoint() {
+        let outcome = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(trusting_counter, forged())
+            .await;
+        assert_eq!(outcome.result, Ok(json!(57)));
+    }
+
+    #[tokio::test]
+    async fn a_re_run_keeps_its_checkpoint() {
+        let outcome = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::Rerun))
+            .run(counter, forged())
+            .await;
+        assert_eq!(outcome.result, Ok(json!(57)));
+    }
+
+    #[tokio::test]
+    async fn the_initial_state_is_ignored_when_the_input_is_kept() {
+        let unknown = env_with(&[delete()]).run(seeded_counter, forged()).await;
+        assert_eq!(unknown.result, Ok(json!(57)), "unknown source keeps input");
+        let trusted = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(trusting_seeded_counter, forged())
+            .await;
+        assert_eq!(trusted.result, Ok(json!(57)), "trusted input wins");
+    }
+
+    /// A counter entity with both an initial state and a trusted start input.
+    fn trusting_seeded_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::new(ctx, checkpoint_of(input)?)
+                .initial_state(100)
+                .trust_start_input()
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    /// A counter entity that decodes its raw start input after the gate.
+    fn raw_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let state = Entity::<i64>::from_input(ctx, input)
+                .run(|count, op: CounterOp| async move { apply(count, &op) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state))
+        })
+    }
+
+    #[tokio::test]
+    async fn a_malformed_client_input_does_not_fail_a_fresh_start() {
+        let outcome = env_with(&[op(1), delete()])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(raw_counter, json!({"state": "wrong-type"}))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(1)));
+    }
+
+    #[tokio::test]
+    async fn a_kept_input_that_does_not_decode_fails_the_run() {
+        let outcome = env_with(&[delete()])
+            .with_start_provenance(StartProvenance::continued_from(ExecutionId::new()))
+            .run(raw_counter, json!({"state": "wrong-type"}))
+            .await;
+        assert!(outcome.result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_raw_input_follows_the_same_gate_as_a_typed_one() {
+        let dropped = env_with(&[delete()])
+            .with_start_provenance(fresh(StartSource::SignalWithStart))
+            .run(raw_counter, forged())
+            .await;
+        assert_eq!(dropped.result, Ok(json!(0)));
+        let kept = env_with(&[delete()])
+            .with_start_provenance(StartProvenance::continued_from(ExecutionId::new()))
+            .run(raw_counter, forged())
+            .await;
+        assert_eq!(kept.result, Ok(json!(57)));
+        let legacy = env_with(&[delete()]).run(raw_counter, forged()).await;
+        assert_eq!(legacy.result, Ok(json!(57)));
+    }
+
+    #[tokio::test]
+    async fn the_fresh_start_gate_replays() {
+        let outcome = env_with(&[op(1), delete()])
+            .with_start_provenance(fresh(StartSource::Api))
+            .run(counter, forged())
+            .await;
+        let report = outcome.replay_check(counter).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
     }
 
     fn started(input: Value) -> WorkflowEvent {

@@ -843,8 +843,8 @@ pub use trace_export::export_chrome_trace;
 pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalAwaitId,
     ExternalCancelId, ExternalSignalId, ExternalTarget, ParentClosePolicy, Priority, SessionId,
-    ShardId, StartSource, TimerId, UpdateId, WorkerId, WorkflowId, WorkflowIdConflictPolicy,
-    WorkflowIdReusePolicy,
+    ShardId, StartProvenance, StartSource, TimerId, UpdateId, WorkerId, WorkflowId,
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;
 #[cfg(feature = "db")]

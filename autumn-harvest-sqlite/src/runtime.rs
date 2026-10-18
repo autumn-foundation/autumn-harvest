@@ -5562,6 +5562,8 @@ fn drive_span_meta(
         execution_timeout: None,
         deadline_at: None,
         parent_execution_id,
+        // This backend does not record a start source (issue #2082).
+        start_provenance: autumn_harvest::types::StartProvenance::default(),
         cancellation_reason: cancel_reason,
     }
 }

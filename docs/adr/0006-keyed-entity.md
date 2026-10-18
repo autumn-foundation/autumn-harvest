@@ -120,14 +120,33 @@ A native primitive stays at rank 13, behind customer pull.
 - `stats.last_error` keeps at most 1024 bytes, marker included
   (`ENTITY_LAST_ERROR_MAX_BYTES`). `Entity::run` cuts a longer error at a
   `char` boundary and ends it with `... [truncated]`. The cut covers the error
-  of a failed op and the trusted start input. A huge error then cannot stop a
+  of a failed op and a kept start input. A huge error then cannot stop a
   later checkpoint. The bound counts UTF-8 bytes, and JSON escapes can grow it
   to about 6 KiB in the checkpoint input. A decode error can quote the
   payload, so the cut also limits that quote.
 - The deadline check runs only after an op. An idle entity with an
   `execution_timeout` times out. Do not set one on an entity.
-- The start input is trusted. A caller who may start the workflow may set
-  the first state. Clients send `{}` or no input.
+- `Entity::run` drops the input of a start that a caller chose (issue
+  #2082). `ctx.info().start_source` tells it: `ContinueAsNew`, `Reset`,
+  `Rerun` and `Unknown` keep the input. Every other source starts from
+  `S::default()`, or from `Entity::initial_state`. A start route or a
+  signal-with-start cannot set the first state, the pending ops or the
+  counters. `Entity::trust_start_input` restores the old behavior. A run with
+  no recorded source is an entity from before the engine recorded it, so it
+  keeps its input.
+- Declare the workflow input as `serde_json::Value` and build the loop with
+  `Entity::from_input`. It decodes the input only when the run keeps it. A
+  typed `EntityCheckpoint<S>` input decodes before `Entity::run`, so a
+  malformed client input fails the start.
+- The gate has three known limits. A reset or a re-run copies the stored
+  input of the source run. An admin who resets or re-runs a run that a client
+  started with a forged input keeps that input. Workflow code that passes
+  caller data to `continue_as_new_as` for an entity type also keeps that data,
+  because workflow code is trusted. An older worker reads a source that it
+  does not know as `Unknown`, so it keeps the input.
+- Existing runs replay from their recorded start. A run that a caller seeded
+  before the upgrade replays from `S::default()` after it. Drain those runs
+  first, or call `trust_start_input` on the entity before the upgrade.
 - A handler panic fails the run, as in any workflow. The next op then
   starts a new entity from the default state.
 - The SQLite backend has no queries. It cannot run an entity. (Issue #2023
