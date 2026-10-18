@@ -1026,15 +1026,6 @@ impl ForkEffects {
     }
 }
 
-/// One payload field of a [`WorkflowEvent`], as
-/// [`WorkflowEvent::payload_slot_mut`] returns it.
-pub(crate) enum PayloadSlot<'a> {
-    /// A field that is always present.
-    Required(&'a mut serde_json::Value),
-    /// A field that null or absence stores as `None`.
-    Optional(&'a mut Option<serde_json::Value>),
-}
-
 impl WorkflowEvent {
     /// Forward-compatible constructor for [`WorkflowEvent::WorkflowStarted`] that
     /// defaults the carryover (#488) and scheduled-time (#508) additive fields to
@@ -1169,93 +1160,6 @@ impl WorkflowEvent {
         }
     }
 
-    /// The payload field this event stores under the wire key `key`.
-    ///
-    /// The keys are `payload_store::PAYLOAD_FIELD_KEYS`. Returns `None` when
-    /// this variant has no field by that name.
-    ///
-    /// The codec read path uses this to move each payload tree into the
-    /// decoded event. Serde would otherwise rebuild every tree node by node.
-    /// A payload field that is missing here reads back as null, so a new
-    /// payload field must be added to this match. The match names every
-    /// variant, so a new variant does not compile until someone sorts it.
-    pub(crate) fn payload_slot_mut(&mut self, key: &str) -> Option<PayloadSlot<'_>> {
-        match self {
-            Self::WorkflowStarted {
-                input,
-                last_completion_result,
-                ..
-            } => match key {
-                "input" => Some(PayloadSlot::Required(input)),
-                "last_completion_result" => Some(PayloadSlot::Optional(last_completion_result)),
-                _ => None,
-            },
-            Self::ActivityAwaitingExternal { input, .. }
-            | Self::ActivityScheduled { input, .. }
-            | Self::ChildWorkflowSpawnedDetached { input, .. }
-            | Self::ChildWorkflowStarted { input, .. }
-            | Self::LocalActivityScheduled { input, .. }
-            | Self::UpdateAdmitted { input, .. }
-            | Self::WorkflowContinuedAsNew { input, .. } => {
-                (key == "input").then_some(PayloadSlot::Required(input))
-            }
-            Self::ActivityCompleted { output, .. }
-            | Self::ActivityCompletedExternally { output, .. }
-            | Self::ChildWorkflowCompleted { output, .. }
-            | Self::ExternalAwaitResolved { output, .. }
-            | Self::ForkActivityResultOverridden { output, .. }
-            | Self::LocalActivityCompleted { output, .. }
-            | Self::UpdateCompleted { output, .. }
-            | Self::WorkflowCompleted { output } => {
-                (key == "output").then_some(PayloadSlot::Required(output))
-            }
-            Self::ActivityHeartbeat { details, .. } | Self::MarkerRecorded { details, .. } => {
-                (key == "details").then_some(PayloadSlot::Required(details))
-            }
-            Self::ActivityFailed { details, .. }
-            | Self::ChildWorkflowFailed { details, .. }
-            | Self::ExternalAwaitFailed { details, .. }
-            | Self::WorkflowFailed { details, .. } => {
-                (key == "details").then_some(PayloadSlot::Optional(details))
-            }
-            Self::ExternalSignalRequested { payload, .. }
-            | Self::SignalReceived { payload, .. } => {
-                (key == "payload").then_some(PayloadSlot::Required(payload))
-            }
-            Self::SideEffectRecorded { value, .. } => {
-                (key == "value").then_some(PayloadSlot::Required(value))
-            }
-            Self::ActivityExternalDeadlineExtended { .. }
-            | Self::ActivityFailedExternally { .. }
-            | Self::ActivityStarted { .. }
-            | Self::ActivityTimedOut { .. }
-            | Self::ChildWorkflowCascadeApplied { .. }
-            | Self::DecisionCommitted { .. }
-            | Self::ExternalAwaitRequested { .. }
-            | Self::ExternalCancelDelivered { .. }
-            | Self::ExternalCancelFailed { .. }
-            | Self::ExternalCancelRequested { .. }
-            | Self::ExternalSignalDelivered { .. }
-            | Self::ExternalSignalFailed { .. }
-            | Self::LocalActivityExhausted { .. }
-            | Self::LocalActivityFailed { .. }
-            | Self::MutexGranted { .. }
-            | Self::TimerCancelled { .. }
-            | Self::TimerFired { .. }
-            | Self::TimerStarted { .. }
-            | Self::UpdateFailed { .. }
-            | Self::WorkflowCancelled { .. }
-            | Self::WorkflowExecutionPaused { .. }
-            | Self::WorkflowExecutionResumed { .. }
-            | Self::WorkflowExecutionTimedOut { .. }
-            | Self::WorkflowForked { .. }
-            | Self::WorkflowRedriven { .. }
-            | Self::WorkflowResetFork { .. }
-            | Self::WorkflowResetTerminated { .. }
-            | Self::WorkflowRetryScheduled { .. } => None,
-        }
-    }
-
     /// Returns `true` for a [`Self::DecisionCommitted`] boundary (issue #1833).
     #[must_use]
     pub const fn is_decision_boundary(&self) -> bool {
@@ -1371,6 +1275,7 @@ impl WorkflowEvent {
             | Self::ExternalAwaitRequested { .. }
             | Self::MutexGranted { .. }
             | Self::DecisionCommitted { .. }
+            | Self::WorkflowCancelRequested { .. }
             | Self::WorkflowForked { .. } => None,
         }
     }
