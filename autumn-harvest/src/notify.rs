@@ -21,6 +21,10 @@
 //! queue and one per execution. That statement writes no data, so its commit
 //! does not wait for a WAL flush and holds the NOTIFY lock only briefly.
 //!
+//! The stage needs the transaction id and the database of the write. An
+//! engine write inside a transaction returns them itself. Any other stage
+//! reads them in one extra statement (issue #2125).
+//!
 //! Call a `notify_*` function after the write in the same transaction. A note
 //! staged in a savepoint that later rolls back is still sent. That costs one
 //! extra wake. A wake can also stand for several writes: one queue wake
@@ -248,6 +252,20 @@ pub async fn notify_task_enqueued(
     queue_name: &str,
     task_id: Uuid,
 ) -> HarvestResult<()> {
+    notify_task_enqueued_stamped(conn, None, queue_name, task_id).await
+}
+
+/// [`notify_task_enqueued`] with the [`Stamp`] that the task write returned.
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub(crate) async fn notify_task_enqueued_stamped(
+    conn: &mut AsyncPgConnection,
+    stamp: Option<Stamp>,
+    queue_name: &str,
+    task_id: Uuid,
+) -> HarvestResult<()> {
     // Chaos: drop this wake (issue #940 AC1(c)). The poll loop still finds the
     // task, because NOTIFY only reduces latency.
     if crate::chaos_drop_notify!(NOTIFY_TASK_ENQUEUED) {
@@ -260,6 +278,7 @@ pub async fn notify_task_enqueued(
             channel: queue_channel(queue_name),
             task_id,
         }],
+        stamp,
     )
     .await
 }
@@ -286,7 +305,7 @@ pub async fn notify_tasks_enqueued(
             task_id,
         })
         .collect();
-    stage(conn, notes).await
+    stage(conn, notes, None).await
 }
 
 /// Tell the listeners of [`workflow_events_channel`] that history advanced,
@@ -304,6 +323,29 @@ pub async fn notify_workflow_events_appended(
     event_count: usize,
     last_event_type: &str,
 ) -> HarvestResult<()> {
+    notify_workflow_events_appended_stamped(
+        conn,
+        None,
+        workflow_exec_id,
+        event_count,
+        last_event_type,
+    )
+    .await
+}
+
+/// [`notify_workflow_events_appended`] with the [`Stamp`] that the event
+/// write returned.
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub(crate) async fn notify_workflow_events_appended_stamped(
+    conn: &mut AsyncPgConnection,
+    stamp: Option<Stamp>,
+    workflow_exec_id: Uuid,
+    event_count: usize,
+    last_event_type: &str,
+) -> HarvestResult<()> {
     stage(
         conn,
         vec![Note::Events {
@@ -311,6 +353,7 @@ pub async fn notify_workflow_events_appended(
             count: event_count,
             last_event_type: last_event_type.to_string(),
         }],
+        stamp,
     )
     .await
 }
@@ -319,12 +362,14 @@ pub async fn notify_workflow_events_appended(
 ///
 /// A decision boundary (issue #1833) uses it. The count of the wake includes
 /// the boundary, and the last event type stays the decision's outcome.
+/// `stamp` is the [`Stamp`] that the boundary write returned, if any.
 ///
 /// # Errors
 ///
 /// Same as [`notify_task_enqueued`].
 pub(crate) async fn notify_trailing_events_appended(
     conn: &mut AsyncPgConnection,
+    stamp: Option<Stamp>,
     workflow_exec_id: Uuid,
     event_count: usize,
     event_type: &str,
@@ -336,6 +381,7 @@ pub(crate) async fn notify_trailing_events_appended(
             count: event_count,
             event_type: event_type.to_string(),
         }],
+        stamp,
     )
     .await
 }
@@ -958,9 +1004,12 @@ pub(crate) fn in_transaction(conn: &mut AsyncPgConnection) -> bool {
     !matches!(status.transaction_depth(), Ok(None))
 }
 
-/// The row the write connection reads to stage a note.
-#[derive(diesel::QueryableByName)]
-struct StageRow {
+/// The transaction id and the database of a write.
+///
+/// The stage probe reads it. A write can also return it with
+/// [`stamp_returning`], so the stage needs no probe (issue #2125).
+#[derive(Clone, diesel::QueryableByName, diesel::Queryable)]
+pub(crate) struct Stamp {
     /// The transaction id of the write, or `NULL` outside a transaction.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
     txid: Option<i64>,
@@ -972,12 +1021,46 @@ struct StageRow {
     started_at: DateTime<Utc>,
 }
 
+/// The `RETURNING` expressions of a [`Stamp`].
+pub(crate) type StampReturning = (
+    diesel::expression::SqlLiteral<diesel::sql_types::Nullable<diesel::sql_types::BigInt>>,
+    diesel::expression::SqlLiteral<Text>,
+    diesel::expression::SqlLiteral<diesel::sql_types::Timestamptz>,
+);
+
+/// The `RETURNING` expressions that make a write return its [`Stamp`].
+///
+/// `txid_current()` gives the id of the top-level transaction, also inside a
+/// savepoint. Every row of one statement returns the same values.
+pub(crate) fn stamp_returning() -> StampReturning {
+    (
+        diesel::dsl::sql("txid_current()"),
+        diesel::dsl::sql("current_database()::text"),
+        diesel::dsl::sql("pg_postmaster_start_time()"),
+    )
+}
+
+/// True when a write on `conn` returns a [`Stamp`] for its note.
+///
+/// A write asks for a stamp only inside a diesel transaction, and only when a
+/// sender is ready. A failed stamp then fails the transaction, as a failed
+/// probe does. An autocommit write and a raw `BEGIN` block keep the probe.
+pub(crate) fn stamp_wanted(conn: &mut AsyncPgConnection) -> bool {
+    in_transaction(conn) && any_sink()
+}
+
 /// Notes that [`coalesced`] holds for one write connection (issue #1833).
 struct HeldNotes {
     /// The address of the connection the notes belong to.
     conn: usize,
     /// The notes staged on that connection so far.
     notes: Vec<Note>,
+    /// True when the scope opened inside a diesel transaction. Then every
+    /// write of the scope belongs to that transaction.
+    in_tx: bool,
+    /// The first stamp of a write in the scope. It is kept only when
+    /// `in_tx` is true (issue #2125).
+    stamp: Option<Stamp>,
 }
 
 tokio::task_local! {
@@ -1001,6 +1084,9 @@ fn conn_key(conn: &AsyncPgConnection) -> usize {
 /// A note staged on another connection is not held. It can belong to
 /// another database or another transaction.
 ///
+/// A scope that opens inside a diesel transaction keeps the first [`Stamp`]
+/// of its writes. The single stage then sends no probe (issue #2125).
+///
 /// # Errors
 ///
 /// Returns the error of `body`, or the error of the stage call.
@@ -1012,12 +1098,17 @@ pub async fn coalesced<T>(
     let held = HeldNotes {
         conn: conn_key(conn),
         notes: Vec::new(),
+        in_tx: in_transaction(conn),
+        stamp: None,
     };
     HELD.scope(std::cell::RefCell::new(held), async move {
         let out = body(conn).await?;
-        let notes = HELD.with(|held| std::mem::take(&mut held.borrow_mut().notes));
+        let (notes, stamp) = HELD.with(|held| {
+            let mut held = held.borrow_mut();
+            (std::mem::take(&mut held.notes), held.stamp.take())
+        });
         if !notes.is_empty() {
-            stage_now(conn, notes).await?;
+            stage_now(conn, notes, stamp).await?;
         }
         Ok(out)
     })
@@ -1027,34 +1118,50 @@ pub async fn coalesced<T>(
 /// Stage `notes` for the write on `conn`, or hold them in a [`coalesced`]
 /// scope for `conn`.
 ///
+/// `stamp` is the [`Stamp`] that the write returned, if any.
+///
 /// # Errors
 ///
 /// Same as [`stage_now`].
-async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<()> {
+async fn stage(
+    conn: &mut AsyncPgConnection,
+    notes: Vec<Note>,
+    stamp: Option<Stamp>,
+) -> HarvestResult<()> {
     let key = conn_key(conn);
-    let mut notes = Some(notes);
+    let mut staged = Some((notes, stamp));
     let _ = HELD.try_with(|held| {
         let mut held = held.borrow_mut();
         if held.conn == key
-            && let Some(notes) = notes.take()
+            && let Some((notes, stamp)) = staged.take()
         {
             held.notes.extend(notes);
+            if held.in_tx && held.stamp.is_none() {
+                held.stamp = stamp;
+            }
         }
     });
-    match notes {
-        Some(notes) => stage_now(conn, notes).await,
+    match staged {
+        Some((notes, stamp)) => stage_now(conn, notes, stamp).await,
         None => Ok(()),
     }
 }
 
 /// Stage `notes` for the write on `conn`.
 ///
+/// With a `stamp`, the stage sends no probe. The stamp must come from a write
+/// of the transaction that is open on `conn`.
+///
 /// # Errors
 ///
 /// Returns an error only when the write transaction has already failed.
 /// Postgres answers `COMMIT` on a failed transaction with a silent rollback.
 /// The error therefore tells the caller that its write did not commit.
-async fn stage_now(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<()> {
+async fn stage_now(
+    conn: &mut AsyncPgConnection,
+    notes: Vec<Note>,
+    stamp: Option<Stamp>,
+) -> HarvestResult<()> {
     let has_sink = any_sink();
     if AtomicBool::load(&ANY_DEFERRED, Ordering::Relaxed)
         && let Ok(runtime) = tokio::runtime::Handle::try_current()
@@ -1066,26 +1173,15 @@ async fn stage_now(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestRes
     let mut raw_block = RawBlock::Unknown;
     if has_sink {
         let in_tx = in_transaction(conn);
-        // Inside a diesel transaction, `txid_current()` assigns an id when
-        // the transaction has none yet. Thus the gate never sends before the
-        // commit. Outside one, `txid_current_if_assigned()` still finds a raw
-        // `BEGIN` block that wrote. After an autocommit write it reads NULL,
-        // because that write already committed.
-        let txid = if in_tx {
-            "txid_current()"
-        } else {
-            "txid_current_if_assigned()"
+        // Only a probe shows a raw `BEGIN` block. A stamp does not.
+        let probed = stamp.is_none();
+        let row = match stamp {
+            Some(stamp) => Ok(stamp),
+            None => probe(conn, in_tx).await,
         };
-        let row = diesel::sql_query(format!(
-            "SELECT {txid} AS txid, \
-                    current_database()::text AS database, \
-                    pg_postmaster_start_time() AS started_at"
-        ))
-        .get_result::<StageRow>(conn)
-        .await;
         match row {
             Ok(row) => {
-                if !in_tx {
+                if !in_tx && probed {
                     raw_block = RawBlock::from_txid(row.txid);
                 }
                 let fingerprint = Fingerprint {
@@ -1111,6 +1207,28 @@ async fn stage_now(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestRes
         }
     }
     send_on_write_connection(conn, notes, raw_block).await
+}
+
+/// Read the [`Stamp`] of the write on `conn` in its own statement.
+///
+/// Inside a diesel transaction, `txid_current()` assigns an id when the
+/// transaction has none yet. Thus the gate never sends before the commit.
+/// Outside one, `txid_current_if_assigned()` still finds a raw `BEGIN` block
+/// that wrote. After an autocommit write it reads NULL, because that write
+/// already committed.
+async fn probe(conn: &mut AsyncPgConnection, in_tx: bool) -> diesel::QueryResult<Stamp> {
+    let txid = if in_tx {
+        "txid_current()"
+    } else {
+        "txid_current_if_assigned()"
+    };
+    diesel::sql_query(format!(
+        "SELECT {txid} AS txid, \
+                current_database()::text AS database, \
+                pg_postmaster_start_time() AS started_at"
+    ))
+    .get_result::<Stamp>(conn)
+    .await
 }
 
 /// The fallback: send `notes` on the write connection.
@@ -1630,6 +1748,7 @@ pub async fn notify_durable_stream(
         vec![Note::Stream {
             channel: durable_stream_channel(workflow_exec_id),
         }],
+        None,
     )
     .await
 }

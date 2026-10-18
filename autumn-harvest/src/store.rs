@@ -197,11 +197,12 @@ pub async fn append_events_with_codecs(
     }
 
     let rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
-    let inserted = insert_event_rows(conn, exec_id, &rows).await?;
+    let (inserted, stamp) = insert_event_rows(conn, exec_id, &rows).await?;
 
     if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended(
+        crate::notify::notify_workflow_events_appended_stamped(
             conn,
+            stamp,
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
@@ -213,11 +214,16 @@ pub async fn append_events_with_codecs(
 }
 
 /// Insert prepared event rows behind the DR write fence. Stages no NOTIFY.
+///
+/// Returns the row count, and the stamp of the insert when
+/// [`crate::notify::stamp_wanted`] holds.
 async fn insert_event_rows(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     rows: &[NewHarvestEvent<'_>],
-) -> HarvestResult<usize> {
+) -> HarvestResult<(usize, Option<crate::notify::Stamp>)> {
+    // Decide before the fence opens its own transaction (issue #2125).
+    let stamped = crate::notify::stamp_wanted(conn);
     // Cross-region DR write-authority fence (issue #954).
     //
     // Callers skip an empty append — it writes nothing, so there is nothing to
@@ -236,23 +242,40 @@ async fn insert_event_rows(
     // no fence read, no savepoint, one INSERT.
     if crate::replication::FenceRegistry::is_enabled() {
         Box::pin(
-            conn.transaction::<usize, crate::error::HarvestError, _>(async |conn| {
+            conn.transaction::<_, crate::error::HarvestError, _>(async |conn| {
                 crate::replication::assert_fence(conn, exec_id.shard()).await?;
-                diesel::insert_into(harvest_events::table)
-                    .values(rows)
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)
+                insert_events(conn, rows, stamped).await
             }),
         )
         .await
     } else {
-        diesel::insert_into(harvest_events::table)
-            .values(rows)
+        insert_events(conn, rows, stamped).await
+    }
+}
+
+/// Insert `rows` into `harvest_events`. Fences nothing and stages no NOTIFY.
+///
+/// With `stamped`, the insert also returns the stamp of its transaction. The
+/// stage of its note then sends no probe (issue #2125).
+async fn insert_events(
+    conn: &mut AsyncPgConnection,
+    rows: &[NewHarvestEvent<'_>],
+    stamped: bool,
+) -> HarvestResult<(usize, Option<crate::notify::Stamp>)> {
+    let insert = diesel::insert_into(harvest_events::table).values(rows);
+    if !stamped {
+        let inserted = insert
             .execute(conn)
             .await
-            .map_err(crate::error::database_error)
+            .map_err(crate::error::database_error)?;
+        return Ok((inserted, None));
     }
+    let stamps = insert
+        .returning(crate::notify::stamp_returning())
+        .get_results::<crate::notify::Stamp>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok((stamps.len(), stamps.into_iter().next()))
 }
 
 /// Append a decision boundary when the decision grew the history (issue #1833).
@@ -304,9 +327,10 @@ pub(crate) async fn append_decision_boundary(
         next_id,
         codecs,
     )?;
-    insert_event_rows(conn, exec_id, &rows).await?;
+    let (_, stamp) = insert_event_rows(conn, exec_id, &rows).await?;
     crate::notify::notify_trailing_events_appended(
         conn,
+        stamp,
         exec_id.as_uuid(),
         rows.len(),
         boundary.type_name(),
@@ -389,7 +413,9 @@ pub async fn append_events_offloaded_with_codecs(
     // failed ref INSERT cannot leave events with offload envelopes but no
     // corresponding harvest_payload_refs rows (which would make those blobs
     // permanently invisible to the GC sweep).
-    let inserted = Box::pin(conn.transaction::<usize, crate::error::HarvestError, _>(
+    // Decide before the transaction below opens (issue #2125).
+    let stamped = crate::notify::stamp_wanted(conn);
+    let (inserted, stamp) = Box::pin(conn.transaction::<_, crate::error::HarvestError, _>(
         async |conn| {
             // Cross-region DR write-authority fence (issue #954), inside the
             // transaction and *after* the offload upload above. Checking before
@@ -400,11 +426,7 @@ pub async fn append_events_offloaded_with_codecs(
             // fencing during an incident queued behind the slowest payload PUT.
             crate::replication::assert_fence(conn, exec_id.shard()).await?;
 
-            let inserted = diesel::insert_into(harvest_events::table)
-                .values(&rows)
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            let inserted = insert_events(conn, &rows, stamped).await?;
             if !all_refs.is_empty() {
                 insert_payload_refs(conn, exec_id, &all_refs).await?;
             }
@@ -414,8 +436,9 @@ pub async fn append_events_offloaded_with_codecs(
     .await?;
 
     if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended(
+        crate::notify::notify_workflow_events_appended_stamped(
             conn,
+            stamp,
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
@@ -469,14 +492,11 @@ pub(crate) async fn append_events_offloaded_with_codecs_and_patch(
 
     // One transaction for the fence, the events and the refs, for the reasons
     // `append_events_offloaded_with_codecs` gives.
-    let inserted = Box::pin(conn.transaction::<usize, crate::error::HarvestError, _>(
+    let stamped = crate::notify::stamp_wanted(conn);
+    let (inserted, stamp) = Box::pin(conn.transaction::<_, crate::error::HarvestError, _>(
         async |conn| {
             crate::replication::assert_fence(conn, exec_id.shard()).await?;
-            let inserted = diesel::insert_into(harvest_events::table)
-                .values(&rows)
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            let inserted = insert_events(conn, &rows, stamped).await?;
             if !all_refs.is_empty() {
                 insert_payload_refs(conn, exec_id, &all_refs).await?;
             }
@@ -486,8 +506,9 @@ pub(crate) async fn append_events_offloaded_with_codecs_and_patch(
     .await?;
 
     if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended(
+        crate::notify::notify_workflow_events_appended_stamped(
             conn,
+            stamp,
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),

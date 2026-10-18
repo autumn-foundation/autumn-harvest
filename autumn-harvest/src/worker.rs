@@ -15007,78 +15007,84 @@ async fn finalize_activity_completion_write(
 
     let result = Box::pin(
         conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
-            let mut output = output.clone();
-            let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
-            if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
-                return Ok(queue::ClaimWrite::LeaseLost);
-            }
-            // A lost lease is a no-op, not an error (issue #1789). The later
-            // claim owns the outcome of this activity.
-            if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
-                log_lease_lost(task, "activity completion");
-                return Ok(queue::ClaimWrite::LeaseLost);
-            }
-            // The blob is already in the store (issue #1986). Its reference
-            // row commits with the event, so retention can delete the blob.
-            if let Some(stored) = stored {
-                store::insert_payload_refs(
+            // Issue #2125: the event and the wake stage once, with the stamp
+            // of the event insert.
+            crate::notify::coalesced(conn, async |conn| {
+                let mut output = output.clone();
+                let history =
+                    lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
+                if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
+                    return Ok(queue::ClaimWrite::LeaseLost);
+                }
+                // A lost lease is a no-op, not an error (issue #1789). The later
+                // claim owns the outcome of this activity.
+                if lock_activity_claim(conn, task).await? != queue::ClaimLock::Held {
+                    log_lease_lost(task, "activity completion");
+                    return Ok(queue::ClaimWrite::LeaseLost);
+                }
+                // The blob is already in the store (issue #1986). Its reference
+                // row commits with the event, so retention can delete the blob.
+                if let Some(stored) = stored {
+                    store::insert_payload_refs(
+                        conn,
+                        exec_id,
+                        &[crate::payload_store::OffloadedRef {
+                            blob_key: stored.key.clone(),
+                            store_id: stored.store_id.clone(),
+                            byte_len: stored.len,
+                        }],
+                    )
+                    .await?;
+                    output = stored.to_recorded_value();
+                }
+                let completion_event = WorkflowEvent::ActivityCompleted {
+                    activity_id,
+                    output: output.clone(),
+                };
+                // A stored reference is already out of line. Ordinary offload
+                // would upload it again under a low threshold.
+                let offloader = offloader.filter(|_| stored.is_none());
+                store::append_events_offloaded_with_codecs(
                     conn,
                     exec_id,
-                    &[crate::payload_store::OffloadedRef {
-                        blob_key: stored.key.clone(),
-                        store_id: stored.store_id.clone(),
-                        byte_len: stored.len,
-                    }],
+                    &[completion_event],
+                    history.next_event_id,
+                    offloader,
+                    codecs,
                 )
                 .await?;
-                output = stored.to_recorded_value();
-            }
-            let completion_event = WorkflowEvent::ActivityCompleted {
-                activity_id,
-                output: output.clone(),
-            };
-            // A stored reference is already out of line. Ordinary offload
-            // would upload it again under a low threshold.
-            let offloader = offloader.filter(|_| stored.is_none());
-            store::append_events_offloaded_with_codecs(
-                conn,
-                exec_id,
-                &[completion_event],
-                history.next_event_id,
-                offloader,
-                codecs,
-            )
-            .await?;
-            crate::llm_ledger::insert_ledger_rows(
-                conn,
-                exec_id,
-                history.next_event_id,
-                activity_name,
-                llm_calls,
-            )
-            .await?;
-            let row_output = encoded_row_output.clone().unwrap_or_else(|| output.clone());
-            queue::complete_claimed_task(conn, &claim_of_task(task)?, row_output)
-                .await?
-                .require_applied(task.id)?;
-            // Worker sessions (issue #606): a session member activity's
-            // completion pushes the session's lease forward, so a
-            // long-running but still-legitimate pipeline isn't reclaimed by
-            // the broken-session scanner's `expires_at < NOW()` check just
-            // because its steps individually outlast one sticky-timeout
-            // window. `task.session_id` is `None` for both ordinary
-            // activities and the reserved acquire/release activities
-            // themselves (neither is dispatched through `Session::
-            // execute_activity`), so this is scoped to genuine members only.
-            if let Some(session_uuid) = task.session_id {
-                crate::sessions::refresh_session_lease(
+                crate::llm_ledger::insert_ledger_rows(
                     conn,
-                    crate::types::SessionId::from_uuid(session_uuid),
+                    exec_id,
+                    history.next_event_id,
+                    activity_name,
+                    llm_calls,
                 )
                 .await?;
-            }
-            queue::wake_workflow_task(conn, exec_id).await?;
-            Ok(queue::ClaimWrite::Applied)
+                let row_output = encoded_row_output.clone().unwrap_or_else(|| output.clone());
+                queue::complete_claimed_task(conn, &claim_of_task(task)?, row_output)
+                    .await?
+                    .require_applied(task.id)?;
+                // Worker sessions (issue #606): a session member activity's
+                // completion pushes the session's lease forward, so a
+                // long-running but still-legitimate pipeline isn't reclaimed by
+                // the broken-session scanner's `expires_at < NOW()` check just
+                // because its steps individually outlast one sticky-timeout
+                // window. `task.session_id` is `None` for both ordinary
+                // activities and the reserved acquire/release activities
+                // themselves (neither is dispatched through `Session::
+                // execute_activity`), so this is scoped to genuine members only.
+                if let Some(session_uuid) = task.session_id {
+                    crate::sessions::refresh_session_lease(
+                        conn,
+                        crate::types::SessionId::from_uuid(session_uuid),
+                    )
+                    .await?;
+                }
+                queue::wake_workflow_task(conn, exec_id).await?;
+                Ok(queue::ClaimWrite::Applied)
+            })
+            .await
         }),
     )
     .await;
@@ -15153,43 +15159,49 @@ async fn finalize_activity_failure_write(
     // workflow propagates the error.
     let result = Box::pin(
         conn.transaction::<queue::ClaimWrite, HarvestError, _>(async |conn| {
-            let error = error.to_string();
-            let history = lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
-            if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
-                return Ok(queue::ClaimWrite::LeaseLost);
-            }
-            // A lost lease is a no-op, not an error (issue #1789).
-            if let queue::ClaimLock::Lost { state } = lock_activity_claim(conn, task).await? {
-                log_lease_lost(task, "activity failure");
-                // If the task reached COMPLETED before the handler returned
-                // (e.g. via run_transactional) and the handler then returned
-                // Err, the error is discarded — the workflow already observed
-                // ActivityCompleted.  Emit a warning so the misuse is visible.
-                if state.as_deref() == Some("COMPLETED") {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        activity_name = %activity_name,
-                        "activity handler returned Err but task is already COMPLETED \
-                         (run_transactional committed it); the error is discarded and \
-                         the workflow observes ActivityCompleted — run_transactional \
-                         must be the final expression in the activity handler"
-                    );
+            // Issue #2125: the event and the wake stage once, with the stamp
+            // of the event insert.
+            crate::notify::coalesced(conn, async |conn| {
+                let error = error.to_string();
+                let history =
+                    lock_workflow_execution_and_load_history(conn, exec_id, codecs).await?;
+                if pending_activity_id_for_task(&history.events, task, activity_name)?.is_none() {
+                    return Ok(queue::ClaimWrite::LeaseLost);
                 }
-                return Ok(queue::ClaimWrite::LeaseLost);
-            }
-            store::append_events_with_codecs(
-                conn,
-                exec_id,
-                &[failed_event],
-                history.next_event_id,
-                codecs,
-            )
-            .await?;
-            queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
-                .await?
-                .require_applied(task.id)?;
-            queue::wake_workflow_task(conn, exec_id).await?;
-            Ok(queue::ClaimWrite::Applied)
+                // A lost lease is a no-op, not an error (issue #1789).
+                if let queue::ClaimLock::Lost { state } = lock_activity_claim(conn, task).await? {
+                    log_lease_lost(task, "activity failure");
+                    // If the task reached COMPLETED before the handler returned
+                    // (e.g. via run_transactional) and the handler then returned
+                    // Err, the error is discarded — the workflow already observed
+                    // ActivityCompleted.  Emit a warning so the misuse is visible.
+                    if state.as_deref() == Some("COMPLETED") {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            activity_name = %activity_name,
+                            "activity handler returned Err but task is already COMPLETED \
+                             (run_transactional committed it); the error is discarded and \
+                             the workflow observes ActivityCompleted — run_transactional \
+                             must be the final expression in the activity handler"
+                        );
+                    }
+                    return Ok(queue::ClaimWrite::LeaseLost);
+                }
+                store::append_events_with_codecs(
+                    conn,
+                    exec_id,
+                    &[failed_event],
+                    history.next_event_id,
+                    codecs,
+                )
+                .await?;
+                queue::fail_claimed_task(conn, &claim_of_task(task)?, &error)
+                    .await?
+                    .require_applied(task.id)?;
+                queue::wake_workflow_task(conn, exec_id).await?;
+                Ok(queue::ClaimWrite::Applied)
+            })
+            .await
         }),
     )
     .await;
