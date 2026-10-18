@@ -70,13 +70,7 @@ fn main() {
             unreachable!("a breaker that only sees successes stays closed");
         };
         registry.begin_claim(activity, claim, token);
-        black_box(registry.on_claim_result(
-            activity,
-            AttemptOutcome::Success,
-            token,
-            claim,
-            now,
-        ));
+        black_box(registry.on_claim_result(activity, AttemptOutcome::Success, token, claim, now));
         registry.end_claim(activity, claim);
     }
     println!("circuit_breaker_dispatch_profile: {reps} simulated attempts");
