@@ -251,3 +251,87 @@ fixes:
 - Section 8 gains the operation attribute and the system values that an
   upstream reviewer can raise. Section 10 lists the files that the upstream
   pull request needs.
+
+---
+
+## 4. Follow-up: ready the filing for the upstream process
+
+### 4.1 Facts found before the plan
+
+- PRs #2158 and #2174 merged the draft and the Weaver check. The status
+  is still `pending`. The only open AC is the filing, or a decision not to
+  file.
+- The pins are current. On 2026-10-18, upstream `main` is `331541c` and
+  the latest release is `v1.44.0`. The script passes.
+- Upstream has an issue form for new conventions,
+  `.github/ISSUE_TEMPLATE/new-conventions.yaml`. It asks for an area,
+  with `area:new` for a new one, and a "Propose new conventions" text.
+  Section 9 does not follow that form.
+- The form and `CONTRIBUTING.md` point to the community
+  `project-management.md`. New conventions need a project proposal. A pull
+  request adds it to `open-telemetry/community/projects/`. A majority of
+  the GC must approve it. Section 10 says only "read the project process".
+- The proposal follows `project-template.md`. Each section that is not
+  "Optional" or "Post-Approval" must have text.
+- `dapr/dapr#9213` is a pull request, not an issue. It closed as stale on
+  2026-04-23 and did not merge. Its text does not name Weaver. The OTel
+  blog post on Dapr workflow observability says that Dapr is adopting
+  Weaver. It also says that none of the span changes are in Dapr yet.
+- On 2026-10-18, a search of the upstream issues found no workflow engine
+  proposal.
+- `CONTRIBUTING.md` also offers a path outside upstream. Conventions that
+  one library owns live in that library's repository. Weaver work on
+  decentralized conventions is in `open-telemetry/weaver#215`.
+
+### 4.2 Brainstorm — what moves the filing forward?
+
+| # | Idea | Verdict |
+|---|------|---------|
+| P1 | File the upstream issue from this session. | Rejected. The session has no access to upstream. Filing is a public action for a maintainer. |
+| P2 | Record a decision not to file. | Rejected. That decision belongs to the maintainer. |
+| P3 | Fit section 9 to the upstream issue form: the form, the area and the field. | **Adopted.** |
+| P4 | Draft the community project proposal from `project-template.md`. | **Adopted.** It is the next gate after the issue. |
+| P5 | Name leads and sponsors in the proposal. | Rejected. Nobody agreed yet. Each open slot says `Open.` |
+| P6 | Correct the Dapr facts, and record each external fact with the date of the check. | **Adopted.** |
+| P7 | Rewrite section 10 as the real order: check, issue, project proposal, upstream pull request. | **Adopted.** |
+| P8 | Check the issue form and the project template at a pinned upstream commit in the script. | **Adopted.** The weekly `latest` job finds a changed template. |
+| P9 | Stage the upstream pull request files: the generated docs, `.chloggen`, `areas.yaml`. | Rejected. They wait for an approved project, and upstream regenerates them. |
+| P10 | Give the decline path a fallback: publish the model as an own Weaver registry. | **Adopted.** One paragraph in section 10. |
+| P11 | Fill the `<commit>` placeholder now. | Rejected, as in F6. This change edits the draft. |
+
+### 4.3 Reverse brainstorm — how can this change do harm?
+
+| # | How to make it harmful | Mitigation |
+|---|------------------------|------------|
+| K1 | The issue text states a false fact about another project. | Each link in the issue text has a row in a "Facts checked" table, with a date. |
+| K2 | The proposal claims staff or sponsors that did not agree. | Each staffing slot names a GitHub handle or starts with `Open.` A guard checks it. |
+| K3 | Upstream adds a required template section, and the proposal misses it. | The script compares the template at the pin with the proposal. The `latest` job reads `main`. |
+| K4 | The form loses `area:new`, and section 9 tells the maintainer to pick it. | The script checks the form at the pin. |
+| K5 | The page and the script pin different community commits. | A guard compares them. |
+| K6 | Section 10 puts the project proposal before the issue that finds co-owners. | A guard checks the step order. |
+| K7 | The proposal is an orphan page. | The README links it. A guard checks the link. |
+| K8 | Long sentences return in the new page. | The sentence guard reads the proposal too. |
+| K9 | The proposal hides that Harvest does not yet emit `workflow.*`. | The deliverables say so, and link section 7. |
+
+### 4.4 Six thinking hats
+
+| Hat | Notes |
+|-----|-------|
+| White | The draft passes the upstream checks. Upstream needs an issue, then a project proposal with leads and sponsors. The Dapr work is a closed pull request. |
+| Red | A complete packet makes filing feel cheap. Empty staffing slots feel exposed, but they are true. |
+| Black | One engine cannot staff a project. The project can stall at sponsorship. The Dapr claim was wrong, so other claims need a check too. |
+| Yellow | The maintainer files in minutes. Co-owners see the full plan. The packet is honest about gaps. |
+| Green | Use the issue to recruit co-owners. Invite the authors of `dapr/dapr#9213` there. Keep an own-registry fallback. |
+| Blue | Fit the form, draft the proposal, record the facts, order the steps. Keep the status `pending`. |
+
+### 4.5 TDD map
+
+| Phase | Test | Proves |
+|-------|------|--------|
+| Red → green | `the_issue_text_fits_the_upstream_form` | P3. |
+| Red → green | `the_project_proposal_covers_the_template` | P4, P5, K2, K7, K9. |
+| Red → green | `every_issue_text_link_is_a_checked_fact` | P6, K1. |
+| Red → green | `the_submission_steps_follow_the_upstream_process` | P7, P10, K6. |
+| Red → green | `the_weaver_check_script_mirrors_upstream` (extended) | P8, K3, K4. |
+| Red → green | `the_page_records_the_weaver_check` (extended) | K5. |
+| Red → green | `prose_sentences_and_yaml_texts_stay_short` (extended) | K8. |
