@@ -584,9 +584,11 @@ impl DeferredCancelState {
                 WorkflowEvent::WorkflowCancelRequested { reason } if requested.is_none() => {
                     requested = Some(reason.clone());
                 }
-                // A reset copies the source history. A request from the source
-                // run does not apply to the new run.
-                WorkflowEvent::WorkflowResetFork { .. } => requested = None,
+                // A reset or a fork copies the source history. A request from
+                // the source run does not apply to the new run.
+                WorkflowEvent::WorkflowResetFork { .. } | WorkflowEvent::WorkflowForked { .. } => {
+                    requested = None;
+                }
                 _ => {}
             }
         }
@@ -649,6 +651,49 @@ mod deferred_cancel_state_tests {
 
         assert_eq!(state.open_blocks, 1);
         assert_eq!(state.requested, None);
+    }
+
+    #[test]
+    fn a_fork_drops_a_request_from_the_source_run() {
+        let events = [
+            marker("non_cancellable_open:1"),
+            WorkflowEvent::WorkflowCancelRequested {
+                reason: "source".into(),
+            },
+            WorkflowEvent::WorkflowForked {
+                forked_from_exec_id: crate::types::ExecutionId::new(),
+                fork_event_id: 2,
+                effects: crate::event::ForkEffects::Recorded,
+                reason: "debug".into(),
+                operator_id: "ops".into(),
+            },
+        ];
+
+        let state = DeferredCancelState::of(&events);
+
+        assert_eq!(state.open_blocks, 1);
+        assert_eq!(state.requested, None);
+    }
+
+    #[test]
+    fn a_request_after_the_fork_marker_applies_to_the_fork() {
+        let events = [
+            WorkflowEvent::WorkflowForked {
+                forked_from_exec_id: crate::types::ExecutionId::new(),
+                fork_event_id: 1,
+                effects: crate::event::ForkEffects::Recorded,
+                reason: "debug".into(),
+                operator_id: "ops".into(),
+            },
+            marker("non_cancellable_open:1"),
+            WorkflowEvent::WorkflowCancelRequested {
+                reason: "fork".into(),
+            },
+        ];
+
+        let state = DeferredCancelState::of(&events);
+
+        assert_eq!(state.requested.as_deref(), Some("fork"));
     }
 
     #[test]

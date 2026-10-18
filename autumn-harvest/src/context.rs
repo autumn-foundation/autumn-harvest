@@ -5129,7 +5129,26 @@ impl WorkflowContext {
             crate::replay::ContinueAsNewMatch::True => true,
             crate::replay::ContinueAsNewMatch::False => false,
             crate::replay::ContinueAsNewMatch::Frontier => {
-                let due = self.history_size_exceeded();
+                // Issue #1984: a cancelled scope captured the answer of its
+                // cancelling cycle. The replay of the scope body reads it, as
+                // the other recorded decisions do.
+                let due = self
+                    .captured_or_drift(self.captured_scope_record(
+                        crate::event::SideEffectKind::Custom,
+                        Some(crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME),
+                    ))
+                    .and_then(|value| {
+                        let due = value.as_bool();
+                        if due.is_none() {
+                            self.record_deferred_nd(
+                                "side-effect drift mismatch: the continue-as-new decision that \
+                                 a scope cancel recorded is not a boolean"
+                                    .to_string(),
+                            );
+                        }
+                        due
+                    })
+                    .unwrap_or_else(|| self.history_size_exceeded());
                 self.push_command(WorkflowCommand::RecordSideEffect {
                     kind: crate::event::SideEffectKind::Custom,
                     name: Some(crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME.to_string()),

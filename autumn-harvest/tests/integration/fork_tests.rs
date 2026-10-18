@@ -74,9 +74,25 @@ fn lookups(tag: &str) -> u32 {
 /// `"local": true`, it first runs the local activity `fork_lookup`. With
 /// `"session": true`, it charges in a worker session. With `"race": true`,
 /// the charge races a receipt on a queue that no worker polls, and wins.
+/// With `"shield": true`, it waits for the signal `go` in a non-cancellable
+/// block, and `"local": true` then runs `fork_lookup` in the block.
 #[workflow]
 async fn fork_pay_wf(ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
     let queue = ctx.queue_name().to_string();
+    if input["shield"] == json!(true) {
+        return ctx
+            .non_cancellable(async {
+                ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+                if input["local"] == json!(true) {
+                    ctx.execute_local_activity_raw("fork_lookup", input.clone(), None, Some(30))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(json!("shielded"))
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     if input["race"] == json!(true) {
         let won = ctx
             .race()
@@ -490,6 +506,60 @@ async fn recorded_fork_fails_before_a_local_activity() {
         error.contains("RunLocalActivity"),
         "the failure names the effect: {error}"
     );
+}
+
+/// Wait until the run `exec_id` has opened its non-cancellable block.
+async fn wait_for_open_block(url: &str, exec_id: ExecutionId) {
+    for _ in 0..200 {
+        let (_, events) = snapshot(url, exec_id).await;
+        if events.iter().any(|(_, kind, data)| {
+            kind == "MarkerRecorded" && data.to_string().contains("non_cancellable_open:1")
+        }) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the run {exec_id} did not open its block");
+}
+
+/// Issue #1984: a recorded fork that refuses an effect while a cancel is
+/// deferred is cancelled, not failed. The refused effect never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_fork_refusal_completes_a_deferred_cancel() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("shield");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "shield": true })).await;
+    let running = Running::start(&queue, &pool);
+    wait_for_open_block(&url, source).await;
+    autumn_harvest::signal::send_signal(&mut conn, source, "go", Value::Null)
+        .await
+        .expect("signal the source");
+    wait_for_execution_state(&url, source, "COMPLETED").await;
+
+    // The new input takes the local-activity branch that the source skipped.
+    let mut local = request(ForkEffects::Recorded);
+    local.input = Some(json!({ "tag": queue, "shield": true, "local": true }));
+    let forked = fork(&url, source, local).await;
+    wait_for_open_block(&url, forked).await;
+    let cancelled = autumn_harvest::cancel_workflow_execution(
+        &mut conn,
+        forked,
+        "operator abort",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel the fork");
+    assert!(cancelled.deferred, "the open block defers the cancel");
+    autumn_harvest::signal::send_signal(&mut conn, forked, "go", Value::Null)
+        .await
+        .expect("signal the fork");
+    let row = wait_for_execution_state(&url, forked, "CANCELLED").await;
+    running.stop().await;
+
+    assert_eq!(lookups(&queue), 0, "the refused local activity never runs");
+    assert_eq!(row.error.as_deref(), Some("operator abort"));
 }
 
 /// An override replaces the result of one activity at the fork point.

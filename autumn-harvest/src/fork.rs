@@ -1805,6 +1805,10 @@ const RACE_LOSER_ERROR: &str = "lost race to a sibling branch";
 /// The text alone is not enough. An activity can fail with the same text.
 /// The engine terminal also has attempt 1, type `Error`, no retry and no
 /// details, so the whole shape must match.
+///
+/// A cancelled cancellation scope writes the same terminal with its own text
+/// (issue #1984). The scope cancels its members again through the same
+/// command, so the fork holds them as it holds a race loser.
 fn is_race_loser(event: &WorkflowEvent) -> bool {
     matches!(
         event,
@@ -1815,7 +1819,9 @@ fn is_race_loser(event: &WorkflowEvent) -> bool {
             non_retryable: true,
             details: None,
             ..
-        } if error == RACE_LOSER_ERROR && error_type == "Error"
+        } if (error == RACE_LOSER_ERROR
+            || error == crate::context::LoserCancelReason::ScopeCancelled.message())
+            && error_type == "Error"
     )
 }
 
@@ -2397,6 +2403,10 @@ mod tests {
         };
         for (error, held) in [
             (RACE_LOSER_ERROR, true),
+            (
+                crate::context::LoserCancelReason::ScopeCancelled.message(),
+                true,
+            ),
             (crate::event::ABANDONED_DISPATCH_REASON, false),
         ] {
             let first = ActivityExecId::new();

@@ -125,7 +125,7 @@ The worker reads the request from the history that the cycle replayed:
 - A cycle that completes keeps its result.
 
 The same-shard parent-close cascade defers in the same way as the
-cross-shard path. A reset drops a request that it copies from the source.
+cross-shard path. A reset or a fork (#2000) drops a request that it copies from the source.
 
 ### 1.3 Worker
 

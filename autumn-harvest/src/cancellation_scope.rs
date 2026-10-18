@@ -2134,6 +2134,30 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
+    /// The history-size decision of `should_continue_as_new` is captured as
+    /// the other recorded decisions are. Replay reads it, so the cancel does
+    /// not report a skipped record.
+    #[tokio::test]
+    async fn replay_reads_a_captured_continue_as_new_decision() {
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| json!(ctx.should_continue_as_new())).await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&replay, &replayed, |ctx| {
+            json!(ctx.should_continue_as_new())
+        })
+        .await;
+
+        assert_eq!(
+            replayed.lock().expect("replayed lock").take(),
+            seen.lock().expect("seen lock").take()
+        );
+        assert!(replay.take_nd_details().is_none());
+    }
+
     /// A replayed marker that differs from the captured one is drift.
     #[tokio::test]
     async fn a_replayed_marker_that_differs_from_the_capture_is_drift() {

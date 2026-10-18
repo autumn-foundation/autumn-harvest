@@ -26410,14 +26410,39 @@ async fn process_workflow_task(
             && let Some(command) =
                 crate::fork::recorded_outcome_refusal(&run_outcome, &pending_cmds)
         {
+            let refusal = HarvestError::Config(format!(
+                "recorded fork refused {command}: recorded mode cannot serve it, so \
+                 fork with effects = live to run it"
+            ));
+            // Issue #1984: with a deferred cancel pending, a failing cycle
+            // cancels the run. The refused cycle takes that path too, and
+            // none of its commands persist.
+            if crate::execution::DeferredCancelState::of(&history_events)
+                .requested
+                .is_some()
+            {
+                final_resident = if hot_swapped {
+                    final_miss(hot_swapped, ResidentOutcome::HotSwap)
+                } else {
+                    iter_resident
+                };
+                break (
+                    WorkflowOutcome::Failed {
+                        error: refusal.to_string(),
+                        non_deterministic_details: None,
+                        handler_panic: false,
+                        unhandled_signals: std::collections::BTreeMap::new(),
+                    },
+                    Vec::new(),
+                    execute_span,
+                    resolved_router,
+                );
+            }
             return fail_workflow_execution_clearing_strikes(
                 conn,
                 task,
                 worker_id,
-                Err::<(), _>(HarvestError::Config(format!(
-                    "recorded fork refused {command}: recorded mode cannot serve it, so \
-                     fork with effects = live to run it"
-                ))),
+                Err::<(), _>(refusal),
                 workflow_panic_strikes,
                 prepared.exec_id.as_uuid(),
                 registry.payload_codecs(),

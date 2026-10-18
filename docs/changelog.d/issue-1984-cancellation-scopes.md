@@ -30,9 +30,13 @@ non-determinism. A withdrawn timer command restores the timer state.
 - A cycle that would fail, continue as new, deadlock or panic is
   cancelled instead. A cycle that completes keeps its result.
 - A paused run is not deferred, and a run with a pending deferred cancel
-  cannot be paused. A reset drops a copied request. The
+  cannot be paused. A reset or a fork drops a copied request. The
   same-shard parent-close cascade defers like the cross-shard path.
 - Scheduler `CancelOther` counts a deferred cancel as no freed slot.
+- A recorded fork (#2000) that refuses an effect while a cancel is
+  deferred is cancelled, not failed.
+- A recorded fork holds a scope member that the source cancelled, as it
+  holds a race loser. It does not serve the cancel as a recorded failure.
 
 **API changes.**
 
