@@ -566,6 +566,150 @@ async fn a_registered_pool_wakes_after_commit_and_not_before() {
     wake_of(&mut listener, exec_id).await;
 }
 
+// ── A stamped write sends no stage probe (issue #2125) ─────────────────
+
+/// The backend pid of `conn`.
+async fn backend_pid(conn: &mut AsyncPgConnection) -> i32 {
+    #[derive(diesel::QueryableByName)]
+    struct Pid {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        pid: i32,
+    }
+    diesel::sql_query("SELECT pg_backend_pid() AS pid")
+        .get_result::<Pid>(conn)
+        .await
+        .expect("read pid")
+        .pid
+}
+
+/// The last statement that the backend `pid` ran, read on its own connection.
+async fn last_query(url: &str, pid: i32) -> String {
+    #[derive(diesel::QueryableByName)]
+    struct LastQuery {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        query: String,
+    }
+    let mut admin = AsyncPgConnection::establish(url).await.expect("connect");
+    diesel::sql_query("SELECT query FROM pg_stat_activity WHERE pid = $1")
+        .bind::<diesel::sql_types::Integer, _>(pid)
+        .get_result::<LastQuery>(&mut admin)
+        .await
+        .expect("read the last query")
+        .query
+}
+
+/// A pool with a ready sender, and one of its connections.
+async fn ready_pool(url: &str) -> (DbPool, autumn_harvest::pool::PooledConn) {
+    let pool = build_pool(url);
+    assert!(
+        autumn_harvest::notify::register_pool(&pool)
+            .wait_ready(READY)
+            .await,
+        "the sender must be ready, so a write asks for a stamp"
+    );
+    let conn = pool.get().await.expect("pool connection");
+    (pool, conn)
+}
+
+#[tokio::test]
+async fn an_append_in_a_transaction_sends_no_stage_probe() {
+    let (url, _container) = setup().await;
+    let (_pool, mut conn) = ready_pool(&url).await;
+    let exec_id = insert_execution(&mut conn).await;
+    let pid = backend_pid(&mut conn).await;
+    let mut listener = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+
+    let url_in_tx = url.clone();
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        store::append_events(conn, exec_id, &[started()], 0).await?;
+        let last = last_query(&url_in_tx, pid).await;
+        assert!(
+            last.starts_with("INSERT INTO \"harvest_events\""),
+            "the event insert must be the last statement, not a probe: {last}"
+        );
+        Ok(())
+    }))
+    .await
+    .expect("append");
+
+    wake_of(&mut listener, exec_id).await;
+}
+
+#[tokio::test]
+async fn an_enqueue_in_a_transaction_sends_no_stage_probe() {
+    let (url, _container) = setup().await;
+    let (_pool, mut conn) = ready_pool(&url).await;
+    let exec_id = insert_execution(&mut conn).await;
+    let pid = backend_pid(&mut conn).await;
+    let queues = vec!["default".to_string()];
+    let mut listener = QueueListener::connect(&url, &queues)
+        .await
+        .expect("listener");
+
+    let params = enqueue_params("default", exec_id);
+    let url_in_tx = url.clone();
+    let task_id = Box::pin(conn.transaction::<Uuid, HarvestError, _>(async |conn| {
+        let task_id = queue::enqueue(conn, &params).await?;
+        let last = last_query(&url_in_tx, pid).await;
+        assert!(
+            last.starts_with("INSERT INTO \"harvest_task_queue\""),
+            "the task insert must be the last statement, not a probe: {last}"
+        );
+        Ok(task_id)
+    }))
+    .await
+    .expect("enqueue");
+
+    let wake = listener
+        .wait_for_notification(WAIT)
+        .await
+        .expect("payload parses")
+        .expect("one wake after commit");
+    assert_eq!(wake.task_id, task_id);
+}
+
+#[tokio::test]
+async fn a_coalesced_scope_stages_with_the_stamp_of_its_append() {
+    let (url, _container) = setup().await;
+    let (_pool, mut conn) = ready_pool(&url).await;
+    let exec_id = insert_execution(&mut conn).await;
+    let pid = backend_pid(&mut conn).await;
+    let queues = vec!["default".to_string()];
+    let mut events = WorkflowEventListener::connect(&url)
+        .await
+        .expect("listener");
+    let mut tasks = QueueListener::connect(&url, &queues)
+        .await
+        .expect("listener");
+
+    let url_in_tx = url.clone();
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        autumn_harvest::notify::coalesced(conn, async |conn| {
+            store::append_events(conn, exec_id, &[started()], 0).await?;
+            // This note has no write of its own. It takes the scope stamp.
+            autumn_harvest::notify::notify_tasks_enqueued(conn, &queues, Uuid::nil()).await
+        })
+        .await?;
+        let last = last_query(&url_in_tx, pid).await;
+        assert!(
+            last.starts_with("INSERT INTO \"harvest_events\""),
+            "the scope must stage with the stamp of its append: {last}"
+        );
+        Ok(())
+    }))
+    .await
+    .expect("append and wake");
+
+    wake_of(&mut events, exec_id).await;
+    let wake = tasks
+        .wait_for_notification(WAIT)
+        .await
+        .expect("payload parses");
+    assert!(wake.is_some(), "the task wake arrives after commit");
+}
+
 #[tokio::test]
 async fn a_raw_begin_block_wakes_after_commit_and_not_before() {
     let (url, _container) = setup().await;

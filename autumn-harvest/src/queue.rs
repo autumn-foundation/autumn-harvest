@@ -497,6 +497,32 @@ fn check_enqueue_fairness_key(params: &EnqueueParams) -> HarvestResult<()> {
         .map_or(Ok(()), crate::queue_fairness::validate_fairness_key)
 }
 
+/// Insert `rows` into `harvest_task_queue`. Stages no NOTIFY.
+///
+/// Returns the stamp of the insert when [`crate::notify::stamp_wanted`]
+/// holds. The stage of its note then sends no probe (issue #2125).
+async fn insert_task_rows(
+    conn: &mut AsyncPgConnection,
+    rows: &[NewTaskQueueItem<'_>],
+) -> HarvestResult<Option<crate::notify::Stamp>> {
+    use crate::schema::harvest_task_queue;
+
+    let insert = diesel::insert_into(harvest_task_queue::table).values(rows);
+    if !crate::notify::stamp_wanted(conn) {
+        insert
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        return Ok(None);
+    }
+    let stamps = insert
+        .returning(crate::notify::stamp_returning())
+        .get_results::<crate::notify::Stamp>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(stamps.into_iter().next())
+}
+
 /// Insert a new task into the work queue and return its ID.
 ///
 /// # Errors
@@ -505,8 +531,6 @@ fn check_enqueue_fairness_key(params: &EnqueueParams) -> HarvestResult<()> {
 /// [`EnqueueParams::fairness_key`], and
 /// [`crate::error::HarvestError::Database`] on insert failure.
 pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> HarvestResult<Uuid> {
-    use crate::schema::harvest_task_queue;
-
     check_enqueue_fairness_key(params)?;
     let task_id = Uuid::new_v4();
 
@@ -565,11 +589,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         fairness_key: params.fairness_key.as_deref(),
     };
 
-    diesel::insert_into(harvest_task_queue::table)
-        .values(&row)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let stamp = insert_task_rows(conn, std::slice::from_ref(&row)).await?;
 
     if let Some((worker_id, timeout)) = sticky {
         diesel::sql_query(
@@ -587,7 +607,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         .map_err(crate::error::database_error)?;
     }
 
-    crate::notify::notify_task_enqueued(conn, &params.queue_name, task_id).await?;
+    crate::notify::notify_task_enqueued_stamped(conn, stamp, &params.queue_name, task_id).await?;
 
     // Dispatch hint (issue #1312). The row is `PENDING`, so the channel gets a
     // reference to it. A row scheduled in the future is still recorded; the
@@ -773,8 +793,6 @@ pub async fn enqueue_batch(
     conn: &mut AsyncPgConnection,
     params: &[EnqueueParams],
 ) -> HarvestResult<Vec<Uuid>> {
-    use crate::schema::harvest_task_queue;
-
     if params.is_empty() {
         return Ok(Vec::new());
     }
@@ -784,6 +802,9 @@ pub async fn enqueue_batch(
 
     let task_ids: Vec<Uuid> = params.iter().map(|_| Uuid::new_v4()).collect();
 
+    // A chunk returns a stamp only inside the caller's transaction. All chunks
+    // share that transaction, so the first stamp serves every note.
+    let mut stamp = None;
     // Byte-and-row-bounded chunk boundaries, decided up front from
     // `params`' borrowed fields -- see `compute_chunk_bounds`'s doc
     // comment. No row is cloned until its chunk is actually built below.
@@ -835,11 +856,8 @@ pub async fn enqueue_batch(
             })
             .collect();
 
-        diesel::insert_into(harvest_task_queue::table)
-            .values(&rows)
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
+        let chunk_stamp = insert_task_rows(conn, &rows).await?;
+        stamp = stamp.or(chunk_stamp);
     }
 
     // Sticky pin follow-up (rare -- see the doc comment above). Same shape as
@@ -869,7 +887,8 @@ pub async fn enqueue_batch(
     }
 
     for (p, &task_id) in params.iter().zip(&task_ids) {
-        crate::notify::notify_task_enqueued(conn, &p.queue_name, task_id).await?;
+        crate::notify::notify_task_enqueued_stamped(conn, stamp.clone(), &p.queue_name, task_id)
+            .await?;
     }
 
     for (p, &task_id) in params.iter().zip(&task_ids) {
