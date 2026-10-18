@@ -1642,6 +1642,7 @@ async fn run_orphan_blob_pass(
         page_budget: PAYLOAD_ORPHAN_PAGES_PER_TICK,
         dry_run: config.dry_run,
         cursor: state.cursor.take(),
+        call_timeout: config.archival_timeout(),
     };
     match sweep_orphaned_blobs(offloader.store().as_ref(), pools, &options, shutdown).await {
         OrphanSweep::Unsupported => {

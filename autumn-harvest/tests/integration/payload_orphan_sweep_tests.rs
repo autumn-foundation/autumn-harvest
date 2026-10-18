@@ -76,6 +76,10 @@ struct ListingStore {
     conditional: AtomicBool,
     /// A key that a writer re-uploads right after the next `list`.
     reput_after_list: Mutex<Option<String>>,
+    /// Never answer a `list`, as a hung backend.
+    hang_list: AtomicBool,
+    /// Never answer a `delete` or `delete_if_older`, as a hung backend.
+    hang_delete: AtomicBool,
 }
 
 impl ListingStore {
@@ -89,6 +93,8 @@ impl ListingStore {
             list_calls: AtomicUsize::new(0),
             conditional: AtomicBool::new(true),
             reput_after_list: Mutex::default(),
+            hang_list: AtomicBool::new(false),
+            hang_delete: AtomicBool::new(false),
         })
     }
 
@@ -162,6 +168,9 @@ impl PayloadStore for ListingStore {
 
     fn delete(&self, key: &str) -> PayloadStoreFuture<'_, ()> {
         self.deletes.lock().unwrap().push(key.to_owned());
+        if AtomicBool::load(&self.hang_delete, Ordering::SeqCst) {
+            return Box::pin(std::future::pending());
+        }
         if self.fail_deletes.lock().unwrap().contains(key) {
             return Box::pin(async { Err(PayloadStoreError("delete refused".to_owned())) });
         }
@@ -178,6 +187,9 @@ impl PayloadStore for ListingStore {
             return None;
         }
         self.deletes.lock().unwrap().push(key.to_owned());
+        if AtomicBool::load(&self.hang_delete, Ordering::SeqCst) {
+            return Some(Box::pin(std::future::pending()));
+        }
         if self.fail_deletes.lock().unwrap().contains(key) {
             return Some(Box::pin(async {
                 Err(PayloadStoreError("delete refused".to_owned()))
@@ -203,6 +215,9 @@ impl PayloadStore for ListingStore {
         self.list_calls.fetch_add(1, Ordering::SeqCst);
         if !self.can_list {
             return None;
+        }
+        if AtomicBool::load(&self.hang_list, Ordering::SeqCst) {
+            return Some(Box::pin(std::future::pending()));
         }
         let mut found: Vec<StoredBlob> = self
             .blobs
@@ -330,6 +345,7 @@ const fn options() -> OrphanSweepOptions {
         page_budget: 100,
         dry_run: false,
         cursor: None,
+        call_timeout: Duration::from_secs(30),
     }
 }
 
@@ -819,4 +835,87 @@ async fn store_without_a_conditional_delete_falls_back_to_a_plain_delete() {
     let swept = report(sweep(&store, &single(&url), &options()).await);
     assert_eq!((swept.found, swept.deleted), (1, 1));
     assert_eq!(store.keys().len(), 0);
+}
+
+/// A sweep that must end soon, or the test fails instead of hanging.
+async fn sweep_within_five_seconds(
+    store: &ListingStore,
+    pools: &ShardedDbPool,
+    options: &OrphanSweepOptions,
+    shutdown: &CancellationToken,
+) -> OrphanSweepReport {
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        sweep_orphaned_blobs(store, pools, options, shutdown),
+    )
+    .await
+    .expect("a hung store must not hold the sweep");
+    report(outcome)
+}
+
+#[tokio::test]
+async fn hung_delete_costs_one_timeout_and_ends_the_sweep() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    for conditional in [true, false] {
+        let store = ListingStore::listing();
+        store.set_conditional_delete(conditional);
+        for key in ["a", "b", "c"] {
+            store.add_aged(key, GRACE * 2);
+        }
+        store.hang_delete.store(true, Ordering::SeqCst);
+        let opts = OrphanSweepOptions {
+            call_timeout: Duration::from_millis(200),
+            ..options()
+        };
+
+        let swept =
+            sweep_within_five_seconds(&store, &single(&url), &opts, &CancellationToken::new())
+                .await;
+        assert!(swept.error.is_some(), "the timeout is reported");
+        assert_eq!(store.delete_calls(), 1, "the other keys are not tried");
+        assert_eq!((swept.deleted, swept.failed), (0, 1));
+        assert_eq!(store.keys(), ["a", "b", "c"]);
+    }
+}
+
+#[tokio::test]
+async fn hung_listing_times_out_and_keeps_the_cursor() {
+    let (url, _c) = setup_db().await;
+    let store = ListingStore::listing();
+    store.add_aged("old", GRACE * 2);
+    store.hang_list.store(true, Ordering::SeqCst);
+    let opts = OrphanSweepOptions {
+        call_timeout: Duration::from_millis(200),
+        cursor: Some("a".to_owned()),
+        ..options()
+    };
+
+    let swept =
+        sweep_within_five_seconds(&store, &single(&url), &opts, &CancellationToken::new()).await;
+    assert!(swept.error.is_some());
+    assert_eq!(swept.next_cursor.as_deref(), Some("a"));
+    assert_eq!(store.delete_calls(), 0);
+}
+
+#[tokio::test]
+async fn shutdown_ends_a_hung_delete_before_the_timeout() {
+    let (url, _c) = setup_db().await;
+    let mut conn = connect(&url).await;
+    scrub(&mut conn).await;
+    let store = ListingStore::listing();
+    store.add_aged("old", GRACE * 2);
+    store.hang_delete.store(true, Ordering::SeqCst);
+    let shutdown = CancellationToken::new();
+    let stopper = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stopper.cancel();
+    });
+
+    // The default 30 s timeout is far above the 5 s bound of the helper.
+    let swept = sweep_within_five_seconds(&store, &single(&url), &options(), &shutdown).await;
+    assert_eq!(swept.deleted, 0);
+    assert_eq!(store.keys(), ["old"]);
 }

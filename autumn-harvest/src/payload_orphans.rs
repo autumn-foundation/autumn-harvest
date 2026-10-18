@@ -48,6 +48,8 @@ pub struct OrphanSweepOptions {
     pub dry_run: bool,
     /// Where the previous call stopped, or `None` to start from the top.
     pub cursor: Option<String>,
+    /// The longest one store call may take. RED PHASE: not enforced yet.
+    pub call_timeout: Duration,
 }
 
 /// What one [`sweep_orphaned_blobs`] call did.
