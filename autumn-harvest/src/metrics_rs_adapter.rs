@@ -43,8 +43,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::sync::{LazyLock, Mutex, OnceLock, PoisonError};
 
 use metrics::{Key, Label, SharedString, counter, gauge, histogram};
 
@@ -137,13 +136,9 @@ const INTERNED_LABEL_CAP: usize = 4096;
 /// flooding. See `docs/performance-metrics-rs-labels.md`.
 type LabelSet = HashSet<&'static str, foldhash::fast::RandomState>;
 
-/// Every interned label value. Each one is leaked once and lives for the
-/// rest of the process.
-static INTERNED_LABELS: LazyLock<Mutex<LabelSet>> = LazyLock::new(Mutex::default);
-
-/// Set once [`INTERNED_LABELS`] holds [`INTERNED_LABEL_CAP`] values. A miss
-/// then skips the shared lock.
-static INTERNED_LABELS_FULL: AtomicBool = AtomicBool::new(false);
+/// Every interned label value, shared by all threads.
+static INTERNED_LABELS: LazyLock<LabelInterner> =
+    LazyLock::new(|| LabelInterner::new(INTERNED_LABEL_CAP));
 
 thread_local! {
     /// The interned values that this thread has used. A hit takes no lock
@@ -167,7 +162,7 @@ fn label_value(value: &str) -> SharedString {
     if let Ok(Some(interned)) = cached {
         return SharedString::from(interned);
     }
-    let Some(interned) = intern_label(value) else {
+    let Some(interned) = INTERNED_LABELS.intern(value) else {
         return SharedString::from(value.to_owned());
     };
     // A thread that is shutting down has no local set. The value is still
@@ -176,36 +171,46 @@ fn label_value(value: &str) -> SharedString {
     SharedString::from(interned)
 }
 
-/// The shared copy of `value`, or `None` once the interner is full.
-fn intern_label(value: &str) -> Option<&'static str> {
-    if INTERNED_LABELS_FULL.load(Ordering::Relaxed) {
-        return None;
-    }
-    let interned = intern_into(
-        &mut INTERNED_LABELS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner),
-        value,
-        INTERNED_LABEL_CAP,
-    );
-    if interned.is_none() {
-        INTERNED_LABELS_FULL.store(true, Ordering::Relaxed);
-    }
-    interned
+/// The shared store behind [`label_value`].
+///
+/// Each value is leaked once and lives for the rest of the process. The set
+/// holds at most `cap` values. When it fills, a frozen copy is published.
+/// The set never grows again, so a later miss reads the frozen copy without
+/// the lock. That copy still resolves every interned value and refuses only
+/// a new one.
+struct LabelInterner {
+    labels: Mutex<LabelSet>,
+    frozen: OnceLock<LabelSet>,
+    cap: usize,
 }
 
-/// The copy of `value` in `labels`. A new value is leaked and added while
-/// `labels` holds fewer than `cap` values. Otherwise the result is `None`.
-fn intern_into(labels: &mut LabelSet, value: &str, cap: usize) -> Option<&'static str> {
-    if let Some(&interned) = labels.get(value) {
-        return Some(interned);
+impl LabelInterner {
+    fn new(cap: usize) -> Self {
+        Self {
+            labels: Mutex::default(),
+            frozen: OnceLock::new(),
+            cap,
+        }
     }
-    if labels.len() >= cap {
-        return None;
+
+    /// The shared copy of `value`, or `None` for a new value past the cap.
+    fn intern(&self, value: &str) -> Option<&'static str> {
+        if let Some(frozen) = self.frozen.get() {
+            return frozen.get(value).copied();
+        }
+        let mut labels = self.labels.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(&interned) = labels.get(value) {
+            return Some(interned);
+        }
+        if labels.len() >= self.cap {
+            self.frozen.get_or_init(|| labels.clone());
+            return None;
+        }
+        let interned: &'static str = Box::leak(Box::from(value));
+        labels.insert(interned);
+        drop(labels);
+        Some(interned)
     }
-    let interned: &'static str = Box::leak(Box::from(value));
-    labels.insert(interned);
-    Some(interned)
 }
 
 impl MetricsRecorder for MetricsRsRecorder {
@@ -3625,22 +3630,36 @@ mod tests {
     }
 
     #[test]
-    fn intern_into_refuses_a_new_value_at_the_cap() {
-        let mut labels = LabelSet::default();
-        let a = intern_into(&mut labels, "a", 2).unwrap();
-        let b = intern_into(&mut labels, "b", 2).unwrap();
+    fn a_full_interner_refuses_only_new_values() {
+        let interner = LabelInterner::new(2);
+        let a = interner.intern("a").unwrap();
+        let b = interner.intern("b").unwrap();
 
         assert_eq!(
-            intern_into(&mut labels, "c", 2),
+            interner.intern("c"),
             None,
-            "a full set takes no new value"
+            "a full interner takes no new value"
+        );
+        assert!(
+            interner.frozen.get().is_some(),
+            "a full interner publishes its frozen copy"
         );
         assert_eq!(
-            intern_into(&mut labels, "a", 2).map(str::as_ptr),
+            interner.intern("a").map(str::as_ptr),
             Some(a.as_ptr()),
-            "a full set still resolves the values it holds"
+            "a full interner still resolves the values it holds"
         );
-        assert_eq!(intern_into(&mut labels, "b", 2), Some(b));
-        assert_eq!(labels.len(), 2);
+        let other_thread = std::thread::scope(|scope| {
+            scope
+                .spawn(|| interner.intern("b").map(|s| s.as_ptr() as usize))
+                .join()
+                .unwrap()
+        });
+        assert_eq!(
+            other_thread,
+            Some(b.as_ptr() as usize),
+            "a thread that first meets a held value after the cap still resolves it"
+        );
+        assert_eq!(interner.intern("c"), None);
     }
 }

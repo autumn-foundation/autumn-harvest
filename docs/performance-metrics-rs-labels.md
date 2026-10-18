@@ -59,7 +59,10 @@ set. So a hit takes no lock and touches no shared cache line. A miss takes a
 shared lock, leaks one copy of the value and caches it in the thread. The
 shared set holds at most 4,096 values. Past that cap, a new value is copied
 as before. The cap bounds the leak if a caller breaks the low-cardinality
-rule.
+rule. When the set fills, the interner publishes a frozen copy of it. A
+later miss reads that copy without the lock. It still resolves every value
+that was interned, so a thread that starts after the cap still caches the
+common names.
 
 The first cut hashed both sets with the standard library's SipHash. That
 cost more than the allocations it removed; see the measurement below. The
@@ -111,7 +114,9 @@ avoids both, so a multi-threaded worker gains at least as much.
 
 - `a_label_value_is_interned_once_across_calls_and_threads` checks that
   repeat calls, and calls on another thread, resolve to one shared copy.
-- `intern_into_refuses_a_new_value_at_the_cap` checks the cap.
+- `a_full_interner_refuses_only_new_values` checks the cap. A full interner
+  still resolves every value it holds, also on a thread that first meets the
+  value after the cap.
 - The existing `CapturingRecorder` tests in `metrics_rs_adapter.rs` check
   the exact label sets each family registers.
 - The existing `circuit_breaker` unit tests and the loom model in
