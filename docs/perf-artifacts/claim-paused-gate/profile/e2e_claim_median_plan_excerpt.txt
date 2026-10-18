@@ -1,0 +1,257 @@
+	CTE Scan on claimed  (actual time=0.735..0.764 rows=1 loops=1)
+	  Buffers: shared hit=194
+	  CTE worker_info
+	    ->  Result  (actual time=0.005..0.006 rows=1 loops=1)
+	          Buffers: shared hit=2
+	            ->  Index Scan using harvest_workers_pkey on public.harvest_workers  (actual time=0.004..0.004 rows=1 loops=1)
+	                  Index Cond: (harvest_workers.worker_id = $1)
+	                  Buffers: shared hit=2
+	  CTE paused_queues
+	    ->  Aggregate  (actual time=0.002..0.002 rows=1 loops=1)
+	          ->  Seq Scan on public.harvest_queue_pauses  (actual time=0.001..0.001 rows=0 loops=1)
+	                Filter: (harvest_queue_pauses.queue_name = ANY ($2))
+	  CTE paused_activities
+	    ->  Aggregate  (actual time=0.005..0.006 rows=1 loops=1)
+	          ->  Seq Scan on public.harvest_activity_pauses  (actual time=0.004..0.004 rows=0 loops=1)
+	  CTE concurrency_pending_keys
+	    ->  Unique  (never executed)
+	          ->  Sort  (never executed)
+	                ->  Index Scan using idx_harvest_tq_live_created on public.harvest_task_queue  (never executed)
+	                      Filter: ((harvest_task_queue.concurrency_key IS NOT NULL) AND (harvest_task_queue.concurrency_cap IS NOT NULL) AND (harvest_task_queue.state = 'PEN
+	  CTE concurrency_running_counts
+	    ->  GroupAggregate  (never executed)
+	          ->  Incremental Sort  (never executed)
+	                ->  Nested Loop Semi Join  (never executed)
+	                      Join Filter: (concurrency_pending_keys.concurrency_key = t.concurrency_key)
+	                      ->  Index Scan using harvest_task_queue_concurrency_key_running on public.harvest_task_queue t  (never executed)
+	                            Filter: (t.worker_id IS NOT NULL)
+	                      ->  CTE Scan on concurrency_pending_keys  (never executed)
+	  CTE expired_runs
+	    ->  Append  (actual time=0.006..0.006 rows=0 loops=1)
+	          Buffers: shared hit=2
+	          ->  Index Scan using idx_harvest_executions_deadline on public.harvest_workflow_executions  (actual time=0.002..0.002 rows=0 loops=1)
+	                Index Cond: (harvest_workflow_executions.deadline_at < now())
+	                Buffers: shared hit=1
+	          ->  Index Scan using idx_harvest_executions_chain_deadline on public.harvest_workflow_executions harvest_workflow_executions_1  (actual time=0.003..0.003 rows=
+	                Index Cond: (harvest_workflow_executions_1.chain_deadline_at < now())
+	                Buffers: shared hit=1
+	  CTE seek_heads
+	    ->  WindowAgg  (actual time=0.214..0.233 rows=26 loops=1)
+	          Buffers: shared hit=34
+	          ->  Sort  (actual time=0.209..0.218 rows=26 loops=1)
+	                Buffers: shared hit=34
+	                ->  Result  (actual time=0.056..0.140 rows=26 loops=1)
+	                      Buffers: shared hit=34
+	                      ->  Append  (actual time=0.056..0.135 rows=26 loops=1)
+	                            Buffers: shared hit=34
+	                            ->  Result  (actual time=0.055..0.114 rows=26 loops=1)
+	                                  One-Time Filter: (($4 IS NULL) OR ($4 <= 0))
+	                                  Buffers: shared hit=29
+	                                  ->  Subquery Scan on "*SELECT* 1_1"  (actual time=0.054..0.108 rows=26 loops=1)
+	                                        Buffers: shared hit=29
+	                                        ->  Nested Loop  (actual time=0.053..0.103 rows=26 loops=1)
+	                                              Buffers: shared hit=29
+	                                              ->  Nested Loop  (actual time=0.023..0.030 rows=4 loops=1)
+	                                                    ->  Nested Loop  (actual time=0.020..0.023 rows=1 loops=1)
+	                                                          ->  CTE Scan on paused_activities  (actual time=0.007..0.007 rows=1 loops=1)
+	                                                          ->  Nested Loop  (actual time=0.012..0.014 rows=1 loops=1)
+	                                                                Join Filter: (u.name <> ALL (paused_queues.names))
+	                                                                ->  CTE Scan on paused_queues  (actual time=0.002..0.003 rows=1 loops=1)
+	                                                                ->  HashAggregate  (actual time=0.008..0.009 rows=1 loops=1)
+	                                                                      ->  Function Scan on pg_catalog.unnest u  (actual time=0.004..0.005 rows=1 loops=1)
+	                                                    ->  Materialize  (actual time=0.002..0.005 rows=4 loops=1)
+	                                                          ->  Values Scan on "*VALUES*"  (actual time=0.001..0.003 rows=4 loops=1)
+	                                              ->  Limit  (actual time=0.009..0.016 rows=6 loops=4)
+	                                                    Buffers: shared hit=29
+	                                                      ->  Function Scan on pg_catalog.unnest marked  (actual time=0.003..0.003 rows=0 loops=1)
+	                                                            Filter: ("left"(marked.marked, 1) = ''::text)
+	                                                    ->  Index Scan using idx_harvest_tq_claim_seek on public.harvest_task_queue harvest_task_queue_1  (actual time=0.009.
+	                                                          Index Cond: ((harvest_task_queue_1.queue_name = u.name) AND (harvest_task_queue_1.task_type = "*VALUES*".column
+	                                                          Filter: (((harvest_task_queue_1.session_id IS NULL) OR (harvest_task_queue_1.sticky_worker_id = $1)) AND ((harv
+	                                                          Buffers: shared hit=29
+	                            ->  Result  (actual time=0.013..0.016 rows=0 loops=1)
+	                                  One-Time Filter: (($4 IS NULL) OR ($4 <= 0))
+	                                  Buffers: shared hit=5
+	                                  ->  Subquery Scan on "*SELECT* 2"  (actual time=0.012..0.014 rows=0 loops=1)
+	                                        Buffers: shared hit=5
+	                                        ->  Nested Loop  (actual time=0.012..0.014 rows=0 loops=1)
+	                                              Buffers: shared hit=5
+	                                              ->  CTE Scan on paused_activities paused_activities_1  (actual time=0.000..0.001 rows=1 loops=1)
+	                                              ->  Nested Loop  (actual time=0.010..0.011 rows=0 loops=1)
+	                                                    Buffers: shared hit=5
+	                                                    ->  CTE Scan on paused_queues paused_queues_1  (actual time=0.000..0.001 rows=1 loops=1)
+	                                                    ->  Limit  (actual time=0.008..0.009 rows=0 loops=1)
+	                                                          Buffers: shared hit=5
+	                                                            ->  Function Scan on pg_catalog.unnest marked_1  (never executed)
+	                                                                  Filter: ("left"(marked_1.marked, 1) = ''::text)
+	                                                          ->  Sort  (actual time=0.008..0.008 rows=0 loops=1)
+	                                                                Buffers: shared hit=5
+	                                                                ->  Index Scan using idx_harvest_tq_sticky_poll on public.harvest_task_queue harvest_task_queue_2  (actua
+	                                                                      Index Cond: ((harvest_task_queue_2.sticky_worker_id = $1) AND (harvest_task_queue_2.scheduled_at <=
+	                                                                      Filter: ((harvest_task_queue_2.sticky_until > now()) AND ((harvest_task_queue_2.schedule_to_close_a
+	                                                                      Buffers: shared hit=5
+	  CTE seek_bounds
+	    ->  CTE Scan on seek_heads  (actual time=0.023..0.023 rows=0 loops=1)
+	          Filter: (seek_heads.seek_rn = 32)
+	          Rows Removed by Filter: 26
+	  CTE seek_pending_keys
+	    ->  HashAggregate  (never executed)
+	          ->  CTE Scan on seek_heads seek_heads_1  (never executed)
+	                Filter: ((seek_heads_1.seek_concurrency_key IS NOT NULL) AND (seek_heads_1.seek_concurrency_cap IS NOT NULL))
+	  CTE seek_running_counts
+	    ->  GroupAggregate  (never executed)
+	          ->  Incremental Sort  (never executed)
+	                ->  Nested Loop Semi Join  (never executed)
+	                      Join Filter: (seek_pending_keys.concurrency_key = t_1.concurrency_key)
+	                      ->  Index Scan using harvest_task_queue_concurrency_key_running on public.harvest_task_queue t_1  (never executed)
+	                            Filter: (t_1.worker_id IS NOT NULL)
+	                      ->  CTE Scan on seek_pending_keys  (never executed)
+	  CTE seek_candidate
+	    ->  Limit  (actual time=0.556..0.561 rows=1 loops=1)
+	          Buffers: shared hit=141
+	            ->  Result  (actual time=0.000..0.001 rows=1 loops=1)
+	            ->  Nested Loop Anti Join  (actual time=0.241..0.250 rows=26 loops=1)
+	                  Join Filter: ((b.bound_pinned OR (w.seek_rank = 0)) AND ((b.bound_pinned AND (w.seek_rank = 0)) OR (w.seek_priority < b.bound_priority) OR ((w.seek_pri
+	                  Buffers: shared hit=34
+	                  ->  CTE Scan on seek_heads w  (actual time=0.216..0.220 rows=26 loops=1)
+	                        Buffers: shared hit=34
+	                  ->  CTE Scan on seek_bounds b  (actual time=0.001..0.001 rows=0 loops=26)
+	            ->  Function Scan on pg_catalog.unnest marked_2  (actual time=0.001..0.002 rows=0 loops=1)
+	                  Filter: ("left"(marked_2.marked, 1) = ''::text)
+	          ->  LockRows  (actual time=0.555..0.559 rows=1 loops=1)
+	                Buffers: shared hit=141
+	                ->  Sort  (actual time=0.546..0.549 rows=2 loops=1)
+	                      Buffers: shared hit=139
+	                      ->  Nested Loop  (actual time=0.296..0.520 rows=26 loops=1)
+	                            Join Filter: ((harvest_task_queue_3.task_type <> 'activity'::text) OR (harvest_task_queue_3.activity_name IS NULL) OR (harvest_task_queue_3.a
+	                            Buffers: shared hit=139
+	                            ->  Nested Loop  (actual time=0.291..0.496 rows=26 loops=1)
+	                                  Join Filter: (harvest_task_queue_3.queue_name <> ALL (paused_queues_2.names))
+	                                  Buffers: shared hit=139
+	                                  ->  Nested Loop  (actual time=0.288..0.477 rows=26 loops=1)
+	                                        Join Filter: ((harvest_task_queue_3.required_capabilities IS NULL) OR (NOT (SubPlan 24)))
+	                                        Buffers: shared hit=139
+	                                        ->  Index Scan using harvest_task_queue_pkey on public.harvest_task_queue harvest_task_queue_3  (actual time=0.279..0.451 rows=26
+	                                              Index Cond: (harvest_task_queue_3.id = ANY ($20))
+	                                              Filter: (((harvest_task_queue_3.session_id IS NULL) OR (harvest_task_queue_3.sticky_worker_id = $1)) AND (harvest_task_queu
+	                                              Buffers: shared hit=137
+	                                                ->  CTE Scan on seek_running_counts rc  (never executed)
+	                                                      Filter: ((rc.concurrency_key = harvest_task_queue_3.concurrency_key) AND (rc.task_type = harvest_task_queue_3.task_
+	                                                ->  CTE Scan on expired_runs x  (actual time=0.006..0.006 rows=0 loops=1)
+	                                                      Buffers: shared hit=2
+	                                                ->  Seq Scan on public.harvest_workflow_executions e  (actual time=0.093..0.093 rows=0 loops=1)
+	                                                      Filter: (e.state = 'PAUSED'::text)
+	                                                      Rows Removed by Filter: 757
+	                                                      Buffers: shared hit=29
+	                                                ->  Index Only Scan using harvest_build_compat_build_id_compatible_with_key on public.harvest_build_compat  (never execut
+	                                                      Index Cond: ((harvest_build_compat.build_id = $3) AND (harvest_build_compat.compatible_with = harvest_task_queue_3.
+	                                                ->  Index Scan using harvest_rate_limit_buckets_pkey on public.harvest_rate_limit_buckets b_1  (never executed)
+	                                                      Index Cond: ((b_1.key)::text = (harvest_task_queue_3.rate_limit_key)::text)
+	                                                      Filter: (LEAST(COALESCE(CASE WHEN (b_1.override_expires_at > now()) THEN b_1.override_burst ELSE NULL::double preci
+	                                        ->  CTE Scan on worker_info  (actual time=0.001..0.001 rows=1 loops=26)
+	                                              Buffers: shared hit=2
+	                                          ->  Function Scan on pg_catalog.jsonb_array_elements r  (never executed)
+	                                                Filter: (((r.value ? 'Exact'::text) AND (((worker_info.labels ->> ((r.value -> 'Exact'::text) ->> 'key'::text)) IS NULL) 
+	                                  ->  CTE Scan on paused_queues paused_queues_2  (actual time=0.000..0.000 rows=1 loops=26)
+	                            ->  CTE Scan on paused_activities paused_activities_2  (actual time=0.000..0.000 rows=1 loops=26)
+	  CTE legacy_candidate
+	    ->  Limit  (actual time=0.007..0.010 rows=0 loops=1)
+	            ->  CTE Scan on seek_candidate  (actual time=0.000..0.001 rows=1 loops=1)
+	            ->  CTE Scan on seek_bounds  (never executed)
+	            ->  Function Scan on pg_catalog.unnest marked_3  (never executed)
+	                  Filter: ("left"(marked_3.marked, 1) = ''::text)
+	          ->  LockRows  (actual time=0.006..0.008 rows=0 loops=1)
+	                ->  Sort  (actual time=0.006..0.008 rows=0 loops=1)
+	                      ->  Result  (actual time=0.002..0.004 rows=0 loops=1)
+	                            One-Time Filter: ((NOT $36) AND ($37 OR (($4 IS NOT NULL) AND ($4 > 0))))
+	                            ->  Nested Loop  (never executed)
+	                                  Join Filter: ((harvest_task_queue_4.task_type <> 'activity'::text) OR (harvest_task_queue_4.activity_name IS NULL) OR (harvest_task_que
+	                                  ->  Nested Loop  (never executed)
+	                                        Join Filter: (harvest_task_queue_4.queue_name <> ALL (paused_queues_3.names))
+	                                        ->  Nested Loop  (never executed)
+	                                              Join Filter: ((harvest_task_queue_4.required_capabilities IS NULL) OR (NOT (SubPlan 38)))
+	                                              ->  Index Scan using idx_harvest_tq_claim_seek on public.harvest_task_queue harvest_task_queue_4  (never executed)
+	                                                    Index Cond: ((harvest_task_queue_4.queue_name = ANY ($2)) AND (harvest_task_queue_4.scheduled_at <= now()))
+	                                                    Filter: (((harvest_task_queue_4.session_id IS NULL) OR (harvest_task_queue_4.sticky_worker_id = $1)) AND (harvest_tas
+	                                                      ->  CTE Scan on concurrency_running_counts rc_1  (never executed)
+	                                                            Filter: ((rc_1.concurrency_key = harvest_task_queue_4.concurrency_key) AND (rc_1.task_type = harvest_task_que
+	                                                      ->  CTE Scan on expired_runs x_1  (never executed)
+	                                                      ->  Seq Scan on public.harvest_workflow_executions e_1  (never executed)
+	                                                            Filter: (e_1.state = 'PAUSED'::text)
+	                                                      ->  Index Only Scan using harvest_build_compat_build_id_compatible_with_key on public.harvest_build_compat harvest_
+	                                                            Index Cond: ((harvest_build_compat_1.build_id = $3) AND (harvest_build_compat_1.compatible_with = harvest_tas
+	                                                      ->  Index Scan using harvest_rate_limit_buckets_pkey on public.harvest_rate_limit_buckets b_2  (never executed)
+	                                                            Index Cond: ((b_2.key)::text = (harvest_task_queue_4.rate_limit_key)::text)
+	                                                            Filter: (LEAST(COALESCE(CASE WHEN (b_2.override_expires_at > now()) THEN b_2.override_burst ELSE NULL::double
+	                                              ->  CTE Scan on worker_info worker_info_1  (never executed)
+	                                                ->  Function Scan on pg_catalog.jsonb_array_elements r_1  (never executed)
+	                                                      Filter: (((r_1.value ? 'Exact'::text) AND (((worker_info_1.labels ->> ((r_1.value -> 'Exact'::text) ->> 'key'::text
+	                                        ->  CTE Scan on paused_queues paused_queues_3  (never executed)
+	                                  ->  CTE Scan on paused_activities paused_activities_3  (never executed)
+	  CTE candidate
+	    ->  Append  (actual time=0.558..0.567 rows=1 loops=1)
+	          Buffers: shared hit=141
+	          ->  CTE Scan on seek_candidate seek_candidate_1  (actual time=0.557..0.558 rows=1 loops=1)
+	                Buffers: shared hit=141
+	          ->  CTE Scan on legacy_candidate  (actual time=0.008..0.008 rows=0 loops=1)
+	  CTE fresh_now
+	    ->  Nested Loop Left Join  (actual time=0.577..0.578 rows=1 loops=1)
+	          Buffers: shared hit=141
+	          ->  Result  (actual time=0.000..0.000 rows=1 loops=1)
+	          ->  Subquery Scan on locked  (actual time=0.575..0.576 rows=0 loops=1)
+	                Buffers: shared hit=141
+	                ->  LockRows  (actual time=0.575..0.575 rows=0 loops=1)
+	                      Buffers: shared hit=141
+	                      ->  Nested Loop  (actual time=0.574..0.575 rows=0 loops=1)
+	                            Buffers: shared hit=141
+	                            ->  CTE Scan on candidate c  (actual time=0.562..0.571 rows=1 loops=1)
+	                                  Filter: (c.activity_name <> ALL ($5))
+	                                  Buffers: shared hit=141
+	                            ->  Index Scan using harvest_rate_limit_buckets_pkey on public.harvest_rate_limit_buckets b_3  (actual time=0.001..0.001 rows=0 loops=1)
+	                                  Index Cond: ((b_3.key)::text = (c.rate_limit_key)::text)
+	  CTE run_expired_now
+	    ->  Result  (actual time=0.608..0.610 rows=1 loops=1)
+	          Buffers: shared hit=174
+	            ->  Nested Loop  (actual time=0.607..0.608 rows=0 loops=1)
+	                  Join Filter: (c_1.workflow_exec_id = e_2.id)
+	                  Buffers: shared hit=174
+	                    ->  CTE Scan on fresh_now  (actual time=0.578..0.579 rows=1 loops=1)
+	                          Buffers: shared hit=141
+	                    ->  CTE Scan on fresh_now fresh_now_1  (actual time=0.000..0.000 rows=1 loops=1)
+	                  ->  Index Scan using idx_harvest_we_canary_order on public.harvest_workflow_executions e_2  (actual time=0.606..0.606 rows=0 loops=1)
+	                        Filter: ((e_2.deadline_at < $57) OR (e_2.chain_deadline_at < $58))
+	                        Rows Removed by Filter: 31
+	                        Buffers: shared hit=174
+	                  ->  CTE Scan on candidate c_1  (never executed)
+	  CTE rate_limit_debit
+	    ->  Update on public.harvest_rate_limit_buckets b_4  (actual time=0.007..0.007 rows=0 loops=1)
+	            ->  CTE Scan on run_expired_now  (actual time=0.000..0.000 rows=1 loops=1)
+	          ->  Result  (actual time=0.006..0.006 rows=0 loops=1)
+	                One-Time Filter: (NOT $61)
+	                ->  Nested Loop  (actual time=0.004..0.004 rows=0 loops=1)
+	                      ->  CTE Scan on candidate  (actual time=0.002..0.003 rows=1 loops=1)
+	                            Filter: (candidate.activity_name <> ALL ($5))
+	                      ->  Index Scan using harvest_rate_limit_buckets_pkey on public.harvest_rate_limit_buckets b_4  (actual time=0.001..0.001 rows=0 loops=1)
+	                            Index Cond: ((b_4.key)::text = (candidate.rate_limit_key)::text)
+	                            Filter: (LEAST(COALESCE(CASE WHEN (b_4.override_expires_at > now()) THEN b_4.override_burst ELSE NULL::double precision END, b_4.burst), ((b_
+	  CTE claimed
+	    ->  Update on public.harvest_task_queue harvest_task_queue_5  (actual time=0.730..0.732 rows=1 loops=1)
+	          Buffers: shared hit=194
+	            ->  CTE Scan on run_expired_now run_expired_now_1  (actual time=0.609..0.609 rows=1 loops=1)
+	                  Buffers: shared hit=174
+	          ->  Result  (actual time=0.626..0.627 rows=1 loops=1)
+	                One-Time Filter: (NOT $69)
+	                Buffers: shared hit=177
+	                ->  Nested Loop  (actual time=0.008..0.009 rows=1 loops=1)
+	                      Buffers: shared hit=3
+	                      ->  CTE Scan on candidate candidate_1  (actual time=0.003..0.004 rows=1 loops=1)
+	                            Filter: (((candidate_1.rate_limit_key IS NULL) OR (candidate_1.activity_name = ANY ($5)) OR (hashed SubPlan 52)) AND ((candidate_1.concurrenc
+	                              ->  CTE Scan on rate_limit_debit  (never executed)
+	                              ->  Aggregate  (never executed)
+	                                    ->  Index Scan using harvest_task_queue_concurrency_key_running on public.harvest_task_queue recheck  (never executed)
+	                                          Index Cond: (recheck.concurrency_key = candidate_1.concurrency_key)
+	                                          Filter: ((recheck.worker_id IS NOT NULL) AND (recheck.task_type = candidate_1.task_type))
+	                      ->  Index Scan using harvest_task_queue_pkey on public.harvest_task_queue harvest_task_queue_5  (actual time=0.003..0.003 rows=1 loops=1)
+	                            Index Cond: (harvest_task_queue_5.id = candidate_1.id)
+	                            Buffers: shared hit=3
+	Settings: jit = 'off', plan_cache_mode = 'force_generic_plan', enable_bitmapscan = 'off'
