@@ -473,6 +473,12 @@ An agent loop can spend without limit. A budget caps the LLM tokens or the cost 
 | `query.rs` | `query_macro` — pass-through attribute that validates the annotated item is a function; used for documentation and future typed query discovery |
 | `webhook.rs` | `webhook_macro` (issue #344) — emits user fn + companion `WebhookTriggerInfo` fn + public `{fn}_info()` alias; rejects `verifier =`/`idempotency_header =` at compile time (superseded by autumn-web's `[security.webhooks]`) |
 
+### Plugin Modules (`autumn-harvest-plugin`)
+
+| File | Purpose |
+|------|---------|
+| `durable_route.rs` | Durable routes: the `DurableRoute` extractor runs an Autumn route as a workflow keyed by the request's `Idempotency-Key`. A retry attaches to the same run through the start-idempotency claim. No migration and no new event. See [`docs/durable-routes.md`](durable-routes.md). |
+
 ---
 
 ## Macro Usage

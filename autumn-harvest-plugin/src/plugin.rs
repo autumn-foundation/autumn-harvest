@@ -284,6 +284,9 @@ pub struct HarvestPlugin {
     /// startup gate already refuses this case earlier. It only matters if
     /// ambient configuration changed in the narrow window since.
     require_embedded_harvest_mode: bool,
+    /// The cap on durable-route requests that wait at the same time. Set via
+    /// [`Self::durable_route_max_waiters`].
+    durable_route_max_waiters: usize,
 }
 
 /// One registered broker connector: a binding plus the source that feeds it.
@@ -371,6 +374,7 @@ impl HarvestPlugin {
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled: false,
             require_embedded_harvest_mode: false,
+            durable_route_max_waiters: crate::durable_route::DEFAULT_MAX_WAITERS,
         }
     }
 
@@ -473,6 +477,20 @@ impl HarvestPlugin {
     #[must_use]
     pub fn start_idempotency_window(mut self, window: std::time::Duration) -> Self {
         self.builder = self.builder.start_idempotency_window(window);
+        self
+    }
+
+    /// Cap the durable-route requests that wait for a result at the same time
+    /// in this process. The default is
+    /// [`DEFAULT_MAX_WAITERS`](crate::durable_route::DEFAULT_MAX_WAITERS).
+    ///
+    /// Each waiting request holds one Postgres `LISTEN` connection. A request
+    /// that finds the cap full answers pending at once. `0` means that no
+    /// request waits. A completed run needs no wait, so its retry still gets
+    /// the result.
+    #[must_use]
+    pub const fn durable_route_max_waiters(mut self, max_waiters: usize) -> Self {
+        self.durable_route_max_waiters = max_waiters;
         self
     }
 
@@ -1302,6 +1320,7 @@ impl Plugin for HarvestPlugin {
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled,
             require_embedded_harvest_mode,
+            durable_route_max_waiters,
         } = self;
         #[cfg(not(feature = "mcp"))]
         let _ = (
@@ -1691,16 +1710,28 @@ impl Plugin for HarvestPlugin {
         let shutdown_slot = Arc::clone(&slot);
         let startup_api_state = api_state.clone();
         let shutdown_api_state = api_state.clone();
+        // One waiter cap for the process. It outlives a runtime restart.
+        let durable_waiters = Arc::new(tokio::sync::Semaphore::new(
+            durable_route_max_waiters.min(tokio::sync::Semaphore::MAX_PERMITS),
+        ));
 
         let app = app
             .on_startup(move |state| {
                 let slot = Arc::clone(&startup_slot);
                 let api_state = startup_api_state.clone();
+                let durable_waiters = Arc::clone(&durable_waiters);
                 async move {
                     tracing::info!("on_startup hook: executing start_harvest_runtime");
                     // `start_harvest_runtime` returns a large future (clippy::large_futures under
                     // the workspace pedantic lints); box it to keep this closure's future small.
                     let res = Box::pin(start_harvest_runtime(&state, &slot, &api_state)).await;
+                    // Durable routes answer 503 until the runtime is ready.
+                    if res.is_ok() && !crate::durable_route::install(&state, durable_waiters) {
+                        tracing::warn!(
+                            "on_startup hook: durable routes are off; the Harvest client or pool \
+                             is missing"
+                        );
+                    }
                     match &res {
                         Ok(()) => tracing::info!(
                             "on_startup hook: start_harvest_runtime completed successfully"

@@ -49,6 +49,8 @@ pub mod dag_retry;
 /// run`. Development and evaluation only; see the module docs.
 #[cfg(feature = "dev-runtime")]
 pub mod dev;
+/// Durable routes: an Autumn route that runs as a keyed Harvest workflow.
+pub mod durable_route;
 /// One entry point for a standalone embedding (issue #1613).
 pub mod embedding;
 /// One test suite for every KMS binding (issue #1981).
