@@ -3,6 +3,7 @@
 //! These tests need no database. `docs/testing/simulation.md` lists the
 //! environment variables and the replay command.
 
+mod owner;
 mod speculate;
 mod world;
 

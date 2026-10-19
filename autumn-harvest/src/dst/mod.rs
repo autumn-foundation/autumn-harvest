@@ -19,13 +19,21 @@
 //! The [`world`] module drives whole actors instead (issue #2002). Its
 //! Postgres world runs the real `worker.rs` poll loop.
 //!
+//! The [`owner`] module models the fenced owner lease of a decision
+//! partition (issue #2250). It drives the four nemeses of
+//! `formal/tla/OwnerLease.tla`.
+//!
 //! The [`speculate`] module models speculative decisions over an in-flight
 //! commit (issue #2011). It is an R&D spike with no database.
 //!
 //! See `docs/testing/simulation.md` and
 //! `docs/adr/0004-deterministic-simulation-testing.md`.
 
+#[macro_use]
+mod named;
+
 mod invariant;
+pub mod owner;
 mod rng;
 mod sim;
 pub mod speculate;
