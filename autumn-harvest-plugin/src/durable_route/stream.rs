@@ -313,6 +313,11 @@ pub(super) async fn produce(
             Some(RunState::Gone) => return finish(sink, unavailable_frame()).await,
             Some(_) if positioning => true,
             Some(_) => match drain(reads, sink, &walk, &mut offset, drain_until).await {
+                // The last send can end after the deadline. The `attempt` or
+                // final frame must not add a second slow send.
+                Drain::Done if Instant::now() >= drain_until => {
+                    return send_pending(sink).await;
+                }
                 Drain::Done => true,
                 Drain::Failed => false,
                 Drain::Expired => return send_pending(sink).await,
@@ -1747,6 +1752,25 @@ mod tests {
         );
         // The overrun is at most the send in flight and the pending frame.
         assert!(Instant::now() <= until + Duration::from_secs(100));
+        // A drain that ends after the deadline sends no final frame.
+        let mut fake = Fake::new(completed(json!("done")));
+        let root = fake.run(true, 3, None);
+        let mut sink = Recorder {
+            delay: Duration::from_secs(50),
+            ..Recorder::default()
+        };
+        let until = Instant::now() + Duration::from_secs(120);
+        let end = produce(&mut fake, &mut sink, root, Cursor::default(), 1024, until).await;
+        assert_eq!(end, StreamEnd::Pending);
+        assert_eq!(
+            sink.frames,
+            vec![
+                progress(0, 0),
+                progress(0, 1),
+                progress(0, 2),
+                Frame::Pending
+            ]
+        );
     }
 
     // SAC-49
