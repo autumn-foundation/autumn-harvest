@@ -19,10 +19,56 @@ pub const MAX_PAYLOAD_DEPTH: usize = 100;
 /// [`MAX_PAYLOAD_DEPTH`]. The failure is non-retryable.
 pub const PAYLOAD_TOO_DEEP_ERROR_TYPE: &str = "PayloadTooDeep";
 
+/// The children of a JSON container, as one iterator type.
+enum Children<'a> {
+    Array(std::slice::Iter<'a, Value>),
+    Object(serde_json::map::Values<'a>),
+}
+
+impl<'a> Iterator for Children<'a> {
+    type Item = &'a Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Array(items) => items.next(),
+            Self::Object(values) => values.next(),
+        }
+    }
+}
+
+/// The children of `value`, or `None` for a scalar.
+fn children(value: &Value) -> Option<Children<'_>> {
+    match value {
+        Value::Array(items) => Some(Children::Array(items.iter())),
+        Value::Object(map) => Some(Children::Object(map.values())),
+        _ => None,
+    }
+}
+
 /// Returns `true` when `value` has more than [`MAX_PAYLOAD_DEPTH`] open arrays
 /// and objects on a path.
+///
+/// The walk keeps one iterator per open container. A recursive walk would
+/// overflow the call stack on the input it must refuse. Memory use is bound
+/// by the cap, not by the width of the value.
+///
+/// Call it before any code that recurses over the value, such as a schema check
+/// or a settlement decoder.
 #[must_use]
-pub fn nests_past_cap(_value: &Value) -> bool {
+pub fn nests_past_cap(value: &Value) -> bool {
+    let mut open: Vec<Children<'_>> = children(value).into_iter().collect();
+    while let Some(top) = open.last_mut() {
+        let Some(child) = top.next() else {
+            open.pop();
+            continue;
+        };
+        if let Some(inner) = children(child) {
+            if open.len() >= MAX_PAYLOAD_DEPTH {
+                return true;
+            }
+            open.push(inner);
+        }
+    }
     false
 }
 
@@ -30,19 +76,30 @@ pub fn nests_past_cap(_value: &Value) -> bool {
 ///
 /// `subject` names the producer, for example `activity 'charge'`.
 #[must_use]
-pub fn too_deep_failure_payload(_subject: &str) -> String {
-    String::new()
+pub fn too_deep_failure_payload(subject: &str) -> String {
+    use crate::failure::IntoActivityErrorString as _;
+    crate::failure::ActivityFailure::non_retryable(
+        PAYLOAD_TOO_DEEP_ERROR_TYPE,
+        format!("{subject} result nests more than {MAX_PAYLOAD_DEPTH} levels"),
+    )
+    .into_error_payload()
 }
 
 /// Turn a successful activity result nested past the cap into a failure.
 ///
-/// Other results pass unchanged.
+/// The workflow sees the failure in place of the result. Other results pass
+/// unchanged.
 #[must_use]
 pub fn refuse_deep_result(
-    _activity_name: &str,
+    activity_name: &str,
     result: Result<Value, String>,
 ) -> Result<Value, String> {
-    result
+    match result {
+        Ok(output) if nests_past_cap(&output) => Err(too_deep_failure_payload(&format!(
+            "activity '{activity_name}'"
+        ))),
+        other => other,
+    }
 }
 
 #[cfg(test)]

@@ -195,7 +195,18 @@ impl HeartbeatSink for PgHeartbeatSink {
         let task_id = self.claim.task_id;
         match crate::pool::acquire(&self.pool, self.acquire_timeout).await {
             Ok(mut conn) => {
-                match crate::queue::record_heartbeat(&mut conn, &self.claim, payload).await {
+                // A deep checkpoint refreshes the heartbeat time only (issue #2225).
+                let written = if checkpoint_too_deep(task_id, &payload) {
+                    crate::queue::record_heartbeat_liveness_sent_ago(
+                        &mut conn,
+                        &self.claim,
+                        Duration::ZERO,
+                    )
+                    .await
+                } else {
+                    crate::queue::record_heartbeat(&mut conn, &self.claim, payload).await
+                };
+                match written {
                     Ok(ClaimWrite::Applied) => FlushOutcome::Continue,
                     // The claim is no longer current (issue #1789). The loop
                     // then cancels the activity, so this stale attempt does
@@ -546,10 +557,21 @@ fn stored_checkpoint(
 /// Whether a checkpoint nests past the depth cap (issue #2225).
 ///
 /// A stored checkpoint of that depth cannot be read back, and every later
-/// claim of the task would fail.
+/// claim of the task would fail. The flush then refreshes the heartbeat time
+/// only, so the previous checkpoint stays and the activity stays alive. Unlike
+/// a checkpoint that does not encode, a deep one never becomes valid. The flush
+/// drops it and does not try it again.
 #[cfg(feature = "db")]
-fn checkpoint_too_deep(_task_id: uuid::Uuid, _payload: &Value) -> bool {
-    false
+fn checkpoint_too_deep(task_id: uuid::Uuid, payload: &Value) -> bool {
+    let too_deep = crate::payload_depth::nests_past_cap(payload);
+    if too_deep {
+        tracing::warn!(
+            task_id = %task_id,
+            cap_depth = crate::payload_depth::MAX_PAYLOAD_DEPTH,
+            "dropped an activity heartbeat that nests past the depth cap; the last good checkpoint stays"
+        );
+    }
+    too_deep
 }
 
 /// Whether a cached stored form still matches the registry (issue #2043).
@@ -617,8 +639,13 @@ async fn flush(
         }
         let write_started = std::time::Instant::now();
         let age = beat.sent_order.elapsed();
-        let details = stored_checkpoint(codecs, &beat.payload, cache);
-        let checkpoint_kept = details.is_none();
+        let dropped = checkpoint_too_deep(claim.task_id, &beat.payload);
+        let details = if dropped {
+            None
+        } else {
+            stored_checkpoint(codecs, &beat.payload, cache)
+        };
+        let checkpoint_kept = details.is_none() && !dropped;
         let written = match details {
             Some(details) => {
                 crate::queue::record_heartbeat_sent_ago(&mut conn, claim, details, age).await

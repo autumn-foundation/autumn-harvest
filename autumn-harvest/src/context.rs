@@ -18331,6 +18331,15 @@ impl ActivityContext {
                 let mut output =
                     serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
 
+                // Issue #2225: a result nested past the depth cap cannot be read
+                // back from the history. Roll back before the upload and the
+                // commit, so no user write commits and no blob is stored.
+                if crate::payload_depth::nests_past_cap(&output) {
+                    return Err(TxError::Payload(
+                        crate::payload_depth::too_deep_failure_payload("transactional activity"),
+                    ));
+                }
+
                 // Issue #1986: a fan-out row with the result writer records a
                 // reference. The upload runs before the execution row lock.
                 // Its reference row commits with the event, so retention can
