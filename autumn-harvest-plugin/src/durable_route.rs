@@ -22,8 +22,11 @@
 //! }
 //! ```
 //!
-//! See `docs/durable-routes.md` for the guide and `DESIGN-durable-routes.md`
-//! for the design record.
+//! [`DurableCall::stream`] answers with a resumable SSE stream of the run's
+//! durable chunks instead. See [`stream`] for that mode.
+//!
+//! See `docs/durable-routes.md` for the guide. `DESIGN-durable-routes.md`
+//! and `DESIGN-durable-streaming.md` are the design records.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -51,6 +54,12 @@ use tracing::Instrument as _;
 use tracing::instrument::WithSubscriber as _;
 
 use crate::state::HarvestDbPool;
+
+pub mod stream;
+
+pub use stream::{
+    DEFAULT_MAX_STREAMS, DEFAULT_STREAM_FOR, DurableStream, LAST_EVENT_ID_HEADER, MAX_STREAM_FOR,
+};
 
 /// The request header that carries the client key.
 pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
@@ -105,6 +114,7 @@ pub const PROBLEM_SLUGS: &[&str] = &[
     "timed-out",
     "erased",
     "result-unavailable",
+    "stream-cursor-invalid",
 ];
 
 /// The domain tag of the dedupe digest. A new derivation needs a new tag.
@@ -121,17 +131,36 @@ pub(crate) struct DurableRouteRuntime {
     client: WorkflowHandleClient,
     pool: HarvestDbPool,
     waiters: Arc<Semaphore>,
+    /// The cap on live streams in this process.
+    streams: Arc<Semaphore>,
     /// The most continue-as-new steps that one wait follows.
     max_chain_steps: usize,
     /// The effective input cap of each registered workflow, in bytes.
     input_caps: HashMap<String, u64>,
+    /// The `LISTEN` URL of the default shard. A stream polls without it.
+    notify_url: Option<String>,
+}
+
+/// The process-wide caps of durable routes.
+pub(crate) struct DurableRouteLimits {
+    /// The cap on requests that wait for a result.
+    pub(crate) waiters: Arc<Semaphore>,
+    /// The cap on live streams.
+    pub(crate) streams: Arc<Semaphore>,
+    /// The most continue-as-new steps that one request follows.
+    pub(crate) max_chain_steps: usize,
 }
 
 /// Install the durable-route runtime into `state`.
 ///
-/// The plugin calls this after the Harvest runtime starts. Returns `false`
-/// when the client or the pool is absent.
-pub(crate) fn install(state: &AppState, waiters: Arc<Semaphore>, max_chain_steps: usize) -> bool {
+/// The plugin calls this after the Harvest runtime starts. `notify_url` gives
+/// the `LISTEN` URL of a shard. Returns `false` when the client or the pool
+/// is absent.
+pub(crate) fn install(
+    state: &AppState,
+    limits: DurableRouteLimits,
+    notify_url: impl FnOnce(autumn_harvest::ShardId) -> Option<String>,
+) -> bool {
     let (Some(client), Some(pool)) = (
         state.extension::<WorkflowHandleClient>(),
         state.extension::<HarvestDbPool>(),
@@ -155,12 +184,15 @@ pub(crate) fn install(state: &AppState, waiters: Arc<Semaphore>, max_chain_steps
                 .collect()
         })
         .unwrap_or_default();
+    let notify_url = notify_url(pool.default_shard());
     state.insert_extension(DurableRouteRuntime {
         client: (*client).clone(),
         pool: (*pool).clone(),
-        waiters,
-        max_chain_steps,
+        waiters: limits.waiters,
+        streams: limits.streams,
+        max_chain_steps: limits.max_chain_steps,
         input_caps,
+        notify_url,
     });
     true
 }
@@ -190,6 +222,8 @@ pub struct DurableRoute {
     method: Method,
     route: Option<String>,
     key: KeyField,
+    /// The `Last-Event-ID` fields. Only [`DurableCall::stream`] reads them.
+    cursor: KeyField,
     layer_active: bool,
     bearer: bool,
     tenant: Option<String>,
@@ -232,7 +266,8 @@ impl DurableRoute {
                 .extensions
                 .get::<MatchedPath>()
                 .map(|path| path.as_str().to_owned()),
-            key: key_field(&parts.headers),
+            key: header_field(&parts.headers, IDEMPOTENCY_KEY_HEADER),
+            cursor: header_field(&parts.headers, LAST_EVENT_ID_HEADER),
             // Autumn's idempotency layer adds this context before any
             // extractor runs. Its presence means that the layer caches 2xx.
             layer_active: parts
@@ -298,6 +333,7 @@ impl ScopedDurableRoute {
             success: StatusCode::OK,
             failures: Vec::new(),
             expose_id: false,
+            stream_for: DEFAULT_STREAM_FOR,
         }
     }
 }
@@ -313,6 +349,7 @@ pub struct DurableCall {
     success: StatusCode,
     failures: Vec<(String, StatusCode)>,
     expose_id: bool,
+    stream_for: Duration,
 }
 
 impl DurableCall {
@@ -358,21 +395,48 @@ impl DurableCall {
         self
     }
 
+    /// End a stream from [`Self::stream`] after `budget`. The default is
+    /// 5 min. The route clamps a longer budget to 1 h.
+    ///
+    /// A stream that ends at its budget sends a `pending` frame. The client
+    /// then resumes with `Last-Event-ID`. `Duration::ZERO` sends the stored
+    /// chunks and does not wait.
+    pub const fn stream_for(mut self, budget: Duration) -> Self {
+        self.stream_for = budget;
+        self
+    }
+
+    /// Start or attach to the run, and answer with a resumable SSE stream.
+    ///
+    /// The stream sends each chunk that the run stores with
+    /// `publish_durable_progress`, then one final frame. A retry with the
+    /// same key and a `Last-Event-ID` header resumes after that id. This
+    /// never fails: a problem before the stream is a plain answer.
+    pub async fn stream(self) -> DurableStream {
+        stream::start(self).await
+    }
+
     /// Start or attach to the run, wait, and build the answer.
     ///
     /// This never fails. Every problem is a [`DurableOutcome`].
     pub async fn send(self) -> DurableOutcome {
-        let span = tracing::info_span!(
+        let span = self.span();
+        let outcome = self.run().instrument(span.clone()).await;
+        span.record("outcome", outcome.slug());
+        outcome
+    }
+
+    /// The span of one call. It never records the key, the scope or the
+    /// input.
+    fn span(&self) -> tracing::Span {
+        tracing::info_span!(
             "harvest.durable_route",
             workflow = %self.workflow,
             route = self.route.route.as_deref().unwrap_or_default(),
             created = tracing::field::Empty,
             exec_id = tracing::field::Empty,
             outcome = tracing::field::Empty,
-        );
-        let outcome = self.run().instrument(span.clone()).await;
-        span.record("outcome", outcome.slug());
-        outcome
+        )
     }
 
     /// The setup error of this call, if it has one.
@@ -615,13 +679,18 @@ impl Prepared {
 
     /// Wait for the run and build the answer.
     async fn answer(&self, started: &Started) -> DurableOutcome {
-        let after_start = |kind, status, output| self.after_start(started, kind, status, output);
         let budget = wait_budget(
             self.wait,
             self.extracted_at.elapsed(),
             self.request_timeout,
             self.layer_active,
         );
+        self.answer_within(started, budget).await
+    }
+
+    /// Wait up to `budget` for the run and build the answer.
+    async fn answer_within(&self, started: &Started, budget: Duration) -> DurableOutcome {
+        let after_start = |kind, status, output| self.after_start(started, kind, status, output);
         let waited = wait_for_result(
             &*self.runtime,
             &self.runtime.waiters,
@@ -839,16 +908,11 @@ impl IntoResponse for DurableOutcome {
             DurableOutcomeKind::Failed {
                 error_type,
                 details,
-            } => {
-                let mut extra = Map::new();
-                if let Some(error_type) = error_type {
-                    extra.insert("error_type".to_owned(), json!(error_type));
-                }
-                if let Some(details) = details {
-                    extra.insert("details".to_owned(), details.clone());
-                }
-                problem_response(self.status, "failed", extra)
-            }
+            } => problem_response(
+                self.status,
+                "failed",
+                failed_extra(error_type.as_ref(), details.as_ref()),
+            ),
             kind => {
                 let mut response = problem_response(self.status, self.slug(), Map::new());
                 if let (DurableOutcomeKind::Problem { .. }, Some(secs)) = (kind, self.retry_after) {
@@ -939,12 +1003,25 @@ const fn problem_text(slug: &str) -> (&'static str, &'static str) {
             "Result unavailable",
             "The server cannot read the result of this operation.",
         ),
+        b"stream-cursor-invalid" => (
+            "Invalid Last-Event-ID",
+            "Send one Last-Event-ID header with an id from this stream.",
+        ),
         _ => ("Server error", "The operation failed to start."),
     }
 }
 
 /// An RFC 9457 problem answer with fixed text.
 fn problem_response(status: StatusCode, slug: &str, extra: Map<String, Value>) -> Response {
+    json_response(
+        status,
+        "application/problem+json",
+        Value::Object(problem_json(status, slug, extra)).to_string(),
+    )
+}
+
+/// The members of an RFC 9457 problem body with fixed text.
+fn problem_json(status: StatusCode, slug: &str, extra: Map<String, Value>) -> Map<String, Value> {
     let (title, detail) = problem_text(slug);
     let mut body = Map::new();
     body.insert(
@@ -959,11 +1036,19 @@ fn problem_response(status: StatusCode, slug: &str, extra: Map<String, Value>) -
         json!(format!("harvest.durable_route.{}", slug.replace('-', "_"))),
     );
     body.extend(extra);
-    json_response(
-        status,
-        "application/problem+json",
-        Value::Object(body).to_string(),
-    )
+    body
+}
+
+/// The extra members of a `failed` problem: the typed class and details.
+fn failed_extra(error_type: Option<&String>, details: Option<&Value>) -> Map<String, Value> {
+    let mut extra = Map::new();
+    if let Some(error_type) = error_type {
+        extra.insert("error_type".to_owned(), json!(error_type));
+    }
+    if let Some(details) = details {
+        extra.insert("details".to_owned(), details.clone());
+    }
+    extra
 }
 
 // ── Start and wait ───────────────────────────────────────────────────────────
@@ -1392,8 +1477,9 @@ fn log_start_error(workflow: &str, error: &HarvestError) {
 
 // ── Pure parts ───────────────────────────────────────────────────────────────
 
-fn key_field(headers: &HeaderMap) -> KeyField {
-    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
+/// The fields of the header `name`.
+fn header_field(headers: &HeaderMap, name: &str) -> KeyField {
+    let mut values = headers.get_all(name).iter();
     match (values.next(), values.next()) {
         (None, _) => KeyField::Absent,
         (Some(_), Some(_)) => KeyField::Many,
@@ -3083,7 +3169,7 @@ mod tests {
 
     /// A log sink in memory.
     #[derive(Clone, Default)]
-    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+    pub(super) struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
 
     impl std::io::Write for Captured {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -3100,7 +3186,7 @@ mod tests {
     }
 
     impl Captured {
-        fn text(&self) -> String {
+        pub(super) fn text(&self) -> String {
             let bytes = self
                 .0
                 .lock()
@@ -3110,7 +3196,7 @@ mod tests {
     }
 
     /// An input that fails to serialize with its value in the message.
-    struct Leaky(&'static str);
+    pub(super) struct Leaky(pub(super) &'static str);
 
     impl serde::Serialize for Leaky {
         fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
@@ -3124,7 +3210,7 @@ mod tests {
     }
 
     /// A subscriber that writes every event, and each span when it closes.
-    fn capture() -> (Captured, tracing::Dispatch) {
+    pub(super) fn capture() -> (Captured, tracing::Dispatch) {
         // With one live dispatcher, tracing-core lets another test thread
         // cache a callsite as never. A second dispatcher for the whole
         // process turns that path off.
@@ -3367,6 +3453,10 @@ mod tests {
                 terminal(WorkflowResultState::Terminated, None),
             ),
             ("timed-out", terminal(WorkflowResultState::TimedOut, None)),
+            (
+                "stream-cursor-invalid",
+                stream::CURSOR_INVALID.status.as_u16(),
+            ),
             (
                 "erased",
                 terminal(

@@ -2535,7 +2535,7 @@ async fn durable_runs_have_no_tenant_and_record_the_transactional_source() {
     assert_eq!(traced, 0, "the run does not join the HTTP trace");
 }
 
-// AC-84
+// AC-84, SAC-40
 #[test]
 fn ci_manifest_lists_every_durable_route_suite() {
     let path = concat!(
@@ -2552,6 +2552,7 @@ fn ci_manifest_lists_every_durable_route_suite() {
         ("allos", "durable_route_docs"),
         ("linux", "durable_route_dispatch"),
         ("linux", "durable_route_integration"),
+        ("linux", "durable_stream_integration"),
     ] {
         assert!(
             rows.iter().any(|row| row.len() >= 3

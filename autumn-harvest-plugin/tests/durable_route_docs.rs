@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use autumn_harvest_plugin::durable_route::{
-    DEFAULT_MAX_CHAIN_STEPS, DEFAULT_MAX_WAITERS, PROBLEM_SLUGS,
+    DEFAULT_MAX_CHAIN_STEPS, DEFAULT_MAX_STREAMS, DEFAULT_MAX_WAITERS, DEFAULT_STREAM_FOR,
+    MAX_STREAM_FOR, PROBLEM_SLUGS,
 };
 
 fn workspace_root() -> PathBuf {
@@ -156,28 +157,152 @@ fn plugin_fn_names() -> BTreeSet<String> {
     names
 }
 
-// AC-47
-#[test]
-fn design_note_ac_table_names_existing_tests() {
-    let design = read("DESIGN-durable-routes.md");
+/// Check that each test the AC table of `note` names exists. Returns the
+/// count of names checked.
+fn ac_table_names_existing_tests(note: &str, row_prefix: &str) -> usize {
+    let design = read(note);
     let start = design
         .find("## 3. Tests and acceptance criteria")
         .expect("the design note has an AC table");
     let names = plugin_fn_names();
     let mut checked = 0;
-    for line in design[start..].lines().filter(|l| l.starts_with("| AC-")) {
+    for line in design[start..]
+        .lines()
+        .filter(|l| l.starts_with(row_prefix))
+    {
         let test_cell = line.split('|').nth(3).expect("test cell");
         for candidate in test_cell.split('`').skip(1).step_by(2) {
             let is_fn_name = candidate
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
             if is_fn_name {
-                assert!(names.contains(candidate), "no test fn named {candidate}");
+                assert!(
+                    names.contains(candidate),
+                    "{note}: no test fn named {candidate}"
+                );
                 checked += 1;
             }
         }
     }
+    checked
+}
+
+// AC-47
+#[test]
+fn design_note_ac_table_names_existing_tests() {
+    let checked = ac_table_names_existing_tests("DESIGN-durable-routes.md", "| AC-");
     assert!(checked >= 40, "only {checked} test names checked");
+}
+
+// SAC-37
+#[test]
+fn stream_design_note_ac_table_names_existing_tests() {
+    let checked = ac_table_names_existing_tests("DESIGN-durable-streaming.md", "| SAC-");
+    assert!(checked >= 38, "only {checked} test names checked");
+}
+
+/// Count the table rows of `text` that start with `prefix` and a digit.
+fn numbered_rows<'a>(text: &'a str, prefix: &str) -> Vec<&'a str> {
+    text.lines()
+        .filter(|line| {
+            line.strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .collect()
+}
+
+// SAC-37
+#[test]
+fn stream_design_note_keeps_its_planning_sections() {
+    let design = read("DESIGN-durable-streaming.md");
+    for heading in [
+        "### 0.1 Facts found before the plan",
+        "### 0.2 Brainstorm",
+        "### 0.3 Reverse brainstorm",
+        "### 0.4 Six thinking hats",
+        "## 2. Known limits",
+        "## 3. Tests and acceptance criteria",
+    ] {
+        assert!(design.contains(heading), "the design note lost {heading:?}");
+    }
+    for (prefix, least) in [("| F", 15), ("| B", 20), ("| R", 25)] {
+        let rows = numbered_rows(&design, prefix).len();
+        assert!(rows >= least, "only {rows} rows that start with {prefix}");
+    }
+    for row in numbered_rows(&design, "| R") {
+        assert!(
+            row.split('|').nth(3).is_some_and(|m| !m.trim().is_empty()),
+            "a harm lost its mitigation: {row}"
+        );
+    }
+    for hat in ["White", "Red", "Black", "Yellow", "Green", "Blue"] {
+        assert!(
+            design.contains(&format!("| {hat} |")),
+            "the hats lost {hat}"
+        );
+    }
+    let start = design.find("## 2. Known limits").expect("known limits");
+    let end = design
+        .find("## 3. Tests and acceptance criteria")
+        .expect("AC table");
+    for limit in [
+        "EventSource",
+        "at-least-once",
+        "operator rerun",
+        "durable_route_max_chain_steps",
+    ] {
+        assert!(
+            design[start..end].contains(limit),
+            "the known limits lost {limit:?}"
+        );
+    }
+}
+
+// SAC-36
+#[test]
+fn streaming_section_states_the_client_contract() {
+    let page = one_line(&read("docs/durable-routes.md"));
+    let start = page
+        .find("## Stream the run")
+        .expect("the page has a streaming section");
+    let section = &page[start..];
+    let section = &section[..section[3..].find(" ## ").map_or(section.len(), |i| i + 3)];
+    for needle in [
+        ".stream()",
+        "publish_durable_progress",
+        "Last-Event-ID",
+        "`<attempt>.<offset>`",
+        "event: progress",
+        "event: attempt",
+        "event: result",
+        "event: problem",
+        "event: pending",
+        "`stream-cursor-invalid`",
+        "durable_route_max_streams",
+        "EventSource",
+        "x-accel-buffering",
+        "Do not turn on `.idempotent()`",
+        "dedup",
+    ] {
+        assert!(
+            section.contains(needle),
+            "the streaming section must mention {needle:?}"
+        );
+    }
+    let secs = |d: std::time::Duration| d.as_secs();
+    for needle in [
+        format!("The default is {DEFAULT_MAX_STREAMS}."),
+        format!(
+            "The default budget is {} min",
+            secs(DEFAULT_STREAM_FOR) / 60
+        ),
+        format!("at most {} h", secs(MAX_STREAM_FOR) / 3600),
+    ] {
+        assert!(
+            section.contains(&needle),
+            "the streaming section must say {needle:?}"
+        );
+    }
 }
 
 // AC-47
@@ -266,6 +391,31 @@ fn changelog_fragment_describes_the_feature() {
         "the fragment starts with a heading"
     );
     assert!(text.contains("Durable routes"));
+    assert!(text.contains("No migration"));
+    assert!(text.contains("No new `WorkflowEvent`"));
+}
+
+// SAC-38
+#[test]
+fn stream_changelog_fragment_describes_the_feature() {
+    let dir = workspace_root().join("docs/changelog.d");
+    let fragments: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .expect("changelog.d")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("-durable-streaming.md"))
+        })
+        .collect();
+    assert_eq!(fragments.len(), 1, "exactly one durable-streaming fragment");
+    let text = std::fs::read_to_string(&fragments[0]).expect("fragment");
+    assert!(
+        text.starts_with("## "),
+        "the fragment starts with a heading"
+    );
+    assert!(text.contains("Durable streaming"));
     assert!(text.contains("No migration"));
     assert!(text.contains("No new `WorkflowEvent`"));
 }

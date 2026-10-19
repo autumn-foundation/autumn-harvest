@@ -84,6 +84,7 @@ A key binds its body. A retry with another body under the same key gets a
 | The run is still going, and Autumn's idempotency layer is on. | 409, `Retry-After: 1` | `pending` |
 | No `Idempotency-Key`, or an empty one. | 400 | `idempotency-key-missing` |
 | More than one key, a byte outside printable ASCII, or more than 255 bytes. | 400 | `idempotency-key-invalid` |
+| A stream's `Last-Event-ID` is repeated or does not parse. | 400 | `stream-cursor-invalid` |
 | The key belongs to a request with another body. | 422 | `idempotency-key-reused` |
 | The input fails the workflow's JSON Schema. | 422 | `input-invalid` |
 | The input is larger than the workflow accepts. | 413 | `input-too-large` |
@@ -146,6 +147,100 @@ A live run waits for up to the budget.
 - A read error other than a codec error also answers pending, because the
   run exists. A workflow-level retry chain past the engine's walk depth
   (256 attempts) answers `result-unavailable`, because it never shrinks.
+
+## Stream the run
+
+`.stream()` answers with a resumable Server-Sent Events (SSE) stream in
+place of one JSON answer. Use it for LLM token streaming and other long
+output. The design record is
+[`DESIGN-durable-streaming.md`](../DESIGN-durable-streaming.md).
+
+```rust,ignore
+use autumn_harvest_plugin::durable_route::{DurableRoute, DurableStream};
+
+#[post("/answers")]
+async fn answer(
+    durable: DurableRoute,
+    user: CurrentUser,
+    Json(prompt): Json<Prompt>,
+) -> DurableStream {
+    durable
+        .scope(user.id)
+        .call("answer", AnswerInput { user_id: user.id, prompt })
+        .stream()
+        .await
+}
+```
+
+The workflow publishes each chunk with `ctx.publish_durable_progress`. The
+stream sends the stored chunks in order, then one final frame. The run
+commits before the stream opens. A crash, a deploy or a dropped connection
+loses no chunk.
+
+| Frame | `id:` | `data:` |
+|---|---|---|
+| `event: progress` | `<attempt>.<offset>` | The chunk JSON, as published. |
+| `event: attempt` | `<attempt>` | `{"attempt": n, "cause": "retry"}`, or `"continued-as-new"`. |
+| `event: result` | none | The workflow output. The stream then ends. |
+| `event: problem` | none | The problem body that `.send()` answers, with its `status`. The stream then ends. |
+| `event: pending` | none | `{"state":"pending"}`. The stream budget is spent. Resume. |
+
+The stream also sends a `: ping` comment every 5 s.
+
+The attempt counts the runs of one operation. Attempt 0 is the run that the
+key started. A workflow-level retry or a continue-as-new successor adds 1,
+and the stream then sends an `attempt` frame. A token view must clear the
+text of the attempt before. The id never holds the execution id.
+
+### Resume
+
+1. Keep the `id:` of the last frame that you received.
+2. When the connection drops, or after `event: pending`, send the same
+   request again. Use the same body, the same `Idempotency-Key`, and
+   `Last-Event-ID: <id>`.
+3. The stream sends each frame after that id. With no `Last-Event-ID`, it
+   starts at attempt 0.
+
+A malformed or repeated `Last-Event-ID` answers `400`
+`stream-cursor-invalid` and starts nothing. Delivery is at-least-once across
+reconnects, so dedup by the `id:`. A browser `EventSource` sends `GET` with
+no custom header, so it cannot send `Idempotency-Key`. Use a `fetch` SSE
+reader that sends headers and `Last-Event-ID`.
+
+### Answers
+
+- A problem before the run is known is a plain answer, as for `.send()`.
+- Every answer about the run is `200` with `content-type:
+  text/event-stream`, `cache-control: no-cache` and `x-accel-buffering: no`.
+  The final status is in the `problem` frame.
+- The stream carries `x-idempotent-replayed` and the opt-in
+  `x-harvest-execution-id`, as for `.send()`.
+- `.wait(..)` and `.success_status(..)` do not apply to a stream.
+
+### Limits
+
+- `.stream_for(budget)` ends the stream with `event: pending`. The default
+  budget is 5 min, and the route allows at most 1 h. `Duration::ZERO` sends
+  the stored chunks and does not wait.
+- Each live stream holds one Postgres `LISTEN` connection, and a pooled
+  connection for one page read only. Set the cap for each process with
+  `HarvestPlugin::durable_route_max_streams(n)`. The default is 32. A request
+  for a live run that finds the cap full answers `202` with
+  `Retry-After: 1`. A stream of a run that has ended needs no slot.
+- Autumn's idempotency layer collects the whole body to cache it. A durable
+  stream therefore answers `500` `misconfigured` under that layer, and starts
+  nothing. Do not turn on `.idempotent()` for an app with durable streams.
+- The stream takes at most `durable_route_max_chain_steps` steps from run to
+  run. Past that, or at a loop, it ends with the `result-unavailable` problem.
+- A client that takes no frame for 60 s loses the stream. It resumes and
+  loses nothing.
+- Only `publish_durable_progress` chunks reach the stream. A reset and an
+  operator rerun start no link from the run, so the stream does not follow
+  them.
+- The `harvest.durable_route` span records the outcome `stream` when the
+  stream opens. The stream logs never hold a chunk.
+- The chunks are plain JSON at rest. See
+  [durable streams](streaming-progress.md#durable-mode-issue-1974).
 
 ## With Autumn's idempotency layer
 
