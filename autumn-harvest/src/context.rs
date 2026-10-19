@@ -11607,6 +11607,29 @@ impl WorkflowContext {
         Ok(fresh_dispatch)
     }
 
+    /// Check an activity fan-out against history, then record its marker.
+    ///
+    /// A fresh dispatch first checks every input against the depth cap
+    /// (issue #2224). A deep input then fails the whole fan-out before the
+    /// marker or any earlier activity is queued.
+    fn check_activity_fan_out(
+        &self,
+        seq: u32,
+        activities: &[(String, Value, String)],
+    ) -> HarvestResult<bool> {
+        let count = activities.len();
+        let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
+        if fresh_dispatch {
+            if !self.replays_a_scope_cancel() {
+                for (name, input, _) in activities {
+                    self.check_payload_depth(PayloadKind::ActivityInput, Some(name), input)?;
+                }
+            }
+            self.record_fan_out_marker(seq, count);
+        }
+        Ok(fresh_dispatch)
+    }
+
     /// Check the fan-out count against event history **without** pushing the
     /// `RecordMarker` command on a fresh dispatch.
     ///
@@ -11824,7 +11847,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -11892,7 +11915,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -12114,7 +12137,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -12230,7 +12253,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -33739,6 +33762,27 @@ mod payload_depth_tests {
             .await
             .expect_err("a deep input must be refused");
         assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+    }
+
+    #[tokio::test]
+    async fn activity_fan_out_over_the_cap_queues_nothing() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_activity_fan_out_raw(vec![
+                ("a".to_string(), serde_json::json!(1), "default".to_string()),
+                (
+                    "a".to_string(),
+                    nested(MAX_PAYLOAD_DEPTH + 1),
+                    "default".to_string(),
+                ),
+            ])
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no marker and no earlier activity is queued"
+        );
     }
 
     #[tokio::test]
