@@ -36,6 +36,7 @@ No migration. No new `WorkflowEvent` variant. No `harvest_events` write. No
 management API route. `sha2` becomes a plain dependency of the plugin.
 
 Tests: unit and property tests in `durable_route.rs`; Postgres tests in
-`autumn-harvest-plugin/tests/durable_route_integration.rs`; docs guards in
+`autumn-harvest-plugin/tests/durable_route_integration.rs` and
+`autumn-harvest-plugin/tests/durable_route_dispatch.rs`; docs guards in
 `autumn-harvest-plugin/tests/durable_route_docs.rs`. Guide:
 `docs/durable-routes.md`. Design: `DESIGN-durable-routes.md`.

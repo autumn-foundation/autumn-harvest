@@ -2505,7 +2505,7 @@ async fn durable_runs_have_no_tenant_and_record_the_transactional_source() {
 
 // AC-84
 #[test]
-fn ci_manifest_lists_both_durable_route_suites() {
+fn ci_manifest_lists_every_durable_route_suite() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../.github/ci/integration-suites.txt"
@@ -2518,6 +2518,7 @@ fn ci_manifest_lists_both_durable_route_suites() {
         .collect();
     for (osclass, target) in [
         ("allos", "durable_route_docs"),
+        ("linux", "durable_route_dispatch"),
         ("linux", "durable_route_integration"),
     ] {
         assert!(

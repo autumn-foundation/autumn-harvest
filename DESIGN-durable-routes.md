@@ -314,8 +314,10 @@ advise against the layer in such an app.
 ## 3. Tests and acceptance criteria
 
 Unit tests live in `autumn-harvest-plugin/src/durable_route.rs`. Postgres tests
-live in `autumn-harvest-plugin/tests/durable_route_integration.rs`. Docs guards
-live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
+live in `autumn-harvest-plugin/tests/durable_route_integration.rs`. The dispatch
+test installs a process-global channel, so it lives in its own binary,
+`autumn-harvest-plugin/tests/durable_route_dispatch.rs`. Docs guards live in
+`autumn-harvest-plugin/tests/durable_route_docs.rs`.
 
 | AC | Criterion | Test |
 |----|-----------|------|
@@ -370,7 +372,7 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | AC-49 | Both new test binaries have a sorted row in `.github/ci/integration-suites.txt`. | Existing `ci_run_coverage.rs` suite |
 | AC-50 | Comment hygiene adds no Tier A defect and no Tier B regression. | `docs/audits/comment-hygiene.py --base origin/trunk-dev` |
 | AC-51 | `cargo fmt` and `cargo clippy -D warnings` pass for the plugin. | CI lint job |
-| AC-52 | The diff adds no migration, no `harvest_events` writer and no version bump. `sha2` is a plain dependency of the plugin. The start calls `finish()` after it commits. | Review |
+| AC-52 | The diff adds no migration, no `harvest_events` writer and no version bump. `sha2` is a plain dependency of the plugin. The start calls `finish()` after it commits. | Review; `the_start_publishes_its_dispatch_hint` |
 | AC-53 | A stalled start ends with a pending answer before the request deadline. The answer names no run. The start still commits, and a retry attaches to it. | `reads_after_the_start_end_before_the_request_deadline` |
 | AC-54 | A retry attempt that continues as new into another type gives the final output. | `retry_attempt_that_switches_type_returns_final_output` |
 | AC-55 | A request holds no pooled connection while it waits. Eight waiters on a four-slot pool each wait out their budget, and a ninth request completes. | `start_connection_is_released_before_the_wait` |
@@ -402,9 +404,10 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | AC-81 | After the claim window, a terminated run's key starts a new run, and a rerun's key attaches to the rerun. | `after_the_window_the_business_id_holder_answers` |
 | AC-82 | Erasing the first run of a chain keeps the final output, and the id header still names the first run. | `erasing_the_first_run_of_a_chain_keeps_the_final_output` |
 | AC-83 | A durable run has no Harvest tenant, records the `transactional` start source, and its task holds no trace from the request. | `durable_runs_have_no_tenant_and_record_the_transactional_source` |
-| AC-84 | The CI manifest runs the docs guards on all OSes and the Postgres suite on Linux. | `ci_manifest_lists_both_durable_route_suites` |
+| AC-84 | The CI manifest runs the docs guards on all OSes, and the Postgres suite and the dispatch suite on Linux. | `ci_manifest_lists_every_durable_route_suite` |
 | AC-85 | An erased run answers a final `410` whatever its end: cancelled, terminated, timed out, failed with no mapping, failed with an unmapped class, or failed with a mapped class, with or without details. | `erased_runs_answer_410_whatever_their_end` |
 | AC-86 | A client input equal to the erasure tombstone does not make a run read as erased. | `a_tombstone_input_does_not_read_as_erased` |
 | AC-87 | The erasure marker comes from the live retry attempt. Erasing only the first attempt keeps the answer, and erasing the live attempt answers `410`. | `erasure_is_read_from_the_live_retry_attempt` |
 | AC-88 | A route log never holds the text of a payload codec error, a serde error or a panic. | `error_logs_hold_no_codec_or_panic_text` |
 | AC-89 | A read that the deadline cuts after the start answers pending with the run's execution id and replay headers. | `a_read_cut_at_the_deadline_keeps_the_run_headers` |
+| AC-90 | With a dispatch channel installed and no worker, the start publishes the dispatch hint of its task. | `the_start_publishes_its_dispatch_hint` |
