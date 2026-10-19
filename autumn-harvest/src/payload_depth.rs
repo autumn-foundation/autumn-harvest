@@ -6,8 +6,8 @@
 //! caps. The workflow sees a typed error and can handle it.
 //!
 //! The walk does not recurse. Dropping or serializing a value thousands of
-//! levels deep still recurses in `serde_json`, so the cap is sound for the
-//! range that a workflow builds by hand, not for a hostile value.
+//! levels deep still recurses in `serde_json`. So the cap is sound for values
+//! that a workflow builds by hand. It is not sound for a hostile value.
 
 use serde_json::Value;
 
