@@ -40,8 +40,8 @@ runs applied nothing and are discarded, not measurements.
 | PG 14.19 (extra arm, see below) | 139/139 | 139/139 | 139/139 | byte-identical, 3/3 |
 | PG 12.22 | 139/139 | 139/139 | 139/139 | byte-identical, 3/3 |
 
-The signature is 872 rows: 56 tables, 612 columns (name, type), 201 indexes by name,
-3 triggers. All raw outputs, including all three signatures per server, are under `apparatus/0015-postgres-12-floor/results/`.
+The signature is 872 rows: 56 tables, 612 columns (name and `format_type`), 201 indexes
+by name, 3 triggers. The two array columns record as `text[]`. All raw outputs, including all three signatures per server, are under `apparatus/0015-postgres-12-floor/results/`.
 There is no worst-case axis for a deterministic DDL replay, so none was probed.
 
 **Protocol deviation, found in review.** The pre-registration fixes the PG 14 arm at the
@@ -52,9 +52,11 @@ the verdict. The verdict rests on the 12.22 and 14.24 arms.
 
 Review also fixed four harness defects: an appending `summary.txt`, an unchecked
 signature query, a zero exit status after a failed migration, and an ignored
-server-start failure. PG 12.22, PG 14.24 and PG 16.15 were rerun on the final
-`run.sh`. Every run applied 139/139. The archived outputs for those three servers come
-from that final run.
+server-start failure. A fifth finding showed that `information_schema` records array
+columns as the bare `ARRAY`, which hid element types from the parity check. The
+signature query now uses `format_type`. All four servers (12.22, 14.19, 14.24, 16.15)
+were rerun on the final `run.sh`. Every run applied 139/139, and every signature is
+identical to PG 16's. The archived outputs come from that final run.
 
 ## 🏁 Verdict
 

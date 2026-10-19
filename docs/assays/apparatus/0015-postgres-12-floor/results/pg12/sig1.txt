@@ -157,21 +157,21 @@ col|harvest_completion_trigger_fires|fired_at|timestamp with time zone
 col|harvest_completion_trigger_fires|outcome|text
 col|harvest_completion_trigger_fires|source_exec_id|uuid
 col|harvest_completion_trigger_fires|target_shard|integer
-col|harvest_completion_trigger_fires|target_workflow_name|character varying
+col|harvest_completion_trigger_fires|target_workflow_name|character varying(255)
 col|harvest_completion_trigger_fires|trigger_id|uuid
-col|harvest_completion_trigger_outbox|concurrency_key|character varying
+col|harvest_completion_trigger_outbox|concurrency_key|character varying(255)
 col|harvest_completion_trigger_outbox|concurrency_limit|integer
 col|harvest_completion_trigger_outbox|created_at|timestamp with time zone
 col|harvest_completion_trigger_outbox|id|uuid
 col|harvest_completion_trigger_outbox|max_workflow_input_bytes|bigint
 col|harvest_completion_trigger_outbox|next_attempt_at|timestamp with time zone
 col|harvest_completion_trigger_outbox|priority|jsonb
-col|harvest_completion_trigger_outbox|queue_name|character varying
+col|harvest_completion_trigger_outbox|queue_name|character varying(255)
 col|harvest_completion_trigger_outbox|source_exec_id|uuid
 col|harvest_completion_trigger_outbox|target_input|jsonb
 col|harvest_completion_trigger_outbox|target_shard|integer
-col|harvest_completion_trigger_outbox|target_workflow_id|character varying
-col|harvest_completion_trigger_outbox|target_workflow_name|character varying
+col|harvest_completion_trigger_outbox|target_workflow_id|character varying(255)
+col|harvest_completion_trigger_outbox|target_workflow_name|character varying(255)
 col|harvest_completion_trigger_outbox|tenant|text
 col|harvest_completion_trigger_outbox|trigger_id|uuid
 col|harvest_completion_triggers|condition|jsonb
@@ -179,9 +179,9 @@ col|harvest_completion_triggers|created_at|timestamp with time zone
 col|harvest_completion_triggers|id|uuid
 col|harvest_completion_triggers|input_mapping|jsonb
 col|harvest_completion_triggers|is_static|boolean
-col|harvest_completion_triggers|queue_name|character varying
-col|harvest_completion_triggers|source_workflow_name|character varying
-col|harvest_completion_triggers|target_workflow_name|character varying
+col|harvest_completion_triggers|queue_name|character varying(255)
+col|harvest_completion_triggers|source_workflow_name|character varying(255)
+col|harvest_completion_triggers|target_workflow_name|character varying(255)
 col|harvest_completion_triggers|terminal_states|jsonb
 col|harvest_completion_triggers|updated_at|timestamp with time zone
 col|harvest_cross_shard_children|attempts|integer
@@ -455,7 +455,7 @@ col|harvest_task_queue|activity_id|uuid
 col|harvest_task_queue|activity_name|text
 col|harvest_task_queue|attempt|integer
 col|harvest_task_queue|capability_miss_handler|text
-col|harvest_task_queue|capability_miss_workers|ARRAY
+col|harvest_task_queue|capability_miss_workers|text[]
 col|harvest_task_queue|capability_misses|integer
 col|harvest_task_queue|completed_at|timestamp with time zone
 col|harvest_task_queue|concurrency_cap|integer
@@ -492,7 +492,7 @@ col|harvest_task_queue|sticky_timeout|interval
 col|harvest_task_queue|sticky_until|timestamp with time zone
 col|harvest_task_queue|sticky_worker_id|text
 col|harvest_task_queue|task_type|text
-col|harvest_task_queue|timed_out_claims|ARRAY
+col|harvest_task_queue|timed_out_claims|text[]
 col|harvest_task_queue|timer_fires_at|timestamp with time zone
 col|harvest_task_queue|trace_context|jsonb
 col|harvest_task_queue|wake_requested|boolean
@@ -564,7 +564,7 @@ col|harvest_workflow_executions|nd_blocked_at|timestamp with time zone
 col|harvest_workflow_executions|origin|text
 col|harvest_workflow_executions|output|jsonb
 col|harvest_workflow_executions|owner|text
-col|harvest_workflow_executions|parent_close_policy|character varying
+col|harvest_workflow_executions|parent_close_policy|character varying(50)
 col|harvest_workflow_executions|parent_id|uuid
 col|harvest_workflow_executions|pause_actor|text
 col|harvest_workflow_executions|pause_reason|text

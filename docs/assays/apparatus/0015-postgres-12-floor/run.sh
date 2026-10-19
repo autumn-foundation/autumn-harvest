@@ -19,7 +19,7 @@ for run in 1 2 3; do
   done
   echo "run $run: applied=$ok failed=$fail total=$((ok+fail))" | tee -a "$OUT/summary.txt"
   $P -d $db -v ON_ERROR_STOP=1 -Atc "
-   select 'col',table_name,column_name,data_type from information_schema.columns where table_schema='public'
+   select 'col',c.relname,a.attname,format_type(a.atttypid,a.atttypmod) from pg_attribute a join pg_class c on c.oid=a.attrelid where c.relnamespace='public'::regnamespace and c.relkind in ('r','p') and a.attnum>0 and not a.attisdropped
    union all select 'idx',tablename,indexname,'' from pg_indexes where schemaname='public'
    union all select 'trg',c.relname,t.tgname,'' from pg_trigger t join pg_class c on c.oid=t.tgrelid where not t.tgisinternal and c.relnamespace='public'::regnamespace
    union all select 'tbl',tablename,'','' from pg_tables where schemaname='public' order by 1,2,3,4" > "$OUT/sig$run.txt" || { echo "signature query failed on run $run" >&2; rc=1; rm -f "$OUT/sig$run.txt"; }
