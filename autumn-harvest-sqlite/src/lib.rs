@@ -117,10 +117,16 @@
 //!   `harvest_activity_failure_v1` envelope) — byte-equivalent to the Postgres worker's
 //!   `finalize_activity_failure` (issue #1069 P2). A legacy `Err(String)` decodes to
 //!   `error_type = "Error"`, `non_retryable = false`, `details = None`, unchanged.
-//! - **Payload depth is capped at ingress** (issue #2157). `serde_json` reads at most
+//! - **Payload depth is capped at ingress and on activity output** (issues #2157 and
+//!   #2216). `serde_json` reads at most
 //!   128 levels. A start input, memo, signal payload or update input that nests deeper than
 //!   [`MAX_PAYLOAD_DEPTH`] is refused with [`SqliteError::PayloadTooDeep`] before
 //!   anything is persisted. The run stays live and the driver stays healthy.
+//!   An activity result that nests too deep becomes a non-retryable
+//!   [`PAYLOAD_TOO_DEEP_ERROR_TYPE`] failure, for a remote or a local activity.
+//!   The workflow sees the failure. A local failure keeps only its message. A
+//!   heartbeat that nests too deep is dropped, and the last good checkpoint stays.
+//!   A too-deep result or heartbeat is never stored.
 //! - **Payload-size caps are enforced at every boundary, matching the core** (issue
 //!   #252). A caller-supplied payload that exceeds its byte cap is refused before it
 //!   can enter `harvest_events`, so this backend never stores an unbounded history
@@ -766,9 +772,9 @@ pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
 pub use crate::query::DEFAULT_QUERY_TIMEOUT;
 pub use crate::runtime::{
-    ActivityBody, ActivitySpec, ExecutionOutcome, MAX_PAYLOAD_DEPTH, RunState, SignalDelivery,
-    SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions, StartOutcome,
-    UNSUPPORTED_FEATURE_ERROR_TYPE,
+    ActivityBody, ActivitySpec, ExecutionOutcome, MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE,
+    RunState, SignalDelivery, SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions,
+    StartOutcome, UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
 pub use crate::schedule::ScheduleSummary;
 pub use crate::store::ActivityAttempt;
