@@ -47,6 +47,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument as _;
+use tracing::instrument::WithSubscriber as _;
 
 use crate::state::HarvestDbPool;
 
@@ -463,25 +464,47 @@ impl DurableCall {
             Err(problem) => return DurableOutcome::problem(problem),
         };
         let layer_active = prepared.layer_active;
-        let io_limit = prepared.request_timeout.map(|timeout| {
-            time_left(
-                prepared.extracted_at.elapsed(),
-                timeout,
-                layer_active,
-                DEADLINE_HEADROOM / 2,
-            )
-        });
-        let work = prepared.start_and_answer(start);
         // Every read after the start ends before Autumn's request deadline.
         // A dropped handler would keep Autumn's in-flight lock for its TTL.
-        match io_limit {
-            None => work.await,
-            Some(limit) => tokio::time::timeout(limit, work).await.unwrap_or_else(|_| {
-                tracing::warn!("durable route reached its deadline margin; answering pending");
-                DurableOutcome::pending(layer_active)
-            }),
-        }
+        let deadline = prepared.request_timeout.map(|timeout| {
+            tokio::time::Instant::now()
+                + time_left(
+                    prepared.extracted_at.elapsed(),
+                    timeout,
+                    layer_active,
+                    DEADLINE_HEADROOM / 2,
+                )
+        });
+        let started = match within(deadline, prepared.start(start)).await {
+            Some(Ok(started)) => started,
+            Some(Err(problem)) => return DurableOutcome::problem(problem),
+            // The start can still commit. A retry then finds the claim.
+            None => return DurableOutcome::pending(layer_active),
+        };
+        // The run is known now, so a late read keeps the run's headers. The
+        // answer future is large, so it lives on the heap.
+        within(deadline, Box::pin(prepared.answer(&started)))
+            .await
+            .unwrap_or_else(|| {
+                let (kind, status) = pending_outcome(layer_active);
+                prepared.after_start(&started, kind, status, None)
+            })
     }
+}
+
+/// Run `work` until `deadline`. `None` means that the deadline came first.
+async fn within<T>(
+    deadline: Option<tokio::time::Instant>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    let Some(deadline) = deadline else {
+        return Some(work.await);
+    };
+    let done = tokio::time::timeout_at(deadline, work).await.ok();
+    if done.is_none() {
+        tracing::warn!("durable route reached its deadline margin; answering pending");
+    }
+    done
 }
 
 /// Warn once that Autumn's idempotency layer does not use the scope.
@@ -516,38 +539,48 @@ struct Prepared {
 }
 
 impl Prepared {
-    /// Start or attach to the run, then build the answer.
-    async fn start_and_answer(self, start: StartRequest) -> DurableOutcome {
+    /// Start or attach to the run. An `Err` is the final answer.
+    async fn start(&self, start: StartRequest) -> Result<Started, Problem> {
         let workflow = start.workflow.clone();
+        let runtime = Arc::clone(&self.runtime);
         // The start runs in its own task. A dropped request cannot cut the
-        // start transaction short, and the retry then finds the claim.
-        let task = start_run(Arc::clone(&self.runtime), start);
-        let started = match tokio::spawn(task.in_current_span()).await {
-            Ok(Ok(started)) => started,
-            Ok(Err(error)) => {
-                log_start_error(&workflow, &error);
-                return DurableOutcome::problem(start_error_problem(&error));
+        // start transaction short, and the retry then finds the claim. The
+        // task logs its own error, so a start that ends after the deadline
+        // is logged too. The task logs to the request's subscriber.
+        let task = async move {
+            let started = start_run(runtime, start).await;
+            if let Err(error) = &started {
+                log_start_error(&workflow, error);
             }
+            started
+        };
+        let task = task.in_current_span().with_current_subscriber();
+        let started = match tokio::spawn(task).await {
+            Ok(Ok(started)) => started,
+            Ok(Err(error)) => return Err(start_error_problem(&error)),
             Err(error) => {
-                tracing::error!(error = %error, "durable route start task failed");
-                return DurableOutcome::problem(Problem::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                ));
+                log_task_failure(&error);
+                return Err(Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "internal"));
             }
         };
         let span = tracing::Span::current();
         span.record("created", started.created);
         span.record("exec_id", tracing::field::display(started.exec_id));
         if !started.created && !workflow_id_matches(&started.workflow_id, &self.digest, &self.fp) {
-            return DurableOutcome::problem(KEY_REUSED);
+            return Err(KEY_REUSED);
         }
-        self.answer(&started).await
+        Ok(started)
     }
 
-    /// Wait for the run and build the answer.
-    async fn answer(self, started: &Started) -> DurableOutcome {
-        let after_start = |kind, status, output| DurableOutcome {
+    /// An answer about the run that the start found, with the run's headers.
+    const fn after_start(
+        &self,
+        started: &Started,
+        kind: DurableOutcomeKind,
+        status: StatusCode,
+        output: Option<Value>,
+    ) -> DurableOutcome {
+        DurableOutcome {
             kind,
             status,
             execution_id: Some(started.exec_id),
@@ -555,7 +588,12 @@ impl Prepared {
             expose_id: self.expose_id,
             output,
             retry_after: None,
-        };
+        }
+    }
+
+    /// Wait for the run and build the answer.
+    async fn answer(&self, started: &Started) -> DurableOutcome {
+        let after_start = |kind, status, output| self.after_start(started, kind, status, output);
         let budget = wait_budget(
             self.wait,
             self.extracted_at.elapsed(),
@@ -1118,10 +1156,10 @@ fn read_error(error: &HarvestError) -> ReadFailure {
     let failure = read_failure(error);
     match failure {
         ReadFailure::Pending => {
-            tracing::warn!(error = %error, "durable route cannot read the run; answering pending");
+            tracing::warn!(error = %Loggable(error), "durable route cannot read the run; answering pending");
         }
         ReadFailure::Unreadable => {
-            tracing::error!(error = %error, "durable route cannot decode the result");
+            tracing::error!(error = %Loggable(error), "durable route cannot decode the result");
         }
     }
     failure
@@ -1279,6 +1317,33 @@ async fn end_facts(
     )))
 }
 
+/// Log a start task that did not finish.
+///
+/// A panic message can quote the input, so the log holds only the kind.
+fn log_task_failure(error: &tokio::task::JoinError) {
+    tracing::error!(
+        panicked = error.is_panic(),
+        "durable route start task failed"
+    );
+}
+
+/// A `HarvestError` as a route log shows it.
+///
+/// A custom payload codec writes its own error message, and that message can
+/// quote payload bytes. A serde message can quote a value. So these errors
+/// show only their kind.
+struct Loggable<'a>(&'a HarvestError);
+
+impl std::fmt::Display for Loggable<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            HarvestError::Codec(_) => f.write_str("payload codec error"),
+            HarvestError::Serialization(_) => f.write_str("payload serialization error"),
+            error => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+
 /// Log a start error. The log never holds an input value.
 fn log_start_error(workflow: &str, error: &HarvestError) {
     match error {
@@ -1297,9 +1362,9 @@ fn log_start_error(workflow: &str, error: &HarvestError) {
             tracing::warn!(workflow, %resource, "durable route start hit a quota");
         }
         HarvestError::Config(_) => {
-            tracing::error!(workflow, error = %error, "durable route cannot start its workflow");
+            tracing::error!(workflow, error = %Loggable(error), "durable route cannot start its workflow");
         }
-        _ => tracing::warn!(workflow, error = %error, "durable route start failed"),
+        _ => tracing::warn!(workflow, error = %Loggable(error), "durable route start failed"),
     }
 }
 
@@ -1550,10 +1615,15 @@ enum ReadFailure {
 }
 
 /// A codec failure needs an operator, so it is not pending. A retry chain
-/// past the engine's walk depth only grows, so that error is final too. Any
+/// past the engine's walk depth only grows, so that error is final too. A
+/// stored payload that does not parse never parses, so it is final too. Any
 /// other read error can pass, and the run exists, so the client retries.
 const fn read_failure(error: &HarvestError) -> ReadFailure {
-    if error.is_codec_failure() || matches!(error, HarvestError::RetryChainMaxDepthExceeded { .. })
+    if error.is_codec_failure()
+        || matches!(
+            error,
+            HarvestError::RetryChainMaxDepthExceeded { .. } | HarvestError::Serialization(_)
+        )
     {
         ReadFailure::Unreadable
     } else {
@@ -2387,6 +2457,8 @@ mod tests {
                 exec_id: ExecutionId::new(),
                 max_depth: 256,
             },
+            // A stored payload that does not parse never parses.
+            HarvestError::Serialization(serde_json::from_str::<Value>("{").expect_err("not JSON")),
         ];
         for error in unreadable {
             assert_eq!(read_failure(&error), ReadFailure::Unreadable, "{error}");
@@ -2994,6 +3066,11 @@ mod tests {
         }
     }
 
+    /// Panic with a secret in the message.
+    fn panic_with_secret() {
+        panic!("secret-panic-text");
+    }
+
     /// A subscriber that writes every event, and each span when it closes.
     fn capture() -> (Captured, tracing::Dispatch) {
         // With one live dispatcher, tracing-core lets another test thread
@@ -3043,6 +3120,44 @@ mod tests {
         assert!(text.contains("count=7"), "{text}");
         assert!(text.contains("durable route start hit a quota"), "{text}");
         for secret in ["secret-message", "secret-input-key", "secret-quota-key"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+    }
+
+    // AC-88
+    #[tokio::test]
+    async fn error_logs_hold_no_codec_or_panic_text() {
+        // A custom payload codec writes its own message, and a panic carries
+        // its own text. Either can quote the input.
+        let codec = HarvestError::Codec("secret-codec-text".to_owned());
+        // A serde message quotes the value that it cannot read.
+        let serde = HarvestError::Serialization(
+            serde_json::from_str::<u8>("\"secret-serde-text\"").expect_err("not a u8"),
+        );
+        let joined = tokio::spawn(async { panic_with_secret() }).await;
+        let (captured, dispatch) = capture();
+        tracing::dispatcher::with_default(&dispatch, || {
+            log_start_error("place_order", &codec);
+            log_start_error("place_order", &serde);
+            assert_eq!(read_error(&codec), ReadFailure::Unreadable);
+            assert_eq!(read_error(&serde), ReadFailure::Unreadable);
+            match &joined {
+                Err(error) => log_task_failure(error),
+                Ok(()) => panic!("the task must panic"),
+            }
+        });
+        let text = captured.text();
+        assert!(text.contains("durable route start failed"), "{text}");
+        assert!(
+            text.contains("durable route cannot decode the result"),
+            "{text}"
+        );
+        assert!(text.contains("durable route start task failed"), "{text}");
+        for secret in [
+            "secret-codec-text",
+            "secret-serde-text",
+            "secret-panic-text",
+        ] {
             assert!(!text.contains(secret), "{secret} in {text}");
         }
     }

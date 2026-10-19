@@ -68,8 +68,9 @@ joins the key on its own.
 3. `Retry-After` means that the run is not finished or cannot start yet.
 4. A durable-route problem with no `Retry-After` is final for this key. Do
    not retry it. Its `type` starts with `urn:autumn-harvest:durable-route:`.
-5. An answer for a run that an earlier request started carries
-   `x-idempotent-replayed: true`.
+5. An answer about a run that this request did not start carries
+   `x-idempotent-replayed: true`. The `idempotency-key-reused` answer
+   carries no run header.
 
 A key binds its body. A retry with another body under the same key gets a
 `422` and starts nothing. Use a new key for a new operation.
@@ -120,9 +121,11 @@ A live run waits for up to the budget.
   `0` means that no request waits.
 - The wait ends 2 s before Autumn's request deadline
   (`server.timeouts.request_timeout_ms`). Every read after the start ends
-  1 s before it, and a late read answers pending. Both margins count from
-  the time the route reads the request. Middleware time before the handler
-  uses up the margin.
+  1 s before it, and a late read answers pending with the run's headers. A
+  start that is not done by then answers pending with no run header. That
+  start can still commit, and a retry then finds its run. Both margins
+  count from the time the route reads the request. Middleware time before
+  the handler uses up the margin.
 - With Autumn's idempotency layer on, the route counts only half of the
   deadline, because that layer reads the whole body before the handler.
 - A route that sets its own `timeout_ms` must set `.wait(..)` below it,

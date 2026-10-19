@@ -1159,9 +1159,11 @@ async fn reads_after_the_start_end_before_the_request_deadline() {
         ("x-user", "ada"),
         ("x-workflow", "dr_parked"),
         ("x-wait-ms", "0"),
+        ("x-expose", "1"),
     ];
+    let body = json!({"tag": "ac53"});
     let started = Instant::now();
-    let response = post(&client, Some("key-ac53"), &extra, &json!({"tag": "ac53"})).await;
+    let response = post(&client, Some("key-ac53"), &extra, &body).await;
     let elapsed = started.elapsed();
     blocker.batch_execute("COMMIT").await.expect("unlock");
     // The stalled start ends at the 1 s margin with a pending answer, not with
@@ -1175,6 +1177,77 @@ async fn reads_after_the_start_end_before_the_request_deadline() {
     assert!(
         elapsed >= Duration::from_millis(2_500),
         "answered in {elapsed:?}"
+    );
+    // No run is known yet, so the answer names none.
+    assert_eq!(response.header(EXEC_HEADER), None);
+    assert_eq!(response.header(REPLAYED_HEADER), None);
+    // The start was not stopped. It commits, and a retry attaches to it.
+    let mut runs = 0;
+    for _ in 0..50 {
+        runs = count_runs(&db, "dr_parked").await;
+        if runs > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(runs, 1, "the detached start committed one run");
+    let again = post(&client, Some("key-ac53"), &extra, &body).await;
+    assert_eq!(again.status.as_u16(), 202, "{}", again.text());
+    assert_eq!(again.header(REPLAYED_HEADER), Some("true"));
+    assert_eq!(count_runs(&db, "dr_parked").await, 1);
+}
+
+// AC-89
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_cut_at_the_deadline_keeps_the_run_headers() {
+    use diesel_async::SimpleAsyncConnection as _;
+    let db = setup_db().await;
+    let mut config = app_config(&db);
+    config.server.timeouts.request_timeout_ms = Some(4_000);
+    let mut route = __autumn_route_info_durable();
+    route.name = "durable";
+    let client = TestApp::new()
+        .config(config)
+        .routes(vec![route])
+        .plugin(base_plugin())
+        .with_db(db.pool.clone())
+        .build();
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_typed_failure"),
+        ("x-map", "OutOfStock=422"),
+        ("x-expose", "1"),
+    ];
+    let body = json!({"error_type": "OutOfStock"});
+    let first = post(&client, Some("key-ac89"), &extra, &body).await;
+    assert_eq!(first.status.as_u16(), 422, "{}", first.text());
+    let exec_id = exec_id_of(&first);
+    // The retry attaches without the history. Its typed-failure read then
+    // stalls on the lock until the deadline margin.
+    let mut blocker = db.pool.get().await.expect("blocker");
+    blocker
+        .batch_execute("BEGIN; LOCK TABLE harvest_events IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("lock");
+    let started = Instant::now();
+    let again = post(&client, Some("key-ac89"), &extra, &body).await;
+    let elapsed = started.elapsed();
+    blocker.batch_execute("COMMIT").await.expect("unlock");
+    assert_eq!(again.status.as_u16(), 202, "{}", again.text());
+    assert_eq!(again.header("retry-after"), Some("1"));
+    assert!(
+        elapsed < Duration::from_millis(3_900),
+        "answered in {elapsed:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(2_500),
+        "the deadline cut the read: {elapsed:?}"
+    );
+    assert_eq!(exec_id_of(&again), exec_id);
+    assert_eq!(again.header(REPLAYED_HEADER), Some("true"));
+    assert_eq!(
+        again.json::<Value>()["execution_id"],
+        json!(exec_id.to_string())
     );
 }
 

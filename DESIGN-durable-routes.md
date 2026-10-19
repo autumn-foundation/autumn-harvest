@@ -73,7 +73,7 @@ the start-idempotency claim (issue #808).
 | R3 | Accept a changed body under a used key. | The fingerprint compare answers `422` and starts nothing (B11). |
 | R4 | Let a guessable key reveal a stored result. | The scope confines a guess to one principal. The docs tell clients to use random keys. |
 | R5 | Cache a pending answer for 24 h under Autumn's layer. | The route answers `409` when the layer is on (B14). |
-| R6 | Hold Autumn's in-flight lock for 24 h when the request deadline drops the handler. | The wait ends 2 s before the request deadline, and every read after the start ends 1 s before it. A late read answers pending. Under the layer the route counts half the deadline, because the layer reads the body before the handler (F11, F12). |
+| R6 | Hold Autumn's in-flight lock for 24 h when the request deadline drops the handler. | The wait ends 2 s before the request deadline, and every read after the start ends 1 s before it. A late read answers pending. When the start has returned, that answer keeps the run's headers. Under the layer the route counts half the deadline, because the layer reads the body before the handler (F11, F12). |
 | R7 | Lose the start when the client disconnects. | The start runs in a spawned task, so a dropped request still commits. The retry attaches through the claim. |
 | R8 | Pin a pool connection for the whole wait. | The spawned task drops the connection before the wait starts. |
 | R9 | Exhaust Postgres connections with waiters. | A semaphore caps the waiters (B16). A completed run needs no permit. |
@@ -87,7 +87,7 @@ the start-idempotency claim (issue #808).
 | R17 | Turn a schema violation into a leak of the input shape. | `422` with fixed text. The debug log holds only the violation count. A message can quote an input value, and a field path can hold an input key. |
 | R18 | Crash on a request that arrives before plugin startup ends. | The extractor never panics. `send()` answers `503` with `Retry-After`. |
 | R19 | Fail every request for a debounce, batch or throttle workflow with a confusing error. | `500` misconfigured, with an error log that names the cause. A name that is not a registered workflow answers the same way. |
-| R20 | Put the key, scope or input into logs or metrics. | The tracing span records the workflow, route, outcome, creation flag and execution id only. A quota error log names the resource, not the quota key, because that key can come from the input. A serializer error stays out of the log, because a custom serializer can quote a value. |
+| R20 | Put the key, scope or input into logs or metrics. | The tracing span records the workflow, route, outcome, creation flag and execution id only. A quota error log names the resource, not the quota key, because that key can come from the input. A serializer error stays out of the log, because a custom serializer can quote a value. A codec error, a serde error and a panic show only their kind, because each can quote a value. |
 | R21 | Let Autumn's layer replay one token client's cached answer to another client. The layer keys by session cookie, not by scope. | The docs advise against `.idempotent()` for token APIs. The route logs one warning when it sees the layer and an `Authorization` header. |
 | R22 | Strand a retry on a long continue-as-new chain, because each retry walks the chain from its start. | A same-type chain takes one step, a lookup of the newest run of the chain with the business id. Each change of workflow type, and each workflow-level retry, costs at most one more step. A visited set stops a cycle. |
 | R23 | Copy, validate, encrypt and insert a 32 MiB body before the 2 MiB input cap rejects it. | The route compares the canonical input length with the workflow's effective cap before any I/O, and answers `413`. |
@@ -329,7 +329,7 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | AC-08 | The `workflow_id` is 69 bytes, parses back, and a foreign id is a mismatch. | `workflow_id_round_trips_and_rejects_foreign_ids` |
 | AC-09 | Every `WorkflowResultState` maps to the documented status, with the layer on and off. | `status_map_covers_every_workflow_result_state`, `failure_mapping_uses_the_last_status_and_spots_erasure` |
 | AC-10 | Start errors map to the documented statuses. Every pool, shard, load and database error answers `503` with a `Retry-After` of at least 1 s. No error text reaches the body. | `start_errors_map_to_public_statuses`, `retryable_start_errors_answer_503_with_retry_after` |
-| AC-11 | Codec read errors and a retry chain past the engine's walk depth give `result-unavailable`. Other read errors give pending. The typed-failure read answers through the same policy, so a passing error never makes a mapped failure final. | `read_errors_map_to_result_unavailable_or_pending` |
+| AC-11 | Codec read errors, a stored payload that does not parse, and a retry chain past the engine's walk depth give `result-unavailable`. Other read errors give pending. The typed-failure read answers through the same policy, so a passing error never makes a mapped failure final. | `read_errors_map_to_result_unavailable_or_pending` |
 | AC-12 | The wait budget defaults to 5 s, clamps to 30 s and to the request deadline less 2 s. | `wait_budget_is_clamped` |
 | AC-13 | Every problem has the URN type, the code and fixed text. | `problem_bodies_never_carry_internal_text` |
 | AC-14 | The replay header needs a found run. The id header needs `expose_execution_id()`, also on a replay. | `replayed_and_execution_id_headers` |
@@ -371,7 +371,7 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | AC-50 | Comment hygiene adds no Tier A defect and no Tier B regression. | `docs/audits/comment-hygiene.py --base origin/trunk-dev` |
 | AC-51 | `cargo fmt` and `cargo clippy -D warnings` pass for the plugin. | CI lint job |
 | AC-52 | The diff adds no migration, no `harvest_events` writer and no version bump. `sha2` is a plain dependency of the plugin. The start calls `finish()` after it commits. | Review |
-| AC-53 | A stalled start ends with a pending answer before the request deadline. | `reads_after_the_start_end_before_the_request_deadline` |
+| AC-53 | A stalled start ends with a pending answer before the request deadline. The answer names no run. The start still commits, and a retry attaches to it. | `reads_after_the_start_end_before_the_request_deadline` |
 | AC-54 | A retry attempt that continues as new into another type gives the final output. | `retry_attempt_that_switches_type_returns_final_output` |
 | AC-55 | A request holds no pooled connection while it waits. Eight waiters on a four-slot pool each wait out their budget, and a ninth request completes. | `start_connection_is_released_before_the_wait` |
 | AC-56 | After an operator rerun, a retry of the original request gets the outcome its own run recorded. | `rerun_sealed_run_reports_its_original_outcome` |
@@ -406,3 +406,5 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | AC-85 | An erased run answers a final `410` whatever its end: cancelled, terminated, timed out, failed with no mapping, failed with an unmapped class, or failed with a mapped class, with or without details. | `erased_runs_answer_410_whatever_their_end` |
 | AC-86 | A client input equal to the erasure tombstone does not make a run read as erased. | `a_tombstone_input_does_not_read_as_erased` |
 | AC-87 | The erasure marker comes from the live retry attempt. Erasing only the first attempt keeps the answer, and erasing the live attempt answers `410`. | `erasure_is_read_from_the_live_retry_attempt` |
+| AC-88 | A route log never holds the text of a payload codec error, a serde error or a panic. | `error_logs_hold_no_codec_or_panic_text` |
+| AC-89 | A read that the deadline cuts after the start answers pending with the run's execution id and replay headers. | `a_read_cut_at_the_deadline_keeps_the_run_headers` |
