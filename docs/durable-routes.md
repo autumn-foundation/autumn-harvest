@@ -95,7 +95,7 @@ A key binds its body. A retry with another body under the same key gets a
 | The run was cancelled. | 500 | `cancelled` |
 | The run was terminated. | 500 | `terminated` |
 | The run exceeded its execution timeout. | 500 | `timed-out` |
-| PII erasure removed the result. | 410 | `erased` |
+| PII erasure removed the run's data, whatever the run's end. | 410 | `erased` |
 | The server cannot decode the result, or cannot reach the end of its chain or of its retries. | 500 | `result-unavailable` |
 
 A problem body is `application/problem+json` (RFC 9457). Its `type` is
@@ -203,15 +203,24 @@ ends. In such an app, do not turn on `.idempotent()` for durable routes.
 - After the window, a retry of a run that was terminated, or that continued
   as new into another workflow type, starts a new run. Those runs no longer
   hold the business id.
-- PII erasure works on one execution. To erase a durable run, erase every
-  execution with its `workflow_id`: each retry attempt and each
-  continue-as-new run. `x-harvest-execution-id` names only one of them.
+- PII erasure works on one execution. To erase a durable run, erase each of
+  its executions: the first run, each retry attempt and each continue-as-new
+  run. A retry attempt has its own `workflow_id`, and its `retry_of_exec_id`
+  names the attempt before it. A continue-as-new run names the run before it
+  in `continued_from_exec_id`. `x-harvest-execution-id` names only one of
+  them.
 - The route checks the input size before any I/O, with the current cap. A
   retry of an accepted input gets `413` when an operator lowers the cap.
 - Workflow-level retries run the activities again. Activities must be
   idempotent.
 - Durable runs have no Harvest tenant, record the `transactional` start
   source and do not join the HTTP trace.
+- History retention shorter than the claim window can delete a run while its
+  key is live. A retry then starts a new run, and its activities run again.
+  Keep the retention age longer than the window.
+- The route's own logs never hold the key, the scope or the input. Engine
+  logs are outside the route. For example, the engine logs a concurrency
+  key, which can come from the input.
 - Within the claim window, a run that a reset sealed reads as `terminated`.
   When the run failed or timed out before the reset, the MCP task tools
   report that end. They report any other reset-sealed run as `cancelled`. A

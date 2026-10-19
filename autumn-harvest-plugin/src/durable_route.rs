@@ -401,10 +401,9 @@ impl DurableCall {
         }
         let misconfigured = Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "misconfigured");
         if let Some(cause) = self.setup_problem() {
+            // A custom serializer can quote an input value in its error, so
+            // the log names only the cause.
             tracing::error!(workflow = %self.workflow, cause, "durable route setup error");
-            if let Err(error) = &self.input {
-                tracing::debug!(workflow = %self.workflow, error = %error, "durable route input");
-            }
             return Err(misconfigured);
         }
         let key = check_key(&self.route.key)
@@ -577,18 +576,31 @@ impl Prepared {
                 after_start(kind, status, None)
             }
             Waited::Terminal { exec_id, result } => {
-                // The typed failure costs a history read, so read it only
-                // when a mapping can use it.
-                let typed =
-                    if result.state == WorkflowResultState::Failed && !self.failures.is_empty() {
-                        let read = typed_failure(&self.runtime, exec_id).await;
-                        match typed_or_answer(read, self.layer_active) {
-                            Ok(typed) => typed,
-                            Err((kind, status)) => return after_start(kind, status, None),
+                // Only a completed snapshot keeps its output. Any other end
+                // needs a read of its row to see an erasure.
+                let ended_otherwise = matches!(
+                    result.state,
+                    WorkflowResultState::Failed
+                        | WorkflowResultState::Cancelled
+                        | WorkflowResultState::TimedOut
+                        | WorkflowResultState::Terminated
+                );
+                let typed = if ended_otherwise {
+                    // The typed failure costs a history read, so read it only
+                    // when a mapping can use it.
+                    let want_typed =
+                        result.state == WorkflowResultState::Failed && !self.failures.is_empty();
+                    let read = end_facts(&self.runtime, exec_id, want_typed).await;
+                    match read_or_answer(read, self.layer_active) {
+                        Ok(EndFacts::Erased) => {
+                            return after_start(DurableOutcomeKind::Erased, StatusCode::GONE, None);
                         }
-                    } else {
-                        None
-                    };
+                        Ok(EndFacts::Kept(typed)) => typed,
+                        Err((kind, status)) => return after_start(kind, status, None),
+                    }
+                } else {
+                    None
+                };
                 let (kind, status, output) = terminal_outcome(
                     result.state,
                     result.output,
@@ -1199,20 +1211,48 @@ async fn continued_as(
     }))
 }
 
-/// The typed failure of a failed run, from its last `WorkflowFailed` event.
+/// What the route reads from a run that ended other than completed.
+enum EndFacts {
+    /// PII erasure removed the run's payloads.
+    Erased,
+    /// The run keeps its payloads. This holds the typed failure when the
+    /// caller asked for it and the run has one.
+    Kept(Option<TypedFailure>),
+}
+
+/// The erasure marker of an ended run, and its typed failure when `typed`
+/// is set.
+///
+/// Erasure always replaces the row's `input` and `output`, so those columns
+/// are the marker. The row is the live attempt that the snapshot also reads.
+/// The typed failure comes from the last `WorkflowFailed` event.
 ///
 /// A read error is an error, not an untyped failure. The caller answers it as
 /// any read error: pending, or `result-unavailable` for a codec error. So a
 /// short outage never turns a mapped failure into a final 500.
-async fn typed_failure(
+async fn end_facts(
     runtime: &DurableRouteRuntime,
     exec_id: ExecutionId,
-) -> HarvestResult<Option<TypedFailure>> {
+    typed: bool,
+) -> HarvestResult<EndFacts> {
     let sharded = runtime.pool.sharded_pool();
     let shard = sharded.routed_shard_for_execution(exec_id);
     let mut held = autumn_harvest::pool::acquire_within_pool_bound(sharded.pool_for(shard)).await?;
     let (live, live_shard) =
         autumn_harvest::execution::resolve_live_attempt(&mut held, sharded, shard, exec_id).await?;
+    // A client can send the tombstone as its input. A run that did not
+    // complete has no output of its own, so the output proves the erasure.
+    let erased = autumn_harvest::erase::execution_input_is_erased(&live.input)
+        && live
+            .output
+            .as_ref()
+            .is_some_and(autumn_harvest::erase::is_erasure_tombstone);
+    if erased {
+        return Ok(EndFacts::Erased);
+    }
+    if !typed {
+        return Ok(EndFacts::Kept(None));
+    }
     // The live attempt can sit on another shard after a rebalance.
     let mut resident =
         autumn_harvest::shard_rebalance::bind_to_shard(&mut held, sharded, shard, live_shard)
@@ -1223,11 +1263,8 @@ async fn typed_failure(
         runtime.client.payload_codecs(),
     )
     .await?;
-    Ok(history
-        .events
-        .into_iter()
-        .rev()
-        .find_map(|event| match event {
+    Ok(EndFacts::Kept(history.events.into_iter().rev().find_map(
+        |event| match event {
             WorkflowEvent::WorkflowFailed {
                 error_type,
                 details,
@@ -1238,24 +1275,20 @@ async fn typed_failure(
                 details,
             }),
             _ => None,
-        }))
+        },
+    )))
 }
 
 /// Log a start error. The log never holds an input value.
 fn log_start_error(workflow: &str, error: &HarvestError) {
     match error {
         HarvestError::InputValidationFailed { violations } => {
-            // A violation message can quote an input value, so log only the
-            // count and a few field paths.
-            let paths: Vec<&str> = violations
-                .iter()
-                .filter_map(|violation| violation.field_path.as_deref())
-                .take(5)
-                .collect();
+            // A violation message can quote an input value. A field path can
+            // hold an input key, through `additionalProperties`. So the log
+            // holds only the count.
             tracing::debug!(
                 workflow,
                 count = violations.len(),
-                ?paths,
                 "durable route input fails the schema"
             );
         }
@@ -1567,6 +1600,8 @@ fn terminal_outcome(
                 Some((error_type, failure.details, status))
             });
             match mapped {
+                // An erasure can commit between the row read and the history
+                // read. The details then hold the tombstone.
                 Some((_, Some(details), _))
                     if autumn_harvest::erase::is_erasure_tombstone(&details) =>
                 {
@@ -1604,16 +1639,16 @@ fn terminal_outcome(
     }
 }
 
-/// The typed failure, or the answer when the route cannot read it.
+/// What a read of an ended run found, or the answer when the read failed.
 ///
-/// The run failed, but its class is unknown. A passing read error answers
-/// pending, so a retry reads it again, and a short outage never turns a
-/// mapped failure into a final 500. A codec error answers
-/// `result-unavailable`.
-fn typed_or_answer(
-    read: HarvestResult<Option<TypedFailure>>,
+/// The run ended, but the route does not know whether it was erased or how
+/// it failed. A passing read error answers pending, so a retry reads it
+/// again, and a short outage never turns a mapped failure into a final 500.
+/// A codec error answers `result-unavailable`.
+fn read_or_answer<T>(
+    read: HarvestResult<T>,
     layer_active: bool,
-) -> Result<Option<TypedFailure>, (DurableOutcomeKind, StatusCode)> {
+) -> Result<T, (DurableOutcomeKind, StatusCode)> {
     read.map_err(|error| no_result_outcome(read_error(&error), layer_active))
 }
 
@@ -2386,19 +2421,19 @@ mod tests {
             details: None,
         };
         assert_eq!(
-            typed_or_answer(Ok(Some(typed.clone())), false),
+            read_or_answer(Ok(Some(typed.clone())), false),
             Ok(Some(typed))
         );
         assert_eq!(
-            typed_or_answer(Err(HarvestError::Database("blip".to_owned())), false),
+            read_or_answer::<()>(Err(HarvestError::Database("blip".to_owned())), false),
             Err((DurableOutcomeKind::Pending, StatusCode::ACCEPTED))
         );
         assert_eq!(
-            typed_or_answer(Err(HarvestError::Database("blip".to_owned())), true),
+            read_or_answer::<()>(Err(HarvestError::Database("blip".to_owned())), true),
             Err((DurableOutcomeKind::Pending, StatusCode::CONFLICT))
         );
         assert_eq!(
-            typed_or_answer(Err(HarvestError::Codec("bad".to_owned())), false),
+            read_or_answer::<()>(Err(HarvestError::Codec("bad".to_owned())), false),
             Err((
                 DurableOutcomeKind::Problem {
                     slug: "result-unavailable"
@@ -2950,6 +2985,15 @@ mod tests {
         }
     }
 
+    /// An input that fails to serialize with its value in the message.
+    struct Leaky(&'static str);
+
+    impl serde::Serialize for Leaky {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom(format!("bad value {}", self.0)))
+        }
+    }
+
     /// A subscriber that writes every event, and each span when it closes.
     fn capture() -> (Captured, tracing::Dispatch) {
         // With one live dispatcher, tracing-core lets another test thread
@@ -2971,10 +3015,11 @@ mod tests {
     // AC-63
     #[test]
     fn start_error_logs_hold_no_input_values() {
+        // With `additionalProperties`, a field path holds an input key.
         let violations = (0..7)
             .map(|i| autumn_harvest::info::SchemaViolation {
                 message: format!("secret-message-{i}"),
-                field_path: Some(format!("/field{i}")),
+                field_path: Some(format!("/secret-input-key-{i}")),
             })
             .collect();
         let (captured, dispatch) = capture();
@@ -2996,15 +3041,8 @@ mod tests {
         });
         let text = captured.text();
         assert!(text.contains("count=7"), "{text}");
-        for i in 0..5 {
-            assert!(text.contains(&format!("/field{i}")), "{text}");
-        }
-        assert!(
-            !text.contains("/field5") && !text.contains("/field6"),
-            "{text}"
-        );
         assert!(text.contains("durable route start hit a quota"), "{text}");
-        for secret in ["secret-message", "secret-quota-key"] {
+        for secret in ["secret-message", "secret-input-key", "secret-quota-key"] {
             assert!(!text.contains(secret), "{secret} in {text}");
         }
     }
@@ -3032,6 +3070,14 @@ mod tests {
             .send()
             .await;
         assert_eq!(misconfigured.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // A custom serializer can quote a value in its error message.
+        let leaky = extract(&key)
+            .await
+            .scope("secret-scope-64")
+            .call("place_order", Leaky("secret-input-64"))
+            .send()
+            .await;
+        assert_eq!(leaky.status(), StatusCode::INTERNAL_SERVER_ERROR);
         drop(guard);
         let text = captured.text();
         assert!(text.contains("harvest.durable_route{"), "{text}");

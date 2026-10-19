@@ -30,6 +30,7 @@ feature-gap report.
 - Problem bodies use fixed text. They never hold the workflow error message,
   the key, the scope or the input. `failure_status` maps a typed
   `WorkflowFailure` class to a final 4xx or 5xx status.
+- An erased run answers `410`, whatever its end.
 
 No migration. No new `WorkflowEvent` variant. No `harvest_events` write. No
 management API route. `sha2` becomes a plain dependency of the plugin.

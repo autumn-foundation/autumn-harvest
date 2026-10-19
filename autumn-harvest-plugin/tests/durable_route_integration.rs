@@ -74,20 +74,30 @@ async fn dr_parked(ctx: &WorkflowContext, input: Value) -> Result<Value, String>
     Ok(json!({"body": input["body"], "go": go}))
 }
 
-/// Fails with a typed failure whose class the body names.
+/// Fails with a typed failure whose class the body names. With
+/// `body.no_details`, the failure has no details.
 #[workflow]
 async fn dr_typed_failure(_ctx: &WorkflowContext, input: Value) -> Result<Value, WorkflowFailure> {
     let error_type = input["body"]["error_type"]
         .as_str()
         .unwrap_or("OutOfStock")
         .to_owned();
-    Err(WorkflowFailure::new(error_type, "secret workflow message")
-        .with_details(json!({"sku": "A-1"})))
+    let failure = WorkflowFailure::new(error_type, "secret workflow message");
+    if input["body"]["no_details"] == json!(true) {
+        return Err(failure);
+    }
+    Err(failure.with_details(json!({"sku": "A-1"})))
 }
 
 /// Fails with a plain string.
 #[workflow]
 async fn dr_untyped_failure(_ctx: &WorkflowContext, _input: Value) -> Result<Value, String> {
+    Err("secret workflow message".to_owned())
+}
+
+/// Fails on every attempt. The plugin gives it two attempts.
+#[workflow]
+async fn dr_always_fails(_ctx: &WorkflowContext, _input: Value) -> Result<Value, String> {
     Err("secret workflow message".to_owned())
 }
 
@@ -255,7 +265,12 @@ async fn durable(
     let workflow = header(&headers, "x-workflow")
         .unwrap_or("dr_order")
         .to_owned();
-    let input = json!({"user": user, "body": body});
+    // `x-raw-body` makes the body the whole input.
+    let input = if headers.contains_key("x-raw-body") {
+        body
+    } else {
+        json!({"user": user, "body": body})
+    };
     let scoped = match &user {
         Some(user) => durable.scope(user),
         None => durable.unscoped(),
@@ -343,6 +358,9 @@ fn base_plugin() -> HarvestPlugin {
             __autumn_workflow_info_dr_parked(),
             __autumn_workflow_info_dr_typed_failure(),
             __autumn_workflow_info_dr_untyped_failure(),
+            __autumn_workflow_info_dr_always_fails().with_retry_policy(
+                autumn_harvest::policy::RetryPolicy::exponential(2, Duration::from_millis(100)),
+            ),
             __autumn_workflow_info_dr_slow(),
             __autumn_workflow_info_dr_chain(),
             __autumn_workflow_info_dr_retry_then_switch().with_retry_policy(
@@ -1384,6 +1402,187 @@ async fn erased_run_returns_410() {
     let replay = post(&client, Some("key-ac42"), &extra, &body).await;
     assert_eq!(replay.status.as_u16(), 410, "{}", replay.text());
     assert_eq!(problem_type(&replay.json::<Value>()), slug_type("erased"));
+}
+
+/// One erasure case: the key, the headers, the body, and the status and slug
+/// before the erasure.
+type ErasureCase<'a> = (&'a str, &'a [(&'a str, &'a str)], Value, u16, &'a str);
+
+// AC-85
+#[tokio::test(flavor = "multi_thread")]
+async fn erased_runs_answer_410_whatever_their_end() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    let handles = handle_client(&client);
+    let cancelled = start_parked(&client, "key-ac85-a").await;
+    handles
+        .handle(cancelled)
+        .cancel("test")
+        .await
+        .expect("cancel");
+    let terminated = start_parked(&client, "key-ac85-b").await;
+    handles
+        .handle(terminated)
+        .terminate("test")
+        .await
+        .expect("terminate");
+    let parked = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_parked"),
+        ("x-wait-ms", "5000"),
+        ("x-expose", "1"),
+    ];
+    let slow = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_slow"),
+        ("x-wait-ms", "5000"),
+        ("x-expose", "1"),
+    ];
+    let untyped = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_untyped_failure"),
+        ("x-expose", "1"),
+    ];
+    let typed = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_typed_failure"),
+        ("x-map", "OutOfStock=422"),
+        ("x-expose", "1"),
+    ];
+    let cases: [ErasureCase<'_>; 7] = [
+        (
+            "key-ac85-a",
+            &parked,
+            json!({"tag": "key-ac85-a"}),
+            500,
+            "cancelled",
+        ),
+        (
+            "key-ac85-b",
+            &parked,
+            json!({"tag": "key-ac85-b"}),
+            500,
+            "terminated",
+        ),
+        (
+            "key-ac85-c",
+            &slow,
+            json!({"tag": "ac85-c"}),
+            500,
+            "timed-out",
+        ),
+        ("key-ac85-d", &untyped, json!({}), 500, "failed"),
+        (
+            "key-ac85-e",
+            &typed,
+            json!({"error_type": "Unmapped"}),
+            500,
+            "failed",
+        ),
+        (
+            "key-ac85-f",
+            &typed,
+            json!({"error_type": "OutOfStock"}),
+            422,
+            "failed",
+        ),
+        // Erasure leaves no tombstone in a failure with no details.
+        (
+            "key-ac85-g",
+            &typed,
+            json!({"error_type": "OutOfStock", "no_details": true}),
+            422,
+            "failed",
+        ),
+    ];
+    for (key, extra, body, status, slug) in cases {
+        let ended = until_done(&client, key, extra, &body).await;
+        assert_eq!(ended.status.as_u16(), status, "{key}: {}", ended.text());
+        assert_eq!(problem_type(&ended.json::<Value>()), slug_type(slug));
+        {
+            let mut conn = db.pool.get().await.expect("conn");
+            autumn_harvest::erase::erase_workflow_payloads(&mut conn, exec_id_of(&ended), "test")
+                .await
+                .expect("erase");
+        }
+        let again = post(&client, Some(key), extra, &body).await;
+        assert_eq!(again.status.as_u16(), 410, "{key}: {}", again.text());
+        assert!(again.header("retry-after").is_none(), "{key}");
+        assert_eq!(problem_type(&again.json::<Value>()), slug_type("erased"));
+    }
+}
+
+// AC-86
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tombstone_input_does_not_read_as_erased() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    // A route that passes the raw body lets a client send the tombstone.
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_parked"),
+        ("x-wait-ms", "0"),
+        ("x-expose", "1"),
+        ("x-raw-body", "1"),
+    ];
+    let body = json!({"_harvest_erased": true});
+    let pending = post(&client, Some("key-ac86"), &extra, &body).await;
+    assert_eq!(pending.status.as_u16(), 202, "{}", pending.text());
+    handle_client(&client)
+        .handle(exec_id_of(&pending))
+        .cancel("test")
+        .await
+        .expect("cancel");
+    let ended = until_done(&client, "key-ac86", &extra, &body).await;
+    assert_eq!(ended.status.as_u16(), 500, "{}", ended.text());
+    assert_eq!(problem_type(&ended.json::<Value>()), slug_type("cancelled"));
+}
+
+/// The attempt that retries `exec_id`.
+async fn retry_attempt_of(db: &TestPg, exec_id: ExecutionId) -> ExecutionId {
+    let mut conn = db.pool.get().await.expect("conn");
+    diesel::sql_query(
+        "SELECT id::text AS id FROM harvest_workflow_executions \
+         WHERE retry_of_exec_id = $1::uuid",
+    )
+    .bind::<Text, _>(exec_id.to_string())
+    .get_result::<Id>(&mut conn)
+    .await
+    .expect("one retry attempt")
+    .id
+    .parse()
+    .expect("execution id")
+}
+
+// AC-87
+#[tokio::test(flavor = "multi_thread")]
+async fn erasure_is_read_from_the_live_retry_attempt() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_always_fails"),
+        ("x-wait-ms", "5000"),
+        ("x-expose", "1"),
+    ];
+    let body = json!({"tag": "ac87"});
+    let ended = until_done(&client, "key-ac87", &extra, &body).await;
+    assert_eq!(ended.status.as_u16(), 500, "{}", ended.text());
+    let first = exec_id_of(&ended);
+    let live = retry_attempt_of(&db, first).await;
+    // The answer comes from the last attempt, so erasing the first changes
+    // nothing.
+    for (erased, status, slug) in [(first, 500, "failed"), (live, 410, "erased")] {
+        {
+            let mut conn = db.pool.get().await.expect("conn");
+            autumn_harvest::erase::erase_workflow_payloads(&mut conn, erased, "test")
+                .await
+                .expect("erase");
+        }
+        let again = post(&client, Some("key-ac87"), &extra, &body).await;
+        assert_eq!(again.status.as_u16(), status, "{}", again.text());
+        assert_eq!(problem_type(&again.json::<Value>()), slug_type(slug));
+    }
 }
 
 // AC-43

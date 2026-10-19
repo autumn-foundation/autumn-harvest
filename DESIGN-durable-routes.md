@@ -36,7 +36,7 @@ the start-idempotency claim (issue #808).
 | F11 | Each wait opens one Postgres `LISTEN` connection outside the pool. The connect can take up to 5 s. | `handle.rs`, `notify.rs` |
 | F12 | The `prod` profile sets a 30 s request deadline. Autumn answers `503` when it fires and drops the handler future. | `autumn-web-0.8.0/src/config.rs`, `router.rs` |
 | F13 | The plugin installs a `WorkflowHandleClient` with every workflow, queue, codec and the claim window. The extension is absent until startup ends. | `plugin.rs`, `start_harvest_runtime` |
-| F14 | PII erasure replaces the output with `{"_harvest_erased": true}`. | `erase.rs` |
+| F14 | PII erasure replaces the row's `input` and `output`, and each payload field of the history, with `{"_harvest_erased": true}`. The `input` column is the marker. A snapshot of a run that did not complete holds no output. | `erase.rs`, `handle.rs` |
 | F15 | `workflow_id` is clear `TEXT` with no length or charset check. The claim key is clear `TEXT`, at most 512 bytes, and must not start with `conn:`. | `execution.rs`, `start_idempotency.rs` |
 
 ### 0.2 Brainstorm — what shape does a durable route take?
@@ -80,14 +80,14 @@ the start-idempotency claim (issue #808).
 | R10 | Report a continue-as-new row as the final result. | The wait follows successors (B18). Each step reads one history and reaches the newest run of one type, or crosses one change of type. A chain needs at most one step more than its changes of type. `HarvestPlugin::durable_route_max_chain_steps` caps the steps (1024 by default). Past the cap, a walk that read only ended runs answers `result-unavailable`, because a retry repeats the same walk over sealed runs. A walk that met a live run answers pending, because a retry can then need fewer steps. A cycle answers `result-unavailable` (R22). |
 | R11 | Leak the workflow error text, a codec envelope or an internal message. | The route never renders `WorkflowResult.error` or a `HarvestError` message. Problem bodies use fixed text. |
 | R12 | Leak the execution id, which is the management API handle. | The id header is opt-in. |
-| R13 | Replay an erasure tombstone as a success. | A tombstone answers `410` (F14). |
+| R13 | Replay an erasure tombstone as a success, or report an erased run by its old end. | A tombstone answers `410` (F14). For any other end, the route reads the row of the live attempt. The run reads as erased when its `input` and `output` both hold the tombstone. A client can send the tombstone as its input, but a run that did not complete has no output of its own. |
 | R14 | Store the raw key in the database. | Only a SHA-256 digest reaches the database. |
 | R15 | Read the key differently from a proxy, or inject a header. | More than one key field is a `400`. Only printable ASCII is valid. The route never echoes the key. |
 | R16 | Answer a terminal business failure with a retry status. | `failure_status` refuses `408`, `409`, `425`, `429`, `502`, `503` and `504`. Terminal problems carry no `Retry-After`. The client contract says that a durable-route problem with no `Retry-After` is final, so a client does not loop on a final `500`. |
-| R17 | Turn a schema violation into a leak of the input shape. | `422` with fixed text. The debug log holds the violation count and at most five field paths, never a violation message, because a message can quote an input value. |
+| R17 | Turn a schema violation into a leak of the input shape. | `422` with fixed text. The debug log holds only the violation count. A message can quote an input value, and a field path can hold an input key. |
 | R18 | Crash on a request that arrives before plugin startup ends. | The extractor never panics. `send()` answers `503` with `Retry-After`. |
 | R19 | Fail every request for a debounce, batch or throttle workflow with a confusing error. | `500` misconfigured, with an error log that names the cause. A name that is not a registered workflow answers the same way. |
-| R20 | Put the key, scope or input into logs or metrics. | The tracing span records the workflow, route, outcome, creation flag and execution id only. A quota error log names the resource, not the quota key, because that key can come from the input. |
+| R20 | Put the key, scope or input into logs or metrics. | The tracing span records the workflow, route, outcome, creation flag and execution id only. A quota error log names the resource, not the quota key, because that key can come from the input. A serializer error stays out of the log, because a custom serializer can quote a value. |
 | R21 | Let Autumn's layer replay one token client's cached answer to another client. The layer keys by session cookie, not by scope. | The docs advise against `.idempotent()` for token APIs. The route logs one warning when it sees the layer and an `Authorization` header. |
 | R22 | Strand a retry on a long continue-as-new chain, because each retry walks the chain from its start. | A same-type chain takes one step, a lookup of the newest run of the chain with the business id. Each change of workflow type, and each workflow-level retry, costs at most one more step. A visited set stops a cycle. |
 | R23 | Copy, validate, encrypt and insert a 32 MiB body before the 2 MiB input cap rejects it. | The route compares the canonical input length with the workflow's effective cap before any I/O, and answers `413`. |
@@ -210,7 +210,7 @@ trait, so unit tests drive it on a fake chain.
 | Run failed with a mapped `error_type` | The mapped status | Problem `failed`, with `error_type` and `details` |
 | Run failed, not mapped | 500 | Problem `failed` |
 | Run cancelled, terminated or timed out | 500 | Problem `cancelled`, `terminated` or `timed-out` |
-| Run erased | 410 | Problem `erased` |
+| Run erased, whatever its end | 410 | Problem `erased` |
 | Result cannot be decoded | 500 | Problem `result-unavailable` |
 
 A problem body is `application/problem+json`. Its `type` is
@@ -261,7 +261,9 @@ advise against the layer in such an app.
   business id.
 - Erasure works on one execution. A durable run with retries or a
   continue-as-new chain needs each execution erased. The output lives on the
-  last run, so erasing the first run alone keeps it.
+  last run, so erasing the first run alone keeps it. A retry attempt has its
+  own `workflow_id`, so a search by the route's `workflow_id` misses it.
+  `retry_of_exec_id` and `continued_from_exec_id` link the executions.
 - The input-size check uses the current cap, before the claim probe. A retry
   of an accepted input gets `413` when an operator lowers the cap.
 - The route counts its deadline from the time it reads the request.
@@ -301,6 +303,11 @@ advise against the layer in such an app.
   its own chain, so the chain-scoped jump skips it, also after a rerun of a
   chain's last run. `failure_status` still maps its typed failure. After the
   window, the retry attaches to the rerun, which holds the business id.
+- History retention shorter than the claim window can delete a run while its
+  key is live. The claim then dangles, and a retry starts a new run. Its
+  activities run again. Keep the retention age longer than the window.
+- R20 covers the route's own logs. Engine logs are outside the route. For
+  example, the engine logs a concurrency key, which can come from the input.
 
 ---
 
@@ -374,8 +381,8 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | AC-60 | A cycle in a chain answers `result-unavailable`. | `chain_walk_stops_at_a_cycle` |
 | AC-61 | A codec error in the snapshot, the wait or the successor read answers `result-unavailable`. Another read error answers pending. | `chain_walk_maps_read_errors` |
 | AC-62 | Only a wait takes a permit. A finished chain, a full cap or a zero budget never waits, and a wait returns its permit. | `chain_walk_takes_a_permit_only_to_wait` |
-| AC-63 | The schema log holds the count and at most five field paths, never a message. The quota log holds no quota key. | `start_error_logs_hold_no_input_values` |
-| AC-64 | The span records the workflow, the route, the creation flag, the execution id and the outcome. No route log holds the key, the scope or the input. The route's setup log and the engine's setup log name their cause. | `send_logs_hold_no_key_scope_or_input`, `durable_route_logs_hold_no_key_scope_or_input` |
+| AC-63 | The schema log holds only the violation count, never a message or a field path. The quota log holds no quota key. | `start_error_logs_hold_no_input_values` |
+| AC-64 | The span records the workflow, the route, the creation flag, the execution id and the outcome. No route log holds the key, the scope or the input. The route's setup log and the engine's setup log name their cause. A serializer error never reaches a log. | `send_logs_hold_no_key_scope_or_input`, `durable_route_logs_hold_no_key_scope_or_input` |
 | AC-65 | Under Autumn's layer with an `Authorization` header, the route warns once. | `layer_with_authorization_warns_once` |
 | AC-66 | The outcome accessors expose the kind, the status, the execution id, the replay flag and the output. A missing output decodes from `null`. | `outcome_accessors_expose_the_result` |
 | AC-67 | The status column of the docs table matches the code for each problem slug. | `status_table_statuses_match_the_code` |
@@ -396,3 +403,6 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | AC-82 | Erasing the first run of a chain keeps the final output, and the id header still names the first run. | `erasing_the_first_run_of_a_chain_keeps_the_final_output` |
 | AC-83 | A durable run has no Harvest tenant, records the `transactional` start source, and its task holds no trace from the request. | `durable_runs_have_no_tenant_and_record_the_transactional_source` |
 | AC-84 | The CI manifest runs the docs guards on all OSes and the Postgres suite on Linux. | `ci_manifest_lists_both_durable_route_suites` |
+| AC-85 | An erased run answers a final `410` whatever its end: cancelled, terminated, timed out, failed with no mapping, failed with an unmapped class, or failed with a mapped class, with or without details. | `erased_runs_answer_410_whatever_their_end` |
+| AC-86 | A client input equal to the erasure tombstone does not make a run read as erased. | `a_tombstone_input_does_not_read_as_erased` |
+| AC-87 | The erasure marker comes from the live retry attempt. Erasing only the first attempt keeps the answer, and erasing the live attempt answers `410`. | `erasure_is_read_from_the_live_retry_attempt` |
