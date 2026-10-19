@@ -63,11 +63,8 @@ forbidden:thread::spawn
 forbidden:tokio::spawn
 forbidden:try_select
 reduction:all
-reduction:contains
 reduction:contains@HashSet
 reduction:contains_key@HashMap
-reduction:count
-reduction:fold
 reduction:get_mut@HashMap
 reduction:index@HashMap
 reduction:insert@HashSet

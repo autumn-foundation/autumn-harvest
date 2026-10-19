@@ -1102,6 +1102,33 @@ async fn an_abandoned_claim_is_recovered() {
     assert!(events.contains(&done), "{events:?}");
 }
 
+/// The nightly seed of issue #2217 converges.
+///
+/// Worker `w1.1` abandons the first decision task of `s2` at step 73. Only
+/// the reclaimer requeues it. The weighted draw ran no reclaimer pass in
+/// the 400 drain steps, so the run did not converge.
+#[tokio::test]
+async fn the_drain_phase_reclaims_an_abandoned_decision() {
+    const SEED: u64 = 52_000_000_302;
+    let harness = Harness::new().await;
+    let config = WorldConfig::new(SEED);
+    let report = world::run(&config, harness.world(&config).await).await;
+    assert_eq!(report.violation, None, "{}", report.trace_tail(TAIL_LINES));
+    assert!(report.converged, "{}", report.trace_tail(TAIL_LINES));
+    let drain_requeue = report.trace.iter().any(|line| {
+        let step: usize = line[..4].parse().expect("a step number");
+        let requeued = line.split_once("reclaimer pass -> requeued ");
+        let rows = requeued.and_then(|(_, rows)| rows.parse::<u64>().ok());
+        step >= config.fault_steps && rows.is_some_and(|rows| rows > 0)
+    });
+    assert!(
+        drain_requeue,
+        "no drain pass requeued a row. If the planner changed, pick a seed \
+         that abandons a claim late in the fault phase.\n{}",
+        report.trace.join("\n")
+    );
+}
+
 /// Two runs of one seed, each on a fresh database, give equal reports.
 #[tokio::test]
 async fn a_world_seed_runs_twice_with_equal_traces() {

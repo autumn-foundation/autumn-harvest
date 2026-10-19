@@ -1235,8 +1235,8 @@ impl WorkflowEvent {
             | Self::TimerFired { .. }
             | Self::TimerStarted { .. }
             | Self::UpdateFailed { .. }
-            | Self::WorkflowCancelRequested { .. }
             | Self::WorkflowCancelled { .. }
+            | Self::WorkflowCancelRequested { .. }
             | Self::WorkflowExecutionPaused { .. }
             | Self::WorkflowExecutionResumed { .. }
             | Self::WorkflowExecutionTimedOut { .. }
@@ -1244,7 +1244,8 @@ impl WorkflowEvent {
             | Self::WorkflowRedriven { .. }
             | Self::WorkflowResetFork { .. }
             | Self::WorkflowResetTerminated { .. }
-            | Self::WorkflowRetryScheduled { .. } => None,
+            | Self::WorkflowRetryScheduled { .. }
+            | Self::WorkflowCancelRequested { .. } => None,
         }
     }
 
@@ -1337,6 +1338,7 @@ impl WorkflowEvent {
                 named("value", key, PayloadSlot::Required(value))
             }
             Self::WorkflowCancelled { .. }
+            | Self::WorkflowCancelRequested { .. }
             | Self::ActivityStarted { .. }
             | Self::ActivityTimedOut { .. }
             | Self::TimerStarted { .. }
@@ -1363,8 +1365,8 @@ impl WorkflowEvent {
             | Self::ExternalAwaitRequested { .. }
             | Self::MutexGranted { .. }
             | Self::DecisionCommitted { .. }
-            | Self::WorkflowCancelRequested { .. }
-            | Self::WorkflowForked { .. } => None,
+            | Self::WorkflowForked { .. }
+            | Self::WorkflowCancelRequested { .. } => None,
         }
     }
 }

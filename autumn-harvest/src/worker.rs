@@ -18471,6 +18471,10 @@ async fn handle_session_acquire(
     .map(Some)
 }
 
+/// How long a drop release waits before it checks again for a live member of
+/// its session (issue #2193).
+const SESSION_DROP_RELEASE_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 /// Handle the internal session-release activity (issue #606), dispatched by
 /// [`crate::context::Session::complete`] and hard-pinned to the session's
 /// host worker. A dropped [`crate::context::Session`] dispatches the same
@@ -18478,6 +18482,11 @@ async fn handle_session_acquire(
 ///
 /// Marks the `harvest_sessions` row `COMPLETED` and frees the in-process
 /// slot before completing the task normally.
+///
+/// A drop release first checks for a member task of the session that is
+/// still `PENDING` or `RUNNING`. If one exists, the release goes back to the
+/// queue for [`SESSION_DROP_RELEASE_RETRY_DELAY`] and the session keeps its
+/// slot (issue #2193). It returns `Ok(None)`, as any deferral does.
 async fn handle_session_release(
     pool: &DbPool,
     task: &TaskQueueItem,
@@ -18516,6 +18525,39 @@ async fn handle_session_release(
         fail_task_and_execution(&mut conn, task, worker_id, &error, codecs).await?;
         return Err(HarvestError::Config(error));
     };
+
+    // A dropped owner can leave a member task queued or running (issue #2193).
+    // The release must not free the slot while that member can still run, so
+    // it goes back to the queue. The release that `complete()` awaits keeps
+    // its behavior.
+    if best_effort {
+        let live = match queue::session_has_other_live_tasks(
+            &mut conn,
+            exec_id.as_uuid(),
+            session_id.as_uuid(),
+            task.id,
+        )
+        .await
+        {
+            Ok(live) => live,
+            Err(error) if crate::pool::is_transient_db_error(&error) => return Err(error),
+            Err(error) => {
+                return fail_task_only(&mut conn, task.id, &error.to_string())
+                    .await
+                    .map(|()| None);
+            }
+        };
+        if live {
+            defer_unstarted_claim(
+                &mut conn,
+                task,
+                SESSION_DROP_RELEASE_RETRY_DELAY,
+                "session drop-release deferral",
+            )
+            .await?;
+            return Ok(None);
+        }
+    }
 
     if let Err(error) = crate::sessions::record_session_completed(&mut conn, session_id).await {
         // A transient failure (issue #1788) wrote nothing. Return it, and the
