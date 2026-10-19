@@ -17,6 +17,10 @@ A claim sorts eligible `PENDING` rows by these keys:
    (`priority_aging_secs`).
 3. The claim-order due time, oldest first.
 
+A worker with [fairness keys](../fairness-keys.md) on adds one key between 2
+and 3: the fairness lag of the row's key (issue #1976). Within one fairness
+key the order above does not change.
+
 The claim-order due time is `scheduled_at`, with one exception. A **new
 start** sorts as if it were due 30 seconds later
 (`queue::NEW_START_HANDICAP_SECS`).

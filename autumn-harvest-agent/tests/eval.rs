@@ -511,7 +511,7 @@ async fn a_recorded_tool_failure_fails_the_candidate_at_the_same_call() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_turn_over_the_worker_result_cap_fails_as_in_production() {
+async fn a_turn_over_the_worker_result_cap_ends_as_in_production() {
     let source = one_lookup().await;
     let long = "x".repeat(2_000);
     let model = ScriptedModel::new(vec![
@@ -524,15 +524,62 @@ async fn a_turn_over_the_worker_result_cap_fails_as_in_production() {
         .await
         .unwrap();
 
-    let RunEnd::Failed(error) = &evaluation.candidate else {
-        panic!("the oversized turn fails: {:?}", evaluation.candidate);
+    // A worker drops the reply and ends the run under a named stop (issue
+    // #2040). It does not fail the activity.
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!(
+            "the oversized turn ends the run: {:?}",
+            evaluation.candidate
+        );
     };
-    assert!(error.contains("PayloadTooLarge"), "{error}");
+    assert_eq!(report.stop, AgentStop::ReplyTooLarge);
     assert!(evaluation.end_diverged);
+    // The dropped reply is a divergence, not an empty reworded answer.
     assert_eq!(
         evaluation.turns[1].verdict,
-        Verdict::Diverged(Divergence::Missing(Side::Candidate))
+        Verdict::Diverged(Divergence::Stop)
     );
+}
+
+/// A worker records the turn with the call ids the provider gave. The
+/// evaluation gives a call that differs from the recorded one a new, longer
+/// id. The cap must still measure the provider ids (issue #2040).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_worker_result_cap_measures_the_ids_the_provider_gave() {
+    let source = one_lookup().await;
+    let request: autumn_harvest_agent::ModelTurnRequest = source
+        .iter()
+        .find_map(|event| match event {
+            WorkflowEvent::ActivityScheduled { name, input, .. } if name == "agent_model_turn" => {
+                Some(serde_json::from_value(input.clone()).unwrap())
+            }
+            _ => None,
+        })
+        .expect("the source asks the model");
+    // The candidate asks for another call than the source, so its id changes.
+    let replies = || {
+        vec![
+            calls(&[("c1", "lookup", json!({"q": "y"}))], 5),
+            answer("done", 5),
+        ]
+    };
+    let (harness, _) = candidate(ScriptedModel::new(replies()));
+    let turn = harness.model_turn(request).await.unwrap();
+    let as_recorded = autumn_harvest_agent::bounds::json_len(&turn);
+
+    for (cap, stop) in [
+        (as_recorded, AgentStop::Completed),
+        (as_recorded - 1, AgentStop::ReplyTooLarge),
+    ] {
+        let (harness, _) = candidate(ScriptedModel::new(replies()));
+        let evaluation = evaluate(&source, &Candidate::new(harness.max_result_bytes(cap)))
+            .await
+            .unwrap();
+        let RunEnd::Completed(report) = &evaluation.candidate else {
+            panic!("the candidate ends: {:?}", evaluation.candidate);
+        };
+        assert_eq!(report.stop, stop, "cap {cap}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1179,5 +1226,383 @@ async fn each_segment_sees_its_recorded_memory_snapshot() {
     assert!(
         blocks.iter().all(|block| block.entries.is_empty()),
         "the memory write never runs live"
+    );
+}
+
+/// A delegation run evaluates with no roster on the candidate: the recorded
+/// peer lookup answers it (agent mesh, AC13).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delegation_run_evaluates_without_divergence() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    let (_dir, db) = fresh_db();
+    let script = || {
+        vec![
+            calls(
+                &[(
+                    "d1",
+                    DELEGATE_TOOL,
+                    json!({"agent": "researcher", "task": "dig"}),
+                )],
+                1,
+            ),
+            answer("dug", 1),
+            answer("done", 1),
+        ]
+    };
+    let harness = AgentHarness::new(ScriptedModel::new(script()))
+        .peer(Peer::new("researcher", "Finds facts."));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("go").mandate(Mandate::new("planner").peers(["researcher"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+
+    let model = ScriptedModel::new(script());
+    let evaluation = evaluate(&source, &Candidate::new(AgentHarness::new(model.clone())))
+        .await
+        .unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(evaluation.turns.len(), 3);
+    assert_eq!(model.calls(), 3);
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    assert_eq!(report.delegations.len(), 1);
+}
+
+/// In a delegation run, a recorded tool outcome answers only an equal call of
+/// the same agent (agent mesh, AC13).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_call_takes_the_outcome_of_the_same_agent() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer, ToolContext};
+
+    let whoami = || {
+        FnTool::with_context(
+            "whoami",
+            "Name the run.",
+            json!({"type": "object"}),
+            |_input, ctx: ToolContext| async move { Ok(json!(ctx.run_id.as_str())) },
+        )
+        .effect(ToolEffect::ReadOnly)
+        .shared()
+    };
+    let script = || {
+        vec![
+            calls(&[("c1", "whoami", json!({}))], 1),
+            calls(
+                &[(
+                    "d1",
+                    DELEGATE_TOOL,
+                    json!({"agent": "researcher", "task": "who?"}),
+                )],
+                1,
+            ),
+            calls(&[("c1", "whoami", json!({}))], 1),
+            answer("child", 1),
+            answer("parent", 1),
+        ]
+    };
+    let (_dir, db) = fresh_db();
+    let harness = AgentHarness::new(ScriptedModel::new(script()))
+        .tool(whoami())
+        .peer(Peer::new("researcher", "Finds facts."));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("go").mandate(Mandate::new("planner").peers(["researcher"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+
+    // The candidate parent skips its own call. Without lanes, the child call
+    // would take the parent outcome, which has the same step, name and
+    // arguments.
+    let model = ScriptedModel::new(script().split_off(1));
+    let harness = AgentHarness::new(model.clone()).tool(whoami());
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert_eq!(evaluation.replayed_tool_calls, 1);
+    assert_eq!(evaluation.stubbed_tool_calls, 0);
+    // The second child request carries the replayed outcome.
+    let child = &model.requests()[2];
+    let result = child
+        .messages
+        .last()
+        .and_then(|message| {
+            message.content.iter().find_map(|part| match part {
+                ContentPart::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+        })
+        .expect("the child reads its tool result");
+    assert!(
+        result.contains(":d1"),
+        "the child gets its own outcome: {result}"
+    );
+}
+
+/// A nested and a refused delegation evaluate with no roster on the
+/// candidate (agent mesh, AC13).
+#[tokio::test(flavor = "multi_thread")]
+async fn nested_and_refused_delegations_evaluate_without_divergence() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    let delegate = |id: &str, agent: &str| {
+        calls(
+            &[(id, DELEGATE_TOOL, json!({"agent": agent, "task": "go"}))],
+            1,
+        )
+    };
+    let script = || {
+        vec![
+            delegate("d1", "researcher"),
+            delegate("d2", "critic"),
+            answer("checked", 1),
+            answer("dug", 1),
+            delegate("d3", "ghost"),
+            answer("planned", 1),
+        ]
+    };
+    let (_dir, db) = fresh_db();
+    let harness = AgentHarness::new(ScriptedModel::new(script()))
+        .peer(Peer::new("researcher", "R.").peers(["critic"]))
+        .peer(Peer::new("critic", "C."));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("go").mandate(
+        Mandate::new("planner")
+            .peers(["researcher", "critic", "ghost"])
+            .max_depth(2),
+    );
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+
+    let model = ScriptedModel::new(script());
+    let evaluation = evaluate(&source, &Candidate::new(AgentHarness::new(model.clone())))
+        .await
+        .unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(model.calls(), 6);
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    let RunEnd::Completed(recorded) = &evaluation.recorded else {
+        panic!("the source completes");
+    };
+    // The candidate engine has its own execution id, so compare each record
+    // with the lane of its run id only.
+    let shape = |report: &autumn_harvest_agent::AgentReport| {
+        report
+            .delegations
+            .iter()
+            .map(|record| {
+                (
+                    record.chain.clone(),
+                    record.stop,
+                    record.refusal,
+                    record.usage,
+                    record
+                        .run_id
+                        .as_deref()
+                        .and_then(|id| id.rsplit_once(':'))
+                        .map(|(_, lane)| lane.to_owned()),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(shape(report), shape(recorded));
+    assert_eq!(report.delegations.len(), 3);
+}
+
+/// A recorded approval of a child call never releases a candidate call of
+/// another agent, even at the same round, position and arguments.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_child_approval_never_releases_a_root_call_in_the_candidate() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    let (_dir, db) = fresh_db();
+    let source_model = ScriptedModel::new(vec![
+        calls(
+            &[(
+                "d1",
+                DELEGATE_TOOL,
+                json!({"agent": "researcher", "task": "pay"}),
+            )],
+            1,
+        ),
+        calls(&[("c1", "pay", json!({"amount": 1}))], 1),
+        answer("paid", 1),
+        answer("done", 1),
+    ]);
+    let source_harness = AgentHarness::new(source_model)
+        .tool(recorded_tool(
+            "pay",
+            ToolEffect::Write,
+            &Arc::new(Recorder::default()),
+        ))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .peer(Peer::new("researcher", "R."));
+    let mut rt = runtime(&db, source_harness);
+    let task = AgentTask::new("go").mandate(Mandate::new("planner").peers(["researcher"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the child pay waits");
+    };
+    assert_eq!(signal, "tool_approval:1:0:c1");
+    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+
+    // The candidate root does not delegate. Its second turn makes the same
+    // call as the recorded child, in the same tool slot of the tree.
+    let (harness, _recorder, _model) = gated_candidate(vec![
+        calls(&[("x0", "lookup", json!({}))], 1),
+        calls(&[("x1", "pay", json!({"amount": 1}))], 1),
+        answer("finished", 1),
+    ]);
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    let results = tool_results(report);
+    assert!(
+        results[1].contains("no approval arrived"),
+        "the child approval must not release the root call: {results:?}"
+    );
+}
+
+/// A source that failed for good at its peer lookup fails the candidate at
+/// the same lookup. No model call runs past it (agent mesh, AC13).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recorded_lookup_failure_fails_the_candidate_at_the_same_lookup() {
+    use autumn_harvest_agent::Mandate;
+
+    let task = AgentTask::new("go").mandate(Mandate::new("planner").peers(["researcher"]));
+    let mut source = record(&task, vec![answer("done", 1)]).await;
+    let lookup = source
+        .iter()
+        .position(|event| {
+            matches!(event, WorkflowEvent::ActivityScheduled { name, .. }
+                if name == "agent_discover_peers")
+        })
+        .unwrap();
+    let WorkflowEvent::ActivityScheduled { activity_id, .. } = source[lookup].clone() else {
+        unreachable!();
+    };
+    let completed = source
+        .iter()
+        .position(|event| {
+            matches!(event, WorkflowEvent::ActivityCompleted { activity_id: id, .. }
+                if *id == activity_id)
+        })
+        .unwrap();
+    source.truncate(completed);
+    source.push(WorkflowEvent::ActivityFailed {
+        activity_id,
+        error: "no agent harness is registered".into(),
+        attempt: 3,
+        error_type: "Error".into(),
+        non_retryable: true,
+        details: None,
+    });
+    source.push(WorkflowEvent::WorkflowFailed {
+        error: "no agent harness is registered".into(),
+        error_type: None,
+        details: None,
+        non_retryable: None,
+    });
+    let model = ScriptedModel::new(vec![answer("done", 1)]);
+    let (harness, _) = candidate(model.clone());
+
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert!(
+        matches!(evaluation.candidate, RunEnd::Failed(_)),
+        "the candidate fails at the lookup: {:?}",
+        evaluation.candidate
+    );
+    assert_eq!(model.calls(), 0, "no model call runs past the failure");
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+}
+
+/// Two peers can hold the same delegation ordinal. A recorded approval and
+/// outcome of one peer never answer a call of the other (agent mesh, AC13).
+#[tokio::test(flavor = "multi_thread")]
+async fn another_peer_at_the_same_ordinal_takes_no_recorded_approval() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    let delegate_to = |peer: &str| {
+        calls(
+            &[("d1", DELEGATE_TOOL, json!({"agent": peer, "task": "pay"}))],
+            1,
+        )
+    };
+    let (_dir, db) = fresh_db();
+    let source_model = ScriptedModel::new(vec![
+        delegate_to("researcher"),
+        calls(&[("c1", "pay", json!({"amount": 1}))], 1),
+        answer("paid", 1),
+        answer("done", 1),
+    ]);
+    let source_harness = AgentHarness::new(source_model)
+        .tool(recorded_tool(
+            "pay",
+            ToolEffect::Write,
+            &Arc::new(Recorder::default()),
+        ))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .peer(Peer::new("researcher", "R."))
+        .peer(Peer::new("critic", "C."));
+    let mut rt = runtime(&db, source_harness);
+    let task =
+        AgentTask::new("go").mandate(Mandate::new("planner").peers(["researcher", "critic"]));
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the researcher pay waits");
+    };
+    assert_eq!(signal, "tool_approval:1:0:c1");
+    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+
+    // The candidate asks critic instead. Critic runs as `:d1` too, and makes
+    // the same call in the same slot.
+    let (harness, _recorder, model) = gated_candidate(vec![
+        delegate_to("critic"),
+        calls(&[("x1", "pay", json!({"amount": 1}))], 1),
+        answer("paid", 1),
+        answer("done", 1),
+    ]);
+    let evaluation = evaluate(&source, &Candidate::new(harness)).await.unwrap();
+
+    assert!(
+        matches!(evaluation.candidate, RunEnd::Completed(_)),
+        "{:?}",
+        evaluation.candidate
+    );
+    assert_eq!(
+        evaluation.replayed_tool_calls, 0,
+        "researcher's outcome must not answer critic: {evaluation:#?}"
+    );
+    let after_pay = format!("{:?}", model.requests()[2].messages.last());
+    assert!(
+        after_pay.contains("no approval arrived"),
+        "researcher's approval must not release critic's call: {after_pay}"
     );
 }

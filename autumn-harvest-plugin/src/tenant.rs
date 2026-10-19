@@ -317,12 +317,38 @@ fn declared_tenant(request: &Request) -> Result<Option<String>, ()> {
     Ok(Some(value.to_string()))
 }
 
+/// Marks a request that the outer binding layer has already handled.
+///
+/// Only this crate can build it, so an embedder cannot forge it.
+#[derive(Clone, Copy)]
+struct BindingApplied;
+
+/// The binding layer that `harvest_api_router` installs (issue #2076).
+///
+/// A mount through [`apply_admin_auth_layers`](crate::api) already ran the
+/// outer copy, so this copy skips. A raw mount has no outer copy, so this one
+/// does the work.
+///
+/// The skip assumes that no layer between the two copies sets `VerifiedTenant`
+/// or `TokenPrincipal`. Keep it so.
+pub(crate) async fn enforce_tenant_binding_once(
+    State(api_state): State<HarvestApiState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.extensions().get::<BindingApplied>().is_some() {
+        return next.run(request).await;
+    }
+    enforce_tenant_binding(State(api_state), request, next).await
+}
+
 /// The tenant binding layer (issue #1977). See the module docs.
 pub(crate) async fn enforce_tenant_binding(
     State(api_state): State<HarvestApiState>,
     mut request: Request,
     next: Next,
 ) -> Response {
+    request.extensions_mut().insert(BindingApplied);
     if *request.method() == Method::OPTIONS {
         return next.run(request).await;
     }
@@ -623,6 +649,42 @@ mod tests {
         );
         assert!(verified_tenant(&request_with(Some("acme"), Some("globex"))).is_err());
         assert!(verified_tenant(&request_with(Some("a b"), None)).is_err());
+    }
+
+    /// The inner copy skips after the outer copy ran (issue #2076). The route
+    /// is not tenant-scoped, so a copy that does not skip answers `403`.
+    #[tokio::test]
+    async fn the_inner_binding_skips_only_after_the_outer_copy() {
+        use tower::ServiceExt as _;
+        let api_state = HarvestApiState::new();
+        let app = |marked: bool| {
+            axum::Router::new()
+                .route("/workflows", axum::routing::get(|| async { "ran" }))
+                .layer(axum::middleware::from_fn_with_state(
+                    api_state.clone(),
+                    enforce_tenant_binding_once,
+                ))
+                .layer(axum::middleware::from_fn(
+                    move |mut request: Request, next: Next| async move {
+                        request
+                            .extensions_mut()
+                            .insert(VerifiedTenant::new("acme").unwrap());
+                        if marked {
+                            request.extensions_mut().insert(BindingApplied);
+                        }
+                        next.run(request).await
+                    },
+                ))
+        };
+        let call = |marked: bool| {
+            let request = Request::builder()
+                .uri("/workflows")
+                .body(Body::empty())
+                .unwrap();
+            app(marked).oneshot(request)
+        };
+        assert_eq!(call(true).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(call(false).await.unwrap().status(), StatusCode::FORBIDDEN);
     }
 
     #[cfg(feature = "mcp")]

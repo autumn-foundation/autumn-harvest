@@ -20,8 +20,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # `flock` for the per-database daemon lock. The kernel releases the lock when
 # the holder dies, so a crashed daemon strands nothing.
 rustix = { version = "1", features = ["fs", "process"] }
-# A second, READ-ONLY connection for the inspector queries the runtime does not
-# expose. The version matches the one the backend links, so there is one SQLite.
+# A second, READ-ONLY connection for the event, timer, signal and task reads the
+# backend does not list. Executions are read through `SqliteReader` (issue
+# #2027). The version matches the one the backend links, so there is one SQLite.
 rusqlite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -158,16 +158,25 @@ Two attribution details:
 - `GET /dead-letters/aggregate` is unchanged: `failure_signature` groups over
   the stored (possibly ciphertext) error first-line. Counts and ids remain
   correct; signatures on an encrypted deployment group by ciphertext shape.
-- With column encoding on (issue #1979), the engine writes envelopes into
-  the execution `input`/`output`/`memo` columns, signal payloads,
-  dead-letter inputs and workflow task rows. The surfaces above decode them under the same rules. A
+- With column encoding on (issue #1979, issue #2043), the engine writes
+  envelopes into the covered columns. These include the execution
+  `input`, `output` and `memo`, signal payloads, dead-letter inputs and task
+  rows. The surfaces above decode them under the same rules. A
   non-admin caller, and the undecoded list surfaces, see the envelopes. See
   the column coverage table in `docs/security-posture.md`.
+- The schedule API and the UI show the stored envelope for a schedule input
+  (issue #2043). A history export decodes context headers only when the caller
+  may decode. Without that, the export document carries no headers.
 - A column write can wrap the whole value in one envelope: the column codec,
   or an identity escape while the switch is off. A column read removes that
   layer first, then applies the walk below. So a decoded column shows the
   same value with the switch off or on, and the same value as a row written
   before issue #1979.
+- The walk runs twice on a column: once for the column layer, once for the
+  value inside. A business value that is itself an envelope therefore decodes
+  on an admin read (issue #2054). The strict engine read returns it as
+  written. The difference is intended. A row from before issue #1979 has no
+  column layer, and its nested envelopes must still decode.
 - Because the walk is envelope-driven, business data stored as plaintext that
   happens to be byte-for-byte a codec envelope — at any nesting depth — is
   transformed on the decoded view: decoded when its `codec_id` is registered,

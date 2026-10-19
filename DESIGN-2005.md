@@ -130,8 +130,8 @@ route behind the existing `mcp` cargo feature.
 
 - `notifications/tasks` and `subscriptions/listen`. Polling is enough, and
   the spec makes push optional.
-- An update wait as `input_required`. The engine does not run an admitted
-  update yet (issue #2035), and no history marks a wait for one.
+- An update wait as `input_required`. No history marks a wait for an
+  update.
 - A `tasks/list`. The spec removed it.
 - A reset fork. The task does not follow it. A reset of a live run reads
   `cancelled`. A failed or timed-out run keeps that end, from history.

@@ -19,6 +19,11 @@
 //! A run has two phases. The fault phase can stall or crash a worker. The
 //! drain phase injects no fault, and it ends when all work is complete.
 //! [`WorldInvariant::Converges`] fails a run whose work does not finish.
+//!
+//! `Converges` is a liveness property, so it holds only under a fair
+//! scheduler. The drain phase is weakly fair (issue #2217). An action that
+//! stays enabled for [`FAIR_STEPS`] steps without a run is overdue. Each
+//! step runs the overdue action that waited longest, with no draw.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -30,6 +35,13 @@ use crate::event::WorkflowEvent;
 
 /// The length of one clock tick, in seconds: one day.
 pub const TICK_SECS: u64 = 86_400;
+
+/// In the drain phase, an action that stays enabled this many steps without
+/// a run is overdue.
+///
+/// Overdue actions run one per step. With `k` enabled actions, a wait is
+/// thus at most `FAIR_STEPS + k - 1` steps.
+pub const FAIR_STEPS: usize = 60;
 
 /// The planted defect: `none` (the default) or `foreign-state`.
 pub const PLANT_VAR: &str = "HARVEST_DST_WORLD_PLANT";
@@ -240,7 +252,7 @@ impl WorldConfig {
 }
 
 /// One action of one actor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum WorldAction {
     /// Move the clock one tick forward.
     Advance,
@@ -822,6 +834,8 @@ struct Driver<'a, W> {
     held: Vec<bool>,
     fired_slots: BTreeSet<u64>,
     seen: BTreeMap<String, Seen>,
+    /// The step from which each enabled action waits for a run.
+    waiting: BTreeMap<WorldAction, usize>,
     report: WorldReport,
 }
 
@@ -844,6 +858,7 @@ impl<'a, W: World> Driver<'a, W> {
             held: vec![false; config.schedulers],
             fired_slots: BTreeSet::new(),
             seen: BTreeMap::new(),
+            waiting: BTreeMap::new(),
             report: WorldReport {
                 config: config.clone(),
                 trace: Vec::new(),
@@ -882,7 +897,7 @@ impl<'a, W: World> Driver<'a, W> {
         if self.report.violation.is_none() && !self.report.converged {
             self.report.converged = self.done();
             if !self.report.converged {
-                let detail = format!("work remains after {limit} steps");
+                let detail = format!("work remains after {limit} steps: {}", self.remaining());
                 self.fail(vec![(WorldInvariant::Converges, detail)]);
             }
         }
@@ -903,6 +918,34 @@ impl<'a, W: World> Driver<'a, W> {
                 .executions
                 .iter()
                 .all(|exec| !ACTIVE_STATES.contains(&exec.status.as_str()) && !exec.blocked)
+    }
+
+    /// The work that keeps [`Self::done`] false, as a comma list.
+    fn remaining(&self) -> String {
+        let last = &self.report.last;
+        let mut open: Vec<String> = last
+            .executions
+            .iter()
+            .filter(|exec| ACTIVE_STATES.contains(&exec.status.as_str()) || exec.blocked)
+            .map(|exec| {
+                let blocked = if exec.blocked { " blocked" } else { "" };
+                format!("{} {}{blocked}", exec.label, exec.status)
+            })
+            .collect();
+        let unsent = self
+            .signalled
+            .iter()
+            .enumerate()
+            .filter(|(_, sent)| !**sent);
+        open.extend(unsent.map(|(i, _)| format!("signal c{i}")));
+        if !last.schedules_done {
+            open.push("schedule".to_string());
+        }
+        let started = last.executions.len();
+        if started < self.config.workflows {
+            open.push(format!("{started} of {} executions", self.config.workflows));
+        }
+        open.join(", ")
     }
 
     fn worker_id(&self, w: usize) -> String {
@@ -960,9 +1003,46 @@ impl<'a, W: World> Driver<'a, W> {
     fn choose(&mut self) -> WorldAction {
         self.wake_stalled();
         let actions = self.enabled();
+        self.track_waits(&actions);
+        let action = self
+            .overdue(&actions)
+            .unwrap_or_else(|| self.draw(&actions));
+        self.waiting.remove(&action);
+        action
+    }
+
+    /// Start the wait of each newly enabled action. Drop each disabled one.
+    fn track_waits(&mut self, actions: &[(u64, WorldAction)]) {
+        let enabled: BTreeSet<WorldAction> = actions.iter().map(|(_, action)| *action).collect();
+        self.waiting.retain(|action, _| enabled.contains(action));
+        for action in enabled {
+            self.waiting.entry(action).or_insert(self.step);
+        }
+    }
+
+    /// In the drain phase, the action that waited longest, if it waited
+    /// [`FAIR_STEPS`] steps. A tie goes to the first action in `actions`.
+    ///
+    /// A weighted draw alone can skip a rare action for the whole drain. In
+    /// issue #2217, a drain of 400 steps ran no reclaimer pass. This rule
+    /// needs no draw, so a run with no overdue action keeps its trace.
+    fn overdue(&self, actions: &[(u64, WorldAction)]) -> Option<WorldAction> {
+        if !self.draining() {
+            return None;
+        }
+        actions
+            .iter()
+            .filter_map(|(_, action)| Some((*action, *self.waiting.get(action)?)))
+            .filter(|(_, since)| self.step - since >= FAIR_STEPS)
+            .min_by_key(|(_, since)| *since)
+            .map(|(action, _)| action)
+    }
+
+    /// One weighted draw from `actions`.
+    fn draw(&mut self, actions: &[(u64, WorldAction)]) -> WorldAction {
         let total: u64 = actions.iter().map(|(weight, _)| weight).sum();
         let mut pick = self.rng.below(total);
-        for (weight, action) in actions {
+        for &(weight, action) in actions {
             if pick < weight {
                 return action;
             }
@@ -1250,4 +1330,87 @@ fn check_exec(exec: &ExecFacts, ticks: &[u64], first_new: usize) -> Vec<(WorldIn
         }
     }
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A world in which every action takes effect and no work exists.
+    struct Empty;
+
+    impl World for Empty {
+        fn apply(&mut self, _action: WorldAction, _now_tick: u64) -> impl Future<Output = Effect> {
+            std::future::ready(Effect::Done)
+        }
+
+        fn snapshot(&mut self) -> impl Future<Output = Snapshot> {
+            std::future::ready(Snapshot::default())
+        }
+    }
+
+    const ACTIONS: [(u64, WorldAction); 3] = [
+        (W_ADVANCE, WorldAction::Advance),
+        (W_RECLAIM, WorldAction::Reclaim),
+        (W_SWEEP, WorldAction::Sweep),
+    ];
+
+    /// A config whose drain starts at step `fault_steps`.
+    fn config(fault_steps: usize) -> WorldConfig {
+        WorldConfig {
+            fault_steps,
+            ..WorldConfig::new(0)
+        }
+    }
+
+    /// A driver at `step` whose `ACTIONS` wait from step 0.
+    fn waiting_from_zero(config: &WorldConfig, step: usize) -> Driver<'_, Empty> {
+        let mut driver = Driver::new(config, Empty);
+        driver.track_waits(&ACTIONS);
+        driver.step = step;
+        driver
+    }
+
+    #[test]
+    fn an_action_is_overdue_at_fair_steps_and_not_before() {
+        let drain = config(0);
+        let early = waiting_from_zero(&drain, FAIR_STEPS - 1);
+        assert_eq!(early.overdue(&ACTIONS), None);
+        // Equal waits go to the first action in the list.
+        let due = waiting_from_zero(&drain, FAIR_STEPS);
+        assert_eq!(due.overdue(&ACTIONS), Some(WorldAction::Advance));
+    }
+
+    #[test]
+    fn the_fault_phase_forces_no_action() {
+        let fault = config(10 * FAIR_STEPS);
+        let driver = waiting_from_zero(&fault, 2 * FAIR_STEPS);
+        assert_eq!(driver.overdue(&ACTIONS), None);
+    }
+
+    #[test]
+    fn the_longest_wait_runs_first_and_a_run_ends_the_wait() {
+        let drain = config(0);
+        let mut driver = Driver::new(&drain, Empty);
+        driver.track_waits(&ACTIONS[1..]);
+        driver.step = 5;
+        driver.track_waits(&ACTIONS);
+        driver.step = FAIR_STEPS + 5;
+        assert_eq!(driver.overdue(&ACTIONS), Some(WorldAction::Reclaim));
+
+        driver.waiting.remove(&WorldAction::Reclaim);
+        driver.track_waits(&ACTIONS);
+        assert_eq!(driver.overdue(&ACTIONS), Some(WorldAction::Sweep));
+        assert_eq!(driver.waiting[&WorldAction::Reclaim], FAIR_STEPS + 5);
+    }
+
+    #[test]
+    fn a_disabled_action_starts_a_new_wait() {
+        let drain = config(0);
+        let mut driver = waiting_from_zero(&drain, FAIR_STEPS);
+        driver.track_waits(&ACTIONS[..1]);
+        driver.track_waits(&ACTIONS);
+        assert_eq!(driver.overdue(&ACTIONS), Some(WorldAction::Advance));
+        assert_eq!(driver.waiting[&WorldAction::Sweep], FAIR_STEPS);
+    }
 }

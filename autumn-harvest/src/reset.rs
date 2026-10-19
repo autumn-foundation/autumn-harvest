@@ -417,6 +417,27 @@ pub enum WorkflowResetError {
          tombstones, so a fork would resume on unreadable state"
     )]
     ErasedSource { exec_id: ExecutionId },
+    /// The source is a fork (issue #2000), and its lineage cannot be proven
+    /// free of erasure. An ancestor is gone or sealed by a shard migration, or
+    /// the lineage is too deep to walk. A reset makes another descendant of
+    /// that lineage, so it fails closed, as a fork does.
+    #[error("the fork lineage of workflow execution {exec_id} cannot be checked: {reason}")]
+    ForkLineage {
+        exec_id: ExecutionId,
+        reason: String,
+    },
+    /// A reset of a fork (issue #2000) would store a history at or past a
+    /// worker history cap. The new run could not run one workflow task, so
+    /// the reset is refused and the source is not sealed.
+    #[error("the reset would store {observed} history {measure}, which reaches the cap of {cap}")]
+    HistoryCapReached {
+        /// The capped measure: `events` or `bytes`.
+        measure: &'static str,
+        /// The prospective value of the measure.
+        observed: u64,
+        /// The cap.
+        cap: u64,
+    },
     /// An underlying storage or database error occurred during the reset operation.
     #[error(transparent)]
     Harvest(#[from] HarvestError),
@@ -750,6 +771,8 @@ pub async fn preview_workflow_reset(
     validate_source_execution(exec_id, &execution, request.allow_terminal_source)?;
     // A preview must return the refusal that the reset returns (issue #1999).
     reject_if_source_erased(exec_id, &execution)?;
+    // The same holds for the fork lineage of a fork (issue #2000).
+    reject_unclean_fork_lineage(conn, exec_id, &execution).await?;
     // A reset while the source holds a durable mutex would phantom-grant the
     // lock to the fork; surface that in the preview so the operator sees the
     // same rejection the actual reset would return (issue #691).
@@ -814,6 +837,10 @@ pub async fn reset_workflow_execution(
             // The refusal also keeps tombstoned node outputs out of an
             // `input_from` binding (issue #702).
             reject_if_source_erased(exec_id, &source)?;
+            // A reset of a fork makes another descendant of its lineage (issue
+            // #2000). It walks the lineage as a fork does, under the same
+            // locks, so an erased ancestor refuses it too.
+            reject_unclean_fork_lineage(conn, exec_id, &source).await?;
 
             let rows = load_event_rows(conn, exec_id).await?;
             let events = decode_events(&rows)?;
@@ -851,9 +878,57 @@ pub async fn reset_workflow_execution(
                 ),
             )
             .await?;
-            let fork = insert_fork_execution(conn, &source, new_exec_id).await?;
+            let fork = insert_fork_execution(
+                conn,
+                &source,
+                new_exec_id,
+                registry.map_or(
+                    &crate::store::DEFAULT_PAYLOAD_CODECS,
+                    HandlerRegistry::payload_codecs,
+                ),
+            )
+            .await?;
             copy_carried_events(conn, new_exec_id, &rows, reset_event_id).await?;
-            append_fork_marker(conn, new_exec_id, exec_id, &request, &plan).await?;
+            share_carried_refs(
+                conn,
+                (exec_id, new_exec_id),
+                &rows,
+                &source,
+                reset_event_id,
+                registry,
+            )
+            .await?;
+            // A reset of a fork keeps the effects mode of that fork (issue
+            // #2000). The carried prefix can hold an ancestor marker with
+            // another mode, so the reset appends its own last marker.
+            // Its overrides count only after that marker, so the reset copies
+            // them there, byte for byte.
+            let fork_mode = crate::fork::is_fork(&source).then(|| {
+                crate::fork::fork_marker(&events)
+                    .unwrap_or((exec_id, crate::fork::ForkEffects::Recorded))
+            });
+            let override_rows: Vec<&HarvestEvent> = if fork_mode.is_some() {
+                crate::fork::own_override_indices(&events)
+                    .into_iter()
+                    .map(|index| &rows[index])
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            append_fork_marker(
+                conn,
+                new_exec_id,
+                exec_id,
+                &request,
+                &plan,
+                fork_mode,
+                &override_rows,
+            )
+            .await?;
+            if fork_mode.is_some() {
+                reject_capped_fork_reset(conn, registry, &source.workflow_name, new_exec_id)
+                    .await?;
+            }
 
             let source_tasks_cancelled = queue::cancel_open_tasks_for_execution(
                 conn,
@@ -866,7 +941,15 @@ pub async fn reset_workflow_execution(
             let signals_buffered =
                 reapply_or_drop_signals(conn, exec_id, new_exec_id, request.signal_reapply).await?;
 
-            enqueue_fork_workflow_task(conn, &fork, new_exec_id, registry).await?;
+            enqueue_fork_workflow_task(
+                conn,
+                &fork,
+                source.quota_key.as_deref(),
+                new_exec_id,
+                registry,
+                false,
+            )
+            .await?;
 
             Ok((
                 ResetResult {
@@ -1056,6 +1139,55 @@ pub fn batch_skip_reason(error: &WorkflowResetError) -> ResetSkipReason {
     }
 }
 
+/// Refuse a reset of a fork whose stored history reaches a worker cap.
+///
+/// The reset copies the overrides of the fork again, after its own markers.
+/// So the new history can reach a cap that the fork stayed under. The check
+/// runs before commit, so a refusal rolls back the seal of the source.
+async fn reject_capped_fork_reset(
+    conn: &mut AsyncPgConnection,
+    registry: Option<&HandlerRegistry>,
+    workflow_name: &str,
+    new_exec_id: ExecutionId,
+) -> Result<(), WorkflowResetError> {
+    match crate::fork::check_stored_history(conn, registry, workflow_name, new_exec_id, None).await
+    {
+        Ok(()) => Ok(()),
+        Err(crate::fork::WorkflowForkError::HistoryCapReached {
+            measure,
+            observed,
+            cap,
+        }) => Err(WorkflowResetError::HistoryCapReached {
+            measure,
+            observed,
+            cap,
+        }),
+        Err(crate::fork::WorkflowForkError::Harvest(error)) => Err(error.into()),
+        Err(other) => Err(HarvestError::Database(other.to_string()).into()),
+    }
+}
+
+/// Refuse a fork whose lineage reaches an erased run, or cannot be walked.
+///
+/// An erased ancestor maps to [`WorkflowResetError::ErasedSource`] for that
+/// ancestor. A gap, a migration seal or a lineage past the scan bound maps to
+/// [`WorkflowResetError::ForkLineage`].
+async fn reject_unclean_fork_lineage(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    source: &WorkflowExecution,
+) -> Result<(), WorkflowResetError> {
+    match crate::fork::erased_fork_ancestor(conn, source).await {
+        Ok(None) => Ok(()),
+        Ok(Some(ancestor)) => Err(WorkflowResetError::ErasedSource { exec_id: ancestor }),
+        Err(crate::fork::WorkflowForkError::Harvest(error)) => Err(error.into()),
+        Err(error) => Err(WorkflowResetError::ForkLineage {
+            exec_id,
+            reason: error.to_string(),
+        }),
+    }
+}
+
 /// Refuse a PII-erased source (issue #495).
 ///
 /// Every fork path calls this, with no opt-out (issue #1999). The check is
@@ -1128,6 +1260,13 @@ pub async fn resolve_batch_reset_one(
     if crate::erase::execution_input_is_erased(&execution.input) {
         return Ok(Err(ResetSkipReason::ErasedSource));
     }
+    // A fork whose lineage the reset refuses is skipped with the reason that
+    // the reset reports (issue #2000).
+    match reject_unclean_fork_lineage(conn, exec_id, &execution).await {
+        Ok(()) => {}
+        Err(WorkflowResetError::Harvest(error)) => return Err(error.into()),
+        Err(error) => return Ok(Err(batch_skip_reason(&error))),
+    }
 
     let rows = load_event_rows(conn, exec_id).await?;
     let events = decode_events(&rows)?;
@@ -1182,10 +1321,11 @@ async fn load_source_execution(
     }
 }
 
-async fn load_event_rows(
+/// Load the stored event rows of `exec_id` in `event_id` order.
+pub(crate) async fn load_event_rows(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-) -> Result<Vec<HarvestEvent>, WorkflowResetError> {
+) -> Result<Vec<HarvestEvent>, HarvestError> {
     harvest_events::table
         .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
         .order(harvest_events::event_id.asc())
@@ -1193,7 +1333,6 @@ async fn load_event_rows(
         .load(conn)
         .await
         .map_err(database_error)
-        .map_err(WorkflowResetError::from)
 }
 
 fn decode_events(rows: &[HarvestEvent]) -> Result<Vec<WorkflowEvent>, WorkflowResetError> {
@@ -1366,7 +1505,69 @@ async fn insert_fork_execution(
     conn: &mut AsyncPgConnection,
     source: &WorkflowExecution,
     new_exec_id: ExecutionId,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> Result<WorkflowExecution, WorkflowResetError> {
+    // The fork is a new write: encode a clear legacy `input` and `memo` (issue #2065).
+    let input = codecs.recode_column_for_copy(&source.input)?;
+    let memo = codecs.recode_column_opt_for_copy(source.memo.as_ref())?;
+    insert_fork_row(
+        conn,
+        source,
+        new_exec_id,
+        ForkRow {
+            workflow_id: &source.workflow_id,
+            input,
+            memo,
+            // A reset of a fork stays a fork (issue #2000). With reset
+            // provenance, a recorded fork would run its effects live.
+            start_source: if crate::fork::is_fork(source) {
+                crate::types::StartSource::Fork
+            } else {
+                crate::types::StartSource::Reset
+            },
+            completion_callbacks: source.completion_callbacks.clone(),
+            // The reset keeps the key of its source (issue #1997). The key is
+            // the same value that `quota_reconcile` would backfill from the
+            // same input. Without it the reset would read no tenant LLM spend,
+            // and its ledger rows would never count for the tenant. The copy
+            // needs no workflow registry, so a reset from an API-only process
+            // keeps it too.
+            quota_key: source.quota_key.as_deref(),
+            assigned_build_id: source.assigned_build_id.clone(),
+        },
+    )
+    .await
+    .map_err(database_error)
+    .map_err(WorkflowResetError::from)
+}
+
+/// The fields in which a reset fork and a non-destructive fork differ.
+pub(crate) struct ForkRow<'a> {
+    /// A reset keeps the source id. A fork of issue #2000 takes a new id.
+    pub(crate) workflow_id: &'a str,
+    /// The stored input. A fork can replace it.
+    pub(crate) input: Value,
+    /// The stored memo, encoded for the new row (issue #2065).
+    pub(crate) memo: Option<Value>,
+    /// Provenance. `start_source_ref` is always the source id.
+    pub(crate) start_source: crate::types::StartSource,
+    /// A recorded fork drops the targets, so that it sends no notification.
+    pub(crate) completion_callbacks: Option<Value>,
+    /// The quota key of the row. A reset passes the key of its source
+    /// (issue #1997). A fork passes the key of its quota admission (#946).
+    pub(crate) quota_key: Option<&'a str>,
+    /// The build that runs the row. A carried history needs a build that can
+    /// replay it, so a reset keeps the source build.
+    pub(crate) assigned_build_id: Option<String>,
+}
+
+/// Insert the execution row of a fork of `source`.
+pub(crate) async fn insert_fork_row(
+    conn: &mut AsyncPgConnection,
+    source: &WorkflowExecution,
+    new_exec_id: ExecutionId,
+    spec: ForkRow<'_>,
+) -> Result<WorkflowExecution, diesel::result::Error> {
     // Re-compute deadline_at from the source execution's timeout so the fork
     // gets a fresh deadline anchored to its own start time (issue #243).
     let deadline_at = source.execution_timeout.map(|d| chrono::Utc::now() + d);
@@ -1409,19 +1610,19 @@ async fn insert_fork_execution(
         chain_deadline_at,
         id: new_exec_id.as_uuid(),
         workflow_name: &source.workflow_name,
-        workflow_id: &source.workflow_id,
+        workflow_id: spec.workflow_id,
         run_id: Uuid::new_v4(),
         shard_id: source.shard_id,
-        input: source.input.clone().into(),
+        input: spec.input.into(),
         parent_id: None,
         queue_name: &source.queue_name,
         execution_timeout: source.execution_timeout,
         deadline_at,
         sla: source.sla,
         sla_deadline_at,
-        memo: source.memo.clone(),
+        memo: spec.memo,
         search_attrs: fork_search_attrs,
-        assigned_build_id: source.assigned_build_id.clone(),
+        assigned_build_id: spec.assigned_build_id,
         parent_close_policy: None, // reset fork is a fresh root execution
         owner: source.owner.as_deref(),
         runbook_url: source.runbook_url.as_deref(),
@@ -1437,14 +1638,14 @@ async fn insert_fork_execution(
         retry_of_exec_id: None,
         // Reset fork is an operator intervention, not a schedule fire (issue #534).
         origin: None,
-        // Inherit the source's completion-callback targets (issue #605): the
-        // fork continues the same logical run, so its terminal notification
-        // targets should too.
-        completion_callbacks: source.completion_callbacks.clone(),
+        // A reset fork inherits the completion-callback targets (issue #605).
+        // It continues the same logical run, so its terminal notification
+        // targets do too. A recorded fork of issue #2000 drops them.
+        completion_callbacks: spec.completion_callbacks,
         // A reset fork has its OWN provenance (issue #740 AC3) — it is an
         // operator intervention, never re-attributed to the source's source.
         // Ref is the source execution id.
-        start_source: Some(crate::types::StartSource::Reset.as_str()),
+        start_source: Some(spec.start_source.as_str()),
         start_source_ref: Some(source_exec_id_str.as_str()),
         started_by: None,
         // A reset fork is an operator intervention that bypasses every other
@@ -1452,13 +1653,12 @@ async fn insert_fork_execution(
         // enforcement) -- issue #946 AC3 scopes quota enforcement to
         // registry-aware *start* paths (plain start, signal-/update-with-start,
         // batch, schedule tick/backfill, debounce/throttle fires), which does
-        // not include reset. `None` here keeps the fork invisible to quota
-        // accounting rather than silently double-counting it against
-        // whatever key its original admission resolved: `load_quota_usage`'s
-        // `WHERE quota_key = $2` never matches NULL, and `list_quota_usage`
-        // filters `WHERE quota_key IS NOT NULL`, so a reset fork neither
-        // consumes headroom nor is blocked by one.
-        quota_key: None,
+        // not include reset. The fork is never refused here.
+        //
+        // `spec.quota_key` carries the key. A reset keeps the key of its
+        // source (issue #1997). A fork of issue #2000 passes the key of its
+        // own admission.
+        quota_key: spec.quota_key,
         // A reset fork belongs to the tenant of its source (issue #1977).
         tenant: source.tenant.as_deref(),
     };
@@ -1468,8 +1668,6 @@ async fn insert_fork_execution(
         .returning(WorkflowExecution::as_returning())
         .get_result(conn)
         .await
-        .map_err(database_error)
-        .map_err(WorkflowResetError::from)
 }
 
 #[derive(Insertable)]
@@ -1479,6 +1677,73 @@ struct NewHarvestEventOwned {
     event_id: i32,
     event_type: String,
     event_data: Value,
+}
+
+/// Give the reset its own reference to each blob that its copied history names.
+///
+/// The prefix rows and the kept input are copied byte for byte, envelopes
+/// included. The reset seals its source, and retention of that source drops
+/// its references. Without its own reference, the blob goes with them (issue
+/// #2000). A codec can hide a stored result in a payload field, so the keys
+/// also come from the decoded prefix.
+async fn share_carried_refs(
+    conn: &mut AsyncPgConnection,
+    ids: (ExecutionId, ExecutionId),
+    source_rows: &[HarvestEvent],
+    source: &WorkflowExecution,
+    reset_to_event_id: i64,
+    registry: Option<&HandlerRegistry>,
+) -> Result<(), WorkflowResetError> {
+    let codecs: &crate::payload_codec::PayloadCodecs = registry.map_or(
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+        HandlerRegistry::payload_codecs,
+    );
+    let carried = source_rows
+        .iter()
+        .filter(|row| i64::from(row.event_id) <= reset_to_event_id);
+    let copied = carried
+        .clone()
+        .map(|row| row.event_data.clone())
+        .collect::<Vec<_>>();
+    let decoded = decode_carried_checked(carried, codecs)?;
+    crate::fork::share_payload_refs(conn, ids, &copied, Some(&source.input), &decoded, &[]).await?;
+    Ok(())
+}
+
+/// Decode the carried rows for their stored-result keys.
+///
+/// Only an activity result can hold a fan-out stored result. Its key sits
+/// in a payload field, so a codec can hide it. A reset that cannot decode
+/// such a row would take no reference to the blob, and retention of the
+/// sealed source could collect it. So that row fails the reset. A codec
+/// that the node does not hold either fails the decode or leaves the
+/// envelope in place, so both fail it. The API passes no registry before
+/// start-up ends, so a retry after start-up succeeds. Any other row that
+/// cannot be decoded still names its envelopes, so it is skipped.
+fn decode_carried_checked<'a>(
+    rows: impl Iterator<Item = &'a HarvestEvent>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> Result<Vec<WorkflowEvent>, HarvestError> {
+    let mut decoded = Vec::new();
+    for row in rows {
+        let event = match codecs.decode_event(row.event_data.clone()) {
+            Ok(event) => event,
+            Err(error) if row.event_type == "ActivityCompleted" => return Err(error),
+            Err(_) => continue,
+        };
+        // A codec that this node does not hold leaves the envelope in place.
+        if let WorkflowEvent::ActivityCompleted { output, .. } = &event
+            && crate::payload_codec::is_codec_envelope(output)
+        {
+            return Err(HarvestError::Config(format!(
+                "event {} holds an activity result that this node cannot decode; \
+                 retry the reset on a node with the payload codecs",
+                row.event_id
+            )));
+        }
+        decoded.push(event);
+    }
+    Ok(decoded)
 }
 
 async fn copy_carried_events(
@@ -1516,21 +1781,57 @@ async fn append_fork_marker(
     source_exec_id: ExecutionId,
     request: &WorkflowResetRequest,
     plan: &ResetPlan,
+    // The record source and effects mode of a fork source (issue #2000).
+    fork_mode: Option<(ExecutionId, crate::fork::ForkEffects)>,
+    // The override rows of that fork, copied after its new marker.
+    override_rows: &[&HarvestEvent],
 ) -> Result<(), WorkflowResetError> {
     let marker_event_id = i32::try_from(plan.events_carried_over)
         .map_err(|_| HarvestError::Database("reset carried too many events".to_string()))?;
-    crate::store::append_events(
-        conn,
-        new_exec_id,
-        &[WorkflowEvent::WorkflowResetFork {
-            reset_from_exec_id: source_exec_id,
-            reset_to_event_id: request.reset_to_event_id.unwrap_or(0),
+    let reset_to_event_id = request.reset_to_event_id.unwrap_or(0);
+    let mut markers = vec![WorkflowEvent::WorkflowResetFork {
+        reset_from_exec_id: source_exec_id,
+        reset_to_event_id,
+        reason: request.reason.clone(),
+        operator_id: request.operator_id.clone(),
+    }];
+    if let Some((forked_from_exec_id, effects)) = fork_mode {
+        markers.push(WorkflowEvent::WorkflowForked {
+            forked_from_exec_id,
+            fork_event_id: reset_to_event_id,
+            effects,
             reason: request.reason.clone(),
             operator_id: request.operator_id.clone(),
-        }],
-        marker_event_id,
-    )
-    .await?;
+        });
+    }
+    crate::store::append_events(conn, new_exec_id, &markers, marker_event_id).await?;
+    if override_rows.is_empty() {
+        return Ok(());
+    }
+    let first_override_id = marker_event_id
+        .checked_add(i32::try_from(markers.len()).unwrap_or(i32::MAX))
+        .ok_or_else(|| HarvestError::Database("reset event id overflow".to_string()))?;
+    let copies = override_rows
+        .iter()
+        .zip(first_override_id..)
+        .map(|(row, event_id)| NewHarvestEventOwned {
+            workflow_exec_id: new_exec_id.as_uuid(),
+            event_id,
+            event_type: row.event_type.clone(),
+            event_data: row.event_data.clone(),
+        })
+        .collect::<Vec<_>>();
+    diesel::insert_into(harvest_events::table)
+        .values(&copies)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+    // An override output can be an offload envelope. The reset needs its own
+    // reference, or retention of the sealed fork can collect the blob.
+    let named = crate::fork::envelope_keys(override_rows.iter().map(|row| &row.event_data));
+    let refs = crate::store::load_payload_refs(conn, source_exec_id).await?;
+    crate::store::insert_payload_refs(conn, new_exec_id, &crate::fork::refs_named_in(refs, &named))
+        .await?;
     Ok(())
 }
 
@@ -1650,12 +1951,21 @@ async fn reapply_or_drop_signals(
     Ok(signals.len())
 }
 
-async fn enqueue_fork_workflow_task(
+/// Enqueue the first workflow task of a fork.
+///
+/// `new_start` marks the task as a fresh admission in the claim order (issue
+/// #1824). A non-destructive fork is one. A reset continues admitted work.
+pub(crate) async fn enqueue_fork_workflow_task(
     conn: &mut AsyncPgConnection,
     fork: &WorkflowExecution,
+    // The quota key of the new run. It is also its fairness key (issue
+    // #1976). A reset keeps the key of its source, and a fork passes the key
+    // of its own admission.
+    quota_key: Option<&str>,
     new_exec_id: ExecutionId,
     registry: Option<&HandlerRegistry>,
-) -> Result<(), WorkflowResetError> {
+    new_start: bool,
+) -> Result<(), HarvestError> {
     // The fork row holds the source's stored input, which may be an envelope
     // (issue #1979). The concurrency key needs the plaintext. The task stores
     // the input encoded or not, as the switch says. A process with no codec
@@ -1672,6 +1982,8 @@ async fn enqueue_fork_workflow_task(
     let mut enqueue = EnqueueParams::new(fork.queue_name.clone(), TaskType::Workflow, task_input);
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
     enqueue.required_build_id = fork.assigned_build_id.clone();
+    enqueue.new_start = new_start;
+    enqueue.fairness_key = crate::queue_fairness::fairness_key_for(None, quota_key);
     if let Some(reg) = registry
         && let Some(input) = &decoded
         && let Some(info) = reg.workflows.get(&fork.workflow_name)
@@ -1686,7 +1998,7 @@ async fn enqueue_fork_workflow_task(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use chrono::Utc;
     use serde_json::Value;
 
@@ -1698,7 +2010,42 @@ mod tests {
         validate_source_execution,
     };
 
-    fn execution_in_state(state: &str) -> crate::models::WorkflowExecution {
+    /// A carried row with a keyed codec envelope that the codecs cannot open.
+    fn encoded_row(event_type: &str, field: &str) -> crate::models::HarvestEvent {
+        let envelope = serde_json::json!({
+            crate::payload_codec::CODEC_ENVELOPE_KEY: {
+                "codec_id": "aes",
+                "data": "AAAA",
+                crate::payload_codec::CODEC_ENVELOPE_KID_KEY: "k1",
+            },
+        });
+        assert!(crate::payload_codec::is_codec_envelope(&envelope));
+        crate::models::HarvestEvent {
+            id: 1,
+            workflow_exec_id: uuid::Uuid::new_v4(),
+            event_id: 1,
+            event_type: event_type.to_string(),
+            event_data: serde_json::json!({
+                "type": event_type,
+                "data": { "activity_id": uuid::Uuid::new_v4(), "signal_name": "go", field: envelope },
+            }),
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// A stored result can hide in an encoded activity output. A reset that
+    /// cannot decode one would take no reference to its blob, so it fails.
+    /// Another row that this node cannot decode does not refuse the reset.
+    #[test]
+    fn a_reset_refuses_an_activity_result_it_cannot_decode() {
+        let codecs = &*crate::store::DEFAULT_PAYLOAD_CODECS;
+        let result = encoded_row("ActivityCompleted", "output");
+        assert!(super::decode_carried_checked([&result].into_iter(), codecs).is_err());
+        let signal = encoded_row("SignalReceived", "payload");
+        assert!(super::decode_carried_checked([&signal].into_iter(), codecs).is_ok());
+    }
+
+    pub fn execution_in_state(state: &str) -> crate::models::WorkflowExecution {
         crate::models::WorkflowExecution {
             migrated_to_shard: None,
             migrated_at: None,

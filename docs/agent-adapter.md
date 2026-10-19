@@ -74,9 +74,9 @@ if let RunState::WaitingSignal(signal) = rt.run_until_blocked(exec).await? {
 let state = rt.run_until_blocked(exec).await?;
 ```
 
-The SQLite backend runs a synchronous activity body. `sqlite::register`
-runs each async body with `block_in_place`, so use a multi-thread Tokio
-runtime.
+The SQLite backend has no shared-state registry, so `sqlite::register`
+captures the harness in synchronous closures. Each closure runs its async
+body with `block_in_place`, so use a multi-thread Tokio runtime.
 
 ## 3. Run it on Postgres
 
@@ -100,18 +100,27 @@ let built = HarvestBuilder::new()
 
 `workflows()` returns `agent_loop` and `agent_heartbeat`. `activities()`
 returns `agent_model_turn`, `agent_tool_call`, `agent_memory_snapshot`,
-`agent_deliver` and `agent_precheck`. The test
+`agent_deliver`, `agent_precheck` and `agent_discover_peers`. The test
 `the_engine_registration_builds` builds this exact registration.
 
 Start a run under the name `agent_loop` with an `AgentTask` as input. To
-decide on a gated call, send a signal to the run. Build the name with
-`approval::approval_signal(step, position, call_id)` from the recorded
-`ModelTurn`, and send a serialised `Approval` as the payload. A worker with
+decide on a gated call, send a signal to the run, with a serialised
+`Approval` as the payload. Read the signal name from the wait: the
+deadline timer of the wait is `__signal_timeout:<seq>:<signal name>`. On
+SQLite, `RunState::WaitingSignal` holds the name. For a run with no
+delegation, `approval::approval_signal(step, position, call_id)` also builds
+it from the recorded `ModelTurn`. A worker with
 no harness fails the call as `AgentHarnessMissing`, which is not retryable.
 
 A worker with a payload cap other than the default must say so. Set
 `AgentTask::max_request_bytes` to its activity-input cap, and
-`AgentHarness::max_result_bytes` to its activity-result cap.
+`AgentHarness::max_result_bytes` to its activity-result cap. A cap of zero
+means no cap, as in the engine.
+
+A worker with a payload store offloads an input or a result over the store
+threshold. The engine then skips its cap for that value. The adapter does not
+see the store, so it still applies its own caps. Set both caps to zero for such
+a worker. Otherwise the adapter ends a run that the store could carry.
 
 ## 4. Build the harness
 
@@ -128,10 +137,12 @@ A worker with a payload cap other than the default must say so. Set
 - `tool_output_limit(chars)` — the cap on one tool result. The default is
   8 000 characters.
 - `max_result_bytes(bytes)` — the activity-result cap of the workers. A
-  larger tool result is cut to fit it. The default is the engine default.
+  larger tool result is cut to fit it. A model reply that does not fit ends
+  the run as `reply_too_large`. The default is the engine default. Zero is
+  no cap.
 - `model_timeout(d)` — the time budget of one model call. The default is
-  13 minutes. With the policy budget, it stays below the 15-minute
-  `start_to_close`. A call over it is a
+  13 minutes. With the policy, cache and ledger budgets, it stays below the
+  15-minute `start_to_close`. A call over it is a
   retryable failure.
 - `tool_timeout(d)` — the time budget of one tool call. The default is
   9 minutes, below the 10-minute `start_to_close`. A call over it is an
@@ -141,25 +152,53 @@ A worker with a payload cap other than the default must say so. Set
   ends is denied, and the decision is recorded.
 - `hook_timeout(d)` — the time budget of one memory read, delivery or
   precheck. The default is 30 seconds.
+- `cache_timeout(d)` — the time budget of one response-cache call. The
+  default is 5 seconds.
+- `budget_timeout(d)` — the time budget of the LLM budget check of one
+  turn (issue #1997). The default is 10 seconds. A check over it is a
+  retryable failure, before the model call.
 - `memory(store)` — the `MemoryStore` for runs with a memory scope.
 - `delivery(delivery)` — where reports go. The default is `LogDelivery`.
 - `precheck(precheck)` — the cheap check that can skip a heartbeat tick.
+- `response_cache(cache)` — serve an identical model call across runs.
+  Section 11 explains it.
 
 The names `memory` and `schedule_followup` belong to the built-in tools.
 When a built-in is active, it hides an app tool with the same name. With a
 memory store installed, `memory` is always reserved, even in a run that gets
-no memory tool.
+no memory tool. In a run with a mandate, `delegate` is reserved too. See
+[agent mesh](agent-mesh.md).
 
 A tool error is cut to fit the result cap too, so a huge error message
 cannot fail the run.
 
+### The cost ledger
+
+On Postgres, each model turn writes one row to the
+[agent cost ledger](llm-cost-ledger.md) (issue #1996). The row holds the
+model id, the tokens, the cost and the call latency. It is outside the
+encrypted turn output, so the usage report can sum it per tenant. Two
+`AgentModel` methods fill it in:
+
+- `model_id()` — the model id, which the response cache also keys on. The
+  default is `None`. The ledger stores the id in clear, so do not put PII
+  in it. It takes a token of ASCII letters, digits and `._:/@+-`, and
+  records `None` or any other id as `"unknown"`.
+- `cost_usd_micros(usage)` — the cost of one call, in millionths of a US
+  dollar. The default is `None`, which counts the call as unpriced.
+
+A response cache hit calls no model and spends no tokens, so it writes no
+ledger row.
+
 `AgentTask` sets the run. Its bounds are `max_steps` (default 8, per
 segment), `max_total_tokens` (per run), `max_output_tokens`,
 `approval_timeout` (default one hour, rounded up to whole seconds) and
-`max_request_bytes` (default: the engine default). Its content is `input`,
-`system`, `history` and `session`. Section 10 explains the always-on
-settings: `deliver`, `memory`, `followups`, `loop_guard`, `read_only`,
-`unattended` and `unattended_memory_writes`.
+`max_request_bytes` (the default is the engine default; zero is no cap). Its
+content is `input`,
+`system`, `history` and `session`. `tenant` scopes the response cache.
+Section 10 explains the always-on settings: `deliver`, `memory`,
+`followups`, `loop_guard`, `read_only`, `unattended` and
+`unattended_memory_writes`.
 
 The loop drops a system message inside `history`. Only `system` reaches
 the model as the prompt.
@@ -167,7 +206,9 @@ the model as the prompt.
 ## 5. Approvals
 
 A call that the policy answers with `RequireApproval` waits on one signal.
-The name is `tool_approval:<step>:<position>:<call_id>`.
+The name is `tool_approval:<round>:<position>:<call_id>`. `round` counts the
+tool rounds of the whole run tree. With no delegation, it is the step of the
+run.
 `approval::approval_call_id` reads the call id back from a name.
 
 | Decision | Effect |
@@ -221,13 +262,16 @@ A bound is a normal end, not an error. `AgentReport.stop` names it:
 | `output_capped` | The last turn hit the output cap. Its tool calls do not run. |
 | `steps_exhausted` | The model asked for tools after `max_steps` rounds. |
 | `tokens_exhausted` | The run spent more than `max_total_tokens`, follow-ups included. |
-| `transcript_full` | The next request, or the results of one round, could not fit the request cap. The request was not sent. |
+| `transcript_full` | The next request would exceed the request cap. The request is not sent. |
+| `reply_too_large` | The model reply exceeds the result cap, even with its decision reasons cut. The activity drops the reply. |
+| `budget_exceeded` | A run or tenant LLM budget refused the next model call. The call was not sent. See [LLM budgets](#llm-budgets-issue-1997). |
 | `loop_detected` | The loop guard saw the same call, with the same result, too many times. |
 
 A turn that ends the run before its tool calls run is left out of
-`AgentReport.messages`. Its text is not the answer either. A round whose
-results pass the request cap stays in the transcript: each call that did not
-fit gets an error result, so the transcript shows what ran.
+`AgentReport.messages`. Its text is not the answer either. A round that ends
+the run as `transcript_full` stays in the transcript. Each call that did not
+run, or whose result did not fit, gets an error result, so the transcript
+shows what ran. The text of that turn is not the answer either.
 
 A `transcript_full` transcript is too large for one request. Do not pass it
 whole as the `history` of a new run. Summarise it, or keep its last turns.
@@ -242,12 +286,117 @@ reads.
 The run fails when a model call fails for good: a non-retryable kind, for
 example a rejected API key, or four failed attempts.
 
+### Payload caps (issue #2040)
+
+A tool round measures the whole next request before it runs a call. The
+request holds the transcript, the assistant turn and an answer for each call.
+The round reserves a placeholder answer for each call. It replaces the
+placeholder with the real result.
+
+- When the placeholders exceed the request cap, no call runs. No result can
+  reach the model, so no call with a side effect runs. The run ends as
+  `transcript_full`.
+- The round drops a result that exceeds the cap. The call ran. The calls
+  after it do not run. The run ends as `transcript_full`.
+
+The measure covers the result text and the flow state that this turn can
+add. A delegation adds the labels and usage of its child, which the round
+cannot know in advance. The loop measures the next request again before it
+sends it. It ends the run as `transcript_full` if that request exceeds the
+cap.
+
+A task recorded before this rule measures the results alone, so a run in
+flight replays as it ran. Such a task also reads a zero request cap as a limit
+of zero bytes, as it did. `AgentTask::new` and `HeartbeatTask::new` turn the
+new rule on. A recorded tick keeps the flag in `HeartbeatTask`.
+
+The model-turn activity fits its reply to the result cap:
+
+1. It cuts each decision reason to 256 bytes. It does this only when the
+   turn exceeds the cap.
+2. When the reply still exceeds the cap, the activity returns a turn with
+   `oversized` set and no content. The run ends as `reply_too_large`. The
+   activity logs a warning with the sizes.
+
+The report keeps the usage of the paid call. The reply is not in
+`AgentReport.messages`. A result cap of 256 bytes or more always holds the
+`oversized` turn. A smaller cap can still fail the activity with
+`PayloadTooLarge`.
+
+A cap of zero is no cap, as in the engine. This holds for
+`AgentTask::max_request_bytes` and `AgentHarness::max_result_bytes`, in every
+check above.
+
+### LLM budgets (issue #1997)
+
+`max_total_tokens` bounds one run inside the workflow. A budget on the
+Postgres engine also bounds a tenant across runs, and it can bound cost.
+
+Each model turn checks the budget before the call. The budget sums the
+[cost ledger](#the-cost-ledger) rows of the run and of its tenant. The cost
+caps are in millionths of a US dollar, as `cost_usd_micros` is. An unpriced
+call adds no cost, so only the token caps apply to it. Price the cache
+counts in `cost_usd_micros` if your provider bills them at another rate.
+
+The ledger writes the calls of a completed attempt only. A call in an
+attempt that fails or times out is not counted, even when the provider
+charges for it.
+
+The budget counts `input_tokens` plus `output_tokens`. `input_tokens` must
+count the whole prompt, cached tokens included. Some providers report the
+cached tokens apart, so add them to `input_tokens` in your `AgentModel`.
+
+A response cache hit calls no model. It spends no tokens and records no
+row. The budget check still runs before the cache lookup, so a spent cap
+refuses a turn that the cache could answer.
+
+A failed spend read retries the turn, and uses one of its four attempts.
+The turn calls no model before the check passes, so the retry pays nothing.
+
+Declare the caps on `agent_loop`, and set the tenant on each task:
+
+```rust
+use autumn_harvest::builder::HarvestBuilder;
+use autumn_harvest::quota::QuotaPolicy;
+use autumn_harvest_agent::AgentTask;
+use autumn_harvest_agent::workflow::{activities, agent_loop_info};
+
+let budget = QuotaPolicy::new("tenant")
+    .with_max_run_llm_tokens(200_000)
+    .with_max_tenant_llm_cost_usd_micros(50_000_000) // 50 US dollars a day
+    .with_tenant_llm_window_secs(86_400);
+let built = HarvestBuilder::new()
+    .workflows(vec![agent_loop_info().with_quota(budget)])
+    .activities(activities())
+    .state(harness)
+    .build();
+
+let task = AgentTask::new("Summarise the ticket.").tenant("acme");
+```
+
+Register `agent_loop` with its policy on every worker that runs
+`agent_model_turn`. The check reads the policy in its own process. A worker
+without it does not enforce the budget, and logs one warning.
+
+A spent cap refuses the next model turn. The adapter does not send the call,
+and the run ends under `budget_exceeded`. Three limits apply:
+
+- The cap is soft. The last turn that passes the check can pass the cap by
+  its whole usage. Runs of one tenant at the same time can pass it
+  together.
+- A task with no `tenant` has no tenant budget. Its run caps still apply.
+- The budget reads `AgentTask::tenant` as the task gives it. It does not
+  read the verified tenant (#1977), as the response cache does.
+- The SQLite backend rejects a workflow that declares `quota`. A budgeted
+  `agent_loop` therefore does not build there.
+
 ## 8. History types
 
 The adapter owns the payloads it records: `AgentTask`, `ModelTurnRequest`,
 `ModelTurn`, `ToolCallRequest`, `ToolOutcome`, `AgentReport`,
 `HeartbeatTask`, `HeartbeatReport`, `Report`, `ReportSource`,
-`MemoryScope`, `Followups` and `LoopGuard`. They hold only types this crate
+`MemoryScope`, `Followups`, `LoopGuard`, `Mandate`, `Peer` and
+`DelegationRecord`. They hold only types this crate
 defines, so the crate owns their serde shape. Replay reads these payloads
 back, so add a field only with `#[serde(default)]`. A new field of an
 activity input also needs `skip_serializing_if` at its default, because a
@@ -263,8 +412,11 @@ strict replay compares each recorded input as it was written.
   list changes only later turns. Recorded turns replay as they were.
 - **A follow-up chain shares one workflow history.** Each segment adds to
   it. Keep `max_chain` low, or start a new run from the report.
-- **The session entity is separate.** It is a sibling issue. Per-step token
-  cost belongs to the agent cost ledger (#1970).
+- **The session entity is separate.** It is a sibling issue.
+- **All agents share the harness model.** A peer cannot choose its own
+  model. See [the agent mesh guide](agent-mesh.md).
+- **The cost ledger needs Postgres.** The SQLite path calls the model
+  directly, with no activity context, so it writes no ledger rows.
 
 ## 10. Always-on agents
 
@@ -323,9 +475,10 @@ A tick is one short workflow:
    `HEARTBEAT_OK` with no other letter or digit.
 
 A tick never books a follow-up. `HeartbeatTask` takes its own budget:
-`max_steps`, `max_total_tokens`, `max_output_tokens` and
-`approval_timeout`. The approval wait defaults to 15 minutes, because the
-schedule starts no new tick while one runs.
+`max_steps`, `max_total_tokens`, `max_output_tokens`, `max_request_bytes`
+and `approval_timeout`. Set `max_request_bytes` to the activity-input cap
+of the workers, as for `AgentTask`. The approval wait defaults to 15
+minutes, because the schedule starts no new tick while one runs.
 
 On Postgres, register the schedule that `heartbeat::schedule` builds:
 
@@ -348,8 +501,9 @@ let built = HarvestBuilder::new()
 
 The engine keeps one schedule per workflow name, so a deployment has one
 heartbeat schedule. For one heartbeat per user, start each tick from the
-app, or let one scheduled workflow start the ticks. SQLite has no
-scheduler: the app calls `sqlite::start_heartbeat` on each tick.
+app, or let one scheduled workflow start the ticks. On SQLite, pass the
+same `heartbeat::schedule` to `SqliteRuntime::upsert_schedule` (issue
+#2031). An app can also call `sqlite::start_heartbeat` on each tick.
 
 ### Follow-ups
 
@@ -365,6 +519,8 @@ a fixed user message that the app controls, which tells the model to act on
 that call.
 
 - The workflow refuses a second follow-up in one segment.
+- The prompt is at most 2 000 characters. The count includes white space,
+  because the transcript keeps the prompt as the model wrote it.
 - The delay is at most the `max_delay` of `Followups::new`. The shortest
   delay is one minute.
 - A chain cap (`Followups::max_chain`, 10 by default) stops an agent that
@@ -386,7 +542,12 @@ the harness. The default `LogDelivery` logs the run id and the size of the
 text, never the text itself.
 
 - A `completed` answer goes out, unless it is empty or a silent heartbeat
-  acknowledgement.
+  acknowledgement. Only the text of the last turn counts. A segment that
+  ends on an empty turn sends nothing, even when an earlier turn wrote
+  text beside a tool call. An empty `output_capped` turn sends only the
+  stop notice. A run recorded before this rule replays as it ran. The
+  workflow records the `agent_final_turn_rules` patch marker to tell them
+  apart. The follow-up length rule uses the same marker.
 - A segment that a bound ended early sends a notice, for example
   `The agent stopped early: loop_detected.`. An unattended run therefore
   does not fail in silence.
@@ -420,9 +581,12 @@ entries are its own notes, not instructions from the user.
 
 Each edit carries an `EditKey`: the run, the step and the call. A store
 applies each key once, so a call that runs again after a crash changes
-nothing, even when another run edited the scope in between. A durable store
-must save the key with the edit, in one transaction. An `add` of an entry
-that already exists changes nothing either.
+nothing, even when another run edited the scope in between. A store keeps
+the first result of a key, an error included, and returns it on a retry. A
+failed `remove` therefore cannot remove a newer entry after a crash. A
+durable store must save the key and its result with the edit, in one
+transaction. An `add` of an entry that already exists changes nothing
+either.
 
 ### Loop guard
 
@@ -438,7 +602,107 @@ The guard is not a cost control. A model that changes its arguments, or a
 tool whose result changes, does not trip it. Use `max_steps`,
 `max_total_tokens` and the chain cap for cost.
 
-## 11. Evaluate a candidate model or prompt
+## 11. Response cache
+
+Replay reads an answer from the history of one run. A second run that sends
+the same request pays again. The response cache (issue #1998) serves that
+request from an earlier answer. It is off by default.
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use autumn_harvest_agent::{AgentHarness, InMemoryCacheIndex, ResponseCache};
+
+// Add the codecs to the builder first. Clones share their keys.
+let codecs = builder.payload_codecs().clone();
+let cache = ResponseCache::new(store, Arc::new(InMemoryCacheIndex::default()), codecs)
+    .max_age(Duration::from_secs(24 * 3600));
+let harness = AgentHarness::new(model).response_cache(cache);
+```
+
+**The key.** The key is a SHA-256 hash of the model id, the output cap, the
+temperature, the tools, the messages, the tenant and its source, and the
+namespace.
+
+**The model id.** A model names itself through `AgentModel::model_id`. A
+model with no id is never cached. The crate ships no model with an id. The
+id must change whenever the answer can change for the same request. Use a
+pinned model version, not an alias such as `latest`. Put each client setting
+that `ChatRequest` does not hold, such as `top_p`, in the id.
+
+**The tenant.** The default scope is `CacheScope::Tenant`. Only runs of the
+same tenant share an entry. Runs with no tenant share only with each other.
+A declared tenant never shares an entry with a verified tenant of the same
+name.
+
+| Backend | Tenant of the key |
+|---------|-------------------|
+| Postgres, run with a verified tenant (#1977) | The verified tenant. `AgentTask::tenant` cannot change it. |
+| Postgres, run with no tenant | `AgentTask::tenant`, as a declared tenant |
+| Postgres, the tenant read fails | No key. The turn skips the cache. |
+| SQLite | `AgentTask::tenant`, as a declared tenant |
+
+`HeartbeatTask::tenant` sets the tenant of each tick. `CacheScope::Shared`
+lets every run share every entry. Use it only for prompts that hold no
+tenant data.
+
+**History.** A hit is the result of `agent_model_turn`. History records it
+like any other answer, with `cache_hit: true` and zero token usage. The
+policy still decides each tool call, and each tool still runs. Replay reads
+history and never reads the cache.
+
+**Tool idempotency.** A hit repeats the tool-call ids of the stored answer.
+Tools take the run id, the step and the call id as an idempotency key. With
+`RunIdSource::WorkflowId`, two runs can share a run id. On Postgres, such a
+turn skips the cache. On SQLite, start each run from `AgentTask::new`, which
+uses the execution id.
+
+**Storage.** The answer goes to your `PayloadStore`, inside a codec
+envelope. Pass a clone of the engine's `PayloadCodecs`, so an active codec
+encrypts each entry. A registry with no active codec stores entries in
+clear. The entry holds the answer and no prompt. Use a store for the cache
+alone, with an expiry of at least `max_age`. Do not put an expiry on the
+store that holds offloaded event payloads.
+
+**The index.** A `CacheIndex` maps each key to its blob. `InMemoryCacheIndex`
+keeps the map in process memory, with a capacity. It loses the map on a
+restart, and each worker has its own map. Implement `CacheIndex` to share
+one map between workers:
+
+- `get` returns the blob key of an entry, if any.
+- `put` stores a blob key, and returns each blob key that no entry holds
+  after the write. The cache deletes those blobs.
+- An index owns its blobs. Do not let a store share one blob between two
+  indexes.
+
+**Faults.** A cache fault, a slow cache or an entry that does not decode is a
+miss with a warning. An out-of-date entry is a quiet miss. The cache never
+fails a turn. Each cache call, the tenant read included, has the
+`cache_timeout` budget: 5 seconds by default. One turn makes at most three
+cache calls. The cache neither stores nor serves a turn over
+`AgentHarness::max_result_bytes`, because a cached turn over the cap would end
+every identical run as `reply_too_large`. A hit over the cap is a miss, and
+the harness asks the model. A codec error is logged with fixed text,
+because a custom codec can quote the answer.
+
+**Limits.**
+
+- A hit repeats one sample. At a high temperature, a second run gets the
+  same answer.
+- `max_age` limits what the cache serves, not what the store keeps. Change
+  `namespace` to make every old entry a miss. The old blobs stay in the store
+  until the index drops them.
+- PII erasure (#495) does not reach the cache. Bound it with `max_age` and a
+  store expiry.
+- Key rotation (#948) does not re-encrypt entries. An entry under a retired
+  key is a miss. Its blob stays until a new answer replaces it or the store
+  expires it.
+- Two runs that miss at the same time both call the model.
+- A run that sets `tenant` records it in each model-turn input. An older
+  binary rebuilds that input without it, so set `tenant` only after the
+  whole fleet runs this release.
+
+## 12. Evaluate a candidate model or prompt
 
 `eval::evaluate` re-drives a recorded `agent_loop` run with a candidate model
 or prompt (issue #2001). It reports where the decisions of the two runs
@@ -463,24 +727,25 @@ change.
 
 | Activity | In an evaluation |
 |---|---|
-| `agent_model_turn` | The candidate model answers, then the candidate policy decides. These are the only live calls. |
+| `agent_model_turn` | The candidate model answers, then the candidate policy decides. These are the only live calls. The response cache is skipped, so every turn asks the candidate. |
 | `agent_tool_call` | The recorded outcome of the same call, or an error stub. No tool runs. |
 | `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
 | `agent_deliver` | A stub. No report leaves the harness. |
+| `agent_discover_peers` | The recorded peers for the same names, or none. The candidate needs no roster. |
 | Any other activity, such as `agent_precheck` | No mock. The candidate run fails. |
 
-A tool or snapshot activity that failed the source fails the candidate at the
-same activity.
+A tool, snapshot or peer-lookup activity that failed the source fails the
+candidate at the same activity.
 
 The policy runs live, so use a policy with no side effects. It sees the
 recorded run id and the aligned call ids. A retryable model failure retries
 under the retry policy of `agent_model_turn`, as on a worker. A turn over the
-harness result cap (`AgentHarness::max_result_bytes`) fails, as on a worker
-with no payload store.
+harness result cap (`AgentHarness::max_result_bytes`) is cut or dropped, as on
+a worker with no payload store. A dropped reply reads as a `stop` divergence.
 
 A recorded outcome answers a call with the same step, tool name and
 arguments. A candidate call that equals the recorded call at the same turn
-and position takes the recorded call id. Approval signal names hold the call
+and position, of the same agent, takes the recorded call id. Approval signal names hold the call
 id, so the recorded approvals stay valid. Any other call gets a new `eval_`
 id, so no recorded approval can release it. The harness sends again only an
 approval for a wait that the source opened, when it arrived before the
@@ -508,10 +773,25 @@ run the evaluation on a multi-thread Tokio runtime.
 The evaluation is an in-memory fork at the first event. The database fork of
 issue #2000 is a separate feature.
 
-## 12. The daemon example
+## 13. The daemon example
 
 `examples/claude-agent-daemon` speaks the Anthropic Messages API and replays
 thinking blocks verbatim, which the provider-neutral `ChatMessage` cannot
 carry. It therefore keeps its own turn activity. It takes three parts from
 this crate: the approval signal names, the durable approval wait
 (`approval::await_decision`), and the payload-cap checks.
+
+`examples/autoresearch` runs `agent_loop` as a child workflow of each
+experiment. It uses a mandate with a reviewer peer, a flow rule, approvals,
+memory, delivery, a heartbeat with a precheck, the response cache and
+`eval`. Its runs share a memory scope, so each run starts with the flow
+labels of the runs before it. Its `edit_train` tool keys each edit on the
+run, the step and the call id. Its `FileCacheIndex` implements `CacheIndex`
+on disk, so a model call whose result a crash lost is not paid twice.
+
+## 14. Agent mesh
+
+A run can delegate a task to a peer agent. The peer runs as a sub-agent
+inside the same workflow, with its own prompt, tools and budget. A mandate
+bounds the delegation tree. Flow rules gate a dangerous sequence of tool
+calls across the tree. Read [`agent-mesh.md`](agent-mesh.md).

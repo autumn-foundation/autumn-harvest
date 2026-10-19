@@ -11,6 +11,10 @@ Issue #2002 adds a second harness, the world simulation. It runs the real
 `worker.rs` poll loop on Postgres. See
 [The world simulation](#the-world-simulation).
 
+Issue #2033 adds a third harness for user workflow code. It runs your
+workflow against seeded delivery orders, with no database. See
+[`workflow-simulation.md`](workflow-simulation.md).
+
 ## What it simulates
 
 The module is `autumn_harvest::dst`. It is test infrastructure, not a
@@ -219,6 +223,16 @@ of reach.
 A run has a fault phase of 120 steps. A drain phase of up to 400 steps
 follows. It has no fault, and it ends when all work is complete.
 
+The drain phase is weakly fair (issue #2217). An action that stays enabled
+for 60 steps (`FAIR_STEPS`) without a run is overdue. Each step runs the
+overdue action that waited longest, with no draw. `Converges` is a liveness
+check, and it needs this rule. A weighted draw alone can skip a rare actor,
+such as the reclaimer, for the whole drain. Seed 52000000302 ran no
+reclaimer pass in its 400 drain steps. Its last open task was a claim of a
+dead worker, and only the reclaimer requeues it.
+
+A `Converges` failure names the work that remains, such as `s2 RUNNING`.
+
 ### The clock
 
 The clock moves in ticks of one day. A shift subtracts an interval from
@@ -379,8 +393,9 @@ A failure prints the replay command. It sets `HARVEST_DST_SEED` and runs
   `kill_at` points can close this gap.
 - The world workload never fails an activity, and its reclaimer never
   quarantines. So it does not reach the quarantine or the `FAILED` state.
-- The scheduler draws actions from fixed weights. Unlike probabilistic
-  concurrency testing (PCT), it does not search for rare interleavings.
+- The scheduler draws actions from fixed weights. The drain adds only a
+  fairness bound. Unlike probabilistic concurrency testing (PCT), it does
+  not search for rare interleavings.
 - The oracle harness does not model the timeout sweeper, the `FAILED`
   state or the poison-pill quarantine. Its reclaimer always requeues, so
   many long runs reach strike counts that production would quarantine. The

@@ -348,7 +348,7 @@ their order. Signals that share one time have no defined order on either run.
   stays on the old run.
 - No TLA+ model, simulator or history check covers signals. No
   infrastructure-fault test sends a signal.
-- The SQLite backend has its own signal limits, for example #2020 and #2028.
+- The SQLite backend has its own signal limits, for example #2028.
 
 ## Bugs these tests found
 
@@ -375,8 +375,9 @@ pins the fix.
 
 ## Limits of this report
 
-- No tool measures test coverage (#1818, open). The report lists the tests
-  that exist. It cannot say which code paths no test reaches.
+- A nightly job measures line and branch coverage (#1818). The report does
+  not cite those numbers, so it cannot say which code paths no test
+  reaches.
 - The chaos suite runs nightly, not on each PR. The `test-db-linux` and
   `test-nodb` jobs run the PR suites, and neither is a required check yet.
 - The thread timing of a DB test is not deterministic. A seed fixes the
@@ -401,8 +402,9 @@ From [`simulation.md`](testing/simulation.md#limits):
   `kill_at` points can close this gap.
 - The world workload never fails an activity, and its reclaimer never
   quarantines. So it does not reach the quarantine or the `FAILED` state.
-- The scheduler draws actions from fixed weights. Unlike probabilistic
-  concurrency testing (PCT), it does not search for rare interleavings.
+- The scheduler draws actions from fixed weights. The drain adds only a
+  fairness bound. Unlike probabilistic concurrency testing (PCT), it does
+  not search for rare interleavings.
 - The oracle harness does not model the timeout sweeper, the `FAILED`
   state or the poison-pill quarantine. Its reclaimer always requeues, so
   many long runs reach strike counts that production would quarantine. The

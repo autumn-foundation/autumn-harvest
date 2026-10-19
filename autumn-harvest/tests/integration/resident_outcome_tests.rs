@@ -40,6 +40,8 @@ type HandlerFuture<'a> =
     Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send + 'a>>;
 
 const ECHO: &str = "resident_outcome_echo";
+const JOIN_ECHO: &str = "resident_outcome_join_echo";
+const TOOL_LOOP_ECHO: &str = "resident_outcome_tool_loop_echo";
 const SEQUENTIAL: &str = "resident_outcome_sequential_wf";
 const MIXED_JOIN: &str = "resident_outcome_mixed_join_wf";
 const ACTIVITY_JOIN: &str = "resident_outcome_activity_join_wf";
@@ -87,6 +89,69 @@ fn echo_activity(_ctx: &ActivityContext, input: Value) -> HandlerFuture<'_> {
     Box::pin(async move { Ok(input) })
 }
 
+/// Releases the activity results of one workflow one at a time.
+///
+/// A result that lands during a decision sets `wake_requested`. That
+/// decision can already hold the result, so the wake then finds no new
+/// event. The resident path declines such a delta by design. It is not a
+/// miss, but the hit count would fail on it.
+///
+/// The gate returns result `n` only after the worker records decision
+/// `n + 1`. Each decision records after it loads its delta. So no decision
+/// holds a result that a later wake also sees.
+struct ResultGate {
+    workflow: &'static str,
+    log: Mutex<Option<Arc<OutcomeLog>>>,
+    tickets: AtomicU64,
+}
+
+impl ResultGate {
+    const fn new(workflow: &'static str) -> Self {
+        Self {
+            workflow,
+            log: Mutex::new(None),
+            tickets: AtomicU64::new(0),
+        }
+    }
+
+    /// Resets the gate for a new run that records into `log`.
+    fn open(&self, log: &Arc<OutcomeLog>) {
+        *self.log.lock().expect("gate lock") = Some(Arc::clone(log));
+        self.tickets.store(0, Ordering::SeqCst);
+    }
+
+    /// Returns `input` when its turn comes, or after 20 seconds.
+    async fn release(&self, input: Value) -> Result<Value, String> {
+        let ticket = self.tickets.fetch_add(1, Ordering::SeqCst);
+        let log = self.log.lock().expect("gate lock").clone();
+        let Some(log) = log else {
+            return Ok(input);
+        };
+        let want = usize::try_from(ticket)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while log.of(self.workflow).len() < want && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(input)
+    }
+}
+
+/// The result gate of `activity_join_workflow`. Only one test runs it.
+static JOIN_GATE: ResultGate = ResultGate::new(ACTIVITY_JOIN);
+
+/// The result gate of `tool_loop_workflow`. Only one test runs it.
+static TOOL_LOOP_GATE: ResultGate = ResultGate::new(TOOL_LOOP);
+
+fn join_echo_activity(_ctx: &ActivityContext, input: Value) -> HandlerFuture<'_> {
+    Box::pin(JOIN_GATE.release(input))
+}
+
+fn tool_loop_echo_activity(_ctx: &ActivityContext, input: Value) -> HandlerFuture<'_> {
+    Box::pin(TOOL_LOOP_GATE.release(input))
+}
+
 /// One activity, then one signal. Each await ends one decision.
 fn sequential_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> {
     Box::pin(async move {
@@ -120,7 +185,8 @@ fn activity_join_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<
     JOIN_BODY_STARTS.fetch_add(1, Ordering::SeqCst);
     Box::pin(async move {
         let queue = input["queue"].as_str().ok_or("missing queue")?;
-        let calls = (0..3).map(|i| ctx.execute_activity_raw(ECHO, json!({ "call": i }), queue));
+        let calls =
+            (0..3).map(|i| ctx.execute_activity_raw(JOIN_ECHO, json!({ "call": i }), queue));
         let results = futures::future::try_join_all(calls)
             .await
             .map_err(|e| e.to_string())?;
@@ -136,11 +202,15 @@ fn tool_loop_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> 
         let mut transcript = Vec::new();
         for round in 0..3 {
             let plan = ctx
-                .execute_activity_raw(ECHO, json!({ "model": round }), queue)
+                .execute_activity_raw(TOOL_LOOP_ECHO, json!({ "model": round }), queue)
                 .await
                 .map_err(|e| e.to_string())?;
             let calls = (0..4).map(|tool| {
-                ctx.execute_activity_raw(ECHO, json!({ "plan": plan, "tool": tool }), queue)
+                ctx.execute_activity_raw(
+                    TOOL_LOOP_ECHO,
+                    json!({ "plan": plan, "tool": tool }),
+                    queue,
+                )
             });
             let results = futures::future::try_join_all(calls)
                 .await
@@ -151,9 +221,9 @@ fn tool_loop_workflow(ctx: &WorkflowContext, input: Value) -> HandlerFuture<'_> 
     })
 }
 
-fn echo_info() -> ActivityInfo {
+fn echo_info(name: &'static str, handler: autumn_harvest::info::ActivityHandlerFn) -> ActivityInfo {
     ActivityInfo {
-        name: ECHO,
+        name,
         module: "resident_outcome_tests",
         default_retry_policy: None,
         default_start_to_close: Some(Duration::from_secs(30)),
@@ -174,7 +244,7 @@ fn echo_info() -> ActivityInfo {
         rate_limit_key_expr: None,
         circuit_breaker: None,
         requires: None,
-        handler: echo_activity,
+        handler,
     }
 }
 
@@ -220,7 +290,11 @@ fn build_worker_with(queue: &str, log: Arc<OutcomeLog>, config: WorkerConfig) ->
             info_for(ACTIVITY_JOIN, activity_join_workflow),
             info_for(TOOL_LOOP, tool_loop_workflow),
         ])
-        .activities(vec![echo_info()])
+        .activities(vec![
+            echo_info(ECHO, echo_activity),
+            echo_info(JOIN_ECHO, join_echo_activity),
+            echo_info(TOOL_LOOP_ECHO, tool_loop_echo_activity),
+        ])
         .telemetry(TelemetryConfig {
             service_name: Arc::from("resident_outcome_tests"),
             propagator: Arc::new(NoOpPropagator),
@@ -299,6 +373,11 @@ async fn start_run_with(
         .expect("connect to test DB");
     let queue = unique_id("resident-outcome-q");
     let log = Arc::new(OutcomeLog::default());
+    for gate in [&JOIN_GATE, &TOOL_LOOP_GATE] {
+        if gate.workflow == workflow_name {
+            gate.open(&log);
+        }
+    }
     let worker = build_worker_with(&queue, Arc::clone(&log), config);
     let handle = spawn(&worker, &pool);
     let exec_id = ExecutionId::new();

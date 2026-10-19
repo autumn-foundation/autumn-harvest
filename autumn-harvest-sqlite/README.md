@@ -33,8 +33,8 @@ you need:
 - **Distributed / multi-worker** execution or **multi-server** crash recovery.
 - **High throughput** — a single writer with `BEGIN IMMEDIATE` is not built for
   a fleet claiming thousands of tasks per second.
-- **`LISTEN`/`NOTIFY` push wake-ups**, schedules, DAGs, the management API,
-  worker sessions, retention, or sharding — all v0.1 non-goals here (see below).
+- **`LISTEN`/`NOTIFY` push wake-ups**, DAGs, the management API, worker
+  sessions, or sharding — all v0.1 non-goals here (see below).
 
 ## Quickstart
 
@@ -51,20 +51,18 @@ async fn process_order(ctx: &WorkflowContext, order: serde_json::Value) -> Resul
     Ok(format!("confirmed: {reservation}"))
 }
 
-// The `#[activity]` async body is a placeholder for the shared `ActivityInfo`;
-// this backend runs a caller-supplied SYNCHRONOUS body registered against it.
+// The `#[activity]` body runs with a real `ActivityContext` (issue #2024). The
+// same fn runs unchanged on the Postgres backend.
 #[activity]
-async fn reserve_inventory(_ctx: &ActivityContext, _order: serde_json::Value) -> Result<String, String> {
-    Ok(String::new())
+async fn reserve_inventory(ctx: &ActivityContext, order: serde_json::Value) -> Result<String, String> {
+    Ok(format!("reserved {order} on attempt {}", ctx.attempt()))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), SqliteError> {
     let mut rt = SqliteRuntime::open_in_memory()?;    // or open("workflows.db") for durability
     rt.register_workflow(&process_order_info());
-    rt.register_activity(&reserve_inventory_info(), |input| {
-        Ok(serde_json::json!(format!("reserved {input}")))
-    });
+    rt.register_activity(&reserve_inventory_info());
 
     let exec = rt.start_workflow("process_order", serde_json::json!({"item": "widget"}))?;
     rt.run_until_idle().await?;                        // drive the polling loop to quiescence
@@ -92,25 +90,67 @@ A complete, runnable version is in
   `LISTEN`/`NOTIFY` you *drive* the runtime: `poll_once` / `run_until_blocked` /
   `run_until_idle` drain all ready work and re-run the workflow until every run
   is terminal or blocked on external input.
+- **Queries (issue #2022).** `rt.query(exec, "name", args).await` calls a
+  handler that `ctx.register_query` registered. It replays the stored history
+  to the run's frontier and writes nothing. A terminal run answers with the
+  state at its recorded end.
+- **List and describe (issue #2027).** `list_executions(&filter)` pages runs
+  newest first. It filters by workflow name, workflow id prefix, state, start
+  time and search attributes. `describe(exec)` reads one run with its
+  payloads. `SqliteReader::open(path)` gives the same reads without the
+  writer. `ctx.upsert_search_attrs` and the memo of
+  `start_workflow_with_options` are stored on the run.
 - **Durability & crash recovery.** All state is in the database. Dropping the
   runtime and re-`open`-ing the same file is a faithful restart: any task left
   `RUNNING` by a crash is reclaimed and the workflow resumes purely by
   deterministic replay. Activity execution is therefore **at-least-once** — write
   activity bodies to be idempotent. See
   [`examples/durability.rs`](examples/durability.rs).
+- **Updates (issue #2025).** `update(exec, name, input)` runs a registered
+  update handler and returns its result. A validator rejection writes no event.
+  An accepted update writes `UpdateAdmitted` and then `UpdateCompleted` or
+  `UpdateFailed`, in one transaction. The handler runs on a separate replay,
+  so state that it writes does not reach the workflow body.
 - **Idempotent starts by default (issue #1068).** `start_workflow_with_id`
   applies the `AllowDuplicate` reuse policy. A duplicate `(workflow_name,
   workflow_id)` **attaches** to the existing, non-sealed run instead of
   starting a second one. The new call's input is discarded. Use
   `start_workflow_with_reuse_policy` for the full `WorkflowIdReusePolicy`
   matrix — reject, replace-if-failed, or terminate-and-restart.
+- **Keyed signals and signal-with-start (issue #2028).**
+  `send_signal_idempotent(exec, name, payload, key)` stages a signal once per
+  key, so a retried webhook is safe. `send_signal_by_workflow_id` signals the
+  running run of a `(workflow_name, workflow_id)` key and refuses a terminal
+  one. `signal_with_start` starts a run and signals it, or signals the run
+  that exists, in one transaction.
+- **Cancel and terminate (issue #2021).** `cancel(exec, reason)` is
+  cooperative. The next drive replays the body with
+  `ctx.cancellation_reason()` set, so the body can run cleanup activities. The
+  run then ends `CANCELLED`. `terminate(exec, reason)` ends the run
+  `TERMINATED` at once. Both record the core `WorkflowCancelled` event, as
+  Postgres does.
 - **Long-lived runs (issue #2023).** `ctx.continue_as_new(input)` seals the
   run `CONTINUED_AS_NEW` and starts a successor with the same `workflow_id`, in
-  one transaction. Undelivered signals move to the successor.
+  one transaction. Replayed signals stay with the old run, as on Postgres. A
+  backlog past the history caps moves to the successor.
   `run_until_blocked` returns `RunState::ContinuedAsNew(successor)`. The #1804
   history caps apply with the Postgres defaults: 50,000 events and 50 MiB per
   run. A run that reaches a cap fails. Its error is `HistoryCapReason` JSON. Change
   the caps with `set_history_event_hard_cap` and `set_history_byte_hard_cap`.
+- **Timers, mutex, local activities, timeout and retry (issue #2029).**
+  `ctx.start_timer` and `TimerHandle` arm, cancel and reset durable timers.
+  `ctx.mutex(key).acquire()` grants a key in FIFO order, and a waiting run
+  returns `RunState::WaitingMutex(key)`. `#[activity(local = true)]` runs
+  inline after its decision commits. `#[workflow(execution_timeout = ..)]` ends a
+  late run `TIMED_OUT`. `#[workflow(retry = ..)]` starts a retry run, which
+  `successor(exec)` returns. Each records the Postgres events.
+- **Schedules, retention and the append-only guard (issue #2031).**
+  `upsert_schedule` stores a core `WorkflowSchedule`. Each `poll_once` pass
+  fires the due slots. A reopen keeps every slot. `purge_terminal(older_than)`
+  removes old terminal runs and keeps live ones. Two triggers keep
+  `harvest_events` append-only, the analog of the Postgres guard of issue
+  #1817. This backend has no sanctioned rewriter, so they refuse every
+  `UPDATE` and an `INSERT OR REPLACE`.
 
 ## v0.1 non-goals
 
@@ -118,12 +158,15 @@ Out of scope for this backend (tracked as issue #1068 follow-ups):
 
 - Distributed / multi-writer workers; multi-server crash recovery.
 - `LISTEN`/`NOTIFY` push wake-ups.
-- Schedules, the management API, DAGs, worker sessions, retention, sharding.
-- Child workflows, external signals/cancels, local activities, updates,
-  search attributes, and a continue-as-new to a different workflow type
-  (`continue_as_new_as_type`) — a workflow reaching one of these is
-  rejected **loudly, by name**, never silently dropped. The run then ends
+- The management API, DAGs, worker sessions, sharding.
+- External activities and a continue-as-new to a different workflow type
+  (`continue_as_new_as_type`) — a workflow reaching one of these is rejected
+  **loudly, by name**, never silently dropped. The run then ends
   `FAILED` with `error_type = "UnsupportedFeature"` (issue #1834).
+
+Since issue #2026, the backend supports child workflows and signal, cancel and
+await between runs. See
+[§9 of the docs guide](../docs/sqlite-backend.md#9-child-workflows-and-commands-between-runs).
 
 ## Learn more
 

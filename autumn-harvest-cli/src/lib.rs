@@ -810,6 +810,17 @@ pub enum CliError {
         value: String,
     },
 
+    /// A fairness key would be normalized away as a URL dot-segment.
+    #[error(
+        "invalid fairness key '{value}': '.' and '..' are removed as \
+         dot-segments when the request URL is parsed, which would silently \
+         retarget the request at a different route"
+    )]
+    FairnessKeyDotSegment {
+        /// Original CLI argument value.
+        value: String,
+    },
+
     /// An activity name would be normalized away as a URL dot-segment.
     #[error(
         "invalid activity name '{value}': '.' and '..' are removed as \
@@ -2185,11 +2196,12 @@ enum WorkflowCommand {
         /// live executions or force this sort order.
         #[arg(long = "history-bloat-min-events")]
         history_bloat_min_events: Option<u64>,
-        /// Filter by workflow-start provenance (issue #740): one of api,
+        /// Filter by workflow-start provenance (issue #740). Values: api,
         /// schedule, backfill, `signal_with_start`, `update_with_start`,
-        /// `completion_trigger`, webhook, child, batch, `continue_as_new`,
-        /// reset, outbox, or unknown (matches pre-upgrade/NULL rows). The
-        /// server rejects any other value with a 400.
+        /// `completion_trigger`, webhook, broker, child, batch,
+        /// `continue_as_new`, reset, rerun, outbox, transactional, fork.
+        /// `unknown` matches pre-upgrade/NULL rows. The server rejects any
+        /// other value with a 400.
         #[arg(long = "start-source")]
         start_source: Option<String>,
     },
@@ -2875,7 +2887,8 @@ enum ScheduleCommand {
         /// New task queue name for scheduled runs.
         #[arg(long)]
         queue: Option<String>,
-        /// New overlap policy: skip, `buffer_one`, `buffer_all`, `cancel_other`, `terminate_other`.
+        /// New overlap policy: skip, `buffer_one`, `buffer_all`, `cancel_other`, `terminate_other`,
+        /// `allow_all`.
         #[arg(long)]
         overlap_policy: Option<String>,
         /// New maximum buffered slots under `buffer_all`.
@@ -3043,6 +3056,40 @@ enum QueueCommand {
         /// Output raw JSON instead of the summary table.
         #[arg(long)]
         json: bool,
+    },
+    /// Show, set, or clear fairness key weights in a queue (issue #1976).
+    #[command(subcommand)]
+    Fairness(FairnessCommand),
+}
+
+/// Fairness key weights within one queue (issue #1976).
+///
+/// A key with weight `w` gets `w` claims for each claim of a key with weight
+/// `1`, while both have work. A key with no override has weight `1`. A change
+/// applies at the next claim of the key. No worker restart is needed.
+#[derive(Debug, Subcommand)]
+enum FairnessCommand {
+    /// Show the weight overrides and the claim state of each key.
+    Show {
+        /// Task queue name.
+        queue_name: String,
+    },
+    /// Set the weight of one fairness key.
+    Set {
+        /// Task queue name.
+        queue_name: String,
+        /// Fairness key, matched exactly.
+        fairness_key: String,
+        /// The weight, from 0.001 to 1000.
+        #[arg(long, value_parser = parse_fairness_weight)]
+        weight: f64,
+    },
+    /// Clear the weight of one fairness key. The key goes back to weight 1.
+    Clear {
+        /// Task queue name.
+        queue_name: String,
+        /// Fairness key, matched exactly.
+        fairness_key: String,
     },
 }
 
@@ -8862,6 +8909,11 @@ fn format_usage_table(value: &Value) -> String {
         "ACT_EXEC",
         "ACT_FAILED",
         "COMPUTE_S",
+        "LLM_CALLS",
+        "LLM_IN",
+        "LLM_OUT",
+        "LLM_COST_USD",
+        "LLM_UNPRICED",
     ]
     .iter()
     .map(ToString::to_string)
@@ -8879,6 +8931,11 @@ fn format_usage_table(value: &Value) -> String {
             cell_number(group.get("activity_executions")),
             cell_number(group.get("activity_executions_failed")),
             format_f64(group.get("activity_compute_seconds")),
+            cell_number(group.get("llm_calls")),
+            cell_number(group.get("llm_input_tokens")),
+            cell_number(group.get("llm_output_tokens")),
+            format_usd_micros(group.get("llm_cost_usd_micros")),
+            cell_number(group.get("llm_unpriced_calls")),
         ]);
     }
 
@@ -9035,6 +9092,19 @@ fn format_rate_limit_table(value: &Value) -> String {
     }
 
     render_table(&rows)
+}
+
+/// Millionths of a US dollar as dollars with six decimals (issue #1996).
+///
+/// An absent field, as from an older server, stays blank.
+fn format_usd_micros(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_i64)
+        .map_or_else(String::new, |micros| {
+            let sign = if micros < 0 { "-" } else { "" };
+            let abs = micros.unsigned_abs();
+            format!("{sign}{}.{:06}", abs / 1_000_000, abs % 1_000_000)
+        })
 }
 
 fn format_f64(value: Option<&Value>) -> String {
@@ -12226,11 +12296,17 @@ fn legal_hold_request(command: &LegalHoldCommand) -> ApiRequest {
 /// partial-application contract worth gating the exit code on.
 ///
 /// `list-paused` is a read with no such contract, so it is deliberately excluded.
+/// A fairness weight set or clear has the same contract (issue #1976). The
+/// fairness `show` read does not.
 const fn queue_mutation_should_gate(cli: &Cli) -> bool {
     matches!(
         &cli.command,
         Commands::Queue {
-            command: QueueCommand::Pause { .. } | QueueCommand::Resume { .. }
+            command: QueueCommand::Pause { .. }
+                | QueueCommand::Resume { .. }
+                | QueueCommand::Fairness(
+                    FairnessCommand::Set { .. } | FairnessCommand::Clear { .. }
+                )
         }
     )
 }
@@ -12285,6 +12361,56 @@ fn checked_queue_segment(queue_name: &str) -> Result<String, CliError> {
     Ok(path_segment(queue_name))
 }
 
+/// Reject a fairness key that cannot survive URL path parsing intact.
+///
+/// Only the literal `.` and `..` fail. `path_segment` encodes `%`, so a key
+/// such as `%2e` reaches the route as `%252e`. The core validator accepts it
+/// (issue #2097).
+fn checked_fairness_key_segment(fairness_key: &str) -> Result<String, CliError> {
+    if matches!(fairness_key, "." | "..") {
+        return Err(CliError::FairnessKeyDotSegment {
+            value: fairness_key.to_string(),
+        });
+    }
+    Ok(path_segment(fairness_key))
+}
+
+/// Map `harvest queue fairness …` onto the three fairness routes (issue #1976).
+fn fairness_request(command: &FairnessCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        FairnessCommand::Show { queue_name } => {
+            let queue = checked_queue_segment(queue_name)?;
+            Ok(ApiRequest::get(format!("/admin/queues/{queue}/fairness")))
+        }
+        FairnessCommand::Set {
+            queue_name,
+            fairness_key,
+            weight,
+        } => {
+            let queue = checked_queue_segment(queue_name)?;
+            let key = checked_fairness_key_segment(fairness_key)?;
+            let mut body = Map::new();
+            body.insert("weight".to_string(), Value::from(*weight));
+            Ok(ApiRequest::post(
+                format!("/admin/queues/{queue}/fairness/{key}"),
+                Some(Value::Object(body)),
+            ))
+        }
+        FairnessCommand::Clear {
+            queue_name,
+            fairness_key,
+        } => {
+            let queue = checked_queue_segment(queue_name)?;
+            let key = checked_fairness_key_segment(fairness_key)?;
+            Ok(ApiRequest {
+                method: ApiMethod::Delete,
+                path: format!("/admin/queues/{queue}/fairness/{key}"),
+                body: None,
+            })
+        }
+    }
+}
+
 /// Map `harvest queue …` onto the three management routes (issue #619).
 ///
 /// `--shard-id` is omitted from the body entirely when unset, so the default is
@@ -12322,6 +12448,7 @@ fn queue_request(command: &QueueCommand) -> Result<ApiRequest, CliError> {
             ))
         }
         QueueCommand::ListPaused => Ok(ApiRequest::get("/admin/queues/paused")),
+        QueueCommand::Fairness(command) => fairness_request(command),
         QueueCommand::Coverage { queue_name, .. } => Ok(queue_name.as_ref().map_or_else(
             || ApiRequest::get("/admin/queue-coverage"),
             |value| {
@@ -13733,6 +13860,20 @@ fn retirement_shard_array_cell(item: &Value, field: &str) -> String {
         .join(",")
 }
 
+/// Parse `--weight`. A non-finite number would reach the server as JSON
+/// `null`, so the CLI rejects it with a clear message.
+fn parse_fairness_weight(raw: &str) -> Result<f64, String> {
+    let weight: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|e| format!("weight must be a number: {e}"))?;
+    if weight.is_finite() {
+        Ok(weight)
+    } else {
+        Err("weight must be a finite number from 0.001 to 1000".to_owned())
+    }
+}
+
 #[cfg(test)]
 mod reuse_policy_tests {
     use super::*;
@@ -14708,6 +14849,41 @@ mod reuse_policy_tests {
             "the read route has no partial-application contract to gate on"
         );
         assert!(!queue_mutation_should_gate(&parse(&["health"])));
+    }
+
+    #[test]
+    fn queue_mutation_gate_covers_the_fairness_writes_only() {
+        // Issue #1976: a weight set or clear reports a partial fan-out with
+        // the same `ok`/`status` contract as a queue pause.
+        assert!(queue_mutation_should_gate(&parse(&[
+            "queue", "fairness", "set", "q", "tenant-a", "--weight", "2"
+        ])));
+        assert!(queue_mutation_should_gate(&parse(&[
+            "queue", "fairness", "clear", "q", "tenant-a"
+        ])));
+        assert!(
+            !queue_mutation_should_gate(&parse(&["queue", "fairness", "show", "q"])),
+            "the read route has no partial-application contract to gate on"
+        );
+    }
+
+    #[test]
+    fn fairness_weight_parser_rejects_non_finite_numbers() {
+        assert_eq!(parse_fairness_weight(" 2.5 "), Ok(2.5));
+        for bad in ["inf", "-inf", "NaN", "abc"] {
+            assert!(parse_fairness_weight(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn fairness_key_dot_segment_error_uses_exit_code_one() {
+        assert_eq!(
+            CliError::FairnessKeyDotSegment {
+                value: ".".to_string()
+            }
+            .exit_code(),
+            1
+        );
     }
 
     #[test]
@@ -16782,6 +16958,76 @@ mod usage_cli_tests {
         assert!(rendered.contains("group_by: workflow_name"));
         assert!(rendered.contains("onboarding"));
         assert!(rendered.contains("123.46"));
+    }
+
+    #[test]
+    fn format_usage_table_renders_the_llm_ledger_columns() {
+        let value = serde_json::json!({
+            "status": "complete",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "search_attr:tenant_id",
+            "groups": [
+                {
+                    "group": "acme",
+                    "workflow_starts": 1,
+                    "completed": 1,
+                    "failed": 0,
+                    "cancelled": 0,
+                    "timed_out": 0,
+                    "activity_executions": 2,
+                    "activity_executions_failed": 0,
+                    "activity_compute_seconds": 1.0,
+                    "llm_calls": 3,
+                    "llm_input_tokens": 1_250,
+                    "llm_output_tokens": 340,
+                    "llm_cost_usd_micros": 1_234_567,
+                    "llm_unpriced_calls": 0,
+                    "llm_latency_ms": 900
+                }
+            ],
+            "unavailable_shards": []
+        });
+        let rendered = format_usage_table(&value);
+        for column in [
+            "LLM_CALLS",
+            "LLM_IN",
+            "LLM_OUT",
+            "LLM_COST_USD",
+            "LLM_UNPRICED",
+        ] {
+            assert!(rendered.contains(column), "{column}: {rendered}");
+        }
+        assert!(rendered.contains("1250"), "{rendered}");
+        assert!(rendered.contains("340"), "{rendered}");
+        assert!(rendered.contains("1.234567"), "{rendered}");
+    }
+
+    #[test]
+    fn format_usage_table_leaves_llm_cells_blank_for_an_older_server() {
+        let value = serde_json::json!({
+            "status": "complete",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "workflow_name",
+            "groups": [{"group": "onboarding", "workflow_starts": 1}],
+            "unavailable_shards": []
+        });
+        let rendered = format_usage_table(&value);
+        assert!(rendered.contains("LLM_COST_USD"), "{rendered}");
+        assert!(!rendered.contains("0.000000"), "{rendered}");
+    }
+
+    #[test]
+    fn format_usd_micros_prints_dollars_with_six_decimals() {
+        let cell = |v: serde_json::Value| format_usd_micros(Some(&v));
+        assert_eq!(cell(serde_json::json!(0)), "0.000000");
+        assert_eq!(cell(serde_json::json!(5)), "0.000005");
+        assert_eq!(cell(serde_json::json!(1_234_567)), "1.234567");
+        assert_eq!(cell(serde_json::json!(-1_500_000)), "-1.500000");
+        assert_eq!(cell(serde_json::json!(i64::MAX)), "9223372036854.775807");
+        assert_eq!(cell(serde_json::json!(u64::MAX)), "", "not an i64");
+        assert_eq!(format_usd_micros(None), "");
     }
 
     #[test]

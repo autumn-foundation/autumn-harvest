@@ -22,7 +22,7 @@
 //!
 //! ```rust,ignore
 //! AgentSessionStub::signal_with_start(
-//!     conn, &client, "session-42", EntityCheckpoint::<Session>::default(),
+//!     conn, &client, "session-42", serde_json::json!({}),
 //!     ENTITY_OP_SIGNAL,
 //!     EntityMessage::op(SessionOp::UserMessage { text: "hi".into() }),
 //!     TypedSignalWithStartOptions {
@@ -50,7 +50,7 @@
 //! cargo test -p autumn-harvest --features testing --example agent_session_entity
 //! ```
 
-use autumn_harvest::entity::{Entity, EntityCheckpoint};
+use autumn_harvest::entity::Entity;
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -91,11 +91,8 @@ async fn agent_reply(_ctx: &ActivityContext, transcript: Vec<Turn>) -> Result<St
 
 /// The session entity. The `workflow_id` is the session id.
 #[workflow]
-async fn agent_session(
-    ctx: &WorkflowContext,
-    input: EntityCheckpoint<Session>,
-) -> Result<Session, String> {
-    Entity::new(ctx, input)
+async fn agent_session(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Session, String> {
+    Entity::<Session>::from_input(ctx, input)
         .run(|mut session: Session, op: SessionOp| async move {
             match op {
                 SessionOp::UserMessage { text } => {

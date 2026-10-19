@@ -18,6 +18,24 @@ pub const FENCING_VAR: &str = "HARVEST_DST_FENCING";
 /// A comma list of invariant names to check. The default is all of them.
 pub const CHECKS_VAR: &str = "HARVEST_DST_CHECKS";
 
+/// The names of the three seed variables of one harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeedVars {
+    /// The one seed to run.
+    pub seed: &'static str,
+    /// The number of seeds.
+    pub seeds: &'static str,
+    /// The first seed.
+    pub base: &'static str,
+}
+
+/// The seed variables of the claim-protocol simulator.
+pub const DST_SEED_VARS: SeedVars = SeedVars {
+    seed: SEED_VAR,
+    seeds: SEEDS_VAR,
+    base: SEED_BASE_VAR,
+};
+
 /// Two runs of one seed gave different traces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Nondeterminism {
@@ -139,6 +157,24 @@ impl SeedPlan {
         base: Option<&str>,
         default_count: u64,
     ) -> Result<Self, String> {
+        Self::parse_named(DST_SEED_VARS, seed, seeds, base, default_count)
+    }
+
+    /// [`parse`](Self::parse) for a harness whose variables are `vars`.
+    ///
+    /// The error messages name `vars`. The workflow simulation of issue
+    /// #2033 uses it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message as [`parse`](Self::parse) does.
+    pub fn parse_named(
+        vars: SeedVars,
+        seed: Option<&str>,
+        seeds: Option<&str>,
+        base: Option<&str>,
+        default_count: u64,
+    ) -> Result<Self, String> {
         let number = |name: &str, value: Option<&str>| -> Result<Option<u64>, String> {
             value
                 .map(|text| {
@@ -148,23 +184,26 @@ impl SeedPlan {
                 })
                 .transpose()
         };
-        if let Some(seed) = number(SEED_VAR, seed)? {
+        if let Some(seed) = number(vars.seed, seed)? {
             return Ok(Self {
                 first: seed,
                 count: 1,
             });
         }
         let plan = Self {
-            first: number(SEED_BASE_VAR, base)?.unwrap_or(0),
-            count: number(SEEDS_VAR, seeds)?.unwrap_or(default_count),
+            first: number(vars.base, base)?.unwrap_or(0),
+            count: number(vars.seeds, seeds)?.unwrap_or(default_count),
         };
         if plan.count == 0 {
-            return Err(format!("{SEEDS_VAR} is 0, so the sweep would run no seed"));
+            return Err(format!(
+                "{} is 0, so the sweep would run no seed",
+                vars.seeds
+            ));
         }
         if plan.first.checked_add(plan.count - 1).is_none() {
             return Err(format!(
-                "{SEED_BASE_VAR}={} with {SEEDS_VAR}={} ends past u64::MAX",
-                plan.first, plan.count
+                "{}={} with {}={} ends past u64::MAX",
+                vars.base, plan.first, vars.seeds, plan.count
             ));
         }
         Ok(plan)
@@ -176,10 +215,20 @@ impl SeedPlan {
     ///
     /// Returns a message when a value is not a decimal `u64`.
     pub fn from_env(default_count: u64) -> Result<Self, String> {
-        let seed = std::env::var(SEED_VAR).ok();
-        let seeds = std::env::var(SEEDS_VAR).ok();
-        let base = std::env::var(SEED_BASE_VAR).ok();
-        Self::parse(
+        Self::from_env_named(DST_SEED_VARS, default_count)
+    }
+
+    /// [`from_env`](Self::from_env) for a harness whose variables are `vars`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message as [`parse_named`](Self::parse_named) does.
+    pub fn from_env_named(vars: SeedVars, default_count: u64) -> Result<Self, String> {
+        let seed = std::env::var(vars.seed).ok();
+        let seeds = std::env::var(vars.seeds).ok();
+        let base = std::env::var(vars.base).ok();
+        Self::parse_named(
+            vars,
             seed.as_deref(),
             seeds.as_deref(),
             base.as_deref(),

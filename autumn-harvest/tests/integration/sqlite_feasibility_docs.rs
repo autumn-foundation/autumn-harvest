@@ -227,7 +227,16 @@ const AUDIT_EXCLUDED_MODULES: &[&str] = &["chaos"];
 /// `skipped_subdirectories_have_no_postgres_coupling` checks that every file
 /// in it stays free of the `MECHANISMS` tokens, so the skip cannot hide
 /// coupling.
-const SKIPPED_SUBDIRS: &[&str] = &["dst"];
+///
+/// `testing` holds the workflow simulation of issue #2033, under the
+/// `testing` feature. It is test infrastructure, like `dst`, and it has no
+/// Postgres coupling. The same check covers it.
+///
+/// `sandbox` holds the sandboxed code activities. It is backend-neutral: a
+/// sandbox run is an ordinary activity, so a port to `SQLite` carries it with
+/// no change. The same check keeps it free of Postgres coupling, nested
+/// directories included.
+const SKIPPED_SUBDIRS: &[&str] = &["dst", "sandbox", "testing"];
 
 /// R&D spike subdirectories of `autumn-harvest/src` that the flat scan
 /// skips, each with the Cargo feature that turns it on.
@@ -447,11 +456,24 @@ fn markdown_section<'a>(document: &'a str, heading_contains: &str) -> Option<&'a
 fn skipped_subdirectories_have_no_postgres_coupling() {
     for dir in SKIPPED_SUBDIRS {
         let path = repo_root().join("autumn-harvest/src").join(dir);
-        let entries = std::fs::read_dir(&path)
-            .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+        // Walk nested directories too, so a nested module cannot hide
+        // coupling behind the skip.
+        let mut pending = vec![path];
+        let mut sources = Vec::new();
+        while let Some(next) = pending.pop() {
+            let entries = std::fs::read_dir(&next)
+                .unwrap_or_else(|err| panic!("cannot read {}: {err}", next.display()));
+            for entry in entries {
+                let entry = entry.expect("readable dir entry").path();
+                if entry.is_dir() {
+                    pending.push(entry);
+                } else {
+                    sources.push(entry);
+                }
+            }
+        }
         let mut files = 0;
-        for entry in entries {
-            let file = entry.expect("readable dir entry").path();
+        for file in sources {
             if file.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }

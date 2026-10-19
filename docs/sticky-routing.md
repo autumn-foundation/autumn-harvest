@@ -30,7 +30,9 @@ A warm decision must decide exactly as a cold replay would. The resident path th
 - A signal wait is not for a name that `try_wait_for_signal`, `try_receive_signal` or a drain probed with a scan that reached the end of history.
 - The workflow is not hosted in a hot-swapped module.
 
-A warm decision resumes only on an exact delta. The delta holds the events of the last suspension, in order. Then it holds at least one event that resolves a parked await: an activity success, a timer fire or a signal. Each parked await resolves at most once. The start and heartbeat events of a parked activity may come before its result. The context inputs must not have changed, for example the deadline, shard, build, queue, parent, headers or handler.
+A warm decision resumes only on an exact delta. The delta holds the events of the last suspension, in order. Then it holds the events that resolve parked awaits: an activity success, a timer fire or a signal. Each parked await resolves at most once. The start and heartbeat events of a parked activity may come before its result. The context inputs must not have changed, for example the deadline, shard, build, queue, parent, headers or handler.
+
+A redundant wake brings the events of the last suspension and no result. It can bring start and heartbeat events. It resolves no await, so each parked activity waits again, as below. A lone timer or signal cannot wait again this way, so its redundant wake declines.
 
 A delta can resolve only some activities of a join. The resume then parks the others again with a `WaitForActivity` command, which a cold replay emits too. Such a cycle must only wait. If a branch runs a command, fails, drops a parked sibling or reads history state, such as the replay position, the worker drops the cycle and replays cold (`ResumeDeclined::SiblingStillParked`). The cycle fires no side effect that replay suppresses, such as a log line or a business metric. So a dropped cycle does not repeat one. A delta with several results runs as one cycle per result, in history order, as a cold replay matches them.
 

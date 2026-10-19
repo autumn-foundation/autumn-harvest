@@ -1313,6 +1313,137 @@ async fn residency_key_start_resolves_the_shard() {
     assert_eq!(rows[0].shard_id, Some(7));
 }
 
+/// A hook that confines a caller to keys under `acme/`. It denies the rest,
+/// and a missing key too.
+fn acme_keys_only(req: &AuthzRequest<'_>) -> AuthzDecision {
+    match req.workflow_id {
+        Some(id) if id.starts_with("acme/") => AuthzDecision::Allow,
+        Some(id) => AuthzDecision::deny(format!("key {id} is out of scope")),
+        None => AuthzDecision::deny("no key"),
+    }
+}
+
+/// The hook sees the body `workflow_id` on the three start routes
+/// (issue #2081).
+#[tokio::test]
+async fn start_family_routes_carry_the_workflow_id() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let app = authorized_app(&pool, acme_keys_only);
+
+    for (uri, mut body) in [
+        ("/workflows/ent/start", json!({ "input": {} })),
+        (
+            "/workflows/ent/signal-with-start",
+            json!({ "signal_name": "op", "start_input": {} }),
+        ),
+        (
+            "/workflows/ent/update-with-start",
+            json!({ "update_name": "op", "start_input": {} }),
+        ),
+    ] {
+        body["workflow_id"] = json!("other/1");
+        let (status, resp) = send(&app, Call::new("POST", uri).body(body.clone())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{uri}: {resp:?}");
+        body["workflow_id"] = json!("acme/1");
+        let (status, resp) = send(&app, Call::new("POST", uri).body(body)).await;
+        assert_ne!(status, StatusCode::FORBIDDEN, "{uri}: {resp:?}");
+        // The handler still reads the body the hook buffered.
+        assert_ne!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {resp:?}");
+        assert_ne!(status, StatusCode::BAD_REQUEST, "{uri}: {resp:?}");
+    }
+    let rows = deny_rows(&mut conn).await;
+    assert_eq!(rows.len(), 3, "{rows:?}");
+}
+
+/// A body the handler rejects, or an id hidden in the input, shows no key.
+#[tokio::test]
+async fn start_family_hook_sees_no_key_for_a_hidden_or_bad_one() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    let app = authorized_app(&pool, acme_keys_only);
+
+    for body in [
+        // The only `acme/` key is nested in the input.
+        json!({ "signal_name": "op", "start_input": { "workflow_id": "acme/1" } }),
+        json!({ "signal_name": "op" }),
+        json!({ "signal_name": "op", "workflow_id": 5 }),
+    ] {
+        let (status, resp) = send(
+            &app,
+            Call::new("POST", "/workflows/ent/signal-with-start").body(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{resp:?}");
+    }
+}
+
+/// Other routes carry no key, and the hook sees the start input flag.
+#[tokio::test]
+async fn other_routes_carry_no_workflow_id() {
+    let (url, _c) = setup_database().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.unwrap();
+    scrub(&mut conn).await;
+    type Seen = Vec<(String, Option<String>, bool)>;
+    let seen: Arc<Mutex<Seen>> = Arc::default();
+    let sink = seen.clone();
+    let app = authorized_app(&pool, move |req| {
+        sink.lock().unwrap().push((
+            req.path.to_string(),
+            req.workflow_id.map(str::to_string),
+            req.start_input_present,
+        ));
+        AuthzDecision::Allow
+    });
+
+    send(
+        &app,
+        Call::new("POST", "/workflows/by-id/ent/acme%2F1/signal/op")
+            .body(json!({ "workflow_id": "acme/1", "start_input": {} })),
+    )
+    .await;
+    send(&app, Call::new("GET", "/workflows")).await;
+    send(
+        &app,
+        Call::new("POST", "/workflows/ent/signal-with-start").body(json!({
+            "workflow_id": "acme/1", "signal_name": "op", "start_input": null
+        })),
+    )
+    .await;
+    send(
+        &app,
+        Call::new("POST", "/workflows/ent/start")
+            .body(json!({ "workflow_id": "acme/2", "input": {} })),
+    )
+    .await;
+    let seen = seen.lock().unwrap().clone();
+    let by_path = |path: &str| seen.iter().find(|(p, _, _)| p == path).cloned().unwrap();
+    assert_eq!(
+        by_path("/workflows/by-id/ent/acme%2F1/signal/op"),
+        (
+            "/workflows/by-id/ent/acme%2F1/signal/op".into(),
+            None,
+            false
+        )
+    );
+    assert_eq!(by_path("/workflows").1, None);
+    // A null start input counts as absent.
+    assert_eq!(
+        by_path("/workflows/ent/signal-with-start").1,
+        Some("acme/1".into())
+    );
+    assert!(!by_path("/workflows/ent/signal-with-start").2);
+    assert_eq!(
+        by_path("/workflows/ent/start"),
+        ("/workflows/ent/start".into(), Some("acme/2".into()), true)
+    );
+}
+
 /// Repeated or malformed tenant headers are rejected. OPTIONS skips the hook.
 #[tokio::test]
 async fn tenant_header_edge_cases() {

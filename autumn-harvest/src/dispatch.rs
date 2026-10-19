@@ -1271,6 +1271,21 @@ pub fn hints_wanted() -> bool {
         .unwrap_or_else(|_| is_installed())
 }
 
+/// True when a hint raised now has a channel to publish to (issue #2066).
+///
+/// [`hints_wanted`] is true for a per-shard install. That install leaves the
+/// global slot empty, so an unbound caller still has no channel. A caller that
+/// would load rows only to build hints checks this call first.
+// The caller needs the `db` feature.
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+#[must_use]
+pub(crate) fn hints_deliverable() -> bool {
+    match publish_target() {
+        PublishTarget::Bound(channel) => channel.is_some(),
+        PublishTarget::Live => installed().is_some(),
+    }
+}
+
 /// Publish `hints` on the bound channel, or else on the installed one, now.
 ///
 /// Errors are logged and dropped. The reconcile sweep in the worker is the
@@ -3382,6 +3397,39 @@ mod tests {
             live.published_ids().is_empty(),
             "the live slot must not receive a bound scope's hint"
         );
+    }
+
+    /// `hints_wanted` is true for a per-shard install, yet an unbound caller
+    /// has no channel to publish to. `hints_deliverable` tells them apart
+    /// (issue #2066).
+    #[tokio::test]
+    async fn hints_are_deliverable_only_with_a_publish_target() {
+        let _guard = INSTALL_LOCK.lock().await;
+        uninstall();
+        uninstall_all_shards();
+        assert!(!hints_deliverable(), "an empty topology has no target");
+
+        install_shards(vec![(
+            crate::types::ShardId::new(1),
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        )]);
+        assert!(hints_wanted(), "a per-shard install sets the any flag");
+        assert!(
+            !hints_deliverable(),
+            "an unbound caller publishes to the empty global slot"
+        );
+        let bound = Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>;
+        assert!(with_bound_channel(Some(bound), async { hints_deliverable() }).await);
+        assert!(!with_bound_channel(None, async { hints_deliverable() }).await);
+        uninstall_all_shards();
+
+        install(
+            Arc::new(MemoryDispatch::new()) as Arc<dyn TaskDispatch>,
+            DispatchSettings::default(),
+        );
+        assert!(hints_deliverable(), "the global slot is a target");
+        uninstall();
     }
 
     /// A scope bound to no channel publishes nothing, even while another

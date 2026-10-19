@@ -1914,3 +1914,244 @@ async fn a_moved_row_is_reserved_for_its_new_reason() {
         "the target must go out once, under the reason it moved to"
     );
 }
+
+/// Records the SQL of each statement that `conn` runs from now on.
+fn record_statements(conn: &mut AsyncPgConnection) -> Arc<Mutex<Vec<String>>> {
+    use diesel::connection::InstrumentationEvent;
+    use diesel_async::AsyncConnection;
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&log);
+    conn.set_instrumentation(move |event: InstrumentationEvent<'_>| {
+        if let InstrumentationEvent::StartQuery { query, .. } = event {
+            sink.lock().expect("statement log").push(query.to_string());
+        }
+    });
+    log
+}
+
+/// Takes the recorded statements, and counts the page reads and clock reads.
+fn take_refill_counts(log: &Mutex<Vec<String>>) -> (usize, usize) {
+    let statements = std::mem::take(&mut *log.lock().expect("statement log"));
+    let count = |needle: &str| statements.iter().filter(|s| s.contains(needle)).count();
+    (
+        count("WITH page AS MATERIALIZED"),
+        count("SELECT NOW() AS as_of"),
+    )
+}
+
+/// Expired rows outside `queue`, for any reason. The issue #2126 tests need
+/// none, or another suite's backlog can take their batches.
+async fn foreign_expired_rows_any_reason(conn: &mut AsyncPgConnection, queue: &str) -> usize {
+    timeout::find_timed_out_tasks(conn)
+        .await
+        .expect("unbounded scan")
+        .iter()
+        .filter(|(task, _)| task.queue_name != queue)
+        .count()
+}
+
+/// Lanes at one position share one page read (issue #2126).
+///
+/// The four lanes start their sweeps in one pass. They take one clock and
+/// read the live rows once. While the lanes stay at one position, each pass
+/// reads the page at most once.
+#[tokio::test]
+async fn lanes_at_one_position_share_one_page_read() {
+    use diesel_async::AsyncConnection;
+    let (url, _container) = setup_test_db_url().await;
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connection");
+    let queue = "scanner-lease-shared-page";
+    let ours = insert_expired_running_tasks(&mut conn, queue, 3).await;
+    assert_eq!(
+        foreign_expired_rows_any_reason(&mut conn, queue).await,
+        0,
+        "precondition: no other expired rows in this database"
+    );
+    let log = record_statements(&mut conn);
+
+    let mut cursor = TimeoutScanCursor::default();
+    let first = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 500)
+        .await
+        .expect("batch scan");
+    let first_counts = take_refill_counts(&log);
+    let mut later = Vec::new();
+    for _ in 0..2 {
+        let _ = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 500)
+            .await
+            .expect("batch scan");
+        later.push(take_refill_counts(&log));
+    }
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    let found = start_to_close_ids(&first);
+    assert!(
+        ours.iter().all(|id| found.contains(id)),
+        "the shared read must still queue each expired row"
+    );
+    assert_eq!(
+        first_counts,
+        (1, 1),
+        "four lanes at one position must read the page once and the clock once"
+    );
+    // The batch drains each queue, so each later pass starts four sweeps
+    // together. Another suite's live rows can make a sweep longer than one
+    // page. Then a pass reads the next page and takes no clock, so the
+    // clock bound is `<=`.
+    for (pages, clocks) in later {
+        assert!(
+            pages == 1 && clocks <= 1,
+            "lanes that stay at one position read the page once per pass: \
+             {pages} page reads, {clocks} clock reads"
+        );
+    }
+}
+
+/// Lanes at one position read each later page together (issue #2126).
+///
+/// At a batch of 1, a page holds 64 live rows. No row has expired, so no
+/// lane has a queue. Each pass reads the next page once, for all four lanes.
+#[tokio::test]
+async fn lanes_in_step_read_each_later_page_once() {
+    use diesel_async::AsyncConnection;
+    let (url, _container) = setup_test_db_url().await;
+    let mut conn = AsyncPgConnection::establish(&url)
+        .await
+        .expect("connection");
+    let queue = "scanner-lease-later-pages";
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    insert_live_tasks(&mut conn, queue, 200).await;
+    assert_eq!(
+        foreign_expired_rows_any_reason(&mut conn, queue).await,
+        0,
+        "precondition: no other expired rows in this database"
+    );
+    let log = record_statements(&mut conn);
+
+    let mut cursor = TimeoutScanCursor::default();
+    let mut counts = Vec::new();
+    for _ in 0..4 {
+        let _ = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan");
+        counts.push(take_refill_counts(&log));
+    }
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    // Pass 1 takes the clock. Passes 2 and 3 read later pages of the same
+    // sweep, so they take no clock.
+    assert_eq!(counts[0], (1, 1), "{counts:?}");
+    assert_eq!(counts[1..3], [(1, 0), (1, 0)], "{counts:?}");
+}
+
+/// A shared refill gives each row the first reason it matches (issue #2126).
+///
+/// The unbounded scan tests the reasons one by one and keeps the first
+/// match. The batched scan runs at a batch of 1 over pages of 64 rows. So
+/// lanes fall out of step, a queued lane sits between the lanes of a shared
+/// refill, and later pages are read. Each returned row is then deleted, as
+/// enforcement would end it. A later lane that queued a row of an earlier
+/// lane would return it under its own reason first.
+#[tokio::test]
+async fn a_shared_refill_gives_each_row_its_first_reason() {
+    let (url, _container) = setup_test_db_url().await;
+    let pool = build_pool(&url);
+    let mut conn = pool.get().await.expect("connection");
+    let queue = "scanner-lease-first-reason";
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    // Rows that match one, two or three reasons. The heartbeat lane queues
+    // the row that matches three reasons after three others.
+    let _ = insert_running_task(&mut conn, queue, true, true).await;
+    let _ = insert_running_task(&mut conn, queue, false, true).await;
+    let _ = insert_running_task(&mut conn, queue, true, false).await;
+    insert_schedule_to_close_task(&mut conn, queue).await;
+    let _ = insert_running_task(&mut conn, queue, true, false).await;
+    let three = insert_running_task(&mut conn, queue, true, true).await;
+    diesel::sql_query(
+        "UPDATE harvest_task_queue SET schedule_to_close_at = NOW() - INTERVAL '1 hour' \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(three)
+    .execute(&mut conn)
+    .await
+    .expect("expire schedule-to-close");
+    diesel::sql_query(
+        "INSERT INTO harvest_task_queue \
+         (id, queue_name, task_type, input, state, attempt, max_attempts, \
+          scheduled_at, schedule_to_start, schedule_to_close_at) \
+         SELECT gen_random_uuid(), $1, 'activity', '{}'::jsonb, 'PENDING', 1, 1, \
+                NOW() - INTERVAL '1 minute', INTERVAL '1 second', \
+                NOW() - INTERVAL '1 second' * g \
+         FROM generate_series(0, 1) AS g",
+    )
+    .bind::<diesel::sql_types::Text, _>(queue)
+    .execute(&mut conn)
+    .await
+    .expect("insert pending tasks");
+    // Live rows that have not expired. Sweeps then span two pages.
+    insert_live_tasks(&mut conn, queue, 100).await;
+    assert_eq!(
+        foreign_expired_rows_any_reason(&mut conn, queue).await,
+        0,
+        "precondition: no other expired rows in this database"
+    );
+
+    let first_reasons: BTreeMap<uuid::Uuid, String> = timeout::find_timed_out_tasks(&mut conn)
+        .await
+        .expect("unbounded scan")
+        .into_iter()
+        .filter(|(task, _)| task.queue_name == queue)
+        .map(|(task, reason)| (task.id, reason.to_string()))
+        .collect();
+    let mut returned = Vec::new();
+    let mut cursor = TimeoutScanCursor::default();
+    for _ in 0..30 {
+        let page = timeout::find_timed_out_tasks_batch(&mut conn, &mut cursor, 1)
+            .await
+            .expect("batch scan");
+        let ids: Vec<uuid::Uuid> = page.iter().map(|(task, _)| task.id).collect();
+        returned.extend(
+            page.into_iter()
+                .map(|(task, reason)| (task.id, reason.to_string())),
+        );
+        diesel::sql_query("DELETE FROM harvest_task_queue WHERE id = ANY($1)")
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(&ids)
+            .execute(&mut conn)
+            .await
+            .expect("end the returned rows");
+        if returned.len() >= first_reasons.len() {
+            break;
+        }
+    }
+
+    diesel::sql_query("DELETE FROM harvest_task_queue WHERE queue_name = $1")
+        .bind::<diesel::sql_types::Text, _>(queue)
+        .execute(&mut conn)
+        .await
+        .expect("clear queue");
+    assert_eq!(first_reasons.len(), 8, "{first_reasons:?}");
+    let returned_reasons: BTreeMap<uuid::Uuid, String> = returned.iter().cloned().collect();
+    assert_eq!(
+        returned.len(),
+        returned_reasons.len(),
+        "a row came back twice: {returned:?}"
+    );
+    assert_eq!(returned_reasons, first_reasons);
+}

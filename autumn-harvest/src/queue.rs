@@ -394,6 +394,9 @@ pub struct EnqueueParams {
     /// (issue #1824). The workflow start path sets it. Every other path
     /// keeps `false`, so its row is a continuation in the claim order.
     pub new_start: bool,
+    /// The fairness key of the task (issue #1976). `None` is the default
+    /// key. A worker with fairness keys on rotates claims across keys.
+    pub fairness_key: Option<String>,
 }
 
 impl EnqueueParams {
@@ -433,6 +436,7 @@ impl EnqueueParams {
             context_headers: None,
             session_id: None,
             new_start: false,
+            fairness_key: None,
         }
     }
 
@@ -481,14 +485,53 @@ impl EnqueueParams {
 // Queue operations
 // ---------------------------------------------------------------------------
 
+/// Check the fairness key of an enqueue (issue #1976).
+///
+/// The claim charges the key into the primary key of
+/// `harvest_fairness_state`. A key that the weight API rejects would make
+/// that charge fail, so enqueue rejects it first.
+fn check_enqueue_fairness_key(params: &EnqueueParams) -> HarvestResult<()> {
+    params
+        .fairness_key
+        .as_deref()
+        .map_or(Ok(()), crate::queue_fairness::validate_fairness_key)
+}
+
+/// Insert `rows` into `harvest_task_queue`. Stages no NOTIFY.
+///
+/// Returns the stamp of the insert when [`crate::notify::stamp_wanted`]
+/// holds. The stage of its note then sends no probe (issue #2125).
+async fn insert_task_rows(
+    conn: &mut AsyncPgConnection,
+    rows: &[NewTaskQueueItem<'_>],
+) -> HarvestResult<Option<crate::notify::Stamp>> {
+    use crate::schema::harvest_task_queue;
+
+    let insert = diesel::insert_into(harvest_task_queue::table).values(rows);
+    if !crate::notify::stamp_wanted(conn) {
+        insert
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        return Ok(None);
+    }
+    let stamps = insert
+        .returning(crate::notify::stamp_returning())
+        .get_results::<crate::notify::Stamp>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(stamps.into_iter().next())
+}
+
 /// Insert a new task into the work queue and return its ID.
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on insert failure.
+/// Returns [`crate::error::HarvestError::Config`] for an invalid
+/// [`EnqueueParams::fairness_key`], and
+/// [`crate::error::HarvestError::Database`] on insert failure.
 pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> HarvestResult<Uuid> {
-    use crate::schema::harvest_task_queue;
-
+    check_enqueue_fairness_key(params)?;
     let task_id = Uuid::new_v4();
 
     // Sticky pin: only valid when both worker_id and timeout are present so the
@@ -543,13 +586,10 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         context_headers: params.context_headers.clone(),
         session_id: params.session_id,
         new_start: params.new_start,
+        fairness_key: params.fairness_key.as_deref(),
     };
 
-    diesel::insert_into(harvest_task_queue::table)
-        .values(&row)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let stamp = insert_task_rows(conn, std::slice::from_ref(&row)).await?;
 
     if let Some((worker_id, timeout)) = sticky {
         diesel::sql_query(
@@ -567,7 +607,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         .map_err(crate::error::database_error)?;
     }
 
-    crate::notify::notify_task_enqueued(conn, &params.queue_name, task_id).await?;
+    crate::notify::notify_task_enqueued_stamped(conn, stamp, &params.queue_name, task_id).await?;
 
     // Dispatch hint (issue #1312). The row is `PENDING`, so the channel gets a
     // reference to it. A row scheduled in the future is still recorded; the
@@ -594,7 +634,7 @@ const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
 /// number by exhaustive field destructure. Adding or removing a
 /// `NewTaskQueueItem` field breaks that test at compile time until this
 /// constant is updated too, so it cannot silently drift.
-const NEW_TASK_QUEUE_ITEM_COLUMNS: usize = 28;
+const NEW_TASK_QUEUE_ITEM_COLUMNS: usize = 29;
 
 /// Largest row count one `enqueue_batch` `INSERT` may carry.
 ///
@@ -746,19 +786,25 @@ fn compute_chunk_bounds(params: &[EnqueueParams]) -> Vec<(usize, usize)> {
 ///
 /// # Errors
 ///
-/// Returns [`crate::error::HarvestError::Database`] on insert failure.
+/// Returns [`crate::error::HarvestError::Config`] for an invalid
+/// [`EnqueueParams::fairness_key`], before any row is inserted, and
+/// [`crate::error::HarvestError::Database`] on insert failure.
 pub async fn enqueue_batch(
     conn: &mut AsyncPgConnection,
     params: &[EnqueueParams],
 ) -> HarvestResult<Vec<Uuid>> {
-    use crate::schema::harvest_task_queue;
-
     if params.is_empty() {
         return Ok(Vec::new());
+    }
+    for p in params {
+        check_enqueue_fairness_key(p)?;
     }
 
     let task_ids: Vec<Uuid> = params.iter().map(|_| Uuid::new_v4()).collect();
 
+    // A chunk returns a stamp only inside the caller's transaction. All chunks
+    // share that transaction, so the first stamp serves every note.
+    let mut stamp = None;
     // Byte-and-row-bounded chunk boundaries, decided up front from
     // `params`' borrowed fields -- see `compute_chunk_bounds`'s doc
     // comment. No row is cloned until its chunk is actually built below.
@@ -805,15 +851,13 @@ pub async fn enqueue_batch(
                     context_headers: p.context_headers.clone(),
                     session_id: p.session_id,
                     new_start: p.new_start,
+                    fairness_key: p.fairness_key.as_deref(),
                 }
             })
             .collect();
 
-        diesel::insert_into(harvest_task_queue::table)
-            .values(&rows)
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
+        let chunk_stamp = insert_task_rows(conn, &rows).await?;
+        stamp = stamp.or(chunk_stamp);
     }
 
     // Sticky pin follow-up (rare -- see the doc comment above). Same shape as
@@ -843,7 +887,8 @@ pub async fn enqueue_batch(
     }
 
     for (p, &task_id) in params.iter().zip(&task_ids) {
-        crate::notify::notify_task_enqueued(conn, &p.queue_name, task_id).await?;
+        crate::notify::notify_task_enqueued_stamped(conn, stamp.clone(), &p.queue_name, task_id)
+            .await?;
     }
 
     for (p, &task_id) in params.iter().zip(&task_ids) {
@@ -875,7 +920,9 @@ pub const NEW_START_HANDICAP_SECS: u32 = 30;
 /// Every other task is a continuation. That includes an activity task and a
 /// woken workflow task. It also includes the first task of a child, a
 /// continue-as-new, a reset fork, a workflow retry or a DLQ redrive. Each of
-/// these extends admitted work. The admission gate uses a similar split.
+/// these extends admitted work. The admission gate uses a similar split. A
+/// non-destructive fork (issue #2000) is admitted as a fresh start, so its
+/// first task is a new start.
 ///
 /// A new start sorts as if it were due [`NEW_START_HANDICAP_SECS`] later. So
 /// at equal priority, a continuation goes first under a backlog. The
@@ -979,6 +1026,22 @@ macro_rules! expired_run_gate_sql {
                        WHERE x.id = harvest_task_queue.workflow_exec_id \
                    ) \
                ) "
+    };
+}
+
+/// The override-expiry-aware available-tokens formula, as SQL text, for the
+/// `b` alias (issue #945).
+///
+/// This must render exactly what [`effective_available_tokens_expr`] computes
+/// at runtime. `claim_task_query` and `oldest_pending_ages_query` need the
+/// formula as compile-time SQL text: one is built by `concat!`-only macros,
+/// and the other is a `pub const fn` body. Neither can call a runtime
+/// helper. This macro gives both the one formula instead of a hand-typed
+/// copy at each site. `rate_limit_available_sql_matches_the_effective_available_tokens_expr`
+/// pins it to the helper.
+macro_rules! rate_limit_available_sql {
+    () => {
+        "LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate)"
     };
 }
 
@@ -1203,7 +1266,9 @@ macro_rules! claim_candidate_gates_sql {
                    OR EXISTS ( \
                        SELECT 1 FROM harvest_rate_limit_buckets b \
                        WHERE b.key = harvest_task_queue.rate_limit_key \
-                         AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
+                         AND ",
+            rate_limit_available_sql!(),
+            " >= 1.0 \
                    ) \
                ) ",
         )
@@ -1320,7 +1385,8 @@ macro_rules! claim_result_columns_sql {
              claimed.capability_misses, claimed.capability_miss_workers, \
              claimed.capability_miss_handler, claimed.timer_fires_at, \
              claimed.handler_started_attempt, claimed.timed_out_claims, \
-             claimed.handler_started_at, claimed.new_start"
+             claimed.handler_started_at, claimed.new_start, \
+             claimed.fairness_key"
     };
 }
 
@@ -1333,13 +1399,17 @@ macro_rules! claim_trailing_ctes_sql {
             ", \
         rate_limit_debit AS ( \
             UPDATE harvest_rate_limit_buckets b \
-            SET tokens = LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) - 1.0, \
+            SET tokens = ",
+            rate_limit_available_sql!(),
+            " - 1.0, \
                 last_refilled_at = NOW() \
             FROM candidate \
             WHERE b.key = candidate.rate_limit_key \
               AND NOT (candidate.activity_name = ANY($5)) \
               AND NOT (SELECT expired FROM run_expired_now) \
-              AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
+              AND ",
+            rate_limit_available_sql!(),
+            " >= 1.0 \
             RETURNING b.key AS debited_key \
         ), \
         claimed AS ( \
@@ -2084,7 +2154,7 @@ pub async fn claim_task_on_shard(
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] on query failure.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub async fn claim_task_of_kind_on_shard(
     conn: &mut AsyncPgConnection,
     queues: &[String],
@@ -2095,6 +2165,132 @@ pub async fn claim_task_of_kind_on_shard(
     ineligible_activities: &[String],
     shard: Option<crate::types::ShardId>,
     kind: Option<TaskType>,
+) -> HarvestResult<Option<TaskQueueItem>> {
+    claim_task_with_fairness(
+        conn,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        kind,
+        ClaimFairness::Off,
+    )
+    .await
+}
+
+/// How a claim orders rows across fairness keys (issue #1976).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClaimFairness {
+    /// The claim ignores fairness keys. The statement is the unchanged one.
+    #[default]
+    Off,
+    /// The claim rotates across the fairness keys of each queue in weighted
+    /// round robin, and charges the key it claims. See
+    /// [`crate::queue_fairness::FairClock`].
+    Keys,
+}
+
+/// [`claim_task_of_kind_on_shard`] with a fairness mode (issue #1976).
+///
+/// [`ClaimFairness::Off`] issues the unchanged statement.
+/// [`ClaimFairness::Keys`] issues the fair form, one queue per statement.
+///
+/// # One queue at a time
+///
+/// A key's lag is relative to its own queue's clock, so lags of two queues do
+/// not compare. A queue with one active key keeps a lag of `1 / w`, while a
+/// queue with several keys always has one at lag 0. One statement over both
+/// queues would thus starve the first. So a fair claim over several queues
+/// tries them one at a time, in a random order, as queue weights do.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure. With
+/// [`ClaimFairness::Keys`], it returns [`crate::error::HarvestError::Config`]
+/// for a queue name that the weight API cannot address, before any statement.
+/// The queues of a fair claim, each once, in first-seen order.
+///
+/// The fair claim polls the queues in a random order. A name listed twice
+/// would get two places in that order, and so a larger share. The plain
+/// claim matches `= ANY($2)`, where a repeated name counts once.
+fn distinct_queues(queues: &[String]) -> Vec<&String> {
+    let mut seen = std::collections::HashSet::new();
+    queues.iter().filter(|q| seen.insert(q.as_str())).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_with_fairness(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    kind: Option<TaskType>,
+    fairness: ClaimFairness,
+) -> HarvestResult<Option<TaskQueueItem>> {
+    if fairness == ClaimFairness::Keys {
+        for queue in queues {
+            crate::queue_fairness::validate_fairness_queue_name(queue)?;
+        }
+    }
+    if fairness == ClaimFairness::Keys && queues.len() > 1 {
+        use rand::seq::SliceRandom as _;
+        let mut order = distinct_queues(queues);
+        order.shuffle(&mut rand::thread_rng());
+        for queue in order {
+            let claimed = claim_task_one_statement(
+                conn,
+                std::slice::from_ref(queue),
+                worker_id,
+                worker_build_id,
+                priority_aging_secs,
+                circuit_breaker_activities,
+                ineligible_activities,
+                shard,
+                kind,
+                fairness,
+            )
+            .await?;
+            if claimed.is_some() {
+                return Ok(claimed);
+            }
+        }
+        return Ok(None);
+    }
+    claim_task_one_statement(
+        conn,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        kind,
+        fairness,
+    )
+    .await
+}
+
+/// One claim statement over `queues`, then the rechecks and the charge.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn claim_task_one_statement(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    kind: Option<TaskType>,
+    fairness: ClaimFairness,
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -2231,7 +2427,10 @@ pub async fn claim_task_of_kind_on_shard(
         .run(
             async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
                 let ageing = aging_secs_i64.is_some_and(|secs| secs > 0);
-                let settings = if ageing {
+                // A fair claim skips the seek window and always runs the full
+                // scan, as ageing does (issue #1976). It takes the same plan
+                // settings. Its text differs, so it gets its own cached plan.
+                let settings = if ageing || fairness == ClaimFairness::Keys {
                     CLAIM_AGEING_PLAN_SETTINGS_SQL
                 } else {
                     CLAIM_PLAN_SETTINGS_SQL
@@ -2245,12 +2444,7 @@ pub async fn claim_task_of_kind_on_shard(
                 // without a boxed builder, so neither form pays a heap
                 // allocation per bind.
                 let fence = fence_binding(shard);
-                let sql = match (fence.is_some(), kind) {
-                    (false, None) => claim_task_query(),
-                    (false, Some(kind)) => claim_task_query_for_kind(kind, false),
-                    (true, None) => claim_task_query_fenced(),
-                    (true, Some(kind)) => claim_task_query_for_kind(kind, true),
-                };
+                let sql = claim_query_for(kind, fence.is_some(), fairness);
                 let result: Vec<TaskQueueItem> = CachedClaimQuery {
                     sql,
                     ageing,
@@ -2270,7 +2464,7 @@ pub async fn claim_task_of_kind_on_shard(
                     return Ok(ClaimOutcome::Empty);
                 };
 
-                apply_post_claim_rechecks(conn, task, worker_id).await
+                recheck_and_charge(conn, task, worker_id, fairness).await
             },
         )
         .await?;
@@ -2387,6 +2581,21 @@ pub fn claim_task_by_id_query_fenced() -> &'static str {
     &BY_ID_FENCED
 }
 
+/// The by-id claim statement for one `(fenced, fairness)` choice.
+///
+/// Both choices return the unchanged by-id statement. A by-id claim names
+/// one row, so the lag sort cannot change its pick. A fair by-id claim still
+/// charges the key after the rechecks (issue #1976).
+#[must_use]
+pub fn claim_by_id_query_for(fenced: bool, fairness: ClaimFairness) -> &'static str {
+    let _ = fairness;
+    if fenced {
+        claim_task_by_id_query_fenced()
+    } else {
+        claim_task_by_id_query()
+    }
+}
+
 /// The pin-head predicate that the kind splice extends (issue #1971).
 ///
 /// It appears once, in the pin head of the seek window. The other scans
@@ -2424,6 +2633,215 @@ fn splice_kind_predicate(base: &str, kind: TaskType) -> String {
         );
     }
     spliced
+}
+
+/// The claim statement for one `(kind, fenced, fairness)` choice.
+///
+/// [`ClaimFairness::Off`] returns the unchanged statement for `kind` and
+/// `fenced`.
+#[must_use]
+pub fn claim_query_for(
+    kind: Option<TaskType>,
+    fenced: bool,
+    fairness: ClaimFairness,
+) -> &'static str {
+    let base = match (kind, fenced) {
+        (None, false) => claim_task_query(),
+        (None, true) => claim_task_query_fenced(),
+        (Some(kind), fenced) => claim_task_query_for_kind(kind, fenced),
+    };
+    match fairness {
+        ClaimFairness::Off => base,
+        ClaimFairness::Keys => fair_variant(kind, fenced),
+    }
+}
+
+/// The fair form of each `(kind, fenced)` claim statement (issue #1976).
+fn fair_variant(kind: Option<TaskType>, fenced: bool) -> &'static str {
+    use std::sync::LazyLock;
+    static FAIR: [LazyLock<String>; 6] = [
+        LazyLock::new(|| splice_fairness(claim_task_query())),
+        LazyLock::new(|| splice_fairness(claim_task_query_fenced())),
+        LazyLock::new(|| splice_fairness(claim_task_query_for_kind(TaskType::Workflow, false))),
+        LazyLock::new(|| splice_fairness(claim_task_query_for_kind(TaskType::Workflow, true))),
+        LazyLock::new(|| splice_fairness(claim_task_query_for_kind(TaskType::Activity, false))),
+        LazyLock::new(|| splice_fairness(claim_task_query_for_kind(TaskType::Activity, true))),
+    ];
+    let slot = match kind {
+        None => 0,
+        Some(TaskType::Workflow) => 2,
+        Some(TaskType::Activity) => 4,
+    } + usize::from(fenced);
+    &FAIR[slot]
+}
+
+/// The lag of a candidate row's key: `max(pass - V, 0)` (issue #1976).
+///
+/// An uncorrelated subquery maps each queue to its keys in debt, with their
+/// lags. A key is in debt when its `pass` is above the queue clock `V`, the
+/// largest `last_start`. A key not in the map has lag 0. See
+/// [`crate::queue_fairness::fair_lag`].
+///
+/// The subquery runs once per claim, as an `InitPlan`. Each candidate row then
+/// does one map lookup, so the plan does not depend on row estimates.
+///
+/// Two earlier forms did depend on them. The claim filters estimate one
+/// candidate row. The planner then joined a lag table as a nested loop and
+/// read it again for each row. At 10,000 rows that cost about 0.6 s per claim.
+/// A map in a CTE copied the whole map for each row.
+///
+/// The lag goes through `float8::text`, which round-trips exactly under the
+/// default `extra_float_digits`. A lower setting changes only the sort, by at
+/// most one unit in the last place.
+pub const FAIR_LAG_SQL: &str = "COALESCE((( \
+         SELECT COALESCE(jsonb_object_agg(fq.queue_name, fq.lags), '{}'::jsonb) \
+         FROM ( \
+             SELECT s.queue_name, \
+                 jsonb_object_agg(s.fairness_key, (s.pass - c.v)::text) AS lags \
+             FROM harvest_fairness_state s \
+             JOIN ( \
+                 SELECT queue_name, MAX(last_start) AS v \
+                 FROM harvest_fairness_state \
+                 WHERE queue_name = ANY($2) \
+                 GROUP BY queue_name \
+             ) c ON c.queue_name = s.queue_name \
+             WHERE s.pass > c.v \
+             GROUP BY s.queue_name \
+         ) fq \
+     ) -> harvest_task_queue.queue_name \
+       ->> COALESCE(harvest_task_queue.fairness_key, ''))::float8, 0)";
+
+/// The weight of the key `(q, k)`: its override, else the default `1`.
+macro_rules! fair_weight_sql {
+    ($q:literal, $k:literal) => {
+        concat!(
+            "COALESCE((SELECT fw.weight FROM harvest_fairness_weights fw \
+              WHERE fw.queue_name = ",
+            $q,
+            " AND fw.fairness_key = ",
+            $k,
+            "), 1.0)"
+        )
+    };
+}
+
+/// Charge one claim to the key of a claimed row (issue #1976).
+///
+/// Binds `$1` queue and `$2` key. A key with no row starts at the queue's
+/// clock `V`. An existing key starts at `max(pass, V)`. The new `pass` is the
+/// start plus `1 / weight`. This is [`crate::queue_fairness::FairClock::charge`]
+/// in SQL.
+///
+/// The claim runs it in its own transaction, after the post-claim rechecks
+/// accept the row. A recheck that gives the row back thus charges nothing.
+/// The upsert waits for a concurrent charge of the same key, then starts from
+/// the current `pass`. Two charges thus never share one slot.
+///
+/// The claim locks the task row first, then the state row. No other writer
+/// locks a state row first, so the order cannot deadlock.
+pub const FAIR_CHARGE_SQL: &str = concat!(
+    "INSERT INTO harvest_fairness_state AS fs \
+         (queue_name, fairness_key, pass, last_start, updated_at) \
+     SELECT $1, $2, clock.v + 1.0 / ",
+    fair_weight_sql!("$1", "$2"),
+    ", clock.v, NOW() \
+     FROM (SELECT COALESCE(MAX(last_start), 0) AS v \
+           FROM harvest_fairness_state WHERE queue_name = $1) clock \
+     ON CONFLICT (queue_name, fairness_key) DO UPDATE \
+     SET last_start = GREATEST(fs.pass, EXCLUDED.last_start), \
+         pass = GREATEST(fs.pass, EXCLUDED.last_start) + 1.0 / ",
+    fair_weight_sql!("$1", "$2"),
+    ", updated_at = NOW()"
+);
+
+/// Charge the key of `task` (issue #1976). See [`FAIR_CHARGE_SQL`].
+async fn charge_fairness_key(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+) -> HarvestResult<()> {
+    diesel::sql_query(FAIR_CHARGE_SQL)
+        .bind::<diesel::sql_types::Text, _>(&task.queue_name)
+        .bind::<diesel::sql_types::Text, _>(
+            task.fairness_key
+                .as_deref()
+                .unwrap_or(crate::queue_fairness::DEFAULT_FAIRNESS_KEY),
+        )
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Run the post-claim rechecks, then charge the key of a row they accept.
+async fn recheck_and_charge(
+    conn: &mut AsyncPgConnection,
+    task: TaskQueueItem,
+    worker_id: &str,
+    fairness: ClaimFairness,
+) -> HarvestResult<ClaimOutcome> {
+    let outcome = apply_post_claim_rechecks(conn, task, worker_id).await?;
+    if fairness == ClaimFairness::Keys
+        && let ClaimOutcome::Claimed(task) = &outcome
+    {
+        charge_fairness_key(conn, task).await?;
+    }
+    Ok(outcome)
+}
+
+/// Anchors of [`splice_fairness`].
+///
+/// The order anchor appears in each candidate scan. The other two appear
+/// once each. One gate empties the seek window under ageing. The other runs
+/// the full scan under ageing (issue #1971).
+const FAIR_ORDER_ANCHOR: &str = concat!("END DESC, ", claim_order_due_sql!(), " ASC");
+const FAIR_SEEK_WINDOW_ANCHOR: &str = "WHERE $4::BIGINT IS NULL OR $4::BIGINT <= 0 ";
+const FAIR_FULL_SCAN_ANCHOR: &str = "OR ($4::BIGINT IS NOT NULL AND $4::BIGINT > 0)) ";
+
+/// Splice the fair claim into a claim statement (issue #1976).
+///
+/// Three edits:
+///
+/// 1. Each candidate scan sorts on the lag ([`FAIR_LAG_SQL`]) after the
+///    effective priority and before the due time. Sticky rank and priority
+///    keep their meaning. Within one key the order is the old order.
+/// 2. The seek window is empty, as under priority ageing. The window guard
+///    proves a pick from priority and due time only. The lag can put any row
+///    of the backlog first, so the window cannot prove a fair pick.
+/// 3. The full scan always runs, as under ageing.
+///
+/// The statement does not charge the key. The claim does that after the
+/// post-claim rechecks. See [`FAIR_CHARGE_SQL`].
+///
+/// No bind, join or lock changes, so the fenced binds keep their numbers.
+/// `fair_claim_query_preserves_every_gate_and_bind` pins that.
+///
+/// # Panics
+///
+/// Panics at first use if an anchor is missing, or a single anchor appears
+/// more than once. That makes a future edit of the base query fail loudly,
+/// not claim unfairly.
+#[must_use]
+pub fn splice_fairness(base: &str) -> String {
+    assert!(
+        base.contains(FAIR_ORDER_ANCHOR),
+        "fair claim anchor {FAIR_ORDER_ANCHOR:?} must appear"
+    );
+    for anchor in [FAIR_SEEK_WINDOW_ANCHOR, FAIR_FULL_SCAN_ANCHOR] {
+        assert_eq!(
+            base.matches(anchor).count(),
+            1,
+            "fair claim anchor {anchor:?} must appear exactly once"
+        );
+    }
+    base.replace(
+        FAIR_ORDER_ANCHOR,
+        &format!(
+            "END DESC, {FAIR_LAG_SQL} ASC, {} ASC",
+            claim_order_due_sql!()
+        ),
+    )
+    .replace(FAIR_SEEK_WINDOW_ANCHOR, "WHERE FALSE ")
+    .replace(FAIR_FULL_SCAN_ANCHOR, "OR TRUE) ")
 }
 
 /// [`claim_task_query`] limited to one task kind (issue #1787).
@@ -2685,6 +3103,50 @@ pub async fn claim_task_by_id_on_shard(
     ineligible_activities: &[String],
     shard: Option<crate::types::ShardId>,
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    claim_task_by_id_with_fairness(
+        conn,
+        task_id,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        ClaimFairness::Off,
+    )
+    .await
+}
+
+/// [`claim_task_by_id_on_shard`] with a fairness mode (issue #1976).
+///
+/// A by-id claim names its row, so the key order does not apply. With
+/// [`ClaimFairness::Keys`] the claim still charges the key of the row. The
+/// poll path then sees the true share of each key.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure. With
+/// [`ClaimFairness::Keys`], it returns [`crate::error::HarvestError::Config`]
+/// for a queue name that the weight API cannot address, before any statement.
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_by_id_with_fairness(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    fairness: ClaimFairness,
+) -> HarvestResult<Option<TaskQueueItem>> {
+    if fairness == ClaimFairness::Keys {
+        for queue in queues {
+            crate::queue_fairness::validate_fairness_queue_name(queue)?;
+        }
+    }
     let aging_secs_i64: Option<i64> = priority_aging_secs.map(i64::from);
 
     let mut tx = conn.build_transaction().read_committed();
@@ -2696,7 +3158,7 @@ pub async fn claim_task_by_id_on_shard(
                 // heap-allocates per bind and dispatches dynamically.
                 let result: Vec<TaskQueueItem> = match fence_binding(shard) {
                     None => {
-                        diesel::sql_query(claim_task_by_id_query())
+                        diesel::sql_query(claim_by_id_query_for(false, fairness))
                             .bind::<diesel::sql_types::Text, _>(worker_id)
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
                             .bind::<diesel::sql_types::Text, _>(worker_build_id)
@@ -2714,7 +3176,7 @@ pub async fn claim_task_by_id_on_shard(
                             .await
                     }
                     Some((fence_shards, generations)) => {
-                        diesel::sql_query(claim_task_by_id_query_fenced())
+                        diesel::sql_query(claim_by_id_query_for(true, fairness))
                             .bind::<diesel::sql_types::Text, _>(worker_id)
                             .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
                             .bind::<diesel::sql_types::Text, _>(worker_build_id)
@@ -2744,7 +3206,7 @@ pub async fn claim_task_by_id_on_shard(
                     return Ok(ClaimOutcome::Empty);
                 };
 
-                apply_post_claim_rechecks(conn, task, worker_id).await
+                recheck_and_charge(conn, task, worker_id, fairness).await
             },
         )
         .await?;
@@ -3844,6 +4306,25 @@ pub(crate) async fn claim_handler_started(
     Ok(row.is_some_and(|(held, started)| held == Some(true) && started == Some(claim.attempt)))
 }
 
+/// An activity result as its task row stores it (issue #2043).
+///
+/// The row holds the result in the column form. A stored-result reference
+/// holds no payload, only a pointer to the blob, so it stays as it is.
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError`] when the codec fails to encode.
+pub fn activity_row_output(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    output: &serde_json::Value,
+    is_stored_reference: bool,
+) -> crate::error::HarvestResult<serde_json::Value> {
+    if is_stored_reference {
+        return Ok(output.clone());
+    }
+    codecs.encode_column(output)
+}
+
 /// Complete the task that `claim` holds. A stale claim changes nothing.
 ///
 /// Returns [`ClaimWrite::LeaseLost`] for a stale claim. [`complete_task`] is
@@ -4422,6 +4903,9 @@ pub async fn cancel_open_tasks_for_execution(
 /// is still open (`PENDING`/`RUNNING`) — the loser-cancellation primitive for
 /// `ctx.race()` (issue #600).
 ///
+/// A loser that a recorded fork holds is already `CANCELLED` with the hold
+/// mark of issue #2000. It counts as open here.
+///
 /// Returns `Some((activity_name, queue_name))` if a still-open row was
 /// transitioned to `CANCELLED` (the caller should then record a synthetic
 /// terminal event for it so replay never re-observes it as in-progress, and
@@ -4439,17 +4923,41 @@ pub async fn cancel_activity_task(
     conn: &mut AsyncPgConnection,
     activity_id: crate::types::ActivityExecId,
 ) -> HarvestResult<Option<(String, String)>> {
+    cancel_activity_task_with_reason(
+        conn,
+        activity_id,
+        crate::context::LoserCancelReason::RaceLoser.message(),
+    )
+    .await
+}
+
+/// [`cancel_activity_task`] that stores `reason` as the row's error
+/// (issue #1984). A cancellation scope names itself here.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) on
+/// update failure.
+pub async fn cancel_activity_task_with_reason(
+    conn: &mut AsyncPgConnection,
+    activity_id: crate::types::ActivityExecId,
+    reason: &str,
+) -> HarvestResult<Option<(String, String)>> {
     use crate::schema::harvest_task_queue::dsl;
 
     let cancelled = diesel::update(
         dsl::harvest_task_queue
             .filter(dsl::activity_id.eq(Some(activity_id.as_uuid())))
-            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+            .filter(
+                dsl::state.eq_any(["PENDING", "RUNNING"]).or(dsl::state
+                    .eq("CANCELLED")
+                    .and(dsl::error.eq(Some(crate::fork::FORK_HOLD_ERROR)))),
+            ),
     )
     .set((
         dsl::state.eq("CANCELLED"),
         dsl::worker_id.eq(None::<String>),
-        dsl::error.eq(Some("lost race to a sibling branch".to_string())),
+        dsl::error.eq(Some(reason.to_string())),
         dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
@@ -4534,7 +5042,8 @@ pub async fn queue_depths(
 /// Binds: `$1` queue names, `$2` circuit-breaker-tracked activities.
 #[must_use]
 pub const fn oldest_pending_ages_query() -> &'static str {
-    "SELECT queue_name, \
+    concat!(
+        "SELECT queue_name, \
                 GREATEST( \
                     EXTRACT(EPOCH FROM (NOW() - MIN(GREATEST(scheduled_at, COALESCE(created_at, scheduled_at))))), \
                     0 \
@@ -4578,10 +5087,13 @@ pub const fn oldest_pending_ages_query() -> &'static str {
                OR EXISTS ( \
                    SELECT 1 FROM harvest_rate_limit_buckets b \
                    WHERE b.key = harvest_task_queue.rate_limit_key \
-                     AND LEAST(COALESCE(CASE WHEN b.override_expires_at > NOW() THEN b.override_burst ELSE NULL END, b.burst), b.tokens + GREATEST(0, EXTRACT(EPOCH FROM (LEAST(COALESCE(b.override_expires_at, b.last_refilled_at), NOW()) - b.last_refilled_at))) * COALESCE(b.override_refill_rate, b.refill_rate) + GREATEST(0, EXTRACT(EPOCH FROM (NOW() - GREATEST(COALESCE(b.override_expires_at, b.last_refilled_at), b.last_refilled_at)))) * b.refill_rate) >= 1.0 \
+                     AND ",
+        rate_limit_available_sql!(),
+        " >= 1.0 \
                ) \
            ) \
          GROUP BY queue_name"
+    )
 }
 
 /// Returns the age in seconds of the oldest currently-*claimable* eligible task
@@ -4707,6 +5219,34 @@ pub async fn record_heartbeat_sent_ago(
     details: serde_json::Value,
     age: std::time::Duration,
 ) -> HarvestResult<ClaimWrite> {
+    record_heartbeat_inner(conn, claim, Some(details), age).await
+}
+
+/// [`record_heartbeat_sent_ago`] for a heartbeat that holds no details
+/// (issue #2043).
+///
+/// It refreshes `last_heartbeat_at` and leaves the stored checkpoint as it
+/// is. The heartbeat flusher uses it when a checkpoint does not encode, so the
+/// previous checkpoint survives.
+///
+/// # Errors
+///
+/// As [`record_heartbeat_sent_ago`].
+pub async fn record_heartbeat_liveness_sent_ago(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    age: std::time::Duration,
+) -> HarvestResult<ClaimWrite> {
+    record_heartbeat_inner(conn, claim, None, age).await
+}
+
+/// The shared body of the two heartbeat writes. `None` keeps the checkpoint.
+async fn record_heartbeat_inner(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    details: Option<serde_json::Value>,
+    age: std::time::Duration,
+) -> HarvestResult<ClaimWrite> {
     use diesel_async::AsyncConnection as _;
     if !crate::replication::FenceRegistry::is_enabled() {
         return write_heartbeat(conn, claim, details, age).await;
@@ -4724,7 +5264,7 @@ pub async fn record_heartbeat_sent_ago(
 async fn write_heartbeat(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
-    details: serde_json::Value,
+    details: Option<serde_json::Value>,
     age: std::time::Duration,
 ) -> HarvestResult<ClaimWrite> {
     use crate::schema::harvest_task_queue::dsl;
@@ -4734,16 +5274,20 @@ async fn write_heartbeat(
     )
     .bind::<diesel::sql_types::Double, _>(age.as_secs_f64())
     .sql(")");
-    let update = diesel::update(dsl::harvest_task_queue.find(claim.task_id))
-        .set((
-            dsl::last_heartbeat_at.eq(stamp),
-            dsl::heartbeat_details.eq(Some(details)),
-        ))
-        .into_boxed();
-    let updated = fence(update, Some(claim))
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let target = diesel::update(dsl::harvest_task_queue.find(claim.task_id));
+    let updated = if let Some(details) = details {
+        let update = target
+            .set((
+                dsl::last_heartbeat_at.eq(stamp),
+                dsl::heartbeat_details.eq(Some(details)),
+            ))
+            .into_boxed();
+        fence(update, Some(claim)).execute(conn).await
+    } else {
+        let update = target.set(dsl::last_heartbeat_at.eq(stamp)).into_boxed();
+        fence(update, Some(claim)).execute(conn).await
+    }
+    .map_err(crate::error::database_error)?;
     Ok(claim_write(updated > 0))
 }
 
@@ -7119,6 +7663,37 @@ pub async fn task_exists(conn: &mut AsyncPgConnection, task_id: Uuid) -> Harvest
     Ok(found.is_some())
 }
 
+/// Whether a task of `session_id` other than `except_task_id` can still run
+/// (issue #2193).
+///
+/// A task can still run while it is `PENDING` or `RUNNING`. The scan keys on
+/// `workflow_exec_id`, because the `session_id` index was dropped: no query
+/// could use it. A session belongs to one run, so its member tasks carry the
+/// run's id.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn session_has_other_live_tasks(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+    session_id: Uuid,
+    except_task_id: Uuid,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    diesel::select(diesel::dsl::exists(
+        dsl::harvest_task_queue
+            .filter(dsl::workflow_exec_id.eq(Some(workflow_exec_id)))
+            .filter(dsl::session_id.eq(Some(session_id)))
+            .filter(dsl::id.ne(except_task_id))
+            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+    ))
+    .get_result::<bool>(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
 // ---------------------------------------------------------------------------
 // TTL'd rate-limit / start-throttle runtime overrides (issue #945)
 // ---------------------------------------------------------------------------
@@ -8123,15 +8698,24 @@ const TERMINAL_TASK_CURSOR: &str = "AND (t.completed_at, t.id) > ($3, $4) ";
 ///   takes its entry, so the row goes 7 days after the cutoff. The grace is
 ///   at most [`crate::worker::MAX_CANCELLATION_GRACE_PERIOD`], so a live
 ///   owner always takes its entry first.
+/// - **Fork hold.** A race loser that a recorded fork holds stays while its
+///   execution is live (issue #2000). The race finds the hold mark when its
+///   winner fires. A timer winner can fire after the window.
 #[must_use]
 fn terminal_task_predicates() -> String {
     let terminal = crate::erase::sql_literal_list(TERMINAL_TASK_STATES);
     let execution_terminal = crate::erase::sql_literal_list(crate::erase::TERMINAL_STATES);
+    let hold = crate::erase::sql_literal_list(&[crate::fork::FORK_HOLD_ERROR]);
     format!(
         "t.state IN ({terminal}) \
          AND t.completed_at < $1 \
          AND (COALESCE(cardinality(t.timed_out_claims), 0) = 0 \
               OR t.completed_at < $1 - INTERVAL '7 days') \
+         AND (t.error IS DISTINCT FROM {hold} OR NOT EXISTS ( \
+             SELECT 1 FROM harvest_workflow_executions e \
+              WHERE e.id = t.workflow_exec_id \
+                AND e.state NOT IN ({execution_terminal}) \
+         )) \
          AND (t.task_type = 'activity' OR ( \
              NOT EXISTS ( \
                  SELECT 1 FROM harvest_workflow_executions e \
@@ -9627,6 +10211,38 @@ mod tests {
     use super::*;
     use crate::error::CapabilityMissPhase;
 
+    /// An activity result is stored in the column form (issue #2043). A
+    /// stored-result reference holds no payload, so it stays as it is.
+    #[test]
+    fn an_activity_row_output_follows_the_column_switch() {
+        let codecs = crate::payload_codec::PayloadCodecs::default();
+        let key = crate::aead_codec::DataKey::from_bytes(&[0x31; 32]).expect("key");
+        crate::aead_codec::AeadCodec::new("k1", &key)
+            .expect("codec")
+            .register_with(&codecs)
+            .expect("register");
+        let result = serde_json::json!({"card": "4111"});
+
+        codecs.set_column_encoding(false);
+        assert_eq!(
+            activity_row_output(&codecs, &result, false).expect("off"),
+            result,
+            "with the switch off, the result stays as it is"
+        );
+
+        codecs.set_column_encoding(true);
+        let stored = activity_row_output(&codecs, &result, false).expect("on");
+        assert!(crate::payload_codec::is_codec_envelope(&stored));
+        assert_eq!(codecs.decode_column(&stored).expect("decode"), result);
+
+        let reference = serde_json::json!({"blob": "key"});
+        assert_eq!(
+            activity_row_output(&codecs, &reference, true).expect("reference"),
+            reference,
+            "a stored-result reference stays clear"
+        );
+    }
+
     /// `EnqueueParams` shares its input with the caller (issue #1733).
     #[test]
     fn enqueue_params_share_the_input() {
@@ -10043,9 +10659,11 @@ mod tests {
     /// Every public claim entry point applies the DR fence (issue #1823).
     ///
     /// The test reads this file, up to the test module. A top-level
-    /// `pub async fn claim_task*` passes when its body calls `fence_binding`,
-    /// or calls another variant that passes. Comment lines do not count. A
-    /// new claim variant without the fence fails here, not during a failover.
+    /// `async fn claim_task*`, public or private, passes when its body calls
+    /// `fence_binding`, or calls another variant that passes. A private
+    /// helper is scanned too, so a public variant may reach the fence through
+    /// it (issue #1976). Comment lines do not count. A new claim variant
+    /// without the fence fails here, not during a failover.
     #[test]
     fn every_claim_variant_applies_the_dr_fence() {
         // A Windows checkout can use CRLF line ends. The scan matches LF.
@@ -10053,21 +10671,23 @@ mod tests {
         let source = &full[..full
             .find("\n#[cfg(test)]\nmod tests")
             .expect("queue.rs has a test module")];
-        let marker = "\npub async fn claim_task";
         let mut variants: Vec<(String, String)> = Vec::new();
-        let mut rest = source;
-        while let Some(start) = rest.find(marker) {
-            let tail = &rest[start + "\npub async fn ".len()..];
-            let name_end = tail.find('(').expect("fn name ends at its parameter list");
-            let body_start = tail.find("{\n").expect("fn body opens a block");
-            let body_end = tail.find("\n}\n").expect("fn body ends at column zero");
-            let code: String = tail[body_start..body_end]
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            variants.push((tail[..name_end].to_string(), code));
-            rest = &tail[body_end..];
+        for prefix in ["\npub async fn ", "\nasync fn "] {
+            let marker = format!("{prefix}claim_task");
+            let mut rest = source;
+            while let Some(start) = rest.find(&marker) {
+                let tail = &rest[start + prefix.len()..];
+                let name_end = tail.find('(').expect("fn name ends at its parameter list");
+                let body_start = tail.find("{\n").expect("fn body opens a block");
+                let body_end = tail.find("\n}\n").expect("fn body ends at column zero");
+                let code: String = tail[body_start..body_end]
+                    .lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                variants.push((tail[..name_end].to_string(), code));
+                rest = &tail[body_end..];
+            }
         }
         // A call to `name(` that is not the tail of a longer identifier.
         let calls = |body: &str, name: &str| {
@@ -11345,11 +11965,28 @@ mod tests {
 
     // ── TTL'd rate-limit override drift locks (issue #945) ──────────────────
     //
-    // These sites are hand-copied literal SQL (2 of the 3 live inside
-    // `pub const fn` bodies, which cannot call runtime helpers), so nothing
-    // stops them drifting from `effective_available_tokens_expr` except a
-    // test asserting textual containment -- mirroring the queue-pause /
-    // activity-pause drift locks immediately above.
+    // `claim_task_query` and `oldest_pending_ages_query` need the formula as
+    // compile-time SQL text. 2 of the 3 sites below live inside a
+    // `concat!`-only macro or a `pub const fn` body. Neither can call the
+    // runtime helper. Both now render `rate_limit_available_sql!()`, one
+    // macro, instead of a hand-typed copy at each site --
+    // `rate_limit_available_sql_matches_the_effective_available_tokens_expr`
+    // pins that macro to the helper. These tests stay. They mirror the
+    // queue-pause / activity-pause drift locks immediately above. A correct
+    // macro expansion is still worth asserting at its actual call sites, not
+    // only at its own definition.
+
+    #[test]
+    fn rate_limit_available_sql_matches_the_effective_available_tokens_expr() {
+        assert_eq!(
+            rate_limit_available_sql!(),
+            effective_available_tokens_expr("b"),
+            "rate_limit_available_sql! must render exactly what \
+             effective_available_tokens_expr(\"b\") computes at runtime, or \
+             the sites that cannot call that helper directly silently diverge \
+             from it"
+        );
+    }
 
     #[test]
     fn claim_task_query_honors_the_effective_rate_limit_override() {
@@ -11868,6 +12505,16 @@ mod tests {
             assert!(!sql.contains(live), "{live} must not appear: {sql}");
         }
         assert!(sql.contains("t.completed_at < $1"));
+    }
+
+    #[test]
+    fn terminal_task_predicates_keep_a_live_fork_hold() {
+        let sql = terminal_task_predicates();
+        let hold = format!(
+            "t.error IS DISTINCT FROM '{}'",
+            crate::fork::FORK_HOLD_ERROR
+        );
+        assert!(sql.contains(&hold), "{sql}");
     }
 
     #[test]
@@ -13892,6 +14539,7 @@ mod tests {
             context_headers: None,
             session_id: None,
             new_start: false,
+            fairness_key: None,
         };
         let NewTaskQueueItem {
             id: _,
@@ -13922,13 +14570,14 @@ mod tests {
             context_headers: _,
             session_id: _,
             new_start: _,
+            fairness_key: _,
         } = sample;
         // The field destructure above is the compile-time proof that
         // NEW_TASK_QUEUE_ITEM_COLUMNS counts every field. This const block
         // is a second, independent compile-time check: the chunk size
         // computed from that count never crosses Postgres's ceiling.
         const {
-            assert!(NEW_TASK_QUEUE_ITEM_COLUMNS == 28);
+            assert!(NEW_TASK_QUEUE_ITEM_COLUMNS == 29);
             assert!(
                 ROWS_PER_INSERT_CHUNK * NEW_TASK_QUEUE_ITEM_COLUMNS <= POSTGRES_MAX_BIND_PARAMS
             );
@@ -14373,5 +15022,190 @@ mod tests {
     fn primary_repend_returns_every_hint_column() {
         let sql = primary_repend_workflow_task_query();
         assert!(sql.contains("RETURNING id, queue_name, scheduled_at, priority, task_type"));
+    }
+
+    // -------------------------------------------------------------------
+    // Fair claim splice (issue #1976).
+    // -------------------------------------------------------------------
+
+    /// Every fair claim variant, with the unfair variant it derives from.
+    fn fair_pairs() -> Vec<(&'static str, &'static str)> {
+        let mut pairs = Vec::new();
+        for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+            for fenced in [false, true] {
+                pairs.push((
+                    claim_query_for(kind, fenced, ClaimFairness::Off),
+                    claim_query_for(kind, fenced, ClaimFairness::Keys),
+                ));
+            }
+        }
+        pairs
+    }
+
+    /// A by-id claim names one row, so a fair by-id claim skips the lag
+    /// sort. It still charges the key.
+    /// A repeated queue name gets one place in the fair poll order.
+    #[test]
+    fn a_fair_claim_polls_each_queue_once() {
+        let queues = ["a", "a", "b", "a"].map(String::from);
+        let order: Vec<&str> = distinct_queues(&queues)
+            .into_iter()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(order, ["a", "b"]);
+    }
+
+    #[test]
+    fn a_fair_by_id_claim_uses_the_plain_statement() {
+        for fenced in [false, true] {
+            assert_eq!(
+                claim_by_id_query_for(fenced, ClaimFairness::Keys),
+                claim_by_id_query_for(fenced, ClaimFairness::Off)
+            );
+        }
+    }
+
+    /// The `$n` binds of a statement, sorted and deduplicated.
+    fn binds(sql: &str) -> Vec<u32> {
+        let mut out: Vec<u32> = sql
+            .match_indices('$')
+            .filter_map(|(i, _)| {
+                let digits: String = sql[i + 1..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                digits.parse().ok()
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn fairness_off_claim_is_byte_identical() {
+        assert_eq!(
+            claim_query_for(None, false, ClaimFairness::Off),
+            claim_task_query()
+        );
+        assert_eq!(
+            claim_query_for(None, true, ClaimFairness::Off),
+            claim_task_query_fenced()
+        );
+        for kind in [TaskType::Workflow, TaskType::Activity] {
+            for fenced in [false, true] {
+                assert_eq!(
+                    claim_query_for(Some(kind), fenced, ClaimFairness::Off),
+                    claim_task_query_for_kind(kind, fenced)
+                );
+            }
+        }
+        assert_eq!(
+            claim_by_id_query_for(false, ClaimFairness::Off),
+            claim_task_by_id_query()
+        );
+        assert_eq!(
+            claim_by_id_query_for(true, ClaimFairness::Off),
+            claim_task_by_id_query_fenced()
+        );
+    }
+
+    #[test]
+    fn fair_claim_query_preserves_every_gate_and_bind() {
+        for (base, fair) in fair_pairs() {
+            for gate in CLAIM_GATES {
+                assert_eq!(
+                    base.matches(gate).count(),
+                    fair.matches(gate).count(),
+                    "the fair splice changed gate {gate:?}"
+                );
+            }
+            assert_eq!(
+                binds(base),
+                binds(fair),
+                "the fair splice changed the binds"
+            );
+            assert_eq!(
+                base.matches("FOR UPDATE").count(),
+                fair.matches("FOR UPDATE").count(),
+                "the fair splice changed the row locks"
+            );
+            assert_eq!(
+                base.matches("advisory_xact_lock").count(),
+                fair.matches("advisory_xact_lock").count()
+            );
+        }
+    }
+
+    #[test]
+    fn fair_claim_sorts_on_the_lag_before_the_due_time() {
+        let order = format!("END DESC, {FAIR_LAG_SQL} ASC, {CLAIM_ORDER_DUE_SQL} ASC");
+        for (base, fair) in fair_pairs() {
+            // One lag term per candidate scan.
+            assert_eq!(
+                fair.matches(order.as_str()).count(),
+                base.matches(FAIR_ORDER_ANCHOR).count(),
+                "{fair}"
+            );
+            // The seek window is off and the full scan always runs.
+            assert!(fair.contains("WHERE FALSE "));
+            assert!(fair.contains("OR TRUE) "));
+            assert!(!fair.contains("fair_lag"), "the lag is not a join");
+        }
+    }
+
+    /// A post-claim recheck can give the row back. The claim statement must
+    /// therefore never charge; the separate charge runs after the rechecks.
+    #[test]
+    fn the_fair_claim_statement_never_charges() {
+        for (_, fair) in fair_pairs() {
+            assert!(
+                !fair.contains("INSERT INTO harvest_fairness_state"),
+                "{fair}"
+            );
+            assert!(fair.ends_with("FROM claimed"));
+        }
+        // A Windows checkout has CRLF line ends.
+        let src = include_str!("queue.rs").replace("\r\n", "\n");
+        let body = &src[src
+            .find("async fn recheck_and_charge(")
+            .expect("helper exists")..];
+        let body = &body[..body.find("\n}\n").expect("helper ends")];
+        let recheck = body
+            .find("apply_post_claim_rechecks")
+            .expect("rechecks run");
+        let charge = body.find("charge_fairness_key(conn").expect("charge runs");
+        assert!(recheck < charge, "the charge must follow the rechecks");
+        assert!(
+            body.contains("ClaimOutcome::Claimed(task)"),
+            "only a kept claim charges"
+        );
+    }
+
+    #[test]
+    fn fair_sql_mirrors_the_model_rules() {
+        // lag = max(pass - V, 0): only keys with pass > V are in the map, and
+        // a missing key has lag 0.
+        assert!(FAIR_LAG_SQL.contains("(s.pass - c.v)::text"));
+        assert!(FAIR_LAG_SQL.contains("WHERE s.pass > c.v"));
+        assert!(FAIR_LAG_SQL.contains("MAX(last_start) AS v"));
+        assert!(FAIR_LAG_SQL.starts_with("COALESCE((("));
+        assert!(FAIR_LAG_SQL.ends_with("::float8, 0)"));
+        // The map is keyed by queue, then by key, so a lag never crosses
+        // queues.
+        assert!(FAIR_LAG_SQL.contains("-> harvest_task_queue.queue_name"));
+        // A new key starts at V. An existing key starts at max(pass, V).
+        assert!(FAIR_CHARGE_SQL.contains("SELECT COALESCE(MAX(last_start), 0) AS v"));
+        assert!(
+            FAIR_CHARGE_SQL.contains("SET last_start = GREATEST(fs.pass, EXCLUDED.last_start)")
+        );
+        // A key with no override has weight 1.
+        assert!(FAIR_CHARGE_SQL.contains("), 1.0)"));
+    }
+
+    #[test]
+    #[should_panic(expected = "fair claim anchor")]
+    fn fair_splice_panics_when_an_anchor_is_missing() {
+        let _ = splice_fairness("WITH candidate AS ( SELECT 1 ) SELECT * FROM claimed");
     }
 }

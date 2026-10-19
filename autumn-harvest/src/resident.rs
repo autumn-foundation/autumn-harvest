@@ -27,13 +27,17 @@
 //!
 //! # When a warm decision resumes
 //!
-//! The delta must start with the events of the last suspension, in order.
-//! Then it must hold at least one event that resolves a parked await. Each
-//! parked await resolves at most once. A resolving event must be an
-//! activity success, a timer fire or a signal. The start and heartbeat
-//! events of a parked activity may come before its result, because replay
-//! skips those too. The live channels carry these payloads exactly, as a
-//! replay reads them. Any other delta declines.
+//! The delta must start with all the events of the last suspension, in
+//! order. Then it holds the events that resolve parked awaits. Each parked
+//! await resolves at most once. A resolving event must be an activity
+//! success, a timer fire or a signal. The start and heartbeat events of a
+//! parked activity may come before its result, because replay skips those
+//! too. The live channels carry these payloads exactly, as a replay reads
+//! them. Any other delta declines.
+//!
+//! A delta with no resolving event is a redundant wake. Each parked
+//! activity then waits again, as in a partial join. A lone timer or signal
+//! cannot wait again, so its redundant wake declines.
 //!
 //! # Partial joins
 //!
@@ -97,7 +101,9 @@ pub enum ResumeDeclined {
     KeyChanged,
     /// The delta does not start with the events of the last suspension.
     OwnEventsMismatch,
-    /// The delta resolves no parked await.
+    /// The delta resolves no parked await, and the resume cannot wait
+    /// again. The delta is shorter than the events of the last suspension,
+    /// or the lone parked await is a timer or a signal.
     NoResolution,
     /// The delta holds an event after every parked await resolved, or a
     /// second result for one await.
@@ -170,6 +176,7 @@ pub(crate) struct ResidentKey {
     execution_timeout: Option<chrono::Duration>,
     deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     parent_execution_id: Option<ExecutionId>,
+    start_provenance: crate::types::StartProvenance,
     context_headers: HashMap<String, String>,
 }
 
@@ -192,6 +199,7 @@ impl ResidentKey {
             execution_timeout: span_meta.and_then(|m| m.execution_timeout),
             deadline_at: span_meta.and_then(|m| m.deadline_at),
             parent_execution_id: span_meta.and_then(|m| m.parent_execution_id),
+            start_provenance: span_meta.map(|m| m.start_provenance).unwrap_or_default(),
             context_headers: context_headers.clone(),
         }
     }
@@ -210,6 +218,7 @@ impl PartialEq for ResidentKey {
             && self.execution_timeout == other.execution_timeout
             && self.deadline_at == other.deadline_at
             && self.parent_execution_id == other.parent_execution_id
+            && self.start_provenance == other.start_provenance
             && self.context_headers == other.context_headers
     }
 }
@@ -606,16 +615,21 @@ impl ResidentWorkflow {
     /// that the live channel can carry each payload exactly.
     ///
     /// Decision boundaries (issue #1833) are skipped. Replay never reads them.
+    ///
+    /// A delta that holds all the own events and no result resolves no
+    /// await. That is a redundant wake, so every await stays parked.
     fn resolutions(&self, delta: &[WorkflowEvent]) -> Result<Vec<Option<usize>>, ResumeDeclined> {
         let mut events = delta
             .iter()
             .enumerate()
             .filter(|(_, event)| !event.is_decision_boundary());
         // A delta shorter than the own events is checked as far as it goes.
+        let mut own_seen = 0;
         let own_match = self.own_events.iter().all(|expected| {
-            events
-                .next()
-                .is_none_or(|(_, event)| expected.matches(event))
+            events.next().is_none_or(|(_, event)| {
+                own_seen += 1;
+                expected.matches(event)
+            })
         });
         if !own_match {
             return Err(ResumeDeclined::OwnEventsMismatch);
@@ -647,7 +661,9 @@ impl ResidentWorkflow {
             }
             resolved[index] = Some(at);
         }
-        if resolved.iter().all(Option::is_none) {
+        // A short delta can still lack an event that the last decision
+        // wrote, so only a complete one is a redundant wake.
+        if resolved.iter().all(Option::is_none) && own_seen < self.own_events.len() {
             return Err(ResumeDeclined::NoResolution);
         }
         Ok(resolved)
@@ -671,6 +687,11 @@ impl ResidentWorkflow {
             return Err(ResumeDeclined::KeyChanged);
         }
         let mut ends: Vec<usize> = self.resolutions(delta)?.into_iter().flatten().collect();
+        // A redundant wake runs one step that only waits again. A lone timer
+        // or signal cannot wait again, so the step declines it.
+        if ends.is_empty() {
+            return self.step(delta, span_meta).await;
+        }
         ends.sort_unstable();
         // The last step also takes the progress events after the last result.
         if let Some(last) = ends.last_mut() {
@@ -717,8 +738,8 @@ impl ResidentWorkflow {
                 parked.deliver(&delta[at])?;
                 continue;
             }
-            // Only an activity can wait again. Capture parks a timer or a
-            // signal only alone, and a delta always resolves a lone await.
+            // Only an activity can wait again. A lone timer or signal that
+            // a redundant wake does not resolve declines here.
             let wait = parked.into_wait().ok_or(ResumeDeclined::NoResolution)?;
             if let WorkflowCommand::WaitForActivity { activity_id, .. } = &wait {
                 reparked.push(*activity_id);
@@ -1313,6 +1334,18 @@ mod tests {
         })
     }
 
+    /// Parks on a payload-matching signal wait (issue #1985).
+    ///
+    /// A warm resume sends any same-name payload to the parked future. It
+    /// does not run the predicate.
+    fn predicate_wait_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
+        Box::pin(async move {
+            ctx.wait_for_signal_matching("order", |p| p["id"] == 42)
+                .await
+                .map_err(|e| e.to_string())
+        })
+    }
+
     /// Acquires a durable mutex, then awaits an activity.
     fn mutex_workflow(ctx: &WorkflowContext, _input: Value) -> HandlerFuture<'_> {
         Box::pin(async move {
@@ -1335,7 +1368,7 @@ mod tests {
     #[tokio::test]
     async fn capture_names_why_a_suspension_is_not_resident() {
         // Issue #2007: each miss reason is the `outcome` label of a decision.
-        let cases: [(&str, WorkflowHandlerFn, ResidentOutcome); 6] = [
+        let cases: [(&str, WorkflowHandlerFn, ResidentOutcome); 7] = [
             (
                 "mixed join",
                 mixed_join_workflow,
@@ -1349,6 +1382,11 @@ mod tests {
                 "child workflow",
                 child_workflow,
                 ResidentOutcome::Unsupported,
+            ),
+            (
+                "signal predicate",
+                predicate_wait_workflow,
+                ResidentOutcome::Blocked,
             ),
         ];
         for (name, handler, expected) in cases {
@@ -1447,6 +1485,16 @@ mod tests {
         }
     }
 
+    /// An update that the edge admitted while the workflow was parked (issue #2035).
+    fn admitted_update() -> WorkflowEvent {
+        WorkflowEvent::UpdateAdmitted {
+            update_id: crate::types::UpdateId::new(),
+            name: "bump".into(),
+            input: Value::Null,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
     /// Builds a delta from the own events and the id of the parked activity.
     type DeltaBuilder = Box<dyn Fn(&[WorkflowEvent], ActivityExecId) -> Vec<WorkflowEvent>>;
 
@@ -1464,11 +1512,6 @@ mod tests {
                 "no own events",
                 ResumeDeclined::OwnEventsMismatch,
                 Box::new(|_own, id| vec![completed(id)]),
-            ),
-            (
-                "own events only",
-                ResumeDeclined::NoResolution,
-                Box::new(|own, _id| own.to_vec()),
             ),
             (
                 "wrong activity id",
@@ -1530,6 +1573,16 @@ mod tests {
                     ]
                     .concat()
                 }),
+            ),
+            (
+                "an update admitted before the result",
+                ResumeDeclined::UnexpectedEvent("UpdateAdmitted"),
+                Box::new(|own, id| [own.to_vec(), vec![admitted_update(), completed(id)]].concat()),
+            ),
+            (
+                "an update admitted after the result",
+                ResumeDeclined::ExtraEvents,
+                Box::new(|own, id| [own.to_vec(), vec![completed(id), admitted_update()]].concat()),
             ),
             (
                 "a timer fire for another timer",
@@ -1682,6 +1735,8 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            start_provenance: crate::types::StartProvenance::default(),
+            cancellation_reason: None,
         };
         let key = ResidentKey::new(one_activity_workflow, Some(&meta), &HashMap::new());
         let declined = resident.resume_with(&delta, Some(&key), Some(&meta)).await;
@@ -1689,6 +1744,52 @@ mod tests {
             declined.err(),
             Some(ResumeDeclined::KeyChanged),
             "a new shard or name must decline"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wake_with_nothing_new_waits_again() {
+        // A second wake for results that the last decision already read
+        // brings only the own events of the suspension.
+        let (resident, own, id) = suspended_activity().await;
+        let (outcome, next) = resident
+            .resume(&own)
+            .await
+            .expect("a wake with nothing new must not decline");
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Suspended { commands }
+                if matches!(commands.as_slice(), [WorkflowCommand::WaitForActivity { activity_id, .. }] if *activity_id == id)),
+            "the cycle must only wait again: {outcome:?}"
+        );
+        let next = next.expect("the workflow stays resident");
+        let (outcome, _) = next
+            .resume(&[decision_boundary(), completed(id)])
+            .await
+            .expect("the result resolves");
+        assert!(
+            matches!(&outcome, WorkflowOutcome::Completed { output, .. } if *output == json!(1)),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wake_with_nothing_new_declines_for_a_lone_timer() {
+        let (outcome, resident) = start(
+            ExecutionId::new(),
+            vec![started(Value::Null)],
+            timer_loop_workflow,
+            Value::Null,
+        )
+        .await;
+        let WorkflowOutcome::Suspended { commands } = outcome else {
+            panic!("the first decision must suspend");
+        };
+        let own = own_events(&commands);
+        let resident = resident.expect("a timer suspension is resident");
+        assert_eq!(
+            resident.resume(&own).await.err(),
+            Some(ResumeDeclined::NoResolution),
+            "only an activity can wait again"
         );
     }
 
@@ -2498,10 +2599,44 @@ mod tests {
             execution_timeout: None,
             deadline_at: None,
             parent_execution_id: None,
+            start_provenance: crate::types::StartProvenance::default(),
+            cancellation_reason: None,
         };
         let key = ResidentKey::new(pair_then_c_workflow, Some(&meta), &HashMap::new());
         let declined = resident.resume_with(&delta, Some(&key), Some(&meta)).await;
         assert_eq!(declined.err(), Some(ResumeDeclined::KeyChanged));
+    }
+
+    #[test]
+    fn keys_differ_when_only_the_start_provenance_differs() {
+        let meta = |provenance| crate::executor::WorkflowExecuteSpanMeta {
+            workflow_name: "wf".into(),
+            workflow_id: String::new(),
+            shard_id: 0,
+            queue_name: String::new(),
+            is_replay: false,
+            link_traceparent: None,
+            build_id: None,
+            execution_timeout: None,
+            deadline_at: None,
+            parent_execution_id: None,
+            start_provenance: provenance,
+            cancellation_reason: None,
+        };
+        let key = |m: &crate::executor::WorkflowExecuteSpanMeta| {
+            ResidentKey::new(pair_then_c_workflow, Some(m), &HashMap::new())
+        };
+        let api = meta(crate::types::StartProvenance::fresh(
+            crate::types::StartSource::Api,
+        ));
+        let again = meta(crate::types::StartProvenance::fresh(
+            crate::types::StartSource::Api,
+        ));
+        let can = meta(crate::types::StartProvenance::continued_from(
+            ExecutionId::new(),
+        ));
+        assert_eq!(key(&api), key(&again));
+        assert_ne!(key(&api), key(&can));
     }
 
     #[tokio::test]

@@ -42,5 +42,9 @@ async fn main() {
     // Register the same workflows, signals, updates, queries, codecs, payload
     // caps, history policy and build id as the worker.
     let check = UpgradeCheck::new().register(workflows![place_order]);
-    std::process::exit(run_command(check, std::env::args().collect()).await);
+    // Lossy: `args()` would panic and print a non-UTF-8 argument.
+    let args = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    std::process::exit(run_command(check, args).await);
 }

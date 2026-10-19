@@ -197,11 +197,12 @@ pub async fn append_events_with_codecs(
     }
 
     let rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
-    let inserted = insert_event_rows(conn, exec_id, &rows).await?;
+    let (inserted, stamp) = insert_event_rows(conn, exec_id, &rows).await?;
 
     if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended(
+        crate::notify::notify_workflow_events_appended_stamped(
             conn,
+            stamp,
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
@@ -213,11 +214,18 @@ pub async fn append_events_with_codecs(
 }
 
 /// Insert prepared event rows behind the DR write fence. Stages no NOTIFY.
+///
+/// Returns the row count, and the stamp of the insert when
+/// [`crate::notify::stamp_wanted`] holds.
 async fn insert_event_rows(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
     rows: &[NewHarvestEvent<'_>],
-) -> HarvestResult<usize> {
+) -> HarvestResult<(usize, Option<crate::notify::Stamp>)> {
+    // Decide before the fence opens a transaction (issue #2125). Inside it, an
+    // autocommit write would ask for a stamp. A failed stamp would then fail a
+    // write that the probe path lets commit.
+    let stamped = crate::notify::stamp_wanted(conn);
     // Cross-region DR write-authority fence (issue #954).
     //
     // Callers skip an empty append — it writes nothing, so there is nothing to
@@ -236,23 +244,40 @@ async fn insert_event_rows(
     // no fence read, no savepoint, one INSERT.
     if crate::replication::FenceRegistry::is_enabled() {
         Box::pin(
-            conn.transaction::<usize, crate::error::HarvestError, _>(async |conn| {
+            conn.transaction::<_, crate::error::HarvestError, _>(async |conn| {
                 crate::replication::assert_fence(conn, exec_id.shard()).await?;
-                diesel::insert_into(harvest_events::table)
-                    .values(rows)
-                    .execute(conn)
-                    .await
-                    .map_err(crate::error::database_error)
+                insert_events(conn, rows, stamped).await
             }),
         )
         .await
     } else {
-        diesel::insert_into(harvest_events::table)
-            .values(rows)
+        insert_events(conn, rows, stamped).await
+    }
+}
+
+/// Insert `rows` into `harvest_events`. Fences nothing and stages no NOTIFY.
+///
+/// With `stamped`, the insert also returns the stamp of its transaction. The
+/// stage of its note then sends no probe (issue #2125).
+async fn insert_events(
+    conn: &mut AsyncPgConnection,
+    rows: &[NewHarvestEvent<'_>],
+    stamped: bool,
+) -> HarvestResult<(usize, Option<crate::notify::Stamp>)> {
+    let insert = diesel::insert_into(harvest_events::table).values(rows);
+    if !stamped {
+        let inserted = insert
             .execute(conn)
             .await
-            .map_err(crate::error::database_error)
+            .map_err(crate::error::database_error)?;
+        return Ok((inserted, None));
     }
+    let stamps = insert
+        .returning(crate::notify::stamp_returning())
+        .get_results::<crate::notify::Stamp>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok((stamps.len(), stamps.into_iter().next()))
 }
 
 /// Append a decision boundary when the decision grew the history (issue #1833).
@@ -304,9 +329,10 @@ pub(crate) async fn append_decision_boundary(
         next_id,
         codecs,
     )?;
-    insert_event_rows(conn, exec_id, &rows).await?;
+    let (_, stamp) = insert_event_rows(conn, exec_id, &rows).await?;
     crate::notify::notify_trailing_events_appended(
         conn,
+        stamp,
         exec_id.as_uuid(),
         rows.len(),
         boundary.type_name(),
@@ -389,7 +415,11 @@ pub async fn append_events_offloaded_with_codecs(
     // failed ref INSERT cannot leave events with offload envelopes but no
     // corresponding harvest_payload_refs rows (which would make those blobs
     // permanently invisible to the GC sweep).
-    let inserted = Box::pin(conn.transaction::<usize, crate::error::HarvestError, _>(
+    // Decide before the transaction below opens (issue #2125). Inside it, an
+    // autocommit write would ask for a stamp. A failed stamp would then fail a
+    // write that the probe path lets commit.
+    let stamped = crate::notify::stamp_wanted(conn);
+    let (inserted, stamp) = Box::pin(conn.transaction::<_, crate::error::HarvestError, _>(
         async |conn| {
             // Cross-region DR write-authority fence (issue #954), inside the
             // transaction and *after* the offload upload above. Checking before
@@ -400,11 +430,7 @@ pub async fn append_events_offloaded_with_codecs(
             // fencing during an incident queued behind the slowest payload PUT.
             crate::replication::assert_fence(conn, exec_id.shard()).await?;
 
-            let inserted = diesel::insert_into(harvest_events::table)
-                .values(&rows)
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            let inserted = insert_events(conn, &rows, stamped).await?;
             if !all_refs.is_empty() {
                 insert_payload_refs(conn, exec_id, &all_refs).await?;
             }
@@ -414,8 +440,9 @@ pub async fn append_events_offloaded_with_codecs(
     .await?;
 
     if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended(
+        crate::notify::notify_workflow_events_appended_stamped(
             conn,
+            stamp,
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
@@ -468,15 +495,13 @@ pub(crate) async fn append_events_offloaded_with_codecs_and_patch(
     patch(&mut rows);
 
     // One transaction for the fence, the events and the refs, for the reasons
-    // `append_events_offloaded_with_codecs` gives.
-    let inserted = Box::pin(conn.transaction::<usize, crate::error::HarvestError, _>(
+    // `append_events_offloaded_with_codecs` gives. Decide on the stamp before
+    // that transaction opens, for the same reason (issue #2125).
+    let stamped = crate::notify::stamp_wanted(conn);
+    let (inserted, stamp) = Box::pin(conn.transaction::<_, crate::error::HarvestError, _>(
         async |conn| {
             crate::replication::assert_fence(conn, exec_id.shard()).await?;
-            let inserted = diesel::insert_into(harvest_events::table)
-                .values(&rows)
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
+            let inserted = insert_events(conn, &rows, stamped).await?;
             if !all_refs.is_empty() {
                 insert_payload_refs(conn, exec_id, &all_refs).await?;
             }
@@ -486,8 +511,9 @@ pub(crate) async fn append_events_offloaded_with_codecs_and_patch(
     .await?;
 
     if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended(
+        crate::notify::notify_workflow_events_appended_stamped(
             conn,
+            stamp,
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
@@ -781,12 +807,16 @@ pub async fn insert_payload_refs(
             byte_len: i64::try_from(r.byte_len).unwrap_or(i64::MAX),
         })
         .collect();
-    diesel::insert_into(harvest_payload_refs::table)
-        .values(&rows)
-        .on_conflict_do_nothing()
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    // Each row binds four parameters. Chunks keep a statement far below the
+    // Postgres limit of 65,535, so a long fork prefix still inserts.
+    for chunk in rows.chunks(1_000) {
+        diesel::insert_into(harvest_payload_refs::table)
+            .values(chunk)
+            .on_conflict_do_nothing()
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+    }
     Ok(())
 }
 
@@ -807,6 +837,44 @@ pub async fn load_payload_refs(
         .map_err(crate::error::database_error)?;
     Ok(rows
         .into_iter()
+        .map(
+            |(blob_key, store_id, byte_len)| crate::payload_store::OffloadedRef {
+                blob_key,
+                store_id,
+                byte_len: byte_len.max(0).cast_unsigned(),
+            },
+        )
+        .collect())
+}
+
+/// One reference to each of `keys` that any execution on this shard holds.
+///
+/// A copied history can name a blob that its direct source does not
+/// reference. A reset from before issue #2000 copied envelopes without
+/// references, for example. The rows are locked `FOR SHARE`. Retention then
+/// cannot drop the last reference to a blob before the caller commits its own.
+#[cfg(feature = "db")]
+pub async fn load_payload_refs_for_keys(
+    conn: &mut AsyncPgConnection,
+    keys: &[String],
+) -> HarvestResult<Vec<crate::payload_store::OffloadedRef>> {
+    use crate::schema::harvest_payload_refs::dsl;
+
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wanted: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let rows: Vec<(String, String, i64)> = dsl::harvest_payload_refs
+        .filter(dsl::blob_key.eq_any(wanted))
+        .select((dsl::blob_key, dsl::store_id, dsl::byte_len))
+        .for_share()
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(rows
+        .into_iter()
+        .filter(|(blob_key, _, _)| seen.insert(blob_key.clone()))
         .map(
             |(blob_key, store_id, byte_len)| crate::payload_store::OffloadedRef {
                 blob_key,
@@ -1374,6 +1442,53 @@ pub async fn load_history_undecoded(
                 .map_err(crate::error::HarvestError::from)
         })
         .collect::<Result<Vec<WorkflowEvent>, _>>()?;
+
+    Ok(EventHistory {
+        exec_id,
+        events,
+        next_event_id,
+    })
+}
+
+/// [`load_history_undecoded`] that also inflates offloaded payload fields.
+///
+/// Each offload reference is replaced with the bytes it points at. Codec
+/// envelopes stay as they are, so the payloads stay ciphertext. The retention
+/// archive uses this (issue #1983). With no offloader, this is
+/// [`load_history_undecoded`].
+///
+/// **Never use this to feed workflow code.** Replay needs decoded plaintext.
+///
+/// # Errors
+///
+/// As [`load_history_undecoded`], and a payload-store error when a blob
+/// fetch or its checksum check fails.
+pub async fn load_history_inflated_undecoded(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+) -> HarvestResult<EventHistory> {
+    use crate::models::HarvestEvent;
+
+    let Some(offloader) = offloader else {
+        return load_history_undecoded(conn, exec_id).await;
+    };
+
+    let rows: Vec<HarvestEvent> = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .order(harvest_events::event_id.asc())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
+    let next_event_id = rows.last().map_or(0, |r| r.event_id.saturating_add(1));
+
+    let mut events = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut data = row.event_data;
+        offloader.inflate_event_value(&mut data).await?;
+        events.push(serde_json::from_value::<WorkflowEvent>(data)?);
+    }
 
     Ok(EventHistory {
         exec_id,
@@ -2850,8 +2965,18 @@ pub struct DurableStreamChunk {
 /// with the cycle or not at all.
 ///
 /// **Keep-first dedup.** A re-driven cycle offers the same offsets again.
-/// `ON CONFLICT DO NOTHING` on `(workflow_exec_id, stream_offset)` keeps the
-/// stored row, so a reader never sees a chunk change or repeat.
+/// The store keeps the stored row, so a reader never sees a chunk change or
+/// repeat. `ON CONFLICT DO NOTHING` on `(workflow_exec_id, stream_offset)`
+/// backs this up.
+///
+/// **Monotonic.** The store admits only offsets above the highest stored
+/// real offset (issue #2083). A reader can hold a cursor above a hole that a
+/// failed call left. A later chunk in that hole is below the cursor, so no
+/// reader would get it. The store drops it.
+///
+/// **Serialized.** An advisory lock on the run orders overlapping writers,
+/// such as a stale worker after a lease reclaim. The second writer reads the
+/// first writer's rows, so the rule and the cap hold across both.
 ///
 /// **Cap.** Once the execution holds `max_chunks` real chunks, the store
 /// drops newer chunks and stores one marker at
@@ -2923,6 +3048,17 @@ async fn append_stream_chunks_in_tx(
         return Ok(0);
     }
 
+    // `FOR KEY SHARE` does not conflict with itself, so two overlapping
+    // appends for one run could read the same stored rows. Each could then
+    // admit offsets below the other's, or pass the cap together. A
+    // transaction-scoped advisory lock on the run orders the reads and the
+    // inserts below. A terminal write does not take it, so no cycle forms.
+    diesel::sql_query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind::<diesel::sql_types::Text, _>(format!("harvest_stream_chunks:{}", exec_id.as_uuid()))
+        .execute(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+
     let truncated: bool = diesel::select(diesel::dsl::exists(
         dsl::harvest_stream_chunks
             .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
@@ -2937,27 +3073,26 @@ async fn append_stream_chunks_in_tx(
 
     // Admit by the real row count, so the cap holds for any stored offsets.
     // A failed serialization leaves an offset unused, so stored offsets can
-    // have holes. A chunk that is already stored is a re-drive: it costs no
-    // budget and is never a drop. Only new offsets use the budget.
-    let batch_offsets: Vec<i64> = chunks.iter().map(|c| c.offset).collect();
+    // have holes. A reader can hold a cursor above a hole, so a hole never
+    // fills: only offsets above the highest stored real offset are new. This
+    // also drops a re-driven offset, which is already stored. Only new
+    // offsets use the budget. The marker is not a real offset.
     let stored: i64 = dsl::harvest_stream_chunks
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
         .count()
         .get_result(conn)
         .await
         .map_err(crate::error::database_error)?;
-    let already: std::collections::HashSet<i64> = dsl::harvest_stream_chunks
+    let highest: Option<i64> = dsl::harvest_stream_chunks
         .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(dsl::stream_offset.eq_any(batch_offsets))
-        .select(dsl::stream_offset)
-        .load::<i64>(conn)
+        .filter(dsl::stream_offset.lt(DURABLE_STREAM_TRUNCATION_OFFSET))
+        .select(diesel::dsl::max(dsl::stream_offset))
+        .get_result(conn)
         .await
-        .map_err(crate::error::database_error)?
-        .into_iter()
-        .collect();
+        .map_err(crate::error::database_error)?;
     let mut new_chunks: Vec<&DurableStreamChunk> = chunks
         .iter()
-        .filter(|c| !already.contains(&c.offset))
+        .filter(|c| highest.is_none_or(|h| c.offset > h))
         .collect();
     new_chunks.sort_by_key(|c| c.offset);
     new_chunks.dedup_by_key(|c| c.offset);

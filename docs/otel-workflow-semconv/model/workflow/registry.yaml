@@ -1,0 +1,116 @@
+groups:
+  - id: registry.workflow
+    type: attribute_group
+    display_name: Workflow Attributes
+    brief: >
+      Attributes that describe durable workflow runs and the steps that they
+      schedule.
+    attributes:
+      - id: workflow.system.name
+        type: string
+        stability: development
+        brief: >
+          The name of the durable workflow engine.
+        note: >
+          Each engine documents its own lower-case value. A later revision
+          can list well-known values.
+        examples: ["temporal", "dapr"]
+      - id: workflow.name
+        type: string
+        stability: development
+        brief: >
+          The name of the workflow definition.
+        note: >
+          The name identifies the code, not one run. It is low-cardinality.
+          Some engines call it the workflow type.
+        examples: ["onboarding", "order_fulfillment"]
+      - id: workflow.run.id
+        type: string
+        stability: development
+        brief: >
+          The unique identifier of one workflow run.
+        note: >
+          The value is high-cardinality. Do not use it as a metric attribute.
+        examples: ["0c8f2b9a-7e1d-4c5b-9f36-2d8e4a1b6c70"]
+      - id: workflow.operation.name
+        type:
+          members:
+            - id: schedule_workflow
+              value: schedule_workflow
+              brief: A caller schedules a new workflow run.
+              stability: development
+            - id: execute_workflow
+              value: execute_workflow
+              brief: A worker runs one decision cycle of a workflow run.
+              stability: development
+            - id: start_child_workflow
+              value: start_child_workflow
+              brief: A workflow run schedules a child workflow run.
+              stability: development
+            - id: schedule_activity
+              value: schedule_activity
+              brief: A workflow run schedules an activity.
+              stability: development
+            - id: execute_activity
+              value: execute_activity
+              brief: A worker runs one attempt of an activity.
+              stability: development
+            - id: send_signal
+              value: send_signal
+              brief: A caller sends a signal to a workflow run.
+              stability: development
+            - id: deliver_signal
+              value: deliver_signal
+              brief: A workflow run receives a signal.
+              stability: development
+            - id: fire_timer
+              value: fire_timer
+              brief: A durable timer of a workflow run fires.
+              stability: development
+        stability: development
+        brief: >
+          The workflow operation that the span describes.
+      - id: workflow.queue.name
+        type: string
+        stability: development
+        brief: >
+          The name of the task queue that holds the work item.
+        examples: ["default", "email_workers"]
+      - id: workflow.activity.name
+        type: string
+        stability: development
+        brief: >
+          The name of the activity definition.
+        note: >
+          The name identifies the code, not one call. It is low-cardinality.
+        examples: ["send_email", "charge_card"]
+      - id: workflow.activity.attempt
+        type: int
+        stability: development
+        brief: >
+          The attempt number of the activity call, starting at 1.
+        examples: [1, 3]
+      - id: workflow.replay
+        type: boolean
+        stability: development
+        brief: >
+          Whether the cycle rebuilds workflow state from recorded history.
+        note: >
+          The value is true for each cycle that re-runs workflow code over
+          recorded history, a routine resume included. It is false for a
+          first cycle and for a resume from state in memory. A replay does
+          not repeat the side effects of the original run.
+      - id: workflow.signal.name
+        type: string
+        stability: development
+        brief: >
+          The name of the signal.
+        examples: ["approve", "cancel_order"]
+      - id: workflow.signal.id
+        type: string
+        stability: development
+        brief: >
+          The unique identifier of one signal.
+        note: >
+          The value is high-cardinality. Do not use it as a metric attribute.
+        examples: ["5d1e7a40-3b2c-4f8e-a9d6-0e7b1c2f4a85"]

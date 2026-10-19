@@ -7,7 +7,7 @@
 //! * both gates are deliberately non-strict, so deleting either leaves a green
 //!   build that verifies nothing;
 //! * the clippy step for this crate is the only place `--all-targets` lint
-//!   coverage exists for it — the workspace `lint` job does not use
+//!   coverage exists for it — the workspace clippy jobs do not use
 //!   `--workspace`.
 //!
 //! So the steps are asserted here, the way `determinism_static_analysis_docs`
@@ -116,6 +116,21 @@ fn the_examples_gate_is_wired_into_ci() {
 }
 
 #[test]
+fn the_autoresearch_gate_is_wired_into_ci() {
+    assert_wired(
+        "harvest-verify",
+        &[
+            "harvest-verify -p autoresearch -p autumn-harvest-agent --lib --strict --report",
+            "--target-dir target/harvest-verify/autoresearch",
+        ],
+        "The autoresearch capstone is its own workspace member, so the examples \
+         gate does not analyze it. This step is the only one that runs the \
+         analyzer over the capstone's workflows. It is `--strict`: all four \
+         workflows prove, so an `unknown` must fail the job, not warn.",
+    );
+}
+
+#[test]
 fn tests_corpus_step_is_wired_into_ci() {
     assert_wired(
         "harvest-verify-tests",
@@ -148,9 +163,9 @@ fn the_corpus_suite_runs_in_ci() {
 #[test]
 fn this_crate_is_linted_in_ci() {
     assert_wired(
-        "lint",
+        "clippy-crates",
         &["cargo clippy -p autumn-harvest-verify --all-targets -- -D warnings"],
-        "The workspace `lint` job does not use `--workspace`, so this is the \
+        "The workspace clippy jobs do not use `--workspace`, so this is the \
          only clippy coverage this crate has, and the only step that compiles \
          its test targets outside the `harvest-verify` job.",
     );

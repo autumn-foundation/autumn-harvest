@@ -146,7 +146,7 @@ counts and the boundary set. Verbatim, from a real run over this repo's examples
 $ cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- harvest-verify \
     -p autumn-harvest --all-examples --no-default-features --features testing \
     --allowlist harvest-verify.allow.toml --report
-harvest-verify: model 2026.10.1, rustc 1.98.0 (88d9e12ae 2026-08-18)
+harvest-verify: model 2026.10.2, rustc 1.98.0 (88d9e12ae 2026-08-18)
 
 proven-deterministic  workflow_logs::import_batch
 ... one line per workflow ...
@@ -154,7 +154,7 @@ proven-deterministic  workflow_logs::import_batch
 warning: skipping example wasm_activity: required feature(s) not enabled: wasm-activities
 
 analyzed 57: proven 56, unknown 0, found 0, allowed 1
-verdicts hold under model 2026.10.1; boundaries not analyzed: dyn-dispatch, indirect-call, ffi, unsafe-raw-pointer, inline-asm, external-crate-body, unmodeled-ctx-method, unresolved-generic, recursion, mir-parse, missing-body, drop-glue
+verdicts hold under model 2026.10.2; boundaries not analyzed: dyn-dispatch, indirect-call, ffi, unsafe-raw-pointer, inline-asm, external-crate-body, unmodeled-ctx-method, unresolved-generic, recursion, mir-parse, missing-body, drop-glue
 ```
 
 Three things about that footer are worth knowing before you quote it:
@@ -465,7 +465,7 @@ Run with it:
 $ cargo harvest-verify -p my-workflows --lib --model my-model.toml
 ```
 
-Two things to know about how rows match:
+Three things to know about how rows match:
 
 - **`path` is a `::`-segment *suffix* of the callee path**, with generic
   arguments stripped — never a prefix. Stable MIR prints callee paths using
@@ -478,6 +478,11 @@ Two things to know about how rows match:
   fully qualified). `dest_type` is how a bare `var` is pinned to
   `std::env::var` — no user function can accidentally return
   `Result<String, VarError>`.
+- **A bare row yields to a body.** A row with one segment and no `receiver`
+  (`count`, `sort`, `var`) describes std. A first-party function of that name
+  has a body in the analyzed set, and that body is analyzed instead. This holds
+  for every table, so a helper named `count` that reads the clock is still a
+  finding (`corpus/seeded/src/wf_helper_named_count.rs`).
 
 Rows are matched most-specific-first (`receiver` + `dest_type` > `receiver` >
 `path` alone), and a `[[source]]` row always beats a `[[trusted]]` crate: a
@@ -600,11 +605,18 @@ The ones you are most likely to meet:
   when it is a **method** whose receiver argument's declared
   type is rooted entirely in trusted crates (or, for an associated function,
   whose receiver type is spelled with a trusted root in some declared type at the
-  site), when the receiver is a primitive, or when a `[[std_free_fn]]` row names
-  it; otherwise it is an `external-crate-body` boundary and you get `unknown`.
+  site), when the receiver is a primitive, a slice, an array or a tuple, or when
+  a `[[std_free_fn]]` row names it; otherwise it is an `external-crate-body`
+  boundary and you get `unknown`. A receiver that every declaration at the site
+  prints trimmed — a helper's signature prints its parameters that way
+  (`fn remember(_1: &mut Vec<Row>)`) — counts when every rooted spelling of its
+  name elsewhere in the dumps is trusted. rustc trims a path only when the name
+  is unique in the crate graph, so `Vec` is the one item that `std::vec::Vec`
+  names. The same rule covers the future of a trusted crate's `async fn`
+  (`{async fn body of Saga<'_>::step()}`).
   `[[std_free_fn]]` therefore holds the **free** functions of std and of trusted
-  crates that rustc trims to one segment — seven rows here (`format`,
-  `must_use`, `to_value`, `from_value`, `display`, `debug`, `task_duration`). The
+  crates that rustc trims to one segment (`format`, `must_use`, `to_value`,
+  `to_vec`, `from_value`, `display`, `debug`, `task_duration`). The
   residual cost: a dependency's *extension trait* on a std type
   (`impl DepExt for String`) is trusted, because rustc trims both the trait and
   the self type, leaving a genuinely std receiver as the only qualified text.
@@ -624,12 +636,16 @@ The ones you are most likely to meet:
   that run before the sort, and including on branches where the sort never runs.
   A value sorted on one path counts as sorted on all of them. This under-reports;
   it never over-reports.
-- **Recursion is cut, not solved.** A callee already on the call stack, a call
-  chain deeper than 96 bodies, or an exhausted 6000-body budget is not entered:
-  the analyzer records a `recursion` boundary and returns a pass-through summary
-  that reports **no sinks**. The verdict degrades to
-  `unknown`, so you are told — but a command emitted only from inside a recursive
-  cycle produces no finding and no trace.
+- **Recursion is solved as a bounded fixpoint.** A call into a body already on
+  the call stack is not entered again. It returns the cycle's current summary,
+  joined with a pass-through of its argument taint, and records that argument
+  taint. The outer call then runs the body again with the joined argument
+  taint, until a round adds no fact. So a command emitted inside the cycle with
+  a value that only the recursive call carries is found
+  (`corpus/seeded/src/wf_recursive_relay.rs`). Three cases are still cut, with
+  a `recursion` boundary and an `unknown` verdict: a cycle that has not
+  converged after 8 rounds, a call chain deeper than 96 bodies, and an
+  exhausted 6000-body budget.
 - **Single-impl devirtualization assumes a closed world.** Correct for the
   analyzed crate set; wrong the moment a downstream crate adds a second impl.
 - **A sink inside a closure handed to a higher-order function is not recorded at

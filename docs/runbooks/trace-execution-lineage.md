@@ -212,3 +212,7 @@ no `WorkflowEvent` variant or migration. To *act* on a subtree use the batch
 surfaces (`POST /batch-operations`, issue #533) or per-execution
 cancel/terminate (#504); for activity-level detail inside one execution use
 `/stack` (#503) and `/timeline` (#739).
+
+A fork (issue #2000) is a new root, not a child, so this tree does not show
+it. Its row names the source in `start_source_ref`. See
+[fork-a-run.md](fork-a-run.md).

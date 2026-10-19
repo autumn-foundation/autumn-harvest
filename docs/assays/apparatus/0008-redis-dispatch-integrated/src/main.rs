@@ -719,6 +719,7 @@ async fn start_one(conn: &mut AsyncPgConnection, workflow_id: &str) -> bool {
             start_source_ref: None,
             started_by: None,
             tenant: None,
+            fairness_key: None,
         },
         None,
     )

@@ -81,6 +81,11 @@ Need a real reference instead of the tiny hello-world path? See:
   Docker. Each model call and tool call is an activity, a workspace write parks on an
   approval signal with a deadline, and killing the daemon mid-session resumes by replay instead
   of paying for completed turns twice. It runs with no API key (a scripted offline model).
+- [`examples/autoresearch/`](examples/autoresearch/) for Karpathy's autoresearch loop as durable
+  workflows: an agent edits `train.py`, a trainer runs it, and a keep rule decides, all night. It is
+  the capstone of the agent primitives and of most of the engine surface. It uses child workflows, a
+  saga, mutexes, signals, a query, an update, schedules, continue-as-new and seeded simulation
+  sweeps. It runs offline with a simulated trainer and a scripted researcher.
 
 ```rust
 use autumn_harvest::prelude::*;
@@ -251,9 +256,11 @@ async fn polling_loop(ctx: &WorkflowContext, mut state: serde_json::Value)
 ```
 
 `ctx.history_event_count()` reports the number of loaded durable history events.
+That count grows from task to task, so do not branch on it.
 `ctx.should_continue_as_new()` turns true once that count exceeds the
 `HarvestBuilder::history_continue_as_new_threshold(...)` soft threshold. The
-default threshold is `10_000` events.
+default threshold is `10_000` events. The engine records each answer, so a
+replay gives the same answer at the same code position.
 
 ```rust
 let harvest = HarvestBuilder::new()

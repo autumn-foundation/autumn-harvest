@@ -402,6 +402,9 @@ it.
 
 Distributed counting across shards requires either a coordination service (Redis, a dedicated Postgres coordinator) or accepting bounded inaccuracy (approximate counts via gossip). Both add operational complexity that conflicts with Harvest's goal of being a Postgres-native engine. Cross-shard global limits are therefore **out of scope** for this feature; the per-shard guarantee is the contract.
 
+[Fairness keys](fairness-keys.md) (issue #1976) are shard-local too. Each
+shard keeps its own key state.
+
 If you need approximate cross-shard fair-share rather than a hard global cap, the metrics observable via `GET /admin/concurrency` can feed an external rate limiter in the layer above Harvest.
 
 ### Worker crash and slot release
@@ -731,6 +734,8 @@ time.
 | Queued for no durable mutex | The grant is delivered by waking the waiter **on this shard**, so a migrated waiter's grant would be delivered to a sealed row — a lost wake. |
 | No dead-letter rows | Redriving a DLQ entry enqueues a task on this shard, which after a migration would target a sealed row. Redrive or discard it first. |
 | Not schedule-attributed (`schedule_id IS NULL`) | A schedule row does not move with its runs, and its overlap enforcement is **shard-local**: the tick counts `RUNNING`/`PAUSED` executions on its own shard for `max_active_runs`, and `CancelOther`/`TerminateOther` cancel priors with the same shard-local query. After a migration the local row reads `MIGRATED`, so the schedule stops counting the still-running copy and stops cancelling it — silently exceeding its own cap, or starting a run without terminating the prior it was told to replace. Making this safe means teaching schedule overlap enforcement to see forwarded residences, which is a change to the scheduler rather than to this feature. |
+| Not a fork (`start_source` is not `fork`, issue #2000) | A recorded fork reads its source, and a new fork walks the fork lineage, on the shard of the fork. Only the fork moves, so on the target both lookups would miss: every recorded result would fail closed, and an erased ancestor would go unseen. |
+| Not in the fork lineage of a live fork (issue #2000) | A recorded fork reads the outcomes of its source on the shard of the fork. A migrated source records later outcomes on the target, so the fork would fail closed. A reset of a fork reads the source of the fork it resets, so the check walks the lineage up, for at most 64 links. The partial index on `start_source` keeps the walk small. |
 | No live children, **including paused ones** | A paused child still completes eventually, and its terminal appends to the parent's history on the shard the parent used to be on. |
 
 **A run waiting on a timer or a signal IS migratable — that is the point.** Both
@@ -843,6 +848,7 @@ The loop reports as scanner `rebalance_resume` in `scanner_liveness` and in
 | Durable timers | ✅ verbatim, including `fires_at` | none |
 | Signals, including `idempotency_key` | ✅ verbatim | none |
 | Payload refs (`harvest_payload_refs`) | ✅ | none — the blob store is shard-external |
+| Agent cost ledger (`harvest_llm_ledger`, issue #1996) | ✅ verbatim, including `recorded_at` | none — the usage report counts the source until the move is done, then the target |
 | The parked workflow task row | ✅ | none |
 | Terminal task rows (activity history) | ❌ stays on the sealed source | none — the durable record is in `harvest_events` |
 | Workflow logs | ✅ | none — copied for a privacy reason as much as an operational one: they are free text, so a PII sink, and `erase.rs` scrubs them via the execution's own shard. Logs left behind would be out of reach of an erasure issued against the run. |
@@ -1066,7 +1072,13 @@ Response:
       "timed_out": 3,
       "activity_executions": 51820,
       "activity_executions_failed": 340,
-      "activity_compute_seconds": 918422.7
+      "activity_compute_seconds": 918422.7,
+      "llm_calls": 1290,
+      "llm_input_tokens": 3812400,
+      "llm_output_tokens": 640150,
+      "llm_cost_usd_micros": 21037500,
+      "llm_unpriced_calls": 0,
+      "llm_latency_ms": 1543200
     }
   ],
   "unavailable_shards": []
@@ -1083,6 +1095,7 @@ Executions that lack the requested `search_attrs` key are grouped under the lite
 - `activity_executions_failed`: count of terminal `ActivityFailed`/`ActivityTimedOut` events in the window that have a matching `ActivityStarted` (non-final retry attempts emit no event, so this counts exhausted-retry-or-timeout only). The start-match requirement excludes external activities, whose `ActivityTimedOut` can be appended with no `ActivityStarted` at all.
 - `activity_compute_seconds`: for each activity whose terminal event falls in the window, the wall-clock span from that activity's most recent (final-attempt) start to its terminal event, summed. Retry backoff wall time is excluded by construction.
 - Local activities and externally-completed activities are excluded from the activity counters — they never emit `ActivityStarted`, so they're not worker compute.
+- `llm_calls`, `llm_input_tokens`, `llm_output_tokens`, `llm_cost_usd_micros`, `llm_unpriced_calls` and `llm_latency_ms` (issue #1996): sums over the agent cost ledger rows whose `recorded_at` falls in the window. Cost is in millionths of a US dollar. A row with no cost counts in `llm_unpriced_calls`. The report skips a shard move's staged target copy and counts the sealed source until the move is done, so one shard reports each run. See [the agent cost ledger](llm-cost-ledger.md).
 
 **Window ceiling**: a `from`/`to` window wider than a configurable ceiling (default 90 days, `HarvestApiState::set_usage_window_ceiling`) is rejected with `400`, naming the ceiling, so an operator cannot accidentally trigger a full-table scan across every shard.
 

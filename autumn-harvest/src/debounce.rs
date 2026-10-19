@@ -127,7 +127,10 @@ pub fn compute_fire_deadline(
 /// Serialised start options stored alongside the last qualifying input.
 ///
 /// Persisted as opaque JSONB in `harvest_debounce.start_options` so the
-/// schema stays stable even as `StartWorkflowParams` grows.
+/// schema stays stable even as `StartWorkflowParams` grows. The stored
+/// `context_headers` and `memo` keys hold an envelope when column encoding is
+/// on (issue #2043). [`encode_stored_start_options`] and
+/// [`decode_stored_start_options`] convert between the two forms.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub struct DebounceStartOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,7 +259,7 @@ pub struct DebounceAdmitOutcome {
     /// The stable `workflow_id` the eventual run will be created with. This is
     /// the **first** request's id for the key (kept across retriggers), which
     /// the caller should echo instead of its own generated id. See
-    /// [`admit_debounced_start`]'s doc comment for the legacy-empty-id healing
+    /// [`admit_debounced_start_with_codecs`]'s doc comment for the legacy-empty-id healing
     /// exception (issue #1430).
     pub workflow_id: String,
     /// Current fire deadline after this admission.
@@ -281,6 +284,29 @@ pub struct PendingDebounceRecord {
     pub shard_id: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// [`admit_debounced_start_with_codecs`], with the identity registry.
+///
+/// The row then stores the input in clear. An envelope-shaped input gets an
+/// identity escape. Engine code calls the `_with_codecs` variant.
+///
+/// # Errors
+///
+/// As [`admit_debounced_start_with_codecs`].
+#[cfg(feature = "db")]
+pub async fn admit_debounced_start(
+    conn: &mut diesel_async::AsyncPgConnection,
+    params: AdmitDebounceParams<'_>,
+    gate_active: bool,
+) -> crate::error::HarvestResult<Option<DebounceAdmitOutcome>> {
+    admit_debounced_start_with_codecs(
+        conn,
+        params,
+        gate_active,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
 }
 
 /// Upsert a pending debounce record for the given key.
@@ -321,10 +347,11 @@ pub struct PendingDebounceRecord {
 /// into the gated scope. `Ok(Some(outcome))` is returned when admitted.
 #[cfg(feature = "db")]
 #[allow(clippy::too_many_lines)]
-pub async fn admit_debounced_start(
+pub async fn admit_debounced_start_with_codecs(
     conn: &mut diesel_async::AsyncPgConnection,
     params: AdmitDebounceParams<'_>,
     gate_active: bool,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> crate::error::HarvestResult<Option<DebounceAdmitOutcome>> {
     // Sentinel error used to roll the transaction back when the gate is active
     // (an Ok return would commit). Distinguished from a real DB error below.
@@ -386,6 +413,13 @@ pub async fn admit_debounced_start(
     let new_id = uuid::Uuid::new_v4();
     let start_options_json = serde_json::to_value(&params.start_options)
         .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()));
+    // The row stores the headers and the memo in the column form. A gated
+    // admission rolls back, so it drops them and needs no encode (issue #2043).
+    let start_options_json = if gate_active {
+        without_payload_start_options(start_options_json)
+    } else {
+        encode_stored_start_options(codecs, start_options_json)?
+    };
 
     // Upsert: insert on first request, update deadline + last-input on collision.
     // effective_fire_at is LEAST(now + window, existing max_fire_at) so the cap
@@ -441,7 +475,16 @@ pub async fn admit_debounced_start(
             (xmax = 0) AS is_new_record
     ";
 
-    let last_input = params.last_input;
+    // The row stores the input in the column form (issue #2043). The fire
+    // path decodes it before the start. A gated admission rolls back, so its
+    // row never holds an input. It binds `null`. That needs no encode, so a
+    // failing codec cannot turn the gate result into an error. It also keeps
+    // the plain input out of the write-ahead log.
+    let last_input = if gate_active {
+        serde_json::Value::Null
+    } else {
+        codecs.encode_column(&params.last_input)?
+    };
     let workflow_name = params.workflow_name;
     let debounce_key = params.debounce_key;
     let workflow_id = params.workflow_id;
@@ -538,6 +581,118 @@ impl crate::quota_lock_order::QuotaLockRow for FireDueRow {
     fn quota_input(&self) -> &serde_json::Value {
         &self.last_input
     }
+}
+
+/// How far a row that does not decode moves its fire time (issue #2043).
+///
+/// A long backoff keeps the warning rate low. The row still keeps its
+/// `max_fire_at` bound.
+#[cfg(feature = "db")]
+const UNDECODABLE_REDEFER_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Decode the stored input of each claimed row (issue #2043).
+///
+/// The row stores `last_input` in the column form. The quota ordering and the
+/// start both need the plain input. A row that does not decode moves its fire
+/// time back and logs a warning with no payload text. It fires after an
+/// operator restores the key. The row thus cannot sit at the head of the claim
+/// window, and it cannot abort the claim of its neighbours.
+///
+/// # Errors
+///
+/// Database failures while the row moves back.
+#[cfg(feature = "db")]
+async fn decode_due_rows(
+    conn: &mut diesel_async::AsyncPgConnection,
+    rows: Vec<FireDueRow>,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    now: DateTime<Utc>,
+) -> crate::error::HarvestResult<Vec<FireDueRow>> {
+    let mut decodable = Vec::with_capacity(rows.len());
+    for mut row in rows {
+        match codecs.decode_column(&row.last_input).and_then(|plain| {
+            let options = decode_stored_start_options(codecs, row.start_options.clone())?;
+            Ok((plain, options))
+        }) {
+            Ok((plain, options)) => {
+                row.last_input = plain;
+                row.start_options = options;
+                decodable.push(row);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    debounce_id = %row.id,
+                    error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                    "debounce input or headers could not be decoded; the row moves back"
+                );
+                let target =
+                    redefer_target(now, row.max_fire_at, now + UNDECODABLE_REDEFER_BACKOFF);
+                redefer_debounce_row(conn, row.id, target).await?;
+            }
+        }
+    }
+    Ok(decodable)
+}
+
+/// The start option keys that hold payload (issue #2043). A buffered start
+/// stores each one in the column form. The rotation list names the same keys.
+#[cfg(feature = "db")]
+const PAYLOAD_START_OPTION_KEYS: [&str; 2] = ["context_headers", "memo"];
+
+/// Replace the plain payload keys of stored start options with the column form
+/// (issue #2043). The headers can carry a tenant and the memo can carry user
+/// data, so a buffered start keeps both as ciphertext until it fires.
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError`] when a value does not encode.
+#[cfg(feature = "db")]
+pub(crate) fn encode_stored_start_options(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    mut options: serde_json::Value,
+) -> crate::error::HarvestResult<serde_json::Value> {
+    for key in PAYLOAD_START_OPTION_KEYS {
+        if let Some(cell) = options.get_mut(key)
+            && !cell.is_null()
+        {
+            *cell = codecs.encode_column(cell)?;
+        }
+    }
+    Ok(options)
+}
+
+/// Undo [`encode_stored_start_options`]. A cell in clear passes through
+/// unchanged, so a row from before the change still reads.
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError`] when a cell does not decode. The function
+/// never returns a partial result.
+#[cfg(feature = "db")]
+pub(crate) fn decode_stored_start_options(
+    codecs: &crate::payload_codec::PayloadCodecs,
+    mut options: serde_json::Value,
+) -> crate::error::HarvestResult<serde_json::Value> {
+    for key in PAYLOAD_START_OPTION_KEYS {
+        if let Some(cell) = options.get_mut(key)
+            && !cell.is_null()
+        {
+            *cell = codecs.decode_column(cell)?;
+        }
+    }
+    Ok(options)
+}
+
+/// Remove the payload keys from start options that a rolled-back write binds,
+/// or that a reader needs only for the configuration.
+#[cfg(feature = "db")]
+pub(crate) fn without_payload_start_options(mut options: serde_json::Value) -> serde_json::Value {
+    if let Some(map) = options.as_object_mut() {
+        for key in PAYLOAD_START_OPTION_KEYS {
+            map.remove(key);
+        }
+    }
+    options
 }
 
 /// Fire all pending debounce records whose `effective_fire_at` has elapsed.
@@ -646,6 +801,7 @@ async fn fire_due_on_conn(
                             .await
                             .map_err(crate::error::database_error)?;
 
+                        let due_rows = decode_due_rows(conn, due_rows, codecs, now).await?;
                         let due_rows =
                             crate::quota_lock_order::order_due_rows_for_deadlock_free_firing(
                                 conn, due_rows,

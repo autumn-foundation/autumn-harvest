@@ -1,0 +1,3011 @@
+#![cfg(feature = "db")]
+// Activity handlers must be `async`, even with no await.
+#![allow(clippy::too_many_lines, clippy::unused_async)]
+//! Non-destructive fork of a run (issue #2000).
+//!
+//! A fork copies a history prefix to a new workflow id. The source stays
+//! unchanged. By default, a fork takes each activity result from the source
+//! record and never runs the activity again. Live effects need
+//! `effects = live`. An erased source is always refused.
+//!
+//! Set `HARVEST_TEST_DATABASE_URL` to use a migrated Postgres. Otherwise the
+//! suite starts a testcontainers Postgres 16.
+
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::Duration;
+
+use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::fork::{
+    ForkActivityOverride, ForkEffects, WorkflowForkError, WorkflowForkRequest,
+    fork_workflow_execution, is_recorded_fork,
+};
+use autumn_harvest::models::{NewWorkflowExecution, WorkflowExecution};
+use autumn_harvest::prelude::*;
+use autumn_harvest::queue::{self, EnqueueParams, TaskType};
+use autumn_harvest::reset::{
+    ResetPoint, WorkflowResetError, WorkflowResetRequest, reset_workflow_execution,
+};
+use autumn_harvest::schema::{harvest_events, harvest_task_queue, harvest_workflow_executions};
+use autumn_harvest::store;
+use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker};
+use autumn_harvest::{ExecutionId, ShardId};
+
+use chrono::Utc;
+use diesel::prelude::*;
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::integration_e2e::{
+    build_test_pool, runtime_config, setup_test_database_url_or_env, spawn_test_worker,
+    wait_for_execution_state,
+};
+
+// ---------------------------------------------------------------------------
+// Handlers.
+// ---------------------------------------------------------------------------
+
+/// Calls of `fork_charge`, keyed by the `tag` of the run.
+static CHARGES: LazyLock<Mutex<HashMap<String, u32>>> = LazyLock::new(Mutex::default);
+
+fn charges(tag: &str) -> u32 {
+    CHARGES
+        .lock()
+        .expect("charges lock")
+        .get(tag)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Calls of `fork_lookup`, keyed by the `tag` of the run.
+static LOOKUPS: LazyLock<Mutex<HashMap<String, u32>>> = LazyLock::new(Mutex::default);
+
+fn lookups(tag: &str) -> u32 {
+    LOOKUPS
+        .lock()
+        .expect("lookups lock")
+        .get(tag)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Charges `amount`, then writes a receipt for the charge. With
+/// `"local": true`, it first runs the local activity `fork_lookup`. With
+/// `"session": true`, it charges in a worker session. With `"race": true`,
+/// the charge races a receipt on a queue that no worker polls, and wins.
+/// With `"shield": true`, it waits for the signal `go` in a non-cancellable
+/// block, and `"local": true` then runs `fork_lookup` in the block.
+#[workflow]
+async fn fork_pay_wf(ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
+    let queue = ctx.queue_name().to_string();
+    if input["shield"] == json!(true) {
+        return ctx
+            .non_cancellable(async {
+                ctx.wait_for_signal("go").await.map_err(|e| e.to_string())?;
+                if input["local"] == json!(true) {
+                    ctx.execute_local_activity_raw("fork_lookup", input.clone(), None, Some(30))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(json!("shielded"))
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    if input["race"] == json!(true) {
+        let won = ctx
+            .race()
+            .activity_raw("fork_charge", input.clone(), &queue)
+            .activity_raw(
+                "fork_receipt",
+                json!({ "charge": "none" }),
+                &format!("{queue}-idle"),
+            )
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(json!({ "winner": won.index, "value": won.value }));
+    }
+    if input["local"] == json!(true) {
+        ctx.execute_local_activity_raw("fork_lookup", input.clone(), None, Some(30))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    let charge = if input["session"] == json!(true) {
+        let session = ctx
+            .create_session(autumn_harvest::context::SessionOptions::new(&queue))
+            .await
+            .map_err(|e| e.to_string())?;
+        let charge = session
+            .execute_activity_raw("fork_charge", input.clone(), &queue)
+            .await
+            .map_err(|e| e.to_string())?;
+        session.complete().await.map_err(|e| e.to_string())?;
+        charge
+    } else {
+        ctx.execute_activity_raw("fork_charge", input.clone(), &queue)
+            .await
+            .map_err(|e| e.to_string())?
+    };
+    let receipt = ctx
+        .execute_activity_raw("fork_receipt", json!({ "charge": charge }), &queue)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!({ "charge": charge, "receipt": receipt }))
+}
+
+/// The side effect under test. Each call adds one to `CHARGES[tag]`.
+#[activity(start_to_close = "60s")]
+async fn fork_charge(_ctx: &ActivityContext, input: Value) -> Result<Value, String> {
+    let tag = input["tag"].as_str().unwrap_or_default().to_string();
+    let mut map = CHARGES.lock().map_err(|e| e.to_string())?;
+    let entry = map.entry(tag).or_insert(0);
+    *entry += 1;
+    let count = *entry;
+    drop(map);
+    Ok(json!({ "charge_id": format!("ch-{count}"), "amount": input["amount"] }))
+}
+
+/// A local activity. Each call adds one to `LOOKUPS[tag]`.
+#[activity(start_to_close = "60s")]
+async fn fork_lookup(_ctx: &ActivityContext, input: Value) -> Result<Value, String> {
+    let tag = input["tag"].as_str().unwrap_or_default().to_string();
+    *LOOKUPS
+        .lock()
+        .map_err(|e| e.to_string())?
+        .entry(tag)
+        .or_insert(0) += 1;
+    Ok(json!("found"))
+}
+
+#[activity(start_to_close = "60s")]
+async fn fork_receipt(_ctx: &ActivityContext, input: Value) -> Result<Value, String> {
+    Ok(json!({ "receipt_for": input["charge"]["charge_id"] }))
+}
+
+fn registry() -> Arc<HandlerRegistry> {
+    Arc::new(HandlerRegistry::new(
+        vec![fork_pay_wf_info()],
+        activities![fork_charge, fork_receipt, fork_lookup],
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers.
+// ---------------------------------------------------------------------------
+
+struct Running {
+    worker: Arc<Worker>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Running {
+    fn start(queue: &str, pool: &DbPool) -> Self {
+        Self::start_with(queue, pool, registry())
+    }
+
+    fn start_with(queue: &str, pool: &DbPool, registry: Arc<HandlerRegistry>) -> Self {
+        let mut config = runtime_config(&format!("w-{queue}"), 2, 2, Duration::from_secs(10));
+        config.queues = vec![queue.to_string()];
+        config.max_concurrent_sessions = 2;
+        let worker = Arc::new(Worker::new(config, registry).expect("worker builds"));
+        let handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
+        Self { worker, handle }
+    }
+
+    async fn stop(self) {
+        self.worker.shutdown();
+        tokio::time::timeout(Duration::from_secs(10), self.handle)
+            .await
+            .expect("the worker must stop")
+            .expect("the worker task must not panic");
+    }
+}
+
+/// A queue and a tag that no earlier run used. A shared database keeps rows.
+fn unique(label: &str) -> String {
+    format!("q2000-{label}-{}", Uuid::new_v4().simple())
+}
+
+async fn connect(url: &str) -> AsyncPgConnection {
+    AsyncPgConnection::establish(url)
+        .await
+        .expect("connect to Postgres")
+}
+
+/// Start a `fork_pay_wf` run on `queue`.
+async fn seed_run(conn: &mut AsyncPgConnection, queue: &str, input: &Value) -> ExecutionId {
+    seed_run_with(conn, queue, input, None, None).await
+}
+
+/// Start a `fork_pay_wf` run with a carryover, through an optional offloader.
+async fn seed_run_with(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+    input: &Value,
+    last_completion_result: Option<Value>,
+    offloader: Option<&autumn_harvest::payload_store::PayloadOffloader>,
+) -> ExecutionId {
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let row = NewWorkflowExecution {
+        quota_key: None,
+        id: exec_id.as_uuid(),
+        workflow_name: "fork_pay_wf",
+        workflow_id: &format!("wf-{}", exec_id.as_uuid()),
+        run_id: Uuid::new_v4(),
+        shard_id: 0,
+        input: input.clone().into(),
+        parent_id: None,
+        queue_name: queue,
+        execution_timeout: None,
+        deadline_at: None,
+        chain_execution_timeout: None,
+        chain_deadline_at: None,
+        memo: None,
+        search_attrs: None,
+        assigned_build_id: None,
+        parent_close_policy: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        context_headers: None,
+        sla: None,
+        sla_deadline_at: None,
+        schedule_id: None,
+        scheduled_for: None,
+        workflow_attempt: 1,
+        workflow_retry_policy: None,
+        retry_of_exec_id: None,
+        origin: None,
+        completion_callbacks: None,
+        continued_from_exec_id: None,
+        first_exec_id: None,
+        start_source: None,
+        start_source_ref: None,
+        started_by: None,
+        tenant: None,
+    };
+    diesel::insert_into(harvest_workflow_executions::table)
+        .values(&row)
+        .execute(conn)
+        .await
+        .expect("insert workflow execution");
+    store::append_events_offloaded_with_codecs(
+        conn,
+        exec_id,
+        &[WorkflowEvent::WorkflowStarted {
+            input: input.clone(),
+            timestamp: Utc::now(),
+            last_completion_result,
+            last_error: None,
+            scheduled_time: None,
+        }],
+        0,
+        offloader,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("append WorkflowStarted");
+    let mut params = EnqueueParams::new(queue, TaskType::Workflow, input.clone());
+    params.workflow_exec_id = Some(exec_id.as_uuid());
+    params.scheduled_at = Utc::now() - chrono::Duration::seconds(5);
+    queue::enqueue(conn, &params)
+        .await
+        .expect("enqueue workflow task");
+    exec_id
+}
+
+/// Run a source to `COMPLETED` and return it.
+/// The fairness key of the first workflow task of `exec` (issue #1976).
+async fn first_task_fairness_key(
+    conn: &mut AsyncPgConnection,
+    exec: ExecutionId,
+) -> Option<String> {
+    harvest_task_queue::table
+        .filter(harvest_task_queue::workflow_exec_id.eq(exec.as_uuid()))
+        .filter(harvest_task_queue::task_type.eq("workflow"))
+        .select(harvest_task_queue::fairness_key)
+        .first(conn)
+        .await
+        .expect("read the first workflow task")
+}
+
+async fn completed_source(url: &str, pool: &DbPool, queue: &str, tag: &str) -> ExecutionId {
+    let mut conn = connect(url).await;
+    let source = seed_run(&mut conn, queue, &json!({ "tag": tag, "amount": 42 })).await;
+    let running = Running::start(queue, pool);
+    wait_for_execution_state(url, source, "COMPLETED").await;
+    running.stop().await;
+    assert_eq!(charges(tag), 1, "the source charges once");
+    source
+}
+
+/// The stored rows of an execution and its history, for a before/after check.
+async fn snapshot(
+    url: &str,
+    exec_id: ExecutionId,
+) -> (WorkflowExecution, Vec<(i32, String, Value)>) {
+    let mut conn = connect(url).await;
+    let row = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(WorkflowExecution::as_select())
+        .first(&mut conn)
+        .await
+        .expect("load execution");
+    let events = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
+        .order(harvest_events::event_id.asc())
+        .select((
+            harvest_events::event_id,
+            harvest_events::event_type,
+            harvest_events::event_data,
+        ))
+        .load::<(i32, String, Value)>(&mut conn)
+        .await
+        .expect("load events");
+    (row, events)
+}
+
+fn request(effects: ForkEffects) -> WorkflowForkRequest {
+    WorkflowForkRequest {
+        reason: "what-if".to_string(),
+        operator_id: "tester".to_string(),
+        effects,
+        ..WorkflowForkRequest::default()
+    }
+}
+
+async fn fork(url: &str, source: ExecutionId, request: WorkflowForkRequest) -> ExecutionId {
+    let mut conn = connect(url).await;
+    fork_workflow_execution(&mut conn, source, request, Some(&registry()))
+        .await
+        .expect("fork succeeds")
+        .new_exec_id
+}
+
+// ---------------------------------------------------------------------------
+// Tests.
+// ---------------------------------------------------------------------------
+
+/// AC1: a completed run can be forked, and the source is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_of_a_completed_run_leaves_the_source_unchanged() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("ac1");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let before = snapshot(&url, source).await;
+
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let running = Running::start(&queue, &pool);
+    let fork_row = wait_for_execution_state(&url, forked, "COMPLETED").await;
+    running.stop().await;
+
+    let after = snapshot(&url, source).await;
+    assert_eq!(before.1, after.1, "the source history is unchanged");
+    assert_eq!(
+        serde_json::to_value(&before.0).expect("row json"),
+        serde_json::to_value(&after.0).expect("row json"),
+        "the source row is unchanged"
+    );
+
+    assert_ne!(
+        fork_row.workflow_id, before.0.workflow_id,
+        "a new workflow id"
+    );
+    assert_eq!(fork_row.parent_id, None, "a fork is a root");
+    assert_eq!(fork_row.start_source.as_deref(), Some("fork"));
+    let source_ref = source.to_string();
+    assert_eq!(
+        fork_row.start_source_ref.as_deref(),
+        Some(source_ref.as_str())
+    );
+    assert_eq!(
+        fork_row.output, before.0.output,
+        "the fork returns the recorded result"
+    );
+
+    let (_, fork_events) = snapshot(&url, forked).await;
+    let marker = fork_events
+        .iter()
+        .find(|(_, kind, _)| kind == "WorkflowForked")
+        .expect("the fork history names its source");
+    assert_eq!(
+        marker.2["data"]["forked_from_exec_id"],
+        json!(source.to_string())
+    );
+}
+
+/// AC2: by default, a fork does not run an activity that the source completed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_fork_does_not_run_a_completed_activity_again() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("ac2");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+
+    // `WorkflowForkRequest::default()` sets no effects mode.
+    let forked = fork(
+        &url,
+        source,
+        WorkflowForkRequest {
+            reason: "replay".to_string(),
+            ..WorkflowForkRequest::default()
+        },
+    )
+    .await;
+    let running = Running::start(&queue, &pool);
+    wait_for_execution_state(&url, forked, "COMPLETED").await;
+    running.stop().await;
+
+    assert_eq!(charges(&queue), 1, "the fork must not charge again");
+}
+
+/// AC3: a live effect needs `effects = live`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_fork_runs_the_activity() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("ac3");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+
+    let forked = fork(&url, source, request(ForkEffects::Live)).await;
+    let running = Running::start(&queue, &pool);
+    wait_for_execution_state(&url, forked, "COMPLETED").await;
+    running.stop().await;
+
+    assert_eq!(charges(&queue), 2, "a live fork runs the activity");
+}
+
+/// A recorded fork with no matching record fails closed. It never runs the
+/// activity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_fork_fails_closed_without_a_record() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("closed");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+
+    let mut changed = request(ForkEffects::Recorded);
+    changed.input = Some(json!({ "tag": queue, "amount": 7 }));
+    let forked = fork(&url, source, changed).await;
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, forked, "FAILED").await;
+    running.stop().await;
+
+    assert_eq!(charges(&queue), 1, "no record, so no charge");
+    let error = row.error.unwrap_or_default();
+    assert!(
+        error.contains("ForkEffectUnavailable") || error.contains("no recorded result"),
+        "the failure names the missing record: {error}"
+    );
+}
+
+/// A recorded fork fails before an effect that it cannot serve. The local
+/// activity never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_fork_fails_before_a_local_activity() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("local");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+
+    // The new input takes the local-activity branch that the source skipped.
+    let mut local = request(ForkEffects::Recorded);
+    local.input = Some(json!({ "tag": queue, "amount": 42, "local": true }));
+    let forked = fork(&url, source, local).await;
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, forked, "FAILED").await;
+    running.stop().await;
+
+    assert_eq!(lookups(&queue), 0, "the local activity never runs");
+    assert_eq!(charges(&queue), 1);
+    let error = row.error.unwrap_or_default();
+    assert!(
+        error.contains("RunLocalActivity"),
+        "the failure names the effect: {error}"
+    );
+}
+
+/// Wait until the run `exec_id` has opened its non-cancellable block.
+async fn wait_for_open_block(url: &str, exec_id: ExecutionId) {
+    for _ in 0..200 {
+        let (_, events) = snapshot(url, exec_id).await;
+        if events.iter().any(|(_, kind, data)| {
+            kind == "MarkerRecorded" && data.to_string().contains("non_cancellable_open:1")
+        }) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the run {exec_id} did not open its block");
+}
+
+/// Issue #1984: a recorded fork that refuses an effect while a cancel is
+/// deferred is cancelled, not failed. The refused effect never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_fork_refusal_completes_a_deferred_cancel() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("shield");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "shield": true })).await;
+    let running = Running::start(&queue, &pool);
+    wait_for_open_block(&url, source).await;
+    autumn_harvest::signal::send_signal(&mut conn, source, "go", Value::Null)
+        .await
+        .expect("signal the source");
+    wait_for_execution_state(&url, source, "COMPLETED").await;
+
+    // The new input takes the local-activity branch that the source skipped.
+    let mut local = request(ForkEffects::Recorded);
+    local.input = Some(json!({ "tag": queue, "shield": true, "local": true }));
+    let forked = fork(&url, source, local).await;
+    wait_for_open_block(&url, forked).await;
+    let cancelled = autumn_harvest::cancel_workflow_execution(
+        &mut conn,
+        forked,
+        "operator abort",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("cancel the fork");
+    assert!(cancelled.deferred, "the open block defers the cancel");
+    autumn_harvest::signal::send_signal(&mut conn, forked, "go", Value::Null)
+        .await
+        .expect("signal the fork");
+    let row = wait_for_execution_state(&url, forked, "CANCELLED").await;
+    running.stop().await;
+
+    assert_eq!(lookups(&queue), 0, "the refused local activity never runs");
+    assert_eq!(row.error.as_deref(), Some("operator abort"));
+}
+
+/// An override replaces the result of one activity at the fork point.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn override_replaces_a_recorded_result() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("override");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+
+    let mut overridden = request(ForkEffects::Recorded);
+    // The new charge changes the receipt input, so no record matches it. The
+    // receipt therefore needs its own override.
+    overridden.activity_overrides = vec![
+        ForkActivityOverride {
+            activity_name: "fork_charge".to_string(),
+            occurrence: 1,
+            output: json!({ "charge_id": "stub", "amount": 0 }),
+        },
+        ForkActivityOverride {
+            activity_name: "fork_receipt".to_string(),
+            occurrence: 1,
+            output: json!({ "receipt_for": "stub" }),
+        },
+    ];
+    let forked = fork(&url, source, overridden).await;
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, forked, "COMPLETED").await;
+    running.stop().await;
+
+    assert_eq!(charges(&queue), 1, "an override never runs the activity");
+    let output = row.output.expect("fork output");
+    assert_eq!(output["charge"]["charge_id"], json!("stub"));
+    assert_eq!(output["receipt"]["receipt_for"], json!("stub"));
+}
+
+/// AC4: an erased source is always refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_refuses_an_erased_source() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("erased");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+
+    let mut conn = connect(&url).await;
+    autumn_harvest::erase::erase_workflow_payloads(&mut conn, source, "gdpr")
+        .await
+        .expect("erase the source");
+
+    for effects in [ForkEffects::Recorded, ForkEffects::Live] {
+        let error = fork_workflow_execution(&mut conn, source, request(effects), None)
+            .await
+            .expect_err("an erased source is refused");
+        assert!(
+            matches!(error, WorkflowForkError::ErasedSource { .. }),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+/// Erasure does not reach a fork. A fork of that fork is refused, because
+/// its lineage reaches the erased run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_of_a_fork_of_an_erased_source_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("lineage");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let first = fork(&url, source, request(ForkEffects::Recorded)).await;
+
+    let mut conn = connect(&url).await;
+    autumn_harvest::erase::erase_workflow_payloads(&mut conn, source, "gdpr")
+        .await
+        .expect("erase the source");
+    let error = fork_workflow_execution(&mut conn, first, request(ForkEffects::Live), None)
+        .await
+        .expect_err("the lineage reaches an erased run");
+    assert!(
+        matches!(error, WorkflowForkError::ErasedSource { exec_id } if exec_id == source),
+        "unexpected error: {error}"
+    );
+}
+
+/// A reset of a fork makes another descendant of its lineage. So it walks
+/// the lineage as a fork does, and refuses an erased or missing ancestor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_of_a_fork_checks_its_lineage() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("reset-lineage");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let erased_lineage = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let mut conn = connect(&url).await;
+    autumn_harvest::erase::erase_workflow_payloads(&mut conn, source, "gdpr")
+        .await
+        .expect("erase the source");
+    // Both previews predict the refusal.
+    let preview =
+        autumn_harvest::reset::preview_workflow_reset(&mut conn, erased_lineage, reset_request())
+            .await
+            .expect_err("the preview refuses too");
+    assert!(
+        matches!(preview, WorkflowResetError::ErasedSource { exec_id } if exec_id == source),
+        "unexpected preview: {preview}"
+    );
+    let batch = autumn_harvest::reset::resolve_batch_reset_one(
+        &mut conn,
+        erased_lineage,
+        &ResetPoint::EventId { event_id: 0 },
+        autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+    )
+    .await
+    .expect("the batch preview reads the run");
+    assert_eq!(
+        batch.err(),
+        Some(autumn_harvest::reset::ResetSkipReason::ErasedSource),
+        "the batch preview skips the fork"
+    );
+    let error = reset_workflow_execution(&mut conn, erased_lineage, reset_request(), None)
+        .await
+        .expect_err("the lineage reaches an erased run");
+    assert!(
+        matches!(error, WorkflowResetError::ErasedSource { exec_id } if exec_id == source),
+        "unexpected error: {error}"
+    );
+
+    let root = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 2 })).await;
+    let gap_lineage = fork(&url, root, request(ForkEffects::Recorded)).await;
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(root.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("retain the root");
+    let error = reset_workflow_execution(&mut conn, gap_lineage, reset_request(), None)
+        .await
+        .expect_err("a missing ancestor fails closed");
+    assert!(
+        matches!(error, WorkflowResetError::ForkLineage { exec_id, .. } if exec_id == gap_lineage),
+        "unexpected error: {error}"
+    );
+}
+
+fn reset_request() -> WorkflowResetRequest {
+    WorkflowResetRequest {
+        reset_to_event_id: Some(0),
+        reset_point: None,
+        reason: "retry".to_string(),
+        operator_id: "tester".to_string(),
+        signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+        allow_terminal_source: false,
+    }
+}
+
+/// A row marked as a fork whose source reference is missing or not a UUID
+/// cannot prove its lineage clean. A fork of it fails closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_fork_reference_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("malformed");
+    let mut conn = connect(&url).await;
+    for reference in [Some("not-a-uuid"), None] {
+        let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+        diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+            .set((
+                harvest_workflow_executions::start_source.eq(Some("fork")),
+                harvest_workflow_executions::start_source_ref.eq(reference),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("mark the row as a fork");
+        let error =
+            fork_workflow_execution(&mut conn, source, request(ForkEffects::Recorded), None)
+                .await
+                .expect_err("a malformed lineage fails closed");
+        assert!(
+            matches!(error, WorkflowForkError::LineageMalformed { exec_id } if exec_id == source),
+            "{reference:?}: unexpected error: {error}"
+        );
+    }
+}
+
+/// A fork lineage deeper than the scan bound is refused. The walk cannot
+/// prove that no erased run lies above it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_lineage_past_the_scan_bound_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("deep");
+    let mut conn = connect(&url).await;
+    // Link 66 rows as forks, each of the previous one, with fork provenance.
+    let mut parent = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    for _ in 0..66 {
+        let child = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+        diesel::update(harvest_workflow_executions::table.find(child.as_uuid()))
+            .set((
+                harvest_workflow_executions::start_source.eq(Some("fork")),
+                harvest_workflow_executions::start_source_ref.eq(Some(parent.to_string())),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("link the chain");
+        parent = child;
+    }
+    let error = fork_workflow_execution(&mut conn, parent, request(ForkEffects::Recorded), None)
+        .await
+        .expect_err("a lineage past the bound is refused");
+    assert!(
+        matches!(error, WorkflowForkError::LineageTooDeep { .. }),
+        "unexpected error: {error}"
+    );
+}
+
+/// A malformed fork row at the scan bound is refused. The walk loads exactly
+/// the bound of ancestors and ends on a fork row that names no source.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_ancestor_at_the_scan_bound_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("deep-malformed");
+    let mut conn = connect(&url).await;
+    // The root says that it is a fork, but it names no source.
+    let root = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    diesel::update(harvest_workflow_executions::table.find(root.as_uuid()))
+        .set(harvest_workflow_executions::start_source.eq(Some("fork")))
+        .execute(&mut conn)
+        .await
+        .expect("mark the root");
+    // 64 forks above it, so the walk loads the root as its last ancestor.
+    let mut parent = root;
+    for _ in 0..64 {
+        let child = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+        diesel::update(harvest_workflow_executions::table.find(child.as_uuid()))
+            .set((
+                harvest_workflow_executions::start_source.eq(Some("fork")),
+                harvest_workflow_executions::start_source_ref.eq(Some(parent.to_string())),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("link the chain");
+        parent = child;
+    }
+    let error = fork_workflow_execution(&mut conn, parent, request(ForkEffects::Recorded), None)
+        .await
+        .expect_err("a malformed ancestor at the bound is refused");
+    assert!(
+        matches!(error, WorkflowForkError::LineageMalformed { exec_id } if exec_id == root),
+        "unexpected error: {error}"
+    );
+}
+
+/// A fork at a later point carries the completed charge and takes the
+/// receipt from the record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_at_a_later_point_carries_the_prefix() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("later");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let source_row = snapshot(&url, source).await.0;
+
+    let mut later = request(ForkEffects::Recorded);
+    later.fork_point = Some(ResetPoint::FirstActivityRun {
+        activity_name: "fork_receipt".to_string(),
+    });
+    let mut conn = connect(&url).await;
+    let result = fork_workflow_execution(&mut conn, source, later, Some(&registry()))
+        .await
+        .expect("fork succeeds");
+    assert!(result.fork_event_id > 0, "the fork starts after the charge");
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, result.new_exec_id, "COMPLETED").await;
+    running.stop().await;
+
+    assert_eq!(charges(&queue), 1, "the carried charge does not run again");
+    assert_eq!(row.output, source_row.output);
+    let (_, events) = snapshot(&url, result.new_exec_id).await;
+    let carried = usize::try_from(result.fork_event_id).expect("event id") + 1;
+    assert_eq!(
+        events[carried].1, "WorkflowForked",
+        "the marker follows the prefix"
+    );
+    assert!(
+        events[..carried]
+            .iter()
+            .any(|(_, kind, _)| kind == "ActivityCompleted"),
+        "the prefix carries the charge result"
+    );
+}
+
+/// A recorded fork serves a member of a session that the source closed. The
+/// record settles the member before the broken-session check, so the fork
+/// gets the recorded charge and not `SessionBroken`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_fork_serves_a_member_of_a_closed_session() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("session");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 5, "session": true });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let running = Running::start(&queue, &pool);
+    let source_row = wait_for_execution_state(&url, source, "COMPLETED").await;
+    running.stop().await;
+    assert_eq!(charges(&queue), 1, "the source charges once");
+
+    let mut at_member = request(ForkEffects::Recorded);
+    at_member.fork_point = Some(ResetPoint::FirstActivityRun {
+        activity_name: "fork_charge".to_string(),
+    });
+    let result = fork_workflow_execution(&mut conn, source, at_member, Some(&registry()))
+        .await
+        .expect("fork succeeds");
+    assert!(result.fork_event_id > 0, "the fork carries the session");
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, result.new_exec_id, "COMPLETED").await;
+    running.stop().await;
+
+    assert_eq!(charges(&queue), 1, "the fork never charges");
+    assert_eq!(row.output, source_row.output);
+}
+
+/// A reset of a recorded fork stays a recorded fork. It never runs live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_of_a_recorded_fork_stays_recorded() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("reset");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+
+    // Event 0 is before the fork marker. The reset appends its own marker.
+    let mut conn = connect(&url).await;
+    let reset = reset_workflow_execution(
+        &mut conn,
+        forked,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "retry".to_string(),
+            operator_id: "tester".to_string(),
+            signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+            allow_terminal_source: false,
+        },
+        Some(&registry()),
+    )
+    .await
+    .expect("reset the fork");
+    let reset_row = snapshot(&url, reset.new_exec_id).await.0;
+    assert_eq!(reset_row.start_source.as_deref(), Some("fork"));
+    assert!(
+        is_recorded_fork(&mut conn, &reset_row)
+            .await
+            .expect("read marker")
+    );
+
+    // The reset takes the record of the original source, so it completes
+    // with no new charge.
+    let running = Running::start(&queue, &pool);
+    wait_for_execution_state(&url, reset.new_exec_id, "COMPLETED").await;
+    running.stop().await;
+    assert_eq!(charges(&queue), 1, "the reset fork never charges");
+}
+
+/// A reset between the markers of a recorded fork of a live fork stays
+/// recorded. The carried prefix holds only the live ancestor marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_of_a_nested_recorded_fork_stays_recorded() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("nested");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    // History of the live fork: WorkflowStarted, WorkflowForked(live).
+    let live = fork(&url, source, request(ForkEffects::Live)).await;
+    let mut recorded_request = request(ForkEffects::Recorded);
+    recorded_request.fork_point = Some(ResetPoint::EventId { event_id: 1 });
+    let recorded = fork(&url, live, recorded_request).await;
+
+    // The live fork must not run in this test, so its task never starts.
+    let mut conn = connect(&url).await;
+    queue::cancel_open_tasks_for_execution(&mut conn, live, "test keeps it idle")
+        .await
+        .expect("cancel the live fork task");
+
+    // Event 1 is the live marker, before the recorded marker.
+    let reset = reset_workflow_execution(
+        &mut conn,
+        recorded,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(1),
+            reset_point: None,
+            reason: "retry".to_string(),
+            operator_id: "tester".to_string(),
+            signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+            allow_terminal_source: false,
+        },
+        Some(&registry()),
+    )
+    .await
+    .expect("reset the nested fork");
+    let reset_row = snapshot(&url, reset.new_exec_id).await.0;
+    assert!(
+        is_recorded_fork(&mut conn, &reset_row)
+            .await
+            .expect("read marker")
+    );
+
+    // The live fork never ran, so it holds no record. The reset fails closed.
+    let running = Running::start(&queue, &pool);
+    wait_for_execution_state(&url, reset.new_exec_id, "FAILED").await;
+    running.stop().await;
+    assert_eq!(charges(&queue), 1, "the reset never charges");
+}
+
+/// A reset of a live fork keeps its overrides. The stubbed charge never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_of_a_fork_keeps_its_overrides() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("reset-override");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    // History: WorkflowStarted, WorkflowForked(live), the charge override.
+    let mut live = request(ForkEffects::Live);
+    live.activity_overrides = vec![ForkActivityOverride {
+        activity_name: "fork_charge".to_string(),
+        occurrence: 1,
+        output: json!({ "charge_id": "stub", "amount": 0 }),
+    }];
+    let forked = fork(&url, source, live).await;
+
+    // Event 2 carries the override. The reset appends a new marker after it.
+    let mut conn = connect(&url).await;
+    let reset = reset_workflow_execution(
+        &mut conn,
+        forked,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(2),
+            reset_point: None,
+            reason: "retry".to_string(),
+            operator_id: "tester".to_string(),
+            signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+            allow_terminal_source: false,
+        },
+        Some(&registry()),
+    )
+    .await
+    .expect("reset the fork");
+
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, reset.new_exec_id, "COMPLETED").await;
+    running.stop().await;
+    assert_eq!(charges(&queue), 1, "the override still stubs the charge");
+    assert_eq!(
+        row.output.expect("output")["charge"]["charge_id"],
+        json!("stub")
+    );
+}
+
+/// An in-memory blob store for the offload test.
+#[derive(Default)]
+struct MemStore {
+    blobs: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl autumn_harvest::payload_store::PayloadStore for MemStore {
+    fn store_id(&self) -> &'static str {
+        "fork-test"
+    }
+    fn put(&self, bytes: &[u8]) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, String> {
+        let key = format!("blob/{}", Uuid::new_v4());
+        self.blobs
+            .lock()
+            .expect("blobs lock")
+            .insert(key.clone(), bytes.to_vec());
+        Box::pin(async move { Ok(key) })
+    }
+    fn get(&self, key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, Vec<u8>> {
+        let found = self.blobs.lock().expect("blobs lock").get(key).cloned();
+        let key = key.to_string();
+        Box::pin(async move {
+            found.ok_or_else(|| {
+                autumn_harvest::payload_store::PayloadStoreError(format!("missing {key}"))
+            })
+        })
+    }
+    fn delete(&self, key: &str) -> autumn_harvest::payload_store::PayloadStoreFuture<'_, ()> {
+        self.blobs.lock().expect("blobs lock").remove(key);
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+/// A reset of a fork keeps a reference to each offloaded override blob, so
+/// retention of the sealed fork cannot collect it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_of_a_fork_references_its_offloaded_overrides() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("reset-blob");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let offloading = Arc::new(
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_payload_offloader(Some(offloader)),
+    );
+
+    let mut live = request(ForkEffects::Live);
+    live.activity_overrides = vec![ForkActivityOverride {
+        activity_name: "fork_charge".to_string(),
+        occurrence: 1,
+        output: json!({ "charge_id": "X".repeat(512) }),
+    }];
+    let forked = fork_workflow_execution(&mut conn, source, live, Some(&offloading))
+        .await
+        .expect("fork")
+        .new_exec_id;
+    let fork_refs = store::load_payload_refs(&mut conn, forked)
+        .await
+        .expect("refs");
+    assert_eq!(fork_refs.len(), 1, "the override output is offloaded");
+
+    let reset = reset_workflow_execution(
+        &mut conn,
+        forked,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "retry".to_string(),
+            operator_id: "tester".to_string(),
+            signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+            allow_terminal_source: false,
+        },
+        Some(&offloading),
+    )
+    .await
+    .expect("reset the fork");
+    let reset_refs = store::load_payload_refs(&mut conn, reset.new_exec_id)
+        .await
+        .expect("refs");
+    assert_eq!(
+        reset_refs.iter().map(|r| &r.blob_key).collect::<Vec<_>>(),
+        fork_refs.iter().map(|r| &r.blob_key).collect::<Vec<_>>(),
+        "the reset references the override blob"
+    );
+}
+
+/// A reset copies its carried prefix byte for byte, envelopes included. It
+/// takes its own reference to each blob that the prefix names. A reset seals
+/// its source, so retention of that source cannot then collect the blob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reset_references_the_blobs_of_its_carried_prefix() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("reset-prefix");
+    let mut conn = connect(&url).await;
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let carryover = json!({ "previous": "X".repeat(512) });
+    let source = seed_run_with(
+        &mut conn,
+        &queue,
+        &json!({ "n": 1 }),
+        Some(carryover),
+        Some(&offloader),
+    )
+    .await;
+    let blob_keys = |refs: Vec<autumn_harvest::payload_store::OffloadedRef>| {
+        refs.into_iter().map(|r| r.blob_key).collect::<Vec<_>>()
+    };
+    let source_keys = blob_keys(
+        store::load_payload_refs(&mut conn, source)
+            .await
+            .expect("refs"),
+    );
+    assert_eq!(source_keys.len(), 1, "the carryover is offloaded");
+    let offloading = Arc::new(
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_payload_offloader(Some(offloader)),
+    );
+    let forked = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&offloading),
+    )
+    .await
+    .expect("fork")
+    .new_exec_id;
+
+    // A plain run and a fork each carry the started event with its envelope.
+    for exec_id in [source, forked] {
+        let reset =
+            reset_workflow_execution(&mut conn, exec_id, reset_request(), Some(&offloading))
+                .await
+                .expect("reset");
+        let reset_keys = blob_keys(
+            store::load_payload_refs(&mut conn, reset.new_exec_id)
+                .await
+                .expect("refs"),
+        );
+        assert_eq!(
+            reset_keys, source_keys,
+            "the reset of {exec_id} keeps the blob"
+        );
+    }
+}
+
+/// A reset from before issue #2000 copied envelopes without references. A
+/// fork or a reset of it still references each blob that it names. It takes
+/// the reference from another run. Retention of the first run then cannot
+/// collect the blob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_of_a_legacy_reset_references_its_blobs() {
+    use autumn_harvest::schema::harvest_payload_refs;
+
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("legacy-reset");
+    let mut conn = connect(&url).await;
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let carryover = json!({ "previous": "X".repeat(512) });
+    let source = seed_run_with(
+        &mut conn,
+        &queue,
+        &json!({ "n": 1 }),
+        Some(carryover),
+        Some(&offloader),
+    )
+    .await;
+    let blob_keys = |refs: Vec<autumn_harvest::payload_store::OffloadedRef>| {
+        refs.into_iter().map(|r| r.blob_key).collect::<Vec<_>>()
+    };
+    let source_keys = blob_keys(
+        store::load_payload_refs(&mut conn, source)
+            .await
+            .expect("refs"),
+    );
+    assert_eq!(source_keys.len(), 1, "the carryover is offloaded");
+    let offloading = Arc::new(
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_payload_offloader(Some(offloader)),
+    );
+    let legacy = reset_workflow_execution(&mut conn, source, reset_request(), Some(&offloading))
+        .await
+        .expect("reset")
+        .new_exec_id;
+    // A reset from before issue #2000 has no references of its own.
+    diesel::delete(
+        harvest_payload_refs::table
+            .filter(harvest_payload_refs::workflow_exec_id.eq(legacy.as_uuid())),
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop the reset references");
+
+    let forked = fork_workflow_execution(
+        &mut conn,
+        legacy,
+        request(ForkEffects::Live),
+        Some(&offloading),
+    )
+    .await
+    .expect("fork")
+    .new_exec_id;
+    let reset = reset_workflow_execution(&mut conn, legacy, reset_request(), Some(&offloading))
+        .await
+        .expect("reset the legacy reset")
+        .new_exec_id;
+    for copy in [forked, reset] {
+        let keys = blob_keys(
+            store::load_payload_refs(&mut conn, copy)
+                .await
+                .expect("refs"),
+        );
+        assert_eq!(keys, source_keys, "{copy} references the blob");
+    }
+
+    // Once no run references the blob, retention can delete it. A copy would
+    // name a blob that may be gone, so the fork is refused.
+    diesel::delete(
+        harvest_payload_refs::table.filter(harvest_payload_refs::blob_key.eq(&source_keys[0])),
+    )
+    .execute(&mut conn)
+    .await
+    .expect("drop every reference");
+    let refused = fork_workflow_execution(
+        &mut conn,
+        legacy,
+        request(ForkEffects::Live),
+        Some(&offloading),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::HistoryUnavailable { .. }
+            ))
+        ),
+        "a fork that names an unreferenced blob is refused: {refused:?}"
+    );
+}
+
+/// An input override keeps an offloaded carryover as an envelope. The fork
+/// references its blob, so retention of the source cannot collect it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_input_override_keeps_an_offloaded_carryover() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("carryover");
+    let mut conn = connect(&url).await;
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let carryover = json!({ "previous": "X".repeat(512) });
+    let source = seed_run_with(
+        &mut conn,
+        &queue,
+        &json!({ "n": 1 }),
+        Some(carryover),
+        Some(&offloader),
+    )
+    .await;
+    let source_refs = store::load_payload_refs(&mut conn, source)
+        .await
+        .expect("refs");
+    assert_eq!(source_refs.len(), 1, "the carryover is offloaded");
+    let offloading = Arc::new(
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_payload_offloader(Some(offloader)),
+    );
+
+    let mut what_if = request(ForkEffects::Live);
+    what_if.input = Some(json!({ "n": 2 }));
+    let forked = fork_workflow_execution(&mut conn, source, what_if, Some(&offloading))
+        .await
+        .expect("fork")
+        .new_exec_id;
+
+    let (_, source_events) = snapshot(&url, source).await;
+    let (_, fork_events) = snapshot(&url, forked).await;
+    let start = &fork_events[0].2;
+    assert_eq!(start["data"]["input"], json!({ "n": 2 }));
+    assert_eq!(
+        start["data"]["last_completion_result"],
+        source_events[0].2["data"]["last_completion_result"],
+        "the carryover keeps its stored envelope"
+    );
+    let fork_refs = store::load_payload_refs(&mut conn, forked)
+        .await
+        .expect("refs");
+    assert_eq!(
+        fork_refs.iter().map(|r| &r.blob_key).collect::<Vec<_>>(),
+        source_refs.iter().map(|r| &r.blob_key).collect::<Vec<_>>(),
+        "the fork references the carryover blob"
+    );
+}
+
+/// A large input override is offloaded, as an appended event is. The fork
+/// stores an envelope and references its blob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_large_input_override_is_offloaded() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("big-input");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "n": 1 })).await;
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let offloading = Arc::new(
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_payload_offloader(Some(offloader)),
+    );
+    let mut large = request(ForkEffects::Live);
+    large.input = Some(json!({ "n": 2, "note": "X".repeat(512) }));
+    let forked = fork_workflow_execution(&mut conn, source, large, Some(&offloading))
+        .await
+        .expect("fork")
+        .new_exec_id;
+
+    let (_, fork_events) = snapshot(&url, forked).await;
+    let stored = &fork_events[0].2["data"]["input"];
+    assert!(
+        autumn_harvest::payload_store::is_offload_envelope(stored),
+        "the input is stored as an envelope: {stored}"
+    );
+    let fork_refs = store::load_payload_refs(&mut conn, forked)
+        .await
+        .expect("refs");
+    assert_eq!(fork_refs.len(), 1, "the fork references the input blob");
+}
+
+/// A fork is admitted as a fresh start, so its first task is a new start in
+/// the claim order (issue #1824). A reset continues admitted work, so its
+/// first task is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_task_is_a_new_start() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("new-start");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let new_start = |exec_id: ExecutionId| {
+        autumn_harvest::schema::harvest_task_queue::table
+            .filter(
+                autumn_harvest::schema::harvest_task_queue::workflow_exec_id
+                    .eq(Some(exec_id.as_uuid())),
+            )
+            .select(autumn_harvest::schema::harvest_task_queue::new_start)
+    };
+    let fork_flags: Vec<bool> = new_start(forked).load(&mut conn).await.expect("fork task");
+    assert_eq!(fork_flags, vec![true], "the fork task is a new start");
+
+    let reset = reset_workflow_execution(
+        &mut conn,
+        forked,
+        WorkflowResetRequest {
+            reset_to_event_id: Some(0),
+            reset_point: None,
+            reason: "retry".to_string(),
+            operator_id: "tester".to_string(),
+            signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::Drop,
+            allow_terminal_source: false,
+        },
+        Some(&registry()),
+    )
+    .await
+    .expect("reset the fork");
+    let reset_flags: Vec<bool> = new_start(reset.new_exec_id)
+        .load(&mut conn)
+        .await
+        .expect("reset task");
+    assert_eq!(reset_flags, vec![false], "a reset task is a continuation");
+}
+
+/// A served outcome that is a fan-out stored result names a source blob. The
+/// fork takes its own reference to that blob, so retention of the source does
+/// not delete it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_served_stored_result_keeps_its_blob() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("stored");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1 });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let key = format!("result-{}", Uuid::new_v4().simple());
+    let stored = autumn_harvest::fan_out::StoredResult::new("mem", key.clone(), 1, "c");
+    let charge = autumn_harvest::ActivityExecId::new();
+    store::append_events(
+        &mut conn,
+        source,
+        &[
+            WorkflowEvent::ActivityScheduled {
+                activity_id: charge,
+                name: "fork_charge".to_string(),
+                input: input.clone(),
+                queue: queue.clone(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: charge,
+                output: stored.to_recorded_value(),
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("record the stored result");
+    store::insert_payload_refs(
+        &mut conn,
+        source,
+        &[autumn_harvest::payload_store::OffloadedRef {
+            blob_key: key.clone(),
+            store_id: "mem".to_string(),
+            byte_len: 1,
+        }],
+    )
+    .await
+    .expect("own the blob");
+
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let running = Running::start(&queue, &pool);
+    let mut shared = false;
+    for _ in 0..100 {
+        let refs = store::load_payload_refs(&mut conn, forked)
+            .await
+            .expect("refs");
+        if refs.iter().any(|blob| blob.blob_key == key) {
+            shared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    running.stop().await;
+    assert!(shared, "the fork references the served stored-result blob");
+}
+
+/// A recorded stored result whose blob no run references can already be gone.
+/// The record cannot serve it, so the activity fails closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_result_with_no_reference_fails_closed() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("stored-gone");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1 });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let key = format!("result-{}", Uuid::new_v4().simple());
+    let stored = autumn_harvest::fan_out::StoredResult::new("mem", key.clone(), 1, "c");
+    let charge = autumn_harvest::ActivityExecId::new();
+    // No run references the blob, so retention can delete it.
+    store::append_events(
+        &mut conn,
+        source,
+        &[
+            WorkflowEvent::ActivityScheduled {
+                activity_id: charge,
+                name: "fork_charge".to_string(),
+                input: input.clone(),
+                queue: queue.clone(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: charge,
+                output: stored.to_recorded_value(),
+            },
+        ],
+        1,
+    )
+    .await
+    .expect("record the stored result");
+
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, forked, "FAILED").await;
+    running.stop().await;
+
+    assert_eq!(charges(&queue), 0, "the record settles the activity");
+    let error = row.error.unwrap_or_default();
+    assert!(
+        error.contains(&key),
+        "the failure names the missing blob: {error}"
+    );
+    let refs = store::load_payload_refs(&mut conn, forked)
+        .await
+        .expect("refs");
+    assert!(refs.is_empty(), "the fork takes no reference: {refs:?}");
+}
+
+/// A fork at point 0 carries no decision to replay, so it takes the build of
+/// a fresh start under the current policy. A fork with a carried prefix keeps
+/// the source build, which can replay that prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_fork_with_a_prefix_keeps_the_source_build() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("build");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let mut conn = connect(&url).await;
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::assigned_build_id.eq(Some("build-old")))
+        .execute(&mut conn)
+        .await
+        .expect("pin the source build");
+    autumn_harvest::build_routing::set_build_policy(&mut conn, &queue, "build-new", None)
+        .await
+        .expect("set the current build");
+    let fresh = fork_workflow_execution(&mut conn, source, request(ForkEffects::Recorded), None)
+        .await
+        .expect("fork at point 0");
+    assert_eq!(fresh.fork_event_id, 0);
+    let new = Some("build-new".to_string());
+    assert_eq!(build_of(&url, fresh.new_exec_id).await, (new.clone(), new));
+
+    let mut later = request(ForkEffects::Recorded);
+    later.fork_point = Some(ResetPoint::FirstActivityRun {
+        activity_name: "fork_receipt".to_string(),
+    });
+    let prefix = fork_workflow_execution(&mut conn, source, later, None)
+        .await
+        .expect("fork with a prefix");
+    assert!(prefix.fork_event_id > 0);
+    let old = Some("build-old".to_string());
+    assert_eq!(build_of(&url, prefix.new_exec_id).await, (old.clone(), old));
+}
+
+/// The build of a fork row and the build that its first task requires.
+async fn build_of(url: &str, exec_id: ExecutionId) -> (Option<String>, Option<String>) {
+    let mut conn = connect(url).await;
+    let row: Option<String> = harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::assigned_build_id)
+        .first(&mut conn)
+        .await
+        .expect("fork row");
+    let task: Option<String> = autumn_harvest::schema::harvest_task_queue::table
+        .filter(
+            autumn_harvest::schema::harvest_task_queue::workflow_exec_id
+                .eq(Some(exec_id.as_uuid())),
+        )
+        .select(autumn_harvest::schema::harvest_task_queue::required_build_id)
+        .first(&mut conn)
+        .await
+        .expect("fork task");
+    (row, task)
+}
+
+/// A source whose workflow type is not registered is refused. Its fork would
+/// fail on every worker, so the route refuses it, as a rerun does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_of_an_unregistered_workflow_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("unregistered");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::workflow_name.eq("retired_wf"))
+        .execute(&mut conn)
+        .await
+        .expect("retire the workflow type");
+    let error = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Recorded),
+        Some(&registry()),
+    )
+    .await
+    .expect_err("an unregistered workflow type is refused");
+    assert!(
+        matches!(&error, WorkflowForkError::WorkflowNotRegistered { workflow_name } if workflow_name == "retired_wf"),
+        "unexpected error: {error}"
+    );
+}
+
+/// The success audit commits with the fork. An audit insert that fails
+/// rolls the fork back, so a retry cannot make a second fork.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_commits_with_its_audit_row() {
+    use autumn_harvest::audit::OP_WORKFLOW_FORK;
+    use autumn_harvest::models::NewAuditRecord;
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("audited");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let target = source.to_string();
+    let record = |source: &'static str| NewAuditRecord {
+        actor: "tester",
+        operation: OP_WORKFLOW_FORK,
+        target_type: "workflow",
+        target_id: Some(target.as_str()),
+        route_or_command: "POST /workflows/{id}/fork",
+        request_id: None,
+        idempotency_key: None,
+        status: "succeeded",
+        error_summary: None,
+        shard_id: None,
+        source,
+    };
+    // The audit table accepts only api, cli or ui as a source.
+    autumn_harvest::fork::fork_workflow_execution_audited(
+        &mut conn,
+        source,
+        request(ForkEffects::Recorded),
+        None,
+        &record("bogus"),
+    )
+    .await
+    .expect_err("a failed audit insert fails the fork");
+    assert_eq!(forks_of(&mut conn, source).await, 0, "the fork rolled back");
+
+    autumn_harvest::fork::fork_workflow_execution_audited(
+        &mut conn,
+        source,
+        request(ForkEffects::Recorded),
+        None,
+        &record("api"),
+    )
+    .await
+    .expect("an audited fork");
+    assert_eq!(forks_of(&mut conn, source).await, 1);
+    let audits: i64 = autumn_harvest::schema::harvest_audit_log::table
+        .filter(autumn_harvest::schema::harvest_audit_log::operation.eq(OP_WORKFLOW_FORK))
+        .filter(autumn_harvest::schema::harvest_audit_log::target_id.eq(Some(target.clone())))
+        .count()
+        .get_result(&mut conn)
+        .await
+        .expect("audit rows");
+    assert_eq!(audits, 1, "the audit row committed with the fork");
+}
+
+/// The number of forks that name `source`.
+async fn forks_of(conn: &mut AsyncPgConnection, source: ExecutionId) -> i64 {
+    harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::start_source.eq(Some("fork")))
+        .filter(harvest_workflow_executions::start_source_ref.eq(Some(source.to_string())))
+        .count()
+        .get_result(conn)
+        .await
+        .expect("count forks")
+}
+
+/// A live fork never reads the source history. A source blob that is gone
+/// does not stop the fork from running its activities.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_live_fork_does_not_read_the_source_history() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("live-blob");
+    let mut conn = connect(&url).await;
+    let blobs = Arc::new(MemStore::default());
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::clone(&blobs) as Arc<dyn autumn_harvest::payload_store::PayloadStore>,
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    // Only the fork runs. The source keeps its history.
+    diesel::delete(autumn_harvest::schema::harvest_task_queue::table.filter(
+        autumn_harvest::schema::harvest_task_queue::workflow_exec_id.eq(Some(source.as_uuid())),
+    ))
+    .execute(&mut conn)
+    .await
+    .expect("drop the source task");
+    store::append_events_offloaded_with_codecs(
+        &mut conn,
+        source,
+        &[WorkflowEvent::ActivityScheduled {
+            activity_id: autumn_harvest::types::ActivityExecId::new(),
+            name: "fork_charge".to_string(),
+            input: json!({ "blob": "X".repeat(512) }),
+            queue: queue.clone(),
+        }],
+        1,
+        Some(&offloader),
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+    )
+    .await
+    .expect("append an offloaded event");
+    blobs.blobs.lock().expect("blobs lock").clear();
+
+    let forked = fork(&url, source, request(ForkEffects::Live)).await;
+    let offloading = Arc::new(
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_payload_offloader(Some(offloader)),
+    );
+    let running = Running::start_with(&queue, &pool, offloading);
+    wait_for_execution_state(&url, forked, "COMPLETED").await;
+    running.stop().await;
+    assert_eq!(charges(&queue), 1, "the live fork charges once");
+}
+
+/// A fork copies a prefix longer than one insert can bind. Postgres caps a
+/// statement at 65,535 parameters, and each copied row binds four.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_copies_a_prefix_past_the_parameter_limit() {
+    const MARKERS: usize = 16_500;
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("long");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let markers = (0..MARKERS)
+        .map(|n| WorkflowEvent::MarkerRecorded {
+            name: "step".to_string(),
+            details: json!(n),
+        })
+        .collect::<Vec<_>>();
+    for (n, chunk) in markers.chunks(1_000).enumerate() {
+        let start = i32::try_from(1 + n * 1_000).expect("event id");
+        store::append_events(&mut conn, source, chunk, start)
+            .await
+            .expect("append markers");
+    }
+
+    let mut at_end = request(ForkEffects::Recorded);
+    at_end.fork_point = Some(ResetPoint::EventId {
+        event_id: i64::try_from(MARKERS).expect("event id"),
+    });
+    let result = fork_workflow_execution(&mut conn, source, at_end, Some(&registry()))
+        .await
+        .expect("fork succeeds");
+    assert_eq!(result.events_carried_over, MARKERS + 1);
+    let (_, events) = snapshot(&url, result.new_exec_id).await;
+    assert_eq!(events.len(), MARKERS + 2, "the prefix and the marker");
+}
+
+/// A fork is admitted under the tenant quota of its workflow type, as a start
+/// is. A kept input keeps the key of the source. A new input resolves its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_is_admitted_under_the_tenant_quota() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    // The start of the source admitted it under its tenant key.
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::quota_key.eq(Some(queue.as_str())))
+        .execute(&mut conn)
+        .await
+        .expect("stamp the source key");
+    let mut info = fork_pay_wf_info();
+    info.quota =
+        Some(autumn_harvest::quota::QuotaPolicy::new("tenant").with_max_active_executions(2));
+    let quota_registry = Arc::new(HandlerRegistry::new(
+        vec![info],
+        activities![fork_charge, fork_receipt],
+    ));
+
+    let first = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await
+    .expect("the source and one fork fit the cap")
+    .new_exec_id;
+    let row = snapshot(&url, first).await.0;
+    assert_eq!(row.quota_key.as_deref(), Some(queue.as_str()));
+    // The admission key is also the fairness key of the first task.
+    assert_eq!(
+        first_task_fairness_key(&mut conn, first).await.as_deref(),
+        Some(queue.as_str())
+    );
+
+    let over = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await;
+    assert!(
+        matches!(
+            over,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::QuotaExceeded { .. }
+            ))
+        ),
+        "a third active run of the key is refused: {over:?}"
+    );
+
+    let other = format!("{queue}-other");
+    let mut elsewhere = request(ForkEffects::Live);
+    elsewhere.input = Some(json!({ "tag": queue, "amount": 1, "tenant": other }));
+    let moved = fork_workflow_execution(&mut conn, source, elsewhere, Some(&quota_registry))
+        .await
+        .expect("a new input resolves its own key")
+        .new_exec_id;
+    let row = snapshot(&url, moved).await.0;
+    assert_eq!(row.quota_key.as_deref(), Some(other.as_str()));
+}
+
+/// A source with no stored quota key, such as a reset run, resolves the key
+/// from its input. A kept input then cannot skip the quota.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_resolves_a_quota_key_that_the_source_lacks() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota-null");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let mut info = fork_pay_wf_info();
+    info.quota =
+        Some(autumn_harvest::quota::QuotaPolicy::new("tenant").with_max_active_executions(5));
+    let quota_registry = Arc::new(HandlerRegistry::new(
+        vec![info],
+        activities![fork_charge, fork_receipt],
+    ));
+    let forked = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await
+    .expect("fork")
+    .new_exec_id;
+    let row = snapshot(&url, forked).await.0;
+    assert_eq!(row.quota_key.as_deref(), Some(queue.as_str()));
+}
+
+/// A kept input resolves its quota key under the current policy. A stale key
+/// that the source stored at its own start does not decide the tenant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_resolves_its_quota_key_under_the_current_policy() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota-now");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::quota_key.eq(Some("stale-tenant")))
+        .execute(&mut conn)
+        .await
+        .expect("stamp a stale key");
+    let mut info = fork_pay_wf_info();
+    info.quota =
+        Some(autumn_harvest::quota::QuotaPolicy::new("tenant").with_max_active_executions(5));
+    let quota_registry = Arc::new(HandlerRegistry::new(
+        vec![info],
+        activities![fork_charge, fork_receipt],
+    ));
+    let forked = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await
+    .expect("fork")
+    .new_exec_id;
+    let row = snapshot(&url, forked).await.0;
+    assert_eq!(row.quota_key.as_deref(), Some(queue.as_str()));
+}
+
+/// A fork whose lineage reaches a deleted ancestor is refused. Retention can
+/// delete an erased run, so a gap cannot prove that the lineage is clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_lineage_with_a_deleted_ancestor_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("gap");
+    let mut conn = connect(&url).await;
+    let root = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let first = fork(&url, root, request(ForkEffects::Recorded)).await;
+    diesel::sql_query("DELETE FROM harvest_workflow_executions WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(root.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("retain the root");
+
+    let result = fork_workflow_execution(
+        &mut conn,
+        first,
+        request(ForkEffects::Recorded),
+        Some(&registry()),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(WorkflowForkError::LineageGap { exec_id }) if exec_id == root),
+        "a deleted ancestor fails closed: {result:?}"
+    );
+}
+
+/// A source or an ancestor that a shard migration sealed is not the live run.
+/// Its erasure and its later outcomes live on another shard. A sealed source
+/// is refused as retryable, so a retry follows the forwarding pointer. A
+/// sealed ancestor fails closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_migration_seal_is_not_a_fork_source() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("seal");
+    let mut conn = connect(&url).await;
+    let root = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let first = fork(&url, root, request(ForkEffects::Recorded)).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'MIGRATED', migrated_to_shard = 1, \
+         migrated_at = NOW() WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(root.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("seal the root");
+
+    let sealed_source = fork_workflow_execution(
+        &mut conn,
+        root,
+        request(ForkEffects::Recorded),
+        Some(&registry()),
+    )
+    .await;
+    assert!(
+        matches!(
+            sealed_source,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::ShardUnavailable { .. }
+            ))
+        ),
+        "a sealed source is retryable: {sealed_source:?}"
+    );
+    let sealed_ancestor = fork_workflow_execution(
+        &mut conn,
+        first,
+        request(ForkEffects::Recorded),
+        Some(&registry()),
+    )
+    .await;
+    assert!(
+        matches!(sealed_ancestor, Err(WorkflowForkError::LineageGap { exec_id }) if exec_id == root),
+        "a sealed ancestor fails closed: {sealed_ancestor:?}"
+    );
+}
+
+/// A fork is a fresh admission. An admission gate on its queue refuses it,
+/// as the gate refuses a start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admission_gate_refuses_a_fork() {
+    use autumn_harvest::admission_gate::{
+        AdmissionGate, AdmissionGateCache, AdmissionGateId, GateScope,
+        set_global_admission_gate_cache,
+    };
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("gate");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let cache = Arc::new(AdmissionGateCache::new());
+    cache.refresh(vec![AdmissionGate {
+        id: AdmissionGateId(Uuid::new_v4()),
+        scope: GateScope::Queue(queue.clone()),
+        reason: "incident".to_string(),
+        message: None,
+        created_by: "test".to_string(),
+        created_at: Utc::now(),
+        expires_at: None,
+    }]);
+    set_global_admission_gate_cache(Some(cache));
+    let result = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&registry()),
+    )
+    .await;
+    set_global_admission_gate_cache(None);
+    assert!(
+        matches!(
+            result,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::AdmissionBlocked { .. }
+            ))
+        ),
+        "the gate refuses the fork: {result:?}"
+    );
+}
+
+/// The copied prefix counts against the history cap of the tenant quota. A
+/// fork starts with that history, so the cap sees it before the insert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_copied_prefix_counts_against_the_history_quota() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota-bytes");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let mut info = fork_pay_wf_info();
+    info.quota = Some(autumn_harvest::quota::QuotaPolicy::new("tenant").with_max_history_bytes(16));
+    let quota_registry = Arc::new(HandlerRegistry::new(
+        vec![info],
+        activities![fork_charge, fork_receipt],
+    ));
+    let result = fork_workflow_execution(
+        &mut conn,
+        source,
+        request(ForkEffects::Live),
+        Some(&quota_registry),
+    )
+    .await;
+    assert!(
+        matches!(
+            result,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::QuotaExceeded {
+                    resource: autumn_harvest::quota::QuotaResource::HistoryBytes,
+                    ..
+                }
+            ))
+        ),
+        "the prefix alone exceeds the cap: {result:?}"
+    );
+}
+
+/// The history cap counts the rows that the fork stores, not only the source
+/// prefix. A large input override must not slip past a cap that the source
+/// prefix alone fits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_history_quota_counts_a_large_input_override() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota-override");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let prefix: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(source.as_uuid()))
+        .select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "COALESCE(SUM(pg_column_size(event_data)), 0)::BIGINT",
+        ))
+        .first(&mut conn)
+        .await
+        .expect("measure the prefix");
+    let cap = u64::try_from(prefix).expect("size") + 200;
+    let mut info = fork_pay_wf_info();
+    info.quota =
+        Some(autumn_harvest::quota::QuotaPolicy::new("tenant").with_max_history_bytes(cap));
+    let quota_registry = Arc::new(HandlerRegistry::new(
+        vec![info],
+        activities![fork_charge, fork_receipt],
+    ));
+    let mut large = request(ForkEffects::Live);
+    large.input = Some(json!({ "tag": queue, "tenant": queue, "note": "X".repeat(4_096) }));
+    let result = fork_workflow_execution(&mut conn, source, large, Some(&quota_registry)).await;
+    assert!(
+        matches!(
+            result,
+            Err(WorkflowForkError::Harvest(
+                autumn_harvest::error::HarvestError::QuotaExceeded {
+                    resource: autumn_harvest::quota::QuotaResource::HistoryBytes,
+                    ..
+                }
+            ))
+        ),
+        "the large input exceeds the cap: {result:?}"
+    );
+}
+
+/// An override that the offloader stores out of line counts as its envelope.
+/// A large offloaded result must not exhaust a history quota that the stored
+/// fork fits.
+#[tokio::test]
+async fn the_history_quota_counts_an_offloaded_override_as_its_envelope() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("quota-offload");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "tenant": queue });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let prefix: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(source.as_uuid()))
+        .select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "COALESCE(SUM(pg_column_size(event_data)), 0)::BIGINT",
+        ))
+        .first(&mut conn)
+        .await
+        .expect("measure the prefix");
+    let mut info = fork_pay_wf_info();
+    info.quota = Some(
+        autumn_harvest::quota::QuotaPolicy::new("tenant")
+            .with_max_history_bytes(u64::try_from(prefix).expect("size") + 8_192),
+    );
+    let offloader = Arc::new(autumn_harvest::payload_store::PayloadOffloader::new(
+        Arc::new(MemStore::default()),
+        64,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+    ));
+    let offloading = Arc::new(
+        HandlerRegistry::new(vec![info], activities![fork_charge, fork_receipt])
+            .with_payload_offloader(Some(offloader)),
+    );
+    let mut large = request(ForkEffects::Recorded);
+    large.activity_overrides = vec![ForkActivityOverride {
+        activity_name: "fork_charge".to_string(),
+        occurrence: 1,
+        output: json!({ "charge_id": "X".repeat(100_000) }),
+    }];
+    let result = fork_workflow_execution(&mut conn, source, large, Some(&offloading)).await;
+    assert!(
+        result.is_ok(),
+        "the stored fork holds an envelope, which fits the cap: {result:?}"
+    );
+}
+
+/// The history cap reads the stored fork rows with the worker measure, so it
+/// is exact. A byte cap at the stored size refuses the fork. One byte more
+/// admits the same fork.
+#[tokio::test]
+async fn the_history_cap_uses_the_stored_measure() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("cap-measure");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let mut overrides = request(ForkEffects::Recorded);
+    overrides.activity_overrides = (1..=50)
+        .map(|occurrence| ForkActivityOverride {
+            activity_name: "fork_charge".to_string(),
+            occurrence,
+            output: json!({ "n": occurrence }),
+        })
+        .collect();
+    let free = fork_workflow_execution(&mut conn, source, overrides.clone(), Some(&registry()))
+        .await
+        .expect("fork without a cap")
+        .new_exec_id;
+    let stored: i64 = harvest_events::table
+        .filter(harvest_events::workflow_exec_id.eq(free.as_uuid()))
+        .select(diesel::dsl::sql::<diesel::sql_types::BigInt>(
+            "COALESCE(SUM(pg_column_size(event_data)), 0)::BIGINT",
+        ))
+        .first(&mut conn)
+        .await
+        .expect("measure the fork");
+    let stored = u64::try_from(stored).expect("size");
+    let capped = |cap: u64| {
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_history_policy(
+            autumn_harvest::WorkflowHistoryPolicy::default().with_byte_hard_cap(cap),
+        )
+    };
+    let at_cap =
+        fork_workflow_execution(&mut conn, source, overrides.clone(), Some(&capped(stored))).await;
+    assert!(
+        matches!(
+            at_cap,
+            Err(WorkflowForkError::HistoryCapReached { measure: "bytes", observed, .. })
+                if observed == stored
+        ),
+        "a fork at the cap is refused with its stored size: {at_cap:?}"
+    );
+    fork_workflow_execution(&mut conn, source, overrides, Some(&capped(stored + 1)))
+        .await
+        .expect("one byte under the cap is admitted");
+}
+
+/// A reset of a fork adds markers and copies its overrides again. A reset
+/// history that reaches a worker cap is refused before commit. The source fork
+/// is then not sealed for a run that could never start.
+#[tokio::test]
+async fn a_reset_of_a_fork_that_reaches_a_history_cap_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("reset-cap");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let capped = HandlerRegistry::new(
+        vec![fork_pay_wf_info()],
+        activities![fork_charge, fork_receipt],
+    )
+    .with_history_policy(autumn_harvest::WorkflowHistoryPolicy::default().with_event_hard_cap(2));
+
+    let result = reset_workflow_execution(&mut conn, forked, reset_request(), Some(&capped)).await;
+    assert!(
+        matches!(
+            result,
+            Err(WorkflowResetError::HistoryCapReached {
+                measure: "events",
+                ..
+            })
+        ),
+        "a reset that reaches the cap is refused: {result:?}"
+    );
+    assert_eq!(
+        snapshot(&url, forked).await.0.state,
+        "RUNNING",
+        "the refused reset leaves the fork running"
+    );
+}
+
+/// A fork whose history reaches a worker history cap could never run. Its
+/// first workflow task would dead-letter it. So the fork is refused, and no
+/// row is written.
+#[tokio::test]
+async fn a_fork_that_reaches_a_history_cap_is_refused() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("history-cap");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1 });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let capped = |policy: autumn_harvest::WorkflowHistoryPolicy| {
+        HandlerRegistry::new(
+            vec![fork_pay_wf_info()],
+            activities![fork_charge, fork_receipt],
+        )
+        .with_history_policy(policy)
+    };
+    let policies = [
+        autumn_harvest::WorkflowHistoryPolicy::default().with_event_hard_cap(1),
+        autumn_harvest::WorkflowHistoryPolicy::default().with_byte_hard_cap(1),
+    ];
+    for policy in policies {
+        let mut named = request(ForkEffects::Recorded);
+        named.workflow_id = Some(unique("capped-fork"));
+        let result =
+            fork_workflow_execution(&mut conn, source, named.clone(), Some(&capped(policy))).await;
+        assert!(
+            matches!(result, Err(WorkflowForkError::HistoryCapReached { .. })),
+            "a fork that reaches the cap is refused: {result:?}"
+        );
+        let written: i64 = harvest_workflow_executions::table
+            .filter(harvest_workflow_executions::workflow_id.eq(named.workflow_id.unwrap()))
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("count fork rows");
+        assert_eq!(written, 0, "a refused fork writes no row");
+    }
+}
+
+/// A held race loser still gets its loser terminal when the race resolves in
+/// the fork. Every activity that the fork schedules then has an outcome, so
+/// a later reset or fork point after the race stays valid.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_race_loser_gets_its_terminal_in_the_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("race");
+    let mut conn = connect(&url).await;
+    let input = json!({ "tag": queue, "amount": 1, "race": true });
+    let source = seed_run(&mut conn, &queue, &input).await;
+    let running = Running::start(&queue, &pool);
+    let source_row = wait_for_execution_state(&url, source, "COMPLETED").await;
+    running.stop().await;
+
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, forked, "COMPLETED").await;
+    running.stop().await;
+    assert_eq!(row.output, source_row.output);
+    assert_eq!(charges(&queue), 1, "the fork never charges");
+
+    let (_, events) = snapshot(&url, forked).await;
+    let count = |kinds: &[&str]| {
+        events
+            .iter()
+            .filter(|(_, kind, _)| kinds.contains(&kind.as_str()))
+            .count()
+    };
+    assert_eq!(
+        count(&["ActivityScheduled"]),
+        count(&["ActivityCompleted", "ActivityFailed"]),
+        "every scheduled activity has a terminal: {events:#?}"
+    );
+}
+
+/// The fork inserts its payload references in chunks. Postgres caps a
+/// statement at 65,535 parameters, and each reference binds four.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn payload_references_insert_past_the_parameter_limit() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("refs");
+    let mut conn = connect(&url).await;
+    let exec_id = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let refs = (0..16_500)
+        .map(|n| autumn_harvest::payload_store::OffloadedRef {
+            blob_key: format!("{queue}/blob-{n}"),
+            store_id: "fork-test".to_string(),
+            byte_len: 1,
+        })
+        .collect::<Vec<_>>();
+    store::insert_payload_refs(&mut conn, exec_id, &refs)
+        .await
+        .expect("insert the references");
+    let stored = store::load_payload_refs(&mut conn, exec_id)
+        .await
+        .expect("load the references");
+    assert_eq!(stored.len(), refs.len());
+}
+
+/// A source erased after the fork exists serves no record. The fork fails
+/// closed and never charges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_erased_after_the_fork_serves_no_record() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let queue = unique("erased-later");
+    let source = completed_source(&url, &pool, &queue, &queue).await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+
+    let mut conn = connect(&url).await;
+    autumn_harvest::erase::erase_workflow_payloads(&mut conn, source, "gdpr")
+        .await
+        .expect("erase the source");
+    let running = Running::start(&queue, &pool);
+    let row = wait_for_execution_state(&url, forked, "FAILED").await;
+    running.stop().await;
+    assert_eq!(charges(&queue), 1);
+    let error = row.error.unwrap_or_default();
+    assert!(error.contains("no recorded result"), "{error}");
+}
+
+/// Only a recorded fork skips completion callbacks and triggers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_recorded_fork_suppresses_completion_notifications() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("notify");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let targets = json!([{ "url": "https://callbacks.invalid/done" }]);
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::completion_callbacks.eq(Some(targets.clone())))
+        .execute(&mut conn)
+        .await
+        .expect("set the callback targets");
+    let recorded = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let live = fork(&url, source, request(ForkEffects::Live)).await;
+    let live_of_recorded = fork(&url, recorded, request(ForkEffects::Live)).await;
+
+    for (exec_id, expected) in [
+        (source, false),
+        (recorded, true),
+        (live, false),
+        (live_of_recorded, false),
+    ] {
+        let row = snapshot(&url, exec_id).await.0;
+        assert_eq!(
+            is_recorded_fork(&mut conn, &row)
+                .await
+                .expect("read marker"),
+            expected,
+            "{exec_id}"
+        );
+    }
+    // The marker gates the callbacks, so each row keeps the targets. A live
+    // fork of a recorded fork then sends them.
+    for exec_id in [recorded, live, live_of_recorded] {
+        let row = snapshot(&url, exec_id).await.0;
+        assert_eq!(row.completion_callbacks, Some(targets.clone()), "{exec_id}");
+    }
+}
+
+/// A running source stays running, with no new event, after a fork.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_of_a_running_source_leaves_it_running() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("running");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let before = snapshot(&url, source).await;
+
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+
+    let after = snapshot(&url, source).await;
+    assert_eq!(after.0.state, "RUNNING");
+    assert_eq!(before.1, after.1, "the source history is unchanged");
+    let fork_row = snapshot(&url, forked).await.0;
+    assert_eq!(fork_row.state, "RUNNING");
+}
+
+/// A caller-chosen workflow id that a live run holds is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fork_refuses_a_workflow_id_in_use() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("id");
+    let mut conn = connect(&url).await;
+    let source = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 1 })).await;
+    let other = seed_run(&mut conn, &queue, &json!({ "tag": queue, "amount": 2 })).await;
+    let taken = snapshot(&url, other).await.0.workflow_id;
+
+    let mut other_id = request(ForkEffects::Recorded);
+    other_id.workflow_id = Some(taken);
+    let error = fork_workflow_execution(&mut conn, source, other_id, None)
+        .await
+        .expect_err("a workflow id in use is refused");
+    assert!(
+        matches!(error, WorkflowForkError::WorkflowIdInUse { .. }),
+        "unexpected error: {error}"
+    );
+
+    // The source key routes by-id calls to the real entity, so it is refused
+    // even when the source no longer holds it.
+    let mut own_id = request(ForkEffects::Recorded);
+    own_id.workflow_id = Some(snapshot(&url, source).await.0.workflow_id);
+    let error = fork_workflow_execution(&mut conn, source, own_id, None)
+        .await
+        .expect_err("the source key is refused");
+    assert!(
+        matches!(error, WorkflowForkError::InvalidOverride { .. }),
+        "unexpected error: {error}"
+    );
+}
+
+/// A reset keeps the quota key of its source, so its LLM spend still counts
+/// for the tenant (issue #1997). A fork passes the key of its own admission
+/// through the same row insert, so the reset path must not drop the key.
+#[tokio::test]
+async fn a_reset_keeps_the_quota_key_of_its_source() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let queue = unique("reset-quota-key");
+    let mut conn = connect(&url).await;
+    let source = seed_run_with(&mut conn, &queue, &json!({ "n": 1 }), None, None).await;
+    diesel::update(harvest_workflow_executions::table.find(source.as_uuid()))
+        .set(harvest_workflow_executions::quota_key.eq("tenant-a"))
+        .execute(&mut conn)
+        .await
+        .expect("set the source key");
+
+    let reset = reset_workflow_execution(&mut conn, source, reset_request(), None)
+        .await
+        .expect("reset");
+    let key: Option<String> = harvest_workflow_executions::table
+        .find(reset.new_exec_id.as_uuid())
+        .select(harvest_workflow_executions::quota_key)
+        .first(&mut conn)
+        .await
+        .expect("read the reset row");
+    assert_eq!(key.as_deref(), Some("tenant-a"));
+    assert_eq!(
+        first_task_fairness_key(&mut conn, reset.new_exec_id)
+            .await
+            .as_deref(),
+        Some("tenant-a")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Retention keeps the source of a recorded fork (issue #2122).
+// ---------------------------------------------------------------------------
+
+/// The age past which the retention tests delete a run of their tenant.
+const RETENTION_AGE: Duration = Duration::from_secs(86_400);
+
+/// Put `exec` in `tenant` and make it older than [`RETENTION_AGE`].
+///
+/// Only the runs of a unique tenant are candidates, so a tick leaves the
+/// rows of other tests alone. A fork takes the tenant of its source.
+async fn age_into_tenant(conn: &mut AsyncPgConnection, exec: ExecutionId, tenant: &str) {
+    diesel::update(harvest_workflow_executions::table.find(exec.as_uuid()))
+        .set((
+            harvest_workflow_executions::tenant.eq(Some(tenant)),
+            harvest_workflow_executions::completed_at
+                .eq(Some(Utc::now() - chrono::Duration::days(30))),
+        ))
+        .execute(conn)
+        .await
+        .expect("age the run into the tenant");
+}
+
+/// A completed source in a unique tenant, older than [`RETENTION_AGE`].
+async fn aged_source(url: &str, pool: &DbPool, label: &str) -> (ExecutionId, String) {
+    let queue = unique(label);
+    let source = completed_source(url, pool, &queue, &queue).await;
+    age_into_tenant(&mut connect(url).await, source, &queue).await;
+    (source, queue)
+}
+
+/// Run one retention tick that deletes only the old runs of `tenant`.
+///
+/// Every pass that reads other rows is off, so the tick is safe on a shared
+/// database.
+async fn retention_tick(
+    pool: &DbPool,
+    tenant: &str,
+    archiver: Option<Arc<dyn autumn_harvest::HistoryArchiver>>,
+) -> autumn_harvest::retention::RetentionTickResult {
+    let config = autumn_harvest::retention::RetentionConfig {
+        max_age_secs: None,
+        audit_retention_days: 0,
+        schedule_decision_retention_days: 0,
+        terminal_task_retention_secs: None,
+        partitions: autumn_harvest::retention::PartitionMaintenanceConfig {
+            enabled: false,
+            ..autumn_harvest::retention::PartitionMaintenanceConfig::default()
+        },
+        ..autumn_harvest::retention::RetentionConfig::default()
+    }
+    .without_rate_limit_bucket_gc()
+    .with_tenant_override(tenant, RETENTION_AGE);
+    let runtime = autumn_harvest::retention::RetentionRuntime::spawn(
+        autumn_harvest::shard::ShardedDbPool::single(pool.clone()),
+        config,
+        Arc::new(autumn_harvest::telemetry::NoOpMetrics),
+        archiver,
+        None,
+    )
+    .expect("a tenant override turns retention on");
+    runtime.run_now();
+    let mut result = None;
+    for _ in 0..400 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Some(tick) = runtime
+            .monitor()
+            .snapshot()
+            .per_shard
+            .into_iter()
+            .find(|tick| tick.shard == 0 && tick.ran_at.is_some())
+        {
+            result = Some(tick);
+            break;
+        }
+    }
+    runtime.shutdown();
+    let tick = result.expect("the retention tick reports in time");
+    assert_eq!(tick.last_error, None, "the retention tick must not fail");
+    tick
+}
+
+async fn exists(conn: &mut AsyncPgConnection, exec: ExecutionId) -> bool {
+    harvest_workflow_executions::table
+        .find(exec.as_uuid())
+        .count()
+        .get_result::<i64>(conn)
+        .await
+        .expect("count the run")
+        == 1
+}
+
+async fn end_run(conn: &mut AsyncPgConnection, exec: ExecutionId) {
+    autumn_harvest::execution::terminate_workflow_execution(
+        conn,
+        exec,
+        "done",
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("terminate the run");
+}
+
+/// End `forks`, run a tick, and check that `source` is gone.
+///
+/// A kept source and a failed delete look the same. A delete after the
+/// forks end proves that the kept source was a skip.
+async fn assert_deleted_once_closed(
+    url: &str,
+    pool: &DbPool,
+    tenant: &str,
+    source: ExecutionId,
+    forks: &[ExecutionId],
+) {
+    let mut conn = connect(url).await;
+    for fork in forks {
+        end_run(&mut conn, *fork).await;
+    }
+    retention_tick(pool, tenant, None).await;
+    assert!(!exists(&mut conn, source).await, "no open fork reads it");
+}
+
+/// Issue #2122 AC1: retention keeps a terminal source while a recorded fork
+/// runs. The gate runs before archival, so the source is not archived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_the_source_of_a_running_recorded_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "pin").await;
+    // No worker polls the queue, so the fork stays `RUNNING`.
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+
+    let archiver = Arc::new(ForkRaceArchiver::new(&url, None));
+    let tick = retention_tick(&pool, &tenant, Some(Arc::clone(&archiver) as _)).await;
+
+    let mut conn = connect(&url).await;
+    assert!(tick.candidate_count >= 1, "the scan saw the source");
+    assert!(exists(&mut conn, source).await, "the fork reads the source");
+    assert!(exists(&mut conn, forked).await);
+    assert!(
+        archiver.archived().is_empty(),
+        "a kept source is not archived"
+    );
+    assert_deleted_once_closed(&url, &pool, &tenant, source, &[forked]).await;
+}
+
+/// Issue #2122 AC2: the source is a candidate again once each recorded fork
+/// has ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_deletes_the_source_once_its_recorded_forks_end() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "unpin").await;
+    let first = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let second = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let mut conn = connect(&url).await;
+
+    end_run(&mut conn, first).await;
+    retention_tick(&pool, &tenant, None).await;
+    assert!(exists(&mut conn, source).await, "one fork still runs");
+
+    assert_deleted_once_closed(&url, &pool, &tenant, source, &[second]).await;
+    assert!(exists(&mut conn, first).await, "a fork is not old enough");
+    assert!(exists(&mut conn, second).await, "a fork is not old enough");
+}
+
+/// Issue #2122 AC3: a live-mode fork reads no source, so it keeps nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_does_not_keep_the_source_of_a_live_mode_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "live").await;
+    let forked = fork(&url, source, request(ForkEffects::Live)).await;
+
+    retention_tick(&pool, &tenant, None).await;
+
+    let mut conn = connect(&url).await;
+    assert!(!exists(&mut conn, source).await, "a live fork pins nothing");
+    assert!(exists(&mut conn, forked).await);
+}
+
+/// A dead-lettered recorded fork is `FAILED`, but a redrive can reopen it.
+/// So it keeps its source until the dead letter goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_the_source_of_a_dead_lettered_recorded_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "dlq").await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let mut conn = connect(&url).await;
+    // Quarantine seals the run `FAILED` and writes its dead letter together.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(forked.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("seal the fork");
+    diesel::sql_query(
+        "INSERT INTO harvest_dead_letters \
+            (original_task_id, queue_name, task_type, workflow_exec_id, input, error, attempts) \
+         VALUES (gen_random_uuid(), $1, 'workflow', $2, '{}'::jsonb, 'poison', 3)",
+    )
+    .bind::<diesel::sql_types::Text, _>(&tenant)
+    .bind::<diesel::sql_types::Uuid, _>(forked.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("dead-letter the fork");
+
+    retention_tick(&pool, &tenant, None).await;
+    assert!(exists(&mut conn, source).await, "a redrive can reopen it");
+
+    diesel::sql_query("DELETE FROM harvest_dead_letters WHERE workflow_exec_id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(forked.as_uuid())
+        .execute(&mut conn)
+        .await
+        .expect("discard the dead letter");
+    retention_tick(&pool, &tenant, None).await;
+    assert!(!exists(&mut conn, source).await, "nothing can reopen it");
+}
+
+/// A callback dead letter redrives only a delivery, so it never reopens the
+/// fork. Redrive matches its type in any case, so the pin does too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_ignores_a_callback_dead_letter_of_a_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "dlq-callback").await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let mut conn = connect(&url).await;
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'FAILED', completed_at = NOW() \
+         WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(forked.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("seal the fork");
+    diesel::sql_query(
+        "INSERT INTO harvest_dead_letters \
+            (original_task_id, queue_name, task_type, workflow_exec_id, input, error, attempts) \
+         VALUES (gen_random_uuid(), $1, 'callback', $2, '{}'::jsonb, 'unreachable', 3)",
+    )
+    .bind::<diesel::sql_types::Text, _>(&tenant)
+    .bind::<diesel::sql_types::Uuid, _>(forked.as_uuid())
+    .execute(&mut conn)
+    .await
+    .expect("dead-letter the delivery");
+
+    retention_tick(&pool, &tenant, None).await;
+    assert!(
+        !exists(&mut conn, source).await,
+        "a delivery cannot reopen it"
+    );
+}
+
+/// A recorded fork keeps its whole fork lineage. A reset or a new fork of
+/// it walks that lineage and refuses a gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_the_lineage_of_a_recorded_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "lineage").await;
+    let first = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let mut conn = connect(&url).await;
+    end_run(&mut conn, first).await;
+    age_into_tenant(&mut conn, first, &tenant).await;
+    let second = fork(&url, first, request(ForkEffects::Recorded)).await;
+
+    retention_tick(&pool, &tenant, None).await;
+    assert!(exists(&mut conn, source).await, "the lineage root stays");
+    assert!(exists(&mut conn, first).await, "the record source stays");
+
+    // The lineage stays usable: a new fork of the running fork walks it.
+    let third = fork(&url, second, request(ForkEffects::Recorded)).await;
+    assert_deleted_once_closed(&url, &pool, &tenant, source, &[second, third]).await;
+    assert!(!exists(&mut conn, first).await, "no open fork reads it");
+}
+
+/// A reset of a recorded fork names the sealed fork as its source. Its
+/// marker names the original source, which it reads. Both stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_the_lineage_of_a_reset_of_a_recorded_fork() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "reset-pin").await;
+    let forked = fork(&url, source, request(ForkEffects::Recorded)).await;
+    let mut conn = connect(&url).await;
+    let reset = reset_workflow_execution(&mut conn, forked, reset_request(), Some(&registry()))
+        .await
+        .expect("reset the fork");
+    age_into_tenant(&mut conn, forked, &tenant).await;
+
+    retention_tick(&pool, &tenant, None).await;
+    assert!(
+        exists(&mut conn, source).await,
+        "the reset reads the source"
+    );
+    assert!(exists(&mut conn, forked).await, "the sealed fork stays");
+    assert!(exists(&mut conn, reset.new_exec_id).await);
+
+    assert_deleted_once_closed(&url, &pool, &tenant, source, &[reset.new_exec_id]).await;
+}
+
+/// A new fork reads 64 ancestors of its source and adds one link. So the
+/// walk reaches an open fork 65 links below the root. A fork row with no
+/// marker counts as recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_keeps_the_root_of_the_deepest_lineage() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (root, tenant) = aged_source(&url, &pool, "deep-pin").await;
+    let mut conn = connect(&url).await;
+    let mut parent = root;
+    for link in 1..=65 {
+        let child = seed_run(&mut conn, &tenant, &json!({ "tag": tenant, "amount": 1 })).await;
+        // Only the deepest fork is open. The walk passes the closed ones.
+        let state = if link == 65 { "RUNNING" } else { "TERMINATED" };
+        diesel::update(harvest_workflow_executions::table.find(child.as_uuid()))
+            .set((
+                harvest_workflow_executions::state.eq(state),
+                harvest_workflow_executions::start_source.eq(Some("fork")),
+                harvest_workflow_executions::start_source_ref.eq(Some(parent.to_string())),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("link the chain");
+        parent = child;
+    }
+
+    retention_tick(&pool, &tenant, None).await;
+    assert!(exists(&mut conn, root).await, "link 65 is still in reach");
+
+    assert_deleted_once_closed(&url, &pool, &tenant, root, &[parent]).await;
+}
+
+/// An archiver that records each archived run. When `fork_on` names the run,
+/// it forks that run from inside `archive()`. The fork then commits after the
+/// per-candidate gate and before the delete.
+///
+/// With `hold_open`, the fork runs in a transaction that locks the source
+/// `FOR SHARE` first. It commits only once the delete waits on that lock.
+///
+/// A failed fork panics on purpose. An `Err` from `archive()` skips the
+/// delete with no tick error, so the test would pass for the wrong reason.
+struct ForkRaceArchiver {
+    url: String,
+    fork_on: Option<ExecutionId>,
+    hold_open: bool,
+    archived: Mutex<Vec<ExecutionId>>,
+    forks: Mutex<Vec<tokio::task::JoinHandle<ExecutionId>>>,
+}
+
+impl ForkRaceArchiver {
+    fn new(url: &str, fork_on: Option<ExecutionId>) -> Self {
+        Self {
+            url: url.to_string(),
+            fork_on,
+            hold_open: false,
+            archived: Mutex::default(),
+            forks: Mutex::default(),
+        }
+    }
+
+    fn archived(&self) -> Vec<ExecutionId> {
+        self.archived.lock().expect("archived lock").clone()
+    }
+
+    async fn forks(&self) -> Vec<ExecutionId> {
+        let handles = std::mem::take(&mut *self.forks.lock().expect("forks lock"));
+        let mut forks = Vec::new();
+        for handle in handles {
+            forks.push(handle.await.expect("the fork task must not panic"));
+        }
+        forks
+    }
+}
+
+/// Wait until a backend waits on a lock that `holder` holds.
+async fn wait_until_blocked_on(conn: &mut AsyncPgConnection, holder: i32) {
+    #[derive(diesel::QueryableByName)]
+    struct Blocked {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    for _ in 0..400 {
+        let blocked: Blocked = diesel::sql_query(
+            "SELECT count(*) AS n FROM pg_stat_activity \
+             WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind::<diesel::sql_types::Integer, _>(holder)
+        .get_result(conn)
+        .await
+        .expect("probe pg_stat_activity");
+        if blocked.n > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the delete never waited on the held source lock");
+}
+
+/// Fork `source` in a transaction that holds the source lock. The fork
+/// commits only once the delete waits on that lock.
+async fn fork_held_open(
+    url: String,
+    source: ExecutionId,
+    locked: tokio::sync::oneshot::Sender<()>,
+) -> ExecutionId {
+    #[derive(diesel::QueryableByName)]
+    struct Pid {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        pid: i32,
+    }
+    let mut conn = connect(&url).await;
+    let mut probe = connect(&url).await;
+    conn.transaction::<_, diesel::result::Error, _>(async |conn| {
+        harvest_workflow_executions::table
+            .find(source.as_uuid())
+            .for_share()
+            .select(harvest_workflow_executions::id)
+            .first::<Uuid>(conn)
+            .await?;
+        let holder = diesel::sql_query("SELECT pg_backend_pid() AS pid")
+            .get_result::<Pid>(conn)
+            .await?
+            .pid;
+        locked.send(()).expect("the archiver waits for the lock");
+        wait_until_blocked_on(&mut probe, holder).await;
+        Ok(fork_workflow_execution(
+            conn,
+            source,
+            request(ForkEffects::Recorded),
+            Some(&registry()),
+        )
+        .await
+        .expect("the fork commits inside the open transaction")
+        .new_exec_id)
+    })
+    .await
+    .expect("commit the held fork")
+}
+
+impl autumn_harvest::HistoryArchiver for ForkRaceArchiver {
+    fn archive(
+        &self,
+        doc: &autumn_harvest::history_export::HistoryExportDocument,
+    ) -> autumn_harvest::ArchiverFuture<'_> {
+        let exec = doc.execution_id;
+        Box::pin(async move {
+            self.archived.lock().expect("archived lock").push(exec);
+            if self.fork_on != Some(exec) {
+                return Ok(());
+            }
+            let handle = if self.hold_open {
+                let (locked, held) = tokio::sync::oneshot::channel();
+                let handle = tokio::spawn(fork_held_open(self.url.clone(), exec, locked));
+                held.await.expect("the fork takes the source lock");
+                handle
+            } else {
+                let forked = fork(&self.url, exec, request(ForkEffects::Recorded)).await;
+                tokio::spawn(async move { forked })
+            };
+            self.forks.lock().expect("forks lock").push(handle);
+            Ok(())
+        })
+    }
+}
+
+/// Issue #2122 AC4: a fork that commits after the gate still keeps the
+/// source. The delete re-checks under its row lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_committed_after_the_scan_keeps_the_source() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "race").await;
+
+    let archiver = Arc::new(ForkRaceArchiver::new(&url, Some(source)));
+    retention_tick(&pool, &tenant, Some(Arc::clone(&archiver) as _)).await;
+
+    assert_eq!(
+        archiver.archived(),
+        vec![source],
+        "the gate passed the source"
+    );
+    let forks = archiver.forks().await;
+    assert_eq!(forks.len(), 1, "the archiver forked the source");
+    let mut conn = connect(&url).await;
+    assert!(
+        exists(&mut conn, source).await,
+        "the delete saw the new fork"
+    );
+    assert_deleted_once_closed(&url, &pool, &tenant, source, &forks).await;
+}
+
+/// `url` with a session default of `REPEATABLE READ`, as an operator can set
+/// on the database or the role.
+fn repeatable_read_url(url: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}options=-c%20default_transaction_isolation%3Drepeatable%5C%20read")
+}
+
+/// Issue #2122 AC4: a fork that holds the source lock when the delete
+/// reaches it still keeps the source. The re-check runs after the lock wait,
+/// so it sees the fork that committed in that wait.
+///
+/// The retention pool defaults to `REPEATABLE READ`. The delete pins `READ
+/// COMMITTED`, or its snapshot would predate the fork.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fork_in_flight_at_the_delete_keeps_the_source() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool = build_test_pool(&url);
+    let (source, tenant) = aged_source(&url, &pool, "in-flight").await;
+    let repeatable_read = build_test_pool(&repeatable_read_url(&url));
+
+    let archiver = Arc::new(ForkRaceArchiver {
+        hold_open: true,
+        ..ForkRaceArchiver::new(&url, Some(source))
+    });
+    retention_tick(&repeatable_read, &tenant, Some(Arc::clone(&archiver) as _)).await;
+
+    let forks = archiver.forks().await;
+    assert_eq!(forks.len(), 1, "the held fork committed");
+    let mut conn = connect(&url).await;
+    assert!(
+        exists(&mut conn, source).await,
+        "the delete saw the held fork"
+    );
+    assert_deleted_once_closed(&url, &pool, &tenant, source, &forks).await;
+}

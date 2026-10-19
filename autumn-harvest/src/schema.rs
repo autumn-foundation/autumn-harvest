@@ -339,6 +339,9 @@ diesel::table! {
         /// (issue #1824). Set only by the workflow start path. The claim
         /// order reads it while `attempt = 0`.
         new_start -> Bool,
+        /// The fairness key of the task (issue #1976). `NULL` is the
+        /// default key.
+        fairness_key -> Nullable<Text>,
     }
 }
 
@@ -886,6 +889,9 @@ diesel::table! {
         attempts -> Integer,
         last_error -> Nullable<Text>,
         last_attempt_at -> Nullable<Timestamptz>,
+        /// The reason that the parent gave its cancel (issue #2194).
+        /// NULL = use the generic parent-cancel text.
+        cancel_reason -> Nullable<Text>,
     }
 }
 
@@ -1041,7 +1047,8 @@ diesel::table! {
         target_url       -> Text,
         event_filter     -> Jsonb,
         terminal_state   -> Text,
-        /// Frozen `CompletionEnvelope` JSON, signed and `POSTed` verbatim on
+        /// Frozen `CompletionEnvelope` JSON in the column form (issue #2043).
+        /// The scanner decodes it, then signs and `POST`s the plain body on
         /// every attempt (including redeliveries).
         payload          -> Jsonb,
         /// PENDING | INFLIGHT | DELIVERED | FAILED
@@ -1208,6 +1215,28 @@ diesel::table! {
 diesel::table! {
     use diesel::sql_types::*;
 
+    /// Agent cost ledger (issue #1996): one row per LLM call that an
+    /// activity records.
+    ///
+    /// The completion transaction writes it. `event_id` names the completion
+    /// event. The table is outside `harvest_events` and in clear.
+    harvest_llm_ledger (workflow_exec_id, event_id, call_index) {
+        workflow_exec_id -> Uuid,
+        event_id         -> Int4,
+        call_index       -> Int4,
+        activity_name    -> Text,
+        model            -> Text,
+        input_tokens     -> Int8,
+        output_tokens    -> Int8,
+        cost_usd_micros  -> Nullable<Int8>,
+        latency_ms       -> Int8,
+        recorded_at      -> Timestamptz,
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+
     /// Durable workflow output-stream chunks (issue #1974).
     ///
     /// Written in the worker persist transaction by
@@ -1313,6 +1342,7 @@ diesel::table! {
 
 diesel::joinable!(harvest_stream_chunks -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_workflow_logs -> harvest_workflow_executions (workflow_exec_id));
+diesel::joinable!(harvest_llm_ledger -> harvest_workflow_executions (workflow_exec_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     harvest_workflow_executions,
@@ -1354,6 +1384,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_mutex_waiters,
     harvest_stream_chunks,
     harvest_workflow_logs,
+    harvest_llm_ledger,
     harvest_codec_rotation_cursor,
     harvest_codec_key_state,
 );

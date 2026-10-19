@@ -1212,6 +1212,18 @@ mod tests {
                 false,
             ),
             (
+                "WorkflowForked",
+                "reason",
+                WorkflowEvent::WorkflowForked {
+                    forked_from_exec_id: ExecutionId::new(),
+                    fork_event_id: 1,
+                    effects: crate::event::ForkEffects::Recorded,
+                    reason: msg(),
+                    operator_id: "op".into(),
+                },
+                false,
+            ),
+            (
                 "WorkflowResetTerminated",
                 "reason",
                 WorkflowEvent::WorkflowResetTerminated {
@@ -1397,6 +1409,26 @@ mod tests {
             assert_eq!(row, plaintext);
             assert!(outcome.decoded >= 1 && outcome.failed == 0);
         }
+    }
+
+    /// Issue #2054: the operator read decodes one layer more than the engine read.
+    #[test]
+    fn an_operator_read_decodes_a_business_envelope_that_the_engine_read_keeps() {
+        let codecs = PayloadCodecs::default();
+        codec("k1", KEY_A).register_with(&codecs).unwrap();
+        codecs.set_column_encoding(true);
+        let plaintext = json!({"ssn": PAYLOAD_SECRET});
+        // The business value is itself an envelope.
+        let business = codecs.encode_payload(&plaintext).unwrap();
+        let stored = codecs.encode_column(&business).unwrap();
+
+        assert_eq!(codecs.decode_column(&stored).unwrap(), business);
+
+        let mut operator_view = stored;
+        let outcome = codecs.decode_column_lossy(&mut operator_view);
+        assert_eq!(operator_view, plaintext);
+        assert_eq!(outcome.decoded, 2);
+        assert_eq!(outcome.failed, 0);
     }
 
     #[test]
