@@ -128,6 +128,9 @@ A live run waits for up to the budget.
   the handler uses up the margin.
 - With Autumn's idempotency layer on, the route counts only half of the
   deadline, because that layer reads the whole body before the handler.
+- A request timeout of 1 s or less, or 2 s or less under the layer, leaves
+  no time for the start. The route then answers `500` `misconfigured` and
+  starts nothing. Give the route several seconds.
 - A route that sets its own `timeout_ms` must set `.wait(..)` below it,
   because the route cannot see that value.
 - A run that continues as new is followed to its newest run. Each step is

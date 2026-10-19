@@ -1251,6 +1251,38 @@ async fn a_read_cut_at_the_deadline_keeps_the_run_headers() {
     );
 }
 
+// AC-91
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_timeout_with_no_time_left_starts_nothing() {
+    let db = setup_db().await;
+    let mut config = app_config(&db);
+    config.server.timeouts.request_timeout_ms = Some(1_000);
+    let mut route = __autumn_route_info_durable();
+    route.name = "durable";
+    let client = TestApp::new()
+        .config(config)
+        .routes(vec![route])
+        .plugin(base_plugin())
+        .with_db(db.pool.clone())
+        .build();
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_parked"),
+        ("x-wait-ms", "0"),
+    ];
+    let response = post(&client, Some("key-ac91"), &extra, &json!({"tag": "ac91"})).await;
+    assert_eq!(response.status.as_u16(), 500, "{}", response.text());
+    assert!(
+        response.header("retry-after").is_none(),
+        "the answer is final"
+    );
+    assert_eq!(
+        problem_type(&response.json::<Value>()),
+        slug_type("misconfigured")
+    );
+    assert_eq!(count_runs(&db, "dr_parked").await, 0);
+}
+
 // AC-54
 #[tokio::test(flavor = "multi_thread")]
 async fn retry_attempt_that_switches_type_returns_final_output() {

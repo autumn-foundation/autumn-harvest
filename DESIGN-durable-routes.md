@@ -73,7 +73,7 @@ the start-idempotency claim (issue #808).
 | R3 | Accept a changed body under a used key. | The fingerprint compare answers `422` and starts nothing (B11). |
 | R4 | Let a guessable key reveal a stored result. | The scope confines a guess to one principal. The docs tell clients to use random keys. |
 | R5 | Cache a pending answer for 24 h under Autumn's layer. | The route answers `409` when the layer is on (B14). |
-| R6 | Hold Autumn's in-flight lock for 24 h when the request deadline drops the handler. | The wait ends 2 s before the request deadline, and every read after the start ends 1 s before it. A late read answers pending. When the start has returned, that answer keeps the run's headers. Under the layer the route counts half the deadline, because the layer reads the body before the handler (F11, F12). |
+| R6 | Hold Autumn's in-flight lock for 24 h when the request deadline drops the handler. | The wait ends 2 s before the request deadline, and every read after the start ends 1 s before it. A late read answers pending. When the start has returned, that answer keeps the run's headers. The start task exists before the deadline applies. A request timeout that leaves no time after the margin is a setup error, because every request would answer pending. Under the layer the route counts half the deadline, because the layer reads the body before the handler (F11, F12). |
 | R7 | Lose the start when the client disconnects. | The start runs in a spawned task, so a dropped request still commits. The retry attaches through the claim. |
 | R8 | Pin a pool connection for the whole wait. | The spawned task drops the connection before the wait starts. |
 | R9 | Exhaust Postgres connections with waiters. | A semaphore caps the waiters (B16). A completed run needs no permit. |
@@ -411,3 +411,4 @@ test installs a process-global channel, so it lives in its own binary,
 | AC-88 | A route log never holds the text of a payload codec error, a serde error or a panic. | `error_logs_hold_no_codec_or_panic_text` |
 | AC-89 | A read that the deadline cuts after the start answers pending with the run's execution id and replay headers. | `a_read_cut_at_the_deadline_keeps_the_run_headers` |
 | AC-90 | With a dispatch channel installed and no worker, the start publishes the dispatch hint of its task. | `the_start_publishes_its_dispatch_hint` |
+| AC-91 | A request timeout that leaves no time after the deadline margin answers `500` misconfigured before any I/O, and starts nothing. | `a_request_timeout_with_no_time_left_is_misconfigured`, `a_request_timeout_with_no_time_left_starts_nothing` |

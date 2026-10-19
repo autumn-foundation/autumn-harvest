@@ -46,6 +46,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tracing::Instrument as _;
 use tracing::instrument::WithSubscriber as _;
 
@@ -392,6 +393,19 @@ impl DurableCall {
         {
             return Some("failure_status refuses this status");
         }
+        // Such a deadline cuts every request before its answer, so the
+        // client would retry forever.
+        if self.route.request_timeout.is_some_and(|timeout| {
+            time_left(
+                Duration::ZERO,
+                timeout,
+                self.route.layer_active,
+                DEADLINE_HEADROOM / 2,
+            )
+            .is_zero()
+        }) {
+            return Some("the request timeout leaves no time for the start");
+        }
         None
     }
 
@@ -475,7 +489,10 @@ impl DurableCall {
                     DEADLINE_HEADROOM / 2,
                 )
         });
-        let started = match within(deadline, prepared.start(start)).await {
+        // The task exists before the deadline applies, so a deadline that has
+        // passed cuts only the wait for the task, never the start.
+        let task = prepared.spawn_start(start);
+        let started = match within(deadline, prepared.started(task)).await {
             Some(Ok(started)) => started,
             Some(Err(problem)) => return DurableOutcome::problem(problem),
             // The start can still commit. A retry then finds the claim.
@@ -539,14 +556,15 @@ struct Prepared {
 }
 
 impl Prepared {
-    /// Start or attach to the run. An `Err` is the final answer.
-    async fn start(&self, start: StartRequest) -> Result<Started, Problem> {
+    /// Spawn the start or the attach to the run.
+    ///
+    /// The start runs in its own task. A dropped request cannot cut the start
+    /// transaction short, and the retry then finds the claim. The task logs
+    /// its own error, so a start that ends after the deadline is logged too.
+    /// The task logs to the request's subscriber.
+    fn spawn_start(&self, start: StartRequest) -> JoinHandle<HarvestResult<Started>> {
         let workflow = start.workflow.clone();
         let runtime = Arc::clone(&self.runtime);
-        // The start runs in its own task. A dropped request cannot cut the
-        // start transaction short, and the retry then finds the claim. The
-        // task logs its own error, so a start that ends after the deadline
-        // is logged too. The task logs to the request's subscriber.
         let task = async move {
             let started = start_run(runtime, start).await;
             if let Err(error) = &started {
@@ -554,8 +572,12 @@ impl Prepared {
             }
             started
         };
-        let task = task.in_current_span().with_current_subscriber();
-        let started = match tokio::spawn(task).await {
+        tokio::spawn(task.in_current_span().with_current_subscriber())
+    }
+
+    /// Wait for the start task. An `Err` is the final answer.
+    async fn started(&self, task: JoinHandle<HarvestResult<Started>>) -> Result<Started, Problem> {
+        let started = match task.await {
             Ok(Ok(started)) => started,
             Ok(Err(error)) => return Err(start_error_problem(&error)),
             Err(error) => {
@@ -1890,6 +1912,36 @@ mod tests {
                 &DurableOutcomeKind::Problem {
                     slug: "misconfigured"
                 }
+            );
+        }
+    }
+
+    // AC-91
+    #[tokio::test]
+    async fn a_request_timeout_with_no_time_left_is_misconfigured() {
+        // Without the layer the margin is 1 s. With it, the route counts half
+        // the deadline, so 2 s leaves nothing.
+        for (timeout_ms, layer_active, misconfigured) in [
+            (1_000, false, true),
+            (1_500, false, false),
+            (2_000, true, true),
+            (2_500, true, false),
+        ] {
+            let mut route = extract(&keyed()).await;
+            route.request_timeout = Some(Duration::from_millis(timeout_ms));
+            route.layer_active = layer_active;
+            let outcome = route.scope("u").call("place_order", 1).send().await;
+            let expected = if misconfigured {
+                StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                // No runtime is installed, so a call that passes the check
+                // answers 503.
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            assert_eq!(
+                outcome.status(),
+                expected,
+                "{timeout_ms} ms, layer {layer_active}"
             );
         }
     }
