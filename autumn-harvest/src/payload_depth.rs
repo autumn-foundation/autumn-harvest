@@ -79,6 +79,22 @@ pub fn nests_past_cap(value: &Value) -> bool {
     false
 }
 
+/// Drop `value` without recursion (issue #2225).
+///
+/// `Value` drops its children by recursion. A tree of tens of thousands of
+/// levels overflows the stack when it drops, and the worker aborts. This
+/// function moves the children out first, and drops them one at a time.
+fn drop_without_recursion(value: Value) {
+    let mut pending = vec![value];
+    while let Some(next) = pending.pop() {
+        match next {
+            Value::Array(items) => pending.extend(items),
+            Value::Object(map) => pending.extend(map.into_iter().map(|(_, child)| child)),
+            _ => {}
+        }
+    }
+}
+
 /// The message of a failure for a result nested past the cap.
 ///
 /// `subject` names the producer, for example `external activity`.
@@ -102,16 +118,21 @@ pub(crate) fn too_deep_failure_payload(subject: &str) -> String {
 /// [`PAYLOAD_TOO_DEEP_ERROR_TYPE`] failure.
 ///
 /// The workflow sees the failure in place of the result. Other results pass
-/// unchanged. The `SQLite` backend calls this function. It is not a stable API.
+/// unchanged. The refused tree drops without recursion, so a result of any depth
+/// cannot overflow the stack. The `SQLite` backend calls this function. It is
+/// not a stable API.
 #[doc(hidden)]
 pub fn refuse_deep_result(
     activity_name: &str,
     result: Result<Value, String>,
 ) -> Result<Value, String> {
     match result {
-        Ok(output) if nests_past_cap(&output) => Err(too_deep_failure_payload(&format!(
-            "activity '{activity_name}'"
-        ))),
+        Ok(output) if nests_past_cap(&output) => {
+            drop_without_recursion(output);
+            Err(too_deep_failure_payload(&format!(
+                "activity '{activity_name}'"
+            )))
+        }
         other => other,
     }
 }
@@ -122,8 +143,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE, nests_past_cap, refuse_deep_result,
-        too_deep_failure_payload,
+        MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE, drop_without_recursion, nests_past_cap,
+        refuse_deep_result, too_deep_failure_payload,
     };
     use crate::failure::parse_error_payload_full;
 
@@ -199,15 +220,32 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_result_drops_without_recursion() {
+        // Dropping a `Value` recurses over its children. A recursive drop of
+        // 100,000 levels needs far more than 256 KiB of stack.
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| refuse_deep_result("act", Ok(nested_arrays(100_000))).is_err())
+            .expect("spawn the small-stack thread");
+        assert!(
+            handle
+                .join()
+                .expect("the refusal must not overflow the stack"),
+            "the deep result is refused"
+        );
+    }
+
+    #[test]
     fn the_walk_does_not_recurse_over_deep_input() {
         // A recursive walk needs far more than 256 KiB of stack for 100,000
-        // levels. Dropping a `Value` recurses, so the test leaks the value.
+        // levels. Dropping a `Value` recurses too, so the test drops it with
+        // the helper.
         let handle = std::thread::Builder::new()
             .stack_size(256 * 1024)
             .spawn(|| {
                 let deep = nested_arrays(100_000);
                 let past_cap = nests_past_cap(&deep);
-                std::mem::forget(deep);
+                drop_without_recursion(deep);
                 past_cap
             })
             .expect("spawn the small-stack thread");
