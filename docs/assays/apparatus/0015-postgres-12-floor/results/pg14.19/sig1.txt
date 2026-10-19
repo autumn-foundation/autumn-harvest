@@ -1,0 +1,872 @@
+col|harvest_activity_pauses|activity_name|text
+col|harvest_activity_pauses|paused_at|timestamp with time zone
+col|harvest_activity_pauses|paused_by|text
+col|harvest_activity_pauses|reason|text
+col|harvest_activity_pauses|scope_shard_id|integer
+col|harvest_admission_gates|created_at|timestamp with time zone
+col|harvest_admission_gates|created_by|text
+col|harvest_admission_gates|expires_at|timestamp with time zone
+col|harvest_admission_gates|id|uuid
+col|harvest_admission_gates|lifted_at|timestamp with time zone
+col|harvest_admission_gates|lifted_by|text
+col|harvest_admission_gates|message|text
+col|harvest_admission_gates|reason|text
+col|harvest_admission_gates|scope_kind|text
+col|harvest_admission_gates|scope_value|text
+col|harvest_api_tokens|created_at|timestamp with time zone
+col|harvest_api_tokens|created_by|text
+col|harvest_api_tokens|expires_at|timestamp with time zone
+col|harvest_api_tokens|id|uuid
+col|harvest_api_tokens|last_used_at|timestamp with time zone
+col|harvest_api_tokens|name|text
+col|harvest_api_tokens|revoked_at|timestamp with time zone
+col|harvest_api_tokens|scope|text
+col|harvest_api_tokens|tenant|text
+col|harvest_api_tokens|token_hash|text
+col|harvest_audit_export_cursor|chain_head|bytea
+col|harvest_audit_export_cursor|chain_head_seq|bigint
+col|harvest_audit_export_cursor|chain_mac|bytea
+col|harvest_audit_export_cursor|chain_newest_at|timestamp with time zone
+col|harvest_audit_export_cursor|chain_start_seq|bigint
+col|harvest_audit_export_cursor|claim_epoch|bigint
+col|harvest_audit_export_cursor|consecutive_failures|integer
+col|harvest_audit_export_cursor|last_acked_seq|bigint
+col|harvest_audit_export_cursor|last_assigned_seq|bigint
+col|harvest_audit_export_cursor|last_delivered_at|timestamp with time zone
+col|harvest_audit_export_cursor|last_error|text
+col|harvest_audit_export_cursor|last_status|integer
+col|harvest_audit_export_cursor|lease_until|timestamp with time zone
+col|harvest_audit_export_cursor|next_attempt_at|timestamp with time zone
+col|harvest_audit_export_cursor|retired_at|timestamp with time zone
+col|harvest_audit_export_cursor|shard_id|integer
+col|harvest_audit_export_cursor|updated_at|timestamp with time zone
+col|harvest_audit_log|actor|text
+col|harvest_audit_log|chain_hash|bytea
+col|harvest_audit_log|chain_newest_before|timestamp with time zone
+col|harvest_audit_log|chain_prev|bytea
+col|harvest_audit_log|chain_shard|integer
+col|harvest_audit_log|error_summary|text
+col|harvest_audit_log|export_seq|bigint
+col|harvest_audit_log|id|uuid
+col|harvest_audit_log|idempotency_key|text
+col|harvest_audit_log|occurred_at|timestamp with time zone
+col|harvest_audit_log|operation|text
+col|harvest_audit_log|request_id|text
+col|harvest_audit_log|route_or_command|text
+col|harvest_audit_log|shard_id|integer
+col|harvest_audit_log|source|text
+col|harvest_audit_log|status|text
+col|harvest_audit_log|target_id|text
+col|harvest_audit_log|target_type|text
+col|harvest_audit_purge_watermark|max_purged_occurred_at|timestamp with time zone
+col|harvest_audit_purge_watermark|purged_records|bigint
+col|harvest_audit_purge_watermark|singleton|boolean
+col|harvest_audit_purge_watermark|updated_at|timestamp with time zone
+col|harvest_backfill_log|actor|text
+col|harvest_backfill_log|completed_at|timestamp with time zone
+col|harvest_backfill_log|dispatched|integer
+col|harvest_backfill_log|dry_run|boolean
+col|harvest_backfill_log|error_summary|text
+col|harvest_backfill_log|failed|integer
+col|harvest_backfill_log|from_ts|timestamp with time zone
+col|harvest_backfill_log|id|uuid
+col|harvest_backfill_log|schedule_id|uuid
+col|harvest_backfill_log|skipped|integer
+col|harvest_backfill_log|source|text
+col|harvest_backfill_log|started_at|timestamp with time zone
+col|harvest_backfill_log|status|text
+col|harvest_backfill_log|to_ts|timestamp with time zone
+col|harvest_backfill_log|total|integer
+col|harvest_batch_jobs|action|text
+col|harvest_batch_jobs|completed|bigint
+col|harvest_batch_jobs|completed_at|timestamp with time zone
+col|harvest_batch_jobs|created_at|timestamp with time zone
+col|harvest_batch_jobs|created_by|text
+col|harvest_batch_jobs|errors|jsonb
+col|harvest_batch_jobs|failed|bigint
+col|harvest_batch_jobs|filter|jsonb
+col|harvest_batch_jobs|id|uuid
+col|harvest_batch_jobs|idempotency_key|text
+col|harvest_batch_jobs|processed_ids|jsonb
+col|harvest_batch_jobs|signal_name|text
+col|harvest_batch_jobs|signal_payload|jsonb
+col|harvest_batch_jobs|started_at|timestamp with time zone
+col|harvest_batch_jobs|status|text
+col|harvest_batch_jobs|total|bigint
+col|harvest_batch_jobs|updated_at|timestamp with time zone
+col|harvest_build_compat|build_id|text
+col|harvest_build_compat|compatible_with|text
+col|harvest_build_compat|declared_at|timestamp with time zone
+col|harvest_build_compat|id|uuid
+col|harvest_build_policies|build_id|text
+col|harvest_build_policies|created_at|timestamp with time zone
+col|harvest_build_policies|deployment_name|text
+col|harvest_build_policies|id|uuid
+col|harvest_build_policies|queue_name|text
+col|harvest_build_policies|ramp_aborted|jsonb
+col|harvest_build_policies|ramp_caller_id|uuid
+col|harvest_build_policies|ramp_id|uuid
+col|harvest_build_policies|ramp_percent|integer
+col|harvest_build_policies|target_build_id|text
+col|harvest_build_policies|updated_at|timestamp with time zone
+col|harvest_calendar_exclusions|calendar_name|text
+col|harvest_calendar_exclusions|created_at|timestamp with time zone
+col|harvest_calendar_exclusions|excluded_date|date
+col|harvest_calendar_exclusions|id|uuid
+col|harvest_calendars|built_in|boolean
+col|harvest_calendars|created_at|timestamp with time zone
+col|harvest_calendars|description|text
+col|harvest_calendars|id|uuid
+col|harvest_calendars|name|text
+col|harvest_calendars|updated_at|timestamp with time zone
+col|harvest_codec_key_state|activated_at|timestamp with time zone
+col|harvest_codec_key_state|key_id|text
+col|harvest_codec_key_state|retired_at|timestamp with time zone
+col|harvest_codec_key_state|retiring_since|timestamp with time zone
+col|harvest_codec_key_state|state|text
+col|harvest_codec_key_state|updated_at|timestamp with time zone
+col|harvest_codec_rotation_cursor|active_key_id|text
+col|harvest_codec_rotation_cursor|completed_at|timestamp with time zone
+col|harvest_codec_rotation_cursor|last_event_id|bigint
+col|harvest_codec_rotation_cursor|next_revalidation_at|timestamp with time zone
+col|harvest_codec_rotation_cursor|rows_reencrypted|bigint
+col|harvest_codec_rotation_cursor|shard_id|integer
+col|harvest_codec_rotation_cursor|unresolved_rows|bigint
+col|harvest_codec_rotation_cursor|updated_at|timestamp with time zone
+col|harvest_completion_deliveries|attempt|integer
+col|harvest_completion_deliveries|callback_index|integer
+col|harvest_completion_deliveries|created_at|timestamp with time zone
+col|harvest_completion_deliveries|delivered_at|timestamp with time zone
+col|harvest_completion_deliveries|event_filter|jsonb
+col|harvest_completion_deliveries|id|uuid
+col|harvest_completion_deliveries|last_error|text
+col|harvest_completion_deliveries|last_status|integer
+col|harvest_completion_deliveries|max_attempts|integer
+col|harvest_completion_deliveries|next_attempt_at|timestamp with time zone
+col|harvest_completion_deliveries|payload|jsonb
+col|harvest_completion_deliveries|retry_policy|jsonb
+col|harvest_completion_deliveries|shard_id|integer
+col|harvest_completion_deliveries|state|text
+col|harvest_completion_deliveries|target_url|text
+col|harvest_completion_deliveries|terminal_state|text
+col|harvest_completion_deliveries|updated_at|timestamp with time zone
+col|harvest_completion_deliveries|workflow_exec_id|uuid
+col|harvest_completion_deliveries|workflow_id|text
+col|harvest_completion_deliveries|workflow_name|text
+col|harvest_completion_trigger_fires|fired_at|timestamp with time zone
+col|harvest_completion_trigger_fires|outcome|text
+col|harvest_completion_trigger_fires|source_exec_id|uuid
+col|harvest_completion_trigger_fires|target_shard|integer
+col|harvest_completion_trigger_fires|target_workflow_name|character varying(255)
+col|harvest_completion_trigger_fires|trigger_id|uuid
+col|harvest_completion_trigger_outbox|concurrency_key|character varying(255)
+col|harvest_completion_trigger_outbox|concurrency_limit|integer
+col|harvest_completion_trigger_outbox|created_at|timestamp with time zone
+col|harvest_completion_trigger_outbox|id|uuid
+col|harvest_completion_trigger_outbox|max_workflow_input_bytes|bigint
+col|harvest_completion_trigger_outbox|next_attempt_at|timestamp with time zone
+col|harvest_completion_trigger_outbox|priority|jsonb
+col|harvest_completion_trigger_outbox|queue_name|character varying(255)
+col|harvest_completion_trigger_outbox|source_exec_id|uuid
+col|harvest_completion_trigger_outbox|target_input|jsonb
+col|harvest_completion_trigger_outbox|target_shard|integer
+col|harvest_completion_trigger_outbox|target_workflow_id|character varying(255)
+col|harvest_completion_trigger_outbox|target_workflow_name|character varying(255)
+col|harvest_completion_trigger_outbox|tenant|text
+col|harvest_completion_trigger_outbox|trigger_id|uuid
+col|harvest_completion_triggers|condition|jsonb
+col|harvest_completion_triggers|created_at|timestamp with time zone
+col|harvest_completion_triggers|id|uuid
+col|harvest_completion_triggers|input_mapping|jsonb
+col|harvest_completion_triggers|is_static|boolean
+col|harvest_completion_triggers|queue_name|character varying(255)
+col|harvest_completion_triggers|source_workflow_name|character varying(255)
+col|harvest_completion_triggers|target_workflow_name|character varying(255)
+col|harvest_completion_triggers|terminal_states|jsonb
+col|harvest_completion_triggers|updated_at|timestamp with time zone
+col|harvest_cross_shard_children|attempts|integer
+col|harvest_cross_shard_children|cancel_reason|text
+col|harvest_cross_shard_children|cancel_requested|boolean
+col|harvest_cross_shard_children|child_exec_id|uuid
+col|harvest_cross_shard_children|child_spec|jsonb
+col|harvest_cross_shard_children|created_at|timestamp with time zone
+col|harvest_cross_shard_children|last_attempt_at|timestamp with time zone
+col|harvest_cross_shard_children|last_error|text
+col|harvest_cross_shard_children|parent_close_policy|text
+col|harvest_cross_shard_children|parent_exec_id|uuid
+col|harvest_cross_shard_children|status|text
+col|harvest_cross_shard_children|target_shard|integer
+col|harvest_cross_shard_children|workflow_name|text
+col|harvest_dead_letters|activity_name|text
+col|harvest_dead_letters|attempts|integer
+col|harvest_dead_letters|error|text
+col|harvest_dead_letters|failed_at|timestamp with time zone
+col|harvest_dead_letters|id|uuid
+col|harvest_dead_letters|input|jsonb
+col|harvest_dead_letters|original_task_id|uuid
+col|harvest_dead_letters|owner|text
+col|harvest_dead_letters|queue_name|text
+col|harvest_dead_letters|quota_key|text
+col|harvest_dead_letters|severity|text
+col|harvest_dead_letters|task_type|text
+col|harvest_dead_letters|workflow_exec_id|uuid
+col|harvest_dead_letters|workflow_name|text
+col|harvest_debounce|created_at|timestamp with time zone
+col|harvest_debounce|debounce_key|text
+col|harvest_debounce|effective_fire_at|timestamp with time zone
+col|harvest_debounce|id|uuid
+col|harvest_debounce|last_input|jsonb
+col|harvest_debounce|max_fire_at|timestamp with time zone
+col|harvest_debounce|pending_count|integer
+col|harvest_debounce|queue_name|text
+col|harvest_debounce|shard_id|integer
+col|harvest_debounce|start_options|jsonb
+col|harvest_debounce|updated_at|timestamp with time zone
+col|harvest_debounce|workflow_id|text
+col|harvest_debounce|workflow_name|text
+col|harvest_event_batches|batch_key|text
+col|harvest_event_batches|buffered_payloads|jsonb
+col|harvest_event_batches|created_at|timestamp with time zone
+col|harvest_event_batches|fire_at|timestamp with time zone
+col|harvest_event_batches|id|uuid
+col|harvest_event_batches|max_size|integer
+col|harvest_event_batches|queue_name|text
+col|harvest_event_batches|shard_id|integer
+col|harvest_event_batches|start_options|jsonb
+col|harvest_event_batches|updated_at|timestamp with time zone
+col|harvest_event_batches|workflow_id|text
+col|harvest_event_batches|workflow_name|text
+col|harvest_events|cohort|timestamp with time zone
+col|harvest_events|event_data|jsonb
+col|harvest_events|event_id|integer
+col|harvest_events|event_type|text
+col|harvest_events|id|bigint
+col|harvest_events|timestamp|timestamp with time zone
+col|harvest_events|workflow_exec_id|uuid
+col|harvest_execution_summaries|completed_at|timestamp with time zone
+col|harvest_execution_summaries|duration_ms|bigint
+col|harvest_execution_summaries|error|text
+col|harvest_execution_summaries|execution_id|uuid
+col|harvest_execution_summaries|migrated_from_shards|jsonb
+col|harvest_execution_summaries|parent_id|uuid
+col|harvest_execution_summaries|result|jsonb
+col|harvest_execution_summaries|search_attrs|jsonb
+col|harvest_execution_summaries|shard_id|integer
+col|harvest_execution_summaries|started_at|timestamp with time zone
+col|harvest_execution_summaries|state|text
+col|harvest_execution_summaries|summarized_at|timestamp with time zone
+col|harvest_execution_summaries|workflow_id|text
+col|harvest_execution_summaries|workflow_name|text
+col|harvest_external_tasks|activity_id|uuid
+col|harvest_external_tasks|created_at|timestamp with time zone
+col|harvest_external_tasks|id|uuid
+col|harvest_external_tasks|name|text
+col|harvest_external_tasks|queue|text
+col|harvest_external_tasks|schedule_to_close_at|timestamp with time zone
+col|harvest_external_tasks|schedule_to_close_secs|bigint
+col|harvest_external_tasks|state|text
+col|harvest_external_tasks|token|uuid
+col|harvest_external_tasks|updated_at|timestamp with time zone
+col|harvest_external_tasks|workflow_exec_id|uuid
+col|harvest_fairness_state|fairness_key|text
+col|harvest_fairness_state|last_start|double precision
+col|harvest_fairness_state|pass|double precision
+col|harvest_fairness_state|queue_name|text
+col|harvest_fairness_state|updated_at|timestamp with time zone
+col|harvest_fairness_weights|fairness_key|text
+col|harvest_fairness_weights|queue_name|text
+col|harvest_fairness_weights|updated_at|timestamp with time zone
+col|harvest_fairness_weights|updated_by|text
+col|harvest_fairness_weights|weight|double precision
+col|harvest_llm_ledger|activity_name|text
+col|harvest_llm_ledger|call_index|integer
+col|harvest_llm_ledger|cost_usd_micros|bigint
+col|harvest_llm_ledger|event_id|integer
+col|harvest_llm_ledger|input_tokens|bigint
+col|harvest_llm_ledger|latency_ms|bigint
+col|harvest_llm_ledger|model|text
+col|harvest_llm_ledger|output_tokens|bigint
+col|harvest_llm_ledger|recorded_at|timestamp with time zone
+col|harvest_llm_ledger|workflow_exec_id|uuid
+col|harvest_mutex_locks|acquired_at|timestamp with time zone
+col|harvest_mutex_locks|holder_exec_id|uuid
+col|harvest_mutex_locks|lease_expires_at|timestamp with time zone
+col|harvest_mutex_locks|lock_key|text
+col|harvest_mutex_locks|lock_seq|bigint
+col|harvest_mutex_waiters|id|bigint
+col|harvest_mutex_waiters|lock_key|text
+col|harvest_mutex_waiters|requested_at|timestamp with time zone
+col|harvest_mutex_waiters|waiter_exec_id|uuid
+col|harvest_partition_export|required_since|timestamp with time zone
+col|harvest_partition_export|singleton|boolean
+col|harvest_partition_exports|dropped_at|timestamp with time zone
+col|harvest_partition_exports|lower_bound|timestamp with time zone
+col|harvest_partition_exports|manifest_key|text
+col|harvest_partition_exports|partition_name|text
+col|harvest_partition_exports|row_count|bigint
+col|harvest_partition_exports|upper_bound|timestamp with time zone
+col|harvest_payload_refs|blob_key|text
+col|harvest_payload_refs|byte_len|bigint
+col|harvest_payload_refs|created_at|timestamp with time zone
+col|harvest_payload_refs|store_id|text
+col|harvest_payload_refs|workflow_exec_id|uuid
+col|harvest_queue_pauses|paused_at|timestamp with time zone
+col|harvest_queue_pauses|paused_by|text
+col|harvest_queue_pauses|queue_name|text
+col|harvest_queue_pauses|reason|text
+col|harvest_queue_pauses|scope_shard_id|integer
+col|harvest_ramp_abort_reports|queue_name|text
+col|harvest_ramp_abort_reports|ramp_id|uuid
+col|harvest_ramp_abort_reports|reported_at|timestamp with time zone
+col|harvest_ramp_retired_ids|queue_name|text
+col|harvest_ramp_retired_ids|ramp_id|uuid
+col|harvest_ramp_retired_ids|retired_at|timestamp with time zone
+col|harvest_rate_limit_buckets|baseline_set_at|timestamp with time zone
+col|harvest_rate_limit_buckets|burst|double precision
+col|harvest_rate_limit_buckets|created_at|timestamp with time zone
+col|harvest_rate_limit_buckets|key|character varying
+col|harvest_rate_limit_buckets|last_refilled_at|timestamp with time zone
+col|harvest_rate_limit_buckets|last_registered_at|timestamp with time zone
+col|harvest_rate_limit_buckets|override_burst|double precision
+col|harvest_rate_limit_buckets|override_expires_at|timestamp with time zone
+col|harvest_rate_limit_buckets|override_refill_rate|double precision
+col|harvest_rate_limit_buckets|refill_rate|double precision
+col|harvest_rate_limit_buckets|tokens|double precision
+col|harvest_rate_limit_buckets|updated_at|timestamp with time zone
+col|harvest_replication_heartbeat|beat_at|timestamp with time zone
+col|harvest_replication_heartbeat|beat_lsn|pg_lsn
+col|harvest_replication_heartbeat|fence_generation|bigint
+col|harvest_replication_heartbeat|shard_id|integer
+col|harvest_scanner_leases|acquired_at|timestamp with time zone
+col|harvest_scanner_leases|epoch|bigint
+col|harvest_scanner_leases|holder|text
+col|harvest_scanner_leases|lease_until|timestamp with time zone
+col|harvest_scanner_leases|scanner|text
+col|harvest_scanner_leases|shard_id|integer
+col|harvest_schedule_decisions|decision|text
+col|harvest_schedule_decisions|detail|jsonb
+col|harvest_schedule_decisions|id|uuid
+col|harvest_schedule_decisions|next_fire_at|timestamp with time zone
+col|harvest_schedule_decisions|occurred_at|timestamp with time zone
+col|harvest_schedule_decisions|reason_code|text
+col|harvest_schedule_decisions|schedule_id|uuid
+col|harvest_schedule_decisions|schedule_name|text
+col|harvest_schedule_decisions|shard_id|smallint
+col|harvest_schedule_decisions|target_kind|text
+col|harvest_schedules|auto_paused_at|timestamp with time zone
+col|harvest_schedules|buffer_all_max|integer
+col|harvest_schedules|buffered_runs|jsonb
+col|harvest_schedules|calendar_name|text
+col|harvest_schedules|catchup|boolean
+col|harvest_schedules|catchup_policy|text
+col|harvest_schedules|catchup_window_secs|bigint
+col|harvest_schedules|consecutive_failure_count|integer
+col|harvest_schedules|consecutive_failure_limit|integer
+col|harvest_schedules|created_at|timestamp with time zone
+col|harvest_schedules|dag_name|text
+col|harvest_schedules|end_at|timestamp with time zone
+col|harvest_schedules|exhausted_at|timestamp with time zone
+col|harvest_schedules|exhausted_reason|text
+col|harvest_schedules|fire_claim_token|uuid
+col|harvest_schedules|fire_claimed_until|timestamp with time zone
+col|harvest_schedules|id|uuid
+col|harvest_schedules|is_paused|boolean
+col|harvest_schedules|jitter_secs|bigint
+col|harvest_schedules|last_catchup_at|timestamp with time zone
+col|harvest_schedules|last_catchup_dropped|integer
+col|harvest_schedules|last_run_at|timestamp with time zone
+col|harvest_schedules|max_active_runs|integer
+col|harvest_schedules|max_runs|integer
+col|harvest_schedules|next_run_at|timestamp with time zone
+col|harvest_schedules|overlap_policy|text
+col|harvest_schedules|pause_reason|text
+col|harvest_schedules|paused_at|timestamp with time zone
+col|harvest_schedules|paused_by|text
+col|harvest_schedules|queue_name|text
+col|harvest_schedules|retry_policy|jsonb
+col|harvest_schedules|runs_started|integer
+col|harvest_schedules|schedule_expr|text
+col|harvest_schedules|skip_policy|text
+col|harvest_schedules|timezone|text
+col|harvest_schedules|updated_at|timestamp with time zone
+col|harvest_schedules|workflow_input|jsonb
+col|harvest_schedules|workflow_name|text
+col|harvest_sessions|broken_at|timestamp with time zone
+col|harvest_sessions|broken_reason|text
+col|harvest_sessions|completed_at|timestamp with time zone
+col|harvest_sessions|created_at|timestamp with time zone
+col|harvest_sessions|expires_at|timestamp with time zone
+col|harvest_sessions|host_worker_id|text
+col|harvest_sessions|id|uuid
+col|harvest_sessions|queue_name|text
+col|harvest_sessions|state|text
+col|harvest_sessions|workflow_exec_id|uuid
+col|harvest_shard_generation|fenced_at|timestamp with time zone
+col|harvest_shard_generation|fenced_by|text
+col|harvest_shard_generation|fenced_reason|text
+col|harvest_shard_generation|generation|bigint
+col|harvest_shard_generation|shard_id|integer
+col|harvest_shard_migrations|abort_reason|text
+col|harvest_shard_migrations|attempts|integer
+col|harvest_shard_migrations|created_at|timestamp with time zone
+col|harvest_shard_migrations|execution_id|uuid
+col|harvest_shard_migrations|last_attempt_at|timestamp with time zone
+col|harvest_shard_migrations|last_error|text
+col|harvest_shard_migrations|legal_hold_verified|boolean
+col|harvest_shard_migrations|phase|text
+col|harvest_shard_migrations|source_shard|integer
+col|harvest_shard_migrations|staged_task|jsonb
+col|harvest_shard_migrations|target_shard|integer
+col|harvest_shard_migrations|updated_at|timestamp with time zone
+col|harvest_shard_migrations|verified_event_count|bigint
+col|harvest_shard_migrations|verified_fingerprint|text
+col|harvest_shard_migrations|verified_legal_hold_set_at|timestamp with time zone
+col|harvest_shard_migrations|verified_max_event_id|integer
+col|harvest_signals|consumed|boolean
+col|harvest_signals|id|uuid
+col|harvest_signals|idempotency_key|text
+col|harvest_signals|payload|jsonb
+col|harvest_signals|received_at|timestamp with time zone
+col|harvest_signals|signal_name|text
+col|harvest_signals|workflow_exec_id|uuid
+col|harvest_start_idempotency|created_at|timestamp with time zone
+col|harvest_start_idempotency|idempotency_key|text
+col|harvest_start_idempotency|shard_id|integer
+col|harvest_start_idempotency|workflow_exec_id|uuid
+col|harvest_start_idempotency|workflow_name|text
+col|harvest_start_throttle|bucket_key|text
+col|harvest_start_throttle|created_at|timestamp with time zone
+col|harvest_start_throttle|deferred_at|timestamp with time zone
+col|harvest_start_throttle|expires_at|timestamp with time zone
+col|harvest_start_throttle|id|uuid
+col|harvest_start_throttle|input|jsonb
+col|harvest_start_throttle|queue_name|text
+col|harvest_start_throttle|shard_id|integer
+col|harvest_start_throttle|start_options|jsonb
+col|harvest_start_throttle|throttle_key|text
+col|harvest_start_throttle|workflow_id|text
+col|harvest_start_throttle|workflow_name|text
+col|harvest_stream_chunks|chunk|jsonb
+col|harvest_stream_chunks|created_at|timestamp with time zone
+col|harvest_stream_chunks|id|bigint
+col|harvest_stream_chunks|stream_offset|bigint
+col|harvest_stream_chunks|workflow_exec_id|uuid
+col|harvest_task_queue|activity_id|uuid
+col|harvest_task_queue|activity_name|text
+col|harvest_task_queue|attempt|integer
+col|harvest_task_queue|capability_miss_handler|text
+col|harvest_task_queue|capability_miss_workers|text[]
+col|harvest_task_queue|capability_misses|integer
+col|harvest_task_queue|completed_at|timestamp with time zone
+col|harvest_task_queue|concurrency_cap|integer
+col|harvest_task_queue|concurrency_key|text
+col|harvest_task_queue|context_headers|jsonb
+col|harvest_task_queue|crash_strikes|integer
+col|harvest_task_queue|created_at|timestamp with time zone
+col|harvest_task_queue|error|text
+col|harvest_task_queue|fairness_key|text
+col|harvest_task_queue|handler_started_at|timestamp with time zone
+col|harvest_task_queue|handler_started_attempt|integer
+col|harvest_task_queue|heartbeat_details|jsonb
+col|harvest_task_queue|heartbeat_timeout|interval
+col|harvest_task_queue|id|uuid
+col|harvest_task_queue|input|jsonb
+col|harvest_task_queue|last_heartbeat_at|timestamp with time zone
+col|harvest_task_queue|max_attempts|integer
+col|harvest_task_queue|new_start|boolean
+col|harvest_task_queue|output|jsonb
+col|harvest_task_queue|priority|integer
+col|harvest_task_queue|queue_name|text
+col|harvest_task_queue|rate_limit_key|character varying
+col|harvest_task_queue|required_build_id|text
+col|harvest_task_queue|required_capabilities|jsonb
+col|harvest_task_queue|retry_policy|jsonb
+col|harvest_task_queue|schedule_to_close_at|timestamp with time zone
+col|harvest_task_queue|schedule_to_start|interval
+col|harvest_task_queue|scheduled_at|timestamp with time zone
+col|harvest_task_queue|session_id|uuid
+col|harvest_task_queue|start_to_close|interval
+col|harvest_task_queue|started_at|timestamp with time zone
+col|harvest_task_queue|state|text
+col|harvest_task_queue|sticky_timeout|interval
+col|harvest_task_queue|sticky_until|timestamp with time zone
+col|harvest_task_queue|sticky_worker_id|text
+col|harvest_task_queue|task_type|text
+col|harvest_task_queue|timed_out_claims|text[]
+col|harvest_task_queue|timer_fires_at|timestamp with time zone
+col|harvest_task_queue|trace_context|jsonb
+col|harvest_task_queue|wake_requested|boolean
+col|harvest_task_queue|worker_id|text
+col|harvest_task_queue|workflow_exec_id|uuid
+col|harvest_timers|fired|boolean
+col|harvest_timers|fires_at|timestamp with time zone
+col|harvest_timers|id|uuid
+col|harvest_timers|timer_id|text
+col|harvest_timers|workflow_exec_id|uuid
+col|harvest_wasm_modules|active|boolean
+col|harvest_wasm_modules|activity_name|text
+col|harvest_wasm_modules|hash|text
+col|harvest_wasm_modules|published_at|timestamp with time zone
+col|harvest_wasm_modules|signature|text
+col|harvest_wasm_modules|wasm_bytes|bytea
+col|harvest_worker_task_stats|cohort|text
+col|harvest_worker_task_stats|p99_latency_ms|bigint
+col|harvest_worker_task_stats|snapshot_seq|bigint
+col|harvest_worker_task_stats|updated_at|timestamp with time zone
+col|harvest_worker_task_stats|window_failures|integer
+col|harvest_worker_task_stats|window_tasks|integer
+col|harvest_worker_task_stats|worker_id|text
+col|harvest_workers|build_id|text
+col|harvest_workers|deployment_name|text
+col|harvest_workers|drain_deadline_at|timestamp with time zone
+col|harvest_workers|host|text
+col|harvest_workers|in_flight_count|integer
+col|harvest_workers|in_use_sessions|integer
+col|harvest_workers|labels|jsonb
+col|harvest_workers|last_heartbeat_at|timestamp with time zone
+col|harvest_workers|max_concurrency|integer
+col|harvest_workers|max_concurrent_sessions|integer
+col|harvest_workers|queues|jsonb
+col|harvest_workers|shard_assignments|jsonb
+col|harvest_workers|started_at|timestamp with time zone
+col|harvest_workers|status|text
+col|harvest_workers|version|text
+col|harvest_workers|worker_id|text
+col|harvest_workflow_executions|assigned_build_id|text
+col|harvest_workflow_executions|chain_deadline_at|timestamp with time zone
+col|harvest_workflow_executions|chain_execution_timeout|interval
+col|harvest_workflow_executions|completed_at|timestamp with time zone
+col|harvest_workflow_executions|completion_callbacks|jsonb
+col|harvest_workflow_executions|context_headers|jsonb
+col|harvest_workflow_executions|continued_from_exec_id|uuid
+col|harvest_workflow_executions|created_at|timestamp with time zone
+col|harvest_workflow_executions|current_details|text
+col|harvest_workflow_executions|deadline_at|timestamp with time zone
+col|harvest_workflow_executions|error|text
+col|harvest_workflow_executions|execution_timeout|interval
+col|harvest_workflow_executions|first_exec_id|uuid
+col|harvest_workflow_executions|history_bloat_warned_at|timestamp with time zone
+col|harvest_workflow_executions|id|uuid
+col|harvest_workflow_executions|input|jsonb
+col|harvest_workflow_executions|legal_hold_actor|text
+col|harvest_workflow_executions|legal_hold_reason|text
+col|harvest_workflow_executions|legal_hold_set_at|timestamp with time zone
+col|harvest_workflow_executions|legal_hold_until|timestamp with time zone
+col|harvest_workflow_executions|memo|jsonb
+col|harvest_workflow_executions|migrated_at|timestamp with time zone
+col|harvest_workflow_executions|migrated_from_shards|jsonb
+col|harvest_workflow_executions|migrated_run_terminal_at|timestamp with time zone
+col|harvest_workflow_executions|migrated_run_terminal_state|text
+col|harvest_workflow_executions|migrated_to_shard|integer
+col|harvest_workflow_executions|nd_block_count|integer
+col|harvest_workflow_executions|nd_block_reason|text
+col|harvest_workflow_executions|nd_blocked_at|timestamp with time zone
+col|harvest_workflow_executions|origin|text
+col|harvest_workflow_executions|output|jsonb
+col|harvest_workflow_executions|owner|text
+col|harvest_workflow_executions|parent_close_policy|character varying(50)
+col|harvest_workflow_executions|parent_id|uuid
+col|harvest_workflow_executions|pause_actor|text
+col|harvest_workflow_executions|pause_reason|text
+col|harvest_workflow_executions|paused_at|timestamp with time zone
+col|harvest_workflow_executions|queue_name|text
+col|harvest_workflow_executions|quota_key|text
+col|harvest_workflow_executions|retry_of_exec_id|uuid
+col|harvest_workflow_executions|run_id|uuid
+col|harvest_workflow_executions|runbook_url|text
+col|harvest_workflow_executions|schedule_id|uuid
+col|harvest_workflow_executions|scheduled_for|timestamp with time zone
+col|harvest_workflow_executions|search_attrs|jsonb
+col|harvest_workflow_executions|severity|text
+col|harvest_workflow_executions|shard_id|integer
+col|harvest_workflow_executions|sla|interval
+col|harvest_workflow_executions|sla_breached|boolean
+col|harvest_workflow_executions|sla_breached_at|timestamp with time zone
+col|harvest_workflow_executions|sla_deadline_at|timestamp with time zone
+col|harvest_workflow_executions|staging_vacated_by|uuid
+col|harvest_workflow_executions|staging_vacated_state|text
+col|harvest_workflow_executions|start_source|text
+col|harvest_workflow_executions|start_source_ref|text
+col|harvest_workflow_executions|started_at|timestamp with time zone
+col|harvest_workflow_executions|started_by|text
+col|harvest_workflow_executions|state|text
+col|harvest_workflow_executions|sticky_worker_id|text
+col|harvest_workflow_executions|tenant|text
+col|harvest_workflow_executions|triage_note|text
+col|harvest_workflow_executions|workflow_attempt|integer
+col|harvest_workflow_executions|workflow_id|text
+col|harvest_workflow_executions|workflow_name|text
+col|harvest_workflow_executions|workflow_retry_policy|jsonb
+col|harvest_workflow_logs|id|bigint
+col|harvest_workflow_logs|level|text
+col|harvest_workflow_logs|message|text
+col|harvest_workflow_logs|occurred_at|timestamp with time zone
+col|harvest_workflow_logs|seq|bigint
+col|harvest_workflow_logs|workflow_exec_id|uuid
+col|harvest_workflow_modules|build_id|text
+col|harvest_workflow_modules|module_bytes|bytea
+col|harvest_workflow_modules|module_hash|text
+col|harvest_workflow_modules|published_at|timestamp with time zone
+col|harvest_workflow_modules|retired_at|timestamp with time zone
+col|harvest_workflow_modules|signature|text
+col|harvest_workflow_modules|workflow_name|text
+idx|harvest_activity_pauses|harvest_activity_pauses_pkey|
+idx|harvest_admission_gates|harvest_admission_gates_active_idx|
+idx|harvest_admission_gates|harvest_admission_gates_pkey|
+idx|harvest_api_tokens|harvest_api_tokens_active_idx|
+idx|harvest_api_tokens|harvest_api_tokens_hash_uidx|
+idx|harvest_api_tokens|harvest_api_tokens_pkey|
+idx|harvest_audit_export_cursor|harvest_audit_export_cursor_pkey|
+idx|harvest_audit_log|harvest_audit_actor_occurred_at_idx|
+idx|harvest_audit_log|harvest_audit_log_export_seq_idx|
+idx|harvest_audit_log|harvest_audit_log_pkey|
+idx|harvest_audit_log|harvest_audit_occurred_at_idx|
+idx|harvest_audit_log|harvest_audit_operation_occurred_at_idx|
+idx|harvest_audit_log|harvest_audit_target_occurred_at_idx|
+idx|harvest_audit_purge_watermark|harvest_audit_purge_watermark_pkey|
+idx|harvest_backfill_log|harvest_backfill_log_pkey|
+idx|harvest_backfill_log|harvest_backfill_log_schedule_id_idx|
+idx|harvest_batch_jobs|harvest_batch_jobs_created_at_idx|
+idx|harvest_batch_jobs|harvest_batch_jobs_idempotency_key_idx|
+idx|harvest_batch_jobs|harvest_batch_jobs_pkey|
+idx|harvest_batch_jobs|harvest_batch_jobs_status_idx|
+idx|harvest_build_compat|harvest_build_compat_build_id_compatible_with_key|
+idx|harvest_build_compat|harvest_build_compat_pkey|
+idx|harvest_build_policies|harvest_build_policies_pkey|
+idx|harvest_build_policies|harvest_build_policies_queue_name_key|
+idx|harvest_calendar_exclusions|harvest_calendar_exclusions_name_idx|
+idx|harvest_calendar_exclusions|harvest_calendar_exclusions_pkey|
+idx|harvest_calendar_exclusions|harvest_calendar_exclusions_unique|
+idx|harvest_calendars|harvest_calendars_name_unique|
+idx|harvest_calendars|harvest_calendars_pkey|
+idx|harvest_codec_key_state|harvest_codec_key_state_one_active_idx|
+idx|harvest_codec_key_state|harvest_codec_key_state_pkey|
+idx|harvest_codec_rotation_cursor|harvest_codec_rotation_cursor_pkey|
+idx|harvest_completion_deliveries|harvest_completion_deliveries_pkey|
+idx|harvest_completion_deliveries|harvest_completion_deliveries_unique_target|
+idx|harvest_completion_deliveries|idx_harvest_completion_deliveries_due|
+idx|harvest_completion_deliveries|idx_harvest_completion_deliveries_exec|
+idx|harvest_completion_trigger_fires|harvest_completion_trigger_fires_pkey|
+idx|harvest_completion_trigger_fires|idx_harvest_completion_trigger_fires_fired_at|
+idx|harvest_completion_trigger_outbox|harvest_completion_trigger_outbox_pkey|
+idx|harvest_completion_trigger_outbox|idx_harvest_completion_trigger_outbox_shard_next_attempt|
+idx|harvest_completion_trigger_outbox|idx_harvest_completion_trigger_outbox_source_trigger|
+idx|harvest_completion_triggers|harvest_completion_triggers_pkey|
+idx|harvest_completion_triggers|idx_harvest_completion_triggers_source|
+idx|harvest_cross_shard_children|harvest_cross_shard_children_pkey|
+idx|harvest_cross_shard_children|idx_harvest_cross_shard_children_actionable|
+idx|harvest_cross_shard_children|idx_harvest_cross_shard_children_inflight|
+idx|harvest_dead_letters|harvest_dead_letters_pkey|
+idx|harvest_dead_letters|idx_harvest_dl_owner|
+idx|harvest_dead_letters|idx_harvest_dl_quota|
+idx|harvest_dead_letters|idx_harvest_dl_workflow_exec_id|
+idx|harvest_debounce|harvest_debounce_pkey|
+idx|harvest_debounce|harvest_debounce_unique_key|
+idx|harvest_debounce|idx_harvest_debounce_fire_at|
+idx|harvest_event_batches|harvest_event_batches_pkey|
+idx|harvest_event_batches|harvest_event_batches_unique_key|
+idx|harvest_event_batches|idx_harvest_event_batches_shard_fire_at|
+idx|harvest_events|harvest_events_pkey|
+idx|harvest_events|harvest_events_workflow_exec_id_event_id_key|
+idx|harvest_events|idx_harvest_events_activity_started_lookup|
+idx|harvest_events|idx_harvest_events_activity_type_ts|
+idx|harvest_events|idx_harvest_events_exec|
+idx|harvest_events|idx_harvest_events_exec_last|
+idx|harvest_events|idx_harvest_events_external_await_resolved|
+idx|harvest_events|idx_harvest_events_external_cancel_resolved|
+idx|harvest_events|idx_harvest_events_external_outbox_pending|
+idx|harvest_events|idx_harvest_events_external_signal_resolved|
+idx|harvest_events|idx_harvest_events_history_page|
+idx|harvest_events|idx_harvest_events_recent_by_timestamp|
+idx|harvest_events|idx_harvest_events_reset_terminated|
+idx|harvest_events|idx_harvest_events_workflow_terminal_type_ts|
+idx|harvest_execution_summaries|harvest_execution_summaries_pkey|
+idx|harvest_execution_summaries|idx_harvest_execution_summaries_gc|
+idx|harvest_execution_summaries|idx_harvest_execution_summaries_name|
+idx|harvest_execution_summaries|idx_harvest_execution_summaries_parent|
+idx|harvest_execution_summaries|idx_harvest_execution_summaries_search|
+idx|harvest_execution_summaries|idx_harvest_execution_summaries_wfid|
+idx|harvest_external_tasks|harvest_external_tasks_pkey|
+idx|harvest_external_tasks|idx_harvest_ext_activity_name|
+idx|harvest_external_tasks|idx_harvest_ext_state_updated|
+idx|harvest_external_tasks|idx_harvest_ext_timeout|
+idx|harvest_external_tasks|idx_harvest_ext_token|
+idx|harvest_external_tasks|idx_harvest_ext_workflow_exec|
+idx|harvest_fairness_state|harvest_fairness_state_clock|
+idx|harvest_fairness_state|harvest_fairness_state_pass|
+idx|harvest_fairness_state|harvest_fairness_state_pkey|
+idx|harvest_fairness_weights|harvest_fairness_weights_pkey|
+idx|harvest_llm_ledger|harvest_llm_ledger_pkey|
+idx|harvest_llm_ledger|harvest_llm_ledger_recorded_at|
+idx|harvest_mutex_locks|harvest_mutex_locks_pkey|
+idx|harvest_mutex_locks|idx_harvest_mutex_locks_holder|
+idx|harvest_mutex_locks|idx_harvest_mutex_locks_lease|
+idx|harvest_mutex_waiters|harvest_mutex_waiters_lock_key_waiter_exec_id_key|
+idx|harvest_mutex_waiters|harvest_mutex_waiters_pkey|
+idx|harvest_mutex_waiters|idx_harvest_mutex_waiters_key_id|
+idx|harvest_partition_export|harvest_partition_export_pkey|
+idx|harvest_partition_exports|harvest_partition_exports_pkey|
+idx|harvest_payload_refs|harvest_payload_refs_pkey|
+idx|harvest_payload_refs|idx_harvest_payload_refs_exec|
+idx|harvest_payload_refs|idx_harvest_payload_refs_key|
+idx|harvest_queue_pauses|harvest_queue_pauses_pkey|
+idx|harvest_ramp_abort_reports|harvest_ramp_abort_reports_pkey|
+idx|harvest_ramp_retired_ids|harvest_ramp_retired_ids_pkey|
+idx|harvest_rate_limit_buckets|harvest_rate_limit_buckets_pkey|
+idx|harvest_replication_heartbeat|harvest_replication_heartbeat_pkey|
+idx|harvest_replication_heartbeat|harvest_replication_heartbeat_shard_at_idx|
+idx|harvest_scanner_leases|harvest_scanner_leases_pkey|
+idx|harvest_schedule_decisions|harvest_sched_dec_occurred_at_idx|
+idx|harvest_schedule_decisions|harvest_sched_dec_schedule_id_occurred_at_idx|
+idx|harvest_schedule_decisions|harvest_schedule_decisions_pkey|
+idx|harvest_schedules|harvest_schedules_dag_name_key|
+idx|harvest_schedules|harvest_schedules_fire_claim_expiry_idx|
+idx|harvest_schedules|harvest_schedules_pkey|
+idx|harvest_schedules|harvest_schedules_workflow_name_unique|
+idx|harvest_schedules|idx_harvest_schedules_catchup_dropped|
+idx|harvest_schedules|idx_harvest_schedules_exhausted|
+idx|harvest_sessions|harvest_sessions_active_expires_at|
+idx|harvest_sessions|harvest_sessions_active_host_worker_id|
+idx|harvest_sessions|harvest_sessions_pkey|
+idx|harvest_sessions|harvest_sessions_workflow_exec_id|
+idx|harvest_shard_generation|harvest_shard_generation_pkey|
+idx|harvest_shard_migrations|harvest_shard_migrations_pkey|
+idx|harvest_shard_migrations|idx_harvest_shard_migrations_unsettled|
+idx|harvest_signals|harvest_signals_pkey|
+idx|harvest_signals|idx_harvest_signals_pending|
+idx|harvest_signals|uq_harvest_signals_idem|
+idx|harvest_start_idempotency|harvest_start_idempotency_pkey|
+idx|harvest_start_idempotency|idx_harvest_start_idempotency_sweep|
+idx|harvest_start_throttle|harvest_start_throttle_pkey|
+idx|harvest_start_throttle|idx_harvest_start_throttle_bucket|
+idx|harvest_start_throttle|idx_harvest_start_throttle_bucket_deferred|
+idx|harvest_start_throttle|idx_harvest_start_throttle_drain|
+idx|harvest_start_throttle|idx_harvest_start_throttle_workflow_id|
+idx|harvest_stream_chunks|harvest_stream_chunks_exec_offset|
+idx|harvest_stream_chunks|harvest_stream_chunks_pkey|
+idx|harvest_task_queue|harvest_task_queue_concurrency_key_running|
+idx|harvest_task_queue|harvest_task_queue_pkey|
+idx|harvest_task_queue|harvest_task_queue_required_build_id_pending|
+idx|harvest_task_queue|harvest_task_queue_running_worker_idx|
+idx|harvest_task_queue|harvest_task_queue_schedule_to_close_idx|
+idx|harvest_task_queue|idx_harvest_task_queue_rate_limit_key_live|
+idx|harvest_task_queue|idx_harvest_tq_activity_id|
+idx|harvest_task_queue|idx_harvest_tq_activity_pause|
+idx|harvest_task_queue|idx_harvest_tq_capability_miss_workers|
+idx|harvest_task_queue|idx_harvest_tq_claim_seek|
+idx|harvest_task_queue|idx_harvest_tq_coverage_sample|
+idx|harvest_task_queue|idx_harvest_tq_live_created|
+idx|harvest_task_queue|idx_harvest_tq_poll|
+idx|harvest_task_queue|idx_harvest_tq_running_started|
+idx|harvest_task_queue|idx_harvest_tq_sticky_poll|
+idx|harvest_task_queue|idx_harvest_tq_terminal_completed_at|
+idx|harvest_task_queue|idx_harvest_tq_workflow|
+idx|harvest_timers|harvest_timers_pkey|
+idx|harvest_timers|idx_harvest_timers_pending|
+idx|harvest_wasm_modules|harvest_wasm_modules_pkey|
+idx|harvest_wasm_modules|uq_harvest_wasm_modules_active|
+idx|harvest_worker_task_stats|harvest_worker_task_stats_cohort_idx|
+idx|harvest_worker_task_stats|harvest_worker_task_stats_pkey|
+idx|harvest_worker_task_stats|harvest_worker_task_stats_updated_at_idx|
+idx|harvest_workers|harvest_workers_last_heartbeat_at_idx|
+idx|harvest_workers|harvest_workers_pkey|
+idx|harvest_workers|harvest_workers_status_idx|
+idx|harvest_workflow_executions|harvest_we_workflow_name_workflow_id_active_key|
+idx|harvest_workflow_executions|harvest_wf_exec_detached_running|
+idx|harvest_workflow_executions|harvest_wfe_assigned_build_id|
+idx|harvest_workflow_executions|harvest_workflow_executions_pkey|
+idx|harvest_workflow_executions|idx_harvest_executions_chain_deadline|
+idx|harvest_workflow_executions|idx_harvest_executions_deadline|
+idx|harvest_workflow_executions|idx_harvest_executions_legal_hold|
+idx|harvest_workflow_executions|idx_harvest_executions_nd_blocked|
+idx|harvest_workflow_executions|idx_harvest_executions_paused|
+idx|harvest_workflow_executions|idx_harvest_executions_sla_deadline|
+idx|harvest_workflow_executions|idx_harvest_we_canary_order|
+idx|harvest_workflow_executions|idx_harvest_we_created_id|
+idx|harvest_workflow_executions|idx_harvest_we_fork_source|
+idx|harvest_workflow_executions|idx_harvest_we_llm_tenant|
+idx|harvest_workflow_executions|idx_harvest_we_migrated_forward|
+idx|harvest_workflow_executions|idx_harvest_we_non_terminal_wf_name|
+idx|harvest_workflow_executions|idx_harvest_we_owner_created|
+idx|harvest_workflow_executions|idx_harvest_we_parent_id|
+idx|harvest_workflow_executions|idx_harvest_we_quota_active|
+idx|harvest_workflow_executions|idx_harvest_we_quota_reconcile_candidates|
+idx|harvest_workflow_executions|idx_harvest_we_quota_reconcile_name_id|
+idx|harvest_workflow_executions|idx_harvest_we_ramp_guard_outcome|
+idx|harvest_workflow_executions|idx_harvest_we_retention_scan|
+idx|harvest_workflow_executions|idx_harvest_we_search|
+idx|harvest_workflow_executions|idx_harvest_we_severity_created|
+idx|harvest_workflow_executions|idx_harvest_we_shard|
+idx|harvest_workflow_executions|idx_harvest_we_shard_started|
+idx|harvest_workflow_executions|idx_harvest_we_state|
+idx|harvest_workflow_executions|idx_harvest_wfx_continued_from|
+idx|harvest_workflow_executions|idx_harvest_wfx_first_exec_id|
+idx|harvest_workflow_executions|idx_harvest_wfx_retry_of|
+idx|harvest_workflow_executions|idx_harvest_wfx_schedule_carryover|
+idx|harvest_workflow_executions|idx_harvest_wfx_schedule_runs|
+idx|harvest_workflow_executions|idx_harvest_wfx_schedule_runs_slot|
+idx|harvest_workflow_executions|idx_harvest_wfx_start_source|
+idx|harvest_workflow_executions|idx_harvest_wfx_workflow_identity|
+idx|harvest_workflow_logs|harvest_workflow_logs_exec_seq|
+idx|harvest_workflow_logs|harvest_workflow_logs_pkey|
+idx|harvest_workflow_modules|harvest_workflow_modules_pkey|
+idx|harvest_workflow_modules|idx_harvest_workflow_modules_hash|
+tbl|harvest_activity_pauses||
+tbl|harvest_admission_gates||
+tbl|harvest_api_tokens||
+tbl|harvest_audit_export_cursor||
+tbl|harvest_audit_log||
+tbl|harvest_audit_purge_watermark||
+tbl|harvest_backfill_log||
+tbl|harvest_batch_jobs||
+tbl|harvest_build_compat||
+tbl|harvest_build_policies||
+tbl|harvest_calendar_exclusions||
+tbl|harvest_calendars||
+tbl|harvest_codec_key_state||
+tbl|harvest_codec_rotation_cursor||
+tbl|harvest_completion_deliveries||
+tbl|harvest_completion_trigger_fires||
+tbl|harvest_completion_trigger_outbox||
+tbl|harvest_completion_triggers||
+tbl|harvest_cross_shard_children||
+tbl|harvest_dead_letters||
+tbl|harvest_debounce||
+tbl|harvest_event_batches||
+tbl|harvest_events||
+tbl|harvest_execution_summaries||
+tbl|harvest_external_tasks||
+tbl|harvest_fairness_state||
+tbl|harvest_fairness_weights||
+tbl|harvest_llm_ledger||
+tbl|harvest_mutex_locks||
+tbl|harvest_mutex_waiters||
+tbl|harvest_partition_export||
+tbl|harvest_partition_exports||
+tbl|harvest_payload_refs||
+tbl|harvest_queue_pauses||
+tbl|harvest_ramp_abort_reports||
+tbl|harvest_ramp_retired_ids||
+tbl|harvest_rate_limit_buckets||
+tbl|harvest_replication_heartbeat||
+tbl|harvest_scanner_leases||
+tbl|harvest_schedule_decisions||
+tbl|harvest_schedules||
+tbl|harvest_sessions||
+tbl|harvest_shard_generation||
+tbl|harvest_shard_migrations||
+tbl|harvest_signals||
+tbl|harvest_start_idempotency||
+tbl|harvest_start_throttle||
+tbl|harvest_stream_chunks||
+tbl|harvest_task_queue||
+tbl|harvest_timers||
+tbl|harvest_wasm_modules||
+tbl|harvest_worker_task_stats||
+tbl|harvest_workers||
+tbl|harvest_workflow_executions||
+tbl|harvest_workflow_logs||
+tbl|harvest_workflow_modules||
+trg|harvest_build_policies|harvest_build_policies_reset_ramp_id_trigger|
+trg|harvest_events|harvest_events_append_only_trg|
+trg|harvest_shard_migrations|harvest_shard_migrations_reset_hold_verification_trigger|
