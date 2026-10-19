@@ -9641,11 +9641,11 @@ impl WorkflowContext {
         // this does not claim replay-safety across a cap change (see the
         // fan-out `validate_child_payload_caps` note).
         let fresh_dispatch = !self.match_history(|m| m.peek_child_start_at_cursor(&timer_id));
-        // Issue #1984: a scope that replays its cancel holds this dispatch.
-        // The cap applied when the cancelling cycle made it.
         if fresh_dispatch {
             self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
         }
+        // Issue #1984: a scope that replays its cancel holds this dispatch.
+        // The cap applied when the cancelling cycle made it.
         if fresh_dispatch && !self.replays_a_scope_cancel() {
             let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
             if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input {
@@ -11044,6 +11044,7 @@ impl WorkflowContext {
                     &payload_json,
                     idempotency_key.as_deref(),
                 )?;
+                self.check_payload_depth(PayloadKind::SignalPayload, None, &payload_json)?;
                 let observed = serde_json::to_string(&payload_json).map_or(0, |s| s.len() as u64);
                 if self.payload_max_signal > 0 && observed > self.payload_max_signal {
                     return Err(HarvestError::PayloadTooLarge {
@@ -13555,12 +13556,15 @@ impl WorkflowContext {
         // The caps applied when the cancelling cycle made them.
         let replays_a_scope_cancel = self.replays_a_scope_cancel();
         for dispatch in &to_dispatch {
-            if !dispatch.is_new || replays_a_scope_cancel {
+            if !dispatch.is_new {
                 continue;
             }
             match &branches[dispatch.index].kind {
                 RaceBranchKind::Activity { name, input, .. } => {
                     self.check_payload_depth(PayloadKind::ActivityInput, Some(name), input)?;
+                    if replays_a_scope_cancel {
+                        continue;
+                    }
                     let effective_cap = {
                         let global = self.payload_max_activity_input;
                         self.activity_input_cap_overrides
@@ -13584,6 +13588,9 @@ impl WorkflowContext {
                 }
                 RaceBranchKind::ChildWorkflow { input, .. } => {
                     self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, input)?;
+                    if replays_a_scope_cancel {
+                        continue;
+                    }
                     let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
                     if self.payload_max_workflow_input > 0
                         && observed > self.payload_max_workflow_input
@@ -14251,6 +14258,8 @@ impl WorkflowContext {
 
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!("ExternalActivityScheduled({name})"))?;
+
+                self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
 
                 // First time — generate a fresh token and schedule.
                 let activity_id = self.next_activity_id();
@@ -15175,8 +15184,15 @@ impl WorkflowContext {
             return result;
         }
 
-        // Live path: invoke the registered handler.
-        let result = self.run_update_handler(name, input).await;
+        // Live path: invoke the registered handler. A result nested past the
+        // depth cap cannot be read back, so the update fails instead (issue #2224).
+        let result = match self.run_update_handler(name, input).await {
+            Ok(output) if crate::payload_depth::nests_past_cap(&output) => Err(format!(
+                "payload too deep: update '{name}' result nests more than {} levels",
+                crate::payload_depth::MAX_PAYLOAD_DEPTH
+            )),
+            other => other,
+        };
 
         // Durably record the terminal result so the worker can append
         // UpdateCompleted/UpdateFailed before persisting other side effects.
@@ -15677,8 +15693,8 @@ impl WorkflowContext {
 
     /// Refuse a payload that nests past the depth cap (issue #2224).
     ///
-    /// The check reads the value only. It is the same on live and replay
-    /// runs, so it needs no replay guard.
+    /// The check reads the value only. It gives the same answer on live and
+    /// replay runs, so it needs no replay guard.
     fn check_payload_depth(
         &self,
         kind: PayloadKind,
@@ -33689,6 +33705,98 @@ mod payload_depth_tests {
         ctx.side_effect("s", || nested(MAX_PAYLOAD_DEPTH))
             .expect("a value at the cap is accepted");
         assert_eq!(ctx.drain_commands().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn race_activity_branch_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .race()
+            .activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), "default")
+            .timer(std::time::Duration::from_secs(60))
+            .run()
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn race_child_branch_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .race()
+            .child_workflow_raw("c", nested(MAX_PAYLOAD_DEPTH + 1))
+            .timer(std::time::Duration::from_secs(60))
+            .run()
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_fan_out_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_fan_out_raw(vec![
+                ("c".to_string(), serde_json::json!(1)),
+                ("c".to_string(), nested(MAX_PAYLOAD_DEPTH + 1)),
+            ])
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+    }
+
+    #[tokio::test]
+    async fn external_signal_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .signal_external_workflow(
+                crate::types::ExecutionId::new(),
+                "go",
+                nested(MAX_PAYLOAD_DEPTH + 1),
+            )
+            .await
+            .expect_err("a deep payload must be refused");
+        assert_too_deep(&err, &PayloadKind::SignalPayload);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inputs_at_the_cap_are_not_refused_for_depth() {
+        let ctx = WorkflowContext::new_test();
+        let deep = nested(MAX_PAYLOAD_DEPTH);
+        let wait = std::time::Duration::from_millis(100);
+        // Each call parks on its result. A depth refusal returns at once.
+        assert!(
+            tokio::time::timeout(wait, ctx.execute_activity_raw("a", deep.clone(), "default"))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(
+                wait,
+                ctx.execute_local_activity_raw("a", deep.clone(), None, None)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(wait, ctx.continue_as_new(deep.clone()))
+                .await
+                .is_err()
+        );
+        let commands = ctx.drain_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
+                && commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::ContinueAsNew { .. })),
+            "the calls must queue their commands: {commands:?}"
+        );
     }
 
     #[tokio::test]
