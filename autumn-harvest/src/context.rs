@@ -11581,32 +11581,6 @@ impl WorkflowContext {
         *seq
     }
 
-    /// Record or verify the fan-out count in event history.
-    ///
-    /// On **live execution** (past end of history): pushes a `RecordMarker`
-    /// command so future replays can verify the collection length, and
-    /// returns `Ok(true)` — this is the very first time this fan-out group
-    /// has ever been dispatched, which callers use to gate one-time,
-    /// pre-dispatch validation that must never re-run on replay.
-    ///
-    /// On **replay**: matches the `MarkerRecorded` event and compares the
-    /// recorded count with the current count, returning `Ok(false)` on a
-    /// match. Returns a [`HarvestError::NonDeterministic`] when they differ.
-    ///
-    /// The activity fan-out methods use it as-is, except `fan_out_with_impl`.
-    /// That method checks the store between the peek and the marker. Child
-    /// fan-out also uses [`peek_fan_out_count`](Self::peek_fan_out_count) +
-    /// [`record_fan_out_marker`](Self::record_fan_out_marker), so the marker
-    /// is recorded only *after* payload validation succeeds — see those
-    /// methods' docs for why.
-    fn check_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
-        let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
-        if fresh_dispatch {
-            self.record_fan_out_marker(seq, count);
-        }
-        Ok(fresh_dispatch)
-    }
-
     /// Check an activity fan-out against history, then record its marker.
     ///
     /// A fresh dispatch first checks every input against the depth cap
@@ -11633,16 +11607,16 @@ impl WorkflowContext {
     /// Check the fan-out count against event history **without** pushing the
     /// `RecordMarker` command on a fresh dispatch.
     ///
-    /// Splitting this out of [`check_fan_out_count`](Self::check_fan_out_count)
-    /// lets a caller run additional validation (e.g. the child fan-out
-    /// payload-cap pre-check) *between* determining "this is a fresh
-    /// dispatch" and actually committing the `fan_out:{n}` marker to the
-    /// command list — so a validation failure discovered in between never
-    /// leaves a persisted marker with no corresponding dispatch attempt. A
-    /// terminal execution whose history contains a `fan_out:{n}` marker but
-    /// no children would otherwise be replayed by matching the marker
-    /// (`fresh_dispatch == false`) and then diverging when it tries to
-    /// re-derive a `ChildWorkflowStarted` that was never recorded.
+    /// A caller can run more validation after this check. An example is the
+    /// payload-cap pre-check of a fan-out. The check runs between "this is a
+    /// fresh dispatch" and the commit of the `fan_out:{n}` marker.
+    ///
+    /// A validation failure in between then leaves no marker without a
+    /// dispatch attempt. Such a marker is a hazard. A terminal execution whose
+    /// history holds a `fan_out:{n}` marker but no children would replay by
+    /// matching the marker (`fresh_dispatch == false`). It would then diverge
+    /// when it tries to re-derive a `ChildWorkflowStarted` that was never
+    /// recorded.
     fn peek_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
         let marker_result = self.match_history(|m| m.match_fan_out_marker(seq, count));
         match marker_result {
@@ -11846,7 +11820,6 @@ impl WorkflowContext {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
-        let count = activities.len();
         let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
@@ -11914,7 +11887,6 @@ impl WorkflowContext {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
-        let count = activities.len();
         let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {

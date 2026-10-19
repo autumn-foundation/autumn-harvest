@@ -88,7 +88,7 @@ fn runtime() -> SqliteRuntime {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&probe_info());
     rt.register_activity(&echo_local_info());
-    rt.register_activity_raw("echo_remote", ActivitySpec::new(1, |v| Ok(v)));
+    rt.register_activity_raw("echo_remote", ActivitySpec::new(1, Ok));
     rt
 }
 
@@ -278,6 +278,20 @@ async fn catch_then_wait(ctx: &WorkflowContext, input: Value) -> Result<Value, S
             .await
             .is_err(),
         "child" => ctx.spawn_child_workflow_raw("probe", value).await.is_err(),
+        "activity_fan_out" => ctx
+            .execute_activity_fan_out_raw(vec![
+                ("echo_remote".to_string(), json!(1), "default".to_string()),
+                ("echo_remote".to_string(), value, "default".to_string()),
+            ])
+            .await
+            .is_err(),
+        "child_fan_out" => ctx
+            .spawn_child_workflow_fan_out_raw(vec![
+                ("probe".to_string(), json!(1)),
+                ("probe".to_string(), value),
+            ])
+            .await
+            .is_err(),
         _ => return Err(format!("unknown path {path}")),
     };
     ctx.timer("t", 1).await.map_err(|e| e.to_string())?;
@@ -286,7 +300,13 @@ async fn catch_then_wait(ctx: &WorkflowContext, input: Value) -> Result<Value, S
 
 #[tokio::test]
 async fn a_caught_refusal_replays_after_a_later_command() {
-    for path in ["activity", "local_activity", "child"] {
+    for path in [
+        "activity",
+        "local_activity",
+        "child",
+        "activity_fan_out",
+        "child_fan_out",
+    ] {
         let mut rt = runtime();
         rt.register_workflow(&catch_then_wait_info());
         let exec = rt.start_workflow("catch_then_wait", json!(path)).unwrap();
