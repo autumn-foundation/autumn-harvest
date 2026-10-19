@@ -166,6 +166,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          parent_close_cascade_unfinished_handlers_perf
 linux        autumn-harvest         integration                      -                          partition_archive_tests
 linux        autumn-harvest         integration                      -                          pause_tests
+linux        autumn-harvest         integration                      -                          payload_depth_tests
 linux        autumn-harvest         integration                      -                          payload_offload_db_tests
 linux        autumn-harvest         integration                      -                          payload_orphan_sweep_tests
 linux        autumn-harvest         integration                      -                          pg_timeouts_tests
