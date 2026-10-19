@@ -299,6 +299,11 @@ pub(super) async fn produce(
         if sink.is_closed() {
             return StreamEnd::ClientGone;
         }
+        // A long lineage of ended runs steps with no pause, so each step
+        // checks the budget too.
+        if Instant::now() >= drain_until {
+            return send_pending(sink).await;
+        }
         let positioning = walk.attempt < cursor.attempt;
         // The state comes first. A terminal cycle commits its chunks and its
         // successor with its state, so the reads after an end see both.
@@ -1094,6 +1099,8 @@ mod tests {
         scripts: std::collections::VecDeque<Script>,
         /// Outcome reads that answer pending before the final outcome.
         pending_outcomes: usize,
+        /// The time that each state read takes.
+        read_delay: Duration,
         wakes: usize,
         reads: usize,
     }
@@ -1108,6 +1115,7 @@ mod tests {
                 commit_after_chunks: None,
                 scripts: std::collections::VecDeque::new(),
                 pending_outcomes: 0,
+                read_delay: Duration::ZERO,
                 wakes: 0,
                 reads: 0,
             }
@@ -1143,16 +1151,13 @@ mod tests {
     }
 
     impl StreamReads for Fake {
-        fn state(
-            &mut self,
-            exec_id: ExecutionId,
-        ) -> impl Future<Output = HarvestResult<RunState>> + Send {
-            let state = self.fail().map(|()| match self.runs.get(&exec_id) {
+        async fn state(&mut self, exec_id: ExecutionId) -> HarvestResult<RunState> {
+            tokio::time::sleep(self.read_delay).await;
+            self.fail().map(|()| match self.runs.get(&exec_id) {
                 None => RunState::Gone,
                 Some(run) if run.ended => RunState::Ended,
                 Some(_) => RunState::Live,
-            });
-            std::future::ready(state)
+            })
         }
 
         fn chunks(
@@ -1742,6 +1747,33 @@ mod tests {
         );
         // The overrun is at most the send in flight and the pending frame.
         assert!(Instant::now() <= until + Duration::from_secs(100));
+    }
+
+    // SAC-49
+    #[tokio::test(start_paused = true)]
+    async fn the_budget_ends_a_long_walk_with_pending() {
+        // Fifty ended runs, each read in 1 s, with a zero budget.
+        let mut fake = Fake::new(completed(json!("done")));
+        let mut next = None;
+        for _ in 0..50 {
+            next = Some((fake.run(true, 1, next), Cause::ContinuedAsNew));
+        }
+        let (root, _) = next.expect("a root");
+        fake.read_delay = Duration::from_secs(1);
+        let started = Instant::now();
+        let mut sink = Recorder::default();
+        let end = produce(&mut fake, &mut sink, root, at(49, None), 1024, started).await;
+        assert_eq!(end, StreamEnd::Pending);
+        assert_eq!(sink.frames, vec![Frame::Pending]);
+        // The walk stops at the drain floor, far from the end of the lineage.
+        assert!(started.elapsed() <= DRAIN_FLOOR + Duration::from_secs(1));
+        // The same budget ends a main-loop walk over ended runs.
+        let mut sink = Recorder::default();
+        let started = Instant::now();
+        let end = produce(&mut fake, &mut sink, root, Cursor::default(), 1024, started).await;
+        assert_eq!(end, StreamEnd::Pending);
+        assert_eq!(sink.frames.last(), Some(&Frame::Pending));
+        assert!(started.elapsed() <= DRAIN_FLOOR + Duration::from_secs(1));
     }
 
     // SAC-46

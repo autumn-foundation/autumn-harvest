@@ -113,7 +113,7 @@ fails `clippy -D warnings` with Rust 1.99.
 
 ### 0.5 Review record
 
-Four review agents and the Codex bot read the first push. Each finding below
+Four review agents and the Codex bot read the first two pushes. Each finding below
 changed the code or the docs.
 
 | # | Finding | Resolution |
@@ -131,6 +131,7 @@ changed the code or the docs.
 | V11 | `cache-control: no-cache` lets a shared cache store the stream. | `no-cache, no-store, private`. |
 | V12 | The stream cap is not fair across principals. | Documented. The app must rate-limit stream requests. |
 | V13 | The stream step cap counts runs, and `send()` counts type changes. | Documented. |
+| V14 | A walk over ended runs, also to the cursor, did not check the budget. | Each step checks it (SAC-49). |
 
 ---
 
@@ -329,3 +330,4 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | SAC-46 | The walk to the cursor retries a failed read, stops at the step cap, waits for a live last run, ends at the budget, and stops for a gone client. | `the_walk_to_the_cursor_handles_each_branch` |
 | SAC-47 | The main loop reads a pending outcome again, stops for a gone client at an `attempt` or final frame, ends a gone row with `result-unavailable`, and pages at exact page sizes. | `the_main_loop_handles_each_branch` |
 | SAC-48 | Only a true end streams without `LISTEN`. An erased run and a final problem are plain answers. The span outcome of an open stream is `stream`. | `only_a_true_end_streams_without_listen` |
+| SAC-49 | The budget ends a long walk over ended runs with `pending`, while it walks to the cursor and after. | `the_budget_ends_a_long_walk_with_pending` |
