@@ -74,8 +74,9 @@ pub const DEFAULT_MAX_WAITERS: usize = 32;
 
 /// The default cap on the continue-as-new steps that one wait follows.
 ///
-/// A same-type chain of any length takes one step. Only a change of workflow
-/// type costs a step.
+/// Each step reads one history. A step follows a chain to its newest run of
+/// the same type, or across one change of workflow type. A chain needs at
+/// most one step more than its changes of type.
 pub const DEFAULT_MAX_CHAIN_STEPS: usize = 1024;
 
 /// The prefix of the start-idempotency claim key.
@@ -583,7 +584,8 @@ impl Prepared {
                         match typed_failure(&self.runtime, exec_id).await {
                             Ok(typed) => typed,
                             // The run failed, but its class is unknown. A
-                            // retry reads it again, so the answer is not final.
+                            // passing error answers pending, so a retry reads
+                            // it again.
                             Err(error) => {
                                 let (kind, status) =
                                     no_result_outcome(read_error(&error), self.layer_active);
@@ -1011,8 +1013,10 @@ impl RunReads for DurableRouteRuntime {
 
 /// Wait up to `budget` for the end of the run and its continue-as-new chain.
 ///
-/// The walk follows at most `max_steps` runs. A waiting read takes a permit
-/// from `waiters`. A run that is already terminal needs no permit.
+/// The walk takes at most `max_steps` steps. Each step reads one successor.
+/// Past the cap, the answer is pending when the walk met a live run, and the
+/// result is unavailable when every run had ended. A waiting read takes a
+/// permit from `waiters`. A run that is already terminal needs no permit.
 async fn wait_for_result(
     reads: &impl RunReads,
     waiters: &Arc<Semaphore>,
@@ -1025,7 +1029,9 @@ async fn wait_for_result(
     // The permit lives until the wait ends. One request holds at most one.
     let mut permit: Option<OwnedSemaphorePermit> = None;
     let mut visited = HashSet::new();
-    for _ in 0..max_steps {
+    let mut steps = 0;
+    let mut saw_live = false;
+    loop {
         if !visited.insert(current) {
             tracing::error!(exec_id = %current, "durable route found a cycle in a continue-as-new chain");
             return Waited::NoResult(ReadFailure::Unreadable);
@@ -1039,6 +1045,7 @@ async fn wait_for_result(
         let snapshot = if snapshot.state.is_terminal() {
             snapshot
         } else {
+            saw_live = true;
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Waited::NoResult(ReadFailure::Pending);
@@ -1061,6 +1068,24 @@ async fn wait_for_result(
                 result: snapshot,
             };
         }
+        if steps == max_steps {
+            // A walk that met a live run can need fewer steps once the chain
+            // ends, so a retry can succeed.
+            if saw_live {
+                tracing::warn!(
+                    max_steps,
+                    "durable route reached its chain step cap on a live chain; answering pending"
+                );
+                return Waited::NoResult(ReadFailure::Pending);
+            }
+            // A walk over ended runs only repeats itself, so the answer is final.
+            tracing::error!(
+                max_steps,
+                "durable route reached its chain step cap; the result is unavailable"
+            );
+            return Waited::NoResult(ReadFailure::Unreadable);
+        }
+        steps += 1;
         match reads.successor(current).await {
             Ok(Some(next)) => current = next,
             Ok(None) => {
@@ -1072,11 +1097,6 @@ async fn wait_for_result(
             Err(error) => return Waited::NoResult(read_error(&error)),
         }
     }
-    tracing::warn!(
-        max_steps,
-        "durable route reached its chain step cap; answering pending"
-    );
-    Waited::NoResult(ReadFailure::Pending)
 }
 
 /// Classify a read error and log it.
@@ -1105,18 +1125,33 @@ async fn chain_successor(
 ) -> HarvestResult<Option<ExecutionId>> {
     let sharded = runtime.pool.sharded_pool();
     let shard = sharded.routed_shard_for_execution(exec_id);
-    let mut conn = autumn_harvest::pool::acquire_within_pool_bound(sharded.pool_for(shard)).await?;
+    let mut held = autumn_harvest::pool::acquire_within_pool_bound(sharded.pool_for(shard)).await?;
     // A workflow-level retry can hold the continue-as-new event, so read the
     // live attempt first.
-    let (live, _) =
-        autumn_harvest::execution::resolve_live_attempt(&mut conn, sharded, shard, exec_id).await?;
+    let (live, live_shard) =
+        autumn_harvest::execution::resolve_live_attempt(&mut held, sharded, shard, exec_id).await?;
+    // A rebalance can move the live attempt to another shard. Every later
+    // read runs on the shard that holds it.
+    let mut resident =
+        autumn_harvest::shard_rebalance::bind_to_shard(&mut held, sharded, shard, live_shard)
+            .await?;
+    let conn = resident.as_mut();
     let live_id = ExecutionId::from_uuid(live.id);
-    let newest = autumn_harvest::execution::resolve_execution_id_by_workflow_id(
-        &mut conn,
+    let mut newest = autumn_harvest::execution::resolve_execution_id_by_workflow_id(
+        conn,
         &live.workflow_name,
         &live.workflow_id,
     )
     .await?;
+    // An operator rerun takes the business id but starts its own chain. Only
+    // a run of this chain may stand in for the live run.
+    let live_chain = live.first_exec_id.unwrap_or(live.id);
+    if let Some(run) = &newest
+        && run.exec_id != live_id
+        && chain_head(conn, run.exec_id).await? != Some(live_chain)
+    {
+        newest = None;
+    }
     let sealed = match newest {
         Some(run) if run.exec_id != live_id && run.state != "CONTINUED_AS_NEW" => {
             return Ok(Some(run.exec_id));
@@ -1124,28 +1159,51 @@ async fn chain_successor(
         Some(run) => run.exec_id,
         None => live_id,
     };
-    let history = autumn_harvest::store::load_history_undecoded(&mut conn, sealed).await?;
+    let history = autumn_harvest::store::load_history_undecoded(conn, sealed).await?;
     Ok(history.events.into_iter().find_map(|event| match event {
         WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(new_exec_id),
         _ => None,
     }))
 }
 
+/// The first run of the continue-as-new chain that holds `exec_id`.
+async fn chain_head(
+    conn: &mut diesel_async::AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Option<uuid::Uuid>> {
+    use autumn_harvest::schema::harvest_workflow_executions as executions;
+    use diesel::{OptionalExtension as _, QueryDsl as _};
+    use diesel_async::RunQueryDsl as _;
+    executions::table
+        .find(exec_id.as_uuid())
+        .select((executions::id, executions::first_exec_id))
+        .first::<(uuid::Uuid, Option<uuid::Uuid>)>(conn)
+        .await
+        .optional()
+        .map(|row| row.map(|(id, first)| first.unwrap_or(id)))
+        .map_err(|error| HarvestError::Database(error.to_string()))
+}
+
 /// The typed failure of a failed run, from its last `WorkflowFailed` event.
 ///
-/// A read error is an error, not an untyped failure. The caller then answers
-/// pending, so a short outage never turns a mapped failure into a final 500.
+/// A read error is an error, not an untyped failure. The caller answers it as
+/// any read error: pending, or `result-unavailable` for a codec error. So a
+/// short outage never turns a mapped failure into a final 500.
 async fn typed_failure(
     runtime: &DurableRouteRuntime,
     exec_id: ExecutionId,
 ) -> HarvestResult<Option<TypedFailure>> {
     let sharded = runtime.pool.sharded_pool();
     let shard = sharded.routed_shard_for_execution(exec_id);
-    let mut conn = autumn_harvest::pool::acquire_within_pool_bound(sharded.pool_for(shard)).await?;
-    let (live, _) =
-        autumn_harvest::execution::resolve_live_attempt(&mut conn, sharded, shard, exec_id).await?;
+    let mut held = autumn_harvest::pool::acquire_within_pool_bound(sharded.pool_for(shard)).await?;
+    let (live, live_shard) =
+        autumn_harvest::execution::resolve_live_attempt(&mut held, sharded, shard, exec_id).await?;
+    // The live attempt can sit on another shard after a rebalance.
+    let mut resident =
+        autumn_harvest::shard_rebalance::bind_to_shard(&mut held, sharded, shard, live_shard)
+            .await?;
     let history = autumn_harvest::store::load_history_with_codecs(
-        &mut conn,
+        resident.as_mut(),
         ExecutionId::from_uuid(live.id),
         runtime.client.payload_codecs(),
     )
@@ -2531,7 +2589,10 @@ mod tests {
     struct FakeRun {
         state: WorkflowResultState,
         next: Option<ExecutionId>,
+        /// The state that the wait reports, when it differs from `state`.
+        wait_state: Option<WorkflowResultState>,
         snapshot_error: Option<fn() -> HarvestError>,
+        wait_error: Option<fn() -> HarvestError>,
         successor_error: Option<fn() -> HarvestError>,
     }
 
@@ -2551,7 +2612,9 @@ mod tests {
                 FakeRun {
                     state,
                     next,
+                    wait_state: None,
                     snapshot_error: None,
+                    wait_error: None,
                     successor_error: None,
                 },
             );
@@ -2599,8 +2662,12 @@ mod tests {
         ) -> impl Future<Output = HarvestResult<Option<WorkflowResult>>> + Send {
             self.waits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let state = self.runs[&exec_id].state;
-            std::future::ready(Ok(state.is_terminal().then(|| fake_result(state))))
+            let run = &self.runs[&exec_id];
+            let state = run.wait_state.unwrap_or(run.state);
+            std::future::ready(run.wait_error.map_or_else(
+                || Ok(state.is_terminal().then(|| fake_result(state))),
+                |error| Err(error()),
+            ))
         }
 
         fn successor(
@@ -2659,11 +2726,29 @@ mod tests {
     #[tokio::test]
     async fn chain_walk_answers_pending_past_the_step_cap() {
         assert_eq!(DEFAULT_MAX_CHAIN_STEPS, 1024);
+        // The chain `a -> b -> c` takes two steps. The first read is free.
         let (chain, a, c) = three_runs();
-        let capped = wait_for_result(&chain, &waiters(1), 2, a, ONE_SECOND).await;
-        assert!(matches!(capped, Waited::NoResult(ReadFailure::Pending)));
-        let enough = wait_for_result(&chain, &waiters(1), 3, a, ONE_SECOND).await;
+        // Every run had ended, so a retry would repeat the walk: final.
+        let capped = wait_for_result(&chain, &waiters(1), 1, a, ONE_SECOND).await;
+        assert!(matches!(capped, Waited::NoResult(ReadFailure::Unreadable)));
+        assert_eq!(chain.successors(), 1);
+        let enough = wait_for_result(&chain, &waiters(1), 2, a, ONE_SECOND).await;
         assert!(matches!(enough, Waited::Terminal { exec_id, .. } if exec_id == c));
+        // A walk that met a live run answers pending at the cap. Once the
+        // chain ends, a retry can need fewer steps.
+        let mut live = FakeChain::default();
+        let end = live.run(WorkflowResultState::Completed, None);
+        let middle = live.run(WorkflowResultState::ContinuedAsNew, Some(end));
+        let start = live.run(WorkflowResultState::Running, Some(middle));
+        live.run_mut(start).wait_state = Some(WorkflowResultState::ContinuedAsNew);
+        let waited = wait_for_result(&live, &waiters(1), 1, start, ONE_SECOND).await;
+        assert!(matches!(waited, Waited::NoResult(ReadFailure::Pending)));
+        // A run that did not continue as new needs no step.
+        let mut single = FakeChain::default();
+        let done = single.run(WorkflowResultState::Completed, None);
+        let waited = wait_for_result(&single, &waiters(1), 1, done, ONE_SECOND).await;
+        assert!(matches!(waited, Waited::Terminal { .. }));
+        assert_eq!(single.successors(), 0);
     }
 
     // AC-60
@@ -2701,6 +2786,21 @@ mod tests {
             let waited =
                 wait_for_result(&chain, &waiters(1), DEFAULT_MAX_CHAIN_STEPS, a, ONE_SECOND).await;
             assert!(matches!(waited, Waited::NoResult(found) if found == expected));
+
+            // A run that ends during the wait can fail to decode.
+            let mut chain = FakeChain::default();
+            let live = chain.run(WorkflowResultState::Running, None);
+            chain.run_mut(live).wait_error = Some(error);
+            let waited = wait_for_result(
+                &chain,
+                &waiters(1),
+                DEFAULT_MAX_CHAIN_STEPS,
+                live,
+                ONE_SECOND,
+            )
+            .await;
+            assert!(matches!(waited, Waited::NoResult(found) if found == expected));
+            assert_eq!(chain.waits(), 1, "the error comes from the wait");
         }
     }
 
@@ -2765,6 +2865,11 @@ mod tests {
 
     /// A subscriber that writes every event, and each span when it closes.
     fn capture() -> (Captured, tracing::Dispatch) {
+        // With one live dispatcher, tracing-core lets another test thread
+        // cache a callsite as never. A second dispatcher for the whole
+        // process turns that path off.
+        static KEEP: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        KEEP.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()));
         let captured = Captured::default();
         let writer = captured.clone();
         let subscriber = tracing_subscriber::fmt()

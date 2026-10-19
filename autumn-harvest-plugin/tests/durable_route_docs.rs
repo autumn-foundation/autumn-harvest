@@ -173,12 +173,30 @@ fn design_note_keeps_its_planning_sections() {
         assert!(design.contains(heading), "the design note lost {heading:?}");
     }
     // Each reverse-brainstorm row keeps its mitigation.
-    let harms = design
+    let harms: Vec<&str> = design
         .lines()
-        .filter(|line| line.starts_with("| R"))
-        .filter(|line| line.split('|').nth(3).is_some_and(|m| !m.trim().is_empty()))
+        .filter(|line| {
+            line.strip_prefix("| R")
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        })
+        .collect();
+    assert!(harms.len() >= 25, "only {} harms", harms.len());
+    for row in &harms {
+        assert!(
+            row.split('|').nth(3).is_some_and(|m| !m.trim().is_empty()),
+            "a harm lost its mitigation: {row}"
+        );
+    }
+    // The known limits keep their bullets.
+    let start = design.find("## 2. Known limits").expect("known limits");
+    let end = design
+        .find("## 3. Tests and acceptance criteria")
+        .expect("AC table");
+    let limits = design[start..end]
+        .lines()
+        .filter(|line| line.starts_with("- "))
         .count();
-    assert!(harms >= 20, "only {harms} harms with a mitigation");
+    assert!(limits >= 20, "only {limits} known limits");
 }
 
 // AC-48

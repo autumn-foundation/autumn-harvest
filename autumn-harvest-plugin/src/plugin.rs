@@ -502,9 +502,12 @@ impl HarvestPlugin {
     /// The default is
     /// [`DEFAULT_MAX_CHAIN_STEPS`](crate::durable_route::DEFAULT_MAX_CHAIN_STEPS).
     ///
-    /// A same-type chain of any length takes one step. Each change of
-    /// workflow type takes one more step. Past the cap, the request answers
-    /// pending. Each step costs one history read. A value below 1 counts as 1.
+    /// Each step reads one history. A step follows a chain to its newest run
+    /// of the same type, or across one change of workflow type. A chain needs
+    /// at most one step more than its changes of type. Past the cap, a chain
+    /// that still runs answers pending. A chain whose runs all ended answers
+    /// `500` `result-unavailable`, because every retry walks the same runs. A
+    /// value below 1 counts as 1, so a finished chain of one type resolves.
     #[must_use]
     pub const fn durable_route_max_chain_steps(mut self, steps: usize) -> Self {
         self.durable_route_max_chain_steps = if steps == 0 { 1 } else { steps };

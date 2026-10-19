@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use autumn_harvest::event_batch::BatchPolicy;
 use autumn_harvest::prelude::*;
 use autumn_harvest::throttle::ThrottlePolicy;
-use autumn_harvest::{ExecutionId, WorkflowHandleClient, WorkflowInfo};
+use autumn_harvest::{ExecutionId, HarvestError, WorkflowHandleClient, WorkflowInfo};
 use autumn_harvest_plugin::HarvestPlugin;
 use autumn_harvest_plugin::durable_route::{DurableOutcome, DurableRoute, REPLAYED_HEADER};
 use autumn_web::prelude::*;
@@ -91,9 +91,13 @@ async fn dr_untyped_failure(_ctx: &WorkflowContext, _input: Value) -> Result<Val
     Err("secret workflow message".to_owned())
 }
 
-/// Parks until its one-second execution timeout ends it.
+/// Parks until its one-second execution timeout ends it. With `body.fast`,
+/// it completes at once instead.
 #[workflow(execution_timeout = "1s")]
-async fn dr_slow(ctx: &WorkflowContext, _input: Value) -> Result<Value, String> {
+async fn dr_slow(ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
+    if input["body"]["fast"] == json!(true) {
+        return Ok(json!({"fast": true}));
+    }
     let _ = ctx.wait_for_signal("never").await;
     Ok(Value::Null)
 }
@@ -132,6 +136,24 @@ async fn dr_retry_then_switch(ctx: &WorkflowContext, input: Value) -> Result<Val
         return Err("first attempt fails".to_owned());
     }
     ctx.continue_as_new_as_type("dr_chain_end", json!({"from": "retry"}))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Null)
+}
+
+/// Continues as new into `dr_switch_mid`: the first change of type.
+#[workflow]
+async fn dr_switch_start(ctx: &WorkflowContext, _input: Value) -> Result<Value, String> {
+    ctx.continue_as_new_as_type("dr_switch_mid", json!({}))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Null)
+}
+
+/// Continues as new into `dr_chain_end`: the second change of type.
+#[workflow]
+async fn dr_switch_mid(ctx: &WorkflowContext, _input: Value) -> Result<Value, String> {
+    ctx.continue_as_new_as_type("dr_chain_end", json!({"from": "mid"}))
         .await
         .map_err(|e| e.to_string())?;
     Ok(Value::Null)
@@ -327,6 +349,8 @@ fn base_plugin() -> HarvestPlugin {
                 autumn_harvest::policy::RetryPolicy::exponential(2, Duration::from_millis(100)),
             ),
             __autumn_workflow_info_dr_chain_end(),
+            __autumn_workflow_info_dr_switch_start(),
+            __autumn_workflow_info_dr_switch_mid(),
             __autumn_workflow_info_dr_debounced(),
             dr_batched_info(),
             dr_throttled_info(),
@@ -1449,28 +1473,45 @@ async fn start_connection_is_released_before_the_wait() {
 
 /// Rerun a terminal run, as an operator does. Returns the state it sealed.
 async fn rerun(db: &TestPg, exec_id: ExecutionId) -> String {
-    let mut conn = db.pool.get().await.expect("conn");
-    autumn_harvest::execution::rerun_workflow_execution(
-        &mut conn,
-        exec_id,
-        autumn_harvest::execution::RerunRequest {
-            input_override: None,
-            workflow_id_override: None,
-            started_by: None,
-            concurrency_key: None,
-            concurrency_limit: None,
-            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
-            max_workflow_input_bytes: 0,
-            max_execution_timeout_ceiling: None,
-            max_workflow_chain_timeout_ceiling: None,
-            max_workflow_attempts_ceiling: None,
-            trace_context: None,
-        },
-        None,
-    )
-    .await
-    .expect("rerun")
-    .source_prior_state
+    rerun_with(db, exec_id, None).await
+}
+
+/// [`rerun`] with another input, so the rerun can end another way.
+///
+/// Each app installs a process-wide admission cache that loads after start.
+/// Until it loads, a rerun fails closed, so the helper tries again.
+async fn rerun_with(db: &TestPg, exec_id: ExecutionId, input: Option<Value>) -> String {
+    for _ in 0..50 {
+        let mut conn = db.pool.get().await.expect("conn");
+        let outcome = autumn_harvest::execution::rerun_workflow_execution(
+            &mut conn,
+            exec_id,
+            autumn_harvest::execution::RerunRequest {
+                input_override: input.clone(),
+                workflow_id_override: None,
+                started_by: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+                max_workflow_input_bytes: 0,
+                max_execution_timeout_ceiling: None,
+                max_workflow_chain_timeout_ceiling: None,
+                max_workflow_attempts_ceiling: None,
+                trace_context: None,
+            },
+            None,
+        )
+        .await;
+        match outcome {
+            Ok(outcome) => return outcome.source_prior_state,
+            Err(HarvestError::AdmissionBlocked { gate_id, .. }) if gate_id.is_nil() => {
+                drop(conn);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("rerun: {error:?}"),
+        }
+    }
+    panic!("the admission cache never loaded");
 }
 
 // AC-56
@@ -1677,8 +1718,8 @@ async fn undecodable_typed_failure_returns_result_unavailable() {
 #[tokio::test(flavor = "multi_thread")]
 async fn same_type_chain_takes_one_step() {
     let db = setup_db().await;
-    let client = app_with(&db, base_plugin().durable_route_max_chain_steps(2)).build();
-    // A walk that read one run at a time would need eleven steps here.
+    let client = app_with(&db, base_plugin().durable_route_max_chain_steps(1)).build();
+    // A walk that read one run at a time would need ten steps here.
     let extra = [
         ("x-user", "ada"),
         ("x-workflow", "dr_chain"),
@@ -1713,26 +1754,48 @@ async fn until_state(db: &TestPg, workflow: &str, state: &str) {
     panic!("no {workflow} run reached {state}");
 }
 
-// AC-72
-#[tokio::test(flavor = "multi_thread")]
-async fn chain_step_cap_answers_pending() {
+/// Runs the two-change chain to its end, then asks again under `steps`.
+async fn two_changes_of_type(steps: usize) -> (TestResponse, Duration) {
     let db = setup_db().await;
-    let client = app_with(&db, base_plugin().durable_route_max_chain_steps(1)).build();
+    let client = app_with(&db, base_plugin().durable_route_max_chain_steps(steps)).build();
     let extra = [
         ("x-user", "ada"),
-        ("x-workflow", "dr_retry_then_switch"),
+        ("x-workflow", "dr_switch_start"),
         ("x-wait-ms", "0"),
     ];
     let body = json!({"tag": "ac72"});
     let first = post(&client, Some("key-ac72"), &extra, &body).await;
-    assert_eq!(first.status.as_u16(), 202, "{}", first.text());
+    assert_ne!(first.status.as_u16(), 500, "{}", first.text());
     until_state(&db, "dr_chain_end", "COMPLETED").await;
-    // The chain is done, but one step cannot cross the change of type.
     let started = Instant::now();
-    let capped = post(&client, Some("key-ac72"), &extra, &body).await;
-    assert_eq!(capped.status.as_u16(), 202, "{}", capped.text());
-    assert_eq!(capped.header("retry-after"), Some("1"));
-    assert!(started.elapsed() < Duration::from_secs(2));
+    let answer = post(&client, Some("key-ac72"), &extra, &body).await;
+    (answer, started.elapsed())
+}
+
+// AC-72
+#[tokio::test(flavor = "multi_thread")]
+async fn chain_step_cap_answers_result_unavailable() {
+    // One step crosses only one change of type. A retry walks the same runs,
+    // so the answer is final.
+    let (capped, elapsed) = two_changes_of_type(1).await;
+    assert_eq!(capped.status.as_u16(), 500, "{}", capped.text());
+    assert!(
+        capped.header("retry-after").is_none(),
+        "the answer is final"
+    );
+    assert_eq!(
+        problem_type(&capped.json::<Value>()),
+        slug_type("result-unavailable")
+    );
+    assert!(elapsed < Duration::from_secs(2), "answered in {elapsed:?}");
+}
+
+// AC-72
+#[tokio::test(flavor = "multi_thread")]
+async fn chain_step_cap_admits_one_step_for_each_change_of_type() {
+    let (done, _) = two_changes_of_type(2).await;
+    assert_eq!(done.status.as_u16(), 200, "{}", done.text());
+    assert_eq!(done.json::<Value>(), json!({"final": "mid"}));
 }
 
 // AC-73
@@ -1776,13 +1839,8 @@ async fn raised_input_cap_admits_a_larger_input() {
     let client = build_app(&db).await;
     // Over the 2 MiB deployment cap, under the 4 MiB cap of `dr_big`.
     let big = json!({"tag": "ac74", "pad": "x".repeat(2_200_000)});
-    let response = post(
-        &client,
-        Some("key-ac74"),
-        &[("x-user", "ada"), ("x-workflow", "dr_big")],
-        &big,
-    )
-    .await;
+    let extra = [("x-user", "ada"), ("x-workflow", "dr_big")];
+    let response = until_done(&client, "key-ac74", &extra, &big).await;
     assert_eq!(response.status.as_u16(), 200, "{}", response.status);
     assert_eq!(response.json::<Value>(), json!({"pad": 2_200_000}));
 }
@@ -1831,7 +1889,14 @@ async fn rerun_sealed_failures_report_their_original_outcome() {
     let body = json!({"tag": "ac76-a"});
     let failed = until_done(&client, "key-ac76-a", &mapped, &body).await;
     assert_eq!(failed.status.as_u16(), 422, "{}", failed.text());
-    assert_eq!(rerun(&db, exec_id_of(&failed)).await, "FAILED");
+    // The rerun fails with an unmapped class, so its outcome differs.
+    let other = json!({"user": "ada", "body": {"error_type": "Other"}});
+    assert_eq!(
+        rerun_with(&db, exec_id_of(&failed), Some(other)).await,
+        "FAILED"
+    );
+    // The rerun seals the original run, so the one failed run is the rerun.
+    until_state(&db, "dr_typed_failure", "FAILED").await;
     let again = post(&client, Some("key-ac76-a"), &mapped, &body).await;
     assert_eq!(again.status.as_u16(), 422, "{}", again.text());
     assert_eq!(again.json::<Value>()["error_type"], "OutOfStock");
@@ -1859,7 +1924,13 @@ async fn rerun_sealed_failures_report_their_original_outcome() {
     let body = json!({"tag": "ac76-c"});
     let timed_out = until_done(&client, "key-ac76-c", &slow, &body).await;
     assert_eq!(timed_out.status.as_u16(), 500, "{}", timed_out.text());
-    assert_eq!(rerun(&db, exec_id_of(&timed_out)).await, "TIMED_OUT");
+    // The rerun completes, so its outcome differs.
+    let fast = json!({"user": "ada", "body": {"fast": true}});
+    assert_eq!(
+        rerun_with(&db, exec_id_of(&timed_out), Some(fast)).await,
+        "TIMED_OUT"
+    );
+    until_state(&db, "dr_slow", "COMPLETED").await;
     let again = post(&client, Some("key-ac76-c"), &slow, &body).await;
     assert_eq!(problem_type(&again.json::<Value>()), slug_type("timed-out"));
 }
@@ -1894,6 +1965,11 @@ impl Captured {
 async fn durable_route_logs_hold_no_key_scope_or_input() {
     use tracing::instrument::WithSubscriber as _;
     use tracing_subscriber::layer::SubscriberExt as _;
+    // With one live dispatcher, tracing-core lets another test thread cache
+    // a callsite as never. A second dispatcher for the whole process turns
+    // that path off.
+    static KEEP: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    KEEP.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::new()));
     let db = setup_db().await;
     let client = build_app(&db).await;
     let captured = Captured::default();
@@ -1955,4 +2031,52 @@ async fn durable_route_logs_hold_no_key_scope_or_input() {
     for marker in ["key-marker-64", "scope-marker-64", "input-marker-64"] {
         assert!(!text.contains(marker), "{marker} in {text}");
     }
+}
+
+#[derive(QueryableByName)]
+struct Id {
+    #[diesel(sql_type = Text)]
+    id: String,
+}
+
+/// The one completed run of `workflow`.
+async fn completed_run(db: &TestPg, workflow: &str) -> ExecutionId {
+    let mut conn = db.pool.get().await.expect("conn");
+    diesel::sql_query(
+        "SELECT id::text AS id FROM harvest_workflow_executions \
+         WHERE workflow_name = $1 AND state = 'COMPLETED'",
+    )
+    .bind::<Text, _>(workflow)
+    .get_result::<Id>(&mut conn)
+    .await
+    .expect("one completed run")
+    .id
+    .parse()
+    .expect("execution id")
+}
+
+// AC-79
+#[tokio::test(flavor = "multi_thread")]
+async fn rerun_of_a_chain_end_keeps_the_original_outcome() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_chain"),
+        ("x-wait-ms", "5000"),
+    ];
+    let body = json!({"tag": "ac79", "hops": 1});
+    let first = until_done(&client, "key-ac79", &extra, &body).await;
+    assert_eq!(first.status.as_u16(), 200, "{}", first.text());
+    assert_eq!(first.json::<Value>(), json!({"final": 1}));
+    // An operator reruns the last run of the chain, and the rerun ends
+    // another way. The rerun keeps the business id.
+    let last = completed_run(&db, "dr_chain").await;
+    let other = json!({"hop": 5, "target": 5});
+    assert_eq!(rerun_with(&db, last, Some(other)).await, "COMPLETED");
+    until_state(&db, "dr_chain", "COMPLETED").await;
+    let again = post(&client, Some("key-ac79"), &extra, &body).await;
+    assert_eq!(again.status.as_u16(), 200, "{}", again.text());
+    assert_eq!(again.json::<Value>(), json!({"final": 1}));
+    assert_eq!(again.header(REPLAYED_HEADER), Some("true"));
 }
