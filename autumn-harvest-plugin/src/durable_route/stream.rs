@@ -310,14 +310,9 @@ pub(super) async fn produce(
         let state = logged(reads.state(walk.current).await);
         let drained = match state {
             None => false,
-            Some(RunState::Gone) => return finish(sink, unavailable_frame()).await,
+            Some(RunState::Gone) => return finish(sink, unavailable_frame(), drain_until).await,
             Some(_) if positioning => true,
             Some(_) => match drain(reads, sink, &walk, &mut offset, drain_until).await {
-                // The last send can end after the deadline. The `attempt` or
-                // final frame must not add a second slow send.
-                Drain::Done if Instant::now() >= drain_until => {
-                    return send_pending(sink).await;
-                }
                 Drain::Done => true,
                 Drain::Failed => false,
                 Drain::Expired => return send_pending(sink).await,
@@ -328,7 +323,7 @@ pub(super) async fn produce(
             match logged(reads.next_run(walk.current).await) {
                 Some(Some((next, cause))) => {
                     if !walk.step(next) {
-                        return finish(sink, unavailable_frame()).await;
+                        return finish(sink, unavailable_frame(), drain_until).await;
                     }
                     if walk.attempt == cursor.attempt {
                         offset = cursor.offset;
@@ -338,8 +333,10 @@ pub(super) async fn produce(
                             attempt: walk.attempt,
                             cause,
                         };
-                        if !sink.send(frame).await {
-                            return StreamEnd::ClientGone;
+                        match send_frame(sink, frame, drain_until).await {
+                            Sent::Delivered => {}
+                            Sent::Expired => return send_pending(sink).await,
+                            Sent::ClientGone => return StreamEnd::ClientGone,
                         }
                     }
                     continue;
@@ -348,7 +345,7 @@ pub(super) async fn produce(
                 // next read, so read again.
                 Some(None) => {
                     if let Some(frame) = final_frame(&reads.outcome().await) {
-                        return finish(sink, frame).await;
+                        return finish(sink, frame, drain_until).await;
                     }
                 }
                 None => {}
@@ -428,18 +425,16 @@ async fn drain(
         };
         let full = i64::try_from(page.len()).unwrap_or(i64::MAX) >= PAGE;
         for (chunk_offset, chunk) in page {
-            if Instant::now() >= until {
-                return Drain::Expired;
-            }
             let frame = Frame::Progress {
                 attempt: walk.attempt,
                 offset: chunk_offset,
                 chunk,
             };
-            if !sink.send(frame).await {
-                return Drain::ClientGone;
+            match send_frame(sink, frame, until).await {
+                Sent::Delivered => *offset = Some(chunk_offset),
+                Sent::Expired => return Drain::Expired,
+                Sent::ClientGone => return Drain::ClientGone,
             }
-            *offset = Some(chunk_offset);
         }
         if !full {
             return Drain::Done;
@@ -472,12 +467,34 @@ async fn send_pending(sink: &mut impl FrameSink) -> StreamEnd {
     }
 }
 
-/// Send the final frame.
-async fn finish(sink: &mut impl FrameSink, frame: Frame) -> StreamEnd {
-    if sink.send(frame).await {
-        StreamEnd::Final
+/// How one budgeted send ended.
+enum Sent {
+    Delivered,
+    /// The deadline passed before the send. Nothing went out.
+    Expired,
+    ClientGone,
+}
+
+/// Send `frame` only while `until` is in the future.
+///
+/// Every frame but `pending` goes through here. A slow read or a slow send
+/// before it therefore never leads to another slow send past the budget.
+async fn send_frame(sink: &mut impl FrameSink, frame: Frame, until: Instant) -> Sent {
+    if Instant::now() >= until {
+        Sent::Expired
+    } else if sink.send(frame).await {
+        Sent::Delivered
     } else {
-        StreamEnd::ClientGone
+        Sent::ClientGone
+    }
+}
+
+/// Send the final frame, or `pending` when the deadline has passed.
+async fn finish(sink: &mut impl FrameSink, frame: Frame, until: Instant) -> StreamEnd {
+    match send_frame(sink, frame, until).await {
+        Sent::Delivered => StreamEnd::Final,
+        Sent::Expired => send_pending(sink).await,
+        Sent::ClientGone => StreamEnd::ClientGone,
     }
 }
 
@@ -1174,11 +1191,12 @@ mod tests {
             std::future::ready(self.page(exec_id, after, limit))
         }
 
-        fn next_run(
+        async fn next_run(
             &mut self,
             exec_id: ExecutionId,
-        ) -> impl Future<Output = HarvestResult<Option<(ExecutionId, Cause)>>> + Send {
-            std::future::ready(self.fail().map(|()| self.runs[&exec_id].next))
+        ) -> HarvestResult<Option<(ExecutionId, Cause)>> {
+            tokio::time::sleep(self.read_delay).await;
+            self.fail().map(|()| self.runs[&exec_id].next)
         }
 
         fn outcome(&mut self) -> impl Future<Output = DurableOutcome> + Send {
@@ -1771,6 +1789,16 @@ mod tests {
                 Frame::Pending
             ]
         );
+        // A slow read after the drain crosses the deadline. The final frame
+        // then becomes `pending`.
+        let mut fake = Fake::new(completed(json!("done")));
+        let root = fake.run(true, 1, None);
+        fake.read_delay = Duration::from_secs(4);
+        let mut sink = Recorder::default();
+        let until = Instant::now() + Duration::from_secs(6);
+        let end = produce(&mut fake, &mut sink, root, Cursor::default(), 1024, until).await;
+        assert_eq!(end, StreamEnd::Pending);
+        assert_eq!(sink.frames, vec![progress(0, 0), Frame::Pending]);
     }
 
     // SAC-49

@@ -113,7 +113,7 @@ fails `clippy -D warnings` with Rust 1.99.
 
 ### 0.5 Review record
 
-Four review agents and the Codex bot read the first three pushes. Each finding below
+Four review agents and the Codex bot read the first four pushes. Each finding below
 changed the code or the docs.
 
 | # | Finding | Resolution |
@@ -132,7 +132,7 @@ changed the code or the docs.
 | V12 | The stream cap is not fair across principals. | Documented. The app must rate-limit stream requests. |
 | V13 | The stream step cap counts runs, and `send()` counts type changes. | Documented. |
 | V14 | A walk over ended runs, also to the cursor, did not check the budget. | Each step checks it (SAC-49). |
-| V15 | A drain whose last send ended after the deadline still sent an `attempt` or final frame. | The stream checks the budget after the drain (SAC-45). |
+| V15 | A slow send or a slow read before an `attempt` or final frame could cross the deadline, and that frame then sent late. | Each frame but `pending` goes through one send that checks the deadline first (SAC-45). |
 | V16 | A rebalanced run lives on another shard, so reads on the origin shard see a stub. | Not reachable: the plugin refuses a pool of more than one shard, so no rebalance can happen. |
 
 ---
@@ -328,7 +328,7 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | SAC-42 | The diff adds no migration, no `harvest_events` writer and no version bump. | Review |
 | SAC-43 | Each frame renders its documented event name, `id:`, `data:` and `retry:`. | `frames_render_the_documented_wire_form` |
 | SAC-44 | No stream log holds the key, the scope, the input, the cursor, a chunk, the output or codec error text. The span records the outcome. | `stream_logs_hold_no_key_scope_input_or_chunk` |
-| SAC-45 | The budget ends a slow drain with `pending`, also when the last send ends after the deadline. The overrun is at most the send in flight and the `pending` frame. | `the_budget_ends_a_slow_drain_with_pending` |
+| SAC-45 | The budget ends a slow drain with `pending`, also when the last send or a later read ends after the deadline. Each frame but `pending` checks the deadline first. | `the_budget_ends_a_slow_drain_with_pending` |
 | SAC-46 | The walk to the cursor retries a failed read, stops at the step cap, waits for a live last run, ends at the budget, and stops for a gone client. | `the_walk_to_the_cursor_handles_each_branch` |
 | SAC-47 | The main loop reads a pending outcome again, stops for a gone client at an `attempt` or final frame, ends a gone row with `result-unavailable`, and pages at exact page sizes. | `the_main_loop_handles_each_branch` |
 | SAC-48 | Only a true end streams without `LISTEN`. An erased run and a final problem are plain answers. The span outcome of an open stream is `stream`. | `only_a_true_end_streams_without_listen` |
