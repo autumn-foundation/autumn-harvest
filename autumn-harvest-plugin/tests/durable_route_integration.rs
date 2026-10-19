@@ -96,12 +96,17 @@ async fn dr_slow(ctx: &WorkflowContext, _input: Value) -> Result<Value, String> 
     Ok(Value::Null)
 }
 
-/// Continues as new twice, then completes.
+/// Continues as new `body.hops` times, then completes.
 #[workflow]
 async fn dr_chain(ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
+    let target = input
+        .get("target")
+        .and_then(Value::as_u64)
+        .or_else(|| input["body"]["hops"].as_u64())
+        .unwrap_or(2);
     let hop = input.get("hop").and_then(Value::as_u64).unwrap_or(0);
-    if hop < 2 {
-        ctx.continue_as_new(json!({"hop": hop + 1}))
+    if hop < target {
+        ctx.continue_as_new(json!({"hop": hop + 1, "target": target}))
             .await
             .map_err(|e| e.to_string())?;
         return Ok(json!({"carry": hop}));
@@ -374,7 +379,7 @@ async fn until_done(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("the run did not end in 10 s");
+    panic!("the run did not end after 100 tries");
 }
 
 // ── Completed runs and dedupe ─────────────────────────────────────────────────
@@ -1091,9 +1096,20 @@ async fn continued_as_new_chain_returns_final_output() {
         ("x-workflow", "dr_chain"),
         ("x-wait-ms", "5000"),
     ];
-    let response = until_done(&client, "key-ac41", &extra, &json!({"tag": "ac41"})).await;
-    assert_eq!(response.status.as_u16(), 200, "{}", response.text());
-    assert_eq!(response.json::<Value>(), json!({"final": 2}));
+    let short = until_done(&client, "key-ac41-a", &extra, &json!({"tag": "ac41"})).await;
+    assert_eq!(short.status.as_u16(), 200, "{}", short.text());
+    assert_eq!(short.json::<Value>(), json!({"final": 2}));
+    // A chain longer than any per-request step cap still resolves, because
+    // a same-type chain takes one lookup.
+    let long = until_done(
+        &client,
+        "key-ac41-b",
+        &extra,
+        &json!({"tag": "ac41", "hops": 130}),
+    )
+    .await;
+    assert_eq!(long.status.as_u16(), 200, "{}", long.text());
+    assert_eq!(long.json::<Value>(), json!({"final": 130}));
 }
 
 // AC-42

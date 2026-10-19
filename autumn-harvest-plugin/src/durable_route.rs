@@ -25,6 +25,7 @@
 //! See `docs/durable-routes.md` for the guide and `DESIGN-durable-routes.md`
 //! for the design record.
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt::Display;
 use std::sync::Arc;
@@ -103,8 +104,9 @@ const DEDUPE_DOMAIN: &[u8] = b"autumn-harvest/durable-route/v1";
 /// The domain tag of the request fingerprint.
 const FINGERPRINT_DOMAIN: &[u8] = b"autumn-harvest/durable-route/fp/v1";
 
-/// The most continue-as-new successors that one wait follows.
-const MAX_CHAIN_HOPS: usize = 128;
+/// The most chain steps that one wait follows. A same-type chain of any
+/// length takes one step, so only a change of workflow type costs a step.
+const MAX_CHAIN_HOPS: usize = 1024;
 
 /// The `Retry-After` value of a pending answer, in seconds.
 const PENDING_RETRY_AFTER_SECS: u64 = 1;
@@ -152,6 +154,7 @@ pub struct DurableRoute {
     route: Option<String>,
     key: KeyField,
     layer_active: bool,
+    bearer: bool,
     tenant: Option<String>,
     extracted_at: Instant,
     request_timeout: Option<Duration>,
@@ -199,6 +202,7 @@ impl DurableRoute {
                 .extensions
                 .get::<autumn_web::idempotency::IdempotencyContext>()
                 .is_some(),
+            bearer: parts.headers.contains_key(header::AUTHORIZATION),
             tenant: autumn_web::tenancy::CURRENT_TENANT
                 .try_with(Clone::clone)
                 .ok()
@@ -350,6 +354,9 @@ impl DurableCall {
 
     /// Check the call and build the start. Every check runs before any I/O.
     fn prepare(self) -> Result<Prepared, Problem> {
+        if self.route.layer_active && self.route.bearer {
+            warn_layer_ignores_scope();
+        }
         let misconfigured = Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "misconfigured");
         if let Some(cause) = self.setup_problem() {
             tracing::error!(workflow = %self.workflow, cause, "durable route setup error");
@@ -433,6 +440,21 @@ impl DurableCall {
             ));
         }
         prepared.answer(&started).await
+    }
+}
+
+/// Warn once that Autumn's idempotency layer does not use the scope.
+///
+/// The layer keys its cache by the session cookie, not by the scope. Two
+/// token clients that send one key and one body share one cached answer, and
+/// that answer skips the handler.
+fn warn_layer_ignores_scope() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "a durable route runs under Autumn's idempotency layer with token auth; that layer \
+             caches answers by session, not by the durable-route scope; see docs/durable-routes.md"
+        );
     }
 }
 
@@ -850,7 +872,12 @@ async fn wait_for_result(
     let mut current = exec_id;
     // The permit lives until the wait ends. One request holds at most one.
     let mut permit: Option<OwnedSemaphorePermit> = None;
+    let mut visited = HashSet::new();
     for _ in 0..MAX_CHAIN_HOPS {
+        if !visited.insert(current) {
+            tracing::error!(exec_id = %current, "durable route found a cycle in a continue-as-new chain");
+            return Waited::Unreadable;
+        }
         let handle = runtime.client.handle(current);
         // A first read with no wait opens no `LISTEN` connection, so a
         // finished run needs no permit.
@@ -886,7 +913,7 @@ async fn wait_for_result(
                 result: snapshot,
             };
         }
-        match continue_as_new_successor(runtime, current).await {
+        match chain_successor(runtime, current).await {
             Ok(Some(next)) => current = next,
             Ok(None) => {
                 return Waited::Terminal {
@@ -913,8 +940,13 @@ fn read_error(error: &HarvestError) -> Waited {
     }
 }
 
-/// The successor of a run that continued as new.
-async fn continue_as_new_successor(
+/// The next run of a chain that continued as new.
+///
+/// A successor of the same type keeps the business id, so one lookup finds
+/// the newest run of a long chain. A successor of another type comes from
+/// the continue-as-new event. Each step therefore crosses a type change or
+/// reaches the end, and a retry never walks the chain one run at a time.
+async fn chain_successor(
     runtime: &DurableRouteRuntime,
     exec_id: ExecutionId,
 ) -> HarvestResult<Option<ExecutionId>> {
@@ -925,9 +957,21 @@ async fn continue_as_new_successor(
     // live attempt first.
     let (live, _) =
         autumn_harvest::execution::resolve_live_attempt(&mut conn, sharded, shard, exec_id).await?;
-    let history =
-        autumn_harvest::store::load_history_undecoded(&mut conn, ExecutionId::from_uuid(live.id))
-            .await?;
+    let live_id = ExecutionId::from_uuid(live.id);
+    let newest = autumn_harvest::execution::resolve_execution_id_by_workflow_id(
+        &mut conn,
+        &live.workflow_name,
+        &live.workflow_id,
+    )
+    .await?;
+    let sealed = match newest {
+        Some(run) if run.exec_id != live_id && run.state != "CONTINUED_AS_NEW" => {
+            return Ok(Some(run.exec_id));
+        }
+        Some(run) => run.exec_id,
+        None => live_id,
+    };
+    let history = autumn_harvest::store::load_history_undecoded(&mut conn, sealed).await?;
     Ok(history.events.into_iter().find_map(|event| match event {
         WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(new_exec_id),
         _ => None,

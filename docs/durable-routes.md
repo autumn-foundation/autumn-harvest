@@ -135,6 +135,13 @@ With the layer on, Autumn answers some requests before the route runs:
 - A changed body against a cached answer gets Autumn's `422`.
 - A repeat of a completed request gets Autumn's cached copy.
 
+Autumn's cache key binds the session cookie, not the durable-route scope.
+Two clients that authenticate with a bearer token and send the same key and
+body share one cached answer, and that answer skips the handler. Do not turn
+on `.idempotent()` for a token-authenticated API with durable routes. The
+durable route already replays its own results, bound to the scope. The route
+logs one warning when it runs under the layer with an `Authorization` header.
+
 A client that drops its connection while the route waits leaves Autumn's
 in-flight lock in place for `idempotency.in_flight_ttl_secs`. Keep that value
 short, for example 60 s.

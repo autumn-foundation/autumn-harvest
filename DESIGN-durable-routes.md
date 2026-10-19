@@ -88,6 +88,8 @@ the start-idempotency claim (issue #808).
 | R18 | Crash on a request that arrives before plugin startup ends. | The extractor never panics. `send()` answers `503` with `Retry-After`. |
 | R19 | Fail every request for a debounce, batch, throttle or DAG workflow with a confusing error. | `500` misconfigured, with an error log that names the cause. |
 | R20 | Put the key, scope or input into logs or metrics. | The tracing span records the workflow, route, outcome and creation flag only. |
+| R21 | Let Autumn's layer replay one token client's cached answer to another client. The layer keys by session cookie, not by scope. | The docs advise against `.idempotent()` for token APIs. The route logs one warning when it sees the layer and an `Authorization` header. |
+| R22 | Strand a retry on a long continue-as-new chain, because each retry walks the chain from its start. | A same-type chain takes one business-id lookup to its newest run. Only a change of workflow type costs a step. A visited set stops a cycle. |
 
 ### 0.4 Six thinking hats
 
@@ -170,8 +172,10 @@ minus 2 s. The route first reads a snapshot with no wait. Only a live run with
 a budget above zero takes a waiter permit. With no permit, the route answers
 pending at once. A `tokio::time::timeout` bounds the engine wait, so a slow
 listener connect cannot overrun the budget. On a `CONTINUED_AS_NEW` result the
-route resolves the live attempt, reads its successor from the history and
-waits on the successor.
+route resolves the live attempt and looks up the newest run with the same
+business id. A same-type chain of any length takes one lookup. A successor
+of another type comes from the continue-as-new event. A visited set stops a
+cycle.
 
 ### 1.5 Responses
 
@@ -206,7 +210,9 @@ adds `x-harvest-execution-id`.
 With `.idempotent()` on, Autumn answers before the route in three cases: an
 in-flight duplicate (`409`), a changed body against a cached answer (`422`),
 and a cache hit (the cached answer). The route answers pending with `409`, so
-Autumn never caches it. Do not put `#[intercept]` on a durable route. Autumn
+Autumn never caches it. The layer keys its cache by session cookie, not by
+scope. Two token clients with one key and one body share a cached answer, so
+the docs advise against the layer for token APIs (R21). Do not put `#[intercept]` on a durable route. Autumn
 then fails closed with `409` on every cache hit.
 
 ---
