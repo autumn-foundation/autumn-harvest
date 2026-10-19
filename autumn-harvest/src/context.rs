@@ -11025,10 +11025,11 @@ impl WorkflowContext {
 
             // First live call: generate a new signal_id and dispatch.
             HistoryMatch::NoMatch => {
+                let payload_json = serde_json::to_value(&payload)?;
+                self.check_payload_depth(PayloadKind::SignalPayload, None, &payload_json)?;
                 self.check_strict_replay_no_match(&format!(
                     "ExternalSignalRequested(target={target}, signal={signal_name})"
                 ))?;
-                let payload_json = serde_json::to_value(&payload)?;
                 // Issue #1985: a broken promise signal is the sender's bug.
                 // Refuse it here, before a request is recorded. The outbox
                 // would otherwise report it as a target state, such as
@@ -11038,7 +11039,6 @@ impl WorkflowContext {
                     &payload_json,
                     idempotency_key.as_deref(),
                 )?;
-                self.check_payload_depth(PayloadKind::SignalPayload, None, &payload_json)?;
                 let observed = serde_json::to_string(&payload_json).map_or(0, |s| s.len() as u64);
                 if self.payload_max_signal > 0 && observed > self.payload_max_signal {
                     return Err(HarvestError::PayloadTooLarge {
