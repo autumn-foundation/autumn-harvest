@@ -41,13 +41,13 @@ async fn place_order(
 
 | Call | Effect |
 |---|---|
-| `.scope(principal)` | Binds the key to the principal, for example the user id. Two principals with one key get two runs. |
+| `.scope(principal)` | Binds the key to the principal, for example the user id. Two principals with one key get two runs. The string must be unique across every route that runs the workflow, so give ids of different kinds a prefix, such as `user:7`. |
 | `.unscoped()` | Uses no principal. Use it only for an anonymous route. Every caller then shares one key space. |
 | `.call(workflow, input)` | Names the registered workflow and its input. The input must be a pure function of the request and the principal. |
-| `.wait(budget)` | Waits up to `budget` for the result. The default is 5 s and the maximum is 30 s. `Duration::ZERO` never waits. |
+| `.wait(budget)` | Waits up to `budget` for the result. The default is 5 s and the maximum is 30 s. `Duration::ZERO` never waits. See [Waiting](#waiting). |
 | `.success_status(status)` | The status of a completed run: 200 (default), 201 or 204. |
 | `.failure_status(error_type, status)` | The status of a run that fails with the typed `WorkflowFailure` class `error_type`. |
-| `.expose_execution_id()` | Adds `x-harvest-execution-id` to each answer after the start. |
+| `.expose_execution_id()` | Adds `x-harvest-execution-id` to each answer that reports on the run, and an `execution_id` member to a pending body. The id names the run that the key started, which is the first run of a continue-as-new chain. |
 | `.send()` | Runs the call. It never fails: every problem is a `DurableOutcome`. |
 
 `DurableOutcome` implements `IntoResponse`. To render HTML, read
@@ -62,11 +62,13 @@ joins the key on its own.
 ## The client contract
 
 1. Send a **random** `Idempotency-Key` (a UUID) with each new operation.
-2. On a network error, a `5xx` or a `Retry-After`, send the same request
-   again: the same body and the same `Idempotency-Key`.
-3. `Retry-After` means "the run is still going, retry". Use the same
-   `Idempotency-Key`.
-4. An answer for a run that an earlier request started carries
+2. On a network error, a `502`, `503` or `504`, or any answer with
+   `Retry-After`, send the same request again. Use the same body and the
+   same `Idempotency-Key`.
+3. `Retry-After` means that the run is not finished or cannot start yet.
+4. A durable-route problem with no `Retry-After` is final for this key. Do
+   not retry it. Its `type` starts with `urn:autumn-harvest:durable-route:`.
+5. An answer for a run that an earlier request started carries
    `x-idempotent-replayed: true`.
 
 A key binds its body. A retry with another body under the same key gets a
@@ -117,37 +119,62 @@ A live run waits for up to the budget.
   default is 32. A request that finds the cap full answers pending at once.
   `0` means that no request waits.
 - The wait ends 2 s before Autumn's request deadline
-  (`server.timeouts.request_timeout_ms`). A route that sets its own
-  `timeout_ms` must set `.wait(..)` below it, because the route cannot see
-  that value.
-- A run that continues as new is followed to its last successor.
+  (`server.timeouts.request_timeout_ms`). Every read after the start ends
+  1 s before it, and a late read answers pending. Both margins count from
+  the time the route reads the request. Middleware time before the handler
+  uses up the margin.
+- With Autumn's idempotency layer on, the route counts only half of the
+  deadline, because that layer reads the whole body before the handler.
+- A route that sets its own `timeout_ms` must set `.wait(..)` below it,
+  because the route cannot see that value.
+- A run that continues as new is followed to its newest run. A chain of the
+  same workflow type takes one lookup. Each change of workflow type takes one
+  step, up to 1024 steps. Past that cap, the route answers pending.
+- A read error other than a codec error also answers pending, because the
+  run exists.
 
 ## With Autumn's idempotency layer
 
 `AppBuilder::idempotent()` caches every 2xx answer. A cached `202` would
-replay for 24 h in place of the result, so a durable route answers pending
-with `409` when the layer is on. Autumn does not cache a `409`.
+replay for 24 h in place of the result. When the layer is on, a durable route
+answers pending with `409`. Autumn does not cache a `409`.
 
 With the layer on, Autumn answers some requests before the route runs:
 
 - A duplicate that arrives while the first request is in flight gets
   Autumn's `409` with `Retry-After: 1`.
 - A changed body against a cached answer gets Autumn's `422`.
-- A repeat of a completed request gets Autumn's cached copy.
+- A repeat of a completed request gets Autumn's cached copy, except in the
+  fail-closed cases below.
 
 Autumn's cache key binds the session cookie, not the durable-route scope.
-Two clients that authenticate with a bearer token and send the same key and
-body share one cached answer, and that answer skips the handler. Do not turn
-on `.idempotent()` for a token-authenticated API with durable routes. The
-durable route already replays its own results, bound to the scope. The route
-logs one warning when it runs under the layer with an `Authorization` header.
+Two clients whose principal is not a cookie session, such as a bearer token,
+an API key or a client certificate, can send the same key and body. They then
+share one cached answer, and that answer skips the handler. Do not turn on
+`.idempotent()` for such an API with durable routes. The durable route
+already replays its own results, bound to the scope. The route logs one
+warning when it runs under the layer with an `Authorization` header.
+
+The cached copy is the workflow output in clear. The Harvest payload codec
+does not encrypt it, and PII erasure does not remove it. Until
+`idempotency.ttl_secs` ends, a repeat gets that copy, not `410`. For durable
+routes whose output holds personal data, keep `.idempotent()` off or set a
+short TTL.
 
 A client that drops its connection while the route waits leaves Autumn's
 in-flight lock in place for `idempotency.in_flight_ttl_secs`. Keep that value
 short, for example 60 s.
 
-Do not put `#[intercept]` on a durable route. Autumn then refuses every cache
-hit with a `409`.
+Autumn refuses every cache hit with a plain `409` and no `Retry-After` in
+these cases:
+
+- The route has `#[intercept]`.
+- The route is in a scoped group, or in a merged or nested router.
+- The app registers an `AppBuilder::layer` or a `static_gate`, other than
+  Autumn's own session layer.
+
+A retry then cannot collect a completed result until `idempotency.ttl_secs`
+ends. In such an app, do not turn on `.idempotent()` for durable routes.
 
 ## Known limits
 
@@ -161,6 +188,14 @@ hit with a `409`.
   `HarvestPlugin::start_idempotency_window`). After that, the same body
   attaches to the original run until retention deletes it, and the attach
   binds the key again. Another body under an expired key starts a new run.
+- After the window, a retry of a run that was terminated, or that continued
+  as new into another workflow type, starts a new run. Those runs no longer
+  hold the business id.
+- PII erasure works on one execution. To erase a durable run, erase every
+  execution with its `workflow_id`: each retry attempt and each
+  continue-as-new run. `x-harvest-execution-id` names only the first.
+- The route checks the input size before any I/O, with the current cap. A
+  retry of an accepted input gets `413` when an operator lowers the cap.
 - Workflow-level retries run the activities again. Activities must be
   idempotent.
 - Durable runs have no Harvest tenant, record the `transactional` start

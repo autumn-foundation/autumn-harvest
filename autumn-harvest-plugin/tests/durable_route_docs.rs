@@ -82,6 +82,9 @@ fn page_states_layer_timeout_and_key_guidance() {
         "timeout_ms",
         "#[intercept]",
         "durable_route_max_waiters",
+        "AppBuilder::layer",
+        "idempotency.ttl_secs",
+        "is final for this key",
         "## Known limits",
     ] {
         assert!(

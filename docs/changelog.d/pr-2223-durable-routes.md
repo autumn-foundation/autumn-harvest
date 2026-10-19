@@ -16,9 +16,13 @@ feature-gap report.
 - A fingerprint of the canonical input rides in the `workflow_id`. A reused
   key with another body answers `422` and starts nothing.
 - The start runs in its own task and drops its connection before the wait.
-  The wait follows continue-as-new successors, stops 2 s before Autumn's
-  request deadline, and takes a permit from
-  `HarvestPlugin::durable_route_max_waiters` (default 32).
+  The wait takes a permit from `HarvestPlugin::durable_route_max_waiters`
+  (default 32) and follows continue-as-new chains. A same-type chain takes
+  one business-id lookup.
+- The wait ends 2 s, and every read after the start ends 1 s, before
+  Autumn's request deadline, counted from when the route reads the request.
+  Under Autumn's idempotency layer the route counts half the deadline.
+- An input over the workflow's input cap answers `413` before any I/O.
 - Problem bodies use fixed text. They never hold the workflow error message,
   the key, the scope or the input. `failure_status` maps a typed
   `WorkflowFailure` class to a final 4xx or 5xx status.

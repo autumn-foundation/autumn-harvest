@@ -25,16 +25,16 @@
 //! See `docs/durable-routes.md` for the guide and `DESIGN-durable-routes.md`
 //! for the design record.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use autumn_harvest::{
-    ExecutionId, HarvestError, HarvestResult, TransactionalStartOptions, TypedWorkflowHandle,
-    WorkflowEvent, WorkflowHandleClient, WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
-    WorkflowResult, WorkflowResultState,
+    ExecutionId, HarvestError, HarvestResult, TransactionalStartOptions, WorkflowEvent,
+    WorkflowHandleClient, WorkflowIdConflictPolicy, WorkflowIdReusePolicy, WorkflowResult,
+    WorkflowResultState,
 };
 use autumn_web::AppState;
 use autumn_web::reexports::axum;
@@ -63,7 +63,7 @@ pub const MAX_KEY_BYTES: usize = 255;
 /// The wait budget when the handler sets none.
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 
-/// The longest wait budget. A longer request is clamped to it.
+/// The longest wait budget. The route clamps a longer budget to it.
 pub const MAX_WAIT: Duration = Duration::from_secs(30);
 
 /// The time kept free before Autumn's request deadline.
@@ -116,6 +116,8 @@ pub(crate) struct DurableRouteRuntime {
     client: WorkflowHandleClient,
     pool: HarvestDbPool,
     waiters: Arc<Semaphore>,
+    /// The effective input cap of each registered workflow, in bytes.
+    input_caps: HashMap<String, u64>,
 }
 
 /// Install the durable-route runtime into `state`.
@@ -129,10 +131,28 @@ pub(crate) fn install(state: &AppState, waiters: Arc<Semaphore>) -> bool {
     ) else {
         return false;
     };
+    // The route checks the input size before any I/O, with the cap that the
+    // engine applies to a fresh start.
+    let input_caps = state
+        .extension::<Arc<autumn_harvest::worker::HandlerRegistry>>()
+        .map(|registry| {
+            registry
+                .workflows
+                .iter()
+                .map(|(name, info)| {
+                    (
+                        name.clone(),
+                        client.max_workflow_input_bytes(info.max_input_bytes),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     state.insert_extension(DurableRouteRuntime {
         client: (*client).clone(),
         pool: (*pool).clone(),
         waiters,
+        input_caps,
     });
     true
 }
@@ -215,8 +235,10 @@ impl DurableRoute {
 
     /// Bind the key to `principal`, for example the user id.
     ///
-    /// Two principals that send the same key get two runs. An empty
-    /// principal is a setup error.
+    /// Two principals that send the same key get two runs. The string must
+    /// be unique across every route that runs the workflow. When ids of
+    /// different kinds can be equal, add a prefix, such as `user:7`. An
+    /// empty principal is a setup error.
     #[must_use]
     pub fn scope(self, principal: impl Display) -> ScopedDurableRoute {
         ScopedDurableRoute {
@@ -254,7 +276,7 @@ impl ScopedDurableRoute {
             route: self.route,
             scope: self.scope,
             workflow: workflow.to_owned(),
-            input: serde_json::to_value(input).map_err(|_| "the input does not serialize"),
+            input: serde_json::to_value(input),
             wait: DEFAULT_WAIT,
             success: StatusCode::OK,
             failures: Vec::new(),
@@ -269,7 +291,7 @@ pub struct DurableCall {
     route: DurableRoute,
     scope: Scope,
     workflow: String,
-    input: Result<Value, &'static str>,
+    input: Result<Value, serde_json::Error>,
     wait: Duration,
     success: StatusCode,
     failures: Vec<(String, StatusCode)>,
@@ -277,11 +299,14 @@ pub struct DurableCall {
 }
 
 impl DurableCall {
-    /// Wait up to `budget` for the result. The default is 5 s. A budget over
-    /// 30 s is clamped to 30 s. `Duration::ZERO` never waits.
+    /// Wait up to `budget` for the result. The default is 5 s. The route
+    /// clamps a longer budget to 30 s. `Duration::ZERO` never waits.
     ///
-    /// The wait also ends 2 s before Autumn's request deadline. A per-route
-    /// `timeout_ms` is not visible here, so keep `budget` below it.
+    /// The wait also ends 2 s before Autumn's request deadline, counted from
+    /// the time the route reads the request. With Autumn's idempotency layer
+    /// on, the route counts half the deadline, because that layer reads the
+    /// body first. A per-route `timeout_ms` is not visible here, so keep
+    /// `budget` below it.
     pub const fn wait(mut self, budget: Duration) -> Self {
         self.wait = budget;
         self
@@ -304,11 +329,13 @@ impl DurableCall {
         self
     }
 
-    /// Add the `x-harvest-execution-id` header to every answer after the
-    /// start.
+    /// Add the `x-harvest-execution-id` header to each answer that reports on
+    /// the run, and an `execution_id` member to a pending body.
     ///
-    /// The execution id is the handle of the management API. Expose it only
-    /// when that API has its own authentication.
+    /// The id names the run that the key started. For a continue-as-new
+    /// chain, that is the first run. The execution id is the handle of the
+    /// management API. Expose it only when that API has its own
+    /// authentication.
     pub const fn expose_execution_id(mut self) -> Self {
         self.expose_id = true;
         self
@@ -336,8 +363,8 @@ impl DurableCall {
         if matches!(&self.scope, Scope::Principal(p) if p.is_empty()) {
             return Some("the scope is empty");
         }
-        if let Err(cause) = &self.input {
-            return Some(cause);
+        if self.input.is_err() {
+            return Some("the input does not serialize");
         }
         if !success_status_is_valid(self.success) {
             return Some("success_status must be 200, 201 or 204");
@@ -353,13 +380,16 @@ impl DurableCall {
     }
 
     /// Check the call and build the start. Every check runs before any I/O.
-    fn prepare(self) -> Result<Prepared, Problem> {
+    fn prepare(self) -> Result<(StartRequest, Prepared), Problem> {
         if self.route.layer_active && self.route.bearer {
             warn_layer_ignores_scope();
         }
         let misconfigured = Problem::new(StatusCode::INTERNAL_SERVER_ERROR, "misconfigured");
         if let Some(cause) = self.setup_problem() {
             tracing::error!(workflow = %self.workflow, cause, "durable route setup error");
+            if let Err(error) = &self.input {
+                tracing::debug!(workflow = %self.workflow, error = %error, "durable route input");
+            }
             return Err(misconfigured);
         }
         let key = check_key(&self.route.key)
@@ -379,9 +409,19 @@ impl DurableCall {
             &self.scope,
             &key,
         );
-        let fp = fingerprint(&key, &self.workflow, &input);
+        let (fp, input_bytes) = canonical_fingerprint(&key, &self.workflow, &input);
+        // The canonical form has the length of the compact form that the
+        // engine measures. An oversized input stops here, before any I/O.
+        if let Some(cap) = runtime.input_caps.get(&self.workflow)
+            && *cap > 0
+            && input_bytes as u64 > *cap
+        {
+            return Err(Problem::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "input-too-large",
+            ));
+        }
         let start = StartRequest {
-            workflow: self.workflow.clone(),
             workflow_id: workflow_id(&digest, &fp),
             claim: claim_key(&digest),
             input,
@@ -389,10 +429,10 @@ impl DurableCall {
                 "method": self.route.method.as_str(),
                 "route": self.route.route,
             }}),
+            workflow: self.workflow,
         };
-        Ok(Prepared {
+        let prepared = Prepared {
             runtime,
-            start,
             digest,
             fp,
             wait: self.wait,
@@ -402,19 +442,76 @@ impl DurableCall {
             success: self.success,
             failures: self.failures,
             expose_id: self.expose_id,
-        })
+        };
+        Ok((start, prepared))
     }
 
     async fn run(self) -> DurableOutcome {
-        let prepared = match self.prepare() {
-            Ok(prepared) => prepared,
+        let (start, prepared) = match self.prepare() {
+            Ok(parts) => parts,
             Err(problem) => return DurableOutcome::problem(problem),
         };
-        let workflow = prepared.start.workflow.clone();
+        let layer_active = prepared.layer_active;
+        let io_limit = prepared.request_timeout.map(|timeout| {
+            time_left(
+                prepared.extracted_at.elapsed(),
+                timeout,
+                layer_active,
+                DEADLINE_HEADROOM / 2,
+            )
+        });
+        let work = prepared.start_and_answer(start);
+        // Every read after the start ends before Autumn's request deadline.
+        // A dropped handler would keep Autumn's in-flight lock for its TTL.
+        match io_limit {
+            None => work.await,
+            Some(limit) => tokio::time::timeout(limit, work).await.unwrap_or_else(|_| {
+                tracing::warn!("durable route reached its deadline margin; answering pending");
+                DurableOutcome::pending(layer_active)
+            }),
+        }
+    }
+}
+
+/// Warn once that Autumn's idempotency layer does not use the scope.
+///
+/// The layer keys its cache by the session cookie, not by the scope. Two
+/// clients whose principal is not a session, such as two token clients, that
+/// send one key and one body share one cached answer. That answer skips the
+/// handler.
+fn warn_layer_ignores_scope() {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!(
+            "a durable route runs under Autumn's idempotency layer with an Authorization header; \
+             that layer caches answers by session, not by the durable-route scope; see \
+             docs/durable-routes.md"
+        );
+    }
+}
+
+/// A checked call, ready to start.
+struct Prepared {
+    runtime: Arc<DurableRouteRuntime>,
+    digest: [u8; 32],
+    fp: [u8; 32],
+    wait: Duration,
+    extracted_at: Instant,
+    request_timeout: Option<Duration>,
+    layer_active: bool,
+    success: StatusCode,
+    failures: Vec<(String, StatusCode)>,
+    expose_id: bool,
+}
+
+impl Prepared {
+    /// Start or attach to the run, then build the answer.
+    async fn start_and_answer(self, start: StartRequest) -> DurableOutcome {
+        let workflow = start.workflow.clone();
         // The start runs in its own task. A dropped request cannot cut the
         // start transaction short, and the retry then finds the claim.
-        let start = start_run(Arc::clone(&prepared.runtime), prepared.start.clone());
-        let started = match tokio::spawn(start.in_current_span()).await {
+        let task = start_run(Arc::clone(&self.runtime), start);
+        let started = match tokio::spawn(task.in_current_span()).await {
             Ok(Ok(started)) => started,
             Ok(Err(error)) => {
                 log_start_error(&workflow, &error);
@@ -431,49 +528,15 @@ impl DurableCall {
         let span = tracing::Span::current();
         span.record("created", started.created);
         span.record("exec_id", tracing::field::display(started.exec_id));
-        if !started.created
-            && !workflow_id_matches(&started.workflow_id, &prepared.digest, &prepared.fp)
-        {
+        if !started.created && !workflow_id_matches(&started.workflow_id, &self.digest, &self.fp) {
             return DurableOutcome::problem(Problem::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "idempotency-key-reused",
             ));
         }
-        prepared.answer(&started).await
+        self.answer(&started).await
     }
-}
 
-/// Warn once that Autumn's idempotency layer does not use the scope.
-///
-/// The layer keys its cache by the session cookie, not by the scope. Two
-/// token clients that send one key and one body share one cached answer, and
-/// that answer skips the handler.
-fn warn_layer_ignores_scope() {
-    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        tracing::warn!(
-            "a durable route runs under Autumn's idempotency layer with token auth; that layer \
-             caches answers by session, not by the durable-route scope; see docs/durable-routes.md"
-        );
-    }
-}
-
-/// A checked call, ready to start.
-struct Prepared {
-    runtime: Arc<DurableRouteRuntime>,
-    start: StartRequest,
-    digest: [u8; 32],
-    fp: [u8; 32],
-    wait: Duration,
-    extracted_at: Instant,
-    request_timeout: Option<Duration>,
-    layer_active: bool,
-    success: StatusCode,
-    failures: Vec<(String, StatusCode)>,
-    expose_id: bool,
-}
-
-impl Prepared {
     /// Wait for the run and build the answer.
     async fn answer(self, started: &Started) -> DurableOutcome {
         let after_start = |kind, status, output| DurableOutcome {
@@ -485,7 +548,12 @@ impl Prepared {
             output,
             retry_after: None,
         };
-        let budget = wait_budget(self.wait, self.extracted_at.elapsed(), self.request_timeout);
+        let budget = wait_budget(
+            self.wait,
+            self.extracted_at.elapsed(),
+            self.request_timeout,
+            self.layer_active,
+        );
         match wait_for_result(&self.runtime, started.exec_id, budget).await {
             Waited::Pending => {
                 let (kind, status) = pending_outcome(self.layer_active);
@@ -503,7 +571,25 @@ impl Prepared {
                 // when a mapping can use it.
                 let typed =
                     if result.state == WorkflowResultState::Failed && !self.failures.is_empty() {
-                        typed_failure(&self.runtime, exec_id).await
+                        match typed_failure(&self.runtime, exec_id).await {
+                            Ok(typed) => typed,
+                            // The run failed, but its class is unknown. A
+                            // retry reads it again, so the answer is not final.
+                            Err(error) => {
+                                return if matches!(read_error(&error), Waited::Unreadable) {
+                                    after_start(
+                                        DurableOutcomeKind::Problem {
+                                            slug: "result-unavailable",
+                                        },
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        None,
+                                    )
+                                } else {
+                                    let (kind, status) = pending_outcome(self.layer_active);
+                                    after_start(kind, status, None)
+                                };
+                            }
+                        }
                     } else {
                         None
                     };
@@ -529,6 +615,7 @@ pub enum DurableOutcomeKind {
     /// The run is still live. Retry the same request.
     Pending,
     /// The run failed.
+    #[non_exhaustive]
     Failed {
         /// The typed failure class, when a mapping matched it.
         error_type: Option<String>,
@@ -544,6 +631,7 @@ pub enum DurableOutcomeKind {
     /// PII erasure removed the result.
     Erased,
     /// The call failed before or outside the run.
+    #[non_exhaustive]
     Problem {
         /// The problem slug, one of [`PROBLEM_SLUGS`].
         slug: &'static str,
@@ -564,6 +652,20 @@ pub struct DurableOutcome {
 }
 
 impl DurableOutcome {
+    /// A pending answer that names no run.
+    fn pending(layer_active: bool) -> Self {
+        let (kind, status) = pending_outcome(layer_active);
+        Self {
+            kind,
+            status,
+            execution_id: None,
+            replayed: false,
+            expose_id: false,
+            output: None,
+            retry_after: None,
+        }
+    }
+
     const fn problem(problem: Problem) -> Self {
         Self {
             kind: DurableOutcomeKind::Problem { slug: problem.slug },
@@ -588,7 +690,8 @@ impl DurableOutcome {
         self.status
     }
 
-    /// The execution, when the call started or found one.
+    /// The run that the key started, when the call started or found one.
+    /// For a continue-as-new chain, this is the first run.
     #[must_use]
     pub const fn execution_id(&self) -> Option<ExecutionId> {
         self.execution_id
@@ -798,7 +901,6 @@ fn problem_response(status: StatusCode, slug: &str, extra: Map<String, Value>) -
 // ── Start and wait ───────────────────────────────────────────────────────────
 
 /// The inputs of one keyed start.
-#[derive(Clone)]
 struct StartRequest {
     workflow: String,
     workflow_id: String,
@@ -816,8 +918,8 @@ struct Started {
 
 /// Start the run, or find the run that the claim already holds.
 ///
-/// The pooled connection is dropped before `finish`, so no request holds a
-/// pool slot while it waits.
+/// The start drops its pooled connection before `finish`, so no request
+/// holds a pool slot while it waits.
 async fn start_run(
     runtime: Arc<DurableRouteRuntime>,
     start: StartRequest,
@@ -829,8 +931,9 @@ async fn start_run(
         let options = TransactionalStartOptions::new()
             .with_shard(shard)
             .with_idempotency_key(start.claim)
-            // Pinned, so that a same-input retry after the claim window still
-            // attaches to the run with the same `workflow_id`.
+            // Pinned for a same-input retry after the claim window. It then
+            // attaches to the run with the same `workflow_id`, while that run
+            // holds the business id.
             .with_reuse_policy(WorkflowIdReusePolicy::AllowDuplicate)
             .with_conflict_policy(WorkflowIdConflictPolicy::UseExisting)
             .with_memo(start.memo);
@@ -978,29 +1081,64 @@ async fn chain_successor(
     }))
 }
 
-/// The typed failure of a failed run. A read error gives `None`.
+/// The typed failure of a failed run, from its last `WorkflowFailed` event.
+///
+/// A read error is an error, not an untyped failure. The caller then answers
+/// pending, so a short outage never turns a mapped failure into a final 500.
 async fn typed_failure(
     runtime: &DurableRouteRuntime,
     exec_id: ExecutionId,
-) -> Option<TypedFailure> {
-    TypedWorkflowHandle::<Value>::new(runtime.client.handle(exec_id))
-        .result_snapshot()
-        .await
-        .ok()
-        .map(|result| TypedFailure {
-            error_type: result.error_type,
-            details: result.error_details,
-        })
+) -> HarvestResult<Option<TypedFailure>> {
+    let sharded = runtime.pool.sharded_pool();
+    let shard = sharded.routed_shard_for_execution(exec_id);
+    let mut conn = autumn_harvest::pool::acquire_within_pool_bound(sharded.pool_for(shard)).await?;
+    let (live, _) =
+        autumn_harvest::execution::resolve_live_attempt(&mut conn, sharded, shard, exec_id).await?;
+    let history = autumn_harvest::store::load_history_with_codecs(
+        &mut conn,
+        ExecutionId::from_uuid(live.id),
+        runtime.client.payload_codecs(),
+    )
+    .await?;
+    Ok(history
+        .events
+        .into_iter()
+        .rev()
+        .find_map(|event| match event {
+            WorkflowEvent::WorkflowFailed {
+                error_type,
+                details,
+                ..
+            } => Some(TypedFailure {
+                // `Error` is the untyped sentinel of `WorkflowFailure`.
+                error_type: error_type.filter(|class| class != "Error"),
+                details,
+            }),
+            _ => None,
+        }))
 }
 
+/// Log a start error. The log never holds an input value.
 fn log_start_error(workflow: &str, error: &HarvestError) {
     match error {
         HarvestError::InputValidationFailed { violations } => {
+            // A violation message can quote an input value, so log only the
+            // count and a few field paths.
+            let paths: Vec<&str> = violations
+                .iter()
+                .filter_map(|violation| violation.field_path.as_deref())
+                .take(5)
+                .collect();
             tracing::debug!(
                 workflow,
-                ?violations,
+                count = violations.len(),
+                ?paths,
                 "durable route input fails the schema"
             );
+        }
+        // The quota key can come from the input, so the message stays out.
+        HarvestError::QuotaExceeded { resource, .. } => {
+            tracing::warn!(workflow, %resource, "durable route start hit a quota");
         }
         HarvestError::Config(_) => {
             tracing::error!(workflow, error = %error, "durable route cannot start its workflow");
@@ -1079,20 +1217,7 @@ fn claim_key(digest: &[u8; 32]) -> String {
 /// `serde_json`.
 fn canonical_json(value: &Value, out: &mut Vec<u8>) {
     match value {
-        Value::Object(map) => {
-            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
-            entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
-            out.push(b'{');
-            for (i, (name, item)) in entries.into_iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
-                }
-                out.extend_from_slice(Value::from(name.as_str()).to_string().as_bytes());
-                out.push(b':');
-                canonical_json(item, out);
-            }
-            out.push(b'}');
-        }
+        Value::Object(map) => canonical_object(map.iter().collect(), out),
         Value::Array(items) => {
             out.push(b'[');
             for (i, item) in items.iter().enumerate() {
@@ -1107,9 +1232,30 @@ fn canonical_json(value: &Value, out: &mut Vec<u8>) {
     }
 }
 
+/// Write the object `entries` with their names sorted.
+fn canonical_object(mut entries: Vec<(&String, &Value)>, out: &mut Vec<u8>) {
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    out.push(b'{');
+    for (i, (name, item)) in entries.into_iter().enumerate() {
+        if i > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(Value::from(name.as_str()).to_string().as_bytes());
+        out.push(b':');
+        canonical_json(item, out);
+    }
+    out.push(b'}');
+}
+
 /// The request fingerprint. The raw key is in it, so the `workflow_id`
 /// reveals nothing about the input to a reader without the key.
+#[cfg(test)]
 fn fingerprint(key: &[u8], workflow: &str, input: &Value) -> [u8; 32] {
+    canonical_fingerprint(key, workflow, input).0
+}
+
+/// The request fingerprint and the length of the canonical input in bytes.
+fn canonical_fingerprint(key: &[u8], workflow: &str, input: &Value) -> ([u8; 32], usize) {
     let mut canonical = Vec::new();
     canonical_json(input, &mut canonical);
     let mut hasher = Sha256::new();
@@ -1117,7 +1263,7 @@ fn fingerprint(key: &[u8], workflow: &str, input: &Value) -> [u8; 32] {
     put(&mut hasher, key);
     put(&mut hasher, workflow.as_bytes());
     put(&mut hasher, &canonical);
-    hasher.finalize().into()
+    (hasher.finalize().into(), canonical.len())
 }
 
 fn workflow_id(digest: &[u8; 32], fingerprint: &[u8; 32]) -> String {
@@ -1143,20 +1289,32 @@ fn hex(bytes: &[u8]) -> String {
         })
 }
 
+/// The time left before Autumn's request deadline `timeout`, less `margin`.
+///
+/// The count starts when the route reads the request. Autumn's idempotency
+/// layer reads the whole body before that, so with the layer on the route
+/// counts only half the deadline.
+fn time_left(
+    elapsed: Duration,
+    timeout: Duration,
+    layer_active: bool,
+    margin: Duration,
+) -> Duration {
+    let timeout = if layer_active { timeout / 2 } else { timeout };
+    timeout.saturating_sub(margin).saturating_sub(elapsed)
+}
+
 /// The wait budget: the requested wait, clamped to [`MAX_WAIT`] and to the
 /// request deadline less [`DEADLINE_HEADROOM`].
 fn wait_budget(
     requested: Duration,
     elapsed: Duration,
     request_timeout: Option<Duration>,
+    layer_active: bool,
 ) -> Duration {
     let budget = requested.min(MAX_WAIT);
     request_timeout.map_or(budget, |timeout| {
-        budget.min(
-            timeout
-                .saturating_sub(DEADLINE_HEADROOM)
-                .saturating_sub(elapsed),
-        )
+        budget.min(time_left(elapsed, timeout, layer_active, DEADLINE_HEADROOM))
     })
 }
 
@@ -1580,6 +1738,15 @@ mod tests {
         );
         let fp = fingerprint(KEY.as_bytes(), "place_order", &a);
         assert_eq!(fp, fingerprint(KEY.as_bytes(), "place_order", &b));
+        // A map type that keeps insertion order must not change the bytes.
+        let (qty, sku) = ("qty".to_owned(), "sku".to_owned());
+        let (two, part) = (serde_json::json!(2), serde_json::json!("A-1"));
+        let mut forward = Vec::new();
+        canonical_object(vec![(&qty, &two), (&sku, &part)], &mut forward);
+        let mut reversed = Vec::new();
+        canonical_object(vec![(&sku, &part), (&qty, &two)], &mut reversed);
+        assert_eq!(forward, reversed);
+        assert_eq!(forward, br#"{"qty":2,"sku":"A-1"}"#.as_slice());
         assert_eq!(
             hex(&fp),
             "a6a21a78f14e2be87440d70006fb29109a589e5b5f795d0976e6bd4f4e30ad8d"
@@ -1621,15 +1788,26 @@ mod tests {
     }
 
     proptest! {
-        // AC-07 (property): the canonical form is valid JSON that equals
-        // the input, and a parse round trip keeps the fingerprint.
+        // AC-07 (property): the canonical form is valid JSON that equals the
+        // input. Any entry order gives the same bytes. A parse round trip
+        // keeps the fingerprint.
         #[test]
-        fn fingerprint_ignores_object_key_order(value in json_value()) {
+        fn fingerprint_ignores_object_key_order(
+            value in json_value(),
+            entries in prop::collection::btree_map("[a-z]{0,4}", json_value(), 0..6),
+        ) {
             let mut out = Vec::new();
             canonical_json(&value, &mut out);
             let parsed: Value = serde_json::from_slice(&out).expect("canonical JSON parses");
             prop_assert_eq!(&parsed, &value);
-            prop_assert_eq!(out, serde_json::to_vec(&value).unwrap());
+            prop_assert_eq!(out.len(), value.to_string().len());
+
+            let mut forward = Vec::new();
+            canonical_object(entries.iter().collect(), &mut forward);
+            let mut reversed = Vec::new();
+            canonical_object(entries.iter().rev().collect(), &mut reversed);
+            prop_assert_eq!(&forward, &reversed);
+
             let round_trip: Value =
                 serde_json::from_str(&serde_json::to_string_pretty(&value).unwrap()).unwrap();
             prop_assert_eq!(
@@ -1944,25 +2122,39 @@ mod tests {
     #[test]
     fn wait_budget_is_clamped() {
         let s = Duration::from_secs;
-        assert_eq!(wait_budget(DEFAULT_WAIT, Duration::ZERO, None), s(5));
-        assert_eq!(wait_budget(s(60), Duration::ZERO, None), MAX_WAIT);
+        let ms = Duration::from_millis;
+        assert_eq!(wait_budget(DEFAULT_WAIT, Duration::ZERO, None, false), s(5));
+        assert_eq!(wait_budget(s(60), Duration::ZERO, None, false), MAX_WAIT);
         assert_eq!(
-            wait_budget(Duration::ZERO, Duration::ZERO, Some(s(30))),
+            wait_budget(Duration::ZERO, Duration::ZERO, Some(s(30)), false),
             Duration::ZERO
         );
         // A 3 s deadline leaves 1 s after the 2 s headroom.
-        assert_eq!(wait_budget(s(30), Duration::ZERO, Some(s(3))), s(1));
+        assert_eq!(wait_budget(s(30), Duration::ZERO, Some(s(3)), false), s(1));
         // Time spent before the wait counts against the deadline.
-        assert_eq!(
-            wait_budget(s(30), Duration::from_millis(500), Some(s(3))),
-            Duration::from_millis(500)
-        );
+        assert_eq!(wait_budget(s(30), ms(500), Some(s(3)), false), ms(500));
         // A deadline inside the headroom leaves no wait.
         assert_eq!(
-            wait_budget(s(30), Duration::ZERO, Some(s(1))),
+            wait_budget(s(30), Duration::ZERO, Some(s(1)), false),
             Duration::ZERO
         );
-        assert_eq!(wait_budget(s(30), s(5), Some(s(3))), Duration::ZERO);
+        assert_eq!(wait_budget(s(30), s(5), Some(s(3)), false), Duration::ZERO);
+        // With Autumn's layer on, the route counts half the deadline.
+        assert_eq!(wait_budget(s(30), Duration::ZERO, Some(s(10)), true), s(3));
+        assert_eq!(wait_budget(s(30), Duration::ZERO, Some(s(30)), true), s(13));
+        // Every read after the start ends 1 s before the counted deadline.
+        assert_eq!(
+            time_left(Duration::ZERO, s(10), false, DEADLINE_HEADROOM / 2),
+            s(9)
+        );
+        assert_eq!(
+            time_left(Duration::ZERO, s(10), true, DEADLINE_HEADROOM / 2),
+            s(4)
+        );
+        assert_eq!(
+            time_left(s(9), s(10), false, DEADLINE_HEADROOM),
+            Duration::ZERO
+        );
     }
 
     fn outcome(kind: DurableOutcomeKind, status: StatusCode) -> DurableOutcome {

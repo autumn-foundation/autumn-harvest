@@ -114,6 +114,33 @@ async fn dr_chain(ctx: &WorkflowContext, input: Value) -> Result<Value, String> 
     Ok(json!({"final": hop}))
 }
 
+/// Fails once, then continues as `dr_chain_end` on the retry attempt.
+///
+/// The retry attempt holds the continue-as-new event. The successor has
+/// another workflow type. The route must read the live attempt and hop by
+/// the event.
+#[workflow]
+async fn dr_retry_then_switch(ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
+    let tag = input["body"]["tag"].as_str().unwrap_or("none").to_owned();
+    let count = ctx
+        .execute_activity_raw("dr_record", json!(tag), "default")
+        .await
+        .map_err(|e| e.to_string())?;
+    if count == json!(1) {
+        return Err("first attempt fails".to_owned());
+    }
+    ctx.continue_as_new_as_type("dr_chain_end", json!({"from": "retry"}))
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Value::Null)
+}
+
+/// The end of a cross-type continue-as-new chain.
+#[workflow]
+async fn dr_chain_end(_ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
+    Ok(json!({"final": input["from"]}))
+}
+
 /// A debounce workflow. A transactional start refuses it.
 #[workflow(debounce(key = "input.body.tag", window = "10s"))]
 async fn dr_debounced(_ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
@@ -142,6 +169,18 @@ fn dr_schema_input() -> Value {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
+/// The `Idempotency-Key` of each request that reached the route handler.
+static HANDLER_ENTRIES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn handler_entries(key: &str) -> usize {
+    HANDLER_ENTRIES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .filter(|seen| *seen == key)
+        .count()
+}
+
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
@@ -153,6 +192,12 @@ async fn durable(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> DurableOutcome {
+    if let Some(key) = header(&headers, "idempotency-key") {
+        HANDLER_ENTRIES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(key.to_owned());
+    }
     let user = header(&headers, "x-user").map(str::to_owned);
     let workflow = header(&headers, "x-workflow")
         .unwrap_or("dr_order")
@@ -239,6 +284,10 @@ fn base_plugin() -> HarvestPlugin {
             __autumn_workflow_info_dr_untyped_failure(),
             __autumn_workflow_info_dr_slow(),
             __autumn_workflow_info_dr_chain(),
+            __autumn_workflow_info_dr_retry_then_switch().with_retry_policy(
+                autumn_harvest::policy::RetryPolicy::exponential(2, Duration::from_millis(100)),
+            ),
+            __autumn_workflow_info_dr_chain_end(),
             __autumn_workflow_info_dr_debounced(),
             __autumn_workflow_info_dr_schema().with_input_schema_fn(dr_schema_input),
         ])
@@ -489,6 +538,27 @@ async fn tenants_with_same_key_get_separate_runs() {
     assert_eq!(count_runs(&db, "dr_order").await, 2);
 }
 
+/// How many tables hold `needle` in any column of any row.
+///
+/// Each table counts its own matches on the row cast to text, so only an
+/// integer goes through XML.
+async fn tables_containing(db: &TestPg, needle: &str) -> i64 {
+    let mut conn = db.pool.get().await.expect("conn");
+    diesel::sql_query(
+        "SELECT count(*)::bigint AS n FROM information_schema.tables t \
+         WHERE t.table_schema = 'public' AND t.table_type = 'BASE TABLE' \
+           AND (xpath('/row/c/text()', query_to_xml(format( \
+                 'SELECT count(*) AS c FROM %I.%I r WHERE r::text LIKE %L', \
+                 t.table_schema, t.table_name, '%' || $1 || '%'), false, true, '')))[1] \
+               ::text::bigint > 0",
+    )
+    .bind::<Text, _>(needle)
+    .get_result::<Count>(&mut conn)
+    .await
+    .expect("scan")
+    .n
+}
+
 // AC-21
 #[tokio::test(flavor = "multi_thread")]
 async fn raw_key_never_reaches_the_database() {
@@ -503,30 +573,13 @@ async fn raw_key_never_reaches_the_database() {
     )
     .await;
     assert_eq!(response.status.as_u16(), 200);
-    let mut conn = db.pool.get().await.expect("conn");
-    let leaked = diesel::sql_query(
-        "SELECT ((SELECT count(*) FROM harvest_start_idempotency \
-                  WHERE idempotency_key LIKE '%' || $1 || '%') + \
-                 (SELECT count(*) FROM harvest_workflow_executions \
-                  WHERE workflow_id LIKE '%' || $1 || '%' \
-                     OR coalesce(memo::text, '') LIKE '%' || $1 || '%' \
-                     OR input::text LIKE '%' || $1 || '%'))::bigint AS n",
-    )
-    .bind::<Text, _>(key)
-    .get_result::<Count>(&mut conn)
-    .await
-    .expect("scan")
-    .n;
-    assert_eq!(leaked, 0);
-    let claims = diesel::sql_query(
-        "SELECT count(*)::bigint AS n FROM harvest_start_idempotency \
-         WHERE idempotency_key LIKE 'durable-route:v1:%'",
-    )
-    .get_result::<Count>(&mut conn)
-    .await
-    .expect("claims")
-    .n;
-    assert_eq!(claims, 1);
+    assert_eq!(
+        tables_containing(&db, key).await,
+        0,
+        "the raw key is in a table"
+    );
+    // The same scan finds the digest claim, so it can see a stored value.
+    assert!(tables_containing(&db, "durable-route:v1:").await >= 1);
 }
 
 // AC-22
@@ -785,8 +838,14 @@ async fn idempotent_layer_pending_is_409_and_not_cached() {
     let done = until_done(&client, "key-ac29", &extra, &body).await;
     assert_eq!(done.status.as_u16(), 200, "{}", done.text());
     assert_eq!(done.json::<Value>()["go"], "now");
-    // Autumn now replays its cached copy of the 200.
+    // Autumn now replays its cached copy of the 200. The handler does not run.
+    let entries = handler_entries("key-ac29");
     let cached = post(&client, Some("key-ac29"), &extra, &body).await;
+    assert_eq!(
+        handler_entries("key-ac29"),
+        entries,
+        "Autumn answered from its cache"
+    );
     assert_eq!(cached.status.as_u16(), 200);
     assert_eq!(cached.header(REPLAYED_HEADER), Some("true"));
     assert_eq!(cached.json::<Value>(), done.json::<Value>());
@@ -798,22 +857,26 @@ async fn idempotent_layer_pending_is_409_and_not_cached() {
 async fn idempotent_layer_answers_cached_mismatch() {
     let db = setup_db().await;
     let client = app_with(&db, base_plugin()).idempotent().build();
-    let first = post(
-        &client,
-        Some("key-ac30"),
-        &[("x-user", "ada")],
-        &json!({"tag": "ac30"}),
-    )
-    .await;
+    let extra = [("x-user", "ada")];
+    let first = post(&client, Some("key-ac30"), &extra, &json!({"tag": "ac30"})).await;
     assert_eq!(first.status.as_u16(), 200);
-    let changed = post(
-        &client,
-        Some("key-ac30"),
-        &[("x-user", "ada")],
-        &json!({"tag": "ac30-x"}),
-    )
-    .await;
+    let entries = handler_entries("key-ac30");
+    let changed = post(&client, Some("key-ac30"), &extra, &json!({"tag": "ac30-x"})).await;
     assert_eq!(changed.status.as_u16(), 422);
+    // Autumn's own answer, not the route's problem body.
+    assert_eq!(
+        changed.text(),
+        "idempotency key reused with different payload"
+    );
+    assert_ne!(
+        changed.header("content-type"),
+        Some("application/problem+json")
+    );
+    assert_eq!(
+        handler_entries("key-ac30"),
+        entries,
+        "the route did not run"
+    );
     assert_eq!(count_runs(&db, "dr_order").await, 1);
     assert_eq!(side_effects("ac30-x"), 0);
 }
@@ -823,7 +886,7 @@ async fn idempotent_layer_answers_cached_mismatch() {
 async fn wait_is_clamped_below_request_timeout() {
     let db = setup_db().await;
     let mut config = app_config(&db);
-    config.server.timeouts.request_timeout_ms = Some(3_000);
+    config.server.timeouts.request_timeout_ms = Some(6_000);
     let mut route = __autumn_route_info_durable();
     route.name = "durable";
     let client = TestApp::new()
@@ -844,7 +907,12 @@ async fn wait_is_clamped_below_request_timeout() {
     let pending = post(&client, Some("key-ac31"), &extra, &body).await;
     let elapsed = started.elapsed();
     assert_eq!(pending.status.as_u16(), 409, "{}", pending.text());
-    assert!(elapsed < Duration::from_secs(3), "answered in {elapsed:?}");
+    // Under the layer the route counts half of the 6 s deadline, less 2 s of
+    // headroom. It waits about 1 s, not 4 s.
+    assert!(
+        elapsed < Duration::from_millis(2_500),
+        "answered in {elapsed:?}"
+    );
     signal(&client, exec_id_of(&pending), json!("now")).await;
     // Autumn holds no in-flight lock, so the retry reaches the route.
     let done = until_done(&client, "key-ac31", &extra, &body).await;
@@ -863,20 +931,30 @@ async fn waiter_cap_answers_pending_at_once() {
     ];
     let body_a = json!({"tag": "a"});
     let body_b = json!({"tag": "b"});
-    let holder = post(&client, Some("key-ac32-a"), &extra, &body_a);
+    let holder = async {
+        let started = Instant::now();
+        let response = post(&client, Some("key-ac32-a"), &extra, &body_a).await;
+        (response, started.elapsed())
+    };
     let second = async {
-        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
         let started = Instant::now();
         let response = post(&client, Some("key-ac32-b"), &extra, &body_b).await;
         (response, started.elapsed())
     };
-    let (holder, (second, elapsed)) = tokio::join!(holder, second);
+    let ((holder, holder_elapsed), (second, elapsed)) = tokio::join!(holder, second);
+    // The holder took the only permit and waited out its budget.
+    assert_eq!(holder.status.as_u16(), 202, "{}", holder.text());
+    assert!(
+        holder_elapsed >= Duration::from_millis(3_500),
+        "held {holder_elapsed:?}"
+    );
+    // The second request found the cap full and did not wait.
     assert_eq!(second.status.as_u16(), 202, "{}", second.text());
     assert!(
         elapsed < Duration::from_millis(1_000),
         "answered in {elapsed:?}"
     );
-    assert_eq!(holder.status.as_u16(), 202, "{}", holder.text());
 }
 
 // AC-33
@@ -885,14 +963,28 @@ async fn completed_replay_needs_no_waiter_permit() {
     let db = setup_db().await;
     let client = app_with(&db, base_plugin().durable_route_max_waiters(0)).build();
     let body = json!({"tag": "ac33"});
-    let done = until_done(&client, "key-ac33", &[("x-user", "ada")], &body).await;
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_parked"),
+        ("x-expose", "1"),
+    ];
+    // With no permit, the default 5 s wait does not happen.
+    let started = Instant::now();
+    let pending = post(&client, Some("key-ac33"), &extra, &body).await;
+    assert_eq!(pending.status.as_u16(), 202, "{}", pending.text());
+    assert!(started.elapsed() < Duration::from_secs(2), "it waited");
+    signal(&client, exec_id_of(&pending), json!("now")).await;
+    // A completed run answers from the first read, which needs no permit.
+    let done = until_done(&client, "key-ac33", &extra, &body).await;
     assert_eq!(done.status.as_u16(), 200, "{}", done.text());
-    assert_eq!(done.json::<Value>()["count"], 1);
+    assert_eq!(done.header(REPLAYED_HEADER), Some("true"));
+    assert_eq!(done.json::<Value>()["go"], "now");
 }
 
 // AC-34
 #[tokio::test(flavor = "multi_thread")]
 async fn dropped_request_still_commits_and_retry_attaches() {
+    use diesel_async::SimpleAsyncConnection as _;
     let db = setup_db().await;
     let client = build_app(&db).await;
     let body = json!({"tag": "ac34"});
@@ -901,13 +993,35 @@ async fn dropped_request_still_commits_and_retry_attaches() {
         ("x-workflow", "dr_parked"),
         ("x-wait-ms", "10000"),
     ];
+    // The lock lets the claim probe read but blocks the claim upsert, so the
+    // request is dropped inside the start transaction.
+    let mut blocker = db.pool.get().await.expect("blocker");
+    blocker
+        .batch_execute("BEGIN; LOCK TABLE harvest_start_idempotency IN SHARE ROW EXCLUSIVE MODE")
+        .await
+        .expect("lock");
     let dropped = tokio::time::timeout(
-        Duration::from_millis(1_500),
+        Duration::from_millis(500),
         post(&client, Some("key-ac34"), &extra, &body),
     )
     .await;
-    assert!(dropped.is_err(), "the request must still wait when dropped");
-    assert_eq!(count_runs(&db, "dr_parked").await, 1);
+    assert!(
+        dropped.is_err(),
+        "the request must still be in its start when dropped"
+    );
+    assert_eq!(count_runs(&db, "dr_parked").await, 0);
+    blocker.batch_execute("COMMIT").await.expect("unlock");
+    drop(blocker);
+    // The start task outlives the request and commits the run.
+    let mut runs = 0;
+    for _ in 0..50 {
+        runs = count_runs(&db, "dr_parked").await;
+        if runs == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(runs, 1, "the detached start committed the run");
     let exposed = [
         ("x-user", "ada"),
         ("x-workflow", "dr_parked"),
@@ -921,6 +1035,65 @@ async fn dropped_request_still_commits_and_retry_attaches() {
     let done = until_done(&client, "key-ac34", &extra, &body).await;
     assert_eq!(done.status.as_u16(), 200, "{}", done.text());
     assert_eq!(count_runs(&db, "dr_parked").await, 1);
+}
+
+// AC-53
+#[tokio::test(flavor = "multi_thread")]
+async fn reads_after_the_start_end_before_the_request_deadline() {
+    use diesel_async::SimpleAsyncConnection as _;
+    let db = setup_db().await;
+    let mut config = app_config(&db);
+    config.server.timeouts.request_timeout_ms = Some(4_000);
+    let mut route = __autumn_route_info_durable();
+    route.name = "durable";
+    let client = TestApp::new()
+        .config(config)
+        .routes(vec![route])
+        .plugin(base_plugin())
+        .with_db(db.pool.clone())
+        .build();
+    let mut blocker = db.pool.get().await.expect("blocker");
+    blocker
+        .batch_execute("BEGIN; LOCK TABLE harvest_start_idempotency IN SHARE ROW EXCLUSIVE MODE")
+        .await
+        .expect("lock");
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_parked"),
+        ("x-wait-ms", "0"),
+    ];
+    let started = Instant::now();
+    let response = post(&client, Some("key-ac53"), &extra, &json!({"tag": "ac53"})).await;
+    let elapsed = started.elapsed();
+    blocker.batch_execute("COMMIT").await.expect("unlock");
+    // The stalled start ends at the 1 s margin with a pending answer, not with
+    // Autumn's deadline 503.
+    assert_eq!(response.status.as_u16(), 202, "{}", response.text());
+    assert_eq!(response.header("retry-after"), Some("1"));
+    assert!(
+        elapsed < Duration::from_millis(3_900),
+        "answered in {elapsed:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(2_500),
+        "answered in {elapsed:?}"
+    );
+}
+
+// AC-54
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_attempt_that_switches_type_returns_final_output() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_retry_then_switch"),
+        ("x-wait-ms", "5000"),
+    ];
+    let response = until_done(&client, "key-ac54", &extra, &json!({"tag": "ac54"})).await;
+    assert_eq!(response.status.as_u16(), 200, "{}", response.text());
+    assert_eq!(response.json::<Value>(), json!({"final": "retry"}));
+    assert_eq!(side_effects("ac54"), 2, "one side effect for each attempt");
 }
 
 // ── Terminal mapping ──────────────────────────────────────────────────────────
