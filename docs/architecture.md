@@ -479,6 +479,7 @@ An agent loop can spend without limit. A budget caps the LLM tokens or the cost 
 | File | Purpose |
 |------|---------|
 | `durable_route.rs` | Durable routes: the `DurableRoute` extractor runs an Autumn route as a workflow keyed by the request's `Idempotency-Key`. A retry attaches to the same run through the start-idempotency claim. No migration and no new event. See [`docs/durable-routes.md`](durable-routes.md). |
+| `durable_route/stream.rs` | Durable streaming: `DurableCall::stream()` answers with a resumable SSE stream of the run's `publish_durable_progress` chunks. The SSE id is `<attempt>.<offset>`. No migration and no new event. See [`docs/durable-routes.md`](durable-routes.md#stream-the-run). |
 
 ---
 

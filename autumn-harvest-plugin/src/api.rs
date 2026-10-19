@@ -46618,7 +46618,7 @@ async fn stream_workflow_changes(
 /// so the close is driven by a periodic terminal-state poll on the idle tick).
 /// Capped by the configured `sse_keepalive_interval` so operators (and tests)
 /// can shorten it; a modest default keeps close latency bounded.
-const PROGRESS_STREAM_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const PROGRESS_STREAM_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Bounded producer→SSE channel capacity for the progress stream. Progress is a
 /// best-effort side channel: chunks are sent non-blocking (`try_send`), so a
@@ -46965,17 +46965,18 @@ async fn stream_workflow_progress(
 ///
 /// The producer reads the next page only when the send buffer has room. One
 /// stream therefore holds at most this page and the buffer in memory.
-const DURABLE_STREAM_PAGE: i64 = 256;
+pub(crate) const DURABLE_STREAM_PAGE: i64 = 256;
 
 /// Longest wait for a client to take one durable stream frame (issue #1974).
 ///
 /// A client that reads nothing for this long loses its stream. Nothing is
 /// lost: the client resumes with `Last-Event-ID`. Without this bound, a
 /// stalled client holds its producer task and connections forever.
-const DURABLE_STREAM_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const DURABLE_STREAM_SEND_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60);
 
 /// Sender half of an SSE frame channel.
-type SseSender =
+pub(crate) type SseSender =
     futures::channel::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>;
 
 /// Query of `GET /workflows/{id}/stream/durable` (issue #1974).
