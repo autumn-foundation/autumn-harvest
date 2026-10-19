@@ -16,7 +16,9 @@ use autumn_harvest::executor::{
     QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
     run_workflow_with_state_history_policy_and_caps,
 };
-use autumn_harvest::payload_depth::{MAX_PAYLOAD_DEPTH, nests_past_cap};
+use autumn_harvest::payload_depth::{
+    MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE, nests_past_cap,
+};
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::{
     ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, TimerId,
@@ -3169,6 +3171,32 @@ impl SqliteRuntime {
         }
         self.workflow_panic_strikes.remove(&exec);
 
+        // Issue #2224: a result nested past the cap cannot be read back. The
+        // body has already returned, so it cannot handle the error. The run
+        // fails with a typed failure instead of storing the value.
+        let outcome = match outcome {
+            WorkflowOutcome::Completed {
+                output,
+                unhandled_signals,
+            } if nests_past_cap(&output) => {
+                tracing::warn!(%exec, "workflow result nests past the depth cap; failing the run");
+                let failure = autumn_harvest::failure::WorkflowFailure::new(
+                    PAYLOAD_TOO_DEEP_ERROR_TYPE,
+                    format!("workflow result nests more than {MAX_PAYLOAD_DEPTH} levels"),
+                )
+                .non_retryable();
+                WorkflowOutcome::Failed {
+                    error: autumn_harvest::failure::IntoWorkflowErrorString::into_workflow_error_payload(
+                        failure,
+                    ),
+                    non_deterministic_details: None,
+                    handler_panic: false,
+                    unhandled_signals,
+                }
+            }
+            other => other,
+        };
+
         // Issue #2021: a pending cancel request ends the run here.
         // - A body that returns `Ok` or `Err` has done its cleanup. Its
         //   bookkeeping commands persist before the terminal event.
@@ -4750,6 +4778,8 @@ fn retry_plan(
     let error_type = failure.error_type.as_deref();
     if config.attempt >= policy.max_attempts
         || error_type == Some(autumn_harvest::failure::ERROR_TYPE_HANDLER_PANIC)
+        // A deep result is the same on every attempt (issue #2224).
+        || error_type == Some(PAYLOAD_TOO_DEEP_ERROR_TYPE)
     {
         return Ok(None);
     }

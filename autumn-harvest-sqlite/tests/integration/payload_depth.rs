@@ -266,7 +266,7 @@ async fn run_deep(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
         .execute_activity_raw("deep", json!(null), "default")
         .await
     {
-        Ok(output) => Ok(json!({ "output": output })),
+        Ok(output) => Ok(output),
         Err(e) => Ok(json!({ "failed": e.to_string() })),
     }
 }
@@ -382,7 +382,7 @@ async fn an_activity_result_at_the_cap_round_trips() {
     let exec = rt.start_workflow("run_deep", json!(0)).unwrap();
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
-        matches!(state, RunState::Completed(ref v) if v["output"] == nested(MAX_PAYLOAD_DEPTH)),
+        matches!(state, RunState::Completed(ref v) if *v == nested(MAX_PAYLOAD_DEPTH)),
         "got {state:?}"
     );
     rt.run_until_idle().await.unwrap();
@@ -424,7 +424,7 @@ async fn run_local(ctx: &WorkflowContext, name: String) -> Result<Value, String>
         capped_local_info()
     };
     match ctx.execute_local_activity::<i64, Value>(&info, 0).await {
-        Ok(output) => Ok(json!({ "output": output })),
+        Ok(output) => Ok(output),
         Err(e) => Ok(json!({ "failed": e.to_string() })),
     }
 }
@@ -481,7 +481,7 @@ async fn a_local_activity_result_at_the_cap_round_trips() {
     let exec = rt.start_workflow("run_local", json!("capped")).unwrap();
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
-        matches!(state, RunState::Completed(ref v) if v["output"] == nested(MAX_PAYLOAD_DEPTH)),
+        matches!(state, RunState::Completed(ref v) if *v == nested(MAX_PAYLOAD_DEPTH)),
         "got {state:?}"
     );
     rt.run_until_idle().await.unwrap();

@@ -71,6 +71,7 @@ allos        autumn-harvest-plugin  connector_example_budget         -          
 allos        autumn-harvest-plugin  contract_regression              -                          -
 allos        autumn-harvest-plugin  custom_roles                     -                          -
 allos        autumn-harvest-plugin  dev_runtime_tests                dev-runtime                -
+allos        autumn-harvest-plugin  durable_route_docs               -                          -
 allos        autumn-harvest-plugin  effective_config_http_tests      -                          -
 allos        autumn-harvest-plugin  gate_no_global_install           -                          -
 allos        autumn-harvest-plugin  oidc_login                       oidc                       -
@@ -305,6 +306,8 @@ linux        autumn-harvest-plugin  dlq_bulk_discard_perf            -          
 linux        autumn-harvest-plugin  dlq_bulk_integration             -                          -
 linux        autumn-harvest-plugin  dlq_redrive_integration          -                          -
 linux        autumn-harvest-plugin  dr_fence_admin_integration       -                          -
+linux        autumn-harvest-plugin  durable_route_dispatch           -                          -
+linux        autumn-harvest-plugin  durable_route_integration        -                          -
 linux        autumn-harvest-plugin  eligibility_tests                -                          -
 linux        autumn-harvest-plugin  erase_payloads_integration       -                          -
 linux        autumn-harvest-plugin  event_batch_integration          -                          -

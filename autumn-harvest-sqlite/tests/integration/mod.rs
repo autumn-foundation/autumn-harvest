@@ -49,5 +49,6 @@ mod updates;
 mod visibility;
 mod workflow_info_features;
 mod workflow_mutex;
+mod workflow_payload_depth;
 mod workflow_queries;
 mod workflow_retry;

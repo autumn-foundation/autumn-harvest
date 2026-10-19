@@ -1,4 +1,4 @@
-//! The depth cap on payloads that Harvest keeps (issues #2157, #2216, #2225).
+//! The depth cap on payloads that Harvest keeps (issues #2157, #2216, #2224, #2225).
 //!
 //! `serde_json` reads at most 128 levels. Postgres `jsonb` and `SQLite` store any
 //! depth. A stored value nested past the read limit makes every later load of
