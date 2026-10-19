@@ -18,6 +18,23 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// The number of `#[workflow]` fns in the clean corpus crate: one per
+/// `src/wf_*.rs` module, by the corpus naming convention.
+///
+/// Counted, not written down, so a new corpus case does not edit this file.
+fn clean_corpus_workflows() -> usize {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus/clean/src");
+    std::fs::read_dir(&src)
+        .unwrap_or_else(|e| panic!("{}: {e}", src.display()))
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("wf_") && name.ends_with(".rs")
+        })
+        .count()
+}
+
 fn run(args: &[&str]) -> Output {
     Command::new(BIN)
         .args(args)
@@ -319,7 +336,7 @@ fn a_bare_run_in_a_package_directory_analyzes_that_package() {
     );
     assert_eq!(
         report.summary().analyzed,
-        13,
+        clean_corpus_workflows(),
         "every `#[workflow]` in the clean corpus crate: {:?}",
         report.summary()
     );
@@ -354,7 +371,7 @@ fn a_package_with_no_target_flag_builds_its_default_targets() {
         .unwrap_or_else(|e| panic!("stdout is not a Report: {e}\n{}", stdout(&out)));
     assert_eq!(
         report.summary().analyzed,
-        13,
+        clean_corpus_workflows(),
         "the package has a lib, so its lib is what `-p` alone builds: {:?}",
         report.summary()
     );

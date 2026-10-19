@@ -38,6 +38,7 @@
 
 pub mod helpers_ctx;
 
+pub mod wf_async_helper_argument;
 pub mod wf_atomic_shard_pick;
 pub mod wf_cell_ambient_counter;
 pub mod wf_closure_captures_ambient;
@@ -47,16 +48,22 @@ pub mod wf_env_var_os_in_helper;
 pub mod wf_hashmap_adaptor_chain_fanout;
 pub mod wf_hashmap_generic_dispatch;
 pub mod wf_hashmap_join_string;
+pub mod wf_hashmap_keys_fold;
 pub mod wf_hashmap_keys_next;
 pub mod wf_hashset_via_trait_method;
+pub mod wf_helper_named_count;
 pub mod wf_instant_elapsed_field;
 pub mod wf_order_dependence_which_first;
 pub mod wf_process_id_payload;
 pub mod wf_rand_behind_dyn;
 pub mod wf_rand_in_helper_branch;
+pub mod wf_recursive_carry;
+pub mod wf_recursive_instantiation;
+pub mod wf_recursive_relay;
 pub mod wf_refcell_captured_state;
 pub mod wf_replay_varying_ctx_read;
 pub mod wf_rwlock_config_read;
+pub mod wf_saga_compensation_clock;
 pub mod wf_static_counter_in_helper;
 pub mod wf_static_mutex_queue;
 pub mod wf_systemtime_two_crates_deep;

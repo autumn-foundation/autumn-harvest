@@ -7663,6 +7663,37 @@ pub async fn task_exists(conn: &mut AsyncPgConnection, task_id: Uuid) -> Harvest
     Ok(found.is_some())
 }
 
+/// Whether a task of `session_id` other than `except_task_id` can still run
+/// (issue #2193).
+///
+/// A task can still run while it is `PENDING` or `RUNNING`. The scan keys on
+/// `workflow_exec_id`, because the `session_id` index was dropped: no query
+/// could use it. A session belongs to one run, so its member tasks carry the
+/// run's id.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn session_has_other_live_tasks(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+    session_id: Uuid,
+    except_task_id: Uuid,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    diesel::select(diesel::dsl::exists(
+        dsl::harvest_task_queue
+            .filter(dsl::workflow_exec_id.eq(Some(workflow_exec_id)))
+            .filter(dsl::session_id.eq(Some(session_id)))
+            .filter(dsl::id.ne(except_task_id))
+            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+    ))
+    .get_result::<bool>(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
 // ---------------------------------------------------------------------------
 // TTL'd rate-limit / start-throttle runtime overrides (issue #945)
 // ---------------------------------------------------------------------------

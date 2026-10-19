@@ -862,6 +862,7 @@ impl std::fmt::Debug for PayloadCodecs {
 /// Every payload field is a `Value` or an `Option<Value>`, which accepts any
 /// JSON. The lift therefore changes no error. A null reads as `None` either way.
 fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_json::Error> {
+    use crate::event::PayloadSlot;
     use crate::payload_store::PAYLOAD_FIELD_KEYS;
     use serde::de::IntoDeserializer;
     use serde::de::value::MapDeserializer;
@@ -894,9 +895,11 @@ fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_js
         let Some(payload) = payload else {
             continue;
         };
-        // Serde ignores a key that the variant does not have.
-        if let Some(field) = event.payload_slot(key) {
-            field.fill(payload);
+        match event.payload_slot_mut(key) {
+            Some(PayloadSlot::Required(field)) => *field = payload,
+            Some(PayloadSlot::Optional(field)) => *field = Some(payload),
+            // Serde ignores a key that the variant does not have.
+            None => {}
         }
     }
     Ok(event)
@@ -2637,7 +2640,7 @@ mod tests {
             for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
                 if stored["data"].get(key).is_some() {
                     assert!(
-                        decoded.payload_slot(key).is_some(),
+                        decoded.payload_slot_mut(key).is_some(),
                         "{} has no payload slot for `{key}`",
                         event.type_name()
                     );

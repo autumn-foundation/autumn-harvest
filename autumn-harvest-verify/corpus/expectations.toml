@@ -62,7 +62,7 @@
 schema_version = 1
 
 # ════════════════════════════════════════════════════════════════════════════
-# SEEDED — must be `nondeterminism-found` with a named trace (29 rows)
+# SEEDED — must be `nondeterminism-found` with a named trace (35 rows)
 # ════════════════════════════════════════════════════════════════════════════
 
 [[workflow]]
@@ -302,8 +302,64 @@ mechanism = "hash order collapsed into a value by `join` - a NON-commutative fol
 launder = "no HashMap token in the body; the iteration is an adaptor chain in another crate over a fn parameter. Pins the order-killing reduction list to len/count/integer sum/max/min - if `join` ever leaks into it, this flips to proven"
 trace_contains = ["values_joined", "values", "join"]
 
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_recursive_carry::wf_recursive_carry"
+verdict = "nondeterminism-found"
+mechanism = "a recursive helper passes `acc ^ fine_stamp()` to its own recursive call and returns what that call returns"
+launder = "fine_stamp is two crates away, past det_check's one hop. The clock reaches the return only through the ARGUMENT of the recursive call, so only the fixpoint round that reruns the cycle with the joined argument taint finds it. Before the fixpoint the cycle was cut, and this was `unknown`"
+trace_contains = ["carry", "fine_stamp", "SystemTime::now"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_saga_compensation_clock::wf_saga_compensation_clock"
+verdict = "nondeterminism-found"
+mechanism = "a `Saga::step` compensation closure reads the clock and passes it to an activity"
+launder = "fine_stamp is two crates away, past det_check's one hop. The engine runs the closure later and its future has no body here, so the finding rests on analyzing the closure where it is passed. Pins that trusting the `Saga::step` future never hides its closures"
+trace_contains = ["fine_stamp", "SystemTime::now"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_hashmap_keys_fold::wf_hashmap_keys_fold"
+verdict = "nondeterminism-found"
+mechanism = "hash order collapsed into a value by `fold` with string concatenation over HashMap::keys"
+launder = "as wf_hashmap_join_string. Pins the removal of the `[[reduction]] path = \"fold\"` row, which matched every `fold` and cleared the order taint, so this came back proven"
+trace_contains = ["keys_folded", "keys", "fold"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_helper_named_count::wf_helper_named_count"
+verdict = "nondeterminism-found"
+mechanism = "a first-party helper named `count` reads the clock"
+launder = "fine_stamp is two crates away, past det_check's one hop. The bare `[[reduction]] path = \"count\"` row once applied to any callee named `count`, so the helper's body was never read. A bare row now yields to a body in the analyzed set"
+trace_contains = ["count", "fine_stamp", "SystemTime::now"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_recursive_relay::wf_recursive_relay"
+verdict = "nondeterminism-found"
+mechanism = "a boxed recursive `async fn` emits an activity with its `stamp` argument, and passes `fine_stamp()` as the next stamp"
+launder = "fine_stamp is two crates away, past det_check's one hop. The outer call passes a clean stamp, so only the recursive activation carries the clock into the sink. A cut cycle reports no sink inside it; only the fixpoint round with the joined argument taint finds it"
+trace_contains = ["relay", "fine_stamp", "SystemTime::now"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_recursive_instantiation::wf_recursive_instantiation"
+verdict = "nondeterminism-found"
+mechanism = "a generic recursive fn `chain::<Fixed>` calls `chain::<Clock>`, and only `Clock::stamp` reads the clock through `fine_stamp()`"
+launder = "fine_stamp is two crates away, past det_check's one hop. The clock read is behind a static trait call on a type parameter, and only the recursive call's substitution selects it. A cycle keyed on the body path alone solves only the outer substitution and never analyzes Clock::stamp"
+trace_contains = ["chain", "fine_stamp", "SystemTime::now"]
+
+[[workflow]]
+crate = "harvest-verify-corpus-seeded"
+workflow = "harvest_verify_corpus_seeded::wf_async_helper_argument::wf_async_helper_argument"
+verdict = "nondeterminism-found"
+mechanism = "a clock value passed as the third argument of an `async fn` helper reaches an activity argument"
+launder = "fine_stamp is two crates away, past det_check's one hop. A call to an `async fn` resolves to its coroutine, whose parameters are the pinned future and the context. Seeding the call's arguments by position dropped `stamp`, so this came back proven"
+trace_contains = ["emit", "fine_stamp", "SystemTime::now"]
+
 # ════════════════════════════════════════════════════════════════════════════
-# CLEAN — must be `proven-deterministic` (13 rows)
+# CLEAN — must be `proven-deterministic` (19 rows)
 # ════════════════════════════════════════════════════════════════════════════
 
 [[workflow]]
@@ -408,6 +464,54 @@ workflow = "harvest_verify_corpus_clean::wf_helper_emits_clean_activity::wf_help
 verdict = "proven-deterministic"
 mechanism = "a helper taking &WorkflowContext emits the commands itself, with arguments derived only from its parameters"
 launder = "n/a - sinks are not confined to the workflow body; a helper containing a sink is ordinary good code. The analyzer must not treat 'touches ctx' as unanalyzable"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_const_argument::wf_const_argument"
+verdict = "proven-deterministic"
+mechanism = "first-party `const` items passed as arguments to std methods"
+launder = "n/a - MIR prints a const operand as `const m::KEEP`, the shape of a fn item. A constant is fixed at compile time, so it is not a callback into an untrusted crate named `m`"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_trimmed_param_receiver::wf_trimmed_param_receiver"
+verdict = "proven-deterministic"
+mechanism = "`Vec::push`/`drain` on a `&mut Vec<u32>` parameter, slice iteration on a `&[u32]` parameter, `Vec::new` as a fn item"
+launder = "n/a - a signature prints parameter types trimmed, with no root. A `let` declaration elsewhere prints `std::vec::Vec`, and rustc trims only a unique name"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_float_inherent::wf_float_inherent"
+verdict = "proven-deterministic"
+mechanism = "`f64::round` and `f64::mul_add` on workflow input"
+launder = "n/a - MIR prints `f64::<impl f64>::round`; the primitive first segment is core, not an untrusted crate"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_derived_comparison::wf_derived_comparison"
+verdict = "proven-deterministic"
+mechanism = "`!=` and `<` on a derived `PartialEq`/`PartialOrd` enum"
+launder = "n/a - `ne` and `lt` run core's default body, which calls the derived `eq` and `partial_cmp` in the analyzed set"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_saga_step::wf_saga_step"
+verdict = "proven-deterministic"
+mechanism = "a `Saga::step` with a forward activity and a compensating activity"
+launder = "n/a - the `Saga::step` future prints trimmed; a `let` declaration names `autumn_harvest::Saga`, a trusted crate. Paired with wf_saga_compensation_clock, which must be FOUND"
+trace_contains = []
+
+[[workflow]]
+crate = "harvest-verify-corpus-clean"
+workflow = "harvest_verify_corpus_clean::wf_recursive_helper::wf_recursive_helper"
+verdict = "proven-deterministic"
+mechanism = "a recursive helper over workflow input, with `strip_prefix('[')` and `strip_suffix(']')`"
+launder = "n/a - the recursion is solved as a fixpoint, not cut. The char literals pin the lexer: `const ']'` once closed a bracket that was never opened, and the call became a `mir-parse` boundary. Paired with wf_recursive_carry, which must be FOUND"
 trace_contains = []
 
 # ════════════════════════════════════════════════════════════════════════════
