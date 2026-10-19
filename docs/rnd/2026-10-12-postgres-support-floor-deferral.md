@@ -64,5 +64,9 @@ Revisit on the first of:
 ## Cheapest evidence to gather first (tier 3, under one day)
 
 Run the core DB suite once against `postgres:12` and once against `postgres:14` in a
-throwaway CI job. A failure turns "12+" into a measured false claim. A pass makes it a
-tested one. Either result closes the question without an RFC.
+throwaway CI job. Exclude fixtures that deliberately need newer SQL. `event_partitioning_tests`
+runs `CREATE UNIQUE INDEX ... NULLS NOT DISTINCT`, which needs PG 15 or later, and the
+partitioned layout already requires PG 14. Judge each failure by whether the engine path
+under test needs newer SQL. A failure in the supported non-partitioned engine turns "12+"
+into a measured false claim. A pass makes it a tested one. Either result closes the
+question without an RFC.
