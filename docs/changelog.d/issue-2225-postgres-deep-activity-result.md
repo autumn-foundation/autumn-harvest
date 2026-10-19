@@ -27,6 +27,9 @@ The flush still refreshes the heartbeat time, so the timeout scanner sees a live
 activity. The last good checkpoint stays. Before this fix, a deep checkpoint made
 every later claim of the task fail.
 
+This fix stops new deep results. It does not repair a history that already
+holds one.
+
 The cap and the depth walk now live in `autumn_harvest::payload_depth`. The
 SQLite backend uses the same code and keeps its public names. The walk uses a
 heap stack, so a very deep value cannot overflow the call stack. No migration.
