@@ -2561,3 +2561,7 @@ standalone note rather than part of the claim-path attribution table above:
   — before issue #2126, the four task-timeout lanes read one page of live
   rows four times per pass. Lanes at one position now share one refill
   statement (refill buffers -75% at 100,000 live rows, `pg_stat_statements`).
+* [`docs/performance-stream-append-count.md`](performance-stream-append-count.md)
+  — `append_stream_chunks` counted every stored chunk of a run on each append.
+  It now skips the count while the offset span plus the new chunks fits the cap
+  (count buffers -99.8%, total buffers -35.5% over full stream lifetimes).

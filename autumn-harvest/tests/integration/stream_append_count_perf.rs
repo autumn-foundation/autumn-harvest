@@ -2,13 +2,13 @@
 //! Ledger performance investigation: the durable stream append (issue #2083).
 //!
 //! `store::append_stream_chunks` admits chunks against a per-run cap. It reads
-//! the stored row count of the run on every append, so one append of ten chunks
+//! the stored row count of the run on every append. So one append of ten chunks
 //! to a long stream reads every stored chunk of that run.
 //!
 //! The harness seeds running executions with no chunks. It then replays the
-//! whole lifetime of every stream through the public `append_stream_chunks`:
-//! round by round, each live stream appends ten chunks, until it has emitted its
-//! length. A stream of `n` chunks makes `n / 10` appends, and append `k` finds
+//! whole lifetime of every stream through the public `append_stream_chunks`.
+//! Round by round, each live stream appends ten chunks, until it has emitted its
+//! length. A stream of `n` chunks makes `n / 10` appends. Append `k` finds
 //! `10 k` stored chunks. So the long streams dominate the count cost, as they do
 //! in production. Stream lengths are heavy-tailed. The harness reads
 //! `pg_stat_statements`. Evidence is call counts, buffers and WAL bytes.
@@ -242,7 +242,11 @@ async fn measure(admin: &str, label: &str, execs: i64, vacuumed: bool) -> (Point
         appends,
         statements: rows.iter().map(|r| r.calls).sum(),
         buffers: rows.iter().map(|r| r.buffers).sum(),
-        count_calls: rows.iter().filter(|r| is_count(&r.query)).map(|r| r.calls).sum(),
+        count_calls: rows
+            .iter()
+            .filter(|r| is_count(&r.query))
+            .map(|r| r.calls)
+            .sum(),
         count_buffers: rows
             .iter()
             .filter(|r| is_count(&r.query))
@@ -415,8 +419,13 @@ async fn append_admission_edge_cases() {
     assert_eq!(stored, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, marker]);
 
     // A batch bigger than the room is cut at the room, then the marker latches.
-    let (written, stored) =
-        run_scenario(&admin, &[0, 1, 2, 3, 4, 5, 6, 7, 8], &[&[9, 10, 11], &[12]], 10).await;
+    let (written, stored) = run_scenario(
+        &admin,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8],
+        &[&[9, 10, 11], &[12]],
+        10,
+    )
+    .await;
     assert_eq!(written, [1, 0]);
     assert_eq!(stored, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, marker]);
 
