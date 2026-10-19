@@ -224,7 +224,7 @@ async fn measure(admin: &str, label: &str, execs: i64, vacuumed: bool) -> (Point
         }
         // Autovacuum's insert rule: 1000 + 0.2 * reltuples inserts since the last pass.
         #[allow(clippy::cast_precision_loss)]
-        let due = since_vacuum as f64 > 1000.0 + 0.2 * rows_at_vacuum as f64;
+        let due = since_vacuum as f64 > 0.2_f64.mul_add(rows_at_vacuum as f64, 1000.0);
         if vacuumed && due {
             conn.batch_execute("VACUUM harvest_stream_chunks")
                 .await
