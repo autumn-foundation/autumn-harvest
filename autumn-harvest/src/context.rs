@@ -11594,14 +11594,22 @@ impl WorkflowContext {
         let count = activities.len();
         let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
         if fresh_dispatch {
-            if !self.replays_a_scope_cancel() {
-                for (name, input, _) in activities {
-                    self.check_payload_depth(PayloadKind::ActivityInput, Some(name), input)?;
-                }
-            }
+            self.check_activity_fan_out_depth(activities)?;
             self.record_fan_out_marker(seq, count);
         }
         Ok(fresh_dispatch)
+    }
+
+    /// Check every input of a fresh activity fan-out against the depth cap
+    /// (issue #2224). The caller records no marker before this check passes.
+    fn check_activity_fan_out_depth(
+        &self,
+        activities: &[(String, Value, String)],
+    ) -> HarvestResult<()> {
+        for (name, input, _) in activities {
+            self.check_payload_depth(PayloadKind::ActivityInput, Some(name), input)?;
+        }
+        Ok(())
     }
 
     /// Check the fan-out count against event history **without** pushing the
@@ -12565,6 +12573,7 @@ impl WorkflowContext {
                         .into(),
                 ));
             }
+            self.check_activity_fan_out_depth(&activities)?;
             self.record_fan_out_marker(seq, count);
         }
         let writer = self.fan_out_writer_mode(seq, fresh, options.result_writer());
@@ -33749,6 +33758,30 @@ mod payload_depth_tests {
                     "default".to_string(),
                 ),
             ])
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no marker and no earlier activity is queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn option_based_activity_fan_out_over_the_cap_queues_nothing() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_activity_fan_out_raw_with(
+                vec![
+                    ("a".to_string(), serde_json::json!(1), "default".to_string()),
+                    (
+                        "a".to_string(),
+                        nested(MAX_PAYLOAD_DEPTH + 1),
+                        "default".to_string(),
+                    ),
+                ],
+                &crate::fan_out::FanOutOptions::new(),
+            )
             .await
             .expect_err("a deep input must be refused");
         assert_too_deep(&err, &PayloadKind::ActivityInput);
