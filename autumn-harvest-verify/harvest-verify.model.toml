@@ -2284,10 +2284,11 @@ reason = "Existential quantification; see `all`."
 path = "contains"
 clears = "order"
 reason = "Membership is order-independent."
-[[reduction]]
-path = "fold"
-clears = "order"
-reason = "NOT order-independent in general — `fold` with a non-commutative accumulator IS order-sensitive. Listed with `clears = \"order\"` would be wrong, so this row is deliberately absent from the analyzer's effective set: see the note in the `reverse` sanitizer row for the same device. Kept as a documented non-rule so a future contributor does not add it."
+# No `fold` row. `fold` with a non-commutative accumulator IS order-sensitive,
+# so a row with `clears = "order"` would be wrong. An earlier revision kept such
+# a row as a "documented non-rule", but with no receiver it matched every
+# `fold` call and cleared hash order through `map.keys().fold(..)`. This
+# comment records the decision instead. Do not add the row.
 [[reduction]]
 path = "get"
 receiver = "HashMap"
@@ -2420,6 +2421,10 @@ reason = "serde_json::to_value, a `[[trusted]]` crate's free function that rustc
 [[std_free_fn]]
 path = "from_value"
 reason = "serde_json::from_value, the decoding half of `to_value` and trimmed the same way. Verified in the dumps: `from_value::<bool>(move _N)` with a `serde_json::Value` argument and a `std::result::Result<bool, serde_json::Error>` destination — again the crate is named only in types that are the CALLER's, not the callee's."
+
+[[std_free_fn]]
+path = "to_vec"
+reason = "serde_json::to_vec, the byte-vector sibling of `to_value`, trimmed the same way. Verified in the `autumn-harvest-agent` dump: `_2 = to_vec::<T>(copy _1)` with `_1: &T` and `_2: std::result::Result<std::vec::Vec<u8>, serde_json::Error>` — the crate is named only in the RESULT, the caller's type. A structural walk over the value. The method `<[T]>::to_vec` prints with its receiver (`slice::<impl [T]>::to_vec`), so this bare row never stands in for it."
 
 [[std_free_fn]]
 path = "display"

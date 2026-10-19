@@ -239,6 +239,20 @@ pub struct Program {
     /// crate then takes effect here too, not only in `Model::classify` at
     /// the analysis stage.
     trusted_crates: BTreeSet<String>,
+    /// Type name → every rooted path that a declared type spells it with.
+    ///
+    /// A signature prints a parameter type trimmed, as `&mut Vec<Row>`. A
+    /// `let` declaration prints the same type in full, as
+    /// `&mut std::vec::Vec<rows::Row>`. rustc trims a path only when its
+    /// name is unique in the crate graph. So a trimmed name stands for the
+    /// one item that its rooted spellings name.
+    type_spellings: BTreeMap<String, BTreeSet<String>>,
+    /// Last path segment → `(path, declared type)` of each `const` item.
+    ///
+    /// MIR passes a `const` item as an operand, as `const rows::LIMIT`. A fn
+    /// item has the same shape, as `const Uuid::new_v4`. This index tells the
+    /// two apart.
+    const_items: BTreeMap<String, Vec<(String, String)>>,
 }
 
 impl Program {
@@ -360,6 +374,9 @@ impl Program {
             for item in &doc.statics {
                 index_static(&mut self.statics, &mut self.statics_by_last, item.clone());
             }
+            for (path, header) in &doc.inline_consts {
+                index_const_item(&mut self.const_items, path, inline_const_type(header));
+            }
             for (body_at, body) in doc.bodies.iter().enumerate() {
                 let id = if collides.contains(&body.path) {
                     format!("{}::{}", doc.crate_name, body.path)
@@ -376,7 +393,16 @@ impl Program {
                     .or_insert_with(|| id.clone());
                 self.crate_of.insert(id.clone(), doc.crate_name.clone());
                 self.bodies.entry(id).or_insert((doc_at, body_at));
+                for ty in body.locals.values().chain(std::iter::once(&body.return_ty)) {
+                    for path in rooted_type_paths(ty) {
+                        self.type_spellings
+                            .entry(last_segment(path).to_string())
+                            .or_default()
+                            .insert(path.to_string());
+                    }
+                }
                 if body.is_const {
+                    index_const_item(&mut self.const_items, &body.path, &body.return_ty);
                     // A `const NAME: Ty = {..}` body is how a `thread_local!` key
                     // and a promoted constant reach the analysis.
                     index_static(
@@ -402,8 +428,12 @@ impl Program {
                 }
             }
         }
-        // Async shims: `fn f(..) -> {async fn body of m::f()}` means the body to
-        // analyze for a call to `f` is `f::{closure#0}`.
+        self.index_async_bodies();
+    }
+
+    /// Async shims: `fn f(..) -> {async fn body of m::f()}` means the body to
+    /// analyze for a call to `f` is `f::{closure#0}`.
+    fn index_async_bodies(&mut self) {
         let paths: BTreeSet<&str> = self.order.iter().map(String::as_str).collect();
         let mut async_bodies: BTreeMap<String, String> = BTreeMap::new();
         for doc in &self.docs {
@@ -748,6 +778,44 @@ impl Program {
         matched
     }
 
+    /// Does the operand path `name` print a `const` item rather than a fn item?
+    ///
+    /// The item path is trimmed (`LIMIT`) where the operand is not
+    /// (`const rows::LIMIT`), so the match is by segment suffix in either
+    /// direction. A `const` of a callable type never matches.
+    #[must_use]
+    pub fn names_const_item(&self, name: &str) -> bool {
+        let name = strip_generics_everywhere(name.trim());
+        let Some(items) = self.const_items.get(last_segment(&name)) else {
+            return false;
+        };
+        let want = segments(&name);
+        items.iter().any(|(path, ty)| {
+            (is_segment_suffix(&name, &segments(path)) || is_segment_suffix(path, &want))
+                && !is_callable_type(ty)
+        })
+    }
+
+    /// Do the declared types name the trimmed type `name` only with a root
+    /// that `trusted` accepts?
+    ///
+    /// rustc trims a path only when the name is unique in the crate graph. So
+    /// a trimmed `Vec` is the one item that `std::vec::Vec` names elsewhere in
+    /// the dumps. A name with no rooted spelling is never trusted, and neither
+    /// is a name that the sources declare as a first-party type.
+    #[must_use]
+    pub fn trimmed_type_is_trusted(&self, name: &str, trusted: impl Fn(&str) -> bool) -> bool {
+        if name.contains("::") || self.sources.declares_type_named(name) {
+            return false;
+        }
+        self.type_spellings.get(name).is_some_and(|paths| {
+            !paths.is_empty()
+                && paths
+                    .iter()
+                    .all(|path| crate_root(path).is_some_and(&trusted))
+        })
+    }
+
     /// A `static`/`const` item by its printed name, when exactly one answers.
     #[must_use]
     pub fn static_named(&self, name: &str) -> Option<&StaticItem> {
@@ -911,17 +979,27 @@ impl Program {
         }
     }
 
+    /// The coroutine body behind an async shim callee. A generic `async fn`
+    /// is indexed as `f<T>`, and a call site prints its own arguments, as
+    /// `f<Approval>`. Without the generics both print `f`.
+    fn async_coroutine(&self, near: Option<&str>, callee: &str) -> Option<&String> {
+        let inner = async_body_of(callee)?;
+        near.and_then(|krate| self.async_bodies.get(&format!("{krate}::{inner}")))
+            .or_else(|| self.async_bodies.get(&inner))
+            .or_else(|| {
+                let bare = strip_generics_everywhere(&inner);
+                near.and_then(|krate| self.async_bodies.get(&format!("{krate}::{bare}")))
+                    .or_else(|| self.async_bodies.get(&bare))
+            })
+    }
+
     /// Resolve a printed callee path as seen from `caller_body`.
     #[must_use]
     pub fn resolve_call(&self, caller_body: &str, callee: &str) -> Resolution {
         let path = CalleePath::parse(callee);
         let near = self.crate_of.get(caller_body).map(String::as_str);
         // 1. An async coroutine reached through its shim, `poll` or `into_future`.
-        if let Some(inner) = async_body_of(callee)
-            && let Some(body) = near
-                .and_then(|krate| self.async_bodies.get(&format!("{krate}::{inner}")))
-                .or_else(|| self.async_bodies.get(&inner))
-        {
+        if let Some(body) = self.async_coroutine(near, callee) {
             return Resolution::Body(body.clone());
         }
         // 2. A closure named by its span, either as the receiver or in the turbofish.
@@ -974,6 +1052,20 @@ impl Program {
             if let Some(resolution) = bodies_resolution(bodies, Ambiguity::Impl) {
                 return resolution;
             }
+            // A provided method that the impl does not override runs core's
+            // default body, which calls the impl's required method.
+            if let Some(required) = provided_comparison(path.trait_.as_deref(), method) {
+                let bodies = self.impl_method_candidates(
+                    receiver,
+                    path.trait_.as_deref(),
+                    required,
+                    path.receiver_path.as_deref(),
+                    near,
+                );
+                if let Some(resolution) = bodies_resolution(bodies, Ambiguity::Impl) {
+                    return resolution;
+                }
+            }
             if let Some(detail) = self.unresolved_impl_methods.get(method) {
                 return Resolution::Boundary(BoundaryKind::MissingBody, detail.clone());
             }
@@ -1003,7 +1095,9 @@ impl Program {
             if self.crates.contains(root) {
                 return Resolution::Boundary(BoundaryKind::MissingBody, callee.trim().to_string());
             }
-            if !self.is_trusted_crate(root) {
+            // A primitive root (`f64::<impl f64>::round`) is core's own
+            // inherent impl. The analysis then checks the receiver.
+            if !self.is_trusted_root(root) {
                 return Resolution::Boundary(
                     BoundaryKind::ExternalCrateBody,
                     callee.trim().to_string(),
@@ -1486,6 +1580,76 @@ fn index_static(
         by.push(item.path.clone());
     }
     statics.entry(item.path.clone()).or_insert(item);
+}
+
+/// The required method that core's default body of a provided comparison
+/// method calls: `PartialEq::ne` calls `eq`, and `PartialOrd::lt`, `le`, `gt`
+/// and `ge` call `partial_cmp`.
+///
+/// Each returns a `bool` computed from the required method's result alone.
+/// So the required method's body carries the same taint. `Ord::max` and
+/// `min` are not here: they return one of their arguments, and that value
+/// flow is not in `cmp`.
+fn provided_comparison(trait_: Option<&str>, method: &str) -> Option<&'static str> {
+    match (trait_?, method) {
+        ("PartialEq", "ne") => Some("eq"),
+        ("PartialOrd", "lt" | "le" | "gt" | "ge") => Some("partial_cmp"),
+        _ => None,
+    }
+}
+
+/// Index a `const` item under its last path segment.
+///
+/// A promoted constant (`f::promoted[0]`) and an anonymous one (`m::_`) have
+/// no name that an operand can print, so they are skipped.
+fn index_const_item(items: &mut BTreeMap<String, Vec<(String, String)>>, path: &str, ty: &str) {
+    let last = last_segment(path);
+    if last == "_" || path.contains('[') || path.contains('{') {
+        return;
+    }
+    let entry = items.entry(last.to_string()).or_default();
+    if !entry.iter().any(|(have, _)| have == path) {
+        entry.push((path.to_string(), ty.trim().to_string()));
+    }
+}
+
+/// The declared type of a one-line `const PATH: TY = VALUE;` header.
+fn inline_const_type(header: &str) -> &str {
+    let sig = header.trim().strip_prefix("const ").unwrap_or(header);
+    let Some(colon) = crate::mir::lexer::find_type_colon(sig) else {
+        return "";
+    };
+    let rest = sig.get(colon.saturating_add(1)..).unwrap_or("");
+    rest.split_once(" = ").map_or(rest, |(ty, _)| ty).trim()
+}
+
+/// Can a value of the declared type `ty` be called?
+///
+/// A `const` of fn-pointer or closure type is a callback in all but name. It
+/// must stay on the fn-item path, so that the analysis does not drop the call.
+fn is_callable_type(ty: &str) -> bool {
+    ty.is_empty()
+        || ty.contains("fn(")
+        || ty.contains("fn<")
+        || ty.contains("Fn(")
+        || ty.contains("FnMut(")
+        || ty.contains("FnOnce(")
+        || ty.contains("{closure")
+        || ty.contains("dyn ")
+}
+
+/// Every rooted path in a declared type that names a type: `a::b::Name`,
+/// whose last segment is type-shaped.
+///
+/// A trimmed name (`Vec`) has no `::` and is not returned. A lowercase last
+/// segment is a module or a function, not a type, and is skipped too.
+fn rooted_type_paths(ty: &str) -> impl Iterator<Item = &str> {
+    ty.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+        .map(|token| token.trim_matches(':'))
+        .filter(|token| {
+            crate_root(token).is_some()
+                && last_segment(token).starts_with(|c: char| c.is_ascii_uppercase())
+        })
 }
 
 /// Append a candidate unless the same body is already recorded.
