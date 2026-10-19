@@ -5831,6 +5831,7 @@ impl WorkflowContext {
                     crate::cancellation_scope::Captured::NotReplaying => {
                         let result = f();
                         let output = serde_json::to_value(&result)?;
+                        self.check_payload_depth(PayloadKind::SideEffectValue, None, &output)?;
 
                         // Enforce side-effect payload cap before recording.
                         // SideEffectRecorded events are written via pre_suspension_events_from_commands
@@ -6851,6 +6852,7 @@ impl WorkflowContext {
                 )
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
                 self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
 
                 // Enforce activity input payload cap before scheduling.
@@ -7173,6 +7175,7 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
                 self.check_strict_replay_no_match(&format!("LocalActivityScheduled({name})"))?;
 
                 // Enforce activity input payload cap for local activities too.
@@ -9015,6 +9018,7 @@ impl WorkflowContext {
                 }
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
                 self.check_strict_replay_no_match(&format!(
                     "ChildWorkflowStarted({workflow_name})"
                 ))?;
@@ -9177,6 +9181,7 @@ impl WorkflowContext {
                 Ok(child_id)
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
                 self.check_strict_replay_no_match(&format!(
                     "ChildWorkflowSpawnedDetached({workflow_name})"
                 ))?;
@@ -9635,6 +9640,7 @@ impl WorkflowContext {
         // Issue #1984: a scope that replays its cancel holds this dispatch.
         // The cap applied when the cancelling cycle made it.
         if fresh_dispatch && !self.replays_a_scope_cancel() {
+            self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
             let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
             if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input {
                 return Err(HarvestError::PayloadTooLarge {
@@ -11019,10 +11025,11 @@ impl WorkflowContext {
 
             // First live call: generate a new signal_id and dispatch.
             HistoryMatch::NoMatch => {
+                let payload_json = serde_json::to_value(&payload)?;
+                self.check_payload_depth(PayloadKind::SignalPayload, None, &payload_json)?;
                 self.check_strict_replay_no_match(&format!(
                     "ExternalSignalRequested(target={target}, signal={signal_name})"
                 ))?;
-                let payload_json = serde_json::to_value(&payload)?;
                 // Issue #1985: a broken promise signal is the sender's bug.
                 // Refuse it here, before a request is recorded. The outbox
                 // would otherwise report it as a target state, such as
@@ -11570,45 +11577,50 @@ impl WorkflowContext {
         *seq
     }
 
-    /// Record or verify the fan-out count in event history.
+    /// Check an activity fan-out against history, then record its marker.
     ///
-    /// On **live execution** (past end of history): pushes a `RecordMarker`
-    /// command so future replays can verify the collection length, and
-    /// returns `Ok(true)` — this is the very first time this fan-out group
-    /// has ever been dispatched, which callers use to gate one-time,
-    /// pre-dispatch validation that must never re-run on replay.
-    ///
-    /// On **replay**: matches the `MarkerRecorded` event and compares the
-    /// recorded count with the current count, returning `Ok(false)` on a
-    /// match. Returns a [`HarvestError::NonDeterministic`] when they differ.
-    ///
-    /// The activity fan-out methods use it as-is, except `fan_out_with_impl`.
-    /// That method checks the store between the peek and the marker. Child
-    /// fan-out also uses [`peek_fan_out_count`](Self::peek_fan_out_count) +
-    /// [`record_fan_out_marker`](Self::record_fan_out_marker), so the marker
-    /// is recorded only *after* payload validation succeeds — see those
-    /// methods' docs for why.
-    fn check_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
+    /// A fresh dispatch first checks every input against the depth cap
+    /// (issue #2224). A deep input then fails the whole fan-out before the
+    /// marker or any earlier activity is queued.
+    fn check_activity_fan_out(
+        &self,
+        seq: u32,
+        activities: &[(String, Value, String)],
+    ) -> HarvestResult<bool> {
+        let count = activities.len();
         let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
         if fresh_dispatch {
+            self.check_activity_fan_out_depth(activities)?;
             self.record_fan_out_marker(seq, count);
         }
         Ok(fresh_dispatch)
     }
 
+    /// Check every input of a fresh activity fan-out against the depth cap
+    /// (issue #2224). The caller records no marker before this check passes.
+    fn check_activity_fan_out_depth(
+        &self,
+        activities: &[(String, Value, String)],
+    ) -> HarvestResult<()> {
+        for (name, input, _) in activities {
+            self.check_payload_depth(PayloadKind::ActivityInput, Some(name), input)?;
+        }
+        Ok(())
+    }
+
     /// Check the fan-out count against event history **without** pushing the
     /// `RecordMarker` command on a fresh dispatch.
     ///
-    /// Splitting this out of [`check_fan_out_count`](Self::check_fan_out_count)
-    /// lets a caller run additional validation (e.g. the child fan-out
-    /// payload-cap pre-check) *between* determining "this is a fresh
-    /// dispatch" and actually committing the `fan_out:{n}` marker to the
-    /// command list — so a validation failure discovered in between never
-    /// leaves a persisted marker with no corresponding dispatch attempt. A
-    /// terminal execution whose history contains a `fan_out:{n}` marker but
-    /// no children would otherwise be replayed by matching the marker
-    /// (`fresh_dispatch == false`) and then diverging when it tries to
-    /// re-derive a `ChildWorkflowStarted` that was never recorded.
+    /// A caller can run more validation after this check. An example is the
+    /// payload-cap pre-check of a fan-out. The check runs between "this is a
+    /// fresh dispatch" and the commit of the `fan_out:{n}` marker.
+    ///
+    /// A validation failure in between then leaves no marker without a
+    /// dispatch attempt. Such a marker is a hazard. A terminal execution whose
+    /// history holds a `fan_out:{n}` marker but no children would replay by
+    /// matching the marker (`fresh_dispatch == false`). It would then diverge
+    /// when it tries to re-derive a `ChildWorkflowStarted` that was never
+    /// recorded.
     fn peek_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
         let marker_result = self.match_history(|m| m.match_fan_out_marker(seq, count));
         match marker_result {
@@ -11812,8 +11824,7 @@ impl WorkflowContext {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
-        let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -11880,8 +11891,7 @@ impl WorkflowContext {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
-        let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -12103,7 +12113,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -12219,7 +12229,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -12559,6 +12569,7 @@ impl WorkflowContext {
                         .into(),
                 ));
             }
+            self.check_activity_fan_out_depth(&activities)?;
             self.record_fan_out_marker(seq, count);
         }
         let writer = self.fan_out_writer_mode(seq, fresh, options.result_writer());
@@ -12696,6 +12707,11 @@ impl WorkflowContext {
     ) -> HarvestResult<()> {
         // Issue #1984: a scope that replays its cancel holds these dispatches.
         // The cap applied when the cancelling cycle made them.
+        if fresh_dispatch && !self.replays_a_scope_cancel() {
+            for (_, input) in children {
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, input)?;
+            }
+        }
         if !fresh_dispatch || self.payload_max_workflow_input == 0 || self.replays_a_scope_cancel()
         {
             return Ok(());
@@ -13543,6 +13559,7 @@ impl WorkflowContext {
             }
             match &branches[dispatch.index].kind {
                 RaceBranchKind::Activity { name, input, .. } => {
+                    self.check_payload_depth(PayloadKind::ActivityInput, Some(name), input)?;
                     let effective_cap = {
                         let global = self.payload_max_activity_input;
                         self.activity_input_cap_overrides
@@ -13565,6 +13582,7 @@ impl WorkflowContext {
                     }
                 }
                 RaceBranchKind::ChildWorkflow { input, .. } => {
+                    self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, input)?;
                     let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
                     if self.payload_max_workflow_input > 0
                         && observed > self.payload_max_workflow_input
@@ -14231,6 +14249,7 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
                 self.check_strict_replay_no_match(&format!("ExternalActivityScheduled({name})"))?;
 
                 // First time — generate a fresh token and schedule.
@@ -14582,6 +14601,7 @@ impl WorkflowContext {
                 ))
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::WorkflowInput, None, &input)?;
                 self.check_strict_replay_no_match("ContinueAsNew")?;
                 // Issue #1161: check the cap only for a SAME-type
                 // continuation. `self.payload_max_workflow_input` is
@@ -15187,7 +15207,15 @@ impl WorkflowContext {
             .expect("update_registry lock poisoned")
             .get_handler(name);
         match handler {
-            Some(handler) => handler(input).await,
+            // A result nested past the depth cap cannot be read back, so the
+            // update fails instead (issue #2224). Both update paths run here.
+            Some(handler) => match handler(input).await {
+                Ok(output) if crate::payload_depth::nests_past_cap(&output) => Err(format!(
+                    "payload too deep: update '{name}' result nests more than {} levels",
+                    crate::payload_depth::MAX_PAYLOAD_DEPTH
+                )),
+                other => other,
+            },
             None => Err(format!("update handler '{name}' not found")),
         }
     }
@@ -15654,6 +15682,28 @@ impl WorkflowContext {
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
+
+    /// Refuse a payload that nests past the depth cap (issue #2224).
+    ///
+    /// A scope that replays its cancel holds its dispatches (issue #1984). The
+    /// cap applied when the cancelling cycle made them, so the check skips them
+    /// and an older recorded cancel still replays.
+    fn check_payload_depth(
+        &self,
+        kind: PayloadKind,
+        activity_name: Option<&str>,
+        value: &Value,
+    ) -> HarvestResult<()> {
+        if !self.replays_a_scope_cancel() && crate::payload_depth::nests_past_cap(value) {
+            return Err(HarvestError::PayloadTooDeep {
+                kind,
+                cap_depth: crate::payload_depth::MAX_PAYLOAD_DEPTH,
+                workflow_type: self.workflow_name.clone(),
+                activity_name: activity_name.map(str::to_string),
+            });
+        }
+        Ok(())
+    }
 
     /// Generate the next sequential activity execution ID.
     fn next_activity_id(&self) -> ActivityExecId {
@@ -33527,5 +33577,283 @@ mod activity_info_tests {
         assert_eq!(info.clone(), info);
         let identity = info.identity();
         assert_eq!(identity.clone(), identity);
+    }
+}
+
+/// A workflow-side payload nested past the depth cap is refused at the call
+/// site (issue #2224). Each test checks the cap, one level over it, and that
+/// the refusal queues no command.
+#[cfg(test)]
+mod payload_depth_tests {
+    use super::*;
+    use crate::error::PayloadKind;
+    use crate::payload_depth::MAX_PAYLOAD_DEPTH;
+
+    fn nested(depth: usize) -> Value {
+        let mut value = serde_json::json!(1);
+        for _ in 0..depth {
+            value = Value::Array(vec![value]);
+        }
+        value
+    }
+
+    fn assert_too_deep(err: &HarvestError, expected: &PayloadKind) {
+        match err {
+            HarvestError::PayloadTooDeep {
+                kind, cap_depth, ..
+            } => {
+                assert_eq!(kind, expected);
+                assert_eq!(*cap_depth, MAX_PAYLOAD_DEPTH);
+            }
+            other => panic!("expected PayloadTooDeep, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), "default")
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_activity_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_local_activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), None, None)
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_raw("c", nested(MAX_PAYLOAD_DEPTH + 1))
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_timeout_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_timeout(
+                "c",
+                nested(MAX_PAYLOAD_DEPTH + 1),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn detached_child_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_detached_raw(
+                "c",
+                nested(MAX_PAYLOAD_DEPTH + 1),
+                crate::types::ParentClosePolicy::default(),
+            )
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continue_as_new_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .continue_as_new(nested(MAX_PAYLOAD_DEPTH + 1))
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::WorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn side_effect_value_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .side_effect("s", || nested(MAX_PAYLOAD_DEPTH + 1))
+            .expect_err("a deep value must be refused");
+        assert_too_deep(&err, &PayloadKind::SideEffectValue);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn side_effect_value_at_the_cap_is_recorded() {
+        let ctx = WorkflowContext::new_test();
+        ctx.side_effect("s", || nested(MAX_PAYLOAD_DEPTH))
+            .expect("a value at the cap is accepted");
+        assert_eq!(ctx.drain_commands().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn race_activity_branch_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .race()
+            .activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), "default")
+            .timer(std::time::Duration::from_secs(60))
+            .run()
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn race_child_branch_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .race()
+            .child_workflow_raw("c", nested(MAX_PAYLOAD_DEPTH + 1))
+            .timer(std::time::Duration::from_secs(60))
+            .run()
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_fan_out_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_fan_out_raw(vec![
+                ("c".to_string(), serde_json::json!(1)),
+                ("c".to_string(), nested(MAX_PAYLOAD_DEPTH + 1)),
+            ])
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+    }
+
+    #[tokio::test]
+    async fn activity_fan_out_over_the_cap_queues_nothing() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_activity_fan_out_raw(vec![
+                ("a".to_string(), serde_json::json!(1), "default".to_string()),
+                (
+                    "a".to_string(),
+                    nested(MAX_PAYLOAD_DEPTH + 1),
+                    "default".to_string(),
+                ),
+            ])
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no marker and no earlier activity is queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn option_based_activity_fan_out_over_the_cap_queues_nothing() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_activity_fan_out_raw_with(
+                vec![
+                    ("a".to_string(), serde_json::json!(1), "default".to_string()),
+                    (
+                        "a".to_string(),
+                        nested(MAX_PAYLOAD_DEPTH + 1),
+                        "default".to_string(),
+                    ),
+                ],
+                &crate::fan_out::FanOutOptions::new(),
+            )
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no marker and no earlier activity is queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_replay_reproduces_the_refusal_not_a_divergence() {
+        let ctx = WorkflowContext::for_replay_strict(crate::types::ExecutionId::new(), Vec::new());
+        let err = ctx
+            .execute_activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), "default")
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+    }
+
+    #[tokio::test]
+    async fn external_signal_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .signal_external_workflow(
+                crate::types::ExecutionId::new(),
+                "go",
+                nested(MAX_PAYLOAD_DEPTH + 1),
+            )
+            .await
+            .expect_err("a deep payload must be refused");
+        assert_too_deep(&err, &PayloadKind::SignalPayload);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inputs_at_the_cap_are_not_refused_for_depth() {
+        let ctx = WorkflowContext::new_test();
+        let deep = nested(MAX_PAYLOAD_DEPTH);
+        let wait = std::time::Duration::from_millis(100);
+        // Each call parks on its result. A depth refusal returns at once.
+        assert!(
+            tokio::time::timeout(wait, ctx.execute_activity_raw("a", deep.clone(), "default"))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(
+                wait,
+                ctx.execute_local_activity_raw("a", deep.clone(), None, None)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(wait, ctx.continue_as_new(deep.clone()))
+                .await
+                .is_err()
+        );
+        let commands = ctx.drain_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
+                && commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::ContinueAsNew { .. })),
+            "the calls must queue their commands: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_input_at_the_cap_is_not_refused_for_depth() {
+        let ctx = WorkflowContext::new_test();
+        let fut = ctx.spawn_child_workflow_raw("c", nested(MAX_PAYLOAD_DEPTH));
+        let res = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
+        // The call parks on the child result. A depth refusal returns at once.
+        assert!(res.is_err(), "a value at the cap must be accepted");
+        assert_eq!(ctx.drain_commands().len(), 1);
     }
 }
