@@ -23,7 +23,9 @@
 //! ```
 //!
 //! [`DurableCall::stream`] answers with a resumable SSE stream of the run's
-//! durable chunks instead. See [`stream`] for that mode.
+//! durable chunks instead. The SSE id of a chunk is `<attempt>.<offset>`.
+//! The attempt counts the runs of the lineage: the run that the key gives,
+//! then each retry attempt and each continue-as-new successor.
 //!
 //! See `docs/durable-routes.md` for the guide. `DESIGN-durable-routes.md`
 //! and `DESIGN-durable-streaming.md` are the design records.
@@ -55,7 +57,7 @@ use tracing::instrument::WithSubscriber as _;
 
 use crate::state::HarvestDbPool;
 
-pub mod stream;
+mod stream;
 
 pub use stream::{
     DEFAULT_MAX_STREAMS, DEFAULT_STREAM_FOR, DurableStream, LAST_EVENT_ID_HEADER, MAX_STREAM_FOR,
@@ -354,7 +356,8 @@ pub struct DurableCall {
 
 impl DurableCall {
     /// Wait up to `budget` for the result. The default is 5 s. The route
-    /// clamps a longer budget to 30 s. `Duration::ZERO` never waits.
+    /// clamps a longer budget to 30 s. `Duration::ZERO` never waits. It has
+    /// no effect on [`Self::stream`].
     ///
     /// The wait also ends 2 s before Autumn's request deadline, counted from
     /// the time the route reads the request. With Autumn's idempotency layer
@@ -366,7 +369,8 @@ impl DurableCall {
         self
     }
 
-    /// The status of a completed run: 200 (default), 201 or 204.
+    /// The status of a completed run: 200 (default), 201 or 204. It has no
+    /// effect on [`Self::stream`], which always answers `200`.
     pub const fn success_status(mut self, status: StatusCode) -> Self {
         self.success = status;
         self
@@ -396,7 +400,8 @@ impl DurableCall {
     }
 
     /// End a stream from [`Self::stream`] after `budget`. The default is
-    /// 5 min. The route clamps a longer budget to 1 h.
+    /// [`DEFAULT_STREAM_FOR`]. The route clamps a longer budget to
+    /// [`MAX_STREAM_FOR`]. It has no effect on [`Self::send`].
     ///
     /// A stream that ends at its budget sends a `pending` frame. The client
     /// then resumes with `Last-Event-ID`. `Duration::ZERO` sends the stored
@@ -409,9 +414,13 @@ impl DurableCall {
     /// Start or attach to the run, and answer with a resumable SSE stream.
     ///
     /// The stream sends each chunk that the run stores with
-    /// `publish_durable_progress`, then one final frame. A retry with the
-    /// same key and a `Last-Event-ID` header resumes after that id. This
-    /// never fails: a problem before the stream is a plain answer.
+    /// `publish_durable_progress`, then one final frame. To resume, send the
+    /// same body and key with a `Last-Event-ID` header. The stream then
+    /// sends each frame after that id. [`Self::wait`] and
+    /// [`Self::success_status`] have no effect on a stream.
+    ///
+    /// This never fails. A problem before the stream is a plain answer. A
+    /// full stream cap answers `202` pending with `Retry-After: 1`.
     pub async fn stream(self) -> DurableStream {
         stream::start(self).await
     }
@@ -921,22 +930,30 @@ impl IntoResponse for DurableOutcome {
                 response
             }
         };
-        let headers = response.headers_mut();
-        if self.execution_id.is_some() && self.replayed {
-            headers.insert(
-                HeaderName::from_static(REPLAYED_HEADER),
-                HeaderValue::from_static("true"),
-            );
-        }
-        if let Some(id) = exposed_id
-            && let Ok(value) = HeaderValue::from_str(&id.to_string())
-        {
-            headers.insert(
-                HeaderName::from_static(crate::api::HEADER_EXECUTION_ID),
-                value,
-            );
-        }
+        set_run_headers(
+            response.headers_mut(),
+            self.execution_id.is_some() && self.replayed,
+            exposed_id,
+        );
         response
+    }
+}
+
+/// Add the replay header when `replayed`, and the opt-in execution id.
+fn set_run_headers(headers: &mut HeaderMap, replayed: bool, exposed_id: Option<ExecutionId>) {
+    if replayed {
+        headers.insert(
+            HeaderName::from_static(REPLAYED_HEADER),
+            HeaderValue::from_static("true"),
+        );
+    }
+    if let Some(id) = exposed_id
+        && let Ok(value) = HeaderValue::from_str(&id.to_string())
+    {
+        headers.insert(
+            HeaderName::from_static(crate::api::HEADER_EXECUTION_ID),
+            value,
+        );
     }
 }
 

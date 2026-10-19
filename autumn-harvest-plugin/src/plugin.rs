@@ -513,19 +513,23 @@ impl HarvestPlugin {
     /// run answers pending. A walk that read only ended runs answers `500`
     /// `result-unavailable`, because every retry repeats it. A value below 1
     /// counts as 1, so a finished chain of one type resolves.
+    ///
+    /// A durable stream counts one step for each run of the lineage, a
+    /// same-type successor too. Past the cap, the stream ends with
+    /// `result-unavailable`.
     #[must_use]
     pub const fn durable_route_max_chain_steps(mut self, steps: usize) -> Self {
         self.durable_route_max_chain_steps = if steps == 0 { 1 } else { steps };
         self
     }
 
-    /// Cap the live durable streams in this process. The default is
+    /// Cap the durable streams in this process. The default is
     /// [`DEFAULT_MAX_STREAMS`](crate::durable_route::DEFAULT_MAX_STREAMS).
     ///
-    /// Each live stream holds one Postgres `LISTEN` connection. A stream
-    /// request that finds the cap full answers pending at once. A stream of
-    /// a run that has ended needs no slot, so it still streams. `0` means
-    /// that only ended runs stream.
+    /// Each stream takes a slot, and a stream of a live run also holds one
+    /// Postgres `LISTEN` connection. A stream request that finds the cap
+    /// full answers `202` pending with `Retry-After: 1`. `0` turns streams
+    /// off. The cap is for each process, not for each principal.
     #[must_use]
     pub const fn durable_route_max_streams(mut self, max_streams: usize) -> Self {
         self.durable_route_max_streams = max_streams;

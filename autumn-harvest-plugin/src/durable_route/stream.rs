@@ -27,8 +27,12 @@ use tokio::time::Instant;
 
 use super::{
     DEADLINE_HEADROOM, DurableCall, DurableOutcome, DurableOutcomeKind, KeyField, Loggable,
-    Prepared, Problem, REPLAYED_HEADER, Started, check_key, failed_extra, problem_json, time_left,
+    Prepared, Problem, Started, check_key, failed_extra, problem_json, set_run_headers, time_left,
     within,
+};
+use crate::api::{
+    DURABLE_STREAM_PAGE as PAGE, DURABLE_STREAM_SEND_TIMEOUT as SEND_TIMEOUT,
+    PROGRESS_STREAM_KEEPALIVE as KEEPALIVE, SseSender,
 };
 
 /// The request header that carries the resume cursor.
@@ -43,27 +47,21 @@ pub const DEFAULT_STREAM_FOR: Duration = Duration::from_secs(300);
 /// The longest stream budget. The route clamps a longer budget to it.
 pub const MAX_STREAM_FOR: Duration = Duration::from_secs(3600);
 
-/// Rows that one chunk read returns.
-const PAGE: i64 = 256;
-
-/// Longest wait for a client to take one frame. A slower client loses the
-/// stream and resumes with `Last-Event-ID`.
-const SEND_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// The longest wait for a wake while a `LISTEN` connection is open.
-const LISTEN_TICK: Duration = Duration::from_secs(5);
-
-/// The poll interval without a `LISTEN` connection.
-const POLL_TICK: Duration = Duration::from_secs(1);
+/// The longest wait between two reads of the run.
+///
+/// A wake comes only with a stored chunk. An end with no chunk, or a cancel
+/// from outside, sends no wake, so the tick bounds that delay.
+const TICK: Duration = Duration::from_secs(1);
 
 /// The longest `LISTEN` connect. A slower connect falls back to polling.
 const LISTEN_CONNECT: Duration = Duration::from_secs(5);
 
-/// The interval of the `: ping` comment.
-const KEEPALIVE: Duration = Duration::from_secs(5);
-
 /// Frames that wait for the client in memory.
 const FRAME_BUFFER: usize = 32;
+
+/// The least time that a stream drains stored chunks, also with a zero
+/// budget. A fast client then gets the backlog in one connection.
+const DRAIN_FLOOR: Duration = Duration::from_secs(5);
 
 /// The reconnect delay that a `pending` frame asks for.
 const RESUME_RETRY: Duration = Duration::from_secs(1);
@@ -83,8 +81,8 @@ pub(super) struct Cursor {
 /// Parse the `Last-Event-ID` fields. The error is a problem slug.
 ///
 /// The grammar is `<attempt>` or `<attempt>.<offset>`, in decimal digits. An
-/// absent or empty field starts at attempt 0. An offset above `i64::MAX`
-/// clamps to it.
+/// absent or empty field starts at attempt 0. An offset from `i64::MAX` to
+/// `u64::MAX` clamps to `i64::MAX`. A larger number is invalid.
 pub(super) fn parse_cursor(field: &KeyField) -> Result<Cursor, &'static str> {
     let invalid = CURSOR_INVALID.slug;
     let raw = match field {
@@ -95,24 +93,29 @@ pub(super) fn parse_cursor(field: &KeyField) -> Result<Cursor, &'static str> {
     if raw.is_empty() {
         return Ok(Cursor::default());
     }
-    // `str::parse` takes a leading `+`, so each part must be digits only.
-    let digits =
-        |part: &str| (!part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())).then_some(());
     let (attempt, offset) = match raw.split_once('.') {
         Some((attempt, offset)) => (attempt, Some(offset)),
         None => (raw, None),
     };
-    digits(attempt).ok_or(invalid)?;
+    if !is_digits(attempt) || !offset.is_none_or(is_digits) {
+        return Err(invalid);
+    }
     let attempt = attempt.parse::<usize>().map_err(|_| invalid)?;
     let offset = match offset {
         None => None,
         Some(offset) => {
-            digits(offset).ok_or(invalid)?;
             let offset = offset.parse::<u64>().map_err(|_| invalid)?;
             Some(i64::try_from(offset).unwrap_or(i64::MAX))
         }
     };
     Ok(Cursor { attempt, offset })
+}
+
+/// `true` when `part` is one or more decimal digits.
+///
+/// `str::parse` takes a leading `+`, so the parser checks the digits first.
+fn is_digits(part: &str) -> bool {
+    !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Why the stream moved to the next run.
@@ -223,11 +226,25 @@ pub(super) trait FrameSink: Send {
     fn is_closed(&self) -> bool;
 }
 
+/// The state of one run of the lineage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunState {
+    /// The run can still store chunks.
+    Live,
+    /// The run has ended. Its chunks and its successor are committed.
+    Ended,
+    /// The row is gone, for example after retention. Nothing can follow.
+    Gone,
+}
+
 /// The reads of one stream. Production reads Postgres. A unit test reads a
 /// fake lineage.
 pub(super) trait StreamReads: Send {
-    /// `true` when the run has ended.
-    fn ended(&mut self, exec_id: ExecutionId) -> impl Future<Output = HarvestResult<bool>> + Send;
+    /// The state of the run.
+    fn state(
+        &mut self,
+        exec_id: ExecutionId,
+    ) -> impl Future<Output = HarvestResult<RunState>> + Send;
     /// The stored chunks above `after`, at most `limit`, in offset order.
     fn chunks(
         &mut self,
@@ -259,7 +276,9 @@ pub(super) enum StreamEnd {
 
 /// Stream the lineage of `root` from `cursor` until it ends or `until`.
 ///
-/// The walk takes at most `max_steps` steps from run to run.
+/// The walk takes at most `max_steps` steps from run to run. One loop serves
+/// two phases. While it walks to the run at the cursor, it sends nothing.
+/// After that, it drains each run and sends an `attempt` frame for each step.
 pub(super) async fn produce(
     reads: &mut impl StreamReads,
     sink: &mut impl FrameSink,
@@ -274,65 +293,36 @@ pub(super) async fn produce(
         visited: HashSet::from([root]),
         max_steps,
     };
-    // Walk to the run at the cursor. Each step is one lookup.
-    while walk.attempt < cursor.attempt {
-        if sink.is_closed() {
-            return StreamEnd::ClientGone;
-        }
-        // The state comes first. A run commits its successor with its end.
-        let step = match reads.ended(walk.current).await {
-            Ok(ended) => match reads.next_run(walk.current).await {
-                Ok(next) => Some((ended, next)),
-                Err(error) => {
-                    log_read_error(&error);
-                    None
-                }
-            },
-            Err(error) => {
-                log_read_error(&error);
-                None
-            }
-        };
-        match step {
-            Some((_, Some((next, _)))) => {
-                if !walk.step(next) {
-                    return finish(sink, unavailable_frame()).await;
-                }
-                continue;
-            }
-            // The cursor is past the end of the lineage.
-            Some((true, None)) => {
-                if let Some(frame) = final_frame(&reads.outcome().await) {
-                    return finish(sink, frame).await;
-                }
-            }
-            Some((false, None)) | None => {}
-        }
-        if let Some(end) = pause(reads, sink, walk.current, until).await {
-            return end;
-        }
-    }
-    let mut offset = cursor.offset;
+    let mut offset = cursor.offset.filter(|_| cursor.attempt == 0);
+    let drain_until = until.max(Instant::now() + DRAIN_FLOOR);
     loop {
         if sink.is_closed() {
             return StreamEnd::ClientGone;
         }
-        // The state comes first. A terminal cycle commits its chunks with its
-        // state, so the drain after an end holds every chunk.
-        let ended = match reads.ended(walk.current).await {
-            Ok(ended) => Some(ended),
-            Err(error) => {
-                log_read_error(&error);
-                None
-            }
+        let positioning = walk.attempt < cursor.attempt;
+        // The state comes first. A terminal cycle commits its chunks and its
+        // successor with its state, so the reads after an end see both.
+        let state = logged(reads.state(walk.current).await);
+        let drained = match state {
+            None => false,
+            Some(RunState::Gone) => return finish(sink, unavailable_frame()).await,
+            Some(_) if positioning => true,
+            Some(_) => match drain(reads, sink, &walk, &mut offset, drain_until).await {
+                Drain::Done => true,
+                Drain::Failed => false,
+                Drain::Expired => return send_pending(sink).await,
+                Drain::ClientGone => return StreamEnd::ClientGone,
+            },
         };
-        if let Some(ended) = ended {
-            match drain(reads, sink, walk.attempt, walk.current, &mut offset).await {
-                Drain::Done if ended => match reads.next_run(walk.current).await {
-                    Ok(Some((next, cause))) => {
-                        if !walk.step(next) {
-                            return finish(sink, unavailable_frame()).await;
-                        }
+        if drained && state == Some(RunState::Ended) {
+            match logged(reads.next_run(walk.current).await) {
+                Some(Some((next, cause))) => {
+                    if !walk.step(next) {
+                        return finish(sink, unavailable_frame()).await;
+                    }
+                    if walk.attempt == cursor.attempt {
+                        offset = cursor.offset;
+                    } else if !positioning {
                         offset = None;
                         let frame = Frame::Attempt {
                             attempt: walk.attempt,
@@ -341,26 +331,31 @@ pub(super) async fn produce(
                         if !sink.send(frame).await {
                             return StreamEnd::ClientGone;
                         }
-                        continue;
                     }
-                    // A pending answer is a read that can pass. Read again.
-                    Ok(None) => {
-                        if let Some(frame) = final_frame(&reads.outcome().await) {
-                            return finish(sink, frame).await;
-                        }
+                    continue;
+                }
+                // The lineage ends here. A pending answer can change at the
+                // next read, so read again.
+                Some(None) => {
+                    if let Some(frame) = final_frame(&reads.outcome().await) {
+                        return finish(sink, frame).await;
                     }
-                    Err(error) => {
-                        log_read_error(&error);
-                    }
-                },
-                Drain::Done | Drain::Failed => {}
-                Drain::ClientGone => return StreamEnd::ClientGone,
+                }
+                None => {}
             }
         }
         if let Some(end) = pause(reads, sink, walk.current, until).await {
             return end;
         }
     }
+}
+
+/// The value of `read`, or `None` after it logs the error.
+fn logged<T>(read: HarvestResult<T>) -> Option<T> {
+    read.map_err(|error| {
+        tracing::warn!(error = %Loggable(&error), "durable stream cannot read the run; reading again");
+    })
+    .ok()
 }
 
 /// The place of a stream in its lineage.
@@ -398,30 +393,36 @@ enum Drain {
     Done,
     /// A read failed. The next tick reads again.
     Failed,
+    /// The stream budget is spent. The client resumes at the cursor.
+    Expired,
     /// The client is gone.
     ClientGone,
 }
 
-/// Send each stored chunk of `exec_id` above `offset`, and move `offset`.
+/// Send each stored chunk of the current run above `offset`, and move
+/// `offset`.
+///
+/// The drain checks `until` before each frame. A slow client or a long
+/// backlog therefore cannot hold the stream past its budget, or past
+/// [`DRAIN_FLOOR`] for a shorter budget.
 async fn drain(
     reads: &mut impl StreamReads,
     sink: &mut impl FrameSink,
-    attempt: usize,
-    exec_id: ExecutionId,
+    walk: &Walk,
     offset: &mut Option<i64>,
+    until: Instant,
 ) -> Drain {
     loop {
-        let page = match reads.chunks(exec_id, *offset, PAGE).await {
-            Ok(page) => page,
-            Err(error) => {
-                log_read_error(&error);
-                return Drain::Failed;
-            }
+        let Some(page) = logged(reads.chunks(walk.current, *offset, PAGE).await) else {
+            return Drain::Failed;
         };
         let full = i64::try_from(page.len()).unwrap_or(i64::MAX) >= PAGE;
         for (chunk_offset, chunk) in page {
+            if Instant::now() >= until {
+                return Drain::Expired;
+            }
             let frame = Frame::Progress {
-                attempt,
+                attempt: walk.attempt,
                 offset: chunk_offset,
                 chunk,
             };
@@ -446,14 +447,19 @@ async fn pause(
 ) -> Option<StreamEnd> {
     let remaining = until.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Some(if sink.send(Frame::Pending).await {
-            StreamEnd::Pending
-        } else {
-            StreamEnd::ClientGone
-        });
+        return Some(send_pending(sink).await);
     }
-    reads.wake(exec_id, remaining.min(LISTEN_TICK)).await;
+    reads.wake(exec_id, remaining.min(TICK)).await;
     sink.is_closed().then_some(StreamEnd::ClientGone)
+}
+
+/// Send the `pending` frame at the end of the budget.
+async fn send_pending(sink: &mut impl FrameSink) -> StreamEnd {
+    if sink.send(Frame::Pending).await {
+        StreamEnd::Pending
+    } else {
+        StreamEnd::ClientGone
+    }
 }
 
 /// Send the final frame.
@@ -465,11 +471,6 @@ async fn finish(sink: &mut impl FrameSink, frame: Frame) -> StreamEnd {
     }
 }
 
-/// Log a read error. The stream reads again at the next tick.
-fn log_read_error(error: &autumn_harvest::HarvestError) {
-    tracing::warn!(error = %Loggable(error), "durable stream cannot read the run; reading again");
-}
-
 /// The stream budget: `requested`, clamped to [`MAX_STREAM_FOR`].
 fn stream_budget(requested: Duration) -> Duration {
     requested.min(MAX_STREAM_FOR)
@@ -477,11 +478,19 @@ fn stream_budget(requested: Duration) -> Duration {
 
 /// The answer of [`DurableCall::stream`](super::DurableCall::stream). It
 /// implements [`IntoResponse`].
+///
+/// It is a plain answer before the stream, such as a problem or `202`
+/// pending, or the SSE stream. [`Self::is_stream`] and
+/// [`Self::plain_outcome`] tell them apart.
 #[must_use]
+#[derive(Debug)]
 pub struct DurableStream {
     answer: Answer,
+    execution_id: Option<ExecutionId>,
+    replayed: bool,
 }
 
+#[derive(Debug)]
 enum Answer {
     /// A plain answer before the stream: a problem or pending.
     Outcome(DurableOutcome),
@@ -492,7 +501,29 @@ enum Answer {
 impl DurableStream {
     const fn outcome(outcome: DurableOutcome) -> Self {
         Self {
+            execution_id: outcome.execution_id,
+            replayed: outcome.replayed,
             answer: Answer::Outcome(outcome),
+        }
+    }
+
+    /// The run that the key started, when the call started or found one.
+    #[must_use]
+    pub const fn execution_id(&self) -> Option<ExecutionId> {
+        self.execution_id
+    }
+
+    /// `true` when an earlier request started the run.
+    #[must_use]
+    pub const fn replayed(&self) -> bool {
+        self.replayed
+    }
+
+    /// The span outcome of this answer.
+    const fn slug(&self) -> &'static str {
+        match &self.answer {
+            Answer::Stream(_) => "stream",
+            Answer::Outcome(outcome) => outcome.slug(),
         }
     }
 
@@ -530,11 +561,9 @@ impl IntoResponse for DurableStream {
     }
 }
 
-/// Sender half of the SSE frame channel.
-type SseSender = futures::channel::mpsc::Sender<Result<Event, Infallible>>;
-
 /// The SSE answer, with the headers of the run.
 ///
+/// The stream holds data for one principal, so no cache may store it.
 /// `x-accel-buffering: no` stops nginx from buffering the stream.
 fn stream_response(
     frames: futures::channel::mpsc::Receiver<Result<Event, Infallible>>,
@@ -551,26 +580,13 @@ fn stream_response(
     let headers = response.headers_mut();
     headers.insert(
         axum::http::header::CACHE_CONTROL,
-        HeaderValue::from_static("no-cache"),
+        HeaderValue::from_static("no-cache, no-store, private"),
     );
     headers.insert(
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
     );
-    if replayed {
-        headers.insert(
-            HeaderName::from_static(REPLAYED_HEADER),
-            HeaderValue::from_static("true"),
-        );
-    }
-    if let Some(id) = exposed_id
-        && let Ok(value) = HeaderValue::from_str(&id.to_string())
-    {
-        headers.insert(
-            HeaderName::from_static(crate::api::HEADER_EXECUTION_ID),
-            value,
-        );
-    }
+    set_run_headers(headers, replayed, exposed_id);
     response
 }
 
@@ -579,31 +595,39 @@ pub(super) async fn start(call: DurableCall) -> DurableStream {
     use tracing::Instrument as _;
     let span = call.span();
     let answer = open(call).instrument(span.clone()).await;
-    let outcome = match &answer.answer {
-        Answer::Stream(_) => "stream",
-        Answer::Outcome(outcome) => outcome.slug(),
-    };
-    span.record("outcome", outcome);
+    span.record("outcome", answer.slug());
     answer
 }
 
-/// Check the call, start the run, and open the stream.
-async fn open(call: DurableCall) -> DurableStream {
-    let problem = |problem| DurableStream::outcome(DurableOutcome::problem(problem));
-    // Autumn's layer collects the body to cache it. A live stream would then
-    // reach the client only at its end, and a cut stream would be cached.
-    if call.route.layer_active {
+/// Log once that a durable stream runs under Autumn's idempotency layer.
+///
+/// Each request under that layer answers `500`, so one log line is enough.
+fn log_layer_refusal(workflow: &str) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::error!(
-            workflow = %call.workflow,
+            workflow,
             cause = "a durable stream cannot run under Autumn's idempotency layer",
             "durable route setup error"
         );
+    }
+}
+
+/// Check the call, start the run, and open the stream.
+///
+/// The checks run in this order: the idempotency layer, the key, the
+/// cursor, then the checks of `send()`.
+async fn open(mut call: DurableCall) -> DurableStream {
+    let problem = |problem| DurableStream::outcome(DurableOutcome::problem(problem));
+    // Autumn's layer collects the body to cache it. The client then gets a
+    // live stream only at its end, and the layer caches a cut stream.
+    if call.route.layer_active {
+        log_layer_refusal(&call.workflow);
         return problem(Problem::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "misconfigured",
         ));
     }
-    // A key problem wins over a cursor problem.
     if let Err(slug) = check_key(&call.route.key) {
         return problem(Problem::new(StatusCode::BAD_REQUEST, slug));
     }
@@ -611,6 +635,8 @@ async fn open(call: DurableCall) -> DurableStream {
         return problem(CURSOR_INVALID);
     };
     let budget = stream_budget(call.stream_for);
+    // A stream always answers `200`, so the success status does not apply.
+    call.success = StatusCode::OK;
     let (start, prepared) = match call.prepare() {
         Ok(parts) => parts,
         Err(error) => return problem(error),
@@ -633,31 +659,62 @@ async fn open(call: DurableCall) -> DurableStream {
         // The start can still commit. A retry then finds the claim.
         None => return DurableStream::outcome(DurableOutcome::pending(false)),
     };
-    // A lineage that has ended needs no slot and no `LISTEN` connection.
     let first = within(
         deadline,
         Box::pin(prepared.answer_within(&started, Duration::ZERO)),
     )
     .await;
-    let ended = first.is_some_and(|outcome| outcome.kind != DurableOutcomeKind::Pending);
+    let ended = match first.map(|outcome| (stream_start(&outcome.kind), outcome)) {
+        Some((Start::Ended, _)) => true,
+        Some((Start::Live, _)) | None => false,
+        Some((Start::Plain, outcome)) => return DurableStream::outcome(outcome),
+    };
+    // Every stream takes a slot. A stream of an ended run reads every stored
+    // chunk, so an uncapped count of them could load the database.
+    let Ok(permit) = Arc::clone(&prepared.runtime.streams).try_acquire_owned() else {
+        tracing::debug!("durable stream cap is full; answering pending");
+        let (kind, status) = super::pending_outcome(false);
+        return DurableStream::outcome(prepared.after_start(&started, kind, status, None));
+    };
     let (tx, rx) = futures::channel::mpsc::channel(FRAME_BUFFER);
     let response = stream_response(
         rx,
         !started.created,
         prepared.expose_id.then_some(started.exec_id),
     );
-    let until = Instant::now() + budget;
-    if ended {
-        spawn_producer(prepared, started, cursor, until, None, tx);
-    } else if let Ok(permit) = Arc::clone(&prepared.runtime.streams).try_acquire_owned() {
-        spawn_producer(prepared, started, cursor, until, Some(permit), tx);
-    } else {
-        tracing::debug!("durable stream cap is full; answering pending");
-        let (kind, status) = super::pending_outcome(false);
-        return DurableStream::outcome(prepared.after_start(&started, kind, status, None));
-    }
-    DurableStream {
+    let answer = DurableStream {
         answer: Answer::Stream(response),
+        execution_id: Some(started.exec_id),
+        replayed: !started.created,
+    };
+    let until = Instant::now() + budget;
+    spawn_producer(prepared, started, cursor, until, permit, !ended, tx);
+    answer
+}
+
+/// How a stream starts, from the first answer about the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Start {
+    /// The run is live, or the first read did not finish. The stream opens
+    /// `LISTEN`.
+    Live,
+    /// The lineage ended. The stream reads stored rows only.
+    Ended,
+    /// The answer is final and holds no chunk to send: erased, or a problem
+    /// such as `result-unavailable`. It is a plain answer, as for `send()`.
+    Plain,
+}
+
+/// The [`Start`] of a stream whose first answer is `kind`.
+const fn stream_start(kind: &DurableOutcomeKind) -> Start {
+    match kind {
+        DurableOutcomeKind::Pending => Start::Live,
+        DurableOutcomeKind::Completed
+        | DurableOutcomeKind::Failed { .. }
+        | DurableOutcomeKind::Cancelled
+        | DurableOutcomeKind::Terminated
+        | DurableOutcomeKind::TimedOut => Start::Ended,
+        DurableOutcomeKind::Erased | DurableOutcomeKind::Problem { .. } => Start::Plain,
     }
 }
 
@@ -669,7 +726,8 @@ fn spawn_producer(
     started: Started,
     cursor: Cursor,
     until: Instant,
-    permit: Option<OwnedSemaphorePermit>,
+    permit: OwnedSemaphorePermit,
+    listen: bool,
     tx: SseSender,
 ) {
     use tracing::Instrument as _;
@@ -677,7 +735,6 @@ fn spawn_producer(
     let root = started.exec_id;
     let max_steps = prepared.runtime.max_chain_steps;
     let task = async move {
-        let listen = permit.is_some();
         // A panic drops the slot with the task.
         let _permit = permit;
         let mut reads = PgReads {
@@ -714,7 +771,8 @@ impl FrameSink for SseSink {
 struct PgReads {
     prepared: Prepared,
     started: Started,
-    /// `false` for an ended lineage, which polls and opens no `LISTEN`.
+    /// `false` for an ended lineage, which polls and opens no `LISTEN`. A
+    /// failed connect also sets it to `false`, so the stream polls.
     listen: bool,
     /// The `LISTEN` connection of the current run.
     listener: Option<(ExecutionId, autumn_harvest::notify::DurableStreamListener)>,
@@ -729,18 +787,23 @@ impl PgReads {
 }
 
 impl StreamReads for PgReads {
-    async fn ended(&mut self, exec_id: ExecutionId) -> HarvestResult<bool> {
+    async fn state(&mut self, exec_id: ExecutionId) -> HarvestResult<RunState> {
         use autumn_harvest::schema::harvest_workflow_executions as executions;
-        use diesel::{ExpressionMethods as _, QueryDsl as _};
+        use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl as _};
         use diesel_async::RunQueryDsl as _;
         let mut conn = self.conn(exec_id).await?;
-        let state: String = executions::table
+        let state: Option<String> = executions::table
             .filter(executions::id.eq(exec_id.as_uuid()))
             .select(executions::state)
             .first(&mut conn)
             .await
+            .optional()
             .map_err(|error| autumn_harvest::HarvestError::Database(error.to_string()))?;
-        Ok(crate::api::is_terminal_state(&state))
+        Ok(match state {
+            None => RunState::Gone,
+            Some(state) if crate::api::is_terminal_state(&state) => RunState::Ended,
+            Some(_) => RunState::Live,
+        })
     }
 
     async fn chunks(
@@ -814,15 +877,20 @@ impl StreamReads for PgReads {
                     return;
                 }
             }
+            // A connect retry on each tick would load a busy server. The
+            // stream polls for the rest of its life.
+            tracing::warn!("durable stream cannot open LISTEN; polling the table");
+            self.listen = false;
         }
         match &self.listener {
             Some((_, listener)) => {
                 if listener.wait_timeout(timeout).await == DurableStreamWait::ChannelClosed {
                     self.listener = None;
-                    tokio::time::sleep(timeout.min(POLL_TICK)).await;
+                    self.listen = false;
+                    tokio::time::sleep(timeout).await;
                 }
             }
-            None => tokio::time::sleep(timeout.min(POLL_TICK)).await,
+            None => tokio::time::sleep(timeout).await,
         }
     }
 }
@@ -1024,6 +1092,8 @@ mod tests {
         /// stores one more chunk.
         commit_after_chunks: Option<(ExecutionId, i64)>,
         scripts: std::collections::VecDeque<Script>,
+        /// Outcome reads that answer pending before the final outcome.
+        pending_outcomes: usize,
         wakes: usize,
         reads: usize,
     }
@@ -1037,6 +1107,7 @@ mod tests {
                 read_error: || HarvestError::Database("passing".to_owned()),
                 commit_after_chunks: None,
                 scripts: std::collections::VecDeque::new(),
+                pending_outcomes: 0,
                 wakes: 0,
                 reads: 0,
             }
@@ -1072,11 +1143,16 @@ mod tests {
     }
 
     impl StreamReads for Fake {
-        fn ended(
+        fn state(
             &mut self,
             exec_id: ExecutionId,
-        ) -> impl Future<Output = HarvestResult<bool>> + Send {
-            std::future::ready(self.fail().map(|()| self.runs[&exec_id].ended))
+        ) -> impl Future<Output = HarvestResult<RunState>> + Send {
+            let state = self.fail().map(|()| match self.runs.get(&exec_id) {
+                None => RunState::Gone,
+                Some(run) if run.ended => RunState::Ended,
+                Some(_) => RunState::Live,
+            });
+            std::future::ready(state)
         }
 
         fn chunks(
@@ -1096,7 +1172,13 @@ mod tests {
         }
 
         fn outcome(&mut self) -> impl Future<Output = DurableOutcome> + Send {
-            std::future::ready(self.outcome.clone())
+            let outcome = if self.pending_outcomes > 0 {
+                self.pending_outcomes -= 1;
+                pending()
+            } else {
+                self.outcome.clone()
+            };
+            std::future::ready(outcome)
         }
 
         async fn wake(&mut self, _exec_id: ExecutionId, timeout: Duration) {
@@ -1133,20 +1215,23 @@ mod tests {
         }
     }
 
-    /// Records frames. It closes after `close_after` frames.
+    /// Records frames. It closes after `close_after` frames. Each send takes
+    /// `delay`, as for a slow client.
     #[derive(Default)]
     struct Recorder {
         frames: Vec<Frame>,
         close_after: Option<usize>,
+        delay: Duration,
     }
 
     impl FrameSink for Recorder {
-        fn send(&mut self, frame: Frame) -> impl Future<Output = bool> + Send {
-            let open = !self.is_closed();
-            if open {
-                self.frames.push(frame);
+        async fn send(&mut self, frame: Frame) -> bool {
+            if self.is_closed() {
+                return false;
             }
-            std::future::ready(open)
+            tokio::time::sleep(self.delay).await;
+            self.frames.push(frame);
+            true
         }
 
         fn is_closed(&self) -> bool {
@@ -1234,6 +1319,26 @@ mod tests {
         (a, b, c)
     }
 
+    /// Every frame of [`three_runs`], from the start.
+    fn lineage_frames() -> Vec<Frame> {
+        vec![
+            progress(0, 0),
+            progress(0, 1),
+            Frame::Attempt {
+                attempt: 1,
+                cause: Cause::Retry,
+            },
+            progress(1, 0),
+            progress(1, 1),
+            Frame::Attempt {
+                attempt: 2,
+                cause: Cause::ContinuedAsNew,
+            },
+            progress(2, 0),
+            Frame::Result(json!("done")),
+        ]
+    }
+
     // SAC-08
     #[tokio::test(start_paused = true)]
     async fn producer_follows_retries_and_continue_as_new_with_attempt_frames() {
@@ -1241,6 +1346,7 @@ mod tests {
         let (a, _, _) = three_runs(&mut fake);
         let (end, frames) = run_fake(&mut fake, a, Cursor::default()).await;
         assert_eq!(end, StreamEnd::Final);
+        assert_eq!(frames, lineage_frames());
         assert_eq!(
             frames,
             vec![
@@ -1387,12 +1493,8 @@ mod tests {
             fake.failing_reads = failing;
             let (end, frames) = run_fake(&mut fake, a, Cursor::default()).await;
             assert_eq!(end, StreamEnd::Final, "{failing} failing reads");
-            let chunks = frames
-                .iter()
-                .filter(|f| matches!(f, Frame::Progress { .. }))
-                .count();
-            assert_eq!(chunks, 5, "{failing} failing reads");
-            assert!(fake.wakes >= 1, "a failed read waits one tick");
+            assert_eq!(frames, lineage_frames(), "{failing} failing reads");
+            assert_eq!(fake.wakes, failing, "each failed read waits one tick");
         }
     }
 
@@ -1429,8 +1531,8 @@ mod tests {
         let mut fake = Fake::new(pending());
         let root = fake.run(false, 10, None);
         let mut sink = Recorder {
-            frames: Vec::new(),
             close_after: Some(3),
+            ..Recorder::default()
         };
         let end = produce(&mut fake, &mut sink, root, Cursor::default(), 1024, far()).await;
         assert_eq!(end, StreamEnd::ClientGone);
@@ -1569,6 +1671,15 @@ mod tests {
         assert_eq!(stream_budget(Duration::ZERO), Duration::ZERO);
     }
 
+    // SAC-20
+    #[tokio::test]
+    async fn a_call_uses_the_default_stream_budget() {
+        let call = extract(&[]).await.scope("u").call("w", 1);
+        assert_eq!(call.stream_for, DEFAULT_STREAM_FOR);
+        let call = call.stream_for(Duration::from_secs(9));
+        assert_eq!(call.stream_for, Duration::from_secs(9));
+    }
+
     // SAC-21
     #[tokio::test]
     async fn stream_response_headers_disable_proxy_buffering() {
@@ -1581,7 +1692,10 @@ mod tests {
             headers.get(header::CONTENT_TYPE).unwrap(),
             "text/event-stream"
         );
-        assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-cache");
+        assert_eq!(
+            headers.get(header::CACHE_CONTROL).unwrap(),
+            "no-cache, no-store, private"
+        );
         assert_eq!(headers.get("x-accel-buffering").unwrap(), "no");
         assert_eq!(headers.get(super::super::REPLAYED_HEADER).unwrap(), "true");
         assert_eq!(
@@ -1602,6 +1716,167 @@ mod tests {
                 .get(crate::api::HEADER_EXECUTION_ID)
                 .is_none()
         );
+    }
+
+    // SAC-45
+    #[tokio::test(start_paused = true)]
+    async fn the_budget_ends_a_slow_drain_with_pending() {
+        let mut fake = Fake::new(completed(json!("done")));
+        let root = fake.run(true, 600, None);
+        let mut sink = Recorder {
+            delay: Duration::from_secs(50),
+            ..Recorder::default()
+        };
+        let until = Instant::now() + Duration::from_secs(120);
+        let end = produce(&mut fake, &mut sink, root, Cursor::default(), 1024, until).await;
+        assert_eq!(end, StreamEnd::Pending);
+        // Three sends start before the budget ends. Then the drain stops.
+        assert_eq!(
+            sink.frames,
+            vec![
+                progress(0, 0),
+                progress(0, 1),
+                progress(0, 2),
+                Frame::Pending
+            ]
+        );
+        // The overrun is at most the send in flight and the pending frame.
+        assert!(Instant::now() <= until + Duration::from_secs(100));
+    }
+
+    // SAC-46
+    #[tokio::test(start_paused = true)]
+    async fn the_walk_to_the_cursor_handles_each_branch() {
+        // A failed read while it walks waits one tick and reads again.
+        let mut fake = Fake::new(completed(json!("done")));
+        let (a, _, _) = three_runs(&mut fake);
+        fake.failing_reads = 2;
+        let (_, frames) = run_fake(&mut fake, a, at(2, None)).await;
+        assert_eq!(frames, vec![progress(2, 0), Frame::Result(json!("done"))]);
+        assert_eq!(fake.wakes, 2);
+        // The step cap stops the walk to the cursor.
+        let mut fake = Fake::new(completed(json!("done")));
+        let (a, _, _) = three_runs(&mut fake);
+        let mut sink = Recorder::default();
+        produce(&mut fake, &mut sink, a, at(2, None), 1, far()).await;
+        assert_eq!(sink.frames, vec![unavailable_frame()]);
+        // A cursor ahead of a live last run waits for the next run.
+        let mut fake = Fake::new(completed(json!("done")));
+        let b = fake.run(true, 1, None);
+        let a = fake.run(false, 1, None);
+        fake.scripts.push_back(Box::new(move |runs| {
+            let run = runs.get_mut(&a).expect("a");
+            run.ended = true;
+            run.next = Some((b, Cause::Retry));
+        }));
+        let (_, frames) = run_fake(&mut fake, a, at(1, None)).await;
+        assert_eq!(frames, vec![progress(1, 0), Frame::Result(json!("done"))]);
+        // The budget ends a walk that waits.
+        let mut fake = Fake::new(pending());
+        let a = fake.run(false, 1, None);
+        let mut sink = Recorder::default();
+        let until = Instant::now() + Duration::from_secs(3);
+        let end = produce(&mut fake, &mut sink, a, at(4, None), 1024, until).await;
+        assert_eq!(end, StreamEnd::Pending);
+        assert_eq!(sink.frames, vec![Frame::Pending]);
+        // A gone client ends the walk.
+        let mut fake = Fake::new(completed(json!("done")));
+        let (a, _, _) = three_runs(&mut fake);
+        let mut sink = Recorder {
+            close_after: Some(0),
+            ..Recorder::default()
+        };
+        let end = produce(&mut fake, &mut sink, a, at(2, None), 1024, far()).await;
+        assert_eq!(end, StreamEnd::ClientGone);
+    }
+
+    // SAC-47
+    #[tokio::test(start_paused = true)]
+    async fn the_main_loop_handles_each_branch() {
+        // A pending outcome after the end reads again at the next tick.
+        let mut fake = Fake::new(completed(json!("done")));
+        let root = fake.run(true, 1, None);
+        fake.pending_outcomes = 2;
+        let (end, frames) = run_fake(&mut fake, root, Cursor::default()).await;
+        assert_eq!(end, StreamEnd::Final);
+        assert_eq!(frames, vec![progress(0, 0), Frame::Result(json!("done"))]);
+        assert_eq!(fake.wakes, 2);
+        // A gone client at an attempt frame ends the stream.
+        let mut fake = Fake::new(completed(json!("done")));
+        let (a, _, _) = three_runs(&mut fake);
+        let mut sink = Recorder {
+            close_after: Some(2),
+            ..Recorder::default()
+        };
+        let end = produce(&mut fake, &mut sink, a, Cursor::default(), 1024, far()).await;
+        assert_eq!(end, StreamEnd::ClientGone);
+        assert_eq!(sink.frames, vec![progress(0, 0), progress(0, 1)]);
+        // A gone client at the final frame ends the stream.
+        let mut fake = Fake::new(completed(json!("done")));
+        let root = fake.run(true, 1, None);
+        let mut sink = Recorder {
+            close_after: Some(1),
+            ..Recorder::default()
+        };
+        let end = produce(&mut fake, &mut sink, root, Cursor::default(), 1024, far()).await;
+        assert_eq!(end, StreamEnd::ClientGone);
+        // A run whose row is gone ends with `result-unavailable`.
+        let mut fake = Fake::new(completed(json!("done")));
+        let root = ExecutionId::new();
+        let (end, frames) = run_fake(&mut fake, root, Cursor::default()).await;
+        assert_eq!(end, StreamEnd::Final);
+        assert_eq!(frames, vec![unavailable_frame()]);
+        // A page boundary: exactly one and two full pages.
+        for count in [PAGE, 2 * PAGE] {
+            let mut fake = Fake::new(completed(json!(0)));
+            let root = fake.run(true, count, None);
+            let (_, frames) = run_fake(&mut fake, root, Cursor::default()).await;
+            assert_eq!(
+                frames.len(),
+                usize::try_from(count).expect("count") + 1,
+                "{count} chunks"
+            );
+        }
+    }
+
+    // SAC-48
+    #[tokio::test]
+    async fn only_a_true_end_streams_without_listen() {
+        assert_eq!(stream_start(&DurableOutcomeKind::Pending), Start::Live);
+        for kind in [
+            DurableOutcomeKind::Completed,
+            DurableOutcomeKind::Failed {
+                error_type: None,
+                details: None,
+            },
+            DurableOutcomeKind::Cancelled,
+            DurableOutcomeKind::Terminated,
+            DurableOutcomeKind::TimedOut,
+        ] {
+            assert_eq!(stream_start(&kind), Start::Ended, "{kind:?}");
+        }
+        for kind in [
+            DurableOutcomeKind::Erased,
+            DurableOutcomeKind::Problem {
+                slug: "result-unavailable",
+            },
+        ] {
+            assert_eq!(stream_start(&kind), Start::Plain, "{kind:?}");
+        }
+        // The span outcome of an open stream is `stream`.
+        let (_tx, rx) = futures::channel::mpsc::channel(1);
+        let open = DurableStream {
+            answer: Answer::Stream(stream_response(rx, false, None)),
+            execution_id: Some(ExecutionId::new()),
+            replayed: true,
+        };
+        assert_eq!(open.slug(), "stream");
+        assert!(open.is_stream());
+        assert!(open.replayed());
+        assert!(open.execution_id().is_some());
+        let plain = DurableStream::outcome(pending());
+        assert_eq!(plain.slug(), "pending");
+        assert_eq!(plain.execution_id(), None);
     }
 
     // SAC-44
@@ -1647,7 +1922,6 @@ mod tests {
         assert!(text.contains("workflow=answer"), "{text}");
         assert!(text.contains("outcome=\"misconfigured\""), "{text}");
         assert!(text.contains("outcome=\"stream-cursor-invalid\""), "{text}");
-        assert!(text.contains("idempotency layer"), "{text}");
         assert!(text.contains("payload codec error"), "{text}");
         for secret in [
             "secret-key-44",

@@ -49,6 +49,8 @@ async fn place_order(
 | `.failure_status(error_type, status)` | The status of a run that fails with the typed `WorkflowFailure` class `error_type`. |
 | `.expose_execution_id()` | Adds `x-harvest-execution-id` to each answer that reports on the run, and an `execution_id` member to a pending body. While the key's claim lasts, the id names the run that the key started, which is the first run of a continue-as-new chain. After the window, it names the run that holds the business id. |
 | `.send()` | Runs the call. It never fails: every problem is a `DurableOutcome`. |
+| `.stream()` | Runs the call and answers with a resumable SSE stream, a `DurableStream`. See [Stream the run](#stream-the-run). |
+| `.stream_for(budget)` | Ends a stream after `budget`. It has no effect on `.send()`. |
 
 `DurableOutcome` implements `IntoResponse`. To render HTML, read
 `outcome.kind()` and `outcome.output_as::<T>()`, and fall back to
@@ -173,70 +175,108 @@ async fn answer(
 ```
 
 The workflow publishes each chunk with `ctx.publish_durable_progress`. The
-stream sends the stored chunks in order, then one final frame. The run
-commits before the stream opens. A crash, a deploy or a dropped connection
-loses no chunk.
+stream sends the stored chunks in order, then one final frame. The start of
+the run commits before the stream opens. A crash, a deploy or a dropped
+connection loses no chunk.
 
 | Frame | `id:` | `data:` |
 |---|---|---|
 | `event: progress` | `<attempt>.<offset>` | The chunk JSON, as published. |
-| `event: attempt` | `<attempt>` | `{"attempt": n, "cause": "retry"}`, or `"continued-as-new"`. |
+| `event: attempt` | `<attempt>` | `{"attempt":1,"cause":"retry"}`, or the cause `"continued-as-new"`. |
 | `event: result` | none | The workflow output. The stream then ends. |
-| `event: problem` | none | The problem body that `.send()` answers, with its `status`. The stream then ends. |
-| `event: pending` | none | `{"state":"pending"}`. The stream budget is spent. Resume. |
+| `event: problem` | none | The problem body that `.send()` answers, with its `status`. `.failure_status(..)` sets that `status`. The stream then ends. |
+| `event: pending` | none | `{"state":"pending"}`, with `retry: 1000`. The stream budget is spent. Resume. |
 
 The stream also sends a `: ping` comment every 5 s.
 
 The attempt counts the runs of one operation. Attempt 0 is the run that the
 key started. A workflow-level retry or a continue-as-new successor adds 1,
 and the stream then sends an `attempt` frame. A token view must clear the
-text of the attempt before. The id never holds the execution id.
+text of the previous attempt. The id never holds the execution id.
+
+A run that stores more than 10,000 chunks ends its chunks with a marker at
+offset `9223372036854775807`. Its id is `<attempt>.9223372036854775807`. See
+[durable streams](streaming-progress.md#limits).
 
 ### Resume
 
-1. Keep the `id:` of the last frame that you received.
+1. Keep the last `id:` that you received. The final frames carry no id.
 2. When the connection drops, or after `event: pending`, send the same
    request again. Use the same body, the same `Idempotency-Key`, and
    `Last-Event-ID: <id>`.
 3. The stream sends each frame after that id. With no `Last-Event-ID`, it
    starts at attempt 0.
+4. A resume can get a plain answer, not a stream: `202` pending, or a
+   problem. Check `content-type` before you parse.
+
+```console
+$ curl -N -X POST -H 'Idempotency-Key: 3f2b6c1e-7d4a-4f0e-9b1a-2c5d8e7f6a90' \
+    -H 'Last-Event-ID: 0.3' -H 'content-type: application/json' \
+    -d '{"prompt":"Hello"}' http://localhost:8080/answers
+event: progress
+data: {"token":"world"}
+id: 0.4
+
+event: result
+data: {"answer":"Hello world"}
+```
 
 A malformed or repeated `Last-Event-ID` answers `400`
-`stream-cursor-invalid` and starts nothing. Delivery is at-least-once across
-reconnects, so dedup by the `id:`. A browser `EventSource` sends `GET` with
-no custom header, so it cannot send `Idempotency-Key`. Use a `fetch` SSE
-reader that sends headers and `Last-Event-ID`.
+`stream-cursor-invalid` and starts nothing. Send the request again with no
+`Last-Event-ID`. Delivery is at-least-once across reconnects, so dedup by
+the `id:`. A browser `EventSource` sends `GET` with no custom header, so it
+cannot send `Idempotency-Key`. Use a `fetch` SSE reader that sends headers
+and `Last-Event-ID`.
 
 ### Answers
 
-- A problem before the run is known is a plain answer, as for `.send()`.
-- Every answer about the run is `200` with `content-type:
-  text/event-stream`, `cache-control: no-cache` and `x-accel-buffering: no`.
-  The final status is in the `problem` frame.
+- The route checks Autumn's idempotency layer first, then the key, then
+  `Last-Event-ID`, then the checks of `.send()`. A problem before the run is
+  known is a plain answer, as for `.send()`.
+- When the stream opens, the answer is `200` with `content-type:
+  text/event-stream`, `cache-control: no-cache, no-store, private` and
+  `x-accel-buffering: no`. The final status is in the `problem` frame.
+- A full stream cap, or a start that is not done before the request
+  deadline, answers `202` pending with `Retry-After: 1`. The cap answer
+  carries the run's headers.
+- An erased run answers a plain `410` `erased`. A result that the server
+  cannot read answers a plain `500` `result-unavailable`.
 - The stream carries `x-idempotent-replayed` and the opt-in
   `x-harvest-execution-id`, as for `.send()`.
-- `.wait(..)` and `.success_status(..)` do not apply to a stream.
+- `.wait(..)` and `.success_status(..)` have no effect on a stream.
 
 ### Limits
 
 - `.stream_for(budget)` ends the stream with `event: pending`. The default
-  budget is 5 min, and the route allows at most 1 h. `Duration::ZERO` sends
-  the stored chunks and does not wait.
-- Each live stream holds one Postgres `LISTEN` connection, and a pooled
-  connection for one page read only. Set the cap for each process with
-  `HarvestPlugin::durable_route_max_streams(n)`. The default is 32. A request
-  for a live run that finds the cap full answers `202` with
-  `Retry-After: 1`. A stream of a run that has ended needs no slot.
+  budget is 5 min, and the route allows at most 1 h. A shorter budget still
+  drains stored chunks for up to 5 s. `Duration::ZERO` therefore sends the
+  backlog and does not wait.
+- Each stream takes a slot. Set the cap for each process with
+  `HarvestPlugin::durable_route_max_streams(n)`. The default is 32. A
+  request that finds the cap full answers `202` with `Retry-After: 1`. `0`
+  turns streams off: every stream request answers pending.
+- The cap is for each process, not for each principal. One user can take
+  every slot. Rate-limit stream requests for each user in the app.
+- A stream of a live run holds one Postgres `LISTEN` connection. Every
+  stream holds a pooled connection for one read at a time. A stream reads
+  the run at least once each second.
 - Autumn's idempotency layer collects the whole body to cache it. A durable
   stream therefore answers `500` `misconfigured` under that layer, and starts
   nothing. Do not turn on `.idempotent()` for an app with durable streams.
 - The stream takes at most `durable_route_max_chain_steps` steps from run to
-  run. Past that, or at a loop, it ends with the `result-unavailable` problem.
-- A client that takes no frame for 60 s loses the stream. It resumes and
-  loses nothing.
+  run. Each run of the lineage is one step, so a same-type continue-as-new
+  chain counts each run. `.send()` counts that chain as one step. Past the
+  cap, or at a loop, the stream ends with the `result-unavailable` problem.
+- A client that leaves the frame buffer full for 60 s loses the stream. It
+  resumes and loses nothing.
 - Only `publish_durable_progress` chunks reach the stream. A reset and an
   operator rerun start no link from the run, so the stream does not follow
   them.
+- The cursor counts from the run that the key gives. After the claim window,
+  that can be the run that holds the business id, so an old cursor can skip
+  frames.
+- PII erasure works on one execution. A stream still sends the chunks of
+  the runs that are not erased. Erase each run of the lineage.
 - The `harvest.durable_route` span records the outcome `stream` when the
   stream opens. The stream logs never hold a chunk.
 - The chunks are plain JSON at rest. See

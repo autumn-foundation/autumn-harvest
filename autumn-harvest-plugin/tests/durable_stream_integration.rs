@@ -11,7 +11,7 @@
 #![allow(clippy::unused_async, clippy::used_underscore_binding)]
 
 use std::sync::{Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use autumn_harvest::ExecutionId;
 use autumn_harvest::prelude::*;
@@ -484,28 +484,39 @@ async fn live_stream_delivers_chunks_published_after_connect() {
         parked = post(&client, Some("key-sac24"), &extra, &body).await;
     }
     let exec_id = exec_id_of(&parked);
-    // A live stream with a long budget is open when the signal lands.
+    // A live stream is open when the signal lands, 800 ms after it opens.
+    let opened = Instant::now();
     let live = async {
-        post(
+        let response = post(
             &client,
             Some("key-sac24"),
             &[
                 ("x-user", "ada"),
                 ("x-workflow", "ds_parked"),
+                ("x-stream-ms", "15000"),
                 ("last-event-id", "0.1"),
             ],
             &body,
         )
-        .await
+        .await;
+        (response, opened.elapsed())
     };
     let later = async {
         tokio::time::sleep(Duration::from_millis(800)).await;
         signal(&client, exec_id, json!("late")).await;
+        opened.elapsed()
     };
-    let (live, ()) = tokio::join!(live, later);
+    let ((live, ended), signalled) = tokio::join!(live, later);
     let frames = frames(&live);
     assert_eq!(progress_ids(&frames), ["0.2", "0.3"]);
     assert_eq!(last(&frames).event, "result");
+    // The stream was open before the signal, and it ended soon after it.
+    let after = ended.saturating_sub(signalled);
+    assert!(ended > signalled, "the stream ended before the signal");
+    assert!(
+        after < Duration::from_secs(5),
+        "the stream took {after:?} after the signal"
+    );
 }
 
 // SAC-25
@@ -633,7 +644,7 @@ async fn failed_run_ends_with_the_problem_frame() {
 
 // SAC-31
 #[tokio::test(flavor = "multi_thread")]
-async fn erased_run_ends_with_the_erased_problem() {
+async fn erased_run_answers_a_plain_410() {
     let db = setup_db(8).await;
     let client = build_app(&db).await;
     let body = json!({"tag": "sac31"});
@@ -648,12 +659,12 @@ async fn erased_run_ends_with_the_erased_problem() {
             .await
             .expect("erase");
     }
+    // An erased run has no chunk to send, so the answer is not a stream.
     let erased = post(&client, Some("key-sac31"), &extra, &body).await;
-    let frames = frames(&erased);
-    assert_eq!(progress_ids(&frames), Vec::<String>::new());
-    assert_eq!(last(&frames).event, "problem");
-    assert_eq!(last(&frames).data["status"], 410);
-    assert_eq!(last(&frames).data["type"], slug_type("erased"));
+    assert_eq!(erased.status.as_u16(), 410, "{}", erased.text());
+    assert_ne!(erased.header("content-type"), Some("text/event-stream"));
+    assert_eq!(erased.json::<Value>()["type"], slug_type("erased"));
+    assert_eq!(erased.header(REPLAYED_HEADER), Some("true"));
 }
 
 // SAC-32
@@ -693,19 +704,53 @@ async fn invalid_cursor_answers_400_and_starts_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn full_stream_cap_answers_202_pending() {
     let db = setup_db(8).await;
-    let client = app_with(&db, base_plugin().durable_route_max_streams(0)).build();
+    // A cap of 0 answers pending for a live run and for an ended run.
+    let none = app_with(&db, base_plugin().durable_route_max_streams(0)).build();
     let parked = [
         ("x-user", "ada"),
         ("x-workflow", "ds_parked"),
         ("x-expose", "1"),
     ];
-    let response = post(&client, Some("key-sac34-live"), &parked, &json!({})).await;
+    let response = post(&none, Some("key-sac34-live"), &parked, &json!({})).await;
     assert_eq!(response.status.as_u16(), 202, "{}", response.text());
     assert_eq!(response.header("retry-after"), Some("1"));
     assert!(response.header(EXEC_HEADER).is_some());
-    // A completed run needs no slot, so it still streams.
-    let body = json!({"tag": "sac34"});
-    let frames = until_final(&client, "key-sac34-done", &[("x-user", "ada")], &body).await;
+    let done = [("x-user", "ada"), ("x-expose", "1")];
+    let body = json!({"tag": "sac34", "n": 1});
+    let mut ended = post(&none, Some("key-sac34-done"), &done, &body).await;
+    for _ in 0..50 {
+        if count_runs(&db, "ds_tokens").await == 1 && side_effects("sac34") == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        ended = post(&none, Some("key-sac34-done"), &done, &body).await;
+    }
+    assert_eq!(ended.status.as_u16(), 202, "{}", ended.text());
+}
+
+// SAC-34
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_stream_holds_its_slot_until_it_ends() {
+    let db = setup_db(8).await;
+    let one = app_with(&db, base_plugin().durable_route_max_streams(1)).build();
+    let parked = [
+        ("x-user", "ada"),
+        ("x-workflow", "ds_parked"),
+        ("x-stream-ms", "3000"),
+    ];
+    let done = [("x-user", "ada"), ("x-expose", "1")];
+    let body = json!({"tag": "sac34b"});
+    let empty = json!({});
+    let holder = post(&one, Some("key-sac34-holder"), &parked, &empty);
+    let blocked = async {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        post(&one, Some("key-sac34-blocked"), &done, &body).await
+    };
+    let (holder, blocked) = tokio::join!(holder, blocked);
+    assert_eq!(last(&frames(&holder)).event, "pending");
+    assert_eq!(blocked.status.as_u16(), 202, "{}", blocked.text());
+    // The holder gave its slot back, so the next request streams.
+    let frames = until_final(&one, "key-sac34-blocked", &done, &body).await;
     assert_eq!(last(&frames).event, "result");
 }
 
