@@ -1236,6 +1236,7 @@ impl WorkflowEvent {
             | Self::TimerStarted { .. }
             | Self::UpdateFailed { .. }
             | Self::WorkflowCancelled { .. }
+            | Self::WorkflowCancelRequested { .. }
             | Self::WorkflowExecutionPaused { .. }
             | Self::WorkflowExecutionResumed { .. }
             | Self::WorkflowExecutionTimedOut { .. }
@@ -1336,6 +1337,7 @@ impl WorkflowEvent {
                 named("value", key, PayloadSlot::Required(value))
             }
             Self::WorkflowCancelled { .. }
+            | Self::WorkflowCancelRequested { .. }
             | Self::ActivityStarted { .. }
             | Self::ActivityTimedOut { .. }
             | Self::TimerStarted { .. }
