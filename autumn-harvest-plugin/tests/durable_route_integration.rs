@@ -1362,7 +1362,10 @@ async fn start_connection_is_released_before_the_wait() {
         "the route shares the 4-slot pool"
     );
     // Eight requests wait 7 s each, longer than the 2 s pool acquire bound.
-    // A request that kept its start connection would starve the others.
+    // A request that kept a pooled connection through its wait would starve
+    // the others. A starved read answers pending early, so each waiter must
+    // use up its whole budget.
+    let budget = Duration::from_secs(7);
     let extra = [
         ("x-user", "ada"),
         ("x-workflow", "dr_parked"),
@@ -1372,13 +1375,27 @@ async fn start_connection_is_released_before_the_wait() {
         .map(|i| json!({"tag": format!("ac55-{i}")}))
         .collect();
     let keys: Vec<String> = (0..8).map(|i| format!("key-ac55-{i}")).collect();
-    let requests = keys
-        .iter()
-        .zip(&bodies)
-        .map(|(key, body)| post(&client, Some(key.as_str()), &extra, body));
-    for response in futures::future::join_all(requests).await {
+    let waiters = keys.iter().zip(&bodies).map(|(key, body)| async {
+        let sent = Instant::now();
+        let response = post(&client, Some(key.as_str()), &extra, body).await;
+        (response, sent.elapsed())
+    });
+    // A ninth request arrives during the waits. Its start and its run need
+    // the pool, so a starved pool answers 503.
+    let probe = async {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let body = json!({"tag": "ac55-probe"});
+        post(&client, Some("key-ac55-probe"), &[("x-user", "ada")], &body).await
+    };
+    let (waited, probe) = tokio::join!(futures::future::join_all(waiters), probe);
+    for (response, elapsed) in waited {
         assert_eq!(response.status.as_u16(), 202, "{}", response.text());
+        assert!(
+            elapsed + Duration::from_millis(250) >= budget,
+            "a waiter answered after {elapsed:?}, before its budget ended"
+        );
     }
+    assert_eq!(probe.status.as_u16(), 200, "{}", probe.text());
     assert_eq!(count_runs(&db, "dr_parked").await, 8);
 }
 
