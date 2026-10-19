@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use autumn_harvest::HarvestResult;
 use autumn_harvest::types::ShardId;
 use autumn_harvest::worker::DbPool;
 use autumn_harvest::workers::WorkerRow;
@@ -61,6 +62,36 @@ pub async fn acquire_shard_conn<R>(
             "database connection for shard {shard_id} could not be acquired"
         )),
     })
+}
+
+/// Fold a per-shard query's [`HarvestResult`] into a [`ShardObservation`].
+///
+/// A successful query becomes `error: None` with its rows attached; a failed
+/// one becomes an empty-rows observation whose `error` carries the failure's
+/// `Display` text. Every fan-out read model built this mapping by hand right
+/// after its own call to [`acquire_shard_conn`] — `usage`, `workflow_count`,
+/// `version_usage`, `version_gate_retirement` and `workflow_reachability` all
+/// hand-copied the identical `match query(...).await { Ok(rows) => ...,
+/// Err(e) => ... }` shape (issues #164 through #596). `acquire_shard_conn`
+/// (#1315) already centralised the connection guard that precedes this; this
+/// folds in the result-mapping half that guard's extraction left behind.
+#[must_use]
+pub fn observe_shard_result<R>(
+    shard_id: i32,
+    result: HarvestResult<Vec<R>>,
+) -> ShardObservation<R> {
+    match result {
+        Ok(rows) => ShardObservation {
+            shard_id,
+            rows,
+            error: None,
+        },
+        Err(error) => ShardObservation {
+            shard_id,
+            rows: Vec::new(),
+            error: Some(error.to_string()),
+        },
+    }
 }
 
 /// Collect per-shard connection pools available in `api_state`.
@@ -439,6 +470,41 @@ mod tests {
         assert_eq!(
             observation.error.as_deref(),
             Some("database connection for shard 3 could not be acquired")
+        );
+    }
+
+    // ── observe_shard_result (characterizes the Ok/Err-to-ShardObservation
+    //    mapping previously hand-copied into usage.rs, workflow_count.rs,
+    //    version_usage.rs, version_gate_retirement.rs and
+    //    workflow_reachability.rs) ─────────────────────────────────────────
+
+    #[test]
+    fn observe_shard_result_ok_attaches_rows_with_no_error() {
+        let observation = observe_shard_result(5, Ok(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(observation.shard_id, 5);
+        assert_eq!(observation.rows, ["a".to_string(), "b".to_string()]);
+        assert_eq!(observation.error, None);
+    }
+
+    #[test]
+    fn observe_shard_result_ok_empty_rows_still_reports_no_error() {
+        let observation: ShardObservation<i64> = observe_shard_result(2, Ok(Vec::new()));
+        assert_eq!(observation.shard_id, 2);
+        assert_eq!(observation.rows, [] as [i64; 0]);
+        assert_eq!(observation.error, None);
+    }
+
+    #[test]
+    fn observe_shard_result_err_reports_empty_rows_and_display_text() {
+        let observation: ShardObservation<i64> = observe_shard_result(
+            9,
+            Err(autumn_harvest::error::database_error("connection reset")),
+        );
+        assert_eq!(observation.shard_id, 9);
+        assert_eq!(observation.rows, [] as [i64; 0]);
+        assert_eq!(
+            observation.error.as_deref(),
+            Some("database error: connection reset")
         );
     }
 
