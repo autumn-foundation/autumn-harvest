@@ -6,7 +6,7 @@ BIN=$1; PORT=$2; OUT=$3; MIG=${MIG:-autumn-harvest/migrations}
 D=$OUT/data; mkdir -p "$OUT"; rm -rf "$D"
 export LD_LIBRARY_PATH=$BIN/../lib
 "$BIN/initdb" -D "$D" -U postgres -A trust >/dev/null
-"$BIN/pg_ctl" -D "$D" -o "-p $PORT -k /tmp -c listen_addresses=127.0.0.1" -l "$OUT/pg.log" -w start >/dev/null
+"$BIN/pg_ctl" -D "$D" -o "-p $PORT -k /tmp -c listen_addresses=127.0.0.1" -l "$OUT/pg.log" -w start >/dev/null || { echo "server failed to start on port $PORT" >&2; exit 2; }
 PSQL=${PSQL:-$BIN/psql}; P="$PSQL -h 127.0.0.1 -p $PORT -U postgres -X -q"
 $P -d postgres -Atc "select version()" | tee "$OUT/version.txt"
 rm -f "$OUT/summary.txt"; : > "$OUT/summary.txt"
@@ -15,7 +15,7 @@ for run in 1 2 3; do
   db=assay$run; $P -d postgres -c "create database $db" 
   ok=0; fail=0; : > "$OUT/run$run.fail"
   for d in $(ls "$MIG"); do
-    if $P -d $db -1 -v ON_ERROR_STOP=1 -f "$MIG/$d/up.sql" >/dev/null 2>"$OUT/err.tmp"; then ok=$((ok+1)); else fail=$((fail+1)); echo "$d: $(head -c 300 $OUT/err.tmp | tr '\n' ' ')" >> "$OUT/run$run.fail"; fi
+    if $P -d $db -1 -v ON_ERROR_STOP=1 -f "$MIG/$d/up.sql" >/dev/null 2>"$OUT/err.tmp"; then ok=$((ok+1)); else fail=$((fail+1)); rc=1; echo "$d: $(head -c 300 $OUT/err.tmp | tr '\n' ' ')" >> "$OUT/run$run.fail"; fi
   done
   echo "run $run: applied=$ok failed=$fail total=$((ok+fail))" | tee -a "$OUT/summary.txt"
   $P -d $db -v ON_ERROR_STOP=1 -Atc "

@@ -19,7 +19,8 @@ run as the cheapest evidence. No earlier ledger entry covers Postgres versions.
 ## 🧪 Apparatus
 
 [`apparatus/0015-postgres-12-floor/run.sh`](apparatus/0015-postgres-12-floor/run.sh).
-PG 12.22 and 14.19 built from source with contrib. PG 16.15 from the Ubuntu package.
+PG 12.22 and 14.24 built from source with contrib. PG 16.15 from the Ubuntu package.
+PG 14.24 is the latest 14 minor and the registered arm. PG 12.22 is the last 12 release.
 Fresh `initdb` per version, a fresh database per run, one transaction per
 `up.sql` with `ON_ERROR_STOP=1`. No migration carries `metadata.toml`, and
 `CONCURRENTLY` appears only in comments, so one transaction each matches Diesel.
@@ -35,23 +36,31 @@ runs applied nothing and are discarded, not measurements.
 | server | run 1 | run 2 | run 3 | schema signature vs PG 16 |
 |:--|:--|:--|:--|:--|
 | PG 16.15 (control) | 139/139 | 139/139 | 139/139 | — |
-| PG 14.19 | 139/139 | 139/139 | 139/139 | byte-identical, 3/3 |
+| PG 14.24 (registered arm) | 139/139 | 139/139 | 139/139 | byte-identical, 3/3 |
+| PG 14.19 (extra arm, see below) | 139/139 | 139/139 | 139/139 | byte-identical, 3/3 |
 | PG 12.22 | 139/139 | 139/139 | 139/139 | byte-identical, 3/3 |
 
 The signature is 872 rows: 56 tables, 612 columns (name, type), 201 indexes by name,
 3 triggers. All raw outputs, including all three signatures per server, are under `apparatus/0015-postgres-12-floor/results/`.
 There is no worst-case axis for a deterministic DDL replay, so none was probed.
 
-After review fixed two harness defects (an appending `summary.txt`, and a signature
-query whose failure went unchecked), all three servers were rerun on the fixed
-`run.sh`. Every run again applied 139/139, and every signature matched the archived
-one byte for byte. The numbers above did not change.
+**Protocol deviation, found in review.** The pre-registration fixes the PG 14 arm at the
+latest minor. The first sweep used PG 14.19 and did not check for a newer release.
+14.24 was already out. The arm was rerun on 14.24 and passes. The 14.19 results stay in
+the archive as an extra arm, run on the earlier harness draft. They carry no weight in
+the verdict. The verdict rests on the 12.22 and 14.24 arms.
+
+Review also fixed four harness defects: an appending `summary.txt`, an unchecked
+signature query, a zero exit status after a failed migration, and an ignored
+server-start failure. PG 12.22, PG 14.24 and PG 16.15 were rerun on the final
+`run.sh`. Every run applied 139/139. The archived outputs for those three servers come
+from that final run.
 
 ## 🏁 Verdict
 
 **Pursue, at the schema layer only.** L1 and L2 did not trigger. L3 (139/139 on 12
 and 14), L4 (valid control) and L5 (identical signature) all passed. The number
-that carries it is zero failed migrations out of 834 PG 12 and PG 14 applications (417 per version).
+that carries it is zero failed migrations out of 834 PG 12 and PG 14 applications on the registered arms (417 per version).
 
 This does not show that 12+ is *supported*. Engine query paths (claim, replay,
 sweeps, partition ops) were not exercised, because the DB suites need
@@ -69,7 +78,7 @@ change, Keystone for the README floor edit.
 ## 🔬 Reproduce
 
 ```sh
-# build PG 12.22 and 14.19 (--without-readline --without-zlib, make install, contrib)
+# build PG 12.22 and 14.24 (--without-readline --without-zlib, make install, contrib)
 runuser -u postgres -- env PSQL=<pg>/bin/psql MIG=$PWD/autumn-harvest/migrations \
   bash docs/assays/apparatus/0015-postgres-12-floor/run.sh <pg>/bin <port> <outdir>
 cmp <outdir16>/sig1.txt <outdirN>/sig1.txt
