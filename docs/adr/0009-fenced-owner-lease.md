@@ -20,7 +20,7 @@ ownership-change seam:
 - **restate#5033.** After a failed seal, leaders accept appends but stop
   applying the log.
 
-The [research report](../../reports/Actor%20ownership%20prior%20art%20for%20Harvest.md)
+The research report, `reports/Actor ownership prior art for Harvest.md`,
 proposes the protocol. Issue #2250 asks for a spec before the code. Two
 models check it:
 
