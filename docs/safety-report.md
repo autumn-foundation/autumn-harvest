@@ -402,8 +402,9 @@ From [`simulation.md`](testing/simulation.md#limits):
   `kill_at` points can close this gap.
 - The world workload never fails an activity, and its reclaimer never
   quarantines. So it does not reach the quarantine or the `FAILED` state.
-- The scheduler draws actions from fixed weights. Unlike probabilistic
-  concurrency testing (PCT), it does not search for rare interleavings.
+- The scheduler draws actions from fixed weights. The drain adds only a
+  fairness bound. Unlike probabilistic concurrency testing (PCT), it does
+  not search for rare interleavings.
 - The oracle harness does not model the timeout sweeper, the `FAILED`
   state or the poison-pill quarantine. Its reclaimer always requeues, so
   many long runs reach strike counts that production would quarantine. The
