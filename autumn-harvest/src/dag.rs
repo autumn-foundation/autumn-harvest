@@ -1737,7 +1737,11 @@ pub async fn run_unified_dag(
 /// unwind diverges") and
 /// `dag_compensation_tests::known_limitation_raising_the_cap_mid_unwind_diverges`.
 const fn is_deterministic_dispatch_rejection(error: &crate::error::HarvestError) -> bool {
-    matches!(error, crate::error::HarvestError::PayloadTooLarge { .. })
+    matches!(
+        error,
+        crate::error::HarvestError::PayloadTooLarge { .. }
+            | crate::error::HarvestError::PayloadTooDeep { .. }
+    )
 }
 
 /// Per-node forward-run state consulted by [`unwind_dag_compensations`] when it

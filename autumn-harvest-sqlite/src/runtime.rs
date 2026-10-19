@@ -3175,6 +3175,28 @@ impl SqliteRuntime {
         }
         self.workflow_panic_strikes.remove(&exec);
 
+        // Issue #2224: a result nested past the cap cannot be read back. The
+        // body has already returned, so it cannot handle the error. The run
+        // fails with a typed message instead of storing the value.
+        let outcome = match outcome {
+            WorkflowOutcome::Completed {
+                output,
+                unhandled_signals,
+            } if nests_past_cap(&output) => {
+                tracing::warn!(%exec, "workflow result nests past the depth cap; failing the run");
+                WorkflowOutcome::Failed {
+                    error: format!(
+                        "{PAYLOAD_TOO_DEEP_ERROR_TYPE}: workflow result nests more than \
+                         {MAX_PAYLOAD_DEPTH} levels"
+                    ),
+                    non_deterministic_details: None,
+                    handler_panic: false,
+                    unhandled_signals,
+                }
+            }
+            other => other,
+        };
+
         // Issue #2021: a pending cancel request ends the run here.
         // - A body that returns `Ok` or `Err` has done its cleanup. Its
         //   bookkeeping commands persist before the terminal event.
@@ -4358,63 +4380,8 @@ fn start_in_tx(
     }
 }
 
-/// The deepest nesting that ingress accepts in a payload (issue #2157).
-///
-/// `serde_json` reads at most 128 levels. Event storage wraps a payload in a
-/// few more levels. The cap leaves room for that wrapping.
-pub const MAX_PAYLOAD_DEPTH: usize = 100;
-
-/// The children of a JSON container, as one iterator type.
-enum Children<'a> {
-    Array(std::slice::Iter<'a, Value>),
-    Object(serde_json::map::Values<'a>),
-}
-
-impl<'a> Iterator for Children<'a> {
-    type Item = &'a Value;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Array(items) => items.next(),
-            Self::Object(values) => values.next(),
-        }
-    }
-}
-
-/// The children of `value`, or `None` for a scalar.
-fn children(value: &Value) -> Option<Children<'_>> {
-    match value {
-        Value::Array(items) => Some(Children::Array(items.iter())),
-        Value::Object(map) => Some(Children::Object(map.values())),
-        _ => None,
-    }
-}
-
-/// Returns `true` when `value` has more than [`MAX_PAYLOAD_DEPTH`] open
-/// arrays and objects on a path.
-///
-/// The walk keeps one iterator per open container. A recursive walk would
-/// overflow the call stack on the input it must refuse. Memory use is bound
-/// by the cap, not by the width of the value.
-///
-/// Call it before any code that recurses over the value, such as a schema check
-/// or a settlement decoder.
-pub fn nests_past_cap(value: &Value) -> bool {
-    let mut open: Vec<Children<'_>> = children(value).into_iter().collect();
-    while let Some(top) = open.last_mut() {
-        let Some(child) = top.next() else {
-            open.pop();
-            continue;
-        };
-        if let Some(inner) = children(child) {
-            if open.len() >= MAX_PAYLOAD_DEPTH {
-                return true;
-            }
-            open.push(inner);
-        }
-    }
-    false
-}
+// The depth cap and its walk live in the core (issues #2157, #2224).
+pub use autumn_harvest::payload_depth::{MAX_PAYLOAD_DEPTH, nests_past_cap};
 
 /// Returns `Ok` only when `value` nests at most [`MAX_PAYLOAD_DEPTH`] levels.
 /// `kind` names the ingress boundary in the error.

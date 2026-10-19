@@ -689,6 +689,28 @@ pub enum HarvestError {
         activity_name: Option<String>,
     },
 
+    /// A workflow-side payload nests deeper than
+    /// [`MAX_PAYLOAD_DEPTH`](crate::payload_depth::MAX_PAYLOAD_DEPTH)
+    /// (issue #2224).
+    ///
+    /// `serde_json` cannot read a value nested past 128 levels. The context
+    /// refuses the value at the call site, so no command and no event is
+    /// written. The workflow can handle the error.
+    #[error(
+        "payload too deep: {kind} for workflow '{workflow_type}' nests more than \
+         {cap_depth} levels"
+    )]
+    PayloadTooDeep {
+        /// The payload boundary that was violated.
+        kind: PayloadKind,
+        /// The deepest nesting that a payload may have.
+        cap_depth: usize,
+        /// The workflow type name that issued the payload.
+        workflow_type: String,
+        /// The activity name, when the violation is activity-scoped.
+        activity_name: Option<String>,
+    },
+
     /// A new workflow start was blocked by an active admission gate (issue #377).
     ///
     /// Returned by the admission check when at least one active gate matches

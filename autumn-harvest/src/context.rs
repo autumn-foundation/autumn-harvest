@@ -5831,6 +5831,7 @@ impl WorkflowContext {
                     crate::cancellation_scope::Captured::NotReplaying => {
                         let result = f();
                         let output = serde_json::to_value(&result)?;
+                        self.check_payload_depth(PayloadKind::SideEffectValue, None, &output)?;
 
                         // Enforce side-effect payload cap before recording.
                         // SideEffectRecorded events are written via pre_suspension_events_from_commands
@@ -6853,6 +6854,8 @@ impl WorkflowContext {
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
 
+                self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
+
                 // Enforce activity input payload cap before scheduling.
                 let effective_cap = {
                     let global = self.payload_max_activity_input;
@@ -7174,6 +7177,8 @@ impl WorkflowContext {
 
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!("LocalActivityScheduled({name})"))?;
+
+                self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
 
                 // Enforce activity input payload cap for local activities too.
                 let effective_cap = {
@@ -9019,6 +9024,8 @@ impl WorkflowContext {
                     "ChildWorkflowStarted({workflow_name})"
                 ))?;
 
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
+
                 // Enforce child-workflow input payload cap before scheduling.
                 // ChildWorkflowStarted is written to the parent's history via
                 // append_single_event (plain), so the offload bypass must NOT apply here.
@@ -9180,6 +9187,8 @@ impl WorkflowContext {
                 self.check_strict_replay_no_match(&format!(
                     "ChildWorkflowSpawnedDetached({workflow_name})"
                 ))?;
+
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
 
                 // Enforce child-workflow input payload cap before scheduling.
                 // ChildWorkflowSpawnedDetached is written via pre_suspension_events_from_commands
@@ -9634,6 +9643,9 @@ impl WorkflowContext {
         let fresh_dispatch = !self.match_history(|m| m.peek_child_start_at_cursor(&timer_id));
         // Issue #1984: a scope that replays its cancel holds this dispatch.
         // The cap applied when the cancelling cycle made it.
+        if fresh_dispatch {
+            self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
+        }
         if fresh_dispatch && !self.replays_a_scope_cancel() {
             let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
             if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input {
@@ -12694,6 +12706,11 @@ impl WorkflowContext {
         fresh_dispatch: bool,
         children: &[(String, Value)],
     ) -> HarvestResult<()> {
+        if fresh_dispatch {
+            for (_, input) in children {
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, input)?;
+            }
+        }
         // Issue #1984: a scope that replays its cancel holds these dispatches.
         // The cap applied when the cancelling cycle made them.
         if !fresh_dispatch || self.payload_max_workflow_input == 0 || self.replays_a_scope_cancel()
@@ -13543,6 +13560,7 @@ impl WorkflowContext {
             }
             match &branches[dispatch.index].kind {
                 RaceBranchKind::Activity { name, input, .. } => {
+                    self.check_payload_depth(PayloadKind::ActivityInput, Some(name), input)?;
                     let effective_cap = {
                         let global = self.payload_max_activity_input;
                         self.activity_input_cap_overrides
@@ -13565,6 +13583,7 @@ impl WorkflowContext {
                     }
                 }
                 RaceBranchKind::ChildWorkflow { input, .. } => {
+                    self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, input)?;
                     let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
                     if self.payload_max_workflow_input > 0
                         && observed > self.payload_max_workflow_input
@@ -14583,6 +14602,7 @@ impl WorkflowContext {
             }
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match("ContinueAsNew")?;
+                self.check_payload_depth(PayloadKind::WorkflowInput, None, &input)?;
                 // Issue #1161: check the cap only for a SAME-type
                 // continuation. `self.payload_max_workflow_input` is
                 // resolved for the CURRENT type, which is also the successor
@@ -15654,6 +15674,27 @@ impl WorkflowContext {
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
+
+    /// Refuse a payload that nests past the depth cap (issue #2224).
+    ///
+    /// The check reads the value only. It is the same on live and replay
+    /// runs, so it needs no replay guard.
+    fn check_payload_depth(
+        &self,
+        kind: PayloadKind,
+        activity_name: Option<&str>,
+        value: &Value,
+    ) -> HarvestResult<()> {
+        if crate::payload_depth::nests_past_cap(value) {
+            return Err(HarvestError::PayloadTooDeep {
+                kind,
+                cap_depth: crate::payload_depth::MAX_PAYLOAD_DEPTH,
+                workflow_type: self.workflow_name.clone(),
+                activity_name: activity_name.map(str::to_string),
+            });
+        }
+        Ok(())
+    }
 
     /// Generate the next sequential activity execution ID.
     fn next_activity_id(&self) -> ActivityExecId {
@@ -33527,5 +33568,136 @@ mod activity_info_tests {
         assert_eq!(info.clone(), info);
         let identity = info.identity();
         assert_eq!(identity.clone(), identity);
+    }
+}
+
+/// A workflow-side payload nested past the depth cap is refused at the call
+/// site (issue #2224). Each test checks the cap, one level over it, and that
+/// the refusal queues no command.
+#[cfg(test)]
+mod payload_depth_tests {
+    use super::*;
+    use crate::error::PayloadKind;
+    use crate::payload_depth::MAX_PAYLOAD_DEPTH;
+
+    fn nested(depth: usize) -> Value {
+        let mut value = serde_json::json!(1);
+        for _ in 0..depth {
+            value = Value::Array(vec![value]);
+        }
+        value
+    }
+
+    fn assert_too_deep(err: &HarvestError, expected: &PayloadKind) {
+        match err {
+            HarvestError::PayloadTooDeep {
+                kind, cap_depth, ..
+            } => {
+                assert_eq!(kind, expected);
+                assert_eq!(*cap_depth, MAX_PAYLOAD_DEPTH);
+            }
+            other => panic!("expected PayloadTooDeep, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), "default")
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_activity_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_local_activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), None, None)
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_raw("c", nested(MAX_PAYLOAD_DEPTH + 1))
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_timeout_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_timeout(
+                "c",
+                nested(MAX_PAYLOAD_DEPTH + 1),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn detached_child_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_detached_raw(
+                "c",
+                nested(MAX_PAYLOAD_DEPTH + 1),
+                crate::types::ParentClosePolicy::default(),
+            )
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continue_as_new_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .continue_as_new(nested(MAX_PAYLOAD_DEPTH + 1))
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::WorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn side_effect_value_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .side_effect("s", || nested(MAX_PAYLOAD_DEPTH + 1))
+            .expect_err("a deep value must be refused");
+        assert_too_deep(&err, &PayloadKind::SideEffectValue);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn side_effect_value_at_the_cap_is_recorded() {
+        let ctx = WorkflowContext::new_test();
+        ctx.side_effect("s", || nested(MAX_PAYLOAD_DEPTH))
+            .expect("a value at the cap is accepted");
+        assert_eq!(ctx.drain_commands().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn child_input_at_the_cap_is_not_refused_for_depth() {
+        let ctx = WorkflowContext::new_test();
+        let fut = ctx.spawn_child_workflow_raw("c", nested(MAX_PAYLOAD_DEPTH));
+        let res = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
+        // The call parks on the child result. A depth refusal returns at once.
+        assert!(res.is_err(), "a value at the cap must be accepted");
+        assert_eq!(ctx.drain_commands().len(), 1);
     }
 }

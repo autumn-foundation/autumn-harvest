@@ -127,6 +127,10 @@
 //!   The workflow sees the failure. A local failure keeps only its message. A
 //!   heartbeat that nests too deep is dropped, and the last good checkpoint stays.
 //!   A too-deep result or heartbeat is never stored.
+//!   A value from workflow code (issue #2224) is refused at the call site with
+//!   `HarvestError::PayloadTooDeep`. That covers activity, local activity, child and
+//!   continue-as-new input, and side-effect values. The workflow can handle the error.
+//!   A workflow result that nests too deep fails the run.
 //! - **Payload-size caps are enforced at every boundary, matching the core** (issue
 //!   #252). A caller-supplied payload that exceeds its byte cap is refused before it
 //!   can enter `harvest_events`, so this backend never stores an unbounded history
