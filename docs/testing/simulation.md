@@ -402,6 +402,9 @@ nemeses bias the scheduler. Each one acts when its trigger holds:
   design reaches each nemesis and never fences itself.
 - `each_nemesis_fires_and_adds_its_fault` runs each nemesis alone. It must
   fire, and its fault counter must be above the run with no nemesis.
+- A sweep fails a seed that does not consume every signal within the
+  step limit. So a store that makes no progress cannot pass.
+  `a_store_that_makes_no_progress_fails_the_sweep` checks this.
 
 With every check on, a defect can fail first on another invariant. For
 example, `memory-ack` fails first on `AckAfterDurableWrite`. Set

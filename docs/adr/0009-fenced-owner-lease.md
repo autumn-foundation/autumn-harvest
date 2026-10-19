@@ -66,7 +66,9 @@ The invariants:
 - `NoDuplicateEvent`: no two events consume one signal.
 - `AckAfterDurableWrite`: a signal is acknowledged only after its durable
   write.
-- `NoAckedSignalLost`: no acknowledged signal is lost.
+- `NoAckedSignalLost`: no acknowledged signal is lost. A signal in the
+  memory of an owner that lost the row counts as lost, because that owner
+  can never commit it.
 - `OwnerNeverFencesItself`: only a takeover fences a commit. This is an
   availability rule, not a safety rule.
 

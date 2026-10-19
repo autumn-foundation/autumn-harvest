@@ -246,8 +246,9 @@ fields:
 - `DecisionOnFreshHistory`: each decision saw every earlier event.
 - `NoDuplicateEvent`: no two events consume one signal.
 - `AckAfterDurableWrite`: a signal is acked only after its durable write.
-- `NoAckedSignalLost`: an acked signal is pending, consumed, or in a live
-  memory.
+- `NoAckedSignalLost`: an acked signal is pending, consumed, or in the
+  memory of the worker that holds the row at its epoch. A stale owner can
+  never commit from memory, so its memory does not count.
 - `OwnerNeverFencesItself`: only a takeover fences a commit.
 
 In the design, `AckAfterDurableWrite` restates the guard of `Ack`. It

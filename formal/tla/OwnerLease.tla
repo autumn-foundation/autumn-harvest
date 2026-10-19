@@ -309,9 +309,14 @@ NoDuplicateEvent ==
 \* A signal is acknowledged only after its durable write.
 AckAfterDurableWrite == acked \subseteq written
 
-\* An acknowledged signal is pending, consumed, or in a live memory.
-NoAckedSignalLost ==
-    acked \subseteq inbox \cup Consumed \cup UNION {mem[w] : w \in Workers}
+\* The memory of the worker that still holds the row at its epoch. Only
+\* that worker can commit a signal from memory.
+LiveMemory ==
+    IF lease.holder # NoWorker /\ pinned[lease.holder] = lease.epoch
+    THEN mem[lease.holder] ELSE {}
+
+\* An acknowledged signal is pending, consumed, or in the live memory.
+NoAckedSignalLost == acked \subseteq inbox \cup Consumed \cup LiveMemory
 
 \* Only a takeover fences a commit. The holder never fences itself.
 OwnerNeverFencesItself == "self-fence" \notin seen

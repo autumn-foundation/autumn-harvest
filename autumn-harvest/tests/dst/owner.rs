@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use autumn_harvest::dst::SeedPlan;
 use autumn_harvest::dst::owner::{
-    self, Defect, Nemesis, OracleOwnerStore, OwnerConfig, OwnerInvariant, OwnerReport, OwnerStats,
+    self, Decision, Defect, Epoch, Fence, LeaseRow, Nemesis, OracleOwnerStore, OwnerConfig,
+    OwnerInvariant, OwnerReport, OwnerStats, OwnerStore, Renewal, SignalId, WorkerId,
 };
 
 /// The sweep size of a normal test run. The nightly job sets
@@ -251,6 +252,56 @@ fn run_with_and_sweep_with_drive_a_caller_store() {
     assert_eq!(made, 16, "each seed runs twice on a fresh store");
 }
 
+/// A store whose takeover never succeeds, as with a leaked lock.
+struct StuckStore(OracleOwnerStore);
+
+impl OwnerStore for StuckStore {
+    fn acquire(&mut self, _worker: WorkerId) -> Option<Epoch> {
+        None
+    }
+    fn release(&mut self, worker: WorkerId, epoch: Epoch) -> bool {
+        self.0.release(worker, epoch)
+    }
+    fn renew(&mut self, worker: WorkerId, epoch: Epoch) -> Renewal {
+        self.0.renew(worker, epoch)
+    }
+    fn expire(&mut self) {
+        self.0.expire();
+    }
+    fn write_signal(&mut self, signal: SignalId) {
+        self.0.write_signal(signal);
+    }
+    fn lock(&mut self, decision: &Decision) -> Fence {
+        self.0.lock(decision)
+    }
+    fn commit(&mut self, decision: &Decision) -> Epoch {
+        self.0.commit(decision)
+    }
+    fn row(&self) -> LeaseRow {
+        self.0.row()
+    }
+    fn pending(&self) -> Vec<SignalId> {
+        self.0.pending()
+    }
+    fn consumed(&self) -> Vec<SignalId> {
+        self.0.consumed()
+    }
+}
+
+#[test]
+fn a_store_that_makes_no_progress_fails_the_sweep() {
+    let plan = SeedPlan { first: 0, count: 1 };
+    let failure = owner::sweep_with(&plan, OwnerConfig::new, |config| {
+        StuckStore(OracleOwnerStore::new(config.defect))
+    })
+    .expect_err("a store with no takeover consumes no signal");
+    assert!(
+        failure.reason.contains("did not consume every signal"),
+        "{failure}"
+    );
+    assert!(owner::run(&OwnerConfig::new(0)).completed);
+}
+
 #[test]
 fn config_vars_parse_and_reject_unknown_names() {
     let config = owner::config_from_vars(3, Some("memory-ack"), Some("ack-before-bump"), None)
@@ -327,7 +378,7 @@ fn drives_a_real_store(sources: &[String]) -> bool {
 }
 
 #[test]
-fn the_real_store_matcher_rejects_the_oracle_and_this_file() {
+fn the_real_store_matcher_rejects_the_oracle_and_skips_tests_dst() {
     let oracle = format!(
         "{} OracleOwnerStore {{}} run_with(",
         concat!("impl Owner", "Store for")
@@ -340,9 +391,34 @@ fn the_real_store_matcher_rejects_the_oracle_and_this_file() {
     assert!(!drives_a_real_store(&[oracle]));
     assert!(!drives_a_real_store(&[undriven]));
     assert!(drives_a_real_store(&[real]));
-    assert!(!drives_a_real_store(&[read(
+    // This file drives a test store, so the tripwire must not read it.
+    assert!(drives_a_real_store(&[read(
         "autumn-harvest/tests/dst/owner.rs"
     )]));
+    let here = std::fs::canonicalize(file_path("autumn-harvest/tests/dst/owner.rs"))
+        .expect("this file exists");
+    assert!(
+        stage_1a_test_files()
+            .iter()
+            .all(|p| std::fs::canonicalize(p).ok().as_ref() != Some(&here)),
+        "the tripwire reads tests/dst"
+    );
+}
+
+fn file_path(rel: &str) -> PathBuf {
+    repo_root().join(rel)
+}
+
+/// The test sources that the tripwire reads: every `.rs` file under
+/// `autumn-harvest/tests`, except `tests/dst`.
+fn stage_1a_test_files() -> Vec<PathBuf> {
+    let tests = repo_root().join("autumn-harvest").join("tests");
+    let dst = tests.join("dst");
+    files(&tests)
+        .into_iter()
+        .filter(|p| !p.starts_with(&dst))
+        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+        .collect()
 }
 
 /// AC 2 of issue #2250 binds once stage 1a lands. A migration that adds
@@ -358,11 +434,8 @@ fn stage_1a_owner_store_gets_a_simulator_run() {
     if !owner_table {
         return;
     }
-    let dst = root.join("tests").join("dst");
-    let sources: Vec<String> = files(&root.join("tests"))
+    let sources: Vec<String> = stage_1a_test_files()
         .into_iter()
-        .filter(|p| !p.starts_with(&dst))
-        .filter(|p| p.extension().is_some_and(|e| e == "rs"))
         .filter_map(|p| std::fs::read_to_string(p).ok())
         .collect();
     assert!(

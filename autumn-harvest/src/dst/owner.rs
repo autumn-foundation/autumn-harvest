@@ -112,7 +112,8 @@ named! {
         NoDuplicateEvent => "NoDuplicateEvent",
         /// A signal is acknowledged only after its durable write.
         AckAfterDurableWrite => "AckAfterDurableWrite",
-        /// An acknowledged signal is pending, consumed, or in a live memory.
+        /// An acknowledged signal is pending, consumed, or in the memory of
+        /// the worker that holds the row.
         NoAckedSignalLost => "NoAckedSignalLost",
         /// Only a takeover fences a commit.
         OwnerNeverFencesItself => "OwnerNeverFencesItself",
@@ -537,6 +538,8 @@ pub struct OwnerReport {
     pub stats: OwnerStats,
     /// The first failed invariant, if any.
     pub violation: Option<OwnerViolation>,
+    /// `true` when every signal was consumed before the step limit.
+    pub completed: bool,
 }
 
 impl OwnerReport {
@@ -1072,11 +1075,14 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
         let pending: BTreeSet<SignalId> = self.store.pending().into_iter().collect();
         let log = self.store.consumed();
         let consumed: BTreeSet<SignalId> = log.iter().copied().collect();
-        let memory: BTreeSet<SignalId> = self
-            .workers
-            .iter()
-            .flat_map(|w| w.memory.iter().copied())
-            .collect();
+        // Only the worker that still holds the row at its epoch can commit a
+        // signal from memory.
+        let row = self.store.row();
+        let memory: BTreeSet<SignalId> = row
+            .holder
+            .filter(|h| self.worker(*h).pinned == Some(row.epoch))
+            .map(|h| self.worker(h).memory.clone())
+            .unwrap_or_default();
         let fail = |invariant, detail: String| {
             Some(OwnerViolation {
                 invariant,
@@ -1170,12 +1176,14 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
             }
             self.step += 1;
         }
+        let completed = self.quiescent();
         OwnerReport {
             config: self.config.clone(),
             trace: self.trace,
             history: self.history,
             stats: self.stats,
             violation,
+            completed,
         }
     }
 }
@@ -1262,7 +1270,8 @@ impl fmt::Display for OwnerFailure {
 ///
 /// # Errors
 ///
-/// Returns the first seed that fails an invariant or is not deterministic.
+/// Returns the first seed that fails an invariant, is not deterministic,
+/// or does not consume every signal within the step limit.
 pub fn sweep(
     plan: &SeedPlan,
     config: impl Fn(u64) -> OwnerConfig,
@@ -1275,7 +1284,8 @@ pub fn sweep(
 ///
 /// # Errors
 ///
-/// Returns the first seed that fails an invariant or is not deterministic.
+/// Returns the first seed that fails an invariant, is not deterministic,
+/// or does not consume every signal within the step limit.
 pub fn sweep_with<S: OwnerStore>(
     plan: &SeedPlan,
     config: impl Fn(u64) -> OwnerConfig,
@@ -1298,6 +1308,17 @@ pub fn sweep_with<S: OwnerStore>(
         if let Some(violation) = &report.violation {
             return Err(Box::new(OwnerFailure {
                 reason: violation.to_string(),
+                trace_tail: report.trace_tail(TAIL_LINES),
+                config,
+            }));
+        }
+        // A store that makes no progress must not pass.
+        if !report.completed {
+            return Err(Box::new(OwnerFailure {
+                reason: format!(
+                    "the run did not consume every signal within {} steps",
+                    config.max_steps
+                ),
                 trace_tail: report.trace_tail(TAIL_LINES),
                 config,
             }));
