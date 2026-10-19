@@ -340,6 +340,13 @@ Against a dependency whose latency grows in proportion to the concurrency above 
 
 *Metrics.* Three gauges, each labeled by `activity`: `harvest.activity.concurrency_limit`, `harvest.activity.concurrency_in_flight` and `harvest.activity.latency_baseline_seconds`. The registry publishes them under its lock after every change. A call that changes nothing publishes nothing. The counter `harvest.activity.concurrency_deferred{activity}` counts deferrals. Prometheus exports it as `harvest_activity_concurrency_deferred_total`. See [`telemetry.md`](telemetry.md#metric-catalogue-adr-0001-7).
 
+### Terms
+
+A **decision partition** is a fixed hash bucket of executions inside one
+shard database, with one owner at a time.
+[ADR 0009](adr/0009-decision-owner.md) records it. The glossary of shard
+and owner terms is in [`sharding.md`](sharding.md#glossary).
+
 ### Sharding
 
 Harvest can spread workflow state across N independent Postgres databases. A single workflow's event log, task queue rows, timers, signals, and DLQ entries all live on the same shard, so per-workflow ACID guarantees are preserved without cross-shard transactions. An operator can move a quiescent workflow to another shard (`shard_rebalance.rs`, issue #964). A running workflow does not move. See [`sharding.md`](sharding.md#shard-rebalancing--migrating-quiescent-workflows-issue-964).

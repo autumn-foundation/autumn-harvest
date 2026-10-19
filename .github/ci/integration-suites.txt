@@ -50,6 +50,7 @@ allos        autumn-harvest         integration                      -          
 allos        autumn-harvest         integration                      -                          assay_rerun_docs
 allos        autumn-harvest         integration                      -                          benchmarks_docs
 allos        autumn-harvest         integration                      -                          contention_adaptive_atomicity_docs
+allos        autumn-harvest         integration                      -                          decision_owner_docs
 allos        autumn-harvest         integration                      -                          hot_code_swap_docs
 allos        autumn-harvest         integration                      -                          lock_order_docs
 allos        autumn-harvest         integration                      -                          otel_semconv_docs
@@ -129,6 +130,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          ctx_info_tests
 linux        autumn-harvest         integration                      -                          dag_execution_timeout_tests
 linux        autumn-harvest         integration                      -                          debounce_tests
+linux        autumn-harvest         integration                      -                          decision_owner_lock_modes_db_tests
 linux        autumn-harvest         integration                      -                          declarative_update_tests
 linux        autumn-harvest         integration                      -                          deep_backlog_fixture_tests
 linux        autumn-harvest         integration                      -                          delayed_start_tests
