@@ -68,13 +68,14 @@ pub async fn acquire_shard_conn<R>(
 ///
 /// A successful query becomes `error: None` with its rows attached; a failed
 /// one becomes an empty-rows observation whose `error` carries the failure's
-/// `Display` text. Every fan-out read model built this mapping by hand right
-/// after its own call to [`acquire_shard_conn`] — `usage`, `workflow_count`,
-/// `version_usage`, `version_gate_retirement` and `workflow_reachability` all
-/// hand-copied the identical `match query(...).await { Ok(rows) => ...,
-/// Err(e) => ... }` shape (issues #164 through #596). `acquire_shard_conn`
-/// (#1315) already centralised the connection guard that precedes this; this
-/// folds in the result-mapping half that guard's extraction left behind.
+/// `Display` text. Every fan-out read model built this mapping by hand,
+/// right after its own call to [`acquire_shard_conn`]. `usage`,
+/// `workflow_count`, `version_usage`, `version_gate_retirement` and
+/// `workflow_reachability` all hand-copied the identical `match
+/// query(...).await { Ok(rows) => ..., Err(e) => ... }` shape (issues #164
+/// through #596). `acquire_shard_conn` (#1315) already centralised the
+/// connection guard that precedes this. This folds in the result-mapping
+/// half that guard's extraction left behind.
 #[must_use]
 pub fn observe_shard_result<R>(
     shard_id: i32,
