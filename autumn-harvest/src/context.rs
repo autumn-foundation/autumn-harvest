@@ -15184,15 +15184,8 @@ impl WorkflowContext {
             return result;
         }
 
-        // Live path: invoke the registered handler. A result nested past the
-        // depth cap cannot be read back, so the update fails instead (issue #2224).
-        let result = match self.run_update_handler(name, input).await {
-            Ok(output) if crate::payload_depth::nests_past_cap(&output) => Err(format!(
-                "payload too deep: update '{name}' result nests more than {} levels",
-                crate::payload_depth::MAX_PAYLOAD_DEPTH
-            )),
-            other => other,
-        };
+        // Live path: invoke the registered handler.
+        let result = self.run_update_handler(name, input).await;
 
         // Durably record the terminal result so the worker can append
         // UpdateCompleted/UpdateFailed before persisting other side effects.
@@ -15223,7 +15216,15 @@ impl WorkflowContext {
             .expect("update_registry lock poisoned")
             .get_handler(name);
         match handler {
-            Some(handler) => handler(input).await,
+            // A result nested past the depth cap cannot be read back, so the
+            // update fails instead (issue #2224). Both update paths run here.
+            Some(handler) => match handler(input).await {
+                Ok(output) if crate::payload_depth::nests_past_cap(&output) => Err(format!(
+                    "payload too deep: update '{name}' result nests more than {} levels",
+                    crate::payload_depth::MAX_PAYLOAD_DEPTH
+                )),
+                other => other,
+            },
             None => Err(format!("update handler '{name}' not found")),
         }
     }

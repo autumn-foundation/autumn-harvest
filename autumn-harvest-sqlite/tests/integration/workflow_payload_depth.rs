@@ -262,3 +262,41 @@ async fn an_update_result_over_the_cap_fails_the_update_and_the_run_stays_live()
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(matches!(state, RunState::Completed(ref v) if v == "ok"));
 }
+
+/// Catch the refusal of a deep call, then wait on a timer.
+#[workflow]
+async fn catch_then_wait(ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
+    let path = input.as_str().unwrap_or_default();
+    let value = nested(MAX_PAYLOAD_DEPTH + 1);
+    let refused = match path {
+        "activity" => ctx
+            .execute_activity_raw("echo_remote", value, "default")
+            .await
+            .is_err(),
+        "local_activity" => ctx
+            .execute_local_activity_raw("echo_local", value, None, None)
+            .await
+            .is_err(),
+        "child" => ctx.spawn_child_workflow_raw("probe", value).await.is_err(),
+        _ => return Err(format!("unknown path {path}")),
+    };
+    ctx.timer("t", 1).await.map_err(|e| e.to_string())?;
+    Ok(json!({ "refused": refused }))
+}
+
+#[tokio::test]
+async fn a_caught_refusal_replays_after_a_later_command() {
+    for path in ["activity", "local_activity", "child"] {
+        let mut rt = runtime();
+        rt.register_workflow(&catch_then_wait_info());
+        let exec = rt.start_workflow("catch_then_wait", json!(path)).unwrap();
+        // The first drive arms the timer. The second drive replays the refusal.
+        let first = rt.run_until_blocked(exec).await.unwrap();
+        assert!(matches!(first, RunState::WaitingTimer), "{path}: {first:?}");
+        let again = rt.run_until_blocked(exec).await;
+        assert!(
+            matches!(again, Ok(RunState::WaitingTimer)),
+            "{path}: replay diverged: {again:?}"
+        );
+    }
+}
