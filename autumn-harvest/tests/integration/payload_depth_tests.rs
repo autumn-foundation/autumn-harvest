@@ -150,17 +150,17 @@ fn deep_value(input: &Value) -> Value {
 }
 
 /// A regular activity that returns a deep value.
-fn deep_result<'a>(_ctx: &'a ActivityContext, input: Value) -> BoxFut<'a> {
+fn deep_result(_ctx: &ActivityContext, input: Value) -> BoxFut<'_> {
     Box::pin(async move { Ok(deep_value(&input)) })
 }
 
 /// A local activity that returns a deep value.
-fn deep_local<'a>(_ctx: &'a ActivityContext, input: Value) -> BoxFut<'a> {
+fn deep_local(_ctx: &ActivityContext, input: Value) -> BoxFut<'_> {
     Box::pin(async move { Ok(deep_value(&input)) })
 }
 
 /// A transactional activity. It writes a row, then returns a deep value.
-fn deep_transactional<'a>(ctx: &'a ActivityContext, input: Value) -> BoxFut<'a> {
+fn deep_transactional(ctx: &ActivityContext, input: Value) -> BoxFut<'_> {
     Box::pin(async move {
         let tag = input["tag"].as_str().unwrap_or("none").to_string();
         let value = deep_value(&input);
@@ -180,7 +180,7 @@ fn deep_transactional<'a>(ctx: &'a ActivityContext, input: Value) -> BoxFut<'a> 
 
 /// Attempt 1 sends a good checkpoint, then a deep one, and fails. Attempt 2
 /// returns the checkpoint that it finds.
-fn heartbeat_probe<'a>(ctx: &'a ActivityContext, _input: Value) -> BoxFut<'a> {
+fn heartbeat_probe(ctx: &ActivityContext, _input: Value) -> BoxFut<'_> {
     Box::pin(async move {
         if ctx.attempt() > 1 {
             let found: Option<Value> = ctx.heartbeat_details().map_err(|e| e.to_string())?;
@@ -201,7 +201,7 @@ fn heartbeat_probe<'a>(ctx: &'a ActivityContext, _input: Value) -> BoxFut<'a> {
 
 /// Input: `{ "activity", "local"?, "depth"?, "pad"?, "tag"? }`. The workflow
 /// completes with a summary of what the activity gave it.
-fn probe_workflow<'a>(ctx: &'a WorkflowContext, input: Value) -> BoxFut<'a> {
+fn probe_workflow(ctx: &WorkflowContext, input: Value) -> BoxFut<'_> {
     Box::pin(async move {
         let activity = input["activity"]
             .as_str()

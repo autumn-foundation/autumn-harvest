@@ -181,6 +181,9 @@ async fn heartbeat_loop(
 }
 
 /// Writes heartbeats to `harvest_task_queue` through `queue::record_heartbeat`.
+///
+/// A checkpoint nested past the depth cap writes the heartbeat time only, with
+/// `queue::record_heartbeat_liveness_sent_ago` (issue #2225).
 #[cfg(feature = "db")]
 struct PgHeartbeatSink {
     claim: TaskClaim,
@@ -196,7 +199,8 @@ impl HeartbeatSink for PgHeartbeatSink {
         match crate::pool::acquire(&self.pool, self.acquire_timeout).await {
             Ok(mut conn) => {
                 // A deep checkpoint refreshes the heartbeat time only (issue #2225).
-                let written = if checkpoint_too_deep(task_id, &payload) {
+                let written = if crate::payload_depth::nests_past_cap(&payload) {
+                    warn_checkpoint_dropped(task_id);
                     crate::queue::record_heartbeat_liveness_sent_ago(
                         &mut conn,
                         &self.claim,
@@ -478,13 +482,27 @@ struct FlushFailure {
     error: Box<HarvestError>,
 }
 
+/// What a flush did with the checkpoint of its heartbeat (issues #2043, #2225).
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Checkpoint {
+    /// The write stored the checkpoint, or the heartbeat held none.
+    Stored,
+    /// The checkpoint did not encode. The write refreshed the heartbeat time
+    /// only, so the row still holds the previous checkpoint. The loop keeps
+    /// the heartbeat and encodes it again on the next tick.
+    Retry,
+    /// The checkpoint nests past the depth cap. The write refreshed the
+    /// heartbeat time only, so the row still holds the previous checkpoint.
+    /// A deep checkpoint never becomes valid, so the loop drops it.
+    Dropped,
+}
+
 /// A written flush (issue #2043).
 #[cfg(feature = "db")]
 struct Flushed {
     write: ClaimWrite,
-    /// The checkpoint did not encode. The write refreshed the heartbeat time
-    /// only, so the row still holds the previous checkpoint.
-    checkpoint_kept: bool,
+    checkpoint: Checkpoint,
 }
 
 /// A heartbeat not yet written, with the time the activity sent it.
@@ -554,24 +572,41 @@ fn stored_checkpoint(
     }
 }
 
-/// Whether a checkpoint nests past the depth cap (issue #2225).
-///
-/// A stored checkpoint of that depth cannot be read back, and every later
-/// claim of the task would fail. The flush then refreshes the heartbeat time
-/// only, so the previous checkpoint stays and the activity stays alive. Unlike
-/// a checkpoint that does not encode, a deep one never becomes valid. The flush
-/// drops it and does not try it again.
+/// Log that a heartbeat checkpoint nested past the depth cap was dropped
+/// (issue #2225).
 #[cfg(feature = "db")]
-fn checkpoint_too_deep(task_id: uuid::Uuid, payload: &Value) -> bool {
-    let too_deep = crate::payload_depth::nests_past_cap(payload);
-    if too_deep {
-        tracing::warn!(
-            task_id = %task_id,
-            cap_depth = crate::payload_depth::MAX_PAYLOAD_DEPTH,
-            "dropped an activity heartbeat that nests past the depth cap; the last good checkpoint stays"
-        );
+fn warn_checkpoint_dropped(task_id: uuid::Uuid) {
+    tracing::warn!(
+        task_id = %task_id,
+        cap_depth = crate::payload_depth::MAX_PAYLOAD_DEPTH,
+        "dropped an activity heartbeat that nests past the depth cap; the stored checkpoint stays"
+    );
+}
+
+/// What the flush writes for `payload`, and what it does with the heartbeat
+/// after the write (issues #2043, #2225).
+///
+/// A checkpoint nested past the depth cap cannot be read back, and a stored
+/// one makes every later claim of the task fail. So it is never encoded or
+/// stored. The write then refreshes the heartbeat time only, the previous
+/// checkpoint stays, and the activity stays alive. The check reads the plain
+/// payload, because an encoded checkpoint does not nest.
+#[cfg(feature = "db")]
+fn checkpoint_to_store(
+    codecs: &PayloadCodecs,
+    payload: &Value,
+    cache: &mut Option<EncodedCheckpoint>,
+) -> (Option<Value>, Checkpoint) {
+    if crate::payload_depth::nests_past_cap(payload) {
+        return (None, Checkpoint::Dropped);
     }
-    too_deep
+    let stored = stored_checkpoint(codecs, payload, cache);
+    let checkpoint = if stored.is_some() {
+        Checkpoint::Stored
+    } else {
+        Checkpoint::Retry
+    };
+    (stored, checkpoint)
 }
 
 /// Whether a cached stored form still matches the registry (issue #2043).
@@ -639,13 +674,7 @@ async fn flush(
         }
         let write_started = std::time::Instant::now();
         let age = beat.sent_order.elapsed();
-        let dropped = checkpoint_too_deep(claim.task_id, &beat.payload);
-        let details = if dropped {
-            None
-        } else {
-            stored_checkpoint(codecs, &beat.payload, cache)
-        };
-        let checkpoint_kept = details.is_none() && !dropped;
+        let (details, checkpoint) = checkpoint_to_store(codecs, &beat.payload, cache);
         let written = match details {
             Some(details) => {
                 crate::queue::record_heartbeat_sent_ago(&mut conn, claim, details, age).await
@@ -662,10 +691,7 @@ async fn flush(
         };
         if !connection_works || !write_blocked(started.elapsed(), interval) || !latest.is_full() {
             return written
-                .map(|write| Flushed {
-                    write,
-                    checkpoint_kept,
-                })
+                .map(|write| Flushed { write, checkpoint })
                 .map_err(|error| FlushFailure {
                     reason: "write_error",
                     error: Box::new(error),
@@ -698,6 +724,10 @@ async fn stamped_heartbeat_loop(
     // Set when a write that blocked for an interval or more succeeds. The
     // next wait then ends as soon as a newer heartbeat is in the slot.
     let mut after_blocked_write = false;
+    // Set at the first dropped deep checkpoint, so the log has one warning for
+    // each activity (issue #2225). The auto-heartbeat ticker sends the same
+    // checkpoint again on every tick.
+    let mut warned_deep = false;
 
     loop {
         if cancel.is_cancelled() {
@@ -746,14 +776,21 @@ async fn stamped_heartbeat_loop(
             match outcome {
                 Ok(Flushed {
                     write: ClaimWrite::Applied,
-                    checkpoint_kept,
+                    checkpoint,
                 }) => {
                     after_blocked_write = blocked;
-                    // A checkpoint that did not encode is not lost
-                    // (issue #2043). A later heartbeat replaces it. Without
-                    // one, the next tick encodes it again.
-                    if checkpoint_kept {
-                        pending = Some(beat);
+                    match checkpoint {
+                        Checkpoint::Stored => {}
+                        // A checkpoint that did not encode is not lost
+                        // (issue #2043). A later heartbeat replaces it.
+                        // Without one, the next tick encodes it again.
+                        Checkpoint::Retry => pending = Some(beat),
+                        // A deep checkpoint is dropped (issue #2225).
+                        Checkpoint::Dropped => {
+                            if !std::mem::replace(&mut warned_deep, true) {
+                                warn_checkpoint_dropped(task_id);
+                            }
+                        }
                     }
                 }
                 // The claim is no longer current (issue #1789). Stop the
@@ -926,45 +963,6 @@ mod tests {
         );
     }
 
-    // -- Issue #2225: a checkpoint nested past the depth cap -----------------
-
-    #[cfg(feature = "db")]
-    mod deep_checkpoint {
-        use super::*;
-        use crate::payload_depth::MAX_PAYLOAD_DEPTH;
-
-        fn nested(depth: usize) -> Value {
-            let mut value = serde_json::json!(1);
-            for _ in 0..depth {
-                value = Value::Array(vec![value]);
-            }
-            value
-        }
-
-        #[test]
-        fn a_checkpoint_past_the_cap_is_too_deep() {
-            let task_id = uuid::Uuid::new_v4();
-            assert!(checkpoint_too_deep(task_id, &nested(MAX_PAYLOAD_DEPTH + 1)));
-            assert!(checkpoint_too_deep(task_id, &nested(1_000)));
-        }
-
-        #[test]
-        fn a_checkpoint_at_the_cap_is_kept() {
-            let task_id = uuid::Uuid::new_v4();
-            assert!(!checkpoint_too_deep(task_id, &nested(MAX_PAYLOAD_DEPTH)));
-        }
-
-        #[test]
-        fn a_liveness_ping_and_a_small_checkpoint_are_kept() {
-            let task_id = uuid::Uuid::new_v4();
-            assert!(!checkpoint_too_deep(task_id, &Value::Null));
-            assert!(!checkpoint_too_deep(
-                task_id,
-                &serde_json::json!({ "step": 1 })
-            ));
-        }
-    }
-
     // -- Issue #2043: the cache of the encoded checkpoint -------------------
 
     #[cfg(feature = "db")]
@@ -1046,6 +1044,53 @@ mod tests {
             let on = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
 
             assert!(is_codec_envelope(&on), "the checkpoint is encoded again");
+        }
+
+        // -- Issue #2225: a checkpoint nested past the depth cap -----------
+
+        fn nested(depth: usize) -> Value {
+            let mut value = serde_json::json!(1);
+            for _ in 0..depth {
+                value = Value::Array(vec![value]);
+            }
+            value
+        }
+
+        #[test]
+        fn a_deep_checkpoint_is_dropped_before_any_encode() {
+            let (codecs, counter) = encoding_registry();
+            let deep = nested(crate::payload_depth::MAX_PAYLOAD_DEPTH + 1);
+
+            let (stored, checkpoint) = checkpoint_to_store(&codecs, &deep, &mut None);
+
+            assert_eq!(stored, None, "nothing is written for a deep checkpoint");
+            assert_eq!(checkpoint, Checkpoint::Dropped);
+            assert_eq!(
+                counter.0.load(Ordering::SeqCst),
+                0,
+                "the check reads the plain payload, so no encode runs"
+            );
+        }
+
+        #[test]
+        fn a_checkpoint_at_the_cap_is_stored() {
+            let (codecs, _counter) = encoding_registry();
+            let capped = nested(crate::payload_depth::MAX_PAYLOAD_DEPTH);
+
+            let (stored, checkpoint) = checkpoint_to_store(&codecs, &capped, &mut None);
+
+            assert!(stored.as_ref().is_some_and(is_codec_envelope));
+            assert_eq!(checkpoint, Checkpoint::Stored);
+        }
+
+        #[test]
+        fn a_liveness_ping_stays_a_stored_null() {
+            let (codecs, _counter) = encoding_registry();
+
+            let (stored, checkpoint) = checkpoint_to_store(&codecs, &Value::Null, &mut None);
+
+            assert_eq!(stored, Some(Value::Null));
+            assert_eq!(checkpoint, Checkpoint::Stored);
         }
     }
 

@@ -772,13 +772,16 @@ pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
 pub use crate::query::DEFAULT_QUERY_TIMEOUT;
 pub use crate::runtime::{
-    ActivityBody, ActivitySpec, ExecutionOutcome, MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE,
-    RunState, SignalDelivery, SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions,
-    StartOutcome, UNSUPPORTED_FEATURE_ERROR_TYPE,
+    ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SignalDelivery, SignalWithStart,
+    SignalWithStartOutcome, SqliteRuntime, StartOptions, StartOutcome,
+    UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
+// The depth cap is shared with the Postgres backend (issue #2225).
 pub use crate::schedule::ScheduleSummary;
 pub use crate::store::ActivityAttempt;
 pub use crate::visibility::{
     DEFAULT_LIST_LIMIT, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,
     ListCursor, MAX_FILTER_TERMS, MAX_LIST_LIMIT, SqliteReader, Stored,
 };
+#[doc(inline)]
+pub use autumn_harvest::payload_depth::{MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE};

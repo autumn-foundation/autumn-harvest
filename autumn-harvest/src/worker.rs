@@ -20026,8 +20026,8 @@ async fn process_activity_task(
 
     // A result nested past the depth cap becomes a non-retryable failure (issue
     // #2225). `serde_json` cannot read it back from the history, the offloader
-    // blob or the result writer. So the check runs first, before the byte cap
-    // and before any upload, and it does not depend on the byte cap.
+    // blob or the result writer. So the check runs before the byte cap and
+    // before any upload. It also runs when the byte cap is off.
     let activity_result = crate::payload_depth::refuse_deep_result(activity_name, activity_result);
 
     // Pre-normalize oversized results to non-retryable failures BEFORE emitting

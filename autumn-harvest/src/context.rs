@@ -17798,6 +17798,11 @@ impl ActivityContext {
     /// `Err(ActivityCancelled)` means the owning workflow was cancelled and the
     /// activity should wind down promptly.
     ///
+    /// A payload nested more than [`MAX_PAYLOAD_DEPTH`](crate::payload_depth::MAX_PAYLOAD_DEPTH)
+    /// levels is dropped with a warning (issue #2225). This call still returns
+    /// `Ok`. The flush then refreshes the heartbeat time only, so the activity
+    /// stays alive and the previous checkpoint stays.
+    ///
     /// Within a single attempt, heartbeat payloads are last-write-wins and are
     /// not read back through this context. Call [`Self::heartbeat_details`] at
     /// the start of a later retry attempt to resume from the prior checkpoint.
@@ -18224,7 +18229,11 @@ impl ActivityContext {
     /// * this context has no transactional pool attached (e.g. test contexts
     ///   or local activities),
     /// * a DB connection cannot be acquired from the pool,
-    /// * `f` returns `Err(e)` (the user error is propagated as-is), or
+    /// * `f` returns `Err(e)` (the user error is propagated as-is),
+    /// * the result nests more than
+    ///   [`MAX_PAYLOAD_DEPTH`](crate::payload_depth::MAX_PAYLOAD_DEPTH) levels
+    ///   (issue #2225). The transaction rolls back, and the error is a
+    ///   non-retryable `PayloadTooDeep` failure, or
     /// * the harvest finalization (event append / task complete / workflow wake)
     ///   fails.
     ///
