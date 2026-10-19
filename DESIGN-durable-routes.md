@@ -332,3 +332,6 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | AC-52 | The diff adds no migration, no `harvest_events` writer and no version bump. `sha2` is a plain dependency of the plugin. | Review |
 | AC-53 | A stalled start ends with a pending answer before the request deadline. | `reads_after_the_start_end_before_the_request_deadline` |
 | AC-54 | A retry attempt that continues as new into another type gives the final output. | `retry_attempt_that_switches_type_returns_final_output` |
+| AC-55 | A request releases its pooled start connection before it waits, so eight waiters share a four-slot pool. | `start_connection_is_released_before_the_wait` |
+| AC-56 | After an operator rerun, a retry of the original request gets the outcome its own run recorded. | `rerun_sealed_run_reports_its_original_outcome` |
+| AC-57 | Result-wait `LISTEN` connections never exceed the waiter cap. | `listen_connections_never_exceed_waiter_cap` |

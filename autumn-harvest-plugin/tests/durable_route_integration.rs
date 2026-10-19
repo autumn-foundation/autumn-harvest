@@ -249,6 +249,10 @@ struct TestPg {
 }
 
 async fn setup_db() -> TestPg {
+    setup_db_with_pool(8).await
+}
+
+async fn setup_db_with_pool(max_size: usize) -> TestPg {
     let container = Postgres::default()
         .with_init_sql(autumn_harvest::test_init_sql().into_bytes())
         .with_tag("16")
@@ -264,8 +268,12 @@ async fn setup_db() -> TestPg {
     autumn_web::migrate::run_pending(&url, autumn_web::migrate::FRAMEWORK_MIGRATIONS)
         .expect("failed to run framework migrations");
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
+    // A short acquire bound makes a starved pool fail fast, so a request that
+    // held its connection through the wait would answer 503.
     let pool = Pool::builder(manager)
-        .max_size(8)
+        .max_size(max_size)
+        .wait_timeout(Some(Duration::from_secs(2)))
+        .runtime(deadpool::Runtime::Tokio1)
         .build()
         .expect("failed to build pool");
     TestPg {
@@ -1335,4 +1343,126 @@ async fn run_memo_names_the_route() {
     );
     let text = memo.to_string();
     assert!(!text.contains("key-ac43") && !text.contains("ada-secret") && !text.contains("ac43"));
+}
+
+// ── Resource bounds and operator actions ─────────────────────────────────────
+
+// AC-55
+#[tokio::test(flavor = "multi_thread")]
+async fn start_connection_is_released_before_the_wait() {
+    let db = setup_db_with_pool(4).await;
+    let client = build_app(&db).await;
+    let pool = client
+        .state()
+        .extension::<autumn_harvest_plugin::HarvestDbPool>()
+        .expect("harvest pool");
+    assert_eq!(
+        pool.default_pool().status().max_size,
+        4,
+        "the route shares the 4-slot pool"
+    );
+    // Eight requests wait 7 s each, longer than the 2 s pool acquire bound.
+    // A request that kept its start connection would starve the others.
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_parked"),
+        ("x-wait-ms", "7000"),
+    ];
+    let bodies: Vec<Value> = (0..8)
+        .map(|i| json!({"tag": format!("ac55-{i}")}))
+        .collect();
+    let keys: Vec<String> = (0..8).map(|i| format!("key-ac55-{i}")).collect();
+    let requests = keys
+        .iter()
+        .zip(&bodies)
+        .map(|(key, body)| post(&client, Some(key.as_str()), &extra, body));
+    for response in futures::future::join_all(requests).await {
+        assert_eq!(response.status.as_u16(), 202, "{}", response.text());
+    }
+    assert_eq!(count_runs(&db, "dr_parked").await, 8);
+}
+
+// AC-56
+#[tokio::test(flavor = "multi_thread")]
+async fn rerun_sealed_run_reports_its_original_outcome() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    let body = json!({"tag": "ac56"});
+    let extra = [("x-user", "ada"), ("x-expose", "1")];
+    let first = post(&client, Some("key-ac56"), &extra, &body).await;
+    assert_eq!(first.status.as_u16(), 200, "{}", first.text());
+    {
+        let mut conn = db.pool.get().await.expect("conn");
+        let outcome = autumn_harvest::execution::rerun_workflow_execution(
+            &mut conn,
+            exec_id_of(&first),
+            autumn_harvest::execution::RerunRequest {
+                input_override: None,
+                workflow_id_override: None,
+                started_by: None,
+                concurrency_key: None,
+                concurrency_limit: None,
+                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+                max_workflow_input_bytes: 0,
+                max_execution_timeout_ceiling: None,
+                max_workflow_chain_timeout_ceiling: None,
+                max_workflow_attempts_ceiling: None,
+                trace_context: None,
+            },
+            None,
+        )
+        .await
+        .expect("rerun");
+        assert_eq!(outcome.source_prior_state, "COMPLETED");
+    }
+    // The original request keeps the outcome that its own run recorded.
+    let again = post(&client, Some("key-ac56"), &extra, &body).await;
+    assert_eq!(again.status.as_u16(), 200, "{}", again.text());
+    assert_eq!(again.json::<Value>(), first.json::<Value>());
+    assert_eq!(again.header(REPLAYED_HEADER), Some("true"));
+}
+
+/// Backends whose last statement opened a result-wait listener.
+async fn result_listeners(db: &TestPg) -> i64 {
+    let mut conn = db.pool.get().await.expect("conn");
+    diesel::sql_query(
+        "SELECT count(*)::bigint AS n FROM pg_stat_activity \
+         WHERE query = 'LISTEN \"harvest_events\"'",
+    )
+    .get_result::<Count>(&mut conn)
+    .await
+    .expect("listeners")
+    .n
+}
+
+// AC-57
+#[tokio::test(flavor = "multi_thread")]
+async fn listen_connections_never_exceed_waiter_cap() {
+    let db = setup_db().await;
+    let client = app_with(&db, base_plugin().durable_route_max_waiters(2)).build();
+    let baseline = result_listeners(&db).await;
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_parked"),
+        ("x-wait-ms", "4000"),
+    ];
+    let bodies: Vec<Value> = (0..6)
+        .map(|i| json!({"tag": format!("ac57-{i}")}))
+        .collect();
+    let keys: Vec<String> = (0..6).map(|i| format!("key-ac57-{i}")).collect();
+    let requests = futures::future::join_all(
+        keys.iter()
+            .zip(&bodies)
+            .map(|(key, body)| post(&client, Some(key.as_str()), &extra, body)),
+    );
+    let sample = async {
+        tokio::time::sleep(Duration::from_millis(2_000)).await;
+        result_listeners(&db).await - baseline
+    };
+    let (responses, during) = tokio::join!(requests, sample);
+    for response in responses {
+        assert_eq!(response.status.as_u16(), 202, "{}", response.text());
+    }
+    assert!(during >= 1, "the sample sees the waiting listeners");
+    assert!(during <= 2, "{during} result listeners exceed the cap of 2");
 }
