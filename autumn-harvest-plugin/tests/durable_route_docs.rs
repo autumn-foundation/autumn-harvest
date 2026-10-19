@@ -70,21 +70,32 @@ fn page_is_linked_from_the_idempotency_chapter_and_architecture() {
     }
 }
 
+/// `text` with each run of whitespace changed to one space, so a needle can
+/// span a line break.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 // AC-46
 #[test]
 fn page_states_layer_timeout_and_key_guidance() {
-    let page = read("docs/durable-routes.md");
+    let page = one_line(&read("docs/durable-routes.md"));
     for needle in [
         "Retry-After",
         "same `Idempotency-Key`",
-        "random",
+        "Send a **random** `Idempotency-Key`",
         "in_flight_ttl_secs",
-        "timeout_ms",
+        "sets its own `timeout_ms` must set `.wait(..)` below it",
+        "The wait ends 2 s before Autumn's request deadline",
+        "Every read after the start ends 1 s before it",
         "#[intercept]",
         "durable_route_max_waiters",
+        "durable_route_max_chain_steps",
         "AppBuilder::layer",
         "idempotency.ttl_secs",
         "is final for this key",
+        "Do not turn on `.idempotent()` for such an API",
+        "PII erasure does not remove it",
         "## Known limits",
     ] {
         assert!(
@@ -147,6 +158,29 @@ fn design_note_ac_table_names_existing_tests() {
     assert!(checked >= 40, "only {checked} test names checked");
 }
 
+// AC-47
+#[test]
+fn design_note_keeps_its_planning_sections() {
+    let design = read("DESIGN-durable-routes.md");
+    for heading in [
+        "### 0.1 Facts found before the plan",
+        "### 0.2 Brainstorm",
+        "### 0.3 Reverse brainstorm",
+        "### 0.4 Six thinking hats",
+        "## 2. Known limits",
+        "## 3. Tests and acceptance criteria",
+    ] {
+        assert!(design.contains(heading), "the design note lost {heading:?}");
+    }
+    // Each reverse-brainstorm row keeps its mitigation.
+    let harms = design
+        .lines()
+        .filter(|line| line.starts_with("| R"))
+        .filter(|line| line.split('|').nth(3).is_some_and(|m| !m.trim().is_empty()))
+        .count();
+    assert!(harms >= 20, "only {harms} harms with a mitigation");
+}
+
 // AC-48
 #[test]
 fn changelog_fragment_describes_the_feature() {
@@ -169,5 +203,5 @@ fn changelog_fragment_describes_the_feature() {
     );
     assert!(text.contains("Durable routes"));
     assert!(text.contains("No migration"));
-    assert!(text.contains("`WorkflowEvent`"));
+    assert!(text.contains("No new `WorkflowEvent`"));
 }

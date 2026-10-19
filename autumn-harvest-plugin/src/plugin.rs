@@ -287,6 +287,9 @@ pub struct HarvestPlugin {
     /// The cap on durable-route requests that wait at the same time. Set via
     /// [`Self::durable_route_max_waiters`].
     durable_route_max_waiters: usize,
+    /// The cap on the continue-as-new steps of one durable-route wait. Set
+    /// via [`Self::durable_route_max_chain_steps`].
+    durable_route_max_chain_steps: usize,
 }
 
 /// One registered broker connector: a binding plus the source that feeds it.
@@ -375,6 +378,7 @@ impl HarvestPlugin {
             metrics_scrape_enabled: false,
             require_embedded_harvest_mode: false,
             durable_route_max_waiters: crate::durable_route::DEFAULT_MAX_WAITERS,
+            durable_route_max_chain_steps: crate::durable_route::DEFAULT_MAX_CHAIN_STEPS,
         }
     }
 
@@ -491,6 +495,19 @@ impl HarvestPlugin {
     #[must_use]
     pub const fn durable_route_max_waiters(mut self, max_waiters: usize) -> Self {
         self.durable_route_max_waiters = max_waiters;
+        self
+    }
+
+    /// Cap the continue-as-new steps that one durable-route request follows.
+    /// The default is
+    /// [`DEFAULT_MAX_CHAIN_STEPS`](crate::durable_route::DEFAULT_MAX_CHAIN_STEPS).
+    ///
+    /// A same-type chain of any length takes one step. Each change of
+    /// workflow type takes one more step. Past the cap, the request answers
+    /// pending. Each step costs one history read. A value below 1 counts as 1.
+    #[must_use]
+    pub const fn durable_route_max_chain_steps(mut self, steps: usize) -> Self {
+        self.durable_route_max_chain_steps = if steps == 0 { 1 } else { steps };
         self
     }
 
@@ -1321,6 +1338,7 @@ impl Plugin for HarvestPlugin {
             metrics_scrape_enabled,
             require_embedded_harvest_mode,
             durable_route_max_waiters,
+            durable_route_max_chain_steps,
         } = self;
         #[cfg(not(feature = "mcp"))]
         let _ = (
@@ -1726,7 +1744,13 @@ impl Plugin for HarvestPlugin {
                     // the workspace pedantic lints); box it to keep this closure's future small.
                     let res = Box::pin(start_harvest_runtime(&state, &slot, &api_state)).await;
                     // Durable routes answer 503 until the runtime is ready.
-                    if res.is_ok() && !crate::durable_route::install(&state, durable_waiters) {
+                    if res.is_ok()
+                        && !crate::durable_route::install(
+                            &state,
+                            durable_waiters,
+                            durable_route_max_chain_steps,
+                        )
+                    {
                         tracing::warn!(
                             "on_startup hook: durable routes are off; the Harvest client or pool \
                              is missing"
@@ -4465,5 +4489,27 @@ mod tests {
             "the FIRST registration would have resolved differently -- which is \
              exactly the silent bug last-wins resolution prevents",
         );
+    }
+
+    // AC-78
+    #[test]
+    fn durable_route_limits_have_defaults_and_a_floor() {
+        let plugin = HarvestPlugin::new();
+        assert_eq!(
+            plugin.durable_route_max_waiters,
+            crate::durable_route::DEFAULT_MAX_WAITERS
+        );
+        assert_eq!(
+            plugin.durable_route_max_chain_steps,
+            crate::durable_route::DEFAULT_MAX_CHAIN_STEPS
+        );
+        let set = HarvestPlugin::new()
+            .durable_route_max_waiters(0)
+            .durable_route_max_chain_steps(7);
+        assert_eq!(set.durable_route_max_waiters, 0);
+        assert_eq!(set.durable_route_max_chain_steps, 7);
+        // Zero steps would answer pending for every run, so it counts as one.
+        let floor = HarvestPlugin::new().durable_route_max_chain_steps(0);
+        assert_eq!(floor.durable_route_max_chain_steps, 1);
     }
 }

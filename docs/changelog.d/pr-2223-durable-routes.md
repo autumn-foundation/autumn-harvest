@@ -18,7 +18,8 @@ feature-gap report.
 - The start runs in its own task and drops its connection before the wait.
   The wait takes a permit from `HarvestPlugin::durable_route_max_waiters`
   (default 32) and follows continue-as-new chains. A same-type chain takes
-  one business-id lookup.
+  one business-id lookup. `HarvestPlugin::durable_route_max_chain_steps`
+  (default 1024) caps the changes of workflow type that one request follows.
 - The wait ends 2 s, and every read after the start ends 1 s, before
   Autumn's request deadline, counted from when the route reads the request.
   Under Autumn's idempotency layer the route counts half the deadline.

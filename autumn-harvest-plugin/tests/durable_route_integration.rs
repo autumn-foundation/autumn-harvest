@@ -12,8 +12,10 @@
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use autumn_harvest::event_batch::BatchPolicy;
 use autumn_harvest::prelude::*;
-use autumn_harvest::{ExecutionId, WorkflowHandleClient};
+use autumn_harvest::throttle::ThrottlePolicy;
+use autumn_harvest::{ExecutionId, WorkflowHandleClient, WorkflowInfo};
 use autumn_harvest_plugin::HarvestPlugin;
 use autumn_harvest_plugin::durable_route::{DurableOutcome, DurableRoute, REPLAYED_HEADER};
 use autumn_web::prelude::*;
@@ -145,6 +147,35 @@ async fn dr_chain_end(_ctx: &WorkflowContext, input: Value) -> Result<Value, Str
 #[workflow(debounce(key = "input.body.tag", window = "10s"))]
 async fn dr_debounced(_ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
     Ok(input)
+}
+
+/// Accepts an input up to 4 MiB, over the 2 MiB deployment cap.
+#[workflow(max_input_bytes = "4MiB")]
+async fn dr_big(_ctx: &WorkflowContext, input: Value) -> Result<Value, String> {
+    Ok(json!({"pad": input["body"]["pad"].as_str().map_or(0, str::len)}))
+}
+
+/// `dr_order` with a batch policy. A transactional start refuses it.
+fn dr_batched_info() -> WorkflowInfo {
+    let mut info = __autumn_workflow_info_dr_order();
+    info.name = "dr_batched";
+    info.batch = Some(BatchPolicy {
+        key_expr: "input.body.tag".to_owned(),
+        max_size: 10,
+        max_wait: Duration::from_secs(10),
+    });
+    info
+}
+
+/// `dr_order` with a throttle policy. A transactional start refuses it.
+fn dr_throttled_info() -> WorkflowInfo {
+    let mut info = __autumn_workflow_info_dr_order();
+    info.name = "dr_throttled";
+    info.throttle = Some(
+        ThrottlePolicy::from_rate_str("100/m", Some(10.0), Some("input.body.tag"), None)
+            .expect("valid rate"),
+    );
+    info
 }
 
 /// Publishes an input schema: `body.sku` must be a string.
@@ -297,6 +328,9 @@ fn base_plugin() -> HarvestPlugin {
             ),
             __autumn_workflow_info_dr_chain_end(),
             __autumn_workflow_info_dr_debounced(),
+            dr_batched_info(),
+            dr_throttled_info(),
+            __autumn_workflow_info_dr_big(),
             __autumn_workflow_info_dr_schema().with_input_schema_fn(dr_schema_input),
         ])
         .activities(activities![dr_record])
@@ -726,10 +760,22 @@ async fn schema_violation_returns_422_and_key_stays_usable() {
     assert_eq!(bad.status.as_u16(), 422, "{}", bad.text());
     let text = bad.text();
     assert!(!text.contains("sku"), "no field path in the body: {text}");
-    assert_eq!(
-        problem_type(&bad.json::<Value>()),
-        slug_type("input-invalid")
-    );
+    // The body holds the fixed problem members and nothing from the schema.
+    let problem = bad.json::<Value>();
+    let mut members: Vec<&str> = problem
+        .as_object()
+        .expect("problem object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    members.sort_unstable();
+    assert_eq!(members, ["code", "detail", "status", "title", "type"]);
+    assert_eq!(problem_type(&problem), slug_type("input-invalid"));
+    assert_eq!(problem["code"], "harvest.durable_route.input_invalid");
+    assert_eq!(problem["status"], 422);
+    for leak in ["string", "number", "violation", "expected"] {
+        assert!(!text.contains(leak), "{leak} in {text}");
+    }
     assert_eq!(count_runs(&db, "dr_schema").await, 0);
     let good = post(&client, Some("key-ac25"), &extra, &json!({"sku": "A-1"})).await;
     assert_eq!(good.status.as_u16(), 200, "{}", good.text());
@@ -760,6 +806,8 @@ async fn unusable_workflow_returns_500_misconfigured() {
     for (key, workflow) in [
         ("key-ac27-a", "dr_not_registered"),
         ("key-ac27-b", "dr_debounced"),
+        ("key-ac27-c", "dr_batched"),
+        ("key-ac27-d", "dr_throttled"),
     ] {
         let response = post(
             &client,
@@ -1399,6 +1447,32 @@ async fn start_connection_is_released_before_the_wait() {
     assert_eq!(count_runs(&db, "dr_parked").await, 8);
 }
 
+/// Rerun a terminal run, as an operator does. Returns the state it sealed.
+async fn rerun(db: &TestPg, exec_id: ExecutionId) -> String {
+    let mut conn = db.pool.get().await.expect("conn");
+    autumn_harvest::execution::rerun_workflow_execution(
+        &mut conn,
+        exec_id,
+        autumn_harvest::execution::RerunRequest {
+            input_override: None,
+            workflow_id_override: None,
+            started_by: None,
+            concurrency_key: None,
+            concurrency_limit: None,
+            concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
+            max_workflow_input_bytes: 0,
+            max_execution_timeout_ceiling: None,
+            max_workflow_chain_timeout_ceiling: None,
+            max_workflow_attempts_ceiling: None,
+            trace_context: None,
+        },
+        None,
+    )
+    .await
+    .expect("rerun")
+    .source_prior_state
+}
+
 // AC-56
 #[tokio::test(flavor = "multi_thread")]
 async fn rerun_sealed_run_reports_its_original_outcome() {
@@ -1408,30 +1482,7 @@ async fn rerun_sealed_run_reports_its_original_outcome() {
     let extra = [("x-user", "ada"), ("x-expose", "1")];
     let first = post(&client, Some("key-ac56"), &extra, &body).await;
     assert_eq!(first.status.as_u16(), 200, "{}", first.text());
-    {
-        let mut conn = db.pool.get().await.expect("conn");
-        let outcome = autumn_harvest::execution::rerun_workflow_execution(
-            &mut conn,
-            exec_id_of(&first),
-            autumn_harvest::execution::RerunRequest {
-                input_override: None,
-                workflow_id_override: None,
-                started_by: None,
-                concurrency_key: None,
-                concurrency_limit: None,
-                concurrency_on_conflict: autumn_harvest::concurrency::ConcurrencyOnConflict::Defer,
-                max_workflow_input_bytes: 0,
-                max_execution_timeout_ceiling: None,
-                max_workflow_chain_timeout_ceiling: None,
-                max_workflow_attempts_ceiling: None,
-                trace_context: None,
-            },
-            None,
-        )
-        .await
-        .expect("rerun");
-        assert_eq!(outcome.source_prior_state, "COMPLETED");
-    }
+    assert_eq!(rerun(&db, exec_id_of(&first)).await, "COMPLETED");
     // The original request keeps the outcome that its own run recorded.
     let again = post(&client, Some("key-ac56"), &extra, &body).await;
     assert_eq!(again.status.as_u16(), 200, "{}", again.text());
@@ -1482,4 +1533,426 @@ async fn listen_connections_never_exceed_waiter_cap() {
     }
     assert!(during >= 1, "the sample sees the waiting listeners");
     assert!(during <= 2, "{during} result listeners exceed the cap of 2");
+}
+
+// ── Gaps that the acceptance audit found ──────────────────────────────────────
+
+// AC-68
+#[tokio::test(flavor = "multi_thread")]
+async fn idempotent_layer_answers_in_flight_duplicate() {
+    let db = setup_db().await;
+    let client = app_with(&db, base_plugin()).idempotent().build();
+    let body = json!({"tag": "ac68"});
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_parked"),
+        ("x-wait-ms", "3000"),
+        ("x-expose", "1"),
+    ];
+    let first = post(&client, Some("key-ac68"), &extra, &body);
+    // The duplicate arrives while the first request still waits.
+    let duplicate = async {
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        post(&client, Some("key-ac68"), &extra, &body).await
+    };
+    let (first, duplicate) = tokio::join!(first, duplicate);
+    assert_eq!(duplicate.status.as_u16(), 409, "{}", duplicate.text());
+    assert_eq!(duplicate.header("retry-after"), Some("1"));
+    assert_ne!(
+        duplicate.header("content-type"),
+        Some("application/problem+json"),
+        "Autumn answers the duplicate, not the route"
+    );
+    assert_eq!(
+        handler_entries("key-ac68"),
+        1,
+        "the duplicate skipped the route"
+    );
+    assert_eq!(first.status.as_u16(), 409, "{}", first.text());
+    assert_eq!(problem_type(&first.json::<Value>()), slug_type("pending"));
+    assert_eq!(count_runs(&db, "dr_parked").await, 1);
+    signal(&client, exec_id_of(&first), json!("now")).await;
+    let done = until_done(&client, "key-ac68", &extra, &body).await;
+    assert_eq!(done.status.as_u16(), 200, "{}", done.text());
+    assert_eq!(count_runs(&db, "dr_parked").await, 1);
+}
+
+/// A codec envelope that names a codec that this app does not have.
+fn unknown_codec_envelope() -> String {
+    json!({
+        "_harvest_codec_envelope": 1,
+        "codec_id": "kms-rotated-away",
+        "data": "e30=",
+    })
+    .to_string()
+}
+
+// AC-69
+#[tokio::test(flavor = "multi_thread")]
+async fn undecodable_output_returns_result_unavailable() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    let body = json!({"tag": "ac69"});
+    let extra = [("x-user", "ada"), ("x-expose", "1")];
+    let first = post(&client, Some("key-ac69"), &extra, &body).await;
+    assert_eq!(first.status.as_u16(), 200, "{}", first.text());
+    {
+        // Another writer stored the output under a codec that this app lacks.
+        let mut conn = db.pool.get().await.expect("conn");
+        let updated = diesel::sql_query(
+            "UPDATE harvest_workflow_executions SET output = $1::jsonb WHERE id = $2::uuid",
+        )
+        .bind::<Text, _>(unknown_codec_envelope())
+        .bind::<Text, _>(exec_id_of(&first).to_string())
+        .execute(&mut conn)
+        .await
+        .expect("plant envelope");
+        assert_eq!(updated, 1);
+    }
+    let again = post(&client, Some("key-ac69"), &extra, &body).await;
+    assert_eq!(again.status.as_u16(), 500, "{}", again.text());
+    assert!(again.header("retry-after").is_none(), "the answer is final");
+    assert_eq!(again.header(REPLAYED_HEADER), Some("true"));
+    assert_eq!(
+        problem_type(&again.json::<Value>()),
+        slug_type("result-unavailable")
+    );
+    assert!(!again.text().contains("kms-rotated-away"));
+}
+
+// AC-70
+#[tokio::test(flavor = "multi_thread")]
+async fn undecodable_typed_failure_returns_result_unavailable() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    let body = json!({"tag": "ac70"});
+    let mapped = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_typed_failure"),
+        ("x-map", "OutOfStock=422"),
+        ("x-expose", "1"),
+    ];
+    let first = until_done(&client, "key-ac70", &mapped, &body).await;
+    assert_eq!(first.status.as_u16(), 422, "{}", first.text());
+    {
+        // Another writer stored the failure details under a codec that this
+        // app lacks. A test fixture may rewrite history with the guard off.
+        let mut conn = db.pool.get().await.expect("conn");
+        let exec_id = exec_id_of(&first).to_string();
+        let updated = autumn_harvest::append_only::with_guard_off(&mut conn, async move |conn| {
+            diesel::sql_query(
+                "UPDATE harvest_events \
+                 SET event_data = jsonb_set(event_data, '{data,details}', $1::jsonb) \
+                 WHERE workflow_exec_id = $2::uuid AND event_data->>'type' = 'WorkflowFailed'",
+            )
+            .bind::<Text, _>(unknown_codec_envelope())
+            .bind::<Text, _>(exec_id)
+            .execute(conn)
+            .await
+        })
+        .await
+        .expect("plant envelope");
+        assert_eq!(updated, 1);
+    }
+    let again = post(&client, Some("key-ac70"), &mapped, &body).await;
+    assert_eq!(again.status.as_u16(), 500, "{}", again.text());
+    assert!(again.header("retry-after").is_none(), "the answer is final");
+    assert_eq!(
+        problem_type(&again.json::<Value>()),
+        slug_type("result-unavailable")
+    );
+    // With no mapping, the route reads no history, so the answer stays failed.
+    let unmapped = post(
+        &client,
+        Some("key-ac70"),
+        &[("x-user", "ada"), ("x-workflow", "dr_typed_failure")],
+        &body,
+    )
+    .await;
+    assert_eq!(unmapped.status.as_u16(), 500, "{}", unmapped.text());
+    assert_eq!(problem_type(&unmapped.json::<Value>()), slug_type("failed"));
+}
+
+// AC-71
+#[tokio::test(flavor = "multi_thread")]
+async fn same_type_chain_takes_one_step() {
+    let db = setup_db().await;
+    let client = app_with(&db, base_plugin().durable_route_max_chain_steps(2)).build();
+    // A walk that read one run at a time would need eleven steps here.
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_chain"),
+        ("x-wait-ms", "5000"),
+    ];
+    let body = json!({"tag": "ac71", "hops": 10});
+    let done = until_done(&client, "key-ac71", &extra, &body).await;
+    assert_eq!(done.status.as_u16(), 200, "{}", done.text());
+    assert_eq!(done.json::<Value>(), json!({"final": 10}));
+}
+
+/// Waits until a run of `workflow` reaches `state`.
+async fn until_state(db: &TestPg, workflow: &str, state: &str) {
+    for _ in 0..100 {
+        let mut conn = db.pool.get().await.expect("conn");
+        let found = diesel::sql_query(
+            "SELECT count(*)::bigint AS n FROM harvest_workflow_executions \
+             WHERE workflow_name = $1 AND state = $2",
+        )
+        .bind::<Text, _>(workflow)
+        .bind::<Text, _>(state)
+        .get_result::<Count>(&mut conn)
+        .await
+        .expect("count")
+        .n;
+        if found > 0 {
+            return;
+        }
+        drop(conn);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("no {workflow} run reached {state}");
+}
+
+// AC-72
+#[tokio::test(flavor = "multi_thread")]
+async fn chain_step_cap_answers_pending() {
+    let db = setup_db().await;
+    let client = app_with(&db, base_plugin().durable_route_max_chain_steps(1)).build();
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_retry_then_switch"),
+        ("x-wait-ms", "0"),
+    ];
+    let body = json!({"tag": "ac72"});
+    let first = post(&client, Some("key-ac72"), &extra, &body).await;
+    assert_eq!(first.status.as_u16(), 202, "{}", first.text());
+    until_state(&db, "dr_chain_end", "COMPLETED").await;
+    // The chain is done, but one step cannot cross the change of type.
+    let started = Instant::now();
+    let capped = post(&client, Some("key-ac72"), &extra, &body).await;
+    assert_eq!(capped.status.as_u16(), 202, "{}", capped.text());
+    assert_eq!(capped.header("retry-after"), Some("1"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+// AC-73
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_input_is_refused_before_any_io() {
+    use diesel_async::SimpleAsyncConnection as _;
+    let db = setup_db().await;
+    let mut config = app_config(&db);
+    config.server.timeouts.request_timeout_ms = Some(4_000);
+    let mut route = __autumn_route_info_durable();
+    route.name = "durable";
+    let client = TestApp::new()
+        .config(config)
+        .routes(vec![route])
+        .plugin(base_plugin())
+        .with_db(db.pool.clone())
+        .build();
+    // Every start now stalls, so only a check before any I/O answers fast.
+    let mut blocker = db.pool.get().await.expect("blocker");
+    blocker
+        .batch_execute("BEGIN; LOCK TABLE harvest_start_idempotency IN SHARE ROW EXCLUSIVE MODE")
+        .await
+        .expect("lock");
+    let big = json!({"tag": "ac73", "pad": "x".repeat(2_200_000)});
+    let started = Instant::now();
+    let response = post(&client, Some("key-ac73"), &[("x-user", "ada")], &big).await;
+    let elapsed = started.elapsed();
+    blocker.batch_execute("COMMIT").await.expect("unlock");
+    assert_eq!(response.status.as_u16(), 413, "{}", response.status);
+    assert_eq!(
+        problem_type(&response.json::<Value>()),
+        slug_type("input-too-large")
+    );
+    assert!(elapsed < Duration::from_secs(2), "answered in {elapsed:?}");
+}
+
+// AC-74
+#[tokio::test(flavor = "multi_thread")]
+async fn raised_input_cap_admits_a_larger_input() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    // Over the 2 MiB deployment cap, under the 4 MiB cap of `dr_big`.
+    let big = json!({"tag": "ac74", "pad": "x".repeat(2_200_000)});
+    let response = post(
+        &client,
+        Some("key-ac74"),
+        &[("x-user", "ada"), ("x-workflow", "dr_big")],
+        &big,
+    )
+    .await;
+    assert_eq!(response.status.as_u16(), 200, "{}", response.status);
+    assert_eq!(response.json::<Value>(), json!({"pad": 2_200_000}));
+}
+
+// AC-75
+#[tokio::test(flavor = "multi_thread")]
+async fn unscoped_route_shares_one_key_space() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    let body = json!({"tag": "ac75"});
+    // With no `x-user`, the test route calls `.unscoped()`.
+    let first = post(&client, Some("key-ac75"), &[], &body).await;
+    assert_eq!(first.status.as_u16(), 200, "{}", first.text());
+    assert_eq!(first.json::<Value>()["user"], Value::Null);
+    let second = post(&client, Some("key-ac75"), &[], &body).await;
+    assert_eq!(second.status.as_u16(), 200, "{}", second.text());
+    assert_eq!(second.header(REPLAYED_HEADER), Some("true"));
+    assert_eq!(second.json::<Value>(), first.json::<Value>());
+    assert_eq!(side_effects("ac75"), 1);
+    let changed = post(&client, Some("key-ac75"), &[], &json!({"tag": "ac75-x"})).await;
+    assert_eq!(changed.status.as_u16(), 422, "{}", changed.text());
+    assert_eq!(
+        problem_type(&changed.json::<Value>()),
+        slug_type("idempotency-key-reused")
+    );
+    // A scoped request with the same key is in another key space.
+    let scoped = post(&client, Some("key-ac75"), &[("x-user", "ada")], &body).await;
+    assert_eq!(scoped.status.as_u16(), 200, "{}", scoped.text());
+    assert_eq!(scoped.header(REPLAYED_HEADER), None);
+    assert_eq!(count_runs(&db, "dr_order").await, 2);
+}
+
+// AC-76
+#[tokio::test(flavor = "multi_thread")]
+async fn rerun_sealed_failures_report_their_original_outcome() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+
+    // A mapped failure keeps its mapped status.
+    let mapped = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_typed_failure"),
+        ("x-map", "OutOfStock=422"),
+        ("x-expose", "1"),
+    ];
+    let body = json!({"tag": "ac76-a"});
+    let failed = until_done(&client, "key-ac76-a", &mapped, &body).await;
+    assert_eq!(failed.status.as_u16(), 422, "{}", failed.text());
+    assert_eq!(rerun(&db, exec_id_of(&failed)).await, "FAILED");
+    let again = post(&client, Some("key-ac76-a"), &mapped, &body).await;
+    assert_eq!(again.status.as_u16(), 422, "{}", again.text());
+    assert_eq!(again.json::<Value>()["error_type"], "OutOfStock");
+
+    // A cancelled run stays cancelled.
+    let exec_id = start_parked(&client, "key-ac76-b").await;
+    handle_client(&client)
+        .handle(exec_id)
+        .cancel("test")
+        .await
+        .expect("cancel");
+    let cancelled = retry_parked(&client, "key-ac76-b").await;
+    assert_eq!(cancelled.status.as_u16(), 500, "{}", cancelled.text());
+    assert_eq!(rerun(&db, exec_id).await, "CANCELLED");
+    let again = retry_parked(&client, "key-ac76-b").await;
+    assert_eq!(problem_type(&again.json::<Value>()), slug_type("cancelled"));
+
+    // A timed-out run stays timed out.
+    let slow = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_slow"),
+        ("x-wait-ms", "5000"),
+        ("x-expose", "1"),
+    ];
+    let body = json!({"tag": "ac76-c"});
+    let timed_out = until_done(&client, "key-ac76-c", &slow, &body).await;
+    assert_eq!(timed_out.status.as_u16(), 500, "{}", timed_out.text());
+    assert_eq!(rerun(&db, exec_id_of(&timed_out)).await, "TIMED_OUT");
+    let again = post(&client, Some("key-ac76-c"), &slow, &body).await;
+    assert_eq!(problem_type(&again.json::<Value>()), slug_type("timed-out"));
+}
+
+/// A log sink in memory.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    fn text(&self) -> String {
+        let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+// AC-64
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_route_logs_hold_no_key_scope_or_input() {
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    let captured = Captured::default();
+    let writer = captured.clone();
+    // Only the route's own events and span count.
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE),
+        )
+        .with(tracing_subscriber::filter::Targets::new().with_target(
+            "autumn_harvest_plugin::durable_route",
+            tracing::Level::TRACE,
+        ));
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let user = [("x-user", "scope-marker-64")];
+    let completed = post(
+        &client,
+        Some("key-marker-64"),
+        &user,
+        &json!({"tag": "input-marker-64"}),
+    )
+    .with_subscriber(dispatch.clone())
+    .await;
+    assert_eq!(completed.status.as_u16(), 200, "{}", completed.text());
+    let invalid = post(
+        &client,
+        Some("key-marker-64-b"),
+        &[("x-user", "scope-marker-64"), ("x-workflow", "dr_schema")],
+        &json!({"sku": ["input-marker-64"]}),
+    )
+    .with_subscriber(dispatch.clone())
+    .await;
+    assert_eq!(invalid.status.as_u16(), 422, "{}", invalid.text());
+    let refused = post(
+        &client,
+        Some("key-marker-64-c"),
+        &[("x-user", "scope-marker-64"), ("x-workflow", "dr_batched")],
+        &json!({"tag": "input-marker-64"}),
+    )
+    .with_subscriber(dispatch)
+    .await;
+    assert_eq!(refused.status.as_u16(), 500, "{}", refused.text());
+
+    let text = captured.text();
+    assert!(text.contains("workflow=dr_order"), "{text}");
+    assert!(text.contains("route=\"/durable\""), "{text}");
+    assert!(text.contains("created=true"), "{text}");
+    assert!(text.contains("exec_id="), "{text}");
+    assert!(text.contains("outcome=\"completed\""), "{text}");
+    assert!(text.contains("count=1"), "the schema log counts: {text}");
+    assert!(
+        text.contains("durable route cannot start its workflow")
+            && text.contains("debounce, batch, or"),
+        "the setup log names the cause: {text}"
+    );
+    for marker in ["key-marker-64", "scope-marker-64", "input-marker-64"] {
+        assert!(!text.contains(marker), "{marker} in {text}");
+    }
 }

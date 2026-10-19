@@ -129,7 +129,9 @@ A live run waits for up to the budget.
   because the route cannot see that value.
 - A run that continues as new is followed to its newest run. A chain of the
   same workflow type takes one lookup. Each change of workflow type takes one
-  step, up to 1024 steps. Past that cap, the route answers pending.
+  step, up to 1024 steps. Set the cap with
+  `HarvestPlugin::durable_route_max_chain_steps(n)`. Past the cap, the route
+  answers pending. A chain that loops back answers `result-unavailable`.
 - A read error other than a codec error also answers pending, because the
   run exists.
 
@@ -200,8 +202,16 @@ ends. In such an app, do not turn on `.idempotent()` for durable routes.
   idempotent.
 - Durable runs have no Harvest tenant, record the `transactional` start
   source and do not join the HTTP trace.
-- A run that a reset sealed reads as `terminated`. A paused run reads as
-  pending.
+- A run that a reset sealed reads as `terminated`. The MCP task tools report
+  its state before the reset instead. A paused run reads as pending.
+- After an operator rerun, a retry of the original request gets the outcome
+  of the original run, not of the rerun. `failure_status` still maps its
+  typed failure.
+- The claim window is one setting for the plugin, not one for each route.
+- The start does not join the handler's own database transaction.
+- There is no `Prefer: wait` header. The handler sets the budget.
+- There is no metric family for durable routes. Use the
+  `harvest.durable_route` tracing span.
 - An untyped failure (`Err(String)`) cannot be mapped.
 - The key and fingerprint hashes are unsalted SHA-256. Use random keys.
 - A handler that returns `DurableOutcome` gets no inferred OpenAPI response

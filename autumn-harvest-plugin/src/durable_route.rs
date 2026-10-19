@@ -72,6 +72,12 @@ pub const DEADLINE_HEADROOM: Duration = Duration::from_secs(2);
 /// The default cap on requests that wait at the same time in one process.
 pub const DEFAULT_MAX_WAITERS: usize = 32;
 
+/// The default cap on the continue-as-new steps that one wait follows.
+///
+/// A same-type chain of any length takes one step. Only a change of workflow
+/// type costs a step.
+pub const DEFAULT_MAX_CHAIN_STEPS: usize = 1024;
+
 /// The prefix of the start-idempotency claim key.
 pub const CLAIM_KEY_PREFIX: &str = "durable-route:v1:";
 
@@ -104,10 +110,6 @@ const DEDUPE_DOMAIN: &[u8] = b"autumn-harvest/durable-route/v1";
 /// The domain tag of the request fingerprint.
 const FINGERPRINT_DOMAIN: &[u8] = b"autumn-harvest/durable-route/fp/v1";
 
-/// The most chain steps that one wait follows. A same-type chain of any
-/// length takes one step, so only a change of workflow type costs a step.
-const MAX_CHAIN_HOPS: usize = 1024;
-
 /// The `Retry-After` value of a pending answer, in seconds.
 const PENDING_RETRY_AFTER_SECS: u64 = 1;
 
@@ -116,6 +118,8 @@ pub(crate) struct DurableRouteRuntime {
     client: WorkflowHandleClient,
     pool: HarvestDbPool,
     waiters: Arc<Semaphore>,
+    /// The most continue-as-new steps that one wait follows.
+    max_chain_steps: usize,
     /// The effective input cap of each registered workflow, in bytes.
     input_caps: HashMap<String, u64>,
 }
@@ -124,7 +128,7 @@ pub(crate) struct DurableRouteRuntime {
 ///
 /// The plugin calls this after the Harvest runtime starts. Returns `false`
 /// when the client or the pool is absent.
-pub(crate) fn install(state: &AppState, waiters: Arc<Semaphore>) -> bool {
+pub(crate) fn install(state: &AppState, waiters: Arc<Semaphore>, max_chain_steps: usize) -> bool {
     let (Some(client), Some(pool)) = (
         state.extension::<WorkflowHandleClient>(),
         state.extension::<HarvestDbPool>(),
@@ -152,6 +156,7 @@ pub(crate) fn install(state: &AppState, waiters: Arc<Semaphore>) -> bool {
         client: (*client).clone(),
         pool: (*pool).clone(),
         waiters,
+        max_chain_steps,
         input_caps,
     });
     true
@@ -169,6 +174,15 @@ enum KeyField {
 ///
 /// It never rejects a request. [`DurableCall::send`] renders every problem,
 /// so the handler signature stays simple. Put it before the body extractor.
+///
+/// The scope is not optional. A call needs [`Self::scope`] or
+/// [`Self::unscoped`] first, so this does not compile:
+///
+/// ```compile_fail,E0599
+/// fn handler(durable: autumn_harvest_plugin::durable_route::DurableRoute) {
+///     let _ = durable.call("place_order", 1);
+/// }
+/// ```
 pub struct DurableRoute {
     method: Method,
     route: Option<String>,
@@ -416,10 +430,7 @@ impl DurableCall {
             && *cap > 0
             && input_bytes as u64 > *cap
         {
-            return Err(Problem::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "input-too-large",
-            ));
+            return Err(INPUT_TOO_LARGE);
         }
         let start = StartRequest {
             workflow_id: workflow_id(&digest, &fp),
@@ -529,10 +540,7 @@ impl Prepared {
         span.record("created", started.created);
         span.record("exec_id", tracing::field::display(started.exec_id));
         if !started.created && !workflow_id_matches(&started.workflow_id, &self.digest, &self.fp) {
-            return DurableOutcome::problem(Problem::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "idempotency-key-reused",
-            ));
+            return DurableOutcome::problem(KEY_REUSED);
         }
         self.answer(&started).await
     }
@@ -554,18 +562,19 @@ impl Prepared {
             self.request_timeout,
             self.layer_active,
         );
-        match wait_for_result(&self.runtime, started.exec_id, budget).await {
-            Waited::Pending => {
-                let (kind, status) = pending_outcome(self.layer_active);
+        let waited = wait_for_result(
+            &*self.runtime,
+            &self.runtime.waiters,
+            self.runtime.max_chain_steps,
+            started.exec_id,
+            budget,
+        )
+        .await;
+        match waited {
+            Waited::NoResult(failure) => {
+                let (kind, status) = no_result_outcome(failure, self.layer_active);
                 after_start(kind, status, None)
             }
-            Waited::Unreadable => after_start(
-                DurableOutcomeKind::Problem {
-                    slug: "result-unavailable",
-                },
-                StatusCode::INTERNAL_SERVER_ERROR,
-                None,
-            ),
             Waited::Terminal { exec_id, result } => {
                 // The typed failure costs a history read, so read it only
                 // when a mapping can use it.
@@ -576,18 +585,9 @@ impl Prepared {
                             // The run failed, but its class is unknown. A
                             // retry reads it again, so the answer is not final.
                             Err(error) => {
-                                return if matches!(read_error(&error), Waited::Unreadable) {
-                                    after_start(
-                                        DurableOutcomeKind::Problem {
-                                            slug: "result-unavailable",
-                                        },
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        None,
-                                    )
-                                } else {
-                                    let (kind, status) = pending_outcome(self.layer_active);
-                                    after_start(kind, status, None)
-                                };
+                                let (kind, status) =
+                                    no_result_outcome(read_error(&error), self.layer_active);
+                                return after_start(kind, status, None);
                             }
                         }
                     } else {
@@ -957,17 +957,66 @@ async fn start_run(
 
 /// How a wait ended.
 enum Waited {
-    Pending,
-    Unreadable,
+    /// No result to report: the run is live, or the route cannot read it.
+    NoResult(ReadFailure),
     Terminal {
         exec_id: ExecutionId,
         result: WorkflowResult,
     },
 }
 
+/// The reads of one wait. [`DurableRouteRuntime`] reads Postgres. A unit
+/// test reads a fake chain.
+trait RunReads: Sync {
+    /// The result of the run, with no wait.
+    fn snapshot(
+        &self,
+        exec_id: ExecutionId,
+    ) -> impl Future<Output = HarvestResult<WorkflowResult>> + Send;
+    /// The terminal result of the run, or `None` when `budget` ends first.
+    fn wait(
+        &self,
+        exec_id: ExecutionId,
+        budget: Duration,
+    ) -> impl Future<Output = HarvestResult<Option<WorkflowResult>>> + Send;
+    /// The next run of a run that continued as new.
+    fn successor(
+        &self,
+        exec_id: ExecutionId,
+    ) -> impl Future<Output = HarvestResult<Option<ExecutionId>>> + Send;
+}
+
+impl RunReads for DurableRouteRuntime {
+    async fn snapshot(&self, exec_id: ExecutionId) -> HarvestResult<WorkflowResult> {
+        self.client.handle(exec_id).result_snapshot().await
+    }
+
+    async fn wait(
+        &self,
+        exec_id: ExecutionId,
+        budget: Duration,
+    ) -> HarvestResult<Option<WorkflowResult>> {
+        // The engine wait can overrun its budget on a slow listener
+        // connect, so an outer timeout bounds it.
+        let handle = self.client.handle(exec_id);
+        tokio::time::timeout(budget, handle.result_snapshot_with_wait(budget))
+            .await
+            .unwrap_or(Ok(None))
+    }
+
+    async fn successor(&self, exec_id: ExecutionId) -> HarvestResult<Option<ExecutionId>> {
+        chain_successor(self, exec_id).await
+    }
+}
+
 /// Wait up to `budget` for the end of the run and its continue-as-new chain.
+///
+/// The walk follows at most `max_steps` runs. A waiting read takes a permit
+/// from `waiters`. A run that is already terminal needs no permit.
 async fn wait_for_result(
-    runtime: &DurableRouteRuntime,
+    reads: &impl RunReads,
+    waiters: &Arc<Semaphore>,
+    max_steps: usize,
     exec_id: ExecutionId,
     budget: Duration,
 ) -> Waited {
@@ -976,38 +1025,34 @@ async fn wait_for_result(
     // The permit lives until the wait ends. One request holds at most one.
     let mut permit: Option<OwnedSemaphorePermit> = None;
     let mut visited = HashSet::new();
-    for _ in 0..MAX_CHAIN_HOPS {
+    for _ in 0..max_steps {
         if !visited.insert(current) {
             tracing::error!(exec_id = %current, "durable route found a cycle in a continue-as-new chain");
-            return Waited::Unreadable;
+            return Waited::NoResult(ReadFailure::Unreadable);
         }
-        let handle = runtime.client.handle(current);
         // A first read with no wait opens no `LISTEN` connection, so a
         // finished run needs no permit.
-        let snapshot = match handle.result_snapshot().await {
+        let snapshot = match reads.snapshot(current).await {
             Ok(snapshot) => snapshot,
-            Err(error) => return read_error(&error),
+            Err(error) => return Waited::NoResult(read_error(&error)),
         };
         let snapshot = if snapshot.state.is_terminal() {
             snapshot
         } else {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Waited::Pending;
+                return Waited::NoResult(ReadFailure::Pending);
             }
             if permit.is_none() {
-                match Arc::clone(&runtime.waiters).try_acquire_owned() {
+                match Arc::clone(waiters).try_acquire_owned() {
                     Ok(acquired) => permit = Some(acquired),
-                    Err(_) => return Waited::Pending,
+                    Err(_) => return Waited::NoResult(ReadFailure::Pending),
                 }
             }
-            // The engine wait can overrun its budget on a slow listener
-            // connect, so an outer timeout bounds it.
-            match tokio::time::timeout(remaining, handle.result_snapshot_with_wait(remaining)).await
-            {
-                Err(_) | Ok(Ok(None)) => return Waited::Pending,
-                Ok(Ok(Some(snapshot))) => snapshot,
-                Ok(Err(error)) => return read_error(&error),
+            match reads.wait(current, remaining).await {
+                Ok(None) => return Waited::NoResult(ReadFailure::Pending),
+                Ok(Some(snapshot)) => snapshot,
+                Err(error) => return Waited::NoResult(read_error(&error)),
             }
         };
         if snapshot.state != WorkflowResultState::ContinuedAsNew {
@@ -1016,7 +1061,7 @@ async fn wait_for_result(
                 result: snapshot,
             };
         }
-        match chain_successor(runtime, current).await {
+        match reads.successor(current).await {
             Ok(Some(next)) => current = next,
             Ok(None) => {
                 return Waited::Terminal {
@@ -1024,23 +1069,28 @@ async fn wait_for_result(
                     result: snapshot,
                 };
             }
-            Err(error) => return read_error(&error),
+            Err(error) => return Waited::NoResult(read_error(&error)),
         }
     }
-    Waited::Pending
+    tracing::warn!(
+        max_steps,
+        "durable route reached its chain step cap; answering pending"
+    );
+    Waited::NoResult(ReadFailure::Pending)
 }
 
-fn read_error(error: &HarvestError) -> Waited {
-    match read_failure(error) {
+/// Classify a read error and log it.
+fn read_error(error: &HarvestError) -> ReadFailure {
+    let failure = read_failure(error);
+    match failure {
         ReadFailure::Pending => {
             tracing::warn!(error = %error, "durable route cannot read the run; answering pending");
-            Waited::Pending
         }
         ReadFailure::Unreadable => {
             tracing::error!(error = %error, "durable route cannot decode the result");
-            Waited::Unreadable
         }
     }
+    failure
 }
 
 /// The next run of a chain that continued as new.
@@ -1347,6 +1397,13 @@ impl Problem {
     }
 }
 
+/// The answer for a key that a request with another body already used.
+const KEY_REUSED: Problem =
+    Problem::new(StatusCode::UNPROCESSABLE_ENTITY, "idempotency-key-reused");
+
+/// The answer for an input over the input cap of the workflow.
+const INPUT_TOO_LARGE: Problem = Problem::new(StatusCode::PAYLOAD_TOO_LARGE, "input-too-large");
+
 /// The public answer for a start error. It never carries the error text.
 fn start_error_problem(error: &HarvestError) -> Problem {
     let unavailable = |secs: u64| Problem {
@@ -1358,9 +1415,7 @@ fn start_error_problem(error: &HarvestError) -> Problem {
         HarvestError::InputValidationFailed { .. } => {
             Problem::new(StatusCode::UNPROCESSABLE_ENTITY, "input-invalid")
         }
-        HarvestError::PayloadTooLarge { .. } => {
-            Problem::new(StatusCode::PAYLOAD_TOO_LARGE, "input-too-large")
-        }
+        HarvestError::PayloadTooLarge { .. } => INPUT_TOO_LARGE,
         HarvestError::QuotaExceeded { .. } => Problem {
             status: StatusCode::TOO_MANY_REQUESTS,
             slug: "quota-exceeded",
@@ -1470,6 +1525,25 @@ fn terminal_outcome(
             },
             error,
             None,
+        ),
+    }
+}
+
+/// The answer when the route has no result to report.
+///
+/// A live run, or a read error that can pass, answers pending. A result that
+/// the server cannot decode answers `500` `result-unavailable`.
+const fn no_result_outcome(
+    failure: ReadFailure,
+    layer_active: bool,
+) -> (DurableOutcomeKind, StatusCode) {
+    match failure {
+        ReadFailure::Pending => pending_outcome(layer_active),
+        ReadFailure::Unreadable => (
+            DurableOutcomeKind::Problem {
+                slug: "result-unavailable",
+            },
+            StatusCode::INTERNAL_SERVER_ERROR,
         ),
     }
 }
@@ -1602,12 +1676,20 @@ mod tests {
             .call("place_order", 1)
             .send()
             .await;
+        // JSON has no map with tuple keys, so this input does not serialize.
+        let bad_input = extract(&keyed())
+            .await
+            .scope("u")
+            .call("place_order", HashMap::from([((1_u8, 2_u8), 3_u8)]))
+            .send()
+            .await;
         for outcome in [
             empty_scope,
             bad_success,
             bad_failure,
             redirect_failure,
             no_key,
+            bad_input,
         ] {
             assert_eq!(outcome.status(), StatusCode::INTERNAL_SERVER_ERROR);
             assert_eq!(
@@ -1995,11 +2077,36 @@ mod tests {
         );
     }
 
+    /// Assert each start error's problem, and that its body holds no secret.
+    async fn assert_start_problems(
+        secret: &str,
+        cases: Vec<(HarvestError, StatusCode, &'static str, Option<u64>)>,
+    ) {
+        for (error, status, slug, retry_after) in cases {
+            let problem = start_error_problem(&error);
+            assert_eq!(
+                problem,
+                Problem {
+                    status,
+                    slug,
+                    retry_after
+                },
+                "{error}"
+            );
+            let response = DurableOutcome::problem(problem).into_response();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let body = String::from_utf8_lossy(&bytes);
+            assert!(!body.contains(secret), "{error}: {body}");
+        }
+    }
+
     // AC-10
-    #[test]
-    fn start_errors_map_to_public_statuses() {
+    #[tokio::test]
+    async fn start_errors_map_to_public_statuses() {
         let secret = "secret-internal-text";
-        let cases = [
+        let cases = vec![
             (
                 HarvestError::InputValidationFailed {
                     violations: vec![autumn_harvest::info::SchemaViolation {
@@ -2036,6 +2143,27 @@ mod tests {
                 Some(1),
             ),
             (
+                HarvestError::Config(secret.to_owned()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "misconfigured",
+                None,
+            ),
+            (
+                HarvestError::NotFound(secret.to_owned()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                None,
+            ),
+        ];
+        assert_start_problems(secret, cases).await;
+    }
+
+    // AC-10
+    #[tokio::test]
+    async fn retryable_start_errors_answer_503_with_retry_after() {
+        let secret = "secret-internal-text";
+        let cases = vec![
+            (
                 HarvestError::LoadShed {
                     queue: secret.to_owned(),
                     oldest_pending_age_secs: 9,
@@ -2064,36 +2192,58 @@ mod tests {
                 Some(1),
             ),
             (
-                HarvestError::Database(secret.to_owned()),
+                HarvestError::LoadShed {
+                    queue: secret.to_owned(),
+                    oldest_pending_age_secs: 9,
+                    retry_after_secs: 0,
+                },
                 StatusCode::SERVICE_UNAVAILABLE,
                 "unavailable",
                 Some(1),
             ),
             (
-                HarvestError::Config(secret.to_owned()),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "misconfigured",
-                None,
+                HarvestError::PoolAcquireTimeout {
+                    waited: Duration::from_secs(2),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                Some(1),
             ),
             (
-                HarvestError::NotFound(secret.to_owned()),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                None,
+                HarvestError::PoolAcquireFailed {
+                    reason: secret.to_owned(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                Some(1),
+            ),
+            (
+                HarvestError::ShardUnavailable {
+                    shard_id: 1,
+                    reason: secret.to_owned(),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                Some(1),
+            ),
+            (
+                HarvestError::ShardFenced {
+                    shard_id: 1,
+                    pinned: 2,
+                    current: Some(3),
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                Some(1),
+            ),
+            (
+                HarvestError::Database(secret.to_owned()),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                Some(1),
             ),
         ];
-        for (error, status, slug, retry_after) in cases {
-            let problem = start_error_problem(&error);
-            assert_eq!(
-                problem,
-                Problem {
-                    status,
-                    slug,
-                    retry_after
-                },
-                "{error}"
-            );
-        }
+        assert_start_problems(secret, cases).await;
     }
 
     // AC-11
@@ -2116,13 +2266,46 @@ mod tests {
         ] {
             assert_eq!(read_failure(&error), ReadFailure::Pending, "{error}");
         }
+        assert_eq!(
+            read_error(&HarvestError::Codec("bad".to_owned())),
+            ReadFailure::Unreadable
+        );
+        assert_eq!(
+            read_error(&HarvestError::Database("down".to_owned())),
+            ReadFailure::Pending
+        );
+        // The answer for each class, with Autumn's layer off and on.
+        assert_eq!(
+            no_result_outcome(ReadFailure::Pending, false),
+            (DurableOutcomeKind::Pending, StatusCode::ACCEPTED)
+        );
+        assert_eq!(
+            no_result_outcome(ReadFailure::Pending, true),
+            (DurableOutcomeKind::Pending, StatusCode::CONFLICT)
+        );
+        for layer_active in [false, true] {
+            assert_eq!(
+                no_result_outcome(ReadFailure::Unreadable, layer_active),
+                (
+                    DurableOutcomeKind::Problem {
+                        slug: "result-unavailable"
+                    },
+                    StatusCode::INTERNAL_SERVER_ERROR
+                )
+            );
+        }
     }
 
     // AC-12
-    #[test]
-    fn wait_budget_is_clamped() {
+    #[tokio::test]
+    async fn wait_budget_is_clamped() {
         let s = Duration::from_secs;
         let ms = Duration::from_millis;
+        assert_eq!(DEFAULT_WAIT, s(5));
+        assert_eq!(MAX_WAIT, s(30));
+        assert_eq!(DEADLINE_HEADROOM, s(2));
+        let call = extract(&keyed()).await.scope("u").call("place_order", 1);
+        assert_eq!(call.wait, DEFAULT_WAIT, "a call waits 5 s by default");
         assert_eq!(wait_budget(DEFAULT_WAIT, Duration::ZERO, None, false), s(5));
         assert_eq!(wait_budget(s(60), Duration::ZERO, None, false), MAX_WAIT);
         assert_eq!(
@@ -2260,6 +2443,18 @@ mod tests {
             id.to_string().as_str()
         );
 
+        // A replay without the opt-in never shows the management handle.
+        let mut replay = outcome(DurableOutcomeKind::Completed, StatusCode::OK);
+        replay.replayed = true;
+        let response = replay.into_response();
+        assert_eq!(response.headers().get(REPLAYED_HEADER).unwrap(), "true");
+        assert!(
+            response
+                .headers()
+                .get(crate::api::HEADER_EXECUTION_ID)
+                .is_none()
+        );
+
         let mut pending = outcome(DurableOutcomeKind::Pending, StatusCode::ACCEPTED);
         pending.execution_id = Some(id);
         pending.expose_id = true;
@@ -2328,5 +2523,503 @@ mod tests {
 
         let none = outcome(DurableOutcomeKind::Completed, StatusCode::OK);
         assert_eq!(body_json(none.into_response()).await, Value::Null);
+    }
+
+    // ── The chain walk, on a fake chain ───────────────────────────────────────
+
+    /// One run of a fake chain.
+    struct FakeRun {
+        state: WorkflowResultState,
+        next: Option<ExecutionId>,
+        snapshot_error: Option<fn() -> HarvestError>,
+        successor_error: Option<fn() -> HarvestError>,
+    }
+
+    /// Runs in memory. The chain counts its waits and its successor reads.
+    #[derive(Default)]
+    struct FakeChain {
+        runs: HashMap<ExecutionId, FakeRun>,
+        waits: std::sync::atomic::AtomicUsize,
+        successors: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeChain {
+        fn run(&mut self, state: WorkflowResultState, next: Option<ExecutionId>) -> ExecutionId {
+            let exec_id = ExecutionId::new();
+            self.runs.insert(
+                exec_id,
+                FakeRun {
+                    state,
+                    next,
+                    snapshot_error: None,
+                    successor_error: None,
+                },
+            );
+            exec_id
+        }
+
+        fn run_mut(&mut self, exec_id: ExecutionId) -> &mut FakeRun {
+            self.runs.get_mut(&exec_id).expect("fake run")
+        }
+
+        fn waits(&self) -> usize {
+            self.waits.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn successors(&self) -> usize {
+            self.successors.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    fn fake_result(state: WorkflowResultState) -> WorkflowResult {
+        WorkflowResult {
+            state,
+            output: Some(json!({"state": format!("{state:?}")})),
+            error: None,
+            completed_at: None,
+        }
+    }
+
+    impl RunReads for FakeChain {
+        fn snapshot(
+            &self,
+            exec_id: ExecutionId,
+        ) -> impl Future<Output = HarvestResult<WorkflowResult>> + Send {
+            let run = &self.runs[&exec_id];
+            std::future::ready(
+                run.snapshot_error
+                    .map_or_else(|| Ok(fake_result(run.state)), |error| Err(error())),
+            )
+        }
+
+        fn wait(
+            &self,
+            exec_id: ExecutionId,
+            _budget: Duration,
+        ) -> impl Future<Output = HarvestResult<Option<WorkflowResult>>> + Send {
+            self.waits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let state = self.runs[&exec_id].state;
+            std::future::ready(Ok(state.is_terminal().then(|| fake_result(state))))
+        }
+
+        fn successor(
+            &self,
+            exec_id: ExecutionId,
+        ) -> impl Future<Output = HarvestResult<Option<ExecutionId>>> + Send {
+            self.successors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let run = &self.runs[&exec_id];
+            std::future::ready(
+                run.successor_error
+                    .map_or_else(|| Ok(run.next), |error| Err(error())),
+            )
+        }
+    }
+
+    fn waiters(permits: usize) -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(permits))
+    }
+
+    /// A chain `a -> b -> c`, where `c` completed.
+    fn three_runs() -> (FakeChain, ExecutionId, ExecutionId) {
+        let mut chain = FakeChain::default();
+        let c = chain.run(WorkflowResultState::Completed, None);
+        let b = chain.run(WorkflowResultState::ContinuedAsNew, Some(c));
+        let a = chain.run(WorkflowResultState::ContinuedAsNew, Some(b));
+        (chain, a, c)
+    }
+
+    const ONE_SECOND: Duration = Duration::from_secs(1);
+
+    // AC-58
+    #[tokio::test]
+    async fn chain_walk_follows_each_step_to_the_final_run() {
+        let (chain, a, c) = three_runs();
+        let waited =
+            wait_for_result(&chain, &waiters(1), DEFAULT_MAX_CHAIN_STEPS, a, ONE_SECOND).await;
+        assert!(
+            matches!(&waited, Waited::Terminal { exec_id, result }
+                if *exec_id == c && result.state == WorkflowResultState::Completed),
+            "the walk ends at the completed run"
+        );
+        assert_eq!(chain.successors(), 2);
+        assert_eq!(chain.waits(), 0, "a finished chain needs no wait");
+
+        // A continue-as-new run with no successor is the last run.
+        let mut lone = FakeChain::default();
+        let x = lone.run(WorkflowResultState::ContinuedAsNew, None);
+        let waited =
+            wait_for_result(&lone, &waiters(1), DEFAULT_MAX_CHAIN_STEPS, x, ONE_SECOND).await;
+        assert!(matches!(&waited, Waited::Terminal { exec_id, result }
+            if *exec_id == x && result.state == WorkflowResultState::ContinuedAsNew));
+    }
+
+    // AC-59
+    #[tokio::test]
+    async fn chain_walk_answers_pending_past_the_step_cap() {
+        assert_eq!(DEFAULT_MAX_CHAIN_STEPS, 1024);
+        let (chain, a, c) = three_runs();
+        let capped = wait_for_result(&chain, &waiters(1), 2, a, ONE_SECOND).await;
+        assert!(matches!(capped, Waited::NoResult(ReadFailure::Pending)));
+        let enough = wait_for_result(&chain, &waiters(1), 3, a, ONE_SECOND).await;
+        assert!(matches!(enough, Waited::Terminal { exec_id, .. } if exec_id == c));
+    }
+
+    // AC-60
+    #[tokio::test]
+    async fn chain_walk_stops_at_a_cycle() {
+        let mut chain = FakeChain::default();
+        let a = chain.run(WorkflowResultState::ContinuedAsNew, None);
+        let b = chain.run(WorkflowResultState::ContinuedAsNew, Some(a));
+        chain.run_mut(a).next = Some(b);
+        let waited =
+            wait_for_result(&chain, &waiters(1), DEFAULT_MAX_CHAIN_STEPS, a, ONE_SECOND).await;
+        assert!(matches!(waited, Waited::NoResult(ReadFailure::Unreadable)));
+        assert_eq!(chain.successors(), 2, "the walk stops at the first repeat");
+    }
+
+    // AC-61
+    #[tokio::test]
+    async fn chain_walk_maps_read_errors() {
+        let codec: fn() -> HarvestError = || HarvestError::UnknownPayloadCodec {
+            id: "gone".to_owned(),
+        };
+        let database: fn() -> HarvestError = || HarvestError::Database("down".to_owned());
+        for (error, expected) in [
+            (codec, ReadFailure::Unreadable),
+            (database, ReadFailure::Pending),
+        ] {
+            let (mut chain, a, _) = three_runs();
+            chain.run_mut(a).snapshot_error = Some(error);
+            let waited =
+                wait_for_result(&chain, &waiters(1), DEFAULT_MAX_CHAIN_STEPS, a, ONE_SECOND).await;
+            assert!(matches!(waited, Waited::NoResult(found) if found == expected));
+
+            let (mut chain, a, _) = three_runs();
+            chain.run_mut(a).successor_error = Some(error);
+            let waited =
+                wait_for_result(&chain, &waiters(1), DEFAULT_MAX_CHAIN_STEPS, a, ONE_SECOND).await;
+            assert!(matches!(waited, Waited::NoResult(found) if found == expected));
+        }
+    }
+
+    // AC-62
+    #[tokio::test]
+    async fn chain_walk_takes_a_permit_only_to_wait() {
+        let mut chain = FakeChain::default();
+        let done = chain.run(WorkflowResultState::Completed, None);
+        let live = chain.run(WorkflowResultState::Running, None);
+        let none = waiters(0);
+        let finished =
+            wait_for_result(&chain, &none, DEFAULT_MAX_CHAIN_STEPS, done, ONE_SECOND).await;
+        assert!(
+            matches!(finished, Waited::Terminal { .. }),
+            "a finished run needs no permit"
+        );
+        let full = wait_for_result(&chain, &none, DEFAULT_MAX_CHAIN_STEPS, live, ONE_SECOND).await;
+        assert!(matches!(full, Waited::NoResult(ReadFailure::Pending)));
+        assert_eq!(chain.waits(), 0, "a full cap never waits");
+
+        let one = waiters(1);
+        let no_budget =
+            wait_for_result(&chain, &one, DEFAULT_MAX_CHAIN_STEPS, live, Duration::ZERO).await;
+        assert!(matches!(no_budget, Waited::NoResult(ReadFailure::Pending)));
+        assert_eq!(chain.waits(), 0, "a zero budget never waits");
+
+        let waited = wait_for_result(&chain, &one, DEFAULT_MAX_CHAIN_STEPS, live, ONE_SECOND).await;
+        assert!(matches!(waited, Waited::NoResult(ReadFailure::Pending)));
+        assert_eq!(chain.waits(), 1);
+        assert_eq!(one.available_permits(), 1, "the wait returns its permit");
+    }
+
+    // ── Logs ──────────────────────────────────────────────────────────────────
+
+    /// A log sink in memory.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Captured {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
+    /// A subscriber that writes every event, and each span when it closes.
+    fn capture() -> (Captured, tracing::Dispatch) {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .finish();
+        (captured, tracing::Dispatch::new(subscriber))
+    }
+
+    // AC-63
+    #[test]
+    fn start_error_logs_hold_no_input_values() {
+        let violations = (0..7)
+            .map(|i| autumn_harvest::info::SchemaViolation {
+                message: format!("secret-message-{i}"),
+                field_path: Some(format!("/field{i}")),
+            })
+            .collect();
+        let (captured, dispatch) = capture();
+        tracing::dispatcher::with_default(&dispatch, || {
+            log_start_error(
+                "place_order",
+                &HarvestError::InputValidationFailed { violations },
+            );
+            log_start_error(
+                "place_order",
+                &HarvestError::QuotaExceeded {
+                    workflow_name: "place_order".to_owned(),
+                    key: "secret-quota-key".to_owned(),
+                    resource: autumn_harvest::quota::QuotaResource::ActiveExecutions,
+                    limit: 1,
+                    current: 1,
+                },
+            );
+        });
+        let text = captured.text();
+        assert!(text.contains("count=7"), "{text}");
+        for i in 0..5 {
+            assert!(text.contains(&format!("/field{i}")), "{text}");
+        }
+        assert!(
+            !text.contains("/field5") && !text.contains("/field6"),
+            "{text}"
+        );
+        assert!(text.contains("durable route start hit a quota"), "{text}");
+        for secret in ["secret-message", "secret-quota-key"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+    }
+
+    // AC-64
+    #[tokio::test]
+    async fn send_logs_hold_no_key_scope_or_input() {
+        let (captured, dispatch) = capture();
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        let key = [(IDEMPOTENCY_KEY_HEADER, b"secret-key-64".as_slice())];
+        let unavailable = extract(&key)
+            .await
+            .scope("secret-scope-64")
+            .call("place_order", json!({"note": "secret-input-64"}))
+            .send()
+            .await;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let misconfigured = extract(&key)
+            .await
+            .scope("secret-scope-64")
+            .call(
+                "place_order",
+                HashMap::from([((1_u8, 2_u8), "secret-input-64")]),
+            )
+            .send()
+            .await;
+        assert_eq!(misconfigured.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        drop(guard);
+        let text = captured.text();
+        assert!(text.contains("harvest.durable_route{"), "{text}");
+        assert!(text.contains("workflow=place_order"), "{text}");
+        assert!(text.contains("outcome=\"unavailable\""), "{text}");
+        assert!(text.contains("outcome=\"misconfigured\""), "{text}");
+        assert!(text.contains("durable route setup error"), "{text}");
+        for secret in ["secret-key-64", "secret-scope-64", "secret-input-64"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+    }
+
+    // AC-65
+    #[tokio::test]
+    async fn layer_with_authorization_warns_once() {
+        let (captured, dispatch) = capture();
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        for _ in 0..2 {
+            let mut route = extract(&[
+                (IDEMPOTENCY_KEY_HEADER, KEY.as_bytes()),
+                ("authorization", b"Bearer token".as_slice()),
+            ])
+            .await;
+            assert!(route.bearer);
+            // Only autumn-web can build the context that its layer adds.
+            route.layer_active = true;
+            let outcome = route.scope("u").call("place_order", 1).send().await;
+            assert_eq!(outcome.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+        drop(guard);
+        let text = captured.text();
+        assert_eq!(
+            text.matches("caches answers by session").count(),
+            1,
+            "{text}"
+        );
+    }
+
+    // ── The public outcome ────────────────────────────────────────────────────
+
+    // AC-66
+    #[test]
+    fn outcome_accessors_expose_the_result() {
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        struct Order {
+            id: u32,
+        }
+        let mut completed = outcome(DurableOutcomeKind::Completed, StatusCode::OK);
+        completed.output = Some(json!({"id": 7}));
+        completed.replayed = true;
+        assert_eq!(completed.kind(), &DurableOutcomeKind::Completed);
+        assert_eq!(completed.status(), StatusCode::OK);
+        assert!(completed.execution_id().is_some());
+        assert!(completed.replayed());
+        assert_eq!(completed.output(), Some(&json!({"id": 7})));
+        assert_eq!(
+            completed.output_as::<Order>().expect("order"),
+            Order { id: 7 }
+        );
+
+        let pending = outcome(DurableOutcomeKind::Pending, StatusCode::ACCEPTED);
+        assert_eq!(pending.output(), None);
+        assert!(!pending.replayed());
+        assert_eq!(pending.output_as::<Option<Order>>().expect("null"), None);
+        assert!(pending.output_as::<Order>().is_err());
+
+        let problem = DurableOutcome::problem(KEY_REUSED);
+        assert_eq!(problem.execution_id(), None);
+        assert_eq!(problem.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    /// The status that the code gives each problem slug.
+    async fn code_statuses() -> Vec<(&'static str, u16)> {
+        let missing = extract(&[]).await.scope("u").call("w", 1).send().await;
+        let invalid = extract(&[
+            (IDEMPOTENCY_KEY_HEADER, b"a".as_slice()),
+            (IDEMPOTENCY_KEY_HEADER, b"b".as_slice()),
+        ])
+        .await
+        .scope("u")
+        .call("w", 1)
+        .send()
+        .await;
+        let misconfigured = extract(&keyed()).await.scope("").call("w", 1).send().await;
+        let unavailable = extract(&keyed()).await.scope("u").call("w", 1).send().await;
+        let start = |error: HarvestError| start_error_problem(&error).status.as_u16();
+        let terminal = |state: WorkflowResultState, output: Option<Value>| {
+            terminal_outcome(state, output, None, StatusCode::OK, &[])
+                .1
+                .as_u16()
+        };
+        vec![
+            ("pending", pending_outcome(true).1.as_u16()),
+            ("idempotency-key-missing", missing.status().as_u16()),
+            ("idempotency-key-invalid", invalid.status().as_u16()),
+            ("idempotency-key-reused", KEY_REUSED.status.as_u16()),
+            (
+                "input-invalid",
+                start(HarvestError::InputValidationFailed { violations: vec![] }),
+            ),
+            ("input-too-large", INPUT_TOO_LARGE.status.as_u16()),
+            (
+                "quota-exceeded",
+                start(HarvestError::QuotaExceeded {
+                    workflow_name: "w".to_owned(),
+                    key: "k".to_owned(),
+                    resource: autumn_harvest::quota::QuotaResource::ActiveExecutions,
+                    limit: 1,
+                    current: 1,
+                }),
+            ),
+            ("unavailable", unavailable.status().as_u16()),
+            ("misconfigured", misconfigured.status().as_u16()),
+            ("internal", start(HarvestError::NotFound("x".to_owned()))),
+            ("failed", terminal(WorkflowResultState::Failed, None)),
+            ("cancelled", terminal(WorkflowResultState::Cancelled, None)),
+            (
+                "terminated",
+                terminal(WorkflowResultState::Terminated, None),
+            ),
+            ("timed-out", terminal(WorkflowResultState::TimedOut, None)),
+            (
+                "erased",
+                terminal(
+                    WorkflowResultState::Completed,
+                    Some(autumn_harvest::erase::erasure_tombstone()),
+                ),
+            ),
+            (
+                "result-unavailable",
+                no_result_outcome(ReadFailure::Unreadable, false).1.as_u16(),
+            ),
+        ]
+    }
+
+    // AC-67
+    #[tokio::test]
+    async fn status_table_statuses_match_the_code() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../docs/durable-routes.md");
+        let page = std::fs::read_to_string(path).expect("docs page");
+        let start = page.find("## Status table").expect("status table");
+        let table = &page[start..];
+        let table = &table[..table[3..].find("\n## ").map_or(table.len(), |i| i + 3)];
+        let mut documented: HashMap<String, Vec<u16>> = HashMap::new();
+        for line in table.lines().filter(|line| line.starts_with('|')) {
+            let cells: Vec<&str> = line.split('|').collect();
+            let (Some(status), Some(slug)) = (cells.get(2), cells.get(3)) else {
+                continue;
+            };
+            // A row with no problem starts its cell with an em dash.
+            if slug.trim_start().starts_with('\u{2014}') {
+                continue;
+            }
+            let Some(slug) = slug.split('`').nth(1) else {
+                continue;
+            };
+            let digits: String = status
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(char::is_ascii_digit)
+                .collect();
+            let entry = documented.entry(slug.to_owned()).or_default();
+            if let Ok(number) = digits.parse() {
+                entry.push(number);
+            }
+        }
+        let code = code_statuses().await;
+        assert_eq!(code.len(), PROBLEM_SLUGS.len());
+        for (slug, status) in code {
+            assert!(PROBLEM_SLUGS.contains(&slug), "{slug}");
+            let rows = documented
+                .get(slug)
+                .unwrap_or_else(|| panic!("no row for {slug}"));
+            assert!(!rows.is_empty(), "{slug}: no status in the table");
+            assert!(
+                rows.iter().all(|row| *row == status),
+                "{slug}: the table says {rows:?}, the code says {status}"
+            );
+        }
+        assert_eq!(pending_outcome(false).1, StatusCode::ACCEPTED);
+        assert!(page.contains("| 202, `Retry-After: 1` |"));
     }
 }
