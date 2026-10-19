@@ -28,8 +28,9 @@ The check covers these paths:
   failure keeps only its message, as every local failure does.
 - An external completion, from the HTTP route or from a remote task poller.
   The token fails with the same message, and the run history stays readable.
-  An HTTP body of 126 levels passes the JSON parser, so this path was open to
-  any holder of the token.
+  Replay of an external failure keeps only the message, so the workflow sees
+  the error type `Error`. An HTTP body of 126 levels passes the JSON parser, so
+  this path was open to any holder of the token.
 
 A heartbeat checkpoint nested past the cap is dropped with a warning. The
 write still refreshes the heartbeat time, so the timeout scanner sees a live
