@@ -161,23 +161,6 @@ ignore = [
     # its parking_lot 0.11 dependency, or instant gains a maintained fork.
     { id = "RUSTSEC-2024-0384", reason = "unmaintained, no safe upgrade exists; reached only through dev-runtime-managed (local `cargo dev` tooling), off by default and never shipped. Revisit: postgresql_archive moves off parking_lot 0.11, or instant is forked/revived." },
 
-    # RUSTSEC-2024-0449 — unsafe-libyaml 0.2.11 is unmaintained (not a
-    # vulnerability). Its repository is archived, and the advisory says no
-    # safe upgrade is available. serde_yaml 0.9.34+deprecated pulls it in
-    # by two paths:
-    # - autumn-web 0.8.0, a crates.io dependency, through its `openapi`
-    #   feature. Its one call is `serde_yaml::to_string` in
-    #   `openapi::write_openapi_spec_to_dist`, which emits our own spec and
-    #   parses no input.
-    # - autumn-harvest's dev-dependencies. Only guard tests use it, and they
-    #   parse checked-in CI workflow files. No release build contains it.
-    # Dropping our dev-dependency alone would not clear the advisory, because
-    # autumn-web still pulls the crate.
-    # Revisit: autumn-web drops or replaces serde_yaml. Then move the guard
-    # tests to a maintained parser, such as serde-saphyr, and delete this
-    # entry.
-    { id = "RUSTSEC-2024-0449", reason = "unmaintained, no safe upgrade exists; autumn-web's openapi feature only emits YAML through serde_yaml::to_string, and our own use is test-only parsing of checked-in workflow files. Revisit: autumn-web drops serde_yaml, then move the guard tests to a maintained YAML parser." },
-
     # RUSTSEC-2026-0098 / -0099 / -0104 (rustls-webpki 0.101.7) and the
     # h2@0.3.27 half of RUSTSEC-2026-0258 — FIXED, not deferred. All four
     # traced to the same root cause, previously mis-scoped in this file as
@@ -228,14 +211,15 @@ ignore = [
 
     # RUSTSEC-2024-0449 — unsafe-libyaml is unmaintained. Its repository was
     # archived on 2024-03-25, and 0.2.11 is the last release. This is an
-    # `unmaintained` notice, not a vulnerability. The advisory reached the
-    # database on 2026-10-12 and turned every cargo-deny run red, on
-    # `trunk-dev` too.
+    # `unmaintained` notice, not a vulnerability.
     #
     # The only path is `serde_yaml` 0.9.34, itself deprecated. Two crates
     # pull it in:
-    # - `autumn-web` 0.8.0 (external, a normal dependency). It is not ours
-    #   to change, so this entry stays until it moves off `serde_yaml`.
+    # - `autumn-web` 0.8.0 (external, a normal dependency), through its
+    #   `openapi` feature. Its one call is `serde_yaml::to_string` in
+    #   `openapi::write_openapi_spec_to_dist`, which emits our own spec and
+    #   parses no input. It is not ours to change, so this entry stays until
+    #   it moves off `serde_yaml`.
     # - our own dev-dependency in autumn-harvest/Cargo.toml. Three test
     #   guards (`slo_pack_docs`, `supply_chain_ci`, `formal_trace_coverage`)
     #   parse checked-in YAML with it. Tests never ship, and they read only
@@ -247,7 +231,16 @@ ignore = [
     #
     # Revisit: when `autumn-web` drops `serde_yaml`, move the three guards
     # to a maintained parser and delete this entry.
-    { id = "RUSTSEC-2024-0449", reason = "unmaintained, not a vulnerability: unsafe-libyaml arrives only through the deprecated serde_yaml, which autumn-web 0.8.0 (external) depends on; our own use is a dev-dependency that parses checked-in YAML in three test guards. Revisit: autumn-web drops serde_yaml." },
+    #
+    # Ballast note (2026-10-19): this advisory previously had two separate
+    # ignore entries here with near-identical reasoning, written at
+    # different times without either noticing the other — `cargo deny check
+    # advisories -s` flags that as "duplicate items detected" (harmless to
+    # the verdict, since both entries agreed, but a ledger that disagrees
+    # with itself about whether an entry already exists is a process bug).
+    # Collapsed to this one entry; no dependency, feature or advisory
+    # verdict changed.
+    { id = "RUSTSEC-2024-0449", reason = "unmaintained, not a vulnerability: unsafe-libyaml arrives only through the deprecated serde_yaml, which autumn-web 0.8.0 (external) depends on via its openapi feature (one call, serde_yaml::to_string, emits our own spec, parses no input); our own use is a dev-dependency that parses checked-in YAML in three test guards. Revisit: autumn-web drops serde_yaml." },
 ]
 
 # ---------------------------------------------------------------------------
