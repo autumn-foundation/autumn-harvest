@@ -39,14 +39,14 @@ runs applied nothing and are discarded, not measurements.
 | PG 12.22 | 139/139 | 139/139 | 139/139 | byte-identical, 3/3 |
 
 The signature is 872 rows: 56 tables, 612 columns (name, type), 201 indexes by name,
-3 triggers. All raw outputs are under `apparatus/0015-postgres-12-floor/results/`.
+3 triggers. All raw outputs, including all three signatures per server, are under `apparatus/0015-postgres-12-floor/results/`.
 There is no worst-case axis for a deterministic DDL replay, so none was probed.
 
 ## 🏁 Verdict
 
 **Pursue, at the schema layer only.** L1 and L2 did not trigger. L3 (139/139 on 12
 and 14), L4 (valid control) and L5 (identical signature) all passed. The number
-that carries it is zero failed migrations out of 417 PG 12 and PG 14 applications.
+that carries it is zero failed migrations out of 834 PG 12 and PG 14 applications (417 per version).
 
 This does not show that 12+ is *supported*. Engine query paths (claim, replay,
 sweeps, partition ops) were not exercised, because the DB suites need
