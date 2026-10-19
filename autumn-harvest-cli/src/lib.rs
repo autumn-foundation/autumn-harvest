@@ -6768,6 +6768,67 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
     emit_partition_report(&out, format, "status")
 }
 
+/// The result of the prelude that `harvest partition enable|maintain|disable`
+/// share (issue #2221).
+// One value exists per shard and the caller moves it out at once. A box
+// would add an allocation and no benefit.
+#[allow(clippy::large_enum_variant)]
+enum PartitionShardPrep {
+    /// The shard is ready for its mutation.
+    Ready {
+        /// A connection that passed the authority check.
+        conn: autumn_harvest::diesel_async::AsyncPgConnection,
+        /// The fence barriers. Hold them until the mutation ends.
+        fence: Vec<autumn_harvest::replication::FencePassGuard>,
+        /// The report row for this shard, with no result filled in yet.
+        row: PartitionShardReport,
+    },
+    /// The shard cannot be mutated. The row says why.
+    Unavailable(PartitionShardReport),
+}
+
+/// Run the DR-fenced prelude for one shard (issue #1823).
+///
+/// The steps are: connect, check write authority, take the fence. The first
+/// failing step ends the prelude. A connect failure gives an unreachable row.
+/// An authority or fence failure gives a reachable row with its error set.
+async fn prepare_partition_shard(
+    target: &autumn_harvest::backup_verify::ShardTarget,
+    expect_generation: &[ExpectGeneration],
+) -> PartitionShardPrep {
+    let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
+    let mut conn = match dr_connect(&target.dsn).await {
+        Ok(conn) => conn,
+        Err(error) => {
+            return PartitionShardPrep::Unavailable(PartitionShardReport::unreachable(
+                target.shard_id,
+                redacted,
+                error.to_string(),
+            ));
+        }
+    };
+    let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
+    if let Err(error) = direct_write_authority(
+        &mut conn,
+        target.shard_id,
+        expect_generation,
+        autumn_harvest::replication::AdminWrite::SchemaOnly,
+    )
+    .await
+    {
+        row.error = Some(error);
+        return PartitionShardPrep::Unavailable(row);
+    }
+    // Held until this shard's mutation ends (issue #1823).
+    match database_fence(&target.dsn, target.shard_id, expect_generation).await {
+        Ok(fence) => PartitionShardPrep::Ready { conn, fence, row },
+        Err(error) => {
+            row.error = Some(error);
+            PartitionShardPrep::Unavailable(row)
+        }
+    }
+}
+
 async fn run_partition_enable(
     shards: &[String],
     opts: &autumn_harvest::partition::EnableOptions,
@@ -6777,40 +6838,14 @@ async fn run_partition_enable(
     let targets = parse_shard_targets(shards)?;
     let mut out = Vec::with_capacity(targets.len());
     for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) = direct_write_authority(
-            &mut conn,
-            target.shard_id,
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::SchemaOnly,
-        )
-        .await
-        {
-            row.error = Some(error);
-            out.push(row);
-            continue;
-        }
-        // Held until this shard's mutation ends (issue #1823).
-        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                row.error = Some(error);
-                out.push(row);
-                continue;
-            }
-        };
+        let (mut conn, fence, mut row) =
+            match prepare_partition_shard(target, expect_generation).await {
+                PartitionShardPrep::Ready { conn, fence, row } => (conn, fence, row),
+                PartitionShardPrep::Unavailable(row) => {
+                    out.push(row);
+                    continue;
+                }
+            };
         // Per-shard independence is deliberate: a shard is a database, and a
         // half-converted cluster is a supported state (each shard's layout is
         // detected at runtime), so one shard's lock timeout must not abort the
@@ -6848,40 +6883,14 @@ async fn run_partition_maintain(
     };
     let mut out = Vec::with_capacity(targets.len());
     for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) = direct_write_authority(
-            &mut conn,
-            target.shard_id,
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::SchemaOnly,
-        )
-        .await
-        {
-            row.error = Some(error);
-            out.push(row);
-            continue;
-        }
-        // Held until this shard's mutation ends (issue #1823).
-        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                row.error = Some(error);
-                out.push(row);
-                continue;
-            }
-        };
+        let (mut conn, fence, mut row) =
+            match prepare_partition_shard(target, expect_generation).await {
+                PartitionShardPrep::Ready { conn, fence, row } => (conn, fence, row),
+                PartitionShardPrep::Unavailable(row) => {
+                    out.push(row);
+                    continue;
+                }
+            };
         // A lost fence session stops the pass. See `run_fenced_pass`.
         let maintained = autumn_harvest::replication::run_fenced_pass(&fence, async {
             // Issue #1823: the connection predates the pass, so it joins it.
@@ -6928,40 +6937,14 @@ async fn run_partition_disable(
     let targets = parse_shard_targets(shards)?;
     let mut out = Vec::with_capacity(targets.len());
     for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) = direct_write_authority(
-            &mut conn,
-            target.shard_id,
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::SchemaOnly,
-        )
-        .await
-        {
-            row.error = Some(error);
-            out.push(row);
-            continue;
-        }
-        // Held until this shard's mutation ends (issue #1823).
-        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                row.error = Some(error);
-                out.push(row);
-                continue;
-            }
-        };
+        let (mut conn, fence, mut row) =
+            match prepare_partition_shard(target, expect_generation).await {
+                PartitionShardPrep::Ready { conn, fence, row } => (conn, fence, row),
+                PartitionShardPrep::Unavailable(row) => {
+                    out.push(row);
+                    continue;
+                }
+            };
         // A lost fence session stops the mutation. See `run_fenced_pass`.
         let disabled = autumn_harvest::replication::run_fenced_pass(&fence, async {
             // Issue #1823: the connection predates the pass, so it joins it.
@@ -20138,5 +20121,36 @@ mod pg_tls_feature_tests {
             "the CLI must enable autumn-harvest/tls: {:?}",
             result.err()
         );
+    }
+}
+
+#[cfg(test)]
+mod partition_shard_prep_tests {
+    //! The shared prelude of `harvest partition enable|maintain|disable`
+    //! (issue #2221). These tests need no database: an unreachable shard
+    //! stops the prelude before any authority or fence step. The authority
+    //! and fence paths need Postgres and run in the DB integration suite.
+    use super::*;
+
+    const DSN: &str = "postgres://user:s3cret@127.0.0.1:1/harvest";
+
+    #[tokio::test]
+    async fn unreachable_shard_yields_a_redacted_report_row() {
+        let target = ShardTarget::new(7, DSN);
+        let prep = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            prepare_partition_shard(&target, &[]),
+        )
+        .await
+        .expect("connect must fail fast");
+        let PartitionShardPrep::Unavailable(row) = prep else {
+            panic!("a closed port must be unavailable");
+        };
+        assert_eq!(row.shard_id, 7);
+        assert!(!row.reachable);
+        assert!(row.error.is_none());
+        assert!(!row.dsn.contains("s3cret"), "{}", row.dsn);
+        let reason = row.unreachable_reason.expect("a reason");
+        assert!(!reason.contains("s3cret"), "{reason}");
     }
 }

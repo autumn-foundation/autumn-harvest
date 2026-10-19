@@ -1441,7 +1441,7 @@ impl PayloadCodecs {
                 }
             }
         }
-        Ok((event_from_wire(wire)?, true))
+        Ok((serde_json::from_value(wire)?, true))
     }
 
     fn transform_event_data(&self, root: &mut Value) -> HarvestResult<()> {
