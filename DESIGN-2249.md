@@ -96,6 +96,8 @@ docs guard and a Postgres lock-mode test.
 | R18 | A replacement worker with the same id renews or releases the old lease. | The holder is a per-process token. Renew, release and revoke match holder and epoch. |
 | R19 | A task claimed the legacy way stays in flight across the switch. | The enable step re-pends such tasks in the same transaction as the guard and the switch. |
 | R20 | A rebalance copies a partition into a database with another count. | The rebalance computes it again when the counts differ. |
+| R21 | The acquisition re-pends task rows and so adds a lock edge. | No path holds a task row and then waits for an owner row. A lock timeout rolls the acquisition back. |
+| R22 | Two pools split the shards of one colocated database and strand executions. | Each owner-mode worker covers a whole colocated group. The enable step and worker start refuse a split. |
 
 ### 0.4 Six thinking hats
 
@@ -128,7 +130,8 @@ docs guard and a Postgres lock-mode test.
    ADR relies on, on Postgres 16.
 
 A review from four angles (protocol safety, code facts, tests and CI,
-acceptance criteria and style) found R14 to R20. The ADR closes each.
+acceptance criteria and style) found R14 to R20. The Codex review of the PR
+found R21 and R22. The ADR closes each.
 
 ---
 

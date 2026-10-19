@@ -151,8 +151,9 @@ Rules:
   This covers acquisition, renewal, release, revoke and the DR bump.
 - A decision commit or an owned claim takes at most one owner row.
 - It takes that row before any execution row, task row or advisory lock.
-- Acquisition, renewal, release and revoke take the generation row and
-  owner rows only.
+- Renewal, release and revoke take the generation row and owner rows
+  only. An acquisition takes them, then locks the workflow task rows that
+  it re-pends (decision 7).
 - A statement on many owner rows locks them in ascending partition order.
   A plain `UPDATE ... WHERE partition = ANY(...)` does not do that. It
   locks rows in scan order.
@@ -165,8 +166,12 @@ Rules:
 
 This adds no deadlock:
 
-- An acquisition holds only the generation row and owner rows. It never
-  waits on a transaction that waits on it.
+- An acquisition holds the generation row and owner rows, then locks task
+  rows. No path holds a task row and then waits for an owner row. Claims
+  and commits take the owner row first, and foreign writers take none.
+- So an acquisition never waits on a transaction that waits on it. A task
+  row lock that it cannot get in its `lock_timeout` rolls the acquisition
+  back. The next scan tries again.
 - A commit does not queue behind a waiting acquisition (decision 5).
 - While a commit waits for an owner row, it holds only the generation row,
   in shared mode. Every owner-row transaction takes that row in shared
@@ -264,6 +269,12 @@ policy.
 - Partitions are inside one physical database. A worker acquires
   partitions only on the shards of its effective assignments
   (`resolve_shard_assignments`).
+- On a database with colocated shards, each worker in owner mode covers
+  all of those shards or none. A split strands executions, because 512
+  owner rows serve every shard on the database.
+- A worker whose assignments split a colocated group refuses owner mode at
+  start. Today one claim scan already serves every shard on such a
+  database.
 - The cell recipe gives each pool explicit assignments
   (`with_shard_assignments`). When the cell shard has its own database,
   only the cell pool can own its partitions.
@@ -277,9 +288,9 @@ policy.
 Owner mode is a per-physical-database switch. The switch is a row in that
 database. The enable step:
 
-1. Refuses while a live worker on the database cannot run owner mode.
-   Issue #2252 picks the signal, because `harvest_workers` has no
-   capability column today.
+1. Refuses while a live worker on the database cannot run owner mode, or
+   covers only part of a colocated group (decision 10). Issue #2252 picks
+   the signal, because `harvest_workers` has no capability column today.
 2. Writes the partition of each execution and adds the owner rows and the
    count.
 3. Installs a database guard on the claim of a workflow task. The guard
