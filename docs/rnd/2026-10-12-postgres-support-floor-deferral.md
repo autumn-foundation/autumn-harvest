@@ -1,5 +1,10 @@
 # 🏛️ Keystone [deferred]: raise the documented Postgres floor (trigger: 2026-11-12 PG14 end of life, or a first feature outside the partitioned layout that needs SQL newer than 12)
 
+> **Update (2026-10-19).** Assay #15 (`docs/assays/0015-postgres-12-floor.md`) ran
+> part of the evidence this record asked for. All 139 migrations apply on PG 12.22 and
+> PG 14.24, and the schema matches PG 16. Engine query paths are not covered. The record
+> still stands: "12+" holds at the schema layer and stays untested above it.
+
 **Status:** deferral record. No RFC, no code change, no architecture review needed.
 **Date:** 2026-10-12. **Scope:** `README.md` Requirements, `docs/partitioned-events.md`, `.github/workflows/ci.yml`.
 
