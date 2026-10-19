@@ -42,6 +42,11 @@ The signature is 872 rows: 56 tables, 612 columns (name, type), 201 indexes by n
 3 triggers. All raw outputs, including all three signatures per server, are under `apparatus/0015-postgres-12-floor/results/`.
 There is no worst-case axis for a deterministic DDL replay, so none was probed.
 
+After review fixed two harness defects (an appending `summary.txt`, and a signature
+query whose failure went unchecked), all three servers were rerun on the fixed
+`run.sh`. Every run again applied 139/139, and every signature matched the archived
+one byte for byte. The numbers above did not change.
+
 ## 🏁 Verdict
 
 **Pursue, at the schema layer only.** L1 and L2 did not trigger. L3 (139/139 on 12
