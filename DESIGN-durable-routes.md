@@ -369,7 +369,7 @@ test installs a process-global channel, so it lives in its own binary,
 | AC-46 | The docs page states the client rule, the key guidance, both deadline margins, the per-route timeout rule, the token-API and plaintext-cache warnings, the layer advice, the cap answer and the `#[intercept]` warning. The waiter default and the step cap match the code constants. | `page_states_layer_timeout_and_key_guidance` |
 | AC-47 | Every test this table names is a test function in the plugin sources or tests. The note keeps its planning sections, its facts and brainstorm rows, a mitigation for each harm, and its key known limits. | `design_note_ac_table_names_existing_tests`, `design_note_keeps_its_planning_sections` |
 | AC-48 | One changelog fragment describes the feature and states "No migration" and "No new `WorkflowEvent`". | `changelog_fragment_describes_the_feature` |
-| AC-49 | Both new test binaries have a sorted row in `.github/ci/integration-suites.txt`. | Existing `ci_run_coverage.rs` suite |
+| AC-49 | Each new test binary has a sorted row in `.github/ci/integration-suites.txt`. | Existing `ci_run_coverage.rs` suite |
 | AC-50 | Comment hygiene adds no Tier A defect and no Tier B regression. | `docs/audits/comment-hygiene.py --base origin/trunk-dev` |
 | AC-51 | `cargo fmt` and `cargo clippy -D warnings` pass for the plugin. | CI lint job |
 | AC-52 | The diff adds no migration, no `harvest_events` writer and no version bump. `sha2` is a plain dependency of the plugin. The start calls `finish()` after it commits. | Review; `the_start_publishes_its_dispatch_hint` |
