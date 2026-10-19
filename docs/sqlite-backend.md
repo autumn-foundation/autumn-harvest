@@ -262,6 +262,15 @@ A start input, memo, signal payload or update input nested over
 `MAX_PAYLOAD_DEPTH` (100) levels is rejected with `SqliteError::PayloadTooDeep` before anything is
 persisted. Postgres has no such cap.
 
+An activity result nested over the same cap is not stored. It becomes a
+non-retryable `ActivityFailed` with `error_type = "PayloadTooDeep"`, as an
+oversized result becomes `PayloadTooLarge`. A result that is too deep and too
+large fails as `PayloadTooDeep`. A local activity fails with the same message
+and ends on its first attempt with `LocalActivityExhausted`. A local failure
+keeps no error type, so the workflow sees `Error` and the message. The workflow
+sees the failure and can handle it. A heartbeat nested over the cap is dropped with
+a warning, and the last good checkpoint stays.
+
 ---
 
 ## 7. The drive model

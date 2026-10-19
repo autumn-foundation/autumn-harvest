@@ -1235,8 +1235,8 @@ impl WorkflowEvent {
             | Self::TimerFired { .. }
             | Self::TimerStarted { .. }
             | Self::UpdateFailed { .. }
-            | Self::WorkflowCancelRequested { .. }
             | Self::WorkflowCancelled { .. }
+            | Self::WorkflowCancelRequested { .. }
             | Self::WorkflowExecutionPaused { .. }
             | Self::WorkflowExecutionResumed { .. }
             | Self::WorkflowExecutionTimedOut { .. }
