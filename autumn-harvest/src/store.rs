@@ -3149,10 +3149,10 @@ async fn append_stream_chunks_in_tx(
 /// `bounds` holds the lowest and highest stored real offsets. The stored
 /// offsets are distinct and lie in that span. The marker is absent, since its
 /// presence returned earlier. So the stored row count cannot exceed the span.
-/// When the span plus the new chunks fits the cap, the room is at least the new
-/// chunks, whatever the count is, and the count read would change nothing. That
-/// read touches every stored chunk of the run, so a long stream skips it until
-/// the span nears the cap.
+/// Suppose the span plus the new chunks fits the cap. Then the room is at least
+/// the new chunks, whatever the count is. So the count read would change
+/// nothing. That read touches every stored chunk of the run. A long stream
+/// therefore skips it until the span nears the cap.
 async fn admitted_count(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
