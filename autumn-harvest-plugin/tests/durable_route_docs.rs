@@ -7,7 +7,9 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use autumn_harvest_plugin::durable_route::PROBLEM_SLUGS;
+use autumn_harvest_plugin::durable_route::{
+    DEFAULT_MAX_CHAIN_STEPS, DEFAULT_MAX_WAITERS, PROBLEM_SLUGS,
+};
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -96,6 +98,8 @@ fn page_states_layer_timeout_and_key_guidance() {
         "is final for this key",
         "Do not turn on `.idempotent()` for such an API",
         "PII erasure does not remove it",
+        "do not turn on `.idempotent()` for durable routes",
+        "A walk that read only ended runs answers `result-unavailable`",
         "## Known limits",
     ] {
         assert!(
@@ -103,9 +107,20 @@ fn page_states_layer_timeout_and_key_guidance() {
             "docs/durable-routes.md must mention {needle:?}"
         );
     }
+    // The numbers come from the code, so the page cannot drift from it.
+    for needle in [
+        format!("The default is {DEFAULT_MAX_WAITERS}."),
+        format!("The cap is {DEFAULT_MAX_CHAIN_STEPS} steps."),
+    ] {
+        assert!(
+            page.contains(&needle),
+            "docs/durable-routes.md must say {needle:?}"
+        );
+    }
 }
 
-/// Every `fn` name in the plugin sources and tests.
+/// Every test `fn` name in the plugin sources and tests. A name counts when
+/// one of the three lines above it holds a test attribute.
 fn plugin_fn_names() -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let root = workspace_root().join("autumn-harvest-plugin");
@@ -117,7 +132,14 @@ fn plugin_fn_names() -> BTreeSet<String> {
                 stack.push(path);
             } else if path.extension().is_some_and(|e| e == "rs") {
                 let text = std::fs::read_to_string(&path).expect("read source");
-                for line in text.lines() {
+                let lines: Vec<&str> = text.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    let is_test = lines[i.saturating_sub(3)..i]
+                        .iter()
+                        .any(|above| above.contains("#[test]") || above.contains("#[tokio::test"));
+                    if !is_test {
+                        continue;
+                    }
                     if let Some(rest) = line.trim_start().split("fn ").nth(1) {
                         let name: String = rest
                             .chars()
@@ -181,6 +203,17 @@ fn design_note_keeps_its_planning_sections() {
         })
         .collect();
     assert!(harms.len() >= 25, "only {} harms", harms.len());
+    // The facts and the brainstorm keep their rows.
+    for (prefix, least) in [("| F", 15), ("| B", 20)] {
+        let rows = design
+            .lines()
+            .filter(|line| {
+                line.strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+            })
+            .count();
+        assert!(rows >= least, "only {rows} rows that start with {prefix}");
+    }
     for row in &harms {
         assert!(
             row.split('|').nth(3).is_some_and(|m| !m.trim().is_empty()),
@@ -197,6 +230,19 @@ fn design_note_keeps_its_planning_sections() {
         .filter(|line| line.starts_with("- "))
         .count();
     assert!(limits >= 20, "only {limits} known limits");
+    for limit in [
+        "Postgres plugin runtime only",
+        "refuses a pool of more than one shard",
+        "After an operator rerun",
+        "A reset seal",
+        "unsalted SHA-256",
+        "No in-process single-flight",
+    ] {
+        assert!(
+            design[start..end].contains(limit),
+            "the known limits lost {limit:?}"
+        );
+    }
 }
 
 // AC-48

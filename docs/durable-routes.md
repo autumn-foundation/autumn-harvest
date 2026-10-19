@@ -47,7 +47,7 @@ async fn place_order(
 | `.wait(budget)` | Waits up to `budget` for the result. The default is 5 s and the maximum is 30 s. `Duration::ZERO` never waits. See [Waiting](#waiting). |
 | `.success_status(status)` | The status of a completed run: 200 (default), 201 or 204. |
 | `.failure_status(error_type, status)` | The status of a run that fails with the typed `WorkflowFailure` class `error_type`. |
-| `.expose_execution_id()` | Adds `x-harvest-execution-id` to each answer that reports on the run, and an `execution_id` member to a pending body. The id names the run that the key started, which is the first run of a continue-as-new chain. |
+| `.expose_execution_id()` | Adds `x-harvest-execution-id` to each answer that reports on the run, and an `execution_id` member to a pending body. While the key's claim lasts, the id names the run that the key started, which is the first run of a continue-as-new chain. After the window, it names the run that holds the business id. |
 | `.send()` | Runs the call. It never fails: every problem is a `DurableOutcome`. |
 
 `DurableOutcome` implements `IntoResponse`. To render HTML, read
@@ -127,14 +127,16 @@ A live run waits for up to the budget.
   deadline, because that layer reads the whole body before the handler.
 - A route that sets its own `timeout_ms` must set `.wait(..)` below it,
   because the route cannot see that value.
-- A run that continues as new is followed to its newest run. Each step reads
-  one history. A step follows the chain to its newest run of the same type,
-  or across one change of workflow type. A chain needs at most one step more
-  than its changes of type. The cap is 1024 steps. Set it with
-  `HarvestPlugin::durable_route_max_chain_steps(n)`. Past the cap, a chain
-  that still runs answers pending. A chain whose runs all ended answers
-  `result-unavailable`, because each retry walks the same runs. A chain that
-  loops back answers `result-unavailable` too.
+- A run that continues as new is followed to its newest run. Each step is
+  one successor lookup. A step follows the chain to its newest run of the
+  same type, or across one change of workflow type or one workflow-level
+  retry. A chain needs at most one step more than its changes of type and
+  its retries. The cap is 1024 steps. Set it with
+  `HarvestPlugin::durable_route_max_chain_steps(n)`.
+- Past the cap, a walk that met a live run answers pending, because a retry
+  can need fewer steps once the chain ends. A walk that read only ended runs
+  answers `result-unavailable`, because a retry repeats the same walk. A
+  chain that loops back answers `result-unavailable` too.
 - A read error other than a codec error also answers pending, because the
   run exists. A workflow-level retry chain past the engine's walk depth
   (256 attempts) answers `result-unavailable`, because it never shrinks.
@@ -185,35 +187,39 @@ ends. In such an app, do not turn on `.idempotent()` for durable routes.
 ## Known limits
 
 - Durable routes need the plugin's Postgres runtime. The SQLite runtime and
-  `HarvestEmbedding` do not support them. The plugin refuses a pool of more
-  than one shard, so a durable route runs on one shard.
+  `HarvestEmbedding` do not support them. There, a durable route answers
+  `503` `unavailable`. The plugin refuses a pool of more than one shard, so a
+  durable route runs on one shard.
 - There is no status monitor and no `Location` header. A client resumes only
   by retrying the same request.
 - A server-made value in the input, such as the time or a new id, makes each
   retry a `422`. Make such values inside the workflow.
 - A key binds its body for the start-idempotency window (24 h by default,
   `HarvestPlugin::start_idempotency_window`). After that, the same body
-  attaches to the original run until retention deletes it, and the attach
-  binds the key again. Another body under an expired key starts a new run.
+  attaches to the run that holds the business id until retention deletes
+  it, and the attach binds the key again. That is the original run, unless
+  an operator rerun or reset gave the business id to a newer run. Another
+  body under an expired key starts a new run.
 - After the window, a retry of a run that was terminated, or that continued
   as new into another workflow type, starts a new run. Those runs no longer
   hold the business id.
 - PII erasure works on one execution. To erase a durable run, erase every
   execution with its `workflow_id`: each retry attempt and each
-  continue-as-new run. `x-harvest-execution-id` names only the first.
+  continue-as-new run. `x-harvest-execution-id` names only one of them.
 - The route checks the input size before any I/O, with the current cap. A
   retry of an accepted input gets `413` when an operator lowers the cap.
 - Workflow-level retries run the activities again. Activities must be
   idempotent.
 - Durable runs have no Harvest tenant, record the `transactional` start
   source and do not join the HTTP trace.
-- A run that a reset sealed reads as `terminated`. When the run failed or
-  timed out before the reset, the MCP task tools report that end. They
-  report any other reset-sealed run as `cancelled`. A paused run reads as
-  pending.
-- After an operator rerun, a retry of the original request gets the outcome
+- Within the claim window, a run that a reset sealed reads as `terminated`.
+  When the run failed or timed out before the reset, the MCP task tools
+  report that end. They report any other reset-sealed run as `cancelled`. A
+  paused run reads as pending.
+- Within the claim window, a retry after an operator rerun gets the outcome
   of the original run, not of the rerun. This also holds for a rerun of the
-  last run of a chain. `failure_status` still maps the typed failure.
+  last run of a chain. `failure_status` still maps the typed failure. After
+  the window, the retry attaches to the rerun, which holds the business id.
 - The claim window is one setting for the plugin, not one for each route.
 - The start does not join the handler's own database transaction.
 - There is no `Prefer: wait` header. The handler sets the budget.

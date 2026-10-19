@@ -2059,24 +2059,201 @@ async fn completed_run(db: &TestPg, workflow: &str) -> ExecutionId {
 #[tokio::test(flavor = "multi_thread")]
 async fn rerun_of_a_chain_end_keeps_the_original_outcome() {
     let db = setup_db().await;
-    let client = build_app(&db).await;
+    // One step must still reach the end of an eleven-run chain.
+    let client = app_with(&db, base_plugin().durable_route_max_chain_steps(1)).build();
     let extra = [
         ("x-user", "ada"),
         ("x-workflow", "dr_chain"),
         ("x-wait-ms", "5000"),
     ];
-    let body = json!({"tag": "ac79", "hops": 1});
+    let body = json!({"tag": "ac79", "hops": 10});
     let first = until_done(&client, "key-ac79", &extra, &body).await;
     assert_eq!(first.status.as_u16(), 200, "{}", first.text());
-    assert_eq!(first.json::<Value>(), json!({"final": 1}));
+    assert_eq!(first.json::<Value>(), json!({"final": 10}));
     // An operator reruns the last run of the chain, and the rerun ends
     // another way. The rerun keeps the business id.
     let last = completed_run(&db, "dr_chain").await;
-    let other = json!({"hop": 5, "target": 5});
+    let other = json!({"hop": 50, "target": 50});
     assert_eq!(rerun_with(&db, last, Some(other)).await, "COMPLETED");
     until_state(&db, "dr_chain", "COMPLETED").await;
     let again = post(&client, Some("key-ac79"), &extra, &body).await;
     assert_eq!(again.status.as_u16(), 200, "{}", again.text());
-    assert_eq!(again.json::<Value>(), json!({"final": 1}));
+    assert_eq!(again.json::<Value>(), json!({"final": 10}));
     assert_eq!(again.header(REPLAYED_HEADER), Some("true"));
+}
+
+// AC-81
+#[tokio::test(flavor = "multi_thread")]
+async fn after_the_window_the_business_id_holder_answers() {
+    let db = setup_db().await;
+    let plugin = base_plugin().start_idempotency_window(Duration::from_secs(1));
+    let client = app_with(&db, plugin).build();
+
+    // A terminated run no longer holds the business id, so a retry after the
+    // window starts a new run.
+    let terminated = start_parked(&client, "key-ac81-a").await;
+    handle_client(&client)
+        .handle(terminated)
+        .terminate("test")
+        .await
+        .expect("terminate");
+    // The retry after an operator rerun attaches to the rerun.
+    let order = [("x-user", "ada"), ("x-expose", "1")];
+    let body = json!({"tag": "ac81-b"});
+    let first = post(&client, Some("key-ac81-b"), &order, &body).await;
+    assert_eq!(first.status.as_u16(), 200, "{}", first.text());
+    let rerun_input = json!({"user": "ada", "body": {"tag": "ac81-rerun"}});
+    assert_eq!(
+        rerun_with(&db, exec_id_of(&first), Some(rerun_input)).await,
+        "COMPLETED"
+    );
+    until_state(&db, "dr_order", "COMPLETED").await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+    let parked = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_parked"),
+        ("x-wait-ms", "0"),
+        ("x-expose", "1"),
+    ];
+    let again = post(
+        &client,
+        Some("key-ac81-a"),
+        &parked,
+        &json!({"tag": "key-ac81-a"}),
+    )
+    .await;
+    assert_eq!(again.status.as_u16(), 202, "{}", again.text());
+    assert_ne!(exec_id_of(&again), terminated, "a new run started");
+    assert_eq!(again.header(REPLAYED_HEADER), None);
+
+    let later = post(&client, Some("key-ac81-b"), &order, &body).await;
+    assert_eq!(later.status.as_u16(), 200, "{}", later.text());
+    assert_eq!(later.json::<Value>()["body"]["tag"], "ac81-rerun");
+    assert_ne!(exec_id_of(&later), exec_id_of(&first));
+}
+
+// AC-82
+#[tokio::test(flavor = "multi_thread")]
+async fn erasing_the_first_run_of_a_chain_keeps_the_final_output() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    let extra = [
+        ("x-user", "ada"),
+        ("x-workflow", "dr_chain"),
+        ("x-wait-ms", "5000"),
+        ("x-expose", "1"),
+    ];
+    let body = json!({"tag": "ac82", "hops": 1});
+    let first = until_done(&client, "key-ac82", &extra, &body).await;
+    assert_eq!(first.status.as_u16(), 200, "{}", first.text());
+    assert_eq!(first.json::<Value>(), json!({"final": 1}));
+    let head = exec_id_of(&first);
+    {
+        // Erasure works on one execution. The output lives on the last run.
+        let mut conn = db.pool.get().await.expect("conn");
+        autumn_harvest::erase::erase_workflow_payloads(&mut conn, head, "test")
+            .await
+            .expect("erase the first run");
+    }
+    let again = post(&client, Some("key-ac82"), &extra, &body).await;
+    assert_eq!(again.status.as_u16(), 200, "{}", again.text());
+    assert_eq!(again.json::<Value>(), json!({"final": 1}));
+    assert_eq!(exec_id_of(&again), head, "the id names the first run");
+}
+
+#[derive(QueryableByName)]
+struct Origin {
+    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+    tenant: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+    start_source: Option<String>,
+}
+
+// AC-83
+#[tokio::test(flavor = "multi_thread")]
+async fn durable_runs_have_no_tenant_and_record_the_transactional_source() {
+    let db = setup_db().await;
+    let client = build_app(&db).await;
+    let extra = [
+        ("x-user", "ada"),
+        ("x-tenant", "acme"),
+        ("x-workflow", "dr_parked"),
+        ("x-wait-ms", "0"),
+        ("x-expose", "1"),
+        (
+            "traceparent",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        ),
+    ];
+    let pending = post_to(
+        &client,
+        "/tenant/durable",
+        Some("key-ac83"),
+        &extra,
+        &json!({"tag": "ac83"}),
+    )
+    .await;
+    assert_eq!(pending.status.as_u16(), 202, "{}", pending.text());
+    let exec_id = exec_id_of(&pending).to_string();
+    let mut conn = db.pool.get().await.expect("conn");
+    let origin = diesel::sql_query(
+        "SELECT tenant, start_source FROM harvest_workflow_executions WHERE id = $1::uuid",
+    )
+    .bind::<Text, _>(&exec_id)
+    .get_result::<Origin>(&mut conn)
+    .await
+    .expect("run row");
+    assert_eq!(
+        origin.tenant, None,
+        "Autumn's tenant is not a Harvest tenant"
+    );
+    assert_eq!(origin.start_source.as_deref(), Some("transactional"));
+    // The parked run keeps its workflow task, and the task holds no trace.
+    let tasks = diesel::sql_query(
+        "SELECT count(*)::bigint AS n FROM harvest_task_queue WHERE workflow_exec_id = $1::uuid",
+    )
+    .bind::<Text, _>(&exec_id)
+    .get_result::<Count>(&mut conn)
+    .await
+    .expect("tasks")
+    .n;
+    assert!(tasks > 0, "the parked run has a task row");
+    let traced = diesel::sql_query(
+        "SELECT count(*)::bigint AS n FROM harvest_task_queue \
+         WHERE workflow_exec_id = $1::uuid AND trace_context IS NOT NULL",
+    )
+    .bind::<Text, _>(&exec_id)
+    .get_result::<Count>(&mut conn)
+    .await
+    .expect("traced tasks")
+    .n;
+    assert_eq!(traced, 0, "the run does not join the HTTP trace");
+}
+
+// AC-84
+#[test]
+fn ci_manifest_lists_both_durable_route_suites() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../.github/ci/integration-suites.txt"
+    );
+    let manifest = std::fs::read_to_string(path).expect("CI suite manifest");
+    let rows: Vec<Vec<&str>> = manifest
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    for (osclass, target) in [
+        ("allos", "durable_route_docs"),
+        ("linux", "durable_route_integration"),
+    ] {
+        assert!(
+            rows.iter().any(|row| row.len() >= 3
+                && row[0] == osclass
+                && row[1] == "autumn-harvest-plugin"
+                && row[2] == target),
+            "the CI manifest must run {target} on {osclass}"
+        );
+    }
 }

@@ -20,9 +20,9 @@ feature-gap report.
   (default 32) and follows continue-as-new chains. A same-type chain takes
   one business-id lookup. `HarvestPlugin::durable_route_max_chain_steps`
   (default 1024) caps the steps of one request. A chain needs at most one
-  step more than its changes of workflow type. Past the cap, a finished
-  chain answers `result-unavailable`, and a chain that still runs answers
-  pending.
+  step more than its changes of workflow type and its retries. Past the cap,
+  a walk over ended runs answers `result-unavailable`, and a walk that met a
+  live run answers pending.
 - The wait ends 2 s, and every read after the start ends 1 s, before
   Autumn's request deadline, counted from when the route reads the request.
   Under Autumn's idempotency layer the route counts half the deadline.

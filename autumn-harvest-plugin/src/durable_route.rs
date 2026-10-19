@@ -74,9 +74,9 @@ pub const DEFAULT_MAX_WAITERS: usize = 32;
 
 /// The default cap on the continue-as-new steps that one wait follows.
 ///
-/// Each step reads one history. A step follows a chain to its newest run of
-/// the same type, or across one change of workflow type. A chain needs at
-/// most one step more than its changes of type.
+/// Each step is one successor lookup. A step follows a chain to its newest
+/// run of the same type, or across one change of workflow type or one retry.
+/// A chain needs at most one step more than its changes of type and retries.
 pub const DEFAULT_MAX_CHAIN_STEPS: usize = 1024;
 
 /// The prefix of the start-idempotency claim key.
@@ -581,16 +581,10 @@ impl Prepared {
                 // when a mapping can use it.
                 let typed =
                     if result.state == WorkflowResultState::Failed && !self.failures.is_empty() {
-                        match typed_failure(&self.runtime, exec_id).await {
+                        let read = typed_failure(&self.runtime, exec_id).await;
+                        match typed_or_answer(read, self.layer_active) {
                             Ok(typed) => typed,
-                            // The run failed, but its class is unknown. A
-                            // passing error answers pending, so a retry reads
-                            // it again.
-                            Err(error) => {
-                                let (kind, status) =
-                                    no_result_outcome(read_error(&error), self.layer_active);
-                                return after_start(kind, status, None);
-                            }
+                            Err((kind, status)) => return after_start(kind, status, None),
                         }
                     } else {
                         None
@@ -998,12 +992,8 @@ impl RunReads for DurableRouteRuntime {
         exec_id: ExecutionId,
         budget: Duration,
     ) -> HarvestResult<Option<WorkflowResult>> {
-        // The engine wait can overrun its budget on a slow listener
-        // connect, so an outer timeout bounds it.
         let handle = self.client.handle(exec_id);
-        tokio::time::timeout(budget, handle.result_snapshot_with_wait(budget))
-            .await
-            .unwrap_or(Ok(None))
+        wait_at_most(budget, handle.result_snapshot_with_wait(budget)).await
     }
 
     async fn successor(&self, exec_id: ExecutionId) -> HarvestResult<Option<ExecutionId>> {
@@ -1011,12 +1001,24 @@ impl RunReads for DurableRouteRuntime {
     }
 }
 
+/// Run `wait`, cut off at `budget`. A cut-off wait reads as a live run.
+///
+/// The engine wait can overrun its budget on a slow listener connect, so
+/// this outer timeout bounds it.
+async fn wait_at_most(
+    budget: Duration,
+    wait: impl Future<Output = HarvestResult<Option<WorkflowResult>>>,
+) -> HarvestResult<Option<WorkflowResult>> {
+    tokio::time::timeout(budget, wait).await.unwrap_or(Ok(None))
+}
+
 /// Wait up to `budget` for the end of the run and its continue-as-new chain.
 ///
-/// The walk takes at most `max_steps` steps. Each step reads one successor.
-/// Past the cap, the answer is pending when the walk met a live run, and the
-/// result is unavailable when every run had ended. A waiting read takes a
-/// permit from `waiters`. A run that is already terminal needs no permit.
+/// The walk takes at most `max_steps` steps. Each step is one successor
+/// lookup. Past the cap, a walk that met a live run answers pending, and a
+/// walk that read only ended runs answers result-unavailable. A waiting read
+/// takes a permit from `waiters`. A run that is already terminal needs no
+/// permit.
 async fn wait_for_result(
     reads: &impl RunReads,
     waiters: &Arc<Semaphore>,
@@ -1137,51 +1139,64 @@ async fn chain_successor(
             .await?;
     let conn = resident.as_mut();
     let live_id = ExecutionId::from_uuid(live.id);
-    let mut newest = autumn_harvest::execution::resolve_execution_id_by_workflow_id(
-        conn,
-        &live.workflow_name,
-        &live.workflow_id,
-    )
-    .await?;
-    // An operator rerun takes the business id but starts its own chain. Only
-    // a run of this chain may stand in for the live run.
+    // An operator rerun takes the business id but starts its own chain, so
+    // the lookup keeps to this chain.
     let live_chain = live.first_exec_id.unwrap_or(live.id);
-    if let Some(run) = &newest
-        && run.exec_id != live_id
-        && chain_head(conn, run.exec_id).await? != Some(live_chain)
-    {
-        newest = None;
+    let newest = newest_chain_run(conn, &live.workflow_name, &live.workflow_id, live_chain).await?;
+    match newest {
+        // The newest run of the chain stands in for the whole same-type chain.
+        Some((run, state)) if run != live_id && state != "CONTINUED_AS_NEW" => Ok(Some(run)),
+        // A sealed newest run leads on through its continue-as-new event. A
+        // run that a rerun sealed has no such event, so it reports itself.
+        Some((run, _)) if run != live_id => Ok(Some(continued_as(conn, run).await?.unwrap_or(run))),
+        _ => continued_as(conn, live_id).await,
     }
-    let sealed = match newest {
-        Some(run) if run.exec_id != live_id && run.state != "CONTINUED_AS_NEW" => {
-            return Ok(Some(run.exec_id));
-        }
-        Some(run) => run.exec_id,
-        None => live_id,
+}
+
+/// The newest run of the chain that starts at `chain`, among the runs with
+/// this business id.
+async fn newest_chain_run(
+    conn: &mut diesel_async::AsyncPgConnection,
+    workflow_name: &str,
+    workflow_id: &str,
+    chain: uuid::Uuid,
+) -> HarvestResult<Option<(ExecutionId, String)>> {
+    use autumn_harvest::schema::harvest_workflow_executions as executions;
+    use diesel::{
+        BoolExpressionMethods as _, ExpressionMethods as _, NullableExpressionMethods as _,
+        OptionalExtension as _, QueryDsl as _,
     };
-    let history = autumn_harvest::store::load_history_undecoded(conn, sealed).await?;
+    use diesel_async::RunQueryDsl as _;
+    executions::table
+        .filter(executions::workflow_name.eq(workflow_name))
+        .filter(executions::workflow_id.eq(workflow_id))
+        .filter(
+            executions::id
+                .eq(chain)
+                .nullable()
+                .or(executions::first_exec_id.eq(chain)),
+        )
+        // A reconciled migration seal is a stub, not a run.
+        .filter(executions::migrated_run_terminal_at.is_null())
+        .order(executions::started_at.desc())
+        .select((executions::id, executions::state))
+        .first::<(uuid::Uuid, String)>(conn)
+        .await
+        .optional()
+        .map(|row| row.map(|(id, state)| (ExecutionId::from_uuid(id), state)))
+        .map_err(|error| HarvestError::Database(error.to_string()))
+}
+
+/// The run that `exec_id` continued as, from its continue-as-new event.
+async fn continued_as(
+    conn: &mut diesel_async::AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<Option<ExecutionId>> {
+    let history = autumn_harvest::store::load_history_undecoded(conn, exec_id).await?;
     Ok(history.events.into_iter().find_map(|event| match event {
         WorkflowEvent::WorkflowContinuedAsNew { new_exec_id, .. } => Some(new_exec_id),
         _ => None,
     }))
-}
-
-/// The first run of the continue-as-new chain that holds `exec_id`.
-async fn chain_head(
-    conn: &mut diesel_async::AsyncPgConnection,
-    exec_id: ExecutionId,
-) -> HarvestResult<Option<uuid::Uuid>> {
-    use autumn_harvest::schema::harvest_workflow_executions as executions;
-    use diesel::{OptionalExtension as _, QueryDsl as _};
-    use diesel_async::RunQueryDsl as _;
-    executions::table
-        .find(exec_id.as_uuid())
-        .select((executions::id, executions::first_exec_id))
-        .first::<(uuid::Uuid, Option<uuid::Uuid>)>(conn)
-        .await
-        .optional()
-        .map(|row| row.map(|(id, first)| first.unwrap_or(id)))
-        .map_err(|error| HarvestError::Database(error.to_string()))
 }
 
 /// The typed failure of a failed run, from its last `WorkflowFailed` event.
@@ -1589,6 +1604,19 @@ fn terminal_outcome(
     }
 }
 
+/// The typed failure, or the answer when the route cannot read it.
+///
+/// The run failed, but its class is unknown. A passing read error answers
+/// pending, so a retry reads it again, and a short outage never turns a
+/// mapped failure into a final 500. A codec error answers
+/// `result-unavailable`.
+fn typed_or_answer(
+    read: HarvestResult<Option<TypedFailure>>,
+    layer_active: bool,
+) -> Result<Option<TypedFailure>, (DurableOutcomeKind, StatusCode)> {
+    read.map_err(|error| no_result_outcome(read_error(&error), layer_active))
+}
+
 /// The answer when the route has no result to report.
 ///
 /// A live run, or a read error that can pass, answers pending. A result that
@@ -1857,6 +1885,9 @@ mod tests {
             dedupe_digest("w", None, &principal("ab"), b"C"),
             dedupe_digest("w", None, &principal("ab"), b"\"c\""),
             dedupe_digest("wa", None, &principal("b"), b"c"),
+            // A value that moves from the tenant slot to the scope slot.
+            dedupe_digest("w", Some("x"), &Scope::Unscoped, b"c"),
+            dedupe_digest("w", None, &principal("x"), b"c"),
         ];
         for (i, a) in digests.iter().enumerate() {
             for b in &digests[i + 1..] {
@@ -2348,6 +2379,33 @@ mod tests {
             no_result_outcome(ReadFailure::Pending, true),
             (DurableOutcomeKind::Pending, StatusCode::CONFLICT)
         );
+        // The typed-failure read answers the same way. A passing error never
+        // turns a mapped failure into a final answer.
+        let typed = TypedFailure {
+            error_type: Some("OutOfStock".to_owned()),
+            details: None,
+        };
+        assert_eq!(
+            typed_or_answer(Ok(Some(typed.clone())), false),
+            Ok(Some(typed))
+        );
+        assert_eq!(
+            typed_or_answer(Err(HarvestError::Database("blip".to_owned())), false),
+            Err((DurableOutcomeKind::Pending, StatusCode::ACCEPTED))
+        );
+        assert_eq!(
+            typed_or_answer(Err(HarvestError::Database("blip".to_owned())), true),
+            Err((DurableOutcomeKind::Pending, StatusCode::CONFLICT))
+        );
+        assert_eq!(
+            typed_or_answer(Err(HarvestError::Codec("bad".to_owned())), false),
+            Err((
+                DurableOutcomeKind::Problem {
+                    slug: "result-unavailable"
+                },
+                StatusCode::INTERNAL_SERVER_ERROR
+            ))
+        );
         for layer_active in [false, true] {
             assert_eq!(
                 no_result_outcome(ReadFailure::Unreadable, layer_active),
@@ -2818,6 +2876,11 @@ mod tests {
         let done = chain.run(WorkflowResultState::Completed, None);
         let live = chain.run(WorkflowResultState::Running, None);
         let none = waiters(0);
+        // A finished chain needs no permit at any step.
+        let (sealed, start, end) = three_runs();
+        let walked =
+            wait_for_result(&sealed, &none, DEFAULT_MAX_CHAIN_STEPS, start, ONE_SECOND).await;
+        assert!(matches!(walked, Waited::Terminal { exec_id, .. } if exec_id == end));
         let finished =
             wait_for_result(&chain, &none, DEFAULT_MAX_CHAIN_STEPS, done, ONE_SECOND).await;
         assert!(
@@ -2838,6 +2901,23 @@ mod tests {
         assert!(matches!(waited, Waited::NoResult(ReadFailure::Pending)));
         assert_eq!(chain.waits(), 1);
         assert_eq!(one.available_permits(), 1, "the wait returns its permit");
+    }
+
+    // AC-80
+    #[tokio::test(start_paused = true)]
+    async fn the_engine_wait_is_cut_off_at_its_budget() {
+        // A listener connect that never ends reads as a live run at the budget.
+        let stalled = std::future::pending::<HarvestResult<Option<WorkflowResult>>>();
+        let cut = tokio::time::timeout(Duration::from_secs(60), wait_at_most(ONE_SECOND, stalled))
+            .await
+            .expect("the wait ends at its budget");
+        assert!(matches!(cut, Ok(None)));
+        // A wait that ends in time passes its result through.
+        let done = std::future::ready(Ok(Some(fake_result(WorkflowResultState::Completed))));
+        let passed = wait_at_most(ONE_SECOND, done).await;
+        assert!(
+            matches!(passed, Ok(Some(result)) if result.state == WorkflowResultState::Completed)
+        );
     }
 
     // ── Logs ──────────────────────────────────────────────────────────────────
@@ -2959,6 +3039,7 @@ mod tests {
         assert!(text.contains("outcome=\"unavailable\""), "{text}");
         assert!(text.contains("outcome=\"misconfigured\""), "{text}");
         assert!(text.contains("durable route setup error"), "{text}");
+        assert!(text.contains("the input does not serialize"), "{text}");
         for secret in ["secret-key-64", "secret-scope-64", "secret-input-64"] {
             assert!(!text.contains(secret), "{secret} in {text}");
         }

@@ -77,7 +77,7 @@ the start-idempotency claim (issue #808).
 | R7 | Lose the start when the client disconnects. | The start runs in a spawned task, so a dropped request still commits. The retry attaches through the claim. |
 | R8 | Pin a pool connection for the whole wait. | The spawned task drops the connection before the wait starts. |
 | R9 | Exhaust Postgres connections with waiters. | A semaphore caps the waiters (B16). A completed run needs no permit. |
-| R10 | Report a continue-as-new row as the final result. | The wait follows successors (B18). Each step reads one history and reaches the newest run of one type, or crosses one change of type. A chain needs at most one step more than its changes of type. `HarvestPlugin::durable_route_max_chain_steps` caps the steps (1024 by default). Past the cap, a chain whose runs all ended answers `result-unavailable`, because a retry walks the same sealed runs. A chain that still runs answers pending, because a retry can then need fewer steps. A cycle answers `result-unavailable` (R22). |
+| R10 | Report a continue-as-new row as the final result. | The wait follows successors (B18). Each step reads one history and reaches the newest run of one type, or crosses one change of type. A chain needs at most one step more than its changes of type. `HarvestPlugin::durable_route_max_chain_steps` caps the steps (1024 by default). Past the cap, a walk that read only ended runs answers `result-unavailable`, because a retry repeats the same walk over sealed runs. A walk that met a live run answers pending, because a retry can then need fewer steps. A cycle answers `result-unavailable` (R22). |
 | R11 | Leak the workflow error text, a codec envelope or an internal message. | The route never renders `WorkflowResult.error` or a `HarvestError` message. Problem bodies use fixed text. |
 | R12 | Leak the execution id, which is the management API handle. | The id header is opt-in. |
 | R13 | Replay an erasure tombstone as a success. | A tombstone answers `410` (F14). |
@@ -89,7 +89,7 @@ the start-idempotency claim (issue #808).
 | R19 | Fail every request for a debounce, batch or throttle workflow with a confusing error. | `500` misconfigured, with an error log that names the cause. A name that is not a registered workflow answers the same way. |
 | R20 | Put the key, scope or input into logs or metrics. | The tracing span records the workflow, route, outcome, creation flag and execution id only. A quota error log names the resource, not the quota key, because that key can come from the input. |
 | R21 | Let Autumn's layer replay one token client's cached answer to another client. The layer keys by session cookie, not by scope. | The docs advise against `.idempotent()` for token APIs. The route logs one warning when it sees the layer and an `Authorization` header. |
-| R22 | Strand a retry on a long continue-as-new chain, because each retry walks the chain from its start. | A same-type chain takes one step, a business-id lookup to its newest run. Each change of workflow type costs at most one more step. A visited set stops a cycle. |
+| R22 | Strand a retry on a long continue-as-new chain, because each retry walks the chain from its start. | A same-type chain takes one step, a lookup of the newest run of the chain with the business id. Each change of workflow type, and each workflow-level retry, costs at most one more step. A visited set stops a cycle. |
 | R23 | Copy, validate, encrypt and insert a 32 MiB body before the 2 MiB input cap rejects it. | The route compares the canonical input length with the workflow's effective cap before any I/O, and answers `413`. |
 | R24 | Turn a mapped failure into a final `500` because a history read failed once. | A failed typed-failure read follows the read-error policy: pending, or `result-unavailable` for a codec error. |
 | R25 | Keep a plaintext copy of the output in Autumn's cache, out of reach of the codec and of erasure. | The guide states it and advises against the layer for routes whose output holds personal data. |
@@ -182,8 +182,11 @@ listener connect cannot overrun the budget. On a `CONTINUED_AS_NEW` result the
 route resolves the live attempt and looks up the newest run with the same
 business id. A same-type chain of any length takes one lookup. A successor
 of another type comes from the continue-as-new event. A visited set stops a
-cycle. Each successor read is one step. The first read of the started run is
-free. The walk takes at most `durable_route_max_chain_steps` steps (1024 by
+cycle. Each successor lookup is one step. The first read of the started run is
+free. The lookup finds the newest run of this chain with the business id, so
+an operator rerun, which starts its own chain, never stands in for it. A step
+also crosses one workflow-level retry, so a chain needs at most one step more
+than its changes of type and its retries. The walk takes at most `durable_route_max_chain_steps` steps (1024 by
 default). Past the cap it answers `result-unavailable` when every run it read
 had ended, and pending when it met a live run. The walk reads runs through a private
 trait, so unit tests drive it on a fake chain.
@@ -241,7 +244,7 @@ advise against the layer in such an app.
 ## 2. Known limits
 
 - Postgres plugin runtime only. No SQLite runtime and no `HarvestEmbedding`.
-  The plugin refuses a pool of more than one shard, so a durable route runs
+  There, a durable route answers `503` `unavailable`. The plugin refuses a pool of more than one shard, so a durable route runs
   on one shard. The chain and failure reads still bind to the shard of the
   live attempt, as the contract of `resolve_live_attempt` requires.
 - No status monitor and no `Location`. A pending client must keep the body
@@ -249,14 +252,16 @@ advise against the layer in such an app.
 - The input must be a pure function of the request and the principal. A
   server-made value in the input makes every retry a `422`.
 - A key binds its input for `start_idempotency_window` (24 h by default).
-  After that, the same input attaches to the original run until retention
-  deletes it, and the attach binds the key again. Another input under an
-  expired key starts a new run.
+  After that, the same input attaches to the run that holds the business id
+  until retention deletes it, and the attach binds the key again. That is
+  the original run, unless an operator rerun or reset gave the business id
+  to a newer run. Another input under an expired key starts a new run.
 - After the window, a retry of a terminated run, or of a run that continued
   as new into another type, starts a new run. Those runs no longer hold the
   business id.
 - Erasure works on one execution. A durable run with retries or a
-  continue-as-new chain needs each execution erased.
+  continue-as-new chain needs each execution erased. The output lives on the
+  last run, so erasing the first run alone keeps it.
 - The input-size check uses the current cap, before the claim probe. A retry
   of an accepted input gets `413` when an operator lowers the cap.
 - The route counts its deadline from the time it reads the request.
@@ -269,7 +274,8 @@ advise against the layer in such an app.
 - Each waiting request holds one `LISTEN` connection. The waiter cap (default
   32 for each process) is the only bound.
 - A per-route `timeout_ms` is invisible to the handler. Set `wait` below it.
-- A reset seal reads as `terminated`. A paused run reads as pending.
+- A reset seal reads as `terminated` within the claim window. A paused run
+  reads as pending.
 - Untyped failures (`Err(String)`) cannot be mapped.
 - The key and fingerprint hashes are unsalted SHA-256. Keys must be random.
 - No OpenAPI response schema for a handler that returns `DurableOutcome`.
@@ -291,9 +297,10 @@ advise against the layer in such an app.
   report the failure. A reset of a live run reads as `cancelled` in the MCP
   task tools.
 - After an operator rerun, a retry of the original request gets the outcome
-  that the original run recorded. A rerun starts its own chain, so the
-  business-id jump skips it, also after a rerun of a chain's last run.
-  `failure_status` still maps its typed failure.
+  that the original run recorded, within the claim window. A rerun starts
+  its own chain, so the chain-scoped jump skips it, also after a rerun of a
+  chain's last run. `failure_status` still maps its typed failure. After the
+  window, the retry attaches to the rerun, which holds the business id.
 
 ---
 
@@ -310,12 +317,12 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | AC-03 | An empty scope, an input that does not serialize, or an invalid status answers `500` misconfigured before any I/O. | `misconfigured_call_returns_500_before_any_io` |
 | AC-04 | The key policy table holds for absent, empty, repeated, non-ASCII and 256-byte keys. | `key_policy_table` |
 | AC-05 | A pinned golden vector gives the 81-byte claim key, and Harvest's key validator accepts it. | `dedupe_key_golden_vector` |
-| AC-06 | Shifted component boundaries, tenant presence, scope presence and workflow names never collide. | `dedupe_key_components_never_collide` |
+| AC-06 | Shifted component boundaries, tenant presence, scope presence, a value moved between the tenant and the scope, and workflow names never collide. | `dedupe_key_components_never_collide` |
 | AC-07 | Object key order, also from a map type that keeps insertion order, does not change the fingerprint. Array order and the raw key do. | `fingerprint_is_order_independent_and_keyed`, `fingerprint_ignores_object_key_order` (property) |
 | AC-08 | The `workflow_id` is 69 bytes, parses back, and a foreign id is a mismatch. | `workflow_id_round_trips_and_rejects_foreign_ids` |
 | AC-09 | Every `WorkflowResultState` maps to the documented status, with the layer on and off. | `status_map_covers_every_workflow_result_state`, `failure_mapping_uses_the_last_status_and_spots_erasure` |
 | AC-10 | Start errors map to the documented statuses. Every pool, shard, load and database error answers `503` with a `Retry-After` of at least 1 s. No error text reaches the body. | `start_errors_map_to_public_statuses`, `retryable_start_errors_answer_503_with_retry_after` |
-| AC-11 | Codec read errors and a retry chain past the engine's walk depth give `result-unavailable`. Other read errors give pending. The wait and the typed-failure read share one answer. | `read_errors_map_to_result_unavailable_or_pending` |
+| AC-11 | Codec read errors and a retry chain past the engine's walk depth give `result-unavailable`. Other read errors give pending. The typed-failure read answers through the same policy, so a passing error never makes a mapped failure final. | `read_errors_map_to_result_unavailable_or_pending` |
 | AC-12 | The wait budget defaults to 5 s, clamps to 30 s and to the request deadline less 2 s. | `wait_budget_is_clamped` |
 | AC-13 | Every problem has the URN type, the code and fixed text. | `problem_bodies_never_carry_internal_text` |
 | AC-14 | The replay header needs a found run. The id header needs `expose_execution_id()`, also on a replay. | `replayed_and_execution_id_headers` |
@@ -350,8 +357,8 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | AC-43 | The run memo names the method and route, and holds no key, scope or input. | `run_memo_names_the_route` |
 | AC-44 | The docs status table lists exactly the problem slugs. | `status_table_matches_problem_slugs` |
 | AC-45 | The docs page has inbound links from the idempotency chapter and the architecture guide. | `page_is_linked_from_the_idempotency_chapter_and_architecture` |
-| AC-46 | The docs page states the client rule, the key guidance, both deadline margins, the per-route timeout rule, the token-API and plaintext-cache warnings, the step cap and the `#[intercept]` warning. | `page_states_layer_timeout_and_key_guidance` |
-| AC-47 | Every test this table names exists in the plugin sources or tests. The note keeps its planning sections, a mitigation for each harm, and its known limits. | `design_note_ac_table_names_existing_tests`, `design_note_keeps_its_planning_sections` |
+| AC-46 | The docs page states the client rule, the key guidance, both deadline margins, the per-route timeout rule, the token-API and plaintext-cache warnings, the layer advice, the cap answer and the `#[intercept]` warning. The waiter default and the step cap match the code constants. | `page_states_layer_timeout_and_key_guidance` |
+| AC-47 | Every test this table names is a test function in the plugin sources or tests. The note keeps its planning sections, its facts and brainstorm rows, a mitigation for each harm, and its key known limits. | `design_note_ac_table_names_existing_tests`, `design_note_keeps_its_planning_sections` |
 | AC-48 | One changelog fragment describes the feature and states "No migration" and "No new `WorkflowEvent`". | `changelog_fragment_describes_the_feature` |
 | AC-49 | Both new test binaries have a sorted row in `.github/ci/integration-suites.txt`. | Existing `ci_run_coverage.rs` suite |
 | AC-50 | Comment hygiene adds no Tier A defect and no Tier B regression. | `docs/audits/comment-hygiene.py --base origin/trunk-dev` |
@@ -366,21 +373,26 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | AC-59 | Each successor read is one step, and a run with no successor needs none. Past the step cap, a walk over ended runs answers `result-unavailable`, and a walk that met a live run answers pending. The default cap is 1024. | `chain_walk_answers_pending_past_the_step_cap` |
 | AC-60 | A cycle in a chain answers `result-unavailable`. | `chain_walk_stops_at_a_cycle` |
 | AC-61 | A codec error in the snapshot, the wait or the successor read answers `result-unavailable`. Another read error answers pending. | `chain_walk_maps_read_errors` |
-| AC-62 | Only a wait takes a permit. A full cap or a zero budget never waits, and a wait returns its permit. | `chain_walk_takes_a_permit_only_to_wait` |
+| AC-62 | Only a wait takes a permit. A finished chain, a full cap or a zero budget never waits, and a wait returns its permit. | `chain_walk_takes_a_permit_only_to_wait` |
 | AC-63 | The schema log holds the count and at most five field paths, never a message. The quota log holds no quota key. | `start_error_logs_hold_no_input_values` |
-| AC-64 | The span records the workflow, the route, the creation flag, the execution id and the outcome. No route log holds the key, the scope or the input. A setup log names its cause. | `send_logs_hold_no_key_scope_or_input`, `durable_route_logs_hold_no_key_scope_or_input` |
+| AC-64 | The span records the workflow, the route, the creation flag, the execution id and the outcome. No route log holds the key, the scope or the input. The route's setup log and the engine's setup log name their cause. | `send_logs_hold_no_key_scope_or_input`, `durable_route_logs_hold_no_key_scope_or_input` |
 | AC-65 | Under Autumn's layer with an `Authorization` header, the route warns once. | `layer_with_authorization_warns_once` |
 | AC-66 | The outcome accessors expose the kind, the status, the execution id, the replay flag and the output. A missing output decodes from `null`. | `outcome_accessors_expose_the_result` |
 | AC-67 | The status column of the docs table matches the code for each problem slug. | `status_table_statuses_match_the_code` |
 | AC-68 | With Autumn's layer, a duplicate in flight gets Autumn's `409` with `Retry-After: 1`. It skips the route and starts no run. | `idempotent_layer_answers_in_flight_duplicate` |
 | AC-69 | A stored output under an unknown codec answers a final `500` `result-unavailable`. | `undecodable_output_returns_result_unavailable` |
 | AC-70 | Failure details under an unknown codec answer `result-unavailable` to a mapped call and `failed` to an unmapped call. | `undecodable_typed_failure_returns_result_unavailable` |
-| AC-71 | A same-type chain takes one step, so a cap of one reaches the end of an eleven-run chain. | `same_type_chain_takes_one_step` |
+| AC-71 | A same-type chain takes one step, so a cap of one reaches the end of an eleven-run chain. A walk that met a live run answers pending at the cap. | `same_type_chain_takes_one_step` |
 | AC-72 | A chain with two changes of workflow type needs two steps. A cap of one answers a final `result-unavailable`, and a cap of two gives the final output. | `chain_step_cap_answers_result_unavailable`, `chain_step_cap_admits_one_step_for_each_change_of_type` |
 | AC-73 | An oversized input answers `413` before any I/O, while every start stalls. | `oversized_input_is_refused_before_any_io` |
 | AC-74 | A workflow's raised input cap admits an input over the deployment cap. | `raised_input_cap_admits_a_larger_input` |
 | AC-75 | An unscoped route shares one key space. A same-key retry attaches, another body gets `422`, and a scoped key is separate. | `unscoped_route_shares_one_key_space` |
 | AC-76 | After an operator rerun that ends another way, a mapped failure, a cancelled run and a timed-out run keep their own outcome. | `rerun_sealed_failures_report_their_original_outcome` |
 | AC-77 | The scope is mandatory by type. `call` does not compile before `scope` or `unscoped`. | `DurableRoute` doctest (compile-fail) |
-| AC-78 | The waiter cap and the step cap have their defaults. A step cap of `0` counts as `1`. | `durable_route_limits_have_defaults_and_a_floor` |
-| AC-79 | After an operator reruns the last run of a chain, a retry of the original request gets the original output. The business-id jump skips a run of another chain. | `rerun_of_a_chain_end_keeps_the_original_outcome` |
+| AC-78 | The waiter cap defaults to 32 and the step cap to 1024. A step cap of `0` counts as `1`. | `durable_route_limits_have_defaults_and_a_floor` |
+| AC-79 | After an operator reruns the last run of an eleven-run chain, a retry of the original request gets the original output in one step. The chain-scoped jump skips the rerun's chain. | `rerun_of_a_chain_end_keeps_the_original_outcome` |
+| AC-80 | The engine wait is cut off at its budget, and a cut-off wait reads as a live run. | `the_engine_wait_is_cut_off_at_its_budget` |
+| AC-81 | After the claim window, a terminated run's key starts a new run, and a rerun's key attaches to the rerun. | `after_the_window_the_business_id_holder_answers` |
+| AC-82 | Erasing the first run of a chain keeps the final output, and the id header still names the first run. | `erasing_the_first_run_of_a_chain_keeps_the_final_output` |
+| AC-83 | A durable run has no Harvest tenant, records the `transactional` start source, and its task holds no trace from the request. | `durable_runs_have_no_tenant_and_record_the_transactional_source` |
+| AC-84 | The CI manifest runs the docs guards on all OSes and the Postgres suite on Linux. | `ci_manifest_lists_both_durable_route_suites` |
