@@ -307,7 +307,10 @@ pub(super) async fn produce(
         let positioning = walk.attempt < cursor.attempt;
         // The state comes first. A terminal cycle commits its chunks and its
         // successor with its state, so the reads after an end see both.
-        let state = logged(reads.state(walk.current).await);
+        let Some(state) = budgeted(drain_until, reads.state(walk.current)).await else {
+            return send_pending(sink).await;
+        };
+        let state = logged(state);
         let drained = match state {
             None => false,
             Some(RunState::Gone) => return finish(sink, unavailable_frame(), drain_until).await,
@@ -320,7 +323,10 @@ pub(super) async fn produce(
             },
         };
         if drained && state == Some(RunState::Ended) {
-            match logged(reads.next_run(walk.current).await) {
+            let Some(next) = budgeted(drain_until, reads.next_run(walk.current)).await else {
+                return send_pending(sink).await;
+            };
+            match logged(next) {
                 Some(Some((next, cause))) => {
                     if !walk.step(next) {
                         return finish(sink, unavailable_frame(), drain_until).await;
@@ -344,7 +350,10 @@ pub(super) async fn produce(
                 // The lineage ends here. A pending answer can change at the
                 // next read, so read again.
                 Some(None) => {
-                    if let Some(frame) = final_frame(&reads.outcome().await) {
+                    let Some(outcome) = budgeted(drain_until, reads.outcome()).await else {
+                        return send_pending(sink).await;
+                    };
+                    if let Some(frame) = final_frame(&outcome) {
                         return finish(sink, frame, drain_until).await;
                     }
                 }
@@ -355,6 +364,14 @@ pub(super) async fn produce(
             return end;
         }
     }
+}
+
+/// Run `read` until `until`. `None` means that the deadline came first.
+///
+/// Every read of the stream goes through here. A read that a busy pool
+/// slows therefore cannot hold the slot past the budget.
+async fn budgeted<T>(until: Instant, read: impl Future<Output = T>) -> Option<T> {
+    tokio::time::timeout_at(until, read).await.ok()
 }
 
 /// The value of `read`, or `None` after it logs the error.
@@ -420,7 +437,10 @@ async fn drain(
     until: Instant,
 ) -> Drain {
     loop {
-        let Some(page) = logged(reads.chunks(walk.current, *offset, PAGE).await) else {
+        let Some(page) = budgeted(until, reads.chunks(walk.current, *offset, PAGE)).await else {
+            return Drain::Expired;
+        };
+        let Some(page) = logged(page) else {
             return Drain::Failed;
         };
         let full = i64::try_from(page.len()).unwrap_or(i64::MAX) >= PAGE;
@@ -1788,6 +1808,20 @@ mod tests {
                 progress(0, 2),
                 Frame::Pending
             ]
+        );
+        // A read that crosses the deadline is cut at the deadline.
+        let mut fake = Fake::new(completed(json!("done")));
+        let root = fake.run(true, 1, None);
+        fake.read_delay = Duration::from_secs(60);
+        let started = Instant::now();
+        let mut sink = Recorder::default();
+        let end = produce(&mut fake, &mut sink, root, Cursor::default(), 1024, started).await;
+        assert_eq!(end, StreamEnd::Pending);
+        assert_eq!(sink.frames, vec![Frame::Pending]);
+        assert_eq!(
+            started.elapsed(),
+            DRAIN_FLOOR,
+            "the read ends at the deadline"
         );
         // A slow read after the drain crosses the deadline. The final frame
         // then becomes `pending`.
