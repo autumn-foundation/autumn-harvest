@@ -9641,12 +9641,10 @@ impl WorkflowContext {
         // this does not claim replay-safety across a cap change (see the
         // fan-out `validate_child_payload_caps` note).
         let fresh_dispatch = !self.match_history(|m| m.peek_child_start_at_cursor(&timer_id));
-        if fresh_dispatch {
-            self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
-        }
         // Issue #1984: a scope that replays its cancel holds this dispatch.
         // The cap applied when the cancelling cycle made it.
         if fresh_dispatch && !self.replays_a_scope_cancel() {
+            self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
             let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
             if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input {
                 return Err(HarvestError::PayloadTooLarge {
@@ -12707,13 +12705,13 @@ impl WorkflowContext {
         fresh_dispatch: bool,
         children: &[(String, Value)],
     ) -> HarvestResult<()> {
-        if fresh_dispatch {
+        // Issue #1984: a scope that replays its cancel holds these dispatches.
+        // The cap applied when the cancelling cycle made them.
+        if fresh_dispatch && !self.replays_a_scope_cancel() {
             for (_, input) in children {
                 self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, input)?;
             }
         }
-        // Issue #1984: a scope that replays its cancel holds these dispatches.
-        // The cap applied when the cancelling cycle made them.
         if !fresh_dispatch || self.payload_max_workflow_input == 0 || self.replays_a_scope_cancel()
         {
             return Ok(());
@@ -13556,15 +13554,12 @@ impl WorkflowContext {
         // The caps applied when the cancelling cycle made them.
         let replays_a_scope_cancel = self.replays_a_scope_cancel();
         for dispatch in &to_dispatch {
-            if !dispatch.is_new {
+            if !dispatch.is_new || replays_a_scope_cancel {
                 continue;
             }
             match &branches[dispatch.index].kind {
                 RaceBranchKind::Activity { name, input, .. } => {
                     self.check_payload_depth(PayloadKind::ActivityInput, Some(name), input)?;
-                    if replays_a_scope_cancel {
-                        continue;
-                    }
                     let effective_cap = {
                         let global = self.payload_max_activity_input;
                         self.activity_input_cap_overrides
@@ -13588,9 +13583,6 @@ impl WorkflowContext {
                 }
                 RaceBranchKind::ChildWorkflow { input, .. } => {
                     self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, input)?;
-                    if replays_a_scope_cancel {
-                        continue;
-                    }
                     let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
                     if self.payload_max_workflow_input > 0
                         && observed > self.payload_max_workflow_input
