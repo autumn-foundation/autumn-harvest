@@ -315,7 +315,7 @@ live in `autumn-harvest-plugin/tests/durable_route_docs.rs`.
 | AC-08 | The `workflow_id` is 69 bytes, parses back, and a foreign id is a mismatch. | `workflow_id_round_trips_and_rejects_foreign_ids` |
 | AC-09 | Every `WorkflowResultState` maps to the documented status, with the layer on and off. | `status_map_covers_every_workflow_result_state`, `failure_mapping_uses_the_last_status_and_spots_erasure` |
 | AC-10 | Start errors map to the documented statuses. Every pool, shard, load and database error answers `503` with a `Retry-After` of at least 1 s. No error text reaches the body. | `start_errors_map_to_public_statuses`, `retryable_start_errors_answer_503_with_retry_after` |
-| AC-11 | Codec read errors give `result-unavailable`. Other read errors give pending. The wait and the typed-failure read share one answer. | `read_errors_map_to_result_unavailable_or_pending` |
+| AC-11 | Codec read errors and a retry chain past the engine's walk depth give `result-unavailable`. Other read errors give pending. The wait and the typed-failure read share one answer. | `read_errors_map_to_result_unavailable_or_pending` |
 | AC-12 | The wait budget defaults to 5 s, clamps to 30 s and to the request deadline less 2 s. | `wait_budget_is_clamped` |
 | AC-13 | Every problem has the URN type, the code and fixed text. | `problem_bodies_never_carry_internal_text` |
 | AC-14 | The replay header needs a found run. The id header needs `expose_execution_id()`, also on a replay. | `replayed_and_execution_id_headers` |

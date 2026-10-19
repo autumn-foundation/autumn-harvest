@@ -1501,10 +1501,12 @@ enum ReadFailure {
     Unreadable,
 }
 
-/// A codec failure needs an operator, so it is not pending. Any other read
-/// error can pass, and the run exists, so the client retries.
+/// A codec failure needs an operator, so it is not pending. A retry chain
+/// past the engine's walk depth only grows, so that error is final too. Any
+/// other read error can pass, and the run exists, so the client retries.
 const fn read_failure(error: &HarvestError) -> ReadFailure {
-    if error.is_codec_failure() {
+    if error.is_codec_failure() || matches!(error, HarvestError::RetryChainMaxDepthExceeded { .. })
+    {
         ReadFailure::Unreadable
     } else {
         ReadFailure::Pending
@@ -2313,6 +2315,11 @@ mod tests {
             HarvestError::UnknownCodecKey {
                 key_id: "k".to_owned(),
                 codec_id: "c".to_owned(),
+            },
+            // A retry chain past the walk depth never shrinks.
+            HarvestError::RetryChainMaxDepthExceeded {
+                exec_id: ExecutionId::new(),
+                max_depth: 256,
             },
         ];
         for error in unreadable {

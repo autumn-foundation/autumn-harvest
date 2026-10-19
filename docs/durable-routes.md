@@ -96,7 +96,7 @@ A key binds its body. A retry with another body under the same key gets a
 | The run was terminated. | 500 | `terminated` |
 | The run exceeded its execution timeout. | 500 | `timed-out` |
 | PII erasure removed the result. | 410 | `erased` |
-| The server cannot decode the result, or cannot reach the end of its chain. | 500 | `result-unavailable` |
+| The server cannot decode the result, or cannot reach the end of its chain or of its retries. | 500 | `result-unavailable` |
 
 A problem body is `application/problem+json` (RFC 9457). Its `type` is
 `urn:autumn-harvest:durable-route:<slug>` and its `code` is
@@ -136,7 +136,8 @@ A live run waits for up to the budget.
   `result-unavailable`, because each retry walks the same runs. A chain that
   loops back answers `result-unavailable` too.
 - A read error other than a codec error also answers pending, because the
-  run exists.
+  run exists. A workflow-level retry chain past the engine's walk depth
+  (256 attempts) answers `result-unavailable`, because it never shrinks.
 
 ## With Autumn's idempotency layer
 
