@@ -1,4 +1,4 @@
-## Feature — Durable streaming: a durable route that answers with a resumable SSE stream
+## Feature — Durable streaming: a durable route that answers with a resumable SSE stream (PR #2246)
 
 `DurableCall::stream()` in `autumn-harvest-plugin` joins durable routes (PR
 #2223) and durable streams (issue #1974). A route starts or attaches to its
