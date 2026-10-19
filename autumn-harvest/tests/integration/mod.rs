@@ -242,6 +242,8 @@ mod pause_tests;
 #[cfg(feature = "testing")]
 mod payload_cap_tests;
 #[cfg(feature = "db")]
+mod payload_depth_tests;
+#[cfg(feature = "db")]
 mod payload_offload_db_tests;
 #[cfg(feature = "testing")]
 mod payload_offload_replay_tests;

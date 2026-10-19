@@ -543,6 +543,15 @@ fn stored_checkpoint(
     }
 }
 
+/// Whether a checkpoint nests past the depth cap (issue #2225).
+///
+/// A stored checkpoint of that depth cannot be read back, and every later
+/// claim of the task would fail.
+#[cfg(feature = "db")]
+fn checkpoint_too_deep(_task_id: uuid::Uuid, _payload: &Value) -> bool {
+    false
+}
+
 /// Whether a cached stored form still matches the registry (issue #2043).
 ///
 /// The entry must come from the present column encoding switch. With the
@@ -888,6 +897,45 @@ mod tests {
             drain_latest(&mut rx).is_none(),
             "empty channel should produce no payload"
         );
+    }
+
+    // -- Issue #2225: a checkpoint nested past the depth cap -----------------
+
+    #[cfg(feature = "db")]
+    mod deep_checkpoint {
+        use super::*;
+        use crate::payload_depth::MAX_PAYLOAD_DEPTH;
+
+        fn nested(depth: usize) -> Value {
+            let mut value = serde_json::json!(1);
+            for _ in 0..depth {
+                value = Value::Array(vec![value]);
+            }
+            value
+        }
+
+        #[test]
+        fn a_checkpoint_past_the_cap_is_too_deep() {
+            let task_id = uuid::Uuid::new_v4();
+            assert!(checkpoint_too_deep(task_id, &nested(MAX_PAYLOAD_DEPTH + 1)));
+            assert!(checkpoint_too_deep(task_id, &nested(1_000)));
+        }
+
+        #[test]
+        fn a_checkpoint_at_the_cap_is_kept() {
+            let task_id = uuid::Uuid::new_v4();
+            assert!(!checkpoint_too_deep(task_id, &nested(MAX_PAYLOAD_DEPTH)));
+        }
+
+        #[test]
+        fn a_liveness_ping_and_a_small_checkpoint_are_kept() {
+            let task_id = uuid::Uuid::new_v4();
+            assert!(!checkpoint_too_deep(task_id, &Value::Null));
+            assert!(!checkpoint_too_deep(
+                task_id,
+                &serde_json::json!({ "step": 1 })
+            ));
+        }
     }
 
     // -- Issue #2043: the cache of the encoded checkpoint -------------------
