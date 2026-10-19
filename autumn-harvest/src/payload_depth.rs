@@ -4,6 +4,10 @@
 //! stored value that deep makes every later drive of the run fail. The
 //! context refuses such a value at the call site, as it does for the size
 //! caps. The workflow sees a typed error and can handle it.
+//!
+//! The walk does not recurse. Dropping or serializing a value thousands of
+//! levels deep still recurses in `serde_json`, so the cap is sound for the
+//! range that a workflow builds by hand, not for a hostile value.
 
 use serde_json::Value;
 

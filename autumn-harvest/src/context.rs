@@ -15709,15 +15709,16 @@ impl WorkflowContext {
 
     /// Refuse a payload that nests past the depth cap (issue #2224).
     ///
-    /// The check reads the value only. It gives the same answer on live and
-    /// replay runs, so it needs no replay guard.
+    /// A scope that replays its cancel holds its dispatches (issue #1984). The
+    /// cap applied when the cancelling cycle made them, so the check skips them
+    /// and an older recorded cancel still replays.
     fn check_payload_depth(
         &self,
         kind: PayloadKind,
         activity_name: Option<&str>,
         value: &Value,
     ) -> HarvestResult<()> {
-        if crate::payload_depth::nests_past_cap(value) {
+        if !self.replays_a_scope_cancel() && crate::payload_depth::nests_past_cap(value) {
             return Err(HarvestError::PayloadTooDeep {
                 kind,
                 cap_depth: crate::payload_depth::MAX_PAYLOAD_DEPTH,
