@@ -6852,9 +6852,8 @@ impl WorkflowContext {
                 )
             }
             HistoryMatch::NoMatch => {
-                self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
-
                 self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
+                self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
 
                 // Enforce activity input payload cap before scheduling.
                 let effective_cap = {
@@ -7176,9 +7175,8 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
-                self.check_strict_replay_no_match(&format!("LocalActivityScheduled({name})"))?;
-
                 self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
+                self.check_strict_replay_no_match(&format!("LocalActivityScheduled({name})"))?;
 
                 // Enforce activity input payload cap for local activities too.
                 let effective_cap = {
@@ -9020,11 +9018,10 @@ impl WorkflowContext {
                 }
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
                 self.check_strict_replay_no_match(&format!(
                     "ChildWorkflowStarted({workflow_name})"
                 ))?;
-
-                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
 
                 // Enforce child-workflow input payload cap before scheduling.
                 // ChildWorkflowStarted is written to the parent's history via
@@ -9184,11 +9181,10 @@ impl WorkflowContext {
                 Ok(child_id)
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
                 self.check_strict_replay_no_match(&format!(
                     "ChildWorkflowSpawnedDetached({workflow_name})"
                 ))?;
-
-                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
 
                 // Enforce child-workflow input payload cap before scheduling.
                 // ChildWorkflowSpawnedDetached is written via pre_suspension_events_from_commands
@@ -14253,9 +14249,8 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
-                self.check_strict_replay_no_match(&format!("ExternalActivityScheduled({name})"))?;
-
                 self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
+                self.check_strict_replay_no_match(&format!("ExternalActivityScheduled({name})"))?;
 
                 // First time — generate a fresh token and schedule.
                 let activity_id = self.next_activity_id();
@@ -14606,8 +14601,8 @@ impl WorkflowContext {
                 ))
             }
             HistoryMatch::NoMatch => {
-                self.check_strict_replay_no_match("ContinueAsNew")?;
                 self.check_payload_depth(PayloadKind::WorkflowInput, None, &input)?;
+                self.check_strict_replay_no_match("ContinueAsNew")?;
                 // Issue #1161: check the cap only for a SAME-type
                 // continuation. `self.payload_max_workflow_input` is
                 // resolved for the CURRENT type, which is also the successor
@@ -33789,6 +33784,16 @@ mod payload_depth_tests {
             ctx.drain_commands().is_empty(),
             "no marker and no earlier activity is queued"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_replay_reproduces_the_refusal_not_a_divergence() {
+        let ctx = WorkflowContext::for_replay_strict(crate::types::ExecutionId::new(), Vec::new());
+        let err = ctx
+            .execute_activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), "default")
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
     }
 
     #[tokio::test]
