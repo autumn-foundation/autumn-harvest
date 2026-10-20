@@ -645,3 +645,10 @@ harness = false
 name = "dag_simulator_profile"
 required-features = ["testing"]
 harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count harness for the
+# static DAG tooling: `DagLinter`, `DagProfiler` and `export_chrome_trace`.
+[[bench]]
+name = "dag_tooling_profile"
+required-features = ["testing"]
+harness = false
