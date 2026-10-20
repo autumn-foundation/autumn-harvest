@@ -63,6 +63,7 @@
 #[cfg(feature = "db")]
 use crate::error::HarvestError;
 use crate::error::HarvestResult;
+use crate::queue::release_claim_prefix;
 #[cfg(feature = "db")]
 use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
@@ -315,26 +316,6 @@ pub async fn release_claim_if_queue_paused(
         worker_id,
     )
     .await
-}
-
-/// The shared prefix of both claim-release statements.
-///
-/// A macro rather than a `const` so the two `const fn`s below can `concat!` it
-/// with their own tail at compile time. Both releases must restore `attempt`
-/// and be guarded on `state = 'RUNNING' AND worker_id = $2` identically; keeping
-/// one copy makes that structural rather than a convention two sites must
-/// remember.
-macro_rules! release_claim_prefix {
-    () => {
-        "UPDATE harvest_task_queue \
-         SET state = 'PENDING', \
-             worker_id = NULL, \
-             started_at = NULL, \
-             attempt = GREATEST(attempt - 1, 0) \
-         WHERE id = $1 \
-           AND state = 'RUNNING' \
-           AND worker_id = $2"
-    };
 }
 
 /// SQL for [`release_claim_if_queue_paused`], exposed for shape tests.

@@ -5466,7 +5466,8 @@ pub async fn pause_workflow_execution(
 /// pause committed before it began.
 ///
 /// Restores `attempt`. The task never ran, so a hold must not consume retry
-/// budget. The queue-pause and activity-pause siblings do the same.
+/// budget. The queue-pause and activity-pause siblings do the same, via the
+/// identical [`crate::queue::release_claim_prefix`] shared prefix.
 ///
 /// Scoped to `task_type = 'workflow'`. A pause holds new workflow dispatch
 /// only. An activity task can carry the same `workflow_exec_id`. This
@@ -5475,18 +5476,13 @@ pub async fn pause_workflow_execution(
 /// in-flight or pending activities.
 #[must_use]
 pub const fn release_claim_if_workflow_paused_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET state = 'PENDING', \
-         worker_id = NULL, \
-         started_at = NULL, \
-         attempt = GREATEST(attempt - 1, 0) \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2 \
-       AND task_type = 'workflow' \
-       AND EXISTS (SELECT 1 FROM harvest_workflow_executions e \
-           WHERE e.id = harvest_task_queue.workflow_exec_id \
-             AND e.state = 'PAUSED')"
+    concat!(
+        crate::queue::release_claim_prefix!(),
+        " AND task_type = 'workflow' \
+           AND EXISTS (SELECT 1 FROM harvest_workflow_executions e \
+               WHERE e.id = harvest_task_queue.workflow_exec_id \
+                 AND e.state = 'PAUSED')"
+    )
 }
 
 /// Releases a just-claimed workflow task back to `PENDING` when its owning
