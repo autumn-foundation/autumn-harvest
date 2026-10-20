@@ -573,7 +573,8 @@ async fn a_panic_seal_past_the_cap_leaves_no_staged_signal() {
     assert_eq!(undelivered(&path, exec), 0, "no row stays on a sealed run");
 }
 
-/// Spawns a child, which this backend does not support, when it reads `spawn`.
+/// Runs a local activity, which this backend does not support, when it reads
+/// `spawn`.
 #[workflow]
 async fn spawn_on_signal(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     if ctx
@@ -583,7 +584,7 @@ async fn spawn_on_signal(ctx: &WorkflowContext, _n: i64) -> Result<Value, String
     {
         return Ok(Value::Null);
     }
-    ctx.spawn_child_workflow_raw("child", json!({}))
+    ctx.execute_activity_external("external", json!({}), "default", 60)
         .await
         .map_err(|e| e.to_string())
 }

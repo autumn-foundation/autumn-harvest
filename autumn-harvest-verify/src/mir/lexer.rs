@@ -7,14 +7,15 @@
 //! nothing here may split on a bare byte. Every helper is tolerant: unbalanced
 //! or truncated input yields `None` or a best-effort answer, never a panic.
 
-/// Calls `f(index, byte, depth)` for every byte outside a string literal,
-/// stopping early when `f` returns `false`.
+/// Calls `f(index, byte, depth)` for every byte outside a string or char
+/// literal, stopping early when `f` returns `false`.
 ///
 /// `depth` is the nesting depth *outside* the delimiter at `index`, so an
 /// opening bracket and its matching closer are both reported at the same
 /// depth. `->` and `=>` are recognised as arrows, so their `>` does not close
 /// a generic argument list; double-quoted strings are skipped wholesale
-/// because MIR assert messages contain `{}` and quotes.
+/// because MIR assert messages contain `{}` and quotes. A char literal is
+/// skipped the same way, because `const ']'` and `const ','` are operands.
 pub fn walk(s: &str, mut f: impl FnMut(usize, u8, u32) -> bool) {
     let bytes = s.as_bytes();
     let mut depth: u32 = 0;
@@ -41,6 +42,13 @@ pub fn walk(s: &str, mut f: impl FnMut(usize, u8, u32) -> bool) {
             i += 1;
             continue;
         }
+        if c == b'\''
+            && let Some(len) = char_literal_len(bytes, i)
+        {
+            prev = c;
+            i += len;
+            continue;
+        }
         let reported = match c {
             b'(' | b'[' | b'{' | b'<' => {
                 let outer = depth;
@@ -63,6 +71,33 @@ pub fn walk(s: &str, mut f: impl FnMut(usize, u8, u32) -> bool) {
         prev = c;
         i += 1;
     }
+}
+
+/// The byte length of the char literal that opens at `at`, quotes included,
+/// or `None` when the quote opens a lifetime.
+///
+/// A literal is `'x'`, a multi-byte `'é'`, or an escape such as `'\''`,
+/// `'\n'` or `'\u{1f600}'`. A lifetime (`'a`, `'_`, `'static`) is never
+/// closed by a quote right after its first char.
+fn char_literal_len(bytes: &[u8], at: usize) -> Option<usize> {
+    let first = *bytes.get(at.checked_add(1)?)?;
+    if first == b'\\' {
+        // The closing quote follows the escape. `\u{10ffff}` is the longest.
+        let from = at.checked_add(3)?;
+        let to = at.saturating_add(13).min(bytes.len());
+        let close = (from..to).find(|&j| bytes.get(j) == Some(&b'\''))?;
+        return close.checked_sub(at)?.checked_add(1);
+    }
+    let width = match first {
+        b'\'' => return None,
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => return None,
+    };
+    let close = at.checked_add(1)?.checked_add(width)?;
+    (bytes.get(close) == Some(&b'\'')).then_some(width.checked_add(2)?)
 }
 
 /// Byte index of the first occurrence of `pat` at nesting depth 0.
@@ -198,6 +233,23 @@ mod tests {
         let (head, inner) = trailing_group(s, b'(', b')').unwrap();
         assert_eq!(head, "assert");
         assert_eq!(split_top(inner, b',').len(), 3);
+    }
+
+    #[test]
+    fn char_literals_hide_brackets_and_commas() {
+        let s = "core::str::<impl str>::strip_suffix::<char>(copy _2, const ']')";
+        let (head, inner) = trailing_group(s, b'(', b')').unwrap();
+        assert_eq!(head, "core::str::<impl str>::strip_suffix::<char>");
+        assert_eq!(split_top(inner, b','), ["copy _2", " const ']'"]);
+        assert_eq!(split_top("const ',', const '['", b',').len(), 2);
+        assert_eq!(split_top(r"const '\'', const '\u{5b}'", b',').len(), 2);
+        assert_eq!(split_top("const 'é', move _3", b',').len(), 2);
+    }
+
+    #[test]
+    fn lifetimes_are_not_char_literals() {
+        let s = "Pin<&'a mut Foo<'_, 'static>>, u8";
+        assert_eq!(split_top(s, b','), ["Pin<&'a mut Foo<'_, 'static>>", " u8"]);
     }
 
     #[test]

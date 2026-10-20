@@ -258,7 +258,7 @@ async fn raw_path_honors_registered_default_start_to_close() {
     // spec so the RAW dispatch can fall back to it at claim time.
     let mut info = raw_stc_act_info();
     info.default_start_to_close = Some(Duration::from_millis(1));
-    rt.register_activity(&info, |input: serde_json::Value| {
+    rt.register_activity_with_body(&info, |input: serde_json::Value| {
         // Real blocking sleep — the crate runs a synchronous body, and start-to-close is
         // a REAL wall-clock budget (measured via Instant).
         std::thread::sleep(Duration::from_millis(40));

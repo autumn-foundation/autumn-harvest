@@ -107,6 +107,89 @@ pub async fn send_signal_idempotent(
     .await
 }
 
+/// Refuse a signal for an execution that cannot accept one (issue #2065).
+///
+/// The insert path runs it after the insert. A codec failure runs it first, so
+/// a terminal target still reports its terminal state, not the codec failure.
+#[cfg(feature = "db")]
+fn signal_state_refusal(
+    exec_id: ExecutionId,
+    execution: &crate::models::WorkflowExecution,
+) -> HarvestResult<()> {
+    match execution.state.as_str() {
+        // PAUSED is a non-terminal active state: a paused workflow
+        // waiting on a signal must still accept (buffer) it so it is
+        // delivered on resume. The wake after the insert re-pends the task, which
+        // the claim gate defers until the execution is RUNNING.
+        "RUNNING" | "PAUSED" => {}
+        // Issue #964. Neither is terminal, and calling them terminal is the
+        // damaging answer: a caller that sees "terminal" reasonably stops
+        // retrying, and the outbox records `target_terminal` in the
+        // sender's history for a workflow that is alive.
+        //
+        // `MIGRATED` — the run was rebalanced onto another shard; this row
+        // is the seal it left behind. The caller reached the wrong database
+        // and should re-resolve through the forwarding pointer.
+        // `MIGRATING` — a staged copy that is not live yet; it becomes
+        // claimable at activation, moments away.
+        //
+        // Both are reported as `ShardUnavailable`, which is the engine's
+        // existing RETRYABLE classification (`HarvestError::is_shard_unavailable`),
+        // so the outbox leaves the row pending and tries again rather than
+        // failing the delivery permanently.
+        //
+        // `MIGRATING` covers two different moments (issue #1317). This
+        // row cannot tell them apart. `commit_cutover` writes only the
+        // SOURCE database, on purpose. That lets it commit even when
+        // the target is briefly unreachable. No distributed two-phase
+        // commit is needed.
+        //
+        // A connection resolved to the target sees the same
+        // `MIGRATING` row in both moments: before cutover, and after
+        // cutover but before activation.
+        //
+        // Accepting the write in the first moment is not safe. If the
+        // migration later aborts, the staged copy is discarded. This
+        // signal would go with it. The caller would see `Ok` for a
+        // signal that silently never existed.
+        //
+        // Refusing in the second moment is suboptimal, not unsafe.
+        // Activation normally follows cutover in the same call.
+        // `resume_incomplete_migrations` finishes the pair after a
+        // crash in between.
+        //
+        // Telling the two moments apart needs a source connection, or
+        // a target-side marker from `commit_cutover`. Callers of this
+        // function are not guaranteed a source connection. A
+        // target-side marker would revive the two-phase dependency
+        // cutover deliberately avoids. So this refuses both,
+        // retryably, rather than risk the unsafe one.
+        state @ ("MIGRATED" | "MIGRATING") => {
+            return Err(HarvestError::ShardUnavailable {
+                shard_id: exec_id.shard().as_i32(),
+                reason: format!(
+                    "workflow execution {exec_id} is mid shard-rebalance on this shard \
+                 ({state}); re-resolve it through its forwarding pointer and retry"
+                ),
+            });
+        }
+        "CANCELLED" => {
+            return Err(HarvestError::Cancelled(
+                execution
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| format!("workflow execution {exec_id} is cancelled")),
+            ));
+        }
+        state => {
+            return Err(HarvestError::Config(format!(
+                "workflow execution {exec_id} is terminal ({state})"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// [`send_signal_idempotent`], encoding the payload column with `codecs`
 /// (issue #1979).
 ///
@@ -129,6 +212,9 @@ pub async fn send_signal_idempotent_with_codecs(
     // An empty key is not in the partial index's NULL exclusion, so it would
     // collide across unrelated signals — treat it as no key (at-least-once).
     let idempotency_key = idempotency_key.filter(|k| !k.is_empty());
+    // Issue #1985: a durable promise settles once on every signal path.
+    let idempotency_key =
+        crate::durable_promise::settlement_idempotency_key(signal_name, &payload, idempotency_key)?;
 
     // The wake at the end of this transaction re-pends a parked workflow task,
     // so it raises a dispatch hint (issue #1312). A hint published before the
@@ -158,6 +244,14 @@ pub async fn send_signal_idempotent_with_codecs(
                         && signal_idempotency_key_exists(conn, exec_id, key).await?
                     {
                         return Ok(false);
+                    }
+                    // A terminal target is a verdict. A codec failure is not.
+                    // A shard move is not a verdict either, so the codec
+                    // failure stays and the request stays pending.
+                    if let Err(refusal) = signal_state_refusal(exec_id, &execution)
+                        && !refusal.is_shard_unavailable()
+                    {
+                        return Err(refusal);
                     }
                     return Err(error);
                 }
@@ -191,74 +285,7 @@ pub async fn send_signal_idempotent_with_codecs(
 
             // Fresh row: the execution must be able to accept it. Returning Err
             // here rolls back the transaction, undoing the insert above.
-            match execution.state.as_str() {
-                // PAUSED is a non-terminal active state: a paused workflow
-                // waiting on a signal must still accept (buffer) it so it is
-                // delivered on resume. The wake below re-pends the task, which
-                // the claim gate defers until the execution is RUNNING.
-                "RUNNING" | "PAUSED" => {}
-                // Issue #964. Neither is terminal, and calling them terminal is the
-                // damaging answer: a caller that sees "terminal" reasonably stops
-                // retrying, and the outbox records `target_terminal` in the
-                // sender's history for a workflow that is alive.
-                //
-                // `MIGRATED` — the run was rebalanced onto another shard; this row
-                // is the seal it left behind. The caller reached the wrong database
-                // and should re-resolve through the forwarding pointer.
-                // `MIGRATING` — a staged copy that is not live yet; it becomes
-                // claimable at activation, moments away.
-                //
-                // Both are reported as `ShardUnavailable`, which is the engine's
-                // existing RETRYABLE classification (`HarvestError::is_shard_unavailable`),
-                // so the outbox leaves the row pending and tries again rather than
-                // failing the delivery permanently.
-                //
-                // `MIGRATING` covers two different moments (issue #1317). This
-                // row cannot tell them apart. `commit_cutover` writes only the
-                // SOURCE database, on purpose. That lets it commit even when
-                // the target is briefly unreachable. No distributed two-phase
-                // commit is needed.
-                //
-                // A connection resolved to the target sees the same
-                // `MIGRATING` row in both moments: before cutover, and after
-                // cutover but before activation.
-                //
-                // Accepting the write in the first moment is not safe. If the
-                // migration later aborts, the staged copy is discarded. This
-                // signal would go with it. The caller would see `Ok` for a
-                // signal that silently never existed.
-                //
-                // Refusing in the second moment is suboptimal, not unsafe.
-                // Activation normally follows cutover in the same call.
-                // `resume_incomplete_migrations` finishes the pair after a
-                // crash in between.
-                //
-                // Telling the two moments apart needs a source connection, or
-                // a target-side marker from `commit_cutover`. Callers of this
-                // function are not guaranteed a source connection. A
-                // target-side marker would revive the two-phase dependency
-                // cutover deliberately avoids. So this refuses both,
-                // retryably, rather than risk the unsafe one.
-                state @ ("MIGRATED" | "MIGRATING") => {
-                    return Err(HarvestError::ShardUnavailable {
-                        shard_id: exec_id.shard().as_i32(),
-                        reason: format!(
-                            "workflow execution {exec_id} is mid shard-rebalance on this shard \
-                         ({state}); re-resolve it through its forwarding pointer and retry"
-                        ),
-                    });
-                }
-                "CANCELLED" => {
-                    return Err(HarvestError::Cancelled(execution.error.unwrap_or_else(
-                        || format!("workflow execution {exec_id} is cancelled"),
-                    )));
-                }
-                state => {
-                    return Err(HarvestError::Config(format!(
-                        "workflow execution {exec_id} is terminal ({state})"
-                    )));
-                }
-            }
+            signal_state_refusal(exec_id, &execution)?;
 
             // ADR-0001 §2.5: harvest.signal.send — PRODUCER, emitted only for an
             // accepted signal. in_scope is synchronous so EnteredSpan (!Send) is
@@ -716,11 +743,26 @@ pub async fn resolve_and_signal_by_workflow_id_with_codecs(
         return Ok(ByIdSignalOutcome::NoRunFound);
     };
 
+    // Issue #1985: apply the promise settlement rules before the dedupe
+    // probe. A refusal ends as a refused insert below would.
+    let idempotency_key = match crate::durable_promise::settlement_idempotency_key(
+        signal_name,
+        &payload,
+        idempotency_key,
+    ) {
+        Ok(key) => key,
+        Err(HarvestError::Config(_)) => return Ok(ByIdSignalOutcome::NotRunning),
+        Err(e) => return Err(e),
+    };
+    // A promise belongs to one run, so its key dedupes per execution only,
+    // at the insert (issue #1985).
+    let promise_signal = signal_name.starts_with(crate::durable_promise::PROMISE_SIGNAL_PREFIX);
+
     // Cross-execution dedup: a keyed request already delivered to ANY
     // execution in this (workflow_name, workflow_id) chain — including a
     // predecessor sealed by a continue-as-new that raced ahead of this
     // retry — is reported as already-delivered without a fresh insert.
-    if let Some(key) = idempotency_key.filter(|k| !k.is_empty())
+    if let Some(key) = idempotency_key.filter(|k| !k.is_empty() && !promise_signal)
         && crate::execution::lookup_idempotent_signal_dedupe(conn, workflow_name, workflow_id, key)
             .await?
             .is_some()
@@ -801,6 +843,29 @@ pub async fn signal_idempotency_key_exists(
         dsl::harvest_signals
             .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
             .filter(dsl::idempotency_key.eq(idempotency_key)),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)
+}
+
+/// Report whether an execution has an unconsumed signal (issue #2079).
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) if
+/// the query fails.
+#[cfg(feature = "db")]
+pub async fn has_pending_signals(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_signals::dsl;
+
+    diesel::select(diesel::dsl::exists(
+        dsl::harvest_signals
+            .filter(dsl::workflow_exec_id.eq(exec_id.as_uuid()))
+            .filter(dsl::consumed.eq(false)),
     ))
     .get_result(conn)
     .await

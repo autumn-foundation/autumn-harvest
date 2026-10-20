@@ -65,6 +65,17 @@ async fn limit_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
     ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
 }
 
+/// Registers `status`, which returns the cancel reason that the body saw.
+#[workflow]
+async fn cancel_aware_wf(ctx: &WorkflowContext, _n: i64) -> Result<Value, String> {
+    let reason = ctx.cancellation_reason().map(str::to_string);
+    ctx.register_update_handler_no_validator("status", move |_input: Value| {
+        let reason = reason.clone();
+        async move { Ok(json!(reason)) }
+    });
+    ctx.wait_for_signal("go").await.map_err(|e| e.to_string())
+}
+
 /// A handler body that a separate thread wakes after 20 ms. It stands for a
 /// timer, I/O or an async lock.
 fn woken_later() -> impl Future<Output = Result<Value, String>> + Send {
@@ -298,6 +309,7 @@ async fn assert_open_history_replays(
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
             workflow_id: None,
             queue_name: None,
@@ -1125,6 +1137,87 @@ async fn update_at_the_byte_cap_fails_the_run() {
     assert!(matches!(
         rt.outcome(exec).unwrap(),
         ExecutionOutcome::Failed(_)
+    ));
+}
+
+/// An update that reaches a cap under a pending cancel ends the run
+/// `CANCELLED`, not `FAILED` (issue #2021).
+#[tokio::test]
+async fn update_at_the_event_cap_under_a_pending_cancel_ends_cancelled() {
+    let (mut rt, exec) = blocked_limit_run().await;
+    let len = u64::try_from(rt.load_history(exec).unwrap().len()).unwrap();
+    rt.set_history_event_hard_cap(Some(len + 2));
+    rt.cancel(exec, "stop").unwrap();
+
+    let err = rt.update(exec, "set_limit", json!(5)).await.unwrap_err();
+
+    assert!(
+        matches!(err, SqliteError::UpdateHistoryCapReached { .. }),
+        "{err:?}"
+    );
+    let history = rt.load_history(exec).unwrap();
+    assert!(update_events(&history).is_empty(), "{history:?}");
+    assert!(
+        matches!(history.last(), Some(WorkflowEvent::WorkflowCancelled { reason }) if reason == "stop"),
+        "{history:?}"
+    );
+    assert!(matches!(
+        rt.outcome(exec).unwrap(),
+        ExecutionOutcome::Terminated(state) if state == "CANCELLED"
+    ));
+}
+
+/// The update replay sees a pending cancel, as the next drive does (issue
+/// #2021).
+#[tokio::test]
+async fn an_update_sees_a_pending_cancel() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&cancel_aware_wf_info());
+    let exec = rt.start_workflow("cancel_aware_wf", json!(0)).unwrap();
+    rt.run_until_blocked(exec).await.unwrap();
+    assert_eq!(
+        rt.update(exec, "status", json!(null)).await.unwrap(),
+        json!(null)
+    );
+
+    rt.cancel(exec, "stop").unwrap();
+
+    assert_eq!(
+        rt.update(exec, "status", json!(null)).await.unwrap(),
+        json!("stop")
+    );
+}
+
+/// Updates after a cancel meet the cleanup budget, as the body's own
+/// events do (issue #2021).
+#[tokio::test]
+async fn updates_after_a_cancel_meet_the_cleanup_budget() {
+    let (mut rt, exec) = blocked_limit_run().await;
+    let from = rt.load_history(exec).unwrap().len();
+    rt.cancel(exec, "stop").unwrap();
+
+    let mut accepted = 0;
+    let err = loop {
+        match rt.update(exec, "set_limit", json!(5)).await {
+            Ok(_) => accepted += 1,
+            Err(err) => break err,
+        }
+        assert!(accepted <= 500, "the budget must stop the updates");
+    };
+
+    assert!(
+        matches!(err, SqliteError::UpdateHistoryCapReached { .. }),
+        "{err:?}"
+    );
+    let history = rt.load_history(exec).unwrap();
+    assert!(
+        history.len() - from <= 1_000,
+        "{} events",
+        history.len() - from
+    );
+    assert!(matches!(
+        history.last(),
+        Some(WorkflowEvent::WorkflowCancelled { reason }) if reason == "stop"
     ));
 }
 

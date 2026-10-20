@@ -17,6 +17,7 @@
 //! snapshot. It can write memory only with
 //! [`HeartbeatTask::allow_memory_writes`].
 
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::time::Duration;
 
@@ -95,10 +96,25 @@ pub struct HeartbeatTask {
     /// untrusted data, and a note shows in every later run of the scope.
     #[serde(default)]
     pub allow_memory_writes: bool,
+    /// The activity-input cap of the workers, in bytes. See
+    /// [`AgentTask::max_request_bytes`](crate::AgentTask::max_request_bytes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_bytes: Option<u64>,
     /// The tenant that scopes the response cache. See
     /// [`AgentTask::tenant`](crate::AgentTask::tenant).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// The flow labels that earlier ticks exercised. Pass the
+    /// `flow_labels` of the last report here with its messages. See
+    /// [`AgentTask::flow_labels`](crate::AgentTask::flow_labels).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+    /// Measure a tool round against the whole next request. See
+    /// [`AgentTask::whole_request_budget`](crate::AgentTask::whole_request_budget).
+    /// [`HeartbeatTask::new`] turns it on. A recorded tick with no field keeps
+    /// the old measure, so a tick in flight replays as it ran.
+    #[serde(default, skip_serializing_if = "crate::types::is_false")]
+    pub whole_request_budget: bool,
 }
 
 fn default_prompt() -> String {
@@ -135,7 +151,10 @@ impl HeartbeatTask {
             max_output_tokens: None,
             approval_timeout_secs: DEFAULT_HEARTBEAT_APPROVAL_TIMEOUT_SECS,
             allow_memory_writes: false,
+            max_request_bytes: None,
             tenant: None,
+            flow_labels: BTreeSet::new(),
+            whole_request_budget: true,
         }
     }
 
@@ -219,6 +238,13 @@ impl HeartbeatTask {
         self
     }
 
+    /// Set the activity-input cap of the workers, in bytes.
+    #[must_use]
+    pub const fn max_request_bytes(mut self, bytes: u64) -> Self {
+        self.max_request_bytes = Some(bytes);
+        self
+    }
+
     /// Set the tenant that scopes the response cache.
     #[must_use]
     pub fn tenant(mut self, tenant: impl Into<String>) -> Self {
@@ -238,10 +264,13 @@ impl HeartbeatTask {
         task.max_total_tokens = self.max_total_tokens;
         task.max_output_tokens = self.max_output_tokens;
         task.approval_timeout_secs = self.approval_timeout_secs;
+        task.max_request_bytes = self.max_request_bytes;
         task.read_only = !self.allow_actions;
         task.unattended = true;
         task.unattended_memory_writes = self.allow_memory_writes;
         task.tenant.clone_from(&self.tenant);
+        task.flow_labels.clone_from(&self.flow_labels);
+        task.whole_request_budget = self.whole_request_budget;
         task
     }
 }
@@ -290,9 +319,10 @@ pub async fn agent_heartbeat(
     })
 }
 
-/// A Postgres engine schedule that starts one heartbeat tick per firing.
+/// An engine schedule that starts one heartbeat tick per firing.
 ///
-/// Register it with `HarvestBuilder::workflow_schedule`, for example with
+/// Register it with `HarvestBuilder::workflow_schedule` on Postgres, or with
+/// `SqliteRuntime::upsert_schedule` on SQLite (issue #2031). For example, use
 /// `Schedule::Interval(Duration::from_secs(1_800))` for a tick every 30
 /// minutes.
 ///
@@ -321,6 +351,20 @@ mod tests {
     use crate::delivery::HEARTBEAT_OK;
 
     #[test]
+    fn a_tick_from_before_the_whole_request_budget_keeps_the_old_measure() {
+        let old: HeartbeatTask = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!old.whole_request_budget);
+        assert!(!old.agent_task().whole_request_budget);
+        // A tick that leaves the flag off encodes as it was recorded.
+        let encoded = serde_json::to_value(&old).unwrap();
+        assert!(encoded.get("whole_request_budget").is_none());
+
+        let new = HeartbeatTask::new();
+        assert!(new.whole_request_budget);
+        assert!(new.agent_task().whole_request_budget);
+    }
+
+    #[test]
     fn the_default_prompt_names_the_silent_answer() {
         assert!(DEFAULT_HEARTBEAT_PROMPT.contains(HEARTBEAT_OK));
     }
@@ -345,6 +389,32 @@ mod tests {
     }
 
     #[test]
+    fn a_tick_carries_the_flow_labels_of_earlier_ticks() {
+        assert_eq!(
+            HeartbeatTask::new().agent_task().flow_labels,
+            BTreeSet::new()
+        );
+        let carried = HeartbeatTask {
+            flow_labels: BTreeSet::from(["untrusted_input".to_owned()]),
+            ..HeartbeatTask::new()
+        };
+        assert_eq!(
+            carried.agent_task().flow_labels,
+            BTreeSet::from(["untrusted_input".to_owned()]),
+            "a tick starts with the labels of the earlier ticks"
+        );
+        let old = serde_json::json!({"prompt": "tick"});
+        let decoded: HeartbeatTask = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.flow_labels, BTreeSet::new());
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("flow_labels")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn a_tick_passes_its_tenant_to_the_run() {
         assert_eq!(HeartbeatTask::new().agent_task().tenant, None);
         let task = HeartbeatTask::new().tenant("acme").agent_task();
@@ -354,7 +424,13 @@ mod tests {
     #[test]
     fn an_empty_task_decodes_to_the_defaults() {
         let task: HeartbeatTask = serde_json::from_str("{}").unwrap();
-        assert_eq!(task, HeartbeatTask::new());
+        // The one difference is the compatibility flag. A recorded tick has
+        // none, so it keeps the old measure.
+        let expected = HeartbeatTask {
+            whole_request_budget: false,
+            ..HeartbeatTask::new()
+        };
+        assert_eq!(task, expected);
     }
 
     #[test]
@@ -363,5 +439,20 @@ mod tests {
         let schedule = schedule(Schedule::Manual, &task).unwrap();
         assert_eq!(schedule.workflow_name, HEARTBEAT_WORKFLOW_NAME);
         assert_eq!(schedule.input, serde_json::to_value(&task).unwrap());
+    }
+
+    #[test]
+    fn a_tick_carries_the_worker_input_cap() {
+        assert_eq!(HeartbeatTask::new().agent_task().max_request_bytes, None);
+        let task = HeartbeatTask::new().max_request_bytes(1_000).agent_task();
+        assert_eq!(task.max_request_bytes, Some(1_000));
+        let old = serde_json::json!({"prompt": "tick"});
+        let decoded: HeartbeatTask = serde_json::from_value(old).unwrap();
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("max_request_bytes")
+                .is_none()
+        );
     }
 }

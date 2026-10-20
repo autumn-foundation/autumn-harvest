@@ -6,11 +6,14 @@
 //! Replay reads these payloads back. Add a field only with `#[serde(default)]`,
 //! so that a history written before the field still decodes.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
+use crate::flow::Released;
 use crate::followup::Followups;
 use crate::loop_guard::LoopGuard;
 use crate::memory::MemoryScope;
+use crate::mesh::{DelegationRecord, Mandate};
 use crate::message::ToolDefinition;
 use crate::message::{
     ChatMessage, ChatRole, ContentPart, SessionId, StopReason, TokenUsage, ToolCall,
@@ -55,7 +58,8 @@ pub struct AgentTask {
     pub approval_timeout_secs: u64,
     /// The activity-input cap of the workers, in bytes. Set it when the
     /// workers use a cap other than the engine default. The loop stops with
-    /// `TranscriptFull` before it sends a request over this size.
+    /// `TranscriptFull` before it sends a request over this size. A cap of
+    /// zero is no cap, as in the engine.
     #[serde(default)]
     pub max_request_bytes: Option<u64>,
     /// Send the final answer to the harness delivery.
@@ -95,12 +99,31 @@ pub struct AgentTask {
     /// started before the change replays as it ran.
     #[serde(default)]
     pub run_id_source: RunIdSource,
+    /// Measure a tool round against the whole next request (issue #2040).
+    /// [`AgentTask::new`] turns it on. A recorded task with no field measures
+    /// the results alone and reads a zero request cap as a limit of zero
+    /// bytes. A run started before the change then replays as it ran.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub whole_request_budget: bool,
     /// The tenant that scopes the response cache.
     ///
     /// On Postgres, the verified tenant of the run wins over this field. Set
     /// it on SQLite, or for a run that has no verified tenant.
+    ///
+    /// A `QuotaPolicy` on `agent_loop` with the key `"tenant"` reads it for
+    /// the tenant LLM budgets (issue #1997).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// The authority of the root agent in a delegation tree. With a mandate
+    /// that names peers, the run gets the `delegate` tool. See
+    /// [`mesh`](crate::mesh).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mandate: Option<Mandate>,
+    /// The flow labels that earlier runs of this conversation exercised.
+    /// Pass [`AgentReport::flow_labels`] here when you pass the transcript as
+    /// the history. See [`flow`](crate::flow).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 /// Where the run id of a task comes from.
@@ -137,8 +160,30 @@ impl AgentTask {
             unattended: false,
             unattended_memory_writes: false,
             run_id_source: RunIdSource::ExecutionId,
+            whole_request_budget: true,
             tenant: None,
+            mandate: None,
+            flow_labels: BTreeSet::new(),
         }
+    }
+
+    /// Start with the flow labels that earlier runs exercised. See
+    /// [`flow_labels`](Self::flow_labels).
+    #[must_use]
+    pub fn flow_labels<I, S>(mut self, labels: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.flow_labels = labels.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the mandate of the root agent. See [`mandate`](Self::mandate).
+    #[must_use]
+    pub fn mandate(mut self, mandate: Mandate) -> Self {
+        self.mandate = Some(mandate);
+        self
     }
 
     /// Set the tenant that scopes the response cache. See
@@ -266,7 +311,11 @@ impl AgentTask {
         timeout.as_secs().saturating_add(partial)
     }
 
-    /// Set the activity-input cap of the workers, in bytes.
+    /// Set the activity-input cap of the workers, in bytes. Zero is no cap.
+    ///
+    /// A worker with a payload store offloads a large input, and the engine
+    /// skips its cap for it. The loop cannot see the store, so set zero for
+    /// such a worker.
     #[must_use]
     pub const fn max_request_bytes(mut self, bytes: u64) -> Self {
         self.max_request_bytes = Some(bytes);
@@ -313,6 +362,19 @@ pub struct ModelTurnRequest {
     /// Postgres, the verified tenant of the run wins over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// The agent that holds the mandate of this run, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// The harness tools that this agent may call. `None` means every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<BTreeSet<String>>,
+    /// The flow labels that the run tree has exercised before this turn.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+    /// The flow rules that a person released in the run tree before this
+    /// turn. See [`Recheck::UntilApproved`](crate::Recheck::UntilApproved).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_released: Released,
 }
 
 /// The recorded result of one model-turn activity.
@@ -334,9 +396,42 @@ pub struct ModelTurn {
     /// so `usage` is zero.
     #[serde(default, skip_serializing_if = "is_false")]
     pub cache_hit: bool,
+    /// The flow labels of each tool call, in order. Empty when the harness
+    /// has no flow rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<BTreeSet<String>>,
+    /// The flow rules that an approval of each tool call releases, in order.
+    /// Empty when no rule of the harness can be released.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub releases: Vec<Released>,
+    /// `true` when the reply did not fit the result cap, even with its
+    /// decision reasons cut. The activity then drops the reply: `content`,
+    /// `decisions`, `labels` and `releases` are empty, and `usage` stays, so
+    /// the paid call is still counted. The loop ends under
+    /// [`AgentStop::ReplyTooLarge`].
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub oversized: bool,
 }
 
 impl ModelTurn {
+    /// The typed outcome for a reply that is too large to record.
+    ///
+    /// It keeps the usage, the stop reason and `cache_hit`, so the paid call
+    /// stays counted. Everything else is dropped.
+    #[must_use]
+    pub(crate) fn into_oversized(self) -> Self {
+        Self {
+            content: Vec::new(),
+            stop: self.stop,
+            usage: self.usage,
+            decisions: Vec::new(),
+            cache_hit: self.cache_hit,
+            labels: Vec::new(),
+            releases: Vec::new(),
+            oversized: true,
+        }
+    }
+
     /// The tool calls of the turn, in order.
     #[must_use]
     pub fn calls(&self) -> Vec<ToolCall> {
@@ -391,10 +486,18 @@ pub struct ToolCallRequest {
     /// decision says.
     #[serde(default, skip_serializing_if = "is_false")]
     pub read_only: bool,
+    /// The harness tools that this agent may call. `None` means every tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<BTreeSet<String>>,
+    /// The flow labels that the decision recorded for the call. The tool-call
+    /// activity refuses a tool whose labels grew after the decision. `None`
+    /// when the decision had no flow rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeSet<String>>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
-const fn is_false(value: &bool) -> bool {
+pub(crate) const fn is_false(value: &bool) -> bool {
     !*value
 }
 
@@ -428,6 +531,8 @@ impl ToolOutcome {
 }
 
 /// Why a run ended.
+///
+/// Later releases can add a reason, so a `match` needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -442,6 +547,13 @@ pub enum AgentStop {
     TokensExhausted,
     /// The next request was too large to record. It was not sent.
     TranscriptFull,
+    /// The model reply was too large to record, even with its decision
+    /// reasons cut. The reply is dropped. The call is still counted in the
+    /// usage.
+    ReplyTooLarge,
+    /// A run or tenant LLM budget refuses the next model call (issue
+    /// #1997). The adapter does not send the call.
+    BudgetExceeded,
     /// The model repeated the same tool call with the same result too often.
     LoopDetected,
 }
@@ -453,10 +565,12 @@ pub struct AgentReport {
     pub stop: AgentStop,
     /// The last text the model produced.
     pub text: String,
-    /// Tool rounds used in the whole run, follow-ups included.
+    /// Tool rounds used in the whole run, follow-ups and delegations
+    /// included. Each agent has its own step bound.
     pub steps_used: u32,
-    /// Tool calls answered in the whole run, whether they ran or not. A round
-    /// cut at the request cap answers its remaining calls with an error.
+    /// Tool calls answered in the whole run, delegations included, whether
+    /// they ran or not. A round cut at the request cap answers its remaining
+    /// calls with an error.
     pub tool_calls: u32,
     /// Provider-reported tokens for the whole run, follow-ups included.
     pub usage: TokenUsage,
@@ -470,6 +584,14 @@ pub struct AgentReport {
     /// than `completed`, so the follow-up did not run.
     #[serde(default)]
     pub followup_dropped: bool,
+    /// Each delegation of the run tree, refused ones too, in the order each
+    /// ended.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delegations: Vec<DelegationRecord>,
+    /// The flow labels that the run tree exercised, with the labels of the
+    /// task. Pass them to the next run of this conversation.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 /// The transcript without system messages.
@@ -537,6 +659,46 @@ mod tests {
     #[test]
     fn stop_names_are_stable_in_history() {
         assert_eq!(json!(AgentStop::TranscriptFull), json!("transcript_full"));
+        assert_eq!(json!(AgentStop::BudgetExceeded), json!("budget_exceeded"));
+        assert_eq!(json!(AgentStop::ReplyTooLarge), json!("reply_too_large"));
+    }
+
+    #[test]
+    fn the_oversized_flag_is_recorded_only_when_set() {
+        let turn = json!({
+            "content": [], "stop": "end_turn",
+            "usage": {
+                "input_tokens": 1, "output_tokens": 2,
+                "cache_read_tokens": 0, "cache_write_tokens": 0,
+            },
+            "decisions": [],
+        });
+        let decoded: ModelTurn = serde_json::from_value(turn.clone()).unwrap();
+        assert!(!decoded.oversized);
+        // A recorded turn from before the flag encodes as it was written.
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), turn);
+        let dropped = ModelTurn {
+            oversized: true,
+            ..decoded
+        };
+        let value = serde_json::to_value(&dropped).unwrap();
+        assert_eq!(value["oversized"], true);
+        assert_eq!(serde_json::from_value::<ModelTurn>(value).unwrap(), dropped);
+    }
+
+    #[test]
+    fn the_tenant_is_in_the_input_only_when_set() {
+        let plain = serde_json::to_value(AgentTask::new("go")).unwrap();
+        assert!(plain.get("tenant").is_none());
+        let task = AgentTask::new("go").tenant("acme");
+        let value = serde_json::to_value(&task).unwrap();
+        assert_eq!(value["tenant"], "acme");
+        assert_eq!(
+            autumn_harvest::quota::resolve_quota_key("tenant", &value).as_deref(),
+            Some("acme")
+        );
+        let back: AgentTask = serde_json::from_value(value).unwrap();
+        assert_eq!(back.tenant.as_deref(), Some("acme"));
     }
 
     #[test]
@@ -563,6 +725,9 @@ mod tests {
             usage: TokenUsage::default(),
             decisions: vec![ToolDecision::Allow],
             cache_hit: false,
+            labels: Vec::new(),
+            releases: Vec::new(),
+            oversized: false,
         };
         assert_eq!(turn.text(), "ab");
         let calls = turn.calls();
@@ -583,7 +748,16 @@ mod tests {
         // The new fields are left out at their defaults, so a recorded input
         // from before them still matches on strict replay.
         let fields = encoded.as_object_mut().unwrap();
-        for key in ["read_only", "memory_scope", "extra_tools", "tenant"] {
+        for key in [
+            "read_only",
+            "memory_scope",
+            "extra_tools",
+            "tenant",
+            "agent",
+            "allowed_tools",
+            "flow_labels",
+            "flow_released",
+        ] {
             assert!(!fields.contains_key(key), "{key}");
         }
         let old_call = json!({
@@ -594,6 +768,56 @@ mod tests {
         let encoded = serde_json::to_value(&call).unwrap();
         assert!(encoded.get("read_only").is_none());
         assert!(encoded.get("memory_scope").is_none());
+        assert!(encoded.get("allowed_tools").is_none());
+        assert!(encoded.get("labels").is_none());
+    }
+
+    #[test]
+    fn a_task_and_a_report_with_no_mesh_keep_the_recorded_shape() {
+        let task = AgentTask::new("go");
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert!(encoded.get("mandate").is_none());
+        assert!(encoded.get("flow_labels").is_none());
+        let old = json!({"input": "go", "max_steps": 8, "approval_timeout_secs": 60});
+        let decoded: AgentTask = serde_json::from_value(old).unwrap();
+        assert_eq!(decoded.mandate, None);
+        assert_eq!(decoded.flow_labels, BTreeSet::new());
+        let with = AgentTask::new("go").mandate(Mandate::new("planner"));
+        let back: AgentTask = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        assert_eq!(back.mandate, Some(Mandate::new("planner")));
+
+        let report = json!({
+            "stop": "completed", "text": "hi", "steps_used": 0, "tool_calls": 0,
+            "usage": {"input_tokens": 0, "output_tokens": 0}, "messages": [],
+            "followups": 0, "followup_dropped": false,
+        });
+        let decoded: AgentReport = serde_json::from_value(report).unwrap();
+        assert_eq!(decoded.delegations, Vec::new());
+        assert_eq!(decoded.flow_labels, BTreeSet::new());
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert!(encoded.get("delegations").is_none());
+        assert!(encoded.get("flow_labels").is_none());
+
+        let turn = json!({
+            "content": [], "stop": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 2},
+            "decisions": [],
+        });
+        let decoded: ModelTurn = serde_json::from_value(turn).unwrap();
+        assert_eq!(decoded.labels, Vec::<BTreeSet<String>>::new());
+        assert_eq!(decoded.releases, Vec::<Released>::new());
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("releases")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(&decoded)
+                .unwrap()
+                .get("labels")
+                .is_none()
+        );
     }
 
     #[test]
@@ -643,6 +867,17 @@ mod tests {
         let task: AgentTask = serde_json::from_value(old).unwrap();
         assert_eq!(task.loop_guard, LoopGuard::disabled());
         assert_eq!(AgentTask::new("go").loop_guard, LoopGuard::default());
+    }
+
+    #[test]
+    fn a_task_from_before_the_whole_request_budget_measures_results_only() {
+        let old = json!({"input": "go", "max_steps": 8, "approval_timeout_secs": 60});
+        let task: AgentTask = serde_json::from_value(old).unwrap();
+        assert!(!task.whole_request_budget);
+        // A task that leaves the flag off encodes as it was recorded.
+        let encoded = serde_json::to_value(&task).unwrap();
+        assert!(encoded.get("whole_request_budget").is_none());
+        assert!(AgentTask::new("go").whole_request_budget);
     }
 
     #[test]

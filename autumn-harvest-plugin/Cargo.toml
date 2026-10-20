@@ -33,7 +33,7 @@ metrics = []
 # whole dispatch path with no Docker. `kafka` / `sqs` add the respective
 # client. The core `autumn-harvest` crate gains zero broker dependencies under
 # every combination; `tests/connector_dependency_graph.rs` enforces it.
-connectors = ["dep:async-trait", "dep:sha2"]
+connectors = ["dep:async-trait"]
 kafka = ["connectors", "dep:rdkafka"]
 sqs = ["connectors", "dep:aws-config", "dep:aws-sdk-sqs"]
 # AWS KMS binding for the core AES-256-GCM payload codec (issue #1825).
@@ -43,6 +43,14 @@ sqs = ["connectors", "dep:aws-config", "dep:aws-sdk-sqs"]
 # `aws-lc-rs`, which needs cmake and a C compiler. The locked `aws-sdk-kms`
 # 1.99.0 needs Rust 1.88, so the effective MSRV does not rise.
 aws-kms = ["dep:aws-sdk-kms", "dep:async-trait"]
+# Object-store adapters for `PayloadStore` and `HistoryArchiver` (issue #1983).
+# `object-store` holds the backend-agnostic adapters and adds no client.
+# `s3` adds an `aws-sdk-s3` backend. `gcs` adds a GCS JSON API backend on the
+# `reqwest` client that this crate already uses. The core crate gains no
+# cloud dependency (`tests/connector_dependency_graph.rs`).
+object-store = []
+s3 = ["object-store", "dep:aws-sdk-s3"]
+gcs = ["object-store"]
 # HashiCorp Vault Transit binding for the same codec (issue #1981).
 # `autumn_harvest_plugin::vault_transit::VaultTransit` implements `KmsDecrypt`
 # over the Vault HTTP API. It uses the `reqwest` client that this crate already
@@ -106,7 +114,7 @@ tower = "0.5"
 # operator role (issue #776) matches a request's nest-stripped path against
 # CLASSIFIED_ROUTES to recover its RouteClass, with correct static-beats-param
 # precedence. MatchedPath is unusable in a nested-router layer (axum #1441).
-matchit = "0.8"
+matchit = "0.9"
 # Strict (non-lossy) percent-decoding for `GET /admin/queue-coverage`'s raw
 # query string (issue #774 review): axum's built-in `Query` extractor is
 # backed by `serde_urlencoded`/`form_urlencoded`, which always succeeds by
@@ -148,8 +156,9 @@ autumn-harvest-redis = { version = "0.7.0", path = "../autumn-harvest-redis", op
 async-trait = { version = "0.1", optional = true }
 # Collision-resistant digest for the bounded idempotency-key encoding, so a
 # pathological topic/key component can never blow the 512-byte start-key cap
-# (the issue #699 `bound_key_component` precedent).
-sha2 = { version = "0.11", optional = true }
+# (the issue #699 `bound_key_component` precedent). Durable routes hash their
+# claim key and request fingerprint with it too, so it is not optional.
+sha2 = "0.11"
 # Kafka client. `cmake-build` builds librdkafka from the vendored source, so
 # the adapter needs no system librdkafka. NOTE: librdkafka's build requires
 # libcurl headers (`libcurl4-openssl-dev` on Debian/Ubuntu) even with
@@ -169,6 +178,9 @@ aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio",
 # KMS client for the `aws-kms` feature. Same feature choice as `aws-sdk-sqs`,
 # for the same reason.
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
+# S3 client for the `s3` feature. Same feature choice as `aws-sdk-sqs`, for the
+# same reason.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
 # Base64 for the Vault Transit wire format (`vault-transit` feature). It is
 # already in the lockfile through the core crate.
 base64 = { version = "0.22", optional = true }
@@ -202,7 +214,7 @@ proptest = { workspace = true }
 # Issue #1978: the OIDC round-trip test signs ID tokens for a local mock
 # identity provider. All three crates are already in the lockfile.
 jsonwebtoken = { version = "11.1", default-features = false, features = ["rust_crypto"] }
-ed25519-dalek = "2.2"
+ed25519-dalek = "3.0"
 # The KMS binding tests also use `base64` for the fake wire formats (issue
 # #1981).
 base64 = "0.22"

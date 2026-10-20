@@ -658,9 +658,11 @@ value     = quoted-string | number | "true" | "false"
 | `started_at` | `>`, `>=`, `<`, `<=` | RFC 3339 string |
 
 **Types.** Quotes decide the type. `attrs.n = 100` matches the number `100`.
-`attrs.n = '100'` matches the string `"100"`. A string takes single or double
-quotes. A backslash escapes the next character. `attrs."my key"` names a key
-that is not a plain word.
+`attrs.n = '100'` matches the string `"100"`. A number keeps all its digits,
+so `attrs.n = 12345678901234567890123` matches only that number. A number is
+1024 bytes or fewer. A string takes single or double quotes. A backslash
+escapes the next character. `attrs."my key"` names a key that is not a plain
+word.
 
 **Semantics.** Attribute predicates have the same meaning as the
 [typed predicates](#typed-search-attribute-predicates-get-workflows). `!=`
@@ -683,8 +685,8 @@ and 100 `IN` values. All `filter` values of a request hold at most 32
 predicates. A filter over a limit gets `400`.
 
 **Errors.** A syntax error gets `400`, and the message gives the byte offset.
-A number that Postgres cannot hold, such as `1e400`, also gets `400`. So does
-a string with a control character. An empty `filter` value is ignored.
+A number outside the range of a 64-bit float, such as `1e400`, also gets
+`400`. So does a string with a control character. An empty `filter` value is ignored.
 
 **States.** The default list hides `MIGRATED` rows, so `state = 'MIGRATED'`
 and an `IN` list with `MIGRATED` get `400`. `state != 'MIGRATED'` is valid. Use the `state=MIGRATED` parameter. The stalled list
@@ -856,6 +858,29 @@ Each entry in `events`:
 | `type` | string | Event discriminator (e.g. `TimerStarted`, `ActivityCompleted`). |
 | `data` | object | Event payload (the `data` object from the adjacently-tagged stored JSON). |
 
+### Archived history (issue #1983)
+
+```
+GET /workflows/{id}/archived-history
+```
+
+Returns the `HistoryExportDocument` that retention archived for a run. The
+route reads the configured `HistoryArchiver` only. It works after retention
+deletes the run from Postgres. Admin only.
+
+| Status | When |
+|--------|------|
+| 200 | The archive holds the run. The body is the document. |
+| 400 | The id is not a valid execution UUID. |
+| 401 | The caller is not a Harvest admin. |
+| 404 | The archive holds no document for the run. |
+| 503 | No archiver is set, the archiver cannot read back, the store fails, or the read times out. |
+
+Payload fields decode under the same gate as `GET /workflows/{id}/history`.
+Otherwise they stay in their stored form, for example codec envelopes. The
+read times out after `archival_timeout_secs`. Vantage shows the same document
+at `/ui/workflows/{id}/archived-history`. See [`docs/archival.md`](archival.md).
+
 ### `get_workflow` truncation contract
 
 `GET /workflows/{id}` now bounds `history` to the first **100** events and adds two
@@ -928,6 +953,15 @@ earlier attempt stays readable after that attempt fails and a retry starts. See
   "workflow_state": "FAILED"
 }
 ```
+
+## Fork a run (`POST /workflows/{id}/fork`)
+
+A fork copies the start of a run to a new execution with a new workflow id.
+The source does not change, so a run in any state can be forked. By default,
+the fork takes each activity result from the source record and never runs an
+effect for real. `"effects": "live"` opts in to real effects. An erased source
+is always refused. See the [fork runbook](runbooks/fork-a-run.md) (issue
+#2000).
 
 ## Signal delivery (`POST /workflows/{id}/signal/{signal_name}`)
 

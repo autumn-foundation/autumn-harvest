@@ -336,6 +336,9 @@ pub struct CircuitBreakerRegistry {
     /// at *dispatch* (issue #369), so the claim query skips the rate-limit gate
     /// and token debit for them.
     tracked_names: Vec<String>,
+    /// One state per policy, seeded by [`new`](Self::new) and never removed.
+    /// A tracked name therefore always has an entry, and the hot paths look
+    /// it up with `get_mut` and do not allocate a key.
     states: Mutex<HashMap<String, BreakerState>>,
 }
 
@@ -345,10 +348,14 @@ impl CircuitBreakerRegistry {
     pub fn new(policies: HashMap<String, CircuitBreakerPolicy>) -> Self {
         let mut tracked_names: Vec<String> = policies.keys().cloned().collect();
         tracked_names.sort_unstable();
+        let states = tracked_names
+            .iter()
+            .map(|name| (name.clone(), BreakerState::default()))
+            .collect();
         Self {
             policies,
             tracked_names,
-            states: Mutex::new(HashMap::new()),
+            states: Mutex::new(states),
         }
     }
 
@@ -394,16 +401,19 @@ impl CircuitBreakerRegistry {
     /// single probe.
     #[must_use]
     pub fn on_dispatch(&self, activity_name: &str, now: Instant) -> DispatchDecision {
+        let untracked = DispatchDecision::Allow {
+            token: DispatchToken {
+                generation: 0,
+                is_probe: false,
+            },
+        };
         let Some(&policy) = self.policies.get(activity_name) else {
-            return DispatchDecision::Allow {
-                token: DispatchToken {
-                    generation: 0,
-                    is_probe: false,
-                },
-            };
+            return untracked;
         };
         let mut states = self.lock();
-        let st = states.entry(activity_name.to_string()).or_default();
+        let Some(st) = states.get_mut(activity_name) else {
+            return untracked;
+        };
 
         if st.forced_open {
             // Operator-forced: no probe is admitted on any timer, so advertise
@@ -483,7 +493,7 @@ impl CircuitBreakerRegistry {
     ) -> Option<CircuitTransition> {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
-        let st = states.entry(activity_name.to_string()).or_default();
+        let st = states.get_mut(activity_name)?;
         apply_result(st, policy, outcome, token, now)
     }
 
@@ -506,7 +516,7 @@ impl CircuitBreakerRegistry {
     ) -> Option<CircuitTransition> {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
-        let st = states.entry(activity_name.to_string()).or_default();
+        let st = states.get_mut(activity_name)?;
         match st.in_flight_claims.get(&claim).map(|entry| entry.state) {
             Some(ClaimState::Provisional(deciding)) => {
                 if let Some(entry) = st.in_flight_claims.get_mut(&claim) {
@@ -551,7 +561,7 @@ impl CircuitBreakerRegistry {
     ) -> Option<CircuitTransition> {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
-        let st = states.entry(activity_name.to_string()).or_default();
+        let st = states.get_mut(activity_name)?;
         let state = st.in_flight_claims.get(&claim).map(|entry| entry.state);
         if lost_to_timeout
             && let Some(ClaimState::Provisional(deciding) | ClaimState::Held(_, _, deciding)) =
@@ -595,7 +605,9 @@ impl CircuitBreakerRegistry {
             return;
         }
         let mut states = self.lock();
-        let st = states.entry(activity_name.to_string()).or_default();
+        let Some(st) = states.get_mut(activity_name) else {
+            return;
+        };
         st.in_flight_claims
             .entry(claim)
             .and_modify(|entry| entry.token = Some(token))
@@ -652,7 +664,9 @@ impl CircuitBreakerRegistry {
             return;
         }
         let mut states = self.lock();
-        let st = states.entry(activity_name.to_string()).or_default();
+        let Some(st) = states.get_mut(activity_name) else {
+            return;
+        };
         let generation = st.generation;
         let entry = st.in_flight_claims.entry(claim).or_insert(InFlightClaim {
             token: None,
@@ -699,7 +713,7 @@ impl CircuitBreakerRegistry {
     ) -> Option<CircuitTransition> {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
-        let st = states.entry(activity_name.to_string()).or_default();
+        let st = states.get_mut(activity_name)?;
         // Every enforcer marks before it confirms, and every path keeps a
         // marked entry until its enforcers decide. So a missing entry has
         // no generation to fence by, and counts nothing.
@@ -808,7 +822,7 @@ impl CircuitBreakerRegistry {
     ) -> Option<CircuitTransition> {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
-        let st = states.entry(activity_name.to_string()).or_default();
+        let st = states.get_mut(activity_name)?;
         apply_external_failure(st, policy, now)
     }
 
@@ -834,7 +848,9 @@ impl CircuitBreakerRegistry {
             return;
         }
         let mut states = self.lock();
-        let st = states.entry(activity_name.to_string()).or_default();
+        let Some(st) = states.get_mut(activity_name) else {
+            return;
+        };
         apply_cancelled(st, token, now);
     }
 
@@ -890,7 +906,7 @@ impl CircuitBreakerRegistry {
     pub fn snapshot(&self, activity_name: &str, now: Instant) -> Option<CircuitSnapshot> {
         let &policy = self.policies.get(activity_name)?;
         let mut states = self.lock();
-        let st = states.entry(activity_name.to_string()).or_default();
+        let st = states.get_mut(activity_name)?;
         st.prune(now, policy.window);
         Some(Self::snapshot_inner(activity_name, &policy, st, now))
     }

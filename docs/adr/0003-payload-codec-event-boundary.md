@@ -210,5 +210,36 @@ caller could store an envelope-shaped value that an engine read unwraps.
 
 **Residual.** A row written before this release had no escape. If it holds
 an envelope-shaped value, an engine read now decodes it. This is the issue
-#1253 residual, now on the engine path. The remaining short-lived copies are
-follow-up work in issue #2043.
+#1253 residual, now on the engine path. Issue #2043 covers the short-lived
+copies. See the addendum below.
+
+## Addendum (issue #2043): the codec covers the short-lived copies
+
+**Decision.** The codec also encodes these copies:
+
+- the activity task row (`input`, `output` and `heartbeat_details`);
+- the completion-callback delivery and its dead letter;
+- the debounce, throttle and outbox buffers;
+- the batch job signal payload.
+
+**Why now.** A finished activity task row stays until task retention removes
+it, and a callback dead letter stays for good. So these copies are not
+short-lived. Each held the same data as the column it copies.
+
+**One rule per reader.** A reader decodes the stored value before it uses it.
+A dead-letter writer takes the input as its source row stores it, and keeps one
+envelope layer. A value that does not decode never reaches a handler, a webhook
+or a start. An activity attempt fails with a retryable error. A buffer scanner
+moves the row back. The callback scanner counts a failed attempt.
+
+**The last payload copies.** The batch buffer, the cross-shard child spec,
+the schedule input and the context headers are encoded too. The buffer keeps
+one envelope for each element, so SQL still appends to and counts the array.
+The spec is one cell, and erasure replaces it with a tombstone without a key.
+The reconciler compares the decoded schedule input, so a new nonce is not
+drift. A header map that does not decode fails the run, and it never means
+no headers. An export decodes headers only for a caller who may decode. The
+archive leaves an encoded header map out.
+
+**What stays clear.** Configuration and identifiers only. The coverage table
+gives the reason for each clear column.

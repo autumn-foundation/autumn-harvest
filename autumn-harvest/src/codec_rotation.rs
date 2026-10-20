@@ -113,6 +113,20 @@ pub struct CodecColumn {
     column: &'static str,
     /// A SQL predicate on the table alias `t` that selects the encoded rows.
     rows: &'static str,
+    shape: CellShape,
+}
+
+/// Where the envelopes sit inside one codec-column cell (issue #2043).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CellShape {
+    /// One envelope at the cell root.
+    Cell,
+    /// A JSON array. Each element is its own envelope or a clear value.
+    Elements,
+    /// A JSON object. One key holds the envelope, and the other keys are
+    /// configuration. The start options of a buffered start use this shape.
+    Field(&'static str),
 }
 
 impl CodecColumn {
@@ -140,25 +154,30 @@ impl CodecColumn {
     pub const fn rows(&self) -> &'static str {
         self.rows
     }
+
+    /// Where the envelopes sit inside the cell.
+    #[must_use]
+    pub const fn shape(&self) -> CellShape {
+        self.shape
+    }
 }
 
 /// Every row of the table holds an encoded cell.
 const ALL_ROWS: &str = "TRUE";
 
-/// Only a workflow task's row is encoded. An activity task keeps its input
-/// and output in clear.
-const WORKFLOW_TASK_ROWS: &str = "t.task_type = 'workflow'";
-
-/// Every codec column the sweep converts and the census counts (issue #1979).
+/// Every codec column the sweep converts and the census counts (issue #1979,
+/// issue #2043).
 ///
 /// Most are written through [`PayloadCodecs::encode_column`].
 /// `harvest_execution_summaries.result` is a verbatim copy of
 /// `harvest_workflow_executions.output`, so it holds the same ciphertext.
-/// `harvest_task_queue` holds the workflow task's input and output, encoded
-/// the same way. An activity task row stays in clear. A clear activity
-/// argument can still have the shape of a valid envelope. So those entries
-/// select workflow rows only, and the sweep and the census never touch an
-/// activity row.
+/// A workflow task row and an activity task row both hold encoded cells. A
+/// completion-callback dead letter copies the stored delivery body, so it
+/// holds an envelope too.
+///
+/// A row written before issue #2043 can hold a clear value. A clear value
+/// that has the shape of an envelope reads as one. The security posture
+/// page names this residual risk.
 ///
 /// A column belongs here exactly when `docs/security-posture.md` marks it
 /// Covered, except `harvest_events.event_data`, which the event pass covers.
@@ -169,48 +188,175 @@ pub const CODEC_COLUMNS: &[CodecColumn] = &[
         id_column: "id",
         column: "input",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_workflow_executions",
         id_column: "id",
         column: "output",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_workflow_executions",
         id_column: "id",
         column: "memo",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_signals",
         id_column: "id",
         column: "payload",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_dead_letters",
         id_column: "id",
         column: "input",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_execution_summaries",
         id_column: "execution_id",
         column: "result",
         rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_task_queue",
         id_column: "id",
         column: "input",
-        rows: WORKFLOW_TASK_ROWS,
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
     CodecColumn {
         table: "harvest_task_queue",
         id_column: "id",
         column: "output",
-        rows: WORKFLOW_TASK_ROWS,
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_task_queue",
+        id_column: "id",
+        column: "heartbeat_details",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_completion_deliveries",
+        id_column: "id",
+        column: "payload",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_debounce",
+        id_column: "id",
+        column: "last_input",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_start_throttle",
+        id_column: "id",
+        column: "input",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_completion_trigger_outbox",
+        id_column: "id",
+        column: "target_input",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_batch_jobs",
+        id_column: "id",
+        column: "signal_payload",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_event_batches",
+        id_column: "id",
+        column: "buffered_payloads",
+        rows: ALL_ROWS,
+        shape: CellShape::Elements,
+    },
+    CodecColumn {
+        table: "harvest_cross_shard_children",
+        id_column: "child_exec_id",
+        column: "child_spec",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_schedules",
+        id_column: "id",
+        column: "workflow_input",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_debounce",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("context_headers"),
+    },
+    CodecColumn {
+        table: "harvest_debounce",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("memo"),
+    },
+    CodecColumn {
+        table: "harvest_start_throttle",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("context_headers"),
+    },
+    CodecColumn {
+        table: "harvest_start_throttle",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("memo"),
+    },
+    CodecColumn {
+        table: "harvest_event_batches",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("context_headers"),
+    },
+    CodecColumn {
+        table: "harvest_event_batches",
+        id_column: "id",
+        column: "start_options",
+        rows: ALL_ROWS,
+        shape: CellShape::Field("memo"),
+    },
+    CodecColumn {
+        table: "harvest_workflow_executions",
+        id_column: "id",
+        column: "context_headers",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    CodecColumn {
+        table: "harvest_task_queue",
+        id_column: "id",
+        column: "context_headers",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
     },
 ];
 
@@ -300,6 +446,64 @@ pub fn reencrypt_column_value_under(
     }
 }
 
+/// Re-encode one cell of `column` under `target_key_id` (issue #2043).
+///
+/// For [`CellShape::Elements`], each envelope element moves to the target key
+/// and a clear element stays as it is. The result is the whole new array. An
+/// element that does not decode fails the cell, so the sweep never writes a
+/// half-converted buffer. For [`CellShape::Field`], only the named key moves.
+/// The other keys stay as they are.
+///
+/// # Errors
+///
+/// As [`reencrypt_column_value_under`].
+pub fn reencrypt_column_cell_under(
+    codecs: &PayloadCodecs,
+    target_key_id: &str,
+    column: &CodecColumn,
+    value: &Value,
+) -> HarvestResult<Option<Value>> {
+    match column.shape {
+        CellShape::Cell => reencrypt_column_value_under(codecs, target_key_id, value),
+        CellShape::Elements => {
+            if !codecs.has_keyed_codecs() {
+                return Ok(None);
+            }
+            let Some(items) = value.as_array() else {
+                return Ok(None);
+            };
+            let mut converted = Vec::with_capacity(items.len());
+            let mut changed = false;
+            for item in items {
+                match reencrypt_field_under(codecs, target_key_id, item)? {
+                    FieldStep::Reencrypted(candidate) => {
+                        converted.push(candidate);
+                        changed = true;
+                    }
+                    _ => converted.push(item.clone()),
+                }
+            }
+            Ok(changed.then_some(Value::Array(converted)))
+        }
+        CellShape::Field(key) => {
+            if !codecs.has_keyed_codecs() {
+                return Ok(None);
+            }
+            let Some(field) = value.get(key) else {
+                return Ok(None);
+            };
+            match reencrypt_field_under(codecs, target_key_id, field)? {
+                FieldStep::Reencrypted(candidate) => {
+                    let mut converted = value.clone();
+                    converted[key] = candidate;
+                    Ok(Some(converted))
+                }
+                _ => Ok(None),
+            }
+        }
+    }
+}
+
 /// `true` when `codecs` is in a state where sweeping could only *remove*
 /// encryption.
 ///
@@ -346,13 +550,13 @@ fn active_key_would_decrypt(codecs: &PayloadCodecs) -> bool {
 const COMPLETED_CURSOR_REVALIDATION_SECS: f64 = 300.0;
 
 #[cfg(feature = "db")]
-const fn sweep_error_kind(error: &HarvestError) -> &'static str {
+pub(crate) const fn sweep_error_kind(error: &HarvestError) -> &'static str {
     match error {
         HarvestError::UnknownCodecKey { .. } => "unknown_key",
         HarvestError::UnknownPayloadCodec { .. } => "unknown_codec",
         HarvestError::Serialization(_) => "invalid_json",
         HarvestError::Database(_) => "database",
-        HarvestError::Config(_) => "codec_error",
+        HarvestError::Codec(_) | HarvestError::Config(_) => "codec_error",
         _ => "other",
     }
 }
@@ -533,13 +737,13 @@ mod db {
         CodecKeyActivationBlocker, CodecKeyShardRemainder, HarvestError, HarvestResult,
         database_error,
     };
-    use crate::payload_codec::PayloadCodecs;
+    use crate::payload_codec::{ColumnCursor, PayloadCodecs};
     use crate::payload_store::PAYLOAD_FIELD_KEYS;
     use crate::telemetry::MetricsRecorder;
 
     use super::{
-        CODEC_COLUMNS, CodecColumn, active_key_would_decrypt, has_non_active_key,
-        reencrypt_column_value_under, reencrypt_event_payload_fields_under,
+        CODEC_COLUMNS, CellShape, CodecColumn, active_key_would_decrypt, has_non_active_key,
+        reencrypt_column_cell_under, reencrypt_event_payload_fields_under,
     };
 
     /// The exact SQL mirror of
@@ -616,6 +820,33 @@ mod db {
         format!(
             "COALESCE(f.value ->> 'kid', f.value -> '_harvest_codec_envelope' ->> 'kid', {legacy})"
         )
+    }
+
+    /// The `FROM` fragment that exposes each value of a cell as `f.value`
+    /// (issue #2043). A [`CellShape::Cell`] gives one value. A
+    /// [`CellShape::Elements`] cell gives one value per array element.
+    ///
+    /// The shared envelope predicate and key expression read `f.value`.
+    /// So one fragment per shape is all the census, the sweep and the pending
+    /// probe need.
+    fn value_source(column: &CodecColumn) -> String {
+        match column.shape {
+            CellShape::Cell => format!(
+                "CROSS JOIN LATERAL (SELECT t.{}) AS f(value)",
+                column.column
+            ),
+            // The key is a compile-time constant of `CODEC_COLUMNS`.
+            CellShape::Field(key) => format!(
+                "CROSS JOIN LATERAL (SELECT t.{col} -> '{key}') AS f(value)",
+                col = column.column,
+            ),
+            CellShape::Elements => format!(
+                "CROSS JOIN LATERAL jsonb_array_elements( \
+                     CASE WHEN jsonb_typeof(t.{col}) = 'array' THEN t.{col} ELSE '[]'::jsonb END \
+                 ) AS f(value)",
+                col = column.column,
+            ),
+        }
     }
 
     #[derive(diesel::QueryableByName)]
@@ -782,14 +1013,19 @@ mod db {
         // The identifiers come from the compile-time `CODEC_COLUMNS` list,
         // never from input.
         for column in CODEC_COLUMNS {
+            // A buffer row counts once per key, not once per element.
+            let count = match column.shape {
+                CellShape::Cell | CellShape::Field(_) => "COUNT(*)".to_string(),
+                CellShape::Elements => format!("COUNT(DISTINCT t.{})", column.id_column),
+            };
             sources.push(format!(
-                "SELECT {key_id} AS key_id, COUNT(*)::BIGINT AS row_count \
+                "SELECT {key_id} AS key_id, {count}::BIGINT AS row_count \
                  FROM {table} t \
-                 CROSS JOIN LATERAL (SELECT t.{col}) AS f(value) \
+                 {source} \
                  WHERE {rows} AND f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
                  GROUP BY 1",
                 table = column.table,
-                col = column.column,
+                source = value_source(column),
                 rows = column.rows,
             ));
         }
@@ -1267,77 +1503,22 @@ mod db {
         pending: bool,
     }
 
-    /// Where one shard's column cycle stopped (issue #1979).
-    ///
-    /// It lives in this process only. A restart or a second worker starts a
-    /// cycle from the first column, which is safe: the census, not this
-    /// cursor, decides completion.
-    #[derive(Debug, Clone, Default)]
-    struct ColumnCursor {
-        /// The key id this cycle converts onto.
-        active_key_id: String,
-        /// Index into [`CODEC_COLUMNS`].
-        column: usize,
-        /// The last primary key examined in that column.
-        after: Option<uuid::Uuid>,
-        /// Cells this cycle could not convert so far.
-        unresolved: i64,
-    }
-
-    /// Column cursors by database identity, schema and shard id.
-    ///
-    /// One process can host several runtimes on different databases, so the
-    /// shard id alone is not a unique scope. Runtimes on one database can
-    /// also select different schemas through `search_path`, so the scope
-    /// names the schema where the codec tables resolve.
-    static COLUMN_CURSORS: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, ColumnCursor>>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeMap::new()));
-
-    #[derive(diesel::QueryableByName)]
-    struct CursorScope {
-        #[diesel(sql_type = Text)]
-        scope: String,
-    }
-
-    /// The cursor key for this connection's database, schema and `shard_id`.
-    async fn column_cursor_scope(
-        conn: &mut AsyncPgConnection,
+    fn load_column_cursor(
+        codecs: &PayloadCodecs,
         shard_id: i32,
-    ) -> HarvestResult<String> {
-        let row: CursorScope = diesel::sql_query(
-            "SELECT current_database() || '@' \
-                 || COALESCE(host(inet_server_addr()), 'local') || ':' \
-                 || COALESCE(inet_server_port()::TEXT, '') || '/' \
-                 || COALESCE(( \
-                     SELECT relnamespace::regnamespace::TEXT FROM pg_class \
-                     WHERE oid = to_regclass('harvest_workflow_executions') \
-                 ), '') AS scope",
-        )
-        .get_result(conn)
-        .await
-        .map_err(database_error)?;
-        Ok(format!("{}/{shard_id}", row.scope))
-    }
-
-    fn load_column_cursor(scope: &str, active_key_id: &str) -> ColumnCursor {
-        let cursors = COLUMN_CURSORS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cursors
-            .get(scope)
+        active_key_id: &str,
+    ) -> ColumnCursor {
+        codecs
+            .column_cursor(shard_id)
             .filter(|cursor| cursor.active_key_id == active_key_id)
-            .cloned()
             .unwrap_or_else(|| ColumnCursor {
                 active_key_id: active_key_id.to_string(),
                 ..ColumnCursor::default()
             })
     }
 
-    fn store_column_cursor(scope: String, cursor: ColumnCursor) {
-        COLUMN_CURSORS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(scope, cursor);
+    fn store_column_cursor(codecs: &PayloadCodecs, shard_id: i32, cursor: ColumnCursor) {
+        codecs.set_column_cursor(shard_id, cursor);
     }
 
     /// Re-encrypt the codec columns onto `active_key_id` (issue #1979).
@@ -1355,8 +1536,7 @@ mod db {
         active_key_id: &str,
         batch_limit: i64,
     ) -> HarvestResult<ColumnPass> {
-        let scope = column_cursor_scope(conn, shard.as_i32()).await?;
-        let mut cursor = load_column_cursor(&scope, active_key_id);
+        let mut cursor = load_column_cursor(codecs, shard.as_i32(), active_key_id);
         let budget = usize::try_from(batch_limit).unwrap_or(usize::MAX);
         let key_id = key_id_expr("$1");
         let mut examined = 0usize;
@@ -1367,10 +1547,15 @@ mod db {
             }
             let remaining = i64::try_from(budget - examined).unwrap_or(batch_limit);
             // The identifiers come from the compile-time `CODEC_COLUMNS` list.
+            // A buffer row with several pending elements matches once per element.
+            let distinct = match column.shape {
+                CellShape::Cell | CellShape::Field(_) => "",
+                CellShape::Elements => "DISTINCT ",
+            };
             let sql = format!(
-                "SELECT t.{id} AS id, t.{col} AS value \
+                "SELECT {distinct}t.{id} AS id, t.{col} AS value \
                  FROM {table} t \
-                 CROSS JOIN LATERAL (SELECT t.{col}) AS f(value) \
+                 {source} \
                  WHERE {rows} AND f.value IS NOT NULL AND {ENVELOPE_PREDICATE} \
                    AND {key_id} <> $2 \
                    AND ($3::UUID IS NULL OR t.{id} > $3) \
@@ -1378,6 +1563,7 @@ mod db {
                 id = column.id_column,
                 col = column.column,
                 table = column.table,
+                source = value_source(column),
                 rows = column.rows,
             );
             let cells: Vec<ColumnCell> = diesel::sql_query(&sql)
@@ -1411,7 +1597,8 @@ mod db {
         let pass = if cursor.column >= CODEC_COLUMNS.len() {
             let unresolved = cursor.unresolved;
             store_column_cursor(
-                scope,
+                codecs,
+                shard.as_i32(),
                 ColumnCursor {
                     active_key_id: active_key_id.to_string(),
                     ..ColumnCursor::default()
@@ -1423,7 +1610,7 @@ mod db {
                 pending: false,
             }
         } else {
-            store_column_cursor(scope, cursor);
+            store_column_cursor(codecs, shard.as_i32(), cursor);
             ColumnPass {
                 rewritten,
                 unresolved: 0,
@@ -1442,7 +1629,8 @@ mod db {
         cell: &ColumnCell,
         active_key_id: &str,
     ) -> HarvestResult<CellOutcome> {
-        let outcome = match reencrypt_column_value_under(codecs, active_key_id, &cell.value) {
+        let outcome = match reencrypt_column_cell_under(codecs, active_key_id, column, &cell.value)
+        {
             Ok(Some(candidate)) => {
                 if compare_and_swap_column(conn, shard, column, cell.id, &cell.value, &candidate)
                     .await?
@@ -1501,12 +1689,12 @@ mod db {
         let sql = format!(
             "SELECT EXISTS ( \
                  SELECT 1 FROM {table} t \
-                 CROSS JOIN LATERAL (SELECT t.{col}) AS f(value) \
+                 {source} \
                  WHERE t.{id} = $3 AND {rows} AND f.value IS NOT NULL \
                    AND {ENVELOPE_PREDICATE} AND {key_id} <> $2 \
              ) AS present",
             table = column.table,
-            col = column.column,
+            source = value_source(column),
             id = column.id_column,
             rows = column.rows,
         );
@@ -2871,6 +3059,51 @@ mod db {
             }
         }
     }
+
+    #[cfg(test)]
+    mod column_cursor_tests {
+        use super::{ColumnCursor, load_column_cursor, store_column_cursor};
+        use crate::payload_codec::PayloadCodecs;
+
+        fn mid_cycle(key: &str) -> ColumnCursor {
+            ColumnCursor {
+                active_key_id: key.to_string(),
+                column: 2,
+                after: Some(uuid::Uuid::from_u128(7)),
+                unresolved: 3,
+            }
+        }
+
+        /// Issue #2054: two runtimes in one process must not share a cursor.
+        #[test]
+        fn a_column_cursor_belongs_to_its_codecs() {
+            let first = PayloadCodecs::default();
+            let second = PayloadCodecs::default();
+            store_column_cursor(&first, 0, mid_cycle("k1"));
+
+            assert_eq!(load_column_cursor(&first, 0, "k1").column, 2);
+            assert_eq!(load_column_cursor(&second, 0, "k1").column, 0);
+        }
+
+        #[test]
+        fn clones_of_one_codecs_share_the_cursor() {
+            let codecs = PayloadCodecs::default();
+            let clone = codecs.clone();
+            store_column_cursor(&clone, 0, mid_cycle("k1"));
+
+            assert_eq!(load_column_cursor(&codecs, 0, "k1").unresolved, 3);
+            assert_eq!(load_column_cursor(&clone, 0, "k1").unresolved, 3);
+        }
+
+        #[test]
+        fn a_column_cursor_is_per_shard_and_per_key() {
+            let codecs = PayloadCodecs::default();
+            store_column_cursor(&codecs, 0, mid_cycle("k1"));
+
+            assert_eq!(load_column_cursor(&codecs, 1, "k1").column, 0);
+            assert_eq!(load_column_cursor(&codecs, 0, "k2").column, 0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2927,6 +3160,246 @@ mod tests {
             .expect("encode");
         codecs.set_active_key(&restore).expect("restore active key");
         event
+    }
+
+    /// A codec column of the given shape. The sweep never reads the names.
+    const fn column(shape: CellShape) -> CodecColumn {
+        CodecColumn {
+            table: "t",
+            id_column: "id",
+            column: "c",
+            rows: ALL_ROWS,
+            shape,
+        }
+    }
+
+    /// The envelope of `input` under `key_id`.
+    fn envelope_under(codecs: &PayloadCodecs, key_id: &str, input: Value) -> Value {
+        event_under(codecs, key_id, input)["data"]["input"].clone()
+    }
+
+    /// The decoded bytes of an envelope.
+    fn plain_of(codecs: &PayloadCodecs, envelope: &Value) -> Vec<u8> {
+        codecs
+            .decode_payload_bytes(envelope)
+            .expect("decode")
+            .expect("envelope")
+    }
+
+    /// The key id of an envelope.
+    fn key_of(envelope: &Value) -> &str {
+        envelope[CODEC_ENVELOPE_KID_KEY].as_str().expect("key id")
+    }
+
+    #[test]
+    fn a_cell_shape_moves_the_whole_cell_to_the_target_key() {
+        let codecs = rotated_registry();
+        let cell = envelope_under(&codecs, "k1", json!({"a": 1}));
+
+        let out = reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Cell), &cell)
+            .expect("sweep")
+            .expect("changed");
+
+        assert_eq!(key_of(&out), "k2");
+        assert_eq!(plain_of(&codecs, &out), plain_of(&codecs, &cell));
+    }
+
+    #[test]
+    fn a_cell_shape_cell_keeps_plaintext_active_tombstone_and_offload_as_they_are() {
+        let codecs = rotated_registry();
+        let shape = column(CellShape::Cell);
+        let offload = json!({"_harvest_offload_envelope": 1, "store_id": "m", "key": "b"});
+        let cells = [
+            json!("clear"),
+            envelope_under(&codecs, "k2", json!(1)),
+            crate::erase::erasure_tombstone(),
+            offload,
+        ];
+
+        for cell in cells {
+            let out = reencrypt_column_cell_under(&codecs, "k2", &shape, &cell).expect("sweep");
+            assert_eq!(out, None, "{cell}");
+        }
+    }
+
+    #[test]
+    fn the_shape_accessor_returns_the_shape() {
+        assert_eq!(column(CellShape::Elements).shape(), CellShape::Elements);
+        assert_eq!(column(CellShape::Field("k")).shape(), CellShape::Field("k"));
+    }
+
+    #[test]
+    fn an_elements_cell_converts_each_envelope_and_keeps_a_clear_element() {
+        let codecs = rotated_registry();
+        let cell = json!([
+            envelope_under(&codecs, "k1", json!("one")),
+            json!("clear"),
+            envelope_under(&codecs, "k2", json!("two")),
+        ]);
+
+        let out = reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Elements), &cell)
+            .expect("sweep")
+            .expect("changed");
+
+        assert_eq!(out.as_array().map(Vec::len), Some(3));
+        assert_eq!(key_of(&out[0]), "k2");
+        assert_eq!(plain_of(&codecs, &out[0]), plain_of(&codecs, &cell[0]));
+        assert_eq!(out[1], json!("clear"));
+        assert_eq!(out[2], cell[2], "an active element stays as it was");
+    }
+
+    #[test]
+    fn an_elements_cell_keeps_tombstone_and_offload_elements_and_an_empty_array() {
+        let codecs = rotated_registry();
+        let shape = column(CellShape::Elements);
+        let offload = json!({"_harvest_offload_envelope": 1, "store_id": "m", "key": "b"});
+        let cell = json!([
+            crate::erase::erasure_tombstone(),
+            offload,
+            envelope_under(&codecs, "k1", json!(1)),
+        ]);
+
+        let out = reencrypt_column_cell_under(&codecs, "k2", &shape, &cell)
+            .expect("sweep")
+            .expect("changed");
+        let empty = reencrypt_column_cell_under(&codecs, "k2", &shape, &json!([]));
+
+        assert_eq!(out[0], cell[0]);
+        assert_eq!(out[1], cell[1]);
+        assert_eq!(key_of(&out[2]), "k2");
+        assert_eq!(empty.expect("empty"), None);
+    }
+
+    #[test]
+    fn an_elements_cell_with_nothing_to_move_is_a_no_op() {
+        let codecs = rotated_registry();
+        let cell = json!([json!("clear"), envelope_under(&codecs, "k2", json!(1))]);
+
+        let out = reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Elements), &cell)
+            .expect("sweep");
+
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn an_elements_cell_that_is_not_an_array_is_a_no_op() {
+        let codecs = rotated_registry();
+        let cell = envelope_under(&codecs, "k1", json!(1));
+
+        let out = reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Elements), &cell)
+            .expect("sweep");
+
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn an_undecodable_element_fails_the_whole_cell() {
+        let writer = PayloadCodecs::default();
+        writer
+            .register_key("k3", Arc::new(XorCodec(0x33)))
+            .expect("register k3");
+        writer.set_active_key("k3").expect("activate k3");
+        let lost = envelope_under(&writer, "k3", json!("lost"));
+        let codecs = rotated_registry();
+        let cell = json!([envelope_under(&codecs, "k1", json!("one")), lost]);
+
+        let out = reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Elements), &cell);
+
+        assert!(
+            matches!(out, Err(HarvestError::UnknownCodecKey { .. })),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_field_shape_moves_only_the_named_key() {
+        let codecs = rotated_registry();
+        let cell = json!({
+            "memo": envelope_under(&codecs, "k1", json!({"m": 1})),
+            "mode": "fast",
+        });
+
+        let out =
+            reencrypt_column_cell_under(&codecs, "k2", &column(CellShape::Field("memo")), &cell)
+                .expect("sweep")
+                .expect("changed");
+
+        assert_eq!(key_of(&out["memo"]), "k2");
+        assert_eq!(
+            plain_of(&codecs, &out["memo"]),
+            plain_of(&codecs, &cell["memo"])
+        );
+        let mut rest = out;
+        rest["memo"] = cell["memo"].clone();
+        assert_eq!(rest, cell, "only the named key changes");
+    }
+
+    #[test]
+    fn a_field_shape_without_the_key_or_with_a_clear_field_is_a_no_op() {
+        let codecs = rotated_registry();
+        let shape = column(CellShape::Field("memo"));
+
+        let missing = reencrypt_column_cell_under(&codecs, "k2", &shape, &json!({"mode": 1}));
+        let clear = reencrypt_column_cell_under(&codecs, "k2", &shape, &json!({"memo": "x"}));
+        let active = json!({"memo": envelope_under(&codecs, "k2", json!(1))});
+        let done = reencrypt_column_cell_under(&codecs, "k2", &shape, &active);
+        let flat = reencrypt_column_cell_under(&codecs, "k2", &shape, &json!("memo"));
+        assert_eq!(flat.expect("non-object"), None);
+
+        assert_eq!(missing.expect("missing"), None);
+        assert_eq!(clear.expect("clear"), None);
+        assert_eq!(done.expect("active"), None);
+    }
+
+    #[test]
+    fn every_shape_is_a_no_op_without_a_keyed_codec() {
+        let keyed = rotated_registry();
+        let envelope = envelope_under(&keyed, "k1", json!(1));
+        let empty = PayloadCodecs::default();
+        let cases = [
+            (CellShape::Cell, envelope.clone()),
+            (CellShape::Elements, json!([envelope.clone()])),
+            (CellShape::Field("x"), json!({"x": envelope})),
+        ];
+
+        for (shape, value) in cases {
+            let moved = reencrypt_column_cell_under(&keyed, "k2", &column(shape), &value);
+            assert!(matches!(moved, Ok(Some(_))), "{shape:?} moves with a key");
+            let out = reencrypt_column_cell_under(&empty, "k2", &column(shape), &value);
+            assert_eq!(out.expect("sweep"), None, "{shape:?}");
+        }
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn sweep_error_kind_names_each_error_class() {
+        let cases = [
+            (
+                HarvestError::UnknownCodecKey {
+                    key_id: "k".into(),
+                    codec_id: "c".into(),
+                },
+                "unknown_key",
+            ),
+            (
+                HarvestError::UnknownPayloadCodec { id: "c".into() },
+                "unknown_codec",
+            ),
+            (
+                HarvestError::Serialization(
+                    serde_json::from_str::<Value>("{").expect_err("invalid json"),
+                ),
+                "invalid_json",
+            ),
+            (HarvestError::Database("d".into()), "database"),
+            (HarvestError::Codec("c".into()), "codec_error"),
+            (HarvestError::Config("c".into()), "codec_error"),
+            (HarvestError::Dispatch("d".into()), "other"),
+        ];
+
+        for (error, kind) in cases {
+            assert_eq!(sweep_error_kind(&error), kind, "{error}");
+        }
     }
 
     #[test]
@@ -3253,11 +3726,11 @@ mod tests {
             text.matches("load_history(").count()
         }
 
-        // Both still need a `PayloadCodecs` threaded through a public
-        // signature (`RetentionScanner::spawn`, `run_canary`), which is
-        // issue #1243's remaining scope rather than rotation's. Neither is on
-        // the task-processing path: archival and the replay canary.
-        const KNOWN_IDENTITY_READS: &[(&str, usize)] = &[("retention.rs", 1), ("testing.rs", 2)];
+        // The replay canary still needs a `PayloadCodecs` threaded through a
+        // public signature (`run_canary`), which is issue #1243's remaining
+        // scope rather than rotation's. It is not on the task-processing path.
+        // Retention archival reads the stored form since issue #1983.
+        const KNOWN_IDENTITY_READS: &[(&str, usize)] = &[("testing.rs", 2)];
 
         // `store.rs` is excluded: it *defines* the loaders, and its own
         // delegation between them is the thing every other file must not do.
@@ -3487,12 +3960,12 @@ mod tests {
         }
     }
 
-    /// An engine signal or dead-letter write without the registry stores the
-    /// payload in clear (issue #1979). The sweep never encrypts plaintext, so
-    /// that leak is permanent. An external-await read without the registry
-    /// cannot decode the target output, so the await stays pending. A trigger
-    /// evaluation without the registry starts its target in clear. This
-    /// guard keeps every engine call on the codec-aware variant.
+    /// An engine write without the registry stores the payload in clear
+    /// (issue #1979, issue #2043). The sweep never encrypts plaintext, so that
+    /// leak is permanent. A read without the registry cannot decode a stored
+    /// value, so a scanner leaves the row pending. A trigger evaluation
+    /// without the registry starts its target in clear. This guard keeps every
+    /// engine call on the codec-aware variant.
     #[test]
     fn engine_signal_and_dead_letter_writes_pass_the_registry() {
         const PLAIN_WRITES: &[&str] = &[
@@ -3505,12 +3978,25 @@ mod tests {
             "dlq::dead_letter(",
             "evaluate_triggers_for_execution(",
             "evaluate_triggers_for_execution_collecting(",
+            "fire_due_completion_deliveries(",
+            "admit_debounced_start(",
+            "reserve_or_defer(",
+            "reserve_or_defer_or_shed(",
+            "submit_batch_job(",
+            "fire_due_debounced_starts(",
+            "fire_due_throttled_starts(",
+            "record_cross_shard_child(",
+            "register_workflow_schedules(",
+            "register_workflow_schedules_for_shard(",
+            "update_workflow_schedule(",
+            "admit_batched_start(",
+            "fire_due_event_batches(",
+            "enforce_completion_triggers_outbox(",
+            "rerun_workflow_execution(",
         ];
-        // A completion-callback dead letter copies the delivery body, which
-        // stays in clear (see `docs/security-posture.md`). The count is pinned
-        // so it can only go down.
-        const KNOWN_PLAIN_WRITES: &[(&str, &str, usize)] =
-            &[("completion_callback.rs", "dlq::dead_letter(", 1)];
+        // No engine call may use a plain variant (issue #2043). A pinned
+        // count here could only go down.
+        const KNOWN_PLAIN_WRITES: &[(&str, &str, usize)] = &[];
         let engine_sources: &[(&str, &str)] = &[
             ("worker.rs", include_str!("worker.rs")),
             ("timeout.rs", include_str!("timeout.rs")),
@@ -3527,6 +4013,7 @@ mod tests {
             ),
             ("reset.rs", include_str!("reset.rs")),
             ("cross_shard_child.rs", include_str!("cross_shard_child.rs")),
+            ("scheduler.rs", include_str!("scheduler.rs")),
         ];
         for (name, src) in engine_sources {
             for call in PLAIN_WRITES {

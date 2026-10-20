@@ -1934,10 +1934,10 @@ impl HarvestBuilder {
 
     /// Encode the codec columns as well as the event payloads (issue #1979).
     ///
-    /// The codec columns are `harvest_workflow_executions.input`, `.output`
-    /// and `.memo`, `harvest_signals.payload`, `harvest_dead_letters.input`,
-    /// and the workflow task's `harvest_task_queue.input` and `.output`. The
-    /// default is off.
+    /// The codec columns are the entries of `codec_rotation::CODEC_COLUMNS`
+    /// (issue #1979, issue #2043). The coverage table in
+    /// `docs/security-posture.md` gives a reason for each column that stays
+    /// clear. The default is off.
     ///
     /// This release always decodes those columns. Turn the switch on only
     /// after every worker and every API process runs this release or later.
@@ -2092,6 +2092,31 @@ impl HarvestBuilder {
                 registration.wasm_bytes,
                 registration.signature,
             ));
+        }
+        self
+    }
+
+    /// Register a sandboxed code activity.
+    ///
+    /// The builder adds a normal activity and puts its runtime in the
+    /// [`SandboxActivities`](crate::sandbox::SandboxActivities) state. One
+    /// shared handler runs each request on the runtime of its activity name.
+    /// See [`crate::sandbox`].
+    #[cfg(feature = "sandbox-activities")]
+    #[must_use]
+    pub fn sandbox_activity(mut self, activity: crate::sandbox::SandboxActivity) -> Self {
+        // A later sandbox registration of the same name replaces the earlier
+        // one. Another kind of activity with the name stays, as for the
+        // other registrations: the worker keeps the later one.
+        self.activities
+            .retain(|info| info.module != "sandbox" || info.name != activity.name);
+        self.activities.push(activity.activity_info());
+        let registry = self
+            .state
+            .entry(TypeId::of::<crate::sandbox::SandboxActivities>())
+            .or_insert_with(|| Box::new(crate::sandbox::SandboxActivities::default()));
+        if let Some(registry) = registry.downcast_mut::<crate::sandbox::SandboxActivities>() {
+            registry.insert(activity);
         }
         self
     }
@@ -3294,8 +3319,8 @@ fn validate_workflow_schedules(
         {
             return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
         }
-        // Reject a bad cron expression, a zero interval and a fractional interval
-        // (issue #1967).
+        // Reject a bad cron expression, a zero interval, a fractional interval
+        // (issue #1967) and an interval over `MAX_INTERVAL_PERIOD` (issue #2048).
         if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
@@ -3877,6 +3902,17 @@ pub struct WorkerConfig {
     /// unchanged, preserving today's byte-for-byte behaviour for all workers
     /// that do not configure weights.
     pub queue_weights: std::collections::HashMap<String, u32>,
+    /// Rotate claims across the fairness keys of each queue (issue #1976).
+    ///
+    /// When `true`, the claim serves the keys of a queue in weighted round
+    /// robin and charges the key it claims. One tenant's flood then cannot
+    /// hold another tenant's tasks in the same queue. See
+    /// [`crate::queue_fairness::FairClock`].
+    ///
+    /// **Default: `false`.** The claim statement is then the unchanged one.
+    /// Turn it on for every worker of a queue. A worker with it off ignores
+    /// keys and does not charge them.
+    pub fairness_keys: bool,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
     /// Optional per-shard LISTEN/NOTIFY database URLs for multi-shard workers
@@ -4447,6 +4483,7 @@ impl Default for WorkerConfig {
         Self {
             queues: vec!["default".to_string()],
             queue_weights: std::collections::HashMap::new(),
+            fairness_keys: false,
             notification_database_url: None,
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 20,
@@ -4533,6 +4570,18 @@ impl WorkerConfig {
     ) -> Self {
         self.queue_weights
             .extend(weights.into_iter().map(|(k, v)| (k.into(), v)));
+        self
+    }
+
+    /// Turn fairness keys on or off for this worker (issue #1976).
+    ///
+    /// With fairness keys on, each claim serves the keys of a queue in
+    /// weighted round robin. A key with no override has weight `1`. Set a
+    /// weight at runtime with [`crate::fairness_keys::set_fairness_weight`].
+    /// See [`WorkerConfig::fairness_keys`].
+    #[must_use]
+    pub const fn with_fairness_keys(mut self, on: bool) -> Self {
+        self.fairness_keys = on;
         self
     }
 
@@ -5855,6 +5904,50 @@ mod tests {
                 err,
                 HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
                     if workflow_name == "test" && reason.contains("whole number of seconds")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn harvest_builder_rejects_workflow_schedule_over_the_interval_cap() {
+        // Adding this period to a timestamp overflows chrono (issue #2048).
+        let err = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "test",
+                Schedule::Interval(Duration::from_secs(9_000_000_000_000_000)),
+            ))
+            .try_build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
+                    if workflow_name == "test" && reason.contains("must not exceed")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn harvest_builder_rejects_dag_schedule_over_the_interval_cap() {
+        // The DAG path has its own validation call (issue #2048).
+        let dag = DagInfo {
+            schedule: Some(Schedule::Interval(Duration::from_secs(
+                9_000_000_000_000_000,
+            ))),
+            ..fake_dag_info()
+        };
+        let err = HarvestBuilder::new()
+            .dags(vec![dag])
+            .try_build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
+                    if workflow_name == "daily_etl" && reason.contains("must not exceed")
             ),
             "got: {err:?}"
         );

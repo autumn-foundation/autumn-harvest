@@ -17,7 +17,7 @@
 //! | Edge | Transition | Dedupe key |
 //! |---|---|---|
 //! | Child start | `PENDING_START` → `STARTED` | the child's `ExecutionId` is the PK on the target shard |
-//! | Cancel | `cancel_requested` → cleared | `cancel_workflow_execution` is idempotent on a terminal target |
+//! | Cancel | `cancel_requested` and `cancel_reason` → cleared | `cancel_workflow_execution` is idempotent on a terminal target |
 //! | Terminal notify | row deleted | the append + delete commit together on the parent's shard |
 //! | Close cascade | row deleted | the cascade only acts on a `RUNNING`/`PAUSED` child |
 //!
@@ -83,6 +83,17 @@ const POLL_BATCH: i64 = 1_000;
 /// single sweep and starving newer rows behind it.
 const DUE_PREDICATE: &str = "(last_attempt_at IS NULL OR last_attempt_at < NOW() - \
      (LEAST(attempts, 6) * INTERVAL '5 seconds'))";
+
+diesel::define_sql_function! {
+    /// SQL `COALESCE` over two nullable text values.
+    fn coalesce(
+        first: diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        second: diesel::sql_types::Nullable<diesel::sql_types::Text>,
+    ) -> diesel::sql_types::Nullable<diesel::sql_types::Text>;
+}
+
+/// The `WorkflowCancelled` reason when the parent stored none (issue #2194).
+const CROSS_SHARD_CANCEL_REASON: &str = "parent requested cancellation";
 
 /// Recorded as the `WorkflowCancelled` reason for a child born cancelled
 /// (issue #1263 item 13). See [`start_child_on_target`]'s cancellation arm.
@@ -150,6 +161,10 @@ pub struct CrossShardChildSpec {
     /// The child's OWN resolved quota key (issue #946), never the parent's.
     #[serde(default)]
     pub quota_key: Option<String>,
+    /// The child's fairness key (issue #1976): the parent's key, else the
+    /// child's quota key.
+    #[serde(default)]
+    pub fairness_key: Option<String>,
     /// The child's own declared quota **caps**, enforced on the target shard at
     /// creation time exactly as the same-shard path enforces them inline.
     ///
@@ -215,10 +230,10 @@ impl QuotaCaps {
     #[must_use]
     pub const fn to_policy(self) -> crate::quota::QuotaPolicy {
         crate::quota::QuotaPolicy {
-            key_expr: "",
             max_active_executions: self.max_active_executions,
             max_history_bytes: self.max_history_bytes,
             max_dead_letters: self.max_dead_letters,
+            ..crate::quota::QuotaPolicy::new("")
         }
     }
 }
@@ -326,6 +341,49 @@ pub async fn record_cross_shard_child(
     parent_close_policy: Option<ParentClosePolicy>,
     spec: &CrossShardChildSpec,
 ) -> HarvestResult<()> {
+    record_cross_shard_child_with_codecs(
+        conn,
+        parent_exec_id,
+        child_exec_id,
+        workflow_name,
+        parent_close_policy,
+        spec,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`record_cross_shard_child`], storing the spec through `codecs`
+/// (issue #2043).
+///
+/// A child that is already recorded stays a no-op, even while the encoder
+/// fails. A retried decision re-emits its children, and no new payload needs
+/// to be written for one that exists.
+///
+/// # Errors
+///
+/// Propagates database errors. Returns the encoder error when the child is new.
+pub async fn record_cross_shard_child_with_codecs(
+    conn: &mut AsyncPgConnection,
+    parent_exec_id: ExecutionId,
+    child_exec_id: ExecutionId,
+    workflow_name: &str,
+    parent_close_policy: Option<ParentClosePolicy>,
+    spec: &CrossShardChildSpec,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    let recorded: bool = diesel::select(diesel::dsl::exists(
+        harvest_cross_shard_children::table.find(child_exec_id.as_uuid()),
+    ))
+    .get_result(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    if recorded {
+        return Ok(());
+    }
+    // The whole spec is one cell. It holds the child input and its headers
+    // (issue #2043).
+    let spec_json = serde_json::to_value(spec).map_err(HarvestError::Serialization)?;
     let row = NewCrossShardChildRow {
         child_exec_id: child_exec_id.as_uuid(),
         parent_exec_id: parent_exec_id.as_uuid(),
@@ -333,7 +391,7 @@ pub async fn record_cross_shard_child(
         status: CrossShardChildStatus::PendingStart.as_db_str().to_string(),
         parent_close_policy: parent_close_policy.map(|p| p.to_string()),
         workflow_name: workflow_name.to_string(),
-        child_spec: serde_json::to_value(spec).map_err(HarvestError::Serialization)?,
+        child_spec: codecs.encode_column(&spec_json)?,
     };
     diesel::insert_into(harvest_cross_shard_children::table)
         .values(&row)
@@ -347,14 +405,19 @@ pub async fn record_cross_shard_child(
 
 /// Durably request cancellation of a cross-shard child.
 ///
-/// Called inside whatever parent-side transaction decided to cancel (a race
-/// loser, an over-deadline child, an operator cancel), so the request commits
-/// with that decision. The relay delivers it to the target shard on its next
+/// Called inside the parent-side transaction that decided to cancel, so the
+/// request commits with that decision. The relay delivers it to the target shard on its next
 /// sweep; delivery is idempotent, so an at-least-once redelivery is harmless.
 ///
 /// Clears `last_attempt_at` so a row that had backed off after an earlier
 /// failure is picked up on the very next sweep — a cancel is latency-sensitive
 /// in a way a routine poll is not.
+///
+/// `reason` is the text for the child's `WorkflowCancelled` event (issue #2194).
+/// The first stored reason wins, as the first cancel of a same-shard child does.
+/// `None` adds no reason, and a reason stored earlier stays. A blank reason
+/// counts as `None`, and the relay trims any other reason, as a same-shard
+/// cancel does. With no reason, the relay uses [`CROSS_SHARD_CANCEL_REASON`].
 ///
 /// Returns the number of rows flagged — `0` means the child is not (or is no
 /// longer) a tracked cross-shard child, which the caller treats as "nothing to
@@ -366,10 +429,16 @@ pub async fn record_cross_shard_child(
 pub async fn request_cross_shard_cancel(
     conn: &mut AsyncPgConnection,
     child_exec_id: ExecutionId,
+    reason: Option<&str>,
 ) -> HarvestResult<usize> {
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
     diesel::update(harvest_cross_shard_children::table.find(child_exec_id.as_uuid()))
         .set((
             harvest_cross_shard_children::cancel_requested.eq(true),
+            harvest_cross_shard_children::cancel_reason.eq(coalesce(
+                harvest_cross_shard_children::cancel_reason,
+                reason,
+            )),
             harvest_cross_shard_children::last_attempt_at.eq(None::<DateTime<Utc>>),
             harvest_cross_shard_children::attempts.eq(0),
         ))
@@ -1101,10 +1170,15 @@ async fn apply_action(
             // Leaving the flag set costs one more sweep in the common case and
             // is idempotent by construction: `cancel_workflow_execution` on an
             // already-`CANCELLED` execution returns the idempotent success arm.
-            if cancel_child_on_target(pool, row, acquire_bound, metrics).await? {
+            // Re-read the reason: a caller can store one after this sweep
+            // loaded the row (issue #2194). The child is terminal after
+            // delivery, so the reason must be current when delivery starts.
+            let reason = current_cancel_reason(conn, row).await?;
+            if cancel_child_on_target(pool, row, reason.as_deref(), acquire_bound, metrics).await? {
                 diesel::update(harvest_cross_shard_children::table.find(row.child_exec_id))
                     .set((
                         harvest_cross_shard_children::cancel_requested.eq(false),
+                        harvest_cross_shard_children::cancel_reason.eq(None::<String>),
                         harvest_cross_shard_children::last_error.eq(None::<String>),
                         harvest_cross_shard_children::attempts.eq(0),
                     ))
@@ -1302,8 +1376,26 @@ async fn start_child_on_target(
 ) -> HarvestResult<()> {
     let mut conn = target_conn(pool, row, acquire_bound).await?;
 
-    let spec: CrossShardChildSpec =
-        serde_json::from_value(row.child_spec.clone()).map_err(HarvestError::Serialization)?;
+    // A retry after a crash finds the child already created. It needs no spec,
+    // so it needs no key either. The transaction below checks again for a race
+    // (issue #2043).
+    let created: bool = diesel::select(diesel::dsl::exists(
+        harvest_workflow_executions::table.find(row.child_exec_id),
+    ))
+    .get_result(&mut *conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    if created {
+        return Ok(());
+    }
+
+    // A spec that does not decode never starts a child. The error leaves the
+    // row pending, so a restored key lets it start (issue #2043).
+    // The error text names no value, because the value is plaintext.
+    let spec: CrossShardChildSpec = serde_json::from_value(codecs.decode_column(&row.child_spec)?)
+        .map_err(|_| {
+            HarvestError::Config("the stored child spec is not a valid spec".to_string())
+        })?;
     let child_exec_id = ExecutionId::from_uuid(row.child_exec_id);
     let parent_exec_id = ExecutionId::from_uuid(row.parent_exec_id);
     let child_workflow_id = child_exec_id.to_string();
@@ -1320,14 +1412,22 @@ async fn start_child_on_target(
     // transaction's own commit. It runs on `parent_conn`'s own connection,
     // held in no transaction of its own, so it never blocks on the target
     // shard's work below.
-    let cancel_requested: bool = harvest_cross_shard_children::table
-        .find(row.child_exec_id)
-        .select(harvest_cross_shard_children::cancel_requested)
-        .first(parent_conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?
-        .unwrap_or(row.cancel_requested);
+    let (cancel_requested, cancel_reason): (bool, Option<String>) =
+        harvest_cross_shard_children::table
+            .find(row.child_exec_id)
+            .select((
+                harvest_cross_shard_children::cancel_requested,
+                harvest_cross_shard_children::cancel_reason,
+            ))
+            .first(parent_conn)
+            .await
+            .optional()
+            .map_err(crate::error::database_error)?
+            .unwrap_or_else(|| (row.cancel_requested, row.cancel_reason.clone()));
+    // A stored reason (issue #2194) wins over the born-cancelled text.
+    let born_cancelled_reason = cancel_reason
+        .as_deref()
+        .unwrap_or(CROSS_SHARD_BORN_CANCELLED_REASON);
 
     // The child's queue task is written inside this transaction, so it raises a
     // dispatch hint (issue #1312). The buffering scope holds the hint until the
@@ -1413,7 +1513,11 @@ async fn start_child_on_target(
                     owner: spec.owner.as_deref(),
                     runbook_url: spec.runbook_url.as_deref(),
                     severity: spec.severity.as_deref(),
-                    context_headers: spec.context_headers.clone(),
+                    context_headers: spec
+                        .context_headers
+                        .as_ref()
+                        .map(|plain| codecs.encode_column(plain))
+                        .transpose()?,
                     schedule_id: None,
                     scheduled_for: None,
                     workflow_attempt: 1,
@@ -1476,7 +1580,7 @@ async fn start_child_on_target(
                         &[
                             started_event,
                             WorkflowEvent::WorkflowCancelled {
-                                reason: CROSS_SHARD_BORN_CANCELLED_REASON.to_string(),
+                                reason: born_cancelled_reason.to_string(),
                             },
                         ],
                         0,
@@ -1516,7 +1620,7 @@ async fn start_child_on_target(
                     .set((
                         harvest_workflow_executions::state.eq("CANCELLED"),
                         harvest_workflow_executions::error
-                            .eq(Some(CROSS_SHARD_BORN_CANCELLED_REASON)),
+                            .eq(Some(born_cancelled_reason)),
                         harvest_workflow_executions::completed_at.eq(Some(created_at)),
                     ))
                     .execute(conn)
@@ -1599,6 +1703,12 @@ async fn start_child_on_target(
                 params.required_build_id = spec.assigned_build_id.clone();
                 params.concurrency_key = spec.concurrency_key.clone();
                 params.max_concurrent = spec.max_concurrent;
+                // A spec from before issue #1976 has no fairness key. It then
+                // takes the child's quota key, as a local child does.
+                params.fairness_key = crate::queue_fairness::fairness_key_for(
+                    spec.fairness_key.as_deref(),
+                    spec.quota_key.as_deref(),
+                );
                 params.trace_context = spec.trace_context.clone();
                 queue::enqueue(conn, &params).await?;
                 Ok((None, Vec::new()))
@@ -1621,6 +1731,32 @@ async fn start_child_on_target(
     Ok(())
 }
 
+/// The cancel reason now stored for `row`, read fresh from the parent shard.
+///
+/// A sweep loads its rows once. A caller that mixes `None` and `Some` can store
+/// a reason after that load, so the relay reads it again before it delivers
+/// (issue #2194). A row that is gone keeps the loaded reason. A reason stored
+/// after this read but before the target commit is still too late, because the
+/// child is then terminal.
+///
+/// # Errors
+///
+/// Propagates database errors.
+#[doc(hidden)] // exposed for the #2194 integration test; not a stable API
+pub async fn current_cancel_reason(
+    conn: &mut AsyncPgConnection,
+    row: &CrossShardChildRow,
+) -> HarvestResult<Option<String>> {
+    let stored: Option<Option<String>> = harvest_cross_shard_children::table
+        .find(row.child_exec_id)
+        .select(harvest_cross_shard_children::cancel_reason)
+        .first(conn)
+        .await
+        .optional()
+        .map_err(crate::error::database_error)?;
+    Ok(stored.unwrap_or_else(|| row.cancel_reason.clone()))
+}
+
 /// Deliver an idempotent cancel to a cross-shard child on its target shard.
 ///
 /// Takes the scanner's REAL metrics recorder, not a no-op. `cancel_workflow_execution`
@@ -1631,6 +1767,7 @@ async fn start_child_on_target(
 async fn cancel_child_on_target(
     pool: &ShardedDbPool,
     row: &CrossShardChildRow,
+    reason: Option<&str>,
     acquire_bound: Option<std::time::Duration>,
     metrics: &(dyn crate::telemetry::MetricsRecorder + Send + Sync),
 ) -> HarvestResult<bool> {
@@ -1639,7 +1776,7 @@ async fn cancel_child_on_target(
     let result = crate::execution::cancel_workflow_execution(
         &mut conn,
         child_exec_id,
-        "parent requested cancellation",
+        reason.unwrap_or(CROSS_SHARD_CANCEL_REASON),
         metrics,
     )
     .await;

@@ -79,6 +79,7 @@ fn build_request(
         context_headers: None,
         execution_timeout: Some(chrono::Duration::hours(24)),
         deadline_at: Some(chrono::Utc::now() + chrono::Duration::hours(24)),
+        start_provenance: None,
         parent_execution_id: None,
     }
 }

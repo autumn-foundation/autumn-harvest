@@ -810,6 +810,17 @@ pub enum CliError {
         value: String,
     },
 
+    /// A fairness key would be normalized away as a URL dot-segment.
+    #[error(
+        "invalid fairness key '{value}': '.' and '..' are removed as \
+         dot-segments when the request URL is parsed, which would silently \
+         retarget the request at a different route"
+    )]
+    FairnessKeyDotSegment {
+        /// Original CLI argument value.
+        value: String,
+    },
+
     /// An activity name would be normalized away as a URL dot-segment.
     #[error(
         "invalid activity name '{value}': '.' and '..' are removed as \
@@ -2185,11 +2196,12 @@ enum WorkflowCommand {
         /// live executions or force this sort order.
         #[arg(long = "history-bloat-min-events")]
         history_bloat_min_events: Option<u64>,
-        /// Filter by workflow-start provenance (issue #740): one of api,
+        /// Filter by workflow-start provenance (issue #740). Values: api,
         /// schedule, backfill, `signal_with_start`, `update_with_start`,
-        /// `completion_trigger`, webhook, child, batch, `continue_as_new`,
-        /// reset, outbox, or unknown (matches pre-upgrade/NULL rows). The
-        /// server rejects any other value with a 400.
+        /// `completion_trigger`, webhook, broker, child, batch,
+        /// `continue_as_new`, reset, rerun, outbox, transactional, fork.
+        /// `unknown` matches pre-upgrade/NULL rows. The server rejects any
+        /// other value with a 400.
         #[arg(long = "start-source")]
         start_source: Option<String>,
     },
@@ -2875,7 +2887,8 @@ enum ScheduleCommand {
         /// New task queue name for scheduled runs.
         #[arg(long)]
         queue: Option<String>,
-        /// New overlap policy: skip, `buffer_one`, `buffer_all`, `cancel_other`, `terminate_other`.
+        /// New overlap policy: skip, `buffer_one`, `buffer_all`, `cancel_other`, `terminate_other`,
+        /// `allow_all`.
         #[arg(long)]
         overlap_policy: Option<String>,
         /// New maximum buffered slots under `buffer_all`.
@@ -3043,6 +3056,40 @@ enum QueueCommand {
         /// Output raw JSON instead of the summary table.
         #[arg(long)]
         json: bool,
+    },
+    /// Show, set, or clear fairness key weights in a queue (issue #1976).
+    #[command(subcommand)]
+    Fairness(FairnessCommand),
+}
+
+/// Fairness key weights within one queue (issue #1976).
+///
+/// A key with weight `w` gets `w` claims for each claim of a key with weight
+/// `1`, while both have work. A key with no override has weight `1`. A change
+/// applies at the next claim of the key. No worker restart is needed.
+#[derive(Debug, Subcommand)]
+enum FairnessCommand {
+    /// Show the weight overrides and the claim state of each key.
+    Show {
+        /// Task queue name.
+        queue_name: String,
+    },
+    /// Set the weight of one fairness key.
+    Set {
+        /// Task queue name.
+        queue_name: String,
+        /// Fairness key, matched exactly.
+        fairness_key: String,
+        /// The weight, from 0.001 to 1000.
+        #[arg(long, value_parser = parse_fairness_weight)]
+        weight: f64,
+    },
+    /// Clear the weight of one fairness key. The key goes back to weight 1.
+    Clear {
+        /// Task queue name.
+        queue_name: String,
+        /// Fairness key, matched exactly.
+        fairness_key: String,
     },
 }
 
@@ -6721,6 +6768,67 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
     emit_partition_report(&out, format, "status")
 }
 
+/// The result of the prelude that `harvest partition enable|maintain|disable`
+/// share (issue #2221).
+// One value exists per shard and the caller moves it out at once. A box
+// would add an allocation and no benefit.
+#[allow(clippy::large_enum_variant)]
+enum PartitionShardPrep {
+    /// The shard is ready for its mutation.
+    Ready {
+        /// A connection that passed the authority check.
+        conn: autumn_harvest::diesel_async::AsyncPgConnection,
+        /// The fence barriers. Hold them until the mutation ends.
+        fence: Vec<autumn_harvest::replication::FencePassGuard>,
+        /// The report row for this shard, with no result filled in yet.
+        row: PartitionShardReport,
+    },
+    /// The shard cannot be mutated. The row says why.
+    Unavailable(PartitionShardReport),
+}
+
+/// Run the DR-fenced prelude for one shard (issue #1823).
+///
+/// The steps are: connect, check write authority, take the fence. The first
+/// failing step ends the prelude. A connect failure gives an unreachable row.
+/// An authority or fence failure gives a reachable row with its error set.
+async fn prepare_partition_shard(
+    target: &autumn_harvest::backup_verify::ShardTarget,
+    expect_generation: &[ExpectGeneration],
+) -> PartitionShardPrep {
+    let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
+    let mut conn = match dr_connect(&target.dsn).await {
+        Ok(conn) => conn,
+        Err(error) => {
+            return PartitionShardPrep::Unavailable(PartitionShardReport::unreachable(
+                target.shard_id,
+                redacted,
+                error.to_string(),
+            ));
+        }
+    };
+    let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
+    if let Err(error) = direct_write_authority(
+        &mut conn,
+        target.shard_id,
+        expect_generation,
+        autumn_harvest::replication::AdminWrite::SchemaOnly,
+    )
+    .await
+    {
+        row.error = Some(error);
+        return PartitionShardPrep::Unavailable(row);
+    }
+    // Held until this shard's mutation ends (issue #1823).
+    match database_fence(&target.dsn, target.shard_id, expect_generation).await {
+        Ok(fence) => PartitionShardPrep::Ready { conn, fence, row },
+        Err(error) => {
+            row.error = Some(error);
+            PartitionShardPrep::Unavailable(row)
+        }
+    }
+}
+
 async fn run_partition_enable(
     shards: &[String],
     opts: &autumn_harvest::partition::EnableOptions,
@@ -6730,40 +6838,14 @@ async fn run_partition_enable(
     let targets = parse_shard_targets(shards)?;
     let mut out = Vec::with_capacity(targets.len());
     for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) = direct_write_authority(
-            &mut conn,
-            target.shard_id,
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::SchemaOnly,
-        )
-        .await
-        {
-            row.error = Some(error);
-            out.push(row);
-            continue;
-        }
-        // Held until this shard's mutation ends (issue #1823).
-        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                row.error = Some(error);
-                out.push(row);
-                continue;
-            }
-        };
+        let (mut conn, fence, mut row) =
+            match prepare_partition_shard(target, expect_generation).await {
+                PartitionShardPrep::Ready { conn, fence, row } => (conn, fence, row),
+                PartitionShardPrep::Unavailable(row) => {
+                    out.push(row);
+                    continue;
+                }
+            };
         // Per-shard independence is deliberate: a shard is a database, and a
         // half-converted cluster is a supported state (each shard's layout is
         // detected at runtime), so one shard's lock timeout must not abort the
@@ -6801,40 +6883,14 @@ async fn run_partition_maintain(
     };
     let mut out = Vec::with_capacity(targets.len());
     for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) = direct_write_authority(
-            &mut conn,
-            target.shard_id,
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::SchemaOnly,
-        )
-        .await
-        {
-            row.error = Some(error);
-            out.push(row);
-            continue;
-        }
-        // Held until this shard's mutation ends (issue #1823).
-        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                row.error = Some(error);
-                out.push(row);
-                continue;
-            }
-        };
+        let (mut conn, fence, mut row) =
+            match prepare_partition_shard(target, expect_generation).await {
+                PartitionShardPrep::Ready { conn, fence, row } => (conn, fence, row),
+                PartitionShardPrep::Unavailable(row) => {
+                    out.push(row);
+                    continue;
+                }
+            };
         // A lost fence session stops the pass. See `run_fenced_pass`.
         let maintained = autumn_harvest::replication::run_fenced_pass(&fence, async {
             // Issue #1823: the connection predates the pass, so it joins it.
@@ -6881,40 +6937,14 @@ async fn run_partition_disable(
     let targets = parse_shard_targets(shards)?;
     let mut out = Vec::with_capacity(targets.len());
     for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) = direct_write_authority(
-            &mut conn,
-            target.shard_id,
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::SchemaOnly,
-        )
-        .await
-        {
-            row.error = Some(error);
-            out.push(row);
-            continue;
-        }
-        // Held until this shard's mutation ends (issue #1823).
-        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                row.error = Some(error);
-                out.push(row);
-                continue;
-            }
-        };
+        let (mut conn, fence, mut row) =
+            match prepare_partition_shard(target, expect_generation).await {
+                PartitionShardPrep::Ready { conn, fence, row } => (conn, fence, row),
+                PartitionShardPrep::Unavailable(row) => {
+                    out.push(row);
+                    continue;
+                }
+            };
         // A lost fence session stops the mutation. See `run_fenced_pass`.
         let disabled = autumn_harvest::replication::run_fenced_pass(&fence, async {
             // Issue #1823: the connection predates the pass, so it joins it.
@@ -12249,11 +12279,17 @@ fn legal_hold_request(command: &LegalHoldCommand) -> ApiRequest {
 /// partial-application contract worth gating the exit code on.
 ///
 /// `list-paused` is a read with no such contract, so it is deliberately excluded.
+/// A fairness weight set or clear has the same contract (issue #1976). The
+/// fairness `show` read does not.
 const fn queue_mutation_should_gate(cli: &Cli) -> bool {
     matches!(
         &cli.command,
         Commands::Queue {
-            command: QueueCommand::Pause { .. } | QueueCommand::Resume { .. }
+            command: QueueCommand::Pause { .. }
+                | QueueCommand::Resume { .. }
+                | QueueCommand::Fairness(
+                    FairnessCommand::Set { .. } | FairnessCommand::Clear { .. }
+                )
         }
     )
 }
@@ -12308,6 +12344,56 @@ fn checked_queue_segment(queue_name: &str) -> Result<String, CliError> {
     Ok(path_segment(queue_name))
 }
 
+/// Reject a fairness key that cannot survive URL path parsing intact.
+///
+/// Only the literal `.` and `..` fail. `path_segment` encodes `%`, so a key
+/// such as `%2e` reaches the route as `%252e`. The core validator accepts it
+/// (issue #2097).
+fn checked_fairness_key_segment(fairness_key: &str) -> Result<String, CliError> {
+    if matches!(fairness_key, "." | "..") {
+        return Err(CliError::FairnessKeyDotSegment {
+            value: fairness_key.to_string(),
+        });
+    }
+    Ok(path_segment(fairness_key))
+}
+
+/// Map `harvest queue fairness …` onto the three fairness routes (issue #1976).
+fn fairness_request(command: &FairnessCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        FairnessCommand::Show { queue_name } => {
+            let queue = checked_queue_segment(queue_name)?;
+            Ok(ApiRequest::get(format!("/admin/queues/{queue}/fairness")))
+        }
+        FairnessCommand::Set {
+            queue_name,
+            fairness_key,
+            weight,
+        } => {
+            let queue = checked_queue_segment(queue_name)?;
+            let key = checked_fairness_key_segment(fairness_key)?;
+            let mut body = Map::new();
+            body.insert("weight".to_string(), Value::from(*weight));
+            Ok(ApiRequest::post(
+                format!("/admin/queues/{queue}/fairness/{key}"),
+                Some(Value::Object(body)),
+            ))
+        }
+        FairnessCommand::Clear {
+            queue_name,
+            fairness_key,
+        } => {
+            let queue = checked_queue_segment(queue_name)?;
+            let key = checked_fairness_key_segment(fairness_key)?;
+            Ok(ApiRequest {
+                method: ApiMethod::Delete,
+                path: format!("/admin/queues/{queue}/fairness/{key}"),
+                body: None,
+            })
+        }
+    }
+}
+
 /// Map `harvest queue …` onto the three management routes (issue #619).
 ///
 /// `--shard-id` is omitted from the body entirely when unset, so the default is
@@ -12345,6 +12431,7 @@ fn queue_request(command: &QueueCommand) -> Result<ApiRequest, CliError> {
             ))
         }
         QueueCommand::ListPaused => Ok(ApiRequest::get("/admin/queues/paused")),
+        QueueCommand::Fairness(command) => fairness_request(command),
         QueueCommand::Coverage { queue_name, .. } => Ok(queue_name.as_ref().map_or_else(
             || ApiRequest::get("/admin/queue-coverage"),
             |value| {
@@ -13756,6 +13843,20 @@ fn retirement_shard_array_cell(item: &Value, field: &str) -> String {
         .join(",")
 }
 
+/// Parse `--weight`. A non-finite number would reach the server as JSON
+/// `null`, so the CLI rejects it with a clear message.
+fn parse_fairness_weight(raw: &str) -> Result<f64, String> {
+    let weight: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|e| format!("weight must be a number: {e}"))?;
+    if weight.is_finite() {
+        Ok(weight)
+    } else {
+        Err("weight must be a finite number from 0.001 to 1000".to_owned())
+    }
+}
+
 #[cfg(test)]
 mod reuse_policy_tests {
     use super::*;
@@ -14731,6 +14832,41 @@ mod reuse_policy_tests {
             "the read route has no partial-application contract to gate on"
         );
         assert!(!queue_mutation_should_gate(&parse(&["health"])));
+    }
+
+    #[test]
+    fn queue_mutation_gate_covers_the_fairness_writes_only() {
+        // Issue #1976: a weight set or clear reports a partial fan-out with
+        // the same `ok`/`status` contract as a queue pause.
+        assert!(queue_mutation_should_gate(&parse(&[
+            "queue", "fairness", "set", "q", "tenant-a", "--weight", "2"
+        ])));
+        assert!(queue_mutation_should_gate(&parse(&[
+            "queue", "fairness", "clear", "q", "tenant-a"
+        ])));
+        assert!(
+            !queue_mutation_should_gate(&parse(&["queue", "fairness", "show", "q"])),
+            "the read route has no partial-application contract to gate on"
+        );
+    }
+
+    #[test]
+    fn fairness_weight_parser_rejects_non_finite_numbers() {
+        assert_eq!(parse_fairness_weight(" 2.5 "), Ok(2.5));
+        for bad in ["inf", "-inf", "NaN", "abc"] {
+            assert!(parse_fairness_weight(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn fairness_key_dot_segment_error_uses_exit_code_one() {
+        assert_eq!(
+            CliError::FairnessKeyDotSegment {
+                value: ".".to_string()
+            }
+            .exit_code(),
+            1
+        );
     }
 
     #[test]
@@ -19985,5 +20121,36 @@ mod pg_tls_feature_tests {
             "the CLI must enable autumn-harvest/tls: {:?}",
             result.err()
         );
+    }
+}
+
+#[cfg(test)]
+mod partition_shard_prep_tests {
+    //! The shared prelude of `harvest partition enable|maintain|disable`
+    //! (issue #2221). These tests need no database: an unreachable shard
+    //! stops the prelude before any authority or fence step. The authority
+    //! and fence paths need Postgres and run in the DB integration suite.
+    use super::*;
+
+    const DSN: &str = "postgres://user:s3cret@127.0.0.1:1/harvest";
+
+    #[tokio::test]
+    async fn unreachable_shard_yields_a_redacted_report_row() {
+        let target = ShardTarget::new(7, DSN);
+        let prep = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            prepare_partition_shard(&target, &[]),
+        )
+        .await
+        .expect("connect must fail fast");
+        let PartitionShardPrep::Unavailable(row) = prep else {
+            panic!("a closed port must be unavailable");
+        };
+        assert_eq!(row.shard_id, 7);
+        assert!(!row.reachable);
+        assert!(row.error.is_none());
+        assert!(!row.dsn.contains("s3cret"), "{}", row.dsn);
+        let reason = row.unreachable_reason.expect("a reason");
+        assert!(!reason.contains("s3cret"), "{reason}");
     }
 }

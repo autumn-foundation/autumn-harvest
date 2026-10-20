@@ -392,6 +392,22 @@ async fn outbox_count(pool: &ShardedDbPool, shard: i32) -> i64 {
         .expect("outbox count")
 }
 
+/// The reason on a run's `WorkflowCancelled` event, if it has one.
+async fn cancelled_reason(
+    pool: &ShardedDbPool,
+    shard: i32,
+    exec_id: ExecutionId,
+) -> Option<String> {
+    let mut conn = shard_conn(pool, shard).await;
+    let history = autumn_harvest::store::load_history(&mut conn, exec_id)
+        .await
+        .expect("history load");
+    history.events.into_iter().find_map(|e| match e {
+        WorkflowEvent::WorkflowCancelled { reason } => Some(reason),
+        _ => None,
+    })
+}
+
 fn parent_start_params<'a>(
     exec_id: ExecutionId,
     workflow_name: &'a str,
@@ -438,6 +454,7 @@ fn parent_start_params<'a>(
         start_source: autumn_harvest::types::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     }
 }
@@ -578,6 +595,7 @@ async fn a_cross_shard_childs_chain_deadline_is_anchored_at_its_own_creation() {
         concurrency_key: None,
         max_concurrent: None,
         trace_context: None,
+        fairness_key: None,
         tenant: None,
     };
 
@@ -688,6 +706,7 @@ async fn a_cross_shard_child_cancelled_before_creation_is_born_cancelled() {
         concurrency_key: None,
         max_concurrent: None,
         trace_context: None,
+        fairness_key: None,
         tenant: None,
     };
 
@@ -706,7 +725,7 @@ async fn a_cross_shard_child_cancelled_before_creation_is_born_cancelled() {
 
         // The cancel arrives before the relay ever creates the child — the
         // exact race this regression covers.
-        autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id)
+        autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id, None)
             .await
             .expect("request cancel");
 
@@ -799,6 +818,7 @@ async fn a_cross_shard_child_cancelled_before_creation_bypasses_an_exceeded_quot
         concurrency_key: None,
         max_concurrent: None,
         trace_context: None,
+        fairness_key: None,
         tenant: None,
     };
 
@@ -813,7 +833,7 @@ async fn a_cross_shard_child_cancelled_before_creation_bypasses_an_exceeded_quot
     )
     .await
     .expect("record cross-shard child");
-    autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id)
+    autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id, None)
         .await
         .expect("request cancel");
 
@@ -848,6 +868,299 @@ async fn a_cross_shard_child_cancelled_before_creation_bypasses_an_exceeded_quot
     assert_eq!(
         state, "CANCELLED",
         "a race loser must settle into CANCELLED even over an exceeded quota"
+    );
+}
+
+// ── Issue #2194: the cancel reason crosses the shard boundary ────────────────
+
+/// Create a cross-shard child, cancel it with each reason in turn, and return
+/// the reason on the child's `WorkflowCancelled` event.
+///
+/// With `before_creation`, the cancel lands before the relay creates the child,
+/// so the child is born cancelled. Otherwise the relay creates it first. No
+/// worker runs, so a created child stays `RUNNING` until the relay cancels it.
+async fn cancel_child(
+    reasons: &[Option<&str>],
+    before_creation: bool,
+    workflow_id: &str,
+) -> Option<String> {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+
+    let parent = start_parent(&sharded, "child_echo", workflow_id).await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+    let spec = autumn_harvest::cross_shard_child::CrossShardChildSpec {
+        input: json!({}),
+        queue_name: "default".to_string(),
+        assigned_build_id: None,
+        context_headers: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        sla_secs: None,
+        execution_timeout_secs: None,
+        chain_execution_timeout_secs: None,
+        retry_policy: None,
+        quota_key: None,
+        quota: None,
+        concurrency_key: None,
+        max_concurrent: None,
+        trace_context: None,
+        fairness_key: None,
+        tenant: None,
+    };
+
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &spec,
+    )
+    .await
+    .expect("record cross-shard child");
+
+    if !before_creation {
+        sweep_until_progress(&mut conn, &sharded).await;
+        assert_eq!(
+            execution_state(&sharded, child_shard.as_i32(), child_id)
+                .await
+                .as_deref(),
+            Some("RUNNING"),
+            "the child must exist and be live before the cancel"
+        );
+    }
+
+    for reason in reasons {
+        autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id, *reason)
+            .await
+            .expect("request cancel");
+    }
+    sweep_until_progress(&mut conn, &sharded).await;
+    assert_eq!(
+        execution_state(&sharded, child_shard.as_i32(), child_id)
+            .await
+            .as_deref(),
+        Some("CANCELLED")
+    );
+    if !before_creation {
+        // Delivery consumes the request, so no stale reason can reach a later
+        // cancel.
+        let stored: Option<Option<String>> = harvest_cross_shard_children::table
+            .find(child_id.as_uuid())
+            .select(harvest_cross_shard_children::cancel_reason)
+            .first(&mut *conn)
+            .await
+            .optional()
+            .expect("stored reason query");
+        assert!(
+            matches!(stored, None | Some(None)),
+            "delivery must clear the stored reason, found {stored:?}"
+        );
+    }
+    cancelled_reason(&sharded, child_shard.as_i32(), child_id).await
+}
+
+/// Run relay sweeps until one acts on a row.
+async fn sweep_until_progress(conn: &mut AsyncPgConnection, sharded: &ShardedDbPool) {
+    let started = std::time::Instant::now();
+    loop {
+        let progressed = autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+            conn,
+            &Some(sharded.clone()),
+            &autumn_harvest::payload_codec::PayloadCodecs::default(),
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .expect("relay sweep");
+        if progressed > 0 {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the relay never acted on the child"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// **Issue #2194.** The relay cancels the child with the reason that the parent
+/// stored, as a same-shard cancel does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_shard_cancel_carries_the_parents_reason() {
+    let reason = cancel_child(
+        &[Some("cancelled by its cancellation scope")],
+        false,
+        "cancel-reason-1",
+    )
+    .await;
+    assert_eq!(
+        reason.as_deref(),
+        Some("cancelled by its cancellation scope")
+    );
+}
+
+/// **Issue #2194.** A cancel with no stored reason keeps the generic text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_shard_cancel_without_a_reason_uses_the_generic_text() {
+    let reason = cancel_child(&[None], false, "cancel-reason-2").await;
+    assert_eq!(reason.as_deref(), Some("parent requested cancellation"));
+}
+
+/// **Issue #2194.** The first stored reason wins, as the first cancel of a
+/// same-shard child does. A later request neither replaces nor clears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_first_stored_cancel_reason_wins() {
+    let reason = cancel_child(
+        &[
+            Some("lost race to a sibling branch"),
+            Some("cancelled by its cancellation scope"),
+            None,
+        ],
+        false,
+        "cancel-reason-3",
+    )
+    .await;
+    assert_eq!(reason.as_deref(), Some("lost race to a sibling branch"));
+}
+
+/// **Issue #2194.** A request with no reason does not block a later reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_reason_fills_an_empty_one() {
+    let reason = cancel_child(
+        &[None, Some("cancelled by its cancellation scope")],
+        false,
+        "cancel-reason-6",
+    )
+    .await;
+    assert_eq!(
+        reason.as_deref(),
+        Some("cancelled by its cancellation scope")
+    );
+}
+
+/// **Issue #2194.** A stored reason is trimmed, as a same-shard cancel trims it,
+/// whether the child is created first or born cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_cancel_reason_is_trimmed() {
+    let started = cancel_child(&[Some("  scope  ")], false, "cancel-reason-7").await;
+    assert_eq!(started.as_deref(), Some("scope"));
+    let born = cancel_child(&[Some("  scope  ")], true, "cancel-reason-8").await;
+    assert_eq!(born.as_deref(), Some("scope"));
+}
+
+/// **Issue #2194.** A blank reason counts as no reason, so it neither blocks a
+/// later reason nor reaches the child's event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blank_cancel_reason_counts_as_none() {
+    let started = cancel_child(&[Some("   ")], false, "cancel-reason-9").await;
+    assert_eq!(started.as_deref(), Some("parent requested cancellation"));
+    let born = cancel_child(&[Some("")], true, "cancel-reason-10").await;
+    assert_eq!(
+        born.as_deref(),
+        Some("parent requested cancellation before the relay created this child")
+    );
+    let later = cancel_child(&[Some(" "), Some("scope")], false, "cancel-reason-11").await;
+    assert_eq!(later.as_deref(), Some("scope"));
+}
+
+/// **Issue #2194.** The relay reads the reason again before it delivers, so a
+/// reason stored after a sweep loaded the row still reaches the child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_relay_rereads_a_reason_stored_after_the_sweep_loaded_the_row() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+
+    let parent = start_parent(&sharded, "child_echo", "cancel-reason-12").await;
+    let child_id = ExecutionId::new_for_shard(ShardId::new(1));
+    let spec = autumn_harvest::cross_shard_child::CrossShardChildSpec {
+        input: json!({}),
+        queue_name: "default".to_string(),
+        assigned_build_id: None,
+        context_headers: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        sla_secs: None,
+        execution_timeout_secs: None,
+        chain_execution_timeout_secs: None,
+        retry_policy: None,
+        quota_key: None,
+        quota: None,
+        concurrency_key: None,
+        max_concurrent: None,
+        trace_context: None,
+        fairness_key: None,
+        tenant: None,
+    };
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &spec,
+    )
+    .await
+    .expect("record cross-shard child");
+    autumn_harvest::cross_shard_child::request_cross_shard_cancel(&mut conn, child_id, None)
+        .await
+        .expect("request cancel without a reason");
+
+    // The sweep loads the row while it holds no reason.
+    let loaded: autumn_harvest::models::CrossShardChildRow = harvest_cross_shard_children::table
+        .find(child_id.as_uuid())
+        .select(autumn_harvest::models::CrossShardChildRow::as_select())
+        .first(&mut *conn)
+        .await
+        .expect("load the row");
+    assert_eq!(loaded.cancel_reason, None);
+
+    // A later caller stores a reason before the relay delivers.
+    autumn_harvest::cross_shard_child::request_cross_shard_cancel(
+        &mut conn,
+        child_id,
+        Some("cancelled by its cancellation scope"),
+    )
+    .await
+    .expect("request cancel with a reason");
+
+    let current = autumn_harvest::cross_shard_child::current_cancel_reason(&mut conn, &loaded)
+        .await
+        .expect("read the current reason");
+    assert_eq!(
+        current.as_deref(),
+        Some("cancelled by its cancellation scope")
+    );
+}
+
+/// **Issue #2194.** A child that the parent cancels before creation is born
+/// cancelled with the stored reason. A race loser usually takes this path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_cancelled_before_creation_is_born_with_the_parents_reason() {
+    let reason = cancel_child(
+        &[Some("lost race to a sibling branch")],
+        true,
+        "cancel-reason-4",
+    )
+    .await;
+    assert_eq!(reason.as_deref(), Some("lost race to a sibling branch"));
+}
+
+/// **Issue #2194.** With no stored reason, a born-cancelled child keeps its
+/// own text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_cancelled_before_creation_without_a_reason_keeps_the_born_text() {
+    let reason = cancel_child(&[None], true, "cancel-reason-5").await;
+    assert_eq!(
+        reason.as_deref(),
+        Some("parent requested cancellation before the relay created this child")
     );
 }
 
@@ -918,6 +1231,7 @@ async fn erasing_a_parent_reaches_a_terminal_cross_shard_childs_payloads() {
             concurrency_key: None,
             max_concurrent: None,
             trace_context: None,
+            fairness_key: None,
             tenant: None,
         };
         autumn_harvest::cross_shard_child::record_cross_shard_child(
@@ -1047,6 +1361,7 @@ async fn erasing_a_parent_scrubs_the_outbox_child_specs_input() {
             concurrency_key: None,
             max_concurrent: None,
             trace_context: None,
+            fairness_key: None,
             tenant: None,
         };
         autumn_harvest::cross_shard_child::record_cross_shard_child(
@@ -1178,6 +1493,7 @@ async fn erasing_a_parent_preserves_a_still_running_started_childs_outbox_spec()
             concurrency_key: None,
             max_concurrent: None,
             trace_context: None,
+            fairness_key: None,
             tenant: None,
         };
         autumn_harvest::cross_shard_child::record_cross_shard_child(
@@ -1295,6 +1611,7 @@ async fn erasing_a_parent_with_a_pending_start_child_reports_it_as_skipped() {
         concurrency_key: None,
         max_concurrent: None,
         trace_context: None,
+        fairness_key: None,
         tenant: None,
     };
     autumn_harvest::cross_shard_child::record_cross_shard_child(
@@ -1403,6 +1720,7 @@ async fn erasing_a_parent_scrubs_a_started_childs_spec_after_target_side_retenti
         concurrency_key: None,
         max_concurrent: None,
         trace_context: None,
+        fairness_key: None,
         tenant: None,
     };
     autumn_harvest::cross_shard_child::record_cross_shard_child(
@@ -1927,6 +2245,108 @@ async fn a_cross_shard_race_loser_is_cancelled_on_its_own_shard() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
+    // Issue #2194: the loser gets the race reason, as a same-shard loser does.
+    let loser = started_child_ids(&sharded, PARENT_SHARD, parent)
+        .await
+        .into_iter()
+        .next()
+        .expect("the parent must record its child");
+    assert_eq!(
+        cancelled_reason(&sharded, 2, loser).await.as_deref(),
+        Some("lost race to a sibling branch")
+    );
+
+    worker.shutdown();
+    let _ = handle.await;
+}
+
+/// **Issue #2194.** A scope cancel gives a cross-shard child the scope reason,
+/// as it gives a same-shard child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_scope_cancel_gives_a_cross_shard_child_the_scope_reason() {
+    fn scoped_parent<'a>(
+        ctx: &'a WorkflowContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let scope = ctx.cancellation_scope();
+            let placement = ChildPlacement::Shard(ShardId::new(2));
+            let (child, ()) = tokio::join!(
+                scope.run(ctx.spawn_child_workflow_raw_placed(
+                    "child_forever",
+                    json!(1),
+                    &placement,
+                )),
+                async {
+                    let _ = ctx.wait_for_signal("abort").await;
+                    scope.cancel();
+                }
+            );
+            Ok(json!({ "cancelled": child.is_err() }))
+        })
+    }
+
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+
+    let built = HarvestBuilder::new()
+        .workflows(vec![
+            wf_info("child_forever", child_forever),
+            wf_info("scoped_parent", scoped_parent),
+        ])
+        .worker(
+            WorkerConfig::default().with_shard_assignments(SHARDS.iter().map(|s| ShardId::new(*s))),
+        )
+        .build();
+    let (registry, _d, _s, worker_config) = built.into_worker_parts();
+    let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
+    runtime_config.worker_id = "w-scope".to_string();
+    runtime_config.poll_interval = Duration::from_millis(50);
+    runtime_config.shutdown_timeout = Duration::from_secs(2);
+    runtime_config.sharded_pool = Some(sharded.clone());
+    let worker = Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker builds"));
+
+    let default_pool = sharded
+        .exact_pool_for(ShardId::new(PARENT_SHARD))
+        .expect("shard 0 pool")
+        .clone();
+    let runner = Arc::clone(&worker);
+    let handle = tokio::spawn(async move { runner.run(&default_pool).await });
+
+    let parent = start_parent(&sharded, "scoped_parent", "scope-1").await;
+
+    // Wait for the child to run on its own shard, then cancel the scope.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let child = loop {
+        let ids = started_child_ids(&sharded, PARENT_SHARD, parent).await;
+        if let Some(id) = ids.into_iter().next()
+            && execution_state(&sharded, 2, id).await.as_deref() == Some("RUNNING")
+        {
+            break id;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cross-shard child never started"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    {
+        let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+        autumn_harvest::signal::send_signal(&mut conn, parent, "abort", Value::Null)
+            .await
+            .expect("send abort");
+    }
+
+    assert!(
+        wait_for_state(&sharded, 2, child, "CANCELLED", Duration::from_secs(60)).await,
+        "the scope cancel never reached the cross-shard child"
+    );
+    assert_eq!(
+        cancelled_reason(&sharded, 2, child).await.as_deref(),
+        Some("cancelled by its cancellation scope")
+    );
+
     worker.shutdown();
     let _ = handle.await;
 }
@@ -2341,6 +2761,7 @@ async fn a_fenced_child_sweep_abandons_its_pass_on_a_busy_target_pool() {
         chain_execution_timeout_secs: None,
         retry_policy: None,
         quota_key: None,
+        fairness_key: None,
         quota: None,
         concurrency_key: None,
         max_concurrent: None,
@@ -2399,5 +2820,412 @@ async fn a_fenced_child_sweep_abandons_its_pass_on_a_busy_target_pool() {
     assert!(
         elapsed < autumn_harvest::replication::FENCED_CHECKOUT_BOUND + Duration::from_millis(1500),
         "the pass must stop within the fenced checkout bound, took {elapsed:?}"
+    );
+}
+
+// ── Column encoding of the outbox spec (issue #2043) ─────────────────────────
+
+const SPEC_SECRET: &str = "cc-spec-input-ssn-555";
+const SPEC_HEADER: &str = "cc-spec-header-tenant-5";
+
+/// An AES-256-GCM registry with column encoding on.
+fn aead_codecs() -> autumn_harvest::payload_codec::PayloadCodecs {
+    use autumn_harvest::aead_codec::{AeadCodec, DataKey};
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    let key = DataKey::from_bytes(&[0x5a; 32]).expect("data key");
+    AeadCodec::new("cc-k1", &key)
+        .expect("aead codec")
+        .register_with(&codecs)
+        .expect("register");
+    codecs.set_column_encoding(true);
+    codecs
+}
+
+fn secret_spec() -> autumn_harvest::cross_shard_child::CrossShardChildSpec {
+    autumn_harvest::cross_shard_child::CrossShardChildSpec {
+        input: json!({ "ssn": SPEC_SECRET }),
+        queue_name: "default".to_string(),
+        assigned_build_id: None,
+        context_headers: Some(json!({ "x-tenant": SPEC_HEADER })),
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        sla_secs: None,
+        execution_timeout_secs: None,
+        chain_execution_timeout_secs: None,
+        retry_policy: None,
+        quota_key: None,
+        quota: None,
+        concurrency_key: None,
+        max_concurrent: None,
+        trace_context: None,
+        fairness_key: None,
+        tenant: None,
+    }
+}
+
+/// A codec whose encode always fails, as a key service that is down would.
+struct FailingEncodeCodec;
+
+impl autumn_harvest::payload_codec::PayloadCodec for FailingEncodeCodec {
+    fn codec_id(&self) -> &'static str {
+        "failing-encode"
+    }
+
+    fn encode(&self, _raw: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        Err(autumn_harvest::payload_codec::CodecError(
+            "the key service is down".to_string(),
+        ))
+    }
+
+    fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, autumn_harvest::payload_codec::CodecError> {
+        Ok(encoded.to_vec())
+    }
+}
+
+fn failing_encoder() -> autumn_harvest::payload_codec::PayloadCodecs {
+    let codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    codecs
+        .register_key("down", std::sync::Arc::new(FailingEncodeCodec))
+        .expect("register");
+    codecs.set_active_key("down").expect("activate");
+    codecs.set_column_encoding(true);
+    codecs
+}
+
+async fn stored_spec(pool: &ShardedDbPool, child_id: ExecutionId) -> Value {
+    let mut conn = shard_conn(pool, PARENT_SHARD).await;
+    harvest_cross_shard_children::table
+        .find(child_id.as_uuid())
+        .select(harvest_cross_shard_children::child_spec)
+        .first(&mut *conn)
+        .await
+        .expect("outbox row")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recording_an_existing_child_is_a_no_op_while_the_encoder_is_down() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+    let parent = start_parent(&sharded, "child_echo", "spec-idem-1").await;
+    let existing = ExecutionId::new_for_shard(ShardId::new(1));
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        existing,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &aead_codecs(),
+    )
+    .await
+    .expect("record");
+    let before = stored_spec(&sharded, existing).await;
+
+    // A retried decision emits the same child again. The encoder is down.
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        existing,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &failing_encoder(),
+    )
+    .await
+    .expect("an existing child needs no encode");
+    assert_eq!(stored_spec(&sharded, existing).await, before);
+
+    // A new child still needs the encoder, so it fails instead of storing clear.
+    let fresh = ExecutionId::new_for_shard(ShardId::new(1));
+    let refused = autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        fresh,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &failing_encoder(),
+    )
+    .await;
+    assert!(refused.is_err(), "a new child is never stored in clear");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_encoded_spec_is_ciphertext_and_the_relay_starts_the_child_on_plaintext() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+    let codecs = aead_codecs();
+    let parent = start_parent(&sharded, "child_echo", "spec-enc-1").await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &codecs,
+    )
+    .await
+    .expect("record");
+
+    let stored = stored_spec(&sharded, child_id).await;
+    assert!(
+        autumn_harvest::payload_codec::is_codec_envelope(&stored),
+        "the spec is one envelope: {stored}"
+    );
+    assert!(
+        !stored.to_string().contains(SPEC_SECRET) && !stored.to_string().contains(SPEC_HEADER),
+        "the spec must not hold the input or the headers in clear"
+    );
+
+    let started = std::time::Instant::now();
+    loop {
+        let progressed = autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+            &mut conn,
+            &Some(sharded.clone()),
+            &codecs,
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .expect("relay sweep");
+        if progressed > 0 {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "no child");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mut child_conn = shard_conn(&sharded, child_shard.as_i32()).await;
+    let input: Value = harvest_workflow_executions::table
+        .find(child_id.as_uuid())
+        .select(harvest_workflow_executions::input)
+        .first(&mut *child_conn)
+        .await
+        .expect("child row");
+    assert!(
+        !input.to_string().contains(SPEC_SECRET),
+        "the child input column holds ciphertext"
+    );
+    assert_eq!(
+        codecs.decode_column(&input).expect("decode one layer"),
+        json!({ "ssn": SPEC_SECRET }),
+        "the child starts on the plaintext input"
+    );
+    let headers: Option<Value> = harvest_workflow_executions::table
+        .find(child_id.as_uuid())
+        .select(harvest_workflow_executions::context_headers)
+        .first(&mut *child_conn)
+        .await
+        .expect("child headers");
+    let headers = headers.expect("the child keeps the headers");
+    assert!(
+        autumn_harvest::payload_codec::is_codec_envelope(&headers)
+            && !headers.to_string().contains(SPEC_HEADER),
+        "the child row holds the headers as ciphertext: {headers}"
+    );
+    assert_eq!(
+        codecs.decode_column(&headers).expect("decode one layer"),
+        json!({ "x-tenant": SPEC_HEADER }),
+        "the child headers decode once, with no second layer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undecodable_spec_stays_pending_and_creates_no_child() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+    let codecs = aead_codecs();
+    let parent = start_parent(&sharded, "child_echo", "spec-enc-2").await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &codecs,
+    )
+    .await
+    .expect("record");
+    assert!(
+        autumn_harvest::payload_codec::is_codec_envelope(&stored_spec(&sharded, child_id).await),
+        "the spec is encoded"
+    );
+
+    let keyless = autumn_harvest::payload_codec::PayloadCodecs::default();
+    for _ in 0..3 {
+        autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+            &mut conn,
+            &Some(sharded.clone()),
+            &keyless,
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .expect("a bad row never fails the sweep");
+    }
+    let mut child_conn = shard_conn(&sharded, child_shard.as_i32()).await;
+    let created: i64 = harvest_workflow_executions::table
+        .filter(harvest_workflow_executions::id.eq(child_id.as_uuid()))
+        .count()
+        .get_result(&mut *child_conn)
+        .await
+        .expect("count");
+    assert_eq!(created, 0, "no child starts on ciphertext");
+    let status: String = harvest_cross_shard_children::table
+        .find(child_id.as_uuid())
+        .select(harvest_cross_shard_children::status)
+        .first(&mut *conn)
+        .await
+        .expect("outbox row");
+    assert_eq!(status, "PENDING_START", "the row stays pending");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retry_for_an_existing_child_needs_no_key() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+    let codecs = aead_codecs();
+    let parent = start_parent(&sharded, "child_echo", "spec-idem-2").await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+    let mut conn = shard_conn(&sharded, PARENT_SHARD).await;
+    autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+        &mut conn,
+        parent,
+        child_id,
+        "child_echo",
+        None,
+        &secret_spec(),
+        &codecs,
+    )
+    .await
+    .expect("record");
+    let started = std::time::Instant::now();
+    loop {
+        let progressed = autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+            &mut conn,
+            &Some(sharded.clone()),
+            &codecs,
+            &autumn_harvest::telemetry::NoOpMetrics,
+        )
+        .await
+        .expect("relay sweep");
+        if progressed > 0 {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "no child");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The relay crashed before it marked the row. The next sweep retries it.
+    diesel::update(harvest_cross_shard_children::table.find(child_id.as_uuid()))
+        .set((
+            harvest_cross_shard_children::status.eq("PENDING_START"),
+            harvest_cross_shard_children::attempts.eq(0),
+            harvest_cross_shard_children::last_attempt_at.eq(None::<chrono::DateTime<Utc>>),
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("reset the row");
+    let keyless = autumn_harvest::payload_codec::PayloadCodecs::default();
+    autumn_harvest::cross_shard_child::enforce_cross_shard_children(
+        &mut conn,
+        &Some(sharded.clone()),
+        &keyless,
+        &autumn_harvest::telemetry::NoOpMetrics,
+    )
+    .await
+    .expect("a retry never fails the sweep");
+    let status: String = harvest_cross_shard_children::table
+        .find(child_id.as_uuid())
+        .select(harvest_cross_shard_children::status)
+        .first(&mut *conn)
+        .await
+        .expect("outbox row");
+    assert_ne!(
+        status, "PENDING_START",
+        "the row advances without a key, because the child exists"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn erasing_a_parent_replaces_an_encoded_spec_with_a_tombstone() {
+    let (urls, _container) = setup_shard_databases(&SHARDS).await;
+    let sharded = build_sharded_pool(&urls);
+    install_globals(&router_for(&SHARDS), &sharded);
+    let codecs = aead_codecs();
+    let parent = start_parent(&sharded, "child_echo", "spec-enc-3").await;
+    let child_shard = ShardId::new(1);
+    let child_id = ExecutionId::new_for_shard(child_shard);
+    {
+        let mut parent_conn = shard_conn(&sharded, PARENT_SHARD).await;
+        diesel::update(harvest_workflow_executions::table.find(parent.as_uuid()))
+            .set((
+                harvest_workflow_executions::state.eq("COMPLETED"),
+                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            ))
+            .execute(&mut *parent_conn)
+            .await
+            .expect("force parent terminal");
+        autumn_harvest::cross_shard_child::record_cross_shard_child_with_codecs(
+            &mut parent_conn,
+            parent,
+            child_id,
+            "child_echo",
+            None,
+            &secret_spec(),
+            &codecs,
+        )
+        .await
+        .expect("record");
+        diesel::update(harvest_cross_shard_children::table.find(child_id.as_uuid()))
+            .set(harvest_cross_shard_children::status.eq("STARTED"))
+            .execute(&mut *parent_conn)
+            .await
+            .expect("mark started");
+    }
+    {
+        let mut child_conn = shard_conn(&sharded, child_shard.as_i32()).await;
+        start_or_load_workflow_execution(
+            &mut child_conn,
+            parent_start_params(child_id, "child_echo", "spec-enc-3-child"),
+            None,
+        )
+        .await
+        .expect("child start");
+        diesel::update(harvest_workflow_executions::table.find(child_id.as_uuid()))
+            .set((
+                harvest_workflow_executions::state.eq("COMPLETED"),
+                harvest_workflow_executions::completed_at.eq(Some(Utc::now())),
+            ))
+            .execute(&mut *child_conn)
+            .await
+            .expect("force child terminal");
+    }
+    let mut parent_conn = shard_conn(&sharded, PARENT_SHARD).await;
+    let outcome = autumn_harvest::erase::erase_workflow_payloads_with_pool(
+        &mut parent_conn,
+        parent,
+        "gdpr",
+        Some(&sharded),
+    )
+    .await
+    .expect("erase");
+    assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+    let stored = stored_spec(&sharded, child_id).await;
+    assert!(
+        autumn_harvest::erase::is_erasure_tombstone(&stored),
+        "the whole encoded spec is tombstoned, got {stored}"
     );
 }

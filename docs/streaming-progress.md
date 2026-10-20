@@ -278,11 +278,20 @@ or a chunk change. The chunk content can be non-deterministic. The **number
 and order** of `publish_durable_progress` calls must be deterministic, as for
 any workflow code.
 
+The store admits only offsets above the highest stored real offset. A call
+that fails to serialize leaves a hole, and the store never fills it later. A
+reader can already hold a cursor above the hole, so that reader would miss a
+late chunk. The truncation marker does not count as an offset.
+
 ### Delivery
 
-- **No gap, no duplicate.** A chunk commits with its decision cycle, or not
-  at all. The reader opens `LISTEN` before its first read. Each wake and each
-  keepalive tick reads the rows above the reader's cursor.
+- **No gap, no duplicate.** On the persist-transaction paths, a chunk commits
+  with its decision cycle, or not at all. The inline arms (local activity,
+  external signal and marker batches) store chunks outside that transaction. A
+  paused or crashed cycle can leave chunks, and its re-run offers the same
+  offsets. The store keeps the first copy. The reader opens `LISTEN` before
+  its first read. Each wake and each keepalive tick reads the rows above the
+  reader's cursor.
 - **The wake is a hint.** The worker sends it after the commit, outside the
   write transaction. A failed or lost wake never fails the write. The reader
   then finds the chunks at its next keepalive tick.
@@ -367,6 +376,8 @@ Explicitly **not** provided by the best-effort mode (see the issue for rationale
 
 ## See also
 
+- [Durable streaming routes](durable-routes.md#stream-the-run) — an app route
+  that streams the durable chunks of a keyed run, behind the app's own auth.
 - `autumn-harvest/examples/streaming_agent.rs` — a worked AI-agent-shaped example
   that publishes per-step chunks and documents the `curl -N` consumer.
 - [`set_current_details`](architecture.md#current-details--operator-status-breadcrumb-issue-593) (#473/#593) — the single-value pull status

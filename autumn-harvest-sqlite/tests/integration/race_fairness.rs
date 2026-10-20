@@ -32,8 +32,8 @@
 // The `#[workflow]`/`#[activity]` macros reference their input params, so a
 // deliberately-unused param reads as a "used underscore binding" through expansion.
 #![allow(clippy::used_underscore_binding)]
-// The `#[activity]` fixture bodies are trivial and await-free — the crate runs a
-// registered `ActivitySpec`, not the macro body.
+// The `#[activity]` fixture bodies are trivial and await-free. These tests
+// register closures in their place.
 #![allow(clippy::unused_async)]
 
 use std::sync::Arc;
@@ -104,7 +104,7 @@ async fn zero_delay_retry_branch_yields_to_a_faster_sibling() {
         let a_calls = a_calls.clone();
         // Info-based registration so the raw race dispatch falls back to the
         // `fixed(N, 0ms)` `default_retry_policy` at claim time.
-        rt.register_activity(&slow_branch_a_info(), move |_input: serde_json::Value| {
+        rt.register_activity_with_body(&slow_branch_a_info(), move |_input: serde_json::Value| {
             a_calls.fetch_add(1, Ordering::SeqCst);
             Err("branch A always fails".to_string())
         });
@@ -206,7 +206,7 @@ async fn zero_delay_retry_still_converges_without_a_race() {
     let body_calls = calls.clone();
 
     rt.register_workflow(&flaky_zero_delay_wf_info());
-    rt.register_activity(&flaky_zero_delay_info(), move |input: serde_json::Value| {
+    rt.register_activity_with_body(&flaky_zero_delay_info(), move |input: serde_json::Value| {
         // Fail attempts 1 and 2, succeed on attempt 3.
         if body_calls.fetch_add(1, Ordering::SeqCst) < 2 {
             Err("transient".to_string())
@@ -242,7 +242,7 @@ async fn race_winner_is_replay_deterministic_after_fair_yield() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
 
     rt.register_workflow(&fairness_race_info());
-    rt.register_activity(&slow_branch_a_info(), |_input: serde_json::Value| {
+    rt.register_activity_with_body(&slow_branch_a_info(), |_input: serde_json::Value| {
         Err("branch A always fails".to_string())
     });
     rt.register_activity_raw(

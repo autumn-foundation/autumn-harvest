@@ -58,7 +58,11 @@ async fn main() {
         .signals(signals![approve])
         .queries(queries![order_status])
         .with_codecs(Arc::new(my_codecs()));
-    std::process::exit(run_command(check, std::env::args().collect()).await);
+    // Lossy: `args()` would panic and print a non-UTF-8 argument.
+    let args = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    std::process::exit(run_command(check, args).await);
 }
 ```
 
@@ -127,6 +131,10 @@ $ my-upgrade-check \
 
 A flag also takes its value as `--flag=value`. The report goes to stdout,
 and an error goes to stderr.
+
+A usage error names a plain flag or variable name only. Any other argument
+shows as `<hidden>`, so a mistyped URL never reaches stderr. An error that names a
+file shows `<hidden>` for a path with other characters than letters, digits and `_-./+~ `.
 
 The check reads `RUNNING` and `PAUSED` runs. It reads inside read-only
 transactions and writes nothing.

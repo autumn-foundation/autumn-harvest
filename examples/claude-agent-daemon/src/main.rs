@@ -17,10 +17,10 @@
 //!
 //! See `README.md` for the full walkthrough, including the restart proof.
 
-// This backend runs the registered closures, not the async fn bodies. The
-// `#[activity]` macro expands each await-free placeholder body into code that
-// consumes the `_`-prefixed parameters. Both lints are artifacts of that
-// pattern.
+// The daemon registers closures with `register_activity_with_body`, so the
+// `#[activity]` bodies are stubs. The macro expands each await-free stub into
+// code that consumes the `_`-prefixed parameters. Both lints are artifacts of
+// that pattern.
 #![allow(clippy::unused_async, clippy::used_underscore_binding)]
 
 mod claude;

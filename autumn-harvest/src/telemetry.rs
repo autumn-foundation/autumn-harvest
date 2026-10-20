@@ -607,6 +607,10 @@ pub const METRIC_RATE_LIMIT_BUCKETS_DELETED: &str = "harvest.retention.rate_limi
 /// Real deletes only, never a `dry_run` preview.
 pub const METRIC_TERMINAL_TASKS_DELETED: &str = "harvest.retention.terminal_tasks_deleted";
 
+/// Counter of payload blobs the orphan sweep handled (issue #2123), labeled
+/// `store.id` and `outcome` (`found` / `deleted` / `failed`).
+pub const METRIC_PAYLOAD_ORPHANS: &str = "harvest.retention.payload_orphans";
+
 /// Histogram: wall-clock latency of query handler invocations (seconds).
 ///
 /// Labelled with `query.name` (low-cardinality handler name registered by the
@@ -1250,11 +1254,15 @@ pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active"
 /// its resolved per-tenant [`crate::quota::QuotaPolicy`] key is at or over
 /// one of its declared caps (issue #946).
 ///
+/// It also counts each LLM step that an LLM budget refuses (issue #1997).
+///
 /// Labels:
 ///   - `"workflow"` (= [`METRIC_LABEL_WORKFLOW`]) — the workflow type name.
-///   - `"resource"` (= [`METRIC_LABEL_RESOURCE`]) — which cap was exhausted
-///     (`"active_executions"`, `"history_bytes"`, or `"dead_letters"`, per
-///     [`crate::quota::QuotaResource::as_str`]).
+///   - `"resource"` (= [`METRIC_LABEL_RESOURCE`]) — which cap was exhausted,
+///     per [`crate::quota::QuotaResource::as_str`]. A start rejection gives
+///     `"active_executions"`, `"history_bytes"` or `"dead_letters"`. An LLM
+///     refusal gives `"run_llm_tokens"`, `"run_llm_cost_usd_micros"`,
+///     `"tenant_llm_tokens"` or `"tenant_llm_cost_usd_micros"`.
 ///
 /// The *resolved tenant key* is deliberately **not** a label — it is
 /// caller/tenant-controlled input and would be unbounded cardinality. Per-key
@@ -1892,7 +1900,7 @@ pub enum ResidentOutcome {
     /// The workflow runs in a hot-swap module, which binds around one drive.
     HotSwap,
     /// Another context state blocked the capture, such as a park token, a
-    /// push signal handler or unread history.
+    /// push signal handler, unread history or a deferred update.
     Blocked,
     /// The last suspension had a command that the resident path does not
     /// cover, such as a child workflow or a local activity.
@@ -2881,7 +2889,8 @@ pub trait MetricsRecorder: Send + Sync {
     }
 
     /// A fresh workflow start was rejected because its resolved per-tenant
-    /// quota key is at or over a declared cap (issue #946).
+    /// quota key is at or over a declared cap (issue #946). An LLM budget
+    /// also calls it for each refused LLM step (issue #1997).
     ///
     /// `workflow` is the workflow type name; `resource` is the bounded
     /// [`crate::quota::QuotaResource::as_str`] value naming the exhausted
@@ -3384,6 +3393,15 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to [`METRIC_TERMINAL_TASKS_DELETED`]. Real deletes only.
     fn record_terminal_tasks_deleted(&self, state: &str, count: u64) {
         let _ = (state, count);
+    }
+
+    /// Number of orphaned payload blobs one sweep tick handled, per outcome
+    /// (issue #2123).
+    ///
+    /// Maps to [`METRIC_PAYLOAD_ORPHANS`]. `outcome` is `found`, `deleted` or
+    /// `failed`. Real deletes only: a dry run records nothing.
+    fn record_payload_orphans(&self, store_id: &str, outcome: &str, count: u64) {
+        let _ = (store_id, outcome, count);
     }
 
     /// Current number of RUNNING tasks for a concurrency group key.
@@ -4933,6 +4951,7 @@ mod tests {
             METRIC_TERMINAL_TASKS_DELETED,
             "harvest.retention.terminal_tasks_deleted"
         );
+        assert_eq!(METRIC_PAYLOAD_ORPHANS, "harvest.retention.payload_orphans");
         // issue #618: exempt-by-design start producers increment this counter.
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
         assert_eq!(METRIC_LABEL_PRODUCER, "producer");

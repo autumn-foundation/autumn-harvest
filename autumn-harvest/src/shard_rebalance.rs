@@ -70,6 +70,10 @@ use crate::types::ShardId;
 /// of the predicate said "no task rows at all", which would have refused to
 /// migrate every timer-parked workflow — i.e. the entire population this
 /// feature exists to move.
+///
+/// Each bool is an independent fact, and several can hold at once. The
+/// predicate names every blocker, so an enum would lose information.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuiescenceObservation {
     /// `harvest_workflow_executions.state`.
@@ -83,6 +87,10 @@ pub struct QuiescenceObservation {
     /// overlap enforcement is shard-local, so its runs may not move away from
     /// it — see [`QuiescenceBlocker::ScheduleAttributed`].
     pub schedule_attributed: bool,
+    /// Whether the execution is a fork of another run
+    /// (`harvest_workflow_executions.start_source = 'fork'`, issue #2000). See
+    /// [`QuiescenceBlocker::ForkLineage`].
+    pub fork_lineage: bool,
     /// Workflow task rows a worker currently holds
     /// (`state = 'RUNNING' AND worker_id IS NOT NULL`).
     pub claimed_workflow_tasks: i64,
@@ -107,6 +115,9 @@ pub struct QuiescenceObservation {
     pub live_external_tasks: i64,
     /// Non-terminal children on this shard.
     pub live_children: i64,
+    /// Live forks on this shard whose fork lineage holds this execution
+    /// (issue #2000). See [`QuiescenceBlocker::LiveFork`].
+    pub live_forks: i64,
     /// In-flight `harvest_cross_shard_children` rows parented by this execution.
     pub cross_shard_child_rows: i64,
     /// Durable mutex keys this execution currently **holds**
@@ -187,6 +198,23 @@ pub enum QuiescenceBlocker {
     /// forwarded residences, which is a change to the scheduler rather than to
     /// this feature.
     ScheduleAttributed,
+    /// The execution is a fork of another run (issue #2000). A recorded fork
+    /// reads its source, and a new fork walks the fork lineage, on the shard
+    /// of the fork. Only the fork moves in a migration, so on the target both
+    /// lookups would miss. Every recorded result would then fail closed, and
+    /// an erased ancestor would go unseen. A fork therefore stays with its
+    /// lineage.
+    ForkLineage,
+    /// The fork lineage of a live fork holds the execution (issue #2000). A
+    /// recorded fork reads the outcomes of its source on its own shard. A
+    /// migrated source records its later outcomes on the target, so the fork
+    /// would not see them and would fail closed. A reset of a fork reads the
+    /// source of the fork it resets. So every run in the lineage stays until
+    /// each live fork is terminal.
+    ///
+    /// A `FAILED` fork with a dead letter counts as live, because a redrive
+    /// can reopen it (issue #2122).
+    LiveFork,
 }
 
 impl QuiescenceBlocker {
@@ -216,6 +244,10 @@ impl QuiescenceBlocker {
                 "a dead-letter row is attributed to this execution; redrive or discard it first"
             }
             Self::NonDeterminismBlocked => "the run is blocked on a replay non-determinism",
+            Self::ForkLineage => {
+                "the execution is a fork, which reads its source and lineage on this shard"
+            }
+            Self::LiveFork => "a live fork on this shard has this execution in its fork lineage",
         }
     }
 }
@@ -265,6 +297,9 @@ pub fn assess_quiescence(obs: &QuiescenceObservation) -> Quiescence {
     if obs.schedule_attributed {
         blockers.push(QuiescenceBlocker::ScheduleAttributed);
     }
+    if obs.fork_lineage {
+        blockers.push(QuiescenceBlocker::ForkLineage);
+    }
     if obs.claimed_workflow_tasks > 0 {
         blockers.push(QuiescenceBlocker::ClaimedWorkflowTask);
     }
@@ -294,6 +329,9 @@ pub fn assess_quiescence(obs: &QuiescenceObservation) -> Quiescence {
     }
     if obs.live_children > 0 {
         blockers.push(QuiescenceBlocker::LiveChild);
+    }
+    if obs.live_forks > 0 {
+        blockers.push(QuiescenceBlocker::LiveFork);
     }
     if obs.cross_shard_child_rows > 0 {
         blockers.push(QuiescenceBlocker::CrossShardChildRow);
@@ -688,6 +726,42 @@ mod db {
         resolve_forward_chain,
     };
 
+    /// The fork lineage of every open fork, as `lineage.source_ref` rows (issue
+    /// #2000). It starts at the source of each open fork. It then follows
+    /// `start_source_ref` up while the row is a fork, for at most 65 links. A reset of a fork names the sealed fork as its source, but its
+    /// marker names the original source. So the walk must reach past the
+    /// sealed fork. A macro, so both predicates use one literal.
+    ///
+    /// The partial index `idx_harvest_we_fork_source` serves the seed, so it
+    /// reads only fork rows. The step joins on the primary key. A reference
+    /// that is not a UUID ends the walk instead of failing the cast.
+    ///
+    /// Retention reads the same open-fork predicate and link bound (issue
+    /// #2122). A `FAILED` fork with a dead letter is open, because a redrive
+    /// can reopen it.
+    macro_rules! live_fork_lineage_sql {
+        () => {
+            concat!(
+                "WITH RECURSIVE lineage(source_ref, depth) AS ( \
+                SELECT f.start_source_ref, 1 FROM harvest_workflow_executions f \
+                 WHERE f.start_source = 'fork' \
+                   AND ",
+                crate::fork::open_fork_sql!(),
+                " \
+                UNION \
+                SELECT p.start_source_ref, l.depth + 1 FROM lineage l \
+                  JOIN harvest_workflow_executions p ON p.id = CASE \
+                    WHEN l.source_ref ~* \
+                      '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' \
+                    THEN l.source_ref::uuid END \
+                 WHERE p.start_source = 'fork' AND l.depth < ",
+                crate::fork::max_stored_fork_links_sql!(),
+                " \
+             ) SELECT 1 FROM lineage l WHERE l.source_ref = e.id::text"
+            )
+        };
+    }
+
     /// The SQL half of the quiescence predicate, as one AND-able fragment over
     /// an alias `e` bound to `harvest_workflow_executions`.
     ///
@@ -696,10 +770,12 @@ mod db {
     /// SQL and Rust could drift, so it is written once and
     /// `the_sql_predicate_agrees_with_the_pure_predicate` in
     /// `shard_rebalance_db_tests.rs` pins them together against real rows.
-    const QUIESCENCE_SQL: &str = "\
+    const QUIESCENCE_SQL: &str = concat!(
+        "\
         e.state = 'RUNNING' \
         AND e.parent_id IS NULL \
         AND e.schedule_id IS NULL \
+        AND e.start_source IS DISTINCT FROM 'fork' \
         AND e.nd_blocked_at IS NULL \
         AND NOT EXISTS (SELECT 1 FROM harvest_task_queue t WHERE t.workflow_exec_id = e.id \
             AND t.task_type = 'workflow' AND t.state = 'RUNNING' AND t.worker_id IS NOT NULL) \
@@ -723,6 +799,9 @@ mod db {
             AND x.state = 'PENDING') \
         AND NOT EXISTS (SELECT 1 FROM harvest_workflow_executions c WHERE c.parent_id = e.id \
             AND c.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED')) \
+        AND NOT EXISTS (",
+        live_fork_lineage_sql!(),
+        ") \
         AND NOT EXISTS (SELECT 1 FROM harvest_cross_shard_children x \
             WHERE x.parent_exec_id = e.id) \
         AND NOT EXISTS (SELECT 1 FROM harvest_mutex_locks ml \
@@ -730,7 +809,8 @@ mod db {
         AND NOT EXISTS (SELECT 1 FROM harvest_mutex_waiters mw \
             WHERE mw.waiter_exec_id = e.id) \
         AND NOT EXISTS (SELECT 1 FROM harvest_dead_letters dl \
-            WHERE dl.workflow_exec_id = e.id)";
+            WHERE dl.workflow_exec_id = e.id)"
+    );
 
     /// The second half of the cutover's `WHERE`: "the source history is still
     /// exactly the history verification passed on".
@@ -780,6 +860,8 @@ mod db {
                  WHERE m.execution_id = e.id AND m.legal_hold_verified \
                    AND m.verified_legal_hold_set_at IS NOT DISTINCT FROM e.legal_hold_set_at)";
 
+    // One column per fact of `QuiescenceObservation`, bools included.
+    #[allow(clippy::struct_excessive_bools)]
     #[derive(diesel::QueryableByName)]
     struct QuiescenceRow {
         #[diesel(sql_type = Text)]
@@ -788,6 +870,8 @@ mod db {
         parent_id: Option<Uuid>,
         #[diesel(sql_type = Bool)]
         schedule_attributed: bool,
+        #[diesel(sql_type = Bool)]
+        fork_lineage: bool,
         #[diesel(sql_type = Bool)]
         nd_blocked: bool,
         #[diesel(sql_type = BigInt)]
@@ -811,6 +895,8 @@ mod db {
         #[diesel(sql_type = BigInt)]
         live_children: i64,
         #[diesel(sql_type = BigInt)]
+        live_forks: i64,
+        #[diesel(sql_type = BigInt)]
         cross_shard_child_rows: i64,
         #[diesel(sql_type = BigInt)]
         held_mutex_locks: i64,
@@ -820,10 +906,12 @@ mod db {
         dead_letter_rows: i64,
     }
 
-    const OBSERVE_SQL: &str = "\
+    const OBSERVE_SQL: &str = concat!(
+        "\
         SELECT e.state, \
                e.parent_id, \
                (e.schedule_id IS NOT NULL) AS schedule_attributed, \
+               (e.start_source IS NOT DISTINCT FROM 'fork') AS fork_lineage, \
                (e.nd_blocked_at IS NOT NULL) AS nd_blocked, \
                (SELECT count(*) FROM harvest_task_queue t WHERE t.workflow_exec_id = e.id \
                   AND t.task_type = 'workflow' AND t.state = 'RUNNING' \
@@ -855,6 +943,9 @@ mod db {
                (SELECT count(*) FROM harvest_workflow_executions c WHERE c.parent_id = e.id \
                   AND c.state IN ('RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED'))::BIGINT \
                   AS live_children, \
+               (SELECT count(*) FROM (",
+        live_fork_lineage_sql!(),
+        ") AS live)::BIGINT AS live_forks, \
                (SELECT count(*) FROM harvest_cross_shard_children x \
                   WHERE x.parent_exec_id = e.id)::BIGINT AS cross_shard_child_rows, \
                (SELECT count(*) FROM harvest_mutex_locks ml \
@@ -864,7 +955,8 @@ mod db {
                (SELECT count(*) FROM harvest_dead_letters dl \
                   WHERE dl.workflow_exec_id = e.id)::BIGINT AS dead_letter_rows \
         FROM harvest_workflow_executions e \
-        WHERE e.id = $1";
+        WHERE e.id = $1"
+    );
 
     /// Gather the facts [`assess_quiescence`] needs for one execution.
     ///
@@ -888,6 +980,7 @@ mod db {
             state: row.state,
             parent_id: row.parent_id.map(ExecutionId::from_uuid),
             schedule_attributed: row.schedule_attributed,
+            fork_lineage: row.fork_lineage,
             claimed_workflow_tasks: row.claimed_workflow_tasks,
             due_pending_tasks: row.due_pending_tasks,
             parked_workflow_tasks: row.parked_workflow_tasks,
@@ -898,6 +991,7 @@ mod db {
             active_sessions: row.active_sessions,
             live_external_tasks: row.live_external_tasks,
             live_children: row.live_children,
+            live_forks: row.live_forks,
             cross_shard_child_rows: row.cross_shard_child_rows,
             held_mutex_locks: row.held_mutex_locks,
             queued_mutex_waiters: row.queued_mutex_waiters,
@@ -2957,8 +3051,8 @@ mod db {
         activate_target_inner(source, target, exec_id, Some(settle)).await
     }
 
-    #[allow(clippy::too_many_lines)] // One target transaction, gated as a
-    // whole on `activated > 0`: splitting it would scatter that gate.
+    #[allow(clippy::too_many_lines)] // One target transaction. The task and
+    // signal steps need `activated > 0`: splitting it would scatter that gate.
     async fn activate_target_inner(
         source: &mut AsyncPgConnection,
         target: &mut AsyncPgConnection,
@@ -3061,8 +3155,31 @@ mod db {
                 .await
                 .map_err(database_error)?;
 
-                // Gated on `activated > 0` (issue #1596 review, finding
-                // 1). Termination is an operator override with no
+                // Late chunks are not gated on `activated` (issue #2128). An
+                // operator can terminate the staged copy before activation.
+                // A terminated copy is not erased, and its durable stream
+                // reader must still see every chunk. Erasure locks the same
+                // row (`load_erase_gate_row`), so this lock waits for an
+                // erasure in flight. The check then reads the committed
+                // input, so activation never restores erased output. A
+                // missing row, or a `MIGRATED` seal that an aborted
+                // migration restored, gets no copy.
+                let target_input: Option<TargetInputRow> = diesel::sql_query(
+                    "SELECT input FROM harvest_workflow_executions \
+                      WHERE id = $1 AND state <> 'MIGRATED' FOR UPDATE",
+                )
+                .bind::<SqlUuid, _>(exec_id.as_uuid())
+                .get_result(&mut *conn)
+                .await
+                .optional_row()?;
+                if target_input
+                    .is_some_and(|row| !crate::erase::execution_input_is_erased(&row.input))
+                {
+                    insert_stream_chunk_pages(&mut *conn, &late_chunk_pages).await?;
+                }
+
+                // The task restore and signal re-pend below are gated on
+                // `activated > 0` (issue #1596 review, finding 1). Termination is an operator override with no
                 // state-precondition filter. It can seal this copy
                 // `TERMINATED` before activation ever runs. The update
                 // above then matches zero rows against an
@@ -3077,13 +3194,6 @@ mod db {
                 // already has the task from the original transaction.
                 // Gating here never loses legitimate work.
                 if activated > 0 {
-                    // Gated like the task: an operator can terminate the
-                    // staged copy, and erasure can then scrub it, before this
-                    // runs. Copying then would restore erased author output.
-                    // The chunks stay on the sealed source, where erasure
-                    // also reaches them.
-                    insert_stream_chunk_pages(&mut *conn, &late_chunk_pages).await?;
-
                     // `jsonb_populate_record` over a NULL base turns a missing
                     // key into NULL, and the column DEFAULT does not apply.
                     // A row staged before a NOT NULL column existed, or by a
@@ -4611,6 +4721,12 @@ mod db {
         chain.retain(|shard| seen.insert(*shard));
         chain.push(live);
         Ok(chain)
+    }
+
+    #[derive(diesel::QueryableByName)]
+    struct TargetInputRow {
+        #[diesel(sql_type = Jsonb)]
+        input: Value,
     }
 
     #[derive(diesel::QueryableByName)]

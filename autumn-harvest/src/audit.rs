@@ -53,6 +53,11 @@ pub const OP_WORKFLOW_RESET: &str = "workflow.reset";
 /// a re-run starts a brand-new execution of the whole workflow. The audit
 /// row's `target_id` is the SOURCE execution id.
 pub const OP_WORKFLOW_RERUN: &str = "workflow.rerun";
+/// Audit operation: Non-destructive fork of a workflow execution (issue #2000).
+///
+/// The source stays unchanged. The audit row's `target_id` is the SOURCE
+/// execution id.
+pub const OP_WORKFLOW_FORK: &str = "workflow.fork";
 /// Audit operation: Paused an individual workflow execution (issue #383).
 pub const OP_WORKFLOW_PAUSE: &str = "workflow.pause";
 /// Audit operation: Resumed a paused workflow execution (issue #383).
@@ -230,6 +235,12 @@ pub const OP_PAYLOAD_DECODE_READ: &str = "payload.decode_read";
 pub const OP_QUEUE_PAUSE: &str = "queue.pause";
 /// Operation: an operator resumed dispatch on a task queue (issue #619).
 pub const OP_QUEUE_RESUME: &str = "queue.resume";
+/// Operation: an operator set the weight of a fairness key in a queue
+/// (issue #1976).
+pub const OP_FAIRNESS_WEIGHT_SET: &str = "fairness.weight.set";
+/// Operation: an operator cleared the weight of a fairness key in a queue
+/// (issue #1976).
+pub const OP_FAIRNESS_WEIGHT_CLEAR: &str = "fairness.weight.clear";
 
 pub const OP_TOKEN_CREATE: &str = "token.create";
 /// Audit operation: revoked a scoped API token (issue #942).
@@ -479,6 +490,8 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     // Paginated, filterable single-execution history (issue #529): read-only cursor walk.
     ("GET /workflows/{id}/history", RouteClass::ReadOnly),
     ("GET /workflows/{id}/history/export", RouteClass::ReadOnly),
+    // Issue #1983: read back an archived history. Admin only.
+    ("GET /workflows/{id}/archived-history", RouteClass::ReadOnly),
     // Completion-callback delivery listing (issue #605): read-only, no audit.
     (
         "GET /workflows/{id}/completion-deliveries",
@@ -577,6 +590,7 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
     ("POST /workflows/{id}/resume", RouteClass::Mutating),
     ("PATCH /workflows/{id}/triage", RouteClass::Mutating),
     ("POST /workflows/{id}/reset", RouteClass::Mutating),
+    ("POST /workflows/{id}/fork", RouteClass::Mutating),
     (
         "POST /workflows/{id}/signal/{signal_name}",
         RouteClass::Mutating,
@@ -806,6 +820,20 @@ pub const CLASSIFIED_ROUTES: &[(&str, RouteClass)] = &[
         "POST /admin/queues/{queue_name}/resume",
         RouteClass::Mutating,
     ),
+    // Fairness key weights (issue #1976). GET is read-only. The two
+    // mutations are admin-gated.
+    (
+        "GET /admin/queues/{queue_name}/fairness",
+        RouteClass::ReadOnly,
+    ),
+    (
+        "POST /admin/queues/{queue_name}/fairness/{fairness_key}",
+        RouteClass::Mutating,
+    ),
+    (
+        "DELETE /admin/queues/{queue_name}/fairness/{fairness_key}",
+        RouteClass::Mutating,
+    ),
     ("GET /admin/metrics", RouteClass::ReadOnly),
     ("GET /admin/completion-triggers", RouteClass::ReadOnly),
     ("GET /admin/schedules/{id}", RouteClass::ReadOnly),
@@ -890,6 +918,7 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     OP_WORKFLOW_ANNOTATE,
     OP_WORKFLOW_RESET,
     OP_WORKFLOW_RERUN,
+    OP_WORKFLOW_FORK,
     OP_DAG_TRIGGER,
     OP_DAG_PATCH,
     OP_SCHEDULE_CREATE,
@@ -972,6 +1001,9 @@ pub const AUDITED_OPERATIONS: &[&str] = &[
     // Task-queue pause/resume (issue #619)
     OP_QUEUE_PAUSE,
     OP_QUEUE_RESUME,
+    // Fairness key weights (issue #1976)
+    OP_FAIRNESS_WEIGHT_SET,
+    OP_FAIRNESS_WEIGHT_CLEAR,
     OP_TOKEN_CREATE,
     OP_TOKEN_REVOKE,
     // Automatic load shedding (issue #1794). No route entry: the sampler
@@ -1018,6 +1050,7 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "POST /workflows/{id}/update/{update_name}",
     "GET /workflows/{id}/history",
     "GET /workflows/{id}/history/export",
+    "GET /workflows/{id}/archived-history",
     "GET /workflows/{id}/completion-deliveries",
     "GET /dags",
     "GET /dags/{dag_name}/runs",
@@ -1116,6 +1149,8 @@ pub const EXCLUDED_ROUTES: &[&str] = &[
     "GET /admin/queues/scaling",
     // Paused-queue list is read-only.
     "GET /admin/queues/paused",
+    // Fairness weight and state read is read-only (issue #1976).
+    "GET /admin/queues/{queue_name}/fairness",
     "GET /admin/metrics",
     "GET /admin/completion-triggers",
     "GET /admin/schedules/{id}",
@@ -1185,6 +1220,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("POST /workflows/{id}/resume", Some(OP_WORKFLOW_RESUME)),
     ("PATCH /workflows/{id}/triage", Some(OP_WORKFLOW_ANNOTATE)),
     ("POST /workflows/{id}/reset", Some(OP_WORKFLOW_RESET)),
+    ("POST /workflows/{id}/fork", Some(OP_WORKFLOW_FORK)),
     (
         "POST /workflows/{id}/signal/{signal_name}",
         Some(OP_WORKFLOW_SIGNAL),
@@ -1197,6 +1233,7 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     ("GET /workflows/{id}/result", None),
     ("GET /workflows/{id}/history", None),
     ("GET /workflows/{id}/history/export", None),
+    ("GET /workflows/{id}/archived-history", None),
     ("GET /workflows/{id}/completion-deliveries", None),
     (
         "POST /workflows/{id}/completion-deliveries/{delivery_id}/redrive",
@@ -1452,6 +1489,15 @@ pub const ALL_MUTATION_ROUTES: &[(&str, Option<&str>)] = &[
     (
         "POST /admin/queues/{queue_name}/resume",
         Some(OP_QUEUE_RESUME),
+    ),
+    ("GET /admin/queues/{queue_name}/fairness", None),
+    (
+        "POST /admin/queues/{queue_name}/fairness/{fairness_key}",
+        Some(OP_FAIRNESS_WEIGHT_SET),
+    ),
+    (
+        "DELETE /admin/queues/{queue_name}/fairness/{fairness_key}",
+        Some(OP_FAIRNESS_WEIGHT_CLEAR),
     ),
     ("GET /admin/metrics", None),
     ("GET /admin/completion-triggers", None),
@@ -2371,6 +2417,23 @@ mod tests {
             EXCLUDED_ROUTES.contains(&get_route),
             "{get_route} should be listed in EXCLUDED_ROUTES, matching its GET /admin/circuits/{{activity_name}} sibling (issue #945)"
         );
+    }
+
+    #[test]
+    fn fork_route_is_classified_and_audited() {
+        // Issue #2000: a fork starts a new run, so it is a mutation.
+        let route = "POST /workflows/{id}/fork";
+        assert!(
+            CLASSIFIED_ROUTES
+                .iter()
+                .any(|(r, c)| *r == route && *c == RouteClass::Mutating)
+        );
+        assert!(
+            ALL_MUTATION_ROUTES
+                .iter()
+                .any(|(r, op)| *r == route && *op == Some(OP_WORKFLOW_FORK))
+        );
+        assert!(AUDITED_OPERATIONS.contains(&OP_WORKFLOW_FORK));
     }
 
     #[test]

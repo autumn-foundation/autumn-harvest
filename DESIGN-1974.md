@@ -89,6 +89,11 @@ resident cycle keeps the counter.
 Consequence: the number and order of durable calls must be deterministic. The
 chunk content can change. The first stored content is canonical.
 
+The store admits only offsets above the highest stored real offset (issue
+#2083). A reader can hold a cursor above a hole that a failed call left, so the
+store never fills the hole later. An advisory lock on the run orders
+overlapping writers.
+
 ### 1.3 Write path
 
 The worker writes the rows in the persist transaction, next to
@@ -96,8 +101,8 @@ The worker writes the rows in the persist transaction, next to
 A deadlock or serialization conflict re-runs the cycle. Another database error
 fails the execution, as for every write in the persist transaction. The cycle
 never commits with a missing chunk. The inline local-activity path writes
-outside the outer transaction. A failure there re-runs the same offsets, which
-dedup.
+outside the outer transaction. A failure there re-runs the same offsets. The
+store drops each of them, because it is at or below the highest stored offset.
 After the rows, the worker stages one wake on `harvest_stream_<exec_hex>`.
 The post-commit sender of `notify.rs` sends it after the commit, as for task
 and history wakes (issue #1796). A full `NOTIFY` queue cannot fail the write,
@@ -152,5 +157,5 @@ The frames are the `/stream` frames. The SSE `id:` is the offset.
 
 Unit tests in `context.rs` cover the offset and the queue bound. Store tests in
 `autumn-harvest/tests/integration/durable_stream_tests.rs` cover the dedup, the
-cap, the batch insert and the `LISTEN` wake. Harness tests are in
+monotonic insert, the cap, the batch insert and the `LISTEN` wake. Harness tests are in
 `publish_progress_tests.rs` and in `testing.rs`.

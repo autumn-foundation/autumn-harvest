@@ -1075,6 +1075,11 @@ async fn policy_branching_workflow_diagnoses_clean_with_registry_history_policy(
             last_error: None,
             scheduled_time: None,
         },
+        WorkflowEvent::SideEffectRecorded {
+            kind: autumn_harvest::event::SideEffectKind::Custom,
+            name: Some(autumn_harvest::CONTINUE_AS_NEW_SIDE_EFFECT_NAME.to_string()),
+            value: serde_json::json!(true),
+        },
         WorkflowEvent::ActivityScheduled {
             activity_id,
             name: "checkpoint".into(),

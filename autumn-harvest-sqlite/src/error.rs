@@ -41,6 +41,10 @@ pub enum SqliteError {
     Json(#[from] serde_json::Error),
 
     /// A workflow name with no registered handler.
+    ///
+    /// A drive also returns it when a workflow starts a child whose name has
+    /// no handler (issue #2026). The cycle rolls back, and the parent stays
+    /// `RUNNING`.
     #[error("unknown workflow: {0}")]
     UnknownWorkflow(String),
 
@@ -56,23 +60,27 @@ pub enum SqliteError {
     #[error("execution not found: {0}")]
     ExecutionNotFound(ExecutionId),
 
-    /// A signal was sent to an execution that is not accepting signals — it has
-    /// reached a terminal state (`COMPLETED`/`FAILED`/…). Mirrors the Postgres
-    /// engine's rejection of a signal to a terminal target
-    /// ([`send_signal`](crate::SqliteRuntime::send_signal)). No drive ever
-    /// consumes a row staged for a sealed run, so the wakeup would be lost
-    /// silently. An unknown id is [`ExecutionNotFound`](Self::ExecutionNotFound); this
-    /// variant is only for a *present but sealed* run.
+    /// A signal, update, cancel or terminate targeted an execution in a
+    /// terminal state (`COMPLETED`, `FAILED`, `CANCELLED`, `TERMINATED` or
+    /// `CONTINUED_AS_NEW`).
     ///
-    /// `update` also returns this variant for a terminal run (issue #2025).
+    /// [`send_signal`](crate::SqliteRuntime::send_signal) mirrors the Postgres
+    /// rejection of a signal to a terminal target. No drive consumes a row
+    /// staged for a sealed run, so the wakeup would be lost silently.
+    /// [`send_signal_by_workflow_id`](crate::SqliteRuntime::send_signal_by_workflow_id)
+    /// returns it when the newest run of the key is terminal (issue #2028). `update`
+    /// also returns it (issue #2025), and so do
+    /// [`cancel`](crate::SqliteRuntime::cancel) and
+    /// [`terminate`](crate::SqliteRuntime::terminate) (issue #2021). An unknown
+    /// id is [`ExecutionNotFound`](Self::ExecutionNotFound). This variant is
+    /// only for a stored, terminal run.
     #[error(
-        "workflow execution {execution_id} is not running (state: {state}); \
-         cannot accept a signal or an update"
+        "workflow execution {execution_id} is not running (state: {state}); cannot accept the request"
     )]
     WorkflowNotRunning {
-        /// The terminal execution the signal or update targeted.
+        /// The terminal execution the request targeted.
         execution_id: ExecutionId,
-        /// Its current (terminal) state — `COMPLETED`, `FAILED`, etc.
+        /// Its current terminal state, for example `COMPLETED` or `CANCELLED`.
         state: String,
     },
 
@@ -177,8 +185,8 @@ pub enum SqliteError {
     },
 
     /// A workflow emitted a [`WorkflowCommand`](autumn_harvest::WorkflowCommand)
-    /// outside the single-writer backend's supported subset (child workflows,
-    /// external signals/cancels, continue-as-new, local activities, …).
+    /// outside the single-writer backend's supported subset (continue-as-new,
+    /// local activities, updates, …).
     ///
     /// The run is terminal (issue #1834). The drive that returns this error
     /// first rolls back the cycle. It then seals the run `FAILED` with a typed
@@ -214,6 +222,29 @@ pub enum SqliteError {
         cap_bytes: u64,
     },
 
+    /// A caller-supplied payload nests deeper than
+    /// [`MAX_PAYLOAD_DEPTH`](crate::MAX_PAYLOAD_DEPTH) at an ingress boundary
+    /// (issue #2157).
+    ///
+    /// `serde_json` writes any depth but refuses to read past 128 levels. The
+    /// payload is refused before it is stored, so a later drive never fails on
+    /// a value it cannot read back. `kind` names the boundary
+    /// (`"workflow_input"`, `"memo"`, `"signal_payload"` or `"update_input"`).
+    ///
+    /// A deep activity result does not use this variant (issue #2216). It
+    /// becomes a non-retryable `PayloadTooDeep` activity failure, so the
+    /// workflow sees the failure.
+    ///
+    /// A deep value from workflow code does not use this variant (issue
+    /// #2224). The context returns `HarvestError::PayloadTooDeep` instead.
+    #[error("payload too deep: {kind} nests more than {cap_depth} levels")]
+    PayloadTooDeep {
+        /// The ingress boundary that was violated.
+        kind: &'static str,
+        /// The deepest nesting that ingress accepts.
+        cap_depth: usize,
+    },
+
     /// A start carrying the [`RejectDuplicate`](autumn_harvest::WorkflowIdReusePolicy::RejectDuplicate)
     /// reuse policy collided with an existing, non-sealed execution for the same
     /// `(workflow_name, workflow_id)` key (issue #1068). Mirrors the Postgres core
@@ -233,6 +264,47 @@ pub enum SqliteError {
         /// Its current state — `RUNNING`, `COMPLETED`, or `FAILED`.
         existing_state: String,
     },
+
+    /// No run exists for this `(workflow_name, workflow_id)` key (issue
+    /// #2028). [`send_signal_by_workflow_id`](crate::SqliteRuntime::send_signal_by_workflow_id)
+    /// returns it.
+    #[error("no workflow run for ({workflow_name}, {workflow_id})")]
+    WorkflowIdNotFound {
+        /// The workflow type of the request.
+        workflow_name: String,
+        /// The business id of the request.
+        workflow_id: String,
+    },
+
+    /// A call that addresses a run by its business id has a blank id (issue
+    /// #2028). A blank id has no reuse key, so it matches no run.
+    #[error("the workflow_id must not be blank")]
+    BlankWorkflowId,
+
+    /// A signal broke a rule of its name. A `harvest.promise:` signal must
+    /// carry a [`PromiseSettlement`](autumn_harvest::durable_promise::PromiseSettlement)
+    /// (issue #1985).
+    #[error("invalid signal: {0}")]
+    InvalidSignal(String),
+
+    /// A search attribute at start, or in a list filter, is not a JSON
+    /// primitive (issue #2027).
+    #[error("invalid search attribute: {0}")]
+    InvalidSearchAttribute(String),
+
+    /// A list filter has more terms than
+    /// [`MAX_FILTER_TERMS`](crate::MAX_FILTER_TERMS) allows (issue #2027).
+    #[error("invalid filter: {0}")]
+    InvalidFilter(String),
+
+    /// A schedule has an invalid cron expression, timezone or interval
+    /// (issue #2031).
+    #[error("invalid schedule: {0}")]
+    InvalidSchedule(String),
+
+    /// No schedule exists for this workflow name (issue #2031).
+    #[error("schedule not found: {0}")]
+    ScheduleNotFound(String),
 
     /// A value stored in `SQLite` could not be parsed back into its Rust type.
     #[error("corrupt stored value: {0}")]
@@ -294,8 +366,86 @@ pub enum SqliteError {
         details: String,
     },
 
-    /// A driven execution made no durable progress and could not be classified
-    /// as waiting on a timer or a signal — surfaced honestly instead of looping.
+    /// The run has no query handler with this name (issue #2022).
+    ///
+    /// The replay registers every query that the workflow reaches before its
+    /// frontier. The replay does not know a query that the workflow registers
+    /// past the frontier.
+    #[error("execution {execution_id} has no query handler named {name:?}")]
+    QueryNotFound {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+    },
+
+    /// The query handler returned an `Err` (issue #2022).
+    #[error("query {name:?} on execution {execution_id} failed: {details}")]
+    QueryFailed {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+        /// The handler's error.
+        details: String,
+    },
+
+    /// The query handler panicked, or the workflow panicked during the replay
+    /// of a running run (issue #2022). The panic does not reach the caller.
+    /// The run does not change.
+    #[error("query {name:?} on execution {execution_id} panicked: {details}")]
+    QueryPanicked {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+        /// The panic message of a query handler. A workflow panic during the
+        /// replay gives a fixed text, and the core logs the message.
+        details: String,
+    },
+
+    /// The query replay did not stop before the query timeout (issue #2022).
+    ///
+    /// The usual cause is a workflow that spins on a non-Harvest future. Set
+    /// the timeout with
+    /// [`set_query_timeout`](crate::SqliteRuntime::set_query_timeout). The
+    /// timeout holds only while the replay yields. A workflow that loops or
+    /// blocks without an `.await` is not bounded.
+    #[error("query {name:?} on execution {execution_id} timed out after {timeout_ms} ms")]
+    QueryTimedOut {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+        /// The timeout that elapsed.
+        timeout_ms: u64,
+    },
+
+    /// A terminal run cannot give a stable answer (issue #2022).
+    ///
+    /// The query serves no answer rather than a wrong one. There are three
+    /// causes:
+    ///
+    /// - The workflow code changed, so the replay diverges from the history.
+    /// - The workflow panics during the replay. The panic recurs on every
+    ///   retry, as on the Postgres HTTP path.
+    /// - A seal for an unsupported feature or a history cap rolled back the
+    ///   last cycle. The replay then mints side-effect values that the
+    ///   history does not record.
+    #[error("query {name:?} on terminal execution {execution_id} is unavailable: {details}")]
+    QueryUnavailable {
+        /// The queried execution.
+        execution_id: ExecutionId,
+        /// The query name.
+        name: String,
+        /// Why the replay cannot serve.
+        details: String,
+    },
+
+    /// A driven execution made no durable progress. It waits on no timer, no
+    /// signal and no other run, so this error surfaces it instead of a loop.
+    /// It also names a run that spent its cycle budget in one
+    /// `run_until_blocked` call.
     /// The most common cause is a task stranded `RUNNING` by a crash that the
     /// orphan reclaim on [`SqliteRuntime::open`](crate::SqliteRuntime::open) did
     /// not clear (e.g. a different database file).

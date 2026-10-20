@@ -13,6 +13,27 @@ adding workers stops helping and sharding (or shedding the backlog) is the
 answer. Measure your own steady-state backlog against that table before
 provisioning a second shard.
 
+## Glossary
+
+Epic #2247 plans owner mode. Harvest does not implement it yet.
+[ADR 0009](adr/0009-decision-owner.md) records the decisions behind it.
+
+- **Shard**: a logical shard, usually one Postgres database. An
+  execution's history, tasks, timers and signals all live on one shard.
+  Colocated shards share one database.
+- **Decision partition**: a fixed hash bucket of executions inside one
+  physical database. Each database has 512. The hash input is
+  `workflow_id`.
+- **Owner**: the worker that holds the lease of a decision partition. Only
+  the owner commits decisions for the executions in it.
+- **Owner row** (owner lease): the row in the shard database that names
+  the owner, its epoch and its lease end.
+- **Owner epoch**: a counter that each acquisition increments. Each
+  decision commit checks it, so a stale owner cannot commit.
+- **Foreign writer**: code that appends to a history outside the owner's
+  decision, such as an activity completion. It takes no owner row.
+- **Owner mode**: the per-database switch that turns the owner model on.
+
 ---
 
 ## Per-Key Concurrency Limits and Sharding (issue #247)
@@ -402,6 +423,9 @@ it.
 
 Distributed counting across shards requires either a coordination service (Redis, a dedicated Postgres coordinator) or accepting bounded inaccuracy (approximate counts via gossip). Both add operational complexity that conflicts with Harvest's goal of being a Postgres-native engine. Cross-shard global limits are therefore **out of scope** for this feature; the per-shard guarantee is the contract.
 
+[Fairness keys](fairness-keys.md) (issue #1976) are shard-local too. Each
+shard keeps its own key state.
+
 If you need approximate cross-shard fair-share rather than a hard global cap, the metrics observable via `GET /admin/concurrency` can feed an external rate limiter in the layer above Harvest.
 
 ### Worker crash and slot release
@@ -731,6 +755,8 @@ time.
 | Queued for no durable mutex | The grant is delivered by waking the waiter **on this shard**, so a migrated waiter's grant would be delivered to a sealed row — a lost wake. |
 | No dead-letter rows | Redriving a DLQ entry enqueues a task on this shard, which after a migration would target a sealed row. Redrive or discard it first. |
 | Not schedule-attributed (`schedule_id IS NULL`) | A schedule row does not move with its runs, and its overlap enforcement is **shard-local**: the tick counts `RUNNING`/`PAUSED` executions on its own shard for `max_active_runs`, and `CancelOther`/`TerminateOther` cancel priors with the same shard-local query. After a migration the local row reads `MIGRATED`, so the schedule stops counting the still-running copy and stops cancelling it — silently exceeding its own cap, or starting a run without terminating the prior it was told to replace. Making this safe means teaching schedule overlap enforcement to see forwarded residences, which is a change to the scheduler rather than to this feature. |
+| Not a fork (`start_source` is not `fork`, issue #2000) | A recorded fork reads its source, and a new fork walks the fork lineage, on the shard of the fork. Only the fork moves, so on the target both lookups would miss: every recorded result would fail closed, and an erased ancestor would go unseen. |
+| Not in the fork lineage of a live fork (issue #2000) | A recorded fork reads the outcomes of its source on the shard of the fork. A migrated source records later outcomes on the target, so the fork would fail closed. A reset of a fork reads the source of the fork it resets, so the check walks the lineage up, for at most 64 links. The partial index on `start_source` keeps the walk small. |
 | No live children, **including paused ones** | A paused child still completes eventually, and its terminal appends to the parent's history on the shard the parent used to be on. |
 
 **A run waiting on a timer or a signal IS migratable — that is the point.** Both

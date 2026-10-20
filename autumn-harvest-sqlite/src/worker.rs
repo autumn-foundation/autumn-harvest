@@ -32,16 +32,23 @@
 //! history a clean, terminal-only, replay-correct log.
 
 use std::collections::HashMap;
+use std::task::Poll;
 
-use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
+use autumn_harvest::builder::{DEFAULT_MAX_ACTIVITY_RESULT_BYTES, DEFAULT_RETRY_AFTER_CEILING};
+use autumn_harvest::context::{ActivityIdentity, empty_shared_state};
+use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::{
-    ExecutionId, TimeoutType, TimerId, WorkflowCommand, WorkflowEvent, WorkflowHistoryPolicy,
+    ActivityContext, ActivityExecId, ActivityHandlerFn, ExecutionId, TimeoutType, TimerId,
+    WorkflowCommand, WorkflowEvent, WorkflowHistoryPolicy,
 };
+use chrono::{DateTime, Utc};
 use rusqlite::Connection;
+use serde_json::Value;
+use tokio::sync::mpsc;
 
 use crate::error::SqliteResult;
 use crate::queue::{self, ClaimedTask};
-use crate::runtime::ActivitySpec;
+use crate::runtime::{ActivityRunner, ActivitySpec};
 use crate::store;
 
 /// Run all currently-ready work for `exec_id` at logical time `now`: drain ready
@@ -88,9 +95,11 @@ use crate::store;
 /// fan-out (wait-all, N schedules in one batch, resolves only when every branch
 /// completes) and ordinary single/sequential activities are byte-for-byte
 /// unchanged — they never set the flag.
-pub fn drain_ready(
+#[allow(clippy::too_many_arguments)]
+pub async fn drain_ready(
     conn: &mut Connection,
     exec_id: ExecutionId,
+    owner: &RunOwner<'_>,
     now: i64,
     // `+ Send + Sync` keeps the enclosing async `drive_one_cycle` future `Send`
     // (clippy `future_not_send`); the drivers' closures capture only a `Send + Sync`
@@ -185,6 +194,28 @@ pub fn drain_ready(
             continue;
         }
 
+        // Honor the workflow's declared/per-call retry cap (issue #1069 P2). The
+        // context reports it, so resolve it before the body runs. By this
+        // point the task is ALWAYS frozen: the freeze-or-read branch above sets
+        // `defaults_frozen = true` and `task.max_attempts = Some(..)` for a
+        // previously-unfrozen row, and a schedule-time-frozen row already carries the
+        // cap. So make the freeze invariant SELF-ENFORCING at the read site (issue
+        // #1068 P3-1): for a frozen task NEVER fall back to `spec.max_attempts` —
+        // re-consulting the mutable registry here would silently defeat the freeze if
+        // a frozen row ever held NULL. The spec fallback is kept ONLY for the
+        // unfrozen case, which is unreachable in practice (the branch above always
+        // freezes first) but left as a defensive read. Clamp to `>= 1` to mirror
+        // `ActivitySpec::new` (a body always runs once).
+        debug_assert!(
+            task.max_attempts.is_some(),
+            "a frozen task must carry a resolved max_attempts (issue #1068 freeze invariant)",
+        );
+        let max_attempts = if task.defaults_frozen {
+            task.max_attempts.unwrap_or(1).max(1)
+        } else {
+            task.max_attempts.unwrap_or(spec.max_attempts).max(1)
+        };
+
         // Body runs OUTSIDE any transaction — at-least-once (see module docs).
         //
         // Contain a PANICKING body (issue #782 analog; Codex round 8). A body
@@ -206,32 +237,38 @@ pub fn drain_ready(
         // `now` — start-to-close is a real budget for real execution) so a body
         // that overran its start-to-close budget records a timeout below.
         let started = std::time::Instant::now();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (spec.body)(task.input.clone())
-        }))
-        .unwrap_or_else(|payload| {
-            // Encode the caught panic as the TYPED `harvest_activity_failure_v1`
-            // envelope carrying `error_type = "HandlerPanic"` (issue #782; Codex
-            // #1069 P2, `worker.rs:119`) — NOT a plain string. This is the one
-            // activity-failure path that would otherwise skip the typed-envelope
-            // treatment the ordinary `Err(String)` path already gets, because the
-            // finalize path derives BOTH the retry classification
-            // (`parse_typed_payload` → `RetryPolicy::is_non_retryable`) AND the
-            // terminal `ActivityFailed` metadata (`parse_error_payload_full`) from
-            // this string. Emitting the typed HandlerPanic envelope makes a retry
-            // policy that marks `HandlerPanic` non-retryable actually match (the
-            // panicking task fails terminally after ONE attempt instead of being
-            // retried to `max_attempts`), and records a terminal
-            // `ActivityFailed { error_type: "HandlerPanic", .. }` byte-equivalent
-            // to the Postgres worker's caught-panic path
-            // (`handler_panic_activity_envelope`). Retryable like the core — a
-            // caught panic follows the activity's retry policy exactly as
-            // `Err(String)` does. The carried message is the raw panic message (no
-            // synthetic prefix), matching the core envelope.
-            Err(handler_panic_activity_envelope(
-                autumn_harvest::error::panic_message(payload),
-            ))
-        });
+        let result = match &spec.body {
+            ActivityRunner::Closure(body) => {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(task.input.clone())))
+                    .unwrap_or_else(|payload| {
+                        // Encode the caught panic as the TYPED `harvest_activity_failure_v1`
+                        // envelope carrying `error_type = "HandlerPanic"` (issue #782; Codex
+                        // #1069 P2, `worker.rs:119`) — NOT a plain string. This is the one
+                        // activity-failure path that would otherwise skip the typed-envelope
+                        // treatment the ordinary `Err(String)` path already gets, because the
+                        // finalize path derives BOTH the retry classification
+                        // (`parse_typed_payload` → `RetryPolicy::is_non_retryable`) AND the
+                        // terminal `ActivityFailed` metadata (`parse_error_payload_full`) from
+                        // this string. Emitting the typed HandlerPanic envelope makes a retry
+                        // policy that marks `HandlerPanic` non-retryable actually match (the
+                        // panicking task fails terminally after ONE attempt instead of being
+                        // retried to `max_attempts`), and records a terminal
+                        // `ActivityFailed { error_type: "HandlerPanic", .. }` byte-equivalent
+                        // to the Postgres worker's caught-panic path
+                        // (`handler_panic_activity_envelope`). Retryable like the core — a
+                        // caught panic follows the activity's retry policy exactly as
+                        // `Err(String)` does. The carried message is the raw panic message (no
+                        // synthetic prefix), matching the core envelope.
+                        Err(handler_panic_activity_envelope(
+                            autumn_harvest::error::panic_message(payload),
+                        ))
+                    })
+            }
+            ActivityRunner::Handler(handler) => {
+                let ctx = activity_context(exec_id, owner, &task, claim_now, max_attempts);
+                run_handler(conn, *handler, ctx, &task).await
+            }
+        };
         let elapsed = started.elapsed();
 
         // Enforce the activity's start-to-close timeout (issue #1069 P2), when the
@@ -258,26 +295,6 @@ pub fn drain_ready(
             continue;
         }
 
-        // Honor the workflow's declared/per-call retry cap (issue #1069 P2). By this
-        // point the task is ALWAYS frozen: the freeze-or-read branch above sets
-        // `defaults_frozen = true` and `task.max_attempts = Some(..)` for a
-        // previously-unfrozen row, and a schedule-time-frozen row already carries the
-        // cap. So make the freeze invariant SELF-ENFORCING at the read site (issue
-        // #1068 P3-1): for a frozen task NEVER fall back to `spec.max_attempts` —
-        // re-consulting the mutable registry here would silently defeat the freeze if
-        // a frozen row ever held NULL. The spec fallback is kept ONLY for the
-        // unfrozen case, which is unreachable in practice (the branch above always
-        // freezes first) but left as a defensive read. Clamp to `>= 1` to mirror
-        // `ActivitySpec::new` (a body always runs once).
-        debug_assert!(
-            task.max_attempts.is_some(),
-            "a frozen task must carry a resolved max_attempts (issue #1068 freeze invariant)",
-        );
-        let max_attempts = if task.defaults_frozen {
-            task.max_attempts.unwrap_or(1).max(1)
-        } else {
-            task.max_attempts.unwrap_or(spec.max_attempts).max(1)
-        };
         // Read the clock seam NOW — after the body has run and returned (Codex
         // #1069 P2, `worker.rs:328`). A policy retry's backoff is measured from
         // THIS instant, not the pre-body cycle `now`.
@@ -352,6 +369,158 @@ pub fn drain_ready(
     }
 
     Ok(produced)
+}
+
+/// The run that owns a drain (issue #2024). `ActivityContext::info()` reports it.
+pub struct RunOwner<'a> {
+    /// The run's business `workflow_id`.
+    pub workflow_id: &'a str,
+    /// The run's workflow type, the `#[workflow]` fn name.
+    pub workflow_type: &'a str,
+}
+
+/// The heartbeat channel capacity. The drain empties it on every poll, so a
+/// small bound is enough.
+const HEARTBEAT_CHANNEL_CAPACITY: usize = 16;
+
+/// Build the `ActivityContext` for one attempt of `task` (issue #2024).
+///
+/// The values match the Postgres worker for one process. `attempt` is 1-based.
+/// `previous_failure` is set on a retry only. The returned receiver gets every
+/// heartbeat of the attempt.
+fn activity_context(
+    exec_id: ExecutionId,
+    owner: &RunOwner<'_>,
+    task: &ClaimedTask,
+    claim_now: i64,
+    max_attempts: u32,
+) -> (ActivityContext, mpsc::Receiver<Value>) {
+    let (tx, rx) = mpsc::channel(HEARTBEAT_CHANNEL_CAPACITY);
+    let identity = ActivityIdentity::new(
+        exec_id,
+        owner.workflow_id,
+        owner.workflow_type,
+        task.name.clone(),
+        task.activity_id,
+    );
+    let attempt = task.attempt.saturating_add(1);
+    let task_id = task.task_id.parse().ok();
+    debug_assert!(task_id.is_some(), "a task row id is a UUID");
+    let ctx = ActivityContext::new_embedded(
+        empty_shared_state(),
+        identity,
+        tx,
+        task.heartbeat_details.clone(),
+    )
+    .with_queue_name(task.queue.clone())
+    .with_task_id(task_id)
+    .with_deadline(attempt_deadline(
+        claim_now,
+        task.start_to_close_ms,
+        task.schedule_to_close_at,
+    ))
+    .with_attempt(attempt)
+    .with_max_attempts(max_attempts)
+    .with_previous_failure(if attempt > 1 {
+        task.last_error.clone()
+    } else {
+        None
+    });
+    (ctx, rx)
+}
+
+/// The attempt deadline: the earlier of `claim_ms + start_to_close_ms` and
+/// `schedule_to_close_at` (issue #2024).
+///
+/// It is the same rule as the Postgres worker. A non-positive budget is
+/// unbounded, as in [`start_to_close_exceeded`]. `claim_ms` can be a simulated
+/// clock, but `ActivityContext::time_remaining` reads the real clock. So the
+/// result is the remaining span added to `Utc::now()`.
+fn attempt_deadline(
+    claim_ms: i64,
+    start_to_close_ms: Option<i64>,
+    schedule_to_close_at: Option<i64>,
+) -> Option<DateTime<Utc>> {
+    let per_attempt = start_to_close_ms
+        .filter(|ms| *ms > 0)
+        .map(|ms| claim_ms.saturating_add(ms));
+    let at = match (per_attempt, schedule_to_close_at) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }?;
+    let remaining = chrono::Duration::try_milliseconds(at.saturating_sub(claim_ms))?;
+    Utc::now().checked_add_signed(remaining)
+}
+
+/// Await one `#[activity]` handler with its context (issue #2024).
+///
+/// One `poll_fn` drives the body and the heartbeat channel. Each poll runs the
+/// body under `catch_unwind`, then persists the latest heartbeat. So the last
+/// heartbeat before a return is on the row before the finalize. A panic, in
+/// the handler call or in a poll, becomes the typed `HandlerPanic` envelope,
+/// as for a closure body.
+// The `&mut` is load-bearing: `&mut Connection` is `Send`, `&Connection` is not.
+#[allow(clippy::needless_pass_by_ref_mut)]
+async fn run_handler(
+    conn: &mut Connection,
+    handler: ActivityHandlerFn,
+    (ctx, mut heartbeats): (ActivityContext, mpsc::Receiver<Value>),
+    task: &ClaimedTask,
+) -> Result<Value, String> {
+    let panicked = |payload| {
+        Err(handler_panic_activity_envelope(
+            autumn_harvest::error::panic_message(payload),
+        ))
+    };
+    let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        handler(&ctx, task.input.clone())
+    }));
+    let mut body = match call {
+        Ok(body) => body,
+        Err(payload) => return panicked(payload),
+    };
+    // `move` takes the `&mut Connection` itself. A shared capture needs
+    // `Connection: Sync`, so the drive future would not be `Send`.
+    std::future::poll_fn(move |cx| {
+        let polled =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.as_mut().poll(cx)));
+        persist_heartbeats(conn, &task.task_id, &mut heartbeats);
+        polled.unwrap_or_else(|payload| Poll::Ready(panicked(payload)))
+    })
+    .await
+}
+
+/// Write the latest queued heartbeat of `task_id` to its row (issue #2024).
+///
+/// Only the last payload of a batch is written, because last write wins. A
+/// failed write logs a warning and keeps the attempt alive, as the Postgres
+/// flusher does.
+///
+/// A payload nested past the cap is dropped with a warning (issue #2216). The
+/// next claim reads the checkpoint back, and `serde_json` cannot read that
+/// payload. So the last good checkpoint stays.
+///
+/// `try_recv` takes no Tokio coop budget, so the drain always empties the
+/// channel. A body that waits for capacity wakes when the drain frees a slot.
+fn persist_heartbeats(conn: &Connection, task_id: &str, heartbeats: &mut mpsc::Receiver<Value>) {
+    let mut latest = None;
+    while let Ok(details) = heartbeats.try_recv() {
+        if autumn_harvest::payload_depth::nests_past_cap(&details) {
+            tracing::warn!(
+                task_id,
+                cap_depth = crate::MAX_PAYLOAD_DEPTH,
+                "dropped an activity heartbeat that nests past the depth cap"
+            );
+            continue;
+        }
+        latest = Some(details);
+    }
+    if let Some(details) = latest
+        && let Err(err) = queue::record_heartbeat(conn, task_id, &details)
+    {
+        tracing::warn!(task_id, error = %err, "failed to persist an activity heartbeat");
+    }
 }
 
 /// FREEZE-OR-READ the four resolved activity defaults on a claimed task row (issue
@@ -782,7 +951,10 @@ pub fn finalize_within_tx(
     // override (like the input cap, which uses the global), so the GLOBAL
     // `DEFAULT_MAX_ACTIVITY_RESULT_BYTES` (2 MiB) is the faithful cap — the same
     // constant the core resolves each activity's cap against. A zero cap = uncapped.
-    let result = match result {
+    //
+    // A result nested past the depth cap fails the same way (issue #2216).
+    // Check the depth first, because the size check serializes the whole value.
+    let result = match autumn_harvest::payload_depth::refuse_deep_result(&task.name, result) {
         Ok(output) if DEFAULT_MAX_ACTIVITY_RESULT_BYTES > 0 => {
             let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
             if observed > DEFAULT_MAX_ACTIVITY_RESULT_BYTES {
@@ -931,10 +1103,19 @@ pub fn finalize_within_tx(
                 //   yields naturally — its future `run_at` keeps it out of this
                 //   pass's `run_at <= now` claim window — so keep its `seq`
                 //   unchanged and leave the existing behavior byte-for-byte intact.
+                // Store the message the way Postgres does: a typed payload
+                // keeps only its message (issue #2024).
+                let previous = autumn_harvest::failure::parse_error_payload_full(&error).message;
                 if run_at <= now {
-                    queue::requeue_task_to_back(conn, &task.task_id, attempt_num, run_at)?;
+                    queue::requeue_task_to_back(
+                        conn,
+                        &task.task_id,
+                        attempt_num,
+                        run_at,
+                        &previous,
+                    )?;
                 } else {
-                    queue::requeue_task(conn, &task.task_id, attempt_num, run_at)?;
+                    queue::requeue_task(conn, &task.task_id, attempt_num, run_at, &previous)?;
                 }
                 Ok(false)
             } else {
@@ -1065,6 +1246,240 @@ pub fn finalize_timeout_within_tx(
     Ok(())
 }
 
+/// The per-attempt budget cap of a local activity (issue #2029). It matches
+/// the default `max_local_activity_start_to_close` of the Postgres worker.
+pub const LOCAL_ACTIVITY_START_TO_CLOSE_CAP: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// One `RunLocalActivity` command that the drive runs after the cycle commits
+/// (issue #2029).
+pub struct LocalRun {
+    /// The id of the `LocalActivityScheduled` event.
+    pub activity_id: ActivityExecId,
+    /// The registered activity name.
+    pub name: String,
+    /// The activity input.
+    pub input: Value,
+    /// The per-attempt budget of the call. The cap above bounds it.
+    pub start_to_close: Option<std::time::Duration>,
+    /// The retry policy of the call. `None` = one attempt.
+    pub retry_policy: Option<RetryPolicy>,
+    /// The failed attempts that history already records.
+    pub failed_attempts: u32,
+    /// The error of the last recorded failed attempt.
+    pub last_error: Option<String>,
+}
+
+impl LocalRun {
+    /// The attempt cap: the policy's `max_attempts`, or 1.
+    pub fn max_attempts(&self) -> u32 {
+        self.retry_policy
+            .as_ref()
+            .map_or(1, |p| p.max_attempts.max(1))
+    }
+
+    /// The per-attempt budget: the declared one, capped at
+    /// [`LOCAL_ACTIVITY_START_TO_CLOSE_CAP`].
+    fn budget(&self) -> std::time::Duration {
+        self.start_to_close
+            .map_or(LOCAL_ACTIVITY_START_TO_CLOSE_CAP, |d| {
+                d.min(LOCAL_ACTIVITY_START_TO_CLOSE_CAP)
+            })
+    }
+}
+
+/// Run attempt `attempt` of a local activity, inline (issue #2029).
+///
+/// A closure body gets no context. An `#[activity]` body gets the local
+/// context that the Postgres worker builds. A panic becomes the retryable
+/// `HandlerPanic` failure. An `#[activity]` body that runs past its budget is
+/// dropped under a Tokio runtime. A closure body cannot be stopped, so its
+/// budget is checked after it returns. As on Postgres, the result has no
+/// size cap here. The history byte cap still bounds it.
+pub async fn run_local_attempt(
+    exec_id: ExecutionId,
+    owner: &RunOwner<'_>,
+    spec: &ActivitySpec,
+    run: &LocalRun,
+    attempt: u32,
+    previous_failure: Option<String>,
+    deadline_left: Option<std::time::Duration>,
+) -> Result<Value, String> {
+    // The workflow deadline bounds the attempt too (issue #2029).
+    let budget = deadline_left.map_or_else(|| run.budget(), |left| run.budget().min(left));
+    let started = std::time::Instant::now();
+    let result = match &spec.body {
+        ActivityRunner::Closure(body) => {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(run.input.clone())))
+                .unwrap_or_else(|payload| {
+                    Err(handler_panic_activity_envelope(
+                        autumn_harvest::error::panic_message(payload),
+                    ))
+                })
+        }
+        ActivityRunner::Handler(handler) => {
+            let identity = ActivityIdentity::new(
+                exec_id,
+                owner.workflow_id,
+                owner.workflow_type,
+                run.name.clone(),
+                run.activity_id,
+            );
+            let deadline = chrono::Duration::from_std(budget)
+                .ok()
+                .and_then(|span| Utc::now().checked_add_signed(span));
+            let ctx = ActivityContext::new_embedded_local(empty_shared_state(), identity)
+                .with_attempt(attempt)
+                .with_max_attempts(run.max_attempts())
+                .with_deadline(deadline)
+                .with_previous_failure(previous_failure);
+            let body = run_local_handler(*handler, &ctx, run.input.clone());
+            match within_budget(body, budget).await {
+                Some(result) => result,
+                None => return Err(local_timeout_error(run, budget)),
+            }
+        }
+    };
+    if started.elapsed() > budget {
+        return Err(local_timeout_error(run, budget));
+    }
+    result
+}
+
+/// The Postgres error text of a local attempt that ran past `budget`.
+fn local_timeout_error(run: &LocalRun, budget: std::time::Duration) -> String {
+    format!("local activity '{}' timed out after {budget:?}", run.name)
+}
+
+/// Await `body` for at most `budget`. Returns `None` at the budget, and the
+/// body is dropped, as on Postgres (issue #2029).
+///
+/// The timer is Tokio's. The drive may run on another runtime, or on a Tokio
+/// runtime with no timer. The body then runs to its end, and the caller
+/// checks the budget after it returns.
+pub async fn within_budget<F>(body: F, budget: std::time::Duration) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    let sleep = tokio::runtime::Handle::try_current()
+        .ok()
+        .and_then(|_| std::panic::catch_unwind(|| tokio::time::sleep(budget)).ok());
+    let Some(sleep) = sleep else {
+        return Some(body.await);
+    };
+    let mut body = std::pin::pin!(body);
+    let mut sleep = std::pin::pin!(sleep);
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(output) = body.as_mut().poll(cx) {
+            return Poll::Ready(Some(output));
+        }
+        sleep.as_mut().poll(cx).map(|()| None)
+    })
+    .await
+}
+
+/// Await one local `#[activity]` handler, and contain a panic in the call
+/// or in a poll (issue #2029).
+async fn run_local_handler(
+    handler: ActivityHandlerFn,
+    ctx: &ActivityContext,
+    input: Value,
+) -> Result<Value, String> {
+    let panicked = |payload| {
+        Err(handler_panic_activity_envelope(
+            autumn_harvest::error::panic_message(payload),
+        ))
+    };
+    let call = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(ctx, input)));
+    let mut body = match call {
+        Ok(body) => body,
+        Err(payload) => return panicked(payload),
+    };
+    std::future::poll_fn(move |cx| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.as_mut().poll(cx)))
+            .unwrap_or_else(|payload| Poll::Ready(panicked(payload)))
+    })
+    .await
+}
+
+/// The events of one local attempt, and the backoff before the next one
+/// (issue #2029). `None` means the activity is done.
+///
+/// A failure appends `LocalActivityFailed`. A terminal failure also appends
+/// `LocalActivityExhausted`, the marker that ends the activity on replay.
+/// The stored error is the typed message, or the raw string, as on Postgres.
+pub fn local_attempt_events(
+    exec_id: ExecutionId,
+    run: &LocalRun,
+    attempt: u32,
+    result: Result<Value, String>,
+) -> (Vec<WorkflowEvent>, Option<std::time::Duration>) {
+    let activity_id = run.activity_id;
+    let error = match autumn_harvest::payload_depth::refuse_deep_result(&run.name, result) {
+        Ok(output) => {
+            return (
+                vec![WorkflowEvent::LocalActivityCompleted {
+                    activity_id,
+                    output,
+                }],
+                None,
+            );
+        }
+        Err(error) => error,
+    };
+    let typed = autumn_harvest::failure::parse_typed_payload(&error);
+    let non_retryable = typed.as_ref().is_some_and(|f| f.non_retryable)
+        || run.retry_policy.as_ref().is_some_and(|p| {
+            p.is_non_retryable(typed.as_ref().map(|f| f.error_type.as_str()), &error)
+        });
+    // A positive `retry_after` hint wins over the policy, within the Postgres
+    // ceiling.
+    let hint = autumn_harvest::policy::resolve_retry_after_hint(
+        typed.as_ref().and_then(|f| f.retry_after),
+        DEFAULT_RETRY_AFTER_CEILING,
+    );
+    let message = typed.map_or(error, |f| f.message);
+    let failed = WorkflowEvent::LocalActivityFailed {
+        activity_id,
+        error: message.clone(),
+        attempt,
+    };
+    if non_retryable || attempt >= run.max_attempts() {
+        let exhausted = WorkflowEvent::LocalActivityExhausted {
+            activity_id,
+            error: message,
+            attempt,
+        };
+        return (vec![failed, exhausted], None);
+    }
+    let seed = local_retry_seed(exec_id, activity_id);
+    let delay = hint
+        .or_else(|| {
+            run.retry_policy
+                .as_ref()
+                .and_then(|p| p.next_delay_with_seed(attempt, seed))
+        })
+        .unwrap_or_default();
+    (vec![failed], Some(delay))
+}
+
+/// The jitter seed of a local retry. It differs per activity of one run.
+///
+/// It is the FNV-1a mix of the Postgres worker, so both backends pick the
+/// same backoff.
+fn local_retry_seed(exec_id: ExecutionId, activity_id: ActivityExecId) -> u64 {
+    const PRIME: u64 = 0x1000_0000_01b3;
+    let mut seed = 0xcbf2_9ce4_8422_2325_u64;
+    for id in [exec_id.as_uuid().as_u128(), activity_id.as_uuid().as_u128()] {
+        let raw = id.to_le_bytes();
+        for half in [&raw[..8], &raw[8..]] {
+            seed ^= u64::from_le_bytes(half.try_into().unwrap_or([0; 8]));
+            seed = seed.wrapping_mul(PRIME);
+        }
+    }
+    seed
+}
+
 /// Fire one due timer atomically: append `TimerFired` and mark the timer row
 /// `fired` in a single transaction, so a crash never records the fired event
 /// without flipping the row — which would both re-fire the timer on restart and
@@ -1108,10 +1523,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        IngestBudget, SignalIngest, commands_open_activity_race, drain_ready, finalize_within_tx,
-        fire_timer, fire_timer_within_tx, handler_panic_activity_envelope,
-        history_has_unsettled_activity_race, payload_too_large_activity_envelope,
-        schedule_to_close_exceeded, signal_timeout_name, start_to_close_exceeded,
+        IngestBudget, LocalRun, SignalIngest, attempt_deadline, commands_open_activity_race,
+        drain_ready, finalize_within_tx, fire_timer, fire_timer_within_tx,
+        handler_panic_activity_envelope, history_has_unsettled_activity_race, local_attempt_events,
+        payload_too_large_activity_envelope, schedule_to_close_exceeded, signal_timeout_name,
+        start_to_close_exceeded,
     };
     use crate::queue::{self, ClaimedTask};
     use crate::runtime::ActivitySpec;
@@ -1213,6 +1629,12 @@ mod tests {
         conn
     }
 
+    /// The owner the drain tests pass. Their closure bodies never read it.
+    const TEST_OWNER: super::RunOwner<'static> = super::RunOwner {
+        workflow_id: "wf-test",
+        workflow_type: "test_workflow",
+    };
+
     fn seed_running_task(conn: &Connection, exec: ExecutionId, name: &str) -> ClaimedTask {
         let act = ActivityExecId::new();
         queue::enqueue_activity(
@@ -1251,6 +1673,9 @@ mod tests {
             scheduled_at: 0,
             schedule_to_close_at: None,
             defaults_frozen: false,
+            queue: "default".to_string(),
+            heartbeat_details: None,
+            last_error: None,
         }
     }
 
@@ -1447,6 +1872,26 @@ mod tests {
     // comparison is `>=` (reached OR passed), mirroring the Postgres
     // `schedule_to_close_deadline_exceeded` contract used at BOTH the pre-run check
     // (cycle `now`) and the retry check (next attempt's `run_at`).
+    // Issue #2024: the deadline is the earlier clock, a non-positive budget is
+    // unbounded, and the span is anchored on the real clock.
+    #[test]
+    fn attempt_deadline_takes_the_earlier_clock_on_the_real_clock() {
+        // The deadline lies `want` seconds after the real clock, give or take
+        // the time the test itself takes.
+        let near = |at: Option<chrono::DateTime<chrono::Utc>>, want: i64| {
+            let secs = (at.expect("a bounded attempt") - chrono::Utc::now()).num_seconds();
+            assert!((want - 2..=want).contains(&secs), "{secs}s, want {want}s");
+        };
+        // A simulated claim at epoch 0 still gives a deadline about 60s away.
+        near(attempt_deadline(0, Some(60_000), None), 60);
+        near(attempt_deadline(0, Some(60_000), Some(30_000)), 30);
+        near(attempt_deadline(0, Some(60_000), Some(90_000)), 60);
+        near(attempt_deadline(0, None, Some(90_000)), 90);
+        assert_eq!(attempt_deadline(0, Some(0), None), None);
+        assert_eq!(attempt_deadline(0, Some(-5), None), None);
+        assert_eq!(attempt_deadline(0, None, None), None);
+    }
+
     #[test]
     fn schedule_to_close_exceeded_truth_table() {
         // No total deadline → never exceeded (prior behavior for every activity
@@ -1518,7 +1963,7 @@ mod tests {
         .unwrap();
 
         // Signal arrives at t=100.
-        store::stage_signal(&conn, exec, "go", &serde_json::json!("v"), 100).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!("v"), 100, None).unwrap();
         // The raced deadline timer of THIS wait, expired at t=60 (<= 100).
         queue::enqueue_timer(&conn, exec, "__signal_timeout:0:go", 60).unwrap();
         // An UNRELATED durable timer, also due at t=50 (<= 100) — must NOT fire
@@ -1598,9 +2043,9 @@ mod tests {
             &serde_json::json!(null),
         )
         .unwrap();
-        store::stage_signal(&conn, exec, "go", &serde_json::json!("on_time"), 10).unwrap();
-        store::stage_signal(&conn, exec, "go", &serde_json::json!("late"), 90).unwrap();
-        store::stage_signal(&conn, exec, "go", &serde_json::json!("later"), 100).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!("on_time"), 10, None).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!("late"), 90, None).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!("later"), 100, None).unwrap();
         queue::enqueue_timer(&conn, exec, "__signal_timeout:0:go", 60).unwrap();
 
         let ingest = SignalIngest::plan(&conn, exec, 120, IngestBudget::default()).unwrap();
@@ -1631,7 +2076,7 @@ mod tests {
         )
         .unwrap();
         for i in 0..5 {
-            store::stage_signal(&conn, exec, "go", &serde_json::json!(i), i).unwrap();
+            store::stage_signal(&conn, exec, "go", &serde_json::json!(i), i, None).unwrap();
         }
         let policy = autumn_harvest::WorkflowHistoryPolicy::default().with_event_hard_cap(3);
 
@@ -1658,7 +2103,7 @@ mod tests {
         for seq in 0..3 {
             queue::enqueue_timer(&conn, exec, &format!("__signal_timeout:{seq}:go"), 10).unwrap();
         }
-        store::stage_signal(&conn, exec, "go", &serde_json::json!(1), 50).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!(1), 50, None).unwrap();
         let policy = autumn_harvest::WorkflowHistoryPolicy::default().with_event_hard_cap(3);
 
         let ingest =
@@ -1680,7 +2125,7 @@ mod tests {
             &serde_json::json!(null),
         )
         .unwrap();
-        store::stage_signal(&conn, exec, "go", &serde_json::json!(1), 100).unwrap();
+        store::stage_signal(&conn, exec, "go", &serde_json::json!(1), 100, None).unwrap();
         queue::enqueue_timer(&conn, exec, "__signal_timeout:0:go", 60).unwrap();
 
         let ingest = SignalIngest::plan(&conn, exec, 200, IngestBudget::default()).unwrap();
@@ -1950,6 +2395,144 @@ mod tests {
         );
     }
 
+    /// The failure message of a deep result of the activity `act`.
+    const DEEP_ACT_MESSAGE: &str = "activity 'act' result nests more than 100 levels";
+
+    /// A value of `depth` nested one-element arrays.
+    fn nested(depth: usize) -> serde_json::Value {
+        let mut value = serde_json::json!(1);
+        for _ in 0..depth {
+            value = serde_json::Value::Array(vec![value]);
+        }
+        value
+    }
+
+    // Issue #2216: `serde_json` cannot read back a result past its read limit.
+    // So a result nested past the cap becomes a non-retryable `PayloadTooDeep`
+    // failure, as an oversized result does. The audit row holds the failure too.
+    #[test]
+    fn finalize_deep_result_records_non_retryable_payload_too_deep_terminal() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        let task = seed_running_task(&conn, exec, "act");
+        let deep = nested(crate::MAX_PAYLOAD_DEPTH + 1);
+
+        let produced =
+            super::finalize_activity_result(&mut conn, exec, &task, 3, 0, 0, Ok(deep)).unwrap();
+        assert!(produced, "a deep result is a terminal event, not a retry");
+
+        let history = store::load_history(&conn, exec).unwrap();
+        assert_eq!(history.len(), 1, "exactly one terminal event");
+        match &history[0] {
+            autumn_harvest::WorkflowEvent::ActivityFailed {
+                error_type,
+                non_retryable,
+                error,
+                ..
+            } => {
+                assert_eq!(error_type, crate::PAYLOAD_TOO_DEEP_ERROR_TYPE);
+                assert!(*non_retryable, "must be non-retryable");
+                assert_eq!(error, DEEP_ACT_MESSAGE);
+            }
+            other => panic!("expected a PayloadTooDeep ActivityFailed, got {other:?}"),
+        }
+        assert_eq!(
+            queue::task_state(&conn, &task.task_id).unwrap().as_deref(),
+            Some("DONE"),
+            "the task is terminal, not requeued"
+        );
+        let attempts = store::load_attempts(&conn, exec, "act").unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert!(
+            attempts[0].result.is_err(),
+            "the audit row holds the failure"
+        );
+    }
+
+    /// A local run of `act` that allows `max_attempts` attempts.
+    fn local_run(max_attempts: u32) -> LocalRun {
+        LocalRun {
+            activity_id: ActivityExecId::new(),
+            name: "act".to_string(),
+            input: serde_json::json!(null),
+            start_to_close: None,
+            retry_policy: Some(RetryPolicy::fixed(max_attempts, Duration::ZERO)),
+            failed_attempts: 0,
+            last_error: None,
+        }
+    }
+
+    // Issue #2216: a local result nested past the cap ends the activity on
+    // the first attempt. It is not stored as `LocalActivityCompleted`.
+    #[test]
+    fn a_deep_local_result_ends_the_activity_on_the_first_attempt() {
+        let run = local_run(3);
+        for depth in [crate::MAX_PAYLOAD_DEPTH + 1, 1_000] {
+            let (events, backoff) =
+                local_attempt_events(ExecutionId::new(), &run, 1, Ok(nested(depth)));
+            assert!(backoff.is_none(), "no retry follows");
+            match events.as_slice() {
+                [
+                    autumn_harvest::WorkflowEvent::LocalActivityFailed { error, .. },
+                    autumn_harvest::WorkflowEvent::LocalActivityExhausted { attempt: 1, .. },
+                ] => assert_eq!(error, DEEP_ACT_MESSAGE),
+                other => panic!("expected a failed and exhausted pair, got {other:?}"),
+            }
+        }
+    }
+
+    // Issue #2216: the depth check runs before the size check. So a result
+    // that is too deep and too large fails as `PayloadTooDeep`.
+    #[test]
+    fn a_deep_and_oversized_result_fails_as_too_deep() {
+        let mut conn = open();
+        let exec = ExecutionId::new();
+        store::insert_execution(
+            &conn,
+            exec,
+            "wf",
+            &exec.to_string(),
+            &serde_json::json!(null),
+        )
+        .unwrap();
+        let task = seed_running_task(&conn, exec, "act");
+        let cap = usize::try_from(autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES)
+            .expect("cap fits usize");
+        let mut value = serde_json::json!("x".repeat(cap + 1));
+        for _ in 0..=crate::MAX_PAYLOAD_DEPTH {
+            value = serde_json::Value::Array(vec![value]);
+        }
+
+        super::finalize_activity_result(&mut conn, exec, &task, 1, 0, 0, Ok(value)).unwrap();
+        match &store::load_history(&conn, exec).unwrap()[..] {
+            [autumn_harvest::WorkflowEvent::ActivityFailed { error_type, .. }] => {
+                assert_eq!(error_type, crate::PAYLOAD_TOO_DEEP_ERROR_TYPE);
+            }
+            other => panic!("expected one ActivityFailed, got {other:?}"),
+        }
+    }
+
+    // Issue #2216: a local result at the cap completes unchanged.
+    #[test]
+    fn a_local_result_at_the_cap_completes() {
+        let capped = nested(crate::MAX_PAYLOAD_DEPTH);
+        let (events, backoff) =
+            local_attempt_events(ExecutionId::new(), &local_run(1), 1, Ok(capped.clone()));
+        assert!(backoff.is_none());
+        assert!(matches!(
+            events.as_slice(),
+            [autumn_harvest::WorkflowEvent::LocalActivityCompleted { output, .. }] if *output == capped
+        ));
+    }
+
     // Codex #1069 P2 (`worker.rs:211`): a body that SUCCEEDS but whose FINALIZE clock
     // has reached the total schedule-to-close deadline is sealed terminal
     // `ActivityTimedOut { ScheduleToClose }` — NOT `ActivityCompleted`. The pre-body
@@ -1963,8 +2546,8 @@ mod tests {
     //
     // RED pre-fix: `drain_ready` had no finalize-time recheck, so the successful result
     // was finalized as `ActivityCompleted` past the declared total cap.
-    #[test]
-    fn drain_ready_seals_schedule_to_close_when_deadline_elapses_during_a_successful_body() {
+    #[tokio::test]
+    async fn drain_ready_seals_schedule_to_close_when_deadline_elapses_during_a_successful_body() {
         let mut conn = open();
         let exec = ExecutionId::new();
         store::insert_execution(
@@ -1985,7 +2568,17 @@ mod tests {
         // post-body finalize clock = 1500 (>= deadline → finalize recheck seals the
         // timeout).
         let failure_now = advancing_finalize_clock(0, 1_500);
-        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities, false).unwrap();
+        let produced = drain_ready(
+            &mut conn,
+            exec,
+            &TEST_OWNER,
+            0,
+            &failure_now,
+            &activities,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(produced, "a terminal timeout event was appended");
 
         let history = store::load_history(&conn, exec).unwrap();
@@ -2018,8 +2611,8 @@ mod tests {
     // Control: a body that SUCCEEDS whose finalize clock is still BEFORE the total
     // deadline completes normally. The finalize-time recheck only diverts a LATE
     // success; an on-time one keeps the common path byte-identical.
-    #[test]
-    fn drain_ready_completes_a_successful_body_finalized_before_the_deadline() {
+    #[tokio::test]
+    async fn drain_ready_completes_a_successful_body_finalized_before_the_deadline() {
         let mut conn = open();
         let exec = ExecutionId::new();
         store::insert_execution(
@@ -2037,7 +2630,17 @@ mod tests {
 
         // finalize clock = 500 < deadline 1000 → normal completion.
         let failure_now = || 500_i64;
-        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities, false).unwrap();
+        let produced = drain_ready(
+            &mut conn,
+            exec,
+            &TEST_OWNER,
+            0,
+            &failure_now,
+            &activities,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(produced);
 
         let history = store::load_history(&conn, exec).unwrap();
@@ -2066,8 +2669,8 @@ mod tests {
     //
     // RED pre-fix: the finalize-time recheck was guarded `result.is_ok()`, so an Err body
     // past the deadline recorded a terminal `ActivityFailed` instead of `ActivityTimedOut`.
-    #[test]
-    fn drain_ready_seals_schedule_to_close_for_a_failing_body_finalized_past_the_deadline() {
+    #[tokio::test]
+    async fn drain_ready_seals_schedule_to_close_for_a_failing_body_finalized_past_the_deadline() {
         let mut conn = open();
         let exec = ExecutionId::new();
         store::insert_execution(
@@ -2091,7 +2694,17 @@ mod tests {
         // post-body finalize clock = 1500 (>= deadline → generalized finalize recheck
         // seals the timeout even though the body returned Err).
         let failure_now = advancing_finalize_clock(0, 1_500);
-        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities, false).unwrap();
+        let produced = drain_ready(
+            &mut conn,
+            exec,
+            &TEST_OWNER,
+            0,
+            &failure_now,
+            &activities,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(produced, "a terminal timeout event was appended");
 
         let history = store::load_history(&conn, exec).unwrap();
@@ -2134,8 +2747,9 @@ mod tests {
     //
     // RED pre-fix: the finalize-time recheck was `result.is_ok()`-only, so the Err body
     // requeued at the stale cycle `now` (0 < 1000) and re-ran a second attempt past the cap.
-    #[test]
-    fn drain_ready_seals_schedule_to_close_for_a_zero_delay_retry_finalized_past_the_deadline() {
+    #[tokio::test]
+    async fn drain_ready_seals_schedule_to_close_for_a_zero_delay_retry_finalized_past_the_deadline()
+     {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2173,7 +2787,17 @@ mod tests {
         // post-body finalize clock = 1500 (>= deadline → the generalized finalize recheck
         // seals the timeout).
         let failure_now = advancing_finalize_clock(0, 1_500);
-        let produced = drain_ready(&mut conn, exec, 0, &failure_now, &activities, false).unwrap();
+        let produced = drain_ready(
+            &mut conn,
+            exec,
+            &TEST_OWNER,
+            0,
+            &failure_now,
+            &activities,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(produced);
 
         let history = store::load_history(&conn, exec).unwrap();

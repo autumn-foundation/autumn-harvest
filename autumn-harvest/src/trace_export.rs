@@ -45,7 +45,8 @@ pub fn export_chrome_trace(profile: &DagProfile) -> Value {
         }
     }
 
-    json!(events)
+    // `json!(events)` would serialize the finished tree into a second copy.
+    Value::Array(events)
 }
 
 #[cfg(test)]

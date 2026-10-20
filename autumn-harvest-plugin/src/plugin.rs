@@ -284,6 +284,15 @@ pub struct HarvestPlugin {
     /// startup gate already refuses this case earlier. It only matters if
     /// ambient configuration changed in the narrow window since.
     require_embedded_harvest_mode: bool,
+    /// The cap on durable-route requests that wait at the same time. Set via
+    /// [`Self::durable_route_max_waiters`].
+    durable_route_max_waiters: usize,
+    /// The cap on the continue-as-new steps of one durable-route wait. Set
+    /// via [`Self::durable_route_max_chain_steps`].
+    durable_route_max_chain_steps: usize,
+    /// The cap on live durable streams. Set via
+    /// [`Self::durable_route_max_streams`].
+    durable_route_max_streams: usize,
 }
 
 /// One registered broker connector: a binding plus the source that feeds it.
@@ -371,6 +380,9 @@ impl HarvestPlugin {
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled: false,
             require_embedded_harvest_mode: false,
+            durable_route_max_waiters: crate::durable_route::DEFAULT_MAX_WAITERS,
+            durable_route_max_chain_steps: crate::durable_route::DEFAULT_MAX_CHAIN_STEPS,
+            durable_route_max_streams: crate::durable_route::DEFAULT_MAX_STREAMS,
         }
     }
 
@@ -473,6 +485,54 @@ impl HarvestPlugin {
     #[must_use]
     pub fn start_idempotency_window(mut self, window: std::time::Duration) -> Self {
         self.builder = self.builder.start_idempotency_window(window);
+        self
+    }
+
+    /// Cap the durable-route requests that wait for a result at the same time
+    /// in this process. The default is
+    /// [`DEFAULT_MAX_WAITERS`](crate::durable_route::DEFAULT_MAX_WAITERS).
+    ///
+    /// Each waiting request holds one Postgres `LISTEN` connection. A request
+    /// that finds the cap full answers pending at once. `0` means that no
+    /// request waits. A completed run needs no wait, so its retry still gets
+    /// the result.
+    #[must_use]
+    pub const fn durable_route_max_waiters(mut self, max_waiters: usize) -> Self {
+        self.durable_route_max_waiters = max_waiters;
+        self
+    }
+
+    /// Cap the continue-as-new steps that one durable-route request follows.
+    /// The default is
+    /// [`DEFAULT_MAX_CHAIN_STEPS`](crate::durable_route::DEFAULT_MAX_CHAIN_STEPS).
+    ///
+    /// Each step is one successor lookup. A step follows a chain to its newest
+    /// run of the same type, or across one change of workflow type or one
+    /// workflow-level retry. A chain needs at most one step more than its
+    /// changes of type and its retries. Past the cap, a walk that met a live
+    /// run answers pending. A walk that read only ended runs answers `500`
+    /// `result-unavailable`, because every retry repeats it. A value below 1
+    /// counts as 1, so a finished chain of one type resolves.
+    ///
+    /// A durable stream counts one step for each run of the lineage, a
+    /// same-type successor too. Past the cap, the stream ends with
+    /// `result-unavailable`.
+    #[must_use]
+    pub const fn durable_route_max_chain_steps(mut self, steps: usize) -> Self {
+        self.durable_route_max_chain_steps = if steps == 0 { 1 } else { steps };
+        self
+    }
+
+    /// Cap the durable streams in this process. The default is
+    /// [`DEFAULT_MAX_STREAMS`](crate::durable_route::DEFAULT_MAX_STREAMS).
+    ///
+    /// Each stream takes a slot, and a stream of a live run also holds one
+    /// Postgres `LISTEN` connection. A stream request that finds the cap
+    /// full answers `202` pending with `Retry-After: 1`. `0` turns streams
+    /// off. The cap is for each process, not for each principal.
+    #[must_use]
+    pub const fn durable_route_max_streams(mut self, max_streams: usize) -> Self {
+        self.durable_route_max_streams = max_streams;
         self
     }
 
@@ -1302,6 +1362,9 @@ impl Plugin for HarvestPlugin {
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled,
             require_embedded_harvest_mode,
+            durable_route_max_waiters,
+            durable_route_max_chain_steps,
+            durable_route_max_streams,
         } = self;
         #[cfg(not(feature = "mcp"))]
         let _ = (
@@ -1691,16 +1754,40 @@ impl Plugin for HarvestPlugin {
         let shutdown_slot = Arc::clone(&slot);
         let startup_api_state = api_state.clone();
         let shutdown_api_state = api_state.clone();
+        // One waiter cap and one stream cap for the process. They outlive a
+        // runtime restart.
+        let durable_waiters = Arc::new(tokio::sync::Semaphore::new(
+            durable_route_max_waiters.min(tokio::sync::Semaphore::MAX_PERMITS),
+        ));
+        let durable_streams = Arc::new(tokio::sync::Semaphore::new(
+            durable_route_max_streams.min(tokio::sync::Semaphore::MAX_PERMITS),
+        ));
 
         let app = app
             .on_startup(move |state| {
                 let slot = Arc::clone(&startup_slot);
                 let api_state = startup_api_state.clone();
+                let durable_waiters = Arc::clone(&durable_waiters);
+                let durable_streams = Arc::clone(&durable_streams);
                 async move {
                     tracing::info!("on_startup hook: executing start_harvest_runtime");
                     // `start_harvest_runtime` returns a large future (clippy::large_futures under
                     // the workspace pedantic lints); box it to keep this closure's future small.
                     let res = Box::pin(start_harvest_runtime(&state, &slot, &api_state)).await;
+                    // Durable routes answer 503 until the runtime is ready.
+                    let limits = crate::durable_route::DurableRouteLimits {
+                        waiters: durable_waiters,
+                        streams: durable_streams,
+                        max_chain_steps: durable_route_max_chain_steps,
+                    };
+                    // A stream without this URL polls the table.
+                    let notify_url = |shard| api_state.sse_notification_url(shard).ok();
+                    if res.is_ok() && !crate::durable_route::install(&state, limits, notify_url) {
+                        tracing::warn!(
+                            "on_startup hook: durable routes are off; the Harvest client or pool \
+                             is missing"
+                        );
+                    }
                     match &res {
                         Ok(()) => tracing::info!(
                             "on_startup hook: start_harvest_runtime completed successfully"
@@ -4434,5 +4521,37 @@ mod tests {
             "the FIRST registration would have resolved differently -- which is \
              exactly the silent bug last-wins resolution prevents",
         );
+    }
+
+    // AC-78
+    #[test]
+    fn durable_route_limits_have_defaults_and_a_floor() {
+        let plugin = HarvestPlugin::new();
+        assert_eq!(crate::durable_route::DEFAULT_MAX_WAITERS, 32);
+        assert_eq!(crate::durable_route::DEFAULT_MAX_CHAIN_STEPS, 1024);
+        assert_eq!(
+            plugin.durable_route_max_waiters,
+            crate::durable_route::DEFAULT_MAX_WAITERS
+        );
+        assert_eq!(
+            plugin.durable_route_max_chain_steps,
+            crate::durable_route::DEFAULT_MAX_CHAIN_STEPS
+        );
+        let set = HarvestPlugin::new()
+            .durable_route_max_waiters(0)
+            .durable_route_max_chain_steps(7);
+        assert_eq!(set.durable_route_max_waiters, 0);
+        assert_eq!(set.durable_route_max_chain_steps, 7);
+        // Zero steps would answer pending for every run, so it counts as one.
+        let floor = HarvestPlugin::new().durable_route_max_chain_steps(0);
+        assert_eq!(floor.durable_route_max_chain_steps, 1);
+        // SAC-20: the stream cap.
+        assert_eq!(crate::durable_route::DEFAULT_MAX_STREAMS, 32);
+        assert_eq!(
+            plugin.durable_route_max_streams,
+            crate::durable_route::DEFAULT_MAX_STREAMS
+        );
+        let none = HarvestPlugin::new().durable_route_max_streams(0);
+        assert_eq!(none.durable_route_max_streams, 0);
     }
 }

@@ -273,8 +273,10 @@ ReplayVerifier::new()
 
 ### Match the deployment's history policy
 
-`continue_as_new_threshold` is a **deployment** setting, and a workflow branching
-on `ctx.should_continue_as_new()` takes a different path under a different
+`continue_as_new_threshold` is a **deployment** setting. A recorded position
+replays its recorded answer (issue #2080), so the threshold matters only where
+a replay reaches the end of the history. A workflow branching on
+`ctx.should_continue_as_new()` takes a different path there under a different
 threshold. Replaying with the default while your fleet runs another value tests
 code your fleet never executes, so pass the same policy the deployment uses:
 

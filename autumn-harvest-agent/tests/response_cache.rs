@@ -135,7 +135,7 @@ async fn tenants_do_not_share_an_entry_by_default() {
     assert_eq!(model.calls(), 3, "only the same tenant shares an entry");
 }
 
-/// An answer whose recorded turn is over the result cap fails its turn, so
+/// An answer whose recorded turn is over the result cap ends the run, so
 /// the cache must not keep it. The content alone fits the cap here, and the
 /// turn envelope does not. A later run with the same request asks the model
 /// again.
@@ -150,7 +150,7 @@ async fn an_answer_over_the_result_cap_is_not_cached() {
     let mut rt = runtime(&db, harness);
     let task = AgentTask::new("hi");
 
-    // The oversized turn may fail the run. Only the cache matters here.
+    // The oversized turn ends the run. Only the cache matters here.
     let exec = sqlite::start(&mut rt, &task).unwrap();
     let _ = rt.run_until_blocked(exec).await;
     assert_eq!(store.len(), 0, "the oversized answer must not be cached");
@@ -173,6 +173,9 @@ async fn a_turn_over_the_cap_with_its_decisions_is_not_cached() {
         usage: TokenUsage::default(),
         decisions: Vec::new(),
         cache_hit: true,
+        labels: Vec::new(),
+        releases: Vec::new(),
+        oversized: false,
     };
     let cap = u64::try_from(serde_json::to_vec(&bare).unwrap().len()).unwrap() + 100;
     let policy = CountingPolicy::new(ToolDecision::Deny {
@@ -190,7 +193,7 @@ async fn a_turn_over_the_cap_with_its_decisions_is_not_cached() {
     let mut rt = runtime(&db, harness);
     let task = AgentTask::new("look it up");
 
-    // The oversized turn may fail the run. Only the cache matters here.
+    // The oversized turn ends the run. Only the cache matters here.
     let exec = sqlite::start(&mut rt, &task).unwrap();
     let _ = rt.run_until_blocked(exec).await;
 

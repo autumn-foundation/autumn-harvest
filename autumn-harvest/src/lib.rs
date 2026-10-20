@@ -246,6 +246,8 @@ pub mod calendar;
 /// Reserved names + predicates for the throwaway workflow that probes the live
 /// execution path. Distinct from the #512 replay canary.
 pub mod canary;
+/// Cancellation scopes and non-cancellable blocks (issue #1984).
+pub mod cancellation_scope;
 /// Deterministic chaos/fault-injection test harness (issue #940).
 ///
 /// [`chaos::points`] is unconditional (a zero-cost const catalogue of named
@@ -312,6 +314,8 @@ pub mod dispatch;
 /// Deterministic simulation of the activity claim protocol (issue #1830),
 /// and of the real worker loop (issue #2002).
 pub mod dst;
+/// Durable promises that any caller settles once (issue #1985).
+pub mod durable_promise;
 /// Effective runtime-configuration introspection (issue #695).
 ///
 /// [`effective_config::EffectiveConfigView`] is the serialisable, secret-free
@@ -344,7 +348,13 @@ pub mod external_target_location;
 #[cfg(feature = "db")]
 pub mod external_task;
 pub mod failure;
+/// Runtime weight overrides and state upkeep for fairness keys (issue #1976).
+#[cfg(feature = "db")]
+pub mod fairness_keys;
 pub mod fan_out;
+/// Non-destructive fork of a workflow run (issue #2000).
+#[cfg(feature = "db")]
+pub mod fork;
 /// Replay fuzz harness (issue #1835). Not a stable API.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -381,6 +391,8 @@ pub mod info;
 pub mod interceptor;
 /// Every persisted workflow execution state and every sanctioned transition.
 pub mod lifecycle;
+/// LLM token and cost budgets per run and per tenant (issue #1997).
+pub mod llm_budget;
 /// Agent cost ledger: model, tokens, cost and latency per LLM step (issue
 /// #1996).
 pub mod llm_ledger;
@@ -407,6 +419,12 @@ pub mod partition;
 /// Export of aged event partitions to object storage (issue #2009).
 pub mod partition_archive;
 pub mod payload_codec;
+/// The depth cap on payloads that Harvest keeps, shared by both backends (issues
+/// #2224, #2225).
+pub mod payload_depth;
+/// Sweep of payload blobs that no execution references (issue #2123).
+#[cfg(feature = "db")]
+pub mod payload_orphans;
 pub mod payload_store;
 /// The connection transport a DSN's `sslmode` selects, with TLS through
 /// rustls.
@@ -504,6 +522,9 @@ pub mod tx_retry;
 mod shuttle_sync;
 /// Signal handler registry for push-based reactive signal handling (issue #546).
 pub mod signal_handler;
+/// `always!` and `sometimes!` for workflow code (issue #2033).
+#[doc(hidden)]
+pub mod sim_probe;
 pub mod simulator;
 /// Adaptive worker dispatch-slot tuner (issue #548).
 pub mod slot_tuner;
@@ -568,8 +589,12 @@ pub mod notify;
 pub mod queue;
 /// Metric-gated automatic abort of a build ramp (issue #1814).
 pub mod ramp_guard;
+#[cfg(feature = "sandbox-activities")]
+pub mod sandbox;
 #[cfg(feature = "db")]
 pub mod schedule_decision;
+/// Backend-neutral cron and interval slot arithmetic (issue #2031).
+pub mod schedule_plan;
 #[cfg(feature = "db")]
 pub mod scheduler;
 #[cfg(feature = "db")]
@@ -632,6 +657,7 @@ pub use calendar::{
 pub use canary::{
     CANARY_ACTIVITY_NAME, CANARY_WORKFLOW_NAME_PREFIX, is_canary_workflow, is_reserved_canary_name,
 };
+pub use cancellation_scope::{CancellationScope, NonCancellable, ScopeRun};
 pub use completion_trigger::{
     CompletionTrigger, ConditionGate, InputMapping, MAX_CONDITION_DEPTH, MAX_CONDITION_IN_VALUES,
     MAX_CONDITION_NODES, TerminalState, TriggerCondition, gate_stored_condition,
@@ -641,9 +667,9 @@ pub use context::{
     DEFAULT_CONTINUE_AS_NEW_DEADLINE_FRACTION, DEFAULT_HISTORY_BLOAT_WARN_FRACTION,
     DEFAULT_HISTORY_BYTE_HARD_CAP, DEFAULT_HISTORY_CONTINUE_AS_NEW_THRESHOLD,
     DEFAULT_HISTORY_EVENT_HARD_CAP, DEFAULT_SESSION_ACQUISITION_TIMEOUT,
-    DEFAULT_WORKFLOW_LOG_MAX_LINES, DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES, MutexGuard,
-    MutexHandle, RaceBuilder, RaceWinner, Session, SessionOptions, TimerHandle, TimerOutcome,
-    WorkflowCommand, WorkflowContext, WorkflowExecutionInfo, WorkflowHistoryPolicy,
+    DEFAULT_WORKFLOW_LOG_MAX_LINES, DEFAULT_WORKFLOW_LOG_MAX_MESSAGE_BYTES, LoserCancelReason,
+    MutexGuard, MutexHandle, RaceBuilder, RaceWinner, Session, SessionOptions, TimerHandle,
+    TimerOutcome, WorkflowCommand, WorkflowContext, WorkflowExecutionInfo, WorkflowHistoryPolicy,
     WorkflowLogLevel, WorkflowLogPolicy, WorkflowLogger, is_reserved_session_activity_name,
 };
 pub use critical_path::{CriticalPathAnalyzer, CriticalPathResult};
@@ -743,9 +769,9 @@ pub use policy::{
 pub use pool::{HarvestPoolConfig, compute_pool_sizes};
 pub use query::QueryRegistry;
 pub use replay::{
-    ChildOrTimerMatch, DEADLINE_PROBE_SIDE_EFFECT_NAME, HistoryMatch, HistoryMatcher,
-    MutexGrantMatch, PatchMarkerMatch, SagaMarkerMatch, SideEffectNowMatch, SignalOrTimerMatch,
-    TimerFireMatch,
+    CONTINUE_AS_NEW_SIDE_EFFECT_NAME, ChildOrTimerMatch, ContinueAsNewMatch,
+    DEADLINE_PROBE_SIDE_EFFECT_NAME, HistoryMatch, HistoryMatcher, MutexGrantMatch,
+    PatchMarkerMatch, SagaMarkerMatch, SideEffectNowMatch, SignalOrTimerMatch, TimerFireMatch,
 };
 #[cfg(feature = "db")]
 pub use reset::{
@@ -755,7 +781,8 @@ pub use reset::{
     resolve_batch_reset_one, resolve_reset_point, validate_reset_point,
 };
 pub use retention::{
-    ArchiverFuture, HistoryArchiver, LegalHoldOutcome, RetentionConfig, legal_hold_active,
+    ArchiveFetchError, ArchiveFetchFuture, ArchiverFuture, HistoryArchiver, LegalHoldOutcome,
+    RetentionConfig, legal_hold_active,
 };
 #[cfg(feature = "db")]
 pub use retention::{
@@ -772,7 +799,8 @@ pub use schedule_decision::record_decision_graceful;
 #[cfg(feature = "db")]
 pub use scheduler::{
     DagCatalog, RegisteredDag, SchedulerMonitor, SchedulerRuntime, compile_dag_catalog,
-    register_schedules, register_workflow_schedules, tick_once, trigger_unified_dag,
+    register_schedules, register_workflow_schedules, register_workflow_schedules_with_codecs,
+    tick_once, trigger_unified_dag,
 };
 pub use schema_contract::{
     AcknowledgedBreakingChange, ActivitySchemaEntry, ChangeKind, CompatibilityRules,
@@ -828,8 +856,8 @@ pub use trace_export::export_chrome_trace;
 pub use types::{
     ActivityExecId, BuildId, DeploymentName, ExecutionId, ExternalActivityToken, ExternalAwaitId,
     ExternalCancelId, ExternalSignalId, ExternalTarget, ParentClosePolicy, Priority, SessionId,
-    ShardId, StartSource, TimerId, UpdateId, WorkerId, WorkflowId, WorkflowIdConflictPolicy,
-    WorkflowIdReusePolicy,
+    ShardId, StartProvenance, StartSource, TimerId, UpdateId, WorkerId, WorkflowId,
+    WorkflowIdConflictPolicy, WorkflowIdReusePolicy,
 };
 pub use update::UpdateRegistry;
 #[cfg(feature = "db")]

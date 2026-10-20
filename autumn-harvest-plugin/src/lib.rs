@@ -49,12 +49,16 @@ pub mod dag_retry;
 /// run`. Development and evaluation only; see the module docs.
 #[cfg(feature = "dev-runtime")]
 pub mod dev;
+/// Durable routes: an Autumn route that runs as a keyed Harvest workflow.
+pub mod durable_route;
 /// One entry point for a standalone embedding (issue #1613).
 pub mod embedding;
 /// One test suite for every KMS binding (issue #1981).
 #[cfg(all(test, any(feature = "aws-kms", feature = "vault-transit")))]
 mod kms_conformance;
 pub mod lineage;
+#[cfg(feature = "object-store")]
+pub mod object_store;
 /// OIDC login for Vantage and the management API (issue #1978).
 #[cfg(feature = "oidc")]
 pub mod oidc;

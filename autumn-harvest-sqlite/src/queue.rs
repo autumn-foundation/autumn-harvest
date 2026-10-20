@@ -113,6 +113,15 @@ pub struct ClaimedTask {
     /// to `true`. The activity BODY is always resolved from the registry regardless —
     /// only the policy/deadline scalars are frozen.
     pub defaults_frozen: bool,
+    /// The task's queue (issue #2024). `ActivityContext::info().queue_name`
+    /// reports it.
+    pub queue: String,
+    /// The latest persisted heartbeat payload (issue #2024). It is the
+    /// checkpoint that `ActivityContext::heartbeat_details` returns.
+    pub heartbeat_details: Option<Value>,
+    /// The previous attempt's error message (issue #2024). `None` on the
+    /// first attempt.
+    pub last_error: Option<String>,
 }
 
 fn next_task_seq(conn: &Connection) -> SqliteResult<i64> {
@@ -135,6 +144,26 @@ fn next_timer_arm_seq(conn: &Connection) -> SqliteResult<i64> {
             row.get(0)
         })?;
     Ok(max.map_or(0, |m| m + 1))
+}
+
+/// Reclaim the tasks of `exec_id` that a dropped drive left `RUNNING` (issue
+/// #2024).
+///
+/// The drain awaits an `#[activity]` body after its claim commits. A caller can
+/// drop the drive future during that await, for example with a timeout. The row
+/// then stays `RUNNING`, and no later drive in this process claims it. Drives
+/// are serialised by `&mut SqliteRuntime`, so a `RUNNING` row at the start of a
+/// drive has no live owner. The body re-runs, as after a crash. Returns the
+/// number of rows reclaimed.
+pub fn reclaim_running_for_execution(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<usize> {
+    let n = conn.execute(
+        "UPDATE harvest_tasks SET state = 'PENDING' WHERE state = 'RUNNING' AND exec_id = ?1",
+        params![exec_id.to_string()],
+    )?;
+    Ok(n)
 }
 
 /// Reclaim tasks stranded `RUNNING` by a crash, flipping them back to `PENDING`.
@@ -289,7 +318,7 @@ pub fn claim_next_ready_task_tx(
         .query_row(
             "SELECT task_id, activity_id, name, input_json, attempt, max_attempts, \
              retry_policy_json, start_to_close_ms, scheduled_at, schedule_to_close_at, \
-             defaults_frozen \
+             defaults_frozen, queue, heartbeat_details, last_error \
              FROM harvest_tasks WHERE state = 'PENDING' AND exec_id = ?1 AND run_at <= ?2 \
              ORDER BY seq LIMIT 1",
             params![exec_id.to_string(), now],
@@ -306,6 +335,11 @@ pub fn claim_next_ready_task_tx(
                     row.get::<_, i64>(8)?,
                     row.get::<_, Option<i64>>(9)?,
                     row.get::<_, i64>(10)?,
+                    (
+                        row.get::<_, String>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                    ),
                 ))
             },
         )
@@ -323,6 +357,7 @@ pub fn claim_next_ready_task_tx(
         scheduled_at,
         schedule_to_close_at,
         defaults_frozen,
+        (queue, heartbeat_json, last_error),
     )) = row
     else {
         // No ready task — commit the empty read tx to release the lock cleanly.
@@ -341,6 +376,10 @@ pub fn claim_next_ready_task_tx(
     let retry_policy = retry_policy_json
         .as_deref()
         .map(serde_json::from_str::<RetryPolicy>)
+        .transpose()?;
+    let heartbeat_details = heartbeat_json
+        .as_deref()
+        .map(serde_json::from_str::<Value>)
         .transpose()?;
 
     // Flip to RUNNING but do NOT commit — the caller freezes the resolved defaults
@@ -366,6 +405,9 @@ pub fn claim_next_ready_task_tx(
         // registered spec, anchored to `scheduled_at`).
         schedule_to_close_at,
         defaults_frozen: defaults_frozen != 0,
+        queue,
+        heartbeat_details,
+        last_error,
     };
     Ok(Some((tx, task)))
 }
@@ -412,6 +454,35 @@ pub fn has_pending_activity(conn: &Connection, exec_id: ExecutionId) -> SqliteRe
     Ok(exists)
 }
 
+/// List the PENDING tasks of `exec_id` in queue order, as
+/// `(activity_id, name, attempt)` (issue #2021).
+pub fn pending_tasks(
+    conn: &Connection,
+    exec_id: ExecutionId,
+) -> SqliteResult<Vec<(ActivityExecId, String, u32)>> {
+    let mut stmt = conn.prepare(
+        "SELECT activity_id, name, attempt FROM harvest_tasks \
+         WHERE exec_id = ?1 AND state = 'PENDING' ORDER BY seq",
+    )?;
+    let rows = stmt.query_map(params![exec_id.to_string()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+    let mut tasks = Vec::new();
+    for row in rows {
+        let (activity_id, name, attempt) = row?;
+        let activity_id = activity_id
+            .parse()
+            .map_err(|_| SqliteError::corrupt("activity_id"))?;
+        let attempt = u32::try_from(attempt).map_err(|_| SqliteError::corrupt("attempt"))?;
+        tasks.push((activity_id, name, attempt));
+    }
+    Ok(tasks)
+}
+
 /// Requeue a task for another attempt at `run_at`, recording the consumed
 /// attempt. The task's `seq` (its ready-queue ordering key) is **preserved** — use
 /// this for a FUTURE-`run_at` backoff retry, which yields to siblings naturally
@@ -419,15 +490,20 @@ pub fn has_pending_activity(conn: &Connection, exec_id: ExecutionId) -> SqliteRe
 /// window this pass), so keeping its low `seq` is correct and leaves existing
 /// ordering undisturbed. For an IMMEDIATE (zero-delay) retry, use
 /// [`requeue_task_to_back`] instead.
+///
+/// `last_error` is the failed attempt's message. The next attempt reads it as
+/// `ActivityContext::previous_failure` (issue #2024).
 pub fn requeue_task(
     conn: &Connection,
     task_id: &str,
     attempt: u32,
     run_at: i64,
+    last_error: &str,
 ) -> SqliteResult<()> {
     conn.execute(
-        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3 WHERE task_id = ?1",
-        params![task_id, i64::from(attempt), run_at],
+        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, last_error = ?4 \
+         WHERE task_id = ?1",
+        params![task_id, i64::from(attempt), run_at, last_error],
     )?;
     Ok(())
 }
@@ -449,17 +525,32 @@ pub fn requeue_task(
 /// ready sibling before returning to it — round-robin fairness. Outside a race a
 /// zero-delay-retrying activity has no siblings, so the bump is harmless: it is
 /// simply re-claimed immediately anyway.
+///
+/// `last_error` has the same role as in [`requeue_task`].
 pub fn requeue_task_to_back(
     conn: &Connection,
     task_id: &str,
     attempt: u32,
     run_at: i64,
+    last_error: &str,
 ) -> SqliteResult<()> {
     let seq = next_task_seq(conn)?;
     conn.execute(
-        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, seq = ?4 \
-         WHERE task_id = ?1",
-        params![task_id, i64::from(attempt), run_at, seq],
+        "UPDATE harvest_tasks SET state = 'PENDING', attempt = ?2, run_at = ?3, seq = ?4, \
+         last_error = ?5 WHERE task_id = ?1",
+        params![task_id, i64::from(attempt), run_at, seq, last_error],
+    )?;
+    Ok(())
+}
+
+/// Persist `details` as the task's latest heartbeat checkpoint (issue #2024).
+///
+/// Last write wins. The write is one autocommit `UPDATE`, because the body
+/// runs outside any transaction.
+pub fn record_heartbeat(conn: &Connection, task_id: &str, details: &Value) -> SqliteResult<()> {
+    conn.execute(
+        "UPDATE harvest_tasks SET heartbeat_details = ?2 WHERE task_id = ?1",
+        params![task_id, serde_json::to_string(details)?],
     )?;
     Ok(())
 }
@@ -512,6 +603,32 @@ pub fn enqueue_timer(
         params![timer_id, exec_id.to_string(), fire_at, arm_seq],
     )?;
     Ok(())
+}
+
+/// Arm the durable row of an awaited cancellable timer (issue #2029). Returns
+/// `true` if it inserted a row.
+///
+/// A parked `TimerHandle::await_fire` pushes its arm again on every replay.
+/// An unfired row keeps its `fire_at`, so the deadline runs from the first
+/// await, as on Postgres. A spent row of an earlier arm is replaced.
+pub fn arm_awaited_timer(
+    conn: &Connection,
+    exec_id: ExecutionId,
+    timer_id: &str,
+    fire_at: i64,
+) -> SqliteResult<bool> {
+    let unfired: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM harvest_timers WHERE exec_id = ?1 AND timer_id = ?2 AND fired = 0",
+            params![exec_id.to_string(), timer_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if unfired.is_some() {
+        return Ok(false);
+    }
+    enqueue_timer(conn, exec_id, timer_id, fire_at)?;
+    Ok(true)
 }
 
 /// Return the ids of all unfired timers for `exec_id` whose deadline has passed.
@@ -644,21 +761,26 @@ pub fn delete_unfired_timers_for_execution(
     )?)
 }
 
-/// Delete every undelivered staged signal row for an execution — companion to
+/// Delete every unkeyed, undelivered staged signal row for an execution — companion to
 /// [`delete_pending_tasks_for_execution`] / [`delete_unfired_timers_for_execution`]
 /// for the `TerminateIfRunning` seal. A signal staged against a sealed prior can
-/// never be delivered, because the prior is never driven again. This backend has
-/// no retention/GC pass to reclaim it otherwise. Returns the number of rows deleted.
+/// never be delivered, because the prior is never driven again. Retention removes
+/// it only with the whole run (issue #2031). Returns the number of rows deleted.
 /// Delivered rows are left untouched (inert audit history).
+///
+/// A row with an idempotency key stays (issues #2026 and #2028). It is the
+/// dedup record of its key, so a retry of the key after the seal still reports
+/// delivered, as on Postgres. No pull primitive consumes it again.
 pub fn delete_undelivered_signals_for_execution(
     conn: &Connection,
     exec_id: ExecutionId,
 ) -> SqliteResult<usize> {
-    Ok(conn.execute(
-        "DELETE FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
-        params![exec_id.to_string()],
-    )?)
+    Ok(conn.execute(DELETE_UNDELIVERED_SIGNALS_SQL, params![exec_id.to_string()])?)
 }
+
+/// The statement of [`delete_undelivered_signals_for_execution`].
+const DELETE_UNDELIVERED_SIGNALS_SQL: &str = "DELETE FROM harvest_signals \
+     WHERE exec_id = ?1 AND delivered = 0 AND idempotency_key IS NULL";
 
 /// Move every undelivered signal of `from` to `to` (issue #2023).
 ///
@@ -676,6 +798,23 @@ pub fn move_undelivered_signals(
     )?)
 }
 
+/// Move every signal of `from` to the retry run `to`, as undelivered (issue
+/// #2029).
+///
+/// Postgres moves the whole mailbox to a workflow retry and marks it
+/// unconsumed. The retry replays from a new history, so it reads each signal
+/// again. Returns the number of rows moved.
+pub fn move_all_signals_to_retry(
+    conn: &Connection,
+    from: ExecutionId,
+    to: ExecutionId,
+) -> SqliteResult<usize> {
+    Ok(conn.execute(
+        "UPDATE harvest_signals SET exec_id = ?2, delivered = 0 WHERE exec_id = ?1",
+        params![from.to_string(), to.to_string()],
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use rusqlite::{Connection, params};
@@ -683,8 +822,8 @@ mod tests {
     use autumn_harvest::ExecutionId;
 
     use super::{
-        delete_undelivered_signals_for_execution, due_timers, due_timers_with_deadlines,
-        enqueue_timer,
+        DELETE_UNDELIVERED_SIGNALS_SQL, delete_undelivered_signals_for_execution, due_timers,
+        due_timers_with_deadlines, enqueue_timer,
     };
     use crate::schema;
 
@@ -698,7 +837,7 @@ mod tests {
 
         let plan: String = conn
             .query_row(
-                "EXPLAIN QUERY PLAN DELETE FROM harvest_signals WHERE exec_id = ?1 AND delivered = 0",
+                &format!("EXPLAIN QUERY PLAN {DELETE_UNDELIVERED_SIGNALS_SQL}"),
                 params![exec.to_string()],
                 |row| row.get::<_, String>(3),
             )
@@ -711,6 +850,35 @@ mod tests {
             !plan.contains("SCAN"),
             "expected no full-table scan, got plan: {plan}"
         );
+    }
+
+    // Issue #2028: a seal deletes the unkeyed undelivered rows. A keyed row
+    // stays, so a retry of its key still dedupes. Delivered rows stay too.
+    #[test]
+    fn a_seal_keeps_keyed_and_delivered_signal_rows() {
+        let conn = open();
+        schema::migrate(&conn).unwrap();
+        let exec = ExecutionId::new();
+        conn.execute(
+            "INSERT INTO harvest_signals (exec_id, name, payload_json, delivered, idempotency_key) \
+             VALUES (?1, 'a', '1', 0, NULL), (?1, 'b', '1', 0, 'k'), (?1, 'c', '1', 1, NULL)",
+            params![exec.to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            delete_undelivered_signals_for_execution(&conn, exec).unwrap(),
+            1
+        );
+        let mut stmt = conn
+            .prepare("SELECT name FROM harvest_signals ORDER BY name")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(names, ["b", "c"]);
     }
 
     // Issue #2020: the bounded signal read must stream rows in arrival order.

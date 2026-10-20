@@ -339,6 +339,9 @@ diesel::table! {
         /// (issue #1824). Set only by the workflow start path. The claim
         /// order reads it while `attempt = 0`.
         new_start -> Bool,
+        /// The fairness key of the task (issue #1976). `NULL` is the
+        /// default key.
+        fairness_key -> Nullable<Text>,
     }
 }
 
@@ -886,6 +889,9 @@ diesel::table! {
         attempts -> Integer,
         last_error -> Nullable<Text>,
         last_attempt_at -> Nullable<Timestamptz>,
+        /// The reason that the parent gave its cancel (issue #2194).
+        /// NULL = use the generic parent-cancel text.
+        cancel_reason -> Nullable<Text>,
     }
 }
 
@@ -1041,7 +1047,8 @@ diesel::table! {
         target_url       -> Text,
         event_filter     -> Jsonb,
         terminal_state   -> Text,
-        /// Frozen `CompletionEnvelope` JSON, signed and `POSTed` verbatim on
+        /// Frozen `CompletionEnvelope` JSON in the column form (issue #2043).
+        /// The scanner decodes it, then signs and `POST`s the plain body on
         /// every attempt (including redeliveries).
         payload          -> Jsonb,
         /// PENDING | INFLIGHT | DELIVERED | FAILED

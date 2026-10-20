@@ -462,6 +462,58 @@ async fn the_drain_phase_injects_no_fault() {
     }
 }
 
+/// In the drain phase, no enabled action waits more than `FAIR_STEPS` steps
+/// (issue #2217).
+///
+/// `Converges` is a liveness check, so it holds only under a fair drain. A
+/// drain of weighted draws once ran no reclaimer pass in 400 steps.
+#[tokio::test]
+async fn the_drain_phase_runs_each_enabled_action_within_the_fair_bound() {
+    // These actions are enabled in every step of a toy drain.
+    let kinds = [
+        "clock advance",
+        "reclaimer pass",
+        "sweeper pass",
+        "sched1 scan",
+        "sched2 scan",
+    ];
+    for seed in 0..32 {
+        let config = toy_config(seed);
+        // A drain enables an advance, the reclaimer and the sweeper. Each
+        // worker adds a poll and a beat. Each scheduler adds a scan and a
+        // fire. Each unsent signal adds one action.
+        let enabled = 1 + 2 * config.workers + config.workflows + 2 * config.schedulers + 2;
+        // Overdue actions run one per step, so the other overdue actions can
+        // delay one action by up to `enabled - 1` steps.
+        let bound = world::FAIR_STEPS + enabled - 1;
+        // The stuck workflow keeps the drain running to its step limit.
+        let report = run_toy(&config, Bug::Stuck).await;
+        let violation = report.violation.as_ref().map(|v| v.invariant);
+        assert_eq!(violation, Some(WorldInvariant::Converges), "seed {seed}");
+        let end = config.fault_steps + config.drain_steps;
+        for kind in kinds {
+            // The first step at which the action waits again.
+            let mut since = 0;
+            let mut worst = 0;
+            for line in &report.trace {
+                let step: usize = line[..4].parse().expect("a step number");
+                if line[11..].starts_with(kind) {
+                    if step >= config.fault_steps {
+                        worst = worst.max(step - since);
+                    }
+                    since = step + 1;
+                }
+            }
+            // The last choice of the run is at step `end - 1`.
+            worst = worst.max((end - 1).saturating_sub(since));
+            assert!(
+                worst <= bound,
+                "seed {seed}: {kind} waited {worst} steps, bound {bound}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn run_twice_reports_a_nondeterministic_world() {
     let config = toy_config(2);

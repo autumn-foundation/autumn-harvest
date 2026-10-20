@@ -722,6 +722,31 @@ pub struct PayloadCodecs {
     /// the client and the management API. See
     /// [`PayloadCodecs::set_column_encoding`].
     columns: Arc<AtomicBool>,
+    /// Where each shard's column sweep stopped (issue #2054).
+    ///
+    /// Shared across clones: one cursor for each registry and shard id. Give
+    /// each runtime its own registry. Do not share one registry, or its
+    /// clones, across databases or schemas.
+    #[cfg(feature = "db")]
+    column_cursors: Arc<std::sync::Mutex<BTreeMap<i32, ColumnCursor>>>,
+}
+
+/// Where one shard's column cycle stopped (issue #1979).
+///
+/// It lives in this process only. A restart or a second worker starts a
+/// cycle from the first column, which is safe: the census, not this
+/// cursor, decides completion.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ColumnCursor {
+    /// The key id this cycle converts onto.
+    pub(crate) active_key_id: String,
+    /// Index into the codec column list.
+    pub(crate) column: usize,
+    /// The last primary key examined in that column.
+    pub(crate) after: Option<uuid::Uuid>,
+    /// Cells this cycle could not convert so far.
+    pub(crate) unresolved: i64,
 }
 
 /// When the key set or the active key last changed (issue #1815).
@@ -795,6 +820,8 @@ impl Default for PayloadCodecs {
             })),
             any_keys: Arc::new(AtomicBool::new(false)),
             columns: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "db")]
+            column_cursors: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -828,7 +855,15 @@ impl std::fmt::Debug for PayloadCodecs {
 /// Any other shape takes the plain `from_value` path, so every error message
 /// stays the same. That covers a non-object root, a missing `type`, and extra
 /// keys.
+///
+/// Serde also rebuilds a `Value` field node by node, even from a `Value`. So
+/// the tagged path lifts each non-null payload field out first, leaving
+/// null. Serde then reads a small event, and each tree moves into its field.
+/// Every payload field is a `Value` or an `Option<Value>`, which accepts any
+/// JSON. The lift therefore changes no error. A null reads as `None` either way.
 fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_json::Error> {
+    use crate::event::PayloadSlot;
+    use crate::payload_store::PAYLOAD_FIELD_KEYS;
     use serde::de::IntoDeserializer;
     use serde::de::value::MapDeserializer;
 
@@ -841,11 +876,33 @@ fn event_from_wire(value: Value) -> Result<crate::event::WorkflowEvent, serde_js
         return serde_json::from_value(Value::Object(map));
     }
     let tag = map.remove("type").unwrap_or_default();
-    let data = map.remove("data");
+    let mut data = map.remove("data");
+    let mut lifted: [Option<Value>; PAYLOAD_FIELD_KEYS.len()] = Default::default();
+    if let Some(Value::Object(fields)) = data.as_mut() {
+        for (slot, key) in lifted.iter_mut().zip(PAYLOAD_FIELD_KEYS) {
+            if let Some(field) = fields.get_mut(key)
+                && !field.is_null()
+            {
+                *slot = Some(std::mem::take(field));
+            }
+        }
+    }
     let pairs = std::iter::once(("type", tag)).chain(data.map(|data| ("data", data)));
     let de: MapDeserializer<'_, _, serde_json::Error> =
         MapDeserializer::new(pairs.map(|(key, value)| (key.into_deserializer(), value)));
-    serde::Deserialize::deserialize(de)
+    let mut event: crate::event::WorkflowEvent = serde::Deserialize::deserialize(de)?;
+    for (payload, key) in lifted.into_iter().zip(PAYLOAD_FIELD_KEYS) {
+        let Some(payload) = payload else {
+            continue;
+        };
+        match event.payload_slot_mut(key) {
+            Some(PayloadSlot::Required(field)) => *field = payload,
+            Some(PayloadSlot::Optional(field)) => *field = Some(payload),
+            // Serde ignores a key that the variant does not have.
+            None => {}
+        }
+    }
+    Ok(event)
 }
 
 /// Validate an operator-supplied codec key id (issue #948).
@@ -1313,7 +1370,7 @@ impl PayloadCodecs {
     /// Returns [`HarvestError`] if event serialization or codec encoding fails.
     pub fn encode_event(&self, event: &crate::event::WorkflowEvent) -> HarvestResult<Value> {
         let mut value = serde_json::to_value(event)?;
-        self.transform_event_data(&mut value, true)?;
+        self.transform_event_data(&mut value)?;
         Ok(value)
     }
 
@@ -1322,12 +1379,72 @@ impl PayloadCodecs {
     /// # Errors
     ///
     /// Returns [`HarvestError`] if codec decoding or event deserialization fails.
-    pub fn decode_event(&self, mut value: Value) -> HarvestResult<crate::event::WorkflowEvent> {
-        self.transform_event_data(&mut value, false)?;
-        Ok(event_from_wire(value)?)
+    pub fn decode_event(&self, value: Value) -> HarvestResult<crate::event::WorkflowEvent> {
+        Ok(self.decode_event_moving_payloads(value)?.0)
     }
 
-    fn transform_event_data(&self, root: &mut Value, encode: bool) -> HarvestResult<()> {
+    /// [`Self::decode_event`], plus `true` when the slow path ran.
+    ///
+    /// Serde cannot move a `Value` into a `Value` field. It visits the tree
+    /// and builds a copy, one map node and one array at a time. Payloads are
+    /// most of an event, so that copy is most of the decode cost.
+    ///
+    /// This lifts each decoded payload out of `data` and leaves `null` in its
+    /// place. Serde then decodes a small event. Each payload moves into its
+    /// field through [`WorkflowEvent::payload_slot`]. The key set that serde
+    /// sees does not change, so every error stays the same.
+    ///
+    /// A payload with no slot is either a key that the variant does not have,
+    /// or a slot that `payload_slot` omits. The slow path puts it back and
+    /// decodes again, so neither case loses data.
+    ///
+    /// [`WorkflowEvent::payload_slot`]: crate::event::WorkflowEvent::payload_slot
+    fn decode_event_moving_payloads(
+        &self,
+        mut value: Value,
+    ) -> HarvestResult<(crate::event::WorkflowEvent, bool)> {
+        use crate::payload_store::PAYLOAD_FIELD_KEYS;
+
+        let mut lifted: [Option<Value>; PAYLOAD_FIELD_KEYS.len()] = Default::default();
+        if let Some(data) = value.get_mut("data") {
+            for (slot, key) in lifted.iter_mut().zip(PAYLOAD_FIELD_KEYS) {
+                if let Some(payload) = data.get_mut(key) {
+                    let decoded = self.decode_payload_owned(std::mem::take(payload))?;
+                    if decoded.is_null() {
+                        continue;
+                    }
+                    *slot = Some(decoded);
+                }
+            }
+        }
+        let mut event = event_from_wire(value)?;
+        let mut unplaced = false;
+        for (slot, key) in lifted.iter_mut().zip(PAYLOAD_FIELD_KEYS) {
+            let Some(payload) = slot.take() else {
+                continue;
+            };
+            if let Some(field) = event.payload_slot(key) {
+                field.fill(payload);
+            } else {
+                *slot = Some(payload);
+                unplaced = true;
+            }
+        }
+        if !unplaced {
+            return Ok((event, false));
+        }
+        let mut wire = serde_json::to_value(&event)?;
+        if let Some(data) = wire.get_mut("data").and_then(Value::as_object_mut) {
+            for (slot, key) in lifted.into_iter().zip(PAYLOAD_FIELD_KEYS) {
+                if let Some(payload) = slot {
+                    data.insert(key.to_string(), payload);
+                }
+            }
+        }
+        Ok((serde_json::from_value(wire)?, true))
+    }
+
+    fn transform_event_data(&self, root: &mut Value) -> HarvestResult<()> {
         let Some(data) = root.get_mut("data") else {
             return Ok(());
         };
@@ -1349,20 +1466,16 @@ impl PayloadCodecs {
                 // site. `payload` is therefore already owned data, not a
                 // borrow into something a caller still needs afterward.
                 // `mem::take` moves it out, leaving `Value::Null` behind.
-                // This lets `encode_payload_owned`/`decode_payload_owned`
-                // hand the unchanged value straight back on the common
+                // This lets `encode_payload_owned` hand the unchanged
+                // value straight back on the common
                 // (non-envelope) fast path. It avoids cloning the whole
                 // JSON tree just to produce a copy of data already in
-                // hand. If encoding or decoding fails, `?` returns before
-                // the `Null` placeholder is ever observed. The caller
-                // discards the whole partially-transformed `value` along
-                // with the error (see `encode_event`/`decode_event`).
+                // hand. If encoding fails, `?` returns before the `Null`
+                // placeholder is ever observed. The caller discards the
+                // whole partially-transformed `value` along with the error
+                // (see `encode_event`).
                 let owned = std::mem::take(payload);
-                *payload = if encode {
-                    self.encode_payload_owned(owned)?
-                } else {
-                    self.decode_payload_owned(owned)?
-                };
+                *payload = self.encode_payload_owned(owned)?;
             }
         }
         Ok(())
@@ -1458,7 +1571,7 @@ impl PayloadCodecs {
         let raw = serde_json::to_vec(payload)?;
         let encoded = codec
             .encode(&raw)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+            .map_err(|e| HarvestError::Codec(e.to_string()))?;
         Ok(Self::envelope(
             codec.codec_id(),
             key_id.as_deref().unwrap_or(CODEC_LEGACY_KEY_ID),
@@ -1494,7 +1607,7 @@ impl PayloadCodecs {
         let raw = serde_json::to_vec(&payload)?;
         let encoded = codec
             .encode(&raw)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+            .map_err(|e| HarvestError::Codec(e.to_string()))?;
         Ok(Self::envelope(
             codec.codec_id(),
             key_id.as_deref().unwrap_or(CODEC_LEGACY_KEY_ID),
@@ -1573,7 +1686,7 @@ impl PayloadCodecs {
         }
         let encoded = codec
             .encode(raw)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+            .map_err(|e| HarvestError::Codec(e.to_string()))?;
         // Never the escape case: identity is refused above, so this key id
         // is always a genuinely active rotation key.
         Ok(Self::envelope(codec.codec_id(), key_id, &encoded, false))
@@ -1671,10 +1784,10 @@ impl PayloadCodecs {
 
     /// Turn encoding of the codec columns on or off (issue #1979).
     ///
-    /// The codec columns are `harvest_workflow_executions.input`, `.output`
-    /// and `.memo`, `harvest_signals.payload`, `harvest_dead_letters.input`,
-    /// and the workflow task's `harvest_task_queue.input` and `.output`. The
-    /// default is off.
+    /// The codec columns are the entries of `codec_rotation::CODEC_COLUMNS`
+    /// (issue #1979, issue #2043). The coverage table in
+    /// `docs/security-posture.md` gives a reason for each column that stays
+    /// clear. The default is off.
     ///
     /// Readers always decode these columns, whatever this switch says. So
     /// turn it on only after every process in the fleet runs a release that
@@ -1684,6 +1797,25 @@ impl PayloadCodecs {
     /// once.
     pub fn set_column_encoding(&self, on: bool) {
         self.columns.store(on, Ordering::Release);
+    }
+
+    /// The column sweep cursor stored for `shard_id` (issue #2054).
+    #[cfg(feature = "db")]
+    pub(crate) fn column_cursor(&self, shard_id: i32) -> Option<ColumnCursor> {
+        self.column_cursors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&shard_id)
+            .cloned()
+    }
+
+    /// Store the column sweep cursor for `shard_id` (issue #2054).
+    #[cfg(feature = "db")]
+    pub(crate) fn set_column_cursor(&self, shard_id: i32, cursor: ColumnCursor) {
+        self.column_cursors
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(shard_id, cursor);
     }
 
     /// Whether writes encode the codec columns (issue #1979).
@@ -1763,9 +1895,101 @@ impl PayloadCodecs {
         value.map(|v| self.decode_column(v)).transpose()
     }
 
+    /// [`PayloadCodecs::encode_column`] for a context header map
+    /// (issue #2043). The whole map is one cell.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::encode_column`].
+    pub fn encode_headers(
+        &self,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> HarvestResult<Value> {
+        self.encode_column(&serde_json::to_value(headers).map_err(HarvestError::Serialization)?)
+    }
+
+    /// Decode a stored header cell into a header map (issue #2043).
+    ///
+    /// A codec failure is an error, never an empty map. A header can carry a
+    /// tenant or a trace, so a missing key must not drop it without a sound.
+    /// A decoded value that is not a string map reads as no headers. That is
+    /// the contract for a row from before column encoding.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::decode_column`].
+    pub fn decode_headers(
+        &self,
+        stored: &Value,
+    ) -> HarvestResult<std::collections::HashMap<String, String>> {
+        let plain = self.decode_column(stored)?;
+        Ok(serde_json::from_value(plain).unwrap_or_default())
+    }
+
+    /// [`PayloadCodecs::decode_headers`] for an optional cell. No cell means
+    /// no headers.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::decode_headers`].
+    pub fn decode_headers_opt(
+        &self,
+        stored: Option<&Value>,
+    ) -> HarvestResult<std::collections::HashMap<String, String>> {
+        stored.map_or_else(
+            || Ok(std::collections::HashMap::new()),
+            |v| self.decode_headers(v),
+        )
+    }
+
+    /// Re-encode a stored column value for a copy into a new row (issue #2065).
+    ///
+    /// A retry, a continue-as-new successor and a reset fork are new writes.
+    /// With column encoding on, this decodes `stored`, then encodes it as
+    /// [`PayloadCodecs::encode_column`] does. A clear legacy value is encoded,
+    /// and ciphertext moves to the active key. With column encoding off, the
+    /// copy keeps the stored bytes, so it never turns ciphertext into clear.
+    /// A value this registry cannot decode, or that decodes to bytes which are
+    /// not JSON, also keeps its stored bytes. The copy never loses or guesses a
+    /// value.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError`] when the codec fails to encode the decoded value.
+    #[cfg(feature = "db")]
+    pub(crate) fn recode_column_for_copy(&self, stored: &Value) -> HarvestResult<Value> {
+        // Read the switch once. A concurrent flip must not leave a decoded
+        // value to be stored in clear.
+        if !self.column_encoding() {
+            return Ok(stored.clone());
+        }
+        match self.decode_column(stored) {
+            Ok(plain) => self.encode_payload(&plain),
+            Err(error)
+                if error.is_codec_failure() || matches!(error, HarvestError::Serialization(_)) =>
+            {
+                Ok(stored.clone())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// [`PayloadCodecs::recode_column_for_copy`] for an optional column.
+    ///
+    /// # Errors
+    ///
+    /// As [`PayloadCodecs::recode_column_for_copy`].
+    #[cfg(feature = "db")]
+    pub(crate) fn recode_column_opt_for_copy(
+        &self,
+        stored: Option<&Value>,
+    ) -> HarvestResult<Option<Value>> {
+        stored.map(|v| self.recode_column_for_copy(v)).transpose()
+    }
+
     /// [`PayloadCodecs::decode_payload`], taking `payload` by value.
     ///
-    /// [`PayloadCodecs::transform_event_data`] already owns the whole event
+    /// [`PayloadCodecs::decode_event_moving_payloads`] already owns the whole event
     /// tree it walks. Its per-field call here hands over ownership (via
     /// `std::mem::take`) instead of borrowing. The not-an-envelope fast
     /// path below can then return the value it was already given. It
@@ -1824,7 +2048,7 @@ impl PayloadCodecs {
     /// As [`PayloadCodecs::decode_payload`], including
     /// [`HarvestError::Serialization`] when the decoded bytes are not valid
     /// JSON.
-    pub(crate) fn decode_payload_bytes(&self, payload: &Value) -> HarvestResult<Option<Vec<u8>>> {
+    pub fn decode_payload_bytes(&self, payload: &Value) -> HarvestResult<Option<Vec<u8>>> {
         let Some(parts) = codec_envelope_parts(payload) else {
             return Ok(None);
         };
@@ -1852,10 +2076,10 @@ impl PayloadCodecs {
         })?;
         let encoded = base64::engine::general_purpose::STANDARD
             .decode(parts.encoded_b64)
-            .map_err(|e| HarvestError::Config(e.to_string()))?;
+            .map_err(|e| HarvestError::Codec(e.to_string()))?;
         codec
             .decode(&encoded)
-            .map_err(|e| HarvestError::Config(e.to_string()))
+            .map_err(|e| HarvestError::Codec(e.to_string()))
     }
 
     /// Decode one already-shape-verified envelope, mapping every failure mode
@@ -1924,6 +2148,11 @@ impl PayloadCodecs {
     /// switch is off or on, and the same value as a row written before
     /// issue #1979. A layer that fails to decode becomes a marker, as in
     /// `decode_value_lossy`.
+    ///
+    /// The second pass is deliberate (issue #2054). A business value that is
+    /// itself an envelope decodes here. [`PayloadCodecs::decode_column`]
+    /// returns it as written. The difference is intended: an old row has
+    /// nested envelopes and no column layer.
     ///
     /// For the operator read path only. Never write the result back.
     pub fn decode_column_lossy(&self, value: &mut Value) -> LossyDecodeOutcome {
@@ -2236,6 +2465,227 @@ mod tests {
         };
         let encoded = codecs.encode_event(&event).expect("encode");
         assert_eq!(encoded["data"]["output"], serde_json::json!({"a": 1}));
+    }
+
+    /// One event of each variant that carries a payload field.
+    ///
+    /// Each `Option` payload is `Some`, so every payload key is on the wire.
+    #[allow(clippy::too_many_lines)]
+    fn every_payload_bearing_event() -> Vec<crate::event::WorkflowEvent> {
+        use crate::event::{SideEffectKind, WorkflowEvent};
+        use crate::types::{
+            ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalSignalId,
+            ExternalTarget, ParentClosePolicy, UpdateId,
+        };
+
+        let some = || Some(json!(0));
+        vec![
+            WorkflowEvent::WorkflowStarted {
+                input: json!(0),
+                timestamp: chrono::Utc::now(),
+                last_completion_result: some(),
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::WorkflowCompleted { output: json!(0) },
+            WorkflowEvent::WorkflowFailed {
+                error: "e".into(),
+                error_type: None,
+                details: some(),
+                non_retryable: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "a".into(),
+                input: json!(0),
+                queue: "q".into(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: json!(0),
+            },
+            WorkflowEvent::ActivityFailed {
+                activity_id: ActivityExecId::new(),
+                error: "e".into(),
+                attempt: 1,
+                error_type: "E".into(),
+                non_retryable: false,
+                details: some(),
+            },
+            WorkflowEvent::ActivityHeartbeat {
+                activity_id: ActivityExecId::new(),
+                details: json!(0),
+            },
+            WorkflowEvent::SignalReceived {
+                signal_name: "s".into(),
+                payload: json!(0),
+            },
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id: ExecutionId::new(),
+                workflow_name: "w".into(),
+                input: json!(0),
+            },
+            WorkflowEvent::ChildWorkflowCompleted {
+                child_id: ExecutionId::new(),
+                output: json!(0),
+            },
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id: ExecutionId::new(),
+                error: "e".into(),
+                error_type: None,
+                details: some(),
+                non_retryable: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: json!(0),
+            },
+            WorkflowEvent::WorkflowContinuedAsNew {
+                new_exec_id: ExecutionId::new(),
+                input: json!(0),
+                new_workflow_type: None,
+            },
+            WorkflowEvent::LocalActivityScheduled {
+                activity_id: ActivityExecId::new(),
+                name: "l".into(),
+                input: json!(0),
+                resolved: true,
+                retry_policy: None,
+                start_to_close_nanos: None,
+            },
+            WorkflowEvent::LocalActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: json!(0),
+            },
+            WorkflowEvent::ActivityAwaitingExternal {
+                activity_id: ActivityExecId::new(),
+                token: ExternalActivityToken::new(),
+                name: "a".into(),
+                input: json!(0),
+                queue: "q".into(),
+                schedule_to_close_secs: 1,
+            },
+            WorkflowEvent::ActivityCompletedExternally {
+                activity_id: ActivityExecId::new(),
+                token: ExternalActivityToken::new(),
+                output: json!(0),
+            },
+            WorkflowEvent::UpdateAdmitted {
+                update_id: UpdateId::new(),
+                name: "u".into(),
+                input: json!(0),
+                timestamp: chrono::Utc::now(),
+            },
+            WorkflowEvent::UpdateCompleted {
+                update_id: UpdateId::new(),
+                output: json!(0),
+            },
+            WorkflowEvent::ExternalSignalRequested {
+                signal_id: ExternalSignalId::new(),
+                target: ExternalTarget::ExecutionId(ExecutionId::new()),
+                signal_name: "s".into(),
+                payload: json!(0),
+                idempotency_key: None,
+            },
+            WorkflowEvent::ChildWorkflowSpawnedDetached {
+                child_id: ExecutionId::new(),
+                workflow_name: "w".into(),
+                input: json!(0),
+                parent_close_policy: ParentClosePolicy::Abandon,
+            },
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::Custom,
+                name: None,
+                value: json!(0),
+            },
+            WorkflowEvent::ExternalAwaitResolved {
+                await_id: ExternalAwaitId::new(),
+                output: json!(0),
+            },
+            WorkflowEvent::ExternalAwaitFailed {
+                await_id: ExternalAwaitId::new(),
+                reason_code: "r".into(),
+                message: None,
+                error_type: None,
+                details: some(),
+                non_retryable: None,
+            },
+            WorkflowEvent::ForkActivityResultOverridden {
+                activity_name: "a".into(),
+                occurrence: 1,
+                output: json!(0),
+            },
+        ]
+    }
+
+    /// The lifted decode in `event_from_wire` must match serde's own decode.
+    ///
+    /// A payload key without a slot reads back as null. So this checks
+    /// every payload key of every payload-bearing variant.
+    #[test]
+    fn lifted_decode_matches_serde_for_every_payload_field() {
+        let codecs = PayloadCodecs::default();
+        let mut fields = 0;
+        for event in every_payload_bearing_event() {
+            let mut stored = serde_json::to_value(&event).expect("serialize");
+            let data = stored["data"].as_object_mut().expect("data object");
+            for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
+                if let Some(field) = data.get_mut(key) {
+                    *field = json!({"key": key, "tree": [1, {"x": "y"}]});
+                    fields += 1;
+                }
+            }
+
+            let mut decoded = codecs.decode_event(stored.clone()).expect("decode");
+            for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
+                if stored["data"].get(key).is_some() {
+                    assert!(
+                        decoded.payload_slot_mut(key).is_some(),
+                        "{} has no payload slot for `{key}`",
+                        event.type_name()
+                    );
+                }
+            }
+            let plain: crate::event::WorkflowEvent =
+                serde_json::from_value(stored.clone()).expect("serde decode");
+            let decoded = serde_json::to_value(&decoded).expect("serialize");
+            assert_eq!(decoded, serde_json::to_value(&plain).expect("serialize"));
+            assert_eq!(decoded, stored, "{}", event.type_name());
+        }
+        assert_eq!(fields, 26, "one field per payload slot");
+    }
+
+    /// A null payload and a key that the variant lacks both read as serde
+    /// reads them.
+    #[test]
+    fn lifted_decode_keeps_null_and_unknown_payload_keys() {
+        let codecs = PayloadCodecs::default();
+
+        let failed = json!({
+            "type": "WorkflowFailed",
+            "data": {"error": "e", "details": null}
+        });
+        match codecs.decode_event(failed).expect("decode") {
+            crate::event::WorkflowEvent::WorkflowFailed { details, .. } => {
+                assert_eq!(details, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        let stray = json!({
+            "type": "WorkflowCompleted",
+            "data": {"output": {"a": 1}, "input": {"stray": true}}
+        });
+        let decoded = codecs.decode_event(stray.clone()).expect("decode");
+        let plain: crate::event::WorkflowEvent = serde_json::from_value(stray).expect("serde");
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("serialize"),
+            serde_json::to_value(&plain).expect("serialize")
+        );
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("serialize"),
+            json!({"type": "WorkflowCompleted", "data": {"output": {"a": 1}}})
+        );
     }
 
     #[test]
@@ -3846,5 +4296,299 @@ mod tests {
                  pair can leave the mirror disagreeing with a non-empty map"
             );
         }
+    }
+
+    // ── codec failure classification (issue #2065) ───────────────────────
+
+    /// A codec whose `encode` always fails, as a remote key service can.
+    #[derive(Debug)]
+    struct BrokenEncode;
+
+    impl PayloadCodec for BrokenEncode {
+        fn codec_id(&self) -> &'static str {
+            "broken"
+        }
+        fn encode(&self, _raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Err(CodecError("key service down".to_string()))
+        }
+        fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+            Ok(encoded.to_vec())
+        }
+    }
+
+    fn broken_codecs() -> PayloadCodecs {
+        let mut codecs = PayloadCodecs::default();
+        codecs.set_default(Arc::new(BrokenEncode));
+        codecs.set_column_encoding(true);
+        codecs
+    }
+
+    #[test]
+    fn an_encode_failure_is_a_codec_failure() {
+        let err = broken_codecs()
+            .encode_column(&json!({"k": "v"}))
+            .expect_err("the codec fails");
+        assert!(matches!(err, HarvestError::Codec(_)), "{err:?}");
+        assert!(err.is_codec_failure());
+    }
+
+    #[test]
+    fn a_decode_failure_is_a_codec_failure() {
+        let codecs = PayloadCodecs::default();
+        let envelope = json!({
+            CODEC_ENVELOPE_KEY: 1,
+            "codec_id": "identity",
+            "data": "not base64 !!",
+        });
+        let err = codecs.decode_column(&envelope).expect_err("bad base64");
+        assert!(matches!(err, HarvestError::Codec(_)), "{err:?}");
+        assert!(err.is_codec_failure());
+    }
+
+    #[test]
+    fn unknown_codec_errors_are_codec_failures() {
+        assert!(
+            HarvestError::UnknownCodecKey {
+                key_id: "k".into(),
+                codec_id: "c".into(),
+            }
+            .is_codec_failure()
+        );
+        assert!(HarvestError::UnknownPayloadCodec { id: "c".into() }.is_codec_failure());
+    }
+
+    #[test]
+    fn other_errors_are_not_codec_failures() {
+        assert!(!HarvestError::Config("terminal target".into()).is_codec_failure());
+        assert!(!HarvestError::NotFound("x".into()).is_codec_failure());
+    }
+
+    // ── recode for a row copy (issue #2065) ──────────────────────────────
+
+    #[cfg(feature = "db")]
+    fn keyed_codecs(columns: bool) -> PayloadCodecs {
+        let codecs = PayloadCodecs::default();
+        codecs
+            .register_key("k1", Arc::new(XorCodec(1)))
+            .expect("register k1");
+        codecs.set_active_key("k1").expect("activate k1");
+        codecs.set_column_encoding(columns);
+        codecs
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_encodes_a_legacy_plaintext_value() {
+        let codecs = keyed_codecs(true);
+        let plain = json!({"ssn": "123-45-6789"});
+        let copied = codecs.recode_column_for_copy(&plain).expect("recode");
+        assert!(is_codec_envelope(&copied), "{copied}");
+        assert_eq!(codecs.decode_column(&copied).expect("decode"), plain);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_rewraps_ciphertext_once() {
+        let codecs = keyed_codecs(true);
+        let plain = json!({"ssn": "123-45-6789"});
+        let stored = codecs.encode_column(&plain).expect("encode");
+        let copied = codecs.recode_column_for_copy(&stored).expect("recode");
+        assert!(is_codec_envelope(&copied));
+        assert_eq!(
+            codecs.decode_column(&copied).expect("decode"),
+            plain,
+            "one decode must give the plaintext, not another envelope"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_leaves_plaintext_in_clear_while_column_encoding_is_off() {
+        let codecs = keyed_codecs(false);
+        let plain = json!({"a": 1});
+        assert_eq!(
+            codecs.recode_column_for_copy(&plain).expect("recode"),
+            plain
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_keeps_ciphertext_while_column_encoding_is_off() {
+        let on = keyed_codecs(true);
+        let stored = on.encode_column(&json!({"a": 1})).expect("encode");
+        let off = keyed_codecs(false);
+        assert_eq!(
+            off.recode_column_for_copy(&stored).expect("recode"),
+            stored,
+            "a copy must not turn ciphertext into clear"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_keeps_the_stored_bytes_when_the_key_is_missing() {
+        let writer = keyed_codecs(true);
+        let stored = writer.encode_column(&json!({"a": 1})).expect("encode");
+        let reader = PayloadCodecs::default();
+        reader.set_column_encoding(true);
+        assert_eq!(
+            reader.recode_column_for_copy(&stored).expect("recode"),
+            stored,
+            "an unreadable value is copied as stored, never dropped or guessed"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_keeps_a_corrupt_envelope_as_stored() {
+        let codecs = keyed_codecs(true);
+        let corrupt = json!({
+            CODEC_ENVELOPE_KEY: CODEC_ENVELOPE_VERSION_KEYED,
+            "codec_id": "xor",
+            "kid": "k1",
+            "data": "not base64 !!",
+        });
+        assert_eq!(
+            codecs.recode_column_for_copy(&corrupt).expect("recode"),
+            corrupt,
+            "an unreadable value is copied as stored"
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_keeps_the_stored_bytes_when_the_decoded_bytes_are_not_json() {
+        let codecs = keyed_codecs(true);
+        let bytes = XorCodec(1).encode(b"not json").expect("encode");
+        let stored = PayloadCodecs::envelope("xor", "k1", &bytes, false);
+        assert_eq!(
+            codecs.recode_column_for_copy(&stored).expect("recode"),
+            stored
+        );
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn recode_reports_an_encode_failure() {
+        let err = broken_codecs()
+            .recode_column_for_copy(&json!({"a": 1}))
+            .expect_err("the codec fails");
+        assert!(err.is_codec_failure(), "{err:?}");
+    }
+
+    /// The decode that issue #2136 replaced: decode each payload in place,
+    /// then let serde rebuild the whole tree.
+    fn rebuilding_decode(codecs: &PayloadCodecs, mut wire: Value) -> HarvestResult<Value> {
+        if let Some(data) = wire.get_mut("data") {
+            for key in crate::payload_store::PAYLOAD_FIELD_KEYS {
+                if let Some(payload) = data.get_mut(key) {
+                    *payload = codecs.decode_payload_owned(std::mem::take(payload))?;
+                }
+            }
+        }
+        let event: crate::event::WorkflowEvent = serde_json::from_value(wire)?;
+        Ok(serde_json::to_value(event)?)
+    }
+
+    /// Decode `wire` both ways and return whether the slow path ran.
+    fn assert_decodes_like_a_rebuild(codecs: &PayloadCodecs, wire: &Value) -> bool {
+        let expected = rebuilding_decode(codecs, wire.clone()).expect("rebuilding decode");
+        let (event, slow) = codecs
+            .decode_event_moving_payloads(wire.clone())
+            .expect("moving decode");
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            expected,
+            "wire: {wire}"
+        );
+        slow
+    }
+
+    #[test]
+    fn decode_moves_every_payload_kind_into_its_field() {
+        let id = crate::types::ActivityExecId::new().to_string();
+        let doc = json!({"a": [1, {"b": "c"}], "d": null});
+        let wires = [
+            json!({"type": "ActivityScheduled", "data": {
+                "activity_id": id, "name": "n", "input": doc, "queue": "q"}}),
+            json!({"type": "ActivityCompleted", "data": {"activity_id": id, "output": doc}}),
+            json!({"type": "WorkflowStarted", "data": {"input": doc,
+                "timestamp": "2026-01-01T00:00:00Z", "last_completion_result": doc}}),
+            json!({"type": "WorkflowFailed", "data": {"error": "e", "details": doc}}),
+            json!({"type": "WorkflowFailed", "data": {"error": "e", "details": null}}),
+            json!({"type": "WorkflowFailed", "data": {"error": "e"}}),
+            json!({"type": "SignalReceived", "data": {"signal_name": "s", "payload": doc}}),
+            json!({"type": "WorkflowCompleted", "data": {"output": null}}),
+        ];
+        let mut codecs = PayloadCodecs::default();
+        for wire in &wires {
+            assert!(!assert_decodes_like_a_rebuild(&codecs, wire));
+        }
+        codecs.set_default(Arc::new(XorCodec(0x5a)));
+        for wire in &wires {
+            let event: crate::event::WorkflowEvent =
+                serde_json::from_value(wire.clone()).expect("fixture");
+            let stored = codecs.encode_event(&event).expect("encode");
+            assert!(!assert_decodes_like_a_rebuild(&codecs, &stored));
+        }
+    }
+
+    #[test]
+    fn decode_keeps_ignoring_a_payload_key_the_variant_lacks() {
+        let wire = json!({"type": "WorkflowCancelled",
+            "data": {"reason": "r", "input": {"a": 1}}});
+        assert!(assert_decodes_like_a_rebuild(
+            &PayloadCodecs::default(),
+            &wire
+        ));
+    }
+
+    #[test]
+    fn decode_errors_still_name_the_bad_field() {
+        let wire = json!({"type": "ActivityCompleted",
+            "data": {"activity_id": 5, "output": {"a": 1}}});
+        let codecs = PayloadCodecs::default();
+        let moved = codecs.decode_event(wire.clone()).unwrap_err().to_string();
+        let rebuilt = rebuilding_decode(&codecs, wire).unwrap_err().to_string();
+        assert_eq!(moved, rebuilt);
+    }
+
+    /// Every variant takes the fast path, so `payload_slot` names every
+    /// payload field (issue #2136).
+    ///
+    /// The derived `Arbitrary` picks the variant from the first four bytes
+    /// as a `u32`. Four equal bytes `b` select variant `b * count / 255`, so
+    /// the sweep over `b` reaches every variant.
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn every_arbitrary_event_decodes_on_the_fast_path() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let codecs = PayloadCodecs::default();
+        let mut state: u64 = 0x2136;
+        let mut types = std::collections::BTreeSet::new();
+        for b in 0..=u8::MAX {
+            for _ in 0..16 {
+                let mut bytes = vec![b; 4];
+                bytes.extend((0..1024).map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[0]
+                }));
+                let event = crate::event::WorkflowEvent::arbitrary(&mut Unstructured::new(&bytes))
+                    .expect("1028 bytes build an event");
+                types.insert(event.type_name());
+                let stored = codecs.encode_event(&event).expect("encode");
+                assert!(
+                    !assert_decodes_like_a_rebuild(&codecs, &stored),
+                    "{} took the slow path",
+                    event.type_name()
+                );
+            }
+        }
+        // History is append-only, so no variant is ever removed. The count
+        // only grows, and this bound never needs an edit.
+        assert!(types.len() >= 53, "the sweep reached {types:?}");
     }
 }

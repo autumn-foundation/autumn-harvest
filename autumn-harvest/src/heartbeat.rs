@@ -14,9 +14,10 @@
 //! Shuttle models in `tests/shuttle_models.rs` drive the same loop with a
 //! recording sink (issue #1800).
 //!
-//! The worker uses [`spawn_heartbeat_flusher_with`] instead (issue #1788). Its
-//! payloads carry the time the activity sent them, and a failed flush keeps
-//! its payload for the next tick. Both need the `db` feature.
+//! The worker uses [`spawn_heartbeat_flusher_with_codecs`] instead (issue
+//! #1788, issue #2043). Its payloads carry the time the activity sent them, a
+//! failed flush keeps its payload for the next tick, and it encodes each
+//! checkpoint. Both need the `db` feature.
 
 use std::future::Future;
 use std::time::Duration;
@@ -34,6 +35,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use crate::context::StampedHeartbeat;
 #[cfg(feature = "db")]
 use crate::error::{HarvestError, HarvestResult};
+#[cfg(feature = "db")]
+use crate::payload_codec::PayloadCodecs;
 #[cfg(feature = "db")]
 use crate::queue::{ClaimWrite, TaskClaim};
 #[cfg(feature = "db")]
@@ -140,7 +143,8 @@ fn drain_latest(rx: &mut mpsc::Receiver<Value>) -> Option<Value> {
 ///
 /// [`crate::pool::acquire_bound`] limits each pool acquire (issue #1788). The
 /// write stamps the time of the flush, and a failed flush drops its payload.
-/// The worker uses [`spawn_heartbeat_flusher_with`], which keeps both.
+/// The worker uses [`spawn_heartbeat_flusher_with_codecs`], which keeps both.
+/// This flusher stores each checkpoint in clear.
 #[cfg(feature = "db")]
 #[must_use]
 pub fn spawn_heartbeat_flusher(
@@ -177,6 +181,9 @@ async fn heartbeat_loop(
 }
 
 /// Writes heartbeats to `harvest_task_queue` through `queue::record_heartbeat`.
+///
+/// A checkpoint nested past the depth cap writes the heartbeat time only, with
+/// `queue::record_heartbeat_liveness_sent_ago` (issue #2225).
 #[cfg(feature = "db")]
 struct PgHeartbeatSink {
     claim: TaskClaim,
@@ -191,7 +198,19 @@ impl HeartbeatSink for PgHeartbeatSink {
         let task_id = self.claim.task_id;
         match crate::pool::acquire(&self.pool, self.acquire_timeout).await {
             Ok(mut conn) => {
-                match crate::queue::record_heartbeat(&mut conn, &self.claim, payload).await {
+                // A deep checkpoint refreshes the heartbeat time only (issue #2225).
+                let written = if crate::payload_depth::nests_past_cap(&payload) {
+                    warn_checkpoint_dropped(task_id);
+                    crate::queue::record_heartbeat_liveness_sent_ago(
+                        &mut conn,
+                        &self.claim,
+                        Duration::ZERO,
+                    )
+                    .await
+                } else {
+                    crate::queue::record_heartbeat(&mut conn, &self.claim, payload).await
+                };
+                match written {
                     Ok(ClaimWrite::Applied) => FlushOutcome::Continue,
                     // The claim is no longer current (issue #1789). The loop
                     // then cancels the activity, so this stale attempt does
@@ -244,7 +263,8 @@ pub struct HeartbeatFlushOptions {
 
 /// A heartbeat flusher for payloads that their sender stamps (issue #1788).
 ///
-/// The worker uses it. It takes an explicit acquire bound and a metrics sink.
+/// It takes an explicit acquire bound and a metrics sink. It stores each
+/// checkpoint in clear. The worker uses [`spawn_heartbeat_flusher_with_codecs`].
 ///
 /// A failed flush keeps its payload. The next tick sends it again, unless a
 /// newer payload replaces it. A lost claim cancels `cancel` and stops the
@@ -261,6 +281,30 @@ pub fn spawn_heartbeat_flusher_with(
     cancel: CancellationToken,
     options: HeartbeatFlushOptions,
 ) -> HeartbeatSlot {
+    spawn_heartbeat_flusher_with_codecs(
+        claim,
+        pool,
+        cancel,
+        options,
+        crate::store::DEFAULT_PAYLOAD_CODECS.clone(),
+    )
+}
+
+/// [`spawn_heartbeat_flusher_with`], encoding each checkpoint through
+/// `codecs` before it is written (issue #2043).
+///
+/// The flusher encodes, and not the activity. Then the shared
+/// [`crate::context::ActivityContext`] needs no codec, and an auto-heartbeat
+/// ping is covered too. A liveness ping holds no details and stays `null`.
+#[cfg(feature = "db")]
+#[must_use]
+pub fn spawn_heartbeat_flusher_with_codecs(
+    claim: TaskClaim,
+    pool: Pool<AsyncPgConnection>,
+    cancel: CancellationToken,
+    options: HeartbeatFlushOptions,
+    codecs: PayloadCodecs,
+) -> HeartbeatSlot {
     // A fence stops this flusher too (issue #1823). The flusher outlives a
     // drain, so the worker token does not reach it.
     if crate::replication::FenceRegistry::is_enabled() {
@@ -273,6 +317,7 @@ pub fn spawn_heartbeat_flusher_with(
         Arc::clone(&latest),
         cancel,
         options,
+        codecs,
     ));
     HeartbeatSlot(latest)
 }
@@ -418,9 +463,12 @@ pub async fn flush_heartbeat(
             metrics: Arc::new(crate::telemetry::NoOpMetrics),
             shards: Arc::from([0]),
         },
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+        &mut None,
         Duration::MAX,
     )
     .await
+    .map(|flushed| flushed.write)
     .map_err(|failure| *failure.error)
 }
 
@@ -434,11 +482,146 @@ struct FlushFailure {
     error: Box<HarvestError>,
 }
 
+/// What a flush did with the checkpoint of its heartbeat (issues #2043, #2225).
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Checkpoint {
+    /// The write stored the checkpoint, or the heartbeat held none.
+    Stored,
+    /// The checkpoint did not encode. The write refreshed the heartbeat time
+    /// only, so the row still holds the previous checkpoint. The loop keeps
+    /// the heartbeat and encodes it again on the next tick.
+    Retry,
+    /// The checkpoint nests past the depth cap. The write refreshed the
+    /// heartbeat time only, so the row still holds the previous checkpoint.
+    /// A deep checkpoint never becomes valid, so the loop drops it.
+    Dropped,
+}
+
+/// A written flush (issue #2043).
+#[cfg(feature = "db")]
+struct Flushed {
+    write: ClaimWrite,
+    checkpoint: Checkpoint,
+}
+
 /// A heartbeat not yet written, with the time the activity sent it.
 #[cfg(feature = "db")]
 struct Pending {
     payload: Value,
     sent_order: std::time::Instant,
+}
+
+/// The last checkpoint the flusher encoded, with its stored form (issue
+/// #2043).
+///
+/// An unchanged checkpoint reuses its stored form, so a repeat does not spend
+/// a new random AES-GCM nonce. The auto-heartbeat ticker sends the same
+/// checkpoint on every tick. Reuse is not nonce reuse. The same bytes go to
+/// the same cell.
+///
+/// The entry also records the column encoding switch it was made under. A
+/// switch change then makes the flusher encode again. A rollback that turns the
+/// switch off thus stores the plain checkpoint for an older worker.
+#[cfg(feature = "db")]
+struct EncodedCheckpoint {
+    plain: Value,
+    stored: Value,
+    column_encoding: bool,
+}
+
+/// The checkpoint as the column stores it (issue #2043).
+///
+/// A liveness ping holds no details, so it stays `null`. A checkpoint that
+/// does not encode gives `None`. The flush then refreshes the heartbeat time
+/// only, and the previous checkpoint survives. The timeout scanner still sees a
+/// live activity. The flush loop keeps the heartbeat and encodes it again on
+/// the next tick.
+#[cfg(feature = "db")]
+fn stored_checkpoint(
+    codecs: &PayloadCodecs,
+    payload: &Value,
+    cache: &mut Option<EncodedCheckpoint>,
+) -> Option<Value> {
+    if payload.is_null() {
+        return Some(Value::Null);
+    }
+    if let Some(hit) = cache
+        .as_ref()
+        .filter(|hit| hit.plain == *payload && cached_form_is_current(codecs, hit))
+    {
+        return Some(hit.stored.clone());
+    }
+    let column_encoding = codecs.column_encoding();
+    match codecs.encode_column(payload) {
+        Ok(stored) => {
+            *cache = Some(EncodedCheckpoint {
+                plain: payload.clone(),
+                stored: stored.clone(),
+                column_encoding,
+            });
+            Some(stored)
+        }
+        Err(error) => {
+            tracing::warn!(
+                error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                "heartbeat details could not be encoded; the flush keeps the stored checkpoint"
+            );
+            None
+        }
+    }
+}
+
+/// Log that a heartbeat checkpoint nested past the depth cap was dropped
+/// (issue #2225).
+#[cfg(feature = "db")]
+fn warn_checkpoint_dropped(task_id: uuid::Uuid) {
+    tracing::warn!(
+        task_id = %task_id,
+        cap_depth = crate::payload_depth::MAX_PAYLOAD_DEPTH,
+        "dropped an activity heartbeat that nests past the depth cap; the stored checkpoint stays"
+    );
+}
+
+/// What the flush writes for `payload`, and what it does with the heartbeat
+/// after the write (issues #2043, #2225).
+///
+/// A checkpoint nested past the depth cap cannot be read back, and a stored
+/// one makes every later claim of the task fail. So it is never encoded or
+/// stored. The write then refreshes the heartbeat time only, the previous
+/// checkpoint stays, and the activity stays alive. The check reads the plain
+/// payload, because an encoded checkpoint does not nest.
+#[cfg(feature = "db")]
+fn checkpoint_to_store(
+    codecs: &PayloadCodecs,
+    payload: &Value,
+    cache: &mut Option<EncodedCheckpoint>,
+) -> (Option<Value>, Checkpoint) {
+    if crate::payload_depth::nests_past_cap(payload) {
+        return (None, Checkpoint::Dropped);
+    }
+    let stored = stored_checkpoint(codecs, payload, cache);
+    let checkpoint = if stored.is_some() {
+        Checkpoint::Stored
+    } else {
+        Checkpoint::Retry
+    };
+    (stored, checkpoint)
+}
+
+/// Whether a cached stored form still matches the registry (issue #2043).
+///
+/// The entry must come from the present column encoding switch. With the
+/// switch off, the form is plain, so it then matches. With the switch on, the
+/// form must also be an envelope under the active key. A switch change or a
+/// key rotation then makes the flusher encode again.
+#[cfg(feature = "db")]
+fn cached_form_is_current(codecs: &PayloadCodecs, hit: &EncodedCheckpoint) -> bool {
+    let column_encoding = codecs.column_encoding();
+    hit.column_encoding == column_encoding
+        && (!column_encoding
+            || crate::payload_codec::codec_envelope_key_id(&hit.stored)
+                .is_some_and(|key_id| key_id == codecs.active_key_id()))
 }
 
 /// Write `beat`, or a newer heartbeat from `latest`, on one connection.
@@ -457,14 +640,17 @@ struct Pending {
 ///
 /// `beat` holds the last heartbeat written or tried.
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 async fn flush(
     pool: &Pool<AsyncPgConnection>,
     claim: &TaskClaim,
     beat: &mut Pending,
     latest: &Latest,
     options: &HeartbeatFlushOptions,
+    codecs: &PayloadCodecs,
+    cache: &mut Option<EncodedCheckpoint>,
     interval: Duration,
-) -> Result<ClaimWrite, FlushFailure> {
+) -> Result<Flushed, FlushFailure> {
     let metrics = options.metrics.as_ref();
     let shards = &options.shards;
     let mut started = tokio::time::Instant::now();
@@ -487,13 +673,14 @@ async fn flush(
             *beat = newer;
         }
         let write_started = std::time::Instant::now();
-        let written = crate::queue::record_heartbeat_sent_ago(
-            &mut conn,
-            claim,
-            beat.payload.clone(),
-            beat.sent_order.elapsed(),
-        )
-        .await;
+        let age = beat.sent_order.elapsed();
+        let (details, checkpoint) = checkpoint_to_store(codecs, &beat.payload, cache);
+        let written = match details {
+            Some(details) => {
+                crate::queue::record_heartbeat_sent_ago(&mut conn, claim, details, age).await
+            }
+            None => crate::queue::record_heartbeat_liveness_sent_ago(&mut conn, claim, age).await,
+        };
         let latency = write_started.elapsed().as_secs_f64();
         for shard in shards.iter() {
             metrics.record_db_query_duration(crate::telemetry::DbOp::Heartbeat, *shard, latency);
@@ -503,10 +690,12 @@ async fn flush(
             Err(error) => crate::pool::is_session_timeout(error),
         };
         if !connection_works || !write_blocked(started.elapsed(), interval) || !latest.is_full() {
-            return written.map_err(|error| FlushFailure {
-                reason: "write_error",
-                error: Box::new(error),
-            });
+            return written
+                .map(|write| Flushed { write, checkpoint })
+                .map_err(|error| FlushFailure {
+                    reason: "write_error",
+                    error: Box::new(error),
+                });
         }
         if written.is_err() {
             metrics.record_heartbeat_flush_failed("write_error");
@@ -523,15 +712,22 @@ async fn stamped_heartbeat_loop(
     latest: LatestHeartbeat,
     cancel: CancellationToken,
     options: HeartbeatFlushOptions,
+    codecs: PayloadCodecs,
 ) {
     let flush_interval = Duration::from_secs(1);
     let task_id = claim.task_id;
     // The newest payload not yet written, with its send time. A failed flush
     // puts it back here. A retry writes that time, not the retry time.
     let mut pending: Option<Pending> = None;
+    // The last checkpoint this flusher encoded (issue #2043).
+    let mut encoded: Option<EncodedCheckpoint> = None;
     // Set when a write that blocked for an interval or more succeeds. The
     // next wait then ends as soon as a newer heartbeat is in the slot.
     let mut after_blocked_write = false;
+    // Set at the first dropped deep checkpoint, so the log has one warning for
+    // each activity (issue #2225). The auto-heartbeat ticker sends the same
+    // checkpoint again on every tick.
+    let mut warned_deep = false;
 
     loop {
         if cancel.is_cancelled() {
@@ -561,17 +757,48 @@ async fn stamped_heartbeat_loop(
         // If we got at least one heartbeat, flush to DB.
         if let Some(mut beat) = pending.take() {
             let started = tokio::time::Instant::now();
-            let outcome = flush(&pool, &claim, &mut beat, &latest, &options, flush_interval).await;
+            let outcome = flush(
+                &pool,
+                &claim,
+                &mut beat,
+                &latest,
+                &options,
+                &codecs,
+                &mut encoded,
+                flush_interval,
+            )
+            .await;
             // A write that blocked leaves the row with an old send time,
             // whether it then succeeds or fails. A newer heartbeat then goes
             // at once, so a timeout scanner does not see a live activity as
             // stale (issue #1788).
             let blocked = write_blocked(started.elapsed(), flush_interval);
             match outcome {
-                Ok(ClaimWrite::Applied) => after_blocked_write = blocked,
+                Ok(Flushed {
+                    write: ClaimWrite::Applied,
+                    checkpoint,
+                }) => {
+                    after_blocked_write = blocked;
+                    match checkpoint {
+                        Checkpoint::Stored => {}
+                        // A checkpoint that did not encode is not lost
+                        // (issue #2043). A later heartbeat replaces it.
+                        // Without one, the next tick encodes it again.
+                        Checkpoint::Retry => pending = Some(beat),
+                        // A deep checkpoint is dropped (issue #2225).
+                        Checkpoint::Dropped => {
+                            if !std::mem::replace(&mut warned_deep, true) {
+                                warn_checkpoint_dropped(task_id);
+                            }
+                        }
+                    }
+                }
                 // The claim is no longer current (issue #1789). Stop the
                 // activity, so this stale attempt does no more work.
-                Ok(ClaimWrite::LeaseLost) => {
+                Ok(Flushed {
+                    write: ClaimWrite::LeaseLost,
+                    ..
+                }) => {
                     tracing::warn!(
                         task_id = %task_id,
                         worker_id = %claim.worker_id,
@@ -734,6 +961,137 @@ mod tests {
             drain_latest(&mut rx).is_none(),
             "empty channel should produce no payload"
         );
+    }
+
+    // -- Issue #2043: the cache of the encoded checkpoint -------------------
+
+    #[cfg(feature = "db")]
+    mod encoded_checkpoint {
+        use super::*;
+        use crate::payload_codec::{CodecError, PayloadCodec, is_codec_envelope};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// A codec that counts its encodes.
+        struct CountingCodec(AtomicUsize);
+
+        impl PayloadCodec for CountingCodec {
+            fn codec_id(&self) -> &'static str {
+                "counting"
+            }
+
+            fn encode(&self, raw: &[u8]) -> Result<Vec<u8>, CodecError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(raw.iter().rev().copied().collect())
+            }
+
+            fn decode(&self, encoded: &[u8]) -> Result<Vec<u8>, CodecError> {
+                Ok(encoded.iter().rev().copied().collect())
+            }
+        }
+
+        /// A registry that encodes columns, and the encode counter.
+        fn encoding_registry() -> (PayloadCodecs, Arc<CountingCodec>) {
+            let codecs = PayloadCodecs::default();
+            let counter = Arc::new(CountingCodec(AtomicUsize::new(0)));
+            codecs
+                .register_key("k1", counter.clone())
+                .expect("register the codec");
+            codecs.set_column_encoding(true);
+            (codecs, counter)
+        }
+
+        #[test]
+        fn an_unchanged_checkpoint_reuses_its_envelope() {
+            let (codecs, counter) = encoding_registry();
+            let payload = serde_json::json!({"cursor": 7});
+            let mut cache = None;
+
+            let first = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
+            let second = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
+
+            assert!(is_codec_envelope(&first), "the checkpoint is encoded");
+            assert_eq!(first, second, "an unchanged checkpoint keeps its envelope");
+            assert_eq!(counter.0.load(Ordering::SeqCst), 1, "one encode, not two");
+        }
+
+        #[test]
+        fn turning_column_encoding_off_drops_the_cached_envelope() {
+            let (codecs, _counter) = encoding_registry();
+            let payload = serde_json::json!({"cursor": 7});
+            let mut cache = None;
+            let on = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
+            assert!(is_codec_envelope(&on), "the checkpoint is encoded");
+
+            codecs.set_column_encoding(false);
+            let off = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
+
+            assert_eq!(
+                off, payload,
+                "a rollback must store the plain checkpoint for an older worker"
+            );
+        }
+
+        #[test]
+        fn turning_column_encoding_on_again_encodes_the_checkpoint() {
+            let (codecs, _counter) = encoding_registry();
+            let payload = serde_json::json!({"cursor": 7});
+            let mut cache = None;
+            codecs.set_column_encoding(false);
+            let off = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
+            assert_eq!(off, payload, "the plain checkpoint is stored while off");
+
+            codecs.set_column_encoding(true);
+            let on = stored_checkpoint(&codecs, &payload, &mut cache).expect("encodes");
+
+            assert!(is_codec_envelope(&on), "the checkpoint is encoded again");
+        }
+
+        // -- Issue #2225: a checkpoint nested past the depth cap -----------
+
+        fn nested(depth: usize) -> Value {
+            let mut value = serde_json::json!(1);
+            for _ in 0..depth {
+                value = Value::Array(vec![value]);
+            }
+            value
+        }
+
+        #[test]
+        fn a_deep_checkpoint_is_dropped_before_any_encode() {
+            let (codecs, counter) = encoding_registry();
+            let deep = nested(crate::payload_depth::MAX_PAYLOAD_DEPTH + 1);
+
+            let (stored, checkpoint) = checkpoint_to_store(&codecs, &deep, &mut None);
+
+            assert_eq!(stored, None, "nothing is written for a deep checkpoint");
+            assert_eq!(checkpoint, Checkpoint::Dropped);
+            assert_eq!(
+                counter.0.load(Ordering::SeqCst),
+                0,
+                "the check reads the plain payload, so no encode runs"
+            );
+        }
+
+        #[test]
+        fn a_checkpoint_at_the_cap_is_stored() {
+            let (codecs, _counter) = encoding_registry();
+            let capped = nested(crate::payload_depth::MAX_PAYLOAD_DEPTH);
+
+            let (stored, checkpoint) = checkpoint_to_store(&codecs, &capped, &mut None);
+
+            assert!(stored.as_ref().is_some_and(is_codec_envelope));
+            assert_eq!(checkpoint, Checkpoint::Stored);
+        }
+
+        #[test]
+        fn a_liveness_ping_stays_a_stored_null() {
+            let (codecs, _counter) = encoding_registry();
+
+            let (stored, checkpoint) = checkpoint_to_store(&codecs, &Value::Null, &mut None);
+
+            assert_eq!(stored, Some(Value::Null));
+            assert_eq!(checkpoint, Checkpoint::Stored);
+        }
     }
 
     // -- Issue #1788: the stamped flusher that the worker uses -------------

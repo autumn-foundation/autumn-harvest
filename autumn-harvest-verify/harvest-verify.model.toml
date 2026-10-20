@@ -84,11 +84,11 @@
 # model error, not a warning, because an unexplained rule is how a model rots.
 #
 # The version string is printed with every verdict ("no non-determinism found,
-# under model 2026.10.1, up to boundaries ..."), so a verdict can always be
+# under model 2026.10.2, up to boundaries ..."), so a verdict can always be
 # traced to the rules that produced it. Bump the date component when rows change,
 # or when the analysis gives another structure manifest for the same MIR.
 
-version = "2026.10.1"
+version = "2026.10.2"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AMBIENT TYPES — statics of these types are taint roots
@@ -743,6 +743,11 @@ path = "history_has_unconsumed_events"
 receiver = "WorkflowContext"
 kind = "value"
 reason = "context.rs:3448 = `match_history(|m| m.has_non_lifecycle_unconsumed())`. Doc 3444-3447: it exists so `run_workflow_strict` can \"detect early-completion non-determinism\" — a cursor-relative predicate, false live and true on replay at the same program point."
+[[source]]
+path = "first_unconsumed_command_event"
+receiver = "WorkflowContext"
+kind = "value"
+reason = "context.rs: `matcher.first_unconsumed_command_event()`, the first recorded command event that the cycle did not consume (issue #1791). A cursor-relative read, like `history_has_unconsumed_events`: `None` live and `Some(..)` on a drifted replay at the same program point. Public for the SQLite query drift check (issue #2022)."
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SOURCES — kind = "order"
@@ -1081,6 +1086,10 @@ path = "mutex"
 receiver = "WorkflowContext"
 reason = "context.rs:6893 returns a `MutexHandle`; `MutexHandle::acquire` (context.rs:1194) pushes `WorkflowCommand::AcquireMutex` at context.rs:1232. The builder itself emits nothing, but the handle it hands back is only useful by emitting, so the builder call is the sink site the author writes."
 [[sink]]
+path = "new_promise"
+receiver = "WorkflowContext"
+reason = "context.rs `new_promise` -> `record_promise` -> `side_effect`* (`*` = the `push_command` site, issue #1985). Every argument is recorded into history and matched on replay. DUAL ROLE (see `[[sanctioned]]`)."
+[[sink]]
 path = "new_uuid"
 receiver = "WorkflowContext"
 reason = "context.rs:5109; emits a command transitively: new_uuid -> capture_builtin -> capture_builtin_validated* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
@@ -1090,9 +1099,21 @@ receiver = "WorkflowContext"
 step = "patch"
 reason = "context.rs:5420 pushes `WorkflowCommand::RecordMarker` (context.rs:5438) and matches it. DUAL ROLE (see `[[sanctioned]]`)."
 [[sink]]
+path = "promise"
+receiver = "WorkflowContext"
+reason = "context.rs `promise` -> `record_promise` -> `side_effect`* (`*` = the `push_command` site, issue #1985). A tainted key is still a finding: the key names the signal that the workflow waits on. DUAL ROLE (see `[[sanctioned]]`)."
+[[sink]]
 path = "race"
 receiver = "WorkflowContext"
 reason = "context.rs:11038 returns a `RaceBuilder`; `RaceBuilder::run` (context.rs:1600) calls `ctx.race_impl`, which pushes `StartChildWorkflow`/`StartTimer`/`WaitForSignal`/`CancelRaceLosers` (context.rs:8217-8356). Branch selection is recorded, so the set and order of branches must be deterministic."
+[[sink]]
+path = "cancellation_scope"
+receiver = "WorkflowContext"
+reason = "cancellation_scope.rs:531 returns a `CancellationScope`; `ScopeRun` records the `cancel_scope:{seq}` marker and pushes `CancelRaceLosers` (cancellation_scope.rs:340). The builder emits nothing, but its handle is only useful by emitting."
+[[sink]]
+path = "non_cancellable"
+receiver = "WorkflowContext"
+reason = "cancellation_scope.rs:569 returns `NonCancellable`, which pushes the `non_cancellable_open:{seq}` and `non_cancellable_close:{seq}` markers through `record_shield_marker` (cancellation_scope.rs:461) and matches them on replay."
 [[sink]]
 path = "random_f64"
 receiver = "WorkflowContext"
@@ -1115,10 +1136,18 @@ receiver = "WorkflowContext"
 step = "signal"
 reason = "context.rs:8448; emits a command transitively: receive_signal -> wait_for_signal* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
+path = "receive_signal_matching"
+receiver = "WorkflowContext"
+reason = "context.rs `receive_signal_matching` -> `wait_for_signal_matching` -> `begin_signal_wait`* (`*` = the `push_command` site, issue #1985). Every argument is recorded or matched on replay. The predicate closure is analysed: a non-deterministic predicate takes a different signal on replay."
+[[sink]]
 path = "receive_signal_timeout"
 receiver = "WorkflowContext"
 step = "signal"
 reason = "context.rs:8992; emits a command transitively: receive_signal_timeout -> wait_for_signal_timeout -> wait_for_signal_timeout_with_timer_id* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
+[[sink]]
+path = "reject_promise"
+receiver = "WorkflowContext"
+reason = "context.rs `reject_promise` -> `settle_promise` -> `signal_external_workflow_with_idempotency` -> `dispatch_signal_command`* (`*` = the `push_command` site, issue #1985). Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "request_cancel_external_workflow"
 receiver = "WorkflowContext"
@@ -1128,13 +1157,17 @@ path = "request_cancel_external_workflow_by_id"
 receiver = "WorkflowContext"
 reason = "context.rs:9447; emits a command transitively: request_cancel_external_workflow_by_id -> request_cancel_external_target -> dispatch_cancel_command* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
 [[sink]]
+path = "resolve_promise"
+receiver = "WorkflowContext"
+reason = "context.rs `resolve_promise` -> `settle_promise` -> `signal_external_workflow_with_idempotency` -> `dispatch_signal_command`* (`*` = the `push_command` site, issue #1985). Every argument is recorded into history and matched on replay."
+[[sink]]
 path = "reset_timer"
 receiver = "WorkflowContext"
 reason = "context.rs:7041; calls `push_command` directly. Every argument is recorded into history and matched on replay."
 [[sink]]
 path = "should_continue_as_new"
 receiver = "WorkflowContext"
-reason = "context.rs:4361 -> `deadline_fraction_reached` (4382) -> `deadline_clock_read` (4478), which pushes `RecordSideEffect{Now, DEADLINE_PROBE}` at the live frontier. DUAL ROLE (see `[[sanctioned]]`): the doc at context.rs:4335-4360 states the replay-safety contract (\"when this returns true the workflow must call continue_as_new\")."
+reason = "context.rs:4361 -> `deadline_fraction_reached` (4382) -> `deadline_clock_read` (4478), which pushes `RecordSideEffect{Now, DEADLINE_PROBE}` at the live frontier. Each live call also pushes `RecordSideEffect{Custom, __harvest_continue_as_new}`. DUAL ROLE (see `[[sanctioned]]`): the doc at context.rs:4335-4360 states the replay-safety contract (\"when this returns true the workflow must call continue_as_new\")."
 [[sink]]
 path = "side_effect"
 receiver = "WorkflowContext"
@@ -1280,6 +1313,10 @@ receiver = "WorkflowContext"
 step = "signal"
 reason = "context.rs:8684; calls `push_command` directly. Every argument is recorded into history and matched on replay."
 [[sink]]
+path = "wait_for_signal_matching"
+receiver = "WorkflowContext"
+reason = "context.rs `wait_for_signal_matching` -> `begin_signal_wait`* (`*` = the `push_command` site, issue #1985). Every argument is recorded or matched on replay. The predicate closure is analysed: a non-deterministic predicate takes a different signal on replay."
+[[sink]]
 path = "wait_for_signal_timeout"
 receiver = "WorkflowContext"
 step = "signal"
@@ -1310,6 +1347,22 @@ path = "await_fire"
 receiver = "TimerHandle"
 reason = "context.rs:1147 -> `WorkflowContext::await_timer_fire`; suspends on a recorded timer."
 [[sink]]
+path = "wait"
+receiver = "DurablePromise"
+reason = "durable_promise.rs:321 -> `WorkflowContext::wait_for_signal` (context.rs:9171), which pushes `WaitForSignal` and matches `SignalReceived` history (issue #1985)."
+[[sink]]
+path = "wait_timeout"
+receiver = "DurablePromise"
+reason = "durable_promise.rs:338 -> `WorkflowContext::wait_for_signal_timeout` (context.rs:9593), which arms a timer and races `WaitForSignal` against it (issue #1985)."
+[[sink]]
+path = "run"
+receiver = "CancellationScope"
+reason = "cancellation_scope.rs:242 returns `ScopeRun`, which records the `cancel_scope:{seq}` marker and pushes `CancelRaceLosers` (cancellation_scope.rs:340). The cancel decision is recorded."
+[[sink]]
+path = "cancel"
+receiver = "CancellationScope"
+reason = "cancellation_scope.rs:257 sets the flag that makes `ScopeRun` record its cancel marker. A tainted decision to call it changes the command stream."
+[[sink]]
 path = "run"
 receiver = "RaceBuilder"
 reason = "context.rs:1600 -> `WorkflowContext::race_impl`, which pushes `StartChildWorkflow`/`StartTimer`/`WaitForSignal`/`CancelRaceLosers` (context.rs:8217-8356). The branch set and its order are recorded."
@@ -1331,7 +1384,7 @@ reason = "context.rs:2517 -> `execute_activity_raw_full`; closing a session is i
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # AC4's list, plus the members of the deadline family that the audit found to be
-# replay-stable. Thirteen of these rows are DUAL ROLE: they also appear in
+# replay-stable. Fifteen of these rows are DUAL ROLE: they also appear in
 # `[[sink]]`, because the primitive records its result and a tainted decision to
 # call it still diverges the command stream. Modelling `side_effect` as sanctioned
 # only (return clean, call ignored) would silently drop the control-taint finding
@@ -1350,9 +1403,17 @@ path = "now"
 receiver = "WorkflowContext"
 reason = "context.rs:3892 returns the recorded `WorkflowStarted` timestamp (`self.start_time`), not a live clock. Replay-stable by construction."
 [[sanctioned]]
+path = "new_promise"
+receiver = "WorkflowContext"
+reason = "issue #1985. The token is recorded through `side_effect` and replays verbatim, so the returned promise handle is clean."
+[[sanctioned]]
 path = "new_uuid"
 receiver = "WorkflowContext"
 reason = "context.rs:5109 \"Deterministic UUID (version 7), captured once and replayed verbatim.\" AC4 replacement for `Uuid::new_v4`."
+[[sanctioned]]
+path = "promise"
+receiver = "WorkflowContext"
+reason = "issue #1985. The token is recorded through `side_effect` and replays verbatim, so the returned promise handle is clean."
 [[sanctioned]]
 path = "random_u64"
 receiver = "WorkflowContext"
@@ -1438,6 +1499,10 @@ reason = "context.rs:4695; the recorded cancellation reason."
 path = "check_cancellation"
 receiver = "WorkflowContext"
 reason = "context.rs:4728; returns `Err(Cancelled)` from the same recorded field. No command."
+[[non_sink]]
+path = "continued_from"
+receiver = "WorkflowContext"
+reason = "context.rs:4600; run-identity metadata from the execution row, fixed at start and identical on every replay and every worker."
 [[non_sink]]
 path = "drain_commands"
 receiver = "WorkflowContext"
@@ -1579,6 +1644,10 @@ path = "set_current_details"
 receiver = "WorkflowContext"
 reason = "context.rs:13164. Pushes `SetCurrentDetails`, but returns at the top when `is_replaying()` (context.rs:13165-13167), so the command never participates in history matching. Modelling it as a sink would turn 13 of the 310 real `ctx.` call sites in this repo's examples into findings."
 [[non_sink]]
+path = "start_source"
+receiver = "WorkflowContext"
+reason = "context.rs:4594; run-identity metadata from the execution row, fixed at start and identical on every replay and every worker."
+[[non_sink]]
 path = "state"
 receiver = "WorkflowContext"
 reason = "context.rs:4669; typed shared state injected by the worker builder. Whether that state is deterministic is a property of the injected value, tracked by the ambient-root rules, not of this accessor."
@@ -1671,6 +1740,10 @@ path = "with_payload_offload_threshold"
 receiver = "WorkflowContext"
 reason = "context.rs:3702; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
 [[non_sink]]
+path = "with_pending_cancellation"
+receiver = "WorkflowContext"
+reason = "context.rs:4262; builder-style setter called by the executor or a backend before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
 path = "with_queue_name"
 receiver = "WorkflowContext"
 reason = "context.rs:3779; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
@@ -1678,6 +1751,10 @@ reason = "context.rs:3779; builder-style setter called by the worker/test harnes
 path = "with_shard_router"
 receiver = "WorkflowContext"
 reason = "context.rs:7260; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
+[[non_sink]]
+path = "with_start_provenance"
+receiver = "WorkflowContext"
+reason = "context.rs:4281; builder-style setter called by the worker/test harness before the workflow body runs. Emits no command and reads nothing ambient."
 [[non_sink]]
 path = "with_workflow_id"
 receiver = "WorkflowContext"
@@ -1765,6 +1842,10 @@ reason = "Activity-side: context.rs:14688; saturating remaining time against the
 path = "is_expiring_within"
 receiver = "ActivityContext"
 reason = "Activity-side: context.rs:14711; a live-clock predicate, activity-side."
+[[non_sink]]
+path = "check_llm_budget"
+receiver = "ActivityContext"
+reason = "Activity-side: context.rs:15241; reads the LLM spend of the run and its tenant (issue #1997). A read of `harvest_llm_ledger`, not a `harvest_events` write and not a workflow command."
 [[non_sink]]
 path = "idempotency_key"
 receiver = "ActivityContext"
@@ -2203,10 +2284,11 @@ reason = "Existential quantification; see `all`."
 path = "contains"
 clears = "order"
 reason = "Membership is order-independent."
-[[reduction]]
-path = "fold"
-clears = "order"
-reason = "NOT order-independent in general — `fold` with a non-commutative accumulator IS order-sensitive. Listed with `clears = \"order\"` would be wrong, so this row is deliberately absent from the analyzer's effective set: see the note in the `reverse` sanitizer row for the same device. Kept as a documented non-rule so a future contributor does not add it."
+# No `fold` row. `fold` with a non-commutative accumulator IS order-sensitive,
+# so a row with `clears = "order"` would be wrong. An earlier revision kept such
+# a row as a "documented non-rule", but with no receiver it matched every
+# `fold` call and cleared hash order through `map.keys().fold(..)`. This
+# comment records the decision instead. Do not add the row.
 [[reduction]]
 path = "get"
 receiver = "HashMap"
@@ -2339,6 +2421,10 @@ reason = "serde_json::to_value, a `[[trusted]]` crate's free function that rustc
 [[std_free_fn]]
 path = "from_value"
 reason = "serde_json::from_value, the decoding half of `to_value` and trimmed the same way. Verified in the dumps: `from_value::<bool>(move _N)` with a `serde_json::Value` argument and a `std::result::Result<bool, serde_json::Error>` destination — again the crate is named only in types that are the CALLER's, not the callee's."
+
+[[std_free_fn]]
+path = "to_vec"
+reason = "serde_json::to_vec, the byte-vector sibling of `to_value`, trimmed the same way. Verified in the `autumn-harvest-agent` dump: `_2 = to_vec::<T>(copy _1)` with `_1: &T` and `_2: std::result::Result<std::vec::Vec<u8>, serde_json::Error>` — the crate is named only in the RESULT, the caller's type. A structural walk over the value. The method `<[T]>::to_vec` prints with its receiver (`slice::<impl [T]>::to_vec`), so this bare row never stands in for it."
 
 [[std_free_fn]]
 path = "display"

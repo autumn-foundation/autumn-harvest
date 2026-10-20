@@ -49,12 +49,25 @@ struct ThrottleArgs {
     schedule_to_start: Option<String>,
 }
 
-/// Per-tenant resource quota (issue #946). `key` is required; each of the
-/// three caps is independently optional -- a policy may declare just one,
-/// two, or all three (mirroring `QuotaPolicy`'s own `with_*` builder chain).
+/// The LLM budget keys of `quota(...)` (issue #1997). Each maps to the
+/// `QuotaPolicy` builder of the same name with a `with_` prefix.
+const LLM_QUOTA_KEYS: [&str; 5] = [
+    "max_run_llm_tokens",
+    "max_run_llm_cost_usd_micros",
+    "max_tenant_llm_tokens",
+    "max_tenant_llm_cost_usd_micros",
+    "tenant_llm_window_secs",
+];
+
+/// Per-tenant resource quota (issue #946). `key` is required. Each admission
+/// cap and each LLM cap (issue #1997) is optional, as in the `with_*` builder
+/// chain of `QuotaPolicy`.
 struct QuotaArgs {
     key_expr: String,
     max_active_executions: Option<u32>,
+    /// The LLM caps and the tenant window (issue #1997), in the order of
+    /// [`LLM_QUOTA_KEYS`].
+    llm: [Option<u64>; 5],
     /// Already parsed at attribute-parse time via [`parse_byte_size_macro`]
     /// (e.g. `"10MiB"` -> `10_485_760`), mirroring `#[workflow(max_input_bytes
     /// = "8MiB")]`'s own compile-time byte-size validation -- a typo is a
@@ -112,7 +125,7 @@ struct WorkflowAttrs {
     /// Per-tenant resource quota (issue #946). Parsed from
     /// `#[workflow(quota(key = "input.tenant_id", max_active_executions = 100,
     /// max_history_bytes = "10MiB", max_dead_letters = 50))]`. `key` is
-    /// required; the three caps are each independently optional.
+    /// required. Each cap is optional.
     quota: Option<QuotaArgs>,
     /// Per-workflow-type cap override in bytes (issue #252). Parsed from
     /// `#[workflow(max_input_bytes = "8MiB")]` at compile time.
@@ -584,6 +597,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             });
             Ok(())
         } else if meta.path.is_ident("quota") {
+            let mut llm: [Option<u64>; 5] = [None; 5];
             let mut key_expr: Option<String> = None;
             let mut max_active_executions: Option<u32> = None;
             let mut max_history_bytes: Option<u64> = None;
@@ -625,9 +639,33 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
                     let n: u32 = value.base10_parse()?;
                     max_dead_letters = Some(n);
                     Ok(())
+                } else if let Some(slot) = LLM_QUOTA_KEYS
+                    .iter()
+                    .position(|name| inner.path.is_ident(name))
+                {
+                    let value: syn::LitInt = inner.value()?.parse()?;
+                    // The window is a `u32` of seconds. Each cap is a `u64`.
+                    llm[slot] = Some(if LLM_QUOTA_KEYS[slot] == "tenant_llm_window_secs" {
+                        let secs = value.base10_parse::<u32>()?;
+                        // A zero window counts no spend, so the tenant caps
+                        // would never refuse a step.
+                        if secs == 0 {
+                            return Err(syn::Error::new_spanned(
+                                &value,
+                                "quota `tenant_llm_window_secs` must be at least 1",
+                            ));
+                        }
+                        u64::from(secs)
+                    } else {
+                        value.base10_parse::<u64>()?
+                    });
+                    Ok(())
                 } else {
                     Err(inner.error(
-                        "expected `key`, `max_active_executions`, `max_history_bytes`, or `max_dead_letters`",
+                        "expected `key`, `max_active_executions`, `max_history_bytes`, \
+                         `max_dead_letters`, `max_run_llm_tokens`, `max_run_llm_cost_usd_micros`, \
+                         `max_tenant_llm_tokens`, `max_tenant_llm_cost_usd_micros`, or \
+                         `tenant_llm_window_secs`",
                     ))
                 }
             })?;
@@ -637,6 +675,7 @@ fn parse_attrs(attr: TokenStream) -> syn::Result<WorkflowAttrs> {
             result.quota = Some(QuotaArgs {
                 key_expr,
                 max_active_executions,
+                llm,
                 max_history_bytes,
                 max_dead_letters,
             });
@@ -1009,6 +1048,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Some(QuotaArgs {
             key_expr,
             max_active_executions,
+            llm,
             max_history_bytes,
             max_dead_letters,
         }) => {
@@ -1023,6 +1063,16 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
             if let Some(n) = max_dead_letters {
                 policy = quote! { #policy.with_max_dead_letters(#n) };
+            }
+            for (name, value) in LLM_QUOTA_KEYS.iter().zip(llm) {
+                let Some(value) = value else { continue };
+                let setter = quote::format_ident!("with_{}", name);
+                policy = if *name == "tenant_llm_window_secs" {
+                    let secs = u32::try_from(value).unwrap_or(u32::MAX);
+                    quote! { #policy.#setter(#secs) }
+                } else {
+                    quote! { #policy.#setter(#value) }
+                };
             }
             quote! { ::std::option::Option::Some(#policy) }
         }
@@ -1078,6 +1128,30 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // clone-cheap.
     let declared_activities_expr = declaration_expr(attrs.declared_activities.as_deref());
     let declared_children_expr = declaration_expr(attrs.declared_children.as_deref());
+
+    // Shared by `start_with_options` and `signal_with_start` below, which
+    // read both fields identically (see `optional_chrono_duration_tokens`'s
+    // doc comment).
+    let stub_execution_timeout_tokens = crate::attr_util::optional_chrono_duration_tokens(
+        "execution_timeout",
+        &quote! { opts.execution_timeout.or(info.execution_timeout) },
+    );
+    let stub_max_execution_timeout_ceiling_tokens =
+        crate::attr_util::optional_chrono_duration_tokens(
+            "max_execution_timeout_ceiling",
+            &quote! { client.max_workflow_execution_timeout() },
+        );
+    // `start_with_options`-only (issue #617): `signal_with_start` and
+    // `update.rs`'s `update_with_start` pass `None` for both instead.
+    let stub_chain_execution_timeout_tokens = crate::attr_util::optional_chrono_duration_tokens(
+        "chain_execution_timeout",
+        &quote! { info.chain_execution_timeout },
+    );
+    let stub_max_workflow_chain_timeout_ceiling_tokens =
+        crate::attr_util::optional_chrono_duration_tokens(
+            "max_workflow_chain_timeout_ceiling",
+            &quote! { client.max_workflow_chain_timeout() },
+        );
 
     quote! {
         #warnings_tokens
@@ -1204,47 +1278,15 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         (None, None, ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer)
                     };
 
-                    let execution_timeout = match opts.execution_timeout.or(info.execution_timeout) {
-                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                    "execution_timeout exceeds chrono duration range".to_string()
-                                ))?
-                        ),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    };
+                    let execution_timeout = #stub_execution_timeout_tokens;
 
-                    let max_execution_timeout_ceiling = match client.max_workflow_execution_timeout() {
-                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                    "max_execution_timeout_ceiling exceeds chrono duration range".to_string()
-                                ))?
-                        ),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    };
+                    let max_execution_timeout_ceiling = #stub_max_execution_timeout_ceiling_tokens;
 
                     // Chain-scoped lifetime cap (issue #617). Resolved from the
                     // workflow-type default and the fleet-wide ceiling, at parity
                     // with the per-run `execution_timeout` above.
-                    let chain_execution_timeout = match info.chain_execution_timeout {
-                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                    "chain_execution_timeout exceeds chrono duration range".to_string()
-                                ))?
-                        ),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    };
-                    let max_workflow_chain_timeout_ceiling = match client.max_workflow_chain_timeout() {
-                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                    "max_workflow_chain_timeout_ceiling exceeds chrono duration range".to_string()
-                                ))?
-                        ),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    };
+                    let chain_execution_timeout = #stub_chain_execution_timeout_tokens;
+                    let max_workflow_chain_timeout_ceiling = #stub_max_workflow_chain_timeout_ceiling_tokens;
 
                     let max_workflow_start_delay = {
                         let ceiling_chrono = ::autumn_harvest::chrono::Duration::from_std(client.max_workflow_start_delay())
@@ -1269,6 +1311,7 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         concurrency_limit,
                         concurrency_on_conflict,
                         priority: opts.priority.unwrap_or_default(),
+                        fairness_key: opts.fairness_key,
                         max_workflow_input_bytes: client.max_workflow_input_bytes(info.max_input_bytes),
                         start_at: opts.start_at,
                         delay: opts.delay,
@@ -1333,25 +1376,9 @@ pub fn workflow_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         (None, None, ::autumn_harvest::concurrency::ConcurrencyOnConflict::Defer)
                     };
 
-                    let execution_timeout = match opts.execution_timeout.or(info.execution_timeout) {
-                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                    "execution_timeout exceeds chrono duration range".to_string()
-                                ))?
-                        ),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    };
+                    let execution_timeout = #stub_execution_timeout_tokens;
 
-                    let max_execution_timeout_ceiling = match client.max_workflow_execution_timeout() {
-                        ::std::option::Option::Some(d) => ::std::option::Option::Some(
-                            ::autumn_harvest::chrono::Duration::from_std(d)
-                                .map_err(|_| ::autumn_harvest::error::HarvestError::Config(
-                                    "max_execution_timeout_ceiling exceeds chrono duration range".to_string()
-                                ))?
-                        ),
-                        ::std::option::Option::None => ::std::option::Option::None,
-                    };
+                    let max_execution_timeout_ceiling = #stub_max_execution_timeout_ceiling_tokens;
 
                     // Note (issue #617): this typed-stub signal-with-start passes
                     // `None` for the two chain-cap fields below, so it does NOT

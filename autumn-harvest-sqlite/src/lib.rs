@@ -88,21 +88,20 @@
 //!   single-server (no fleet to de-synchronize), and retry timing (`run_at`) is not
 //!   recorded in `harvest_events`, so the base delay is behaviorally equivalent with
 //!   ZERO replay / byte-identity impact (Codex #1069 P2, `worker.rs:325`).
-//! - **Activity `start_to_close` timeouts are honored.** The declared/per-call
-//!   `start_to_close` (from `#[activity(start_to_close = "…")]` /
-//!   `execute_activity_with_opts`) flows through the scheduling command's
-//!   `start_to_close_override`; the backend persists it (milliseconds) on the task
-//!   row and the worker enforces it as a **post-execution outcome** (issue #1069 P2):
-//!   a synchronous body cannot be cancelled mid-flight in a single-writer runtime, so
-//!   a body whose real wall-clock runtime exceeds its budget records a **terminal**
-//!   `ActivityTimedOut { StartToClose }` (the workflow observes
-//!   [`HarvestError::Timeout`](autumn_harvest::HarvestError::Timeout) and drives its
-//!   own timeout branch) instead of `ActivityCompleted` — byte-equivalent to the
-//!   durable event the Postgres timeout scanner records. The recorded history is
-//!   byte-equivalent even though the wall-clock behavior (the body runs to completion
-//!   before the timeout is recorded) differs, and it is replay-safe: the outcome is
-//!   recorded once and replay never re-runs the body. `None` = no budget (unbounded,
-//!   the prior behavior for every un-timed activity).
+//! - **Activity `start_to_close` timeouts are honored.** The declared or per-call
+//!   `start_to_close` comes from `#[activity(start_to_close = "…")]` or
+//!   `execute_activity_with_opts`. It flows through the scheduling command's
+//!   `start_to_close_override`. The backend persists it in milliseconds on the task
+//!   row. The worker enforces it as a **post-execution outcome** (issue #1069 P2).
+//!   The drive does not cancel a body mid-flight in a single-writer runtime. So a
+//!   body that runs past its budget records a **terminal**
+//!   `ActivityTimedOut { StartToClose }` instead of `ActivityCompleted`. The
+//!   workflow observes [`HarvestError::Timeout`](autumn_harvest::HarvestError::Timeout)
+//!   and drives its own timeout branch. The event is byte-equivalent to the one the
+//!   Postgres timeout scanner records. The wall-clock behavior differs: the body
+//!   runs to completion before the timeout is recorded. The history stays
+//!   replay-safe, because the outcome is recorded once and replay never re-runs the
+//!   body. `None` means no budget, so the activity is unbounded, as before.
 //! - **Typed workflow failures preserve their metadata.** A `#[workflow]` returning a
 //!   typed [`WorkflowFailure`](autumn_harvest::failure::WorkflowFailure) (issue #767)
 //!   is decoded from its `harvest_workflow_failure_v1` wire envelope before the
@@ -118,6 +117,22 @@
 //!   `harvest_activity_failure_v1` envelope) — byte-equivalent to the Postgres worker's
 //!   `finalize_activity_failure` (issue #1069 P2). A legacy `Err(String)` decodes to
 //!   `error_type = "Error"`, `non_retryable = false`, `details = None`, unchanged.
+//! - **Payload depth is capped at ingress and on activity output** (issues #2157 and
+//!   #2216). `serde_json` reads at most
+//!   128 levels. A start input, memo, signal payload or update input that nests deeper than
+//!   [`MAX_PAYLOAD_DEPTH`] is refused with [`SqliteError::PayloadTooDeep`] before
+//!   anything is persisted. The run stays live and the driver stays healthy.
+//!   An activity result that nests too deep becomes a non-retryable
+//!   [`PAYLOAD_TOO_DEEP_ERROR_TYPE`] failure, for a remote or a local activity.
+//!   The workflow sees the failure. A local failure keeps only its message. A
+//!   heartbeat that nests too deep is dropped, and the last good checkpoint stays.
+//!   A too-deep result or heartbeat is never stored.
+//!   A value from workflow code (issue #2224) is refused at the call site with
+//!   `HarvestError::PayloadTooDeep`. That covers activity, local activity, child and
+//!   continue-as-new input, external signal payloads and side-effect values. The
+//!   workflow can handle the error. A workflow result that nests too deep fails the
+//!   run with a non-retryable [`PAYLOAD_TOO_DEEP_ERROR_TYPE`] failure. An update
+//!   result that nests too deep fails the update.
 //! - **Payload-size caps are enforced at every boundary, matching the core** (issue
 //!   #252). A caller-supplied payload that exceeds its byte cap is refused before it
 //!   can enter `harvest_events`, so this backend never stores an unbounded history
@@ -164,13 +179,11 @@
 //!     Ok(greeting)
 //! }
 //!
-//! // The `#[activity]` supplies the macro-generated `say_hello_info()` (name +
-//! // any declared `#[activity(...)]` defaults). This backend runs a caller-supplied
-//! // SYNCHRONOUS body — the async fn body below is a placeholder for the shared
-//! // `ActivityInfo`; the closure registered against it is what actually runs.
+//! // The `#[activity]` body runs with a real `ActivityContext` (issue #2024).
+//! // The same fn runs unchanged on the Postgres backend.
 //! #[activity]
-//! async fn say_hello(_ctx: &ActivityContext, name: String) -> Result<String, String> {
-//!     Ok(format!("hello {name}"))
+//! async fn say_hello(ctx: &ActivityContext, name: String) -> Result<String, String> {
+//!     Ok(format!("hello {name}, attempt {}", ctx.attempt()))
 //! }
 //!
 //! # async fn run() -> Result<(), autumn_harvest_sqlite::SqliteError> {
@@ -178,12 +191,10 @@
 //! rt.register_workflow(&greet_info());
 //! // The audited, `ActivityInfo`-driven registration: any declared `#[activity(...)]`
 //! // default is HONORED (e.g. `schedule_to_close`) or REJECTED LOUDLY at setup, never
-//! // silently dropped. Use `register_activity_raw(name, ActivitySpec::new(..))` for a
-//! // hand-made body that carries no declared defaults.
-//! rt.register_activity(&say_hello_info(), |input| {
-//!     let name: String = serde_json::from_value(input).unwrap_or_default();
-//!     Ok(serde_json::json!(format!("hello {name}")))
-//! });
+//! // silently dropped. Use `register_activity_with_body` to run a synchronous stub
+//! // in place of the body, or `register_activity_raw(name, ActivitySpec::new(..))`
+//! // for a hand-made body that carries no declared defaults.
+//! rt.register_activity(&say_hello_info());
 //!
 //! let exec = rt.start_workflow("greet", serde_json::json!("world"))?;
 //! rt.run_until_blocked(exec).await?;
@@ -191,11 +202,67 @@
 //! # }
 //! ```
 //!
+//! # Child workflows and commands between runs (issue #2026)
+//!
+//! A workflow can start a child, await another run, and signal or cancel
+//! another run. Each command takes effect in the caller's decision
+//! transaction. One database holds every run, so the backend needs no outbox.
+//!
+//! - **Attached child** — `ctx.spawn_child_workflow(...)`. The parent records
+//!   `ChildWorkflowStarted`. The child gets its own row, with a parent link.
+//!   Its `workflow_id` is its execution id. Its terminal writes
+//!   `ChildWorkflowCompleted` or `ChildWorkflowFailed` to the parent in the
+//!   same transaction. A typed failure keeps `error_type`, `details` and
+//!   `non_retryable`. A cancelled child fails the parent's await with
+//!   `child workflow cancelled: <reason>`, and a terminated child with
+//!   `child workflow terminated: <reason>`. A child cannot continue as new.
+//!   It fails with the Postgres text instead. A parent child-timeout deadline
+//!   that is due fires first, so a late child loses to it, as on Postgres.
+//! - **Detached child** — `ctx.spawn_child_workflow_detached(...)`. The parent
+//!   records `ChildWorkflowSpawnedDetached` and does not wait. When the parent
+//!   closes, `request_cancel` cancels a running child (reason `parent closed`),
+//!   `terminate` fails it (`ParentClosed`), and `abandon` leaves it. The parent
+//!   records `ChildWorkflowCascadeApplied` for each child it cascades to. The
+//!   cascade reaches every level of a chain of detached children.
+//! - **Await** — `ctx.await_external_workflow(...)` reads another run's result.
+//!   A running target leaves the await open. Each later cycle checks it again.
+//!   An await follows a target that continues as new to its last run.
+//! - **Signal** — `ctx.signal_external_workflow(...)`, also by workflow id.
+//!   A running target gets a staged signal. A terminal target fails the call
+//!   with `target_terminal`, or `not_running` by workflow id. An idempotency
+//!   key that the target already holds reports delivered and stages nothing.
+//!   By workflow id, the key dedups across every run of that id. A keyed row
+//!   stays when its run closes, so the dedup outlives a cancel.
+//! - **Cancel** — `ctx.request_cancel_external_workflow(...)`, also by workflow
+//!   id. A running target ends `CANCELLED` with reason `cancelled by external
+//!   request`. Its body does not run again, unlike the cooperative
+//!   [`SqliteRuntime::cancel`]. This matches Postgres. A terminal target is a no-op
+//!   success. A run that its own cancel seals, through a cascade, applies no
+//!   more of its batch.
+//!
+//! An unknown target fails at once with `target_unknown`. Postgres waits a
+//! grace window first, because another shard can still create the run. One
+//! file has no other shard, so its answer is final.
+//!
+//! A run that waits on a `RUNNING` child or await target parks as
+//! [`RunState::WaitingWorkflow`]. [`SqliteRuntime::run_until_blocked`] then
+//! drives each such run in the same call. When all of them block, the waiter
+//! returns `WaitingWorkflow` naming the run it waits on directly. The fleet
+//! drivers treat it as blocked. A drive that starts an unregistered child
+//! workflow returns [`SqliteError::UnknownWorkflow`]. The cycle rolls back,
+//! and the parent stays `RUNNING`.
+//!
+//! A child is a full run. `ctx.info().parent_execution_id` names its parent.
+//! [`SqliteRuntime::parent_execution`] reads the same link, and
+//! [`SqliteRuntime::outcome`] reads the child's result. A drive of a run that
+//! another run cancelled returns [`RunState::Cancelled`] with the reason.
+//!
 //! # Non-goals (see issue #1068 follow-ups)
 //!
 //! Out of scope for this backend: distributed / multi-writer workers, `LISTEN`/
-//! `NOTIFY` push wake-ups, multi-server crash recovery, schedules, the management
-//! API, retention, worker sessions, sharding, and DAGs.
+//! `NOTIFY` push wake-ups, multi-server crash recovery, the management API,
+//! worker sessions, sharding, and DAGs. Schedules and retention shipped under
+//! issue #2031.
 //!
 //! ## Start-boundary reuse policy — enforced (issue #1068)
 //!
@@ -223,20 +290,21 @@
 //!
 //! ### State-model restriction vs. the Postgres core
 //!
-//! This backend's execution state model is a strict subset of the core's: an
-//! active run is only ever `RUNNING` (there is no `PAUSED`), and the only terminal
-//! states it writes are `COMPLETED`, `FAILED`, and the `CONTINUED_AS_NEW` SEAL used
-//! by the reuse "replace" cases (it never writes a distinct `TIMED_OUT`, an active
-//! `CANCELLED`, or a distinct `TERMINATED`). So the reuse matrix is realized over
-//! `{none, RUNNING, COMPLETED, FAILED}` priors only:
+//! This backend's execution state model is a strict subset of the core's. An
+//! active run is only ever `RUNNING` (there is no `PAUSED`). The terminal states
+//! it writes are `COMPLETED`, `FAILED`, `CANCELLED` and `TERMINATED` (issue
+//! #2021), plus the `CONTINUED_AS_NEW` SEAL of the reuse "replace" cases. It never
+//! writes `TIMED_OUT`. The reuse lookup skips `TERMINATED` and `CONTINUED_AS_NEW`,
+//! so the reuse matrix is realized over
+//! `{none, RUNNING, COMPLETED, FAILED, CANCELLED}` priors only:
 //!
 //! - `AllowDuplicate` — attach to / return any non-sealed prior; else fresh.
 //! - `RejectDuplicate` — [`SqliteError::AlreadyExists`] for any non-sealed prior;
 //!   else fresh (a SEALED-only prior is invisible, so it creates fresh).
-//! - `AllowDuplicateFailedOnly` — replace (seal + fresh) a FAILED prior; return a
-//!   RUNNING/COMPLETED prior unchanged; else fresh. (Core also replaces a
-//!   `CANCELLED` prior, but this backend has no active `CANCELLED` state, so FAILED
-//!   is the only replace case.)
+//! - `AllowDuplicateFailedOnly` — replace (seal + fresh) a FAILED or `CANCELLED`
+//!   prior, as core does; return a RUNNING/COMPLETED prior unchanged; else fresh.
+//!   A `CANCELLED` prior comes from [`SqliteRuntime::cancel`] (issue #2021) or
+//!   from another run's cancel (issue #2026).
 //! - `TerminateIfRunning` — cancel (record `WorkflowCancelled` + clean up the
 //!   prior's PENDING tasks and unfired timers) then seal a RUNNING prior; seal an
 //!   already-terminal prior without a cancellation event; then start fresh. The
@@ -247,12 +315,27 @@
 //! See the per-method rustdoc on `start_workflow_with_reuse_policy` for the full
 //! matrix table.
 //!
+//! ## Cancel and terminate (issue #2021)
+//!
+//! [`SqliteRuntime::cancel`] is cooperative. It stores the request, and the next
+//! drive replays the body with `ctx.cancellation_reason()` set. The body can run
+//! cleanup activities. The run ends `CANCELLED` when the body returns, when it
+//! blocks with no activity task left, or when the cycle diverges or deadlocks.
+//! [`SqliteRuntime::terminate`] ends the run `TERMINATED` at once, and the body
+//! does not run again.
+//!
+//! Both paths append the core `WorkflowCancelled` event as the last event, as
+//! Postgres does. Cleanup events come before it. The history replays on the
+//! core `WorkflowReplayer` when the body checks the request before its next new
+//! command. Both paths delete pending tasks, unfired timers and unkeyed staged
+//! signals.
+//! The drives report [`RunState::Cancelled`] and [`RunState::Terminated`].
+//!
 //! ## Unsupported workflow primitives — rejected LOUDLY, by name
 //!
-//! Only the *fire-once* durable timer `ctx.timer(...)` is a supported timer. Every
-//! other out-of-subset primitive a workflow can reach surfaces as
-//! [`SqliteError::Unsupported`] whose message NAMES the specific
-//! `WorkflowCommand` (never an opaque `"Unknown"`, Codex #1069 P2) — a workflow
+//! Every out-of-subset primitive a workflow can reach surfaces as
+//! [`SqliteError::Unsupported`]. Its message NAMES the specific
+//! `WorkflowCommand`, never an opaque `"Unknown"` (Codex #1069 P2). A workflow
 //! author gets an actionable failure, not a silent gap.
 //!
 //! The run then ends `FAILED` (issue #1834). The drive rolls back the cycle and
@@ -262,35 +345,30 @@
 //! not run the handler again. The full v0.1 non-goal set, and the command each
 //! emits:
 //!
-//! - **Child workflows** — `ctx.spawn_child_workflow(...)` (`StartChildWorkflow`),
-//!   `ctx.spawn_child_workflow_detached(...)` (`SpawnDetachedChildWorkflow`).
-//! - **External signals / cancels** — `ctx.signal_external_workflow(...)`
-//!   (`SignalExternalWorkflow`), `ctx.request_cancel_external_workflow(...)`
-//!   (`RequestCancelExternalWorkflow`).
-//! - **Local activities** — `ctx.execute_local_activity(...)` (`RunLocalActivity`).
 //! - **External activities** — task-token activities (`ScheduleExternalActivity`).
-//! - **Search attributes** — `ctx.upsert_search_attributes(...)`
-//!   (`UpsertSearchAttributes`).
 //! - **A cross-type continue-as-new** — `ctx.continue_as_new_as_type(...)`
 //!   (`ContinueAsNew.new_workflow_type`). A same-type `continue_as_new` is
 //!   supported (issue #2023): see [Long-lived runs](#long-lived-runs-issue-2023).
 //! - **Worker sessions** — `ctx.create_session(...)` (issue #606; a session dispatch
 //!   carries the `session_id` / `schedule_to_start_override` `ScheduleActivity`
 //!   fields this single-writer backend cannot honor).
-//! - **Cancellable durable timers** — `ctx.start_timer(...)` and
-//!   `TimerHandle::await_fire`/`cancel`/`reset` (issue #768;
-//!   `ArmTimer`/`CancelTimer`). Use the fire-once `ctx.timer(...)` instead. These
-//!   were previously the opaque `Unsupported("Unknown")` (absent from the
-//!   command-name table); they are now named with a message pointing at the
-//!   supported alternative (Codex #1069 P2, `runtime.rs:840`).
+//! - **A batch that breaks a solo rule.** A mutex acquire must be the only
+//!   awaitable in its batch (`AcquireMutex`). A local activity cannot share a
+//!   batch with a durable awaitable (`RunLocalActivity`, issue #950). Postgres
+//!   rejects both shapes too. This backend also rejects a second local
+//!   activity in one batch.
 //!
 //! The command-name table (`runtime.rs`) is EXHAUSTIVE — a future core
 //! `WorkflowCommand` variant is a compile error in this backend, forcing an
 //! explicit supported / unsupported decision rather than a silent `"Unknown"`.
 //!
-//! Two benign bookkeeping commands are instead silently **no-ops** (they append no
-//! `WorkflowEvent` and gate no control flow): `ctx.set_current_details(...)` (the
-//! operator status breadcrumb, issue #593) and a re-park `WaitForActivity`.
+//! Six commands append no `WorkflowEvent`: `SetCurrentDetails`
+//! (`ctx.set_current_details`, the operator status breadcrumb, issue #593),
+//! `PublishProgress`, `PublishDurableProgress`, `RecordLog`, a re-park
+//! `WaitForActivity` and `WaitForSignal`. Postgres appends no event for them
+//! either. `WaitForSignal` only names the wait. The cycle-start ingest
+//! records the signal. The cross-backend conformance suite (issue #2030)
+//! checks each one against Postgres.
 //!
 //! **No `ScheduleActivity` field is silently dropped** (issue #1069 P2). Every
 //! author-declared field on the core `ScheduleActivity` command is either HONORED
@@ -318,27 +396,48 @@
 //! [`SqliteRuntime::set_history_event_hard_cap`] and
 //! [`SqliteRuntime::set_history_byte_hard_cap`].
 //!
+//! ## Timers, mutex, local activities, timeout and retry (issue #2029)
+//!
+//! Each primitive records the Postgres events, so its history replays on the
+//! core `WorkflowReplayer`.
+//!
+//! - **Cancellable timers.** `ctx.start_timer` appends `TimerStarted`. A parked
+//!   `TimerHandle::await_fire` arms the durable row once, so the deadline counts
+//!   from the first await. `cancel` deletes the unfired row and appends
+//!   `TimerCancelled`.
+//! - **Workflow mutex.** `ctx.mutex(key).acquire()` grants a free key to the
+//!   first run in its FIFO queue and appends `MutexGranted`. A run that waits
+//!   returns [`RunState::WaitingMutex`]. `lock_seq` fences each release. A run
+//!   that ends releases every lock and queue place it holds. No step wakes a
+//!   waiter: the fleet poll drives it again.
+//! - **Local activities.** `register_activity` accepts `#[activity(local =
+//!   true)]`. The cycle appends `LocalActivityScheduled`. The body runs inline
+//!   after the commit. Each attempt appends `LocalActivityFailed` or
+//!   `LocalActivityCompleted`, and a terminal failure adds
+//!   `LocalActivityExhausted`. A retry backoff ends the cycle. A drive before
+//!   its end returns [`RunState::WaitingTimer`].
+//! - **Execution timeout.** A start stores the deadline. Each cycle checks it
+//!   first. A run past it gets `WorkflowExecutionTimedOut`, ends `TIMED_OUT`,
+//!   and returns [`RunState::TimedOut`].
+//! - **Workflow retry.** A run that fails with a retryable error starts a retry
+//!   in the same transaction and appends `WorkflowRetryScheduled`.
+//!   [`SqliteRuntime::successor`] returns the retry. It waits for its backoff.
+//!
 //! ## Unsupported `WorkflowInfo`-level features — rejected at registration
 //!
 //! [`SqliteRuntime::register_workflow`](crate::SqliteRuntime::register_workflow)
-//! retains ONLY the workflow's `name` + `handler`. Every OTHER `WorkflowInfo` field
+//! retains the workflow's `name`, `handler`, `execution_timeout` and
+//! workflow-level `retry_policy` (issue #2029). Every OTHER `WorkflowInfo` field
 //! (populated by `#[workflow(...)]` attributes or the fluent builder) would
-//! otherwise be **silently dropped**. To close that class the SAME way the command
-//! layer already closes its own (above), `register_workflow` audits the incoming
-//! [`WorkflowInfo`](autumn_harvest::WorkflowInfo) and **PANICS at registration**
-//! (setup-time — mirroring the Postgres `HarvestPlugin::build()` panic on
-//! registration misconfiguration) if it declares an execution- or
-//! admission-affecting feature this v0.1 backend cannot honor, naming the specific
-//! feature and pointing at the supported alternative (Codex #1069 P2,
-//! `runtime.rs:602` `execution_timeout`, `:686` `retry_policy`). The partition:
+//! otherwise be **silently dropped**. `register_workflow` closes that class as
+//! the command layer closes its own (above). It audits the incoming
+//! [`WorkflowInfo`](autumn_harvest::WorkflowInfo). It **PANICS at registration**
+//! if the info declares an execution- or admission-affecting feature that this
+//! v0.1 backend cannot honor. The Postgres `HarvestPlugin::build()` panics on a
+//! misconfiguration in the same way. The panic names the feature and points at
+//! the supported alternative (Codex #1069 P2). The partition:
 //!
-//! - **REJECTED (would change lifecycle / admission / retry semantics if ignored):**
-//!   - `execution_timeout` (#243) — no execution-timeout scanner exists here, so a
-//!     declared hard deadline would never fire. Enforce a deadline inside the
-//!     workflow body with `ctx.timer(...)` / `ctx.sleep_until(...)` instead.
-//!   - workflow-level `retry_policy` — `#[workflow(retry(...))]` (#523) — no
-//!     workflow-level auto-retry orchestration here. Use per-activity retry
-//!     (`#[activity(retry = ...)]`, honored in full) or handle failure in the body.
+//! - **REJECTED (would change lifecycle or admission semantics if ignored):**
 //!   - `concurrency` (#247), `debounce` (#499), `batch` (#518), `throttle` (#607) —
 //!     pre-start admission-gate features with no single-writer analog.
 //!   - `quota` (#946) — per-tenant resource quota enforcement needs the shared
@@ -358,12 +457,13 @@
 //!   `catalog_consistency` deploy-time preflight check and its `/workflows/registered`
 //!   discovery endpoint, neither of which this backend has; the core execution path
 //!   never reads either field), and `module` (diagnostics).
-//! - **HONORED:** `name` (the registration key) and `handler` (the dispatch fn).
+//! - **HONORED:** `name` (the registration key), `handler` (the dispatch fn),
+//!   `execution_timeout` (#243) and the workflow-level `retry_policy` (#523). See
+//!   [issue #2029](#timers-mutex-local-activities-timeout-and-retry-issue-2029).
 //!
-//! Honoring the rejected features (execution-timeout enforcement, workflow-level
-//! retry orchestration, the admission gates) is real, out-of-v0.1-scope work tracked
-//! as issue #1068 follow-ups — hence rejection rather than a partial, silently-wrong
-//! implementation.
+//! Honoring the rejected admission gates is real, out-of-v0.1-scope work tracked
+//! as issue #1068 follow-ups — hence rejection rather than a partial,
+//! silently-wrong implementation.
 //!
 //! ## Unsupported `ActivityInfo`-level features — honored or rejected at registration
 //!
@@ -396,20 +496,23 @@
 //!     timeout is terminal here. Postgres retries it per the retry policy (issue
 //!     #1809, ADR 0005).
 //!   - `default_queue` — recorded on the task row (single-writer routing is a no-op).
-//! - **REJECTED (a dispatch-admission / cross-worker semantic with no single-writer
-//!   analog, or a cap raiser that would otherwise silently apply the STRICTER global
-//!   cap):** `default_heartbeat_timeout` (no heartbeating in the inline drain — use
-//!   `start_to_close` / `schedule_to_close`), `default_schedule_to_start` (no queue-wait
-//!   scanner), `circuit_breaker` (#369), `rate_limit_*` (#332), `max_concurrent` (#247),
-//!   `requires` (capability routing), `is_local` (local-activity `RunLocalActivity`
-//!   dispatch is a command-layer non-goal), and a raised `max_input_bytes` /
-//!   `max_result_bytes` (#252).
+//!   - `is_local` — the body runs inline as a local activity (issue #2029).
+//! - **REJECTED:** each is a dispatch-admission or cross-worker semantic with no
+//!   single-writer analog, or a cap raiser. A cap raiser would otherwise silently
+//!   apply the STRICTER global cap.
+//!   - `default_heartbeat_timeout`: no scanner times out a silent attempt. Use
+//!     `start_to_close` or `schedule_to_close`. `ctx.heartbeat(..)` itself works and
+//!     stores a checkpoint (issue #2024).
+//!   - `default_schedule_to_start`: no queue-wait scanner.
+//!   - `circuit_breaker` (#369), `rate_limit_*` (#332), `max_concurrent` (#247).
+//!   - `requires`: capability routing.
+//!   - `default_schedule_to_close` on a local activity, as on Postgres.
+//!   - A raised `max_input_bytes` / `max_result_bytes` (#252).
 //! - **ACCEPTED, inert:** `name` (registration key), `module` (diagnostics), and a lone
-//!   `concurrency_key` (groups a cap that is not set). The core async
-//!   `ActivityInfo::handler` is intentionally NOT used — this backend runs a
-//!   caller-supplied SYNCHRONOUS body (no `ActivityContext`, no I/O framework),
-//!   matching the crate's activity model, so `register_activity` takes both the
-//!   `&ActivityInfo` (for the audit + declared defaults) and the body.
+//!   `concurrency_key` (groups a cap that is not set).
+//! - **RUN:** `handler`. `register_activity` awaits the `#[activity]` body with a
+//!   real `ActivityContext` (issue #2024). `register_activity_with_body` runs a
+//!   synchronous closure in its place, after the same audit.
 //!
 //! **Signals.** Each decision cycle appends every staged signal to history
 //! (as `SignalReceived`) before replay, in arrival order (issue #2020). This
@@ -495,6 +598,19 @@
 //! either, so the call rejects it, as the Postgres engine does. A `RUNNING`
 //! execution stages the signal, and the next drive consumes it.
 //!
+//! **Keyed signals, signals by workflow id, and signal-with-start (issue
+//! #2028).**
+//! [`send_signal_idempotent`](crate::SqliteRuntime::send_signal_idempotent)
+//! stages a signal once per idempotency key. A partial unique index on
+//! `harvest_signals (exec_id, idempotency_key)` enforces the key.
+//! [`send_signal_by_workflow_id`](crate::SqliteRuntime::send_signal_by_workflow_id)
+//! signals the running run of a `(workflow_name, workflow_id)` key, and refuses
+//! a terminal one.
+//! [`signal_with_start`](crate::SqliteRuntime::signal_with_start) starts a run
+//! and signals it, or signals the run that exists, in one transaction.
+//! `send_signal_by_workflow_id` and `signal_with_start` dedupe a key across
+//! the whole chain of runs of the key.
+//!
 //! There is deliberately **no import/seed-a-foreign-history API**. The
 //! cross-backend guarantee (a history written here replays on the core engine) is
 //! export-shaped and needs none. A future edge → hub sync path that ingests an
@@ -578,6 +694,51 @@
 //!   shared with the Postgres engine. Put the activity branch first in a mixed
 //!   `join!`.
 //!
+//! # Queries (issue #2022)
+//!
+//! [`SqliteRuntime::query`] calls a handler that `ctx.register_query`
+//! registered. It loads the history, replays the run to its frontier, then
+//! calls the handler. It writes nothing. A running run answers with the state
+//! at its frontier. A terminal run answers with the state at its recorded
+//! end. One process holds the run, so a query needs no routing to a worker.
+//!
+//! # List, describe and search attributes (issue #2027)
+//!
+//! [`SqliteRuntime::list_executions`] returns one page of runs, newest first.
+//! [`ExecutionFilter`] filters by workflow name, execution id, workflow id
+//! prefix, state, start time and search-attribute equality. A page carries no
+//! payload. [`SqliteRuntime::visit_executions`] passes the same rows with
+//! their payloads, one row at a time. [`SqliteRuntime::describe`] reads one
+//! run.
+//!
+//! [`SqliteReader`] has the same three reads. It opens the file `READ_ONLY`
+//! and takes no writer lock, so it reads beside a live runtime.
+//!
+//! Each field is a [`Stored`] value. A damaged value is
+//! [`Stored::Unreadable`], so one bad row does not fail a page.
+//!
+//! `ctx.upsert_search_attrs` merges its patch into the row, in the cycle
+//! transaction, as on Postgres. [`SqliteRuntime::start_workflow_with_options`]
+//! sets the first search attributes and a memo. A continue-as-new and a
+//! workflow retry copy both to the successor.
+//!
+//! # Schedules, retention and the append-only guard (issue #2031)
+//!
+//! [`SqliteRuntime::upsert_schedule`] stores a core
+//! [`WorkflowSchedule`](autumn_harvest::policy::WorkflowSchedule). Each
+//! [`poll_once`](SqliteRuntime::poll_once) pass fires the due schedules, then
+//! drives the fleet. The slot moves in the start transaction, so a crash
+//! cannot fire a slot twice. A reopen keeps every slot. The slot arithmetic
+//! is the core [`schedule_plan`](autumn_harvest::schedule_plan) module, which
+//! the Postgres scheduler also calls.
+//!
+//! [`SqliteRuntime::purge_terminal`] removes each terminal run closed before
+//! its window, with all its rows. It keeps every live run.
+//!
+//! Two triggers keep `harvest_events` append-only, as the Postgres trigger of
+//! issue #1817 does. They refuse every `UPDATE`, and an `INSERT OR REPLACE`
+//! of a stored event. `DELETE` stays open for retention.
+//!
 //! # Deterministic side effects
 //!
 //! `ctx.system_now()`, `ctx.new_uuid()`, `ctx.random_*()`, and `ctx.side_effect()`
@@ -593,22 +754,40 @@
 //! deterministic primitive is **never** silently dropped, and a history written
 //! here always replays byte-identically on the core `WorkflowReplayer`.
 
+#[doc(hidden)]
+pub mod append_only;
+mod composition;
 mod error;
 mod history_cap;
 mod lock;
+mod mutex;
+mod query;
 mod queue;
+mod retention;
 mod runtime;
+mod schedule;
 mod schema;
 mod store;
 mod update;
+mod visibility;
 mod worker;
 
 pub use autumn_harvest::{ExecutionId, WorkflowEvent};
 
 pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
+pub use crate::query::DEFAULT_QUERY_TIMEOUT;
 pub use crate::runtime::{
-    ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SqliteRuntime, StartOutcome,
+    ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SignalDelivery, SignalWithStart,
+    SignalWithStartOutcome, SqliteRuntime, StartOptions, StartOutcome,
     UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
+// The depth cap is shared with the Postgres backend (issue #2225).
+pub use crate::schedule::ScheduleSummary;
 pub use crate::store::ActivityAttempt;
+pub use crate::visibility::{
+    DEFAULT_LIST_LIMIT, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,
+    ListCursor, MAX_FILTER_TERMS, MAX_LIST_LIMIT, SqliteReader, Stored,
+};
+#[doc(inline)]
+pub use autumn_harvest::payload_depth::{MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE};
