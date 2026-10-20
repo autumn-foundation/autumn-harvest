@@ -12,6 +12,9 @@
 //! With owner mode on and no tenure, a decision fails closed and writes
 //! nothing.
 //!
+//! A body-timeout quarantine with no tenure re-pends the task. It does not
+//! fail the run, and it does not strand the claim.
+//!
 //! Set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run these tests
 //! without Docker.
 
@@ -297,4 +300,98 @@ async fn owner_mode_without_a_tenure_fails_closed() {
         .await;
     worker.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+}
+
+/// A body-timeout quarantine with no tenure re-pends the task.
+///
+/// The quarantine is a decision write, so it needs the tenure of the run.
+/// With owner mode on and no tenure, it must not fail the run. It must also
+/// not leave the claim `RUNNING`, as only the stuck-task sweep would then
+/// free it.
+#[tokio::test]
+async fn a_quarantine_without_a_tenure_repends_the_task() {
+    #[derive(QueryableByName)]
+    struct Task {
+        #[diesel(sql_type = diesel::sql_types::Uuid)]
+        id: uuid::Uuid,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        error: Option<String>,
+    }
+    #[derive(QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    let (mut fx, _container) = Fixture::new().await;
+    let (workflow_id, _partition) = free_workflow_id();
+    let exec = fx.start(&workflow_id).await;
+    let shard = decision_owner::OwnerKey::pool_shard(None);
+
+    // The worker holds the claim at attempt 1 when its body times out.
+    let task = diesel::sql_query(
+        "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = $2, \
+         attempt = 1, started_at = NOW() WHERE workflow_exec_id = $1 \
+         RETURNING id, state, error",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(&fx.worker_id)
+    .get_result::<Task>(&mut fx.conn)
+    .await
+    .expect("claim the task");
+    let owned = decision_owner::OwnedPartitions::default();
+    owned.set_owner_mode(shard, true);
+
+    let recovery = autumn_harvest::worker::quarantine_workflow_task_timeout_owned(
+        &fx.pool,
+        task.id,
+        Some(exec.as_uuid()),
+        &fx.worker_id,
+        1,
+        "",
+        1,
+        10,
+        "owner_fenced_flow",
+        &fx.queue,
+        &fx.metrics,
+        &autumn_harvest::payload_codec::PayloadCodecs::default(),
+        &owned,
+        shard,
+    )
+    .await;
+    assert_eq!(
+        recovery,
+        autumn_harvest::worker::ClaimRecovery::ClaimLost,
+        "the next owner decides"
+    );
+
+    let after = diesel::sql_query("SELECT id, state, error FROM harvest_task_queue WHERE id = $1")
+        .bind::<diesel::sql_types::Uuid, _>(task.id)
+        .get_result::<Task>(&mut fx.conn)
+        .await
+        .expect("read the task");
+    assert_eq!(after.state, "PENDING", "the claim is not stranded");
+    assert!(
+        after
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("owner fence")),
+        "the re-pend names the fence: {:?}",
+        after.error
+    );
+    let dead = diesel::sql_query(
+        "SELECT count(*) AS n FROM harvest_dead_letters WHERE workflow_exec_id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid())
+    .get_result::<Count>(&mut fx.conn)
+    .await
+    .expect("count dead letters");
+    assert_eq!(dead.n, 0, "the run is not quarantined");
+    assert_eq!(
+        event_types(&mut fx.conn, exec).await,
+        ["WorkflowStarted"],
+        "the run did not fail"
+    );
 }

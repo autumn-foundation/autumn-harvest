@@ -489,6 +489,12 @@ impl OwnedPartitions {
         }
     }
 
+    /// Whether owner mode is on for `shard`.
+    #[must_use]
+    pub fn owner_mode(&self, shard: ShardId) -> bool {
+        self.state().owner_mode.contains(&shard)
+    }
+
     /// Hold `tenure`. Returns the tenure that it replaces.
     ///
     /// The caller drops the resident state of the partition first. A new
@@ -1232,7 +1238,10 @@ mod tests {
         };
         assert_eq!(owned.pin_for(other), DecisionPin::Legacy, "owner mode off");
         assert!(owned.may_cache(other, None));
+        assert!(!owned.owner_mode(ShardId::new(0)));
         owned.set_owner_mode(ShardId::new(0), true);
+        assert!(owned.owner_mode(ShardId::new(0)));
+        assert!(!owned.owner_mode(ShardId::new(1)), "per shard");
         owned.adopt(held.clone());
         assert_eq!(owned.pin_for(held.key()), DecisionPin::Owned(held.clone()));
         assert_eq!(owned.pin_for(other), DecisionPin::Unowned);
@@ -1246,6 +1255,7 @@ mod tests {
             "a stale epoch"
         );
         owned.set_owner_mode(ShardId::new(0), false);
+        assert!(!owned.owner_mode(ShardId::new(0)));
         assert_eq!(owned.pin_for(other), DecisionPin::Legacy);
     }
 

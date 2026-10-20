@@ -22512,17 +22512,105 @@ async fn fail_workflow_execution_clearing_strikes<T>(
     fail_execution_on_error(conn, task, worker_id, result, codecs).await
 }
 
+/// Load the run of a task. A failed load fails the task.
+///
+/// Issue #2251: with owner mode on, a failed load can only re-pend the task.
+/// See [`load_failure_fails_task`]. `Ok(None)` is that re-pend.
 async fn load_task_execution(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
-) -> HarvestResult<WorkflowExecution> {
+    owner_mode: bool,
+) -> HarvestResult<Option<WorkflowExecution>> {
     let error = match load_workflow_execution(conn, exec_id).await {
-        Ok(val) => return Ok(val),
+        Ok(val) => return Ok(Some(val)),
         Err(e) => e,
     };
+    if !load_failure_fails_task(owner_mode, &error) {
+        let Some(claim) = queue::TaskClaim::of(task) else {
+            return Err(error);
+        };
+        tracing::warn!(
+            task_id = %task.id,
+            error = %error,
+            "harvest: a run did not load in owner mode; the task is re-pended (issue #2251)"
+        );
+        let delay = fence_repend_delay(crate::decision_owner::OwnerEpoch::new(0));
+        queue::requeue_claimed_workflow_task_after_fence(conn, &claim, delay).await?;
+        return Ok(None);
+    }
     fail_task_only(conn, task.id, &error.to_string()).await?;
     Err(error)
+}
+
+/// Whether a failed run load may fail its task (issue #2251).
+///
+/// The fail write needs the tenure of the run. The tenure needs the workflow
+/// id, which the load did not return. With owner mode on, the write cannot
+/// fence, so the task re-pends. A missing run has no history to protect, so
+/// its task still fails. A re-pend of it would repeat forever.
+const fn load_failure_fails_task(owner_mode: bool, error: &HarvestError) -> bool {
+    !owner_mode || matches!(error, HarvestError::NotFound(_))
+}
+
+/// The delay of a re-pend after a fence (issue #2251).
+///
+/// A fence of a held tenure re-pends at once, for the new owner. With no
+/// tenure at all (epoch 0), this worker would claim the task again at once,
+/// so it waits a second. The owned claim of issue #2252 then skips such
+/// tasks.
+fn fence_repend_delay(pinned: crate::decision_owner::OwnerEpoch) -> chrono::Duration {
+    if pinned == crate::decision_owner::OwnerEpoch::new(0) {
+        chrono::Duration::seconds(1)
+    } else {
+        chrono::Duration::zero()
+    }
+}
+
+#[cfg(test)]
+mod owner_load_failure_tests {
+    use super::{HarvestError, fence_repend_delay, load_failure_fails_task};
+    use crate::decision_owner::OwnerEpoch;
+
+    #[test]
+    fn a_legacy_load_failure_fails_the_task() {
+        assert!(load_failure_fails_task(
+            false,
+            &HarvestError::Config("boom".into())
+        ));
+        assert!(load_failure_fails_task(
+            false,
+            &HarvestError::NotFound("run".into())
+        ));
+    }
+
+    #[test]
+    fn an_owner_mode_load_failure_repends_the_task() {
+        assert!(!load_failure_fails_task(
+            true,
+            &HarvestError::Config("boom".into())
+        ));
+    }
+
+    #[test]
+    fn an_owner_mode_missing_run_still_fails_its_task() {
+        assert!(load_failure_fails_task(
+            true,
+            &HarvestError::NotFound("run".into())
+        ));
+    }
+
+    #[test]
+    fn only_an_ownerless_fence_waits_before_the_repend() {
+        assert_eq!(
+            fence_repend_delay(OwnerEpoch::new(0)),
+            chrono::Duration::seconds(1)
+        );
+        assert_eq!(
+            fence_repend_delay(OwnerEpoch::new(7)),
+            chrono::Duration::zero()
+        );
+    }
 }
 
 async fn load_workflow_replay_state(
@@ -22744,9 +22832,16 @@ async fn prepare_workflow_task_with_cache(
         )
     };
 
-    let execution = load_task_execution(conn, task, exec_id).await?;
+    // Issue #2251: in owner mode, a load failure re-pends instead of failing.
+    let Some(execution) =
+        load_task_execution(conn, task, exec_id, owned.owner_mode(owner_shard)).await?
+    else {
+        // A taken entry never outlives a cycle that did not commit.
+        drop(cached);
+        return Ok(None);
+    };
     // Issue #2251: pin the tenure before the first history write. The wake
-    // ingest below and a load failure then fence it too.
+    // ingest below then fences it too.
     pin_owner_tenure(owned, owner_shard, &execution.workflow_id)?;
 
     if let Some((cached_state, mut resident, cached_history_bytes)) = cached {
@@ -29666,15 +29761,7 @@ async fn unload_fenced_partition(
     let Some(claim) = queue::TaskClaim::of(task) else {
         return Ok(TaskDispatchOutcome::ClaimLostAfterFailure);
     };
-    // A fence of a held tenure re-pends at once, for the new owner. With no
-    // tenure at all (epoch 0), this worker would claim the task again at
-    // once, so it waits a second. The owned claim of issue #2252 then skips
-    // such tasks.
-    let delay = if pinned == crate::decision_owner::OwnerEpoch::new(0) {
-        chrono::Duration::seconds(1)
-    } else {
-        chrono::Duration::zero()
-    };
+    let delay = fence_repend_delay(pinned);
     if queue::requeue_claimed_workflow_task_after_fence(conn, &claim, delay).await? {
         Ok(TaskDispatchOutcome::Fenced)
     } else {
@@ -39727,29 +39814,28 @@ impl Worker {
                                         exec_id,
                                     );
                                 }
-                                // Issue #2251: a decision scope, so the
-                                // terminal write fences the run's tenure.
+                                // Issue #2251: the terminal write fences the
+                                // run's tenure.
                                 let owned = telemetry.decision_owner();
-                                let recovery = Box::pin(crate::decision_owner::scope_decision(
-                                    quarantine_workflow_task_timeout_outcome(
-                                        &pool,
-                                        task_id,
-                                        exec_id_for_timeout,
-                                        &worker_id,
-                                        claim_attempt,
-                                        &build_id,
-                                        new_strikes,
-                                        timeout_secs,
-                                        &workflow_name_str,
-                                        &queue_name_str,
-                                        &*telemetry.telemetry().metrics,
-                                        // Same registry this dispatch replays with:
-                                        // `telemetry` is the Arc<HandlerRegistry>
-                                        // captured above (issue #1243).
-                                        telemetry.payload_codecs(),
-                                        Some((&owned, owner_shard)),
-                                    ),
-                                ))
+                                let recovery = quarantine_workflow_task_timeout_owned(
+                                    &pool,
+                                    task_id,
+                                    exec_id_for_timeout,
+                                    &worker_id,
+                                    claim_attempt,
+                                    &build_id,
+                                    new_strikes,
+                                    timeout_secs,
+                                    &workflow_name_str,
+                                    &queue_name_str,
+                                    &*telemetry.telemetry().metrics,
+                                    // Same registry this dispatch replays with:
+                                    // `telemetry` is the Arc<HandlerRegistry>
+                                    // captured above (issue #1243).
+                                    telemetry.payload_codecs(),
+                                    &owned,
+                                    owner_shard,
+                                )
                                 .await;
                                 // No commit: put the strikes back so the next
                                 // timeout quarantines at once, unless a newer
@@ -40553,6 +40639,51 @@ pub async fn quarantine_workflow_task_timeout(
         == ClaimRecovery::Applied
 }
 
+/// The quarantine that the worker runs, in the decision scope of the run
+/// (issue #2251).
+///
+/// The terminal write fences the tenure of the run in `owned`, keyed by the
+/// shard of the claim's pool. With owner mode on and no tenure, it writes
+/// nothing and re-pends the task under its claim. It then returns
+/// [`ClaimRecovery::ClaimLost`], because the next owner decides.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn quarantine_workflow_task_timeout_owned(
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    exec_id_opt: Option<uuid::Uuid>,
+    worker_id: &str,
+    attempt: i32,
+    build_id: &str,
+    new_strikes: i32,
+    timeout_secs: u64,
+    workflow_name: &str,
+    queue_name: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    owned: &crate::decision_owner::OwnedPartitions,
+    owner_shard: crate::types::ShardId,
+) -> ClaimRecovery {
+    Box::pin(crate::decision_owner::scope_decision(
+        quarantine_workflow_task_timeout_outcome(
+            pool,
+            task_id,
+            exec_id_opt,
+            worker_id,
+            attempt,
+            build_id,
+            new_strikes,
+            timeout_secs,
+            workflow_name,
+            queue_name,
+            metrics,
+            codecs,
+            Some((owned, owner_shard)),
+        ),
+    ))
+    .await
+}
+
 /// [`quarantine_workflow_task_timeout`], which also tells a lost claim from
 /// a failed write (issue #1815). It takes the build of the worker that ran the
 /// task, for the `build_id` label of the terminal metric (issue #1814).
@@ -40703,12 +40834,33 @@ async fn quarantine_workflow_task_timeout_outcome(
     };
 
     // Issue #2251: pin the tenure of the run before its terminal write. With
-    // owner mode on and no tenure, another owner decides, so write nothing.
+    // owner mode on and no tenure, another owner decides. Write nothing, and
+    // re-pend the task under its claim for that owner. A claim left RUNNING
+    // would wait for the stuck-task sweep.
     if let Some((owned, owner_shard)) = owner_scope
         && exec_exists
-        && pin_owner_tenure(owned, owner_shard, &workflow_id_str).is_err()
+        && let Err(error) = pin_owner_tenure(owned, owner_shard, &workflow_id_str)
     {
-        return ClaimRecovery::ClaimLost;
+        let pinned = match error {
+            HarvestError::OwnershipLost { pinned, .. } => pinned,
+            _ => crate::decision_owner::OwnerEpoch::new(0),
+        };
+        let claim = queue::TaskClaim::new(task_id, worker_id, attempt);
+        let delay = fence_repend_delay(pinned);
+        return match queue::requeue_claimed_workflow_task_after_fence(&mut conn, &claim, delay)
+            .await
+        {
+            // The task is no longer this worker's. The next owner decides.
+            Ok(_) => ClaimRecovery::ClaimLost,
+            Err(error) => {
+                tracing::error!(
+                    task_id = %task_id,
+                    error = %error,
+                    "workflow task timeout quarantine: the fenced re-pend failed"
+                );
+                ClaimRecovery::Failed
+            }
+        };
     }
 
     let entry = crate::dlq::NewDeadLetterEntry {

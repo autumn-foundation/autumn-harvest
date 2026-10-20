@@ -150,6 +150,18 @@ A second review round found four more gaps. The fixes:
 - A pin outside a decision scope now fails closed. A decision with no
   tenure in owner mode re-pends after one second, not at once.
 
+The Codex review of the PR found two more gaps, and CI found one. The fixes:
+
+- A body-timeout quarantine with no tenure returned a lost claim and left
+  the task `RUNNING`. It now re-pends the task under its claim, so the
+  next owner can take it.
+- A failed run load failed the task before the pin. The load did not
+  return the workflow id, so that write could not fence. With owner mode
+  on, the task now re-pends. A missing run still fails its task, because
+  it has no history to protect.
+- A build without the `db` feature failed clippy on the db-only cache
+  items. They take the same `cfg_attr` as the other db-only items.
+
 ## 3. Out of scope
 
 - The owner-mode switch, the owned claim, the acquisition loop and the
