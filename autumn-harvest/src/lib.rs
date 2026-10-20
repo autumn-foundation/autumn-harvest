@@ -38,17 +38,16 @@ macro_rules! cfg_db {
 /// `activity_pause::release_claim_if_activity_paused_query`, and
 /// `execution::release_claim_if_workflow_paused_query` all hand-wrote this
 /// exact text and appended their own hold condition. All five releases
-/// must restore `attempt` and be guarded on `state = 'RUNNING' AND
-/// worker_id = $2` identically; keeping one copy makes that structural
-/// rather than a convention five sites must remember.
+/// must restore `attempt`. Each must be guarded on `state = 'RUNNING' AND
+/// worker_id = $2` identically. Keeping one copy makes that structural,
+/// not a convention five sites must remember.
 ///
-/// Lives at the crate root, not inside `queue` (`pub mod queue;` is
-/// `#[cfg(feature = "db")]`-gated), because `activity_pause`, `execution`
-/// and `queue_pause` are not and must build without the `db` feature too.
-/// A macro rather than a `const` so each `const fn` can `concat!` it with
-/// its own tail at compile time, and `pub(crate)` rather than
-/// `#[macro_export]` because this is an internal sharing detail, not part
-/// of the crate's public API.
+/// Lives at the crate root, not inside `queue`. `pub mod queue;` is
+/// `#[cfg(feature = "db")]`-gated. `activity_pause`, `execution` and
+/// `queue_pause` are not, and must build without the `db` feature too.
+/// A macro, not a `const`: each `const fn` can then `concat!` it with its
+/// own tail at compile time. `pub(crate)`, not `#[macro_export]`: this is
+/// an internal sharing detail, not part of the crate's public API.
 macro_rules! release_claim_prefix {
     () => {
         "UPDATE harvest_task_queue \

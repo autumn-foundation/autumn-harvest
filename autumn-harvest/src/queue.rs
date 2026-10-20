@@ -11367,13 +11367,15 @@ mod tests {
     }
 
     /// Every release-if-held statement across the task queue shares one
-    /// literal prefix (🪞 Echo clone-class merge, instances 5→1): this
-    /// over-cap release, both `queue_pause` releases, and the
-    /// workflow-pause and activity-pause releases. The prefix is spelled out
-    /// here rather than taken from the shared macro, so this test still pins
-    /// the real behavior even if a later change collapses the macro back
-    /// into per-site literals. Pins the shared text so a future edit to one
-    /// copy cannot drift from the rest without failing here first.
+    /// literal prefix (🪞 Echo clone-class merge, instances 5→1). That
+    /// covers this over-cap release, both `queue_pause` releases, and the
+    /// workflow-pause and activity-pause releases.
+    ///
+    /// The prefix is spelled out here rather than taken from the shared
+    /// macro. This test then still pins the real behavior, even if a later
+    /// change collapses the macro back into per-site literals. Pins the
+    /// shared text so a future edit to one copy cannot drift from the rest
+    /// without failing here first.
     #[test]
     fn every_release_if_held_statement_shares_the_same_prefix() {
         let prefix = "UPDATE harvest_task_queue \
