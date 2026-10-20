@@ -188,24 +188,14 @@ async fn free_row(conn: &mut AsyncPgConnection, partition: DecisionPartition) {
     .expect("free the row");
 }
 
-#[tokio::test]
-async fn a_stale_tenure_is_fenced_unloaded_and_never_retried() {
-    let (mut fx, _container) = Fixture::new().await;
-    let (workflow_id, partition) = free_workflow_id();
-    // A control run on the legacy path gives the expected history. It must
-    // not share the fenced partition.
-    let control_id = loop {
-        let (id, p) = free_workflow_id();
-        if p != partition {
-            break id;
-        }
-    };
-    let exec = fx.start(&workflow_id).await;
-    let control = fx.start(&control_id).await;
-    // A single-pool worker keys its tenures by the pool shard.
-    let shard = decision_owner::OwnerKey::pool_shard(None);
-
-    // The worker takes the row, its lease lapses, and a peer takes it over.
+/// A tenure of the fixture worker that a peer has taken over.
+///
+/// The worker takes the row, its lease lapses, and a peer takes it over.
+async fn stale_tenure(
+    fx: &mut Fixture,
+    partition: DecisionPartition,
+    shard: autumn_harvest::types::ShardId,
+) -> decision_owner::OwnerTenure {
     free_row(&mut fx.conn, partition).await;
     let config = OwnerLeaseConfig::default();
     let mine = OwnerHolder::for_worker(&fx.worker_id);
@@ -232,6 +222,27 @@ async fn a_stale_tenure_is_fenced_unloaded_and_never_retried() {
     else {
         panic!("the lapsed row is taken over");
     };
+    stale
+}
+
+#[tokio::test]
+async fn a_stale_tenure_is_fenced_unloaded_and_never_retried() {
+    let (mut fx, _container) = Fixture::new().await;
+    let (workflow_id, partition) = free_workflow_id();
+    // A control run on the legacy path gives the expected history. It must
+    // not share the fenced partition.
+    let control_id = loop {
+        let (id, p) = free_workflow_id();
+        if p != partition {
+            break id;
+        }
+    };
+    let exec = fx.start(&workflow_id).await;
+    let control = fx.start(&control_id).await;
+    // A single-pool worker keys its tenures by the pool shard.
+    let shard = decision_owner::OwnerKey::pool_shard(None);
+
+    let stale = stale_tenure(&mut fx, partition, shard).await;
 
     let (worker, owned) = fx.worker(|owned| {
         owned.adopt(stale.clone());
@@ -302,51 +313,43 @@ async fn owner_mode_without_a_tenure_fails_closed() {
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
 }
 
-/// A body-timeout quarantine with no tenure re-pends the task.
-///
-/// The quarantine is a decision write, so it needs the tenure of the run.
-/// With owner mode on and no tenure, it must not fail the run. It must also
-/// not leave the claim `RUNNING`, as only the stuck-task sweep would then
-/// free it.
-#[tokio::test]
-async fn a_quarantine_without_a_tenure_repends_the_task() {
-    #[derive(QueryableByName)]
-    struct Task {
-        #[diesel(sql_type = diesel::sql_types::Uuid)]
-        id: uuid::Uuid,
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        state: String,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
-        error: Option<String>,
-    }
-    #[derive(QueryableByName)]
-    struct Count {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
-    }
+/// A task row: its id, state and last error.
+#[derive(QueryableByName)]
+struct TaskRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    error: Option<String>,
+}
 
-    let (mut fx, _container) = Fixture::new().await;
-    let (workflow_id, _partition) = free_workflow_id();
-    let exec = fx.start(&workflow_id).await;
-    let shard = decision_owner::OwnerKey::pool_shard(None);
-
-    // The worker holds the claim at attempt 1 when its body times out.
-    let task = diesel::sql_query(
+/// Claim the task of `exec` for the fixture worker, at attempt 1.
+async fn claim_task(fx: &mut Fixture, exec: ExecutionId) -> uuid::Uuid {
+    diesel::sql_query(
         "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = $2, \
          attempt = 1, started_at = NOW() WHERE workflow_exec_id = $1 \
          RETURNING id, state, error",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid())
     .bind::<diesel::sql_types::Text, _>(&fx.worker_id)
-    .get_result::<Task>(&mut fx.conn)
+    .get_result::<TaskRow>(&mut fx.conn)
     .await
-    .expect("claim the task");
-    let owned = decision_owner::OwnedPartitions::default();
-    owned.set_owner_mode(shard, true);
+    .expect("claim the task")
+    .id
+}
 
-    let recovery = autumn_harvest::worker::quarantine_workflow_task_timeout_owned(
+/// Run the body-timeout quarantine of the worker on `task`.
+async fn quarantine(
+    fx: &Fixture,
+    task: uuid::Uuid,
+    exec: ExecutionId,
+    owned: &decision_owner::OwnedPartitions,
+) -> autumn_harvest::worker::ClaimRecovery {
+    let cache = tokio::sync::Mutex::new(autumn_harvest::cache::WorkflowCache::new(16));
+    autumn_harvest::worker::quarantine_workflow_task_timeout_owned(
         &fx.pool,
-        task.id,
+        task,
         Some(exec.as_uuid()),
         &fx.worker_id,
         1,
@@ -357,19 +360,23 @@ async fn a_quarantine_without_a_tenure_repends_the_task() {
         &fx.queue,
         &fx.metrics,
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
-        &owned,
-        shard,
+        owned,
+        decision_owner::OwnerKey::pool_shard(None),
+        &cache,
     )
-    .await;
-    assert_eq!(
-        recovery,
-        autumn_harvest::worker::ClaimRecovery::ClaimLost,
-        "the next owner decides"
-    );
+    .await
+}
 
+/// Assert that the quarantine re-pended `task` and did not fail the run.
+async fn assert_repended_and_not_failed(fx: &mut Fixture, task: uuid::Uuid, exec: ExecutionId) {
+    #[derive(QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
     let after = diesel::sql_query("SELECT id, state, error FROM harvest_task_queue WHERE id = $1")
-        .bind::<diesel::sql_types::Uuid, _>(task.id)
-        .get_result::<Task>(&mut fx.conn)
+        .bind::<diesel::sql_types::Uuid, _>(task)
+        .get_result::<TaskRow>(&mut fx.conn)
         .await
         .expect("read the task");
     assert_eq!(after.state, "PENDING", "the claim is not stranded");
@@ -394,4 +401,59 @@ async fn a_quarantine_without_a_tenure_repends_the_task() {
         ["WorkflowStarted"],
         "the run did not fail"
     );
+}
+
+/// A body-timeout quarantine with no tenure re-pends the task.
+///
+/// The quarantine is a decision write, so it needs the tenure of the run.
+/// With owner mode on and no tenure, it must not fail the run. It must also
+/// not leave the claim `RUNNING`, as only the stuck-task sweep would then
+/// free it.
+#[tokio::test]
+async fn a_quarantine_without_a_tenure_repends_the_task() {
+    let (mut fx, _container) = Fixture::new().await;
+    let (workflow_id, _partition) = free_workflow_id();
+    let exec = fx.start(&workflow_id).await;
+    let task = claim_task(&mut fx, exec).await;
+    let owned = decision_owner::OwnedPartitions::default();
+    owned.set_owner_mode(decision_owner::OwnerKey::pool_shard(None), true);
+
+    let recovery = quarantine(&fx, task, exec, &owned).await;
+    assert_eq!(
+        recovery,
+        autumn_harvest::worker::ClaimRecovery::ClaimLost,
+        "the next owner decides"
+    );
+    assert_repended_and_not_failed(&mut fx, task, exec).await;
+}
+
+/// A quarantine whose tenure a takeover fenced unloads it and re-pends.
+///
+/// The pin passes, because the worker still holds the tenure. The fence in
+/// the transaction then fails. The worker must drop the tenure, count the
+/// fence and re-pend the task for the new owner.
+#[tokio::test]
+async fn a_fenced_quarantine_unloads_the_tenure_and_repends_the_task() {
+    let (mut fx, _container) = Fixture::new().await;
+    let (workflow_id, partition) = free_workflow_id();
+    let exec = fx.start(&workflow_id).await;
+    let shard = decision_owner::OwnerKey::pool_shard(None);
+    let stale = stale_tenure(&mut fx, partition, shard).await;
+    let task = claim_task(&mut fx, exec).await;
+    let owned = decision_owner::OwnedPartitions::default();
+    owned.set_owner_mode(shard, true);
+    owned.adopt(stale.clone());
+
+    let recovery = quarantine(&fx, task, exec, &owned).await;
+    assert_eq!(
+        recovery,
+        autumn_harvest::worker::ClaimRecovery::ClaimLost,
+        "the next owner decides"
+    );
+    assert!(
+        owned.tenure_for(stale.key()).is_none(),
+        "the tenure is unloaded"
+    );
+    assert_eq!(fx.fences(), [shard.as_i32().to_string()], "one fence");
+    assert_repended_and_not_failed(&mut fx, task, exec).await;
 }

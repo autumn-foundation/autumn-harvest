@@ -162,6 +162,13 @@ The Codex review of the PR found two more gaps, and CI found one. The fixes:
 - A build without the `db` feature failed clippy on the db-only cache
   items. They take the same `cfg_attr` as the other db-only items.
 
+A second Codex pass found one more gap. The fix:
+
+- A takeover after the quarantine pin fenced its transaction. The error
+  became a failed write, so the tenure stayed and the claim stayed
+  `RUNNING`. The quarantine now unloads the partition, as the dispatcher
+  does, and re-pends the task. Both share `drop_fenced_tenure`.
+
 ## 3. Out of scope
 
 - The owner-mode switch, the owned claim, the acquisition loop and the

@@ -29719,6 +29719,32 @@ async fn process_task(
     resolved
 }
 
+/// Drop a fenced tenure and the cache entries of its partition (issue #2251).
+///
+/// The worker drops its tenure when the tenure still pins `pinned`. It drops
+/// every cache entry of the partition unless a newer tenure holds it. A new
+/// tenure then starts cold. Returns `true` when this call dropped the tenure.
+async fn drop_fenced_tenure(
+    owned: &crate::decision_owner::OwnedPartitions,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    key: crate::decision_owner::OwnerKey,
+    pinned: crate::decision_owner::OwnerEpoch,
+) -> bool {
+    // The decision is over. Later writes of this dispatch fence nothing.
+    let _ = crate::decision_owner::pin_decision(None);
+    let unloaded = owned.unload(key, pinned);
+    // Keep the entries of a newer tenure. Drop them in every other case, so
+    // a later tenure starts cold.
+    if unloaded || owned.tenure_for(key).is_none() {
+        // Drop the parked futures outside the cache lock.
+        let evicted = workflow_cache.lock().await.evict_partition(key);
+        drop(evicted);
+    }
+    metrics.record_decision_owner_fenced(&key.shard.as_i32().to_string());
+    unloaded
+}
+
 /// Unload a fenced partition and re-pend its task (issue #2251).
 ///
 /// The decision transaction rolled back, so it wrote nothing. The worker
@@ -29734,22 +29760,14 @@ async fn unload_fenced_partition(
     key: crate::decision_owner::OwnerKey,
     pinned: crate::decision_owner::OwnerEpoch,
 ) -> HarvestResult<TaskDispatchOutcome> {
-    // The decision is over. Later writes of this dispatch fence nothing.
-    let _ = crate::decision_owner::pin_decision(None);
-    let shard = key.shard;
-    let owned = registry.decision_owner();
-    let unloaded = owned.unload(key, pinned);
-    // Keep the entries of a newer tenure. Drop them in every other case, so
-    // a later tenure starts cold.
-    if unloaded || owned.tenure_for(key).is_none() {
-        // Drop the parked futures outside the cache lock.
-        let evicted = workflow_cache.lock().await.evict_partition(key);
-        drop(evicted);
-    }
-    registry
-        .telemetry()
-        .metrics
-        .record_decision_owner_fenced(&shard.as_i32().to_string());
+    let unloaded = drop_fenced_tenure(
+        &registry.decision_owner(),
+        workflow_cache,
+        &*registry.telemetry().metrics,
+        key,
+        pinned,
+    )
+    .await;
     tracing::warn!(
         task_id = %task.id,
         %key,
@@ -39580,7 +39598,10 @@ impl Worker {
                 // not earn and, at `poison_pill_threshold`, terminally failing
                 // an execution whose body had completed.
                 // Issue #2251: one decision scope covers the cycle and the
-                // terminal writes that follow it in `process_task`.
+                // terminal writes that follow it in `process_task`. A fenced
+                // quarantine unloads the partition from this cache.
+                #[cfg(feature = "db")]
+                let quarantine_cache = Arc::clone(&workflow_cache);
                 let outcome = Box::pin(crate::decision_owner::scope_decision(process_task(
                     &pool,
                     Arc::clone(&registry),
@@ -39835,6 +39856,7 @@ impl Worker {
                                     telemetry.payload_codecs(),
                                     &owned,
                                     owner_shard,
+                                    &quarantine_cache,
                                 )
                                 .await;
                                 // No commit: put the strikes back so the next
@@ -40644,8 +40666,10 @@ pub async fn quarantine_workflow_task_timeout(
 ///
 /// The terminal write fences the tenure of the run in `owned`, keyed by the
 /// shard of the claim's pool. With owner mode on and no tenure, it writes
-/// nothing and re-pends the task under its claim. It then returns
-/// [`ClaimRecovery::ClaimLost`], because the next owner decides.
+/// nothing and re-pends the task under its claim. A fenced tenure also
+/// re-pends the task, after the worker unloads the partition from `owned`
+/// and `workflow_cache`. Both return [`ClaimRecovery::ClaimLost`], because
+/// the next owner decides.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub async fn quarantine_workflow_task_timeout_owned(
@@ -40663,6 +40687,7 @@ pub async fn quarantine_workflow_task_timeout_owned(
     codecs: &crate::payload_codec::PayloadCodecs,
     owned: &crate::decision_owner::OwnedPartitions,
     owner_shard: crate::types::ShardId,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
 ) -> ClaimRecovery {
     Box::pin(crate::decision_owner::scope_decision(
         quarantine_workflow_task_timeout_outcome(
@@ -40678,10 +40703,25 @@ pub async fn quarantine_workflow_task_timeout_owned(
             queue_name,
             metrics,
             codecs,
-            Some((owned, owner_shard)),
+            Some(QuarantineOwner {
+                owned,
+                shard: owner_shard,
+                workflow_cache,
+            }),
         ),
     ))
     .await
+}
+
+/// The owner side of a body-timeout quarantine (issue #2251).
+///
+/// `owned` holds the tenures, keyed by `shard`. A fence unloads the tenure
+/// and drops the cache entries of its partition from `workflow_cache`.
+#[derive(Clone, Copy)]
+struct QuarantineOwner<'a> {
+    owned: &'a crate::decision_owner::OwnedPartitions,
+    shard: crate::types::ShardId,
+    workflow_cache: &'a tokio::sync::Mutex<crate::cache::WorkflowCache>,
 }
 
 /// [`quarantine_workflow_task_timeout`], which also tells a lost claim from
@@ -40703,12 +40743,9 @@ async fn quarantine_workflow_task_timeout_outcome(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
-    // Issue #2251: the owner tenures and the claim's shard. The terminal
-    // write is a decision write, so it fences the tenure of the run.
-    owner_scope: Option<(
-        &crate::decision_owner::OwnedPartitions,
-        crate::types::ShardId,
-    )>,
+    // Issue #2251: the owner side. The terminal write is a decision write,
+    // so it fences the tenure of the run.
+    owner_scope: Option<QuarantineOwner<'_>>,
 ) -> ClaimRecovery {
     use crate::schema::harvest_task_queue::dsl as task_dsl;
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
@@ -40837,30 +40874,16 @@ async fn quarantine_workflow_task_timeout_outcome(
     // owner mode on and no tenure, another owner decides. Write nothing, and
     // re-pend the task under its claim for that owner. A claim left RUNNING
     // would wait for the stuck-task sweep.
-    if let Some((owned, owner_shard)) = owner_scope
+    if let Some(owner) = owner_scope
         && exec_exists
-        && let Err(error) = pin_owner_tenure(owned, owner_shard, &workflow_id_str)
+        && let Err(error) = pin_owner_tenure(owner.owned, owner.shard, &workflow_id_str)
     {
         let pinned = match error {
             HarvestError::OwnershipLost { pinned, .. } => pinned,
             _ => crate::decision_owner::OwnerEpoch::new(0),
         };
         let claim = queue::TaskClaim::new(task_id, worker_id, attempt);
-        let delay = fence_repend_delay(pinned);
-        return match queue::requeue_claimed_workflow_task_after_fence(&mut conn, &claim, delay)
-            .await
-        {
-            // The task is no longer this worker's. The next owner decides.
-            Ok(_) => ClaimRecovery::ClaimLost,
-            Err(error) => {
-                tracing::error!(
-                    task_id = %task_id,
-                    error = %error,
-                    "workflow task timeout quarantine: the fenced re-pend failed"
-                );
-                ClaimRecovery::Failed
-            }
-        };
+        return repend_fenced_quarantine(&mut conn, &claim, pinned).await;
     }
 
     let entry = crate::dlq::NewDeadLetterEntry {
@@ -41120,6 +41143,32 @@ async fn quarantine_workflow_task_timeout_outcome(
                 start.spawn();
             }
         }
+        // Issue #2251: a takeover fenced the pinned tenure after the pin.
+        // The transaction wrote nothing. Unload the partition, as the
+        // dispatcher does, and re-pend the task for the new owner.
+        Err(HarvestError::OwnershipLost {
+            partition, pinned, ..
+        }) => {
+            // With no owner side, nothing pins a tenure, so no fence fails.
+            let Some(owner) = owner_scope else {
+                return ClaimRecovery::Failed;
+            };
+            let key = crate::decision_owner::OwnerKey {
+                shard: owner.shard,
+                partition,
+            };
+            let unloaded =
+                drop_fenced_tenure(owner.owned, owner.workflow_cache, metrics, key, pinned).await;
+            tracing::warn!(
+                task_id = %task_id,
+                %key,
+                %pinned,
+                unloaded,
+                "workflow task timeout quarantine: the owner fence failed; the partition is \
+                 unloaded and the task is re-pended (issue #2251)"
+            );
+            return repend_fenced_quarantine(&mut conn, &claim, pinned).await;
+        }
         Err(e) => {
             tracing::error!(
                 task_id = %task_id,
@@ -41130,6 +41179,30 @@ async fn quarantine_workflow_task_timeout_outcome(
         }
     }
     ClaimRecovery::Applied
+}
+
+/// Re-pend a fenced quarantine under its claim (issue #2251).
+///
+/// The task is then no longer this worker's, so a done re-pend returns
+/// [`ClaimRecovery::ClaimLost`]. So does a claim that a peer already holds.
+/// A failed write returns [`ClaimRecovery::Failed`].
+async fn repend_fenced_quarantine(
+    conn: &mut AsyncPgConnection,
+    claim: &queue::TaskClaim,
+    pinned: crate::decision_owner::OwnerEpoch,
+) -> ClaimRecovery {
+    let delay = fence_repend_delay(pinned);
+    match queue::requeue_claimed_workflow_task_after_fence(conn, claim, delay).await {
+        Ok(_) => ClaimRecovery::ClaimLost,
+        Err(error) => {
+            tracing::error!(
+                task_id = %claim.task_id,
+                error = %error,
+                "workflow task timeout quarantine: the fenced re-pend failed"
+            );
+            ClaimRecovery::Failed
+        }
+    }
 }
 
 /// Whether the dispatch error path releases the claim after `error`.
