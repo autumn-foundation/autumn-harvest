@@ -5467,7 +5467,7 @@ pub async fn pause_workflow_execution(
 ///
 /// Restores `attempt`. The task never ran, so a hold must not consume retry
 /// budget. The queue-pause and activity-pause siblings do the same, via the
-/// identical [`crate::queue::release_claim_prefix`] shared prefix.
+/// identical [`crate::release_claim_prefix`] shared prefix.
 ///
 /// Scoped to `task_type = 'workflow'`. A pause holds new workflow dispatch
 /// only. An activity task can carry the same `workflow_exec_id`. This
@@ -5477,7 +5477,7 @@ pub async fn pause_workflow_execution(
 #[must_use]
 pub const fn release_claim_if_workflow_paused_query() -> &'static str {
     concat!(
-        crate::queue::release_claim_prefix!(),
+        crate::release_claim_prefix!(),
         " AND task_type = 'workflow' \
            AND EXISTS (SELECT 1 FROM harvest_workflow_executions e \
                WHERE e.id = harvest_task_queue.workflow_exec_id \

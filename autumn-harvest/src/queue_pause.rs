@@ -63,7 +63,6 @@
 #[cfg(feature = "db")]
 use crate::error::HarvestError;
 use crate::error::HarvestResult;
-use crate::queue::release_claim_prefix;
 #[cfg(feature = "db")]
 use chrono::{DateTime, Utc};
 #[cfg(feature = "db")]
@@ -326,7 +325,7 @@ pub async fn release_claim_if_queue_paused(
 #[must_use]
 pub const fn release_claim_if_queue_paused_query() -> &'static str {
     concat!(
-        release_claim_prefix!(),
+        crate::release_claim_prefix!(),
         " AND EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
            WHERE qp.queue_name = harvest_task_queue.queue_name)"
     )
@@ -335,7 +334,7 @@ pub const fn release_claim_if_queue_paused_query() -> &'static str {
 /// SQL for [`release_claim`], exposed for shape tests.
 #[must_use]
 pub const fn release_claim_query() -> &'static str {
-    release_claim_prefix!()
+    crate::release_claim_prefix!()
 }
 
 /// Release this worker's own just-made claim **unconditionally**.

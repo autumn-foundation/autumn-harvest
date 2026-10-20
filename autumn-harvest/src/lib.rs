@@ -29,6 +29,40 @@ macro_rules! cfg_db {
     ($($item:item)*) => {};
 }
 
+/// The shared prefix of every release-if-held task-queue statement (🪞
+/// Echo clone-class merge, instances 5→1).
+///
+/// `queue::release_claim_if_over_cap_query`,
+/// `queue_pause::release_claim_if_queue_paused_query`,
+/// `queue_pause::release_claim_query`,
+/// `activity_pause::release_claim_if_activity_paused_query`, and
+/// `execution::release_claim_if_workflow_paused_query` all hand-wrote this
+/// exact text and appended their own hold condition. All five releases
+/// must restore `attempt` and be guarded on `state = 'RUNNING' AND
+/// worker_id = $2` identically; keeping one copy makes that structural
+/// rather than a convention five sites must remember.
+///
+/// Lives at the crate root, not inside `queue` (`pub mod queue;` is
+/// `#[cfg(feature = "db")]`-gated), because `activity_pause`, `execution`
+/// and `queue_pause` are not and must build without the `db` feature too.
+/// A macro rather than a `const` so each `const fn` can `concat!` it with
+/// its own tail at compile time, and `pub(crate)` rather than
+/// `#[macro_export]` because this is an internal sharing detail, not part
+/// of the crate's public API.
+macro_rules! release_claim_prefix {
+    () => {
+        "UPDATE harvest_task_queue \
+         SET state = 'PENDING', \
+             worker_id = NULL, \
+             started_at = NULL, \
+             attempt = GREATEST(attempt - 1, 0) \
+         WHERE id = $1 \
+           AND state = 'RUNNING' \
+           AND worker_id = $2"
+    };
+}
+pub(crate) use release_claim_prefix;
+
 /// Await a chaos injection point (statement position). See [`chaos`].
 ///
 /// `#[allow(unused_macros)]`: every call site lives in a `#[cfg(feature =

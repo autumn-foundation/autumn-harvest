@@ -2920,37 +2920,6 @@ pub(crate) async fn release_claim_via(
     Ok(released > 0)
 }
 
-/// The shared prefix of every release-if-held statement (🪞 Echo
-/// clone-class merge, instances 5→1).
-///
-/// [`release_claim_if_over_cap_query`],
-/// [`crate::queue_pause::release_claim_if_queue_paused_query`],
-/// [`crate::queue_pause::release_claim_query`],
-/// [`crate::activity_pause::release_claim_if_activity_paused_query`], and
-/// [`crate::execution::release_claim_if_workflow_paused_query`] all hand-wrote
-/// this exact text and appended their own hold condition. All five releases
-/// must restore `attempt` and be guarded on `state = 'RUNNING' AND
-/// worker_id = $2` identically; keeping one copy makes that structural
-/// rather than a convention five sites must remember.
-///
-/// A macro rather than a `const` so each `const fn` below can `concat!` it
-/// with its own tail at compile time, and `pub(crate)` so every module that
-/// already calls [`release_claim_via`] can reach it by its crate path
-/// without a new `use`.
-macro_rules! release_claim_prefix {
-    () => {
-        "UPDATE harvest_task_queue \
-         SET state = 'PENDING', \
-             worker_id = NULL, \
-             started_at = NULL, \
-             attempt = GREATEST(attempt - 1, 0) \
-         WHERE id = $1 \
-           AND state = 'RUNNING' \
-           AND worker_id = $2"
-    };
-}
-pub(crate) use release_claim_prefix;
-
 /// SQL for [`release_claim_if_over_cap`], exposed for shape tests.
 ///
 /// One statement, so it takes a fresh `READ COMMITTED` snapshot. The count
@@ -2958,7 +2927,7 @@ pub(crate) use release_claim_prefix;
 #[must_use]
 pub const fn release_claim_if_over_cap_query() -> &'static str {
     concat!(
-        release_claim_prefix!(),
+        crate::release_claim_prefix!(),
         " AND concurrency_key IS NOT NULL \
            AND concurrency_cap IS NOT NULL \
            AND ( \

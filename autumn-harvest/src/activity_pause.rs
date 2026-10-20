@@ -208,7 +208,7 @@ pub const fn activity_pause_suppresses_timeout(
 /// Restores `attempt`: the task never ran, so a hold must not consume retry
 /// budget (AC3). Shares that guard and restoration with its queue-pause and
 /// workflow-pause siblings via the identical
-/// [`crate::queue::release_claim_prefix`] prefix.
+/// [`crate::release_claim_prefix`] prefix.
 ///
 /// Carries `task_type = 'activity'` in the statement itself rather than relying
 /// on the caller to pre-filter. The caller in `queue::claim_task` does check it,
@@ -220,7 +220,7 @@ pub const fn activity_pause_suppresses_timeout(
 #[must_use]
 pub const fn release_claim_if_activity_paused_query() -> &'static str {
     concat!(
-        crate::queue::release_claim_prefix!(),
+        crate::release_claim_prefix!(),
         " AND task_type = 'activity' \
            AND EXISTS (SELECT 1 FROM harvest_activity_pauses ap \
                WHERE ap.activity_name = harvest_task_queue.activity_name)"
