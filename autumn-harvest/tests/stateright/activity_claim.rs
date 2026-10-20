@@ -18,7 +18,7 @@ use autumn_harvest::dst::{
 };
 use stateright::{Checker, Model, Property};
 
-use super::{check_all, check_until, deep, tla_red_rows};
+use super::{cfg_lines, check_all, check_until, deep, read, tla_red_rows};
 
 /// A worker is dead when its last beat is this many ticks old.
 const STALE_TICKS: u64 = 1;
@@ -494,22 +494,64 @@ fn every_dst_invariant_is_a_property() {
     }
 }
 
+/// The constants of a TLC config, as `(name, value)` pairs.
+fn tla_constants(config: &str) -> Vec<(String, String)> {
+    let cfg = read(&format!("formal/tla/{config}"));
+    let mut in_block = false;
+    let mut constants = Vec::new();
+    for line in cfg_lines(&cfg) {
+        if line == "CONSTANTS" {
+            in_block = true;
+        } else if let Some((name, value)) = line.split_once(" = ").filter(|_| in_block) {
+            constants.push((name.trim().to_string(), value.trim().to_string()));
+        } else if !line.is_empty() {
+            in_block = false;
+        }
+    }
+    constants
+}
+
+/// The fence that a TLC config of `ActivityClaim.tla` sets.
+///
+/// A constant that this model does not map is a new defect. It fails here,
+/// so a red row cannot pass on its invariant name alone.
+fn tla_fencing(config: &str) -> Fencing {
+    let mut fencing = None;
+    for (name, value) in tla_constants(config) {
+        match (name.as_str(), value.as_str()) {
+            ("Workers" | "NoWorker" | "MaxClaims", _) => {}
+            ("Fenced", "TRUE") => fencing = Some(Fencing::ClaimEpoch),
+            ("Fenced", "FALSE") => fencing = Some(Fencing::StateOnly),
+            _ => panic!("{config}: the Stateright model has no match for {name} = {value}"),
+        }
+    }
+    fencing.unwrap_or_else(|| panic!("{config} sets no Fenced"))
+}
+
 #[test]
 fn every_tla_counter_example_has_a_stateright_match() {
     let rows = tla_red_rows("ActivityClaim");
     assert!(!rows.is_empty(), "models.txt lists ActivityClaim rows");
     for (config, invariant) in rows {
-        if let Ok(parsed) = Invariant::parse(&invariant) {
-            assert_eq!(
-                parsed,
-                Invariant::TerminalByCurrentClaim,
-                "{config}: a new pre-fix row needs a Stateright test"
-            );
-        } else {
-            assert_eq!(
-                invariant, TLA_REACH,
-                "{config}: a new reachability row needs a Stateright witness"
-            );
-        }
+        let model = ActivityClaim {
+            fencing: tla_fencing(&config),
+            ..ActivityClaim::design()
+        };
+        let property = Invariant::parse(&invariant).map_or_else(
+            |_| {
+                assert_eq!(
+                    invariant, TLA_REACH,
+                    "{config}: a new reachability row needs a Stateright witness"
+                );
+                STALE_OWNER_AFTER_FINISH
+            },
+            Invariant::name,
+        );
+        let checker = check_until(model, property);
+        let path = checker.assert_any_discovery(property);
+        assert!(
+            !path.into_actions().is_empty(),
+            "{config}: the initial state reaches {property}"
+        );
     }
 }

@@ -147,7 +147,7 @@ counter-example must fail here too:
 | `the_pre_fix_guard_lets_a_stale_owner_finish_the_task` | The pre-fix guard breaks `TerminalByCurrentClaim` with the #1789 trace. |
 | `the_pre_fix_guard_breaks_the_other_owner_invariants` | The pre-fix guard breaks three more invariants. |
 | `every_dst_invariant_is_a_property` | Each `dst::Invariant` is an `always` property. |
-| `every_tla_counter_example_has_a_stateright_match` | Each red `ActivityClaim` row has a test here. |
+| `every_tla_counter_example_has_a_stateright_match` | Each red `ActivityClaim` config runs here with its `Fenced` value and reaches the same invariant or witness. An unknown constant fails. |
 | `the_design_keeps_every_invariant_and_reaches_every_nemesis` | The owner design keeps every invariant and reaches every nemesis. |
 | `every_tla_defect_fails_here_on_the_same_invariant` | Each TLA+ defect breaks its invariant here. |
 | `the_no_fence_counter_example_is_a_stale_owner_commit` | The `no-fence` event comes from a worker that pinned an older epoch. |
