@@ -75,7 +75,7 @@ seeded simulator, each with the four nemeses of the issue.
    mutant configs, one design config, one reach config.
 2. New harness `autumn_harvest::dst::owner` with an `OwnerStore` trait and
    an in-memory oracle. Same defects and invariants.
-3. New ADR `docs/adr/0009-fenced-owner-lease.md`, status *Proposed*. It
+3. New ADR `docs/adr/0010-fenced-owner-lease.md`, status *Proposed*. It
    holds only the rules the model forces. #2249 adds the partition rules.
 4. A guard test makes AC 2 bind: when a migration adds the owner table, the
    repo must hold a simulator run against the real store.
@@ -83,7 +83,7 @@ seeded simulator, each with the four nemeses of the issue.
 ## 1. The model-forced rules
 
 The rules R1 to R7 and their mutants are in the table of
-[ADR 0009](docs/adr/0009-fenced-owner-lease.md#decision).
+[ADR 0010](docs/adr/0010-fenced-owner-lease.md#decision).
 
 ## 2. Review findings
 

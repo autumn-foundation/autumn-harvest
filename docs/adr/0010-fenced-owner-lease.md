@@ -1,4 +1,4 @@
-# ADR 0009: The fenced owner lease
+# ADR 0010: The fenced owner lease
 
 ## Status
 

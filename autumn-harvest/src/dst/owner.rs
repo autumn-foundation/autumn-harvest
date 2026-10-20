@@ -25,7 +25,7 @@
 //! oracle has no event-id backstop, so the fence alone keeps the
 //! invariants.
 //!
-//! See `docs/testing/simulation.md` and `docs/adr/0009-fenced-owner-lease.md`.
+//! See `docs/testing/simulation.md` and `docs/adr/0010-fenced-owner-lease.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

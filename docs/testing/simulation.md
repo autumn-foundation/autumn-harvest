@@ -349,7 +349,7 @@ activity of its execution.
 
 Issue #2250. `autumn_harvest::dst::owner` is the simulator half of
 `formal/tla/OwnerLease.tla`. It has the same actions, defects and
-invariants. [ADR 0009](../adr/0009-fenced-owner-lease.md) is the prose
+invariants. [ADR 0010](../adr/0010-fenced-owner-lease.md) is the prose
 spec. Stage 1a (issue #2251) has no code yet.
 
 ### The store seam
