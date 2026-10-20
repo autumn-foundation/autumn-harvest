@@ -324,18 +324,10 @@ async fn observe_shard(
         Ok(conn) => conn,
         Err(observation) => return observation,
     };
-    match count_workflow_executions_grouped(&mut conn, shard_id, query).await {
-        Ok(rows) => ShardObservation {
-            shard_id,
-            rows,
-            error: None,
-        },
-        Err(e) => ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(e.to_string()),
-        },
-    }
+    shard_fanout::observe_shard_result(
+        shard_id,
+        count_workflow_executions_grouped(&mut conn, shard_id, query).await,
+    )
 }
 
 /// Build the grouped workflow-count report for `GET /workflows/count`
