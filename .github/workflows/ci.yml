@@ -328,6 +328,13 @@ jobs:
       - name: Run docs/alerts SLO pack guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration slo_pack_docs::"
 
+      # Issue #2249: ADR 0009 records the decision owner model. A docs-only
+      # PR skips the `test` matrix, so its guards run here.
+      # `decision_owner_docs::guards_run_on_docs_only_changes` checks that
+      # this step exists. Quoted for the trailing-`::` reason above.
+      - name: Run the decision owner ADR guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration decision_owner_docs::"
+
       # Issue #1816: load and unit-test the SLO burn-rate rules. The pinned
       # tarball and its checksum keep a new promtool release from reddening
       # lint, and a tampered download fails the checksum.

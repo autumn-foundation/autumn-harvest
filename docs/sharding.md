@@ -13,6 +13,27 @@ adding workers stops helping and sharding (or shedding the backlog) is the
 answer. Measure your own steady-state backlog against that table before
 provisioning a second shard.
 
+## Glossary
+
+Epic #2247 plans owner mode. Harvest does not implement it yet.
+[ADR 0009](adr/0009-decision-owner.md) records the decisions behind it.
+
+- **Shard**: a logical shard, usually one Postgres database. An
+  execution's history, tasks, timers and signals all live on one shard.
+  Colocated shards share one database.
+- **Decision partition**: a fixed hash bucket of executions inside one
+  physical database. Each database has 512. The hash input is
+  `workflow_id`.
+- **Owner**: the worker that holds the lease of a decision partition. Only
+  the owner commits decisions for the executions in it.
+- **Owner row** (owner lease): the row in the shard database that names
+  the owner, its epoch and its lease end.
+- **Owner epoch**: a counter that each acquisition increments. Each
+  decision commit checks it, so a stale owner cannot commit.
+- **Foreign writer**: code that appends to a history outside the owner's
+  decision, such as an activity completion. It takes no owner row.
+- **Owner mode**: the per-database switch that turns the owner model on.
+
 ---
 
 ## Per-Key Concurrency Limits and Sharding (issue #247)
