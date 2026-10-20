@@ -9,7 +9,7 @@
 //!
 //! A layered DAG of `DAG_TOOL_LAYERS` layers (default 40) by `DAG_TOOL_WIDTH`
 //! tasks (default 50, at most 50). Each task has a distinct activity name, as a
-//! real pipeline does, and each task past layer 0 depends on three tasks of the
+//! real pipeline does. Each task past layer 0 depends on three tasks of the
 //! previous layer. Only half the tasks carry a retry policy, so the linter
 //! rules produce warnings. `DAG_TOOL_REPS` (default 1) repeats the three
 //! stages.
@@ -41,56 +41,56 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn a0() {}
-fn a1() {}
-fn a2() {}
-fn a3() {}
-fn a4() {}
-fn a5() {}
-fn a6() {}
-fn a7() {}
-fn a8() {}
-fn a9() {}
-fn a10() {}
-fn a11() {}
-fn a12() {}
-fn a13() {}
-fn a14() {}
-fn a15() {}
-fn a16() {}
-fn a17() {}
-fn a18() {}
-fn a19() {}
-fn a20() {}
-fn a21() {}
-fn a22() {}
-fn a23() {}
-fn a24() {}
-fn a25() {}
-fn a26() {}
-fn a27() {}
-fn a28() {}
-fn a29() {}
-fn a30() {}
-fn a31() {}
-fn a32() {}
-fn a33() {}
-fn a34() {}
-fn a35() {}
-fn a36() {}
-fn a37() {}
-fn a38() {}
-fn a39() {}
-fn a40() {}
-fn a41() {}
-fn a42() {}
-fn a43() {}
-fn a44() {}
-fn a45() {}
-fn a46() {}
-fn a47() {}
-fn a48() {}
-fn a49() {}
+const fn a0() {}
+const fn a1() {}
+const fn a2() {}
+const fn a3() {}
+const fn a4() {}
+const fn a5() {}
+const fn a6() {}
+const fn a7() {}
+const fn a8() {}
+const fn a9() {}
+const fn a10() {}
+const fn a11() {}
+const fn a12() {}
+const fn a13() {}
+const fn a14() {}
+const fn a15() {}
+const fn a16() {}
+const fn a17() {}
+const fn a18() {}
+const fn a19() {}
+const fn a20() {}
+const fn a21() {}
+const fn a22() {}
+const fn a23() {}
+const fn a24() {}
+const fn a25() {}
+const fn a26() {}
+const fn a27() {}
+const fn a28() {}
+const fn a29() {}
+const fn a30() {}
+const fn a31() {}
+const fn a32() {}
+const fn a33() {}
+const fn a34() {}
+const fn a35() {}
+const fn a36() {}
+const fn a37() {}
+const fn a38() {}
+const fn a39() {}
+const fn a40() {}
+const fn a41() {}
+const fn a42() {}
+const fn a43() {}
+const fn a44() {}
+const fn a45() {}
+const fn a46() {}
+const fn a47() {}
+const fn a48() {}
+const fn a49() {}
 
 fn activity(b: &mut DagBuilder, i: usize) -> DagTaskRef {
     match i {
