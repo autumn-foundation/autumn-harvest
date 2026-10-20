@@ -8,9 +8,10 @@
 //! # Workload
 //!
 //! A layered DAG of `DAG_TOOL_LAYERS` layers (default 40) by `DAG_TOOL_WIDTH`
-//! tasks (default 50, at most 50). Each task has a distinct activity name, as a
-//! real pipeline does. Each task past layer 0 depends on three tasks of the
-//! previous layer. Only half the tasks carry a retry policy, so the linter
+//! tasks (default 50, at most 50). A layer has `DAG_TOOL_WIDTH` distinct activity
+//! names, and every layer reuses them. The workload therefore has repeated
+//! names, and `DuplicateNodeNameRule` reports each one. Each task past layer 0
+//! depends on three tasks of the previous layer. Only half the tasks carry a retry policy, so the linter
 //! rules produce warnings. `DAG_TOOL_REPS` (default 1) repeats the three
 //! stages.
 //!
