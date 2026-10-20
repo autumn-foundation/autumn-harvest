@@ -1,4 +1,4 @@
-## Testing — Stateright model checks of the DST oracles
+## Testing — Stateright model checks of the DST oracles (PR #2283)
 
 **What shipped.** A new test target, `stateright`
 (`autumn-harvest/tests/stateright/`), with the
