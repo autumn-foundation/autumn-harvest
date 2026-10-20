@@ -5226,8 +5226,9 @@ pub async fn record_heartbeat_sent_ago(
 /// (issue #2043).
 ///
 /// It refreshes `last_heartbeat_at` and leaves the stored checkpoint as it
-/// is. The heartbeat flusher uses it when a checkpoint does not encode, so the
-/// previous checkpoint survives.
+/// is. The heartbeat flusher uses it when a checkpoint does not encode, and
+/// when a checkpoint nests past the depth cap (issue #2225). The previous
+/// checkpoint survives in both cases.
 ///
 /// # Errors
 ///

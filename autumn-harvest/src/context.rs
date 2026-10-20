@@ -17848,6 +17848,11 @@ impl ActivityContext {
     /// `Err(ActivityCancelled)` means the owning workflow was cancelled and the
     /// activity should wind down promptly.
     ///
+    /// A payload nested more than [`MAX_PAYLOAD_DEPTH`](crate::payload_depth::MAX_PAYLOAD_DEPTH)
+    /// levels is dropped with a warning (issue #2225). This call still returns
+    /// `Ok`. The flush then refreshes the heartbeat time only, so the activity
+    /// stays alive and the previous checkpoint stays.
+    ///
     /// Within a single attempt, heartbeat payloads are last-write-wins and are
     /// not read back through this context. Call [`Self::heartbeat_details`] at
     /// the start of a later retry attempt to resume from the prior checkpoint.
@@ -18274,7 +18279,11 @@ impl ActivityContext {
     /// * this context has no transactional pool attached (e.g. test contexts
     ///   or local activities),
     /// * a DB connection cannot be acquired from the pool,
-    /// * `f` returns `Err(e)` (the user error is propagated as-is), or
+    /// * `f` returns `Err(e)` (the user error is propagated as-is),
+    /// * the result nests more than
+    ///   [`MAX_PAYLOAD_DEPTH`](crate::payload_depth::MAX_PAYLOAD_DEPTH) levels
+    ///   (issue #2225). The transaction rolls back, and the error is a
+    ///   non-retryable `PayloadTooDeep` failure, or
     /// * the harvest finalization (event append / task complete / workflow wake)
     ///   fails.
     ///
@@ -18380,6 +18389,15 @@ impl ActivityContext {
                 // Serialize the result for the event log.
                 let mut output =
                     serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
+
+                // Issue #2225: a result nested past the depth cap cannot be read
+                // back from the history. Roll back before the upload and the
+                // commit, so no user write commits and no blob is stored.
+                if crate::payload_depth::nests_past_cap(&output) {
+                    return Err(TxError::Payload(
+                        crate::payload_depth::too_deep_failure_payload("transactional activity"),
+                    ));
+                }
 
                 // Issue #1986: a fan-out row with the result writer records a
                 // reference. The upload runs before the execution row lock.

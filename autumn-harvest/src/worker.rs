@@ -5274,7 +5274,10 @@ async fn run_local_activity_inline(
             }
         };
 
-        match result {
+        // A result nested past the depth cap takes the `Err` branch below (issue
+        // #2225). The typed failure is non-retryable, so the activity ends on
+        // this attempt, as it does for a regular activity.
+        match crate::payload_depth::refuse_deep_result(&run.name, result) {
             Ok(output) => {
                 let completed_event = WorkflowEvent::LocalActivityCompleted {
                     activity_id: run.activity_id,
@@ -20020,6 +20023,12 @@ async fn process_activity_task(
     // circuit breaker (issue #369 review). Captured before the unconditional
     // `heartbeat_stop.cancel()` below.
     let was_cancelled = cancel.is_cancelled();
+
+    // A result nested past the depth cap becomes a non-retryable failure (issue
+    // #2225). `serde_json` cannot read it back from the history, the offloader
+    // blob or the result writer. So the check runs before the byte cap and
+    // before any upload. It also runs when the byte cap is off.
+    let activity_result = crate::payload_depth::refuse_deep_result(activity_name, activity_result);
 
     // Pre-normalize oversized results to non-retryable failures BEFORE emitting
     // metrics so that an Ok result above the cap is counted as Failed, not Completed.

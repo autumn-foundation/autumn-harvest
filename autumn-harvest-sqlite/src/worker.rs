@@ -506,7 +506,7 @@ async fn run_handler(
 fn persist_heartbeats(conn: &Connection, task_id: &str, heartbeats: &mut mpsc::Receiver<Value>) {
     let mut latest = None;
     while let Ok(details) = heartbeats.try_recv() {
-        if crate::runtime::nests_past_cap(&details) {
+        if autumn_harvest::payload_depth::nests_past_cap(&details) {
             tracing::warn!(
                 task_id,
                 cap_depth = crate::MAX_PAYLOAD_DEPTH,
@@ -719,34 +719,6 @@ fn payload_too_large_activity_envelope(activity_name: &str, observed: u64, cap: 
         ),
     )
     .into_error_payload()
-}
-
-/// Encode a too-deep activity result as a non-retryable `PayloadTooDeep`
-/// failure envelope (issue #2216).
-fn payload_too_deep_activity_envelope(activity_name: &str) -> String {
-    use autumn_harvest::failure::IntoActivityErrorString as _;
-    autumn_harvest::failure::ActivityFailure::non_retryable(
-        crate::PAYLOAD_TOO_DEEP_ERROR_TYPE,
-        format!(
-            "activity '{activity_name}' result nests more than {} levels",
-            crate::MAX_PAYLOAD_DEPTH
-        ),
-    )
-    .into_error_payload()
-}
-
-/// Turn a successful result nested past the cap into a failure (issue #2216).
-///
-/// `serde_json` reads at most 128 levels. A stored result past that point
-/// fails every later drive of the run. The workflow sees this failure in its
-/// place. Other results pass unchanged.
-fn refuse_deep_result(activity_name: &str, result: Result<Value, String>) -> Result<Value, String> {
-    match result {
-        Ok(output) if crate::runtime::nests_past_cap(&output) => {
-            Err(payload_too_deep_activity_envelope(activity_name))
-        }
-        other => other,
-    }
 }
 
 /// The signal name of a `wait_for_signal_timeout` / `receive_signal_timeout`
@@ -982,7 +954,7 @@ pub fn finalize_within_tx(
     //
     // A result nested past the depth cap fails the same way (issue #2216).
     // Check the depth first, because the size check serializes the whole value.
-    let result = match refuse_deep_result(&task.name, result) {
+    let result = match autumn_harvest::payload_depth::refuse_deep_result(&task.name, result) {
         Ok(output) if DEFAULT_MAX_ACTIVITY_RESULT_BYTES > 0 => {
             let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
             if observed > DEFAULT_MAX_ACTIVITY_RESULT_BYTES {
@@ -1443,7 +1415,7 @@ pub fn local_attempt_events(
     result: Result<Value, String>,
 ) -> (Vec<WorkflowEvent>, Option<std::time::Duration>) {
     let activity_id = run.activity_id;
-    let error = match refuse_deep_result(&run.name, result) {
+    let error = match autumn_harvest::payload_depth::refuse_deep_result(&run.name, result) {
         Ok(output) => {
             return (
                 vec![WorkflowEvent::LocalActivityCompleted {
