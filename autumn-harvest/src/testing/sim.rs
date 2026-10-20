@@ -772,7 +772,8 @@ pub struct SweepReport {
 /// A sweep that failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SimFailure {
-    /// The failed seed. For a sweep-wide failure, the first seed.
+    /// The failed seed. For a sweep-wide failure, the first seed, or 0 when
+    /// the seed variables do not parse.
     pub seed: u64,
     /// What failed.
     pub reason: String,
@@ -1059,8 +1060,9 @@ impl Simulation<'_> {
     /// # Errors
     ///
     /// Returns the first failure. Its `Display` holds a one-line replay
-    /// command with [`SEED_VAR`]. A failure of the whole sweep names its
-    /// seeds with [`SEED_BASE_VAR`] and [`SEEDS_VAR`] instead.
+    /// command with [`SEED_VAR`]. A `sometimes!` label that is never true
+    /// names the seeds of the sweep with [`SEED_BASE_VAR`] and [`SEEDS_VAR`]
+    /// instead.
     pub async fn sweep(
         &self,
         handler: WorkflowHandlerFn,

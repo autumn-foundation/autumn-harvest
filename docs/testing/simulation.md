@@ -175,8 +175,8 @@ test.
   one. A step timeout counts as a failure.
 
 The two Postgres jobs pull `postgres:16` with retries before the tests
-start. testcontainers retries no pull, so one cut pull failed a night
-(issue #2280).
+start. `testcontainers` does not retry a pull. In issue #2280, an
+interrupted pull failed the `world` job.
 
 Each job takes its seed base from the run number, so each night tests new
 seeds. A manual dispatch can set the seed base and the sweep size.

@@ -810,6 +810,7 @@ async fn a_sweep_wide_failure_names_its_seeds() {
         !failure.repro.contains(&format!("{SEED_VAR}=")),
         "{failure}"
     );
+    assert_eq!(failure.seed, 40);
 }
 
 /// Waits on a classic 20 s timer and a cancellable 10 s timer at once.

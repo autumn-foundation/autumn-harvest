@@ -5,7 +5,8 @@
 # `testcontainers` retries nothing on a pull, so a registry blip fails a
 # live-DB test. This script retries each pull. It reads SEMAPHORE_SHARD_COUNT
 # and SEMAPHORE_SHARD_INDEX through `run-suites.sh`, as the suite step does.
-# `ci.yml` (`test-db-linux`) and `coverage-nightly.yml` (`db`) call it.
+# `ci.yml` (`test-db-linux`), `coverage-nightly.yml` (`db`) and
+# `dst-nightly.yml` (`differential`, `world`) call it.
 #
 # Every tag the suites actually request, not just the testcontainers-modules
 # default (Codex review: the default alone left the suites that override it
@@ -26,8 +27,8 @@
 # - The MinIO and fake-gcs-server emulators: only on the shards that run
 #   their suites (issue #1983).
 #
-# Arguments name the images to pull instead. Then the script reads no
-# shard. `dst-nightly.yml` passes `postgres:16` (issue #2280).
+# With arguments, the script pulls only those images and skips the shard
+# plan. `dst-nightly.yml` passes `postgres:16` (issue #2280).
 set -euo pipefail
 
 if [ "$#" -gt 0 ]; then

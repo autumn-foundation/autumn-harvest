@@ -231,10 +231,10 @@ that expects a sweep to fail can pass on one seed.
 
 The replay command names the package and the test target. Add any other
 cargo arguments with `Simulation::cargo_args`, for example
-`--features testing`. When the whole sweep fails, as for a `sometimes!`
-label that is never true, the command sets `HARVEST_SIM_SEED_BASE` and
-`HARVEST_SIM_SEEDS` to the seeds of the failed sweep. The command uses POSIX shell syntax. On Windows, set
-the variable first.
+`--features testing`. When a `sometimes!` label is never true, the
+command sets `HARVEST_SIM_SEED_BASE` and `HARVEST_SIM_SEEDS` to the seeds
+of the failed sweep. The command uses POSIX shell syntax. On Windows, set
+the variables first.
 
 `Simulation::replay_with(handler)` replays each history with another
 handler. Use it to check a new build against the orders of the old one.
@@ -247,11 +247,12 @@ A sweep is a normal `#[tokio::test]`. Enable the `testing` feature of
 `HARVEST_SIM_SEEDS=10000` in a nightly job. Change `HARVEST_SIM_SEED_BASE` to
 explore new seeds without a code change.
 
-A nightly job moves the seed base, so each `require_reached` target must
-be true in any window of seeds, not only in the window of each pull
-request. Give each target a rate of about 10% of seeds or more. Then a
-64-seed window misses it in about 1 sweep of 1000. A rarer target passes
-on a lucky window and fails a later night. Raise its rate with the mocks
+A nightly job moves the seed base. Each `require_reached` target must be
+true in almost every window of seeds, not only in the pull-request window.
+Give each target a rate of about 10% of seeds or more. Then a 64-seed
+window misses one target in about 1 sweep of 850. Each further target adds
+about the same risk. A rarer target passes on a lucky window and fails a
+later night. Raise its rate with the mocks
 or the signals, or require it in a sweep that reaches it more often
 (issue #2280).
 
