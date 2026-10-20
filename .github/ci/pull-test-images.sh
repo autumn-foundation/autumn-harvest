@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Pre-pull the Docker images that this shard's `linux` manifest rows need.
+# Pre-pull the named Docker images, or the ones that this shard's `linux`
+# manifest rows need.
 #
 # `testcontainers` retries nothing on a pull, so a registry blip fails a
 # live-DB test. This script retries each pull. It reads SEMAPHORE_SHARD_COUNT
@@ -30,6 +31,12 @@
 set -euo pipefail
 
 if [ "$#" -gt 0 ]; then
+  for image in "$@"; do
+    if [ -z "$image" ]; then
+      echo "::error::an image argument is empty"
+      exit 1
+    fi
+  done
   images="$*"
 else
   images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0 redis:7.4-alpine"

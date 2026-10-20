@@ -16,9 +16,11 @@
 #   one. GitHub tells only the last editor of a cron about a failure.
 #
 # A job's seed base is run_number * 4 * 999999999. Each shard has at most
-# 999999999 seeds, so two runs never share a seed, whatever their sizes. Each test step has a timeout below its job's timeout. A step
-# timeout is a failure, so the alert fires. A job timeout is a cancel, and
-# `failure()` does not see it.
+# 999999999 seeds, so two runs never share a seed, whatever their sizes.
+#
+# Each test step and each image pull has a timeout. The step timeouts of a
+# job sum to less than its timeout. A step timeout is a failure, so the
+# alert fires. A job timeout is a cancel, and `failure()` does not see it.
 #
 # A failure prints its seed and a local replay command. See
 # docs/testing/simulation.md.
@@ -148,6 +150,7 @@ jobs:
       # testcontainers retries no pull. A cut pull failed `world` in
       # issue #2280, so the image is pulled with retries first.
       - name: Pull the Postgres image
+        timeout-minutes: 10
         run: bash .github/ci/pull-test-images.sh postgres:16
       - name: Replay oracle runs on Postgres
         # The test owns a Postgres container (testcontainers), so the
@@ -158,7 +161,8 @@ jobs:
   world:
     name: Worker world (shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # The build (40), the pull (10) and the run (70) leave 10 for setup.
+    timeout-minutes: 130
     strategy:
       fail-fast: false
       matrix:
@@ -201,6 +205,7 @@ jobs:
         timeout-minutes: 40
         run: cargo test -p autumn-harvest --test integration --no-run
       - name: Pull the Postgres image
+        timeout-minutes: 10
         run: bash .github/ci/pull-test-images.sh postgres:16
       - name: Run the worker loop under the seeded world
         # The test owns a Postgres container (testcontainers), so the
