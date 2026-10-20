@@ -169,11 +169,17 @@ test.
   then runs the owner-lease sweep on the same seeds.
 - `differential`: 2,000 seeds against Postgres, in 4 shards.
 - `world`: 1,000 world seeds on Postgres, in 4 shards.
+- `autoresearch`: the workflow sweeps of the autoresearch example, 5,000
+  seeds each. See [`workflow-simulation.md`](workflow-simulation.md).
 - `stateright`: the Stateright models of the oracles, at their nightly
   bounds. A sweep samples schedules, and these models visit every schedule
   within a bound. See [`stateright.md`](stateright.md).
 - `alert`: a failed scheduled run opens an issue, or comments on the open
   one. A step timeout counts as a failure.
+
+The two Postgres jobs pull `postgres:16` with retries before the tests
+start. `testcontainers` does not retry a pull. In issue #2280, an
+interrupted pull failed the `world` job.
 
 Each job takes its seed base from the run number, so each night tests new
 seeds. A manual dispatch can set the seed base and the sweep size.
