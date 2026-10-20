@@ -33,7 +33,7 @@ Add the `stateright` test target, with the
 - The models reuse the DST ghost checker and invariant names. They read
   `formal/tla/models.txt`, so each TLA+ counter-example must fail here on the
   same invariant.
-- The per-PR bound runs in about 10 seconds in a debug build, inside the
+- The per-PR bound runs in about 20 seconds in a debug build, inside the
   existing no-db test job. The nightly DST workflow checks larger bounds.
 
 The first models cover the activity claim protocol (issue #1789) and the

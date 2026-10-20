@@ -18,7 +18,7 @@ use autumn_harvest::dst::{
 };
 use stateright::{Checker, Model, Property};
 
-use super::{cfg_lines, check_all, check_until, deep, read, tla_red_rows};
+use super::{check_all, check_until, deep, tla_constants, tla_red_rows};
 
 /// A worker is dead when its last beat is this many ticks old.
 const STALE_TICKS: u64 = 1;
@@ -492,23 +492,6 @@ fn every_dst_invariant_is_a_property() {
     for invariant in Invariant::ALL {
         assert!(names.contains(invariant.name()), "{invariant} is unchecked");
     }
-}
-
-/// The constants of a TLC config, as `(name, value)` pairs.
-fn tla_constants(config: &str) -> Vec<(String, String)> {
-    let cfg = read(&format!("formal/tla/{config}"));
-    let mut in_block = false;
-    let mut constants = Vec::new();
-    for line in cfg_lines(&cfg) {
-        if line == "CONSTANTS" {
-            in_block = true;
-        } else if let Some((name, value)) = line.split_once(" = ").filter(|_| in_block) {
-            constants.push((name.trim().to_string(), value.trim().to_string()));
-        } else if !line.is_empty() {
-            in_block = false;
-        }
-    }
-    constants
 }
 
 /// The fence that a TLC config of `ActivityClaim.tla` sets.

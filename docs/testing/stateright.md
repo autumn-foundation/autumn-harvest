@@ -25,7 +25,7 @@ therefore checked on every schedule, with no hand-written spec in between.
 cargo test -p autumn-harvest --no-default-features --test stateright
 ```
 
-The run needs no database. It takes about 10 seconds in a debug build on 4
+The run needs no database. It takes about 20 seconds in a debug build on 4
 cores. The no-db test job runs it on Linux, macOS and Windows, because it is
 part of `cargo test -p autumn-harvest --no-default-features`.
 
@@ -125,7 +125,8 @@ behavior reaches all five tags: `stale-commit`, `flap`,
 `append-after-expiry`, `renew-in-flight` and `ack-before-bump`.
 
 Each red `OwnerLease` row of `formal/tla/models.txt` names a defect and an
-invariant. The test reads the manifest and each config, so a new TLA+
+invariant. The test reads the manifest and each config. It builds the model
+from the config's workers, signals, `MaxEpoch` and `Defect`, so a new TLA+
 counter-example must fail here too:
 
 | Defect | Must break |
@@ -149,7 +150,7 @@ counter-example must fail here too:
 | `every_dst_invariant_is_a_property` | Each `dst::Invariant` is an `always` property. |
 | `every_tla_counter_example_has_a_stateright_match` | Each red `ActivityClaim` config runs here with its `Fenced` value and reaches the same invariant or witness. An unknown constant fails. |
 | `the_design_keeps_every_invariant_and_reaches_every_nemesis` | The owner design keeps every invariant and reaches every nemesis. |
-| `every_tla_defect_fails_here_on_the_same_invariant` | Each TLA+ defect breaks its invariant here. |
+| `every_tla_defect_fails_here_on_the_same_invariant` | Each red `OwnerLease` config runs here with its workers, signals, `MaxEpoch` and `Defect`. It breaks the same invariant, or reaches `EveryNemesisSeen` for the reach row. An unknown constant fails. |
 | `the_no_fence_counter_example_is_a_stale_owner_commit` | The `no-fence` event comes from a worker that pinned an older epoch. |
 | `every_simulator_invariant_is_a_property` | Each `OwnerInvariant` is an `always` property. |
 
@@ -187,6 +188,6 @@ Two mutations of the oracles show that the passing checks can fail:
    you do.
 3. If the change adds a red row to `formal/tla/models.txt`, the
    cross-check tests fail until a test here breaks the same invariant.
-4. Keep the per-PR bound under about 5 seconds in a debug build. Put a larger
+4. Keep each per-PR check under about 10 seconds in a debug build. Put a larger
    bound behind `HARVEST_STATERIGHT_DEEP`.
 5. Update this page.

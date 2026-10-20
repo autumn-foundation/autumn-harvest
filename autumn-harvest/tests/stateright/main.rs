@@ -96,3 +96,20 @@ fn cfg_lines(cfg: &str) -> impl Iterator<Item = &str> {
     cfg.lines()
         .map(|l| l.split("\\*").next().unwrap_or_default().trim())
 }
+
+/// The constants of a TLC config, as `(name, value)` pairs.
+fn tla_constants(config: &str) -> Vec<(String, String)> {
+    let cfg = read(&format!("formal/tla/{config}"));
+    let mut in_block = false;
+    let mut constants = Vec::new();
+    for line in cfg_lines(&cfg) {
+        if line == "CONSTANTS" {
+            in_block = true;
+        } else if let Some((name, value)) = line.split_once(" = ").filter(|_| in_block) {
+            constants.push((name.trim().to_string(), value.trim().to_string()));
+        } else if !line.is_empty() {
+            in_block = false;
+        }
+    }
+    constants
+}

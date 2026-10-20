@@ -18,7 +18,7 @@ use autumn_harvest::dst::owner::{
 };
 use stateright::{Checker, Model, Property};
 
-use super::{cfg_lines, check_all, check_until, deep, read, tla_red_rows};
+use super::{check_all, check_until, deep, tla_constants, tla_red_rows};
 
 /// The bounds of one check.
 #[derive(Debug, Clone, Copy)]
@@ -466,13 +466,39 @@ fn no_acked_signal_lost(state: &State) -> bool {
     })
 }
 
-/// The `Defect` value that a TLC config sets.
-fn tla_defect(config: &str) -> Defect {
-    let cfg = read(&format!("formal/tla/{config}"));
-    let value = cfg_lines(&cfg)
-        .find_map(|l| l.strip_prefix("Defect = "))
-        .unwrap_or_else(|| panic!("{config} sets no Defect"));
-    Defect::parse(value.trim_matches('"')).unwrap_or_else(|e| panic!("{config}: {e}"))
+/// The number of elements in a TLC set such as `{w1, w2}`.
+fn tla_set_size(config: &str, value: &str) -> usize {
+    let items = value
+        .strip_prefix('{')
+        .and_then(|v| v.strip_suffix('}'))
+        .unwrap_or_else(|| panic!("{config}: {value} is not a set"));
+    items.split(',').filter(|i| !i.trim().is_empty()).count()
+}
+
+/// The model that a TLC config of `OwnerLease.tla` describes.
+///
+/// A constant that this model does not map fails here, so a red row cannot
+/// pass on its invariant name alone.
+fn tla_model(config: &str) -> OwnerLease {
+    let mut model = OwnerLease::design();
+    for (name, value) in tla_constants(config) {
+        match name.as_str() {
+            "NoWorker" | "NoSignal" => {}
+            "Workers" => model.workers = tla_set_size(config, &value),
+            "Signals" => model.signals = tla_set_size(config, &value),
+            "MaxEpoch" => {
+                model.max_epoch = value
+                    .parse()
+                    .unwrap_or_else(|e| panic!("{config}: MaxEpoch = {value}: {e}"));
+            }
+            "Defect" => {
+                model.defect = Defect::parse(value.trim_matches('"'))
+                    .unwrap_or_else(|e| panic!("{config}: {e}"));
+            }
+            _ => panic!("{config}: the Stateright model has no match for {name} = {value}"),
+        }
+    }
+    model
 }
 
 #[test]
@@ -486,30 +512,28 @@ fn every_tla_defect_fails_here_on_the_same_invariant() {
     let rows = tla_red_rows("OwnerLease");
     let mut defects = BTreeSet::new();
     for (config, invariant) in rows {
-        let defect = tla_defect(&config);
-        if defect == Defect::None {
+        let model = tla_model(&config);
+        let property = if model.defect == Defect::None {
             assert_eq!(
                 invariant, TLA_REACH,
                 "{config}: a new design row needs a Stateright witness"
             );
-            continue;
-        }
-        let property = OwnerInvariant::parse(&invariant)
-            .unwrap_or_else(|e| panic!("{config}: {e}"))
-            .as_str();
-        let checker = check_until(OwnerLease::with_defect(defect), property);
+            EVERY_NEMESIS_SEEN
+        } else {
+            OwnerInvariant::parse(&invariant)
+                .unwrap_or_else(|e| panic!("{config}: {e}"))
+                .as_str()
+        };
+        let checker = check_until(model, property);
         let path = checker.assert_any_discovery(property);
         assert!(
             !path.into_actions().is_empty(),
-            "{config}: the initial state breaks {property}"
+            "{config}: the initial state reaches {property}"
         );
-        defects.insert(defect);
+        defects.insert(model.defect);
     }
-    let want: BTreeSet<Defect> = Defect::ALL
-        .into_iter()
-        .filter(|d| *d != Defect::None)
-        .collect();
-    assert_eq!(defects, want, "every defect has a TLA+ counter-example");
+    let want: BTreeSet<Defect> = Defect::ALL.into_iter().collect();
+    assert_eq!(defects, want, "every defect and the design have a TLA+ row");
 }
 
 #[test]
