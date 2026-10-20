@@ -11370,6 +11370,54 @@ mod tests {
         }
     }
 
+    /// Every release-if-held statement across the task queue shares one
+    /// literal prefix (🪞 Echo clone-class merge, instances 5→1): this
+    /// over-cap release, both `queue_pause` releases, and the
+    /// workflow-pause and activity-pause releases. The prefix is spelled out
+    /// here rather than taken from the shared macro, so this test still pins
+    /// the real behavior even if a later change collapses the macro back
+    /// into per-site literals. Pins the shared text so a future edit to one
+    /// copy cannot drift from the rest without failing here first.
+    #[test]
+    fn every_release_if_held_statement_shares_the_same_prefix() {
+        let prefix = "UPDATE harvest_task_queue \
+            SET state = 'PENDING', \
+                worker_id = NULL, \
+                started_at = NULL, \
+                attempt = GREATEST(attempt - 1, 0) \
+            WHERE id = $1 \
+              AND state = 'RUNNING' \
+              AND worker_id = $2";
+        for (name, sql) in [
+            (
+                "queue::release_claim_if_over_cap",
+                release_claim_if_over_cap_query(),
+            ),
+            (
+                "queue_pause::release_claim",
+                crate::queue_pause::release_claim_query(),
+            ),
+            (
+                "queue_pause::release_claim_if_queue_paused",
+                crate::queue_pause::release_claim_if_queue_paused_query(),
+            ),
+            (
+                "activity_pause::release_claim_if_activity_paused",
+                crate::activity_pause::release_claim_if_activity_paused_query(),
+            ),
+            (
+                "execution::release_claim_if_workflow_paused",
+                crate::execution::release_claim_if_workflow_paused_query(),
+            ),
+        ] {
+            assert!(
+                sql.starts_with(prefix),
+                "{name} must start with the shared release-claim prefix \
+                 {prefix:?}; got {sql:?}"
+            );
+        }
+    }
+
     /// The window scan gives the planner no partial index (issue #1971).
     ///
     /// The head scans already test the polled queues. A queue test or a
