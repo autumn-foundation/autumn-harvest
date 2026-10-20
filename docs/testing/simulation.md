@@ -169,6 +169,9 @@ test.
   then runs the owner-lease sweep on the same seeds.
 - `differential`: 2,000 seeds against Postgres, in 4 shards.
 - `world`: 1,000 world seeds on Postgres, in 4 shards.
+- `stateright`: the Stateright models of the oracles, at their nightly
+  bounds. A sweep samples schedules, and these models visit every schedule
+  within a bound. See [`stateright.md`](stateright.md).
 - `alert`: a failed scheduled run opens an issue, or comments on the open
   one. A step timeout counts as a failure.
 

@@ -190,6 +190,13 @@ path = "tests/property/mod.rs"
 name = "dst"
 path = "tests/dst/main.rs"
 
+# Stateright model checks of the DST oracles. Exhaustive within a bound, so
+# they complement the seeded sweeps above. Needs no database. See
+# docs/testing/stateright.md.
+[[test]]
+name = "stateright"
+path = "tests/stateright/main.rs"
+
 [[bench]]
 name = "metrics_noop"
 harness = false
@@ -369,6 +376,10 @@ testcontainers-modules = { workspace = true }
 # rate (issue #2013). The loom and shuttle models never use it.
 [target.'cfg(not(any(loom, shuttle)))'.dev-dependencies]
 autumn-harvest-agent = { version = "0.7.0", path = "../autumn-harvest-agent" }
+# Explores every interleaving of the DST oracles within a bound (the
+# `stateright` test target). Dev-only, so it never ships. The loom and Shuttle
+# builds skip it, so `--cfg loom` cannot reach its dependencies.
+stateright = "0.31.0"
 
 # loom is only pulled in under `RUSTFLAGS="--cfg loom"`. It must live under a
 # `cfg(loom)` target dependency rather than `[dev-dependencies]` because the

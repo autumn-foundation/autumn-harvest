@@ -12,6 +12,9 @@
 #   autoresearch example, widened from 64 seeds to 5000 per sweep. It has
 #   its own seed space: its base is run_number * 5000, and it ignores the
 #   `seeds` input.
+# - `stateright`: the Stateright model checks of the DST oracles, at the
+#   larger bounds of HARVEST_STATERIGHT_DEEP. A PR checks the smaller
+#   bounds in the no-db test job. See docs/testing/stateright.md.
 # - `alert`: a failed scheduled run opens an issue, or comments on the open
 #   one. GitHub tells only the last editor of a cron about a failure.
 #
@@ -232,9 +235,26 @@ jobs:
         timeout-minutes: 40
         run: cargo test --release -p autoresearch --test simulation -- --nocapture
 
+  stateright:
+    name: Stateright models (nightly bounds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The checks take about 1 minute on 4 cores. The build takes longer.
+      - name: Check every state within the nightly bounds
+        timeout-minutes: 30
+        env:
+          HARVEST_STATERIGHT_DEEP: "1"
+        run: cargo test --release -p autumn-harvest --no-default-features --test stateright -- --nocapture
+
   alert:
     name: Report a failed nightly
-    needs: [sweep, differential, world, autoresearch]
+    needs: [sweep, differential, world, autoresearch, stateright]
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10

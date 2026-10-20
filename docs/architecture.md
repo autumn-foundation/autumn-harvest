@@ -228,6 +228,8 @@ The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue
 
 *Simulation.* `autumn_harvest::dst` drives the same protocol from a seed, with 3 workers, stalls and crashes (issue #1830). A differential test replays each run on Postgres through the production statements. With the fence off, a sweep reproduces the #1789 bug. The world simulation runs the real worker loop, timers and the scheduler fire claim under a seed (issue #2002). See [`simulation.md`](testing/simulation.md).
 
+*Exhaustive oracle check.* Stateright visits every schedule of the same oracle within a bound. With the fence off, it finds the #1789 trace in 7 steps. See [`stateright.md`](testing/stateright.md).
+
 **10. Suspension readiness (issue #1797)**
 
 A decision cycle suspends when the workflow is blocked on Harvest futures. No clock decides a suspension. A clock bounds only waits on foreign futures. `executor::run_workflow_handler_cycle` applies this rule.
@@ -2023,6 +2025,8 @@ randomized- and model-checking-based testing layers, and CI run coverage:
   deterministic simulation of the activity claim protocol, with a Postgres
   differential test (issue #1830). The world simulation runs the real
   worker loop under a seed (issue #2002).
+* [`docs/testing/stateright.md`](testing/stateright.md) — Stateright model
+  checks that visit every schedule of the DST oracles within a bound.
 * [`docs/testing/ci-db-suite-allowlist.md`](testing/ci-db-suite-allowlist.md)
   — the DB suites that CI does not run from the manifest, each with a
   reason, and an owner for debt (issue #1799).
