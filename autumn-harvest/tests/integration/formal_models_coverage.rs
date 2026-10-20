@@ -6,6 +6,7 @@
 //! - Every `formal/tla/*.cfg` has a row in `formal/tla/models.txt`.
 //! - Each row names a spec, a config and an expected result.
 //! - The claim-epoch model has a passing config and a pre-fix counter-example.
+//! - The owner-lease model has a red config per defect and a witness.
 //! - `ci.yml` runs the model runner and `cargo kani` on every PR.
 //! - The crate holds at least three Kani proofs.
 //! - `docs/testing/formal-methods.md` names every spec and every proof.
@@ -245,6 +246,93 @@ fn claim_epoch_model_has_a_pre_fix_counter_example() {
             .any(|r| matches!(r.expect, Expect::Violation(_))),
         "ActivityClaim needs a config that reproduces the pre-#1789 bug"
     );
+}
+
+/// The `Defect` values that `spec` lists in its `Defects ==` set.
+fn spec_defects(spec: &str) -> BTreeSet<String> {
+    let start = spec.find("Defects ==").expect("the spec defines `Defects`");
+    let end = spec[start..].find('}').expect("`Defects` is a set") + start;
+    spec[start..end]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `Defect` value that a TLC config sets.
+fn config_defect(cfg: &str) -> Option<String> {
+    cfg.lines()
+        .map(|l| l.split("\\*").next().unwrap_or_default().trim())
+        .find_map(|l| l.strip_prefix("Defect = "))
+        .map(|v| v.trim_matches('"').to_string())
+}
+
+/// Issue #2250: each owner-lease defect has a red config, the design has a
+/// green one, and one behaviour of the design reaches all four nemeses.
+#[test]
+fn owner_lease_model_has_a_red_config_per_defect_and_a_witness() {
+    let spec = read("formal/tla/OwnerLease.tla");
+    let rows: Vec<ModelRow> = manifest()
+        .into_iter()
+        .filter(|r| r.spec == "OwnerLease")
+        .collect();
+    let mut red = BTreeSet::new();
+    let mut green = false;
+    let mut witness = false;
+    for row in &rows {
+        let cfg = read(&format!("formal/tla/{}", row.config));
+        let defect =
+            config_defect(&cfg).unwrap_or_else(|| panic!("{} sets no `Defect`", row.config));
+        match (&row.expect, defect.as_str()) {
+            (Expect::Pass, "none") => green = true,
+            (Expect::Violation(inv), "none") => {
+                assert_eq!(inv, "SomeNemesisUnseen", "{}", row.config);
+                witness = true;
+            }
+            (Expect::Violation(_), other) => {
+                assert!(red.insert(other.to_string()), "two configs for `{other}`");
+            }
+            (Expect::Pass, other) => panic!("{} passes with defect `{other}`", row.config),
+        }
+    }
+    let mut want = spec_defects(&spec);
+    assert!(want.remove("none"), "`Defects` must hold \"none\"");
+    assert_eq!(red, want, "each defect needs exactly one red config");
+    assert!(green, "OwnerLease needs a passing config of the design");
+    assert!(witness, "OwnerLease needs a SomeNemesisUnseen witness");
+
+    // The commit-fence mutant of the issue must break the one-owner rule.
+    let no_fence = rows
+        .iter()
+        .find(|r| {
+            config_defect(&read(&format!("formal/tla/{}", r.config))).as_deref() == Some("no-fence")
+        })
+        .expect("a no-fence row");
+    assert_eq!(
+        no_fence.expect,
+        Expect::Violation("OneOwnerPerEpoch".to_string())
+    );
+
+    // The witness covers the four nemeses of the issue. Nemesis 2 has two
+    // tags, a flap under a decision and an append after the lease ends.
+    let witness: String = spec
+        .lines()
+        .skip_while(|l| !l.starts_with("WitnessTags =="))
+        .take_while(|l| !l.trim().is_empty())
+        .collect();
+    for tag in [
+        "stale-commit",
+        "flap",
+        "append-after-expiry",
+        "renew-in-flight",
+        "ack-before-bump",
+    ] {
+        assert!(
+            witness.contains(&format!("\"{tag}\"")),
+            "WitnessTags lacks {tag}"
+        );
+    }
 }
 
 /// The Kani script must run every proof and check the verified count.
