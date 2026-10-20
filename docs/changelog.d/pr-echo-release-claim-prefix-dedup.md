@@ -23,11 +23,15 @@ became its fifth caller, without anyone noticing — a small, concrete
 instance of the drift the original macro's own comment predicted.
 
 **What shipped.** `release_claim_prefix!()` moved from `queue_pause.rs` to
-`queue.rs` (the module `release_claim_via` already lives in, and that every
-one of the five already depends on), as `pub(crate)`. The three
+the crate root in `lib.rs`, as `pub(crate)`, not to `queue.rs`: `pub mod
+queue;` is `#[cfg(feature = "db")]`-gated, but `activity_pause`,
+`execution` and `queue_pause` are not, and must build with no database
+support at all. A first pass moved the macro into `queue.rs` and broke
+exactly that no-`db` build (caught by CI's Lint job); the fix moved it to
+the crate root instead, beside the existing `cfg_db!` macro. The three
 hand-copied `_query()` functions now build their SQL with
-`concat!(crate::queue::release_claim_prefix!(), " AND ...")`, same as
-`queue_pause.rs`'s own two already did. `release_claim_via`'s doc comment
+`concat!(crate::release_claim_prefix!(), " AND ...")`, same as
+`queue_pause.rs`'s own two already do. `release_claim_via`'s doc comment
 is corrected to "five callers" and now names the over-cap release too.
 
 **Characterization tests, committed first.** Each of the five `_query()`
