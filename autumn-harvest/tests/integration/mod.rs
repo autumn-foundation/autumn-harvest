@@ -139,9 +139,12 @@ mod debugger_tests;
 mod decision_boundary_db_tests;
 #[cfg(feature = "testing")]
 mod decision_boundary_replay_tests;
+mod decision_owner_db_tests;
 mod decision_owner_docs;
 #[cfg(feature = "db")]
 mod decision_owner_lock_modes_db_tests;
+mod decision_owner_sim_db_tests;
+mod decision_owner_worker_tests;
 mod declarative_update_tests;
 #[cfg(feature = "db")]
 mod deep_backlog_fixture_tests;

@@ -25,7 +25,7 @@
 //! oracle has no event-id backstop, so the fence alone keeps the
 //! invariants.
 //!
-//! See `docs/testing/simulation.md` and `docs/adr/0009-fenced-owner-lease.md`.
+//! See `docs/testing/simulation.md` and `docs/adr/0010-fenced-owner-lease.md`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -237,7 +237,8 @@ pub trait OwnerStore {
     /// Returns `false` when the row moved.
     fn release(&mut self, worker: WorkerId, epoch: Epoch) -> bool;
 
-    /// The renewal `UPDATE`. It matches `worker` and `epoch`.
+    /// The renewal `UPDATE`. It matches `worker` and `epoch`, and needs a
+    /// live lease.
     fn renew(&mut self, worker: WorkerId, epoch: Epoch) -> Renewal;
 
     /// The lease time runs out. The holder and the epoch stay.
@@ -324,7 +325,9 @@ impl OwnerStore for OracleOwnerStore {
     }
 
     fn renew(&mut self, worker: WorkerId, epoch: Epoch) -> Renewal {
-        if self.row.holder != Some(worker) || self.row.epoch != epoch {
+        // ADR 0009 decision 5: a renewal also needs a live lease. A lapsed
+        // holder acquires again, at a new epoch.
+        if self.row.holder != Some(worker) || self.row.epoch != epoch || !self.row.live {
             return Renewal::Lost;
         }
         if self.defect == Defect::RenewBumps {

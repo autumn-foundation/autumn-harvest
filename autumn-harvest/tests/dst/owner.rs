@@ -29,7 +29,7 @@ const COVER_SEEDS: SeedPlan = SeedPlan {
     count: 200,
 };
 
-/// The table that stage 1a adds. ADR 0009 names it.
+/// The table that stage 1a adds. ADR 0009 decision 4 names it.
 const OWNER_TABLE: &str = "harvest_decision_owner";
 
 fn repo_root() -> PathBuf {

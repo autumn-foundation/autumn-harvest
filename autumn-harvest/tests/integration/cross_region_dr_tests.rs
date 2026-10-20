@@ -231,6 +231,84 @@ macro_rules! require_db {
     };
 }
 
+// ── Issue #2251: the DR bump expires every owner lease ────────────────────
+
+/// ADR 0009 decision 4: the bump expires every owner lease in its own
+/// transaction. Workers in the promoted region then acquire at once. The
+/// epoch stays, so the next acquisition still adds 1.
+#[tokio::test]
+async fn a_bump_expires_every_owner_lease_and_keeps_the_epochs() {
+    use autumn_harvest::decision_owner::{
+        self, Acquisition, DecisionPartition, OwnerHolder, OwnerLeaseConfig,
+    };
+    let (url, _db) = require_db!("owner_bump");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .expect("provision");
+    let old = OwnerHolder::for_worker("old-region");
+    let config = OwnerLeaseConfig::default();
+    let mut tenures = Vec::new();
+    for n in [3_u16, 300, 511] {
+        let p = DecisionPartition::new(n).expect("in range");
+        match decision_owner::acquire(&mut conn, ShardId::new(0), &old, p, &config)
+            .await
+            .expect("acquire")
+        {
+            Acquisition::Acquired(t) => tenures.push(t),
+            other => panic!("acquire {p}: {other:?}"),
+        }
+    }
+
+    bump_generation(&mut conn, ShardId::new(0), "drill", "test")
+        .await
+        .expect("bump");
+
+    // The bump ends each lease and keeps its holder and epoch.
+    #[derive(diesel::QueryableByName)]
+    struct Kept {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let kept: Kept = diesel::sql_query(
+        "SELECT count(*) AS n FROM harvest_decision_owner \
+         WHERE holder = $1 AND lease_until <= clock_timestamp()",
+    )
+    .bind::<diesel::sql_types::Text, _>(old.as_str())
+    .get_result(&mut conn)
+    .await
+    .expect("read the owner rows");
+    assert_eq!(kept.n, 3, "each lease ended and kept its holder");
+    // The old region cannot renew an ended lease.
+    let renewed = decision_owner::renew_all(
+        &mut conn,
+        ShardId::new(0),
+        &tenures,
+        std::time::Duration::from_secs(1),
+    )
+    .await
+    .expect("renew");
+    let lost: Vec<_> = tenures.iter().map(|t| t.partition()).collect();
+    assert_eq!(renewed, decision_owner::LeaseWrite::done(vec![], lost));
+
+    let new = OwnerHolder::for_worker("new-region");
+    for t in &tenures {
+        match decision_owner::acquire(&mut conn, ShardId::new(0), &new, t.partition(), &config)
+            .await
+            .expect("acquire")
+        {
+            Acquisition::Acquired(fresh) => {
+                assert_eq!(
+                    Some(fresh.epoch()),
+                    t.epoch().next(),
+                    "the bump keeps the epoch"
+                );
+            }
+            other => panic!("the bump frees {}: {other:?}", t.partition()),
+        }
+    }
+}
+
 // ── AC2 / AC6(a): the fence ────────────────────────────────────────────────
 
 #[tokio::test]
