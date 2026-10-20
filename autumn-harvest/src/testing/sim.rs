@@ -1059,7 +1059,8 @@ impl Simulation<'_> {
     /// # Errors
     ///
     /// Returns the first failure. Its `Display` holds a one-line replay
-    /// command with [`SEED_VAR`].
+    /// command with [`SEED_VAR`]. A failure of the whole sweep names its
+    /// seeds with [`SEED_BASE_VAR`] and [`SEEDS_VAR`] instead.
     pub async fn sweep(
         &self,
         handler: WorkflowHandlerFn,
@@ -1072,16 +1073,26 @@ impl Simulation<'_> {
                 .filter(|name| *name != "main" && !name.starts_with("tokio-"))
                 .map(str::to_string)
         });
-        let sweep_failure = |reason: String, first: u64| {
+        let sweep_failure = |reason: String, plan: Option<SeedPlan>| {
+            let command = cargo_test_command(test_name.as_deref(), &self.cargo_args);
+            // A target can be true on one window and false on the next, so
+            // the command names the window.
+            let repro = match plan {
+                Some(plan) => format!(
+                    "{SEED_BASE_VAR}={} {SEEDS_VAR}={} {command}",
+                    plan.first, plan.count
+                ),
+                None => command,
+            };
             Box::new(SimFailure {
-                seed: first,
+                seed: plan.map_or(0, |plan| plan.first),
                 reason,
-                repro: cargo_test_command(test_name.as_deref(), &self.cargo_args),
+                repro,
                 trace_tail: String::new(),
                 whole_sweep: true,
             })
         };
-        let plan = self.plan().map_err(|reason| sweep_failure(reason, 0))?;
+        let plan = self.plan().map_err(|reason| sweep_failure(reason, None))?;
         let one_seed = std::env::var(SEED_VAR).is_ok();
         let mut report = SweepReport::default();
         let mut seen = self.required.clone();
@@ -1118,7 +1129,7 @@ impl Simulation<'_> {
                 "sometimes!({label:?}) was never true in {} seeds",
                 report.seeds
             );
-            return Err(sweep_failure(reason, plan.first));
+            return Err(sweep_failure(reason, Some(plan)));
         }
         Ok(report)
     }

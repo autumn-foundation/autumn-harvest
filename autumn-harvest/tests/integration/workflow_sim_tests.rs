@@ -785,6 +785,33 @@ async fn a_required_label_that_no_run_evaluates_fails_the_sweep() {
     );
 }
 
+/// A sweep-wide failure replays only on the same seeds, so its command names
+/// them (issue #2280).
+#[tokio::test]
+async fn a_sweep_wide_failure_names_its_seeds() {
+    use autumn_harvest::testing::sim::{SEED_BASE_VAR, SEED_VAR, SEEDS_VAR};
+    let failure = quotes_env()
+        .simulation()
+        .seeds(SeedPlan {
+            first: 40,
+            count: 4,
+        })
+        .require_reached("an unreachable branch")
+        .sweep(two_steps, json!(null), |_| {})
+        .await
+        .expect_err("no run evaluates the label");
+    assert!(
+        failure
+            .repro
+            .starts_with(&format!("{SEED_BASE_VAR}=40 {SEEDS_VAR}=4 cargo test")),
+        "{failure}"
+    );
+    assert!(
+        !failure.repro.contains(&format!("{SEED_VAR}=")),
+        "{failure}"
+    );
+}
+
 /// Waits on a classic 20 s timer and a cancellable 10 s timer at once.
 fn two_timers(ctx: &WorkflowContext, _: Value) -> Fut<'_> {
     Box::pin(async move {
