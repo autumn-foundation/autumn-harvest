@@ -78,7 +78,8 @@ struct CacheEntry {
     history_bytes: Option<HistoryBytesMark>,
     /// The shard and decision partition of the execution, if the caller
     /// knows them (issue #2251). A fenced owner drops each entry of its
-    /// partition.
+    /// partition. Only the db-gated worker reads the key.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     owner_key: Option<OwnerKey>,
 }
 
@@ -272,6 +273,7 @@ impl WorkflowCache {
     /// caller drops the returned entries outside the cache lock, because
     /// each one can hold a parked handler future.
     #[must_use = "drop the evicted entries outside the cache lock"]
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker unloads a partition.
     pub(crate) fn evict_partition(&mut self, key: OwnerKey) -> ClosedEntries {
         let doomed: Vec<Uuid> = self
             .inner
