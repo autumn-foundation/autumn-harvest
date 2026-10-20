@@ -199,7 +199,8 @@ async fn a_stale_tenure_is_fenced_unloaded_and_never_retried() {
     };
     let exec = fx.start(&workflow_id).await;
     let control = fx.start(&control_id).await;
-    let shard = exec.shard();
+    // A single-pool worker keys its tenures by the pool shard.
+    let shard = decision_owner::OwnerKey::pool_shard(None);
 
     // The worker takes the row, its lease lapses, and a peer takes it over.
     free_row(&mut fx.conn, partition).await;
@@ -272,7 +273,8 @@ async fn owner_mode_without_a_tenure_fails_closed() {
     let (mut fx, _container) = Fixture::new().await;
     let (workflow_id, _partition) = free_workflow_id();
     let exec = fx.start(&workflow_id).await;
-    let shard = exec.shard();
+    // A single-pool worker keys its tenures by the pool shard.
+    let shard = decision_owner::OwnerKey::pool_shard(None);
 
     let (worker, owned) = fx.worker(|owned| owned.set_owner_mode(shard, true));
     let task = spawn_test_worker(Arc::clone(&worker), fx.pool.clone());

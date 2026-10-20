@@ -276,6 +276,17 @@ pub struct OwnerKey {
 }
 
 impl OwnerKey {
+    /// The shard that keys the tenures of a worker pool.
+    ///
+    /// `pool` is the shard of the pool that a task came from. A worker with
+    /// one plain pool has no shard identity, so it uses
+    /// [`ShardId::UNENCODED`]. The acquisition loop of issue #2252 adopts
+    /// each tenure under the same shard.
+    #[must_use]
+    pub fn pool_shard(pool: Option<ShardId>) -> ShardId {
+        pool.unwrap_or(ShardId::UNENCODED)
+    }
+
     /// The key of an execution with `workflow_id` on `shard`.
     #[must_use]
     pub fn of(shard: ShardId, workflow_id: &str) -> Self {

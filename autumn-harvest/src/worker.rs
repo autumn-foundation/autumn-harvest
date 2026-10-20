@@ -39329,7 +39329,7 @@ impl Worker {
         let pool = pool.clone();
         let pool_labels = self.pool_labels(shard);
         // Issue #2251: the owner key names the database of the claim.
-        let owner_shard = shard.unwrap_or(crate::types::ShardId::UNENCODED);
+        let owner_shard = crate::decision_owner::OwnerKey::pool_shard(shard);
         let registry = Arc::clone(&self.registry);
         let task_id = task.id;
         let task_type = task.task_type.clone();
