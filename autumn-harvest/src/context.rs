@@ -482,6 +482,28 @@ fn should_check_durable_cancellation(
 // WorkflowCommand -- commands emitted during live execution
 // ---------------------------------------------------------------------------
 
+/// Why a [`WorkflowCommand::CancelRaceLosers`] cancels its operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LoserCancelReason {
+    /// A sibling branch of a race won.
+    RaceLoser,
+    /// The cancellation scope that started the operations was cancelled
+    /// (issue #1984).
+    ScopeCancelled,
+}
+
+impl LoserCancelReason {
+    /// The error text of the synthetic terminal that the worker records.
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::RaceLoser => "lost race to a sibling branch",
+            Self::ScopeCancelled => "cancelled by its cancellation scope",
+        }
+    }
+}
+
 /// A command emitted by the workflow coroutine during live (non-replay) execution.
 ///
 /// The worker drains these after the coroutine suspends, then schedules real
@@ -887,7 +909,12 @@ pub enum WorkflowCommand {
     ///   necessary terminal event to the parent's history and is idempotent
     ///   against an already-terminal child.
     /// - `timers`: deleting the still-pending `harvest_timers` row.
+    ///
+    /// A cancellation scope (issue #1984) pushes the same command for its
+    /// members. `reason` selects the text of the synthetic terminals.
     CancelRaceLosers {
+        /// Why the operations are cancelled.
+        reason: LoserCancelReason,
         /// Activity execution IDs of losing activity branches still open
         /// (`PENDING`/`RUNNING`) at race-resolution time.
         activities: Vec<ActivityExecId>,
@@ -1188,11 +1215,13 @@ impl std::fmt::Debug for WorkflowCommand {
                 .field("already_requested", already_requested)
                 .finish_non_exhaustive(),
             Self::CancelRaceLosers {
+                reason,
                 activities,
                 children,
                 timers,
             } => f
                 .debug_struct("CancelRaceLosers")
+                .field("reason", reason)
                 .field("activities", activities)
                 .field("children", children)
                 .field("timers", timers)
@@ -1317,6 +1346,17 @@ pub enum TimerOutcome {
 /// does **not** override the recorded fire-vs-cancel race: `await_timer_fire`
 /// always consults recorded history first (`match_timer_or_cancel`) and only
 /// falls back to this state when history holds no resolving event yet.
+/// The handle timer state before a timer command that a scope body pushes
+/// (issue #1984).
+#[derive(Debug)]
+struct TimerUndo {
+    /// The cancellable scopes around the push, innermost last.
+    scopes: Vec<u32>,
+    timer_id: String,
+    state: Option<TimerLogicalState>,
+    epoch: Option<u64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimerLogicalState {
     /// The timer is armed (or has been re-armed by `reset`) and awaiting a fire.
@@ -1443,6 +1483,7 @@ impl<'a> MutexHandle<'a> {
     /// # Errors
     ///
     /// - [`HarvestError::MutexSelfDeadlock`] if the workflow already holds `key`.
+    /// - [`HarvestError::Config`] inside a cancellation scope (issue #1984).
     /// - [`HarvestError::NonDeterministic`] if recorded history diverges from the
     ///   expected `MutexGranted` for this key.
     pub async fn acquire(self) -> HarvestResult<MutexGuard<'a>> {
@@ -1457,6 +1498,12 @@ impl<'a> MutexHandle<'a> {
                 key: self.key.clone(),
             });
         }
+
+        // Issue #1984: a cancelled scope drops a parked acquire. Its waiter
+        // row then stays at the head of the FIFO queue and blocks the key.
+        // So a scope cannot acquire a mutex.
+        self.context
+            .reject_in_cancellable_scope(&format!("ctx.mutex({}).acquire()", self.key))?;
 
         match self
             .context
@@ -2303,13 +2350,15 @@ impl WorkflowLogger<'_> {
         // `max_lines` would make the store's `admit == lines.len()` and the
         // truncation marker would never fire, turning AC4's visible overflow
         // into silent loss.
-        let queued = self
-            .ctx
-            .log_commands_queued
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if queued > u64::from(policy.max_lines()) {
+        //
+        // A call over the bound queues nothing, so it does not count. The
+        // counter then equals the queued `RecordLog` commands, and a scope
+        // cancel that withdraws them gives back the whole budget (#1984).
+        let queued = &self.ctx.log_commands_queued;
+        if queued.load(std::sync::atomic::Ordering::Relaxed) > u64::from(policy.max_lines()) {
             return;
         }
+        queued.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let capped = truncate_on_char_boundary(message, policy.max_message_bytes);
         // `seq` IS the call ordinal: a deterministic identity for this logical
@@ -2362,23 +2411,34 @@ pub(crate) const SESSION_ACQUIRE_ACTIVITY_NAME: &str = "__harvest_session_acquir
 /// like a member activity, so only the host frees its own in-process slot.
 pub(crate) const SESSION_RELEASE_ACTIVITY_NAME: &str = "__harvest_session_release";
 
-/// Returns `true` when `name` is one of the two reserved worker-session
-/// internal activity names (issue #606): `__harvest_session_acquire` or
-/// `__harvest_session_release`.
+/// Reserved activity name for the release that a dropped [`Session`] issues
+/// (issue #2193).
 ///
-/// Both are always registered in `HandlerRegistry::activities` (so the
-/// enqueue-time handler lookup never hard-fails on them) with
-/// `default_queue: None`, but they are dispatched on the *caller-supplied*
-/// session queue (`SessionOptions::queue`) at the point `create_session`/
-/// `Session::complete` is called, never on a fixed queue of their own. A
-/// preflight/readiness check deriving "queues this deployment needs a
-/// worker listening on" from every registered activity's
-/// `default_queue.unwrap_or("default")` must exclude these two names —
-/// otherwise a deployment with no session-based workflow at all is
-/// spuriously reported as requiring a worker on `"default"`.
+/// No body awaits it. Replay treats its records as transparent, so it never
+/// shifts a positional match.
+pub(crate) const SESSION_DROP_RELEASE_ACTIVITY_NAME: &str = "__harvest_session_drop_release";
+
+/// Returns `true` when `name` is one of the reserved worker-session internal
+/// activity names (issue #606): `__harvest_session_acquire`,
+/// `__harvest_session_release` or `__harvest_session_drop_release` (#2193).
+///
+/// All three are always registered in `HandlerRegistry::activities`. The
+/// enqueue-time handler lookup then never hard-fails on them. Each has
+/// `default_queue: None`. Each is dispatched on the *caller-supplied* session
+/// queue (`SessionOptions::queue`) at the point `create_session`,
+/// `Session::complete` or a session drop runs. None uses a fixed queue of its
+/// own.
+///
+/// A preflight or readiness check can derive the queues that a deployment
+/// needs a worker on. It reads `default_queue.unwrap_or("default")` from every
+/// registered activity. That check must exclude these three names. Otherwise a
+/// deployment with no session-based workflow is wrongly reported as requiring
+/// a worker on `"default"`.
 #[must_use]
 pub fn is_reserved_session_activity_name(name: &str) -> bool {
-    name == SESSION_ACQUIRE_ACTIVITY_NAME || name == SESSION_RELEASE_ACTIVITY_NAME
+    name == SESSION_ACQUIRE_ACTIVITY_NAME
+        || name == SESSION_RELEASE_ACTIVITY_NAME
+        || name == SESSION_DROP_RELEASE_ACTIVITY_NAME
 }
 
 /// Default session acquisition timeout.
@@ -2667,11 +2727,43 @@ impl Default for SessionOptions {
 /// Borrows the owning [`WorkflowContext`] for its lifetime, mirroring
 /// [`RaceBuilder`]'s shape — a session cannot outlive the workflow function
 /// invocation that created it.
+///
+/// Dropping a session without [`Self::complete`] releases its host slot
+/// (issue #2193). This covers a cancelled future, a race loser and a
+/// `select!` branch. The release runs at the next suspension. A run that ends
+/// first leaves the session to the broken-session scanner.
 pub struct Session<'a> {
     ctx: &'a WorkflowContext,
     id: SessionId,
     host_worker_id: String,
     queue: String,
+    /// Set when [`Self::complete`] has dispatched the release (issue #2193).
+    settled: bool,
+}
+
+impl Drop for Session<'_> {
+    /// Releases the session when its owner drops it (issue #2193).
+    ///
+    /// The release is an activity that no body awaits. It does nothing when:
+    ///
+    /// - [`Self::complete`] already dispatched the release;
+    /// - a panic is unwinding, because the cycle discards its commands;
+    /// - the cycle is suspending, because the executor drops the handler
+    ///   future at each park and the session stays open;
+    /// - history already holds a drop release for the session.
+    fn drop(&mut self) {
+        // A panicking cycle discards its commands. A lock that the panic
+        // poisoned must not abort the process from inside the unwind.
+        if self.settled
+            || std::thread::panicking()
+            || self.ctx.is_suspending()
+            || self.ctx.history_released_session(self.id)
+        {
+            return;
+        }
+        self.ctx
+            .push_drop_release(self.id, self.host_worker_id.clone(), self.queue.clone());
+    }
 }
 
 impl Session<'_> {
@@ -2804,8 +2896,13 @@ impl Session<'_> {
     /// Returns [`HarvestError::SessionBroken`] if the host worker died or
     /// drained before release could complete — the slot is still reclaimed
     /// by the broken-session scanner in that case.
-    pub async fn complete(self) -> HarvestResult<()> {
-        self.ctx
+    ///
+    /// Dropping the returned future before the dispatch returns releases the
+    /// session on drop (issue #2193). Any result of the dispatch, an error
+    /// included, settles the session.
+    pub async fn complete(mut self) -> HarvestResult<()> {
+        let released = self
+            .ctx
             .execute_activity_raw_full(
                 SESSION_RELEASE_ACTIVITY_NAME,
                 Value::from(self.id.to_string()),
@@ -2817,8 +2914,10 @@ impl Session<'_> {
                 None,
                 false,
             )
-            .await
-            .map_err(|err| self.broken_session_error(err))?;
+            .await;
+        // A drop of this future before this point releases the session.
+        self.settled = true;
+        released.map_err(|err| self.broken_session_error(err))?;
         Ok(())
     }
 }
@@ -2849,6 +2948,26 @@ pub(crate) struct SagaUnwindObservation {
     pub(crate) counted: bool,
 }
 
+/// A buffered command and the cancellation scopes that issued it (issue #1984).
+struct BufferedCommand {
+    /// The push order. A scope cancel keeps it with each record it withdraws.
+    order: u64,
+    cmd: WorkflowCommand,
+    scopes: Vec<u32>,
+}
+
+/// How a pending cancel request shows to the workflow body (issue #1984).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingCancel {
+    /// No pending request. A cancellation reason, if any, is recorded.
+    None,
+    /// A pending request. A non-cancellable block hides it from its body.
+    Pending,
+    /// A pending request while the history holds an open block. The body
+    /// does not see it, so a check before the block replays as it ran.
+    BehindOpenBlock,
+}
+
 /// Context passed to every workflow function.
 ///
 /// In **replay mode** (resuming from Postgres history): commands are matched
@@ -2866,7 +2985,8 @@ pub struct WorkflowContext {
     /// Replay engine -- matches commands against recorded event history.
     matcher: Mutex<HistoryMatcher>,
     /// Commands accumulated during live execution, drained by the worker.
-    commands: Mutex<Vec<WorkflowCommand>>,
+    /// Each command keeps the cancellation scopes that issued it (issue #1984).
+    commands: Mutex<Vec<BufferedCommand>>,
     /// Harvest futures parked with no result channel (issue #1797).
     parks: ParkCounter,
     /// Keys of the promises this run has made, named or generated (issue
@@ -2956,6 +3076,15 @@ pub struct WorkflowContext {
     /// stable, unique `race:{seq}` / `race_winner:{seq}` marker names across
     /// replays, mirroring `fan_out_seq`.
     race_seq: Mutex<u32>,
+    /// Sequence counter for `ctx.cancellation_scope()` (issue #1984).
+    scope_seq: Mutex<u32>,
+    /// Sequence counter for `ctx.non_cancellable()` (issue #1984).
+    shield_seq: Mutex<u32>,
+    /// The scopes and shields whose body is polled now, innermost last.
+    scope_stack: Mutex<Vec<crate::cancellation_scope::ScopeFrame>>,
+    /// Every scope of this run, so a resident cycle can drop the members
+    /// that resolved (issue #1984).
+    live_scopes: Mutex<Vec<std::sync::Weak<crate::cancellation_scope::ScopeShared>>>,
     /// The number of `ctx.race()` calls in flight (issue #2007). A race
     /// that suspends cannot stay resident.
     open_races: std::sync::atomic::AtomicUsize,
@@ -3062,6 +3191,15 @@ pub struct WorkflowContext {
     /// `cancel(); await_fire()` (live or on replay) resolves
     /// [`TimerOutcome::Cancelled`] instead of re-arming a cancelled timer.
     cancellable_timer_state: Mutex<std::collections::HashMap<String, TimerLogicalState>>,
+    /// The arm count of each handle timer id (issue #1984). A scope cancel uses
+    /// it to cancel only the arm that its body made.
+    timer_arm_epochs: Mutex<std::collections::HashMap<String, u64>>,
+    /// The timer state before each timer command that a scope body pushes
+    /// this cycle (issue #1984). A scope cancel restores the entries of the
+    /// commands that it withdraws.
+    timer_undo: Mutex<Vec<TimerUndo>>,
+    /// The next push order of a buffered command (issue #1984).
+    command_order: std::sync::atomic::AtomicU64,
     /// Per-run set of `timer_id`s used by the classic `ctx.timer`/`sleep_until`
     /// API this task (issue #768, Codex P2 round 16). Populated by
     /// [`Self::timer`]; consulted by [`Self::start_timer`] / [`Self::reset_timer`]
@@ -3130,6 +3268,9 @@ pub struct WorkflowContext {
     /// yields [`HarvestError::Cancelled`]. Cooperative: the workflow function is
     /// expected to consult these at strategic points to run cleanup logic.
     cancellation_reason: Option<String>,
+    /// Whether `cancellation_reason` is a pending request, not a recorded
+    /// `WorkflowCancelled`, and where the body sees it (issue #1984).
+    cancellation_pending: PendingCancel,
     /// When `true`, activity and local-activity dispatch compares the input
     /// payload against what was recorded in history, in addition to the name.
     /// Set by the `WorkflowReplayer` to detect non-deterministic input changes.
@@ -3421,6 +3562,11 @@ impl WorkflowContext {
     /// strict replay the matcher is never locked, so no `pump_signal_handlers`
     /// side effect is introduced on the non-strict path.
     fn strict_replay_no_match_is_divergence(&self) -> bool {
+        // Issue #1984: a replayed scope cancel cuts history at its horizon.
+        // The live cycle parked there, so a no-match there is not drift.
+        if self.replays_a_scope_cancel() {
+            return false;
+        }
         self.strict_replay
             && !(self.canary_mode && self.match_history(|m| m.position() >= m.len()))
             // Issue #952 — the FAILING-FRONTIER exception. A history sealed by a
@@ -3669,6 +3815,7 @@ impl WorkflowContext {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn for_replay_with_state_and_history_policy(
         exec_id: ExecutionId,
         events: Vec<WorkflowEvent>,
@@ -3725,6 +3872,10 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            scope_seq: Mutex::new(0),
+            shield_seq: Mutex::new(0),
+            scope_stack: Mutex::new(Vec::new()),
+            live_scopes: Mutex::new(Vec::new()),
             open_races: std::sync::atomic::AtomicUsize::new(0),
             speculative: std::sync::atomic::AtomicBool::new(false),
             speculation_read_position: std::sync::atomic::AtomicBool::new(false),
@@ -3738,6 +3889,9 @@ impl WorkflowContext {
             log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
+            timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
+            timer_undo: Mutex::new(Vec::new()),
+            command_order: std::sync::atomic::AtomicU64::new(0),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -3749,6 +3903,7 @@ impl WorkflowContext {
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
+            cancellation_pending: PendingCancel::None,
             strict_replay: false,
             canary_mode: false,
             update_dispatch: None,
@@ -3916,6 +4071,10 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            scope_seq: Mutex::new(0),
+            shield_seq: Mutex::new(0),
+            scope_stack: Mutex::new(Vec::new()),
+            live_scopes: Mutex::new(Vec::new()),
             open_races: std::sync::atomic::AtomicUsize::new(0),
             speculative: std::sync::atomic::AtomicBool::new(false),
             speculation_read_position: std::sync::atomic::AtomicBool::new(false),
@@ -3929,6 +4088,9 @@ impl WorkflowContext {
             log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
+            timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
+            timer_undo: Mutex::new(Vec::new()),
+            command_order: std::sync::atomic::AtomicU64::new(0),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -3940,6 +4102,7 @@ impl WorkflowContext {
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason,
+            cancellation_pending: PendingCancel::None,
             strict_replay: false,
             canary_mode: false,
             update_dispatch: None,
@@ -3997,6 +4160,10 @@ impl WorkflowContext {
             child_placement_seq: Mutex::new(0),
             shard_router: None,
             race_seq: Mutex::new(0),
+            scope_seq: Mutex::new(0),
+            shield_seq: Mutex::new(0),
+            scope_stack: Mutex::new(Vec::new()),
+            live_scopes: Mutex::new(Vec::new()),
             open_races: std::sync::atomic::AtomicUsize::new(0),
             speculative: std::sync::atomic::AtomicBool::new(false),
             speculation_read_position: std::sync::atomic::AtomicBool::new(false),
@@ -4010,6 +4177,9 @@ impl WorkflowContext {
             log_policy: None,
             saga_seq: Mutex::new(0),
             cancellable_timer_state: Mutex::new(std::collections::HashMap::new()),
+            timer_arm_epochs: Mutex::new(std::collections::HashMap::new()),
+            timer_undo: Mutex::new(Vec::new()),
+            command_order: std::sync::atomic::AtomicU64::new(0),
             classic_timer_ids: Mutex::new(std::collections::HashSet::new()),
             held_mutex_keys: Mutex::new(std::collections::HashSet::new()),
             suspending: std::sync::atomic::AtomicBool::new(false),
@@ -4021,6 +4191,7 @@ impl WorkflowContext {
             signal_registry: Mutex::new(SignalHandlerRegistry::new()),
             signal_pump_hold: std::sync::atomic::AtomicUsize::new(0),
             cancellation_reason: None,
+            cancellation_pending: PendingCancel::None,
             strict_replay: false,
             canary_mode: false,
             update_dispatch: None,
@@ -4390,9 +4561,30 @@ impl WorkflowContext {
     /// replace a recorded reason. `None` changes nothing. A backend that
     /// rebuilds a context outside the executor, such as for an update, calls
     /// it directly.
+    ///
+    /// Issue #1984: a history with an open non-cancellable block hides the
+    /// request for the whole replay. A check before the block then reads as it
+    /// did when the block opened. The request shows once no block is open.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal matcher mutex is poisoned.
     #[must_use]
     pub fn with_pending_cancellation(mut self, reason: Option<String>) -> Self {
         if self.cancellation_reason.is_none() {
+            self.cancellation_pending = if reason.is_none() {
+                PendingCancel::None
+            } else if self
+                .matcher
+                .lock()
+                .expect("matcher lock poisoned")
+                .open_non_cancellable_blocks()
+                > 0
+            {
+                PendingCancel::BehindOpenBlock
+            } else {
+                PendingCancel::Pending
+            };
             self.cancellation_reason = reason;
         }
         self
@@ -4987,7 +5179,26 @@ impl WorkflowContext {
             crate::replay::ContinueAsNewMatch::True => true,
             crate::replay::ContinueAsNewMatch::False => false,
             crate::replay::ContinueAsNewMatch::Frontier => {
-                let due = self.history_size_exceeded();
+                // Issue #1984: a cancelled scope captured the answer of its
+                // cancelling cycle. The replay of the scope body reads it, as
+                // the other recorded decisions do.
+                let due = self
+                    .captured_or_drift(self.captured_scope_record(
+                        crate::event::SideEffectKind::Custom,
+                        Some(crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME),
+                    ))
+                    .and_then(|value| {
+                        let due = value.as_bool();
+                        if due.is_none() {
+                            self.record_deferred_nd(
+                                "side-effect drift mismatch: the continue-as-new decision that \
+                                 a scope cancel recorded is not a boolean"
+                                    .to_string(),
+                            );
+                        }
+                        due
+                    })
+                    .unwrap_or_else(|| self.history_size_exceeded());
                 self.push_command(WorkflowCommand::RecordSideEffect {
                     kind: crate::event::SideEffectKind::Custom,
                     name: Some(crate::replay::CONTINUE_AS_NEW_SIDE_EFFECT_NAME.to_string()),
@@ -5136,7 +5347,23 @@ impl WorkflowContext {
                 // `Utc::now()` exactly as before — `system_now`'s #384
                 // host-wall-clock contract is untouched (this internal probe is
                 // the only reader that consults the virtual clock).
-                let millis = self.deadline_frontier_now_millis();
+                let millis = self
+                    .captured_or_drift(self.captured_scope_record(
+                        crate::event::SideEffectKind::Now,
+                        Some(crate::replay::DEADLINE_PROBE_SIDE_EFFECT_NAME),
+                    ))
+                    .and_then(|value| {
+                        let millis = value.as_i64();
+                        if millis.is_none() {
+                            self.record_deferred_nd(
+                                "side-effect drift mismatch: the deadline clock that a scope \
+                                 cancel recorded is not a millisecond count"
+                                    .to_string(),
+                            );
+                        }
+                        millis
+                    })
+                    .unwrap_or_else(|| self.deadline_frontier_now_millis());
                 // Record the fresh clock read like `system_now` does at its
                 // `NoMatch` (frontier) branch — append the value + push the
                 // `RecordSideEffect` bookkeeping command — but under the reserved
@@ -5212,8 +5439,20 @@ impl WorkflowContext {
         if self.note_position_read() {
             return true;
         }
+        // Issue #1984: the side effects of a replayed cancel already fired.
+        if self.replays_a_scope_cancel() {
+            return true;
+        }
         let matcher = self.matcher.lock().expect("matcher lock poisoned");
         matcher.is_replaying() || matcher.has_terminal_failure_tail()
+    }
+
+    /// Whether a scope body re-runs the cycle of a recorded cancel (issue
+    /// #1984). The matcher stops at the cancel horizon, so the body sees a
+    /// live frontier, but the live cycle already fired its side effects.
+    pub(crate) fn replays_a_scope_cancel(&self) -> bool {
+        let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+        crate::cancellation_scope::replays_a_cancel(&stack)
     }
 
     /// Replay gate of [`publish_durable_progress`](Self::publish_durable_progress)
@@ -5236,6 +5475,11 @@ impl WorkflowContext {
     /// chunk at the same offset.
     pub(crate) fn durable_replay_suppresses(&self) -> bool {
         if self.note_position_read() {
+            return true;
+        }
+        // Issue #1984: a replayed cancel withdraws the chunk again, so the
+        // chunk is not serialized. The offset is claimed before this check.
+        if self.replays_a_scope_cancel() {
             return true;
         }
         let matcher = self.matcher.lock().expect("matcher lock poisoned");
@@ -5358,9 +5602,30 @@ impl WorkflowContext {
     /// [`HarvestError::Cancelled`] when their result channels are dropped as
     /// part of the cancellation flow; this accessor is the analogous hook
     /// for code paths that never suspend.
+    ///
+    /// A pending request is hidden inside a non-cancellable block (issue
+    /// #1984), so the block's cleanup does not stop on it.
     #[must_use]
-    pub const fn is_cancelled(&self) -> bool {
-        self.cancellation_reason.is_some()
+    pub fn is_cancelled(&self) -> bool {
+        self.visible_cancellation_reason().is_some()
+    }
+
+    /// The cancellation reason that the workflow body sees (issue #1984).
+    fn visible_cancellation_reason(&self) -> Option<&str> {
+        if self.cancellation_pending == PendingCancel::BehindOpenBlock {
+            return None;
+        }
+        if self.cancellation_pending == PendingCancel::Pending
+            && self
+                .scope_stack
+                .lock()
+                .expect("scope stack lock poisoned")
+                .iter()
+                .any(|frame| matches!(frame, crate::cancellation_scope::ScopeFrame::Shield))
+        {
+            return None;
+        }
+        self.cancellation_reason.as_deref()
     }
 
     /// Recorded cancellation reason when [`is_cancelled`](Self::is_cancelled)
@@ -5370,7 +5635,7 @@ impl WorkflowContext {
     /// to read the original message or reason that initiated the abort.
     #[must_use]
     pub fn cancellation_reason(&self) -> Option<&str> {
-        self.cancellation_reason.as_deref()
+        self.visible_cancellation_reason()
     }
 
     /// Fail fast with [`HarvestError::Cancelled`] when the workflow has been
@@ -5403,7 +5668,7 @@ impl WorkflowContext {
     /// Returns [`HarvestError::Cancelled`] when
     /// [`is_cancelled`](Self::is_cancelled) is true.
     pub fn check_cancellation(&self) -> HarvestResult<()> {
-        if let Some(reason) = self.cancellation_reason.as_deref() {
+        if let Some(reason) = self.visible_cancellation_reason() {
             return Err(HarvestError::Cancelled(reason.to_string()));
         }
         Ok(())
@@ -5558,23 +5823,46 @@ impl WorkflowContext {
             HistoryMatch::NoMatch => {
                 self.check_strict_replay_no_match(&format!("SideEffectRecorded({id})"))?;
 
-                let result = f();
-                let output = serde_json::to_value(&result)?;
+                // An invalid captured value fails as a recorded one does. Drift
+                // fails before `f` runs.
+                let (result, output) = match self
+                    .captured_scope_record(crate::event::SideEffectKind::Custom, Some(id))
+                {
+                    crate::cancellation_scope::Captured::NotReplaying => {
+                        let result = f();
+                        let output = serde_json::to_value(&result)?;
+                        self.check_payload_depth(PayloadKind::SideEffectValue, None, &output)?;
 
-                // Enforce side-effect payload cap before recording.
-                // SideEffectRecorded events are written via pre_suspension_events_from_commands
-                // using plain store::append_events (no offloader), so the offload bypass must
-                // NOT apply here even when a PayloadStore is configured.
-                let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
-                if observed > self.payload_max_side_effect {
-                    return Err(HarvestError::PayloadTooLarge {
-                        kind: PayloadKind::SideEffectValue,
-                        observed_bytes: observed,
-                        cap_bytes: self.payload_max_side_effect,
-                        workflow_type: self.workflow_name.clone(),
-                        activity_name: None,
-                    });
-                }
+                        // Enforce side-effect payload cap before recording.
+                        // SideEffectRecorded events are written via pre_suspension_events_from_commands
+                        // using plain store::append_events (no offloader), so the offload bypass must
+                        // NOT apply here even when a PayloadStore is configured.
+                        let observed = serde_json::to_string(&output).map_or(0, |s| s.len() as u64);
+                        if observed > self.payload_max_side_effect {
+                            return Err(HarvestError::PayloadTooLarge {
+                                kind: PayloadKind::SideEffectValue,
+                                observed_bytes: observed,
+                                cap_bytes: self.payload_max_side_effect,
+                                workflow_type: self.workflow_name.clone(),
+                                activity_name: None,
+                            });
+                        }
+                        (result, output)
+                    }
+                    // A captured value replays as recorded, as a recorded one does.
+                    // The live cap does not apply to it again.
+                    crate::cancellation_scope::Captured::Value(value) => {
+                        let result = serde_json::from_value::<T>(value.clone())
+                            .map_err(HarvestError::Serialization)?;
+                        (result, value)
+                    }
+                    crate::cancellation_scope::Captured::Drift(drift) => {
+                        return Err(self.scope_nd_error(
+                            format!("non-deterministic replay: {drift}"),
+                            format!("SideEffectRecorded({id})"),
+                        ));
+                    }
+                };
 
                 self.push_command(WorkflowCommand::RecordSideEffect {
                     kind: crate::event::SideEffectKind::Custom,
@@ -5714,7 +6002,21 @@ impl WorkflowContext {
                         kind.as_str()
                     ));
                 }
-                let result = f();
+                // An invalid captured value is drift, as a recorded one is.
+                let result = self
+                    .captured_or_drift(self.captured_scope_record(kind, None))
+                    .and_then(|value| match serde_json::from_value::<T>(value) {
+                        Ok(value) if is_valid(&value) => Some(value),
+                        _ => {
+                            self.record_deferred_nd(format!(
+                                "side-effect drift mismatch: the {} value that a scope cancel \
+                                 recorded is not valid now",
+                                kind.as_str()
+                            ));
+                            None
+                        }
+                    })
+                    .unwrap_or_else(f);
                 // Built-in values (timestamps, UUIDs, u64/f64) always serialise.
                 let value = serde_json::to_value(&result)
                     .expect("built-in side-effect value must serialise");
@@ -5900,13 +6202,30 @@ impl WorkflowContext {
                             .to_string(),
                     );
                 }
-                let result = match self.seeded_draw() {
+                // A simulation run draws its seed first, as the live cycle did,
+                // so a captured value leaves later seeded draws in step.
+                let seeded = self.seeded_draw();
+                // An invalid captured value is drift, as a recorded one is.
+                let captured = self
+                    .captured_or_drift(self.captured_scope_record(SideEffectKind::Random, None))
+                    .and_then(|value| match serde_json::from_value::<T>(value) {
+                        Ok(value) if range.contains(&value) => Some(value),
+                        _ => {
+                            self.record_deferred_nd(
+                                "side-effect drift mismatch: the random value that a scope \
+                                 cancel recorded is not in the current range"
+                                    .to_string(),
+                            );
+                            None
+                        }
+                    });
+                let result = captured.unwrap_or_else(|| match seeded {
                     Some((seed, _)) => rand::Rng::gen_range(
                         &mut <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed),
                         range,
                     ),
                     None => rand::Rng::gen_range(&mut rand::thread_rng(), range),
-                };
+                });
                 let value = serde_json::to_value(&result)
                     .expect("built-in side-effect value must serialise");
                 self.push_command(WorkflowCommand::RecordSideEffect {
@@ -5971,7 +6290,37 @@ impl WorkflowContext {
             min <= max,
             "version gate '{change_id}': min version {min} must not exceed max version {max}"
         );
-        let version = self.match_history(|m| m.match_version(change_id, min, max));
+        let (live, version) = self.match_history(|m| {
+            let live = m.version_gate_is_live();
+            (live, m.match_version(change_id, min, max))
+        });
+
+        // Issue #1984: a scope cancel withdrew the gate's marker. Replay keeps
+        // the version that the live cycle chose, even after a deploy moves the
+        // range. `match_version` returns a recorded marker the same way.
+        // A gate that matched its marker in history takes no captured record.
+        if live
+            && let Some(captured) = self
+                .captured_or_drift(
+                    self.captured_scope_marker(&crate::replay::version_marker_name(change_id)),
+                )
+                .and_then(|details| {
+                    let version = details.as_u64().and_then(|v| u32::try_from(v).ok());
+                    if version.is_none() {
+                        self.record_deferred_nd(format!(
+                            "version gate '{change_id}': the version that a scope cancel \
+                             recorded is not a version number"
+                        ));
+                    }
+                    version
+                })
+        {
+            self.push_command(WorkflowCommand::RecordMarker {
+                name: crate::replay::version_marker_name(change_id),
+                details: Value::from(u64::from(captured)),
+            });
+            return captured;
+        }
 
         // During live execution (matcher returned max_version and is past
         // history), emit a marker so future replays see this version.
@@ -6171,6 +6520,17 @@ impl WorkflowContext {
         self.match_history(|m| {
             m.deprecate_patch(patch_id);
         });
+        // Issue #1984: a scope that replays a cancel holds the gate markers of
+        // that cycle as captured records. The deprecation drops them there too.
+        crate::cancellation_scope::drop_captured_gate(
+            &self.live_scopes.lock().expect("live scopes lock poisoned"),
+            patch_id,
+        );
+    }
+
+    /// Whether this replay cycle deprecated the gate `patch_id` (issue #1984).
+    pub(crate) fn patch_is_deprecated(&self, patch_id: &str) -> bool {
+        self.match_history_unpumped(|m| m.patch_is_deprecated(patch_id))
     }
 
     // ── Saga compensation observability (issue #801) ──────────────────
@@ -6264,15 +6624,20 @@ impl WorkflowContext {
                 // terminal `WorkflowCancelled` the lookahead skips), NOT a
                 // live unwind — never count it retroactively, never push a
                 // fresh marker command mid-replay (Codex P2, PR #973 review).
-                if self.is_replay_probe() {
+                // A replayed scope cancel (issue #1984) holds the marker and
+                // checks it against its capture. The live cycle counted it.
+                let replayed_cancel = self.replays_a_scope_cancel();
+                if self.is_replay_probe() && !replayed_cancel {
                     false
                 } else {
                     self.push_command(WorkflowCommand::RecordMarker {
                         name,
                         details: Value::from(pending as u64),
                     });
-                    self.metrics
-                        .record_saga_compensated(&self.workflow_name, &self.queue_name);
+                    if !replayed_cancel {
+                        self.metrics
+                            .record_saga_compensated(&self.workflow_name, &self.queue_name);
+                    }
                     true
                 }
             }
@@ -6318,14 +6683,18 @@ impl WorkflowContext {
             // probe never records into a frontier, even for a counted unwind
             // (its `counted` came from a marker already in history).
             SagaMarkerMatch::LiveFrontier | SagaMarkerMatch::DrainedSignalFrontier
-                if observation.counted && !self.is_replay_probe() =>
+                if observation.counted
+                    && (!self.is_replay_probe() || self.replays_a_scope_cancel()) =>
             {
                 self.push_command(WorkflowCommand::RecordMarker {
                     name,
                     details: Value::from(error_count as u64),
                 });
-                self.metrics
-                    .record_saga_compensation_failed(&self.workflow_name, &self.queue_name);
+                // A replayed scope cancel counted the failure live (issue #1984).
+                if !self.replays_a_scope_cancel() {
+                    self.metrics
+                        .record_saga_compensation_failed(&self.workflow_name, &self.queue_name);
+                }
             }
             // Silent otherwise: Recorded (already counted on the cycle that
             // first recorded the marker), an uncounted unwind's frontier
@@ -6483,6 +6852,7 @@ impl WorkflowContext {
                 )
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
                 self.check_strict_replay_no_match(&format!("ActivityScheduled({name})"))?;
 
                 // Enforce activity input payload cap before scheduling.
@@ -6494,9 +6864,12 @@ impl WorkflowContext {
                         .map_or(global, |ov| global.max(ov))
                 };
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+                // Issue #1984: a scope that replays its cancel holds this
+                // dispatch. The cap applied when the cancelling cycle made it.
                 if effective_cap > 0
                     && observed > effective_cap
                     && !self.offload_will_apply(observed)
+                    && !self.replays_a_scope_cancel()
                 {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
@@ -6802,6 +7175,7 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
                 self.check_strict_replay_no_match(&format!("LocalActivityScheduled({name})"))?;
 
                 // Enforce activity input payload cap for local activities too.
@@ -6816,7 +7190,9 @@ impl WorkflowContext {
                 // Local activities are written with plain store::append_events (no
                 // offloader), so the offload bypass must NOT apply here even when a
                 // PayloadStore is configured. Always enforce the cap.
-                if effective_cap > 0 && observed > effective_cap {
+                // Issue #1984: a scope that replays its cancel holds this
+                // dispatch. The cap applied when the cancelling cycle made it.
+                if effective_cap > 0 && observed > effective_cap && !self.replays_a_scope_cancel() {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ActivityInput,
                         observed_bytes: observed,
@@ -7465,10 +7841,23 @@ impl WorkflowContext {
     /// it is driven purely by the workflow's own `start_timer`/`cancel_timer`/
     /// `reset_timer` calls in program order.
     fn set_timer_logical_state(&self, timer_id: &str, state: TimerLogicalState) {
+        let armed = matches!(state, TimerLogicalState::Armed { .. });
         self.cancellable_timer_state
             .lock()
             .expect("cancellable_timer_state lock poisoned")
             .insert(timer_id.to_string(), state);
+        // Issue #1984: a scope cancel also cancels the timers that its body arms.
+        if armed {
+            let epoch = *self
+                .timer_arm_epochs
+                .lock()
+                .expect("timer_arm_epochs lock poisoned")
+                .entry(timer_id.to_string())
+                .and_modify(|epoch| *epoch += 1)
+                .or_insert(1);
+            let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+            crate::cancellation_scope::note_armed_timer(&stack, timer_id, epoch);
+        }
     }
 
     /// Clear the logical lifecycle entry for `timer_id` (issue #768).
@@ -7485,6 +7874,159 @@ impl WorkflowContext {
             .lock()
             .expect("cancellable_timer_state lock poisoned")
             .remove(timer_id);
+    }
+
+    /// The value that a cancelled scope recorded here, on replay (issue #1984).
+    fn captured_scope_record(
+        &self,
+        kind: crate::event::SideEffectKind,
+        name: Option<&str>,
+    ) -> crate::cancellation_scope::Captured {
+        let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+        crate::cancellation_scope::take_captured_side_effect(&stack, kind, name)
+    }
+
+    /// The marker details that a cancelled scope recorded here, on replay
+    /// (issue #1984).
+    fn captured_scope_marker(&self, name: &str) -> crate::cancellation_scope::Captured {
+        let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+        crate::cancellation_scope::take_captured_marker(&stack, name)
+    }
+
+    /// The captured value, if any. Drift is deferred non-determinism, and the
+    /// primitive then runs as usual until the task fails.
+    fn captured_or_drift(&self, captured: crate::cancellation_scope::Captured) -> Option<Value> {
+        match captured {
+            crate::cancellation_scope::Captured::NotReplaying => None,
+            crate::cancellation_scope::Captured::Value(value) => Some(value),
+            crate::cancellation_scope::Captured::Drift(drift) => {
+                self.record_deferred_nd(format!("non-deterministic replay: {drift}"));
+                None
+            }
+        }
+    }
+
+    /// Record the state of `timer_id` before a scope body changes it.
+    fn journal_timer_undo(&self, scopes: Vec<u32>, timer_id: String) {
+        let state = self
+            .cancellable_timer_state
+            .lock()
+            .expect("cancellable_timer_state lock poisoned")
+            .get(&timer_id)
+            .copied();
+        let epoch = self
+            .timer_arm_epochs
+            .lock()
+            .expect("timer_arm_epochs lock poisoned")
+            .get(&timer_id)
+            .copied();
+        self.timer_undo
+            .lock()
+            .expect("timer_undo lock poisoned")
+            .push(TimerUndo {
+                scopes,
+                timer_id,
+                state,
+                epoch,
+            });
+    }
+
+    /// Restore the timer state that the withdrawn commands of scope `seq`
+    /// changed (issue #1984).
+    ///
+    /// A withdrawn `CancelTimer` or arm never reaches the worker, so its
+    /// durable row is unchanged. Replay holds the same commands, so it
+    /// restores the same entries. The newest entry is restored first.
+    pub(crate) fn undo_scope_timer_mutations(&self, seq: u32) {
+        let undone: Vec<TimerUndo> = {
+            let mut journal = self.timer_undo.lock().expect("timer_undo lock poisoned");
+            let (undone, kept) = std::mem::take(&mut *journal)
+                .into_iter()
+                .partition(|entry| entry.scopes.contains(&seq));
+            *journal = kept;
+            undone
+        };
+        for entry in undone.into_iter().rev() {
+            {
+                let mut states = self
+                    .cancellable_timer_state
+                    .lock()
+                    .expect("cancellable_timer_state lock poisoned");
+                match entry.state {
+                    Some(state) => states.insert(entry.timer_id.clone(), state),
+                    None => states.remove(&entry.timer_id),
+                };
+            }
+            let undone = {
+                let mut epochs = self
+                    .timer_arm_epochs
+                    .lock()
+                    .expect("timer_arm_epochs lock poisoned");
+                let undone = epochs.get(&entry.timer_id).copied();
+                match entry.epoch {
+                    Some(epoch) => epochs.insert(entry.timer_id.clone(), epoch),
+                    None => epochs.remove(&entry.timer_id),
+                };
+                undone
+            };
+            if let Some(undone) = undone.filter(|epoch| Some(*epoch) != entry.epoch) {
+                crate::cancellation_scope::rewind_armed_timer(
+                    &self.live_scopes.lock().expect("live scopes lock poisoned"),
+                    seq,
+                    &entry.timer_id,
+                    undone,
+                    entry.epoch,
+                );
+            }
+        }
+    }
+
+    /// Mark each armed cancellable timer in `timer_ids` as cancelled (issue #1984).
+    ///
+    /// A scope cancel deletes the durable rows of its member timers. A later
+    /// await or re-arm of the same id must not treat the timer as still armed.
+    /// Live and replay call this with the same recorded list.
+    pub(crate) fn mark_scope_timers_cancelled(&self, timer_ids: &[TimerId]) {
+        let mut state = self
+            .cancellable_timer_state
+            .lock()
+            .expect("cancellable_timer_state lock poisoned");
+        for timer_id in timer_ids {
+            if let Some(entry) = state.get_mut(timer_id.as_str())
+                && matches!(entry, TimerLogicalState::Armed { .. })
+            {
+                *entry = TimerLogicalState::Cancelled;
+            }
+        }
+    }
+
+    /// Mark each recorded arm cancelled while it is still the current arm (issue #1984).
+    ///
+    /// A later arm of the same id has a new epoch, so a scope cancel leaves it.
+    pub(crate) fn mark_scope_arms_cancelled(&self, arms: &[(TimerId, u64)]) {
+        let current = self.current_scope_arms(arms);
+        self.mark_scope_timers_cancelled(&current);
+    }
+
+    /// The current arm epoch of the handle timer `timer_id` (issue #1984).
+    pub(crate) fn timer_arm_epoch(&self, timer_id: &TimerId) -> Option<u64> {
+        self.timer_arm_epochs
+            .lock()
+            .expect("timer_arm_epochs lock poisoned")
+            .get(timer_id.as_str())
+            .copied()
+    }
+
+    /// The timers in `arms` whose recorded arm is still the current arm (issue #1984).
+    pub(crate) fn current_scope_arms(&self, arms: &[(TimerId, u64)]) -> Vec<TimerId> {
+        let epochs = self
+            .timer_arm_epochs
+            .lock()
+            .expect("timer_arm_epochs lock poisoned");
+        arms.iter()
+            .filter(|(id, epoch)| epochs.get(id.as_str()) == Some(epoch))
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Whether the workflow logically cancelled `timer_id` this task without a
@@ -7753,6 +8295,15 @@ impl WorkflowContext {
             .lock()
             .expect("matcher lock poisoned")
             .append_consumed(delta);
+        crate::cancellation_scope::drop_resolved_members(
+            &mut self.live_scopes.lock().expect("live scopes lock poisoned"),
+            delta,
+        );
+        // The last cycle persisted its commands, so no undo entry applies now.
+        self.timer_undo
+            .lock()
+            .expect("timer_undo lock poisoned")
+            .clear();
         self.speculative
             .store(!waits.is_empty(), std::sync::atomic::Ordering::SeqCst);
         self.speculation_read_position
@@ -8220,7 +8771,9 @@ impl WorkflowContext {
         placement: &crate::shard::ChildPlacement,
         workflow_name: &str,
     ) -> HarvestResult<()> {
-        if placement.is_parent_shard() {
+        // Issue #1984: a scope that replays its cancel holds this dispatch.
+        // The placement resolved when the cancelling cycle made it.
+        if placement.is_parent_shard() || self.replays_a_scope_cancel() {
             return Ok(());
         }
         // The key is irrelevant to every failure mode this is checking for; a
@@ -8272,7 +8825,9 @@ impl WorkflowContext {
         let parent_shard = self
             .current_shard_id
             .unwrap_or_else(|| self.exec_id.shard());
-        if placement.is_parent_shard() {
+        // Issue #1984: a scope that replays its cancel discards this id with
+        // the held command. The router can have changed since the cancel.
+        if placement.is_parent_shard() || self.replays_a_scope_cancel() {
             return Ok(ExecutionId::new_for_shard(parent_shard));
         }
         let key = crate::shard::child_placement_key(self.exec_id, seq);
@@ -8463,6 +9018,7 @@ impl WorkflowContext {
                 }
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
                 self.check_strict_replay_no_match(&format!(
                     "ChildWorkflowStarted({workflow_name})"
                 ))?;
@@ -8470,8 +9026,12 @@ impl WorkflowContext {
                 // Enforce child-workflow input payload cap before scheduling.
                 // ChildWorkflowStarted is written to the parent's history via
                 // append_single_event (plain), so the offload bypass must NOT apply here.
+                // Issue #1984: a scope that replays its cancel holds this
+                // dispatch. The cap applied when the cancelling cycle made it.
                 let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
-                if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input
+                if self.payload_max_workflow_input > 0
+                    && observed > self.payload_max_workflow_input
+                    && !self.replays_a_scope_cancel()
                 {
                     return Err(HarvestError::PayloadTooLarge {
                         kind: PayloadKind::ChildWorkflowInput,
@@ -8604,6 +9164,10 @@ impl WorkflowContext {
         parent_close_policy: crate::types::ParentClosePolicy,
         placement: &crate::shard::ChildPlacement,
     ) -> HarvestResult<ExecutionId> {
+        // Issue #1984: a scope cancel withdraws the spawn, but the body has
+        // the minted id. Replay mints another one, so code after the scope
+        // would see a different child.
+        self.reject_in_cancellable_scope("ctx.spawn_child_workflow_detached")?;
         // Advance on every invocation, before the matcher — see
         // `next_child_placement_seq`.
         let placement_seq = self.next_child_placement_seq();
@@ -8617,6 +9181,7 @@ impl WorkflowContext {
                 Ok(child_id)
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
                 self.check_strict_replay_no_match(&format!(
                     "ChildWorkflowSpawnedDetached({workflow_name})"
                 ))?;
@@ -8712,6 +9277,9 @@ impl WorkflowContext {
     where
         I: serde::Serialize,
     {
+        // Issue #1984: reject before the input serializes. A scope cancel
+        // replays this call, and a rejected spawn must not run a serializer.
+        self.reject_in_cancellable_scope("ctx.spawn_child_workflow_detached")?;
         let json_input = serde_json::to_value(input).map_err(HarvestError::Serialization)?;
         self.spawn_child_workflow_detached_raw_placed(
             info.name,
@@ -9069,7 +9637,10 @@ impl WorkflowContext {
         // this does not claim replay-safety across a cap change (see the
         // fan-out `validate_child_payload_caps` note).
         let fresh_dispatch = !self.match_history(|m| m.peek_child_start_at_cursor(&timer_id));
-        if fresh_dispatch {
+        // Issue #1984: a scope that replays its cancel holds this dispatch.
+        // The cap applied when the cancelling cycle made it.
+        if fresh_dispatch && !self.replays_a_scope_cancel() {
+            self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, &input)?;
             let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
             if self.payload_max_workflow_input > 0 && observed > self.payload_max_workflow_input {
                 return Err(HarvestError::PayloadTooLarge {
@@ -9100,6 +9671,7 @@ impl WorkflowContext {
             // bookkeeping-only command.
             ChildOrTimerMatch::ChildCompleted { output } => {
                 self.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::RaceLoser,
                     activities: Vec::new(),
                     children: Vec::new(),
                     timers: vec![TimerId::new(&timer_id)],
@@ -9115,6 +9687,7 @@ impl WorkflowContext {
                 // Child wins — tear down the deadline timer (see the
                 // `ChildCompleted` branch above for the retention rationale).
                 self.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::RaceLoser,
                     activities: Vec::new(),
                     children: Vec::new(),
                     timers: vec![TimerId::new(&timer_id)],
@@ -9143,6 +9716,7 @@ impl WorkflowContext {
                 // re-push so strict replay sees no spurious bookkeeping command.
                 if !child_already_terminal {
                     self.push_command(WorkflowCommand::CancelRaceLosers {
+                        reason: LoserCancelReason::RaceLoser,
                         activities: Vec::new(),
                         children: vec![child_id],
                         timers: Vec::new(),
@@ -10065,6 +10639,7 @@ impl WorkflowContext {
                 // mixed batch.)
                 if self.match_history(|m| m.history_contains_timer_started(&timer_id)) {
                     self.push_command(WorkflowCommand::CancelRaceLosers {
+                        reason: LoserCancelReason::RaceLoser,
                         activities: Vec::new(),
                         children: Vec::new(),
                         timers: vec![TimerId::new(&timer_id)],
@@ -10399,6 +10974,7 @@ impl WorkflowContext {
     ) -> HarvestResult<()> {
         use crate::replay::HistoryMatch;
 
+        self.reject_in_cancellable_scope("ctx.signal_external_workflow")?;
         let history_match = self.match_history(|m| m.match_external_signal(&target, signal_name));
 
         match history_match {
@@ -10449,10 +11025,11 @@ impl WorkflowContext {
 
             // First live call: generate a new signal_id and dispatch.
             HistoryMatch::NoMatch => {
+                let payload_json = serde_json::to_value(&payload)?;
+                self.check_payload_depth(PayloadKind::SignalPayload, None, &payload_json)?;
                 self.check_strict_replay_no_match(&format!(
                     "ExternalSignalRequested(target={target}, signal={signal_name})"
                 ))?;
-                let payload_json = serde_json::to_value(&payload)?;
                 // Issue #1985: a broken promise signal is the sender's bug.
                 // Refuse it here, before a request is recorded. The outbox
                 // would otherwise report it as a target state, such as
@@ -10674,6 +11251,7 @@ impl WorkflowContext {
     async fn request_cancel_external_target(&self, target: ExternalTarget) -> HarvestResult<()> {
         use crate::replay::HistoryMatch;
 
+        self.reject_in_cancellable_scope("ctx.request_cancel_external_workflow")?;
         let history_match = self.match_history(|m| m.match_external_cancel(&target));
 
         match history_match {
@@ -10833,6 +11411,7 @@ impl WorkflowContext {
             });
         }
 
+        self.reject_in_cancellable_scope("ctx.await_external_workflow")?;
         let history_match = self.match_history(|m| m.match_external_await(target));
 
         match history_match {
@@ -10998,45 +11577,50 @@ impl WorkflowContext {
         *seq
     }
 
-    /// Record or verify the fan-out count in event history.
+    /// Check an activity fan-out against history, then record its marker.
     ///
-    /// On **live execution** (past end of history): pushes a `RecordMarker`
-    /// command so future replays can verify the collection length, and
-    /// returns `Ok(true)` — this is the very first time this fan-out group
-    /// has ever been dispatched, which callers use to gate one-time,
-    /// pre-dispatch validation that must never re-run on replay.
-    ///
-    /// On **replay**: matches the `MarkerRecorded` event and compares the
-    /// recorded count with the current count, returning `Ok(false)` on a
-    /// match. Returns a [`HarvestError::NonDeterministic`] when they differ.
-    ///
-    /// The activity fan-out methods use it as-is, except `fan_out_with_impl`.
-    /// That method checks the store between the peek and the marker. Child
-    /// fan-out also uses [`peek_fan_out_count`](Self::peek_fan_out_count) +
-    /// [`record_fan_out_marker`](Self::record_fan_out_marker), so the marker
-    /// is recorded only *after* payload validation succeeds — see those
-    /// methods' docs for why.
-    fn check_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
+    /// A fresh dispatch first checks every input against the depth cap
+    /// (issue #2224). A deep input then fails the whole fan-out before the
+    /// marker or any earlier activity is queued.
+    fn check_activity_fan_out(
+        &self,
+        seq: u32,
+        activities: &[(String, Value, String)],
+    ) -> HarvestResult<bool> {
+        let count = activities.len();
         let fresh_dispatch = self.peek_fan_out_count(seq, count)?;
         if fresh_dispatch {
+            self.check_activity_fan_out_depth(activities)?;
             self.record_fan_out_marker(seq, count);
         }
         Ok(fresh_dispatch)
     }
 
+    /// Check every input of a fresh activity fan-out against the depth cap
+    /// (issue #2224). The caller records no marker before this check passes.
+    fn check_activity_fan_out_depth(
+        &self,
+        activities: &[(String, Value, String)],
+    ) -> HarvestResult<()> {
+        for (name, input, _) in activities {
+            self.check_payload_depth(PayloadKind::ActivityInput, Some(name), input)?;
+        }
+        Ok(())
+    }
+
     /// Check the fan-out count against event history **without** pushing the
     /// `RecordMarker` command on a fresh dispatch.
     ///
-    /// Splitting this out of [`check_fan_out_count`](Self::check_fan_out_count)
-    /// lets a caller run additional validation (e.g. the child fan-out
-    /// payload-cap pre-check) *between* determining "this is a fresh
-    /// dispatch" and actually committing the `fan_out:{n}` marker to the
-    /// command list — so a validation failure discovered in between never
-    /// leaves a persisted marker with no corresponding dispatch attempt. A
-    /// terminal execution whose history contains a `fan_out:{n}` marker but
-    /// no children would otherwise be replayed by matching the marker
-    /// (`fresh_dispatch == false`) and then diverging when it tries to
-    /// re-derive a `ChildWorkflowStarted` that was never recorded.
+    /// A caller can run more validation after this check. An example is the
+    /// payload-cap pre-check of a fan-out. The check runs between "this is a
+    /// fresh dispatch" and the commit of the `fan_out:{n}` marker.
+    ///
+    /// A validation failure in between then leaves no marker without a
+    /// dispatch attempt. Such a marker is a hazard. A terminal execution whose
+    /// history holds a `fan_out:{n}` marker but no children would replay by
+    /// matching the marker (`fresh_dispatch == false`). It would then diverge
+    /// when it tries to re-derive a `ChildWorkflowStarted` that was never
+    /// recorded.
     fn peek_fan_out_count(&self, seq: u32, count: usize) -> HarvestResult<bool> {
         let marker_result = self.match_history(|m| m.match_fan_out_marker(seq, count));
         match marker_result {
@@ -11240,8 +11824,7 @@ impl WorkflowContext {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
-        let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -11308,8 +11891,7 @@ impl WorkflowContext {
         self.check_cancellation()?;
 
         let seq = self.next_fan_out_seq();
-        let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -11531,7 +12113,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -11647,7 +12229,7 @@ impl WorkflowContext {
 
         let seq = self.next_fan_out_seq();
         let count = activities.len();
-        let _fresh_dispatch = self.check_fan_out_count(seq, count)?;
+        let _fresh_dispatch = self.check_activity_fan_out(seq, &activities)?;
 
         if activities.is_empty() {
             return Ok(Vec::new());
@@ -11987,6 +12569,7 @@ impl WorkflowContext {
                         .into(),
                 ));
             }
+            self.check_activity_fan_out_depth(&activities)?;
             self.record_fan_out_marker(seq, count);
         }
         let writer = self.fan_out_writer_mode(seq, fresh, options.result_writer());
@@ -12063,7 +12646,7 @@ impl WorkflowContext {
             self.commands
                 .lock()
                 .expect("commands lock poisoned")
-                .retain(|cmd| match cmd {
+                .retain(|buffered| match &buffered.cmd {
                     WorkflowCommand::WaitForActivity { activity_id, .. }
                         if candidates.contains(activity_id) =>
                     {
@@ -12078,6 +12661,7 @@ impl WorkflowContext {
             // ends, where replay would not consume it.
             if !in_flight.is_empty() {
                 self.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::RaceLoser,
                     activities: in_flight,
                     children: Vec::new(),
                     timers: Vec::new(),
@@ -12121,7 +12705,15 @@ impl WorkflowContext {
         fresh_dispatch: bool,
         children: &[(String, Value)],
     ) -> HarvestResult<()> {
-        if !fresh_dispatch || self.payload_max_workflow_input == 0 {
+        // Issue #1984: a scope that replays its cancel holds these dispatches.
+        // The cap applied when the cancelling cycle made them.
+        if fresh_dispatch && !self.replays_a_scope_cancel() {
+            for (_, input) in children {
+                self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, input)?;
+            }
+        }
+        if !fresh_dispatch || self.payload_max_workflow_input == 0 || self.replays_a_scope_cancel()
+        {
             return Ok(());
         }
         for (_, input) in children {
@@ -12958,12 +13550,16 @@ impl WorkflowContext {
         // open marker below, or a branch's own schedule/start command in
         // Phase B). An oversized branch must abort this race with zero
         // durable trace -- see the comment on `needs_open_marker` above.
+        // Issue #1984: a scope that replays its cancel holds these dispatches.
+        // The caps applied when the cancelling cycle made them.
+        let replays_a_scope_cancel = self.replays_a_scope_cancel();
         for dispatch in &to_dispatch {
-            if !dispatch.is_new {
+            if !dispatch.is_new || replays_a_scope_cancel {
                 continue;
             }
             match &branches[dispatch.index].kind {
                 RaceBranchKind::Activity { name, input, .. } => {
+                    self.check_payload_depth(PayloadKind::ActivityInput, Some(name), input)?;
                     let effective_cap = {
                         let global = self.payload_max_activity_input;
                         self.activity_input_cap_overrides
@@ -12986,6 +13582,7 @@ impl WorkflowContext {
                     }
                 }
                 RaceBranchKind::ChildWorkflow { input, .. } => {
+                    self.check_payload_depth(PayloadKind::ChildWorkflowInput, None, input)?;
                     let observed = serde_json::to_string(input).map_or(0, |s| s.len() as u64);
                     if self.payload_max_workflow_input > 0
                         && observed > self.payload_max_workflow_input
@@ -13246,6 +13843,7 @@ impl WorkflowContext {
             self.match_history(|m| m.consume_race_loser_frontier(&activities, &children));
             if !activities.is_empty() || !children.is_empty() || !timers.is_empty() {
                 self.push_command(WorkflowCommand::CancelRaceLosers {
+                    reason: LoserCancelReason::RaceLoser,
                     activities,
                     children,
                     timers,
@@ -13427,8 +14025,13 @@ impl WorkflowContext {
     /// - [`HarvestError::SessionBroken`] if the session's host worker dies or
     ///   drains before the acquire activity's result is recorded (surfaced
     ///   identically to a broken session discovered later, mid-pipeline).
+    /// - [`HarvestError::Config`] if called inside a cancellation scope
+    ///   (issue #1984).
     pub async fn create_session(&self, options: SessionOptions) -> HarvestResult<Session<'_>> {
         self.check_cancellation()?;
+        // Issue #1984: a scope cancel drops the body, and a dropped session is
+        // never released. Reject the operation, as for a mutex.
+        self.reject_in_cancellable_scope("ctx.create_session")?;
 
         let seq = self.next_session_seq();
         let session_id = self.resolve_session_id(seq)?;
@@ -13477,7 +14080,42 @@ impl WorkflowContext {
             id: session_id,
             host_worker_id,
             queue: options.queue,
+            settled: false,
         })
+    }
+
+    /// Whether history already holds a drop release for `session` (issue
+    /// #2193).
+    ///
+    /// This reads the matcher directly. The read moves no cursor and runs no
+    /// signal handler.
+    fn history_released_session(&self, session: SessionId) -> bool {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .has_drop_release(session)
+    }
+
+    /// Push the release of a dropped [`Session`] (issue #2193).
+    ///
+    /// The command is hard-pinned to the host, like any session activity. Its
+    /// receiver is closed, so no body awaits the result.
+    fn push_drop_release(&self, session: SessionId, host_worker_id: String, queue: String) {
+        let (result_tx, result_rx) = oneshot::channel();
+        drop(result_rx);
+        self.push_command(WorkflowCommand::ScheduleActivity {
+            activity_id: self.next_activity_id(),
+            name: SESSION_DROP_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::from(session.to_string()),
+            queue,
+            retry_policy_override: None,
+            start_to_close_override: None,
+            session_id: Some(session),
+            session_worker_id: Some(host_worker_id),
+            schedule_to_start_override: None,
+            result_writer: false,
+            result_tx,
+        });
     }
 
     /// Dispatch the internal session-acquire activity and resolve it to a
@@ -13611,6 +14249,7 @@ impl WorkflowContext {
             }
 
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::ActivityInput, Some(name), &input)?;
                 self.check_strict_replay_no_match(&format!("ExternalActivityScheduled({name})"))?;
 
                 // First time — generate a fresh token and schedule.
@@ -13962,6 +14601,7 @@ impl WorkflowContext {
                 ))
             }
             HistoryMatch::NoMatch => {
+                self.check_payload_depth(PayloadKind::WorkflowInput, None, &input)?;
                 self.check_strict_replay_no_match("ContinueAsNew")?;
                 // Issue #1161: check the cap only for a SAME-type
                 // continuation. `self.payload_max_workflow_input` is
@@ -13975,9 +14615,12 @@ impl WorkflowContext {
                 // TARGET type's `max_input_bytes` correctly.
                 if new_workflow_type.is_none() {
                     let observed = serde_json::to_string(&input).map_or(0, |s| s.len() as u64);
+                    // Issue #1984: a scope that replays its cancel holds this
+                    // command. The cap applied when the cancelling cycle made it.
                     if self.payload_max_workflow_input > 0
                         && observed > self.payload_max_workflow_input
                         && !self.offload_will_apply(observed)
+                        && !self.replays_a_scope_cancel()
                     {
                         return Err(HarvestError::PayloadTooLarge {
                             kind: crate::error::PayloadKind::WorkflowInput,
@@ -14518,6 +15161,20 @@ impl WorkflowContext {
             }
         }
 
+        // Issue #1984: a scope cancel would drop a running handler, and the
+        // admitted update would wait forever. So the update fails at once.
+        // Its result survives the cancel, as `withdraw_scope_commands` keeps it.
+        if self.in_cancellable_scope() {
+            let result = Err(format!(
+                "update '{name}' cannot run inside a cancellation scope"
+            ));
+            self.push_command(WorkflowCommand::RecordUpdateResult {
+                update_id,
+                result: result.clone(),
+            });
+            return result;
+        }
+
         // Live path: invoke the registered handler.
         let result = self.run_update_handler(name, input).await;
 
@@ -14550,7 +15207,15 @@ impl WorkflowContext {
             .expect("update_registry lock poisoned")
             .get_handler(name);
         match handler {
-            Some(handler) => handler(input).await,
+            // A result nested past the depth cap cannot be read back, so the
+            // update fails instead (issue #2224). Both update paths run here.
+            Some(handler) => match handler(input).await {
+                Ok(output) if crate::payload_depth::nests_past_cap(&output) => Err(format!(
+                    "payload too deep: update '{name}' result nests more than {} levels",
+                    crate::payload_depth::MAX_PAYLOAD_DEPTH
+                )),
+                other => other,
+            },
             None => Err(format!("update handler '{name}' not found")),
         }
     }
@@ -14977,6 +15642,9 @@ impl WorkflowContext {
     pub fn drain_commands(&self) -> Vec<WorkflowCommand> {
         let mut cmds = self.commands.lock().expect("commands lock poisoned");
         std::mem::take(&mut *cmds)
+            .into_iter()
+            .map(|buffered| buffered.cmd)
+            .collect()
     }
 
     /// Non-consuming count of the pending command buffer: returns how many
@@ -15009,11 +15677,33 @@ impl WorkflowContext {
             .lock()
             .expect("commands lock poisoned")
             .iter()
-            .filter(|c| pred(c))
+            .filter(|buffered| pred(&buffered.cmd))
             .count()
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
+
+    /// Refuse a payload that nests past the depth cap (issue #2224).
+    ///
+    /// A scope that replays its cancel holds its dispatches (issue #1984). The
+    /// cap applied when the cancelling cycle made them, so the check skips them
+    /// and an older recorded cancel still replays.
+    fn check_payload_depth(
+        &self,
+        kind: PayloadKind,
+        activity_name: Option<&str>,
+        value: &Value,
+    ) -> HarvestResult<()> {
+        if !self.replays_a_scope_cancel() && crate::payload_depth::nests_past_cap(value) {
+            return Err(HarvestError::PayloadTooDeep {
+                kind,
+                cap_depth: crate::payload_depth::MAX_PAYLOAD_DEPTH,
+                workflow_type: self.workflow_name.clone(),
+                activity_name: activity_name.map(str::to_string),
+            });
+        }
+        Ok(())
+    }
 
     /// Generate the next sequential activity execution ID.
     fn next_activity_id(&self) -> ActivityExecId {
@@ -15059,15 +15749,287 @@ impl WorkflowContext {
                 .lock()
                 .expect("commands lock poisoned")
                 .iter()
-                .any(WorkflowCommand::awaits_result)
+                .any(|buffered| buffered.cmd.awaits_result())
+            // Issue #1984: a replayed scope that never gets its recorded cancel
+            // holds the body's park. The cycle suspends, and the skipped-command
+            // check then reports the unconsumed cancel marker as drift.
+            || crate::cancellation_scope::holds_a_park(
+                &self.live_scopes.lock().expect("live scopes lock poisoned"),
+            )
     }
 
     /// Push a command onto the pending commands queue.
-    fn push_command(&self, cmd: WorkflowCommand) {
-        self.commands
+    ///
+    /// The scopes on the scope stack see the command first (issue #1984). A
+    /// scope that holds commands keeps it, and the worker never gets it.
+    pub(crate) fn push_command(&self, cmd: WorkflowCommand) {
+        let timer_id = match &cmd {
+            WorkflowCommand::CancelTimer { timer_id }
+            | WorkflowCommand::ArmTimer {
+                timer_id,
+                for_await: false,
+                ..
+            } => Some(timer_id.as_str().to_string()),
+            _ => None,
+        };
+        let stack = self.scope_stack.lock().expect("scope stack lock poisoned");
+        let scopes = crate::cancellation_scope::cancellable_seqs(&stack);
+        let drift = crate::cancellation_scope::captured_marker_drift(&stack, &cmd);
+        let routed = crate::cancellation_scope::route_command(&stack, cmd);
+        drop(stack);
+        if let Some(drift) = drift {
+            self.record_deferred_nd(format!("non-deterministic replay: {drift}"));
+        }
+        // The caller changes the timer state after this push.
+        if let Some(timer_id) = timer_id
+            && !scopes.is_empty()
+        {
+            self.journal_timer_undo(scopes, timer_id);
+        }
+        if let Some((cmd, scopes)) = routed {
+            self.commands
+                .lock()
+                .expect("commands lock poisoned")
+                .push(BufferedCommand {
+                    order: self
+                        .command_order
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    cmd,
+                    scopes,
+                });
+        }
+    }
+
+    // ── Cancellation scope support (issue #1984) ──────────────────────
+
+    /// Next cancellation-scope sequence number.
+    pub(crate) fn next_scope_seq(&self) -> u32 {
+        let mut seq = self.scope_seq.lock().expect("scope_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Remember `scope` so a resident cycle can update its members.
+    pub(crate) fn register_scope(
+        &self,
+        scope: &std::sync::Arc<crate::cancellation_scope::ScopeShared>,
+    ) {
+        self.live_scopes
             .lock()
-            .expect("commands lock poisoned")
-            .push(cmd);
+            .expect("live scopes lock poisoned")
+            .push(std::sync::Arc::downgrade(scope));
+    }
+
+    /// Next non-cancellable block sequence number.
+    pub(crate) fn next_shield_seq(&self) -> u32 {
+        let mut seq = self.shield_seq.lock().expect("shield_seq lock poisoned");
+        *seq += 1;
+        *seq
+    }
+
+    /// Run `f` with `frame` on top of the scope stack.
+    pub(crate) fn with_scope_frame<R>(
+        &self,
+        frame: crate::cancellation_scope::ScopeFrame,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        struct Pop<'a>(&'a Mutex<Vec<crate::cancellation_scope::ScopeFrame>>);
+        impl Drop for Pop<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut stack) = self.0.lock() {
+                    stack.pop();
+                }
+            }
+        }
+        self.scope_stack
+            .lock()
+            .expect("scope stack lock poisoned")
+            .push(frame);
+        let _pop = Pop(&self.scope_stack);
+        f()
+    }
+
+    /// Reject `operation` inside a cancellable scope (issue #1984).
+    ///
+    /// A cancelled scope drops its body. The operations named here have a
+    /// durable result that arrives later, and that late result would stay
+    /// unconsumed on replay. So a scope cannot start them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Config`] inside a cancellable scope.
+    pub(crate) fn reject_in_cancellable_scope(&self, operation: &str) -> HarvestResult<()> {
+        if self.in_cancellable_scope() {
+            return Err(HarvestError::Config(format!(
+                "{operation} cannot run inside a cancellation scope"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether a cancellable scope is on the scope stack.
+    pub(crate) fn in_cancellable_scope(&self) -> bool {
+        self.scope_stack
+            .lock()
+            .expect("scope stack lock poisoned")
+            .iter()
+            .any(crate::cancellation_scope::ScopeFrame::is_cancellable)
+    }
+
+    /// The number of history events that this cycle can see.
+    pub(crate) fn history_len(&self) -> usize {
+        self.matcher.lock().expect("matcher lock poisoned").len()
+    }
+
+    /// Run `f` while the matcher sees only the first `horizon` events.
+    ///
+    /// A cancelled scope replays its body this way. The body then sees the
+    /// history that it saw when the scope was cancelled live.
+    pub(crate) fn with_history_horizon<R>(&self, horizon: usize, f: impl FnOnce() -> R) -> R {
+        struct Restore<'a> {
+            matcher: &'a Mutex<HistoryMatcher>,
+            cut: Option<crate::replay::ViewCut>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                if let (Some(cut), Ok(mut matcher)) = (self.cut.take(), self.matcher.lock()) {
+                    matcher.restore_view(cut);
+                }
+            }
+        }
+        let cut = self
+            .matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .cut_view(horizon);
+        let _restore = Restore {
+            matcher: &self.matcher,
+            cut,
+        };
+        f()
+    }
+
+    /// Remove the buffered commands that scope `seq` issued, and return them.
+    ///
+    /// `ReleaseMutex` stays, so a guard dropped in the body still releases.
+    /// `RecordUpdateResult` stays, so an admitted update gets its terminal.
+    pub(crate) fn withdraw_scope_commands(&self, seq: u32) -> Vec<(u64, WorkflowCommand)> {
+        let mut cmds = self.commands.lock().expect("commands lock poisoned");
+        let (withdrawn, kept): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut *cmds)
+                .into_iter()
+                .partition(|buffered| {
+                    buffered.scopes.contains(&seq)
+                        && !matches!(
+                            buffered.cmd,
+                            WorkflowCommand::ReleaseMutex { .. }
+                                | WorkflowCommand::RecordUpdateResult { .. }
+                        )
+                });
+        *cmds = kept;
+        drop(cmds);
+        // A withdrawn chunk or log line leaves the queue, so it no longer
+        // counts toward the queue bound of this cycle.
+        for buffered in &withdrawn {
+            let counter = match buffered.cmd {
+                WorkflowCommand::PublishDurableProgress { .. } => &self.durable_progress_queued,
+                WorkflowCommand::RecordLog { .. } => &self.log_commands_queued,
+                _ => continue,
+            };
+            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        withdrawn
+            .into_iter()
+            .map(|buffered| (buffered.order, buffered.cmd))
+            .collect()
+    }
+
+    /// Keep only the members that are still open in history.
+    pub(crate) fn open_scope_members(
+        &self,
+        members: &crate::cancellation_scope::ScopeMembers,
+    ) -> crate::cancellation_scope::ScopeMembers {
+        self.matcher
+            .lock()
+            .expect("matcher lock poisoned")
+            .open_members(members)
+    }
+
+    /// Find the details of an unconsumed marker without consuming it.
+    ///
+    /// The read does not pump signal handlers. A scope peeks before it cuts
+    /// history at its horizon, and a signal past the horizon must wait.
+    pub(crate) fn peek_marker_details(&self, name: &str) -> Option<Value> {
+        self.match_history_unpumped(|m| m.unconsumed_marker_details(name))
+    }
+
+    /// Whether an unconsumed marker with this name is in history.
+    ///
+    /// The read does not pump signal handlers, as a scope or shield marker
+    /// lookup does not (issue #1984).
+    pub(crate) fn has_unconsumed_marker(&self, name: &str) -> bool {
+        self.match_history_unpumped(|m| m.has_unconsumed_marker(name))
+    }
+
+    /// Consume the marker `name`, tolerating interleaved sibling events.
+    ///
+    /// Returns the marker's index and details, or `None` at the frontier.
+    pub(crate) fn take_marker(&self, name: &str) -> Option<(usize, Value)> {
+        self.match_history_unpumped(|m| m.take_marker(name))
+    }
+
+    /// Whether the cycle parks on Harvest work (issue #1984 tests).
+    #[cfg(test)]
+    pub(crate) fn parks_on_harvest_work(&self) -> bool {
+        self.has_parked_harvest_future()
+    }
+
+    /// The durable chunks queued this cycle (issue #1984 tests).
+    #[cfg(test)]
+    pub(crate) fn durable_chunks_queued(&self) -> u64 {
+        self.durable_progress_queued
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Run `f` on the matcher, but do not pump signal handlers (issue #1984).
+    ///
+    /// A scope or shield marker can lie past signals that other writers
+    /// appended after the recording cycle. That cycle did not see them.
+    /// Their handlers therefore run at the next history read, after the
+    /// marker, as in the live run.
+    fn match_history_unpumped<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut HistoryMatcher) -> R,
+    {
+        self.note_position_read();
+        let mut matcher = self.matcher.lock().expect("matcher lock poisoned");
+        f(&mut matcher)
+    }
+
+    /// Consume the events of a cancelled scope's members on replay.
+    pub(crate) fn consume_scope_members(
+        &self,
+        members: &crate::cancellation_scope::ScopeMembers,
+        timer_window: std::ops::Range<usize>,
+    ) {
+        self.match_history_unpumped(|m| m.consume_scope_members(members, timer_window));
+    }
+
+    /// Consume the start and heartbeat events of members cancelled live.
+    pub(crate) fn consume_cancelled_member_frontier(
+        &self,
+        members: &crate::cancellation_scope::ScopeMembers,
+    ) {
+        // Unpumped, as the replay path is: a live cancel runs no signal
+        // handler that its replay would run only after the scope.
+        self.match_history_unpumped(|m| {
+            m.consume_race_loser_frontier(&members.activities, &members.children);
+        });
+    }
+
+    /// Build a non-determinism error for a scope or a shield.
+    pub(crate) fn scope_nd_error(&self, reason: String, expected: String) -> HarvestError {
+        self.nd_error(reason, None, Some(expected), Some("no match".to_string()))
     }
 }
 
@@ -15132,8 +16094,8 @@ where
             }
             // Unconditionally clean up any stale StartTimer command pushed to commands queue.
             if let Ok(mut cmds) = this.context.commands.lock() {
-                cmds.retain(|cmd| {
-                    if let WorkflowCommand::StartTimer { timer_id: id, .. } = cmd {
+                cmds.retain(|buffered| {
+                    if let WorkflowCommand::StartTimer { timer_id: id, .. } = &buffered.cmd {
                         id.as_str() != this.timer_id
                     } else {
                         true
@@ -16886,6 +17848,11 @@ impl ActivityContext {
     /// `Err(ActivityCancelled)` means the owning workflow was cancelled and the
     /// activity should wind down promptly.
     ///
+    /// A payload nested more than [`MAX_PAYLOAD_DEPTH`](crate::payload_depth::MAX_PAYLOAD_DEPTH)
+    /// levels is dropped with a warning (issue #2225). This call still returns
+    /// `Ok`. The flush then refreshes the heartbeat time only, so the activity
+    /// stays alive and the previous checkpoint stays.
+    ///
     /// Within a single attempt, heartbeat payloads are last-write-wins and are
     /// not read back through this context. Call [`Self::heartbeat_details`] at
     /// the start of a later retry attempt to resume from the prior checkpoint.
@@ -17312,7 +18279,11 @@ impl ActivityContext {
     /// * this context has no transactional pool attached (e.g. test contexts
     ///   or local activities),
     /// * a DB connection cannot be acquired from the pool,
-    /// * `f` returns `Err(e)` (the user error is propagated as-is), or
+    /// * `f` returns `Err(e)` (the user error is propagated as-is),
+    /// * the result nests more than
+    ///   [`MAX_PAYLOAD_DEPTH`](crate::payload_depth::MAX_PAYLOAD_DEPTH) levels
+    ///   (issue #2225). The transaction rolls back, and the error is a
+    ///   non-retryable `PayloadTooDeep` failure, or
     /// * the harvest finalization (event append / task complete / workflow wake)
     ///   fails.
     ///
@@ -17418,6 +18389,15 @@ impl ActivityContext {
                 // Serialize the result for the event log.
                 let mut output =
                     serde_json::to_value(&user_result).map_err(HarvestError::Serialization)?;
+
+                // Issue #2225: a result nested past the depth cap cannot be read
+                // back from the history. Roll back before the upload and the
+                // commit, so no user write commits and no blob is stored.
+                if crate::payload_depth::nests_past_cap(&output) {
+                    return Err(TxError::Payload(
+                        crate::payload_depth::too_deep_failure_payload("transactional activity"),
+                    ));
+                }
 
                 // Issue #1986: a fan-out row with the result writer records a
                 // reference. The upload runs before the execution row lock.
@@ -24540,6 +25520,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -24601,6 +25582,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -25467,6 +26449,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -25524,6 +26507,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -25756,6 +26740,7 @@ mod tests {
             activities,
             children,
             timers,
+            ..
         } = &commands[0]
         else {
             panic!("expected CancelRaceLosers, got {:?}", commands[0]);
@@ -27364,6 +28349,38 @@ mod tests {
             error_schema: None,
             retry_policy: None,
         }
+    }
+
+    /// A typed detached spawn in a scope fails before its input serializes
+    /// (issue #1984).
+    #[tokio::test]
+    async fn a_typed_detached_spawn_in_a_scope_does_not_serialize() {
+        struct Counted<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl serde::Serialize for Counted<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                s.serialize_unit()
+            }
+        }
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let ctx = WorkflowContext::new_test();
+        let info = make_workflow_info("audit_trail");
+        let spawned = ctx
+            .cancellation_scope()
+            .run(async {
+                ctx.spawn_child_workflow_detached(
+                    &info,
+                    Counted(&calls),
+                    crate::ParentClosePolicy::Abandon,
+                )
+            })
+            .await
+            .expect("the scope completes");
+        assert!(
+            matches!(spawned, Err(HarvestError::Config(_))),
+            "{spawned:?}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -30355,7 +31372,7 @@ mod tests {
         assert!(
             commands.iter().any(|c| matches!(
                 c,
-                WorkflowCommand::CancelRaceLosers { activities, children, timers }
+                WorkflowCommand::CancelRaceLosers { activities, children, timers, .. }
                     if activities.is_empty()
                         && children.is_empty()
                         && timers == &vec![TimerId::new(&timer_id)]
@@ -31046,6 +32063,218 @@ mod tests {
             }
             other => panic!("expected ScheduleActivity, got {other:?}"),
         }
+    }
+
+    // ── Release on drop (issue #2193) ────────────────────────────────────
+
+    /// History of a run that holds one open session on `gpu-workers`.
+    fn open_session_history(session_uuid: uuid::Uuid) -> Vec<WorkflowEvent> {
+        let acquire_id = ActivityExecId::new();
+        vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "session:1".into(),
+                details: Value::from(session_uuid.to_string()),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: acquire_id,
+                name: SESSION_ACQUIRE_ACTIVITY_NAME.to_string(),
+                input: Value::Null,
+                queue: "gpu-workers".to_string(),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: acquire_id,
+                output: serde_json::json!("worker-42"),
+            },
+        ]
+    }
+
+    /// The drop releases among `commands`.
+    fn drop_releases(commands: &[WorkflowCommand]) -> Vec<&WorkflowCommand> {
+        commands
+            .iter()
+            .filter(|cmd| {
+                matches!(
+                    cmd,
+                    WorkflowCommand::ScheduleActivity { name, .. }
+                        if name == SESSION_DROP_RELEASE_ACTIVITY_NAME
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn dropping_a_session_issues_one_pinned_release() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), open_session_history(session_uuid));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        drop(session);
+
+        let commands = ctx.drain_commands();
+        let releases = drop_releases(&commands);
+        assert_eq!(releases.len(), 1, "one release per dropped session");
+        let WorkflowCommand::ScheduleActivity {
+            queue,
+            input,
+            session_id,
+            session_worker_id,
+            ..
+        } = releases[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(queue, "gpu-workers");
+        assert_eq!(input, &Value::from(session_uuid.to_string()));
+        assert_eq!(*session_id, Some(SessionId::from_uuid(session_uuid)));
+        assert_eq!(session_worker_id.as_deref(), Some("worker-42"));
+        assert!(
+            !releases[0].awaits_result(),
+            "no body awaits a drop release"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_completed_session_issues_no_drop_release() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let release_id = ActivityExecId::new();
+        let mut events = open_session_history(session_uuid);
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: SESSION_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::from(session_uuid.to_string()),
+            queue: "gpu-workers".to_string(),
+        });
+        events.push(WorkflowEvent::ActivityCompleted {
+            activity_id: release_id,
+            output: Value::Null,
+        });
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        session.complete().await.unwrap();
+
+        assert!(drop_releases(&ctx.drain_commands()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_complete_future_releases_the_session() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), open_session_history(session_uuid));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(20), session.complete()).await;
+        assert!(result.is_err(), "complete() must still be waiting");
+
+        let commands = ctx.drain_commands();
+        assert_eq!(drop_releases(&commands).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_suspending_cycle_issues_no_drop_release() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), open_session_history(session_uuid));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        ctx.set_suspending(true);
+        drop(session);
+
+        assert!(drop_releases(&ctx.drain_commands()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_panic_that_unwinds_a_session_issues_no_drop_release() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let ctx =
+            WorkflowContext::for_replay(ExecutionId::new(), open_session_history(session_uuid));
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _held = session;
+            panic!("workflow panic");
+        }));
+
+        assert!(unwound.is_err());
+        assert!(drop_releases(&ctx.drain_commands()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_complete_future_after_its_release_was_scheduled_still_releases() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let release_id = ActivityExecId::new();
+        let mut events = open_session_history(session_uuid);
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: SESSION_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::from(session_uuid.to_string()),
+            queue: "gpu-workers".to_string(),
+        });
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(20), session.complete()).await;
+        assert!(result.is_err(), "the release has no result yet");
+
+        // The host handler is idempotent, so a second release is safe.
+        assert_eq!(drop_releases(&ctx.drain_commands()).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_drop_release_is_a_reserved_name() {
+        assert!(is_reserved_session_activity_name(
+            SESSION_DROP_RELEASE_ACTIVITY_NAME
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_recorded_drop_release_is_not_issued_again() {
+        let session_uuid = uuid::Uuid::new_v4();
+        let release_id = ActivityExecId::new();
+        let mut events = open_session_history(session_uuid);
+        events.push(WorkflowEvent::ActivityScheduled {
+            activity_id: release_id,
+            name: SESSION_DROP_RELEASE_ACTIVITY_NAME.to_string(),
+            input: Value::from(session_uuid.to_string()),
+            queue: "gpu-workers".to_string(),
+        });
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let session = ctx
+            .create_session(SessionOptions::new("gpu-workers"))
+            .await
+            .unwrap();
+
+        drop(session);
+
+        assert!(drop_releases(&ctx.drain_commands()).is_empty());
     }
 
     #[tokio::test]
@@ -32366,5 +33595,283 @@ mod activity_info_tests {
         assert_eq!(info.clone(), info);
         let identity = info.identity();
         assert_eq!(identity.clone(), identity);
+    }
+}
+
+/// A workflow-side payload nested past the depth cap is refused at the call
+/// site (issue #2224). Each test checks the cap, one level over it, and that
+/// the refusal queues no command.
+#[cfg(test)]
+mod payload_depth_tests {
+    use super::*;
+    use crate::error::PayloadKind;
+    use crate::payload_depth::MAX_PAYLOAD_DEPTH;
+
+    fn nested(depth: usize) -> Value {
+        let mut value = serde_json::json!(1);
+        for _ in 0..depth {
+            value = Value::Array(vec![value]);
+        }
+        value
+    }
+
+    fn assert_too_deep(err: &HarvestError, expected: &PayloadKind) {
+        match err {
+            HarvestError::PayloadTooDeep {
+                kind, cap_depth, ..
+            } => {
+                assert_eq!(kind, expected);
+                assert_eq!(*cap_depth, MAX_PAYLOAD_DEPTH);
+            }
+            other => panic!("expected PayloadTooDeep, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), "default")
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_activity_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_local_activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), None, None)
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_raw("c", nested(MAX_PAYLOAD_DEPTH + 1))
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_timeout_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_timeout(
+                "c",
+                nested(MAX_PAYLOAD_DEPTH + 1),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn detached_child_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_detached_raw(
+                "c",
+                nested(MAX_PAYLOAD_DEPTH + 1),
+                crate::types::ParentClosePolicy::default(),
+            )
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn continue_as_new_input_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .continue_as_new(nested(MAX_PAYLOAD_DEPTH + 1))
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::WorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn side_effect_value_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .side_effect("s", || nested(MAX_PAYLOAD_DEPTH + 1))
+            .expect_err("a deep value must be refused");
+        assert_too_deep(&err, &PayloadKind::SideEffectValue);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[test]
+    fn side_effect_value_at_the_cap_is_recorded() {
+        let ctx = WorkflowContext::new_test();
+        ctx.side_effect("s", || nested(MAX_PAYLOAD_DEPTH))
+            .expect("a value at the cap is accepted");
+        assert_eq!(ctx.drain_commands().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn race_activity_branch_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .race()
+            .activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), "default")
+            .timer(std::time::Duration::from_secs(60))
+            .run()
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn race_child_branch_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .race()
+            .child_workflow_raw("c", nested(MAX_PAYLOAD_DEPTH + 1))
+            .timer(std::time::Duration::from_secs(60))
+            .run()
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn child_fan_out_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .spawn_child_workflow_fan_out_raw(vec![
+                ("c".to_string(), serde_json::json!(1)),
+                ("c".to_string(), nested(MAX_PAYLOAD_DEPTH + 1)),
+            ])
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ChildWorkflowInput);
+    }
+
+    #[tokio::test]
+    async fn activity_fan_out_over_the_cap_queues_nothing() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_activity_fan_out_raw(vec![
+                ("a".to_string(), serde_json::json!(1), "default".to_string()),
+                (
+                    "a".to_string(),
+                    nested(MAX_PAYLOAD_DEPTH + 1),
+                    "default".to_string(),
+                ),
+            ])
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no marker and no earlier activity is queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn option_based_activity_fan_out_over_the_cap_queues_nothing() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .execute_activity_fan_out_raw_with(
+                vec![
+                    ("a".to_string(), serde_json::json!(1), "default".to_string()),
+                    (
+                        "a".to_string(),
+                        nested(MAX_PAYLOAD_DEPTH + 1),
+                        "default".to_string(),
+                    ),
+                ],
+                &crate::fan_out::FanOutOptions::new(),
+            )
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+        assert!(
+            ctx.drain_commands().is_empty(),
+            "no marker and no earlier activity is queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_replay_reproduces_the_refusal_not_a_divergence() {
+        let ctx = WorkflowContext::for_replay_strict(crate::types::ExecutionId::new(), Vec::new());
+        let err = ctx
+            .execute_activity_raw("a", nested(MAX_PAYLOAD_DEPTH + 1), "default")
+            .await
+            .expect_err("a deep input must be refused");
+        assert_too_deep(&err, &PayloadKind::ActivityInput);
+    }
+
+    #[tokio::test]
+    async fn external_signal_over_the_cap_is_refused() {
+        let ctx = WorkflowContext::new_test();
+        let err = ctx
+            .signal_external_workflow(
+                crate::types::ExecutionId::new(),
+                "go",
+                nested(MAX_PAYLOAD_DEPTH + 1),
+            )
+            .await
+            .expect_err("a deep payload must be refused");
+        assert_too_deep(&err, &PayloadKind::SignalPayload);
+        assert!(ctx.drain_commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn inputs_at_the_cap_are_not_refused_for_depth() {
+        let ctx = WorkflowContext::new_test();
+        let deep = nested(MAX_PAYLOAD_DEPTH);
+        let wait = std::time::Duration::from_millis(100);
+        // Each call parks on its result. A depth refusal returns at once.
+        assert!(
+            tokio::time::timeout(wait, ctx.execute_activity_raw("a", deep.clone(), "default"))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(
+                wait,
+                ctx.execute_local_activity_raw("a", deep.clone(), None, None)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(wait, ctx.continue_as_new(deep.clone()))
+                .await
+                .is_err()
+        );
+        let commands = ctx.drain_commands();
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, WorkflowCommand::ScheduleActivity { .. }))
+                && commands
+                    .iter()
+                    .any(|c| matches!(c, WorkflowCommand::ContinueAsNew { .. })),
+            "the calls must queue their commands: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_input_at_the_cap_is_not_refused_for_depth() {
+        let ctx = WorkflowContext::new_test();
+        let fut = ctx.spawn_child_workflow_raw("c", nested(MAX_PAYLOAD_DEPTH));
+        let res = tokio::time::timeout(std::time::Duration::from_millis(200), fut).await;
+        // The call parks on the child result. A depth refusal returns at once.
+        assert!(res.is_err(), "a value at the cap must be accepted");
+        assert_eq!(ctx.drain_commands().len(), 1);
     }
 }

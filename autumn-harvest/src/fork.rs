@@ -757,6 +757,134 @@ fn fork_tail(
 /// Most fork links that a lineage check follows.
 const MAX_FORK_LINEAGE: usize = 64;
 
+/// The states of an open fork, as a SQL list (issue #2122).
+///
+/// An open fork can still run. A `FAILED` fork is open too while a redrive
+/// can reopen it. [`open_fork_sql!`] adds that case.
+macro_rules! open_fork_states_sql {
+    () => {
+        "'RUNNING', 'PAUSED', 'MIGRATING', 'MIGRATED'"
+    };
+}
+pub(crate) use open_fork_states_sql;
+
+/// Whether the fork row `f` is open, as a SQL predicate (issue #2122).
+///
+/// A `FAILED` run with a dead letter is open. A redrive deletes the dead
+/// letter and reopens the run in one commit, so each snapshot sees one of the
+/// two open shapes. A `CALLBACK` dead letter redrives only a delivery.
+/// Redrive matches that type in any case, so this check does too.
+///
+/// Retention and the `LiveFork` rebalance guard read this one predicate. So
+/// both use one meaning of an open fork. It is a macro, so `concat!` can take
+/// it.
+macro_rules! open_fork_sql {
+    () => {
+        concat!(
+            "(f.state IN (",
+            crate::fork::open_fork_states_sql!(),
+            ") OR (f.state = 'FAILED' AND EXISTS (SELECT 1 FROM harvest_dead_letters dl \
+               WHERE dl.workflow_exec_id = f.id AND upper(dl.task_type) <> 'CALLBACK')))"
+        )
+    };
+}
+pub(crate) use open_fork_sql;
+
+/// Most links from a stored fork row up to its lineage root, as SQL.
+///
+/// A new fork or reset reads at most [`MAX_FORK_LINEAGE`] ancestors of its
+/// source. It then adds one link, so a stored lineage holds one link more.
+/// Each walk over stored rows uses this bound (issue #2122).
+macro_rules! max_stored_fork_links_sql {
+    () => {
+        "65"
+    };
+}
+pub(crate) use max_stored_fork_links_sql;
+
+/// The open forks that have `$1` in their fork lineage.
+///
+/// The walk goes down from `$1` through fork rows. It passes through a fork
+/// in any state, because a closed fork can have open forks below it. Each
+/// step probes the partial index `idx_harvest_we_fork_source`.
+const OPEN_FORK_DESCENDANTS_SQL: &str = concat!(
+    "WITH RECURSIVE descendant(id, depth) AS ( \
+        SELECT f.id, 1 FROM harvest_workflow_executions f \
+         WHERE f.start_source = 'fork' AND f.start_source_ref = $1 \
+        UNION \
+        SELECT f.id, d.depth + 1 FROM descendant d \
+          JOIN harvest_workflow_executions f \
+            ON f.start_source = 'fork' AND f.start_source_ref = d.id::text \
+         WHERE d.depth < ",
+    max_stored_fork_links_sql!(),
+    " \
+     ) SELECT f.id FROM descendant d \
+         JOIN harvest_workflow_executions f ON f.id = d.id \
+        WHERE ",
+    open_fork_sql!()
+);
+
+/// Whether one fork in `$1` is recorded.
+///
+/// The last `WorkflowForked` marker of a fork sets its mode. A fork with no
+/// marker, or a marker with no `effects` key, fails safe, as recorded.
+const ANY_RECORDED_FORK_SQL: &str = "SELECT EXISTS ( \
+        SELECT 1 FROM unnest($1::uuid[]) AS f(id) \
+         WHERE (SELECT m.event_data -> 'data' ->> 'effects' FROM harvest_events m \
+                 WHERE m.workflow_exec_id = f.id AND m.event_type = 'WorkflowForked' \
+                 ORDER BY m.event_id DESC LIMIT 1) IS DISTINCT FROM 'live' \
+     ) AS pinned";
+
+#[derive(QueryableByName)]
+struct ForkIdRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: Uuid,
+}
+
+#[derive(QueryableByName)]
+struct PinnedRow {
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    pinned: bool,
+}
+
+/// Whether an open recorded fork has `exec_id` in its fork lineage (issue
+/// #2122). Retention keeps such a run.
+///
+/// A recorded fork reads its record source while it runs. A reset or a new
+/// fork of it walks its whole lineage and refuses a gap. So each run in the
+/// lineage stays until each such fork is closed. A live-mode fork reads no
+/// source, so it keeps nothing.
+///
+/// The first query reads only execution rows. The marker query runs only
+/// when an open fork exists. So a run with no fork never reads
+/// `harvest_events`.
+///
+/// # Errors
+///
+/// Returns [`HarvestError`] when a read fails.
+pub(crate) async fn is_pinned_by_recorded_fork(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<bool> {
+    let open: Vec<Uuid> = diesel::sql_query(OPEN_FORK_DESCENDANTS_SQL)
+        .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+        .load::<ForkIdRow>(conn)
+        .await
+        .map_err(database_error)?
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    if open.is_empty() {
+        return Ok(false);
+    }
+    Ok(diesel::sql_query(ANY_RECORDED_FORK_SQL)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(open)
+        .get_result::<PinnedRow>(conn)
+        .await
+        .map_err(database_error)?
+        .pinned)
+}
+
 /// The first erased run in the fork lineage above `source`, if any.
 ///
 /// It follows `start_source_ref` while the row is a fork. Each ancestor row
@@ -1805,6 +1933,10 @@ const RACE_LOSER_ERROR: &str = "lost race to a sibling branch";
 /// The text alone is not enough. An activity can fail with the same text.
 /// The engine terminal also has attempt 1, type `Error`, no retry and no
 /// details, so the whole shape must match.
+///
+/// A cancelled cancellation scope writes the same terminal with its own text
+/// (issue #1984). The scope cancels its members again through the same
+/// command, so the fork holds them as it holds a race loser.
 fn is_race_loser(event: &WorkflowEvent) -> bool {
     matches!(
         event,
@@ -1815,7 +1947,9 @@ fn is_race_loser(event: &WorkflowEvent) -> bool {
             non_retryable: true,
             details: None,
             ..
-        } if error == RACE_LOSER_ERROR && error_type == "Error"
+        } if (error == RACE_LOSER_ERROR
+            || error == crate::context::LoserCancelReason::ScopeCancelled.message())
+            && error_type == "Error"
     )
 }
 
@@ -2242,6 +2376,35 @@ mod tests {
         )
     }
 
+    /// The open states and the closed states cover every state, with no
+    /// overlap (issue #2122). A new state then needs a decision here.
+    #[test]
+    fn open_fork_states_cover_every_open_state() {
+        let open: Vec<&str> = open_fork_states_sql!()
+            .split(", ")
+            .map(|state| state.trim_matches('\''))
+            .collect();
+        let closed = crate::erase::TERMINAL_STATES_WITHOUT_MIGRATED;
+        for state in &open {
+            assert!(!closed.contains(state), "{state} is open and closed");
+        }
+        let mut both: Vec<&str> = open.iter().chain(closed).copied().collect();
+        both.sort_unstable();
+        let mut every: Vec<&str> = crate::lifecycle::WorkflowState::ALL
+            .iter()
+            .map(|state| state.as_str())
+            .collect();
+        every.sort_unstable();
+        assert_eq!(both, every);
+    }
+
+    /// A stored lineage holds one link more than a new fork reads.
+    #[test]
+    fn stored_lineage_bound_is_one_past_the_read_bound() {
+        let stored: usize = max_stored_fork_links_sql!().parse().expect("a number");
+        assert_eq!(stored, MAX_FORK_LINEAGE + 1);
+    }
+
     #[test]
     fn effects_default_to_recorded() {
         assert_eq!(ForkEffects::default(), ForkEffects::Recorded);
@@ -2399,6 +2562,10 @@ mod tests {
         };
         for (error, held) in [
             (RACE_LOSER_ERROR, true),
+            (
+                crate::context::LoserCancelReason::ScopeCancelled.message(),
+                true,
+            ),
             (crate::event::ABANDONED_DISPATCH_REASON, false),
         ] {
             let first = ActivityExecId::new();

@@ -2353,6 +2353,8 @@ standalone note rather than part of the claim-path attribution table above:
   correctness bug, caught by review before it shipped.
 * [`docs/performance-dag-graph.md`](performance-dag-graph.md) — hoisting a
   per-node rebuild out of `GET /dag-run-graph` (issue #690).
+* [`docs/performance-dag-build-simulate.md`](performance-dag-build-simulate.md) —
+  `DagBuilder::build` and `DagSimulator::run`; a negative result.
 * [`docs/performance-dlq-aggregate.md`](performance-dlq-aggregate.md) — DLQ
   aggregate grouping (issue #385/#613); a measured fix that was reverted after
   review found a regressing input shape — a negative result.
@@ -2523,6 +2525,12 @@ standalone note rather than part of the claim-path attribution table above:
   `serde_json::Value` clone eliminated by taking the field by value
   (`std::mem::take`) instead of borrowing it from the event tree the caller
   already owns (instructions -36.89%, allocation blocks -52.05%).
+* [`docs/performance-decode-event-payload-move.md`](performance-decode-event-payload-move.md)
+  — `PayloadCodecs::decode_event` moves each payload tree into its field
+  instead of letting serde rebuild it (issue #2136). `decode_event` drops
+  54.3% of its instructions in `payload_codec_profile`. The note also
+  records the allocator and `preserve_order` alternatives measured for that
+  issue.
 * [`docs/performance-parent-close-cascade-unfinished-handlers.md`](performance-parent-close-cascade-unfinished-handlers.md)
   — the per-child `harvest_events` N+1 in
   `check_and_report_unfinished_handlers`'s parent-close-cascade callers,
@@ -2535,6 +2543,11 @@ standalone note rather than part of the claim-path attribution table above:
   `derive_timeline` behind `GET /workflows/{id}/timeline` (PR #1894);
   replaced by a manual impl that writes one 128-bit value (instructions
   -8.3%, callgrind).
+* [`docs/performance-metrics-rs-labels.md`](performance-metrics-rs-labels.md)
+  — two per-attempt string allocations. `MetricsRsRecorder` label values are
+  interned as `&'static str` (instructions -10.97%, allocation blocks
+  -66.65%). `CircuitBreakerRegistry` seeds its states, so its hot paths
+  allocate no key (instructions -16.41%, allocation blocks -99.90%).
 * [`docs/performance-standalone-activity-overhead.md`](performance-standalone-activity-overhead.md)
   — the cost of a one-step workflow against a bare activity (issue #1987).
   It writes 17 rows per job with a regular activity and 10 with a local
@@ -2544,3 +2557,7 @@ standalone note rather than part of the claim-path attribution table above:
   — `ChainVerifier::push` in the audit-export chain check recomputed the keyed
   HMAC state for every row. It now sets each key up once and streams the
   canonical row into the MAC (instructions -21.3%, allocation blocks -77.8%).
+* [`docs/performance-timeout-refill-shared-page.md`](performance-timeout-refill-shared-page.md)
+  — before issue #2126, the four task-timeout lanes read one page of live
+  rows four times per pass. Lanes at one position now share one refill
+  statement (refill buffers -75% at 100,000 live rows, `pg_stat_statements`).

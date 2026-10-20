@@ -308,18 +308,10 @@ async fn observe_shard(
         Ok(conn) => conn,
         Err(observation) => return observation,
     };
-    match autumn_harvest::usage::load_usage_grouped(&mut conn, shard_id, query, row_limit).await {
-        Ok(rows) => ShardObservation {
-            shard_id,
-            rows,
-            error: None,
-        },
-        Err(e) => ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(e.to_string()),
-        },
-    }
+    shard_fanout::observe_shard_result(
+        shard_id,
+        autumn_harvest::usage::load_usage_grouped(&mut conn, shard_id, query, row_limit).await,
+    )
 }
 
 /// Build the usage report for `GET /admin/usage` (issue #596).

@@ -42,7 +42,7 @@ fuzzing = ["testing", "dep:arbitrary", "chrono/arbitrary", "uuid/arbitrary"]
 # migration, no engine-runtime change. Depends on `testing` for `HistorySnapshot`
 # and the `WorkflowReplayer` handler-registration surface.
 debugger = ["testing"]
-metrics-rs = ["dep:metrics"]
+metrics-rs = ["dep:metrics", "dep:foldhash"]
 # Enables `WorkflowInfo::with_schemas::<I, O, E>()` for automatic JSON Schema
 # generation from types that derive `schemars::JsonSchema` (issue #373).
 schema = ["dep:schemars"]
@@ -151,16 +151,19 @@ tokio-postgres-rustls = { version = "0.14", optional = true }
 # reason as tokio-postgres above (a downstream lockfile shouldn't be able to
 # freshly resolve the yanked 0.24.5).
 metrics = { version = "0.24.6", optional = true }
+# Hashes the `metrics-rs` label interner. SipHash cost more than the copy it saves.
+foldhash = { version = "0.2", optional = true }
 schemars = { version = "0.8", optional = true }
 # wasmtime 48's own minimum Rust is 1.95, so the `wasm-activities` feature that
 # enables these has an effective MSRV of 1.95 (the crate's core MSRV stays 1.88).
 # 48.0.3 is the first 48.x release with the RUSTSEC-2026-0316 fix (46.x has no
 # patched release). 48.0.6 is the first with the RUSTSEC-2026-0363 and
-# RUSTSEC-2026-0364 fixes. Pin the floor so a downstream consumer enabling
+# RUSTSEC-2026-0364 fixes. 48.0.7 is the first with the RUSTSEC-2026-0378 and
+# RUSTSEC-2026-0379 fixes. Pin the floor so a downstream consumer enabling
 # `wasm-activities` can't silently resolve back to a vulnerable 48.0.x (same
 # reasoning as tokio-postgres above -- a workspace's own Cargo.lock never
 # propagates to downstream consumers, only the manifest constraint does).
-wasmtime = { version = "48.0.6", optional = true }
+wasmtime = { version = "48.0.7", optional = true }
 wat = { version = "1", optional = true }
 # Process limits, signals and namespaces for `sandbox-activities`. The
 # lockfile already holds this crate through tokio.
@@ -190,6 +193,21 @@ path = "tests/dst/main.rs"
 
 [[bench]]
 name = "metrics_noop"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for the label values `MetricsRsRecorder` builds on every activity attempt.
+# See `benches/metrics_rs_labels_profile.rs`.
+[[bench]]
+name = "metrics_rs_labels_profile"
+required-features = ["metrics-rs"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for the four `CircuitBreakerRegistry` calls the worker makes per attempt.
+# See `benches/circuit_breaker_dispatch_profile.rs`.
+[[bench]]
+name = "circuit_breaker_dispatch_profile"
 harness = false
 
 # End-to-end benchmark suite (issue #941). `harness = false`: every scenario is
@@ -309,7 +327,7 @@ required-features = ["debugger"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
-criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+criterion = { version = "0.8", features = ["html_reports", "async_tokio"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 trybuild = "1"
 tempfile = "3"
@@ -626,4 +644,19 @@ workspace = true
 # audit rows. See `benches/audit_chain_verify_profile.rs`.
 [[bench]]
 name = "audit_chain_verify_profile"
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `DagBuilder::build` and `DagSimulator::run`. See
+# `benches/dag_simulator_profile.rs`.
+[[bench]]
+name = "dag_simulator_profile"
+required-features = ["testing"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count harness for the
+# static DAG tooling: `DagLinter`, `DagProfiler` and `export_chrome_trace`.
+[[bench]]
+name = "dag_tooling_profile"
+required-features = ["testing"]
 harness = false

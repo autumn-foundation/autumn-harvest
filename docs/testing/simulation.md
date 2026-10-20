@@ -15,6 +15,9 @@ Issue #2033 adds a third harness for user workflow code. It runs your
 workflow against seeded delivery orders, with no database. See
 [`workflow-simulation.md`](workflow-simulation.md).
 
+Issue #2250 adds a harness for the fenced owner lease of a decision
+partition. See [The owner-lease simulation](#the-owner-lease-simulation).
+
 ## What it simulates
 
 The module is `autumn_harvest::dst`. It is test infrastructure, not a
@@ -162,11 +165,18 @@ test.
 
 `.github/workflows/dst-nightly.yml` runs every night:
 
-- `sweep`: 4,000,000 oracle seeds in release mode, in 4 shards.
+- `sweep`: 4,000,000 oracle seeds in release mode, in 4 shards. Each shard
+  then runs the owner-lease sweep on the same seeds.
 - `differential`: 2,000 seeds against Postgres, in 4 shards.
 - `world`: 1,000 world seeds on Postgres, in 4 shards.
+- `autoresearch`: the workflow sweeps of the autoresearch example, 5,000
+  seeds each. See [`workflow-simulation.md`](workflow-simulation.md).
 - `alert`: a failed scheduled run opens an issue, or comments on the open
   one. A step timeout counts as a failure.
+
+The two Postgres jobs pull `postgres:16` with retries before the tests
+start. `testcontainers` does not retry a pull. In issue #2280, an
+interrupted pull failed the `world` job.
 
 Each job takes its seed base from the run number, so each night tests new
 seeds. A manual dispatch can set the seed base and the sweep size.
@@ -222,6 +232,16 @@ of reach.
 
 A run has a fault phase of 120 steps. A drain phase of up to 400 steps
 follows. It has no fault, and it ends when all work is complete.
+
+The drain phase is weakly fair (issue #2217). An action that stays enabled
+for 60 steps (`FAIR_STEPS`) without a run is overdue. Each step runs the
+overdue action that waited longest, with no draw. `Converges` is a liveness
+check, and it needs this rule. A weighted draw alone can skip a rare actor,
+such as the reclaimer, for the whole drain. Seed 52000000302 ran no
+reclaimer pass in its 400 drain steps. Its last open task was a claim of a
+dead worker, and only the reclaimer requeues it.
+
+A `Converges` failure names the work that remains, such as `s2 RUNNING`.
 
 ### The clock
 
@@ -331,6 +351,90 @@ and `w2.4` is worker 2 in its fourth incarnation. `c1` is client
 workflow 1, and `s0` is the first scheduled run. `a1` is the second
 activity of its execution.
 
+## The owner-lease simulation
+
+Issue #2250. `autumn_harvest::dst::owner` is the simulator half of
+`formal/tla/OwnerLease.tla`. It has the same actions, defects and
+invariants. [ADR 0010](../adr/0010-fenced-owner-lease.md) is the prose
+spec. Stage 1a (issue #2251) has no code yet.
+
+### The store seam
+
+`OwnerStore` is the seam for stage 1a. `OracleOwnerStore` keeps the owner
+row, the signal rows and the consumed signals in memory. Stage 1a
+implements the trait on Postgres and passes it to `owner::run_with` or
+`owner::sweep_with`.
+
+- The store reports only durable facts: the row, the pending signals, the
+  consumed signals and the epoch that each commit saw. The simulator keeps
+  the ghost fields that the invariants compare.
+- The simulator drives the store from one thread, so no call may block.
+  `acquire` and `renew` take their lock with `NOWAIT` or a short
+  `lock_timeout`. A miss is `None` or `Renewal::Busy`.
+- `lock` opens a transaction that stays open until `commit`. A worker can
+  have more than one decision in flight, so a store keys its transactions
+  by `Decision`.
+
+The store applies `no-fence`, `unlocked-fence`, `holder-fence` and
+`renew-bumps`. The simulator applies `keep-cache`, `pipeline` and
+`memory-ack`, because they are owner behaviour. So the seam makes only the
+store side real.
+
+`stage_1a_owner_store_gets_a_simulator_run` fails when a migration adds
+`harvest_decision_owner` and no test outside `tests/dst` implements
+`OwnerStore` for a real store and calls `run_with` or `sweep_with`.
+
+### The run
+
+A run has 3 workers and 4 signals. Each step applies one action. The four
+nemeses bias the scheduler. Each one acts when its trigger holds:
+
+| Nemesis | Trigger | Fault | TLA+ tag |
+|---|---|---|---|
+| `stale-owner` | The holder has a decision that read its state. | Stall the holder and end its lease, so another worker can take over. | `stale-commit` |
+| `lease-flap` | A commit holds the fence lock. | End the lease, so the append lands after it. | `append-after-expiry` |
+| `lease-flap` | A worker with a decision in flight lost the row. | That worker takes the row back. | `flap` |
+| `renew-in-flight` | The holder holds the fence lock. | The holder renews. | `renew-in-flight` |
+| `ack-before-bump` | An acked signal is pending. | End the lease, so the epoch bumps first. | `ack-before-bump` |
+
+### The tests
+
+- `every_tla_defect_fails_here_on_the_same_invariant` reads the
+  `OwnerLease` rows of `formal/tla/models.txt`. Each defect must fail on
+  the invariant that TLC names, within seeds 0 to 199.
+- `the_simulator_checks_the_invariants_of_the_tla_design_config` keeps the
+  invariant lists of the two models equal.
+- `the_design_passes_every_seed_and_reaches_every_nemesis` checks that the
+  design reaches each nemesis and never fences itself.
+- `each_nemesis_fires_and_adds_its_fault` runs each nemesis alone. It must
+  fire, and its fault counter must be above the run with no nemesis.
+- A sweep fails a seed that does not consume every signal within the
+  step limit. So a store that makes no progress cannot pass.
+  `a_store_that_makes_no_progress_fails_the_sweep` checks this.
+
+With every check on, a defect can fail first on another invariant. For
+example, `memory-ack` fails first on `AckAfterDurableWrite`. Set
+`HARVEST_DST_OWNER_CHECKS` to the invariant of the ADR table to see the
+same failure as TLC.
+
+| Variable | Meaning |
+|---|---|
+| `HARVEST_DST_OWNER_SEED` | Run this one seed only. |
+| `HARVEST_DST_OWNER_SEEDS` | The number of seeds. The default is 300. |
+| `HARVEST_DST_OWNER_SEED_BASE` | The first seed. The default is 0. |
+| `HARVEST_DST_OWNER_DEFECT` | `none` (the default) or a defect name. |
+| `HARVEST_DST_OWNER_NEMESES` | A comma list of nemesis names. The default is all. |
+| `HARVEST_DST_OWNER_CHECKS` | A comma list of invariant names. The default is all. |
+
+```sh
+HARVEST_DST_OWNER_SEEDS=100000 \
+  cargo test --release -p autumn-harvest --no-default-features --test dst \
+  owner::owner_sweep -- --nocapture
+```
+
+A failure prints the replay command. It runs `owner::replay_one_owner_seed`
+and prints the trace.
+
 ## The speculation model
 
 Issue #2011 asks whether a worker can run the next decision while the
@@ -383,8 +487,9 @@ A failure prints the replay command. It sets `HARVEST_DST_SEED` and runs
   `kill_at` points can close this gap.
 - The world workload never fails an activity, and its reclaimer never
   quarantines. So it does not reach the quarantine or the `FAILED` state.
-- The scheduler draws actions from fixed weights. Unlike probabilistic
-  concurrency testing (PCT), it does not search for rare interleavings.
+- The scheduler draws actions from fixed weights. The drain adds only a
+  fairness bound. Unlike probabilistic concurrency testing (PCT), it does
+  not search for rare interleavings.
 - The oracle harness does not model the timeout sweeper, the `FAILED`
   state or the poison-pill quarantine. Its reclaimer always requeues, so
   many long runs reach strike counts that production would quarantine. The

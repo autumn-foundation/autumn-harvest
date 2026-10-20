@@ -1,0 +1,4 @@
+-- before: timeout refill, 8 passes, limit 500
+live | refill calls | refill buffers | refill temp blocks | refill ms | refill JIT inline | clock reads | all buffers | rows found
+1000 | 32 | 1216 | 0 | 40 | 0 | 32 | 1912 | 160
+100000 | 32 | 60528 | 39383 | 2871 | 16 | 8 | 80726 | 4000

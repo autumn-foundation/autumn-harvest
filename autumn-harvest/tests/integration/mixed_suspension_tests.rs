@@ -1612,6 +1612,7 @@ async fn cancel_the_loser(
     next_event_id: &mut i32,
 ) -> autumn_harvest::error::HarvestResult<()> {
     let commands = vec![autumn_harvest::WorkflowCommand::CancelRaceLosers {
+        reason: autumn_harvest::context::LoserCancelReason::RaceLoser,
         activities: vec![fixture.loser],
         children: vec![],
         timers: vec![],

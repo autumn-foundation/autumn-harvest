@@ -645,6 +645,14 @@ pub(crate) struct LocalActivityResolution {
     pub(crate) start_to_close_nanos: Option<u64>,
 }
 
+/// The events and stashed signals that [`HistoryMatcher::cut_view`] hides
+/// (issue #1984).
+pub(crate) struct ViewCut {
+    tail: Vec<WorkflowEvent>,
+    hidden_signals: VecDeque<(String, Value, usize)>,
+    cursor: usize,
+}
+
 /// Walks through recorded workflow events during replay, matching
 /// commands against what was previously recorded.
 ///
@@ -914,6 +922,9 @@ impl HistoryMatcher {
             }
         }
         let race_reserved_signal_events = Self::build_race_reserved_signal_events(&events);
+        // A drop release has no awaiter (issue #2193). Its records never
+        // shift a positional match.
+        transparent_events.extend(Self::drop_release_indices(&events));
 
         Self {
             events,
@@ -1017,12 +1028,15 @@ impl HistoryMatcher {
     }
 
     /// Events that carry no workflow command and that replay never consumes:
-    /// pause and resume (#383), post-terminal bookkeeping, and decision
-    /// boundaries (#1833).
+    /// pause and resume (#383), post-terminal bookkeeping, decision
+    /// boundaries (#1833) and deferred cancels (#1984).
     const fn is_command_free_bookkeeping(event: &WorkflowEvent) -> bool {
         Self::is_pause_lifecycle_event(event)
             || Self::is_post_terminal_bookkeeping(event)
             || event.is_decision_boundary()
+            // A deferred cancel (issue #1984) lands at any position and no
+            // workflow command matches it.
+            || matches!(event, WorkflowEvent::WorkflowCancelRequested { .. })
     }
 
     /// Events appended **after** a run's terminal event as durable bookkeeping.
@@ -2067,6 +2081,53 @@ impl HistoryMatcher {
             || !self.pending_external_signals.is_empty()
             || !self.pending_external_cancels.is_empty()
             || !self.pending_external_awaits.is_empty()
+    }
+
+    /// Whether history holds a drop release for `session` (issue #2193).
+    ///
+    /// This scans history. A field would grow every workflow future that
+    /// embeds the matcher past the large-future lint limit.
+    #[must_use]
+    pub(crate) fn has_drop_release(&self, session: crate::types::SessionId) -> bool {
+        let wanted = session.to_string();
+        self.events.iter().any(|event| {
+            matches!(
+                event,
+                WorkflowEvent::ActivityScheduled { name, input, .. }
+                    if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME
+                        && input.as_str() == Some(wanted.as_str())
+            )
+        })
+    }
+
+    /// Indices of the records of each drop release in `events` (issue #2193).
+    ///
+    /// A record is the `ActivityScheduled` event of the reserved name and every
+    /// later event with the same activity id.
+    pub(crate) fn drop_release_indices(events: &[WorkflowEvent]) -> Vec<usize> {
+        let mut releases: HashSet<ActivityExecId> = HashSet::new();
+        let mut indices = Vec::new();
+        for (i, event) in events.iter().enumerate() {
+            match event {
+                WorkflowEvent::ActivityScheduled {
+                    activity_id, name, ..
+                } if name == crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME => {
+                    releases.insert(*activity_id);
+                    indices.push(i);
+                }
+                WorkflowEvent::ActivityStarted { activity_id, .. }
+                | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
+                | WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                    if releases.contains(activity_id) =>
+                {
+                    indices.push(i);
+                }
+                _ => {}
+            }
+        }
+        indices
     }
 
     /// Number of events loaded into this replay matcher.
@@ -6102,6 +6163,13 @@ impl HistoryMatcher {
             .unwrap_or_default()
     }
 
+    /// Whether a `version` gate here is past history, as
+    /// [`Self::match_version`] decides it (issue #1984).
+    pub(crate) fn version_gate_is_live(&mut self) -> bool {
+        self.advance_to_next_unconsumed_event();
+        !self.is_replaying()
+    }
+
     /// Versioning mechanism for safe workflow code changes.
     ///
     /// Checks the recorded history for a version marker. If the marker is present
@@ -6247,6 +6315,17 @@ impl HistoryMatcher {
     /// execution (empty history) the memo is `false`, so a residual
     /// `patched(id)` treats post-deprecation runs as unpatched — the
     /// documented footgun whose fix is deleting the residual call.
+    /// The number of non-cancellable blocks that the history leaves open
+    /// (issue #1984).
+    pub(crate) fn open_non_cancellable_blocks(&self) -> usize {
+        crate::cancellation_scope::open_non_cancellable_blocks(&self.events)
+    }
+
+    /// Whether this replay cycle deprecated the gate `patch_id` (issue #1984).
+    pub(crate) fn patch_is_deprecated(&self, patch_id: &str) -> bool {
+        self.deprecated_patches.contains_key(patch_id)
+    }
+
     pub fn deprecate_patch(&mut self, patch_id: &str) -> bool {
         if let Some(&present) = self.deprecated_patches.get(patch_id) {
             return present;
@@ -6745,6 +6824,216 @@ impl HistoryMatcher {
             }
         }
         None
+    }
+
+    /// Hide every event at or after `horizon` (issue #1984).
+    ///
+    /// A replayed cancelled scope polls its body behind this cut. Stashed
+    /// signals past the cut are hidden too. Returns `None` when nothing is
+    /// hidden.
+    pub(crate) fn cut_view(&mut self, horizon: usize) -> Option<ViewCut> {
+        if horizon >= self.events.len() {
+            return None;
+        }
+        let tail = self.events.split_off(horizon);
+        let (kept, hidden_signals): (VecDeque<_>, VecDeque<_>) =
+            std::mem::take(&mut self.pending_signals)
+                .into_iter()
+                .partition(|(_, _, idx)| *idx < horizon);
+        self.pending_signals = kept;
+        Some(ViewCut {
+            tail,
+            hidden_signals,
+            cursor: self.cursor,
+        })
+    }
+
+    /// Undo a [`Self::cut_view`].
+    pub(crate) fn restore_view(&mut self, cut: ViewCut) {
+        let horizon = self.events.len();
+        self.events.extend(cut.tail);
+        self.pending_signals.extend(cut.hidden_signals);
+        self.pending_signals
+            .make_contiguous()
+            .sort_by_key(|(_, _, idx)| *idx);
+        if cut.cursor > horizon {
+            self.cursor = cut.cursor;
+        }
+    }
+
+    /// Keep only the scope members that are still open (issue #1984).
+    ///
+    /// A member is open when its start event is in history and its terminal
+    /// is not. A warm (resident) cycle and a cold replay then name the same
+    /// members.
+    pub(crate) fn open_members(
+        &self,
+        members: &crate::cancellation_scope::ScopeMembers,
+    ) -> crate::cancellation_scope::ScopeMembers {
+        let mut activities = HashSet::new();
+        let mut children = HashSet::new();
+        let mut timers = HashSet::new();
+        for event in &self.events {
+            match event {
+                WorkflowEvent::ActivityScheduled { activity_id, .. }
+                | WorkflowEvent::ActivityAwaitingExternal { activity_id, .. } => {
+                    activities.insert(*activity_id);
+                }
+                WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                | WorkflowEvent::ActivityCompletedExternally { activity_id, .. }
+                | WorkflowEvent::ActivityFailedExternally { activity_id, .. } => {
+                    activities.remove(activity_id);
+                }
+                WorkflowEvent::ChildWorkflowStarted { child_id, .. } => {
+                    children.insert(*child_id);
+                }
+                WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
+                | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                    children.remove(child_id);
+                }
+                WorkflowEvent::TimerStarted { timer_id, .. } => {
+                    timers.insert(timer_id.as_str());
+                }
+                WorkflowEvent::TimerFired { timer_id }
+                | WorkflowEvent::TimerCancelled { timer_id } => {
+                    timers.remove(timer_id.as_str());
+                }
+                _ => {}
+            }
+        }
+        crate::cancellation_scope::ScopeMembers {
+            activities: members
+                .activities
+                .iter()
+                .copied()
+                .filter(|id| activities.contains(id))
+                .collect(),
+            children: members
+                .children
+                .iter()
+                .copied()
+                .filter(|id| children.contains(id))
+                .collect(),
+            timers: members
+                .timers
+                .iter()
+                .filter(|id| timers.contains(id.as_str()))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The details of an unconsumed marker at or after the cursor.
+    ///
+    /// A pure read: the cursor does not move.
+    pub(crate) fn unconsumed_marker_details(&self, marker_name: &str) -> Option<Value> {
+        self.events
+            .iter()
+            .enumerate()
+            .skip(self.cursor)
+            .find_map(|(i, e)| match e {
+                WorkflowEvent::MarkerRecorded { name, details }
+                    if name == marker_name && !self.is_consumed(i) =>
+                {
+                    Some(details.clone())
+                }
+                _ => None,
+            })
+    }
+
+    /// Consume the marker `marker_name` and return its index and details.
+    ///
+    /// The scan tolerates the same interleaved sibling events as
+    /// [`Self::peek_u64_marker`]. Returns `None` at the live frontier or when
+    /// another event blocks the scan.
+    pub(crate) fn take_marker(&mut self, marker_name: &str) -> Option<(usize, Value)> {
+        if !self.prepare_match() {
+            return None;
+        }
+        let mut scan_cursor = self.cursor;
+        let mut first_interleaved_command = None;
+        while scan_cursor < self.events.len() {
+            if self.is_consumed(scan_cursor) {
+                scan_cursor += 1;
+                continue;
+            }
+            match &self.events[scan_cursor] {
+                WorkflowEvent::MarkerRecorded { name, details } if name == marker_name => {
+                    let details = details.clone();
+                    if let Some(command_cursor) = first_interleaved_command {
+                        self.consumed_out_of_order_events.insert(scan_cursor);
+                        self.cursor = command_cursor;
+                    } else {
+                        self.cursor = scan_cursor + 1;
+                    }
+                    self.advance_to_next_unconsumed_event();
+                    return Some((scan_cursor, details));
+                }
+                // Other writers append between the horizon and the marker: a
+                // completion, a late external result, a signal. The marker
+                // name is unique, so the scan steps over such an event. The
+                // cursor returns to the first stepped-over event, so nothing
+                // is lost. A command event stops the scan: the replayed body
+                // did not issue a command that the recorded run issued, and
+                // that is drift.
+                event if !event.is_terminal_lifecycle() && !Self::is_command_event(event) => {
+                    first_interleaved_command.get_or_insert(scan_cursor);
+                    scan_cursor += 1;
+                }
+                _ => break,
+            }
+        }
+        if let Some(command_cursor) = first_interleaved_command {
+            self.cursor = command_cursor;
+            self.advance_to_next_unconsumed_event();
+        }
+        None
+    }
+
+    /// Consume the events of a cancelled scope's members (issue #1984).
+    ///
+    /// Activity and child ids are unique, so each of their events is
+    /// consumed wherever it is. A timer id can be used again later, so a
+    /// `TimerFired` is consumed only inside `timer_window`.
+    pub(crate) fn consume_scope_members(
+        &mut self,
+        members: &crate::cancellation_scope::ScopeMembers,
+        timer_window: std::ops::Range<usize>,
+    ) {
+        for index in 0..self.events.len() {
+            if self.is_consumed(index) {
+                continue;
+            }
+            let member = match &self.events[index] {
+                WorkflowEvent::ActivityScheduled { activity_id, .. }
+                | WorkflowEvent::ActivityStarted { activity_id, .. }
+                | WorkflowEvent::ActivityHeartbeat { activity_id, .. }
+                | WorkflowEvent::ActivityCompleted { activity_id, .. }
+                | WorkflowEvent::ActivityFailed { activity_id, .. }
+                | WorkflowEvent::ActivityTimedOut { activity_id, .. }
+                | WorkflowEvent::ActivityAwaitingExternal { activity_id, .. }
+                | WorkflowEvent::ActivityCompletedExternally { activity_id, .. }
+                | WorkflowEvent::ActivityFailedExternally { activity_id, .. }
+                | WorkflowEvent::ActivityExternalDeadlineExtended { activity_id, .. } => {
+                    members.activities.contains(activity_id)
+                }
+                WorkflowEvent::ChildWorkflowStarted { child_id, .. }
+                | WorkflowEvent::ChildWorkflowCompleted { child_id, .. }
+                | WorkflowEvent::ChildWorkflowFailed { child_id, .. } => {
+                    members.children.contains(child_id)
+                }
+                WorkflowEvent::TimerFired { timer_id } => {
+                    timer_window.contains(&index) && members.timers.contains(timer_id)
+                }
+                _ => false,
+            };
+            if member {
+                self.consumed_out_of_order_events.insert(index);
+            }
+        }
+        self.advance_to_next_unconsumed_event();
     }
 
     /// Whether an unconsumed `MarkerRecorded { name }` exists anywhere at or
@@ -10126,6 +10415,124 @@ mod tests {
         assert!(
             matcher.is_consumed(1) && matcher.is_consumed(2),
             "the #510 redrive-anchored transparency is unchanged"
+        );
+    }
+
+    /// A history with one drop release of `session` and an activity `charge`
+    /// after it. The release has a started and a completed event.
+    fn drop_release_history(session: uuid::Uuid) -> Vec<WorkflowEvent> {
+        let release_id = ActivityExecId::new();
+        let charge_id = ActivityExecId::new();
+        vec![
+            WorkflowEvent::WorkflowStarted {
+                input: Value::Null,
+                timestamp: chrono::Utc::now(),
+                last_completion_result: None,
+                last_error: None,
+                scheduled_time: None,
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: release_id,
+                name: crate::context::SESSION_DROP_RELEASE_ACTIVITY_NAME.into(),
+                input: Value::from(session.to_string()),
+                queue: "gpu".into(),
+            },
+            WorkflowEvent::ActivityScheduled {
+                activity_id: charge_id,
+                name: "charge".into(),
+                input: Value::Null,
+                queue: "default".into(),
+            },
+            WorkflowEvent::ActivityStarted {
+                activity_id: release_id,
+                worker_id: crate::types::WorkerId::new("w"),
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: release_id,
+                output: Value::Null,
+            },
+            WorkflowEvent::ActivityCompleted {
+                activity_id: charge_id,
+                output: Value::from("ok"),
+            },
+        ]
+    }
+
+    /// Issue #2193: a drop release has no awaiter, so replay passes over its
+    /// records. The next activity still matches at its own position.
+    #[test]
+    fn a_drop_release_record_is_transparent_to_the_matcher() {
+        let session = uuid::Uuid::new_v4();
+        let mut matcher = HistoryMatcher::new(drop_release_history(session));
+        for idx in [1, 3, 4] {
+            assert!(
+                matcher.is_consumed(idx),
+                "event {idx} of the drop release must be transparent"
+            );
+        }
+        assert!(!matcher.is_consumed(2), "an ordinary activity stays opaque");
+        matcher.advance(); // past WorkflowStarted
+        assert_eq!(
+            matcher.match_activity("charge"),
+            HistoryMatch::Matched {
+                output: Value::from("ok")
+            }
+        );
+        assert!(!matcher.has_non_lifecycle_unconsumed());
+    }
+
+    /// Issue #2193: a retried, timed-out or beating release stays transparent.
+    #[test]
+    fn every_record_shape_of_a_drop_release_is_transparent() {
+        let session = uuid::Uuid::new_v4();
+        let extra: [fn(ActivityExecId) -> WorkflowEvent; 3] = [
+            |activity_id| WorkflowEvent::ActivityHeartbeat {
+                activity_id,
+                details: Value::Null,
+            },
+            |activity_id| WorkflowEvent::ActivityFailed {
+                activity_id,
+                error: "host gone".into(),
+                attempt: 1,
+                error_type: "Error".into(),
+                details: None,
+                non_retryable: false,
+            },
+            |activity_id| WorkflowEvent::ActivityTimedOut {
+                activity_id,
+                timeout_type: crate::error::TimeoutType::StartToClose,
+            },
+        ];
+        for make in extra {
+            let mut events = drop_release_history(session);
+            let release_id = match &events[1] {
+                WorkflowEvent::ActivityScheduled { activity_id, .. } => *activity_id,
+                other => panic!("expected the release, got {other:?}"),
+            };
+            events.insert(4, make(release_id));
+            let mut matcher = HistoryMatcher::new(events);
+            assert!(
+                matcher.is_consumed(4),
+                "the extra record must be transparent"
+            );
+            matcher.advance(); // past WorkflowStarted
+            assert!(matches!(
+                matcher.match_activity("charge"),
+                HistoryMatch::Matched { .. }
+            ));
+            assert!(!matcher.has_non_lifecycle_unconsumed());
+        }
+    }
+
+    /// Issue #2193: the matcher reports which sessions history already
+    /// released, so a replayed drop issues nothing.
+    #[test]
+    fn the_matcher_reports_a_session_that_history_released() {
+        let session = uuid::Uuid::new_v4();
+        let matcher = HistoryMatcher::new(drop_release_history(session));
+        assert!(matcher.has_drop_release(crate::types::SessionId::from_uuid(session)));
+        assert!(
+            !matcher.has_drop_release(crate::types::SessionId::from_uuid(uuid::Uuid::new_v4()))
         );
     }
 

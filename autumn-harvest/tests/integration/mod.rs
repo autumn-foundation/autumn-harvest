@@ -61,6 +61,7 @@ mod cache_delta_load_tests;
 mod calendars_docs;
 #[cfg(feature = "db")]
 mod canary_tests;
+mod cancellation_scope_tests;
 mod cancellation_tests;
 #[cfg(feature = "db")]
 mod capability_miss_tests;
@@ -138,6 +139,9 @@ mod debugger_tests;
 mod decision_boundary_db_tests;
 #[cfg(feature = "testing")]
 mod decision_boundary_replay_tests;
+mod decision_owner_docs;
+#[cfg(feature = "db")]
+mod decision_owner_lock_modes_db_tests;
 mod declarative_update_tests;
 #[cfg(feature = "db")]
 mod deep_backlog_fixture_tests;
@@ -228,6 +232,8 @@ mod mutex_tests;
 mod nd_block_tests;
 #[cfg(feature = "db")]
 mod notify_post_commit_tests;
+#[cfg(feature = "db")]
+mod notify_stage_probe_tests;
 mod otel_semconv_docs;
 mod otel_workflow_semconv_docs;
 mod panic_containment_tests;
@@ -238,6 +244,8 @@ mod partitioned_events_docs;
 mod pause_tests;
 #[cfg(feature = "testing")]
 mod payload_cap_tests;
+#[cfg(feature = "db")]
+mod payload_depth_tests;
 #[cfg(feature = "db")]
 mod payload_offload_db_tests;
 #[cfg(feature = "testing")]
@@ -384,6 +392,8 @@ mod throttle_bucket_prelock_batch_perf;
 mod throttle_tests;
 #[cfg(feature = "db")]
 mod throwaway_db;
+#[cfg(feature = "db")]
+mod timeout_refill_shared_page_perf;
 // The recorder is used by the chaos suite only. Its unit tests run in
 // every build, so the exporter is checked on each PR (issue #2003).
 #[cfg_attr(not(feature = "chaos"), allow(dead_code))]

@@ -230,6 +230,13 @@ pub enum SqliteError {
     /// payload is refused before it is stored, so a later drive never fails on
     /// a value it cannot read back. `kind` names the boundary
     /// (`"workflow_input"`, `"memo"`, `"signal_payload"` or `"update_input"`).
+    ///
+    /// A deep activity result does not use this variant (issue #2216). It
+    /// becomes a non-retryable `PayloadTooDeep` activity failure, so the
+    /// workflow sees the failure.
+    ///
+    /// A deep value from workflow code does not use this variant (issue
+    /// #2224). The context returns `HarvestError::PayloadTooDeep` instead.
     #[error("payload too deep: {kind} nests more than {cap_depth} levels")]
     PayloadTooDeep {
         /// The ingress boundary that was violated.

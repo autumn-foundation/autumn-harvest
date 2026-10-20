@@ -856,12 +856,15 @@ pub fn mirror(history: &[WorkflowEvent]) -> Vec<Op> {
     // Records that a redrive superseded: the failure, abandoned dispatches
     // and the rest of that cycle's tail. The matcher passes over them, so
     // the mirror does too.
-    let superseded: HashSet<usize> = last_redrive.map_or_else(HashSet::new, |redrive| {
+    let mut superseded: HashSet<usize> = last_redrive.map_or_else(HashSet::new, |redrive| {
         let matcher = HistoryMatcher::new(history.to_vec());
         (0..redrive)
             .filter(|i| matcher.is_transparent(*i))
             .collect()
     });
+    // The release of a dropped session has no awaiter (issue #2193). The
+    // matcher passes over its records, so the mirror does too.
+    superseded.extend(HistoryMatcher::drop_release_indices(history));
     let mut race_timers: HashSet<&str> = HashSet::new();
     // Commands that a fan-out or race claimed. They are passed over, so the
     // group can share a batch with a sibling command.
@@ -2454,6 +2457,7 @@ fn mirror_external(event: &WorkflowEvent) -> Option<Op> {
         | WorkflowEvent::WorkflowContinuedAsNew { .. }
         | WorkflowEvent::WorkflowStarted { .. }
         | WorkflowEvent::WorkflowCancelled { .. }
+        | WorkflowEvent::WorkflowCancelRequested { .. }
         | WorkflowEvent::ActivityStarted { .. }
         | WorkflowEvent::ActivityCompleted { .. }
         | WorkflowEvent::ActivityFailed { .. }

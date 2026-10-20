@@ -116,6 +116,21 @@ fn the_examples_gate_is_wired_into_ci() {
 }
 
 #[test]
+fn the_autoresearch_gate_is_wired_into_ci() {
+    assert_wired(
+        "harvest-verify",
+        &[
+            "harvest-verify -p autoresearch -p autumn-harvest-agent --lib --strict --report",
+            "--target-dir target/harvest-verify/autoresearch",
+        ],
+        "The autoresearch capstone is its own workspace member, so the examples \
+         gate does not analyze it. This step is the only one that runs the \
+         analyzer over the capstone's workflows. It is `--strict`: all four \
+         workflows prove, so an `unknown` must fail the job, not warn.",
+    );
+}
+
+#[test]
 fn tests_corpus_step_is_wired_into_ci() {
     assert_wired(
         "harvest-verify-tests",

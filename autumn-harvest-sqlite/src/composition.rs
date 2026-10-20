@@ -34,9 +34,6 @@ use rusqlite::Connection;
 /// The cancel reason of an external cancel. It matches Postgres.
 pub const EXTERNAL_CANCEL_REASON: &str = "cancelled by external request";
 
-/// The cancel reason of a child that lost a race. It matches Postgres.
-pub const RACE_LOSER_REASON: &str = "lost race to a sibling branch";
-
 /// The cancel reason of a `request_cancel` parent-close cascade.
 const PARENT_CLOSED_REASON: &str = "parent closed";
 

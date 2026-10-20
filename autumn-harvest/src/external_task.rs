@@ -313,6 +313,9 @@ pub async fn find_by_token_locked(
 /// `_with_codecs` sibling instead. This wrapper keeps the pre-#1243 public
 /// signature for an out-of-tree caller.
 ///
+/// An `output` nested past the depth cap fails the activity instead. See
+/// [`complete_externally_with_codecs`].
+///
 /// # Errors
 ///
 /// Returns [`HarvestError::NotFound`] when `token` is unknown on this shard.
@@ -328,6 +331,11 @@ pub async fn complete_externally(
 /// [`complete_externally`], encoding `ActivityCompletedExternally.output`
 /// through `codecs` (issue #1243).
 ///
+/// An `output` nested past [`MAX_PAYLOAD_DEPTH`](crate::payload_depth::MAX_PAYLOAD_DEPTH)
+/// does not complete the activity (issue #2225). `serde_json` cannot read it
+/// back from the history. The call fails the activity instead, as
+/// [`fail_externally`] does with `retryable` off, and returns the same result.
+///
 /// # Errors
 ///
 /// Same as [`complete_externally`].
@@ -337,6 +345,13 @@ pub async fn complete_externally_with_codecs(
     output: serde_json::Value,
     codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
+    // The HTTP route parses a body of 126 levels, and the event adds two more.
+    // A result that deep makes every load of the history fail (issue #2225).
+    if crate::payload_depth::nests_past_cap(&output) {
+        let message = crate::payload_depth::too_deep_message("external activity");
+        return fail_externally(conn, token, message, false).await;
+    }
+
     // The wake below re-pends a parked workflow task, so it raises a dispatch
     // hint (issue #1312). The buffering scope holds the hint until this
     // transaction commits. A hint published earlier names a row no reader

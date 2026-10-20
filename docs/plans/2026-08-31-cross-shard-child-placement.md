@@ -147,7 +147,7 @@ shard:
 | `parent_exec_id` | the parent on *this* shard |
 | `target_shard` | denormalised for the scanner's index |
 | `status` | `PENDING_START` → `STARTED` |
-| `cancel_requested` | set by the parent's cancel paths |
+| `cancel_requested`, `cancel_reason` | set by the parent's cancel paths; the reason is the text for the child's `WorkflowCancelled` event (#2194) |
 | `workflow_name`, `input`, `queue_name`, `parent_close_policy`, `assigned_build_id`, `context_headers`, `priority` | what the relay needs to create the child |
 | `attempts`, `last_error`, `last_attempt_at`, `created_at` | operability, and the retry backoff / rotation ordering |
 

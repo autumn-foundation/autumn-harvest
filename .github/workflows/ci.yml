@@ -328,6 +328,13 @@ jobs:
       - name: Run docs/alerts SLO pack guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration slo_pack_docs::"
 
+      # Issue #2249: ADR 0009 records the decision owner model. A docs-only
+      # PR skips the `test` matrix, so its guards run here.
+      # `decision_owner_docs::guards_run_on_docs_only_changes` checks that
+      # this step exists. Quoted for the trailing-`::` reason above.
+      - name: Run the decision owner ADR guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration decision_owner_docs::"
+
       # Issue #1816: load and unit-test the SLO burn-rate rules. The pinned
       # tarball and its checksum keep a new promtool release from reddening
       # lint, and a tampered download fails the checksum.
@@ -855,6 +862,11 @@ jobs:
         env:
           SEMAPHORE_SHARD_COUNT: "4"
           SEMAPHORE_SHARD_INDEX: ${{ matrix.shard }}
+          # Each test target maps the large `autumn_harvest` rlib while it
+          # links. On Windows, many links at once exhaust the commit charge
+          # (os error 1455, "the paging file is too small"). Two jobs keep the
+          # peak inside it. The other OSes keep the default.
+          CARGO_BUILD_JOBS: ${{ runner.os == 'Windows' && '2' || 'default' }}
         run: bash .github/ci/run-suites.sh compile
       - name: Run all-OS manifest suites (no live DB)
         if: needs.changes.outputs.code == 'true'
@@ -2417,7 +2429,7 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # The models take about 40 seconds and the trace fixtures about 10.
+    # The models take about 2 minutes and the trace fixtures about 10 seconds.
     # The runner image has Java and Python.
     timeout-minutes: 15
     steps:
@@ -2504,9 +2516,10 @@ jobs:
 
   # Issue #962: the semantic (MIR-level) determinism analyzer, `harvest-verify`.
   # This is the SECOND line behind the syntactic HVG/DET guardrails — opt-in, and
-  # deliberately NON-STRICT here: `unknown` verdicts warn, only a
-  # `nondeterminism-found` fails the job (exit 1). A tool/build error is exit 2,
-  # so "the tool broke" never reads as "your workflow is broken".
+  # deliberately NON-STRICT over the examples: `unknown` verdicts warn, only a
+  # `nondeterminism-found` fails the job (exit 1). The autoresearch capstone
+  # step is the exception, and says why. A tool/build error is exit 2, so "the
+  # tool broke" never reads as "your workflow is broken".
   #
   # Linux-only, like the other single-OS steps: the analysis is
   # platform-independent and a three-OS matrix would triple the cost for no
@@ -2567,6 +2580,23 @@ jobs:
             harvest-verify -p autumn-harvest --all-examples \
             --no-default-features --features testing \
             --allowlist harvest-verify.allow.toml --report
+      # The autoresearch capstone is a workspace member, not an `examples/`
+      # target of `autumn-harvest`. The gate above does not see its two
+      # workflows, so this step analyzes them. `-p autumn-harvest-agent` gives
+      # the analyzer the agent crate's MIR, so a call into it is followed,
+      # and the agent's own two workflows are analyzed too.
+      #
+      # STRICT, unlike the gates above: all four workflows prove, so an
+      # `unknown` fails the job as well as a `nondeterminism-found`. The
+      # capstone is the example that shows the analyzer at work, and a quiet
+      # slide back to `unknown` would undo that. It needs no allowlist entry,
+      # so it passes no allowlist. Its own target directory keeps its units
+      # apart from the examples gate.
+      - name: harvest-verify gate over the autoresearch capstone (strict)
+        run: |
+          time cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- \
+            harvest-verify -p autoresearch -p autumn-harvest-agent --lib --strict --report \
+            --target-dir target/harvest-verify/autoresearch
 
   # Issue #962, AC6's *second* corpus: "the repo's own examples/ + test workflow
   # corpus". The job above covers `examples/`. This one covers

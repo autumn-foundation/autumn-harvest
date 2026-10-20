@@ -117,10 +117,22 @@
 //!   `harvest_activity_failure_v1` envelope) — byte-equivalent to the Postgres worker's
 //!   `finalize_activity_failure` (issue #1069 P2). A legacy `Err(String)` decodes to
 //!   `error_type = "Error"`, `non_retryable = false`, `details = None`, unchanged.
-//! - **Payload depth is capped at ingress** (issue #2157). `serde_json` reads at most
+//! - **Payload depth is capped at ingress and on activity output** (issues #2157 and
+//!   #2216). `serde_json` reads at most
 //!   128 levels. A start input, memo, signal payload or update input that nests deeper than
 //!   [`MAX_PAYLOAD_DEPTH`] is refused with [`SqliteError::PayloadTooDeep`] before
 //!   anything is persisted. The run stays live and the driver stays healthy.
+//!   An activity result that nests too deep becomes a non-retryable
+//!   [`PAYLOAD_TOO_DEEP_ERROR_TYPE`] failure, for a remote or a local activity.
+//!   The workflow sees the failure. A local failure keeps only its message. A
+//!   heartbeat that nests too deep is dropped, and the last good checkpoint stays.
+//!   A too-deep result or heartbeat is never stored.
+//!   A value from workflow code (issue #2224) is refused at the call site with
+//!   `HarvestError::PayloadTooDeep`. That covers activity, local activity, child and
+//!   continue-as-new input, external signal payloads and side-effect values. The
+//!   workflow can handle the error. A workflow result that nests too deep fails the
+//!   run with a non-retryable [`PAYLOAD_TOO_DEEP_ERROR_TYPE`] failure. An update
+//!   result that nests too deep fails the update.
 //! - **Payload-size caps are enforced at every boundary, matching the core** (issue
 //!   #252). A caller-supplied payload that exceeds its byte cap is refused before it
 //!   can enter `harvest_events`, so this backend never stores an unbounded history
@@ -766,13 +778,16 @@ pub use crate::error::{SqliteError, SqliteResult};
 pub use crate::history_cap::HistoryCapReason;
 pub use crate::query::DEFAULT_QUERY_TIMEOUT;
 pub use crate::runtime::{
-    ActivityBody, ActivitySpec, ExecutionOutcome, MAX_PAYLOAD_DEPTH, RunState, SignalDelivery,
-    SignalWithStart, SignalWithStartOutcome, SqliteRuntime, StartOptions, StartOutcome,
+    ActivityBody, ActivitySpec, ExecutionOutcome, RunState, SignalDelivery, SignalWithStart,
+    SignalWithStartOutcome, SqliteRuntime, StartOptions, StartOutcome,
     UNSUPPORTED_FEATURE_ERROR_TYPE,
 };
+// The depth cap is shared with the Postgres backend (issue #2225).
 pub use crate::schedule::ScheduleSummary;
 pub use crate::store::ActivityAttempt;
 pub use crate::visibility::{
     DEFAULT_LIST_LIMIT, ExecutionDescription, ExecutionFilter, ExecutionPage, ExecutionSummary,
     ListCursor, MAX_FILTER_TERMS, MAX_LIST_LIMIT, SqliteReader, Stored,
 };
+#[doc(inline)]
+pub use autumn_harvest::payload_depth::{MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE};

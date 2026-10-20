@@ -497,6 +497,32 @@ fn check_enqueue_fairness_key(params: &EnqueueParams) -> HarvestResult<()> {
         .map_or(Ok(()), crate::queue_fairness::validate_fairness_key)
 }
 
+/// Insert `rows` into `harvest_task_queue`. Stages no NOTIFY.
+///
+/// Returns the stamp of the insert when [`crate::notify::stamp_wanted`]
+/// holds. The stage of its note then sends no probe (issue #2125).
+async fn insert_task_rows(
+    conn: &mut AsyncPgConnection,
+    rows: &[NewTaskQueueItem<'_>],
+) -> HarvestResult<Option<crate::notify::Stamp>> {
+    use crate::schema::harvest_task_queue;
+
+    let insert = diesel::insert_into(harvest_task_queue::table).values(rows);
+    if !crate::notify::stamp_wanted(conn) {
+        insert
+            .execute(conn)
+            .await
+            .map_err(crate::error::database_error)?;
+        return Ok(None);
+    }
+    let stamps = insert
+        .returning(crate::notify::stamp_returning())
+        .get_results::<crate::notify::Stamp>(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    Ok(stamps.into_iter().next())
+}
+
 /// Insert a new task into the work queue and return its ID.
 ///
 /// # Errors
@@ -505,8 +531,6 @@ fn check_enqueue_fairness_key(params: &EnqueueParams) -> HarvestResult<()> {
 /// [`EnqueueParams::fairness_key`], and
 /// [`crate::error::HarvestError::Database`] on insert failure.
 pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> HarvestResult<Uuid> {
-    use crate::schema::harvest_task_queue;
-
     check_enqueue_fairness_key(params)?;
     let task_id = Uuid::new_v4();
 
@@ -565,11 +589,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         fairness_key: params.fairness_key.as_deref(),
     };
 
-    diesel::insert_into(harvest_task_queue::table)
-        .values(&row)
-        .execute(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let stamp = insert_task_rows(conn, std::slice::from_ref(&row)).await?;
 
     if let Some((worker_id, timeout)) = sticky {
         diesel::sql_query(
@@ -587,7 +607,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         .map_err(crate::error::database_error)?;
     }
 
-    crate::notify::notify_task_enqueued(conn, &params.queue_name, task_id).await?;
+    crate::notify::notify_task_enqueued_stamped(conn, stamp, &params.queue_name, task_id).await?;
 
     // Dispatch hint (issue #1312). The row is `PENDING`, so the channel gets a
     // reference to it. A row scheduled in the future is still recorded; the
@@ -773,8 +793,6 @@ pub async fn enqueue_batch(
     conn: &mut AsyncPgConnection,
     params: &[EnqueueParams],
 ) -> HarvestResult<Vec<Uuid>> {
-    use crate::schema::harvest_task_queue;
-
     if params.is_empty() {
         return Ok(Vec::new());
     }
@@ -784,6 +802,9 @@ pub async fn enqueue_batch(
 
     let task_ids: Vec<Uuid> = params.iter().map(|_| Uuid::new_v4()).collect();
 
+    // A chunk returns a stamp only inside the caller's transaction. All chunks
+    // share that transaction, so the first stamp serves every note.
+    let mut stamp = None;
     // Byte-and-row-bounded chunk boundaries, decided up front from
     // `params`' borrowed fields -- see `compute_chunk_bounds`'s doc
     // comment. No row is cloned until its chunk is actually built below.
@@ -835,11 +856,8 @@ pub async fn enqueue_batch(
             })
             .collect();
 
-        diesel::insert_into(harvest_task_queue::table)
-            .values(&rows)
-            .execute(conn)
-            .await
-            .map_err(crate::error::database_error)?;
+        let chunk_stamp = insert_task_rows(conn, &rows).await?;
+        stamp = stamp.or(chunk_stamp);
     }
 
     // Sticky pin follow-up (rare -- see the doc comment above). Same shape as
@@ -869,7 +887,8 @@ pub async fn enqueue_batch(
     }
 
     for (p, &task_id) in params.iter().zip(&task_ids) {
-        crate::notify::notify_task_enqueued(conn, &p.queue_name, task_id).await?;
+        crate::notify::notify_task_enqueued_stamped(conn, stamp.clone(), &p.queue_name, task_id)
+            .await?;
     }
 
     for (p, &task_id) in params.iter().zip(&task_ids) {
@@ -4904,6 +4923,26 @@ pub async fn cancel_activity_task(
     conn: &mut AsyncPgConnection,
     activity_id: crate::types::ActivityExecId,
 ) -> HarvestResult<Option<(String, String)>> {
+    cancel_activity_task_with_reason(
+        conn,
+        activity_id,
+        crate::context::LoserCancelReason::RaceLoser.message(),
+    )
+    .await
+}
+
+/// [`cancel_activity_task`] that stores `reason` as the row's error
+/// (issue #1984). A cancellation scope names itself here.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`](crate::error::HarvestError::Database) on
+/// update failure.
+pub async fn cancel_activity_task_with_reason(
+    conn: &mut AsyncPgConnection,
+    activity_id: crate::types::ActivityExecId,
+    reason: &str,
+) -> HarvestResult<Option<(String, String)>> {
     use crate::schema::harvest_task_queue::dsl;
 
     let cancelled = diesel::update(
@@ -4918,7 +4957,7 @@ pub async fn cancel_activity_task(
     .set((
         dsl::state.eq("CANCELLED"),
         dsl::worker_id.eq(None::<String>),
-        dsl::error.eq(Some("lost race to a sibling branch".to_string())),
+        dsl::error.eq(Some(reason.to_string())),
         dsl::heartbeat_details.eq(None::<serde_json::Value>),
         dsl::completed_at.eq(Some(Utc::now())),
     ))
@@ -5187,8 +5226,9 @@ pub async fn record_heartbeat_sent_ago(
 /// (issue #2043).
 ///
 /// It refreshes `last_heartbeat_at` and leaves the stored checkpoint as it
-/// is. The heartbeat flusher uses it when a checkpoint does not encode, so the
-/// previous checkpoint survives.
+/// is. The heartbeat flusher uses it when a checkpoint does not encode, and
+/// when a checkpoint nests past the depth cap (issue #2225). The previous
+/// checkpoint survives in both cases.
 ///
 /// # Errors
 ///
@@ -7622,6 +7662,37 @@ pub async fn task_exists(conn: &mut AsyncPgConnection, task_id: Uuid) -> Harvest
         .map_err(crate::error::database_error)?;
 
     Ok(found.is_some())
+}
+
+/// Whether a task of `session_id` other than `except_task_id` can still run
+/// (issue #2193).
+///
+/// A task can still run while it is `PENDING` or `RUNNING`. The scan keys on
+/// `workflow_exec_id`, because the `session_id` index was dropped: no query
+/// could use it. A session belongs to one run, so its member tasks carry the
+/// run's id.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on query failure.
+pub async fn session_has_other_live_tasks(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+    session_id: Uuid,
+    except_task_id: Uuid,
+) -> HarvestResult<bool> {
+    use crate::schema::harvest_task_queue::dsl;
+
+    diesel::select(diesel::dsl::exists(
+        dsl::harvest_task_queue
+            .filter(dsl::workflow_exec_id.eq(Some(workflow_exec_id)))
+            .filter(dsl::session_id.eq(Some(session_id)))
+            .filter(dsl::id.ne(except_task_id))
+            .filter(dsl::state.eq_any(["PENDING", "RUNNING"])),
+    ))
+    .get_result::<bool>(conn)
+    .await
+    .map_err(crate::error::database_error)
 }
 
 // ---------------------------------------------------------------------------

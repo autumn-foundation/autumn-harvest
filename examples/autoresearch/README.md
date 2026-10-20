@@ -256,6 +256,29 @@ All tests are offline. They need `git` and a Unix shell.
 The simulation found a real bug while this example was written: the
 experiment set the search attribute `status`, which the engine reserves.
 
+## Proven deterministic
+
+The tests show that replay works for the paths they run. The semantic
+analyzer, [`harvest-verify`](../../docs/harvest-verify.md), checks every path.
+It reads the MIR of both workflows, of every helper they call and of the agent
+loop, and traces each value that reaches a command back to its source:
+
+```console
+$ cargo run -p autumn-harvest-verify --bin cargo-harvest-verify -- harvest-verify \
+    -p autoresearch -p autumn-harvest-agent --lib --strict --report
+proven-deterministic  autoresearch::workflows::experiment
+proven-deterministic  autoresearch::workflows::research_session
+proven-deterministic  autumn_harvest_agent::heartbeat::agent_heartbeat
+proven-deterministic  autumn_harvest_agent::workflow::agent_loop
+analyzed 4: proven 4, unknown 0, found 0, allowed 0
+```
+
+`proven-deterministic` means that the analyzer found no source of
+nondeterminism that reaches a command, under its model, up to its named
+boundaries. CI runs this command with `--strict`, so an `unknown` fails the
+build as well as a finding. The agent loop delegates by recursion, and the
+analyzer solves that cycle as a fixpoint.
+
 ## Limits
 
 - **The simulated trainer is not a GPT.** It scores the hyperparameter block

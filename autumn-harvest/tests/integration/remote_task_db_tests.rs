@@ -733,6 +733,93 @@ async fn a_zero_result_cap_means_no_cap() {
     p.stop().await;
 }
 
+/// A value of `depth` nested one-element arrays around the number 1.
+fn nested(depth: usize) -> Value {
+    let mut value = json!(1);
+    for _ in 0..depth {
+        value = Value::Array(vec![value]);
+    }
+    value
+}
+
+/// A remote result nested past the depth cap fails the run (issue #2225). The
+/// history stays readable. A result under the cap still completes the run.
+#[tokio::test]
+async fn a_remote_result_nested_past_the_depth_cap_fails_the_run() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    let p = Process::start(url, "remote-task-deep", &server);
+    let poller = RemoteTaskPoller::new(&RemoteTasks::new(FakeTransport(Arc::clone(&server))));
+
+    let deep_run = start_run(url, "report-deep", json!({})).await;
+    let deep_token = wait_for_token(url, deep_run).await;
+    server.set(
+        "task-0",
+        RemoteTaskState::Completed(RemoteTaskOutcome {
+            result: nested(126),
+            is_error: false,
+        }),
+    );
+    poll_until_settled(&p.pool, &poller).await;
+    let done = wait_for_execution_state_with_timeout(url, deep_run, "FAILED", WAIT).await;
+    let error = done.error.expect("error");
+    assert!(error.contains("nests more than 100 levels"), "got {error}");
+    assert_eq!(task_state(url, deep_token).await, "FAILED");
+    let mut conn = connect(url).await;
+    autumn_harvest::store::load_history(&mut conn, deep_run)
+        .await
+        .expect("the history of the failed run must load");
+
+    // The outcome adds one level around the result, so 90 is under the cap.
+    let ok_run = start_run(url, "report-shallow", json!({})).await;
+    wait_for_token(url, ok_run).await;
+    server.set(
+        "task-1",
+        RemoteTaskState::Completed(RemoteTaskOutcome {
+            result: nested(90),
+            is_error: false,
+        }),
+    );
+    poll_until_settled(&p.pool, &poller).await;
+    wait_for_execution_state_with_timeout(url, ok_run, "COMPLETED", WAIT).await;
+    p.stop().await;
+}
+
+/// An external completion nested past the depth cap fails the activity
+/// (issue #2225). The HTTP route calls the same function. A body of 126 levels
+/// passes the JSON parser, and the stored event would hold it two levels
+/// deeper.
+#[tokio::test]
+async fn an_external_completion_nested_past_the_depth_cap_fails_the_run() {
+    let db = setup().await;
+    let url = &db.url;
+    let server = Arc::new(FakeServer::default());
+    let p = Process::start(url, "remote-task-ext-deep", &server);
+
+    let exec_id = start_run(url, "report-ext-deep", json!({})).await;
+    let token = wait_for_token(url, exec_id).await;
+    let mut conn = connect(url).await;
+    let settled = external_task::complete_externally_with_codecs(
+        &mut conn,
+        token,
+        nested(126),
+        &PayloadCodecs::default(),
+    )
+    .await
+    .expect("complete");
+    assert!(settled, "the token settles, as a failure");
+
+    let done = wait_for_execution_state_with_timeout(url, exec_id, "FAILED", WAIT).await;
+    let error = done.error.expect("error");
+    assert!(error.contains("nests more than 100 levels"), "got {error}");
+    assert_eq!(task_state(url, token).await, "FAILED");
+    autumn_harvest::store::load_history(&mut conn, exec_id)
+        .await
+        .expect("the history of the failed run must load");
+    p.stop().await;
+}
+
 /// A server poll interval longer than the poller's delays the next read.
 #[tokio::test]
 async fn the_poller_respects_the_server_poll_interval() {

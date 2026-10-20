@@ -84,11 +84,11 @@
 # model error, not a warning, because an unexplained rule is how a model rots.
 #
 # The version string is printed with every verdict ("no non-determinism found,
-# under model 2026.10.1, up to boundaries ..."), so a verdict can always be
+# under model 2026.10.2, up to boundaries ..."), so a verdict can always be
 # traced to the rules that produced it. Bump the date component when rows change,
 # or when the analysis gives another structure manifest for the same MIR.
 
-version = "2026.10.1"
+version = "2026.10.2"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AMBIENT TYPES — statics of these types are taint roots
@@ -1107,6 +1107,14 @@ path = "race"
 receiver = "WorkflowContext"
 reason = "context.rs:11038 returns a `RaceBuilder`; `RaceBuilder::run` (context.rs:1600) calls `ctx.race_impl`, which pushes `StartChildWorkflow`/`StartTimer`/`WaitForSignal`/`CancelRaceLosers` (context.rs:8217-8356). Branch selection is recorded, so the set and order of branches must be deterministic."
 [[sink]]
+path = "cancellation_scope"
+receiver = "WorkflowContext"
+reason = "cancellation_scope.rs:531 returns a `CancellationScope`; `ScopeRun` records the `cancel_scope:{seq}` marker and pushes `CancelRaceLosers` (cancellation_scope.rs:340). The builder emits nothing, but its handle is only useful by emitting."
+[[sink]]
+path = "non_cancellable"
+receiver = "WorkflowContext"
+reason = "cancellation_scope.rs:569 returns `NonCancellable`, which pushes the `non_cancellable_open:{seq}` and `non_cancellable_close:{seq}` markers through `record_shield_marker` (cancellation_scope.rs:461) and matches them on replay."
+[[sink]]
 path = "random_f64"
 receiver = "WorkflowContext"
 reason = "context.rs:5141; emits a command transitively: random_f64 -> capture_builtin_validated* (`*` = the `push_command` site). Every argument is recorded into history and matched on replay."
@@ -1346,6 +1354,14 @@ reason = "durable_promise.rs:321 -> `WorkflowContext::wait_for_signal` (context.
 path = "wait_timeout"
 receiver = "DurablePromise"
 reason = "durable_promise.rs:338 -> `WorkflowContext::wait_for_signal_timeout` (context.rs:9593), which arms a timer and races `WaitForSignal` against it (issue #1985)."
+[[sink]]
+path = "run"
+receiver = "CancellationScope"
+reason = "cancellation_scope.rs:242 returns `ScopeRun`, which records the `cancel_scope:{seq}` marker and pushes `CancelRaceLosers` (cancellation_scope.rs:340). The cancel decision is recorded."
+[[sink]]
+path = "cancel"
+receiver = "CancellationScope"
+reason = "cancellation_scope.rs:257 sets the flag that makes `ScopeRun` record its cancel marker. A tainted decision to call it changes the command stream."
 [[sink]]
 path = "run"
 receiver = "RaceBuilder"
@@ -2268,10 +2284,11 @@ reason = "Existential quantification; see `all`."
 path = "contains"
 clears = "order"
 reason = "Membership is order-independent."
-[[reduction]]
-path = "fold"
-clears = "order"
-reason = "NOT order-independent in general — `fold` with a non-commutative accumulator IS order-sensitive. Listed with `clears = \"order\"` would be wrong, so this row is deliberately absent from the analyzer's effective set: see the note in the `reverse` sanitizer row for the same device. Kept as a documented non-rule so a future contributor does not add it."
+# No `fold` row. `fold` with a non-commutative accumulator IS order-sensitive,
+# so a row with `clears = "order"` would be wrong. An earlier revision kept such
+# a row as a "documented non-rule", but with no receiver it matched every
+# `fold` call and cleared hash order through `map.keys().fold(..)`. This
+# comment records the decision instead. Do not add the row.
 [[reduction]]
 path = "get"
 receiver = "HashMap"
@@ -2404,6 +2421,10 @@ reason = "serde_json::to_value, a `[[trusted]]` crate's free function that rustc
 [[std_free_fn]]
 path = "from_value"
 reason = "serde_json::from_value, the decoding half of `to_value` and trimmed the same way. Verified in the dumps: `from_value::<bool>(move _N)` with a `serde_json::Value` argument and a `std::result::Result<bool, serde_json::Error>` destination — again the crate is named only in types that are the CALLER's, not the callee's."
+
+[[std_free_fn]]
+path = "to_vec"
+reason = "serde_json::to_vec, the byte-vector sibling of `to_value`, trimmed the same way. Verified in the `autumn-harvest-agent` dump: `_2 = to_vec::<T>(copy _1)` with `_1: &T` and `_2: std::result::Result<std::vec::Vec<u8>, serde_json::Error>` — the crate is named only in the RESULT, the caller's type. A structural walk over the value. The method `<[T]>::to_vec` prints with its receiver (`slice::<impl [T]>::to_vec`), so this bare row never stands in for it."
 
 [[std_free_fn]]
 path = "display"

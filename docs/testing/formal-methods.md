@@ -29,7 +29,8 @@ scripts/check-formal-models.sh
 
 The script downloads `tla2tools.jar` 1.7.4 and checks its SHA-256. To use a
 local jar, set `TLA2TOOLS_JAR=/path/to/tla2tools.jar`. A full run takes about
-40 seconds on 4 cores.
+2 minutes on 4 cores. The `OwnerLease` design config takes about 75 seconds
+of it.
 
 To run one config by hand:
 
@@ -76,6 +77,7 @@ fails in these cases:
 | `ActivityClaim` | Activity claim epoch (issue #1789) | fixed, pre-fix, reachability |
 | `WorkflowTaskClaim` | Workflow-task terminal-write ownership (issues #1184, #1806, #1917) | fixed, pre-fix, reachability, capability-miss pre-fix |
 | `CodecRotation` | Codec re-encryption against PII erasure (issues #948, #495) | CAS, blind write, reachability |
+| `OwnerLease` | Fenced owner lease of a decision partition (issue #2250) | design, six defects, reachability |
 
 **Ghost sequence numbers.** Each claim in the two claim models gets a ghost
 `seq`. The code has no such column. An invariant that compared
@@ -209,6 +211,93 @@ The model treats erasure as one step. The real erasure reads the row, then
 writes it back without a lock. That is safe, because it rewrites only the
 payload fields that the sweep also writes. The model does not check pass
 completion or the unresolved count.
+
+#### `OwnerLease` — model (e)
+
+The prose spec is [ADR 0010](../adr/0010-fenced-owner-lease.md). Stage 1a
+(issue #2251) has no code yet, so this model is the spec. The model has one
+partition, one owner row and the history of one execution. Its actions:
+
+| Action | Planned code |
+|---|---|
+| `Acquire` | The takeover: `SELECT ... FOR UPDATE`, then the write. Adds 1 to the epoch. Waits for every fence lock. Then loads the resident state. |
+| `Release` | The graceful release. Frees the row and unloads the worker. |
+| `Expire` | The lease time runs out: a pause or a clock jump. A lock does not stop it. |
+| `Renew` | The renewal `UPDATE` of `lease_until`. Matches the holder and the epoch. A miss unloads the worker. |
+| `Write`, `Ack` | The `harvest_signals` insert, then the HTTP 202. |
+| `Receive` | The `memory-ack` defect only: an ack from owner memory. |
+| `Begin` | A decision reads its resident state and pins the owner's epoch. |
+| `Lock` | The commit reads the owner row `FOR KEY SHARE` and checks the fence. |
+| `Commit` | The commit appends the event and consumes the signal. |
+
+An unloaded worker keeps its decisions in flight, as a paused thread does.
+A new tenure of that worker can begin a decision beside them. The model has
+no event-id backstop, so the fence alone must hold.
+
+Each decision records ghost fields: `pinned` (its epoch), `at` (the row
+epoch at the commit) and `base` (the history length it saw). The owner row
+has a ghost `tenure`, the number of acquisitions. The ghost `owners` maps
+each epoch to the worker that took it. The invariants compare these
+fields:
+
+- `OneOwnerPerEpoch`: each event comes from the worker that took its
+  epoch.
+- `CommitAtPinnedEpoch`: a decision commits only at the epoch it pinned.
+- `DecisionOnFreshHistory`: each decision saw every earlier event.
+- `NoDuplicateEvent`: no two events consume one signal.
+- `AckAfterDurableWrite`: a signal is acked only after its durable write.
+- `NoAckedSignalLost`: an acked signal is pending, consumed, or in the
+  memory of the worker that holds the row at its epoch. A stale owner can
+  never commit from memory, so its memory does not count.
+- `OwnerNeverFencesItself`: only a takeover fences a commit.
+
+In the design, `AckAfterDurableWrite` restates the guard of `Ack`. It
+matters only for the `memory-ack` mutant. `OneOwnerPerEpoch`,
+`DecisionOnFreshHistory` and `NoAckedSignalLost` carry the weight.
+`OwnerNeverFencesItself` is an availability rule: none of the three safety
+properties of the issue catches `renew-bumps`.
+
+`Defect = "none"` is the design. Each other value breaks one rule of the
+ADR. Its config lists only the invariant that it must break:
+
+| Config | Defect | Rule | Nemesis | Must violate |
+|---|---|---|---|---|
+| `OwnerLeaseNoFence.cfg` | `no-fence`: no check in the commit (golem#3766) | R1 | 1 | `OneOwnerPerEpoch` |
+| `OwnerLeaseUnlockedFence.cfg` | `unlocked-fence`: the check takes no lock | R2 | 2 | `OneOwnerPerEpoch` |
+| `OwnerLeaseHolderFence.cfg` | `holder-fence`: the check compares the holder | R3 | 2 | `DecisionOnFreshHistory` |
+| `OwnerLeaseKeepCache.cfg` | `keep-cache`: an acquisition keeps old state | R4 | 2 | `DecisionOnFreshHistory` |
+| `OwnerLeaseRenewBumps.cfg` | `renew-bumps`: a renewal adds 1 to the epoch | R5 | 3 | `OwnerNeverFencesItself` |
+| `OwnerLeaseMemoryAck.cfg` | `memory-ack`: an ack from memory (restate#4566) | R6 | 4 | `NoAckedSignalLost` |
+| `OwnerLeasePipeline.cfg` | `pipeline`: two decisions in one tenure | R7 | — | `DecisionOnFreshHistory` |
+
+`OwnerLeaseNoFence.cfg` gives this trace:
+
+1. `w1` acquires epoch 1. A client writes `s1`.
+2. `w1` begins a decision on `s1`.
+3. `w1` releases the row. Its decision still runs.
+4. `w2` acquires epoch 2.
+5. `w1` commits. No fence stops it, so its event lands at epoch 2, which
+   `w2` took.
+
+`OwnerLease.cfg` checks the design with 3 workers, 2 signals and 4 epochs.
+The workers are interchangeable, so the config sets
+`SYMMETRY WorkerSymmetry`. TLC finds 5,629,559 distinct states and no
+error, in about 75 seconds on 4 cores. The two signals limit the history to
+two events.
+
+`OwnerLeaseReach.cfg` must violate `SomeNemesisUnseen`. The violation is
+one behaviour of the design that reaches all four nemeses:
+
+| Tag | Nemesis |
+|---|---|
+| `stale-commit` | 1. A stale owner reaches its commit after a takeover and is fenced. |
+| `flap` | 2. A worker takes the lease back while its old decision is in flight. |
+| `append-after-expiry` | 2. The lease ends during an append, and the append lands. |
+| `renew-in-flight` | 3. A renewal lands while a commit holds the fence lock. |
+| `ack-before-bump` | 4. The epoch bumps while an acked signal waits. |
+
+`autumn_harvest::dst::owner` runs the same defects and nemeses from a seed.
+See [`simulation.md`](simulation.md#the-owner-lease-simulation).
 
 ### Extend a model
 

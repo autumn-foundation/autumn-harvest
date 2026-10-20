@@ -50,6 +50,7 @@ allos        autumn-harvest         integration                      -          
 allos        autumn-harvest         integration                      -                          assay_rerun_docs
 allos        autumn-harvest         integration                      -                          benchmarks_docs
 allos        autumn-harvest         integration                      -                          contention_adaptive_atomicity_docs
+allos        autumn-harvest         integration                      -                          decision_owner_docs
 allos        autumn-harvest         integration                      -                          hot_code_swap_docs
 allos        autumn-harvest         integration                      -                          lock_order_docs
 allos        autumn-harvest         integration                      -                          otel_semconv_docs
@@ -71,6 +72,7 @@ allos        autumn-harvest-plugin  connector_example_budget         -          
 allos        autumn-harvest-plugin  contract_regression              -                          -
 allos        autumn-harvest-plugin  custom_roles                     -                          -
 allos        autumn-harvest-plugin  dev_runtime_tests                dev-runtime                -
+allos        autumn-harvest-plugin  durable_route_docs               -                          -
 allos        autumn-harvest-plugin  effective_config_http_tests      -                          -
 allos        autumn-harvest-plugin  gate_no_global_install           -                          -
 allos        autumn-harvest-plugin  oidc_login                       oidc                       -
@@ -103,6 +105,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          business_day_timer_tests
 linux        autumn-harvest         integration                      -                          cache_delta_load_tests
 linux        autumn-harvest         integration                      -                          canary_tests
+linux        autumn-harvest         integration                      -                          cancellation_scope_tests
 linux        autumn-harvest         integration                      -                          cancellation_tests
 linux        autumn-harvest         integration                      -                          capability_miss_tests
 linux        autumn-harvest         integration                      -                          chain_timeout_tests
@@ -127,6 +130,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          ctx_info_tests
 linux        autumn-harvest         integration                      -                          dag_execution_timeout_tests
 linux        autumn-harvest         integration                      -                          debounce_tests
+linux        autumn-harvest         integration                      -                          decision_owner_lock_modes_db_tests
 linux        autumn-harvest         integration                      -                          declarative_update_tests
 linux        autumn-harvest         integration                      -                          deep_backlog_fixture_tests
 linux        autumn-harvest         integration                      -                          delayed_start_tests
@@ -160,10 +164,12 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          mutex_lease_reclaim_perf
 linux        autumn-harvest         integration                      -                          mutex_tests
 linux        autumn-harvest         integration                      -                          notify_post_commit_tests
+linux        autumn-harvest         integration                      -                          notify_stage_probe_tests
 linux        autumn-harvest         integration                      -                          panic_containment_tests
 linux        autumn-harvest         integration                      -                          parent_close_cascade_unfinished_handlers_perf
 linux        autumn-harvest         integration                      -                          partition_archive_tests
 linux        autumn-harvest         integration                      -                          pause_tests
+linux        autumn-harvest         integration                      -                          payload_depth_tests
 linux        autumn-harvest         integration                      -                          payload_offload_db_tests
 linux        autumn-harvest         integration                      -                          payload_orphan_sweep_tests
 linux        autumn-harvest         integration                      -                          pg_timeouts_tests
@@ -227,6 +233,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          throttle_bucket_prelock_batch_perf
 linux        autumn-harvest         integration                      -                          throttle_tests
 linux        autumn-harvest         integration                      -                          throwaway_db
+linux        autumn-harvest         integration                      -                          timeout_refill_shared_page_perf
 linux        autumn-harvest         integration                      -                          transactional_start_tests
 linux        autumn-harvest         integration                      -                          triage_tests
 linux        autumn-harvest         integration                      -                          tx_conflict_retry_tests
@@ -301,6 +308,9 @@ linux        autumn-harvest-plugin  dlq_bulk_discard_perf            -          
 linux        autumn-harvest-plugin  dlq_bulk_integration             -                          -
 linux        autumn-harvest-plugin  dlq_redrive_integration          -                          -
 linux        autumn-harvest-plugin  dr_fence_admin_integration       -                          -
+linux        autumn-harvest-plugin  durable_route_dispatch           -                          -
+linux        autumn-harvest-plugin  durable_route_integration        -                          -
+linux        autumn-harvest-plugin  durable_stream_integration       -                          -
 linux        autumn-harvest-plugin  eligibility_tests                -                          -
 linux        autumn-harvest-plugin  erase_payloads_integration       -                          -
 linux        autumn-harvest-plugin  event_batch_integration          -                          -

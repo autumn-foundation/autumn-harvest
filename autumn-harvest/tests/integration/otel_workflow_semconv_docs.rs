@@ -11,6 +11,9 @@
 //! * Each prose sentence and each YAML text has 25 words or fewer.
 //! * A pinned script runs the upstream Weaver policy checks on the model.
 //!   A workflow runs it, and the page records its pin.
+//! * The filing follows the upstream process. Section 9 fits the issue form.
+//!   A project proposal fills the community template. Each link in the
+//!   issue text is a checked fact.
 //!
 //! The suite is pure: no database, no async, no feature gate. It runs on
 //! every OS.
@@ -65,6 +68,54 @@ const REPLAY_SECTION: &str = "## 6. Replay";
 const ISSUE_TEXT_SECTION: &str = "## 9. Upstream issue text";
 const SUBMISSION_SECTION: &str = "## 10. Submission";
 const STATUS_PREFIX: &str = "**Submission status:**";
+const SCOPE_SECTION: &str = "## 3. Scope and prior art";
+const FACTS_HEADING: &str = "### Facts checked";
+const DECLINE_PREFIX: &str = "If the project decides not to submit";
+
+/// The draft community project proposal.
+const PROPOSAL: &str = "docs/otel-workflow-semconv/project-proposal.md";
+
+/// The upstream issue form for new conventions, its area for a new area and
+/// its text field.
+const ISSUE_FORM: &str = "new-conventions.yaml";
+const ISSUE_AREA: &str = "`area:new`";
+const ISSUE_FIELD: &str = "Propose new conventions";
+
+/// The sections of the community `project-template.md` that are not
+/// "Optional" or "Post-Approval". The script checks the proposal against
+/// the template itself.
+const PROJECT_SECTIONS: &[&str] = &[
+    "## Background and description",
+    "### Current challenges",
+    "### Goals, objectives, and requirements",
+    "## Deliverables",
+    "## Staffing / Help Wanted",
+    "### SIG",
+    "### Required staffing",
+    "#### Project Leads(s)",
+    "#### Other Staffing",
+    "### Sponsorship",
+    "#### TC Sponsor",
+    "#### GC Liaison",
+    "## Expected Timeline",
+];
+
+/// The proposal sections that name a person. Each one links a GitHub handle,
+/// `[@name](…)`, or starts with `Open.`
+const STAFFING_SLOTS: &[&str] = &[
+    "#### Project Leads(s)",
+    "#### TC Sponsor",
+    "#### GC Liaison",
+];
+
+/// The open upstream issue that claims the same `workflow.*` namespace.
+const PRIOR_ISSUE: &str = "open-telemetry/semantic-conventions#1688";
+
+/// Links into this repository. They are not external facts.
+const OWN_REPO: &str = "https://github.com/autumn-foundation/autumn-harvest/";
+
+/// The phrase that precedes each copy of the community pin in the docs.
+const COMMUNITY_PIN_PREFIX: &str = "community commit `";
 
 /// Code lines of the Weaver script that must appear exactly, with the reason.
 const WEAVER_SCRIPT_LINES: &[(&str, &str)] = &[
@@ -78,6 +129,34 @@ const WEAVER_SCRIPT_LINES: &[(&str, &str)] = &[
     (
         r#"if run_weaver >"${work}/broken.log" 2>&1; then"#,
         "the broken copy must fail, so a pass is not vacuous",
+    ),
+    (
+        r#"grep -qxE "[[:space:]]*${line}[[:space:]]*" "${form}" || {"#,
+        "the form must hold each line of section 9 as a whole line",
+    ),
+    (
+        r#"[ -r "${proposal}" ] || {"#,
+        "a missing proposal must fail the script",
+    ),
+    (
+        r#"grep -vE '\((Optional|Post-Approval)\)$' || true)""#,
+        "a required section is a heading that is not Optional or Post-Approval",
+    ),
+    (
+        r#"grep -vxF -f <(printf '%s\n' "${clean}") <<<"${required}" || [ $? -eq 1 ]"#,
+        "each required heading must be a whole line of the proposal",
+    ),
+    (
+        r#"grep -xF -f <(printf '%s\n' "${guidance}") <<<"${clean}" || [ $? -eq 1 ]"#,
+        "the proposal must replace the guidance text of the template",
+    ),
+    (
+        r#"missing="$(missing_sections "${proposal}")""#,
+        "the script must check this proposal",
+    ),
+    (
+        r#"if [ -z "$(missing_sections "${work}/proposal-broken.md")" ]; then"#,
+        "a proposal without a required section must fail, so a pass is not vacuous",
     ),
 ];
 
@@ -137,6 +216,31 @@ const WEAVER_SCRIPT_PARTS: &[(&str, &str)] = &[
     (
         "grep -qF 'naming_convention_attribute_namespace_collision'",
         "the broken copy must fail on a package policy, not another error",
+    ),
+    (
+        r#"clone_at "${community_repo}" "${community_commit}""#,
+        "the script must read the pinned community tree",
+    ),
+    (
+        r#"community_commit="$(git ls-remote "${community_repo}" refs/heads/main"#,
+        "`SEMCONV_LATEST=1` must also read community `main`",
+    ),
+    (
+        r#"proposal="${root}/docs/otel-workflow-semconv/project-proposal.md""#,
+        "the script must check this proposal",
+    ),
+    (
+        ".github/ISSUE_TEMPLATE/new-conventions.yaml",
+        "section 9 follows this upstream form",
+    ),
+    ("- area:new", "the form must offer the area of section 9"),
+    (
+        "label: Propose new conventions",
+        "the form must have the field of section 9",
+    ),
+    (
+        "project-template.md",
+        "the proposal follows the community template",
     ),
 ];
 
@@ -433,12 +537,107 @@ fn pin<'a>(script: &'a str, name: &str) -> Option<&'a str> {
 
 /// The full upstream commit SHA that the Weaver script pins.
 fn pinned_commit(script: &str) -> Option<&str> {
-    pin(script, "semconv_commit").filter(|sha| {
+    pinned_sha(script, "semconv_commit")
+}
+
+/// The full commit SHA that the script assigns to `name`.
+fn pinned_sha<'a>(script: &'a str, name: &str) -> Option<&'a str> {
+    pin(script, name).filter(|sha| {
         sha.len() == 40
             && sha
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
+}
+
+/// The external links in `text`: each URL and each `owner/repo#N` ref.
+///
+/// A URL may sit in a Markdown link, in angle brackets or in emphasis. A URL
+/// that holds a `<` placeholder is not a link yet, and a link into this
+/// repository is not external, so both are skipped.
+fn external_refs(text: &str) -> BTreeSet<String> {
+    let mut refs = BTreeSet::new();
+    for token in text.split_whitespace() {
+        let at = token.find("https://").or_else(|| token.find("http://"));
+        if let Some(at) = at {
+            let url = &token[at..];
+            let end = url
+                .find([')', '>', ']', '*', '"', '\'', '`'])
+                .unwrap_or(url.len());
+            let url = url[..end].trim_end_matches(['.', ',', ';', ':']);
+            if !url.contains('<') && !url.starts_with(OWN_REPO) {
+                refs.insert(url.to_owned());
+            }
+            continue;
+        }
+        let item = token
+            .trim_start_matches(['(', '[', '`', '*'])
+            .trim_end_matches(['.', ',', ';', ':', ')', ']', '`', '*']);
+        let is_item = item.split_once('#').is_some_and(|(repo, number)| {
+            repo.split('/').count() == 2
+                && !repo.starts_with('/')
+                && !repo.ends_with('/')
+                && !number.is_empty()
+                && number.bytes().all(|b| b.is_ascii_digit())
+        });
+        if is_item {
+            refs.insert(item.to_owned());
+        }
+    }
+    refs
+}
+
+/// Whether `text` is a date in the form `YYYY-MM-DD`.
+fn is_iso_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 10
+        && bytes.iter().enumerate().all(|(at, b)| match at {
+            4 | 7 => *b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
+/// The text under the heading line `heading`, up to the next heading.
+fn heading_body<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
+    let start = doc
+        .lines()
+        .position(|line| line.trim_end() == heading)
+        .map(|line| {
+            doc.lines()
+                .take(line + 1)
+                .map(|l| l.len() + 1)
+                .sum::<usize>()
+        })?;
+    let body = doc.get(start..).unwrap_or_default();
+    let end = body
+        .lines()
+        .scan(0, |offset, line| {
+            let at = *offset;
+            *offset += line.len() + 1;
+            Some((at, line))
+        })
+        .find(|(_, line)| line.starts_with('#'))
+        .map_or(body.len(), |(at, _)| at);
+    Some(&body[..end])
+}
+
+/// The next heading line after the heading line `heading`.
+fn next_heading<'a>(doc: &'a str, heading: &str) -> Option<&'a str> {
+    doc.lines()
+        .skip_while(|line| line.trim_end() != heading)
+        .skip(1)
+        .find(|line| line.starts_with('#'))
+        .map(str::trim_end)
+}
+
+/// The number of `#` marks that start `heading`.
+fn heading_level(heading: &str) -> usize {
+    heading.bytes().take_while(|b| *b == b'#').count()
+}
+
+/// Whether a table cell is part of a separator row, such as `---` or `:--`.
+fn is_separator(cell: &str) -> bool {
+    !cell.is_empty() && cell.chars().all(|c| matches!(c, '-' | ':'))
 }
 
 /// The trimmed lines of a shell script that are not comments.
@@ -899,6 +1098,10 @@ fn the_weaver_check_script_mirrors_upstream() {
         pin(&script, "baseline_tag").is_some_and(|tag| tag.starts_with('v')),
         "{WEAVER_SCRIPT} must pin `baseline_tag=\"v<release>\"`"
     );
+    assert!(
+        pinned_sha(&script, "community_commit").is_some(),
+        "{WEAVER_SCRIPT} must pin `community_commit=\"<40-hex SHA>\"`, not a branch"
+    );
     let code = code_lines(&script);
     let missing: Vec<String> = WEAVER_SCRIPT_LINES
         .iter()
@@ -1004,12 +1207,27 @@ fn the_page_records_the_weaver_check() {
     let short = format!("`{}`", &sha[..7]);
     let baseline = pin(&script, "baseline_tag")
         .unwrap_or_else(|| panic!("{WEAVER_SCRIPT} must pin a baseline"));
+    let community = pinned_sha(&script, "community_commit")
+        .unwrap_or_else(|| panic!("{WEAVER_SCRIPT} must pin a community commit"));
+    let community = format!("`{}`", &community[..7]);
+    for (file, text) in [(PAGE, page.as_str()), (PROPOSAL, read(PROPOSAL).as_str())] {
+        for (at, _) in text.match_indices(COMMUNITY_PIN_PREFIX) {
+            let copy = text
+                .get(at + COMMUNITY_PIN_PREFIX.len() - 1..)
+                .unwrap_or_default();
+            assert!(
+                copy.starts_with(&community),
+                "each `{COMMUNITY_PIN_PREFIX}…` in {file} must name the pin {community}"
+            );
+        }
+    }
     let submission = page_section(&page, SUBMISSION_SECTION);
     let link = format!("../../{WEAVER_SCRIPT}");
     for (text, what) in [
         (link.as_str(), "the script link"),
         (short.as_str(), "the pinned commit"),
         (&format!("`{baseline}`"), "the pinned baseline"),
+        (community.as_str(), "the pinned community commit"),
     ] {
         assert!(
             submission.contains(text),
@@ -1040,6 +1258,7 @@ fn prose_sentences_and_yaml_texts_stay_short() {
     let mut texts = vec![
         (PAGE.to_owned(), page),
         (format!("{PAGE} section 9"), issue),
+        (PROPOSAL.to_owned(), read(PROPOSAL)),
     ];
     texts.extend(yaml_texts());
     let long: Vec<String> = texts
@@ -1089,6 +1308,171 @@ fn guards_run_on_docs_only_changes() {
         )
     });
     check_stanza(stanza, FILTER).unwrap_or_else(|reason| panic!("{reason}. Stanza:\n{stanza}"));
+}
+
+#[test]
+fn the_issue_text_fits_the_upstream_form() {
+    let page = read(PAGE);
+    let section = page_section(&page, ISSUE_TEXT_SECTION);
+    for (text, what) in [
+        (ISSUE_FORM, "the upstream issue form"),
+        (ISSUE_AREA, "the area to pick"),
+        (ISSUE_FIELD, "the field that takes the text"),
+    ] {
+        assert!(
+            section.contains(text),
+            "{ISSUE_TEXT_SECTION} must name {what}, {text}"
+        );
+    }
+}
+
+#[test]
+fn the_draft_cites_the_overlapping_upstream_issue() {
+    let page = read(PAGE);
+    let issue = markdown_fence(page_section(&page, ISSUE_TEXT_SECTION)).unwrap_or_default();
+    for (text, what) in [
+        (page_section(&page, SCOPE_SECTION), SCOPE_SECTION),
+        (issue, "the issue text"),
+    ] {
+        assert!(
+            text.contains(PRIOR_ISSUE),
+            "{what} must cite {PRIOR_ISSUE}, which claims the same `workflow.*` namespace"
+        );
+    }
+}
+
+#[test]
+fn the_project_proposal_covers_the_template() {
+    let proposal = read(PROPOSAL);
+    assert!(
+        issue_refs(&proposal).contains(&2015),
+        "{PROPOSAL} must cite #2015"
+    );
+    assert!(
+        proposal.contains("README.md#7-mapping-from-harvest"),
+        "{PROPOSAL} must link the list of Harvest gaps in section 7"
+    );
+    assert!(
+        read(PAGE).contains("(project-proposal.md)"),
+        "{PAGE} must link {PROPOSAL}"
+    );
+    let mut last = 0;
+    for heading in PROJECT_SECTIONS {
+        let at = proposal
+            .lines()
+            .position(|line| line.trim_end() == *heading)
+            .unwrap_or_else(|| panic!("{PROPOSAL} must have the template section `{heading}`"));
+        assert!(
+            at > last,
+            "{PROPOSAL} `{heading}` must follow the template order"
+        );
+        last = at;
+        let body = heading_body(&proposal, heading).unwrap_or_default();
+        let subsection = next_heading(&proposal, heading).filter(|next| {
+            heading_level(next) > heading_level(heading)
+                && (PROJECT_SECTIONS.contains(next) || next.ends_with("(Optional)"))
+        });
+        assert!(
+            !body.trim().is_empty() || subsection.is_some(),
+            "{PROPOSAL} `{heading}` must have text or a template subsection"
+        );
+    }
+    let relative: Vec<&str> = proposal
+        .split("](")
+        .skip(1)
+        .filter(|target| !target.starts_with("https://") && !target.starts_with('#'))
+        .map(|target| target.split(')').next().unwrap_or_default())
+        .collect();
+    assert!(
+        relative.is_empty(),
+        "{PROPOSAL} is filed in another repository, so each link must be absolute: {relative:?}"
+    );
+    for slot in STAFFING_SLOTS {
+        let body = heading_body(&proposal, slot).unwrap_or_default().trim();
+        assert!(
+            body.starts_with("Open.") || body.contains("[@"),
+            "{PROPOSAL} `{slot}` must link a GitHub handle or start with `Open.`"
+        );
+    }
+}
+
+#[test]
+fn every_cited_link_is_a_checked_fact() {
+    let page = read(PAGE);
+    let issue = markdown_fence(page_section(&page, ISSUE_TEXT_SECTION)).unwrap_or_default();
+    let proposal = read(PROPOSAL);
+    let facts = section(
+        page_section(&page, SUBMISSION_SECTION),
+        FACTS_HEADING,
+        "\n#",
+    )
+    .unwrap_or_else(|| panic!("{SUBMISSION_SECTION} must have `{FACTS_HEADING}`"));
+    let rows: Vec<Vec<&str>> = facts
+        .lines()
+        .filter_map(cells)
+        .filter(|row| !row.iter().all(|cell| is_separator(cell)))
+        .skip(1)
+        .collect();
+    assert!(!rows.is_empty(), "`{FACTS_HEADING}` must have a table");
+    for row in &rows {
+        assert!(
+            row.last().is_some_and(|date| is_iso_date(date)),
+            "each fact must end with the date of its check, YYYY-MM-DD: {row:?}"
+        );
+    }
+    let refs = external_refs(issue);
+    assert!(!refs.is_empty(), "the issue text must cite its sources");
+    let unchecked: Vec<String> = refs
+        .into_iter()
+        .chain(external_refs(&proposal))
+        .filter(|link| !rows.iter().any(|row| external_refs(row[0]).contains(link)))
+        .collect();
+    assert!(
+        unchecked.is_empty(),
+        "each link in the issue text and the proposal needs a row in `{FACTS_HEADING}`: \
+         {unchecked:?}"
+    );
+}
+
+#[test]
+fn the_submission_steps_follow_the_upstream_process() {
+    let page = read(PAGE);
+    let submission = page_section(&page, SUBMISSION_SECTION);
+    let steps = numbered_items(submission);
+    let step = |needles: &[&str]| {
+        let found: Vec<usize> = steps
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| needles.iter().all(|needle| step.contains(needle)))
+            .map(|(at, _)| at)
+            .collect();
+        match found.as_slice() {
+            [one] => *one,
+            _ => panic!("{SUBMISSION_SECTION} needs exactly one step that holds {needles:?}"),
+        }
+    };
+    let check = step(&["Run the script", "check-otel-workflow-semconv.sh"]);
+    let issue = step(&["file the text", ISSUE_FORM]);
+    let status = step(&["`submitted`"]);
+    let project = step(&["open-telemetry/community", "(project-proposal.md)"]);
+    let upstream = step(&["upstream pull request", "TC", "GC"]);
+    assert!(
+        check < issue && issue < status && issue < project && project < upstream,
+        "the steps must run the check, file the issue, then set the status, open the \
+         project proposal, and open the upstream pull request after the TC and the GC"
+    );
+    for committee in ["Technical Committee (TC)", "Governance Committee (GC)"] {
+        assert!(
+            submission.contains(committee),
+            "{SUBMISSION_SECTION} must say that the project needs the {committee}"
+        );
+    }
+    let decline = paragraph(submission, DECLINE_PREFIX)
+        .unwrap_or_else(|| panic!("{SUBMISSION_SECTION} must have a `{DECLINE_PREFIX}` paragraph"));
+    assert!(
+        decline.contains("`declined`") && decline.contains("registry"),
+        "the decline paragraph must set `declined` and name the separate-registry fallback"
+    );
 }
 
 #[test]
@@ -1177,4 +1561,43 @@ fn helpers_parse_their_inputs() {
     assert_eq!(strings(&doc, "p"), vec!["a".to_owned(), "b".to_owned()]);
     assert!(is_requirement_level(&Value::from("opt_in")));
     assert!(!is_requirement_level(&Value::from("optional")));
+}
+
+#[test]
+fn link_and_heading_helpers_parse_their_inputs() {
+    let sha = "331541c4057c53d133c32efadaa7b656636eda77";
+    assert_eq!(
+        pinned_sha(&format!("community_commit=\"{sha}\""), "community_commit"),
+        Some(sha)
+    );
+    assert_eq!(
+        external_refs("See dapr/dapr#9213, (https://a.b/c). Not #12 or a/b#x or /a/b#1."),
+        BTreeSet::from(["dapr/dapr#9213".to_owned(), "https://a.b/c".to_owned()])
+    );
+    assert_eq!(
+        external_refs("[x](https://a.b/l) <https://a.b/m> **https://a.b/n** http://a.b/o"),
+        BTreeSet::from([
+            "https://a.b/l".to_owned(),
+            "https://a.b/m".to_owned(),
+            "https://a.b/n".to_owned(),
+            "http://a.b/o".to_owned(),
+        ])
+    );
+    assert!(external_refs("https://x.y/tree/<commit>/z").is_empty());
+    assert!(external_refs(&format!("{OWN_REPO}tree/abc/docs")).is_empty());
+    assert!(is_separator("---"));
+    assert!(is_separator(":--:"));
+    assert!(!is_separator(""));
+    assert!(!is_separator("`a-b`"));
+    assert!(is_iso_date("2026-10-18"));
+    assert!(!is_iso_date("2026-1-18"));
+    assert!(!is_iso_date("Oct 2026"));
+    let doc_md = "# T\n\n## A\n\ntext\n\n## B\n### B1\n\nmore\n#### B2\n";
+    assert_eq!(heading_body(doc_md, "## A").map(str::trim), Some("text"));
+    assert_eq!(heading_body(doc_md, "## B").map(str::trim), Some(""));
+    assert_eq!(heading_body(doc_md, "#### B2").map(str::trim), Some(""));
+    assert_eq!(heading_body(doc_md, "## C"), None);
+    assert_eq!(next_heading(doc_md, "## B"), Some("### B1"));
+    assert_eq!(next_heading(doc_md, "#### B2"), None);
+    assert_eq!(heading_level("### B1"), 3);
 }

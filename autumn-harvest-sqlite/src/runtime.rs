@@ -9,10 +9,15 @@ use autumn_harvest::builder::{
     DEFAULT_MAX_WORKFLOW_INPUT_BYTES,
 };
 use autumn_harvest::context::WorkflowContext;
-use autumn_harvest::context::{DEFAULT_CURRENT_DETAILS_CAP_BYTES, empty_shared_state};
+use autumn_harvest::context::{
+    DEFAULT_CURRENT_DETAILS_CAP_BYTES, LoserCancelReason, empty_shared_state,
+};
 use autumn_harvest::executor::{
     QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
     run_workflow_with_state_history_policy_and_caps,
+};
+use autumn_harvest::payload_depth::{
+    MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE, nests_past_cap,
 };
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::{
@@ -3166,6 +3171,32 @@ impl SqliteRuntime {
         }
         self.workflow_panic_strikes.remove(&exec);
 
+        // Issue #2224: a result nested past the cap cannot be read back. The
+        // body has already returned, so it cannot handle the error. The run
+        // fails with a typed failure instead of storing the value.
+        let outcome = match outcome {
+            WorkflowOutcome::Completed {
+                output,
+                unhandled_signals,
+            } if nests_past_cap(&output) => {
+                tracing::warn!(%exec, "workflow result nests past the depth cap; failing the run");
+                let failure = autumn_harvest::failure::WorkflowFailure::new(
+                    PAYLOAD_TOO_DEEP_ERROR_TYPE,
+                    format!("workflow result nests more than {MAX_PAYLOAD_DEPTH} levels"),
+                )
+                .non_retryable();
+                WorkflowOutcome::Failed {
+                    error: autumn_harvest::failure::IntoWorkflowErrorString::into_workflow_error_payload(
+                        failure,
+                    ),
+                    non_deterministic_details: None,
+                    handler_panic: false,
+                    unhandled_signals,
+                }
+            }
+            other => other,
+        };
+
         // Issue #2021: a pending cancel request ends the run here.
         // - A body that returns `Ok` or `Err` has done its cleanup. Its
         //   bookkeeping commands persist before the terminal event.
@@ -3441,8 +3472,11 @@ impl SqliteRuntime {
         if applied || drained {
             return Ok(RunState::InProgress);
         }
+        // Issue #1984: an open non-cancellable block defers the seal, as it
+        // defers a cancel on Postgres. The block may wait on a signal or a timer.
         if let Some(reason) = cancel_reason
             && !queue::has_pending_activity(&self.conn, exec)?
+            && autumn_harvest::cancellation_scope::open_non_cancellable_blocks(history) == 0
         {
             // The drain can take time, so read the clock again for the close.
             return self.seal_cancelled(exec, reason, None, failure_now());
@@ -3630,12 +3664,13 @@ impl SqliteRuntime {
                 // later replay cycle reports no progress once torn down and the loop
                 // converges instead of spinning.
                 WorkflowCommand::CancelRaceLosers {
+                    reason,
                     activities,
                     children,
                     timers,
                 } => {
                     let at = clock.decided_at;
-                    if apply_cancel_race_losers(&tx, exec, activities, children, timers, at)? {
+                    if apply_cancel_race_losers(&tx, exec, *reason, activities, children, timers, at)? {
                         produced = true;
                     }
                 }
@@ -4345,63 +4380,14 @@ fn start_in_tx(
     }
 }
 
-/// The deepest nesting that ingress accepts in a payload (issue #2157).
-///
-/// `serde_json` reads at most 128 levels. Event storage wraps a payload in a
-/// few more levels. The cap leaves room for that wrapping.
-pub const MAX_PAYLOAD_DEPTH: usize = 100;
-
-/// The children of a JSON container, as one iterator type.
-enum Children<'a> {
-    Array(std::slice::Iter<'a, Value>),
-    Object(serde_json::map::Values<'a>),
-}
-
-impl<'a> Iterator for Children<'a> {
-    type Item = &'a Value;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Array(items) => items.next(),
-            Self::Object(values) => values.next(),
-        }
-    }
-}
-
-/// The children of `value`, or `None` for a scalar.
-fn children(value: &Value) -> Option<Children<'_>> {
-    match value {
-        Value::Array(items) => Some(Children::Array(items.iter())),
-        Value::Object(map) => Some(Children::Object(map.values())),
-        _ => None,
-    }
-}
-
-/// Returns `Ok` only when `value` has at most [`MAX_PAYLOAD_DEPTH`] open
-/// arrays and objects on any path.
-///
-/// The walk keeps one iterator per open container. A recursive walk would
-/// overflow the call stack on the input it must refuse. Memory use is bound
-/// by the cap, not by the width of the value.
-///
-/// Call it before any code that recurses over the value, such as a schema check
-/// or a settlement decoder.
+/// Returns `Ok` only when `value` nests at most [`MAX_PAYLOAD_DEPTH`] levels.
+/// `kind` names the ingress boundary in the error.
 fn check_depth(kind: &'static str, value: &Value) -> SqliteResult<()> {
-    let mut open: Vec<Children<'_>> = children(value).into_iter().collect();
-    while let Some(top) = open.last_mut() {
-        let Some(child) = top.next() else {
-            open.pop();
-            continue;
-        };
-        if let Some(inner) = children(child) {
-            if open.len() >= MAX_PAYLOAD_DEPTH {
-                return Err(SqliteError::PayloadTooDeep {
-                    kind,
-                    cap_depth: MAX_PAYLOAD_DEPTH,
-                });
-            }
-            open.push(inner);
-        }
+    if nests_past_cap(value) {
+        return Err(SqliteError::PayloadTooDeep {
+            kind,
+            cap_depth: MAX_PAYLOAD_DEPTH,
+        });
     }
     Ok(())
 }
@@ -4792,6 +4778,8 @@ fn retry_plan(
     let error_type = failure.error_type.as_deref();
     if config.attempt >= policy.max_attempts
         || error_type == Some(autumn_harvest::failure::ERROR_TYPE_HANDLER_PANIC)
+        // A deep result is the same on every attempt (issue #2224).
+        || error_type == Some(PAYLOAD_TOO_DEEP_ERROR_TYPE)
     {
         return Ok(None);
     }
@@ -5385,11 +5373,12 @@ fn persist_terminal_pending_commands<'c>(
             // arm the drain rejected it as `Unsupported`, wedging every
             // pull-signal-plus-timeout workflow (Codex #1069 P2).
             WorkflowCommand::CancelRaceLosers {
+                reason,
                 activities,
                 children,
                 timers,
             } => {
-                apply_cancel_race_losers(conn, exec, activities, children, timers, drain.now)?;
+                apply_cancel_race_losers(conn, exec, *reason, activities, children, timers, drain.now)?;
             }
             // Benign bookkeeping — appends no event, gates no control flow.
             // `PublishProgress` (issue #791) is an ephemeral Postgres-only
@@ -5458,6 +5447,7 @@ fn persist_terminal_pending_commands<'c>(
 fn apply_cancel_race_losers(
     conn: &Connection,
     exec: ExecutionId,
+    reason: LoserCancelReason,
     activities: &[ActivityExecId],
     children: &[ExecutionId],
     timers: &[TimerId],
@@ -5466,10 +5456,11 @@ fn apply_cancel_race_losers(
     let mut changed = false;
     // Cancel a losing child, as Postgres does (issue #2026). Its close then
     // writes the untyped `ChildWorkflowFailed` to this parent. A loser that
-    // never started has no row, and Postgres skips it too.
+    // never started has no row, and Postgres skips it too. A scope cancel
+    // gives its own reason (issue #1984).
     for child in children {
         if composition::state_of(conn, *child)?.as_deref() == Some("RUNNING") {
-            composition::cancel_execution(conn, *child, composition::RACE_LOSER_REASON, now)?;
+            composition::cancel_execution(conn, *child, reason.message(), now)?;
             changed = true;
         }
     }
@@ -5485,7 +5476,7 @@ fn apply_cancel_race_losers(
                 exec,
                 &WorkflowEvent::ActivityFailed {
                     activity_id: *activity_id,
-                    error: "lost race to a sibling branch".to_string(),
+                    error: reason.message().to_string(),
                     attempt: 1,
                     error_type: "Error".to_string(),
                     non_retryable: true,
@@ -5848,9 +5839,16 @@ mod tests {
             &serde_json::json!(0),
         )
         .unwrap();
-        let changed =
-            super::apply_cancel_race_losers(&conn, parent, &[], &[ExecutionId::new()], &[], 0)
-                .unwrap();
+        let changed = super::apply_cancel_race_losers(
+            &conn,
+            parent,
+            super::LoserCancelReason::RaceLoser,
+            &[],
+            &[ExecutionId::new()],
+            &[],
+            0,
+        )
+        .unwrap();
         assert!(!changed);
         assert!(store::load_history(&conn, parent).unwrap().is_empty());
     }
