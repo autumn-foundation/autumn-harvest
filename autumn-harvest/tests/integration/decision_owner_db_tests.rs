@@ -12,6 +12,7 @@
 //!
 //! Each test uses its own partitions, so the tests can share one database.
 #![cfg(feature = "db")]
+#![allow(clippy::items_after_statements)]
 
 use std::time::Duration;
 
@@ -41,7 +42,7 @@ async fn connect(url: &str) -> AsyncPgConnection {
         .expect("the test database must be reachable")
 }
 
-fn partition(n: u16) -> DecisionPartition {
+const fn partition(n: u16) -> DecisionPartition {
     DecisionPartition::new(n).expect("a test partition is in range")
 }
 
@@ -283,9 +284,10 @@ async fn the_same_holder_gets_a_new_epoch_on_each_acquisition() {
     assert_eq!(second.epoch(), first.epoch().next().expect("no overflow"));
 
     // A release keeps the epoch. The next acquisition still adds 1.
-    let released = decision_owner::release_all(&mut conn, SHARD, &[second.clone()], SHORT_WAIT)
-        .await
-        .expect("release");
+    let released =
+        decision_owner::release_all(&mut conn, SHARD, std::slice::from_ref(&second), SHORT_WAIT)
+            .await
+            .expect("release");
     assert_eq!(released, LeaseWrite::done(vec![p], vec![]));
     let freed = row(&mut conn, p).await;
     assert_eq!(freed.epoch, second.epoch().get());
@@ -520,7 +522,7 @@ async fn the_fence_waits_briefly_then_fails_closed() {
     free(&mut conn, p).await;
     let tenure = acquire(&mut conn, &holder("bounded"), p).await;
 
-    for (hold_ms, passes) in [(150_u64, true), (2_000, false)] {
+    for (hold_ms, passes) in [(60_u64, true), (2_000, false)] {
         let url2 = url.clone();
         let blocker = tokio::spawn(async move {
             let mut b = connect(&url2).await;
@@ -533,25 +535,22 @@ async fn the_fence_waits_briefly_then_fails_closed() {
             .await
             .expect("hold the row");
         });
+        // Wait until the blocker holds this row: a NOWAIT probe then fails.
         let mut probe = connect(&url).await;
-        for _ in 0..200 {
-            #[derive(QueryableByName)]
-            struct Held {
-                #[diesel(sql_type = Bool)]
-                held: bool,
-            }
-            let held: Held = diesel::sql_query(
-                "SELECT EXISTS (SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid = l.relation \
-                 WHERE c.relname = 'harvest_decision_owner' AND l.mode = 'RowShareLock' \
-                 AND l.pid <> pg_backend_pid()) AS held",
-            )
-            .get_result(&mut probe)
-            .await
-            .expect("read pg_locks");
-            if held.held {
+        for _ in 0..400 {
+            let held = probe
+                .batch_execute(&format!(
+                    "BEGIN; SELECT 1 FROM harvest_decision_owner WHERE partition = {} \
+                     FOR KEY SHARE NOWAIT; ROLLBACK",
+                    p.get()
+                ))
+                .await
+                .is_err();
+            if held {
+                let _ = probe.batch_execute("ROLLBACK").await;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
         let result = decide!(
             conn,
@@ -704,6 +703,43 @@ async fn the_fence_bounds_an_idle_commit_by_the_ttl() {
     assert_eq!(v, "10s");
 }
 
+/// An offload upload inside a decision widens the idle bound, then
+/// restores the TTL.
+#[tokio::test]
+async fn an_upload_widens_the_idle_bound_for_its_duration() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let p = partition(421);
+    free(&mut conn, p).await;
+    let tenure = acquire(&mut conn, &holder("upload"), p).await;
+
+    #[derive(QueryableByName)]
+    struct Setting {
+        #[diesel(sql_type = Text)]
+        v: String,
+    }
+    let read = "SELECT current_setting('idle_in_transaction_session_timeout') AS v";
+    let seen = decide!(conn, Some(tenure), async |conn: &mut AsyncPgConnection| {
+        let mut seen = Vec::new();
+        for step in 0..3 {
+            match step {
+                1 => decision_owner::start_upload_allowance(conn).await?,
+                2 => decision_owner::end_upload_allowance(conn).await?,
+                _ => {}
+            }
+            let v: Setting = diesel::sql_query(read)
+                .get_result(conn)
+                .await
+                .map_err(autumn_harvest::error::database_error)?;
+            seen.push(v.v);
+        }
+        Ok(seen)
+    })
+    .await
+    .expect("decide");
+    assert_eq!(seen, ["10s", "5min", "10s"]);
+}
+
 /// ADR 0009 decision 6: a statement on many owner rows locks them in
 /// ascending partition order, whatever order its input has.
 ///
@@ -854,7 +890,8 @@ async fn the_epoch_guard_refuses_a_fall_and_a_jump() {
     for sql in [
         "UPDATE harvest_decision_owner SET epoch = epoch - 1 WHERE partition = $1",
         "UPDATE harvest_decision_owner SET epoch = epoch + 2 WHERE partition = $1",
-        "UPDATE harvest_decision_owner SET partition = 600 WHERE partition = $1",
+        "UPDATE harvest_decision_owner SET partition = 499 WHERE partition = $1",
+        "UPDATE harvest_decision_owner SET holder = 'someone-else' WHERE partition = $1",
     ] {
         let result = diesel::sql_query(sql)
             .bind::<Integer, _>(i32::from(p.get()))

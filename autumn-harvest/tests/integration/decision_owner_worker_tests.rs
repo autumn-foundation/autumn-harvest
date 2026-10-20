@@ -1,4 +1,5 @@
 #![cfg(feature = "db")]
+#![allow(clippy::unused_async)]
 //! A worker whose tenure is stale is fenced in its decision commit (issue
 //! #2251).
 //!
@@ -158,7 +159,7 @@ impl Fixture {
         let tenures = registry.decision_owner();
         owned(&tenures);
         let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
-        runtime_config.worker_id = self.worker_id.clone();
+        runtime_config.worker_id.clone_from(&self.worker_id);
         runtime_config.poll_interval = Duration::from_millis(50);
         let worker = Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker"));
         (worker, tenures)
@@ -188,8 +189,14 @@ async fn free_row(conn: &mut AsyncPgConnection, partition: DecisionPartition) {
 async fn a_stale_tenure_is_fenced_unloaded_and_never_retried() {
     let (mut fx, _container) = Fixture::new().await;
     let (workflow_id, partition) = free_workflow_id();
-    // A control run on the legacy path gives the expected history.
-    let (control_id, _) = free_workflow_id();
+    // A control run on the legacy path gives the expected history. It must
+    // not share the fenced partition.
+    let control_id = loop {
+        let (id, p) = free_workflow_id();
+        if p != partition {
+            break id;
+        }
+    };
     let exec = fx.start(&workflow_id).await;
     let control = fx.start(&control_id).await;
     let shard = exec.shard();

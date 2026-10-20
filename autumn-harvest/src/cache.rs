@@ -470,19 +470,19 @@ mod tests {
     fn evict_partition_drops_only_that_partition() {
         use crate::decision_owner::DecisionPartition;
         use crate::types::ShardId;
-        let p = |shard, n| OwnerKey {
+        let key = |shard, n| OwnerKey {
             shard: ShardId::new(shard),
             partition: DecisionPartition::new(n).expect("in range"),
         };
         let mut cache = WorkflowCache::new(8);
         let ids: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();
-        let (a, b, c, d, e) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+        let (first, second, other, untagged, remote) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
         let tags = [
-            (a, Some(p(0, 3))),
-            (b, Some(p(0, 3))),
-            (c, Some(p(0, 4))),
-            (d, None),
-            (e, Some(p(1, 3))),
+            (first, Some(key(0, 3))),
+            (second, Some(key(0, 3))),
+            (other, Some(key(0, 4))),
+            (untagged, None),
+            (remote, Some(key(1, 3))),
         ];
         for (id, partition) in tags {
             let _ = cache.insert_resident_with_history_bytes(
@@ -493,16 +493,16 @@ mod tests {
                 partition,
             );
         }
-        let evicted = cache.evict_partition(p(0, 3));
+        let evicted = cache.evict_partition(key(0, 3));
         assert_eq!(evicted.len(), 2);
-        assert!(cache.get(&a).is_none() && cache.get(&b).is_none());
-        assert!(cache.get(&c).is_some(), "another partition stays");
-        assert!(cache.get(&d).is_some(), "an untagged entry stays");
+        assert!(cache.get(&first).is_none() && cache.get(&second).is_none());
+        assert!(cache.get(&other).is_some(), "another partition stays");
+        assert!(cache.get(&untagged).is_some(), "an untagged entry stays");
         assert!(
-            cache.get(&e).is_some(),
+            cache.get(&remote).is_some(),
             "partition 3 of another database stays"
         );
-        assert_eq!(cache.evict_partition(p(0, 9)).len(), 0);
+        assert_eq!(cache.evict_partition(key(0, 9)).len(), 0);
     }
 
     #[test]

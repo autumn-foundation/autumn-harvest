@@ -138,6 +138,18 @@ docs. The fixes:
   under a held fence, a bounded-wait test, a no-fence mutant store and an
   owner-mode test. Polls replaced fixed sleeps.
 
+A second review round found four more gaps. The fixes:
+
+- A local activity handler saw the pin, so its own writes took the owner
+  row. It now runs in a nested scope that pins nothing.
+- The owner key came from the bits of the execution id. It now comes from
+  the shard of the claim's pool, which names the database.
+- The body-timeout quarantine wrote `WorkflowFailed` with no fence. It now
+  pins the run's tenure and fences first.
+- The bounded-wait test probed any lock on the table. It probes its row.
+- A pin outside a decision scope now fails closed. A decision with no
+  tenure in owner mode re-pends after one second, not at once.
+
 ## 3. Out of scope
 
 - The owner-mode switch, the owned claim, the acquisition loop and the

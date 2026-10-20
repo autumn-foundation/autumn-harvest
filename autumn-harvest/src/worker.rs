@@ -1811,6 +1811,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("circuit_breakers", &self.circuit_breakers)
             .field("retry_budgets", &self.retry_budgets)
             .field("adaptive_limits", &self.adaptive_limits)
+            .field("decision_owner", &self.decision_owner)
             .field(
                 "max_workflow_attempts_ceiling",
                 &self.max_workflow_attempts_ceiling,
@@ -5280,9 +5281,14 @@ async fn run_local_activity_inline(
             }
             Ok(fut) => {
                 use futures::FutureExt as _;
+                // Issue #2251: the handler is user code. It runs in a decision
+                // scope of its own that pins nothing, so its own writes are
+                // foreign writes and take no owner row.
                 let caught = tokio::time::timeout(
                     per_attempt_timeout,
-                    std::panic::AssertUnwindSafe(fut).catch_unwind(),
+                    crate::decision_owner::scope_decision(
+                        std::panic::AssertUnwindSafe(fut).catch_unwind(),
+                    ),
                 )
                 .await;
                 match caught {
@@ -12025,9 +12031,9 @@ async fn persist_started_timer(
 
     let (deferred, had_wake_requested) = Box::pin(conn
         .transaction::<_, HarvestError, _>(async |conn| {
+        use crate::schema::harvest_task_queue::dsl as queue_dsl;
         // Issue #2251: the owner fence comes first.
         crate::replication::assert_decision_fence(conn).await?;
-        use crate::schema::harvest_task_queue::dsl as queue_dsl;
 
         // Cancellable/renewable timer bookkeeping (issue #768) for any
         // *other* timers' ArmTimer/CancelTimer commands in this batch (the
@@ -13724,9 +13730,9 @@ async fn persist_child_timeout_race(
 
     let (deferred, had_wake_requested) =
         match Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            use crate::schema::harvest_task_queue::dsl as queue_dsl;
             // Issue #2251: the owner fence comes first.
             crate::replication::assert_decision_fence(conn).await?;
-            use crate::schema::harvest_task_queue::dsl as queue_dsl;
             let telemetry = telemetry.clone();
             let execute_span = execute_span.clone();
 
@@ -14127,9 +14133,9 @@ async fn persist_mixed_suspension_batch(
     let shard_id = parent_execution.shard_id;
 
     let outcome = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        use crate::schema::harvest_task_queue::dsl as queue_dsl;
         // Issue #2251: the owner fence comes first.
         crate::replication::assert_decision_fence(conn).await?;
-        use crate::schema::harvest_task_queue::dsl as queue_dsl;
         let execute_span = owned_execute_span.clone();
         let telemetry = telemetry.clone();
 
@@ -22651,20 +22657,28 @@ impl CacheOwner<'_> {
 /// nothing and the decision runs as before.
 fn pin_owner_tenure(
     owned: &crate::decision_owner::OwnedPartitions,
-    exec_id: ExecutionId,
+    owner_shard: crate::types::ShardId,
     workflow_id: &str,
 ) -> HarvestResult<()> {
     use crate::decision_owner::{DecisionPin, OwnerEpoch, OwnerKey, pin_decision};
-    let key = OwnerKey::of(exec_id.shard(), workflow_id);
+    let key = OwnerKey::of(owner_shard, workflow_id);
     match owned.pin_for(key) {
         DecisionPin::Legacy => {
             let _ = pin_decision(None);
             Ok(())
         }
         DecisionPin::Owned(tenure) => {
-            let pinned = pin_decision(Some(tenure));
-            debug_assert!(pinned, "a decision runs inside a decision scope");
-            Ok(())
+            // Outside a decision scope a pin does nothing, so a held tenure
+            // would decide unfenced. Fail closed instead.
+            if pin_decision(Some(tenure.clone())) {
+                Ok(())
+            } else {
+                Err(HarvestError::OwnershipLost {
+                    partition: key.partition,
+                    pinned: tenure.epoch(),
+                    current: None,
+                })
+            }
         }
         DecisionPin::Unowned => Err(HarvestError::OwnershipLost {
             partition: key.partition,
@@ -22694,7 +22708,7 @@ fn pin_owner_tenure(
 ///
 /// A hit keeps its resident workflow only when the delta event ids run on
 /// from the cached `next_event_id` with no gap.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn prepare_workflow_task_with_cache(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -22704,8 +22718,10 @@ async fn prepare_workflow_task_with_cache(
     offloader: Option<&crate::payload_store::PayloadOffloader>,
     // Issue #1243: see `load_workflow_replay_state`.
     codecs: &crate::payload_codec::PayloadCodecs,
-    // Issue #2251: the owner tenures of this worker.
+    // Issue #2251: the owner tenures of this worker, and the shard of the
+    // claim's pool that keys them.
     owned: &crate::decision_owner::OwnedPartitions,
+    owner_shard: crate::types::ShardId,
 ) -> HarvestResult<Option<PreparedWorkflowTask>> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let error = HarvestError::Config("workflow task missing workflow_exec_id".into());
@@ -22731,7 +22747,7 @@ async fn prepare_workflow_task_with_cache(
     let execution = load_task_execution(conn, task, exec_id).await?;
     // Issue #2251: pin the tenure before the first history write. The wake
     // ingest below and a load failure then fence it too.
-    pin_owner_tenure(owned, exec_id, &execution.workflow_id)?;
+    pin_owner_tenure(owned, owner_shard, &execution.workflow_id)?;
 
     if let Some((cached_state, mut resident, cached_history_bytes)) = cached {
         // Cache hit path: first load any events already appended since the
@@ -22773,10 +22789,7 @@ async fn prepare_workflow_task_with_cache(
                 resident,
                 cached_history_bytes,
                 CacheOwner {
-                    key: crate::decision_owner::OwnerKey::of(
-                        exec_id.shard(),
-                        &execution.workflow_id,
-                    ),
+                    key: crate::decision_owner::OwnerKey::of(owner_shard, &execution.workflow_id),
                     pinned: crate::decision_owner::pinned_decision().map(|t| t.epoch()),
                     owned,
                 },
@@ -26202,6 +26215,8 @@ async fn process_workflow_task(
     // deadlock or a contained panic. The run stays RUNNING, but the task
     // failed, so the worker's outcome window counts it unless the claim is lost.
     cycle_failure: &CycleFailure,
+    // Issue #2251: the shard of the claim's pool. See `process_task`.
+    owner_shard: crate::types::ShardId,
 ) -> HarvestResult<()> {
     let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
@@ -26212,6 +26227,7 @@ async fn process_workflow_task(
         registry.payload_offloader(),
         registry.payload_codecs(),
         &registry.decision_owner(),
+        owner_shard,
     )
     .await?
     else {
@@ -26223,10 +26239,8 @@ async fn process_workflow_task(
     };
     // Issue #2251: the cache tag of this run, and the epoch that `prepare`
     // pinned.
-    let owner_key = crate::decision_owner::OwnerKey::of(
-        prepared.exec_id.shard(),
-        &prepared.execution.workflow_id,
-    );
+    let owner_key =
+        crate::decision_owner::OwnerKey::of(owner_shard, &prepared.execution.workflow_id);
     let pinned_epoch = crate::decision_owner::pinned_decision().map(|t| t.epoch());
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
         // Issue #804 (AC1): this worker cannot run this type, but a peer on the
@@ -29428,6 +29442,9 @@ async fn process_task(
     pool_labels: &Arc<[u16]>,
     // Issue #1813: the drain's cancel for running activities.
     drain_cancel: &CancellationToken,
+    // Issue #2251: the shard of the pool that this task came from. It keys
+    // the owner tenure, because it names the database of the owner row.
+    owner_shard: crate::types::ShardId,
 ) -> HarvestResult<TaskDispatchOutcome> {
     // Issue #804 (Codex round-22 P2): the workflow path sets this when a
     // frontier reset commits, so the capability-miss interception below knows
@@ -29475,6 +29492,7 @@ async fn process_task(
                         workflow_task_deadline,
                         &frontier_reset_committed,
                         &cycle_failure,
+                        owner_shard,
                     ),
                 ))
                 .await;
@@ -29544,15 +29562,12 @@ async fn process_task(
     // Issue #2251: a fenced decision wrote nothing. Unload the partition and
     // give the task back. Never retry at the stale epoch.
     if let Some((partition, pinned)) = error.ownership_lost() {
-        return unload_fenced_partition(
-            &mut conn,
-            &registry,
-            &workflow_cache,
-            &task,
+        let key = crate::decision_owner::OwnerKey {
+            shard: owner_shard,
             partition,
-            pinned,
-        )
-        .await;
+        };
+        return unload_fenced_partition(&mut conn, &registry, &workflow_cache, &task, key, pinned)
+            .await;
     }
     // Issue #1182 (Codex review round 3): an ambiguous suspended-dispatch
     // claim is intercepted HERE -- after `run_under_workflow_body_budget`
@@ -29621,17 +29636,12 @@ async fn unload_fenced_partition(
     registry: &HandlerRegistry,
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     task: &TaskQueueItem,
-    partition: crate::decision_owner::DecisionPartition,
+    key: crate::decision_owner::OwnerKey,
     pinned: crate::decision_owner::OwnerEpoch,
 ) -> HarvestResult<TaskDispatchOutcome> {
     // The decision is over. Later writes of this dispatch fence nothing.
     let _ = crate::decision_owner::pin_decision(None);
-    let shard = task
-        .workflow_exec_id
-        .map_or(crate::types::ShardId::UNENCODED, |id| {
-            ExecutionId::from_uuid(id).shard()
-        });
-    let key = crate::decision_owner::OwnerKey { shard, partition };
+    let shard = key.shard;
     let owned = registry.decision_owner();
     let unloaded = owned.unload(key, pinned);
     // Keep the entries of a newer tenure. Drop them in every other case, so
@@ -29656,7 +29666,16 @@ async fn unload_fenced_partition(
     let Some(claim) = queue::TaskClaim::of(task) else {
         return Ok(TaskDispatchOutcome::ClaimLostAfterFailure);
     };
-    if queue::requeue_claimed_workflow_task_after_fence(conn, &claim).await? {
+    // A fence of a held tenure re-pends at once, for the new owner. With no
+    // tenure at all (epoch 0), this worker would claim the task again at
+    // once, so it waits a second. The owned claim of issue #2252 then skips
+    // such tasks.
+    let delay = if pinned == crate::decision_owner::OwnerEpoch::new(0) {
+        chrono::Duration::seconds(1)
+    } else {
+        chrono::Duration::zero()
+    };
+    if queue::requeue_claimed_workflow_task_after_fence(conn, &claim, delay).await? {
         Ok(TaskDispatchOutcome::Fenced)
     } else {
         Ok(TaskDispatchOutcome::ClaimLostAfterFailure)
@@ -39309,6 +39328,8 @@ impl Worker {
 
         let pool = pool.clone();
         let pool_labels = self.pool_labels(shard);
+        // Issue #2251: the owner key names the database of the claim.
+        let owner_shard = shard.unwrap_or(crate::types::ShardId::UNENCODED);
         let registry = Arc::clone(&self.registry);
         let task_id = task.id;
         let task_type = task.task_type.clone();
@@ -39497,6 +39518,7 @@ impl Worker {
                     &deferred_failure,
                     &pool_labels,
                     &drain_cancel,
+                    owner_shard,
                 )))
                 .await;
                 // Issue #1815: a success counts now. A failure counts after
@@ -39705,23 +39727,29 @@ impl Worker {
                                         exec_id,
                                     );
                                 }
-                                let recovery = quarantine_workflow_task_timeout_outcome(
-                                    &pool,
-                                    task_id,
-                                    exec_id_for_timeout,
-                                    &worker_id,
-                                    claim_attempt,
-                                    &build_id,
-                                    new_strikes,
-                                    timeout_secs,
-                                    &workflow_name_str,
-                                    &queue_name_str,
-                                    &*telemetry.telemetry().metrics,
-                                    // Same registry this dispatch replays with:
-                                    // `telemetry` is the Arc<HandlerRegistry>
-                                    // captured above (issue #1243).
-                                    telemetry.payload_codecs(),
-                                )
+                                // Issue #2251: a decision scope, so the
+                                // terminal write fences the run's tenure.
+                                let owned = telemetry.decision_owner();
+                                let recovery = Box::pin(crate::decision_owner::scope_decision(
+                                    quarantine_workflow_task_timeout_outcome(
+                                        &pool,
+                                        task_id,
+                                        exec_id_for_timeout,
+                                        &worker_id,
+                                        claim_attempt,
+                                        &build_id,
+                                        new_strikes,
+                                        timeout_secs,
+                                        &workflow_name_str,
+                                        &queue_name_str,
+                                        &*telemetry.telemetry().metrics,
+                                        // Same registry this dispatch replays with:
+                                        // `telemetry` is the Arc<HandlerRegistry>
+                                        // captured above (issue #1243).
+                                        telemetry.payload_codecs(),
+                                        Some((&owned, owner_shard)),
+                                    ),
+                                ))
                                 .await;
                                 // No commit: put the strikes back so the next
                                 // timeout quarantines at once, unless a newer
@@ -39791,6 +39819,7 @@ impl Worker {
                     &deferred_failure,
                     &pool_labels,
                     &drain_cancel,
+                    owner_shard,
                 )))
                 .await;
                 // An activity records its own attempt in `process_activity_task`.
@@ -40518,6 +40547,7 @@ pub async fn quarantine_workflow_task_timeout(
         queue_name,
         metrics,
         codecs,
+        None,
     )
     .await
         == ClaimRecovery::Applied
@@ -40542,6 +40572,12 @@ async fn quarantine_workflow_task_timeout_outcome(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Issue #2251: the owner tenures and the claim's shard. The terminal
+    // write is a decision write, so it fences the tenure of the run.
+    owner_scope: Option<(
+        &crate::decision_owner::OwnedPartitions,
+        crate::types::ShardId,
+    )>,
 ) -> ClaimRecovery {
     use crate::schema::harvest_task_queue::dsl as task_dsl;
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
@@ -40666,6 +40702,15 @@ async fn quarantine_workflow_task_timeout_outcome(
         None => (None, None),
     };
 
+    // Issue #2251: pin the tenure of the run before its terminal write. With
+    // owner mode on and no tenure, another owner decides, so write nothing.
+    if let Some((owned, owner_shard)) = owner_scope
+        && exec_exists
+        && pin_owner_tenure(owned, owner_shard, &workflow_id_str).is_err()
+    {
+        return ClaimRecovery::ClaimLost;
+    }
+
     let entry = crate::dlq::NewDeadLetterEntry {
         original_task_id: task_id,
         queue_name: queue_name.to_string(),
@@ -40686,6 +40731,8 @@ async fn quarantine_workflow_task_timeout_outcome(
         Vec<(ExecutionId, String)>,
         Vec<crate::execution::StartCancelledRun>,
     )>, HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         let error_msg = error_msg.clone();
         let entry = entry.clone();
         let worker_id = worker_id.to_string();
@@ -41276,6 +41323,7 @@ pub async fn chaos_drive_one_workflow_task(
             None,
             &frontier_reset_committed,
             &cycle_failure,
+            crate::types::ShardId::UNENCODED,
         ))
         .await
     })
@@ -41344,6 +41392,7 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
             None,
             &frontier_reset_committed,
             &cycle_failure,
+            crate::types::ShardId::UNENCODED,
         ));
         let cancelled_at_hold = tokio::select! {
             () = hold.reached() => true,

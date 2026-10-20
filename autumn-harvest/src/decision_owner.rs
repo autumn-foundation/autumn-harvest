@@ -394,11 +394,13 @@ pub enum LeaseWrite {
 }
 
 impl LeaseWrite {
-    /// A `Done` result. Both lists are sorted.
+    /// A `Done` result. Both lists are sorted, with no duplicate.
     #[must_use]
     pub fn done(mut matched: Vec<DecisionPartition>, mut lost: Vec<DecisionPartition>) -> Self {
         matched.sort_unstable();
+        matched.dedup();
         lost.sort_unstable();
+        lost.dedup();
         Self::Done(Matched { matched, lost })
     }
 }
@@ -507,11 +509,12 @@ impl OwnedPartitions {
     /// when this call dropped the tenure.
     pub fn unload(&self, key: OwnerKey, epoch: OwnerEpoch) -> bool {
         let mut state = self.state();
-        if state.tenures.get(&key).is_some_and(|t| t.epoch == epoch) {
+        let current = state.tenures.get(&key).is_some_and(|t| t.epoch == epoch);
+        if current {
             state.tenures.remove(&key);
-            return true;
         }
-        false
+        drop(state);
+        current
     }
 
     /// Whether a decision that pinned `pinned` may still cache its state.
@@ -521,10 +524,10 @@ impl OwnedPartitions {
     #[must_use]
     pub fn may_cache(&self, key: OwnerKey, pinned: Option<OwnerEpoch>) -> bool {
         let state = self.state();
-        match pinned {
-            None => !state.owner_mode.contains(&key.shard),
-            Some(epoch) => state.tenures.get(&key).is_some_and(|t| t.epoch == epoch),
-        }
+        pinned.map_or_else(
+            || !state.owner_mode.contains(&key.shard),
+            |epoch| state.tenures.get(&key).is_some_and(|t| t.epoch == epoch),
+        )
     }
 
     /// Every tenure, in key order.
@@ -639,7 +642,8 @@ mod db {
     /// It takes the row `FOR KEY SHARE` and waits at most 250 ms. A lock miss
     /// returns `out_locked = false`. It also sets
     /// `idle_in_transaction_session_timeout` for the caller's transaction.
-    const FENCE_SQL: &str = "SELECT out_holder, out_epoch, out_locked \
+    const FENCE_SQL: &str = "SELECT out_holder AS holder, out_epoch AS epoch, \
+                 out_locked AS locked \
          FROM harvest_decision_owner_fence($1, $2)";
 
     /// Set the idle bound of the current transaction.
@@ -661,11 +665,11 @@ mod db {
     #[derive(QueryableByName)]
     struct FenceRow {
         #[diesel(sql_type = Nullable<Text>)]
-        out_holder: Option<String>,
+        holder: Option<String>,
         #[diesel(sql_type = Nullable<BigInt>)]
-        out_epoch: Option<i64>,
+        epoch: Option<i64>,
         #[diesel(sql_type = Bool)]
-        out_locked: bool,
+        locked: bool,
     }
 
     #[derive(QueryableByName)]
@@ -992,10 +996,10 @@ mod db {
         let Some(row) = row else {
             return Err(lost(None));
         };
-        let (true, Some(epoch)) = (row.out_locked, row.out_epoch) else {
+        let (true, Some(epoch)) = (row.locked, row.epoch) else {
             return Err(lost(None));
         };
-        let holder_matches = row.out_holder.as_deref() == Some(tenure.holder().as_str());
+        let holder_matches = row.holder.as_deref() == Some(tenure.holder().as_str());
         if fence_passes(tenure.epoch().get(), epoch, holder_matches) {
             Ok(())
         } else {
@@ -1146,7 +1150,9 @@ mod tests {
         let deadline = ttl.local_deadline(sent);
         assert_eq!(
             deadline - sent,
-            Duration::from_secs(10) - ttl.renew_interval()
+            Duration::from_secs(10)
+                .checked_sub(ttl.renew_interval())
+                .expect("the interval is shorter than the TTL")
         );
         assert!(OwnerLeaseTtl::new(OwnerLeaseTtl::MAX).is_ok());
     }
@@ -1180,7 +1186,7 @@ mod tests {
         assert_eq!(owned.len(), 1);
         assert!(owned.unload(new.key(), new.epoch()));
         assert!(owned.tenure_for(new.key()).is_none());
-        assert!(owned.tenures().is_empty());
+        assert_eq!(owned.tenures(), Vec::<OwnerTenure>::new());
     }
 
     #[test]

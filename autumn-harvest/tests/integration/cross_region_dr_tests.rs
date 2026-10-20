@@ -288,7 +288,10 @@ async fn a_bump_expires_every_owner_lease_and_keeps_the_epochs() {
     )
     .await
     .expect("renew");
-    let lost: Vec<_> = tenures.iter().map(|t| t.partition()).collect();
+    let lost: Vec<_> = tenures
+        .iter()
+        .map(autumn_harvest::decision_owner::OwnerTenure::partition)
+        .collect();
     assert_eq!(renewed, decision_owner::LeaseWrite::done(vec![], lost));
 
     let new = OwnerHolder::for_worker("new-region");

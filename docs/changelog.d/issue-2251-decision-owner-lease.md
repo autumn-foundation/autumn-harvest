@@ -30,8 +30,10 @@ entry of the partition, counts `harvest.decision_owner.fenced{shard}` and
 re-pends the task under its claim. It never retries at the stale epoch.
 `fail_execution_on_error` passes the error through, so a fence never fails a
 run. A write in another task takes no owner row. With owner mode on and no
-tenure, a decision fails closed. A worker keys tenures by shard and
-partition, because it can serve several databases.
+tenure, a decision fails closed and re-pends after one second. A worker
+keys tenures by the shard of the claim's pool and the partition, because it
+can serve several databases. A local activity handler runs in a scope that
+pins nothing. The body-timeout quarantine fences the run's tenure.
 
 **Deviations from the issue text.** The commit takes `FOR KEY SHARE`, not
 `FOR SHARE`, and the acquisition is a `FOR UPDATE` lock, not the scanner

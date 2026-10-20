@@ -80,8 +80,9 @@ keeps its meaning. Docs, metrics and logs say "decision partition", or
   #2251). The migration seeds rows 0 to 511 at epoch 0. A trigger refuses
   an epoch that falls or grows by more than 1, a new holder at the old
   epoch, and a changed partition.
-- A worker keys each tenure by shard and partition (`OwnerKey`), because
-  it can serve several databases.
+- A worker keys each tenure by the shard of the claim's pool and the
+  partition (`OwnerKey`), because it can serve several databases. The pool
+  names the database of the owner row. The bits of an execution id do not.
 - The row is in the database that holds the history it fences. It fails
   over with the data, and its check is atomic with the append.
 - The DR fence rejects a TTL lease because the lease fails over with the
@@ -205,7 +206,9 @@ covers the wake ingest and the inline local activity and signal writes. It
 also covers the suspension and terminal persists and the projection writes.
 The decision pins its
 tenure in a task-local, so a foreign writer in another task takes no owner
-row.
+row. A local activity handler is user code. It runs in a nested scope that
+pins nothing, so its own writes are foreign writes. The body-timeout
+quarantine pins the tenure of the run and fences too.
 
 Each event insert calls `assert_fence` too, which fences the pinned tenure
 again. That covers a write that a future path adds without a start fence.
@@ -216,7 +219,10 @@ lock wait is at most 250 ms, set on the function. A failed acquisition
 recheck holds the row `FOR UPDATE` for a moment, even on a live lease, so a
 healthy owner must wait briefly. A longer hold is a takeover, so the fence
 fails closed. The wait is short and ends in a refusal, so a late fence
-after other row locks cannot deadlock.
+after other row locks cannot deadlock. A wait for the table lock counts too.
+So a migration that queues an `ACCESS EXCLUSIVE` lock on
+`harvest_decision_owner` fences every commit until its `lock_timeout` ends.
+Keep that timeout short, as `online-migrations.md` requires.
 
 ### 7. Fenced commit: unload, never retry
 

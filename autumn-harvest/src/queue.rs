@@ -5721,9 +5721,9 @@ pub async fn requeue_claimed_workflow_task_after_panic(
 
 /// Re-pend a workflow task whose decision lost its owner fence (issue #2251).
 ///
-/// The decision wrote nothing, so the task is due at once. The new owner of
-/// the partition takes it. The update requires `claim` to be current, as on
-/// the deadlock path, so a stale dispatcher writes nothing.
+/// The decision wrote nothing. The task is due after `delay`, and the new
+/// owner of the partition takes it. The update requires `claim` to be
+/// current, as on the deadlock path, so a stale dispatcher writes nothing.
 ///
 /// Returns `Ok(false)` when the claim is no longer held.
 ///
@@ -5733,11 +5733,12 @@ pub async fn requeue_claimed_workflow_task_after_panic(
 pub async fn requeue_claimed_workflow_task_after_fence(
     conn: &mut AsyncPgConnection,
     claim: &TaskClaim,
+    delay: chrono::Duration,
 ) -> HarvestResult<bool> {
     requeue_claimed_workflow_task_with_backoff(
         conn,
         claim,
-        chrono::Duration::zero(),
+        delay,
         "the decision lost its owner fence (issue #2251)",
     )
     .await
