@@ -16,7 +16,7 @@ visit every reachable state of the DST oracles within a bound:
 **Why.** TLA+ is exhaustive, but its specs restate the protocol by hand. DST
 runs the Rust oracle, but a seed samples one schedule. Stateright checks
 every schedule of the oracle that the differential test compares with
-Postgres. ADR 0010 records the decision.
+Postgres. ADR 0011 records the decision.
 
 **Results.**
 
@@ -44,6 +44,6 @@ decision types and the `named!` enums derive `Hash`. `dst::Ghost`,
 variant, no migration, no production code path changed.
 
 **Docs.** New `docs/testing/stateright.md` and
-`docs/adr/0010-stateright-model-checks.md`. `formal-methods.md`,
+`docs/adr/0011-stateright-model-checks.md`. `formal-methods.md`,
 `concurrency-model-checking.md`, `simulation.md` and `architecture.md` link
 them.

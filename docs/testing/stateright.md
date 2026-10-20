@@ -2,7 +2,7 @@
 
 [Stateright](https://www.stateright.rs) is a model checker for Rust. The
 `stateright` test target uses it to visit every reachable state of two DST
-oracles within a bound. [ADR 0010](../adr/0010-stateright-model-checks.md)
+oracles within a bound. [ADR 0011](../adr/0011-stateright-model-checks.md)
 records why.
 
 The repository already has three tools for these protocols. Each one leaves

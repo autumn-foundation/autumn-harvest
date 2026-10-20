@@ -21,7 +21,7 @@ target runs the sweep on every PR. The nightly sweep runs it on 4,000,000
 seeds. A guard test fails when `harvest_decision_owner` lands with no
 simulator run against a real store.
 
-**ADR.** `docs/adr/0009-fenced-owner-lease.md` records the rules R1 to R7
+**ADR.** `docs/adr/0010-fenced-owner-lease.md` records the rules R1 to R7
 and the spec changes that the model forces. One change: the fence takes
 `FOR KEY SHARE` and the takeover takes `FOR UPDATE`, so a renewal does not
 wait on a commit. Another: the fence compares the epoch that the decision

@@ -217,7 +217,7 @@ completion or the unresolved count.
 
 #### `OwnerLease` — model (e)
 
-The prose spec is [ADR 0009](../adr/0009-fenced-owner-lease.md). Stage 1a
+The prose spec is [ADR 0010](../adr/0010-fenced-owner-lease.md). Stage 1a
 (issue #2251) has no code yet, so this model is the spec. The model has one
 partition, one owner row and the history of one execution. Its actions:
 

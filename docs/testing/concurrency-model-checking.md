@@ -117,7 +117,7 @@ A seed picks one schedule, so a DST sweep samples. Stateright visits every
 schedule of the same oracles within a bound. Its models call `OracleStore`
 and `OracleOwnerStore` directly. The per-PR bound runs in the no-db test
 job, and the DST nightly workflow checks larger bounds.
-[ADR 0010](../adr/0010-stateright-model-checks.md) records the choice, and
+[ADR 0011](../adr/0011-stateright-model-checks.md) records the choice, and
 [`stateright.md`](stateright.md) describes the models.
 
 ## Recommendation matrix

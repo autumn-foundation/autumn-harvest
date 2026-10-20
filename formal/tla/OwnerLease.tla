@@ -2,7 +2,7 @@
 (***************************************************************************)
 (* The fenced owner lease of one decision partition (issue #2250).         *)
 (*                                                                         *)
-(* docs/adr/0009-fenced-owner-lease.md is the prose spec.                  *)
+(* docs/adr/0010-fenced-owner-lease.md is the prose spec.                  *)
 (* docs/testing/formal-methods.md says how to run this model.              *)
 (*                                                                         *)
 (* The owner row holds a holder, an epoch and a lease. A worker acquires   *)

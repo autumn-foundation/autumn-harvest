@@ -1,4 +1,4 @@
-# ADR 0010: Stateright model checks of the DST oracles
+# ADR 0011: Stateright model checks of the DST oracles
 
 ## Status
 
