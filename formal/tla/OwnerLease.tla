@@ -148,12 +148,13 @@ Acquire(w) ==
                ELSE seen
     /\ UNCHANGED <<decs, history, inbox, written, mem, acked>>
 
-\* A graceful release: the holder frees the row and unloads.
+\* A graceful release: the holder ends its lease and unloads. The holder
+\* and the epoch stay, as in a lapse (issue #2251).
 Release(w) ==
     /\ pinned[w] # 0
     /\ lease.holder = w
     /\ lease.epoch = pinned[w]
-    /\ lease' = [lease EXCEPT !.holder = NoWorker, !.live = FALSE]
+    /\ lease' = [lease EXCEPT !.live = FALSE]
     /\ Unload(w)
     /\ UNCHANGED <<owners, held, decs, history, inbox, written, acked, seen>>
 

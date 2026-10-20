@@ -233,8 +233,9 @@ pub trait OwnerStore {
     /// lock.
     fn acquire(&mut self, worker: WorkerId) -> Option<Epoch>;
 
-    /// The graceful release. It frees the row when `worker` holds `epoch`.
-    /// Returns `false` when the row moved.
+    /// The graceful release. It ends the lease when `worker` holds `epoch`,
+    /// and keeps the holder and the epoch. Returns `false` when the row
+    /// moved.
     fn release(&mut self, worker: WorkerId, epoch: Epoch) -> bool;
 
     /// The renewal `UPDATE`. It matches `worker` and `epoch`, and needs a
@@ -319,7 +320,7 @@ impl OwnerStore for OracleOwnerStore {
         if self.row.holder != Some(worker) || self.row.epoch != epoch {
             return false;
         }
-        self.row.holder = None;
+        // A release ends the lease and keeps the holder, as a lapse does.
         self.row.live = false;
         true
     }

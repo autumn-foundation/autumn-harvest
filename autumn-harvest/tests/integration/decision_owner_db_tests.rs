@@ -289,8 +289,12 @@ async fn the_same_holder_gets_a_new_epoch_on_each_acquisition() {
     assert_eq!(released, LeaseWrite::done(vec![p], vec![]));
     let freed = row(&mut conn, p).await;
     assert_eq!(freed.epoch, second.epoch().get());
-    assert_eq!(freed.holder, None);
-    assert!(!freed.live);
+    assert_eq!(
+        freed.holder.as_deref(),
+        Some(a.as_str()),
+        "a release keeps the holder"
+    );
+    assert!(!freed.live, "a release ends the lease");
     let third = acquire(&mut conn, &a, p).await;
     assert_eq!(third.epoch(), second.epoch().next().expect("no overflow"));
 }
@@ -467,10 +471,11 @@ async fn the_same_holder_cannot_commit_at_its_old_epoch() {
     );
 }
 
-/// The fence compares the holder too: a released row fences its last
-/// tenure, although the epoch stays.
+/// A release ends the lease and keeps holder and epoch, as a lapse does.
+/// The released tenure still passes until another worker acquires the row.
+/// Then the fence refuses it.
 #[tokio::test]
-async fn a_released_tenure_cannot_commit() {
+async fn a_released_tenure_is_fenced_by_the_next_acquisition() {
     let (url, _container) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
     let p = partition(419);
@@ -479,18 +484,26 @@ async fn a_released_tenure_cannot_commit() {
     decision_owner::release_all(&mut conn, SHARD, std::slice::from_ref(&tenure), SHORT_WAIT)
         .await
         .expect("release");
+    decide!(
+        conn,
+        Some(tenure.clone()),
+        async |_conn: &mut AsyncPgConnection| Ok(())
+    )
+    .await
+    .expect("no other owner exists yet");
 
+    let next = acquire(&mut conn, &holder("next"), p).await;
     let error = decide!(
         conn,
         Some(tenure.clone()),
         async |_conn: &mut AsyncPgConnection| Ok(())
     )
     .await
-    .expect_err("a released tenure is fenced");
+    .expect_err("the released tenure is fenced");
     assert!(
         matches!(
             error,
-            HarvestError::OwnershipLost { current: Some(current), .. } if current == tenure.epoch()
+            HarvestError::OwnershipLost { current: Some(current), .. } if current == next.epoch()
         ),
         "{error:?}"
     );

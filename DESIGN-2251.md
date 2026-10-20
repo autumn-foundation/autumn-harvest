@@ -131,6 +131,9 @@ docs. The fixes:
   epoch. Both are fixed.
 - The oracle and the TLA+ model let a lapsed holder renew. The code does
   not, so both models now require a live lease. TLC still passes.
+- A release that cleared the holder fenced the releaser's own commit in
+  flight. A release now keeps the holder and the epoch, as a lapse does.
+  The models match. No other owner can acquire before that commit ends.
 - The tests gained the same-holder and released-tenure fences, a renewal
   under a held fence, a bounded-wait test, a no-fence mutant store and an
   owner-mode test. Polls replaced fixed sleeps.

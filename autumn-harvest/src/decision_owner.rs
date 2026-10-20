@@ -615,9 +615,12 @@ mod db {
          ORDER BY o.partition \
          FOR NO KEY UPDATE OF o";
 
-    /// Free each locked row. The epoch stays, so the next acquisition adds 1.
+    /// End each locked lease now. The holder and the epoch stay, so a
+    /// release is a lapse: the next acquisition adds 1. A commit of the
+    /// releaser that holds its fence still passes, and no other owner can
+    /// acquire before it ends.
     const RELEASE_WRITE_SQL: &str = "UPDATE harvest_decision_owner \
-         SET holder = NULL, lease_until = LEAST(lease_until, clock_timestamp()) \
+         SET lease_until = LEAST(lease_until, clock_timestamp()) \
          WHERE partition = ANY($1::int[])";
 
     /// Lock every live row for the DR bump, in ascending partition order.
@@ -907,9 +910,9 @@ mod db {
     /// Release each row of `tenures` in one transaction (ADR 0009
     /// decision 9).
     ///
-    /// A release matches holder and epoch. It frees the row and ends the
-    /// lease now. It keeps the epoch. The holder stops new commits in each
-    /// partition before it calls this.
+    /// A release matches holder and epoch. It ends the lease now and keeps
+    /// the holder and the epoch, so any worker may acquire the row next. The
+    /// holder stops new commits in each partition before it calls this.
     ///
     /// # Errors
     ///

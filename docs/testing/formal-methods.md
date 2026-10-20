@@ -29,7 +29,7 @@ scripts/check-formal-models.sh
 
 The script downloads `tla2tools.jar` 1.7.4 and checks its SHA-256. To use a
 local jar, set `TLA2TOOLS_JAR=/path/to/tla2tools.jar`. A full run takes about
-4 minutes on 4 cores. The `OwnerLease` design config takes about 3 minutes
+3 minutes on 4 cores. The `OwnerLease` design config takes about 2 minutes
 of it.
 
 To run one config by hand:
@@ -223,7 +223,7 @@ partition, one owner row and the history of one execution. Its actions:
 | Action | Planned code |
 |---|---|
 | `Acquire` | The takeover: `SELECT ... FOR UPDATE`, then the write. Adds 1 to the epoch. Waits for every fence lock. Then loads the resident state. |
-| `Release` | The graceful release. Frees the row and unloads the worker. |
+| `Release` | The graceful release. Ends the lease, keeps the holder and the epoch, and unloads the worker. |
 | `Expire` | The lease time runs out: a pause or a clock jump. A lock does not stop it. |
 | `Renew` | The renewal `UPDATE` of `lease_until`. Matches the holder and the epoch, and needs a live lease. A miss unloads the worker. |
 | `Write`, `Ack` | The `harvest_signals` insert, then the HTTP 202. |
@@ -283,9 +283,9 @@ ADR. Its config lists only the invariant that it must break:
 
 `OwnerLease.cfg` checks the design with 3 workers, 2 signals and 4 epochs.
 The workers are interchangeable, so the config sets
-`SYMMETRY WorkerSymmetry`. TLC finds 7,361,902 distinct states and no
-error, in about 3 minutes on 4 cores. A renewal needs a live lease since
-issue #2251, which adds states. The two signals limit the history to
+`SYMMETRY WorkerSymmetry`. TLC finds 4,980,851 distinct states and no
+error, in about 2 minutes on 4 cores. Since issue #2251, a renewal needs a
+live lease, and a release keeps the holder, as the code does. The two signals limit the history to
 two events.
 
 `OwnerLeaseReach.cfg` must violate `SomeNemesisUnseen`. The violation is

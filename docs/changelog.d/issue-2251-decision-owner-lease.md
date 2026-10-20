@@ -13,7 +13,7 @@ replay impact.
 **Lease.** `decision_owner::acquire` takes a free or lapsed row `FOR UPDATE`
 and adds 1 to the epoch, also for the same holder. `renew_all` changes
 `lease_until` only, so it never waits for a commit and never bumps the epoch.
-`release_all` frees a row and keeps its epoch. Both lock their rows in
+`release_all` ends a lease and keeps its holder and epoch, as a lapse does. Both lock their rows in
 ascending partition order first. A lock miss is `Busy`, never an error. The
 DR bump (`harvest dr fence`) ends every owner lease in its transaction. A
 bump of a shard with no generation row now rolls back.
@@ -38,9 +38,10 @@ partition, because it can serve several databases.
 upsert. ADR 0009 decision 5 requires both: `a_for_share_commit_blocks_a_renewal`
 and `a_scanner_style_upsert_does_not_wait_for_a_commit` show why.
 
-**Model.** A renewal now needs a live lease in the TLA+ model and the
-oracle too, as ADR 0009 decision 5 and the Postgres store require. TLC
-passes the design and fails each mutant on its invariant, as before.
+**Model.** In the TLA+ model and the oracle, a renewal now needs a live
+lease, and a release keeps the holder, as the Postgres store does. TLC
+passes the design (4,980,851 distinct states) and fails each mutant on its
+invariant, as before.
 
 **Proof.** `formal/verus/src/owner_fence.rs` proves `next_epoch` and
 `fence_passes` for every input. Its spec shows that only an acquisition moves

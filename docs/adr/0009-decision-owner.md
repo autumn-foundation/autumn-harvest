@@ -279,7 +279,7 @@ On a graceful stop, a worker:
 1. Stops new claims and new commits in every partition.
 2. Waits for its in-flight decisions, up to the drain bound.
 3. Releases every partition in one statement. The statement sets the lease
-   end to `clock_timestamp()` and keeps the epoch.
+   end to `clock_timestamp()` and keeps the holder and the epoch.
 
 Standbys acquire on their next scan. A decision still in flight at the
 bound keeps its row lock, and the acquisition waits for it. There is no
