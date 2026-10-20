@@ -43,4 +43,13 @@ before their tests, with a 10-minute step timeout.
 **Build.** `examples/autoresearch/src/runtime.rs` set `start_provenance`
 twice, so the example did not compile on `trunk-dev`. It is set once.
 
+**`trunk-dev` CI.** Two failures on the base branch blocked this PR.
+
+- `wasmtime` 48.0.6 has RUSTSEC-2026-0378 and RUSTSEC-2026-0379, so the
+  `Dependency ledger (cargo-deny)` job failed. `Cargo.lock` moves the
+  `wasmtime` 48.0.x family to 48.0.7, and the manifest floor moves too.
+- PRs #2277 and #2278 each added an ADR 0009, so `adr_number_is_unique`
+  failed. `0009-fenced-owner-lease.md` is now
+  `0010-fenced-owner-lease.md`, and each link follows it.
+
 **No migration. No new `WorkflowEvent` variant. No public API change.**
