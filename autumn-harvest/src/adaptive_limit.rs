@@ -55,9 +55,10 @@
 //! - The claim skips a type at its cap, also on a row with capability
 //!   requirements. Its tasks stay `PENDING` for another worker or a later
 //!   poll.
-//! - A claim can still race past the cap, for example when two pollers
-//!   claim at once. The dispatch gate then defers the row with the fenced
-//!   retry-budget write. The deferral uses no attempt and appends no event.
+//! - A claim can still race past the cap, for example when two claim
+//!   loops claim at once. The loops can belong to one worker or to two.
+//!   The dispatch gate then defers the row with the fenced retry-budget
+//!   write. The deferral uses no attempt and appends no event.
 //! - The gate runs before the retry budget, so a deferral spends no budget
 //!   token. A circuit short-circuit and a half-open probe take no slot.
 //!
@@ -68,8 +69,12 @@
 //! unaffected. Local activities and the SQLite backend do not use it.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+// Shuttle models drive the registry (issue #1800). See
+// `docs/testing/shuttle.md`.
+use crate::shuttle_sync::{AtomicUsize, Mutex, MutexGuard, Notify};
 use std::time::Duration;
 
 use crate::policy::AdaptiveLimitPolicy;
@@ -460,7 +465,11 @@ pub struct AdaptiveLimitRegistry {
     saturated_count: AtomicUsize,
     /// Wakes the worker's idle wait when a type leaves its cap. The worker
     /// uses it as its capacity wake.
-    slot_freed: Arc<tokio::sync::Notify>,
+    slot_freed: Arc<Notify>,
+    /// Wakes the worker's idle wait when a task deferred at the cap is due.
+    /// See [`Self::wake_when_deferral_due`].
+    #[cfg(feature = "db")]
+    deferral_due: Arc<tokio::sync::Notify>,
     metrics: Option<Arc<dyn MetricsRecorder>>,
 }
 
@@ -485,7 +494,9 @@ impl AdaptiveLimitRegistry {
             config,
             limiters: Mutex::new(HashMap::new()),
             saturated_count: AtomicUsize::new(0),
-            slot_freed: Arc::new(tokio::sync::Notify::new()),
+            slot_freed: Arc::new(Notify::new()),
+            #[cfg(feature = "db")]
+            deferral_due: Arc::new(tokio::sync::Notify::new()),
             metrics: None,
         }
     }
@@ -551,11 +562,37 @@ impl AdaptiveLimitRegistry {
     }
 
     /// The wake that fires when an activity type leaves its cap. The worker
-    /// shares it as its capacity wake.
+    /// shares it as its capacity wake. The Shuttle models wait on it.
+    #[must_use]
+    pub fn slot_freed_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.slot_freed)
+    }
+
+    /// The wake that fires when a task deferred at the cap is due again. The
+    /// worker waits on it in every idle wait.
     #[cfg(feature = "db")]
     #[must_use]
-    pub(crate) fn slot_freed_notify(&self) -> Arc<tokio::sync::Notify> {
-        Arc::clone(&self.slot_freed)
+    pub(crate) fn deferral_due_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.deferral_due)
+    }
+
+    /// Fire the deferral wake `delay` from now.
+    ///
+    /// A claim that raced past the cap puts its row back with a delay. No
+    /// NOTIFY reaches a worker without a listener, and a listener wakes
+    /// before the row is due. Without this wake, the poll loop can sleep a
+    /// full poll interval with the row ready. Two claim loops in one worker
+    /// race past the cap often (issue #2106).
+    ///
+    /// The caller passes the delay of a deferral that persisted. The write
+    /// ran before this call, so the row is due when the wake fires.
+    #[cfg(feature = "db")]
+    pub(crate) fn wake_when_deferral_due(&self, delay: Duration) {
+        let due = Arc::clone(&self.deferral_due);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            due.notify_one();
+        });
     }
 
     /// Whether any activity type is at its cap. It reads no lock, so the
@@ -1045,6 +1082,27 @@ mod tests {
         assert!(
             freed.notified().now_or_never().is_some(),
             "the free must wake"
+        );
+    }
+
+    /// A deferral wakes the worker's idle wait when its row is due, not
+    /// before.
+    #[cfg(feature = "db")]
+    #[tokio::test(start_paused = true)]
+    async fn a_deferral_wakes_the_worker_when_due() {
+        use futures::FutureExt as _;
+        let reg = registry(AdaptiveLimitPolicy::new(1, 1));
+        let due = reg.deferral_due_notify();
+        reg.wake_when_deferral_due(Duration::from_millis(50));
+        tokio::time::sleep(Duration::from_millis(49)).await;
+        assert!(
+            due.notified().now_or_never().is_none(),
+            "the row is not due"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        assert!(
+            due.notified().now_or_never().is_some(),
+            "the due row must wake"
         );
     }
 

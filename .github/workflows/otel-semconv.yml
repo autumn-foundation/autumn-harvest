@@ -1,0 +1,68 @@
+# Upstream OpenTelemetry policy checks on the workflow conventions draft
+# (issue #2015).
+#
+# The `otel_workflow_semconv_docs` guards in the `lint` job check the model
+# shape. This workflow runs scripts/check-otel-workflow-semconv.sh. The
+# script runs the upstream Weaver policies on the model, at a pinned upstream
+# commit. It also checks the upstream issue form, and it checks the project
+# proposal against the community template. It pulls an image and clones four
+# trees, so the `pinned` job runs only when the draft, the script or this
+# file changes.
+#
+# The weekly `latest` job runs the script against upstream `main`, the
+# latest release and community `main`. A failure there shows that the pins
+# cannot move as they are. It does not block a pull request.
+#
+# `otel_workflow_semconv_docs::the_weaver_check_runs_when_the_model_changes`
+# guards this file.
+name: OTel semconv (Weaver)
+
+on:
+  pull_request:
+    # The default types do not include ready_for_review. Without it, a draft
+    # that becomes ready gets no run until its next push.
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "docs/otel-workflow-semconv/**"
+      - "scripts/check-otel-workflow-semconv.sh"
+      - ".github/workflows/otel-semconv.yml"
+  push:
+    branches: [trunk-dev]
+    paths:
+      - "docs/otel-workflow-semconv/**"
+      - "scripts/check-otel-workflow-semconv.sh"
+      - ".github/workflows/otel-semconv.yml"
+  workflow_dispatch:
+  schedule:
+    # Weekly on Tuesday at 05:23 UTC.
+    - cron: "23 5 * * 2"
+
+concurrency:
+  group: otel-semconv-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pinned:
+    name: Upstream Weaver policy checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run the upstream policy checks on the model
+        run: scripts/check-otel-workflow-semconv.sh
+
+  latest:
+    name: Upstream Weaver policy checks (upstream main)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run the upstream policy checks against upstream main
+        env:
+          SEMCONV_LATEST: "1"
+        run: scripts/check-otel-workflow-semconv.sh

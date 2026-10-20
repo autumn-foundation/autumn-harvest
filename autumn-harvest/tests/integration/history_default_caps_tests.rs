@@ -109,6 +109,7 @@ fn build_worker(
                 notification_database_url: None,
                 max_concurrent_workflows: 2,
                 max_concurrent_activities: 2,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(2),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -135,6 +136,7 @@ fn build_worker(
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
                 scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
+                fairness_keys: false,
             },
             registry,
         )
@@ -289,6 +291,8 @@ fn side_effect_activity() -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: side_effect,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

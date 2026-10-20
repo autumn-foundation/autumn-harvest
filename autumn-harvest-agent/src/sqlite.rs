@@ -1,7 +1,8 @@
 //! The agent loop on the embedded SQLite backend.
 //!
-//! This backend runs a synchronous activity body with no `ActivityContext`.
-//! [`register`] therefore wraps each harness method in a closure. The closure
+//! The harness lives in process state, and `ctx.state::<T>()` is always `None`
+//! on this backend. [`register`] therefore wraps each harness method in a
+//! closure for `register_activity_with_body`. The closure
 //! runs the async body with `block_in_place` on the current Tokio runtime, so
 //! drive the runtime from a multi-thread Tokio runtime.
 
@@ -18,8 +19,8 @@ use crate::harness::AgentHarness;
 use crate::heartbeat::{HEARTBEAT_WORKFLOW_NAME, HeartbeatTask, agent_heartbeat_info};
 use crate::types::AgentTask;
 use crate::workflow::{
-    WORKFLOW_NAME, agent_deliver_info, agent_loop_info, agent_memory_snapshot_info,
-    agent_model_turn_info, agent_precheck_info, agent_tool_call_info,
+    WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
+    agent_memory_snapshot_info, agent_model_turn_info, agent_precheck_info, agent_tool_call_info,
 };
 
 /// Register the agent workflows and their activities against `harness`.
@@ -30,22 +31,28 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     rt.register_workflow(&agent_loop_info());
     rt.register_workflow(&agent_heartbeat_info());
     let h = Arc::clone(&harness);
-    rt.register_activity(&agent_model_turn_info(), move |input| {
+    rt.register_activity_with_body(&agent_model_turn_info(), move |input| {
         call(input, |request| h.model_turn(request))
     });
     let h = Arc::clone(&harness);
-    rt.register_activity(&agent_tool_call_info(), move |input| {
+    rt.register_activity_with_body(&agent_tool_call_info(), move |input| {
         call(input, |request| h.tool_call(request))
     });
     let h = Arc::clone(&harness);
-    rt.register_activity(&agent_memory_snapshot_info(), move |input| {
+    rt.register_activity_with_body(&agent_memory_snapshot_info(), move |input| {
         call(input, |scope| h.memory_snapshot(scope))
     });
     let h = Arc::clone(&harness);
-    rt.register_activity(&agent_deliver_info(), move |input| {
+    rt.register_activity_with_body(&agent_deliver_info(), move |input| {
         call(input, |report| h.deliver(report))
     });
-    rt.register_activity(&agent_precheck_info(), move |input| {
+    let h = Arc::clone(&harness);
+    rt.register_activity_with_body(&agent_discover_peers_info(), move |input| {
+        call(input, |names: Vec<String>| {
+            std::future::ready(Ok::<_, String>(h.discover_peers(&names)))
+        })
+    });
+    rt.register_activity_with_body(&agent_precheck_info(), move |input| {
         call(input, |task| harness.precheck_tick(task))
     });
 }
@@ -61,7 +68,9 @@ pub fn start(rt: &mut SqliteRuntime, task: &AgentTask) -> SqliteResult<Execution
 
 /// Start one heartbeat tick. Returns its execution id.
 ///
-/// SQLite has no engine scheduler. Call it from the app on each tick.
+/// Call it from the app on each tick. To let the engine start the ticks,
+/// pass `heartbeat::schedule` to `SqliteRuntime::upsert_schedule` instead
+/// (issue #2031).
 ///
 /// # Errors
 ///

@@ -839,10 +839,10 @@ fn the_registry_refuses_an_oversized_module() {
 #[tokio::test]
 async fn a_wasm_hosted_workflow_runs_to_completion_through_the_ordinary_handler_seam() {
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
-    let outcome = with_module_host(
+    let outcome = Box::pin(with_module_host(
         host(&registry, "wf-v1"),
         env().run(module_workflow_handler, json!({"order": 1})),
-    )
+    ))
     .await;
 
     assert_eq!(outcome.result, Ok(json!("v1-done")));
@@ -860,10 +860,10 @@ async fn a_wasm_hosted_workflow_runs_to_completion_through_the_ordinary_handler_
 #[tokio::test]
 async fn the_v2_module_runs_the_extra_step() {
     let registry = registry_with(&[("wf-v2", "pipeline", pipeline_v2_bytes())]);
-    let outcome = with_module_host(
+    let outcome = Box::pin(with_module_host(
         host(&registry, "wf-v2"),
         env().run(module_workflow_handler, json!({"order": 1})),
-    )
+    ))
     .await;
 
     assert_eq!(outcome.result, Ok(json!("v2-done")));
@@ -893,10 +893,10 @@ async fn the_module_is_chosen_by_the_executions_build_not_by_the_workers_build_i
     // One worker process, advertising a single host build id, hosting both.
     let worker_env = env().with_build_id("host-1");
 
-    let v1 = with_module_host(
+    let v1 = Box::pin(with_module_host(
         host(&registry, "wf-v1"),
         worker_env.run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     assert_eq!(
         v1.result,
@@ -904,12 +904,12 @@ async fn the_module_is_chosen_by_the_executions_build_not_by_the_workers_build_i
         "v1-assigned run stays on v1"
     );
 
-    let v2 = with_module_host(
+    let v2 = Box::pin(with_module_host(
         host(&registry, "wf-v2"),
         env()
             .with_build_id("host-1")
             .run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     assert_eq!(v2.result, Ok(json!("v2-done")), "v2-assigned run uses v2");
 }
@@ -917,10 +917,10 @@ async fn the_module_is_chosen_by_the_executions_build_not_by_the_workers_build_i
 #[tokio::test]
 async fn a_missing_module_fails_the_execution_loudly() {
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
-    let outcome = with_module_host(
+    let outcome = Box::pin(with_module_host(
         host(&registry, "wf-v9"),
         env().run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
 
     let err = outcome
@@ -966,10 +966,10 @@ async fn an_activity_failure_is_handed_to_the_guest_rather_than_failing_the_run(
         .with_frozen_anchor(anchor())
         .mock_activity("charge", |_| Err("card declined".to_string()));
 
-    let hosted = with_module_host(
+    let hosted = Box::pin(with_module_host(
         host(&registry, "wf-v1"),
         failing.run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     assert_eq!(
         hosted.result,
@@ -1027,10 +1027,10 @@ fn normalise(events: &[WorkflowEvent]) -> Vec<Value> {
 async fn a_module_hosted_history_is_byte_identical_to_the_statically_linked_one() {
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
 
-    let hosted = with_module_host(
+    let hosted = Box::pin(with_module_host(
         host(&registry, "wf-v1"),
         env().run(module_workflow_handler, json!({"order": 7})),
-    )
+    ))
     .await;
     let native = env().run(native_pipeline_v1, json!({"order": 7})).await;
 
@@ -1048,10 +1048,10 @@ async fn a_module_hosted_history_replays_clean_under_statically_linked_code() {
     // code, replayed by the ordinary `WorkflowReplayer` against the
     // statically-linked handler.
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
-    let hosted = with_module_host(
+    let hosted = Box::pin(with_module_host(
         host(&registry, "wf-v1"),
         env().run(module_workflow_handler, json!({"order": 7})),
-    )
+    ))
     .await;
 
     let report = hosted.replay_check(native_pipeline_v1).await;
@@ -1087,10 +1087,10 @@ async fn the_replayer_routes_a_module_hosted_history_by_name() {
     // The same proof through the public `WorkflowReplayer::register_fn` seam
     // rather than the harness's own `replay_check` shortcut.
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
-    let hosted = with_module_host(
+    let hosted = Box::pin(with_module_host(
         host(&registry, "wf-v1"),
         env().run(module_workflow_handler, json!({"order": 7})),
-    )
+    ))
     .await;
 
     let replayer = WorkflowReplayer::new().register_fn("pipeline", native_pipeline_v1);
@@ -1107,10 +1107,10 @@ async fn hosting_never_introduces_a_new_event_variant() {
     // module-hosted run produces is a subset of what the statically-linked run
     // produces. Nothing about module loading reaches history.
     let registry = registry_with(&[("wf-v2", "pipeline", pipeline_v2_bytes())]);
-    let hosted = with_module_host(
+    let hosted = Box::pin(with_module_host(
         host(&registry, "wf-v2"),
         env().run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     let native = env().run(native_pipeline_v2, json!({})).await;
 
@@ -1137,10 +1137,10 @@ async fn hosting_never_introduces_a_new_event_variant() {
 async fn a_trapping_guest_is_contained_as_a_workflow_error() {
     let bytes = wat::parse_str(TRAP_WAT).expect("trap wat assembles");
     let registry = registry_with(&[("wf-trap", "pipeline", bytes)]);
-    let outcome = with_module_host(
+    let outcome = Box::pin(with_module_host(
         host(&registry, "wf-trap"),
         env().run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     assert!(
         outcome.result.is_err(),
@@ -1153,10 +1153,10 @@ async fn a_spinning_guest_is_bounded_by_fuel_and_the_epoch_deadline() {
     let bytes = wat::parse_str(SPIN_WAT).expect("spin wat assembles");
     let registry = registry_with(&[("wf-spin", "pipeline", bytes)]);
     let started = Instant::now();
-    let outcome = with_module_host(
+    let outcome = Box::pin(with_module_host(
         host(&registry, "wf-spin"),
         env().run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     assert!(
         outcome.result.is_err(),
@@ -1173,10 +1173,10 @@ async fn a_spinning_guest_is_bounded_by_fuel_and_the_epoch_deadline() {
 async fn a_guest_that_never_completes_is_stopped_by_the_decide_step_cap() {
     let bytes = wat::parse_str(NEVER_TERMINATES_WAT).expect("wat assembles");
     let registry = registry_with(&[("wf-loop", "pipeline", bytes)]);
-    let outcome = with_module_host(
+    let outcome = Box::pin(with_module_host(
         host(&registry, "wf-loop"),
         env().run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     let scheduled = outcome
         .events()
@@ -1211,10 +1211,10 @@ async fn a_guest_may_not_schedule_an_activity_the_host_did_not_allow() {
     // allowlist a module can schedule any activity the worker knows, read its
     // output, and hand it back out — exfiltration through the front door.
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
-    let outcome = with_module_host(
+    let outcome = Box::pin(with_module_host(
         host(&registry, "wf-v1").allowing_activities(["notify"]),
         env().run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     let scheduled_any = outcome
         .events()
@@ -1240,10 +1240,10 @@ async fn a_guest_may_not_pick_the_queue_unless_the_host_allows_it() {
     let bytes = wat::parse_str(QUEUE_HOPPER_WAT).expect("wat assembles");
     let registry = registry_with(&[("wf-hop", "pipeline", bytes)]);
 
-    let refused = with_module_host(
+    let refused = Box::pin(with_module_host(
         host(&registry, "wf-hop"),
         env().run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     let err = refused
         .result
@@ -1252,10 +1252,10 @@ async fn a_guest_may_not_pick_the_queue_unless_the_host_allows_it() {
 
     // With the opt-in it is honoured, so the control is a policy rather than a
     // missing feature.
-    let allowed = with_module_host(
+    let allowed = Box::pin(with_module_host(
         host(&registry, "wf-hop").allowing_queue_override(),
         env().run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     assert_eq!(allowed.result, Ok(json!("v1-done")));
     let queues: Vec<&str> = allowed
@@ -1279,10 +1279,10 @@ async fn a_guest_may_not_pick_an_oversized_queue_name() {
     let bytes = wat::parse_str(LONG_QUEUE_NAME_WAT).expect("wat assembles");
     let registry = registry_with(&[("wf-long-queue", "pipeline", bytes)]);
 
-    let outcome = with_module_host(
+    let outcome = Box::pin(with_module_host(
         host(&registry, "wf-long-queue").allowing_queue_override(),
         env().run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     let scheduled_any = outcome
         .events()
@@ -1928,23 +1928,23 @@ async fn hot_swap_ramp_and_rollback_without_a_restart() {
     assert_eq!(ramped.resolve_assigned_build(fresh), "wf-v2");
 
     // The new start really executes the v2 module...
-    let v2_run = with_module_host(
+    let v2_run = Box::pin(with_module_host(
         host(&registry, &ramped.resolve_assigned_build(fresh)),
         env()
             .with_build_id("host-1")
             .run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     assert_eq!(v2_run.result, Ok(json!("v2-done")));
     let swap_latency = swap_started.elapsed();
 
     // ... while the v1-assigned in-flight execution still runs v1 code.
-    let v1_run = with_module_host(
+    let v1_run = Box::pin(with_module_host(
         host(&registry, &in_flight_build),
         env()
             .with_build_id("host-1")
             .run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     assert_eq!(
         v1_run.result,
@@ -2119,6 +2119,8 @@ mod one_worker_process {
             max_result_bytes: None,
             requires: None,
             handler,
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -2175,10 +2177,12 @@ mod one_worker_process {
                     scanner: autumn_harvest::scanner_lease::ScannerConfig::default(),
                     dr: autumn_harvest::replication::DrConfig::default(),
                     worker_id: "hot-swap-host-1".to_string(),
+                    fairness_keys: false,
                     queues: vec![queue.to_string()],
                     notification_database_url: None,
                     max_concurrent_workflows: 2,
                     max_concurrent_activities: 2,
+                    max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                     poll_interval: Duration::from_millis(25),
                     shutdown_timeout: Duration::from_secs(2),
                     cancellation_grace_period: Duration::from_secs(1),
@@ -2542,10 +2546,10 @@ async fn a_pinned_module_survives_an_unload_that_races_the_dispatch() {
     assert_eq!(registry.unload_build("wf-v1"), 1);
     assert!(registry.get("wf-v1", "pipeline").is_none());
 
-    let outcome = with_module_host(
+    let outcome = Box::pin(with_module_host(
         host(&registry, "wf-v1").with_pinned_module(pinned),
         env().run(module_workflow_handler, json!({"order": 1})),
-    )
+    ))
     .await;
 
     assert_eq!(
@@ -2562,10 +2566,10 @@ async fn an_unpinned_host_still_reports_a_missing_module() {
     let registry = registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]);
     assert_eq!(registry.unload_build("wf-v1"), 1);
 
-    let outcome = with_module_host(
+    let outcome = Box::pin(with_module_host(
         host(&registry, "wf-v1"),
         env().run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
     let err = outcome.result.expect_err("no module is loaded");
     assert!(
@@ -2605,13 +2609,13 @@ async fn the_trampoline_never_yields_between_decisions() {
     );
 
     // And the guest still completes when its decisions are the slow part.
-    let outcome = with_module_host(
+    let outcome = Box::pin(with_module_host(
         host(
             &registry_with(&[("wf-v1", "pipeline", pipeline_v1_bytes())]),
             "wf-v1",
         ),
         env().run(module_workflow_handler, json!({"order": 1})),
-    )
+    ))
     .await;
     assert_eq!(outcome.result.expect("completes"), json!("v1-done"));
 }
@@ -2632,10 +2636,10 @@ async fn decisions_are_reused_across_separate_workflow_tasks() {
 
     // Two independent drives, as two separate tasks would be.
     for _ in 0..2 {
-        let outcome = with_module_host(
+        let outcome = Box::pin(with_module_host(
             ModuleHost::new(Arc::clone(&registry)).with_build_id("wf-v2"),
             env().run(module_workflow_handler, json!({"order": 1})),
-        )
+        ))
         .await;
         assert_eq!(outcome.result.expect("completes"), json!("v2-done"));
     }
@@ -2669,12 +2673,12 @@ async fn a_capability_enabled_host_never_uses_the_decision_cache() {
     };
 
     for _ in 0..2 {
-        let outcome = with_module_host(
+        let outcome = Box::pin(with_module_host(
             ModuleHost::new(Arc::clone(&registry))
                 .with_build_id("wf-v2")
                 .with_capabilities(capable.clone()),
             env().run(module_workflow_handler, json!({"order": 1})),
-        )
+        ))
         .await;
         assert_eq!(outcome.result.expect("completes"), json!("v2-done"));
     }
@@ -2813,15 +2817,15 @@ async fn the_decision_cache_never_serves_one_builds_answer_to_another() {
         ("wf-v2", "pipeline", pipeline_v2_bytes()),
     ]);
 
-    let v1 = with_module_host(
+    let v1 = Box::pin(with_module_host(
         ModuleHost::new(Arc::clone(&registry)).with_build_id("wf-v1"),
         env().run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
-    let v2 = with_module_host(
+    let v2 = Box::pin(with_module_host(
         ModuleHost::new(Arc::clone(&registry)).with_build_id("wf-v2"),
         env().run(module_workflow_handler, json!({})),
-    )
+    ))
     .await;
 
     assert_eq!(v1.result.expect("v1 completes"), json!("v1-done"));

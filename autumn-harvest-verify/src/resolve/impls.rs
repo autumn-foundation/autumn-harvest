@@ -18,6 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use proc_macro2::{TokenStream, TokenTree};
+
 use crate::util::{matching_angle, split_top, split_top_trim};
 
 /// One `impl` block header, as written in the source.
@@ -31,6 +33,114 @@ pub struct ImplHeader {
     pub generics: Vec<String>,
 }
 
+/// What the field types of one declared type hold (issue #2010).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FieldFacts {
+    /// A field type holds `&mut`.
+    pub mut_ref: bool,
+    /// A field type takes a lifetime argument, as `Refs<'a>`. A shared
+    /// `&'a T` does not count.
+    pub lifetime: bool,
+    /// Each path segment a field type names, as `Arc` and `Mutex`.
+    pub names: BTreeSet<String>,
+    /// A macro whose body is not here declares or takes the type. Its
+    /// fields are unknown, so it counts as writable.
+    pub opaque: bool,
+}
+
+/// Collects the items declared in a function body, at any block depth. It
+/// does not enter an item, as `absorb_items` reads each one.
+#[derive(Default)]
+struct BodyItems(Vec<syn::Item>);
+
+impl<'ast> syn::visit::Visit<'ast> for BodyItems {
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        self.0.push(item.clone());
+    }
+
+    // A macro call in a statement can declare a type, as an item can.
+    fn visit_stmt_macro(&mut self, stmt: &'ast syn::StmtMacro) {
+        self.0.push(syn::Item::Macro(syn::ItemMacro {
+            attrs: stmt.attrs.clone(),
+            ident: None,
+            mac: stmt.mac.clone(),
+            semi_token: stmt.semi_token,
+        }));
+    }
+}
+
+/// Collects [`FieldFacts`] from field types.
+#[derive(Default)]
+struct FieldScan(FieldFacts);
+
+impl FieldFacts {
+    fn absorb(&mut self, other: &Self) {
+        self.mut_ref |= other.mut_ref;
+        self.opaque |= other.opaque;
+        self.lifetime |= other.lifetime;
+        self.names.extend(other.names.iter().cloned());
+    }
+
+    /// What a token stream can hold, read without its grammar. A `&mut` or
+    /// `*mut` writes. A lifetime that is not `'static` counts, shared or not.
+    fn of_tokens(tokens: TokenStream) -> Self {
+        let mut facts = Self::default();
+        let mut last = String::new();
+        for tree in tokens {
+            let text = match tree {
+                TokenTree::Group(group) => {
+                    facts.absorb(&Self::of_tokens(group.stream()));
+                    String::new()
+                }
+                TokenTree::Ident(ident) => {
+                    let text = ident.to_string();
+                    if text == "mut" && (last == "&" || last == "*") {
+                        facts.mut_ref = true;
+                    } else if last == "'" {
+                        facts.lifetime |= text != "static";
+                    } else {
+                        facts.names.insert(text.clone());
+                    }
+                    text
+                }
+                TokenTree::Punct(punct) => punct.as_char().to_string(),
+                TokenTree::Literal(_) => String::new(),
+            };
+            last = text;
+        }
+        facts
+    }
+}
+
+impl<'ast> syn::visit::Visit<'ast> for FieldScan {
+    fn visit_type_reference(&mut self, reference: &'ast syn::TypeReference) {
+        if reference.mutability.is_some() {
+            self.0.mut_ref = true;
+        }
+        // The lifetime of a shared reference cannot write. Skip it.
+        self.visit_type(&reference.elem);
+    }
+
+    fn visit_type_ptr(&mut self, pointer: &'ast syn::TypePtr) {
+        // A `*mut` pointer writes as a `&mut` reference does.
+        if pointer.mutability.is_some() {
+            self.0.mut_ref = true;
+        }
+        self.visit_type(&pointer.elem);
+    }
+
+    fn visit_lifetime(&mut self, lifetime: &'ast syn::Lifetime) {
+        if lifetime.ident != "static" {
+            self.0.lifetime = true;
+        }
+    }
+
+    fn visit_path_segment(&mut self, segment: &'ast syn::PathSegment) {
+        self.0.names.insert(segment.ident.to_string());
+        syn::visit::visit_path_segment(self, segment);
+    }
+}
+
 /// Source files indexed for impl-header, foreign-fn and generics lookups.
 #[derive(Debug, Default)]
 pub struct SourceIndex {
@@ -39,6 +149,30 @@ pub struct SourceIndex {
     pub foreign_fns: BTreeSet<String>,
     /// Function name → generic parameter names, in declaration order.
     pub fn_generics: BTreeMap<String, Vec<String>>,
+    /// Function name → each generic parameter name of every function of
+    /// that name. Two functions of one name keep both sets, so a parameter
+    /// is never hidden.
+    pub fn_generic_names: BTreeMap<String, BTreeSet<String>>,
+    /// The structs, enums, unions and type aliases the sources declare, each
+    /// by its module path and name, such as `helpers::Clock`.
+    ///
+    /// The module path comes from the file path and any inline `mod` around
+    /// the item. It is the full path from the target root, as MIR prints a
+    /// local type that it does not trim to its bare name.
+    pub type_paths: BTreeSet<String>,
+    /// The self type name of each `impl Future for T` in the sources, as
+    /// `T` with no generics.
+    pub future_impls: BTreeSet<String>,
+    /// Struct, enum and union name → what its field types hold. Two types of
+    /// one name share an entry, which can only add to it.
+    pub type_fields: BTreeMap<String, FieldFacts>,
+    /// Macro name → what its `macro_rules!` arms can hold.
+    macro_facts: BTreeMap<String, FieldFacts>,
+    /// The macros that declare a type by a metavariable, as `struct $name`.
+    named_by_caller: BTreeSet<String>,
+    /// Each macro call, by macro name, with the names it passes and the
+    /// names it can declare.
+    macro_calls: Vec<MacroCall>,
     /// Source file → why it could not be indexed.
     ///
     /// A file MIR named that the source roots could not produce, or that `syn`
@@ -65,7 +199,24 @@ impl SourceIndex {
                 }
             }
         }
-        for file in &expanded {
+        // A `mod x;` declaration names a file that MIR may never name, such as
+        // a file with types only. Each one read adds its own to the queue.
+        // Each entry carries its module path. A `#[path]` file has a path that
+        // does not give its module, so the declaring module gives it. MIR can
+        // name that file too, so a file is read once per module path.
+        // Each entry also carries the files that declare it, in order. A
+        // `#[path]` cycle returns to one of them, which ends it. There is no
+        // depth cap, so no deep module is skipped.
+        let mut queue: Vec<(String, Vec<String>, Vec<String>)> = expanded
+            .iter()
+            .map(|f| (f.clone(), file_module(f), Vec::new()))
+            .collect();
+        let mut seen: BTreeSet<(String, Vec<String>)> = queue
+            .iter()
+            .map(|(f, m, _)| (f.clone(), m.clone()))
+            .collect();
+        while let Some((file, module, mut declarers)) = queue.pop() {
+            let file = &file;
             let Some(text) = read_relative(roots, file) else {
                 // Only the files MIR *named* are worth reporting; the siblings
                 // are a best-effort widening and their absence means nothing.
@@ -77,17 +228,113 @@ impl SourceIndex {
                 }
                 continue;
             };
-            if !index.absorb_syn(&text) && files.contains(file) {
-                index.unreadable.insert(
-                    file.clone(),
-                    "the source file could not be parsed as Rust".to_string(),
-                );
+            match index.absorb_syn(&text, &module) {
+                Some(children) => {
+                    declarers.push(file.clone());
+                    for (child, path) in module_files(roots, file, &children) {
+                        // `#[path = "../x.rs"]` gives `a/../x.rs`. The cycle
+                        // check compares files, so the path must be normal.
+                        let child = normal_path(&child);
+                        let mut child_module = module.clone();
+                        child_module.extend(path);
+                        if !declarers.contains(&child)
+                            && seen.insert((child.clone(), child_module.clone()))
+                        {
+                            queue.push((child, child_module, declarers.clone()));
+                        }
+                    }
+                }
+                None if files.contains(file) => {
+                    index.unreadable.insert(
+                        file.clone(),
+                        "the source file could not be parsed as Rust".to_string(),
+                    );
+                }
+                None => {}
             }
             index
                 .files
                 .insert(file.clone(), text.lines().map(str::to_string).collect());
         }
+        index.expand_macros();
         index
+    }
+
+    /// Give each type that a macro call names what the macro can hold.
+    ///
+    /// The index does not expand a macro. A macro that takes the type name
+    /// as an argument can declare any name the call passes. So each such name
+    /// gets every fact of the macro. That can only add to a type.
+    ///
+    /// A macro with no definition here, as a dependency or procedural
+    /// macro, can declare any type. Each type its call declares, and each
+    /// bare type name it takes, is opaque. The std macros that declare no
+    /// type are exempt.
+    fn expand_macros(&mut self) {
+        for call in &self.macro_calls {
+            let Some(facts) = self.macro_facts.get(&call.name) else {
+                if !TYPE_FREE_MACROS.contains(&call.name.as_str()) {
+                    for name in &call.declares {
+                        self.type_fields.entry(name.clone()).or_default().opaque = true;
+                    }
+                }
+                continue;
+            };
+            if !self.named_by_caller.contains(&call.name) {
+                continue;
+            }
+            for name in &call.passed {
+                self.type_fields
+                    .entry(name.clone())
+                    .or_default()
+                    .absorb(facts);
+            }
+        }
+    }
+
+    /// Absorb a macro definition or a macro call at item position.
+    ///
+    /// Each `macro_rules!` arm body that parses as items is absorbed as
+    /// items. Another arm gives each type it names every fact of the macro.
+    /// A call records what it can declare, for [`Self::expand_macros`].
+    fn absorb_macro(&mut self, item: &syn::ItemMacro, module: &[String]) {
+        let tokens = &item.mac.tokens;
+        let Some(name) = item.mac.path.segments.last().map(|s| s.ident.to_string()) else {
+            return;
+        };
+        if name != "macro_rules" {
+            let mut declares = declared_names(tokens.clone());
+            declares.extend(bare_type_names(tokens.clone()));
+            self.macro_calls.push(MacroCall {
+                name,
+                passed: passed_names(tokens.clone()),
+                declares,
+            });
+            if let Ok(file) = syn::parse2::<syn::File>(tokens.clone()) {
+                self.absorb_items(&file.items, module);
+            }
+            return;
+        }
+        let Some(macro_name) = item.ident.as_ref().map(ToString::to_string) else {
+            return;
+        };
+        let facts = FieldFacts::of_tokens(tokens.clone());
+        for body in arm_bodies(tokens.clone()) {
+            if let Ok(file) = syn::parse2::<syn::File>(body.clone()) {
+                self.absorb_items(&file.items, module);
+                continue;
+            }
+            for declared in declared_names(body.clone()) {
+                self.type_fields.entry(declared).or_default().absorb(&facts);
+            }
+            if declares_by_metavariable(body) {
+                self.named_by_caller.insert(macro_name.clone());
+            }
+        }
+        self.macro_facts
+            .entry(macro_name)
+            .or_default()
+            .absorb(&facts);
     }
 
     /// The `impl` header whose `impl` keyword sits at `line`:`column` (both 1-based).
@@ -145,32 +392,110 @@ impl SourceIndex {
         })
     }
 
-    /// `false` when `syn` rejected the file (its `extern` blocks and generic
-    /// parameter lists are then invisible).
-    fn absorb_syn(&mut self, text: &str) -> bool {
-        let Ok(file) = syn::parse_file(text) else {
-            return false;
-        };
-        self.absorb_items(&file.items, 0);
-        true
+    /// `None` when `syn` rejected the file (its `extern` blocks and generic
+    /// parameter lists are then invisible). Otherwise each `mod x;` it
+    /// declares, as the path of inline modules around it and its name.
+    fn absorb_syn(&mut self, text: &str, module: &[String]) -> Option<Vec<Declared>> {
+        let file = syn::parse_file(text).ok()?;
+        self.absorb_items(&file.items, module);
+        let mut children = Vec::new();
+        declared_module_files(&file.items, &mut Vec::new(), &mut children);
+        Some(children)
     }
 
-    fn absorb_items(&mut self, items: &[syn::Item], depth: u32) {
-        if depth > 8 {
-            return;
+    /// Record what the field types of the type `name` hold.
+    fn scan_fields<'f>(&mut self, name: &syn::Ident, fields: impl Iterator<Item = &'f syn::Field>) {
+        self.scan_types(name, fields.map(|field| &field.ty));
+    }
+
+    /// Record what the types `types` of the type `name` hold.
+    fn scan_types<'t>(&mut self, name: &syn::Ident, types: impl Iterator<Item = &'t syn::Type>) {
+        let mut scan = FieldScan::default();
+        for ty in types {
+            syn::visit::Visit::visit_type(&mut scan, ty);
         }
+        let facts = self.type_fields.entry(name.to_string()).or_default();
+        facts.mut_ref |= scan.0.mut_ref;
+        facts.lifetime |= scan.0.lifetime;
+        facts.names.extend(scan.0.names);
+    }
+
+    /// Add the generic parameter names of the function `name`.
+    fn record_generics(&mut self, name: &syn::Ident, generics: &[String]) {
+        if !generics.is_empty() {
+            self.fn_generic_names
+                .entry(name.to_string())
+                .or_default()
+                .extend(generics.iter().cloned());
+        }
+    }
+
+    /// Do the sources declare a type whose last path segment is `name`?
+    #[must_use]
+    pub fn declares_type_named(&self, name: &str) -> bool {
+        self.type_paths
+            .iter()
+            .any(|path| path.rsplit("::").next() == Some(name))
+    }
+
+    /// Record the type `name`, declared in `module`.
+    fn declare(&mut self, module: &[String], name: &syn::Ident) {
+        let mut path = module.to_vec();
+        path.push(name.to_string());
+        self.type_paths.insert(path.join("::"));
+    }
+
+    /// Absorb the items declared in the body of the function `name`. A
+    /// workflow can declare a wrapper type there.
+    fn absorb_body(&mut self, block: &syn::Block, name: &syn::Ident, module: &[String]) {
+        let mut found = BodyItems::default();
+        syn::visit::Visit::visit_block(&mut found, block);
+        if !found.0.is_empty() {
+            let mut inner = module.to_vec();
+            inner.push(name.to_string());
+            self.absorb_items(&found.0, &inner);
+        }
+    }
+
+    /// Absorb `items`, declared in `module`. There is no depth cap, as a
+    /// skipped type would read as one that cannot write. The recursion is
+    /// as deep as the tree `syn` already parsed.
+    fn absorb_items(&mut self, items: &[syn::Item], module: &[String]) {
         for item in items {
             match item {
                 syn::Item::Fn(item) => {
                     let generics = generic_names(&item.sig.generics);
+                    self.record_generics(&item.sig.ident, &generics);
                     if !generics.is_empty() {
                         self.fn_generics
                             .insert(item.sig.ident.to_string(), generics);
                     }
+                    self.absorb_body(&item.block, &item.sig.ident, module);
+                }
+                syn::Item::Struct(item) => {
+                    self.declare(module, &item.ident);
+                    self.scan_fields(&item.ident, item.fields.iter());
+                }
+                syn::Item::Enum(item) => {
+                    self.declare(module, &item.ident);
+                    let fields = item.variants.iter().flat_map(|v| v.fields.iter());
+                    self.scan_fields(&item.ident, fields);
+                }
+                syn::Item::Union(item) => {
+                    self.declare(module, &item.ident);
+                    self.scan_fields(&item.ident, item.fields.named.iter());
+                }
+                syn::Item::Type(item) => {
+                    // A wrapper can reach interior-mutable state through an
+                    // alias, so the alias target counts as a field.
+                    self.declare(module, &item.ident);
+                    self.scan_types(&item.ident, std::iter::once(&*item.ty));
                 }
                 syn::Item::Mod(item) => {
                     if let Some((_, items)) = &item.content {
-                        self.absorb_items(items, depth.saturating_add(1));
+                        let mut inner = module.to_vec();
+                        inner.push(item.ident.to_string());
+                        self.absorb_items(items, &inner);
                     }
                 }
                 syn::Item::ForeignMod(item) => {
@@ -181,15 +506,41 @@ impl SourceIndex {
                     }
                 }
                 syn::Item::Impl(item) => {
+                    if let Some(name) = future_self_type(item) {
+                        self.future_impls.insert(name);
+                    }
                     for member in &item.items {
                         if let syn::ImplItem::Fn(f) = member {
                             let mut generics = generic_names(&item.generics);
                             generics.extend(generic_names(&f.sig.generics));
+                            self.record_generics(&f.sig.ident, &generics);
                             if !generics.is_empty() {
                                 self.fn_generics
                                     .entry(f.sig.ident.to_string())
                                     .or_insert(generics);
                             }
+                            self.absorb_body(&f.block, &f.sig.ident, module);
+                        }
+                        // An associated type is an alias. Its target counts as
+                        // a field, as a free alias target does.
+                        if let syn::ImplItem::Type(t) = member {
+                            self.scan_types(&t.ident, std::iter::once(&t.ty));
+                        }
+                    }
+                }
+                syn::Item::Macro(item) => self.absorb_macro(item, module),
+                syn::Item::Trait(item) => {
+                    // A default method body can declare a wrapper too. A
+                    // closure in it sees the trait and method generics.
+                    for member in &item.items {
+                        let syn::TraitItem::Fn(f) = member else {
+                            continue;
+                        };
+                        let mut generics = generic_names(&item.generics);
+                        generics.extend(generic_names(&f.sig.generics));
+                        self.record_generics(&f.sig.ident, &generics);
+                        if let Some(block) = &f.default {
+                            self.absorb_body(block, &f.sig.ident, module);
                         }
                     }
                 }
@@ -197,6 +548,173 @@ impl SourceIndex {
             }
         }
     }
+}
+
+/// One macro call at item or statement position.
+#[derive(Debug)]
+struct MacroCall {
+    /// The last segment of the macro path, as `wrapper` in `dep::wrapper!`.
+    name: String,
+    /// Each name the call passes, at any depth.
+    passed: BTreeSet<String>,
+    /// Each name the call can declare when the macro body is not here.
+    declares: BTreeSet<String>,
+}
+
+/// The std and logging macros that never declare a type.
+const TYPE_FREE_MACROS: [&str; 38] = [
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "cfg",
+    "column",
+    "compile_error",
+    "concat",
+    "dbg",
+    "debug",
+    "debug_assert",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "env",
+    "eprint",
+    "eprintln",
+    "error",
+    "file",
+    "format",
+    "format_args",
+    "include_bytes",
+    "include_str",
+    "info",
+    "join",
+    "line",
+    "matches",
+    "module_path",
+    "option_env",
+    "panic",
+    "pin",
+    "print",
+    "println",
+    "stringify",
+    "todo",
+    "trace",
+    "unimplemented",
+    "unreachable",
+    "vec",
+    "warn",
+];
+
+/// Each capitalized name that stands alone in a macro call, as `Shared` in
+/// `wrapper!(Shared, u64)`. A path part, a generic type, a call or a
+/// struct literal does not count.
+fn bare_type_names(tokens: TokenStream) -> BTreeSet<String> {
+    let trees: Vec<TokenTree> = tokens.into_iter().collect();
+    let mut names = BTreeSet::new();
+    for (at, tree) in trees.iter().enumerate() {
+        match tree {
+            TokenTree::Group(group) => names.extend(bare_type_names(group.stream())),
+            TokenTree::Ident(ident) => {
+                let text = ident.to_string();
+                let after_colon = at
+                    .checked_sub(1)
+                    .and_then(|before| trees.get(before))
+                    .is_some_and(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ':'));
+                let joined = match trees.get(at.saturating_add(1)) {
+                    Some(TokenTree::Punct(p)) => matches!(p.as_char(), '<' | ':' | '!'),
+                    Some(TokenTree::Group(_)) => true,
+                    _ => false,
+                };
+                if text.starts_with(|c: char| c.is_ascii_uppercase()) && !after_colon && !joined {
+                    names.insert(text);
+                }
+            }
+            TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+        }
+    }
+    names
+}
+
+/// The body of each `macro_rules!` arm, as `{ ... }` in `() => { ... };`.
+fn arm_bodies(tokens: TokenStream) -> Vec<TokenStream> {
+    let mut bodies = Vec::new();
+    let mut arrow = false;
+    let mut last = ' ';
+    for tree in tokens {
+        match tree {
+            TokenTree::Group(group) if arrow => {
+                bodies.push(group.stream());
+                arrow = false;
+            }
+            TokenTree::Punct(punct) => {
+                arrow = last == '=' && punct.as_char() == '>';
+                last = punct.as_char();
+            }
+            _ => last = ' ',
+        }
+    }
+    bodies
+}
+
+/// The keywords that declare a type.
+const TYPE_KEYWORDS: [&str; 4] = ["struct", "enum", "union", "type"];
+
+/// Each name that follows `struct`, `enum`, `union` or `type`, at any depth.
+fn declared_names(tokens: TokenStream) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    let mut keyword = false;
+    for tree in tokens {
+        match tree {
+            TokenTree::Ident(ident) => {
+                let text = ident.to_string();
+                if keyword {
+                    names.insert(text.clone());
+                }
+                keyword = TYPE_KEYWORDS.contains(&text.as_str());
+            }
+            TokenTree::Group(group) => {
+                names.extend(declared_names(group.stream()));
+                keyword = false;
+            }
+            _ => keyword = false,
+        }
+    }
+    names
+}
+
+/// Does a type keyword take a metavariable, as `struct $name`?
+fn declares_by_metavariable(tokens: TokenStream) -> bool {
+    let mut keyword = false;
+    for tree in tokens {
+        match tree {
+            TokenTree::Punct(punct) if keyword && punct.as_char() == '$' => return true,
+            TokenTree::Ident(ident) => {
+                keyword = TYPE_KEYWORDS.contains(&ident.to_string().as_str());
+            }
+            TokenTree::Group(group) => {
+                if declares_by_metavariable(group.stream()) {
+                    return true;
+                }
+                keyword = false;
+            }
+            TokenTree::Punct(_) | TokenTree::Literal(_) => keyword = false,
+        }
+    }
+    false
+}
+
+/// Each name a macro call passes, at any depth. A path such as `std::Arc`
+/// adds each of its parts.
+fn passed_names(tokens: TokenStream) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for tree in tokens {
+        match tree {
+            TokenTree::Ident(ident) => {
+                names.insert(ident.to_string());
+            }
+            TokenTree::Group(group) => names.extend(passed_names(group.stream())),
+            TokenTree::Punct(_) | TokenTree::Literal(_) => {}
+        }
+    }
+    names
 }
 
 fn generic_names(generics: &syn::Generics) -> Vec<String> {
@@ -209,6 +727,199 @@ fn generic_names(generics: &syn::Generics) -> Vec<String> {
             syn::GenericParam::Lifetime(_) => None,
         })
         .collect()
+}
+
+/// The self type name of an `impl Future for T` block, with no generics.
+/// An impl for a shared reference, `&T`, gives `&T`.
+fn future_self_type(item: &syn::ItemImpl) -> Option<String> {
+    let (_, trait_path, _) = item.trait_.as_ref()?;
+    if trait_path.segments.last()?.ident != "Future" {
+        return None;
+    }
+    // Each shared reference layer stays, as `&&T` for `&&T`.
+    let mut prefix = String::new();
+    let mut self_ty = item.self_ty.as_ref();
+    while let syn::Type::Reference(r) = self_ty
+        && r.mutability.is_none()
+    {
+        prefix.push('&');
+        self_ty = r.elem.as_ref();
+    }
+    let syn::Type::Path(self_ty) = self_ty else {
+        return None;
+    };
+    Some(format!("{prefix}{}", self_ty.path.segments.last()?.ident))
+}
+
+/// `path` with each `.` dropped and each `..` folded into its parent, as
+/// `src/x.rs` for `src/a/../x.rs`. A `..` with no parent stays.
+fn normal_path(path: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "." | "" => {}
+            ".." if parts.last().is_some_and(|last| *last != "..") => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    parts.join("/")
+}
+
+/// Each `mod x;` in `items`, as the path of inline modules around it and its
+/// name. A `mod x { .. }` with a body adds its name to the path.
+fn declared_module_files(items: &[syn::Item], path: &mut Vec<String>, out: &mut Vec<Declared>) {
+    for item in items {
+        let syn::Item::Mod(item) = item else {
+            continue;
+        };
+        path.push(item.ident.to_string());
+        match &item.content {
+            Some((_, inner)) => declared_module_files(inner, path, out),
+            None => out.push(Declared {
+                path: path.clone(),
+                file: path_attribute(&item.attrs),
+            }),
+        }
+        path.pop();
+    }
+}
+
+/// A body-less `mod x;` declaration.
+struct Declared {
+    /// The module path below the declaring file, inline modules included.
+    path: Vec<String>,
+    /// The `#[path = "..."]` value, when the declaration has one.
+    file: Option<String>,
+}
+
+/// The value of a `#[path = "..."]` attribute.
+fn path_attribute(attrs: &[syn::Attribute]) -> Option<String> {
+    attrs.iter().find_map(|attr| {
+        let syn::Meta::NameValue(meta) = &attr.meta else {
+            return None;
+        };
+        let syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Str(value),
+            ..
+        }) = &meta.value
+        else {
+            return None;
+        };
+        meta.path.is_ident("path").then(|| value.value())
+    })
+}
+
+/// The files of the modules `children` that `file` declares and that exist.
+///
+/// A target root and a `mod.rs` hold their modules in their own directory.
+/// Any other file holds them in a directory named after it, as rustc reads
+/// `src/a.rs` then `src/a/b.rs`. Each module is `x.rs` or `x/mod.rs`. In an
+/// unknown layout the file can be either kind, so both directories are read.
+/// An extra file only adds to the index.
+///
+/// A `#[path]` value replaces the `x.rs` name. At the top of a file it is
+/// relative to the directory of that file, as rustc reads it.
+fn module_files(
+    roots: &[PathBuf],
+    file: &str,
+    children: &[Declared],
+) -> Vec<(String, Vec<String>)> {
+    let path = Path::new(file);
+    let Some(parent) = path.parent() else {
+        return Vec::new();
+    };
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let bases = if matches!(stem, "mod" | "lib" | "main") {
+        vec![parent.to_path_buf()]
+    } else if layout_module(&file_parts(file)).is_empty() {
+        vec![parent.join(stem), parent.to_path_buf()]
+    } else {
+        vec![parent.join(stem)]
+    };
+    let mut out = Vec::new();
+    for child in children {
+        let Some((name, inline)) = child.path.split_last() else {
+            continue;
+        };
+        let top = [parent.to_path_buf()];
+        let bases = match &child.file {
+            Some(_) if inline.is_empty() => &top[..],
+            _ => &bases[..],
+        };
+        for base in bases {
+            let dir = inline.iter().fold(base.clone(), |dir, part| dir.join(part));
+            let candidates = child.file.as_ref().map_or_else(
+                || {
+                    vec![
+                        dir.join(format!("{name}.rs")),
+                        dir.join(name).join("mod.rs"),
+                    ]
+                },
+                |named| vec![dir.join(named)],
+            );
+            for candidate in candidates {
+                let candidate = candidate.to_string_lossy().into_owned();
+                if read_relative(roots, &candidate).is_some() {
+                    out.push((candidate, child.path.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The module path a source file stands for, from its path.
+///
+/// `src/a/b.rs` and `src/a/b/mod.rs` give `a::b`. A target root, such as
+/// `src/lib.rs`, `src/bin/x.rs` or `examples/x.rs`, gives no segment. A file
+/// in another layout reads as a target root. A type of a submodule there
+/// then reads as foreign, which can only add a boundary.
+fn file_module(file: &str) -> Vec<String> {
+    let parts = file_parts(file);
+    let mut module: Vec<String> = layout_module(&parts)
+        .iter()
+        .map(|p| (*p).to_string())
+        .collect();
+    if module
+        .last()
+        .is_some_and(|p| matches!(p.as_str(), "mod" | "lib" | "main"))
+    {
+        module.pop();
+    }
+    module
+}
+
+/// The `/` parts of a source path, with no `.rs`.
+fn file_parts(file: &str) -> Vec<&str> {
+    file.trim_end_matches(".rs")
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// The parts of a source path below its target root.
+fn layout_module<'p>(parts: &'p [&'p str]) -> &'p [&'p str] {
+    // `x.rs` and `x/main.rs` are the root of target `x`. `x/y.rs` is `y`.
+    let below_target = |rest: &'p [&'p str]| rest.get(1..).unwrap_or_default();
+    if let Some(at) = parts.iter().rposition(|p| *p == "src") {
+        let rest = parts.get(at.saturating_add(1)..).unwrap_or_default();
+        if rest.first() == Some(&"bin") {
+            return below_target(rest.get(1..).unwrap_or_default());
+        }
+        return rest;
+    }
+    if let Some(at) = parts
+        .iter()
+        .rposition(|p| matches!(*p, "examples" | "tests" | "benches"))
+    {
+        return below_target(parts.get(at.saturating_add(1)..).unwrap_or_default());
+    }
+    &[]
 }
 
 /// Every `.rs` file directly under `dir` (relative to whichever root holds it).
@@ -344,7 +1055,296 @@ fn generic_param_name(param: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_file_path_gives_its_module_path() {
+        let none = Vec::<String>::new();
+        assert_eq!(super::file_module("src/lib.rs"), none);
+        assert_eq!(super::file_module("src/a/b.rs"), ["a", "b"]);
+        assert_eq!(super::file_module("crates/x/src/a/mod.rs"), ["a"]);
+        assert_eq!(super::file_module("src/bin/tool.rs"), none);
+        assert_eq!(super::file_module("src/bin/tool/main.rs"), none);
+        assert_eq!(super::file_module("src/bin/tool/cli.rs"), ["cli"]);
+        assert_eq!(
+            super::file_module("autumn-harvest/examples/ctx_info.rs"),
+            none
+        );
+        assert_eq!(super::file_module("examples/demo/flows.rs"), ["flows"]);
+        assert_eq!(super::file_module("flow.rs"), none);
+    }
+
     use super::*;
+
+    #[test]
+    fn a_module_file_named_by_a_path_attribute_is_indexed() {
+        // `#[path]` moves the file away from `state.rs`. Its types must be
+        // indexed, or a capture of them reads as read-only.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let write = |file: &str, text: &str| {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, text).expect("write");
+        };
+        write(
+            "src/lib.rs",
+            "#[path = \"types/state.rs\"]\nmod state;\nmod outer { #[path = \"inner.rs\"] mod inner; }\n",
+        );
+        write(
+            "src/types/state.rs",
+            "pub struct Shared(std::sync::Arc<std::sync::Mutex<u64>>);\n",
+        );
+        write(
+            "src/outer/inner.rs",
+            "pub struct Deep(std::cell::Cell<u64>);\n",
+        );
+        let files = BTreeSet::from(["src/lib.rs".to_string()]);
+        let index = SourceIndex::build(&[dir.path().to_path_buf()], &files);
+        assert!(index.type_fields.contains_key("Shared"), "{index:?}");
+        assert!(index.type_paths.contains("state::Shared"), "{index:?}");
+        assert!(index.type_paths.contains("outer::inner::Deep"), "{index:?}");
+    }
+
+    #[test]
+    fn a_path_is_made_normal() {
+        assert_eq!(normal_path("src/a/../x.rs"), "src/x.rs");
+        assert_eq!(normal_path("src/./a/b/../../x.rs"), "src/x.rs");
+        assert_eq!(normal_path("../x.rs"), "../x.rs");
+    }
+
+    #[test]
+    fn a_deep_module_chain_is_indexed_and_a_path_cycle_ends() {
+        // Twenty nested module files, then a `#[path]` cycle back to the
+        // file that declares the last one. The deep type is indexed and the
+        // build ends.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let write = |file: &str, text: &str| {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, text).expect("write");
+        };
+        let depth = 20;
+        let mut file = "src/lib.rs".to_string();
+        for _ in 0..depth {
+            write(&file, "mod m;\n");
+            let dir_of = file.trim_end_matches("lib.rs").trim_end_matches(".rs");
+            file = format!("{}/m.rs", dir_of.trim_end_matches('/'));
+        }
+        write(
+            &file,
+            "pub struct Deep(std::sync::Arc<std::sync::Mutex<u64>>);\n\
+             #[path = \"../m.rs\"]\nmod back;\n",
+        );
+        let files = BTreeSet::from(["src/lib.rs".to_string()]);
+        let index = SourceIndex::build(&[dir.path().to_path_buf()], &files);
+        let names = index.type_fields.get("Deep").map(|f| f.names.clone());
+        assert!(names.is_some_and(|n| n.contains("Mutex")), "{index:?}");
+    }
+
+    #[test]
+    fn a_path_attribute_file_that_mir_names_gets_its_declared_module() {
+        // MIR names the moved file too, so it is seen first by its own path.
+        // Its declared module path must still be indexed.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let write = |file: &str, text: &str| {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+            std::fs::write(path, text).expect("write");
+        };
+        write("src/lib.rs", "#[path = \"types/state.rs\"]\nmod state;\n");
+        write("src/types/state.rs", "pub struct Shared(u64);\n");
+        // A file that declares itself must not loop.
+        write("src/again.rs", "#[path = \"again.rs\"]\nmod again;\n");
+        let files = BTreeSet::from([
+            "src/lib.rs".to_string(),
+            "src/types/state.rs".to_string(),
+            "src/again.rs".to_string(),
+        ]);
+        let index = SourceIndex::build(&[dir.path().to_path_buf()], &files);
+        assert!(index.type_paths.contains("state::Shared"), "{index:?}");
+    }
+
+    #[test]
+    fn a_type_declared_inside_a_function_is_indexed() {
+        // A workflow can declare its wrapper in its own body.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "fn wf() { struct Shared(std::sync::Arc<std::sync::Mutex<u64>>); }\n\
+             impl Ctx { fn run(&self) { struct Inner(std::cell::Cell<u8>); } }\n",
+            &[],
+        );
+        let names = |ty: &str| index.type_fields.get(ty).map(|f| f.names.clone());
+        assert!(
+            names("Shared").is_some_and(|n| n.contains("Mutex")),
+            "{index:?}"
+        );
+        assert!(
+            names("Inner").is_some_and(|n| n.contains("Cell")),
+            "{index:?}"
+        );
+        assert!(index.type_paths.contains("wf::Shared"), "{index:?}");
+    }
+
+    #[test]
+    fn an_associated_type_records_what_its_target_holds() {
+        // `<Tag as Family>::Shared` names the associated type `Shared`.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "impl Family for Tag { type Shared = std::sync::Arc<std::sync::Mutex<u64>>; }\n\
+             struct Wrapper(<Tag as Family>::Shared);\n",
+            &[],
+        );
+        let names = |ty: &str| index.type_fields.get(ty).map(|f| f.names.clone());
+        assert!(
+            names("Wrapper").is_some_and(|n| n.contains("Shared")),
+            "{index:?}"
+        );
+        assert!(
+            names("Shared").is_some_and(|n| n.contains("Mutex")),
+            "{index:?}"
+        );
+    }
+
+    #[test]
+    fn a_type_alias_records_what_its_target_holds() {
+        // `Wrapper` reaches the mutex through the alias `Shared`. The
+        // writable fixpoint needs the alias target to see that.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "type Shared = std::sync::Arc<std::sync::Mutex<u64>>;\nstruct Wrapper(Shared);\n",
+            &[],
+        );
+        let names = |ty: &str| index.type_fields.get(ty).map(|f| f.names.clone());
+        assert!(
+            names("Wrapper").is_some_and(|n| n.contains("Shared")),
+            "{index:?}"
+        );
+        assert!(
+            names("Shared").is_some_and(|n| n.contains("Mutex")),
+            "{index:?}"
+        );
+    }
+
+    #[test]
+    fn a_type_that_a_macro_declares_records_what_it_holds() {
+        // A macro arm can name the type, or take the name as an argument.
+        // Both macros run inside a function too.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "macro_rules! shared { () => { struct Shared(Arc<Mutex<u64>>); }; }\n\
+             macro_rules! named { ($name:ident) => { struct $name(Arc<Mutex<u64>>); }; }\n\
+             macro_rules! plain { ($name:ident) => { struct $name(u64); }; }\n\
+             shared!();\n\
+             named!(Named);\n\
+             plain!(Plain);\n\
+             fn wf() {\n\
+                 macro_rules! inner { ($n:ident) => { struct $n(Cell<u8>); }; }\n\
+                 inner!(Inner);\n\
+             }\n",
+            &[],
+        );
+        index.expand_macros();
+        let names = |ty: &str| index.type_fields.get(ty).map(|f| f.names.clone());
+        for (ty, held) in [("Shared", "Mutex"), ("Named", "Mutex"), ("Inner", "Cell")] {
+            assert!(
+                names(ty).is_some_and(|n| n.contains(held)),
+                "{ty}: {index:?}"
+            );
+        }
+        assert!(
+            !names("Plain").is_some_and(|n| n.contains("Mutex")),
+            "{index:?}"
+        );
+    }
+
+    #[test]
+    fn a_future_impl_for_a_reference_keeps_each_layer() {
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "impl Future for &Tick {}\nimpl Future for &&Tock {}\nimpl Future for Tuck {}\n",
+            &[],
+        );
+        for name in ["&Tick", "&&Tock", "Tuck"] {
+            assert!(index.future_impls.contains(name), "{name}: {index:?}");
+        }
+    }
+
+    #[test]
+    fn a_type_that_an_unseen_macro_makes_counts_as_opaque() {
+        // A dependency or procedural macro has no body here. A type it
+        // declares, or a bare name it takes, can hold anything.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "dep::wrapper!(Shared, u64);\n\
+             bitflags! { struct Flags: u32 { const A = 1; } }\n\
+             fn wf() { println!(\"{}\", Order::new()); make!(Inner); }\n",
+            &[],
+        );
+        index.expand_macros();
+        let opaque = |ty: &str| index.type_fields.get(ty).is_some_and(|f| f.opaque);
+        for ty in ["Shared", "Flags", "Inner"] {
+            assert!(opaque(ty), "{ty}: {index:?}");
+        }
+        // A std macro declares no type, and a path is not a bare name.
+        assert!(!opaque("Order"), "{index:?}");
+    }
+
+    #[test]
+    fn a_type_in_a_default_trait_method_is_indexed() {
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "trait Run { fn run(&self) { struct Shared(Arc<Mutex<u64>>); } }\n",
+            &[],
+        );
+        let names = index.type_fields.get("Shared").map(|f| f.names.clone());
+        assert!(names.is_some_and(|n| n.contains("Mutex")), "{index:?}");
+    }
+
+    #[test]
+    fn a_default_trait_method_records_its_generics() {
+        // A closure in the default body can return either parameter.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "trait Run<Ctx> { fn run<StepFuture>(&self, f: StepFuture) {} }\n",
+            &[],
+        );
+        let names = index
+            .fn_generic_names
+            .get("run")
+            .cloned()
+            .unwrap_or_default();
+        for name in ["Ctx", "StepFuture"] {
+            assert!(names.contains(name), "{name}: {index:?}");
+        }
+    }
+
+    #[test]
+    fn a_deeply_nested_type_is_indexed() {
+        // The index has no depth cap, so a deep type is never skipped.
+        let depth = 20;
+        let text = format!(
+            "{}struct Deep(Arc<Mutex<u64>>);{}",
+            "mod m { ".repeat(depth),
+            " }".repeat(depth)
+        );
+        let mut index = SourceIndex::default();
+        index.absorb_syn(&text, &[]);
+        let names = index.type_fields.get("Deep").map(|f| f.names.clone());
+        assert!(names.is_some_and(|n| n.contains("Mutex")), "{index:?}");
+    }
+
+    #[test]
+    fn a_raw_mut_pointer_field_can_write() {
+        // `*mut` writes as `&mut` does. A `*const` field cannot write.
+        let mut index = SourceIndex::default();
+        index.absorb_syn(
+            "struct Ptr(*mut u64);\nstruct Step(Ptr);\nstruct Read(*const u64);\n",
+            &[],
+        );
+        let facts = |ty: &str| index.type_fields.get(ty).cloned().unwrap_or_default();
+        assert!(facts("Ptr").mut_ref, "{index:?}");
+        assert!(facts("Step").names.contains("Ptr"), "{index:?}");
+        assert!(!facts("Read").mut_ref, "{index:?}");
+    }
 
     #[test]
     fn a_trait_impl_header_is_split_into_trait_and_self_type() {

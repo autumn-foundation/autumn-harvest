@@ -202,6 +202,8 @@ fn slow_activity_info() -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: slow_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -454,6 +456,7 @@ fn start_workflow<'a>(
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     }
 }

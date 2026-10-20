@@ -108,6 +108,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             notification_database_url: None,
             max_concurrent_workflows: 10,
             max_concurrent_activities: 20,
+            max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
             poll_interval: Duration::from_millis(50),
             shutdown_timeout: Duration::from_secs(2),
             cancellation_grace_period: Duration::from_secs(2),
@@ -134,6 +135,7 @@ fn make_worker(registry: Arc<HandlerRegistry>) -> Worker {
             sharded_pool: None,
             slot_tuner: None,
             max_concurrent_sessions: 0,
+            fairness_keys: false,
         },
         registry,
     )
@@ -185,6 +187,7 @@ async fn start(conn: &mut AsyncPgConnection, name: &str, id: &str) -> ExecutionI
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -1329,6 +1332,8 @@ async fn retry_path_requeues_when_a_concurrent_resume_shifted_the_deadline() {
             max_result_bytes: None,
             requires: None,
             handler: deadline_shifting_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
     let worker = Arc::new(make_worker(registry));
@@ -1587,6 +1592,8 @@ async fn retry_path_requeues_when_a_concurrent_pause_committed_after_the_gate() 
             max_result_bytes: None,
             requires: None,
             handler: self_pausing_activity,
+            input_schema: None,
+            output_schema: None,
         }],
     ));
     let worker = Arc::new(make_worker(registry));

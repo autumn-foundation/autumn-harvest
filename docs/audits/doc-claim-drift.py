@@ -130,6 +130,26 @@ STALE_CLAIMS = [
         r"No\s+cell\s+on\s+this\s+page\s+claims\s+a\s+throughput\s+or\s+latency\s+comparison",
         "assay #14 reran the comparison on 0.7.0 (issue #1972)",
     ),
+    (
+        "README.md",
+        r"The\s+SQLite\s+backend\s+does\s+not\.",
+        "the SQLite backend enforces both history caps (issue #2023)",
+    ),
+    (
+        "autumn-harvest-sqlite/README.md",
+        r"search\s+attributes,\s+and\s+`continue_as_new`",
+        "the SQLite backend supports continue_as_new (issue #2023)",
+    ),
+    (
+        "docs/rnd/sqlite-feasibility.md",
+        r"local\s+and\s+external\s+activities,\s+cancellable\s+timers",
+        "the SQLite backend runs local activities and cancellable timers (issue #2029)",
+    ),
+    (
+        "autumn-harvest-sqlite/README.md",
+        r"external\s+signals/cancels,\s+local\s+activities",
+        "the SQLite backend runs local activities (issue #2029)",
+    ),
 ]
 
 

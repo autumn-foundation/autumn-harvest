@@ -820,6 +820,8 @@ mod db_tests {
                 max_result_bytes: None,
                 requires: None,
                 handler: pipeline_step_activity,
+                input_schema: None,
+                output_schema: None,
             }],
         ));
 
@@ -836,6 +838,8 @@ mod db_tests {
                         notification_database_url: None,
                         max_concurrent_workflows: 2,
                         max_concurrent_activities: 2,
+                        max_concurrent_claims:
+                            autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                         poll_interval: Duration::from_millis(25),
                         shutdown_timeout: Duration::from_secs(1),
                         cancellation_grace_period: Duration::from_secs(1),
@@ -865,6 +869,7 @@ mod db_tests {
                         // this test is that whichever wins hosts *all* of
                         // the pipeline's member activities.
                         max_concurrent_sessions: 1,
+                        fairness_keys: false,
                     },
                     registry.clone(),
                 )
@@ -910,6 +915,228 @@ mod db_tests {
         assert!(
             worker_ids.iter().all(|w| *w == first),
             "every session member activity must share the same worker_id, got {worker_ids:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Drop release waits for live members (issue #2193)
+    // -----------------------------------------------------------------------
+
+    const DROP_RELEASE: &str = "__harvest_session_drop_release";
+    const COMPLETE_RELEASE: &str = "__harvest_session_release";
+
+    /// An engine pool on the test database, for the release handler.
+    async fn release_pool(container: &ContainerAsync<Postgres>) -> autumn_harvest::worker::DbPool {
+        let host = container.get_host().await.expect("host");
+        let port = container.get_host_port_ipv4(5432).await.expect("port");
+        autumn_harvest::pool::engine_pool(
+            format!("postgres://postgres:postgres@{host}:{port}/postgres"),
+            2,
+            autumn_harvest::pool::DbRole::Hot,
+            &autumn_harvest::pool::EngineDbTimeouts::default(),
+        )
+        .expect("engine pool")
+    }
+
+    /// An `ACTIVE` session that `w-1` hosts.
+    async fn host_session(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+    ) -> autumn_harvest::types::SessionId {
+        diesel::sql_query(
+            "INSERT INTO harvest_workers \
+             (worker_id, queues, shard_assignments, max_concurrency, in_flight_count, \
+              status, last_heartbeat_at, started_at, host) \
+             VALUES ('w-1', '[]'::jsonb, '[9999]'::jsonb, 1, 0, 'Active', \
+                     NOW() + INTERVAL '1 hour', NOW(), 'worker-session-test') \
+             ON CONFLICT (worker_id) DO NOTHING",
+        )
+        .execute(conn)
+        .await
+        .expect("register the host worker");
+        let session_id = autumn_harvest::types::SessionId::new();
+        autumn_harvest::sessions::record_session_acquired(
+            conn,
+            session_id,
+            exec_id,
+            "w-1",
+            "default",
+            chrono::Utc::now() + chrono::Duration::minutes(5),
+        )
+        .await
+        .expect("record the session");
+        session_id
+    }
+
+    /// A member task of the session, pinned to `w-1`, in `state`.
+    async fn seed_member(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        session_id: autumn_harvest::types::SessionId,
+        state: &str,
+    ) -> Uuid {
+        let mut params = EnqueueParams::new("default", TaskType::Activity, serde_json::json!({}));
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        params.activity_name = Some("member".to_string());
+        let params = params
+            .with_session_id(session_id.as_uuid())
+            .with_sticky("w-1", Duration::from_secs(3600));
+        let task_id = queue::enqueue(conn, &params)
+            .await
+            .expect("enqueue the member");
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET state = $2, \
+             worker_id = CASE WHEN $2 = 'RUNNING' THEN 'w-1' END, \
+             attempt = CASE WHEN $2 = 'RUNNING' THEN 1 ELSE attempt END, \
+             started_at = CASE WHEN $2 = 'RUNNING' THEN NOW() END \
+             WHERE id = $1",
+        )
+        .bind::<SqlUuid, _>(task_id)
+        .bind::<Text, _>(state)
+        .execute(conn)
+        .await
+        .expect("set the member state");
+        task_id
+    }
+
+    /// A release task for `session_id` that `w-1` has claimed, with the
+    /// history events a finalize needs.
+    async fn claimed_release(
+        conn: &mut AsyncPgConnection,
+        exec_id: ExecutionId,
+        session_id: autumn_harvest::types::SessionId,
+        name: &str,
+    ) -> autumn_harvest::models::TaskQueueItem {
+        use autumn_harvest::event::WorkflowEvent;
+        use autumn_harvest::models::TaskQueueItem;
+        use autumn_harvest::schema::harvest_task_queue;
+        use autumn_harvest::types::{ActivityExecId, WorkerId};
+        use diesel::{QueryDsl, SelectableHelper};
+
+        let activity_id = ActivityExecId::from_uuid(Uuid::new_v4());
+        autumn_harvest::store::append_events(
+            conn,
+            exec_id,
+            &[
+                WorkflowEvent::ActivityScheduled {
+                    activity_id,
+                    name: name.to_owned(),
+                    input: serde_json::json!(session_id.to_string()),
+                    queue: "default".to_owned(),
+                },
+                WorkflowEvent::ActivityStarted {
+                    activity_id,
+                    worker_id: WorkerId::new("w-1"),
+                },
+            ],
+            1,
+        )
+        .await
+        .expect("schedule and start the release");
+        let mut params = EnqueueParams::new(
+            "default",
+            TaskType::Activity,
+            serde_json::json!(session_id.to_string()),
+        );
+        params.workflow_exec_id = Some(exec_id.as_uuid());
+        params.activity_id = Some(activity_id.as_uuid());
+        params.activity_name = Some(name.to_owned());
+        let params = params
+            .with_session_id(session_id.as_uuid())
+            .with_sticky("w-1", Duration::from_secs(3600));
+        let task_id = queue::enqueue(conn, &params)
+            .await
+            .expect("enqueue the release");
+        diesel::sql_query(
+            "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'w-1', \
+             attempt = 1, started_at = NOW() WHERE id = $1",
+        )
+        .bind::<SqlUuid, _>(task_id)
+        .execute(conn)
+        .await
+        .expect("model the claim");
+        harvest_task_queue::table
+            .find(task_id)
+            .select(TaskQueueItem::as_select())
+            .first(conn)
+            .await
+            .expect("load the claim")
+    }
+
+    /// A dropped owner can leave a member task of the session queued or
+    /// running. The release must not free the slot while that member can
+    /// still run. It goes back to `PENDING` and leaves the session `ACTIVE`.
+    #[tokio::test]
+    async fn a_drop_release_waits_for_a_live_member_of_its_session() {
+        let (mut conn, container) = setup().await;
+        let pool = release_pool(&container).await;
+        for member_state in ["PENDING", "RUNNING"] {
+            let exec_id = insert_execution(&mut conn).await;
+            let session_id = host_session(&mut conn, exec_id).await;
+            seed_member(&mut conn, exec_id, session_id, member_state).await;
+            let release = claimed_release(&mut conn, exec_id, session_id, DROP_RELEASE).await;
+
+            autumn_harvest::worker::handle_session_release_for_test(
+                &pool, &release, "w-1", exec_id,
+            )
+            .await
+            .expect("the release defers without an error");
+
+            assert_eq!(
+                task_state(&mut conn, release.id).await,
+                "PENDING",
+                "a {member_state} member: the release goes back to the queue"
+            );
+            assert_eq!(
+                session_state(&mut conn, session_id.as_uuid()).await,
+                "ACTIVE",
+                "a {member_state} member: the session keeps its slot"
+            );
+        }
+    }
+
+    /// A member that has settled holds nothing. The release then frees the
+    /// session, as before.
+    #[tokio::test]
+    async fn a_drop_release_proceeds_when_every_member_has_settled() {
+        let (mut conn, container) = setup().await;
+        let pool = release_pool(&container).await;
+        let exec_id = insert_execution(&mut conn).await;
+        let session_id = host_session(&mut conn, exec_id).await;
+        for member_state in ["COMPLETED", "FAILED", "CANCELLED"] {
+            seed_member(&mut conn, exec_id, session_id, member_state).await;
+        }
+        let release = claimed_release(&mut conn, exec_id, session_id, DROP_RELEASE).await;
+
+        autumn_harvest::worker::handle_session_release_for_test(&pool, &release, "w-1", exec_id)
+            .await
+            .expect("the release runs");
+
+        assert_eq!(
+            session_state(&mut conn, session_id.as_uuid()).await,
+            "COMPLETED"
+        );
+        assert_eq!(task_state(&mut conn, release.id).await, "COMPLETED");
+    }
+
+    /// Only the drop release waits. The release that `complete()` awaits keeps
+    /// its behavior, so this change adds no wait to an explicit release.
+    #[tokio::test]
+    async fn an_explicit_release_does_not_wait_for_a_live_member() {
+        let (mut conn, container) = setup().await;
+        let pool = release_pool(&container).await;
+        let exec_id = insert_execution(&mut conn).await;
+        let session_id = host_session(&mut conn, exec_id).await;
+        seed_member(&mut conn, exec_id, session_id, "PENDING").await;
+        let release = claimed_release(&mut conn, exec_id, session_id, COMPLETE_RELEASE).await;
+
+        autumn_harvest::worker::handle_session_release_for_test(&pool, &release, "w-1", exec_id)
+            .await
+            .expect("the release runs");
+
+        assert_eq!(
+            session_state(&mut conn, session_id.as_uuid()).await,
+            "COMPLETED"
         );
     }
 }

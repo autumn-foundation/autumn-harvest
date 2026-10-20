@@ -1725,7 +1725,7 @@
               }
             }
           ],
-          "description": "Fresh workflow starts rejected because a resolved per-tenant quota key was at or over its declared active-executions, history-bytes, or dead-letters cap (issue #946). Per-key usage-vs-limit is visible at GET /api/harvest/admin/quotas."
+          "description": "Fresh workflow starts rejected because a resolved per-tenant quota key was at or over its declared active-executions, history-bytes, or dead-letters cap (issue #946). It also counts LLM steps that an LLM budget refused, under the run_llm_* and tenant_llm_* resources (issue #1997). Per-key usage-vs-limit is visible at GET /api/harvest/admin/quotas."
         },
         {
           "id": 933,
@@ -3832,6 +3832,55 @@
           "description": "Warm-cache hit ratio on the worker hot path (issue #235). A low ratio with sticky routing enabled means affinity is not landing."
         },
         {
+          "id": 542904,
+          "type": "timeseries",
+          "title": "Resident workflow hit rate and miss reasons (issue #2007)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 108
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (outcome) (rate(harvest_workflow_resident_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])) / scalar(sum (rate(harvest_workflow_resident_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])))",
+              "legendFormat": "{{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Share of workflow decisions by resident outcome. `hit` resumed the parked workflow. Each other series names why a decision replayed history (issues #1798, #2007, #2008)."
+        },
+        {
           "id": 63,
           "type": "timeseries",
           "title": "Retention deletions by workflow type",
@@ -4075,6 +4124,55 @@
             }
           ],
           "description": "Terminal harvest_task_queue rows deleted by the terminal-task janitor (issue #1811), by task state. A flat zero while the table grows means the janitor is off (terminal_task_retention_secs = null) or the role lacks DELETE. GET /admin/retention reports the per-shard outcome and any error."
+        },
+        {
+          "id": 479100,
+          "type": "timeseries",
+          "title": "Payload store \u2014 orphaned blobs (issue #2123)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 108
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (outcome) (rate(harvest_retention_payload_orphans_total[$__rate_interval]))",
+              "legendFormat": "{{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Payload blobs the orphan sweep handled (issue #2123), by outcome: found, deleted or failed. A rolled-back write leaves such blobs. A flat zero means the sweep is off (payload_orphan_grace_secs = null) or the store cannot list. A rising failed count means store deletes fail."
         },
         {
           "id": 931,
@@ -7787,7 +7885,7 @@
               }
             }
           ],
-          "description": "Poll loops that claim from each queue, summed over worker replicas (issue #1815). One worker runs one poll loop over all its queues. A drained worker reports 0. When the last poller of a queue exits, its series ends; the queue-depth fallback then draws that queue at 0, and its backlog grows."
+          "description": "Claim loops that claim from each queue, summed over worker replicas (issue #1815). Each worker runs max_concurrent_claims loops (2 by default), each over all its queues. A drained worker reports 0. When the last poller of a queue exits, its series ends; the queue-depth fallback then draws that queue at 0, and its backlog grows."
         },
         {
           "id": 872151,

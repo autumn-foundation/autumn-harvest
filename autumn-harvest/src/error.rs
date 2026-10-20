@@ -330,6 +330,18 @@ pub enum HarvestError {
         compensation_errors: Vec<String>,
     },
 
+    /// More fan-out items failed than the tolerance allows (issue #1986).
+    ///
+    /// The error carries no failure count. A replay that sees more results
+    /// gives a higher count, and a workflow that branches on it drifts.
+    #[error("fan-out failed: more than {tolerated} of {total} items failed")]
+    FanOutFailureThresholdExceeded {
+        /// The largest number of failures the fan-out tolerates.
+        tolerated: usize,
+        /// The number of items in the fan-out.
+        total: usize,
+    },
+
     /// The workflow's published input schema (issue #373) rejected
     /// `start_input` on a **genuine fresh start** initiated through
     /// [`crate::execution::signal_with_start_workflow_execution`].
@@ -389,6 +401,14 @@ pub enum HarvestError {
         /// The `codec_id` stored alongside it.
         codec_id: String,
     },
+
+    /// A payload codec failed to encode or decode a value (issue #2065).
+    ///
+    /// Use [`HarvestError::is_codec_failure`] to test for this error and for
+    /// the unknown-codec errors. A codec failure says nothing about the target
+    /// of an operation, so a caller must not treat it as a terminal state.
+    #[error("payload codec failure: {0}")]
+    Codec(String),
 
     /// Retiring a codec key was refused because stored rows still reference it
     /// (issue #948).
@@ -666,6 +686,28 @@ pub enum HarvestError {
         workflow_type: String,
         /// The activity name, when the violation is activity-scoped.
         /// `None` for workflow-input, signal-payload, and side-effect violations.
+        activity_name: Option<String>,
+    },
+
+    /// A workflow-side payload nests deeper than
+    /// [`MAX_PAYLOAD_DEPTH`](crate::payload_depth::MAX_PAYLOAD_DEPTH)
+    /// (issue #2224).
+    ///
+    /// `serde_json` cannot read a value nested past 128 levels. The context
+    /// refuses the value at the call site, so no command and no event is
+    /// written. The workflow can handle the error.
+    #[error(
+        "payload too deep: {kind} for workflow '{workflow_type}' nests more than \
+         {cap_depth} levels"
+    )]
+    PayloadTooDeep {
+        /// The payload boundary that was violated.
+        kind: PayloadKind,
+        /// The deepest nesting that a payload may have.
+        cap_depth: usize,
+        /// The workflow type name that issued the payload.
+        workflow_type: String,
+        /// The activity name, when the violation is activity-scoped.
         activity_name: Option<String>,
     },
 
@@ -1441,6 +1483,20 @@ impl HarvestError {
     #[must_use]
     pub const fn is_shard_unavailable(&self) -> bool {
         matches!(self, Self::ShardUnavailable { .. })
+    }
+
+    /// Did a payload codec fail to encode or decode a value (issue #2065)?
+    ///
+    /// True for [`HarvestError::Codec`], [`HarvestError::UnknownCodecKey`] and
+    /// [`HarvestError::UnknownPayloadCodec`]. A key outage ends, and an operator
+    /// can add a missing key. So the operation is retryable and is not a
+    /// verdict on its target.
+    #[must_use]
+    pub const fn is_codec_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Codec(_) | Self::UnknownCodecKey { .. } | Self::UnknownPayloadCodec { .. }
+        )
     }
 
     /// Is this a [`HarvestError::PoolAcquireTimeout`]?

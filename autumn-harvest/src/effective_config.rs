@@ -135,10 +135,14 @@ pub struct WorkerConfigView {
     pub queues: Vec<String>,
     /// Per-queue dispatch weights (sorted for stable output). Empty = equal share.
     pub queue_weights: BTreeMap<String, u32>,
+    /// Whether claims rotate across fairness keys (issue #1976).
+    pub fairness_keys: bool,
     /// Maximum concurrent workflow executions.
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity executions.
     pub max_concurrent_activities: usize,
+    /// The most claims this worker runs at once.
+    pub max_concurrent_claims: usize,
     /// Worker poll interval, milliseconds.
     pub poll_interval_ms: u64,
     /// Graceful shutdown timeout, milliseconds.
@@ -402,12 +406,14 @@ impl WorkerConfigView {
         let WorkerConfig {
             queues,
             queue_weights,
+            fairness_keys,
             // REDACTED — presence only, never the URL (may embed a password).
             notification_database_url,
             // REDACTED — count only, never the URLs.
             shard_notification_database_urls,
             max_concurrent_workflows,
             max_concurrent_activities,
+            max_concurrent_claims,
             shutdown_timeout,
             workflow_cache_size,
             resident_workflows,
@@ -456,8 +462,10 @@ impl WorkerConfigView {
         Self {
             queues: queues.clone(),
             queue_weights: queue_weights.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            fairness_keys: *fairness_keys,
             max_concurrent_workflows: *max_concurrent_workflows,
             max_concurrent_activities: *max_concurrent_activities,
+            max_concurrent_claims: *max_concurrent_claims,
             poll_interval_ms: dur_ms(poll_interval),
             shutdown_timeout_ms: dur_ms(*shutdown_timeout),
             workflow_cache_size: *workflow_cache_size,
@@ -1048,6 +1056,23 @@ mod tests {
             view.resident_workflows,
             "resident workflows are on by default"
         );
+    }
+
+    #[test]
+    fn view_reports_the_claim_loop_cap() {
+        let default_view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default(),
+            Duration::from_millis(500),
+        );
+        assert_eq!(
+            default_view.max_concurrent_claims,
+            crate::builder::DEFAULT_MAX_CONCURRENT_CLAIMS
+        );
+        let view = WorkerConfigView::from_worker_config(
+            &WorkerConfig::default().with_max_concurrent_claims(4),
+            Duration::from_millis(500),
+        );
+        assert_eq!(view.max_concurrent_claims, 4);
     }
 
     #[test]

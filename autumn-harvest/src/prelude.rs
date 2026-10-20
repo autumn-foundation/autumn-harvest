@@ -9,6 +9,7 @@ pub use crate::builder::{HarvestBuilder, WorkerConfig};
 pub use crate::calendar::{
     Calendar, ScheduleFirePreview, apply_skip_policy, calendar_excludes_weekends, is_excluded_date,
 };
+pub use crate::cancellation_scope::CancellationScope;
 pub use crate::circuit_breaker::{
     AttemptOutcome, CircuitBreakerRegistry, CircuitPhase, CircuitSnapshot, CircuitTransition,
     DispatchDecision, DispatchToken,
@@ -37,7 +38,8 @@ pub use crate::handle_typed::{
     TypedSignalWithStartOptions, TypedStartOptions, TypedWorkflowHandle, TypedWorkflowResult,
 };
 pub use crate::info::{
-    ActivityInfo, DagInfo, QueryHandlerInfo, SignalHandlerInfo, UpdateHandlerInfo, WorkflowInfo,
+    ActivityInfo, DagInfo, QueryHandlerInfo, SideEffectInfo, SignalHandlerInfo, UpdateHandlerInfo,
+    WorkflowInfo,
 };
 pub use crate::interceptor::{
     ActivityInterceptor, ActivityInterceptorFuture, ActivityInterceptorNext, ActivityInvocation,

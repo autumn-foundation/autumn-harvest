@@ -564,6 +564,7 @@ async fn each_gate_scenario_actually_seeds_its_trigger_column() {
             ClaimGate::RateLimited | ClaimGate::CircuitBreakerSet | ClaimGate::AllGates
         );
         let expect_paused = matches!(gate, ClaimGate::PausedRows | ClaimGate::AllGates);
+        let expect_fair = gate == ClaimGate::FairnessKeys;
         // The equal-depth control seeds twice the claimable rows and nothing
         // else; every other gate seeds exactly one backlog of claimable rows.
         let expect_claimable = if gate == ClaimGate::DoubleBacklog {
@@ -591,6 +592,11 @@ async fn each_gate_scenario_actually_seeds_its_trigger_column() {
             census.with_rate_limit_key,
             if expect_rl { want } else { 0 },
             "gate `{name}`: rate_limit_key column census wrong ({census:?})",
+        );
+        assert_eq!(
+            census.with_fairness_key,
+            if expect_fair { want } else { 0 },
+            "gate `{name}`: fairness_key column census wrong ({census:?})",
         );
         assert_eq!(
             census.paused_ballast,

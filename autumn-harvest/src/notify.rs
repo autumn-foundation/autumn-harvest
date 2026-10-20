@@ -10,8 +10,9 @@
 //! A transaction that calls `pg_notify` takes a database-wide lock at commit,
 //! so these commits run one at a time. A full notification queue also fails
 //! the commit (issue #1796). Thus [`notify_task_enqueued`],
-//! [`notify_tasks_enqueued`] and [`notify_workflow_events_appended`] never
-//! send inside the write transaction, and never fail the write.
+//! [`notify_tasks_enqueued`], [`notify_workflow_events_appended`] and
+//! [`notify_durable_stream`] never send inside the write transaction, and
+//! never fail the write.
 //!
 //! Each call stages a note with the transaction id of the write. The sender
 //! of a pool from [`register_pool`] reads `txid_status` on its own connection.
@@ -19,6 +20,10 @@
 //! write that rolls back. One statement sends a batch, with one wake per
 //! queue and one per execution. That statement writes no data, so its commit
 //! does not wait for a WAL flush and holds the NOTIFY lock only briefly.
+//!
+//! The stage needs the transaction id and the database of the write. An event
+//! or task insert inside a transaction returns them itself when a sender is
+//! ready. Any other stage reads them in one extra statement (issue #2125).
 //!
 //! Call a `notify_*` function after the write in the same transaction. A note
 //! staged in a savepoint that later rolls back is still sent. That costs one
@@ -123,6 +128,31 @@ pub fn workflow_progress_channel(exec_id: Uuid) -> String {
     format!("harvest_progress_{}", exec_id.simple())
 }
 
+/// Postgres NOTIFY channel that wakes the readers of one execution's durable
+/// output stream (issue #1974).
+///
+/// The name is `harvest_stream_{exec_hex}`, which is 47 characters. The
+/// payload is a wake only. A reader reads the chunks from
+/// `harvest_stream_chunks`, so a lost wake delays a chunk but never loses it.
+/// The best-effort channel [`workflow_progress_channel`] is separate, so the
+/// two offset namespaces never mix.
+///
+/// # Examples
+///
+/// ```
+/// # use autumn_harvest::notify::durable_stream_channel;
+/// # use uuid::Uuid;
+/// let id = Uuid::parse_str("0191c1a2-3b4c-7d5e-8f60-112233445566").unwrap();
+/// assert_eq!(
+///     durable_stream_channel(id),
+///     "harvest_stream_0191c1a23b4c7d5e8f60112233445566"
+/// );
+/// ```
+#[must_use]
+pub fn durable_stream_channel(exec_id: Uuid) -> String {
+    format!("harvest_stream_{}", exec_id.simple())
+}
+
 #[must_use]
 fn quote_pg_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
@@ -222,6 +252,20 @@ pub async fn notify_task_enqueued(
     queue_name: &str,
     task_id: Uuid,
 ) -> HarvestResult<()> {
+    notify_task_enqueued_stamped(conn, None, queue_name, task_id).await
+}
+
+/// [`notify_task_enqueued`] with the [`Stamp`] that the task write returned.
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub(crate) async fn notify_task_enqueued_stamped(
+    conn: &mut AsyncPgConnection,
+    stamp: Option<Stamp>,
+    queue_name: &str,
+    task_id: Uuid,
+) -> HarvestResult<()> {
     // Chaos: drop this wake (issue #940 AC1(c)). The poll loop still finds the
     // task, because NOTIFY only reduces latency.
     if crate::chaos_drop_notify!(NOTIFY_TASK_ENQUEUED) {
@@ -234,6 +278,7 @@ pub async fn notify_task_enqueued(
             channel: queue_channel(queue_name),
             task_id,
         }],
+        stamp,
     )
     .await
 }
@@ -260,7 +305,7 @@ pub async fn notify_tasks_enqueued(
             task_id,
         })
         .collect();
-    stage(conn, notes).await
+    stage(conn, notes, None).await
 }
 
 /// Tell the listeners of [`workflow_events_channel`] that history advanced,
@@ -278,6 +323,29 @@ pub async fn notify_workflow_events_appended(
     event_count: usize,
     last_event_type: &str,
 ) -> HarvestResult<()> {
+    notify_workflow_events_appended_stamped(
+        conn,
+        None,
+        workflow_exec_id,
+        event_count,
+        last_event_type,
+    )
+    .await
+}
+
+/// [`notify_workflow_events_appended`] with the [`Stamp`] that the event
+/// write returned.
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub(crate) async fn notify_workflow_events_appended_stamped(
+    conn: &mut AsyncPgConnection,
+    stamp: Option<Stamp>,
+    workflow_exec_id: Uuid,
+    event_count: usize,
+    last_event_type: &str,
+) -> HarvestResult<()> {
     stage(
         conn,
         vec![Note::Events {
@@ -285,6 +353,7 @@ pub async fn notify_workflow_events_appended(
             count: event_count,
             last_event_type: last_event_type.to_string(),
         }],
+        stamp,
     )
     .await
 }
@@ -293,12 +362,14 @@ pub async fn notify_workflow_events_appended(
 ///
 /// A decision boundary (issue #1833) uses it. The count of the wake includes
 /// the boundary, and the last event type stays the decision's outcome.
+/// `stamp` is the [`Stamp`] that the boundary write returned, if any.
 ///
 /// # Errors
 ///
 /// Same as [`notify_task_enqueued`].
 pub(crate) async fn notify_trailing_events_appended(
     conn: &mut AsyncPgConnection,
+    stamp: Option<Stamp>,
     workflow_exec_id: Uuid,
     event_count: usize,
     event_type: &str,
@@ -310,6 +381,7 @@ pub(crate) async fn notify_trailing_events_appended(
             count: event_count,
             event_type: event_type.to_string(),
         }],
+        stamp,
     )
     .await
 }
@@ -397,13 +469,19 @@ pub(crate) enum Note {
         /// Type name to report when no note before them names one.
         event_type: String,
     },
+    /// New chunks of one durable stream (issue #1974). The wake has an empty
+    /// payload, because a reader reads the table.
+    Stream {
+        /// The channel from [`durable_stream_channel`].
+        channel: String,
+    },
 }
 
 impl Note {
     /// The channel the note goes to.
     fn channel(&self) -> &str {
         match self {
-            Self::Task { channel, .. } => channel,
+            Self::Task { channel, .. } | Self::Stream { channel } => channel,
             Self::Events { .. } | Self::Trailing { .. } => workflow_events_channel(),
         }
     }
@@ -419,12 +497,13 @@ const fn valid_channel(channel: &str) -> bool {
 ///
 /// Task notes merge per channel. One task keeps its id. Several tasks give
 /// the nil id, as [`notify_tasks_enqueued`] does. Event notes merge per
-/// execution: the counts add up, and the last type wins. A note on a channel
-/// that Postgres rejects is dropped.
+/// execution: the counts add up, and the last type wins. Stream notes merge
+/// per channel. A note on a channel that Postgres rejects is dropped.
 fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
     enum Merged {
         Task(String, Uuid),
         Events(Uuid, usize, String),
+        Stream(String),
     }
     let mut merged: Vec<Merged> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
@@ -474,6 +553,12 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
                     merged.push(Merged::Events(exec_id, count, event_type));
                 }
             }
+            Note::Stream { channel } => {
+                if !index.contains_key(&channel) {
+                    index.insert(channel.clone(), merged.len());
+                    merged.push(Merged::Stream(channel));
+                }
+            }
         }
     }
     merged
@@ -491,6 +576,7 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
                 .ok()
                 .map(|payload| (workflow_events_channel().to_string(), payload))
             }
+            Merged::Stream(channel) => Some((channel, String::new())),
         })
         .collect()
 }
@@ -911,16 +997,19 @@ fn any_sink() -> bool {
 ///
 /// A broken transaction state counts as inside, so the caller takes the safe
 /// path.
-fn in_transaction(conn: &mut AsyncPgConnection) -> bool {
+pub(crate) fn in_transaction(conn: &mut AsyncPgConnection) -> bool {
     use diesel_async::TransactionManager as _;
     let status =
         <AsyncPgConnection as diesel_async::AsyncConnection>::TransactionManager::transaction_manager_status_mut(conn);
     !matches!(status.transaction_depth(), Ok(None))
 }
 
-/// The row the write connection reads to stage a note.
-#[derive(diesel::QueryableByName)]
-struct StageRow {
+/// The transaction id and the database of a write.
+///
+/// The stage probe reads it. A write can also return it with
+/// [`stamp_returning`], so the stage needs no probe (issue #2125).
+#[derive(Clone, diesel::QueryableByName, diesel::Queryable)]
+pub(crate) struct Stamp {
     /// The transaction id of the write, or `NULL` outside a transaction.
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
     txid: Option<i64>,
@@ -932,12 +1021,46 @@ struct StageRow {
     started_at: DateTime<Utc>,
 }
 
+/// The `RETURNING` expressions of a [`Stamp`].
+pub(crate) type StampReturning = (
+    diesel::expression::SqlLiteral<diesel::sql_types::Nullable<diesel::sql_types::BigInt>>,
+    diesel::expression::SqlLiteral<Text>,
+    diesel::expression::SqlLiteral<diesel::sql_types::Timestamptz>,
+);
+
+/// The `RETURNING` expressions that make a write return its [`Stamp`].
+///
+/// `txid_current()` gives the id of the top-level transaction, also inside a
+/// savepoint. Every row of one statement returns the same values.
+pub(crate) fn stamp_returning() -> StampReturning {
+    (
+        diesel::dsl::sql("txid_current()"),
+        diesel::dsl::sql("current_database()::text"),
+        diesel::dsl::sql("pg_postmaster_start_time()"),
+    )
+}
+
+/// True when a write on `conn` returns a [`Stamp`] for its note.
+///
+/// A write asks for a stamp only inside a diesel transaction, and only when a
+/// sender is ready. A failed stamp then fails the transaction, as a failed
+/// probe does. An autocommit write and a raw `BEGIN` block keep the probe.
+pub(crate) fn stamp_wanted(conn: &mut AsyncPgConnection) -> bool {
+    in_transaction(conn) && any_sink()
+}
+
 /// Notes that [`coalesced`] holds for one write connection (issue #1833).
 struct HeldNotes {
     /// The address of the connection the notes belong to.
     conn: usize,
     /// The notes staged on that connection so far.
     notes: Vec<Note>,
+    /// True when the scope opened inside a diesel transaction. Then every
+    /// write of the scope belongs to that transaction.
+    in_tx: bool,
+    /// The first stamp of a write in the scope. It is kept only when
+    /// `in_tx` is true (issue #2125).
+    stamp: Option<Stamp>,
 }
 
 tokio::task_local! {
@@ -961,6 +1084,9 @@ fn conn_key(conn: &AsyncPgConnection) -> usize {
 /// A note staged on another connection is not held. It can belong to
 /// another database or another transaction.
 ///
+/// A scope that opens inside a diesel transaction keeps the first [`Stamp`]
+/// of its writes. The single stage then sends no probe (issue #2125).
+///
 /// # Errors
 ///
 /// Returns the error of `body`, or the error of the stage call.
@@ -972,12 +1098,17 @@ pub async fn coalesced<T>(
     let held = HeldNotes {
         conn: conn_key(conn),
         notes: Vec::new(),
+        in_tx: in_transaction(conn),
+        stamp: None,
     };
     HELD.scope(std::cell::RefCell::new(held), async move {
         let out = body(conn).await?;
-        let notes = HELD.with(|held| std::mem::take(&mut held.borrow_mut().notes));
+        let (notes, stamp) = HELD.with(|held| {
+            let mut held = held.borrow_mut();
+            (std::mem::take(&mut held.notes), held.stamp.take())
+        });
         if !notes.is_empty() {
-            stage_now(conn, notes).await?;
+            stage_now(conn, notes, stamp).await?;
         }
         Ok(out)
     })
@@ -987,34 +1118,50 @@ pub async fn coalesced<T>(
 /// Stage `notes` for the write on `conn`, or hold them in a [`coalesced`]
 /// scope for `conn`.
 ///
+/// `stamp` is the [`Stamp`] that the write returned, if any.
+///
 /// # Errors
 ///
 /// Same as [`stage_now`].
-async fn stage(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<()> {
+async fn stage(
+    conn: &mut AsyncPgConnection,
+    notes: Vec<Note>,
+    stamp: Option<Stamp>,
+) -> HarvestResult<()> {
     let key = conn_key(conn);
-    let mut notes = Some(notes);
+    let mut staged = Some((notes, stamp));
     let _ = HELD.try_with(|held| {
         let mut held = held.borrow_mut();
         if held.conn == key
-            && let Some(notes) = notes.take()
+            && let Some((notes, stamp)) = staged.take()
         {
             held.notes.extend(notes);
+            if held.in_tx && held.stamp.is_none() {
+                held.stamp = stamp;
+            }
         }
     });
-    match notes {
-        Some(notes) => stage_now(conn, notes).await,
+    match staged {
+        Some((notes, stamp)) => stage_now(conn, notes, stamp).await,
         None => Ok(()),
     }
 }
 
 /// Stage `notes` for the write on `conn`.
 ///
+/// With a `stamp`, the stage sends no probe. The stamp must come from a write
+/// of the transaction that is open on `conn`.
+///
 /// # Errors
 ///
 /// Returns an error only when the write transaction has already failed.
 /// Postgres answers `COMMIT` on a failed transaction with a silent rollback.
 /// The error therefore tells the caller that its write did not commit.
-async fn stage_now(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestResult<()> {
+async fn stage_now(
+    conn: &mut AsyncPgConnection,
+    notes: Vec<Note>,
+    stamp: Option<Stamp>,
+) -> HarvestResult<()> {
     let has_sink = any_sink();
     if AtomicBool::load(&ANY_DEFERRED, Ordering::Relaxed)
         && let Ok(runtime) = tokio::runtime::Handle::try_current()
@@ -1026,26 +1173,15 @@ async fn stage_now(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestRes
     let mut raw_block = RawBlock::Unknown;
     if has_sink {
         let in_tx = in_transaction(conn);
-        // Inside a diesel transaction, `txid_current()` assigns an id when
-        // the transaction has none yet. Thus the gate never sends before the
-        // commit. Outside one, `txid_current_if_assigned()` still finds a raw
-        // `BEGIN` block that wrote. After an autocommit write it reads NULL,
-        // because that write already committed.
-        let txid = if in_tx {
-            "txid_current()"
-        } else {
-            "txid_current_if_assigned()"
+        // Only a probe shows a raw `BEGIN` block. A stamp does not.
+        let probed = stamp.is_none();
+        let row = match stamp {
+            Some(stamp) => Ok(stamp),
+            None => probe(conn, in_tx).await,
         };
-        let row = diesel::sql_query(format!(
-            "SELECT {txid} AS txid, \
-                    current_database()::text AS database, \
-                    pg_postmaster_start_time() AS started_at"
-        ))
-        .get_result::<StageRow>(conn)
-        .await;
         match row {
             Ok(row) => {
-                if !in_tx {
+                if !in_tx && probed {
                     raw_block = RawBlock::from_txid(row.txid);
                 }
                 let fingerprint = Fingerprint {
@@ -1071,6 +1207,28 @@ async fn stage_now(conn: &mut AsyncPgConnection, notes: Vec<Note>) -> HarvestRes
         }
     }
     send_on_write_connection(conn, notes, raw_block).await
+}
+
+/// Read the [`Stamp`] of the write on `conn` in its own statement.
+///
+/// Inside a diesel transaction, `txid_current()` assigns an id when the
+/// transaction has none yet. Thus the gate never sends before the commit.
+/// Outside one, `txid_current_if_assigned()` still finds a raw `BEGIN` block
+/// that wrote. After an autocommit write it reads NULL, because that write
+/// already committed.
+async fn probe(conn: &mut AsyncPgConnection, in_tx: bool) -> diesel::QueryResult<Stamp> {
+    let txid = if in_tx {
+        "txid_current()"
+    } else {
+        "txid_current_if_assigned()"
+    };
+    diesel::sql_query(format!(
+        "SELECT {txid} AS txid, \
+                current_database()::text AS database, \
+                pg_postmaster_start_time() AS started_at"
+    ))
+    .get_result::<Stamp>(conn)
+    .await
 }
 
 /// The fallback: send `notes` on the write connection.
@@ -1570,6 +1728,31 @@ pub async fn notify_workflow_progress(
     Ok(())
 }
 
+/// Wake the readers of `workflow_exec_id`'s durable stream, after the write
+/// commits (issue #1974).
+///
+/// Call this in the transaction that wrote the chunks. See
+/// [post-commit delivery](crate::notify#post-commit-delivery) for how the wake
+/// is sent. A reader never wakes for chunks that roll back. A lost wake costs
+/// latency only, because a reader also reads the table on each keepalive tick.
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub async fn notify_durable_stream(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+) -> HarvestResult<()> {
+    stage(
+        conn,
+        vec![Note::Stream {
+            channel: durable_stream_channel(workflow_exec_id),
+        }],
+        None,
+    )
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // Listener connections (TLS: issue #1717)
 // ---------------------------------------------------------------------------
@@ -1976,6 +2159,119 @@ impl WorkflowProgressListener {
     }
 }
 
+/// Outcome of waiting on a [`DurableStreamListener`] (issue #1974).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableStreamWait {
+    /// At least one wake arrived. New chunks can be in the table.
+    Woken,
+    /// No wake arrived before the timeout.
+    TimedOut,
+    /// The `LISTEN` connection closed.
+    ChannelClosed,
+}
+
+/// Wake state that the forwarder task shares with a [`DurableStreamListener`].
+struct DurableStreamWakes {
+    /// Holds one permit after one or more wakes. Wakes merge into it.
+    notify: tokio::sync::Notify,
+    /// Set when the `LISTEN` connection closes.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// Listener for one execution's durable stream wakes (issue #1974).
+///
+/// The `GET /workflows/{id}/stream/durable` route opens it before its first
+/// read. Postgres then sends a wake for each later commit, so the read loop
+/// misses no chunk.
+///
+/// **It never stalls the connection.** A forwarder task reads every
+/// notification at once and merges it into one pending wake. A reader that
+/// waits for a slow client therefore never stops the driver from reading the
+/// socket. A stopped driver would hold back the shared Postgres NOTIFY queue
+/// for the whole cluster.
+pub struct DurableStreamListener {
+    /// Client handle kept alive so the LISTEN connection stays open.
+    _client: tokio_postgres::Client,
+    /// Wake state shared with the forwarder task.
+    wakes: std::sync::Arc<DurableStreamWakes>,
+    /// Background connection driver handle kept alive for the connection's lifetime.
+    _connection_handle: tokio::task::JoinHandle<()>,
+    /// Forwarder task. Aborted on drop.
+    forwarder: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DurableStreamListener {
+    fn drop(&mut self) {
+        self.forwarder.abort();
+    }
+}
+
+impl DurableStreamListener {
+    /// Connect to Postgres and `LISTEN` on [`durable_stream_channel`].
+    ///
+    /// TLS follows the `sslmode` rules of [`WorkflowProgressListener::connect`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] if the connection or LISTEN fails.
+    /// Returns [`HarvestError::Config`] if the URL or its TLS settings are
+    /// not valid.
+    pub async fn connect(database_url: &str, exec_id: Uuid) -> HarvestResult<Self> {
+        let ListenConnection {
+            client,
+            mut rx,
+            driver,
+        } = open_listen_connection(database_url, "postgres durable stream listener error").await?;
+        let channel = quote_pg_identifier(&durable_stream_channel(exec_id));
+        client
+            .batch_execute(&format!("LISTEN {channel}"))
+            .await
+            .map_err(|e| {
+                HarvestError::Database(format!("LISTEN {channel} failed: {}", error_chain(&e)))
+            })?;
+        let wakes = std::sync::Arc::new(DurableStreamWakes {
+            notify: tokio::sync::Notify::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let forwarder_wakes = std::sync::Arc::clone(&wakes);
+        let forwarder = tokio::spawn(async move {
+            while rx.recv().await.is_some() {
+                forwarder_wakes.notify.notify_one();
+            }
+            forwarder_wakes
+                .closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            forwarder_wakes.notify.notify_one();
+        });
+        Ok(Self {
+            _client: client,
+            wakes,
+            _connection_handle: driver,
+            forwarder,
+        })
+    }
+
+    /// Wait up to `timeout` for a wake. All wakes since the last call merge
+    /// into one, because one table read serves all of them.
+    pub async fn wait_timeout(&self, timeout: Duration) -> DurableStreamWait {
+        if self.is_closed() {
+            return DurableStreamWait::ChannelClosed;
+        }
+        match tokio::time::timeout(timeout, self.wakes.notify.notified()).await {
+            Err(_elapsed) => DurableStreamWait::TimedOut,
+            Ok(()) if self.is_closed() => DurableStreamWait::ChannelClosed,
+            Ok(()) => DurableStreamWait::Woken,
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        std::sync::atomic::AtomicBool::load(
+            &self.wakes.closed,
+            std::sync::atomic::Ordering::Acquire,
+        )
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2194,6 +2490,25 @@ mod tests {
         ]);
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, "harvest_queue_default");
+    }
+
+    /// Issue #1974: durable stream wakes merge per execution, with an empty
+    /// payload. A reader reads the table, so the payload carries nothing.
+    #[test]
+    fn coalesce_merges_durable_stream_wakes_per_execution() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let stream = |exec_id| Note::Stream {
+            channel: durable_stream_channel(exec_id),
+        };
+        let sent = coalesce(vec![stream(a), stream(b), stream(a)]);
+        assert_eq!(
+            sent,
+            vec![
+                (durable_stream_channel(a), String::new()),
+                (durable_stream_channel(b), String::new()),
+            ]
+        );
     }
 
     #[test]

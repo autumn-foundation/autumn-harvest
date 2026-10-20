@@ -49,12 +49,16 @@ pub mod dag_retry;
 /// run`. Development and evaluation only; see the module docs.
 #[cfg(feature = "dev-runtime")]
 pub mod dev;
+/// Durable routes: an Autumn route that runs as a keyed Harvest workflow.
+pub mod durable_route;
 /// One entry point for a standalone embedding (issue #1613).
 pub mod embedding;
 /// One test suite for every KMS binding (issue #1981).
 #[cfg(all(test, any(feature = "aws-kms", feature = "vault-transit")))]
 mod kms_conformance;
 pub mod lineage;
+#[cfg(feature = "object-store")]
+pub mod object_store;
 /// OIDC login for Vantage and the management API (issue #1978).
 #[cfg(feature = "oidc")]
 pub mod oidc;
@@ -89,6 +93,8 @@ pub mod usage;
 pub mod vault_transit;
 pub mod version_gate_retirement;
 pub mod version_usage;
+/// The `filter` grammar of `GET /workflows` (issue #1982).
+mod visibility_query;
 pub mod workflow_count;
 pub mod workflow_reachability;
 
@@ -101,6 +107,14 @@ pub mod webhook_receiver;
 
 #[cfg(feature = "mcp")]
 pub mod mcp_tools;
+
+/// MCP Tasks for `#[workflow(mcp)]` workflows (issue #2005).
+#[cfg(feature = "mcp")]
+pub mod mcp_tasks;
+
+/// JSON-RPC client for remote MCP and A2A tasks (issue #2006).
+#[cfg(feature = "mcp")]
+pub mod remote_tasks;
 
 /// OpenAPI 3.1 document for the management API (issue #694).
 ///

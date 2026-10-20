@@ -170,6 +170,8 @@ fn act_info(name: &'static str, handler: autumn_harvest::info::ActivityHandlerFn
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -238,6 +240,7 @@ fn start_params(exec_id: ExecutionId) -> StartWorkflowParams<'static> {
         start_source: autumn_harvest::StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     }
 }

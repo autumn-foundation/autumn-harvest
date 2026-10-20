@@ -1,14 +1,17 @@
-# Formal methods: TLA+ models and Kani proofs
+# Formal methods: TLA+ models, Kani proofs and Verus proofs
 
-Issue #1819 adds two tools:
+Issue #1819 adds two tools, and a third tool follows it:
 
 - **TLA+ and TLC** check the design of the core protocols. TLC explores every
   interleaving of a small, bounded model and checks safety invariants in each
   state.
 - **Kani** proves bounds on pure Rust kernels. It checks every input of the
   real function, not a sample.
+- **Verus** proves integer kernels with an SMT solver. It handles the
+  128-bit products and the mixer that CBMC cannot finish. See
+  [Run the Verus proofs](#run-the-verus-proofs).
 
-Neither tool replaces the Docker-backed integration tests. A model checks the
+No tool replaces the Docker-backed integration tests. A model checks the
 design. The integration tests check that the SQL implements it.
 [`simulation.md`](simulation.md) covers a seeded harness that checks the
 `ActivityClaim` invariants on an oracle. A differential test checks the
@@ -26,7 +29,8 @@ scripts/check-formal-models.sh
 
 The script downloads `tla2tools.jar` 1.7.4 and checks its SHA-256. To use a
 local jar, set `TLA2TOOLS_JAR=/path/to/tla2tools.jar`. A full run takes about
-40 seconds on 4 cores.
+2 minutes on 4 cores. The `OwnerLease` design config takes about 75 seconds
+of it.
 
 To run one config by hand:
 
@@ -73,6 +77,7 @@ fails in these cases:
 | `ActivityClaim` | Activity claim epoch (issue #1789) | fixed, pre-fix, reachability |
 | `WorkflowTaskClaim` | Workflow-task terminal-write ownership (issues #1184, #1806, #1917) | fixed, pre-fix, reachability, capability-miss pre-fix |
 | `CodecRotation` | Codec re-encryption against PII erasure (issues #948, #495) | CAS, blind write, reachability |
+| `OwnerLease` | Fenced owner lease of a decision partition (issue #2250) | design, six defects, reachability |
 
 **Ghost sequence numbers.** Each claim in the two claim models gets a ghost
 `seq`. The code has no such column. An invariant that compared
@@ -177,6 +182,15 @@ handler can release its claim through
 
 This model found the #1917 gap before any test did.
 
+**The unstarted release (issue #1813).** A draining worker gives back a
+claim that never started, through `queue::release_unstarted_claim`.
+`UnstartedRelease` models it. Its fence is `claim_held`, with no strikes
+term. The release came after #1806, so its guard checks `attempt` in every
+config, the pre-fix config included. It subtracts 1 from `attempt` and keeps `crash_strikes`. The trace
+check of issue #2003 found this gap: the chaos trace of
+`chaos_repro_1813_drain_releases_a_claim_that_never_started` matched no
+action. Every config gives the same result with the new action.
+
 #### `CodecRotation` — model (c)
 
 The sweep reads a payload under the retired key and writes it under the
@@ -198,6 +212,93 @@ writes it back without a lock. That is safe, because it rewrites only the
 payload fields that the sweep also writes. The model does not check pass
 completion or the unresolved count.
 
+#### `OwnerLease` — model (e)
+
+The prose spec is [ADR 0009](../adr/0009-fenced-owner-lease.md). Stage 1a
+(issue #2251) has no code yet, so this model is the spec. The model has one
+partition, one owner row and the history of one execution. Its actions:
+
+| Action | Planned code |
+|---|---|
+| `Acquire` | The takeover: `SELECT ... FOR UPDATE`, then the write. Adds 1 to the epoch. Waits for every fence lock. Then loads the resident state. |
+| `Release` | The graceful release. Frees the row and unloads the worker. |
+| `Expire` | The lease time runs out: a pause or a clock jump. A lock does not stop it. |
+| `Renew` | The renewal `UPDATE` of `lease_until`. Matches the holder and the epoch. A miss unloads the worker. |
+| `Write`, `Ack` | The `harvest_signals` insert, then the HTTP 202. |
+| `Receive` | The `memory-ack` defect only: an ack from owner memory. |
+| `Begin` | A decision reads its resident state and pins the owner's epoch. |
+| `Lock` | The commit reads the owner row `FOR KEY SHARE` and checks the fence. |
+| `Commit` | The commit appends the event and consumes the signal. |
+
+An unloaded worker keeps its decisions in flight, as a paused thread does.
+A new tenure of that worker can begin a decision beside them. The model has
+no event-id backstop, so the fence alone must hold.
+
+Each decision records ghost fields: `pinned` (its epoch), `at` (the row
+epoch at the commit) and `base` (the history length it saw). The owner row
+has a ghost `tenure`, the number of acquisitions. The ghost `owners` maps
+each epoch to the worker that took it. The invariants compare these
+fields:
+
+- `OneOwnerPerEpoch`: each event comes from the worker that took its
+  epoch.
+- `CommitAtPinnedEpoch`: a decision commits only at the epoch it pinned.
+- `DecisionOnFreshHistory`: each decision saw every earlier event.
+- `NoDuplicateEvent`: no two events consume one signal.
+- `AckAfterDurableWrite`: a signal is acked only after its durable write.
+- `NoAckedSignalLost`: an acked signal is pending, consumed, or in the
+  memory of the worker that holds the row at its epoch. A stale owner can
+  never commit from memory, so its memory does not count.
+- `OwnerNeverFencesItself`: only a takeover fences a commit.
+
+In the design, `AckAfterDurableWrite` restates the guard of `Ack`. It
+matters only for the `memory-ack` mutant. `OneOwnerPerEpoch`,
+`DecisionOnFreshHistory` and `NoAckedSignalLost` carry the weight.
+`OwnerNeverFencesItself` is an availability rule: none of the three safety
+properties of the issue catches `renew-bumps`.
+
+`Defect = "none"` is the design. Each other value breaks one rule of the
+ADR. Its config lists only the invariant that it must break:
+
+| Config | Defect | Rule | Nemesis | Must violate |
+|---|---|---|---|---|
+| `OwnerLeaseNoFence.cfg` | `no-fence`: no check in the commit (golem#3766) | R1 | 1 | `OneOwnerPerEpoch` |
+| `OwnerLeaseUnlockedFence.cfg` | `unlocked-fence`: the check takes no lock | R2 | 2 | `OneOwnerPerEpoch` |
+| `OwnerLeaseHolderFence.cfg` | `holder-fence`: the check compares the holder | R3 | 2 | `DecisionOnFreshHistory` |
+| `OwnerLeaseKeepCache.cfg` | `keep-cache`: an acquisition keeps old state | R4 | 2 | `DecisionOnFreshHistory` |
+| `OwnerLeaseRenewBumps.cfg` | `renew-bumps`: a renewal adds 1 to the epoch | R5 | 3 | `OwnerNeverFencesItself` |
+| `OwnerLeaseMemoryAck.cfg` | `memory-ack`: an ack from memory (restate#4566) | R6 | 4 | `NoAckedSignalLost` |
+| `OwnerLeasePipeline.cfg` | `pipeline`: two decisions in one tenure | R7 | — | `DecisionOnFreshHistory` |
+
+`OwnerLeaseNoFence.cfg` gives this trace:
+
+1. `w1` acquires epoch 1. A client writes `s1`.
+2. `w1` begins a decision on `s1`.
+3. `w1` releases the row. Its decision still runs.
+4. `w2` acquires epoch 2.
+5. `w1` commits. No fence stops it, so its event lands at epoch 2, which
+   `w2` took.
+
+`OwnerLease.cfg` checks the design with 3 workers, 2 signals and 4 epochs.
+The workers are interchangeable, so the config sets
+`SYMMETRY WorkerSymmetry`. TLC finds 5,629,559 distinct states and no
+error, in about 75 seconds on 4 cores. The two signals limit the history to
+two events.
+
+`OwnerLeaseReach.cfg` must violate `SomeNemesisUnseen`. The violation is
+one behaviour of the design that reaches all four nemeses:
+
+| Tag | Nemesis |
+|---|---|
+| `stale-commit` | 1. A stale owner reaches its commit after a takeover and is fenced. |
+| `flap` | 2. A worker takes the lease back while its old decision is in flight. |
+| `append-after-expiry` | 2. The lease ends during an append, and the append lands. |
+| `renew-in-flight` | 3. A renewal lands while a commit holds the fence lock. |
+| `ack-before-bump` | 4. The epoch bumps while an acked signal waits. |
+
+`autumn_harvest::dst::owner` runs the same defects and nemeses from a seed.
+See [`simulation.md`](simulation.md#the-owner-lease-simulation).
+
 ### Extend a model
 
 1. Find the action that matches the code path. Change its guard or its
@@ -217,6 +318,184 @@ completion or the unresolved count.
 4. Add a reachability witness for the race that the fix closes.
 5. Add a row for each config to `formal/tla/models.txt`.
 6. Add a section to this page. The guard suite checks that it names the spec.
+
+## Check engine traces against the models
+
+Issue #2003 checks that the running engine follows `ActivityClaim` and
+`WorkflowTaskClaim`. It uses trace validation: TLC checks that a recorded
+history of a task row is a behavior of the spec.
+
+```bash
+scripts/check-formal-traces.sh formal/tla/trace/fixtures
+```
+
+`scripts/check-formal-traces.sh` needs Java 11 or later and Python 3. It
+pins the same `tla2tools.jar` as `scripts/check-formal-models.sh`, and it
+reads `TLA2TOOLS_JAR` in the same way. The fixtures take about 10 seconds.
+
+### Record a trace
+
+The chaos suite records when `HARVEST_TLA_TRACE_DIR` is set. Two triggers
+copy each committed write to `harvest_task_queue`, and each activity or
+terminal event in `harvest_events`, into the `harvest_tla_trace` table. A
+trigger row rolls back with its transaction, so the log holds committed
+steps only. The recorder is in `autumn-harvest/tests/integration/tla_trace.rs`.
+Its unit tests run in every build, so each PR checks the exporter.
+
+At the end of each case, the suite writes one NDJSON file for each task row:
+
+- Line 1 is a header. It names the spec and the checks, for example
+  `{"spec": "ActivityClaim", "checks": {"fixed": "accept"}}`.
+- Line 2 is the row's insert, with op `init`.
+- Each other line is one transaction. It holds the row's `state`,
+  `worker_id`, `attempt`, `crash_strikes` and its count of terminal events.
+
+A line has one of three ops:
+
+| Op | Transaction |
+|---|---|
+| `write` | It changes a logged column or adds a terminal event. |
+| `start` | It appends `ActivityStarted`. `by` names the event's worker. |
+| `heartbeat` | It changes only `last_heartbeat_at` of an activity row. |
+
+A heartbeat line in any state must match an accepted heartbeat. A beat on a
+row that no claim holds therefore fails the check.
+
+The exporter maps the engine onto the spec in three places:
+
+- A parked workflow task is `RUNNING` with no `worker_id`. No claim holds
+  it, so the trace logs it as `PENDING`.
+- `ActivityCompleted` and `ActivityCompletedExternally` are always
+  terminal. `ActivityFailed`, `ActivityTimedOut` and
+  `ActivityFailedExternally` are terminal unless the same transaction
+  requeues the row for a retry. A stale result with no requeue therefore
+  counts as a second terminal event, and the check fails.
+- Transactions are in the order of their last log id. Row locks serialize
+  the writes of one task row, so this order is the commit order.
+
+**The writer.** A test can open a connection with `tla_trace::actor_url`.
+The URL sets `harvest.trace_actor` to `<task>/<worker>/<attempt>`, and the
+trigger copies it. A line that names a claim of its own row must be a new
+claim, or an owner action of the named claim. A system action, such as an
+orphan reclaim, cannot explain it. A line with no name can be explained by
+any action. Production code does not set the name.
+
+The chaos suite names the writer of each decision cycle that it drives. Each
+`chaos_drive_one_workflow_task` call gets its own connection, so the suite
+passes an `actor_url` for the claim that it drives. A stale write by such a
+cycle fails the check. The traces of a real `Worker` have no names, because
+its pooled connections serve many claims.
+
+### Check a trace
+
+`scripts/formal_traces.py` writes a TLA+ module for each check. The module
+holds the trace as the constant `Log`. TLC then checks `ActivityClaimTrace`
+or `WorkflowTaskClaimTrace`, in `formal/tla/trace/`. Each extends its model
+with a line cursor:
+
+- `TraceInit` is the model's `Init`, and the `init` line must match it.
+- `TraceNext` picks an action of the model that explains the next line.
+  The post-state of that action must equal the line.
+- TLC checks `LogNotConsumed`. A violation means that a behavior matches
+  every line, so the trace is **accepted**. "No error" means that no
+  behavior matches, so the trace is **rejected**. The runner then names the
+  first line that no behavior matches.
+
+A check names a guard setting:
+
+| Guard | `ActivityClaim` | `WorkflowTaskClaim` |
+|---|---|---|
+| `fixed` | `Fenced = TRUE` | `ChecksAttempt = TRUE`, `CapMissGuard = "epoch"` |
+| `pre-fix` | `Fenced = FALSE` | `ChecksAttempt = FALSE`, `CapMissGuard = "strikes"` |
+
+The runner renames the workers `w1`, `w2` and so on. The models are
+symmetric in their workers, so equal traces share one TLC run.
+
+The runner fails in these cases:
+
+- A result differs from its check.
+- TLC fails for another reason.
+- A trace is malformed, or a directory is empty.
+- A directory has no trace for a spec.
+
+### Red tests
+
+A red trace holds an injected protocol violation. There are two kinds:
+
+- A **fence** red trace is a stale owner write. Its header expects
+  `"fixed": "reject@N"` and `"pre-fix": "accept"`. The second check proves
+  that the fence causes the rejection, not a malformed trace.
+- A **forged** red trace breaks the protocol under each guard, for example
+  with a second terminal event. Its header expects `reject@N` from both.
+
+`reject@N` names the file line that no behavior may match, usually the
+injected line. A rejection at another line fails the check. A plain
+`reject` accepts any line.
+
+The sources are:
+
+- `formal/tla/trace/fixtures/` holds at least one clean trace and one fence
+  red trace for each spec. The `formal-models` job in `ci.yml` checks them
+  on every PR that changes code.
+- `chaos_tests::trace_red` runs the #1789 and #1806 races on Postgres. The
+  engine fences the stale write. The test then injects the stale write with
+  the pre-fix guard, on a connection that names the stale claim.
+- `oracle_flags_a_duplicate_terminal_event` forges a second terminal event.
+  Its trace expects `reject` from both guards.
+
+### In CI
+
+`chaos.yml` sets `HARVEST_TLA_TRACE_DIR`. After the chaos suite, it runs
+`scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"`. The runner checks
+every trace from the reproducers, the convergence sweep and the
+infrastructure faults. TLC must reject each red trace.
+
+The infrastructure faults need Docker. `chaos_tests::trace_activity` runs
+activities on a real worker against any test database, so the
+`ActivityClaim` check also has engine traces on a machine with no Docker.
+It covers a claim, the start fence, heartbeats, a retry and an orphan
+reclaim.
+
+To check the chaos traces on your machine:
+
+```bash
+export HARVEST_TLA_TRACE_DIR=/tmp/harvest-traces
+rm -rf "$HARVEST_TLA_TRACE_DIR"
+cargo test -p autumn-harvest --features chaos --test integration chaos_tests:: \
+  -- --test-threads=1
+scripts/check-formal-traces.sh "$HARVEST_TLA_TRACE_DIR"
+```
+
+`formal_trace_coverage.rs` fails in these cases:
+
+- A fixture is malformed.
+- A spec has no clean fixture, or no red fixture that only the fence rejects.
+- A trace spec does not extend its model.
+- The two runners pin different TLC releases.
+- `ci.yml` or `chaos.yml` does not run the runner.
+- The chaos suite does not install the recorder or export its traces.
+- This page does not name a part of the trace check.
+
+### Limits
+
+- Only a test can name the writer. A real `Worker` does not name its
+  claims, so any claim can explain its lines. A stale write of a real
+  worker can therefore pass. The red tests and the driven cycles cover the
+  fences of #1789 and #1806.
+- The models have no workflow failure, no cancellation and no quarantine.
+  A trace that reaches `FAILED` on a workflow row, or `CANCELLED`, is
+  rejected. Extend the model before a chaos case reaches such a path.
+- An unobserved action changes no logged column. `TraceNext` omits it. Such
+  an action only drops a claim, so a match never needs it.
+- A recording run leaves the triggers on its database. A shared
+  `HARVEST_TEST_DATABASE_URL` keeps them, and `partition` then refuses to
+  convert `harvest_events`. Drop the triggers before other tests use it, or
+  use a new database.
+- A trace starts at the row's insert. A row from before the recorder was
+  installed fails the export.
+- `ActivityClaim` does not model `crash_strikes`, so the activity check
+  ignores that column. `WorkflowTaskClaim` matches it.
+- The model of `CodecRotation` has no trace check.
 
 ## Run the Kani proofs
 
@@ -259,6 +538,13 @@ kani_proofs` beside the code that it proves.
 | `equal_jitter_stays_in_upper_half` | `policy.rs` | Equal jitter stays in `[base/2, base]`. |
 | `retry_delay_never_exceeds_max_interval` | `policy.rs` | `compute_retry_delay` does not panic. |
 | `seeded_action_respects_caps_and_never_holds` | `chaos.rs` | A seeded plan picks only an allowed action, and never `Hold`, for every stream. |
+| `execution_id_round_trips_every_encodable_shard` | `types.rs` | An id built for an encodable shard decodes to that shard, for every UUID. The other 14 bytes stay. |
+| `supersede_count_sheds_exactly_down_to_the_cap` | `concurrency.rs` | The shed count is the least that meets the limit, up to `usize::MAX`. |
+| `supersede_plan_sheds_only_candidates_and_meets_the_limit` | `concurrency.rs` | A latest-wins plan sheds at most the candidates and the scan limit. A full shed meets the limit. |
+| `apply_action_stays_in_band_and_reports_the_move` | `slot_tuner.rs` | A tuner step lands in the band, even a degenerate band, and its decision names the real move. |
+| `initial_target_lands_in_the_band` | `slot_tuner.rs` | The initial target is in the band, and a target in the band keeps its value. |
+| `slot_occupancy_partitions_the_target` | `slot_tuner.rs` | `in_use + available == target` for every semaphore reading. |
+| `counter_growth_is_one_byte_at_a_power_of_ten` | `entity.rs` | A counter grows by 1 byte exactly when `n + 1` gains a digit, else by 0. |
 
 ### Scope of each proof
 
@@ -286,11 +572,18 @@ A proof is only as wide as its inputs. These limits are deliberate:
   initial interval and `max_interval` are at most `u32::MAX` milliseconds.
   The final `min` makes the bound true by construction. The proof shows
   that no float conversion panics on the way.
-- **The `splitmix64` bijection is not proved.** CBMC did not finish in
-  5 minutes. The chaos proof holds for every stream instead, so it holds for
-  any mixer.
+- **The chaos proof does not use the mixer.** CBMC did not prove the
+  `splitmix64` bijection in 5 minutes. The chaos proof holds for every
+  stream instead, so it holds for any mixer. Verus proves the bijection.
+- **The supersede proof found an overflow.** `supersede_count` added 1 to
+  any `usize`, and `supersede_plan` added two counts. `supersede_count`
+  now subtracts `cap - 1` from the count, so it never adds 1.
+  `supersede_plan` saturates its sum. The proof covers every `usize`.
+- **The entity proof checks a table, not `ilog10`.** A harness that called
+  `ilog10` and `pow` did not finish in 10 minutes. A table of the powers
+  of 10 finishes in about 6 seconds.
 
-Two kernels that issue #1819 names have no Kani proof:
+Three kernels have no Kani proof. Issue #1819 names the first two:
 
 - **`lifecycle::TRANSITIONS`.** The domain is 10 × 10 state pairs, so a
   unit test is exhaustive and runs in microseconds. `lifecycle.rs` holds
@@ -298,6 +591,9 @@ Two kernels that issue #1819 names have no Kani proof:
 - **`failure_signature`.** Kani is slow on UTF-8 string code. A proof of
   `truncate_chars` on 3-byte inputs did not finish in 5 minutes. Unit tests,
   proptests and the `fuzz_failure_signature` target cover it.
+- **`FailureTolerance::max_failures`.** It divides any `usize` by 100.
+  CBMC did not finish that divide in 10 minutes. The fan-out unit tests
+  cover it.
 
 ### Add a Kani proof
 
@@ -316,14 +612,126 @@ Two kernels that issue #1819 names have no Kani proof:
 6. Add a row to the table above. The guard suite checks that this page
    names every proof.
 
+## Run the Verus proofs
+
+[Verus](https://github.com/verus-lang/verus) proves Rust code against a
+specification with the Z3 SMT solver. A Kani proof checks a bounded
+input space. A Verus proof covers every input by deduction. Verus fits the
+integer kernels that make CBMC time out: a 64-bit multiply, a 128-bit
+product, and a mixer that must be shown to be one to one.
+
+```bash
+scripts/check-verus-proofs.sh
+```
+
+The script downloads the pinned Verus release and checks its SHA-256. The pin
+is a weekly release, because Verus deletes the assets of older rolling builds. To
+use a local binary, set `VERUS=/path/to/verus`. The release names the Rust
+toolchain that it links against, and the script installs that toolchain
+with rustup. The proofs take about 2 seconds. The `verus` job in
+`.github/workflows/ci.yml` runs the script. It skips draft PRs and
+docs-only changes, like `lint`.
+
+The script fails when Verus reports an error, or when it verifies nothing.
+
+### Mirrors
+
+Verus cannot compile the engine crate, so each proof checks a copy of an
+engine function in `formal/verus/src/`. A `// mirror: <path> <fn>` line
+marks each copy. The guard suite
+`autumn-harvest/tests/integration/verus_proofs_coverage.rs` removes
+comments, whitespace and `proof { }` blocks from both bodies. The bodies
+must then be equal. A `proof { }` block is ghost code. Verus erases it, so
+it cannot change what the copy computes.
+
+The guard suite fails in these cases:
+
+- A mirrored body differs from its engine source.
+- The mirrored functions differ from the engine functions whose `///` doc
+  comment names a Verus file. A deleted `// mirror:` marker fails, and an
+  editor of a proved function finds its proof in the doc comment.
+- A Verus file uses `assume`, `admit`, `axiom`, `external_body` or another
+  way to skip a step. The guard lexes the file and bans every name that
+  holds `assume`, `admit`, `axiom`, `external` or `truncate`, so a comment,
+  a space or a `use` alias cannot hide one. `macro_rules` is banned too,
+  because a local macro can delete a proof before Verus sees it.
+- A Verus proof file holds anything but `use` items and one `verus! { }`
+  block. Verus checks only the code inside the block, so a mirror moved
+  out of it would prove nothing.
+- A Verus file uses an attribute other than `#[trigger]`. A
+  `#[verifier::...]` attribute can trust a step, and a `#[cfg(...)]` can
+  delete a proof, so a new attribute must be allowed in the guard on
+  purpose.
+- A Verus contract differs from its line in `formal/verus/contracts.txt`.
+  The list holds the signature and the `requires`, `ensures` and
+  `decreases` clauses of each function, and the whole of each `spec fn`.
+  A weaker `ensures` clause still verifies, so this guard makes it a
+  visible change to a second, generated file. A deleted lemma fails the
+  same way. Do not edit the list by hand. Rewrite it with
+  `UPDATE_VERUS_CONTRACTS=1 cargo test -p autumn-harvest --test integration verus_proofs_coverage::every_verus_contract_matches_the_stored_list`.
+- `formal/verus/src/lib.rs` does not declare a module, so Verus never
+  checks it.
+- A Verus file sits below `formal/verus/src`, or a proof file loads
+  another file with `mod <name>;` or `include!`. No guard would read that
+  file.
+- `ci.yml` does not run the script on every PR.
+- This page does not name a Verus file or a mirrored function.
+
+A change to a mirrored function therefore fails the no-DB suite until the
+copy matches. Port the change, then run the script.
+
+### The proofs
+
+| File | Mirrors | Property |
+|---|---|---|
+| `mixers.rs` | `mix64` in `policy.rs` and `dlq.rs`, `splitmix64` in `chaos.rs` | Each mixer is a bijection on `u64`. An explicit inverse undoes it. |
+| `jitter.rs` | `uniform_inclusive`, `full_jitter_nanos`, `equal_jitter_nanos` in `policy.rs` | The jitter stays in its range for every input, with the real mixer. |
+| `dlq_spread.rs` | `spread_offset_nanos` in `dlq.rs` | No step overflows. The jitter is exact and below one slot. Row `index` of `count` stays in its slot and in the window. |
+
+**The mixer inverse.** Each step of the `SplitMix64` finalizer has an
+inverse. A right xor-shift by `s` bits is undone by shifts of `s` and
+`2s` bits. Each odd multiplier has an inverse modulo 2^64. Bit-vector
+lemmas prove the shifts. Integer lemmas prove the multiplies. The Kani
+jitter proofs stub the mixer with any `u64`, and the bijection shows
+that the stub loses no case.
+
+**The jitter without a stub.** The Kani proofs of `uniform_inclusive`
+stub the mixer. The Verus proofs call the verified copy of `mix64`
+itself.
+
+**The redrive spread overflow.** The Verus proof found a defect in
+`dlq::redrive_spread_offset` (issue #1832). It computed the jitter as
+`(slot * mix64(seed)) >> 64` in `u128`. For a window over about 2^34
+seconds, the product passed `u128::MAX`. A debug build panicked. A
+release build wrapped, and the row could leave its slot. The callers cap
+the window at `MAX_REDRIVE_SPREAD_SECS`, so no production path reached
+it, but the function is public. `spread_offset_nanos` now splits `slot`
+at bit 64. The proof shows that the split gives the exact jitter, and
+that no step overflows. The unit test
+`spread_offset_does_not_overflow_for_a_long_window` pins the case.
+
+### Add a Verus proof
+
+1. Pick an integer kernel with no I/O. A Verus proof cannot cover a
+   `Duration`, a `String` or a float. Extract an integer kernel first, as
+   `spread_offset_nanos` does.
+2. Copy the function into a file in `formal/verus/src/`. Put a
+   `// mirror: <path> <fn>` line above it, and declare the module in
+   `lib.rs`.
+3. Write the property as an `ensures` clause. Put proof hints in
+   `proof { }` blocks, or in separate lemmas.
+4. Name the Verus file in a comment on the engine function.
+5. Run the script, then the guard suite.
+6. Add a row to the table above.
+
 ## Not modelled yet
 
 Issue #1819 lists more work than its acceptance criteria require:
 
 - **Model (d), shard-generation fencing and rebalance.** It needs its own
   model of `replication::assert_fence` and the rebalance cutover.
-- **Trace conformance.** Check chaos and integration test traces against
-  the models, so the models do not drift from the code.
+- **Trace conformance of `CodecRotation`.** Issue #2003 checks chaos traces
+  against `ActivityClaim` and `WorkflowTaskClaim` only.
 
 Until then, a change to a modelled protocol must update its model in the
 same PR.

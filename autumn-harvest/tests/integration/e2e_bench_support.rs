@@ -255,6 +255,21 @@ pub const INFLIGHT_ENV_VAR: &str = "HARVEST_BENCH_INFLIGHT";
 /// Override the number of measured completions per shard.
 pub const WORKFLOWS_ENV_VAR: &str = "HARVEST_BENCH_WORKFLOWS";
 
+/// Override the claim loops of each worker (issue #2007).
+///
+/// Unset keeps the worker default. The resident hit-rate record compares one
+/// claim loop against the default with this knob.
+pub const CLAIM_LOOPS_ENV_VAR: &str = "HARVEST_BENCH_CLAIM_LOOPS";
+
+/// The claim loops that `raw` asks for, or `None` for the worker default.
+///
+/// A malformed or zero value means the default, as for [`positive_override`].
+#[must_use]
+pub fn claim_loops_override(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+}
+
 /// Read a positive-integer override from the environment, falling back to
 /// `default`.
 ///
@@ -284,6 +299,61 @@ pub fn stats_dir_from(raw: Option<&str>) -> Option<std::path::PathBuf> {
     raw.map(str::trim)
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
+}
+
+/// Set to `1` to record persist and claim durations (issue #2011).
+///
+/// The scenario notes then give their percentiles. Without it, the bench
+/// keeps `NoOpMetrics`, so a published run pays nothing.
+pub const COMMIT_PROBE_ENV_VAR: &str = "HARVEST_BENCH_COMMIT_PROBE";
+
+/// Whether the [`COMMIT_PROBE_ENV_VAR`] value turns the probe on.
+#[must_use]
+pub fn commit_probe_enabled(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| value.trim() == "1")
+}
+
+/// The value at `percent` of `sorted`, in milliseconds.
+fn percentile_ms(sorted: &[f64], percent: usize) -> f64 {
+    sorted[(sorted.len() - 1) * percent / 100] * 1e3
+}
+
+/// The probe notes of one scenario cell.
+///
+/// `persist` and `claim` are durations in seconds. `workflows` is the number
+/// of workflows that the cell completed.
+#[must_use]
+pub fn commit_probe_notes(persist: &[f64], claim: &[f64], workflows: usize) -> Vec<String> {
+    if persist.is_empty() {
+        return vec!["commit probe: no samples".to_string()];
+    }
+    let sorted = |samples: &[f64]| {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        sorted
+    };
+    let persist = sorted(persist);
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "sample counts here are far below 2^53"
+    )]
+    let per_workflow = persist.len() as f64 / workflows.max(1) as f64;
+    let mut notes = vec![format!(
+        "commit probe: {} persists, p50 {:.2} ms, p99 {:.2} ms, {per_workflow:.2} per workflow",
+        persist.len(),
+        percentile_ms(&persist, 50),
+        percentile_ms(&persist, 99)
+    )];
+    if !claim.is_empty() {
+        let claim = sorted(claim);
+        notes.push(format!(
+            "commit probe: {} claim attempts, empty polls included, p50 {:.2} ms, p99 {:.2} ms",
+            claim.len(),
+            percentile_ms(&claim, 50),
+            percentile_ms(&claim, 99)
+        ));
+    }
+    notes
 }
 
 /// What a teardown with stats left undone, by kind.
@@ -1708,6 +1778,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_commit_probe_is_off_unless_set_to_one() {
+        assert!(!commit_probe_enabled(None));
+        assert!(!commit_probe_enabled(Some("")));
+        assert!(!commit_probe_enabled(Some("0")));
+        assert!(commit_probe_enabled(Some("1")));
+        assert!(commit_probe_enabled(Some(" 1 ")));
+    }
+
+    #[test]
+    fn a_claim_loop_override_is_positive_or_the_default() {
+        assert_eq!(claim_loops_override(Some("1")), Some(1));
+        assert_eq!(claim_loops_override(Some(" 3 ")), Some(3));
+        assert_eq!(claim_loops_override(Some("0")), None);
+        assert_eq!(claim_loops_override(Some("two")), None);
+        assert_eq!(claim_loops_override(None), None);
+    }
+
+    #[test]
+    fn commit_probe_notes_give_percentiles_and_commits_per_workflow() {
+        let persist: Vec<f64> = (1..=100).map(|ms| f64::from(ms) / 1e3).collect();
+        let claim = [0.002, 0.001, 0.003];
+        let notes = commit_probe_notes(&persist, &claim, 25);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("100 persists"), "{notes:?}");
+        assert!(notes[0].contains("p50 50.00 ms"), "{notes:?}");
+        assert!(notes[0].contains("p99 99.00 ms"), "{notes:?}");
+        assert!(notes[0].contains("4.00 per workflow"), "{notes:?}");
+        assert!(notes[1].contains("3 claim attempts"), "{notes:?}");
+        assert!(notes[1].contains("p50 2.00 ms"), "{notes:?}");
+        assert!(commit_probe_notes(&[], &[], 0)[0].contains("no samples"));
+    }
+
+    #[test]
     fn a_failed_snapshot_is_not_reported_as_a_leaked_database() {
         let snapshot_only = TeardownReport {
             stats: vec!["throughput-1shards-s0 stats snapshot: timed out".to_string()],
@@ -2567,12 +2670,11 @@ mod tests {
 pub mod db {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock, PoisonError};
     use std::time::Instant;
 
     use chrono::{DateTime, Utc};
     use diesel::QueryableByName;
-    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
     use testcontainers::ContainerAsync;
     use testcontainers::ImageExt;
@@ -2583,7 +2685,9 @@ pub mod db {
 
     use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
     use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
-    use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
+    use autumn_harvest::telemetry::{
+        DbOp, MetricsRecorder, NoOpMetrics, ResidentOutcome, TelemetryConfig,
+    };
     use autumn_harvest::types::{ExecutionId, ShardId};
     use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
     use autumn_harvest::{
@@ -3067,11 +3171,15 @@ pub mod db {
     }
 
     fn build_pool(url: &str) -> DbPool {
-        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url);
-        deadpool::managed::Pool::builder(manager)
-            .max_size(POOL_SIZE_PER_SHARD)
-            .build()
-            .expect("bench pool build failed")
+        let manager = autumn_harvest::pool::engine_manager(url);
+        autumn_harvest::pool::with_engine_timeouts(
+            deadpool::managed::Pool::builder(manager).max_size(POOL_SIZE_PER_SHARD),
+            autumn_harvest::pool::DbRole::Hot,
+            &autumn_harvest::pool::EngineDbTimeouts::default(),
+        )
+        .expect("bench pool timeouts are valid")
+        .build()
+        .expect("bench pool build failed")
     }
 
     impl ShardCluster {
@@ -3368,17 +3476,253 @@ pub mod db {
             circuit_breaker: None,
             requires: None,
             handler: bench_activity,
+            input_schema: None,
+            output_schema: None,
         }
+    }
+
+    /// Persist and claim durations, kept while [`super::COMMIT_PROBE_ENV_VAR`]
+    /// is `1` (issue #2011).
+    #[derive(Default)]
+    pub struct CommitProbe {
+        persist: Mutex<Vec<f64>>,
+        claim: Mutex<Vec<f64>>,
+    }
+
+    impl CommitProbe {
+        /// Return the samples and clear them.
+        pub fn take(&self) -> (Vec<f64>, Vec<f64>) {
+            let take = |samples: &Mutex<Vec<f64>>| {
+                std::mem::take(&mut *samples.lock().unwrap_or_else(PoisonError::into_inner))
+            };
+            (take(&self.persist), take(&self.claim))
+        }
+    }
+
+    impl MetricsRecorder for CommitProbe {
+        /// `false`, so the worker starts no metric sampler. A sampler issues
+        /// its own queries and adds load to the durations that the probe
+        /// measures. The worker records persist and claim durations anyway.
+        fn is_enabled(&self) -> bool {
+            false
+        }
+
+        fn record_db_query_duration(&self, op: DbOp, _shard: u16, seconds: f64) {
+            let samples = match op {
+                DbOp::Persist => &self.persist,
+                DbOp::Claim => &self.claim,
+                DbOp::Scan | DbOp::Heartbeat => return,
+            };
+            samples
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(seconds);
+        }
+    }
+
+    /// The process-wide probe, or `None` when it is off.
+    pub fn commit_probe() -> Option<&'static Arc<CommitProbe>> {
+        static PROBE: OnceLock<Option<Arc<CommitProbe>>> = OnceLock::new();
+        PROBE
+            .get_or_init(|| {
+                let raw = std::env::var(super::COMMIT_PROBE_ENV_VAR).ok();
+                super::commit_probe_enabled(raw.as_deref()).then(Arc::default)
+            })
+            .as_ref()
+    }
+
+    /// Drop the samples so far, so a cell reports only its measured window.
+    pub fn reset_commit_probe() {
+        if let Some(probe) = commit_probe() {
+            probe.take();
+        }
+    }
+
+    /// The probe notes of a cell: persist and claim durations, and the
+    /// latency of each run whose workflow id starts with `{prefix}-`.
+    pub async fn commit_probe_report(cluster: &ShardCluster, prefix: &str) -> Vec<String> {
+        let Some(probe) = commit_probe() else {
+            return Vec::new();
+        };
+        let (persist, claim) = probe.take();
+        let mut latencies = Vec::new();
+        for shard in cluster.shard_ids() {
+            let mut conn = cluster.connect(shard).await;
+            latencies.extend(run_latencies(&mut conn, prefix).await);
+        }
+        let mut notes = super::commit_probe_notes(&persist, &claim, latencies.len());
+        if !latencies.is_empty() {
+            latencies.sort_by(f64::total_cmp);
+            notes.push(format!(
+                "commit probe: {} runs, start to completion p50 {:.2} ms, p99 {:.2} ms",
+                latencies.len(),
+                super::percentile_ms(&latencies, 50),
+                super::percentile_ms(&latencies, 99)
+            ));
+        }
+        notes
+    }
+
+    #[derive(QueryableByName)]
+    struct LatencyRow {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        secs: f64,
+    }
+
+    /// The start-to-completion time, in seconds, of each completed run whose
+    /// workflow id starts with `{prefix}-`.
+    ///
+    /// `started_at` is the database clock at the start, and `completed_at`
+    /// is the worker host clock. The host-to-database offset thus adds to
+    /// each value. The dispatch scenario measures that offset.
+    async fn run_latencies(conn: &mut AsyncPgConnection, prefix: &str) -> Vec<f64> {
+        diesel::sql_query(
+            "SELECT EXTRACT(EPOCH FROM (completed_at - started_at))::float8 AS secs \
+             FROM harvest_workflow_executions \
+             WHERE state = 'COMPLETED' AND completed_at IS NOT NULL AND workflow_id LIKE $1",
+        )
+        .bind::<diesel::sql_types::Text, _>(format!("{prefix}-%"))
+        .load::<LatencyRow>(conn)
+        .await
+        .expect("load bench run latencies")
+        .into_iter()
+        .map(|row| row.secs)
+        .collect()
+    }
+
+    /// Counts each `outcome` of `harvest.workflow.resident` (issue #2007).
+    ///
+    /// The `throughput` scenario reports the counts in its notes. The
+    /// recorder forwards query durations to the commit probe when the probe
+    /// is on. Every other recorder method stays a no-op.
+    #[derive(Default)]
+    pub struct ResidentCounts {
+        /// Each `outcome` label value to its count.
+        counts: Mutex<BTreeMap<String, u64>>,
+    }
+
+    impl ResidentCounts {
+        /// A copy of the counts so far.
+        #[must_use]
+        pub fn snapshot(&self) -> BTreeMap<String, u64> {
+            self.counts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        /// A copy of the counts once they stop changing.
+        ///
+        /// A closed loop returns when its runs are terminal. A decision
+        /// attempt can still be in flight, and it records its sample later.
+        /// The snapshot waits until two reads 250 ms apart agree, for at most
+        /// ten seconds. A phase boundary then falls between samples.
+        pub async fn settled_snapshot(&self) -> BTreeMap<String, u64> {
+            let mut last = self.snapshot();
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let now = self.snapshot();
+                if now == last {
+                    break;
+                }
+                last = now;
+            }
+            last
+        }
+    }
+
+    impl MetricsRecorder for ResidentCounts {
+        /// `false`, as for [`CommitProbe`]. A metric sampler would add its
+        /// own queries to the measured load.
+        fn is_enabled(&self) -> bool {
+            false
+        }
+
+        fn record_db_query_duration(&self, op: DbOp, shard: u16, seconds: f64) {
+            if let Some(probe) = commit_probe() {
+                probe.record_db_query_duration(op, shard, seconds);
+            }
+        }
+
+        fn record_workflow_resident(
+            &self,
+            _workflow_name: &str,
+            _queue: &str,
+            outcome: ResidentOutcome,
+        ) {
+            *self
+                .counts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(outcome.as_str().to_owned())
+                .or_default() += 1;
+        }
+    }
+
+    /// Renders the resident outcomes that `after` adds to `before`.
+    #[must_use]
+    pub fn resident_note(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> String {
+        let delta: BTreeMap<&str, u64> = after
+            .iter()
+            .map(|(key, n)| (key.as_str(), n - before.get(key).copied().unwrap_or(0)))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        let hits = delta.get("hit").copied().unwrap_or(0);
+        let total: u64 = delta.values().sum();
+        let replays = delta
+            .iter()
+            .filter(|(key, _)| **key != "hit")
+            .map(|(key, n)| format!("{key} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "decision counts here are far below 2^53"
+        )]
+        let rate = if total == 0 {
+            "n/a".to_owned()
+        } else {
+            format!("{:.1}%", hits as f64 * 100.0 / total as f64)
+        };
+        format!(
+            "resident decisions (issue #2007, measured loop): {hits} hits of {total}, \
+             hit rate {rate}; replays: {}",
+            if replays.is_empty() { "none" } else { &replays }
+        )
+    }
+
+    #[test]
+    fn the_resident_note_counts_only_the_measured_decisions() {
+        let counts = ResidentCounts::default();
+        counts.record_workflow_resident("wf", "q", ResidentOutcome::Cold);
+        let before = counts.snapshot();
+        counts.record_workflow_resident("wf", "q", ResidentOutcome::Cold);
+        for _ in 0..3 {
+            counts.record_workflow_resident("wf", "q", ResidentOutcome::Hit);
+        }
+        assert_eq!(
+            resident_note(&before, &counts.snapshot()),
+            "resident decisions (issue #2007, measured loop): 3 hits of 4, hit rate 75.0%; \
+             replays: cold 1"
+        );
+        assert!(resident_note(&before, &before).ends_with("hit rate n/a; replays: none"));
     }
 
     /// Build the registry both bench workflows and all three activities share.
     #[must_use]
     pub fn build_registry() -> (Arc<HandlerRegistry>, Arc<BenchObservations>) {
-        let telemetry = Arc::new(
-            TelemetryConfig::builder()
-                .metrics(Arc::new(NoOpMetrics) as Arc<dyn MetricsRecorder>)
-                .build(),
-        );
+        build_registry_with_metrics(commit_probe().map_or_else(
+            || Arc::new(NoOpMetrics) as Arc<dyn MetricsRecorder>,
+            |probe| Arc::clone(probe) as Arc<dyn MetricsRecorder>,
+        ))
+    }
+
+    /// [`build_registry`] with `metrics` as the recorder.
+    #[must_use]
+    pub fn build_registry_with_metrics(
+        metrics: Arc<dyn MetricsRecorder>,
+    ) -> (Arc<HandlerRegistry>, Arc<BenchObservations>) {
+        let telemetry = Arc::new(TelemetryConfig::builder().metrics(metrics).build());
         let observations = Arc::new(BenchObservations::default());
         let mut state = std::collections::HashMap::new();
         state.insert(
@@ -3485,6 +3829,11 @@ pub mod db {
                 runtime.shutdown_timeout = std::time::Duration::from_secs(5);
                 runtime.max_concurrent_workflows = MAX_CONCURRENT_WORKFLOWS;
                 runtime.max_concurrent_activities = MAX_CONCURRENT_ACTIVITIES;
+                if let Some(loops) = super::claim_loops_override(
+                    std::env::var(super::CLAIM_LOOPS_ENV_VAR).ok().as_deref(),
+                ) {
+                    runtime.max_concurrent_claims = loops;
+                }
                 runtime.sharded_pool = Some(sharded.clone());
                 let worker = Arc::new(
                     Worker::new(runtime, Arc::clone(registry)).expect("bench worker should build"),
@@ -3553,6 +3902,7 @@ pub mod db {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         }
     }
@@ -3980,6 +4330,17 @@ pub mod db {
         notes
     }
 
+    /// [`with_teardown_note`] with the commit probe notes before the
+    /// teardown notes.
+    fn with_probe_and_teardown_notes(
+        probe: Vec<String>,
+        mut notes: Vec<String>,
+        report: &TeardownReport,
+    ) -> Vec<String> {
+        notes.extend(probe);
+        with_teardown_note(notes, report)
+    }
+
     fn shard_note(per_shard: &[u64]) -> String {
         let split: Vec<String> = per_shard
             .iter()
@@ -4016,7 +4377,9 @@ pub mod db {
         let scenario_started = Instant::now();
         let cluster = Box::pin(setup_shards(shard_count)).await?;
         let sharded = cluster.sharded_pool();
-        let (registry, _observations) = build_registry();
+        let resident = Arc::new(ResidentCounts::default());
+        let (registry, _observations) =
+            build_registry_with_metrics(Arc::clone(&resident) as Arc<dyn MetricsRecorder>);
         let fleet = start_fleet(&cluster, &sharded, &registry, &census);
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
@@ -4041,6 +4404,8 @@ pub mod db {
             .map(|l| u64::try_from(l.completed).unwrap_or(0))
             .collect();
 
+        let resident_before = resident.settled_snapshot().await;
+        reset_commit_probe();
         let loops = run_closed_loop(
             &cluster,
             "meas",
@@ -4115,6 +4480,10 @@ pub mod db {
         // population.
         unsound.extend(per_shard_inflight_soundness(inflight, &per_shard_flight));
 
+        let probe_notes = commit_probe_report(&cluster, "meas").await;
+        // The settling wait comes after the probe report, so the probe holds
+        // no idle polls from it.
+        let resident_note = resident_note(&resident_before, &resident.settled_snapshot().await);
         fleet.stop().await;
         let topology = cluster.topology;
         drop(sharded);
@@ -4137,10 +4506,12 @@ pub mod db {
                 Metric::new("measured_window_secs", window_secs),
                 Metric::new("completions", Some(completed_metric)),
             ],
-            notes: with_teardown_note(
+            notes: with_probe_and_teardown_notes(
+                probe_notes,
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
+                    resident_note,
                     format!(
                         "closed loop: {inflight} workflows in flight per shard, {requested} \
                          measured completions, warmup population {}",
@@ -4415,6 +4786,7 @@ pub mod db {
         let warm_drained =
             wait_for_completions(&cluster, "warm", warm_per_shard * shards.len(), deadline).await;
 
+        reset_commit_probe();
         let (paced_ids, elapsed) = paced_seed(
             &cluster,
             BENCH_WORKFLOW,
@@ -4519,6 +4891,7 @@ pub mod db {
             ));
         }
 
+        let probe_notes = commit_probe_report(&cluster, "meas").await;
         fleet.stop().await;
         let topology = cluster.topology;
         drop(sharded);
@@ -4548,7 +4921,8 @@ pub mod db {
                 Metric::new("samples", Some(samples_metric)),
                 Metric::new("achieved_starts_per_sec", Some(achieved)),
             ],
-            notes: with_teardown_note(
+            notes: with_probe_and_teardown_notes(
+                probe_notes,
                 vec![
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),

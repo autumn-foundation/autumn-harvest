@@ -21,7 +21,10 @@ the same shape with one fewer service to operate.
 
 Weighing harvest against Temporal, DBOS, Inngest, Hatchet, or Restate? See the
 honest, evidence-linked [comparison page](docs/comparison.md) — it names
-harvest's own gaps, not just its strengths.
+harvest's own gaps, not just its strengths. The
+[safety report](docs/safety-report.md) states what the engine guarantees for
+leases, fencing, exactly-once completion and signal ordering. It gives the tests,
+the results, a command for each result and the known limits.
 
 Moving an existing Temporal deployment? See the
 [Temporal migration guide](docs/migrating-from-temporal.md) — a concept
@@ -78,6 +81,11 @@ Need a real reference instead of the tiny hello-world path? See:
   Docker. Each model call and tool call is an activity, a workspace write parks on an
   approval signal with a deadline, and killing the daemon mid-session resumes by replay instead
   of paying for completed turns twice. It runs with no API key (a scripted offline model).
+- [`examples/autoresearch/`](examples/autoresearch/) for Karpathy's autoresearch loop as durable
+  workflows: an agent edits `train.py`, a trainer runs it, and a keep rule decides, all night. It is
+  the capstone of the agent primitives and of most of the engine surface. It uses child workflows, a
+  saga, mutexes, signals, a query, an update, schedules, continue-as-new and seeded simulation
+  sweeps. It runs offline with a simulated trainer and a scripted researcher.
 
 ```rust
 use autumn_harvest::prelude::*;
@@ -248,9 +256,11 @@ async fn polling_loop(ctx: &WorkflowContext, mut state: serde_json::Value)
 ```
 
 `ctx.history_event_count()` reports the number of loaded durable history events.
+That count grows from task to task, so do not branch on it.
 `ctx.should_continue_as_new()` turns true once that count exceeds the
 `HarvestBuilder::history_continue_as_new_threshold(...)` soft threshold. The
-default threshold is `10_000` events.
+default threshold is `10_000` events. The engine records each answer, so a
+replay gives the same answer at the same code position.
 
 ```rust
 let harvest = HarvestBuilder::new()
@@ -271,8 +281,11 @@ guardrails against a runaway loop:
 A run that reaches a cap fails unless it calls `continue_as_new`. The worker
 moves it to the DLQ with the typed reason. The guardrail adds no workflow
 event variant. The byte measure is `pg_column_size(event_data)`, the
-same measure as the tenant `max_history_bytes` quota. The Postgres worker
-enforces both caps. The SQLite backend does not.
+same measure as the tenant `max_history_bytes` quota. The SQLite backend
+enforces both caps too, with the same defaults (issue #2023). It has no DLQ, so
+the `WorkflowFailed` event carries the reason. Its byte cap measures the
+stored event JSON length, not `pg_column_size`. Set its caps with `set_history_event_hard_cap` and
+`set_history_byte_hard_cap`.
 
 `harvest.workflow.history_bloat` fires once per run at 20.48% of the event
 cap, so at `10_240` events by default. The worker also logs a warning. Set
@@ -417,7 +430,7 @@ this section documents.
 
 Match each route's own declared content type instead: `harvest events
 tail` sends `Accept: text/event-stream`, and so must any direct client
-of the `.../events/stream` or `.../stream` routes. `GET /admin/metrics`
+of the `.../events/stream`, `.../stream` or `.../stream/durable` routes. `GET /admin/metrics`
 and `GET /admin/queues/scaling?format=prometheus` return Prometheus
 plain text; do not send `Accept: application/json` to either.
 

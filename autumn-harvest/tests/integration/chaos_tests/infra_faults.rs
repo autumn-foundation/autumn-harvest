@@ -246,11 +246,12 @@ impl FaultDb {
         let worker_url = url(port(WORKER_PROXY_PORT).await);
         let admin_url = url(port(ADMIN_PROXY_PORT).await);
 
-        connect(&admin_url)
-            .await
+        let mut admin = connect(&admin_url).await;
+        admin
             .batch_execute(&autumn_harvest::test_init_sql())
             .await
             .expect("migration");
+        super::tla_trace::install(&mut admin).await;
         Self {
             pg,
             _toxiproxy: toxiproxy,
@@ -643,6 +644,7 @@ async fn converge(admin_url: &str, execs: &[ExecutionId], activity_wf: bool, dia
             );
         }
     }
+    super::tla_trace::export(admin_url, &format!("infra-{diag}")).await;
 }
 
 /// Return true when the history of `exec_id` has one activity terminal

@@ -383,6 +383,8 @@ fn recording_activity_info(name: &'static str) -> ActivityInfo {
         circuit_breaker: None,
         requires: None,
         handler: record_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -408,6 +410,8 @@ fn blocking_activity_info(name: &'static str, start_to_close: Duration) -> Activ
         circuit_breaker: None,
         requires: None,
         handler: wait_on_barrier_activity,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -496,6 +500,7 @@ async fn insert_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -594,6 +599,7 @@ async fn insert_child_workflow_on_url(fixture: ChildWorkflowFixture<'_>) -> Exec
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -6036,6 +6042,8 @@ async fn scheduler_tick_creates_and_executes_due_interval_runs() {
             circuit_breaker: None,
             requires: None,
             handler: record_activity,
+            input_schema: None,
+            output_schema: None,
         }],
         Arc::new(state),
     ));

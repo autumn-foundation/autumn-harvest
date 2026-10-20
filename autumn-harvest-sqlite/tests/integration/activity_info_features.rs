@@ -21,8 +21,8 @@
 // The `#[workflow]`/`#[activity]` macros reference their input params, so a
 // deliberately-unused param reads as a "used underscore binding" through expansion.
 #![allow(clippy::used_underscore_binding)]
-// The `#[activity]` fixtures have trivial await-free bodies — the crate runs a
-// registered SYNCHRONOUS closure, not the macro's async body.
+// The `#[activity]` fixtures have trivial await-free bodies. Most tests register
+// a synchronous closure with `register_activity_with_body` in their place.
 #![allow(clippy::unused_async)]
 
 use std::time::Duration;
@@ -72,7 +72,7 @@ async fn schedule_to_close_deadline_records_activity_timed_out_not_retry_or_comp
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&schedule_to_close_wf_info());
     // The audited, info-based registration — HONORS the declared schedule_to_close.
-    rt.register_activity(&always_fails_info(), |_input| Err("boom".to_string()));
+    rt.register_activity_with_body(&always_fails_info(), |_input| Err("boom".to_string()));
     let exec = rt.start_workflow("schedule_to_close_wf", json!(7)).unwrap();
 
     let state = rt.run_until_blocked(exec).await.unwrap();
@@ -138,7 +138,7 @@ async fn under_deadline_wf(ctx: &WorkflowContext, n: i64) -> Result<i64, String>
 async fn a_successful_body_under_a_generous_deadline_completes_normally() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&under_deadline_wf_info());
-    rt.register_activity(&under_deadline_info(), Ok);
+    rt.register_activity_with_body(&under_deadline_info(), Ok);
     let exec = rt.start_workflow("under_deadline_wf", json!(9)).unwrap();
 
     let state = rt.run_until_blocked(exec).await.unwrap();
@@ -219,7 +219,7 @@ async fn a_successful_body_finalized_past_the_total_deadline_records_timed_out_n
     // returning: the pre-body claim check (cycle now = t0 < t0+1s) lets it run, yet the
     // post-body finalize clock (t0+5s) has passed the total cap.
     let clock_for_body = Arc::clone(&clock);
-    rt.register_activity(&slow_but_succeeds_info(), move |input| {
+    rt.register_activity_with_body(&slow_but_succeeds_info(), move |input| {
         clock_for_body.store(t0 + 5_000, Ordering::SeqCst);
         Ok(input)
     });
@@ -339,7 +339,7 @@ async fn a_queued_activity_whose_deadline_elapsed_while_an_earlier_body_ran_is_t
     // past `queued_side_effect`'s absolute deadline (scheduled_at t0 + 1s = t0+1000) —
     // then completes. No schedule_to_close of its own, so it never times out.
     let clock_for_body = Arc::clone(&clock);
-    rt.register_activity(&earlier_body_info(), move |input| {
+    rt.register_activity_with_body(&earlier_body_info(), move |input| {
         clock_for_body.store(t0 + 5_000, Ordering::SeqCst);
         Ok(input)
     });
@@ -349,7 +349,7 @@ async fn a_queued_activity_whose_deadline_elapsed_while_an_earlier_body_ran_is_t
     // the time it is claimed (the earlier body pushed the clock to t0+5s).
     let calls = Arc::new(AtomicUsize::new(0));
     let body_calls = Arc::clone(&calls);
-    rt.register_activity(&queued_side_effect_info(), move |input| {
+    rt.register_activity_with_body(&queued_side_effect_info(), move |input| {
         body_calls.fetch_add(1, Ordering::SeqCst);
         Ok(input)
     });
@@ -417,9 +417,17 @@ async fn heartbeating(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
 #[should_panic(expected = "heartbeat_timeout")]
 fn registering_an_activity_with_heartbeat_timeout_panics_naming_the_feature() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    // No heartbeating in the synchronous inline drain — reject at setup rather than
-    // silently running a body that can never observe the declared heartbeat timeout.
-    rt.register_activity(&heartbeating_info(), Ok);
+    // No scanner times out a silent attempt here. So reject at setup, and do not
+    // run a body that can never observe the declared heartbeat timeout.
+    rt.register_activity_with_body(&heartbeating_info(), Ok);
+}
+
+// Issue #2024: the handler path runs the same audit.
+#[test]
+#[should_panic(expected = "heartbeat_timeout")]
+fn registering_the_handler_with_heartbeat_timeout_panics_naming_the_feature() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_activity(&heartbeating_info());
 }
 
 #[activity(local = true)]
@@ -427,12 +435,11 @@ async fn local_act(_ctx: &ActivityContext, n: i64) -> Result<i64, String> {
     Ok(n)
 }
 
+// Issue #2029: a local activity registers. `local_activities.rs` covers it.
 #[test]
-#[should_panic(expected = "local = true")]
-fn registering_a_local_activity_panics_naming_the_feature() {
+fn registering_a_local_activity_is_accepted() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
-    // Local activities dispatch via RunLocalActivity, a command-layer non-goal here.
-    rt.register_activity(&local_act_info(), Ok);
+    rt.register_activity_with_body(&local_act_info(), Ok);
 }
 
 // ── No regression: a plain activity (only body + honored start_to_close/retry) ─────
@@ -456,7 +463,7 @@ async fn a_plain_activity_registers_and_runs_unchanged() {
     let mut rt = SqliteRuntime::open_in_memory().unwrap();
     rt.register_workflow(&plain_act_wf_info());
     // Only honored fields (start_to_close via command, retry): registers + runs.
-    rt.register_activity(&plain_act_info(), Ok);
+    rt.register_activity_with_body(&plain_act_info(), Ok);
     let exec = rt.start_workflow("plain_act_wf", json!(21)).unwrap();
     let state = rt.run_until_blocked(exec).await.unwrap();
     assert!(
@@ -532,7 +539,7 @@ async fn schedule_to_close_survives_late_activity_registration() {
     // Register the body LATE, carrying the declared 1s deadline. A body that would
     // SUCCEED (`Ok`) — yet it must still be timed out below, because the deadline
     // elapsed while it waited for registration.
-    rt.register_activity(&late_reg_act_info(), Ok);
+    rt.register_activity_with_body(&late_reg_act_info(), Ok);
 
     // Re-drive 10s later — well past the 1s total deadline. The claim resolves the
     // deadline from the now-registered spec anchored to scheduled_at(t0), sees it has
@@ -605,7 +612,7 @@ async fn late_registered_activity_within_deadline_completes_normally() {
     );
 
     // Register late and re-drive only 5s later — well within the 300s deadline.
-    rt.register_activity(&late_reg_ok_act_info(), Ok);
+    rt.register_activity_with_body(&late_reg_ok_act_info(), Ok);
     let state = rt
         .run_until_blocked_as_of(exec, t0 + chrono::Duration::seconds(5))
         .await

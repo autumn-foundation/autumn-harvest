@@ -326,12 +326,13 @@ pub const METRIC_DB_POOL_WAIT: &str = "harvest.db.pool.wait_duration";
 /// which times workflow query handlers.
 pub const METRIC_DB_QUERY_DURATION: &str = "harvest.db.query.duration";
 
-/// Gauge: poll loops that claim work from a queue on this worker (issue #1815).
+/// Gauge: claim loops that claim work from a queue on this worker (issue #1815).
 ///
-/// Labelled `{queue}`. One poll loop claims from all the worker's queues, so
-/// each queue reports the same count. The count covers every worker that
-/// shares the metrics recorder. It drops when a worker drains. This is the Harvest form of
-/// `temporal_num_pollers`.
+/// Labelled `{queue}`. Each claim loop claims from all the worker's queues,
+/// so each queue reports the same count. A worker runs
+/// `max_concurrent_claims` loops, 2 by default. An idle follower still counts.
+/// The count covers every worker that shares the metrics recorder. It drops
+/// when a worker drains. This is the Harvest form of `temporal_num_pollers`.
 pub const METRIC_WORKER_POLLERS: &str = "harvest.worker.pollers";
 
 /// Gauge: 1 when this worker is an outlier against its peers, else 0 (issue
@@ -606,6 +607,10 @@ pub const METRIC_RATE_LIMIT_BUCKETS_DELETED: &str = "harvest.retention.rate_limi
 /// Real deletes only, never a `dry_run` preview.
 pub const METRIC_TERMINAL_TASKS_DELETED: &str = "harvest.retention.terminal_tasks_deleted";
 
+/// Counter of payload blobs the orphan sweep handled (issue #2123), labeled
+/// `store.id` and `outcome` (`found` / `deleted` / `failed`).
+pub const METRIC_PAYLOAD_ORPHANS: &str = "harvest.retention.payload_orphans";
+
 /// Histogram: wall-clock latency of query handler invocations (seconds).
 ///
 /// Labelled with `query.name` (low-cardinality handler name registered by the
@@ -627,6 +632,14 @@ pub const METRIC_WORKFLOW_CACHE_HIT: &str = "harvest.workflow.cache_hit";
 /// Labeled by `workflow` (workflow name). `execution.id` stays span-only per
 /// the existing cardinality rule (ADR-0001 §7).
 pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
+
+/// Counter: one per workflow decision attempt on a worker with resident
+/// state on (issue #2007).
+///
+/// Labels: `workflow`, `queue` and `outcome`. The [`ResidentOutcome`] enum
+/// bounds `outcome`. `hit` means that the decision resumed a resident
+/// workflow. Each other value names why it replayed.
+pub const METRIC_WORKFLOW_RESIDENT: &str = "harvest.workflow.resident";
 
 /// Counter: incremented once per `signal_external_workflow` call after the
 /// terminal outcome is recorded in `harvest_events`.
@@ -1241,11 +1254,15 @@ pub const METRIC_ADMISSION_GATES_ACTIVE: &str = "harvest.admission.gates_active"
 /// its resolved per-tenant [`crate::quota::QuotaPolicy`] key is at or over
 /// one of its declared caps (issue #946).
 ///
+/// It also counts each LLM step that an LLM budget refuses (issue #1997).
+///
 /// Labels:
 ///   - `"workflow"` (= [`METRIC_LABEL_WORKFLOW`]) — the workflow type name.
-///   - `"resource"` (= [`METRIC_LABEL_RESOURCE`]) — which cap was exhausted
-///     (`"active_executions"`, `"history_bytes"`, or `"dead_letters"`, per
-///     [`crate::quota::QuotaResource::as_str`]).
+///   - `"resource"` (= [`METRIC_LABEL_RESOURCE`]) — which cap was exhausted,
+///     per [`crate::quota::QuotaResource::as_str`]. A start rejection gives
+///     `"active_executions"`, `"history_bytes"` or `"dead_letters"`. An LLM
+///     refusal gives `"run_llm_tokens"`, `"run_llm_cost_usd_micros"`,
+///     `"tenant_llm_tokens"` or `"tenant_llm_cost_usd_micros"`.
 ///
 /// The *resolved tenant key* is deliberately **not** a label — it is
 /// caller/tenant-controlled input and would be unbounded cardinality. Per-key
@@ -1852,6 +1869,76 @@ impl WebhookOutcome {
 }
 
 impl std::fmt::Display for WebhookOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The result of one workflow decision for the resident path (issue #2007).
+///
+/// It is the `outcome` label of [`METRIC_WORKFLOW_RESIDENT`]. The set is
+/// closed, so the label cardinality is bounded (ADR-0001 §7). Each value
+/// other than [`Self::Hit`] names why the decision replayed history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ResidentOutcome {
+    /// The decision resumed the resident workflow.
+    Hit,
+    /// The worker held no resident state for the run, for example after a
+    /// cache miss or on the first decision.
+    Cold,
+    /// The resident workflow did not resume. The delta, the context inputs
+    /// or the warm cycle failed a check. See `resident::ResumeDeclined`.
+    Declined,
+    /// The last suspension awaited more than one command, in a shape that
+    /// the resident path does not cover.
+    MultiAwait,
+    /// The last suspension was inside `ctx.race()`.
+    Race,
+    /// The last suspension held or acquired a durable mutex.
+    Mutex,
+    /// The workflow runs in a hot-swap module, which binds around one drive.
+    HotSwap,
+    /// Another context state blocked the capture, such as a park token, a
+    /// push signal handler, unread history or a deferred update.
+    Blocked,
+    /// The last suspension had a command that the resident path does not
+    /// cover, such as a child workflow or a local activity.
+    Unsupported,
+}
+
+impl ResidentOutcome {
+    /// Every value, in label order.
+    pub const ALL: [Self; 9] = [
+        Self::Hit,
+        Self::Cold,
+        Self::Declined,
+        Self::MultiAwait,
+        Self::Race,
+        Self::Mutex,
+        Self::HotSwap,
+        Self::Blocked,
+        Self::Unsupported,
+    ];
+
+    /// The stable `outcome` label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Cold => "cold",
+            Self::Declined => "declined",
+            Self::MultiAwait => "multi_await",
+            Self::Race => "race",
+            Self::Mutex => "mutex",
+            Self::HotSwap => "hot_swap",
+            Self::Blocked => "blocked",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+impl std::fmt::Display for ResidentOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -2802,7 +2889,8 @@ pub trait MetricsRecorder: Send + Sync {
     }
 
     /// A fresh workflow start was rejected because its resolved per-tenant
-    /// quota key is at or over a declared cap (issue #946).
+    /// quota key is at or over a declared cap (issue #946). An LLM budget
+    /// also calls it for each refused LLM step (issue #1997).
     ///
     /// `workflow` is the workflow type name; `resource` is the bounded
     /// [`crate::quota::QuotaResource::as_str`] value naming the exhausted
@@ -3307,6 +3395,15 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (state, count);
     }
 
+    /// Number of orphaned payload blobs one sweep tick handled, per outcome
+    /// (issue #2123).
+    ///
+    /// Maps to [`METRIC_PAYLOAD_ORPHANS`]. `outcome` is `found`, `deleted` or
+    /// `failed`. Real deletes only: a dry run records nothing.
+    fn record_payload_orphans(&self, store_id: &str, outcome: &str, count: u64) {
+        let _ = (store_id, outcome, count);
+    }
+
     /// Current number of RUNNING tasks for a concurrency group key.
     ///
     /// Emitted by the concurrency sampler on every sample interval. The value
@@ -3551,7 +3648,7 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (op, shard, seconds);
     }
 
-    /// The poll loops on this worker that claim from `queue` (issue #1815).
+    /// The claim loops on this worker that claim from `queue` (issue #1815).
     ///
     /// Maps to the gauge `harvest_worker_pollers{queue}`.
     fn record_worker_pollers(&self, queue: &str, pollers: u64) {
@@ -3706,9 +3803,9 @@ pub trait MetricsRecorder: Send + Sync {
 
     /// A task was dispatched from the given shard (issue #961).
     ///
-    /// Recorded once per dispatched task by the worker's poll loop, which is
-    /// the only place that knows which shard the claim came from (a task row
-    /// carries no `shard_id` column — "which shard" *is* "which pool").
+    /// The claim loop that claimed the task records it once. Only that loop
+    /// knows which shard the claim came from. A task row carries no
+    /// `shard_id` column, so "which shard" *is* "which pool".
     /// Lets operators confirm no assigned shard is being starved (AC5).
     ///
     /// Maps to the counter [`METRIC_SHARD_DISPATCHED`].
@@ -3843,6 +3940,20 @@ pub trait MetricsRecorder: Send + Sync {
     /// Maps to the counter `harvest.workflow.cache_miss{workflow}`.
     fn record_workflow_cache_miss(&self, workflow_name: &str, queue: &str) {
         let _ = (workflow_name, queue);
+    }
+
+    /// A workflow decision ran on a worker with resident state on (issue
+    /// #2007).
+    ///
+    /// The worker calls this once per decision attempt, after its first
+    /// drive. A decision that does not commit runs again and records again.
+    /// `outcome` is [`ResidentOutcome::Hit`] when the decision resumed a
+    /// resident workflow, or the reason why it replayed history.
+    ///
+    /// Maps to the counter [`METRIC_WORKFLOW_RESIDENT`] with labels
+    /// `workflow`, `queue` and `outcome`.
+    fn record_workflow_resident(&self, workflow_name: &str, queue: &str, outcome: ResidentOutcome) {
+        let _ = (workflow_name, queue, outcome);
     }
 
     /// A workflow execution was terminated because its `deadline_at` elapsed.
@@ -4840,6 +4951,7 @@ mod tests {
             METRIC_TERMINAL_TASKS_DELETED,
             "harvest.retention.terminal_tasks_deleted"
         );
+        assert_eq!(METRIC_PAYLOAD_ORPHANS, "harvest.retention.payload_orphans");
         // issue #618: exempt-by-design start producers increment this counter.
         assert_eq!(METRIC_ADMISSION_BYPASSED, "harvest.admission.bypassed");
         assert_eq!(METRIC_LABEL_PRODUCER, "producer");
@@ -4957,6 +5069,42 @@ mod tests {
         assert_eq!(METRIC_LABEL_ACTIVITY, "activity");
         assert_eq!(METRIC_LABEL_QUEUE, "queue");
         assert_eq!(METRIC_LABEL_BUILD_ID, "build_id");
+    }
+
+    #[test]
+    fn resident_outcome_labels_are_stable_and_distinct() {
+        // Dashboards and alerts key on these strings (issue #2007).
+        let labels: Vec<&str> = ResidentOutcome::ALL.iter().map(|o| o.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "hit",
+                "cold",
+                "declined",
+                "multi_await",
+                "race",
+                "mutex",
+                "hot_swap",
+                "blocked",
+                "unsupported",
+            ]
+        );
+        assert_eq!(METRIC_WORKFLOW_RESIDENT, "harvest.workflow.resident");
+        assert_eq!(ResidentOutcome::MultiAwait.to_string(), "multi_await");
+        // An exhaustive match: a new variant must join `ALL`.
+        for outcome in ResidentOutcome::ALL {
+            match outcome {
+                ResidentOutcome::Hit
+                | ResidentOutcome::Cold
+                | ResidentOutcome::Declined
+                | ResidentOutcome::MultiAwait
+                | ResidentOutcome::Race
+                | ResidentOutcome::Mutex
+                | ResidentOutcome::HotSwap
+                | ResidentOutcome::Blocked
+                | ResidentOutcome::Unsupported => {}
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

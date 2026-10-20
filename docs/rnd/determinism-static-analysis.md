@@ -372,6 +372,12 @@ the expansion sound for that call site. The cost of the choice is re-analysis
 work; the benefit is that a helper called once with clean arguments and once with
 tainted ones gets two honest answers instead of one merged approximation.
 
+> **Since the prototype:** recursion is now solved as a bounded fixpoint, and
+> the cut described here remains only for a cycle that does not converge in 8
+> rounds, a chain deeper than 96 bodies and an exhausted budget. See
+> [`docs/harvest-verify.md`](../harvest-verify.md) §Limitations and
+> `corpus/seeded/src/wf_recursive_relay.rs`.
+
 **Recursion is cut, not solved — and the prototype is weaker here than a reader
 would assume.** There is no SCC condensation and no interprocedural fixpoint.
 `Analyzer::analyze_body` keeps the active call stack, and a callee already on it
@@ -584,6 +590,7 @@ approximate, and a reader who quotes a verdict needs them.
   and `analysis_fixtures::a_value_read_before_the_sanitizer_keeps_its_taint` /
   `::a_value_read_after_the_sanitizer_is_clean` pin the fix.
 - **Recursion is cut rather than solved, and a sink inside the cycle is lost.**
+  (Since solved as a bounded fixpoint; see §Interprocedural summaries.)
   See §Interprocedural summaries: the partial summary carries `has_sink: false`,
   so a command emitted only through a recursive cycle contributes no finding. The
   `recursion` boundary still lands on the workflow, so the *verdict* degrades to

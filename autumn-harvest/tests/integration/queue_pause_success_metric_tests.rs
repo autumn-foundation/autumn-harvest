@@ -149,6 +149,8 @@ fn registry() -> Arc<HandlerRegistry> {
         max_result_bytes: None,
         requires: None,
         handler: call_downstream_handler,
+        input_schema: None,
+        output_schema: None,
     };
     Arc::new(HandlerRegistry::new(vec![wf], vec![act]))
 }
@@ -294,6 +296,7 @@ async fn start_one(url: &str, n: usize) -> ExecutionId {
             start_source: StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,

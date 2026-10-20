@@ -17,7 +17,7 @@ use autumn_harvest::testing::WorkflowReplayer;
 use autumn_harvest::{
     AcknowledgedBreakingChange, DetCheckReport, DetSeverity, SchemaContractDiff, SchemaDelta,
     SchemaRole, WorkflowSchemaContract, check_paths, diff_schema_contracts,
-    dropped_acknowledgements, unacknowledged_breaking,
+    dropped_acknowledgements, subject_label, unacknowledged_breaking,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use diesel_async::AsyncPgConnection;
@@ -391,6 +391,10 @@ pub enum PartitionCommand {
     /// sweeps droppable cohorts. The retention janitor does exactly this every
     /// tick; this exists for incident response and for a deployment that runs
     /// with history retention disabled (where no janitor is running to do it).
+    ///
+    /// This command never exports a partition. On a shard whose engine exports
+    /// aged partitions (issue #2009), it drops nothing and reports
+    /// `export required, but no archiver is set`.
     Maintain {
         /// A shard database DSN. Repeat once per shard.
         #[arg(long = "shard", value_name = "DSN", required = true)]
@@ -802,6 +806,17 @@ pub enum CliError {
          request at a different route"
     )]
     QueueNameDotSegment {
+        /// Original CLI argument value.
+        value: String,
+    },
+
+    /// A fairness key would be normalized away as a URL dot-segment.
+    #[error(
+        "invalid fairness key '{value}': '.' and '..' are removed as \
+         dot-segments when the request URL is parsed, which would silently \
+         retarget the request at a different route"
+    )]
+    FairnessKeyDotSegment {
         /// Original CLI argument value.
         value: String,
     },
@@ -2181,11 +2196,12 @@ enum WorkflowCommand {
         /// live executions or force this sort order.
         #[arg(long = "history-bloat-min-events")]
         history_bloat_min_events: Option<u64>,
-        /// Filter by workflow-start provenance (issue #740): one of api,
+        /// Filter by workflow-start provenance (issue #740). Values: api,
         /// schedule, backfill, `signal_with_start`, `update_with_start`,
-        /// `completion_trigger`, webhook, child, batch, `continue_as_new`,
-        /// reset, outbox, or unknown (matches pre-upgrade/NULL rows). The
-        /// server rejects any other value with a 400.
+        /// `completion_trigger`, webhook, broker, child, batch,
+        /// `continue_as_new`, reset, rerun, outbox, transactional, fork.
+        /// `unknown` matches pre-upgrade/NULL rows. The server rejects any
+        /// other value with a 400.
         #[arg(long = "start-source")]
         start_source: Option<String>,
     },
@@ -2871,7 +2887,8 @@ enum ScheduleCommand {
         /// New task queue name for scheduled runs.
         #[arg(long)]
         queue: Option<String>,
-        /// New overlap policy: skip, `buffer_one`, `buffer_all`, `cancel_other`, `terminate_other`.
+        /// New overlap policy: skip, `buffer_one`, `buffer_all`, `cancel_other`, `terminate_other`,
+        /// `allow_all`.
         #[arg(long)]
         overlap_policy: Option<String>,
         /// New maximum buffered slots under `buffer_all`.
@@ -3039,6 +3056,40 @@ enum QueueCommand {
         /// Output raw JSON instead of the summary table.
         #[arg(long)]
         json: bool,
+    },
+    /// Show, set, or clear fairness key weights in a queue (issue #1976).
+    #[command(subcommand)]
+    Fairness(FairnessCommand),
+}
+
+/// Fairness key weights within one queue (issue #1976).
+///
+/// A key with weight `w` gets `w` claims for each claim of a key with weight
+/// `1`, while both have work. A key with no override has weight `1`. A change
+/// applies at the next claim of the key. No worker restart is needed.
+#[derive(Debug, Subcommand)]
+enum FairnessCommand {
+    /// Show the weight overrides and the claim state of each key.
+    Show {
+        /// Task queue name.
+        queue_name: String,
+    },
+    /// Set the weight of one fairness key.
+    Set {
+        /// Task queue name.
+        queue_name: String,
+        /// Fairness key, matched exactly.
+        fairness_key: String,
+        /// The weight, from 0.001 to 1000.
+        #[arg(long, value_parser = parse_fairness_weight)]
+        weight: f64,
+    },
+    /// Clear the weight of one fairness key. The key goes back to weight 1.
+    Clear {
+        /// Task queue name.
+        queue_name: String,
+        /// Fairness key, matched exactly.
+        fairness_key: String,
     },
 }
 
@@ -6717,6 +6768,67 @@ async fn run_partition_status(shards: &[String], format: DrFormat) -> Result<(),
     emit_partition_report(&out, format, "status")
 }
 
+/// The result of the prelude that `harvest partition enable|maintain|disable`
+/// share (issue #2221).
+// One value exists per shard and the caller moves it out at once. A box
+// would add an allocation and no benefit.
+#[allow(clippy::large_enum_variant)]
+enum PartitionShardPrep {
+    /// The shard is ready for its mutation.
+    Ready {
+        /// A connection that passed the authority check.
+        conn: autumn_harvest::diesel_async::AsyncPgConnection,
+        /// The fence barriers. Hold them until the mutation ends.
+        fence: Vec<autumn_harvest::replication::FencePassGuard>,
+        /// The report row for this shard, with no result filled in yet.
+        row: PartitionShardReport,
+    },
+    /// The shard cannot be mutated. The row says why.
+    Unavailable(PartitionShardReport),
+}
+
+/// Run the DR-fenced prelude for one shard (issue #1823).
+///
+/// The steps are: connect, check write authority, take the fence. The first
+/// failing step ends the prelude. A connect failure gives an unreachable row.
+/// An authority or fence failure gives a reachable row with its error set.
+async fn prepare_partition_shard(
+    target: &autumn_harvest::backup_verify::ShardTarget,
+    expect_generation: &[ExpectGeneration],
+) -> PartitionShardPrep {
+    let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
+    let mut conn = match dr_connect(&target.dsn).await {
+        Ok(conn) => conn,
+        Err(error) => {
+            return PartitionShardPrep::Unavailable(PartitionShardReport::unreachable(
+                target.shard_id,
+                redacted,
+                error.to_string(),
+            ));
+        }
+    };
+    let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
+    if let Err(error) = direct_write_authority(
+        &mut conn,
+        target.shard_id,
+        expect_generation,
+        autumn_harvest::replication::AdminWrite::SchemaOnly,
+    )
+    .await
+    {
+        row.error = Some(error);
+        return PartitionShardPrep::Unavailable(row);
+    }
+    // Held until this shard's mutation ends (issue #1823).
+    match database_fence(&target.dsn, target.shard_id, expect_generation).await {
+        Ok(fence) => PartitionShardPrep::Ready { conn, fence, row },
+        Err(error) => {
+            row.error = Some(error);
+            PartitionShardPrep::Unavailable(row)
+        }
+    }
+}
+
 async fn run_partition_enable(
     shards: &[String],
     opts: &autumn_harvest::partition::EnableOptions,
@@ -6726,40 +6838,14 @@ async fn run_partition_enable(
     let targets = parse_shard_targets(shards)?;
     let mut out = Vec::with_capacity(targets.len());
     for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) = direct_write_authority(
-            &mut conn,
-            target.shard_id,
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::SchemaOnly,
-        )
-        .await
-        {
-            row.error = Some(error);
-            out.push(row);
-            continue;
-        }
-        // Held until this shard's mutation ends (issue #1823).
-        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                row.error = Some(error);
-                out.push(row);
-                continue;
-            }
-        };
+        let (mut conn, fence, mut row) =
+            match prepare_partition_shard(target, expect_generation).await {
+                PartitionShardPrep::Ready { conn, fence, row } => (conn, fence, row),
+                PartitionShardPrep::Unavailable(row) => {
+                    out.push(row);
+                    continue;
+                }
+            };
         // Per-shard independence is deliberate: a shard is a database, and a
         // half-converted cluster is a supported state (each shard's layout is
         // detected at runtime), so one shard's lock timeout must not abort the
@@ -6797,40 +6883,14 @@ async fn run_partition_maintain(
     };
     let mut out = Vec::with_capacity(targets.len());
     for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) = direct_write_authority(
-            &mut conn,
-            target.shard_id,
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::SchemaOnly,
-        )
-        .await
-        {
-            row.error = Some(error);
-            out.push(row);
-            continue;
-        }
-        // Held until this shard's mutation ends (issue #1823).
-        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                row.error = Some(error);
-                out.push(row);
-                continue;
-            }
-        };
+        let (mut conn, fence, mut row) =
+            match prepare_partition_shard(target, expect_generation).await {
+                PartitionShardPrep::Ready { conn, fence, row } => (conn, fence, row),
+                PartitionShardPrep::Unavailable(row) => {
+                    out.push(row);
+                    continue;
+                }
+            };
         // A lost fence session stops the pass. See `run_fenced_pass`.
         let maintained = autumn_harvest::replication::run_fenced_pass(&fence, async {
             // Issue #1823: the connection predates the pass, so it joins it.
@@ -6877,40 +6937,14 @@ async fn run_partition_disable(
     let targets = parse_shard_targets(shards)?;
     let mut out = Vec::with_capacity(targets.len());
     for target in &targets {
-        let redacted = autumn_harvest::backup_verify::redact_dsn(&target.dsn);
-        let mut conn = match dr_connect(&target.dsn).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                out.push(PartitionShardReport::unreachable(
-                    target.shard_id,
-                    redacted,
-                    error.to_string(),
-                ));
-                continue;
-            }
-        };
-        let mut row = PartitionShardReport::reachable(target.shard_id, redacted);
-        if let Err(error) = direct_write_authority(
-            &mut conn,
-            target.shard_id,
-            expect_generation,
-            autumn_harvest::replication::AdminWrite::SchemaOnly,
-        )
-        .await
-        {
-            row.error = Some(error);
-            out.push(row);
-            continue;
-        }
-        // Held until this shard's mutation ends (issue #1823).
-        let fence = match database_fence(&target.dsn, target.shard_id, expect_generation).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                row.error = Some(error);
-                out.push(row);
-                continue;
-            }
-        };
+        let (mut conn, fence, mut row) =
+            match prepare_partition_shard(target, expect_generation).await {
+                PartitionShardPrep::Ready { conn, fence, row } => (conn, fence, row),
+                PartitionShardPrep::Unavailable(row) => {
+                    out.push(row);
+                    continue;
+                }
+            };
         // A lost fence session stops the mutation. See `run_fenced_pass`.
         let disabled = autumn_harvest::replication::run_fenced_pass(&fence, async {
             // Issue #1823: the connection predates the pass, so it joins it.
@@ -7558,18 +7592,32 @@ async fn run_dr_promote(shards: &[String], format: DrFormat) -> Result<(), CliEr
 
 /// Reads and parses a schema-contract document, naming the path on failure.
 fn read_schema_contract(path: &Path) -> Result<WorkflowSchemaContract, CliError> {
+    read_schema_contract_and_shape(path).map(|(contract, _)| contract)
+}
+
+/// Reads a schema-contract document, and reports whether it is a bare
+/// `GET /workflows/registered` array (issue #1994).
+///
+/// A bare array has no activity or side-effect section, so the guard in
+/// [`guard_empty_current`] needs to know the shape.
+fn read_schema_contract_and_shape(path: &Path) -> Result<(WorkflowSchemaContract, bool), CliError> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         CliError::InvalidInput(format!(
             "failed to read schema contract `{}`: {e}",
             path.display()
         ))
     })?;
+    let bare = raw.trim_start().starts_with('[');
     WorkflowSchemaContract::parse(&raw)
+        .map(|contract| (contract, bare))
         .map_err(|e| CliError::InvalidInput(format!("`{}` is not usable: {e}", path.display())))
 }
 
-/// Renders a schema diff as `workflow.role: <field> — <verdict> — <reason>`
+/// Renders a schema diff as `subject.role: <field> — <verdict> — <reason>`
 /// lines, one per delta, plus a summary line.
+///
+/// The subject is a workflow name, `activity:<name>` or
+/// `<workflow>/side_effect:<id>` (issue #1994).
 #[must_use]
 pub fn format_schema_diff_text(diff: &SchemaContractDiff) -> String {
     use std::fmt::Write as _;
@@ -7586,7 +7634,7 @@ pub fn format_schema_diff_text(diff: &SchemaContractDiff) -> String {
         let _ = writeln!(
             out,
             "{}.{}: {} — {} — {}",
-            d.workflow,
+            subject_label(d.subject, &d.workflow, d.side_effect.as_deref()),
             role,
             field,
             d.verdict.as_str(),
@@ -7651,8 +7699,8 @@ pub fn run_schema_check(
     acknowledged_in: Option<&Path>,
 ) -> Result<(), CliError> {
     let base = read_schema_contract(baseline)?;
-    let cur = read_schema_contract(current)?;
-    guard_empty_current(&base, &cur, current)?;
+    let (cur, is_bare_registry) = read_schema_contract_and_shape(current)?;
+    guard_empty_current(&base, &cur, current, is_bare_registry)?;
     let diff = diff_schema_contracts(&base, &cur);
 
     match format {
@@ -7737,9 +7785,10 @@ pub fn run_schema_check(
     // Two siblings are deliberately NOT compared here. `version` records which
     // BUILD produced the artifact rather than what the gate checks, so tying
     // currency to it would force a regeneration on every crate version bump for
-    // no safety gain. `contract_version` needs no check at all — `parse` already
-    // hard-refuses a value this build does not implement — and `workflows` and
-    // `coverage` are rebuilt from the entries on parse.
+    // no safety gain. `contract_version` needs no check at all. `parse` refuses
+    // a value this build does not implement. It also refuses a legacy `1` that
+    // carries activity or side-effect content (issue #1994). `parse` rebuilds
+    // `workflows`, `activities`, `side_effects` and `coverage` from the entries.
     //
     // Reported before the delta staleness below because it is the stronger
     // claim: a stale schema means the artifact is behind, while a doctored
@@ -7790,7 +7839,7 @@ fn format_unacknowledged(missing: &[&SchemaDelta]) -> String {
         let _ = writeln!(
             out,
             "  {}{role}{}: {} — {}",
-            d.workflow,
+            subject_label(d.subject, &d.workflow, d.side_effect.as_deref()),
             d.field_path,
             d.change.as_str(),
             d.reason
@@ -7810,7 +7859,7 @@ fn format_dropped(dropped: &[&AcknowledgedBreakingChange]) -> String {
         let _ = writeln!(
             out,
             "  {}{role}{}: {} — recorded as {:?}",
-            a.workflow,
+            subject_label(a.subject, &a.workflow, a.side_effect.as_deref()),
             a.field_path,
             a.change.as_str(),
             a.reason
@@ -7836,6 +7885,7 @@ fn guard_empty_current(
     base: &WorkflowSchemaContract,
     cur: &WorkflowSchemaContract,
     current: &Path,
+    is_bare_registry: bool,
 ) -> Result<(), CliError> {
     if cur.workflows.is_empty() && !base.workflows.is_empty() {
         return Err(CliError::InvalidInput(format!(
@@ -7847,6 +7897,40 @@ fn guard_empty_current(
             current.display(),
             base.workflows.len(),
             base.workflows.len()
+        )));
+    }
+    // A bare `GET /workflows/registered` array has no activity or side-effect
+    // section (issue #1994). Diffed as is, it reports every one as removed and
+    // buries the real cause. A generated contract that drops a section is not
+    // refused here: each removal is then a delta of its own.
+    if !is_bare_registry {
+        return Ok(());
+    }
+    let missing: Vec<(&str, usize)> = [
+        ("activities", base.activities.len(), cur.activities.len()),
+        (
+            "side effects",
+            base.side_effects.len(),
+            cur.side_effects.len(),
+        ),
+    ]
+    .into_iter()
+    .filter(|&(_, in_base, in_cur)| in_base > 0 && in_cur == 0)
+    .map(|(section, in_base, _)| (section, in_base))
+    .collect();
+    if !missing.is_empty() {
+        let sections: Vec<&str> = missing.iter().map(|&(section, _)| section).collect();
+        let counts: Vec<String> = missing
+            .iter()
+            .map(|(section, n)| format!("{section} ({n})"))
+            .collect();
+        return Err(CliError::InvalidInput(format!(
+            "`{}` is a bare `GET /workflows/registered` body, so it publishes no {}, but the \
+             baseline has {}. Generate `--current` with \
+             `WorkflowSchemaContract::with_activities` and `with_side_effects` instead.",
+            current.display(),
+            sections.join(" and "),
+            counts.join(" and ")
         )));
     }
     Ok(())
@@ -7904,10 +7988,10 @@ pub fn run_schema_update(
     recorded_in: Option<&str>,
 ) -> Result<(), CliError> {
     let base = read_schema_contract(baseline)?;
-    let cur = read_schema_contract(current)?;
+    let (cur, is_bare_registry) = read_schema_contract_and_shape(current)?;
     // Refuse here too: `update` is the path that would OVERWRITE the baseline
     // with the empty document and disarm the gate for every later run.
-    guard_empty_current(&base, &cur, current)?;
+    guard_empty_current(&base, &cur, current, is_bare_registry)?;
     let diff = diff_schema_contracts(&base, &cur);
 
     // The core recomputes the diff internally rather than accepting ours: it is
@@ -8808,6 +8892,11 @@ fn format_usage_table(value: &Value) -> String {
         "ACT_EXEC",
         "ACT_FAILED",
         "COMPUTE_S",
+        "LLM_CALLS",
+        "LLM_IN",
+        "LLM_OUT",
+        "LLM_COST_USD",
+        "LLM_UNPRICED",
     ]
     .iter()
     .map(ToString::to_string)
@@ -8825,6 +8914,11 @@ fn format_usage_table(value: &Value) -> String {
             cell_number(group.get("activity_executions")),
             cell_number(group.get("activity_executions_failed")),
             format_f64(group.get("activity_compute_seconds")),
+            cell_number(group.get("llm_calls")),
+            cell_number(group.get("llm_input_tokens")),
+            cell_number(group.get("llm_output_tokens")),
+            format_usd_micros(group.get("llm_cost_usd_micros")),
+            cell_number(group.get("llm_unpriced_calls")),
         ]);
     }
 
@@ -8981,6 +9075,19 @@ fn format_rate_limit_table(value: &Value) -> String {
     }
 
     render_table(&rows)
+}
+
+/// Millionths of a US dollar as dollars with six decimals (issue #1996).
+///
+/// An absent field, as from an older server, stays blank.
+fn format_usd_micros(value: Option<&Value>) -> String {
+    value
+        .and_then(Value::as_i64)
+        .map_or_else(String::new, |micros| {
+            let sign = if micros < 0 { "-" } else { "" };
+            let abs = micros.unsigned_abs();
+            format!("{sign}{}.{:06}", abs / 1_000_000, abs % 1_000_000)
+        })
 }
 
 fn format_f64(value: Option<&Value>) -> String {
@@ -12172,11 +12279,17 @@ fn legal_hold_request(command: &LegalHoldCommand) -> ApiRequest {
 /// partial-application contract worth gating the exit code on.
 ///
 /// `list-paused` is a read with no such contract, so it is deliberately excluded.
+/// A fairness weight set or clear has the same contract (issue #1976). The
+/// fairness `show` read does not.
 const fn queue_mutation_should_gate(cli: &Cli) -> bool {
     matches!(
         &cli.command,
         Commands::Queue {
-            command: QueueCommand::Pause { .. } | QueueCommand::Resume { .. }
+            command: QueueCommand::Pause { .. }
+                | QueueCommand::Resume { .. }
+                | QueueCommand::Fairness(
+                    FairnessCommand::Set { .. } | FairnessCommand::Clear { .. }
+                )
         }
     )
 }
@@ -12231,6 +12344,56 @@ fn checked_queue_segment(queue_name: &str) -> Result<String, CliError> {
     Ok(path_segment(queue_name))
 }
 
+/// Reject a fairness key that cannot survive URL path parsing intact.
+///
+/// Only the literal `.` and `..` fail. `path_segment` encodes `%`, so a key
+/// such as `%2e` reaches the route as `%252e`. The core validator accepts it
+/// (issue #2097).
+fn checked_fairness_key_segment(fairness_key: &str) -> Result<String, CliError> {
+    if matches!(fairness_key, "." | "..") {
+        return Err(CliError::FairnessKeyDotSegment {
+            value: fairness_key.to_string(),
+        });
+    }
+    Ok(path_segment(fairness_key))
+}
+
+/// Map `harvest queue fairness …` onto the three fairness routes (issue #1976).
+fn fairness_request(command: &FairnessCommand) -> Result<ApiRequest, CliError> {
+    match command {
+        FairnessCommand::Show { queue_name } => {
+            let queue = checked_queue_segment(queue_name)?;
+            Ok(ApiRequest::get(format!("/admin/queues/{queue}/fairness")))
+        }
+        FairnessCommand::Set {
+            queue_name,
+            fairness_key,
+            weight,
+        } => {
+            let queue = checked_queue_segment(queue_name)?;
+            let key = checked_fairness_key_segment(fairness_key)?;
+            let mut body = Map::new();
+            body.insert("weight".to_string(), Value::from(*weight));
+            Ok(ApiRequest::post(
+                format!("/admin/queues/{queue}/fairness/{key}"),
+                Some(Value::Object(body)),
+            ))
+        }
+        FairnessCommand::Clear {
+            queue_name,
+            fairness_key,
+        } => {
+            let queue = checked_queue_segment(queue_name)?;
+            let key = checked_fairness_key_segment(fairness_key)?;
+            Ok(ApiRequest {
+                method: ApiMethod::Delete,
+                path: format!("/admin/queues/{queue}/fairness/{key}"),
+                body: None,
+            })
+        }
+    }
+}
+
 /// Map `harvest queue …` onto the three management routes (issue #619).
 ///
 /// `--shard-id` is omitted from the body entirely when unset, so the default is
@@ -12268,6 +12431,7 @@ fn queue_request(command: &QueueCommand) -> Result<ApiRequest, CliError> {
             ))
         }
         QueueCommand::ListPaused => Ok(ApiRequest::get("/admin/queues/paused")),
+        QueueCommand::Fairness(command) => fairness_request(command),
         QueueCommand::Coverage { queue_name, .. } => Ok(queue_name.as_ref().map_or_else(
             || ApiRequest::get("/admin/queue-coverage"),
             |value| {
@@ -13679,6 +13843,20 @@ fn retirement_shard_array_cell(item: &Value, field: &str) -> String {
         .join(",")
 }
 
+/// Parse `--weight`. A non-finite number would reach the server as JSON
+/// `null`, so the CLI rejects it with a clear message.
+fn parse_fairness_weight(raw: &str) -> Result<f64, String> {
+    let weight: f64 = raw
+        .trim()
+        .parse()
+        .map_err(|e| format!("weight must be a number: {e}"))?;
+    if weight.is_finite() {
+        Ok(weight)
+    } else {
+        Err("weight must be a finite number from 0.001 to 1000".to_owned())
+    }
+}
+
 #[cfg(test)]
 mod reuse_policy_tests {
     use super::*;
@@ -14654,6 +14832,41 @@ mod reuse_policy_tests {
             "the read route has no partial-application contract to gate on"
         );
         assert!(!queue_mutation_should_gate(&parse(&["health"])));
+    }
+
+    #[test]
+    fn queue_mutation_gate_covers_the_fairness_writes_only() {
+        // Issue #1976: a weight set or clear reports a partial fan-out with
+        // the same `ok`/`status` contract as a queue pause.
+        assert!(queue_mutation_should_gate(&parse(&[
+            "queue", "fairness", "set", "q", "tenant-a", "--weight", "2"
+        ])));
+        assert!(queue_mutation_should_gate(&parse(&[
+            "queue", "fairness", "clear", "q", "tenant-a"
+        ])));
+        assert!(
+            !queue_mutation_should_gate(&parse(&["queue", "fairness", "show", "q"])),
+            "the read route has no partial-application contract to gate on"
+        );
+    }
+
+    #[test]
+    fn fairness_weight_parser_rejects_non_finite_numbers() {
+        assert_eq!(parse_fairness_weight(" 2.5 "), Ok(2.5));
+        for bad in ["inf", "-inf", "NaN", "abc"] {
+            assert!(parse_fairness_weight(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn fairness_key_dot_segment_error_uses_exit_code_one() {
+        assert_eq!(
+            CliError::FairnessKeyDotSegment {
+                value: ".".to_string()
+            }
+            .exit_code(),
+            1
+        );
     }
 
     #[test]
@@ -16728,6 +16941,76 @@ mod usage_cli_tests {
         assert!(rendered.contains("group_by: workflow_name"));
         assert!(rendered.contains("onboarding"));
         assert!(rendered.contains("123.46"));
+    }
+
+    #[test]
+    fn format_usage_table_renders_the_llm_ledger_columns() {
+        let value = serde_json::json!({
+            "status": "complete",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "search_attr:tenant_id",
+            "groups": [
+                {
+                    "group": "acme",
+                    "workflow_starts": 1,
+                    "completed": 1,
+                    "failed": 0,
+                    "cancelled": 0,
+                    "timed_out": 0,
+                    "activity_executions": 2,
+                    "activity_executions_failed": 0,
+                    "activity_compute_seconds": 1.0,
+                    "llm_calls": 3,
+                    "llm_input_tokens": 1_250,
+                    "llm_output_tokens": 340,
+                    "llm_cost_usd_micros": 1_234_567,
+                    "llm_unpriced_calls": 0,
+                    "llm_latency_ms": 900
+                }
+            ],
+            "unavailable_shards": []
+        });
+        let rendered = format_usage_table(&value);
+        for column in [
+            "LLM_CALLS",
+            "LLM_IN",
+            "LLM_OUT",
+            "LLM_COST_USD",
+            "LLM_UNPRICED",
+        ] {
+            assert!(rendered.contains(column), "{column}: {rendered}");
+        }
+        assert!(rendered.contains("1250"), "{rendered}");
+        assert!(rendered.contains("340"), "{rendered}");
+        assert!(rendered.contains("1.234567"), "{rendered}");
+    }
+
+    #[test]
+    fn format_usage_table_leaves_llm_cells_blank_for_an_older_server() {
+        let value = serde_json::json!({
+            "status": "complete",
+            "from": "2026-01-01T00:00:00Z",
+            "to": "2026-02-01T00:00:00Z",
+            "group_by": "workflow_name",
+            "groups": [{"group": "onboarding", "workflow_starts": 1}],
+            "unavailable_shards": []
+        });
+        let rendered = format_usage_table(&value);
+        assert!(rendered.contains("LLM_COST_USD"), "{rendered}");
+        assert!(!rendered.contains("0.000000"), "{rendered}");
+    }
+
+    #[test]
+    fn format_usd_micros_prints_dollars_with_six_decimals() {
+        let cell = |v: serde_json::Value| format_usd_micros(Some(&v));
+        assert_eq!(cell(serde_json::json!(0)), "0.000000");
+        assert_eq!(cell(serde_json::json!(5)), "0.000005");
+        assert_eq!(cell(serde_json::json!(1_234_567)), "1.234567");
+        assert_eq!(cell(serde_json::json!(-1_500_000)), "-1.500000");
+        assert_eq!(cell(serde_json::json!(i64::MAX)), "9223372036854.775807");
+        assert_eq!(cell(serde_json::json!(u64::MAX)), "", "not an i64");
+        assert_eq!(format_usd_micros(None), "");
     }
 
     #[test]
@@ -19838,5 +20121,36 @@ mod pg_tls_feature_tests {
             "the CLI must enable autumn-harvest/tls: {:?}",
             result.err()
         );
+    }
+}
+
+#[cfg(test)]
+mod partition_shard_prep_tests {
+    //! The shared prelude of `harvest partition enable|maintain|disable`
+    //! (issue #2221). These tests need no database: an unreachable shard
+    //! stops the prelude before any authority or fence step. The authority
+    //! and fence paths need Postgres and run in the DB integration suite.
+    use super::*;
+
+    const DSN: &str = "postgres://user:s3cret@127.0.0.1:1/harvest";
+
+    #[tokio::test]
+    async fn unreachable_shard_yields_a_redacted_report_row() {
+        let target = ShardTarget::new(7, DSN);
+        let prep = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            prepare_partition_shard(&target, &[]),
+        )
+        .await
+        .expect("connect must fail fast");
+        let PartitionShardPrep::Unavailable(row) = prep else {
+            panic!("a closed port must be unavailable");
+        };
+        assert_eq!(row.shard_id, 7);
+        assert!(!row.reachable);
+        assert!(row.error.is_none());
+        assert!(!row.dsn.contains("s3cret"), "{}", row.dsn);
+        let reason = row.unreachable_reason.expect("a reason");
+        assert!(!reason.contains("s3cret"), "{reason}");
     }
 }

@@ -242,6 +242,7 @@ fn params<'a>(
         start_source: StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     }
 }
@@ -1056,6 +1057,8 @@ fn act_info(name: &'static str, handler: ActivityHandlerFn) -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

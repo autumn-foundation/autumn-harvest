@@ -19,3 +19,12 @@ WorkflowTaskClaim  WorkflowTaskClaimCapMissPreFix.cfg  violation:OwnerWritesByCu
 CodecRotation      CodecRotation.cfg                   pass
 CodecRotation      CodecRotationBlindWrite.cfg         violation:ErasureIsFinal
 CodecRotation      CodecRotationReach.cfg              violation:NoSweepRacesErasure
+OwnerLease         OwnerLease.cfg                      pass
+OwnerLease         OwnerLeaseNoFence.cfg               violation:OneOwnerPerEpoch
+OwnerLease         OwnerLeaseUnlockedFence.cfg         violation:OneOwnerPerEpoch
+OwnerLease         OwnerLeaseHolderFence.cfg           violation:DecisionOnFreshHistory
+OwnerLease         OwnerLeaseKeepCache.cfg             violation:DecisionOnFreshHistory
+OwnerLease         OwnerLeasePipeline.cfg              violation:DecisionOnFreshHistory
+OwnerLease         OwnerLeaseRenewBumps.cfg            violation:OwnerNeverFencesItself
+OwnerLease         OwnerLeaseMemoryAck.cfg             violation:NoAckedSignalLost
+OwnerLease         OwnerLeaseReach.cfg                 violation:SomeNemesisUnseen

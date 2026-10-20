@@ -76,6 +76,13 @@ pub const DEFAULT_ACTIVITY_START_TO_CLOSE: Duration = Duration::from_secs(10 * 6
 /// itself stopped before the platform sends `SIGKILL`.
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// Default cap on the claims one worker runs at once: 2.
+///
+/// Assay #14 measured claim-loop occupancy at 0.94, which fits one claim in
+/// flight. That loop capped throughput. See
+/// [`WorkerConfig::with_max_concurrent_claims`].
+pub const DEFAULT_MAX_CONCURRENT_CLAIMS: usize = 2;
+
 /// Default sticky routing window (issue #1798): 5 seconds.
 ///
 /// A follow-up task of a suspended execution waits up to this long for the
@@ -100,6 +107,8 @@ pub struct HarvestBuilder {
     telemetry: Option<TelemetryConfig>,
     retention: RetentionConfig,
     history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
+    /// Gets each aged event partition before the sweep drops it (issue #2009).
+    partition_archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
     /// Ordered activity execution interceptor chain (issue #680). Index 0 is the
     /// OUTERMOST wrapper; the activity handler is innermost. Empty (default) =
     /// no interceptors.
@@ -214,6 +223,7 @@ impl Default for HarvestBuilder {
             telemetry: None,
             retention: crate::retention::RetentionConfig::default(),
             history_archiver: None,
+            partition_archiver: None,
             activity_interceptors: Vec::new(),
             payload_codecs: crate::payload_codec::PayloadCodecs::default(),
             payload_store: None,
@@ -372,6 +382,8 @@ pub struct BuiltHarvest {
     telemetry: Arc<TelemetryConfig>,
     retention: RetentionConfig,
     history_archiver: Option<Arc<dyn crate::retention::HistoryArchiver>>,
+    /// Gets each aged event partition before the sweep drops it (issue #2009).
+    partition_archiver: Option<Arc<dyn crate::partition_archive::PartitionArchiver>>,
     /// Ordered activity execution interceptor chain (issue #680). Index 0 = outermost.
     activity_interceptors: Vec<Arc<dyn crate::interceptor::ActivityInterceptor>>,
     payload_codecs: PayloadCodecs,
@@ -1283,6 +1295,14 @@ impl BuiltHarvest {
         self.history_archiver.as_ref()
     }
 
+    /// Get the registered partition archiver (issue #2009).
+    #[must_use]
+    pub fn partition_archiver(
+        &self,
+    ) -> Option<&Arc<dyn crate::partition_archive::PartitionArchiver>> {
+        self.partition_archiver.as_ref()
+    }
+
     /// Resolved builder-wide completion-callback configuration (issue #605).
     #[must_use]
     pub const fn completion_callback_config(
@@ -1914,10 +1934,10 @@ impl HarvestBuilder {
 
     /// Encode the codec columns as well as the event payloads (issue #1979).
     ///
-    /// The codec columns are `harvest_workflow_executions.input`, `.output`
-    /// and `.memo`, `harvest_signals.payload`, `harvest_dead_letters.input`,
-    /// and the workflow task's `harvest_task_queue.input` and `.output`. The
-    /// default is off.
+    /// The codec columns are the entries of `codec_rotation::CODEC_COLUMNS`
+    /// (issue #1979, issue #2043). The coverage table in
+    /// `docs/security-posture.md` gives a reason for each column that stays
+    /// clear. The default is off.
     ///
     /// This release always decodes those columns. Turn the switch on only
     /// after every worker and every API process runs this release or later.
@@ -1971,6 +1991,22 @@ impl HarvestBuilder {
     #[must_use]
     pub fn history_archiver(mut self, archiver: impl crate::retention::HistoryArchiver) -> Self {
         self.history_archiver = Some(Arc::new(archiver));
+        self
+    }
+
+    /// Register a partition archiver (issue #2009).
+    ///
+    /// The retention sweep then exports each aged `harvest_events` partition,
+    /// reads it back, and checks it before the drop. It applies only on a
+    /// partitioned shard. `try_build` refuses it together with
+    /// `straggler_grace_secs`, because a straggler delete removes rows that
+    /// no export holds.
+    #[must_use]
+    pub fn partition_archiver(
+        mut self,
+        archiver: impl crate::partition_archive::PartitionArchiver,
+    ) -> Self {
+        self.partition_archiver = Some(Arc::new(archiver));
         self
     }
 
@@ -2056,6 +2092,31 @@ impl HarvestBuilder {
                 registration.wasm_bytes,
                 registration.signature,
             ));
+        }
+        self
+    }
+
+    /// Register a sandboxed code activity.
+    ///
+    /// The builder adds a normal activity and puts its runtime in the
+    /// [`SandboxActivities`](crate::sandbox::SandboxActivities) state. One
+    /// shared handler runs each request on the runtime of its activity name.
+    /// See [`crate::sandbox`].
+    #[cfg(feature = "sandbox-activities")]
+    #[must_use]
+    pub fn sandbox_activity(mut self, activity: crate::sandbox::SandboxActivity) -> Self {
+        // A later sandbox registration of the same name replaces the earlier
+        // one. Another kind of activity with the name stays, as for the
+        // other registrations: the worker keeps the later one.
+        self.activities
+            .retain(|info| info.module != "sandbox" || info.name != activity.name);
+        self.activities.push(activity.activity_info());
+        let registry = self
+            .state
+            .entry(TypeId::of::<crate::sandbox::SandboxActivities>())
+            .or_insert_with(|| Box::new(crate::sandbox::SandboxActivities::default()));
+        if let Some(registry) = registry.downcast_mut::<crate::sandbox::SandboxActivities>() {
+            registry.insert(activity);
         }
         self
     }
@@ -2704,6 +2765,17 @@ impl HarvestBuilder {
         self.retention
             .validate()
             .map_err(HarvestBuilderError::InvalidRetention)?;
+        // Issue #2009: a straggler delete removes orphan rows that no export
+        // holds, so the pair would lose history with an archiver set.
+        if self.partition_archiver.is_some()
+            && self.retention.partitions.straggler_grace_secs.is_some()
+        {
+            return Err(HarvestBuilderError::InvalidRetention(
+                "partitions.straggler_grace_secs cannot be set with a partition archiver: \
+                 a straggler delete removes rows that no export holds"
+                    .to_string(),
+            ));
+        }
         validate_retention_overrides(
             &self.retention,
             &self.workflows,
@@ -2844,6 +2916,7 @@ impl HarvestBuilder {
             telemetry: telemetry_arc,
             retention: self.retention,
             history_archiver: self.history_archiver,
+            partition_archiver: self.partition_archiver,
             activity_interceptors: self.activity_interceptors,
             payload_codecs: self.payload_codecs.clone(),
             payload_offloader,
@@ -3246,8 +3319,8 @@ fn validate_workflow_schedules(
         {
             return Err(HarvestBuilderError::UnknownTimezone { name: tz.clone() });
         }
-        // Reject a bad cron expression, a zero interval and a fractional interval
-        // (issue #1967).
+        // Reject a bad cron expression, a zero interval, a fractional interval
+        // (issue #1967) and an interval over `MAX_INTERVAL_PERIOD` (issue #2048).
         if let Err(reason) = crate::policy::validate_schedule(&schedule.schedule) {
             return Err(HarvestBuilderError::InvalidWorkflowSchedule {
                 workflow_name: schedule.workflow_name.clone(),
@@ -3829,6 +3902,17 @@ pub struct WorkerConfig {
     /// unchanged, preserving today's byte-for-byte behaviour for all workers
     /// that do not configure weights.
     pub queue_weights: std::collections::HashMap<String, u32>,
+    /// Rotate claims across the fairness keys of each queue (issue #1976).
+    ///
+    /// When `true`, the claim serves the keys of a queue in weighted round
+    /// robin and charges the key it claims. One tenant's flood then cannot
+    /// hold another tenant's tasks in the same queue. See
+    /// [`crate::queue_fairness::FairClock`].
+    ///
+    /// **Default: `false`.** The claim statement is then the unchanged one.
+    /// Turn it on for every worker of a queue. A worker with it off ignores
+    /// keys and does not charge them.
+    pub fairness_keys: bool,
     /// Optional Postgres URL for LISTEN/NOTIFY wakeups.
     pub notification_database_url: Option<String>,
     /// Optional per-shard LISTEN/NOTIFY database URLs for multi-shard workers
@@ -3845,6 +3929,12 @@ pub struct WorkerConfig {
     pub max_concurrent_workflows: usize,
     /// Maximum concurrent activity executions on this worker.
     pub max_concurrent_activities: usize,
+    /// The most claims this worker runs at once.
+    ///
+    /// Default: [`DEFAULT_MAX_CONCURRENT_CLAIMS`] (2). `1` is
+    /// one serial claim loop. Must be at least 1. See
+    /// [`Self::with_max_concurrent_claims`].
+    pub max_concurrent_claims: usize,
     /// The drain budget on shutdown or on a remote drain without a deadline.
     ///
     /// Default: [`DEFAULT_SHUTDOWN_TIMEOUT`] (25 s). Keep it at least 5 s
@@ -4393,10 +4483,12 @@ impl Default for WorkerConfig {
         Self {
             queues: vec!["default".to_string()],
             queue_weights: std::collections::HashMap::new(),
+            fairness_keys: false,
             notification_database_url: None,
             shard_notification_database_urls: Vec::new(),
             max_concurrent_workflows: 20,
             max_concurrent_activities: 50,
+            max_concurrent_claims: DEFAULT_MAX_CONCURRENT_CLAIMS,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             workflow_cache_size: 1000,
             resident_workflows: true,
@@ -4478,6 +4570,18 @@ impl WorkerConfig {
     ) -> Self {
         self.queue_weights
             .extend(weights.into_iter().map(|(k, v)| (k.into(), v)));
+        self
+    }
+
+    /// Turn fairness keys on or off for this worker (issue #1976).
+    ///
+    /// With fairness keys on, each claim serves the keys of a queue in
+    /// weighted round robin. A key with no override has weight `1`. Set a
+    /// weight at runtime with [`crate::fairness_keys::set_fairness_weight`].
+    /// See [`WorkerConfig::fairness_keys`].
+    #[must_use]
+    pub const fn with_fairness_keys(mut self, on: bool) -> Self {
+        self.fairness_keys = on;
         self
     }
 
@@ -4931,6 +5035,34 @@ impl WorkerConfig {
         self
     }
 
+    /// Set the most claims this worker runs at once.
+    ///
+    /// One claim loop runs one claim at a time. Assay #14 measured that loop
+    /// busy 94% of the time, so it capped throughput. Extra loops claim only
+    /// after a claim returns work, and stop at the first empty claim. An idle
+    /// worker therefore polls at the rate of one loop.
+    ///
+    /// Each claim in flight holds one pool connection. Size the pool for
+    /// this value plus the running tasks. `1` restores one serial claim
+    /// loop. `0` fails worker validation.
+    ///
+    /// A worker that claims through a dispatch channel gains nothing. Extra
+    /// loops claim only through Postgres.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_max_concurrent_claims(4);
+    /// assert_eq!(config.max_concurrent_claims, 4);
+    /// ```
+    #[must_use]
+    pub const fn with_max_concurrent_claims(mut self, n: usize) -> Self {
+        self.max_concurrent_claims = n;
+        self
+    }
+
     /// Attach a key-value capability label (issue #382).
     #[must_use]
     pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -5112,6 +5244,57 @@ mod tests {
     use crate::dag::DagBuilder;
     use crate::info::{DagInfo, WorkflowInfo};
     use crate::policy::Schedule;
+
+    /// A no-op partition archiver for the build checks (issue #2009).
+    struct NullPartitionArchiver;
+
+    impl crate::partition_archive::PartitionArchiver for NullPartitionArchiver {
+        fn put<'a>(
+            &'a self,
+            _key: &'a str,
+            _bytes: Vec<u8>,
+        ) -> crate::partition_archive::ArchiveIo<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> crate::partition_archive::ArchiveIo<'a, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    /// A straggler delete removes orphan rows that no export holds, so the
+    /// build refuses both together (issue #2009).
+    #[test]
+    fn a_partition_archiver_with_straggler_deletes_fails_the_build() {
+        let mut retention = RetentionConfig::with_max_age(std::time::Duration::from_secs(3600));
+        retention.partitions.straggler_grace_secs = Some(3600);
+        let Err(err) = HarvestBuilder::new()
+            .retention(retention.clone())
+            .partition_archiver(NullPartitionArchiver)
+            .try_build()
+        else {
+            panic!("the build must refuse the pair");
+        };
+        assert!(
+            matches!(&err, HarvestBuilderError::InvalidRetention(m) if m.contains("straggler_grace_secs")),
+            "{err:?}"
+        );
+
+        let built = HarvestBuilder::new()
+            .retention(retention)
+            .try_build()
+            .expect("straggler deletes alone still build");
+        assert!(built.partition_archiver().is_none());
+
+        let built = HarvestBuilder::new()
+            .partition_archiver(NullPartitionArchiver)
+            .try_build()
+            .expect("an archiver alone builds");
+        assert!(built.partition_archiver().is_some());
+    }
 
     /// A duplicate shard would fan the per-shard control loops out twice
     /// against one database, and would collapse those two instances onto a
@@ -5364,6 +5547,18 @@ mod tests {
         assert_eq!(infos.len(), 2);
         assert!(!infos[0].mcp);
         assert!(infos[1].mcp);
+    }
+
+    #[test]
+    fn max_concurrent_claims_defaults_above_one_and_the_setter_overrides_it() {
+        let config = WorkerConfig::default();
+        assert_eq!(config.max_concurrent_claims, DEFAULT_MAX_CONCURRENT_CLAIMS);
+        assert!(
+            config.max_concurrent_claims > 1,
+            "more than one claim in flight by default"
+        );
+        let serial = WorkerConfig::default().with_max_concurrent_claims(1);
+        assert_eq!(serial.max_concurrent_claims, 1);
     }
 
     #[test]
@@ -5709,6 +5904,50 @@ mod tests {
                 err,
                 HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
                     if workflow_name == "test" && reason.contains("whole number of seconds")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn harvest_builder_rejects_workflow_schedule_over_the_interval_cap() {
+        // Adding this period to a timestamp overflows chrono (issue #2048).
+        let err = HarvestBuilder::new()
+            .workflows(vec![fake_workflow_info()])
+            .workflow_schedule(WorkflowSchedule::new(
+                "test",
+                Schedule::Interval(Duration::from_secs(9_000_000_000_000_000)),
+            ))
+            .try_build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
+                    if workflow_name == "test" && reason.contains("must not exceed")
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn harvest_builder_rejects_dag_schedule_over_the_interval_cap() {
+        // The DAG path has its own validation call (issue #2048).
+        let dag = DagInfo {
+            schedule: Some(Schedule::Interval(Duration::from_secs(
+                9_000_000_000_000_000,
+            ))),
+            ..fake_dag_info()
+        };
+        let err = HarvestBuilder::new()
+            .dags(vec![dag])
+            .try_build()
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HarvestBuilderError::InvalidWorkflowSchedule { ref workflow_name, ref reason }
+                    if workflow_name == "daily_etl" && reason.contains("must not exceed")
             ),
             "got: {err:?}"
         );
@@ -6169,6 +6408,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }])
             .state(String::from("haunted"))
             .build();
@@ -6381,6 +6622,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -6406,6 +6649,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -7356,6 +7601,8 @@ mod tests {
                 circuit_breaker: None,
                 requires: None,
                 handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+                input_schema: None,
+                output_schema: None,
             }])
             .try_build();
         assert!(result.is_ok());
@@ -7654,6 +7901,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let act2 = ActivityInfo {
             name: "act2",
@@ -7676,6 +7925,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let result = HarvestBuilder::new()
@@ -7713,6 +7964,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
 
         let result = HarvestBuilder::new().activities(vec![act]).try_build();
@@ -7752,6 +8005,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let result = HarvestBuilder::new().activities(vec![act]).try_build();
         assert!(
@@ -7798,6 +8053,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let result = HarvestBuilder::new().activities(vec![act]).try_build();
         assert!(
@@ -7840,6 +8097,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         assert!(
             HarvestBuilder::new()
@@ -7880,6 +8139,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         };
         let result = HarvestBuilder::new().activities(vec![act]).try_build();
         assert!(
@@ -7928,6 +8189,8 @@ mod tests {
             max_result_bytes: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 

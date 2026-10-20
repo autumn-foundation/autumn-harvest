@@ -336,6 +336,8 @@ fn activity_info() -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: act_noop,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -717,6 +719,7 @@ async fn start_one(conn: &mut AsyncPgConnection, workflow_id: &str) -> bool {
             start_source_ref: None,
             started_by: None,
             tenant: None,
+            fairness_key: None,
         },
         None,
     )

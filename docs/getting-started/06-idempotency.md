@@ -215,6 +215,13 @@ retention window.
 See the [start route in the management-API contract](../api-contract.json) for
 the full request/response schema.
 
+## Durable routes — keyed starts from an Autumn route
+
+An Autumn route can start a workflow from the `Idempotency-Key` of its own
+request, wait for the result, and replay that result on a retry. The route
+keeps its own authentication and body extractors. See
+[Durable routes](../durable-routes.md).
+
 ---
 
 [← Child workflows](05-child-workflows.md) · [Index](README.md) · [Next: Reliability knobs →](07-reliability-knobs.md)

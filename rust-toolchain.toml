@@ -10,8 +10,11 @@
 #
 # Jobs that need another release override this file explicitly: the MSRV job
 # sets `RUSTUP_TOOLCHAIN=1.88.0`, and the fuzz jobs call `cargo +<nightly>`
-# with the nightly that `fuzz-nightly.yml` pins. The MSRV itself is
-# `rust-version` in Cargo.toml, not this file.
+# with the nightly that `fuzz-nightly.yml` pins. `coverage-nightly.yml` sets
+# `RUSTUP_TOOLCHAIN` to that same nightly, because branch coverage needs `-Z`
+# flags. A bump here can use an API that the nightly does not have, so check
+# that the coverage nightly still builds. The MSRV itself is `rust-version`
+# in Cargo.toml, not this file.
 [toolchain]
 channel = "1.99.0"
 components = ["rustfmt", "clippy"]

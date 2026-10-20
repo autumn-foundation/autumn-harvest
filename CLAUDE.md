@@ -182,6 +182,49 @@ need them.
 A new sanctioned writer needs a new `EventRewrite` variant, a migration that
 adds its value to the trigger, and an entry in the list above.
 
+**The SQLite backend (issue #2031).** Its `harvest_events` has its own guard
+in `autumn-harvest-sqlite/src/schema.rs`. It has no sanctioned writer, so it
+refuses every `UPDATE`, and an `INSERT OR REPLACE` over a stored event. A
+test fixture calls `autumn_harvest_sqlite::append_only::with_guard_off`.
+
+### Decision owner fence (issue #2249)
+
+[ADR 0009](docs/adr/0009-decision-owner.md) defines owner mode. Issue #2251
+builds it. Code for owner mode follows these rules:
+
+- A decision commit or an owned claim takes the generation row, then its
+  owner row `FOR KEY SHARE`. It takes the owner row before any execution
+  row, task row or advisory lock.
+- The commit compares holder and epoch. A mismatch aborts the whole
+  transaction. The commit never checks the lease end.
+- An acquisition takes the owner row `FOR UPDATE`, then increments the
+  epoch. Never change the epoch with a plain `UPDATE` or an upsert. Neither
+  one drains in-flight commits.
+- A renewal changes the lease end only. Renewal, release and revoke match
+  holder and epoch. A release keeps the epoch.
+- A statement on many owner rows locks them in ascending partition order.
+- A fenced owner unloads the partition and never retries at the stale
+  epoch.
+- A commit or an owned claim takes one owner row only. A foreign writer
+  takes none.
+- An acknowledgement never comes from owner memory. It follows a durable
+  write.
+- List, search and describe read Postgres, never an owner cache.
+
+`decision_owner_lock_modes_db_tests.rs` proves the lock modes.
+
+## Performance Agents
+
+Do not profile the strict replay path again (`WorkflowReplayer::replay_from_events`,
+`benches/replay_profile.rs`). Repeated runs found nothing addressable. About 88%
+of the instructions are the harness building its own history and payloads, and
+the freeing of owned events. The strict matching code is spread over many
+functions, each under 6%. `docs/performance-replay.md` records the one fix that
+was available. That harness never runs the non-strict `match_activity` path that
+ordinary workers use, so that path stays unmeasured. Pick a different path, and
+check `docs/performance-*.md` first so you do not repeat one that is already
+measured.
+
 ## Project Documentation
 
 `CLAUDE.md` holds agent instructions and engine invariants only. Do not park
@@ -196,3 +239,20 @@ have homes:
   record. Two guard suites read it as data, so treat it as load-bearing.
 - [`docs/changelog.d/README.md`](docs/changelog.d/README.md) — where a feature
   PR's changelog entry goes (a fragment file, never the shared phase list).
+
+### Keep docs guards from becoming conflict magnets
+
+A docs guard that makes every feature PR edit the same lines makes open PRs
+conflict with each other. Two shapes caused this, and both are now banned:
+
+- **A live count in prose.** "68 of the 137 core modules" or "132 migrations"
+  changes with almost every PR. State a ratio or a bound, and guard that the
+  ratio holds. `sqlite_feasibility_docs` shows the pattern.
+- **A hand-written copy of another page.** When the source page changes on
+  `trunk-dev`, every open branch ports its own wording, and the ports
+  conflict. Mirror the source verbatim and regenerate the mirror with a
+  command. Identical ports merge cleanly. `safety_report_docs` shows the
+  pattern: run its guards with `UPDATE_DOC_MIRRORS=1`.
+
+When a docs guard goes red on `trunk-dev`, fix it once in a small dedicated
+PR. Do not port a hand-written fix into each feature branch.

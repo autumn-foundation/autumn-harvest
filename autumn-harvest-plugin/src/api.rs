@@ -39,23 +39,24 @@ use autumn_harvest::audit::{
     OP_BUILD_POLICY_SET, OP_BUILD_RAMP_CLEAR, OP_BUILD_RAMP_SET, OP_CALLBACK_REDRIVE,
     OP_CIRCUIT_FORCE_CLOSE, OP_CIRCUIT_FORCE_OPEN, OP_DAG_PATCH, OP_DAG_RETRY, OP_DAG_TRIGGER,
     OP_DLQ_DISCARD_BULK, OP_DLQ_REDRIVE, OP_DLQ_REPLAY, OP_DLQ_REPLAY_BULK,
-    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_GATE_CREATE, OP_GATE_LIFT,
-    OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET, OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE,
-    OP_QUEUE_RESUME, OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR, OP_RATE_LIMIT_PACING_OVERRIDE_SET,
-    OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL, OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE,
-    OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME, OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE,
-    OP_START_THROTTLE_PACING_OVERRIDE_CLEAR, OP_START_THROTTLE_PACING_OVERRIDE_SET,
-    OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE, OP_WORKER_DRAIN, OP_WORKFLOW_ANNOTATE,
-    OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS, OP_WORKFLOW_PAUSE, OP_WORKFLOW_RERUN,
-    OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME, OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START,
-    OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE, OP_WORKFLOW_UPDATE_WITH_START, RouteClass,
-    SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED, TARGET_ACTIVITY, TARGET_AUDIT_EXPORT,
-    TARGET_BATCH, TARGET_BUILD_ROUTING, TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG,
-    TARGET_DEAD_LETTER, TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RATE_LIMIT,
-    TARGET_RETENTION, TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER,
-    TARGET_WORKFLOW, deny_readonly_mutation,
+    OP_EXTERNAL_ACTIVITY_COMPLETE, OP_EXTERNAL_ACTIVITY_FAIL, OP_FAIRNESS_WEIGHT_CLEAR,
+    OP_FAIRNESS_WEIGHT_SET, OP_GATE_CREATE, OP_GATE_LIFT, OP_LEGAL_HOLD_RELEASE, OP_LEGAL_HOLD_SET,
+    OP_PAYLOAD_DECODE_READ, OP_QUEUE_PAUSE, OP_QUEUE_RESUME, OP_RATE_LIMIT_PACING_OVERRIDE_CLEAR,
+    OP_RATE_LIMIT_PACING_OVERRIDE_SET, OP_RETENTION_RUN_NOW, OP_SCHEDULE_BACKFILL,
+    OP_SCHEDULE_CREATE, OP_SCHEDULE_DELETE, OP_SCHEDULE_PAUSE, OP_SCHEDULE_RESUME,
+    OP_SCHEDULE_TRIGGER, OP_SCHEDULE_UPDATE, OP_START_THROTTLE_PACING_OVERRIDE_CLEAR,
+    OP_START_THROTTLE_PACING_OVERRIDE_SET, OP_TASK_REPRIORITIZE, OP_TOKEN_CREATE, OP_TOKEN_REVOKE,
+    OP_WORKER_DRAIN, OP_WORKFLOW_ANNOTATE, OP_WORKFLOW_CANCEL, OP_WORKFLOW_ERASE_PAYLOADS,
+    OP_WORKFLOW_PAUSE, OP_WORKFLOW_RERUN, OP_WORKFLOW_RESET, OP_WORKFLOW_RESUME,
+    OP_WORKFLOW_SIGNAL, OP_WORKFLOW_SIGNAL_WITH_START, OP_WORKFLOW_START, OP_WORKFLOW_TERMINATE,
+    OP_WORKFLOW_UPDATE_WITH_START, RouteClass, SOURCE_API, STATUS_FAILED, STATUS_SUCCEEDED,
+    TARGET_ACTIVITY, TARGET_AUDIT_EXPORT, TARGET_BATCH, TARGET_BUILD_ROUTING,
+    TARGET_CALLBACK_DELIVERY, TARGET_CIRCUIT, TARGET_DAG, TARGET_DEAD_LETTER,
+    TARGET_EXTERNAL_ACTIVITY, TARGET_GATE, TARGET_QUEUE, TARGET_RATE_LIMIT, TARGET_RETENTION,
+    TARGET_SCHEDULE, TARGET_TASK, TARGET_THROTTLE, TARGET_TOKEN, TARGET_WORKER, TARGET_WORKFLOW,
+    deny_readonly_mutation,
 };
-use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START};
+use autumn_harvest::audit::{OP_BATCH_RESET, OP_BATCH_START, OP_WORKFLOW_FORK};
 use autumn_harvest::batch::{
     self, BatchAction, BatchExecutorConfig, BatchFilter, BatchJobStatus, BatchJobView,
     BatchSubmission, BatchTargetSample,
@@ -79,6 +80,9 @@ use autumn_harvest::executor::{
     history_reached_terminal_seal,
 };
 use autumn_harvest::external_task;
+use autumn_harvest::fork::{
+    ForkEffects, WorkflowForkError, WorkflowForkRequest, fork_workflow_execution_audited,
+};
 use autumn_harvest::history_export::{
     DEFAULT_HISTORY_EXPORT_MAX_BYTES, HistoryExportDocument, HistoryExportError,
     HistoryExportRequest, HistoryPayloadPolicy, export_history_decoded,
@@ -97,14 +101,14 @@ use autumn_harvest::queue::{self, ConcurrencyKeyStats};
 use autumn_harvest::reset::{
     BatchResetItem, BatchResetOutcome, ResetInvalidPoint, ResetPoint, ResetResult,
     ResetSignalReapplyPolicy, ResetSkipReason, WorkflowResetError, WorkflowResetRequest,
-    preview_workflow_reset, reset_workflow_execution, resolve_batch_reset_one,
+    batch_skip_reason, preview_workflow_reset, reset_workflow_execution, resolve_batch_reset_one,
 };
 use autumn_harvest::retention::{RetentionConfig, RetentionMonitor, RetentionStatus};
 use autumn_harvest::scheduler::{
     BackfillPlanError, DEFAULT_BACKFILL_MAX_COUNT, DagCatalog, RegisteredDag,
     ScheduleUpdateOutcome, SchedulerMonitor, SchedulerSnapshot, WorkflowSchedulePatch,
     ensure_dag_schedule, parse_schedule_from_expr_pub, plan_backfill_timestamps,
-    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule,
+    scheduled_workflow_id_pub, trigger_unified_dag, update_workflow_schedule_with_codecs,
 };
 use autumn_harvest::schema::{
     harvest_backfill_log, harvest_dead_letters, harvest_events, harvest_schedules, harvest_signals,
@@ -147,6 +151,7 @@ use crate::state::HarvestDbPool;
 use crate::usage::{self, UsageParams, UsageResponse};
 use crate::version_gate_retirement::{RetirementCheckQuery, build_retirement_check_report};
 use crate::version_usage::{VersionUsageQuery, build_version_usage_report};
+use crate::visibility_query::{JsonText, number_json};
 use crate::workflow_count::{self, WorkflowCountParams, WorkflowCountResponse};
 use crate::workflow_reachability::{WorkflowReachabilityQuery, build_workflow_reachability_report};
 
@@ -206,6 +211,11 @@ pub struct HarvestApiRuntime {
     /// captured from the resolved configuration.
     /// Wrapped in `Arc` so the per-request `runtime()` clone stays cheap.
     effective_config: Option<Arc<autumn_harvest::effective_config::EffectiveConfigView>>,
+    /// The history archiver that retention writes to (issue #1983).
+    ///
+    /// `GET /workflows/{id}/archived-history` and its Vantage page read
+    /// pruned runs back through it. `None` when no archiver is set.
+    history_archiver: Option<Arc<dyn autumn_harvest::HistoryArchiver>>,
 }
 
 impl HarvestApiRuntime {
@@ -250,6 +260,7 @@ impl HarvestApiRuntime {
             // override fails closed on `GET /admin/config` (see the field doc)
             // rather than serving a fabricated defaults placeholder.
             effective_config: None,
+            history_archiver: None,
         };
         if let Some(first_queue) = this.queues.as_slice().first()
             && let Ok(mut lock) =
@@ -286,6 +297,24 @@ impl HarvestApiRuntime {
         registered.extend(names);
         self.registered_dag_names = Arc::new(registered);
         self
+    }
+
+    /// Attach the history archiver that retention writes to (issue #1983).
+    ///
+    /// The archived-history route and page read pruned runs through it.
+    #[must_use]
+    pub fn with_history_archiver(
+        mut self,
+        archiver: Arc<dyn autumn_harvest::HistoryArchiver>,
+    ) -> Self {
+        self.history_archiver = Some(archiver);
+        self
+    }
+
+    /// The history archiver on this runtime, if any (issue #1983).
+    #[must_use]
+    pub fn history_archiver(&self) -> Option<&Arc<dyn autumn_harvest::HistoryArchiver>> {
+        self.history_archiver.as_ref()
     }
 
     /// Attach the resolved, secret-free effective-config snapshot (issue #695).
@@ -1958,6 +1987,16 @@ pub(crate) struct SignalQuery {
     idempotency_key: Option<String>,
 }
 
+impl SignalQuery {
+    /// A query that carries `key`, for the MCP Tasks route (issue #2005).
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) fn with_key(key: impl Into<String>) -> Self {
+        Self {
+            idempotency_key: Some(key.into()),
+        }
+    }
+}
+
 /// Response for the standalone signal route.
 ///
 /// `signal_delivered` is `true` when a signal row was freshly queued and
@@ -2022,13 +2061,15 @@ struct ReplayDeadLetterResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct CancelWorkflowResponse {
+pub(crate) struct CancelWorkflowResponse {
     ok: bool,
     execution_id: String,
     state: String,
     reason: String,
     newly_cancelled: bool,
     failed_task_count: usize,
+    /// An open non-cancellable block deferred the cancel (issue #1984).
+    deferred: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2294,6 +2335,8 @@ pub(crate) struct StartWorkflowRequest {
     context_headers: Option<std::collections::HashMap<String, String>>,
     /// Dispatch priority for this execution's tasks. Omitted defaults to `Normal`.
     priority: Option<autumn_harvest::types::Priority>,
+    /// The fairness key of the run (issue #1976). Omitted takes the quota key.
+    fairness_key: Option<String>,
     /// Request-scoped idempotency key (issue #808). Two starts carrying the same
     /// key (within the configured retention window, default 24h) converge on
     /// exactly one execution — the second returns the same `execution_id` as a
@@ -2378,6 +2421,7 @@ impl StartWorkflowRequest {
             engine_derived_idempotency_key: false,
             start_source_override: None,
             start_source_ref_override: None,
+            fairness_key: None,
         }
     }
 
@@ -2424,6 +2468,7 @@ impl StartWorkflowRequest {
             engine_derived_idempotency_key: false,
             start_source_override: Some(autumn_harvest::StartSource::Webhook),
             start_source_ref_override: None,
+            fairness_key: None,
         }
     }
 
@@ -2480,6 +2525,7 @@ impl StartWorkflowRequest {
             engine_derived_idempotency_key: true,
             start_source_override: Some(autumn_harvest::StartSource::Broker),
             start_source_ref_override: coordinates,
+            fairness_key: None,
         }
     }
 }
@@ -2735,8 +2781,18 @@ impl DagTriggerRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct CancelWorkflowRequest {
+pub(crate) struct CancelWorkflowRequest {
     reason: Option<String>,
+}
+
+impl CancelWorkflowRequest {
+    /// A cancel request with `reason`, for the MCP Tasks route (issue #2005).
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    pub(crate) fn with_reason(reason: impl Into<String>) -> Self {
+        Self {
+            reason: Some(reason.into()),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2982,7 +3038,7 @@ struct CreateWorkflowScheduleRequest {
     #[serde(default)]
     jitter_secs: Option<u64>,
     /// Overlap policy string (e.g. `"skip"`, `"buffer_one"`, `"buffer_all"`,
-    /// `"cancel_other"`, `"terminate_other"`). Defaults to `"skip"`.
+    /// `"cancel_other"`, `"terminate_other"`, `"allow_all"`). Defaults to `"skip"`.
     #[serde(default = "default_overlap_policy")]
     overlap_policy: String,
     /// Maximum buffered slots under `BufferAll`. Defaults to `100`.
@@ -3177,9 +3233,9 @@ pub(crate) enum CmpOp {
 #[derive(Debug, Clone)]
 pub(crate) enum SearchAttrPredicate {
     /// `key:eq:value` — typed equality (numeric/bool/string coercion).
-    Eq { key: String, value: Value },
+    Eq { key: String, value: JsonText },
     /// `key:ne:value` — key present and typed value differs.
-    Ne { key: String, value: Value },
+    Ne { key: String, value: JsonText },
     /// `key:{gt,gte,lt,lte}:value` — numeric comparison. `value` is the
     /// validated, trimmed numeric *text* (not an f64): it is bound and cast
     /// `::numeric` in SQL so the comparison stays exact even for integers
@@ -3190,7 +3246,7 @@ pub(crate) enum SearchAttrPredicate {
         value: String,
     },
     /// `key:in:v1,v2,…` — membership in a typed set.
-    In { key: String, values: Vec<Value> },
+    In { key: String, values: Vec<JsonText> },
     /// `key:exists` — key is present with any value.
     Exists { key: String },
 }
@@ -3229,6 +3285,9 @@ pub(crate) struct WorkflowFilters {
     /// Combined with `AND` against each other and against the legacy
     /// `search_attrs` containment predicates above.
     pub(crate) search_attr_predicates: Vec<SearchAttrPredicate>,
+    /// Parsed `filter` expressions (issue #1982). Each one joins the query
+    /// with `AND`.
+    pub(crate) filter: Vec<crate::visibility_query::Expr>,
     pub(crate) started_after: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) started_before: Option<chrono::DateTime<chrono::Utc>>,
     /// Prefix match on the execution UUID cast to text (e.g. "abc123").
@@ -3417,6 +3476,12 @@ struct HistoryExportCandidate {
     // lives in no `WorkflowEvent` — same family as `context_headers` above.
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
+    // Issue #2082: the run's start source and predecessor, carried into the
+    // export document so a replay takes the same branch as the live run.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    continued_from_exec_id: Option<uuid::Uuid>,
 }
 
 /// One in-flight execution selected by the stratified sample query (issue #798).
@@ -3461,6 +3526,12 @@ struct HistorySampleCandidate {
     // a FALSE divergence.
     #[diesel(sql_type = diesel::sql_types::Text)]
     queue_name: String,
+    // Issue #2082: the run's start source and predecessor, carried into the
+    // export document so a replay takes the same branch as the live run.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    start_source: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+    continued_from_exec_id: Option<uuid::Uuid>,
     /// `COUNT(*) OVER (PARTITION BY workflow_name)` — the in-flight population
     /// of this workflow type **on this shard**. Summed across shards to give
     /// the AC2 coverage denominator.
@@ -3492,6 +3563,8 @@ impl HistorySampleCandidate {
             context_headers: self.context_headers,
             // Issue #798: likewise the queue the live run was claimed on.
             queue_name: self.queue_name,
+            start_source: self.start_source,
+            continued_from_exec_id: self.continued_from_exec_id,
         }
     }
 }
@@ -4849,6 +4922,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             get(export_workflow_history),
         )
         .route("/workflows/{id}/history", get(get_workflow_history))
+        // Archived history read-back (issue #1983). Admin only: the archive
+        // can hold a full history of a pruned run.
+        .route(
+            "/workflows/{id}/archived-history",
+            get(get_archived_workflow_history).route_layer(require_admin.clone()),
+        )
         .route("/workflows/{id}", get(get_workflow))
         .route("/workflows/{id}/result", get(get_workflow_result))
         .route("/workflows/{id}/children", get(list_workflow_children))
@@ -4893,6 +4972,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         // inherits the general management API auth middleware (api_with_auth)
         // like the other non-admin `/workflows/{id}/…` read routes.
         .route("/workflows/{id}/stream", get(stream_workflow_progress))
+        // Durable, resumable output stream (issue #1974). Same auth posture
+        // as `/stream`: not admin-gated.
+        .route(
+            "/workflows/{id}/stream/durable",
+            get(stream_workflow_progress_durable),
+        )
         .route("/workflows/{workflow_name}/start", post(start_workflow))
         .route(
             "/workflows/{workflow_name}/signal-with-start",
@@ -4913,6 +4998,12 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         .route(
             "/workflows/{id}/rerun",
             post(rerun_workflow).route_layer(require_admin.clone()),
+        )
+        // Issue #2000: a fork starts a new run. A live fork runs effects for
+        // real, so the route is admin-only, as rerun is.
+        .route(
+            "/workflows/{id}/fork",
+            post(fork_workflow).route_layer(require_admin.clone()),
         )
         .route(
             "/workflows/{id}/erase-payloads",
@@ -5211,6 +5302,18 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/admin/queues/{queue_name}/resume",
             post(resume_queue_handler).route_layer(require_admin.clone()),
         )
+        // Fairness key weights (issue #1976). All three are admin-gated. The
+        // read shows tenant keys, and the writes change what the fleet claims.
+        .route(
+            "/admin/queues/{queue_name}/fairness",
+            get(get_queue_fairness_handler).route_layer(require_admin.clone()),
+        )
+        .route(
+            "/admin/queues/{queue_name}/fairness/{fairness_key}",
+            post(set_fairness_weight_handler)
+                .delete(clear_fairness_weight_handler)
+                .route_layer(require_admin.clone()),
+        )
         // Per-activity-type pause/resume (issue #807): the surgical sibling of
         // the queue hold above — stop dispatching ONE broken activity without
         // touching the healthy work sharing its queue. All four are admin-gated:
@@ -5354,6 +5457,11 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
             "/executions/{exec_id}/events/stream",
             get(stream_execution_events).route_layer(require_admin.clone()),
         )
+        // Live list signal (issue #1982). Admin-gated, the same as #324.
+        .route(
+            "/workflows/changes/stream",
+            get(stream_workflow_changes).route_layer(require_admin.clone()),
+        )
         // Build routing management (issue #362): expose build policies,
         // compatibility declarations, and cross-shard reachability.
         // Mutating routes are admin-gated; the read route is open to any
@@ -5429,6 +5537,13 @@ pub fn harvest_api_router(api_state: HarvestApiState) -> Router<()> {
         // A route layer runs on a matched route only, so an unknown path
         // still answers 404. It wraps every per-route layer above.
         .route_layer(require_mutation_auth)
+        // Issue #2076: a raw mount binds the tenant too. A mount through
+        // `apply_admin_auth_layers` runs the outer copy first, and this copy
+        // then skips.
+        .layer(middleware::from_fn_with_state(
+            api_state.clone(),
+            crate::tenant::enforce_tenant_binding_once,
+        ))
         .layer(Extension(api_state))
 }
 
@@ -6894,6 +7009,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/workflows/{id}/history"),
         ("GET", "/workflows/{id}/result"),
         ("GET", "/workflows/{id}/history/export"),
+        ("GET", "/workflows/{id}/archived-history"),
         ("GET", "/workflows/{id}/children"),
         ("GET", "/workflows/{id}/tree"),
         ("GET", "/workflows/{id}/stack"),
@@ -6912,6 +7028,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         // Ephemeral workflow progress SSE stream (issue #791). Read-only,
         // text/event-stream; NOT admin-gated (AC5). See docs/api-contract.json.
         ("GET", "/workflows/{id}/stream"),
+        // Durable output stream (issue #1974): text/event-stream, NOT admin-gated.
+        ("GET", "/workflows/{id}/stream/durable"),
         ("POST", "/workflows/{workflow_name}/start"),
         ("POST", "/workflows/{workflow_name}/signal-with-start"),
         ("POST", "/workflows/{workflow_name}/update-with-start"),
@@ -6938,6 +7056,7 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
             "/workflows/{id}/completion-deliveries/{delivery_id}/redrive",
         ),
         ("POST", "/workflows/{id}/reset"),
+        ("POST", "/workflows/{id}/fork"),
         ("POST", "/workflows/{id}/signal/{signal_name}"),
         ("GET", "/workflows/{id}/queries"),
         ("GET", "/workflows/{id}/query/{query_name}"),
@@ -7076,6 +7195,13 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/queues/paused"),
         ("POST", "/admin/queues/{queue_name}/pause"),
         ("POST", "/admin/queues/{queue_name}/resume"),
+        // ── fairness key weights (issue #1976) ────────────────────────────
+        ("GET", "/admin/queues/{queue_name}/fairness"),
+        ("POST", "/admin/queues/{queue_name}/fairness/{fairness_key}"),
+        (
+            "DELETE",
+            "/admin/queues/{queue_name}/fairness/{fairness_key}",
+        ),
         // ── per-activity-type pause/resume (issue #807) ───────────────────
         ("GET", "/activities"),
         ("GET", "/activities/{activity_name}"),
@@ -7114,6 +7240,8 @@ pub const fn management_api_routes() -> &'static [(&'static str, &'static str)] 
         ("GET", "/admin/audit"),
         // ── SSE execution event stream (issue #324) ───────────────────────────
         ("GET", "/executions/{exec_id}/events/stream"),
+        // ── live list signal (issue #1982) ────────────────────────────────────
+        ("GET", "/workflows/changes/stream"),
         // ── build routing management (issue #362) ─────────────────────────────
         ("GET", "/admin/build-routing"),
         ("POST", "/admin/build-routing/policies"),
@@ -7177,6 +7305,7 @@ pub const fn management_api_request_fields()
                 "residency_key",
                 "context_headers",
                 "priority",
+                "fairness_key",
             ]),
         ),
         (
@@ -7276,6 +7405,19 @@ pub const fn management_api_request_fields()
                 "reason",
                 "operator_id",
                 "signal_reapply",
+            ]),
+        ),
+        (
+            "POST",
+            "/workflows/{id}/fork",
+            Some(&[
+                "fork_point",
+                "reason",
+                "operator_id",
+                "effects",
+                "workflow_id",
+                "input",
+                "activity_overrides",
             ]),
         ),
         ("POST", "/workflows/{id}/signal/{signal_name}", None), // free-form
@@ -7606,6 +7748,17 @@ pub const fn management_api_request_fields()
             "/admin/queues/{queue_name}/resume",
             Some(&["shard_id"]),
         ),
+        // ── fairness key weights (issue #1976) ────────────────────────────
+        (
+            "POST",
+            "/admin/queues/{queue_name}/fairness/{fairness_key}",
+            Some(&["weight"]),
+        ),
+        (
+            "DELETE",
+            "/admin/queues/{queue_name}/fairness/{fairness_key}",
+            Some(&[]),
+        ),
         // ── per-activity-type pause/resume (issue #807) ───────────────────
         // Both bodies are optional; resume carries no fields at all (it deletes
         // the pause row, so there is no provenance for a field to set).
@@ -7685,6 +7838,7 @@ pub const fn management_api_response_fields()
             Some(&["state", "output", "error", "completed_at"]),
         ),
         ("GET", "/workflows/{id}/history/export", None), // HistoryExportDocument (external)
+        ("GET", "/workflows/{id}/archived-history", None), // HistoryExportDocument (external)
         (
             "GET",
             "/workflows/{id}/children",
@@ -7840,6 +7994,8 @@ pub const fn management_api_response_fields()
         // no JSON body. Frames: `event: progress` (data = the chunk JSON, `id:` =
         // monotonic seq), a terminal `event: end`, or `event: error`.
         ("GET", "/workflows/{id}/stream", None),
+        // Durable output stream (issue #1974): text/event-stream, free-form.
+        ("GET", "/workflows/{id}/stream/durable", None),
         (
             "POST",
             "/workflows/{workflow_name}/start",
@@ -7895,6 +8051,7 @@ pub const fn management_api_response_fields()
                 "reason",
                 "newly_cancelled",
                 "failed_task_count",
+                "deferred",
             ]),
         ),
         (
@@ -7969,6 +8126,7 @@ pub const fn management_api_response_fields()
                 "summary_scrubbed",
                 "signals_scrubbed",
                 "logs_deleted",
+                "stream_chunks_deleted",
                 "completion_deliveries_scrubbed",
                 "dead_letters_scrubbed",
                 "children",
@@ -8078,6 +8236,18 @@ pub const fn management_api_response_fields()
         ),
         (
             "POST",
+            "/workflows/{id}/fork",
+            Some(&[
+                "new_exec_id",
+                "workflow_id",
+                "forked_from_exec_id",
+                "fork_event_id",
+                "events_carried_over",
+                "effects",
+            ]),
+        ),
+        (
+            "POST",
             "/workflows/{id}/signal/{signal_name}",
             // `routed_execution_id` (issue #843) is present only when the
             // request's execution id differed from the live retry attempt the
@@ -8146,6 +8316,7 @@ pub const fn management_api_response_fields()
                 "reason",
                 "newly_cancelled",
                 "failed_task_count",
+                "deferred",
             ]),
         ),
         (
@@ -8739,6 +8910,45 @@ pub const fn management_api_response_fields()
                 "partial_failures",
             ]),
         ),
+        // ── fairness key weights (issue #1976) ────────────────────────────
+        (
+            "GET",
+            "/admin/queues/{queue_name}/fairness",
+            Some(&[
+                "queue_name",
+                "weights",
+                "weights_uniform",
+                "state",
+                "status",
+                "unavailable_shards",
+            ]),
+        ),
+        (
+            "POST",
+            "/admin/queues/{queue_name}/fairness/{fairness_key}",
+            Some(&[
+                "queue_name",
+                "fairness_key",
+                "weight",
+                "updated_by",
+                "updated_at",
+                "ok",
+                "status",
+                "partial_failures",
+            ]),
+        ),
+        (
+            "DELETE",
+            "/admin/queues/{queue_name}/fairness/{fairness_key}",
+            Some(&[
+                "ok",
+                "status",
+                "queue_name",
+                "fairness_key",
+                "cleared",
+                "partial_failures",
+            ]),
+        ),
         // ── per-activity-type pause/resume (issue #807) ───────────────────
         (
             "GET",
@@ -9021,6 +9231,7 @@ pub const fn management_api_response_fields()
         ("GET", "/admin/audit", None), // Vec<AuditRecord> (external model)
         // ── SSE execution event stream (issue #324) ───────────────────────────
         ("GET", "/executions/{exec_id}/events/stream", None), // text/event-stream
+        ("GET", "/workflows/changes/stream", None),           // text/event-stream
         // ── build routing (issue #362) ────────────────────────────────────────
         (
             "GET",
@@ -9765,7 +9976,13 @@ async fn submit_batch_operation(
     // Persist the row on the default shard. The executor will fan out across
     // every configured shard at run time via iter_shards().
     let mut conn = acquire_conn(pool.default_pool()).await?;
-    let submit_result = batch::submit_batch_job(
+    // The registry holds the write codec (issue #2043). The API mirror serves
+    // the read path, and it defaults to the identity registry.
+    let write_codecs = api_state.runtime().map_or_else(
+        |_| api_state.payload_codecs(),
+        |rt| rt.registry.payload_codecs().clone(),
+    );
+    let submit_result = batch::submit_batch_job_with_codecs(
         &mut conn,
         BatchSubmission {
             action,
@@ -9775,6 +9992,7 @@ async fn submit_batch_operation(
             idempotency_key: request.idempotency_key,
             created_by: request.created_by,
         },
+        &write_codecs,
     )
     .await;
 
@@ -10654,30 +10872,28 @@ fn schema_validation_response(
 
 /// Coerce a raw predicate token to a typed JSON scalar (issue #506).
 ///
-/// A token that parses as a JSON number becomes a `Number`; the exact literals
-/// `true`/`false` become a `Bool`; everything else stays a `String`. This is the
-/// documented typed-coercion rule that lets `eq`/`ne`/`in` compare against the
-/// stored JSONB value by type (so `amount:eq:100` matches numeric `100`, not the
-/// string `"100"`).
-pub(crate) fn coerce_scalar(raw: &str) -> Value {
-    if let Ok(n) = raw.parse::<i64>() {
-        return Value::Number(n.into());
-    }
-    if let Ok(n) = raw.parse::<u64>() {
-        return Value::Number(n.into());
-    }
-    if let Some(num) = raw
-        .parse::<f64>()
-        .ok()
-        .and_then(serde_json::Number::from_f64)
-    {
-        return Value::Number(num);
+/// A token that parses as a number becomes a number with all its digits. The
+/// exact literals `true`/`false` become a `Bool`. Everything else stays a
+/// `String`. This is the documented typed-coercion rule that lets
+/// `eq`/`ne`/`in` compare against the stored JSONB value by type (so
+/// `amount:eq:100` matches numeric `100`, not the string `"100"`).
+pub(crate) fn coerce_scalar(raw: &str) -> JsonText {
+    // A number keeps every digit. One leading `+`, as in `+5`, is allowed.
+    // A second sign, as in `+-5`, makes the token a string.
+    let digits = match raw.strip_prefix('+') {
+        Some(rest) if rest.starts_with(['+', '-']) => None,
+        Some(rest) => Some(rest),
+        None => Some(raw),
+    };
+    if let Some(number) = digits.and_then(number_json) {
+        return number;
     }
     match raw {
         "true" => Value::Bool(true),
         "false" => Value::Bool(false),
         other => Value::String(other.to_string()),
     }
+    .into()
 }
 
 /// Parse a single `search_attr_filter=key:op:value` query value into a typed
@@ -10764,7 +10980,7 @@ pub(crate) fn parse_search_attr_filter(raw: &str) -> Result<SearchAttrPredicate,
         "lte" => cmp("lte", CmpOp::Lte),
         "in" => {
             let v = require_value(raw, "in")?;
-            let values: Vec<Value> = v
+            let values: Vec<JsonText> = v
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -10876,6 +11092,30 @@ pub(crate) fn parse_workflow_filters(
             "search_attr_filter" => {
                 let predicate = parse_search_attr_filter(value)?;
                 filters.search_attr_predicates.push(predicate);
+            }
+            "filter" => {
+                // An empty value is absent, the same as `state=` or `owner=`.
+                if value.trim().is_empty() {
+                    continue;
+                }
+                // The index rule reads all values together, after the loop.
+                let expr = crate::visibility_query::parse_unanchored(value).map_err(|message| {
+                    AutumnError::bad_request_msg(format!("invalid filter: {message}"))
+                })?;
+                // The predicate limit applies to the request, not to each value.
+                let total = filters
+                    .filter
+                    .iter()
+                    .chain(std::iter::once(&expr))
+                    .map(crate::visibility_query::predicate_count)
+                    .sum::<usize>();
+                if total > crate::visibility_query::MAX_PREDICATES {
+                    return Err(AutumnError::bad_request_msg(format!(
+                        "invalid filter: the filter values hold more than {} predicates",
+                        crate::visibility_query::MAX_PREDICATES
+                    )));
+                }
+                filters.filter.push(expr);
             }
             "failure_cause" => {
                 let trimmed = value.trim();
@@ -11007,6 +11247,9 @@ pub(crate) fn parse_workflow_filters(
             }
         }
     }
+
+    crate::visibility_query::check_anchor(&filters.filter)
+        .map_err(|message| AutumnError::bad_request_msg(format!("invalid filter: {message}")))?;
 
     // `page_size` takes precedence over `limit` whenever it is present, so the
     // documented "page_size overrides limit" contract holds independent of the
@@ -11764,6 +12007,102 @@ async fn get_workflow_history(
         total_events: page.total_events,
         last_event_id: page.last_event_id,
     }))
+}
+
+/// Read the archived history of `exec_id` from the runtime's archiver.
+///
+/// Issue #1983. The API route and the Vantage page share this. Payload
+/// fields decode only when `decoder` is `Some`, under the same gate as live
+/// history. A decoded read is audited. `source` overrides the audit source,
+/// for example `SOURCE_UI` for the Vantage page.
+///
+/// # Errors
+///
+/// - 503 when no archiver is set, the archiver cannot read back, the store
+///   fails, or the read times out.
+/// - 404 when the archive has no document for the run.
+pub(crate) async fn fetch_archived_history(
+    api_state: &HarvestApiState,
+    headers: &axum::http::HeaderMap,
+    exec_id: ExecutionId,
+    decoder: Option<PayloadCodecs>,
+    route: &'static str,
+    source: Option<&'static str>,
+) -> Result<autumn_harvest::history_export::HistoryExportDocument, AutumnError> {
+    let runtime = api_state.runtime().map_err(map_error)?;
+    let Some(archiver) = runtime.history_archiver().cloned() else {
+        return Err(AutumnError::service_unavailable_msg(
+            "no history archiver is configured",
+        ));
+    };
+    let timeout = runtime.retention.config.archival_timeout();
+    let fetched = tokio::time::timeout(timeout, archiver.fetch(&exec_id))
+        .await
+        .map_err(|_| {
+            AutumnError::service_unavailable_msg(format!(
+                "archived history read timed out after {}s",
+                timeout.as_secs()
+            ))
+        })?;
+    let mut doc = match fetched {
+        Ok(Some(doc)) => doc,
+        Ok(None) => {
+            return Err(AutumnError::not_found_msg(format!(
+                "archived history for workflow execution {exec_id}"
+            )));
+        }
+        Err(err) => return Err(AutumnError::service_unavailable_msg(err.to_string())),
+    };
+    if let Some(codecs) = decoder.as_ref() {
+        let mut outcome = LossyDecodeOutcome::default();
+        for event in &mut doc.events {
+            outcome = outcome.merged(codecs.decode_value_lossy(event));
+        }
+        // The decode changes the byte count. State the size of what the
+        // caller gets, as `export_history_decoded` does.
+        if let Err(err) = doc.remeasure() {
+            tracing::warn!(execution_id = %exec_id, error = %err, "archived history size not recomputed");
+        }
+        let target = exec_id.to_string();
+        audit_decoded_read(
+            api_state,
+            None,
+            headers,
+            TARGET_WORKFLOW,
+            Some(&target),
+            route,
+            // The audit row lives on the shard that held the run.
+            Some(ShardId::new(doc.shard_id)),
+            outcome,
+            source,
+        )
+        .await;
+    }
+    Ok(doc)
+}
+
+/// `GET /workflows/{id}/archived-history` (issue #1983).
+///
+/// Returns the `HistoryExportDocument` that retention archived for a run.
+/// The route reads the archiver only. It does not need the run in Postgres.
+async fn get_archived_workflow_history(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    maybe_session: Option<Extension<Session>>,
+) -> Result<Json<autumn_harvest::history_export::HistoryExportDocument>, AutumnError> {
+    let exec_id = parse_execution_id(&id)?;
+    let decoder = read_path_decoder(&api_state, extension_session(maybe_session)).await;
+    let doc = fetch_archived_history(
+        &api_state,
+        &headers,
+        exec_id,
+        decoder,
+        "GET /workflows/{id}/archived-history",
+        None,
+    )
+    .await?;
+    Ok(Json(doc))
 }
 
 async fn get_workflow_result(
@@ -13745,6 +14084,12 @@ pub(crate) async fn build_awaitables_report(
             }
         }
 
+        // The headers decode with the same registry as the history. A cell
+        // that does not decode degrades the report the same way (issue #2043).
+        let decoded_headers = codecs.decode_headers_opt(execution.context_headers.as_ref());
+        if decoded_headers.is_err() {
+            decode_failed = true;
+        }
         if decode_failed {
             (
                 "history_only",
@@ -13762,14 +14107,7 @@ pub(crate) async fn build_awaitables_report(
             // threads (issues #772/#698/#481) so a deadline-aware /
             // parent-aware / identity-reading / header-branching workflow
             // replays cleanly instead of spuriously degrading.
-            let context_headers = execution
-                .context_headers
-                .as_ref()
-                .and_then(|v| {
-                    serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone())
-                        .ok()
-                })
-                .unwrap_or_default();
+            let context_headers = decoded_headers.unwrap_or_default();
             let ctx = WorkflowContext::for_replay_with_state_and_history_policy(
                 exec_id,
                 events,
@@ -13779,6 +14117,11 @@ pub(crate) async fn build_awaitables_report(
             .with_execution_timeout(execution.execution_timeout)
             .with_deadline(execution.deadline_at)
             .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))
+            // Issue #2082: the replay needs the row's start source.
+            .with_start_provenance(autumn_harvest::types::StartProvenance::from_row(
+                execution.start_source.as_deref(),
+                execution.continued_from_exec_id,
+            ))
             .with_workflow_name(execution.workflow_name.clone())
             .with_workflow_id(execution.workflow_id.clone())
             .with_context_headers(context_headers);
@@ -17928,6 +18271,29 @@ pub(crate) async fn start_workflow(
             .into_response();
     }
 
+    // Issue #1976: a deferred start (throttle, debounce or batch) fires later
+    // through its own start path. That path takes the run's quota key, so an
+    // explicit fairness key would apply only to a start that runs at once.
+    // Reject the combination, as for `idempotency_key`.
+    if let Some(key) = request.fairness_key.as_deref() {
+        if throttle_applies || is_debounced_start || has_batch_policy {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "fairness_key cannot be combined with throttle/debounce/batch start"
+                })),
+            )
+                .into_response();
+        }
+        if let Err(err) = autumn_harvest::queue_fairness::validate_fairness_key(key) {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": err.to_string() })),
+            )
+                .into_response();
+        }
+    }
+
     // issue #685: a non-default `conflict_policy` resolves a collision with an
     // *active* (RUNNING/PAUSED) prior at request time (attach / fail / cancel +
     // start fresh). Throttle / debounce / batch all DEFER the start — no start
@@ -18575,10 +18941,11 @@ pub(crate) async fn start_workflow(
             // Gate already enforced before the connection was acquired (above), so
             // pass gate_active = false here: the upsert always proceeds. `Ok(None)`
             // (the gate-rollback signal) is therefore unreachable on this path.
-            match autumn_harvest::debounce::admit_debounced_start(
+            match autumn_harvest::debounce::admit_debounced_start_with_codecs(
                 &mut debounce_conn,
                 admit_params,
                 false,
+                runtime.registry.payload_codecs(),
             )
             .await
             {
@@ -19351,7 +19718,7 @@ pub(crate) async fn start_workflow(
             started_by: None,
         };
 
-        match autumn_harvest::throttle::reserve_or_defer_or_shed(
+        match autumn_harvest::throttle::reserve_or_defer_or_shed_with_codecs(
             &mut conn,
             autumn_harvest::throttle::AdmitThrottleParams {
                 workflow_name: &workflow_name,
@@ -19365,6 +19732,7 @@ pub(crate) async fn start_workflow(
                 schedule_to_start: throttle_policy.schedule_to_start,
                 shard_id: shard.as_i32(),
             },
+            runtime.registry.payload_codecs(),
         )
         .await
         {
@@ -19518,6 +19886,7 @@ pub(crate) async fn start_workflow(
                 concurrency_limit,
                 concurrency_on_conflict,
                 priority: request.priority.unwrap_or_default(),
+                fairness_key: request.fairness_key.clone(),
                 max_workflow_input_bytes: effective_wf_cap,
                 start_at: request.start_at,
                 delay,
@@ -19745,6 +20114,7 @@ pub(crate) async fn start_workflow(
         concurrency_limit,
         concurrency_on_conflict,
         priority: request.priority.unwrap_or_default(),
+        fairness_key: request.fairness_key.clone(),
         max_workflow_input_bytes: effective_wf_cap,
         start_at: request.start_at,
         delay,
@@ -20144,6 +20514,26 @@ async fn batch_start_workflows(
                  batch (atomic=false) instead",
                 item.workflow_name
             ))
+        } else if let Some(Err(err)) = item
+            .fairness_key
+            .as_deref()
+            .map(autumn_harvest::queue_fairness::validate_fairness_key)
+        {
+            // Issue #1976: check the key before any item starts, so an atomic
+            // batch with a bad key inserts nothing.
+            Some(err.to_string())
+        } else if item.fairness_key.is_some()
+            && workflow_resolving_throttle(
+                &runtime.registry,
+                &item.workflow_name,
+                item.input.as_ref().unwrap_or(&Value::Null),
+            )
+            .is_some()
+        {
+            // A throttled start can defer. The deferred start takes the quota
+            // key, so it would drop the explicit key. Reject the combination,
+            // as the standalone start route does.
+            Some("fairness_key cannot be combined with a throttled start".to_string())
         } else {
             // Debounce for an explicit-id item is NOT rejected here: an idempotent
             // retry (existing workflow_id) must still return the existing run.
@@ -20868,7 +21258,7 @@ async fn batch_start_workflows(
                     start_source_ref: None,
                     started_by: Some(actor.clone()),
                 };
-                match autumn_harvest::throttle::reserve_or_defer_or_shed(
+                match autumn_harvest::throttle::reserve_or_defer_or_shed_with_codecs(
                     &mut conn,
                     autumn_harvest::throttle::AdmitThrottleParams {
                         workflow_name: &item.workflow_name,
@@ -20882,6 +21272,7 @@ async fn batch_start_workflows(
                         schedule_to_start: throttle_policy.schedule_to_start,
                         shard_id: shard.as_i32(),
                     },
+                    runtime.registry.payload_codecs(),
                 )
                 .await
                 {
@@ -20955,6 +21346,7 @@ async fn batch_start_workflows(
                         concurrency_limit,
                         concurrency_on_conflict,
                         priority: item.priority.unwrap_or_default(),
+                        fairness_key: item.fairness_key.clone(),
                         max_workflow_input_bytes: effective_wf_cap,
                         owner,
                         runbook_url,
@@ -21497,11 +21889,6 @@ async fn batch_reset_workflows(
                         operator_id: request.operator_id.clone(),
                         signal_reapply: request.signal_reapply,
                         allow_terminal_source: true,
-                        // Left `false` deliberately: this is the batch-reset
-                        // endpoint, not the issue #780 DAG retry, and refusing
-                        // an erased source here would be an unrelated behavior
-                        // change to an already-shipped surface.
-                        refuse_erased_source: false,
                     };
                     match reset_workflow_execution(
                         conn,
@@ -21523,15 +21910,15 @@ async fn batch_reset_workflows(
                             });
                             reset_count += 1;
                         }
+                        // The fork refuses an erased source under its row lock
+                        // (issue #1999). `batch_skip_reason` keeps that skip typed.
                         Err(reset_err) => {
                             items.push(BatchResetItem {
                                 exec_id: exec_id_str,
                                 outcome: BatchResetOutcome::Skipped,
                                 resolved_event_id: Some(resolved_event_id),
                                 new_exec_id: None,
-                                skip_reason: Some(ResetSkipReason::InfrastructureError {
-                                    message: format!("reset failed: {reset_err}"),
-                                }),
+                                skip_reason: Some(batch_skip_reason(&reset_err)),
                             });
                             skipped_count += 1;
                         }
@@ -21762,6 +22149,21 @@ pub(crate) async fn signal_with_start_workflow(
     let start_input = request.start_input.unwrap_or(Value::Null);
     let signal_payload = request.signal_payload.unwrap_or(Value::Null);
 
+    // Issue #1985: apply the promise settlement rules before the replay probe
+    // below. A mismatched key can match an unrelated row and report a false
+    // replay. A promise belongs to one run, but the probe looks across runs.
+    // So a promise signal skips the probe, as the engine does.
+    if let Err(e) = autumn_harvest::durable_promise::settlement_idempotency_key(
+        &request.signal_name,
+        &signal_payload,
+        request.idempotency_key.as_deref(),
+    ) {
+        return map_error(e).into_response();
+    }
+    let promise_signal = request
+        .signal_name
+        .starts_with(autumn_harvest::durable_promise::PROMISE_SIGNAL_PREFIX);
+
     // INVARIANT (this PR): keyed committed-replay short-circuit. A retry of an
     // already-committed keyed signal-with-start must replay to its documented
     // `200 signal_delivered: false` no-op BEFORE any fresh-start-only validation
@@ -21775,7 +22177,8 @@ pub(crate) async fn signal_with_start_workflow(
     // concurrent-first-delivery race — this probe is an additive fast path for
     // COMMITTED replays only, never a replacement. Mirrors #808 (plain start)
     // and #1092 (plain signal route).
-    if let Some(key) = request.idempotency_key.as_deref()
+    if !promise_signal
+        && let Some(key) = request.idempotency_key.as_deref()
         && let Some(resp) = probe_committed_sws_replay(
             &api_state,
             &workflow_name,
@@ -23328,7 +23731,7 @@ async fn update_with_start_workflow(
     }
 }
 
-async fn cancel_workflow(
+pub(crate) async fn cancel_workflow(
     Extension(api_state): Extension<HarvestApiState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
@@ -23439,6 +23842,7 @@ async fn cancel_workflow(
                     reason: cancelled.reason,
                     newly_cancelled: cancelled.newly_cancelled,
                     failed_task_count: cancelled.failed_task_count,
+                    deferred: cancelled.deferred,
                 }),
             ))
         }
@@ -25408,6 +25812,270 @@ async fn reset_workflow(
     }
 }
 
+/// `POST /workflows/{id}/fork` — non-destructive fork of a run (issue #2000).
+///
+/// The source stays unchanged. The fork defaults to recorded effects, so it
+/// never runs an effect for real unless the body sets `"effects": "live"`.
+/// Each outcome writes one `workflow.fork` audit row.
+async fn fork_workflow(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    request: Result<Json<WorkflowForkRequest>, JsonRejection>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let context = audit_context(&headers, &api_state);
+    // Before the source shard resolves, a refusal is audited on the default
+    // shard, as for a reset.
+
+    let exec_id = match parse_execution_id(&id) {
+        Ok(eid) => eid,
+        Err(e) => {
+            let _ =
+                audit_fork_on_default(&api_state, &context, &id, Some("malformed execution id"))
+                    .await;
+            return e.into_response();
+        }
+    };
+    let exec_id_str = exec_id.to_string();
+    // The handler unwraps the body itself, so a rejected body is audited too.
+    // The response keeps the status of the extractor.
+    let request = match request {
+        Ok(Json(request)) => request,
+        Err(rejection) => {
+            let failure = format!("invalid request body: {}", rejection.body_text());
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return rejection.into_response();
+        }
+    };
+    // Fail closed in the boot window. With no runtime there are no payload
+    // codecs, so an override would land in plaintext.
+    let runtime = match api_state.runtime() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            let failure = e.to_string();
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return map_error(e).into_response();
+        }
+    };
+    // The exact resolver never stands the default shard in for the source
+    // shard. A source shard that this node has no pool for answers `503`, not a
+    // false `404` from the wrong database.
+    let mut conn = match db_conn_for_execution_exact(&api_state, exec_id).await {
+        Ok(Some(conn)) => conn,
+        Ok(None) => {
+            let error = HarvestError::NotFound(format!("workflow execution {exec_id_str}"));
+            let failure = error.to_string();
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return map_error(error).into_response();
+        }
+        Err(e) => {
+            let failure = e.to_string();
+            let _ = audit_fork_on_default(&api_state, &context, &exec_id_str, Some(&failure)).await;
+            return e.into_response();
+        }
+    };
+    if request.effects == ForkEffects::Live
+        && let Some(response) =
+            reject_inadmissible_fork_callbacks(&api_state, &mut conn, &context, exec_id).await
+    {
+        return response;
+    }
+    // The fork commits on the source shard, with its success audit row in
+    // the same transaction. A fork leaves its source as it was, so a retry
+    // makes another fork. So a failed audit insert must roll the fork back,
+    // not report a retryable error for a fork that exists.
+    let result = fork_workflow_execution_audited(
+        &mut conn,
+        exec_id,
+        request,
+        Some(runtime.registry().as_ref()),
+        &fork_audit_record(&context, &exec_id_str, None),
+    )
+    .await;
+
+    match result {
+        Ok(result) => (axum::http::StatusCode::CREATED, Json(result)).into_response(),
+        Err(error) => {
+            let failure = error.to_string();
+            let _ = audit_fork(&mut conn, &context, &exec_id_str, Some(&failure)).await;
+            fork_error_response(error)
+        }
+    }
+}
+
+/// Refuse a live fork whose inherited callback targets fail the SSRF policy.
+///
+/// A live fork sends the completion callbacks of its source. The terminal
+/// path checks each target against the current policy and skips a rejected
+/// one in silence. So the route checks the targets first and refuses the fork
+/// with `422`, as a rerun does. The targets are fixed at start, so the check
+/// before the fork transaction sees the targets that the fork copies.
+///
+/// Returns the refusal response, or `None` when the fork can go on.
+async fn reject_inadmissible_fork_callbacks(
+    api_state: &HarvestApiState,
+    conn: &mut AsyncPgConnection,
+    context: &(String, String, Option<String>),
+    exec_id: ExecutionId,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse as _;
+
+    let exec_id_str = exec_id.to_string();
+    // A missing source is left to the fork, which refuses it with `404`.
+    let stored: Option<Option<Value>> = match harvest_workflow_executions::table
+        .find(exec_id.as_uuid())
+        .select(harvest_workflow_executions::completion_callbacks)
+        .first(conn)
+        .await
+        .optional()
+    {
+        Ok(stored) => stored,
+        Err(e) => {
+            let error = autumn_harvest::error::database_error(e);
+            let failure = error.to_string();
+            let _ = audit_fork(conn, context, &exec_id_str, Some(&failure)).await;
+            return Some(map_error(error).into_response());
+        }
+    };
+    // A source with no callback targets has nothing to check.
+    let raw = stored.flatten()?;
+    let targets: Vec<autumn_harvest::completion_callback::CallbackTarget> =
+        match serde_json::from_value(raw) {
+            Ok(targets) => targets,
+            Err(e) => {
+                let failure = "malformed stored completion_callbacks";
+                let _ = audit_fork(conn, context, &exec_id_str, Some(failure)).await;
+                return Some(
+                    AutumnError::bad_request_msg(format!(
+                        "source execution {exec_id} has an unparseable stored \
+                     completion_callbacks value ({e}); a live fork cannot send them"
+                    ))
+                    .into_response(),
+                );
+            }
+        };
+    let policy = api_state.completion_callback_ssrf_policy();
+    for target in &targets {
+        if let Err(rejection) =
+            autumn_harvest::completion_callback::validate_target_url(&target.url, &policy)
+        {
+            let failure = "completion callback target no longer admissible";
+            let _ = audit_fork(conn, context, &exec_id_str, Some(failure)).await;
+            return Some(
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "completion callback target rejected",
+                        "url": target.url,
+                        "rejection": rejection,
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    }
+    None
+}
+
+/// Write one `workflow.fork` audit row on the default shard.
+async fn audit_fork_on_default(
+    api_state: &HarvestApiState,
+    context: &(String, String, Option<String>),
+    target_id: &str,
+    failure: Option<&str>,
+) -> Result<(), String> {
+    let pool = api_state.storage_pool().map_err(|e| e.to_string())?;
+    let mut conn = acquire_conn(pool.default_pool())
+        .await
+        .map_err(|e| e.to_string())?;
+    audit_fork(&mut conn, context, target_id, failure).await
+}
+
+/// Write one `workflow.fork` audit row on `conn`.
+///
+/// `failure` is the error summary of a refused fork, or `None` on success.
+async fn audit_fork(
+    conn: &mut AsyncPgConnection,
+    context: &(String, String, Option<String>),
+    target_id: &str,
+    failure: Option<&str>,
+) -> Result<(), String> {
+    audit::insert_audit(conn, &fork_audit_record(context, target_id, failure))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// The `workflow.fork` audit row of one request.
+fn fork_audit_record<'a>(
+    (actor, source, request_id): &'a (String, String, Option<String>),
+    target_id: &'a str,
+    failure: Option<&'a str>,
+) -> NewAuditRecord<'a> {
+    NewAuditRecord {
+        actor,
+        operation: OP_WORKFLOW_FORK,
+        target_type: TARGET_WORKFLOW,
+        target_id: Some(target_id),
+        route_or_command: "POST /workflows/{id}/fork",
+        request_id: request_id.as_deref(),
+        idempotency_key: None,
+        status: if failure.is_some() {
+            STATUS_FAILED
+        } else {
+            STATUS_SUCCEEDED
+        },
+        error_summary: failure,
+        shard_id: None,
+        source,
+    }
+}
+
+fn fork_error_response(error: WorkflowForkError) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
+    let status = match error {
+        WorkflowForkError::InvalidPoint(invalid) => return reset_invalid_point_response(invalid),
+        // A fork is a fresh admission (issue #2000), so a gate answers as it
+        // does for a start or a rerun.
+        WorkflowForkError::Harvest(HarvestError::AdmissionBlocked { gate_id, reason }) => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "admission blocked",
+                    "gate_id": gate_id,
+                    "reason": reason,
+                })),
+            )
+                .into_response();
+        }
+        WorkflowForkError::Harvest(error) => return map_error(error).into_response(),
+        WorkflowForkError::ContinueAsNew | WorkflowForkError::InvalidOverride { .. } => {
+            axum::http::StatusCode::BAD_REQUEST
+        }
+        // As for a rerun: the fork would fail on every worker.
+        WorkflowForkError::WorkflowNotRegistered { .. } => axum::http::StatusCode::NOT_FOUND,
+        WorkflowForkError::ErasedSource { .. }
+        | WorkflowForkError::UnservableEffect { .. }
+        | WorkflowForkError::CarriedMutex { .. }
+        | WorkflowForkError::WorkflowIdInUse { .. }
+        | WorkflowForkError::LineageTooDeep { .. }
+        | WorkflowForkError::LineageGap { .. }
+        | WorkflowForkError::LineageMalformed { .. }
+        | WorkflowForkError::HistoryCapReached { .. }
+        | WorkflowForkError::ShardRefused { .. } => axum::http::StatusCode::CONFLICT,
+    };
+    (
+        status,
+        Json(ResetErrorResponse {
+            message: error.to_string(),
+        }),
+    )
+        .into_response()
+}
+
 fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
     use axum::response::IntoResponse as _;
 
@@ -25445,18 +26113,33 @@ fn reset_error_response(error: WorkflowResetError) -> axum::response::Response {
             }),
         )
             .into_response(),
-        // Same `409` and the same operator instruction as the DAG-retry
-        // pre-flight guard, so a caller cannot tell whether the erasure was
-        // already committed or landed in the race window — only that the
-        // source is unusable and a fresh run is the answer.
+        // Every fork refuses an erased source (issue #1999). DAG retry maps
+        // this case to its own message in `dag_retry_reset_error_response`.
         WorkflowResetError::ErasedSource { exec_id } => (
             axum::http::StatusCode::CONFLICT,
             Json(ResetErrorResponse {
                 message: format!(
-                    "workflow execution {exec_id} had its payloads erased (issue #495), so its \
-                     carried-over node outputs are tombstones and whether it already compensated \
-                     cannot be determined; retrying would resume on unreadable state — start a \
-                     fresh DAG run instead"
+                    "workflow execution {exec_id} had its payloads erased (issue #495); a fork \
+                     would resume on tombstones, so start a fresh run instead"
+                ),
+            }),
+        )
+            .into_response(),
+        // A reset of a fork that could never run one task (issue #2000).
+        WorkflowResetError::HistoryCapReached { .. } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!("{error}; reset at an earlier point"),
+            }),
+        )
+            .into_response(),
+        // A reset of a fork walks its lineage as a fork does (issue #2000).
+        WorkflowResetError::ForkLineage { exec_id, reason } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "the fork lineage of workflow execution {exec_id} cannot be checked for \
+                     erasure ({reason}); start a fresh run instead"
                 ),
             }),
         )
@@ -25596,8 +26279,26 @@ fn dag_retry_invalid_point_response(invalid: &ResetInvalidPoint) -> axum::respon
 /// contract: the invalid-boundary case is a `409` (not the `400` the standalone
 /// reset uses), everything else mirrors the standalone reset mapping.
 fn dag_retry_reset_error_response(error: WorkflowResetError) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+
     match error {
         WorkflowResetError::InvalidPoint(invalid) => dag_retry_invalid_point_response(&invalid),
+        // Same `409` and the same operator instruction as the DAG-retry
+        // pre-flight guard. A caller cannot tell whether the erasure committed
+        // before the pre-flight check or in the race window. It only learns
+        // that the source is unusable and that a fresh run is the answer.
+        WorkflowResetError::ErasedSource { exec_id } => (
+            axum::http::StatusCode::CONFLICT,
+            Json(ResetErrorResponse {
+                message: format!(
+                    "workflow execution {exec_id} had its payloads erased (issue #495), so its \
+                     carried-over node outputs are tombstones and whether it already compensated \
+                     cannot be determined; retrying would resume on unreadable state — start a \
+                     fresh DAG run instead"
+                ),
+            }),
+        )
+            .into_response(),
         other => reset_error_response(other),
     }
 }
@@ -25928,6 +26629,12 @@ pub(crate) async fn retry_dag_run_inner(
 
     // Compose the reset request: the reason carries the DAG-retry annotation so
     // the audit trail (#158) and the WorkflowResetFork event read cleanly.
+    //
+    // The pre-flight erasure guard above ran on an unlocked read. The
+    // connection was then dropped for blob inflation, so `erase-payloads` can
+    // commit before this transaction opens. The fork rechecks erasure under its
+    // own row lock (issue #1999). So the fork never acts on an issue #780
+    // guard decision whose evidence an erasure destroyed.
     let augmented_reason = format!(
         "{} | dag_retry: nodes=[{}]",
         reason.trim(),
@@ -25940,13 +26647,6 @@ pub(crate) async fn retry_dag_run_inner(
         operator_id: operator_id.trim().to_string(),
         signal_reapply: autumn_harvest::reset::ResetSignalReapplyPolicy::default(),
         allow_terminal_source: true,
-        // Recheck erasure under the fork's own row lock. The pre-flight guard
-        // above ran on an unlocked read, and the connection was dropped for blob
-        // inflation before this transaction opens — so `erase-payloads` can
-        // commit in that window. Without this, the fork would carry tombstoned
-        // outputs and the issue #780 compensated-run guard would have been
-        // decided on evidence that no longer exists.
-        refuse_erased_source: true,
     };
 
     // Dry-run: validate the boundary and return the plan without writing.
@@ -26064,6 +26764,18 @@ pub(crate) async fn signal_workflow(
     {
         return resp;
     }
+
+    // Issue #1985: apply the promise settlement rules before the keyed dedupe
+    // probe below. A mismatched key can match an unrelated row. The probe then
+    // reports success, and the promise stays unsettled.
+    let idempotency_key = match autumn_harvest::durable_promise::settlement_idempotency_key(
+        &signal_name,
+        &payload,
+        idempotency_key.as_deref(),
+    ) {
+        Ok(key) => key.map(str::to_owned),
+        Err(e) => return map_error(e).into_response(),
+    };
 
     let exec_id = match parse_execution_id(&id) {
         Ok(eid) => eid,
@@ -26348,6 +27060,8 @@ pub(crate) async fn signal_workflow(
 
 /// Hydrate a workflow context by replaying its history into the workflow
 /// handler long enough for it to register its query handlers.
+// One linear context setup. A split would only move the lines.
+#[allow(clippy::too_many_lines)]
 async fn hydrate_ctx_for_query(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
@@ -26472,6 +27186,11 @@ async fn hydrate_ctx_for_query(
     // execution row, absent from history, so this context (which sources those
     // from the row) must source parent from the row too.
     .with_parent_execution_id(execution.parent_id.map(ExecutionId::from_uuid))
+    // Issue #2082: the query replays the body, so it needs the row's start source.
+    .with_start_provenance(autumn_harvest::types::StartProvenance::from_row(
+        execution.start_source.as_deref(),
+        execution.continued_from_exec_id,
+    ))
     // Issue #698: thread the execution row's workflow type name and business
     // `workflow_id` so a query replayed on this run reports the real values via
     // `ctx.info().workflow_type` / `ctx.info().workflow_id`. Both live on the
@@ -27920,7 +28639,10 @@ async fn upsert_workflow_schedule_and_read_back(
     registry: Option<&HandlerRegistry>,
 ) -> Result<ScheduleEntry, AutumnError> {
     use autumn_harvest::schema::harvest_schedules::dsl;
-    autumn_harvest::register_workflow_schedules(conn, std::slice::from_ref(ws))
+    // The registry holds the write codec (issue #2043).
+    let identity_codecs = autumn_harvest::payload_codec::PayloadCodecs::default();
+    let codecs = registry.map_or(&identity_codecs, HandlerRegistry::payload_codecs);
+    autumn_harvest::register_workflow_schedules_with_codecs(conn, std::slice::from_ref(ws), codecs)
         .await
         .map_err(map_error)?;
     let row: autumn_harvest::models::HarvestSchedule = dsl::harvest_schedules
@@ -28023,26 +28745,26 @@ async fn create_workflow_schedule(
 
     // Reject unknown overlap_policy strings with 400 before storing.
     // `from_db` is lenient for backward compat; user input is validated strictly.
-    let overlap_policy = match autumn_harvest::OverlapPolicy::from_user_input(
-        &request.overlap_policy,
-    ) {
-        Ok(p) => p,
-        Err(v) => {
-            let err_summary = format!(
-                "invalid overlap_policy '{v}'; valid values: skip, buffer_one, buffer_all, cancel_other, terminate_other"
-            );
-            schedule_create_audit_failed(
-                &api_state,
-                &actor,
-                &source,
-                request_id.as_deref(),
-                &request.workflow_name,
-                &err_summary,
-            )
-            .await;
-            return Err(AutumnError::bad_request_msg(err_summary));
-        }
-    };
+    let overlap_policy =
+        match autumn_harvest::OverlapPolicy::from_user_input(&request.overlap_policy) {
+            Ok(p) => p,
+            Err(v) => {
+                let err_summary = format!(
+                    "invalid overlap_policy '{v}'; valid values: {}",
+                    autumn_harvest::OverlapPolicy::VALID_VALUES
+                );
+                schedule_create_audit_failed(
+                    &api_state,
+                    &actor,
+                    &source,
+                    request_id.as_deref(),
+                    &request.workflow_name,
+                    &err_summary,
+                )
+                .await;
+                return Err(AutumnError::bad_request_msg(err_summary));
+            }
+        };
     let skip_policy = match SkipPolicy::from_user_input(&request.skip_policy) {
         Ok(p) => p,
         Err(v) => {
@@ -28736,7 +29458,8 @@ async fn update_schedule_handler(
             Ok(p) => Some(p),
             Err(v) => {
                 let err_summary = format!(
-                    "invalid overlap_policy '{v}'; valid values: skip, buffer_one, buffer_all, cancel_other, terminate_other"
+                    "invalid overlap_policy '{v}'; valid values: {}",
+                    autumn_harvest::OverlapPolicy::VALID_VALUES
                 );
                 schedule_update_audit_failed(
                     &api_state,
@@ -28875,7 +29598,13 @@ async fn update_schedule_handler(
         retry_policy: request.retry_policy.clone(),
     };
 
-    match update_workflow_schedule(&mut conn, id, &patch).await {
+    // The registry holds the write codec. The API mirror serves the read path
+    // (issue #2043).
+    let write_codecs = api_state.runtime().map_or_else(
+        |_| api_state.payload_codecs(),
+        |rt| rt.registry.payload_codecs().clone(),
+    );
+    match update_workflow_schedule_with_codecs(&mut conn, id, &patch, &write_codecs).await {
         Ok(ScheduleUpdateOutcome::Updated(row)) => {
             let ar = NewAuditRecord {
                 actor: &actor,
@@ -29771,10 +30500,15 @@ async fn trigger_schedule_now(
         schedule.dag_name.as_deref(),
     ) {
         (Some(wf_name), _) => {
-            let input = schedule
-                .workflow_input
-                .clone()
-                .unwrap_or(serde_json::Value::Null);
+            // The engine reads the stored input strictly (issue #2043).
+            let input = match schedule.workflow_input.as_ref() {
+                Some(stored) => runtime
+                    .registry
+                    .payload_codecs()
+                    .decode_column(stored)
+                    .map_err(map_error)?,
+                None => serde_json::Value::Null,
+            };
             let queue = schedule
                 .queue_name
                 .as_deref()
@@ -30183,7 +30917,7 @@ async fn trigger_schedule_now(
             start_source_ref: Some(schedule_id.to_string()),
             started_by: Some(actor.clone()),
         };
-        match autumn_harvest::throttle::reserve_or_defer(
+        match autumn_harvest::throttle::reserve_or_defer_with_codecs(
             &mut exec_conn,
             autumn_harvest::throttle::AdmitThrottleParams {
                 workflow_name: &workflow_name,
@@ -30197,6 +30931,7 @@ async fn trigger_schedule_now(
                 schedule_to_start: throttle_policy.schedule_to_start,
                 shard_id: trigger_exec_shard.as_i32(),
             },
+            runtime.registry.payload_codecs(),
         )
         .await
         {
@@ -30856,6 +31591,20 @@ async fn schedule_backfill(
     .map(Json)
 }
 
+/// The run cap that a backfill enforces for `schedule`.
+///
+/// `AllowAll` ignores `max_active_runs` (issue #1985), so its backfill has no
+/// run cap. The `max_runs` budget and the backfill count limit still apply.
+fn backfill_max_active(schedule: &autumn_harvest::models::HarvestSchedule) -> i64 {
+    if autumn_harvest::OverlapPolicy::from_db(&schedule.overlap_policy)
+        == autumn_harvest::OverlapPolicy::AllowAll
+    {
+        i64::MAX
+    } else {
+        i64::from(schedule.max_active_runs)
+    }
+}
+
 /// The backfill implementation, with the audited `route_or_command` supplied by
 /// the caller.
 ///
@@ -30997,7 +31746,11 @@ pub(crate) async fn schedule_backfill_inner(
         )));
     }
 
-    let max_active = i64::from(schedule.max_active_runs);
+    let max_active = backfill_max_active(&schedule);
+    // `AllowAll` has no run cap, so the shard-wide counts below are not
+    // needed. Skipping them also stops a shard outage from failing the
+    // whole backfill (issue #1985).
+    let uncapped = max_active == i64::MAX;
 
     if schedule.is_paused && request.include_paused && kind == ScheduleKind::Dag && !request.dry_run
     {
@@ -31131,57 +31884,61 @@ pub(crate) async fn schedule_backfill_inner(
     // Count running executions once before the loop; track dispatched_this_call separately
     // so we don't re-query on every timestamp. This value gates max_active_runs,
     // so non-dry-run dispatch must not treat count failures as zero.
-    let running_at_start = match query_running_count(&pool, &kind, &name, schedule_id).await {
-        Ok(count) => count,
-        Err(count_failures) => {
-            let status = "partial";
-            let error_summary = Some("one or more shard failures");
-            write_backfill_log(
-                &pool,
-                schedule_id,
-                &actor,
-                &source,
-                request.from,
-                request.to,
-                false,
-                total,
-                0,
-                0,
-                total,
-                status,
-                error_summary,
-                started_at,
-            )
-            .await;
-            let id_str = schedule_id.to_string();
-            write_audit(
-                &pool,
-                &actor,
-                &source,
-                req_id.as_deref(),
-                route,
-                &id_str,
-                STATUS_FAILED,
-                error_summary,
-            )
-            .await;
+    let running_at_start = if uncapped {
+        0
+    } else {
+        match query_running_count(&pool, &kind, &name, schedule_id).await {
+            Ok(count) => count,
+            Err(count_failures) => {
+                let status = "partial";
+                let error_summary = Some("one or more shard failures");
+                write_backfill_log(
+                    &pool,
+                    schedule_id,
+                    &actor,
+                    &source,
+                    request.from,
+                    request.to,
+                    false,
+                    total,
+                    0,
+                    0,
+                    total,
+                    status,
+                    error_summary,
+                    started_at,
+                )
+                .await;
+                let id_str = schedule_id.to_string();
+                write_audit(
+                    &pool,
+                    &actor,
+                    &source,
+                    req_id.as_deref(),
+                    route,
+                    &id_str,
+                    STATUS_FAILED,
+                    error_summary,
+                )
+                .await;
 
-            return Ok(ScheduleBackfillResponse {
-                status: status.to_string(),
-                schedule_id,
-                kind,
-                name,
-                from: request.from,
-                to: request.to,
-                planned_timestamps: fire_times.clone(),
-                total,
-                dispatched: 0,
-                skipped: 0,
-                failed: total,
-                skipped_reasons,
-                partial_shard_failures: count_failures,
-                paused_schedule_warning,
-            });
+                return Ok(ScheduleBackfillResponse {
+                    status: status.to_string(),
+                    schedule_id,
+                    kind,
+                    name,
+                    from: request.from,
+                    to: request.to,
+                    planned_timestamps: fire_times.clone(),
+                    total,
+                    dispatched: 0,
+                    skipped: 0,
+                    failed: total,
+                    skipped_reasons,
+                    partial_shard_failures: count_failures,
+                    paused_schedule_warning,
+                });
+            }
         }
     };
     // A throttled scheduled/backfill fire (issue #607) durably defers before any
@@ -31197,7 +31954,7 @@ pub(crate) async fn schedule_backfill_inner(
     // matching the earlier fix's precedent of scoping throttle-aware overlap
     // counting (`tick_one_workflow_schedule`/`drain_buffered_schedule_runs` in
     // scheduler.rs) to workflows only.
-    let running_at_start = if kind == ScheduleKind::Workflow {
+    let running_at_start = if kind == ScheduleKind::Workflow && !uncapped {
         match query_pending_throttle_count(&pool, &name).await {
             Ok(pending) => running_at_start + pending,
             Err(count_failures) => {
@@ -31373,11 +32130,6 @@ pub(crate) async fn schedule_backfill_inner(
                 // Match the scheduler: ExecutionId::new() encodes ShardId::UNENCODED so
                 // the execution lands on the default shard, same as tick_one_workflow_schedule.
                 let exec_id = ExecutionId::new();
-                let input = schedule
-                    .workflow_input
-                    .clone()
-                    .unwrap_or(serde_json::Value::Null);
-
                 let Ok(mut conn) = acquire_conn(wf_shard_pool).await else {
                     shard_failures.push(BackfillShardFailure {
                         shard_id: 0,
@@ -31422,6 +32174,25 @@ pub(crate) async fn schedule_backfill_inner(
                         continue;
                     }
                 }
+
+                // A stored input that does not decode never starts a run. A
+                // slot that already ran needs no input, so the prior-run check
+                // above comes first (issue #2043).
+                let input = match schedule.workflow_input.as_ref() {
+                    Some(stored) => {
+                        let Ok(plain) = runtime.registry.payload_codecs().decode_column(stored)
+                        else {
+                            shard_failures.push(BackfillShardFailure {
+                                shard_id: 0,
+                                reason: "stored schedule input could not be decoded".to_string(),
+                            });
+                            failed += 1;
+                            continue;
+                        };
+                        plain
+                    }
+                    None => serde_json::Value::Null,
+                };
 
                 let (
                     owner,
@@ -31650,7 +32421,7 @@ pub(crate) async fn schedule_backfill_inner(
                         start_source_ref: Some(schedule_id.to_string()),
                         started_by: Some(actor.clone()),
                     };
-                    match autumn_harvest::throttle::reserve_or_defer(
+                    match autumn_harvest::throttle::reserve_or_defer_with_codecs(
                         &mut conn,
                         autumn_harvest::throttle::AdmitThrottleParams {
                             workflow_name: &wf_name,
@@ -31664,6 +32435,7 @@ pub(crate) async fn schedule_backfill_inner(
                             schedule_to_start: throttle_policy.schedule_to_start,
                             shard_id: runtime.router.default_shard().as_i32(),
                         },
+                        runtime.registry.payload_codecs(),
                     )
                     .await
                     {
@@ -34544,10 +35316,9 @@ async fn replay_diagnosis(
     // configured) are not offload-inflated for the count, so the audit
     // conservatively counts inline-encrypted envelopes only — a rare-combo edge
     // that under-counts, never a leak.
-    let history = if let Some(codecs) =
-        read_path_decoder(&api_state, extension_session(maybe_session)).await
-    {
-        let history = store::load_history_inflated(&mut conn, exec_id, &codecs, offloader)
+    let decode_codecs = read_path_decoder(&api_state, extension_session(maybe_session)).await;
+    let history = if let Some(codecs) = decode_codecs.as_ref() {
+        let history = store::load_history_inflated(&mut conn, exec_id, codecs, offloader)
             .await
             .map_err(map_error)?;
         let mut outcome = LossyDecodeOutcome::default();
@@ -34557,6 +35328,13 @@ async fn replay_diagnosis(
                     outcome = outcome.merged(codecs.decode_value_lossy(&mut value));
                 }
             }
+        }
+        // The replay below decodes the header cell too. The audit counts it,
+        // so a run whose payloads are all offloaded still leaves a record
+        // (issue #2043).
+        if let Some(cell) = execution.context_headers.as_ref() {
+            let mut cell = cell.clone();
+            outcome = outcome.merged(codecs.decode_value_lossy(&mut cell));
         }
         let target = exec_id.to_string();
         // Reuse the handler's own (execution-shard) connection, mirroring the
@@ -34639,9 +35417,22 @@ async fn replay_diagnosis(
     // exactly the values hydrate_ctx_for_query threads for the query path — so a
     // deadline-aware, parent-aware, or header-branching run replays cleanly instead
     // of surfacing FALSE non-determinism.
-    let context_headers = execution.context_headers.as_ref().and_then(|v| {
-        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
-    });
+    // The headers decode under the same gate as the history. A cell this
+    // caller may not decode makes the run undiagnosable. It never replays
+    // without its headers (issue #2043).
+    let context_headers = decode_codecs
+        .clone()
+        .unwrap_or_default()
+        .decode_headers_opt(execution.context_headers.as_ref())
+        .map(|headers| execution.context_headers.is_some().then_some(headers))
+        .map_err(|_| {
+            map_error(HarvestError::HistoryUnavailable {
+                exec_id,
+                reason: "payload decoding is required to diagnose this execution; \
+                         enable decode-on-read (admin)"
+                    .to_string(),
+            })
+        })?;
     let snapshot = autumn_harvest::testing::HistorySnapshot {
         workflow_name: execution.workflow_name.clone(),
         execution_id: exec_id,
@@ -34649,6 +35440,11 @@ async fn replay_diagnosis(
         context_headers,
         execution_timeout: execution.execution_timeout,
         deadline_at: execution.deadline_at,
+        // Issue #2082: carry the row's start source and predecessor.
+        start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
+            execution.start_source.as_deref(),
+            execution.continued_from_exec_id,
+        )),
         parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         workflow_id: Some(execution.workflow_id.clone()),
         queue_name: None,
@@ -38456,6 +39252,407 @@ async fn list_paused_queues_handler(
     })))
 }
 
+// ── Fairness key weights (issue #1976) ────────────────────────────────────────
+
+/// Body of `POST /admin/queues/{queue_name}/fairness/{fairness_key}`.
+///
+/// An unknown field is a 400. A typo must not set a weight the caller did not
+/// mean.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetFairnessWeightRequest {
+    weight: f64,
+}
+
+/// The claim state of one fairness key on one shard.
+#[derive(Debug, Serialize)]
+struct ShardFairnessKeyState {
+    shard_id: i32,
+    #[serde(flatten)]
+    state: ::autumn_harvest::fairness_keys::FairnessKeyState,
+}
+
+/// What one shard reports for `GET /admin/queues/{queue_name}/fairness`.
+type ShardFairnessRows = (
+    i32,
+    Vec<::autumn_harvest::fairness_keys::FairnessWeight>,
+    Vec<::autumn_harvest::fairness_keys::FairnessKeyState>,
+);
+
+/// Validate the path of a fairness weight write and resolve every shard.
+///
+/// The claim reads weights from the database of its own shard. So each write
+/// goes to every shard, the same as a fleet-wide queue pause. On rejection the
+/// audit row is written and a response is returned in `Err`.
+#[allow(clippy::result_large_err)]
+async fn prepare_fairness_weight_targets(
+    api_state: &HarvestApiState,
+    audit: &QueuePauseAuditCtx,
+    queue_name: &str,
+    fairness_key: &str,
+    operation: &'static str,
+    route: &'static str,
+) -> Result<(String, Vec<(i32, DbPool)>, Vec<String>), axum::response::Response> {
+    let prepared =
+        prepare_queue_pause_targets(api_state, audit, queue_name, None, operation, route).await?;
+    if let Err(error) = ::autumn_harvest::queue_fairness::validate_fairness_key(fairness_key) {
+        let summary = format!("fairness key {fairness_key:?}: {error}");
+        return Err(reject_queue_pause(
+            api_state,
+            audit,
+            operation,
+            route,
+            queue_name,
+            map_error(error),
+            &summary,
+        )
+        .await);
+    }
+    Ok(prepared)
+}
+
+/// The audit context of a fairness weight write: the key, the weight, and
+/// the shards that the write did not reach.
+fn fairness_weight_audit_context(
+    fairness_key: &str,
+    weight: Option<f64>,
+    failures: &[String],
+) -> String {
+    let mut context = format!("fairness_key: {fairness_key:?}");
+    if let Some(weight) = weight {
+        let _ = write!(context, " | weight: {weight}");
+    }
+    if !failures.is_empty() {
+        let _ = write!(context, " | failures: {}", failures.join("; "));
+    }
+    context
+}
+
+/// `GET /admin/queues/{queue_name}/fairness` — weights and claim state.
+///
+/// Each shard keeps its own weights and state. `weights` holds one entry per
+/// key, from the lowest shard that has it. `weights_uniform` is false when the
+/// shards disagree. `state` holds the rows of every shard, each with its
+/// `shard_id`.
+async fn get_queue_fairness_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(queue_name): Path<String>,
+) -> Result<Json<Value>, AutumnError> {
+    let queue =
+        ::autumn_harvest::queue_pause::validate_queue_name(&queue_name).map_err(map_error)?;
+    let observations = observe_shards(&api_state, |shard_id, mut conn| {
+        let queue = queue.clone();
+        async move {
+            let weights = ::autumn_harvest::fairness_keys::list_fairness_weights(&mut conn, &queue)
+                .await
+                .map_err(|e| e.to_string())?;
+            let state = ::autumn_harvest::fairness_keys::list_fairness_state(&mut conn, &queue)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>(vec![(shard_id, weights, state)])
+        }
+    })
+    .await?;
+    let collected = shard_fanout::collect_fanout_rows::<ShardFairnessRows>(observations);
+
+    let mut weights = BTreeMap::new();
+    let mut shard_views: Vec<Vec<(String, u64)>> = Vec::new();
+    let mut state = Vec::new();
+    for (shard_id, shard_weights, shard_state) in collected.rows {
+        shard_views.push(
+            shard_weights
+                .iter()
+                .map(|w| (w.fairness_key.clone(), w.weight.to_bits()))
+                .collect(),
+        );
+        for weight in shard_weights {
+            weights.entry(weight.fairness_key.clone()).or_insert(weight);
+        }
+        state.extend(shard_state.into_iter().map(|row| ShardFairnessKeyState {
+            shard_id,
+            state: row,
+        }));
+    }
+    let weights_uniform = shard_views.windows(2).all(|pair| pair[0] == pair[1]);
+
+    Ok(Json(serde_json::json!({
+        "queue_name": queue,
+        "weights": weights.into_values().collect::<Vec<_>>(),
+        "weights_uniform": weights_uniform,
+        "state": state,
+        "status": collected.status,
+        "unavailable_shards": collected.unavailable_shards,
+    })))
+}
+
+/// Set one fairness weight on every target shard.
+///
+/// Returns the row from the first shard that applied it, and the first cap
+/// rejection. Each shard that fails adds an entry to `failures`.
+async fn apply_fairness_weight_across_shards(
+    targets: &[(i32, DbPool)],
+    queue: &str,
+    fairness_key: &str,
+    weight: f64,
+    actor: &str,
+    failures: &mut Vec<String>,
+) -> (
+    Option<::autumn_harvest::fairness_keys::FairnessWeight>,
+    Option<String>,
+    bool,
+) {
+    let mut applied = None;
+    let mut cap_error = None;
+    let mut outage = false;
+    for (shard_id, pool) in targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                failures.push(format!("shard {shard_id}: {e}"));
+                outage = true;
+                continue;
+            }
+        };
+        match ::autumn_harvest::fairness_keys::set_fairness_weight(
+            &mut conn,
+            queue,
+            fairness_key,
+            weight,
+            actor,
+        )
+        .await
+        {
+            Ok(row) => {
+                applied.get_or_insert(row);
+            }
+            Err(HarvestError::Config(message)) => {
+                failures.push(format!("shard {shard_id}: {message}"));
+                cap_error.get_or_insert(message);
+            }
+            Err(e) => {
+                failures.push(format!("shard {shard_id}: {e}"));
+                outage = true;
+            }
+        }
+    }
+    (applied, cap_error, outage)
+}
+
+/// `POST /admin/queues/{queue_name}/fairness/{fairness_key}` — set a weight.
+///
+/// The weight applies at the next fair claim of the key. No worker restart is
+/// needed. A write that reaches only some shards is a 207, the same as a
+/// partial queue pause. Audited as `fairness.weight.set`, rejections included.
+async fn set_fairness_weight_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((queue_name, fairness_key)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<SetFairnessWeightRequest>, JsonRejection>,
+) -> axum::response::Response {
+    const ROUTE: &str = "POST /admin/queues/{queue_name}/fairness/{fairness_key}";
+    const OP: &str = OP_FAIRNESS_WEIGHT_SET;
+    let audit = audit_context(&headers, &api_state);
+
+    let weight = match body {
+        Ok(Json(request)) => request.weight,
+        Err(rejection) => {
+            let summary = format!("invalid request body: {}", rejection.body_text());
+            return reject_queue_pause(
+                &api_state,
+                &audit,
+                OP,
+                ROUTE,
+                &queue_name,
+                AutumnError::bad_request_msg(summary.clone()),
+                &summary,
+            )
+            .await;
+        }
+    };
+    if let Err(error) = ::autumn_harvest::queue_fairness::validate_fairness_weight(weight) {
+        let summary = format!("fairness key {fairness_key:?}: {error}");
+        return reject_queue_pause(
+            &api_state,
+            &audit,
+            OP,
+            ROUTE,
+            &queue_name,
+            map_error(error),
+            &summary,
+        )
+        .await;
+    }
+    let (queue, targets, mut failures) = match prepare_fairness_weight_targets(
+        &api_state,
+        &audit,
+        &queue_name,
+        &fairness_key,
+        OP,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (actor, source, request_id) = audit;
+
+    let (applied, cap_error, outage) = apply_fairness_weight_across_shards(
+        &targets,
+        &queue,
+        &fairness_key,
+        weight,
+        &actor,
+        &mut failures,
+    )
+    .await;
+
+    let status = if applied.is_some() && failures.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let context = fairness_weight_audit_context(&fairness_key, Some(weight), &failures);
+    write_queue_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP,
+        ROUTE,
+        &queue,
+        None,
+        status,
+        Some(&context),
+    )
+    .await;
+
+    let Some(row) = applied else {
+        // A cap rejection on every shard is a 409, as on a partial cap: the
+        // caller must clear an override first. Any other failure means an
+        // outage, so it is a 500.
+        if let Some(message) = cap_error.filter(|_| !outage) {
+            return AutumnError::bad_request_msg(message)
+                .with_status(axum::http::StatusCode::CONFLICT)
+                .into_response();
+        }
+        return AutumnError::internal_server_error_msg(format!(
+            "fairness weight set failed: {}",
+            failures.join("; ")
+        ))
+        .into_response();
+    };
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    let (mut status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    // A shard at the override cap refuses the key on every retry. A 207 says
+    // "send again", so a cap miss is a 409: clear an override there first.
+    if cap_error.is_some() {
+        status_code = axum::http::StatusCode::CONFLICT;
+    }
+    let mut payload = serde_json::to_value(&row).unwrap_or(Value::Null);
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("ok".to_string(), Value::Bool(ok));
+        map.insert("status".to_string(), Value::String(status.to_string()));
+    }
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
+/// `DELETE /admin/queues/{queue_name}/fairness/{fairness_key}` — clear a
+/// weight.
+///
+/// The key goes back to the default weight at its next claim. Idempotent: a
+/// key with no override returns 200 with `cleared: false`. Audited as
+/// `fairness.weight.clear`, rejections included.
+async fn clear_fairness_weight_handler(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path((queue_name, fairness_key)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    const ROUTE: &str = "DELETE /admin/queues/{queue_name}/fairness/{fairness_key}";
+    const OP: &str = OP_FAIRNESS_WEIGHT_CLEAR;
+    let audit = audit_context(&headers, &api_state);
+
+    let (queue, targets, mut failures) = match prepare_fairness_weight_targets(
+        &api_state,
+        &audit,
+        &queue_name,
+        &fairness_key,
+        OP,
+        ROUTE,
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(response) => return response,
+    };
+    let (actor, source, request_id) = audit;
+
+    let mut any_ok = false;
+    let mut cleared = false;
+    for (shard_id, pool) in &targets {
+        let mut conn = match acquire_conn(pool).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                failures.push(format!("shard {shard_id}: {e}"));
+                continue;
+            }
+        };
+        match ::autumn_harvest::fairness_keys::clear_fairness_weight(
+            &mut conn,
+            &queue,
+            &fairness_key,
+        )
+        .await
+        {
+            Ok(removed) => {
+                any_ok = true;
+                cleared |= removed;
+            }
+            Err(e) => failures.push(format!("shard {shard_id}: {e}")),
+        }
+    }
+
+    let status = if any_ok && failures.is_empty() {
+        STATUS_SUCCEEDED
+    } else {
+        STATUS_FAILED
+    };
+    let context = fairness_weight_audit_context(&fairness_key, None, &failures);
+    write_queue_pause_audit(
+        &targets,
+        &actor,
+        &source,
+        request_id.as_deref(),
+        OP,
+        ROUTE,
+        &queue,
+        None,
+        status,
+        Some(&context),
+    )
+    .await;
+
+    if !any_ok {
+        return AutumnError::internal_server_error_msg(format!(
+            "fairness weight clear failed: {}",
+            failures.join("; ")
+        ))
+        .into_response();
+    }
+    let partial = (!failures.is_empty()).then(|| failures.join("; "));
+    let (status_code, ok, status) = queue_pause_partial_status(partial.as_deref());
+    let mut payload = serde_json::json!({
+        "ok": ok,
+        "status": status,
+        "queue_name": queue,
+        "fairness_key": fairness_key,
+        "cleared": cleared,
+    });
+    queue_pause_attach_partial(&mut payload, partial);
+    (status_code, Json(payload)).into_response()
+}
+
 /// Merge per-shard pause rows into one entry per queue, preserving each shard's
 /// own provenance (issue #619 review).
 ///
@@ -41717,13 +42914,15 @@ fn apply_min_history_events_filter(
     )
 }
 
-/// Apply the legacy `search_attr` containment predicates and the typed
-/// `search_attr_filter` comparison/set predicates (issue #506) to a boxed
-/// `harvest_workflow_executions` query.
+/// Apply the legacy `search_attr` containment predicates, the typed
+/// `search_attr_filter` comparison/set predicates (issue #506) and the
+/// `filter` expressions (issue #1982) to a boxed
+/// `harvest_workflow_executions` query. `visibility_query::SqlFilter` holds
+/// the SQL for all three.
 ///
-/// Shared by `load_workflows` and `load_stalled_workflows` so both list code
-/// paths filter identically — without this the `no_progress_minutes` (stalled)
-/// path silently ignored every search-attribute filter (issue #506 review).
+/// All three list loaders share this helper, so each list path filters the
+/// same way. Before issue #506, the `no_progress_minutes` (stalled) path
+/// ignored every search-attribute filter.
 ///
 /// Every fragment stays on an index path: `@>` (containment) and `?` (key
 /// existence) both hit the existing `idx_harvest_we_search` GIN index;
@@ -41736,70 +42935,22 @@ fn apply_search_attr_filters<'a>(
     mut query: harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg>,
     legacy: &[Value],
     predicates: &[SearchAttrPredicate],
+    exprs: &[crate::visibility_query::Expr],
 ) -> harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg> {
-    use diesel::dsl::sql;
-    use diesel::sql_types::{Array, Bool, Jsonb, Text};
+    use crate::visibility_query::SqlFilter;
 
     // Legacy `search_attr=key:value` exact-match containment. Repeated keys
     // narrow the result set (AND).
     for predicate in legacy {
-        query = query.filter(
-            sql::<Bool>("harvest_workflow_executions.search_attrs @> ")
-                .bind::<Jsonb, _>(predicate.clone()),
-        );
+        query = query.filter(SqlFilter::contains(predicate.clone()));
     }
     for predicate in predicates {
-        query = match predicate {
-            SearchAttrPredicate::Eq { key, value } => {
-                let object = serde_json::json!({ key.clone(): value.clone() });
-                query.filter(
-                    sql::<Bool>("harvest_workflow_executions.search_attrs @> ")
-                        .bind::<Jsonb, _>(object),
-                )
-            }
-            SearchAttrPredicate::Ne { key, value } => {
-                let object = serde_json::json!({ key.clone(): value.clone() });
-                query.filter(
-                    sql::<Bool>("(harvest_workflow_executions.search_attrs ? ")
-                        .bind::<Text, _>(key.clone())
-                        .sql(" AND NOT (harvest_workflow_executions.search_attrs @> ")
-                        .bind::<Jsonb, _>(object)
-                        .sql("))"),
-                )
-            }
-            SearchAttrPredicate::Cmp { key, op, value } => {
-                let head = sql::<Bool>("(harvest_workflow_executions.search_attrs ? ")
-                    .bind::<Text, _>(key.clone())
-                    .sql(" AND jsonb_typeof(harvest_workflow_executions.search_attrs -> ")
-                    .bind::<Text, _>(key.clone())
-                    .sql(") = 'number' AND (harvest_workflow_executions.search_attrs ->> ")
-                    .bind::<Text, _>(key.clone());
-                // Fold the operator (from the fixed `CmpOp` enum) into a single
-                // static literal per branch so the fragment never chains two
-                // raw-SQL pieces back to back. The threshold is bound as text and
-                // cast `::numeric` so the comparison is exact even past 2^53.
-                let body = match op {
-                    CmpOp::Gt => head.sql(")::numeric > "),
-                    CmpOp::Gte => head.sql(")::numeric >= "),
-                    CmpOp::Lt => head.sql(")::numeric < "),
-                    CmpOp::Lte => head.sql(")::numeric <= "),
-                };
-                query.filter(body.bind::<Text, _>(value.clone()).sql("::numeric)"))
-            }
-            SearchAttrPredicate::In { key, values } => query.filter(
-                sql::<Bool>("(harvest_workflow_executions.search_attrs ? ")
-                    .bind::<Text, _>(key.clone())
-                    .sql(" AND harvest_workflow_executions.search_attrs -> ")
-                    .bind::<Text, _>(key.clone())
-                    .sql(" = ANY(")
-                    .bind::<Array<Jsonb>, _>(values.clone())
-                    .sql("))"),
-            ),
-            SearchAttrPredicate::Exists { key } => query.filter(
-                sql::<Bool>("harvest_workflow_executions.search_attrs ? ")
-                    .bind::<Text, _>(key.clone()),
-            ),
-        };
+        query = query.filter(SqlFilter::from_attr(predicate));
+    }
+    // The `filter` grammar (issue #1982). Its attribute leaves compile to the
+    // same SQL as the predicates above.
+    for expr in exprs {
+        query = query.filter(SqlFilter::from_expr(expr));
     }
     query
 }
@@ -41824,29 +42975,104 @@ fn exclude_canary_from_list(workflow_name: Option<&str>) -> bool {
 /// LIKE wildcard ambiguity) and works inside the stalled loader's
 /// correlated-subquery context. The prefix is always a *bound* `Text` param,
 /// never interpolated.
+///
+/// A `filter` expression that names a canary workflow with `=` or `IN` also
+/// opts back in (issue #1982). Only the canary names that it names pass.
 fn apply_canary_list_exclusion<'a>(
     query: harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg>,
-    workflow_name: Option<&str>,
+    filters: &WorkflowFilters,
 ) -> harvest_workflow_executions::BoxedQuery<'a, diesel::pg::Pg> {
     use diesel::dsl::sql;
-    use diesel::sql_types::{Bool, Text};
+    use diesel::sql_types::{Array, Bool, Text};
 
-    if exclude_canary_from_list(workflow_name) {
-        query.filter(
-            sql::<Bool>("NOT starts_with(harvest_workflow_executions.workflow_name, ")
-                .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX)
-                .sql(")"),
-        )
+    if !exclude_canary_from_list(filters.workflow_name.as_deref()) {
+        return query;
+    }
+    let named: Vec<String> = filters
+        .filter
+        .iter()
+        .flat_map(crate::visibility_query::workflow_names)
+        .filter(|name| autumn_harvest::canary::is_canary_workflow(name))
+        .collect();
+    let excluded = sql::<Bool>("(NOT starts_with(harvest_workflow_executions.workflow_name, ")
+        .bind::<Text, _>(autumn_harvest::canary::CANARY_WORKFLOW_NAME_PREFIX);
+    if named.is_empty() {
+        query.filter(excluded.sql("))"))
     } else {
-        query
+        query.filter(
+            excluded
+                .sql(") OR harvest_workflow_executions.workflow_name = ANY(")
+                .bind::<Array<Text>, _>(named)
+                .sql("))"),
+        )
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn load_workflows(
     conn: &mut AsyncPgConnection,
     filters: &WorkflowFilters,
 ) -> HarvestResult<Vec<WorkflowExecution>> {
+    workflow_list_query(filters)
+        .select(WorkflowExecution::as_select())
+        .load(conn)
+        .await
+        .map_err(database_error)
+}
+
+/// Runs `EXPLAIN` on the default `GET /workflows` query for `raw_query`
+/// (issue #1982). Returns one line of the plan for each row.
+///
+/// A test hook. It parses the query string the same way as the route, and it
+/// explains the same SQL that `load_workflows` runs.
+///
+/// # Errors
+///
+/// Returns a message when the query string is not valid, or when the
+/// database rejects the statement.
+#[doc(hidden)]
+pub async fn explain_workflow_list(
+    conn: &mut AsyncPgConnection,
+    raw_query: &str,
+) -> Result<Vec<String>, String> {
+    let pairs =
+        crate::strict_query::decode_or_autumn_error(Some(raw_query)).map_err(|e| e.to_string())?;
+    let filters = parse_workflow_filters(&pairs).map_err(|e| e.to_string())?;
+    let query = workflow_list_query(&filters).select(WorkflowExecution::as_select());
+    Explain(query)
+        .load::<String>(conn)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `EXPLAIN` in front of a query.
+struct Explain<Q>(Q);
+
+impl<Q: diesel::query_builder::QueryFragment<diesel::pg::Pg>>
+    diesel::query_builder::QueryFragment<diesel::pg::Pg> for Explain<Q>
+{
+    fn walk_ast<'b>(
+        &'b self,
+        mut out: diesel::query_builder::AstPass<'_, 'b, diesel::pg::Pg>,
+    ) -> diesel::QueryResult<()> {
+        out.push_sql("EXPLAIN ");
+        self.0.walk_ast(out.reborrow())
+    }
+}
+
+impl<Q> diesel::query_builder::QueryId for Explain<Q> {
+    type QueryId = ();
+    const HAS_STATIC_QUERY_ID: bool = false;
+}
+
+impl<Q> diesel::query_builder::Query for Explain<Q> {
+    type SqlType = diesel::sql_types::Text;
+}
+
+/// Builds the default `GET /workflows` query, with no `SELECT` list.
+#[allow(clippy::too_many_lines)]
+fn workflow_list_query(
+    filters: &WorkflowFilters,
+) -> harvest_workflow_executions::BoxedQuery<'static, diesel::pg::Pg> {
     use diesel::dsl::sql;
     use diesel::sql_types::{Bool, Jsonb, Text, Timestamptz, Uuid as SqlUuid};
 
@@ -41935,7 +43161,7 @@ pub(crate) async fn load_workflows(
     }
     // Issue #796 (AC8): hide synthetic liveness canary runs from the default
     // list unless the caller explicitly filters to a canary workflow name.
-    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    query = apply_canary_list_exclusion(query, filters);
     if let Some(after) = filters.started_after {
         query = query.filter(harvest_workflow_executions::started_at.ge(after));
     }
@@ -41962,6 +43188,7 @@ pub(crate) async fn load_workflows(
         query,
         &filters.search_attrs,
         &filters.search_attr_predicates,
+        &filters.filter,
     );
     if let Some(cause) = &filters.failure_cause {
         let predicate = serde_json::json!({ "failure_cause": cause });
@@ -42011,12 +43238,7 @@ pub(crate) async fn load_workflows(
     // `apply_min_history_events_filter`) rather than an unbounded
     // `COUNT(*)`. No schema migration is required — it reads from the
     // existing `harvest_events` table via the existing composite index.
-    query = apply_min_history_events_filter(query, filters.min_history_events);
-    query
-        .select(WorkflowExecution::as_select())
-        .load(conn)
-        .await
-        .map_err(database_error)
+    apply_min_history_events_filter(query, filters.min_history_events)
 }
 
 // ── Issue #756: partial-availability for cross-shard fan-out reads ───────────
@@ -42380,7 +43602,7 @@ pub(crate) async fn load_stalled_workflows(
     // Without this, a canary stuck RUNNING (e.g. when the timeout scanner is
     // itself wedged — a failure the canary exists to detect) would surface in
     // `GET /workflows?no_progress_minutes=N`, the same endpoint AC8 excludes.
-    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    query = apply_canary_list_exclusion(query, filters);
     if let Some(owner) = &filters.owner {
         query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
     }
@@ -42454,6 +43676,7 @@ pub(crate) async fn load_stalled_workflows(
         query,
         &filters.search_attrs,
         &filters.search_attr_predicates,
+        &filters.filter,
     );
 
     if !filters.include_sleeping {
@@ -42771,7 +43994,7 @@ pub(crate) async fn load_history_bloat_workflows(
     }
     // Issue #796 (AC8): hide synthetic liveness canary runs unless the caller
     // explicitly filters to a canary workflow name.
-    query = apply_canary_list_exclusion(query, filters.workflow_name.as_deref());
+    query = apply_canary_list_exclusion(query, filters);
     if let Some(owner) = &filters.owner {
         query = query.filter(harvest_workflow_executions::owner.eq(owner.as_str()));
     }
@@ -42782,6 +44005,7 @@ pub(crate) async fn load_history_bloat_workflows(
         query,
         &filters.search_attrs,
         &filters.search_attr_predicates,
+        &filters.filter,
     );
     // PR #1139 review: mirror `load_workflows`'s `failure_cause` handling --
     // omitting it here silently broadened the result to unrelated bloated
@@ -42983,9 +44207,13 @@ fn export_history_for_execution(
     decoder: Option<&PayloadCodecs>,
     outcome: &mut LossyDecodeOutcome,
 ) -> Result<HistoryExportDocument, HistoryExportError> {
-    let context_headers = execution.context_headers.as_ref().and_then(|v| {
-        serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
-    });
+    // A cell the caller may not decode stays out of the export (issue #2043).
+    // The Redacted policy drops the headers, so it decodes nothing.
+    let context_headers = autumn_harvest::history_export::export_headers(
+        execution.context_headers.as_ref(),
+        decoder.filter(|_| query.payload_policy != HistoryPayloadPolicy::Redacted),
+        outcome,
+    );
     export_history_decoded(
         HistoryExportRequest {
             workflow_name: execution.workflow_name.clone(),
@@ -43016,6 +44244,11 @@ fn export_history_for_execution(
             // child history round-trips its parent into the JSON / `harvest-replay`
             // replay path (mirrors `execution_timeout`/`deadline_at`; `parent_id`
             // lives in no `WorkflowEvent`). `None` for a top-level run.
+            // Issue #2082: carry the row's start source and predecessor.
+            start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
+                execution.start_source.as_deref(),
+                execution.continued_from_exec_id,
+            )),
             parent_execution_id: execution.parent_id.map(ExecutionId::from_uuid),
         },
         decoder,
@@ -43051,10 +44284,11 @@ fn export_history_for_candidate(
             // Issue #798: carry the execution's own ambient headers so a
             // header-branching workflow replays against what the live run saw
             // instead of an empty map (which would be a FALSE divergence).
-            context_headers: candidate.context_headers.as_ref().and_then(|value| {
-                serde_json::from_value::<std::collections::HashMap<String, String>>(value.clone())
-                    .ok()
-            }),
+            context_headers: autumn_harvest::history_export::export_headers(
+                candidate.context_headers.as_ref(),
+                decoder.filter(|_| query.payload_policy != HistoryPayloadPolicy::Redacted),
+                outcome,
+            ),
             // Issue #772: carry the deadline-aware replay metadata (the batch
             // candidate query now SELECTs `execution_timeout`/`deadline_at`) so a
             // batch-exported deadline-aware history round-trips its continue-as-new
@@ -43067,6 +44301,12 @@ fn export_history_for_candidate(
             // history round-trips its parent into the JSON / `harvest-replay`
             // replay path — parity with the single-execution export.
             parent_execution_id: candidate.parent_id.map(ExecutionId::from_uuid),
+            // Issue #2082: carry the start source and predecessor — parity with
+            // the single-execution export.
+            start_provenance: Some(autumn_harvest::types::StartProvenance::from_row(
+                candidate.start_source.as_deref(),
+                candidate.continued_from_exec_id,
+            )),
         },
         decoder,
         outcome,
@@ -43334,7 +44574,9 @@ SELECT
     w.deadline_at AS deadline_at,
     w.parent_id AS parent_id,
     w.context_headers AS context_headers,
-    w.queue_name AS queue_name
+    w.queue_name AS queue_name,
+    w.start_source AS start_source,
+    w.continued_from_exec_id AS continued_from_exec_id
 FROM harvest_workflow_executions w
 LEFT JOIN harvest_events e
     ON e.workflow_exec_id = w.id
@@ -43342,7 +44584,7 @@ WHERE ($1::TEXT IS NULL OR w.workflow_name = $1::TEXT)
   AND (cardinality($2::TEXT[]) = 0 OR w.state = ANY($2::TEXT[]))
 GROUP BY w.id, w.workflow_name, w.workflow_id, w.shard_id, w.state, w.completed_at, w.started_at,
          w.created_at, w.execution_timeout, w.deadline_at, w.parent_id, w.context_headers,
-         w.queue_name
+         w.queue_name, w.start_source, w.continued_from_exec_id
 HAVING ($3::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) >= $3::TIMESTAMPTZ)
    AND ($4::TIMESTAMPTZ IS NULL OR COALESCE(MAX(e.timestamp), w.completed_at, w.started_at, w.created_at) < $4::TIMESTAMPTZ)
 ORDER BY last_history_event_at DESC, w.id DESC
@@ -43464,6 +44706,8 @@ WITH ranked AS (
         w.parent_id AS parent_id,
         w.context_headers AS context_headers,
         w.queue_name AS queue_name,
+        w.start_source AS start_source,
+        w.continued_from_exec_id AS continued_from_exec_id,
         ROW_NUMBER() OVER (
             PARTITION BY w.workflow_name
             ORDER BY w.started_at ASC, w.id ASC
@@ -43480,7 +44724,7 @@ type_count AS (
 )
 SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
        execution_timeout, deadline_at, parent_id, context_headers, queue_name,
-       in_flight_total
+       start_source, continued_from_exec_id, in_flight_total
 FROM ranked, type_count
 WHERE rn <= LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))
 ORDER BY workflow_name ASC, rn ASC
@@ -43505,6 +44749,8 @@ WITH ranked AS (
         w.parent_id AS parent_id,
         w.context_headers AS context_headers,
         w.queue_name AS queue_name,
+        w.start_source AS start_source,
+        w.continued_from_exec_id AS continued_from_exec_id,
         ROW_NUMBER() OVER (
             PARTITION BY w.workflow_name
             ORDER BY w.started_at DESC, w.id DESC
@@ -43521,7 +44767,7 @@ type_count AS (
 )
 SELECT id, workflow_name, workflow_id, shard_id, state, started_at,
        execution_timeout, deadline_at, parent_id, context_headers, queue_name,
-       in_flight_total
+       start_source, continued_from_exec_id, in_flight_total
 FROM ranked, type_count
 WHERE rn <= LEAST($3, GREATEST($5 / GREATEST(type_count.types, 1), 1))
 ORDER BY workflow_name ASC, rn ASC
@@ -45204,13 +46450,175 @@ async fn stream_execution_events(
         .into_response()
 }
 
+/// The longest wait for the `LISTEN` connection of one shard.
+const WORKFLOW_CHANGES_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The shortest gap between two `changed` frames on the change stream.
+const WORKFLOW_CHANGES_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The shared state of the shard listeners of one change stream.
+#[derive(Default)]
+struct WorkflowChangeSignal {
+    notify: tokio::sync::Notify,
+    count: std::sync::atomic::AtomicU64,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// Stops each listener task when the stream ends.
+struct AbortOnDrop(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Opens one `LISTEN` connection for each shard, all at the same time.
+///
+/// Each connect has a 5 s limit, so one silent shard cannot hold the request.
+/// Returns the first shard that failed.
+async fn connect_change_listeners(
+    urls: &BTreeMap<ShardId, String>,
+) -> Result<Vec<autumn_harvest::notify::WorkflowEventListener>, i32> {
+    use autumn_harvest::notify::WorkflowEventListener;
+
+    let connects = urls.iter().map(|(shard, url)| async move {
+        let connect = WorkflowEventListener::connect(url);
+        match tokio::time::timeout(WORKFLOW_CHANGES_CONNECT_TIMEOUT, connect).await {
+            Ok(Ok(listener)) => Ok(listener),
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    shard = shard.as_i32(),
+                    error = %e,
+                    "workflow change stream: shard listener failed"
+                );
+                Err(shard.as_i32())
+            }
+            Err(_) => {
+                tracing::warn!(
+                    shard = shard.as_i32(),
+                    "workflow change stream: shard listener timed out"
+                );
+                Err(shard.as_i32())
+            }
+        }
+    });
+    futures::future::try_join_all(connects).await
+}
+
+/// `GET /workflows/changes/stream` (issue #1982): a live signal for list views.
+///
+/// The stream listens to `harvest_events` on each shard. That is the channel
+/// of the #324 stream. It sends `event: changed` with the count of
+/// notifications since the last frame, at most once each second. A frame
+/// holds no run id and no payload. A client fetches the list again.
+///
+/// The route is admin-gated, the same as #324. Each stream holds one `LISTEN`
+/// connection for each shard. When a listener closes, the stream sends
+/// `event: stream-error` and ends, so the client connects again.
+async fn stream_workflow_changes(
+    Extension(api_state): Extension<HarvestApiState>,
+    session: Option<axum::extract::Extension<Session>>,
+) -> axum::response::Response {
+    use autumn_harvest::notify::WorkflowEventWaitOutcome;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures::SinkExt as _;
+    use std::sync::atomic::Ordering;
+
+    if !has_harvest_admin_access(&api_state, session.map(|s| s.0)).await {
+        return AutumnError::unauthorized_msg("authentication required").into_response();
+    }
+    let Ok(urls) = api_state.workflow_result_notification_database_urls() else {
+        return AutumnError::service_unavailable_msg(
+            "SSE notification URL is not configured".to_string(),
+        )
+        .into_response();
+    };
+
+    // The listeners start before the response, so the stream gets each later
+    // change. The client fetches the page once on connect, which covers the
+    // time before.
+    let Ok(listeners) = connect_change_listeners(&urls).await else {
+        return AutumnError::service_unavailable_msg(
+            "a shard notification listener is not available".to_string(),
+        )
+        .into_response();
+    };
+
+    let signal = std::sync::Arc::new(WorkflowChangeSignal::default());
+    let tasks = listeners
+        .into_iter()
+        .map(|mut listener| {
+            let signal = signal.clone();
+            tokio::spawn(async move {
+                loop {
+                    let outcome = listener.wait_for_notification().await;
+                    if matches!(outcome, Ok(WorkflowEventWaitOutcome::ChannelClosed)) {
+                        signal.closed.store(true, Ordering::Release);
+                        signal.notify.notify_one();
+                        return;
+                    }
+                    // A payload that does not parse is still a change.
+                    signal.count.fetch_add(1, Ordering::Relaxed);
+                    signal.notify.notify_one();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let keepalive = api_state.sse_keepalive_interval();
+    let (mut tx, rx) =
+        futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(4);
+    tokio::spawn(async move {
+        let _listeners = AbortOnDrop(tasks);
+        loop {
+            // `Notify` keeps one permit, so changes during the gap below
+            // join into the next frame.
+            tokio::select! {
+                () = signal.notify.notified() => {}
+                () = tokio::time::sleep(keepalive) => {
+                    if tx.is_closed() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            if std::sync::atomic::AtomicBool::load(&signal.closed, Ordering::Acquire) {
+                let frame = Event::default()
+                    .event("stream-error")
+                    .data(r#"{"error":"listener_closed","retry":true}"#);
+                let _ = tx.send(Ok(frame)).await;
+                return;
+            }
+            let count = signal.count.swap(0, Ordering::Relaxed);
+            // A late permit from a change that the last frame counted.
+            if count == 0 {
+                continue;
+            }
+            let frame = Event::default()
+                .event("changed")
+                .data(serde_json::json!({ "notifications": count }).to_string());
+            if tx.send(Ok(frame)).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(WORKFLOW_CHANGES_MIN_GAP).await;
+        }
+    });
+
+    Sse::new(rx)
+        .keep_alive(KeepAlive::new().interval(keepalive).text("ping"))
+        .into_response()
+}
+
 /// Terminal-close poll cadence / keepalive ceiling for the workflow progress SSE
 /// stream (issue #791). Bounds how long after a workflow reaches a terminal
 /// state the final `event: end` frame is emitted (there is no terminal *chunk*,
 /// so the close is driven by a periodic terminal-state poll on the idle tick).
 /// Capped by the configured `sse_keepalive_interval` so operators (and tests)
 /// can shorten it; a modest default keeps close latency bounded.
-const PROGRESS_STREAM_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const PROGRESS_STREAM_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Bounded producer→SSE channel capacity for the progress stream. Progress is a
 /// best-effort side channel: chunks are sent non-blocking (`try_send`), so a
@@ -45547,6 +46955,346 @@ async fn stream_workflow_progress(
             }
         }));
     }
+
+    Sse::new(rx)
+        .keep_alive(KeepAlive::new().interval(keepalive).text("ping"))
+        .into_response()
+}
+
+/// Rows that one table read of the durable stream returns (issue #1974).
+///
+/// The producer reads the next page only when the send buffer has room. One
+/// stream therefore holds at most this page and the buffer in memory.
+pub(crate) const DURABLE_STREAM_PAGE: i64 = 256;
+
+/// Longest wait for a client to take one durable stream frame (issue #1974).
+///
+/// A client that reads nothing for this long loses its stream. Nothing is
+/// lost: the client resumes with `Last-Event-ID`. Without this bound, a
+/// stalled client holds its producer task and connections forever.
+pub(crate) const DURABLE_STREAM_SEND_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Sender half of an SSE frame channel.
+pub(crate) type SseSender =
+    futures::channel::mpsc::Sender<Result<axum::response::sse::Event, std::convert::Infallible>>;
+
+/// Query of `GET /workflows/{id}/stream/durable` (issue #1974).
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct DurableStreamQuery {
+    /// Exclusive resume offset. It wins over the `Last-Event-ID` header.
+    #[serde(default)]
+    after: Option<u64>,
+}
+
+/// Resolve the resume cursor of a durable stream (issue #1974).
+///
+/// `?after=` wins over `Last-Event-ID`, which a browser `EventSource` sends
+/// on reconnect. `None` reads from the first chunk. An offset above
+/// `i64::MAX` clamps to it, so the reader gets nothing more.
+fn durable_stream_cursor(
+    after: Option<u64>,
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<i64>, AutumnError> {
+    let raw = match (after, headers.get("last-event-id")) {
+        (Some(after), _) => Some(after),
+        (None, None) => None,
+        (None, Some(value)) => Some(
+            value
+                .to_str()
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .ok_or_else(|| {
+                    AutumnError::bad_request_msg(
+                        "Last-Event-ID must be a non-negative integer offset",
+                    )
+                })?,
+        ),
+    };
+    Ok(raw.map(|offset| i64::try_from(offset).unwrap_or(i64::MAX)))
+}
+
+/// Send one frame, and wait at most [`DURABLE_STREAM_SEND_TIMEOUT`].
+///
+/// Returns `false` when the client is gone or too slow. The caller then ends
+/// the stream.
+async fn send_durable_frame(tx: &mut SseSender, event: axum::response::sse::Event) -> bool {
+    use futures::SinkExt as _;
+    matches!(
+        tokio::time::timeout(DURABLE_STREAM_SEND_TIMEOUT, tx.send(Ok(event))).await,
+        Ok(Ok(()))
+    )
+}
+
+/// Result of one drain of the durable stream table.
+enum DurableDrain {
+    /// Every stored chunk above the cursor went to the client.
+    Done,
+    /// A read failed for a transient reason. The next tick retries.
+    Incomplete,
+    /// The client disconnected or stopped reading.
+    ClientGone,
+    /// The run left the request's shard fence (issue #1803).
+    LeftFence,
+}
+
+/// Send every stored chunk above `cursor`, in pages, and move the cursor.
+///
+/// The send waits while the client is slow. Nothing is dropped, because the
+/// next page comes from the table. No pooled connection is held during a
+/// send.
+async fn drain_durable_stream(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+    cursor: &mut Option<i64>,
+    tx: &mut SseSender,
+) -> DurableDrain {
+    loop {
+        let rows = match stream_conn_for_execution(api_state, exec_id).await {
+            FencedCheckout::Ready(mut conn) => match autumn_harvest::store::load_stream_chunks(
+                &mut conn,
+                exec_id,
+                *cursor,
+                DURABLE_STREAM_PAGE,
+            )
+            .await
+            {
+                Ok(rows) => rows,
+                Err(_) => return DurableDrain::Incomplete,
+            },
+            FencedCheckout::Retry => return DurableDrain::Incomplete,
+            FencedCheckout::LeftFence => return DurableDrain::LeftFence,
+        };
+        let full = i64::try_from(rows.len()).unwrap_or(i64::MAX) >= DURABLE_STREAM_PAGE;
+        for row in rows {
+            let event = axum::response::sse::Event::default()
+                .id(row.stream_offset.to_string())
+                .event("progress")
+                .data(row.chunk.to_string());
+            if !send_durable_frame(tx, event).await {
+                return DurableDrain::ClientGone;
+            }
+            *cursor = Some(row.stream_offset);
+        }
+        if !full {
+            return DurableDrain::Done;
+        }
+    }
+}
+
+/// Send the terminal `event: end` frame of a durable stream.
+async fn send_durable_end(tx: &mut SseSender, reason: &str) {
+    let data = serde_json::json!({ "reason": reason }).to_string();
+    let _ = send_durable_frame(
+        tx,
+        axum::response::sse::Event::default()
+            .event("end")
+            .data(data),
+    )
+    .await;
+}
+
+/// What the durable producer knows about the run when it starts.
+enum DurableStart {
+    /// The run was terminal at connect. No listener is needed.
+    Terminal(String),
+    /// The run is live. The listener opened before the first read.
+    Live {
+        listener: autumn_harvest::notify::DurableStreamListener,
+        shard: ShardId,
+    },
+}
+
+/// Producer task of a durable stream (issue #1974).
+///
+/// A terminal run needs no listener: its chunks are all committed. The
+/// producer drains them and ends. A live run drains on each wake and each
+/// keepalive tick. After a tick sees a terminal state, one more drain reads
+/// the chunks of the terminal cycle, which commit with that state.
+async fn durable_stream_producer(
+    api_state: HarvestApiState,
+    exec_id: ExecutionId,
+    mut cursor: Option<i64>,
+    start: DurableStart,
+    keepalive: std::time::Duration,
+    mut tx: SseSender,
+) {
+    use autumn_harvest::notify::{DurableStreamListener, DurableStreamWait};
+
+    let (mut listener, mut listener_shard, mut end_reason) = match start {
+        DurableStart::Terminal(reason) => {
+            // Retry a transient read failure once per keepalive.
+            loop {
+                match drain_durable_stream(&api_state, exec_id, &mut cursor, &mut tx).await {
+                    DurableDrain::Done => {
+                        send_durable_end(&mut tx, &reason).await;
+                        return;
+                    }
+                    DurableDrain::Incomplete => tokio::time::sleep(keepalive).await,
+                    DurableDrain::ClientGone => return,
+                    DurableDrain::LeftFence => {
+                        let _ = send_durable_frame(&mut tx, shard_fence_error_event()).await;
+                        return;
+                    }
+                }
+                if tx.is_closed() {
+                    return;
+                }
+            }
+        }
+        DurableStart::Live { listener, shard } => (listener, shard, None::<String>),
+    };
+
+    loop {
+        match drain_durable_stream(&api_state, exec_id, &mut cursor, &mut tx).await {
+            DurableDrain::Done => {
+                if let Some(reason) = end_reason.take() {
+                    send_durable_end(&mut tx, &reason).await;
+                    return;
+                }
+            }
+            DurableDrain::Incomplete => {}
+            DurableDrain::ClientGone => return,
+            DurableDrain::LeftFence => {
+                let _ = send_durable_frame(&mut tx, shard_fence_error_event()).await;
+                return;
+            }
+        }
+
+        // Rebind the listener after a shard move, as `/stream` does.
+        match stream_live_shard(&api_state, exec_id).await {
+            FencedCheckout::Ready(current) if current != listener_shard => {
+                if let Ok(url) = api_state.sse_notification_url(current)
+                    && let Ok(l) = DurableStreamListener::connect(&url, exec_id.as_uuid()).await
+                {
+                    listener = l;
+                    listener_shard = current;
+                }
+            }
+            FencedCheckout::LeftFence => {
+                let _ = send_durable_frame(&mut tx, shard_fence_error_event()).await;
+                return;
+            }
+            FencedCheckout::Ready(_) | FencedCheckout::Retry => {}
+        }
+
+        match listener.wait_timeout(keepalive).await {
+            DurableStreamWait::Woken => {}
+            DurableStreamWait::TimedOut => {
+                if tx.is_closed() {
+                    return;
+                }
+                // The tick also reads the table, so a lost wake only delays
+                // a chunk by one keepalive.
+                match progress_stream_end_reason(&api_state, exec_id).await {
+                    ProgressPoll::End(reason) => end_reason = Some(reason),
+                    ProgressPoll::Wait => {}
+                    ProgressPoll::LeftFence => {
+                        let _ = send_durable_frame(&mut tx, shard_fence_error_event()).await;
+                        return;
+                    }
+                }
+            }
+            DurableStreamWait::ChannelClosed => {
+                let data = serde_json::json!({ "error": "listen_connection_closed" }).to_string();
+                let _ = send_durable_frame(
+                    &mut tx,
+                    axum::response::sse::Event::default()
+                        .event("error")
+                        .data(data),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+}
+
+/// `GET /workflows/{id}/stream/durable`
+///
+/// Durable, resumable output stream (issue #1974). It streams the chunks that
+/// [`WorkflowContext::publish_durable_progress`](autumn_harvest::context::WorkflowContext::publish_durable_progress)
+/// stored in `harvest_stream_chunks`, in offset order.
+///
+/// - **Resume**: `?after=<offset>` or `Last-Event-ID` sets an exclusive
+///   cursor. The query parameter wins. With neither, the stream starts at the
+///   first chunk.
+/// - **No gap, no duplicate**: for a live run, `LISTEN` opens before the
+///   first read. Each wake and each keepalive tick reads the rows above the
+///   cursor.
+/// - **No drop**: the producer waits for a slow client and loses nothing. A
+///   client that reads nothing for 60 s loses the stream and resumes.
+/// - **End**: a run that is terminal at connect streams its stored chunks,
+///   then `event: end`, with no `LISTEN`. A live run sends `event: end` after
+///   the drain that follows its terminal state.
+///
+/// The frames are the `/stream` frames, and the SSE `id:` is the offset.
+/// Auth and the 400 and 404 responses are the same as for `/stream`. The 503
+/// for a missing or unreachable LISTEN database applies to a live run only.
+/// A live stream holds one `LISTEN` connection. A pooled connection is held
+/// for one page read only.
+async fn stream_workflow_progress_durable(
+    Extension(api_state): Extension<HarvestApiState>,
+    Path(exec_id_raw): Path<String>,
+    Query(query): Query<DurableStreamQuery>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use autumn_harvest::notify::DurableStreamListener;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    let exec_id = match parse_execution_id(&exec_id_raw) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    let cursor = match durable_stream_cursor(query.after, &headers) {
+        Ok(cursor) => cursor,
+        Err(e) => return e.into_response(),
+    };
+    let state = {
+        let mut conn = match db_conn_for_execution(&api_state, exec_id).await {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        match load_execution(&mut conn, exec_id).await {
+            Ok(execution) => execution.state,
+            Err(e) => return map_error(e).into_response(),
+        }
+    };
+    // A terminal run reads stored rows only, so it needs no LISTEN URL. A
+    // deployment without live streaming can still read finished runs.
+    let start = if is_terminal_state(&state) {
+        DurableStart::Terminal(state.to_lowercase().replace('_', "-"))
+    } else {
+        let Some(shard) = resolve_shard_best_effort(&api_state, exec_id).await else {
+            return AutumnError::service_unavailable_msg(
+                "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+            )
+            .into_response();
+        };
+        let Ok(notification_url) = api_state.sse_notification_url(shard) else {
+            return AutumnError::service_unavailable_msg(
+                "progress streaming is not configured (no LISTEN/NOTIFY database URL)",
+            )
+            .into_response();
+        };
+        // LISTEN before the first read, so no commit falls between the two.
+        match DurableStreamListener::connect(&notification_url, exec_id.as_uuid()).await {
+            Ok(listener) => DurableStart::Live { listener, shard },
+            Err(e) => return map_error(e).into_response(),
+        }
+    };
+
+    let keepalive = api_state
+        .sse_keepalive_interval()
+        .min(PROGRESS_STREAM_KEEPALIVE);
+    let (tx, rx) = futures::channel::mpsc::channel::<Result<Event, std::convert::Infallible>>(
+        PROGRESS_STREAM_CHANNEL_CAPACITY,
+    );
+    let fence = ::autumn_harvest::shard_fence::current();
+    tokio::spawn(::autumn_harvest::shard_fence::scoped(
+        fence,
+        durable_stream_producer(api_state.clone(), exec_id, cursor, start, keepalive, tx),
+    ));
 
     Sse::new(rx)
         .keep_alive(KeepAlive::new().interval(keepalive).text("ping"))
@@ -46499,7 +48247,10 @@ async fn preview_candidate_schedule_handler(
         return Ok((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": format!("unknown overlap_policy '{bad}'; valid: skip, buffer_one, buffer_all, cancel_other, terminate_other"),
+                "error": format!(
+                    "unknown overlap_policy '{bad}'; valid: {}",
+                    autumn_harvest::OverlapPolicy::VALID_VALUES
+                ),
                 "field": "overlap_policy"
             })),
         ));
@@ -51008,6 +52759,47 @@ mod reserved_idempotency_key_tests {
 #[cfg(test)]
 mod tests {
 
+    // ── issue #1974: durable stream resume cursor ──────────────────────────
+
+    fn last_event_id(value: &str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "last-event-id",
+            axum::http::HeaderValue::from_str(value).expect("header value"),
+        );
+        headers
+    }
+
+    #[test]
+    fn durable_stream_cursor_reads_the_query_then_the_header() {
+        let none = axum::http::HeaderMap::new();
+        assert_eq!(durable_stream_cursor(None, &none).ok(), Some(None));
+        assert_eq!(
+            durable_stream_cursor(None, &last_event_id(" 41 ")).ok(),
+            Some(Some(41))
+        );
+        assert_eq!(
+            durable_stream_cursor(Some(7), &last_event_id("41")).ok(),
+            Some(Some(7)),
+            "the query parameter wins over the header"
+        );
+        assert_eq!(
+            durable_stream_cursor(Some(u64::MAX), &none).ok(),
+            Some(Some(i64::MAX)),
+            "an offset above i64::MAX clamps, so the reader gets nothing more"
+        );
+    }
+
+    #[test]
+    fn durable_stream_cursor_rejects_a_malformed_header() {
+        for bad in ["abc", "-1", "1.5", ""] {
+            assert!(
+                durable_stream_cursor(None, &last_event_id(bad)).is_err(),
+                "{bad:?} must be a 400"
+            );
+        }
+    }
+
     // ── issue #1814: one ramp id per keyed build-routing fan-out ────────────
 
     const PAYLOAD: &[Option<&str>] = &[Some("canary-v2"), Some("25")];
@@ -52220,6 +54012,47 @@ mod tests {
         }
     }
 
+    /// Read the `message` of a reset error response.
+    async fn reset_error_message(response: axum::response::Response) -> (StatusCode, String) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body must be readable");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
+        (
+            status,
+            body["message"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// Every fork refuses an erased source (issue #1999). The shared reset
+    /// `409` names no DAG. DAG retry keeps its own advice for the race window.
+    #[tokio::test]
+    async fn erased_source_409_is_generic_for_reset_and_specific_for_dag_retry() {
+        use autumn_harvest::reset::WorkflowResetError;
+        use autumn_harvest::types::{ExecutionId, ShardId};
+
+        let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+
+        let (status, message) =
+            reset_error_message(reset_error_response(WorkflowResetError::ErasedSource {
+                exec_id,
+            }))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.contains("erased"), "message: {message}");
+        assert!(message.contains("fresh run"), "message: {message}");
+        assert!(!message.contains("DAG"), "message: {message}");
+
+        let (status, message) = reset_error_message(dag_retry_reset_error_response(
+            WorkflowResetError::ErasedSource { exec_id },
+        ))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(message.contains("erased"), "message: {message}");
+        assert!(message.contains("fresh DAG run"), "message: {message}");
+    }
+
     /// The bulk DLQ `min_attempts` guard (issue #613): `>= 1` is accepted, but
     /// `0` and negatives — which match every 1-based-attempt row — are rejected
     /// so a malformed request can't slip past the empty-filter safety guard.
@@ -53148,6 +54981,50 @@ mod tests {
     }
 
     // ── Issue #506: typed comparison & set predicates ───────────────────────
+
+    #[test]
+    fn coerce_scalar_keeps_every_digit_of_a_number() {
+        for raw in [
+            "12345678901234567890123",
+            "18446744073709551616",
+            "1.00000000000000000001",
+        ] {
+            assert_eq!(coerce_scalar(raw).to_string(), raw);
+        }
+        assert_eq!(coerce_scalar("+5").to_string(), "5");
+        assert_eq!(coerce_scalar(".5").to_string(), "0.5");
+        assert_eq!(coerce_scalar("inf"), serde_json::json!("inf"));
+    }
+
+    #[test]
+    fn legacy_search_attr_filter_keeps_every_digit() {
+        let big = "12345678901234567890123";
+        match parse_search_attr_filter(&format!("a:eq:{big}")).unwrap() {
+            SearchAttrPredicate::Eq { value, .. } => assert_eq!(value.to_string(), big),
+            other => panic!("expected eq, got {other:?}"),
+        }
+        match parse_search_attr_filter(&format!("a:ne:{big}")).unwrap() {
+            SearchAttrPredicate::Ne { value, .. } => assert_eq!(value.to_string(), big),
+            other => panic!("expected ne, got {other:?}"),
+        }
+        match parse_search_attr_filter(&format!("a:in:{big},2,x")).unwrap() {
+            SearchAttrPredicate::In { values, .. } => {
+                let texts: Vec<String> = values.iter().map(ToString::to_string).collect();
+                assert_eq!(texts, [big, "2", "\"x\""]);
+            }
+            other => panic!("expected in, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coerce_scalar_never_builds_invalid_json() {
+        // A second `+` is not a number, so the token stays a string.
+        assert_eq!(coerce_scalar("++5"), serde_json::json!("++5"));
+        assert_eq!(coerce_scalar("+-5"), serde_json::json!("+-5"));
+        // A very long number stays a string and costs no more memory.
+        let long = "1".repeat(2000);
+        assert_eq!(coerce_scalar(&long), serde_json::json!(long));
+    }
 
     #[test]
     fn coerce_scalar_infers_number_bool_and_string() {
@@ -54092,6 +55969,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                fairness_key: None,
                 tenant: None,
             },
             None,
@@ -54127,6 +56005,7 @@ mod tests {
     /// assert `admit_update` fails closed instead of silently skipping the
     /// validator check and admitting the update anyway.
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn admit_update_fails_closed_when_storage_pool_ready_but_runtime_not_installed() {
         let Some((database_url, _container)) = setup_workflow_result_database().await else {
             return;
@@ -54182,6 +56061,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                fairness_key: None,
                 tenant: None,
             },
             None,
@@ -54310,6 +56190,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                fairness_key: None,
                 tenant: None,
             },
             None,
@@ -54444,6 +56325,7 @@ mod tests {
                 start_source: autumn_harvest::StartSource::Api,
                 start_source_ref: None,
                 started_by: None,
+                fairness_key: None,
                 tenant: None,
             },
             None,
@@ -54615,6 +56497,8 @@ mod tests {
             deadline_at: Some(stale_deadline),
             parent_id: None,
             context_headers: None,
+            start_source: None,
+            continued_from_exec_id: None,
             queue_name: "default".to_string(),
         };
 
@@ -54732,6 +56616,8 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             context_headers: None,
+            start_source: None,
+            continued_from_exec_id: None,
             queue_name: "default".to_string(),
         }
     }
@@ -54794,6 +56680,8 @@ mod tests {
             deadline_at: None,
             parent_id: None,
             context_headers: None,
+            start_source: None,
+            continued_from_exec_id: None,
             queue_name: "default".to_string(),
             in_flight_total,
         }
@@ -55567,6 +57455,7 @@ mod tests {
             context_headers: None,
             execution_timeout: None,
             deadline_at: None,
+            start_provenance: None,
             parent_execution_id: None,
         }
     }
@@ -55708,6 +57597,17 @@ mod tests {
             result.is_err(),
             "malformed cron_tz: must be rejected: {result:?}"
         );
+    }
+
+    #[test]
+    fn parse_schedule_expr_with_tz_interval_over_the_cap_is_rejected() {
+        // Adding this period to a timestamp overflows chrono (issue #2048).
+        let err = parse_schedule_expr_with_tz("interval:9000000000000000", "UTC")
+            .expect_err("a period over the cap must be rejected");
+        assert!(err.contains("must not exceed"), "{err}");
+        let cap = autumn_harvest::policy::MAX_INTERVAL_PERIOD.as_secs();
+        let at_cap = parse_schedule_expr_with_tz(&format!("interval:{cap}"), "UTC");
+        assert!(at_cap.is_ok(), "the cap itself must parse: {at_cap:?}");
     }
 
     #[test]
@@ -56285,6 +58185,23 @@ mod tests {
             last_catchup_dropped: 0,
             last_catchup_at: None,
             retry_policy: None,
+        }
+    }
+
+    #[test]
+    fn backfill_capacity_is_unbounded_only_for_allow_all() {
+        for (policy, expected) in [
+            ("skip", 2),
+            ("buffer_all", 2),
+            ("cancel_other", 2),
+            ("allow_all", i64::MAX),
+        ] {
+            let schedule = autumn_harvest::models::HarvestSchedule {
+                max_active_runs: 2,
+                overlap_policy: policy.to_string(),
+                ..test_harvest_schedule()
+            };
+            assert_eq!(backfill_max_active(&schedule), expected, "{policy}");
         }
     }
 

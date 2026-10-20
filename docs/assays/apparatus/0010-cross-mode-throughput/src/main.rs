@@ -300,6 +300,8 @@ fn activity_info(name: &'static str) -> ActivityInfo {
         max_result_bytes: None,
         requires: None,
         handler: act_inert,
+        input_schema: None,
+        output_schema: None,
     }
 }
 
@@ -655,6 +657,7 @@ async fn start_one(
             start_source_ref: None,
             started_by: None,
             tenant: None,
+            fairness_key: None,
         },
         None,
     )
@@ -857,7 +860,7 @@ async fn run_sqlite_arm(settings: &Settings, rep: usize) -> RepOutcome {
         // `ActivityInfo::handler`. A fix to `act_inert` alone therefore leaves
         // this arm persisting a different activity result from the other two.
         // Found by review on PR #1617.
-        runtime.register_activity(&activity_info(name), |_input| {
+        runtime.register_activity_with_body(&activity_info(name), |_input| {
             ACTIVITY_RUNS.fetch_add(1, Ordering::Relaxed);
             Ok(serde_json::json!({ "ok": true }))
         });

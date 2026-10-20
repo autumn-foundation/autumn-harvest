@@ -617,7 +617,7 @@ The shipped tree passes the check: a bare `harvest det-check` at the repo root r
 
 `det-check` covers non-deterministic **code**. The sibling hazard is a
 non-deterministic **payload**: renaming, retyping, or adding a required field to
-a workflow's input/output/error type compiles green but silently breaks every
+a workflow, activity or side-effect payload type compiles green but silently breaks every
 in-flight execution, whose recorded `harvest_events` JSON no longer deserializes.
 
 That is gated by **`harvest schema check`**
@@ -631,7 +631,7 @@ $ cargo run --quiet --bin dump-schema-contract > /tmp/current.json
 $ harvest schema check --current /tmp/current.json
 ```
 
-`dump-schema-contract` is a **three-line binary you add to your own crate** —
+`dump-schema-contract` is a **short binary you add to your own crate** —
 Harvest is a library, so only your process can enumerate the workflow registry.
 [The schema-contract guide](workflow-schema-contract-guide.md#generating---current)
 has the snippet; `autumn-harvest/examples/schema_workflow.rs --emit-contract` is
@@ -766,9 +766,22 @@ Each layer catches a different class of problem. All six together provide defenc
 
 Workflow Update Handlers allow external clients to interact with running workflows and receive synchronous results (issue #140). However, update handlers run asynchronously and their lifecycles are decoupled from the main workflow function.
 
+### When an Update Handler Runs
+
+The worker runs each pending update at the end of its next decision cycle. The workflow body runs first. The worker then runs the pending updates in history order. It records `UpdateCompleted` or `UpdateFailed` with the other events of that cycle.
+
+A cycle runs under the workflow-task budget. The worker starts a handler only while a full handler limit is left in half of the remaining budget. The first update of a decision always runs. The worker wakes the task for the updates that remain, and the next cycle runs them. A handler also stops at half of the budget that is left. A task with no budget gets a fixed 30 second window.
+
+Replay never runs the handler again. Replay returns the recorded result. Four rules follow:
+
+- Delivery is at least once. Any path that discards the cycle after the handler ran runs the handler again. Examples are a crash, a deadlock retry, an event-id conflict, a pause and a lost claim. Write a handler that tolerates a repeat.
+- A value that a handler writes to a captured variable does not return on replay. Do not let the workflow body depend on it.
+- A handler has 5 seconds to finish. A handler that panics or runs for more than 5 seconds records `UpdateFailed`. A handler that awaits an activity or a timer never finishes, so it hits the same limit.
+- The error text of a panic is not stored. The worker logs it. The caller sees `update handler panicked`.
+
 ### Orphaned Update Handlers
 
-If a workflow completes (or fails, times out, is cancelled/terminated) while update handlers are still in progress, these updates become **orphaned**. Orphaned updates will be terminated immediately, and their clients will receive a `409 Conflict` response with an `update_orphaned` error payload.
+If a workflow ends (completes, fails, times out, is cancelled or is terminated) before the worker runs an admitted update, the update becomes **orphaned**. The engine terminates an orphaned update at once. Its client gets a `409 Conflict` response with an `update_orphaned` error payload.
 
 ### Waiting for Update Handlers to Complete
 
@@ -780,3 +793,5 @@ ctx.await_condition(|| ctx.all_handlers_finished()).await;
 ```
 
 This ensures a clean exit and prevents unhandled update requests from being aborted.
+
+`all_handlers_finished()` reads history up to the replay position. The worker records a result at the end of a cycle. The helper sees that result once the body passes it, which can take one more cycle.

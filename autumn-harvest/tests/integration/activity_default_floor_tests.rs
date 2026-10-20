@@ -280,6 +280,7 @@ fn build_worker(
                 notification_database_url: None,
                 max_concurrent_workflows: 1,
                 max_concurrent_activities: 1,
+                max_concurrent_claims: autumn_harvest::worker::DEFAULT_MAX_CONCURRENT_CLAIMS,
                 poll_interval: Duration::from_millis(25),
                 shutdown_timeout: Duration::from_secs(1),
                 cancellation_grace_period: Duration::from_secs(1),
@@ -305,6 +306,7 @@ fn build_worker(
                 sharded_pool: None,
                 slot_tuner: None,
                 max_concurrent_sessions: 0,
+                fairness_keys: false,
             },
             registry,
         )
@@ -665,6 +667,8 @@ fn act_info(
         max_result_bytes: None,
         requires: None,
         handler,
+        input_schema: None,
+        output_schema: None,
     }
 }
 

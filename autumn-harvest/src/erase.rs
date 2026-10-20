@@ -305,6 +305,11 @@ pub struct EraseOutcome {
     /// never replayed, so deleting them cannot affect determinism.
     #[serde(default)]
     pub logs_deleted: usize,
+    /// Number of durable stream chunks (issue #1974) deleted for this
+    /// execution. Chunks are free-form author output, so erasure deletes them
+    /// like log rows. Replay never reads them.
+    #[serde(default)]
+    pub stream_chunks_deleted: usize,
     /// Number of `harvest_completion_deliveries` rows (issue #605) whose
     /// frozen `payload` envelope was tombstoned. The delivery row itself
     /// (state, retry schedule) is left untouched — a still-pending,
@@ -745,6 +750,7 @@ mod db {
                 // A summary-only node has no live execution row, but its log
                 // rows cascade-deleted with it, so there is nothing to remove.
                 logs_deleted: 0,
+                stream_chunks_deleted: 0,
                 completion_deliveries_scrubbed,
                 dead_letters_scrubbed,
                 children,
@@ -909,7 +915,11 @@ mod db {
         else {
             return Ok(());
         };
-        if let Some(obj) = spec_json.as_object_mut() {
+        if crate::payload_codec::is_codec_envelope(&spec_json) {
+            // An encoded spec is one opaque cell. Erasure needs no key, so it
+            // replaces the whole cell (issue #2043).
+            spec_json = erasure_tombstone();
+        } else if let Some(obj) = spec_json.as_object_mut() {
             if let Some(input) = obj.get_mut("input")
                 && !is_tombstone(input)
             {
@@ -1371,6 +1381,8 @@ mod db {
         // messages are free-form text that can carry personal data, so a
         // payload erasure must remove them too.
         let logs_deleted = crate::store::delete_workflow_logs(conn, exec_id).await?;
+        // Durable stream chunks (issue #1974) are author output too.
+        let stream_chunks_deleted = crate::store::delete_stream_chunks(conn, exec_id).await?;
 
         // Completion-callback PII (deliveries + CALLBACK DLQ), keyed only on
         // `workflow_exec_id` so it applies whether or not a live execution row
@@ -1394,6 +1406,7 @@ mod db {
             summary_scrubbed: false,
             signals_scrubbed,
             logs_deleted,
+            stream_chunks_deleted,
             completion_deliveries_scrubbed,
             dead_letters_scrubbed,
             children,
@@ -1633,6 +1646,7 @@ mod tests {
             summary_scrubbed: false,
             signals_scrubbed: 2,
             logs_deleted: 4,
+            stream_chunks_deleted: 6,
             completion_deliveries_scrubbed: 3,
             dead_letters_scrubbed: 1,
             children: vec![],
@@ -1652,6 +1666,7 @@ mod tests {
         assert!(v.get("summary_scrubbed").is_none());
         // Durable workflow logs deleted by the erase (issue #790).
         assert_eq!(v["logs_deleted"], 4);
+        assert_eq!(v["stream_chunks_deleted"], 6);
     }
 
     // ── summary scrub value (issue #752) ──────────────────────────────────────
@@ -1675,6 +1690,7 @@ mod tests {
             summary_scrubbed: true,
             signals_scrubbed: 0,
             logs_deleted: 0,
+            stream_chunks_deleted: 0,
             completion_deliveries_scrubbed: 0,
             dead_letters_scrubbed: 0,
             children: vec![],

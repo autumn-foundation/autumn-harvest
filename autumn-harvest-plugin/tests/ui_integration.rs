@@ -314,6 +314,7 @@ async fn insert_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -540,7 +541,10 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     assert!(list_html.contains("name=\"state\""));
     assert!(!list_html.contains("http://"));
     assert!(!list_html.contains("https://"));
-    assert!(!list_html.contains("<script"));
+    // Issue #1982: the list loads one same-origin script for live refresh.
+    // The page holds no inline `<script>` element.
+    assert_eq!(list_html.matches("<script").count(), 1, "{list_html}");
+    assert!(list_html.contains(r#"<script src="assets/live.js" defer></script>"#));
 
     let (status, filtered_html) = fetch_html(&ui_app, "/workflows?state=COMPLETED").await;
     assert_eq!(status, StatusCode::OK);
@@ -567,6 +571,7 @@ async fn ui_lists_workflows_and_renders_detail_page() {
     );
     // Input payload is pretty-printed and HTML-escaped
     assert!(detail_html.contains("&quot;hello&quot;"));
+    // Issue #1982: a run that ended loads no live script.
     assert!(!detail_html.contains("<script"));
 
     let (status, _body) = fetch_html(&ui_app, "/workflows/not-a-uuid").await;
@@ -4710,6 +4715,7 @@ async fn insert_child_workflow_on_url(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -6366,6 +6372,7 @@ async fn workflow_detail_ui_renders_decoded_input() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -6571,6 +6578,7 @@ async fn rejected_signal_render_attributes_decode_audit_to_the_post_route() {
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -6662,6 +6670,7 @@ async fn workflow_detail_ui_writes_no_audit_row_when_only_hidden_fields_carry_en
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,
@@ -6960,6 +6969,7 @@ async fn dag957_seed_run(
             start_source: autumn_harvest::StartSource::Api,
             start_source_ref: None,
             started_by: None,
+            fairness_key: None,
             tenant: None,
         },
         None,

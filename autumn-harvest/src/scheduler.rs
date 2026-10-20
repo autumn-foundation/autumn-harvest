@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use croner::Cron;
 use diesel::OptionalExtension;
 use diesel::QueryDsl;
 use diesel::SelectableHelper;
@@ -195,7 +194,7 @@ impl std::fmt::Display for BackfillPlanError {
 /// - For `Cron` schedules the first occurrence at or after `from` is included; subsequent
 ///   occurrences are stepped through until they exceed `to`.
 /// - For `Interval` schedules `from` is treated as the first backfill timestamp and slots are
-///   spaced by the interval duration.
+///   spaced by the interval duration. The plan stops at the last date that `chrono` holds.
 /// - `Manual` schedules and `None` return an empty list (no automatic firing times).
 ///
 /// # Errors
@@ -250,7 +249,11 @@ pub fn plan_backfill_timestamps(
                     return Err(BackfillPlanError::LimitExceeded { limit: max_count });
                 }
                 timestamps.push(cursor);
-                cursor += dur;
+                // Stop when the next slot passes the last date that chrono holds (issue #2048).
+                let Some(next) = cursor.checked_add_signed(dur) else {
+                    break;
+                };
+                cursor = next;
             }
             Ok(timestamps)
         }
@@ -780,9 +783,10 @@ async fn register_one_dag_schedule(
 async fn register_one_workflow_schedule_locked(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<RegistrationOutcome> {
     crate::policy::validate_schedule(&ws.schedule).map_err(crate::error::HarvestError::Config)?;
-    if workflow_registration_is_converged(conn, ws).await? {
+    if workflow_registration_is_converged(conn, ws, codecs).await? {
         return Ok(RegistrationOutcome::Settled);
     }
     // See `register_one_dag_schedule` for why the isolation level is pinned.
@@ -791,7 +795,7 @@ async fn register_one_workflow_schedule_locked(
         if !try_take_registration_lock(c).await? {
             return Ok(RegistrationOutcome::Skipped);
         }
-        upsert_workflow_schedule(c, ws).await?;
+        upsert_workflow_schedule(c, ws, codecs).await?;
         Ok(RegistrationOutcome::Settled)
     }))
     .await
@@ -844,7 +848,23 @@ async fn dag_registration_is_converged(
 async fn workflow_registration_is_converged(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<bool> {
+    Ok(find_converged_workflow_schedule(conn, ws, codecs)
+        .await?
+        .is_some())
+}
+
+/// The row registration would land on, when it is already converged
+/// (issue #2043).
+///
+/// The read needs no encode. A caller that finds the row can skip the write
+/// and the encode, so an encoder that is down fails no idempotent request.
+async fn find_converged_workflow_schedule(
+    conn: &mut AsyncPgConnection,
+    ws: &WorkflowSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<Option<HarvestSchedule>> {
     use crate::schema::harvest_schedules::dsl;
 
     // The row registration would land on.
@@ -864,7 +884,7 @@ async fn workflow_registration_is_converged(
     }
     .map_err(crate::error::database_error)?;
     let Some(existing) = existing else {
-        return Ok(false);
+        return Ok(None);
     };
 
     // Any other row holding this `workflow_name` — a legacy workflow-only row
@@ -877,14 +897,13 @@ async fn workflow_registration_is_converged(
         .optional()
         .map_err(crate::error::database_error)?;
     if holder != Some(existing.id) {
-        return Ok(false);
+        return Ok(None);
     }
 
-    Ok(workflow_schedule_row_is_converged(
-        &existing,
-        ws,
-        Utc::now(),
-    ))
+    let converged = workflow_schedule_row_is_converged_with(&existing, ws, Utc::now(), |stored| {
+        stored_schedule_input_matches(stored, existing.id, &ws.input, codecs)
+    });
+    Ok(converged.then_some(existing))
 }
 
 /// Upsert the durable schedule rows for the provided workflow schedules.
@@ -897,10 +916,26 @@ pub async fn register_workflow_schedules(
     conn: &mut AsyncPgConnection,
     schedules: &[WorkflowSchedule],
 ) -> HarvestResult<()> {
+    register_workflow_schedules_with_codecs(conn, schedules, &crate::store::DEFAULT_PAYLOAD_CODECS)
+        .await
+}
+
+/// [`register_workflow_schedules`], storing each schedule input through
+/// `codecs` (issue #2043).
+///
+/// # Errors
+///
+/// As [`register_workflow_schedules`]. Also fails when the input does not
+/// encode.
+pub async fn register_workflow_schedules_with_codecs(
+    conn: &mut AsyncPgConnection,
+    schedules: &[WorkflowSchedule],
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
     for ws in schedules {
         crate::policy::validate_schedule(&ws.schedule)
             .map_err(crate::error::HarvestError::Config)?;
-        upsert_workflow_schedule(conn, ws).await?;
+        upsert_workflow_schedule(conn, ws, codecs).await?;
     }
     Ok(())
 }
@@ -947,6 +982,32 @@ pub async fn register_workflow_schedules_for_shard(
     shard: ShardId,
     backoff: &ScheduleRegistrationBackoff,
 ) -> HarvestResult<ShardFiringDecision> {
+    register_workflow_schedules_for_shard_with_codecs(
+        conn,
+        schedules,
+        router,
+        shard,
+        backoff,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`register_workflow_schedules_for_shard`], storing each input through
+/// `codecs` (issue #2043).
+///
+/// # Errors
+///
+/// As [`register_workflow_schedules_for_shard`].
+#[doc(hidden)]
+pub async fn register_workflow_schedules_for_shard_with_codecs(
+    conn: &mut AsyncPgConnection,
+    schedules: &[WorkflowSchedule],
+    router: &ShardRouter,
+    shard: ShardId,
+    backoff: &ScheduleRegistrationBackoff,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<ShardFiringDecision> {
     let now = Utc::now();
     let mut decision = ShardFiringDecision::Allowed;
     for ws in schedules {
@@ -962,7 +1023,7 @@ pub async fn register_workflow_schedules_for_shard(
             // costs a missed fire on the owning shard, never a duplicate — the
             // row's previous owner still collects its stale copy — so it is
             // backed off and the pass keeps going.
-            let outcome = register_one_workflow_schedule_locked(conn, ws).await;
+            let outcome = register_one_workflow_schedule_locked(conn, ws, codecs).await;
             record_registration_outcome(
                 backoff,
                 &key,
@@ -1420,12 +1481,13 @@ pub async fn tick_once_sharded_with_backoff(
             // fleet-wide registration lock, and a per-schedule failure is collected
             // and backed off rather than aborting the rest of the pass.
             register_schedules_for_shard(&mut conn, dags.as_ref(), &router, shard, backoff).await?;
-            let firing = register_workflow_schedules_for_shard(
+            let firing = register_workflow_schedules_for_shard_with_codecs(
                 &mut conn,
                 workflow_schedules.as_ref(),
                 &router,
                 shard,
                 backoff,
+                registry.payload_codecs(),
             )
             .await?;
 
@@ -1588,14 +1650,20 @@ pub async fn trigger_unified_dag(
         // successor of this schedule too, not just same-named runs -- a manual
         // trigger must not double-dispatch a schedule whose active run has
         // already changed type mid-chain.
-        let running: i64 = schedule_running_basis(conn, dag_name, schedule.id).await?;
-        if running >= i64::from(schedule.max_active_runs) {
-            return Err(HarvestError::UpdateRejected {
-                reason: format!(
-                    "DAG '{dag_name}' max_active_runs reached ({running}/{}); manual trigger is deferred",
-                    schedule.max_active_runs
-                ),
-            });
+        // `AllowAll` ignores `max_active_runs` here too (issue #1985). It skips
+        // the count, so a failed count query cannot block its trigger.
+        let allow_all =
+            OverlapPolicy::from_db(&schedule.overlap_policy) == OverlapPolicy::AllowAll;
+        if !allow_all {
+            let running: i64 = schedule_running_basis(conn, dag_name, schedule.id).await?;
+            if running >= i64::from(schedule.max_active_runs) {
+                return Err(HarvestError::UpdateRejected {
+                    reason: format!(
+                        "DAG '{dag_name}' max_active_runs reached ({running}/{}); manual trigger is deferred",
+                        schedule.max_active_runs
+                    ),
+                });
+            }
         }
     }
 
@@ -2322,10 +2390,26 @@ async fn find_or_insert_workflow_schedule(
 /// `every_written_column_is_compared` mutates each column in turn and asserts
 /// convergence flips, so a column added to the changeset without being added
 /// here is caught.
+#[cfg(test)]
 fn workflow_schedule_row_is_converged(
     existing: &HarvestSchedule,
     ws: &WorkflowSchedule,
     now: DateTime<Utc>,
+) -> bool {
+    workflow_schedule_row_is_converged_with(existing, ws, now, |stored| stored == Some(&ws.input))
+}
+
+/// [`workflow_schedule_row_is_converged`], with the stored input compared by
+/// `input_matches` (issue #2043).
+///
+/// The stored input is an envelope, and each encode makes a new nonce. The
+/// caller decodes it inside `input_matches`. The decode runs last, so a row
+/// that already drifted in a cheap field costs no decrypt.
+fn workflow_schedule_row_is_converged_with(
+    existing: &HarvestSchedule,
+    ws: &WorkflowSchedule,
+    now: DateTime<Utc>,
+    input_matches: impl FnOnce(Option<&serde_json::Value>) -> bool,
 ) -> bool {
     let expr = schedule_expr(Some(&ws.schedule));
     // A cadence change forces a `next_run_at` recompute, which is by definition
@@ -2406,7 +2490,6 @@ fn workflow_schedule_row_is_converged(
         && existing.catchup == desired_catchup
         && existing.max_active_runs == i32::try_from(ws.max_active_runs).unwrap_or(i32::MAX)
         && existing.workflow_name.as_deref() == Some(ws.workflow_name.as_str())
-        && existing.workflow_input.as_ref() == Some(&ws.input)
         && existing.queue_name.as_deref() == Some(ws.queue_name.as_str())
         && existing.jitter_secs == i64::try_from(ws.jitter.as_secs()).unwrap_or(i64::MAX)
         && existing.overlap_policy == ws.overlap_policy.as_str()
@@ -2421,7 +2504,8 @@ fn workflow_schedule_row_is_converged(
         && existing.max_runs == ws.max_runs.map(|n| i32::try_from(n).unwrap_or(i32::MAX))
         && existing.catchup_policy.as_deref() == desired_catchup_policy
         && existing.catchup_window_secs == desired_catchup_window
-        && existing.retry_policy == desired_retry_policy;
+        && existing.retry_policy == desired_retry_policy
+        && input_matches(existing.workflow_input.as_ref());
     if !converged {
         return false;
     }
@@ -2527,20 +2611,99 @@ fn dag_schedule_row_is_converged(
         && existing.buffered_runs == desired_buffered
 }
 
+/// A copy of `ws` whose input is ready to store (issue #2043).
+///
+/// Every write of `harvest_schedules.workflow_input` goes through this copy.
+fn schedule_for_storage(
+    ws: &WorkflowSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<WorkflowSchedule> {
+    let mut stored = ws.clone();
+    stored.input = codecs.encode_column(&ws.input)?;
+    Ok(stored)
+}
+
+/// Fail before any destructive step when the stored input cannot decode
+/// (issue #2043).
+///
+/// The overlap policies that cancel or terminate a run do so before the new run
+/// starts. A fire whose input does not decode starts nothing, so it must also
+/// disturb nothing.
+fn ensure_schedule_input_decodes(
+    schedule: &HarvestSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> HarvestResult<()> {
+    schedule
+        .workflow_input
+        .as_ref()
+        .map_or(Ok(()), |stored| codecs.decode_column(stored).map(drop))
+}
+
+/// Whether the stored schedule input equals the configured one (issue #2043).
+///
+/// Each encode makes a new nonce, so the probe cannot compare stored bytes. It
+/// decodes the stored cell and compares the plaintext.
+///
+/// A cell that does not decode reads as drift. Registration then writes the
+/// configured input over it. That heals a row whose key is gone. It also
+/// replaces the stored input, so the function logs a warning with no payload
+/// text.
+///
+/// With column encoding on and a codec that encrypts, an input stored in clear
+/// reads as drift too. Registration then stores it encoded. The sweep never
+/// does that.
+fn stored_schedule_input_matches(
+    stored: Option<&serde_json::Value>,
+    schedule_id: uuid::Uuid,
+    configured: &serde_json::Value,
+    codecs: &crate::payload_codec::PayloadCodecs,
+) -> bool {
+    let Some(stored) = stored else {
+        return false;
+    };
+    // The identity codec stores a value in clear, so it never drifts.
+    let encrypts = codecs.column_encoding()
+        && codecs
+            .active_codec_id()
+            .is_some_and(|codec_id| codec_id != "identity");
+    if encrypts && !crate::payload_codec::is_codec_envelope(stored) {
+        return false;
+    }
+    match codecs.decode_column(stored) {
+        Ok(value) => value == *configured,
+        Err(error) => {
+            tracing::warn!(
+                schedule_id = %schedule_id,
+                error_kind = crate::codec_rotation::sweep_error_kind(&error),
+                "schedule input could not be decoded; registration replaces it"
+            );
+            false
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 async fn upsert_workflow_schedule(
     conn: &mut AsyncPgConnection,
     ws: &WorkflowSchedule,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<HarvestSchedule> {
     let expr = schedule_expr(Some(&ws.schedule));
-    let existing = find_or_insert_workflow_schedule(conn, ws, expr.as_deref()).await?;
+    // A converged row needs no write and so no encode (issue #2043).
+    if let Some(converged) = find_converged_workflow_schedule(conn, ws, codecs).await? {
+        return Ok(converged);
+    }
+    let stored_ws = schedule_for_storage(ws, codecs)?;
+    let existing = find_or_insert_workflow_schedule(conn, &stored_ws, expr.as_deref()).await?;
     // Issue #1157, defect 3: a row that already says exactly what registration
     // would write needs no write. This also covers the public/API entry points
     // (`register_workflow_schedules`), not just the tick.
-    if workflow_schedule_row_is_converged(&existing, ws, Utc::now()) {
+    if workflow_schedule_row_is_converged_with(&existing, ws, Utc::now(), |stored| {
+        stored_schedule_input_matches(stored, existing.id, &ws.input, codecs)
+    }) {
         return Ok(existing);
     }
-    match apply_workflow_schedule_update(conn, ws, &existing, false).await? {
+    match apply_workflow_schedule_update(conn, &stored_ws, &existing, false).await? {
         AppliedScheduleUpdate::Updated(row) => Ok(*row),
         // Unreachable: the unguarded (guard_live_fire_claim = false) path never
         // skips. Kept as an error rather than a panic for defensive robustness.
@@ -3024,14 +3187,38 @@ fn merge_schedule_patch(
 /// # Errors
 ///
 /// Returns [`HarvestError::Config`] when the merged spec fails validation
-/// (invalid cron expression, unknown timezone, zero interval) and
-/// [`HarvestError::Database`] on connection/query failure. Row-state
+/// (invalid cron expression, unknown timezone, zero interval, interval over
+/// `MAX_INTERVAL_PERIOD`) and [`HarvestError::Database`] on connection/query failure. Row-state
 /// conditions (missing row, DAG row, live fire claim) are reported through
 /// [`ScheduleUpdateOutcome`], not errors.
 pub async fn update_workflow_schedule(
     conn: &mut AsyncPgConnection,
     schedule_id: uuid::Uuid,
     patch: &WorkflowSchedulePatch,
+) -> HarvestResult<ScheduleUpdateOutcome> {
+    update_workflow_schedule_with_codecs(
+        conn,
+        schedule_id,
+        patch,
+        &crate::store::DEFAULT_PAYLOAD_CODECS,
+    )
+    .await
+}
+
+/// [`update_workflow_schedule`], storing a patched input through `codecs`
+/// (issue #2043).
+///
+/// An input the patch leaves out keeps its stored form.
+///
+/// # Errors
+///
+/// As [`update_workflow_schedule`]. Also fails when the new input does not
+/// encode.
+pub async fn update_workflow_schedule_with_codecs(
+    conn: &mut AsyncPgConnection,
+    schedule_id: uuid::Uuid,
+    patch: &WorkflowSchedulePatch,
+    codecs: &crate::payload_codec::PayloadCodecs,
 ) -> HarvestResult<ScheduleUpdateOutcome> {
     use crate::schema::harvest_schedules::dsl;
     use diesel_async::AsyncConnection;
@@ -3061,9 +3248,14 @@ pub async fn update_workflow_schedule(
             return Ok(ScheduleUpdateOutcome::DagSchedule);
         }
 
+        // Encode the new input only now. A missing row and a DAG row return
+        // their outcome first, so a down encoder changes neither (issue #2043).
+        let mut stored_patch = patch.clone();
+        stored_patch.input = codecs.encode_column_opt(patch.input.as_ref())?;
+
         // Validate the MERGED spec (e.g. new cron + existing timezone)
         // before any write; a Config error rolls the transaction back.
-        let merged = merge_schedule_patch(&existing, patch)?;
+        let merged = merge_schedule_patch(&existing, &stored_patch)?;
         crate::policy::validate_schedule(&merged.schedule).map_err(HarvestError::Config)?;
         // The merge keeps the stored jitter on a cadence change (issue #1792).
         // The new cadence must still hold it.
@@ -3223,6 +3415,39 @@ fn parse_schedule_from_expr(expr: &str) -> Option<Schedule> {
     )
 }
 
+/// The workflow schedules due at `now`, oldest slot first.
+///
+/// The tick fires each of them through
+/// [`claim_and_fire_workflow_schedule`]. The world simulation of issue #2002
+/// reads the due list with this function too, so its scan cannot drift
+/// from the tick.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] when the read fails.
+#[doc(hidden)]
+pub async fn due_workflow_schedules(
+    conn: &mut AsyncPgConnection,
+    now: DateTime<Utc>,
+) -> HarvestResult<Vec<HarvestSchedule>> {
+    use crate::schema::harvest_schedules::dsl;
+
+    dsl::harvest_schedules
+        .filter(dsl::workflow_name.is_not_null())
+        .filter(dsl::is_paused.eq(false))
+        // Auto-paused schedules (issue #360) are excluded from the due list.
+        .filter(dsl::auto_paused_at.is_null())
+        // Exhausted schedules (issue #478) are permanently terminal — never re-fire.
+        .filter(dsl::exhausted_at.is_null())
+        .filter(dsl::next_run_at.is_not_null())
+        .filter(dsl::next_run_at.le(now))
+        .order(dsl::next_run_at.asc())
+        .select(HarvestSchedule::as_select())
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn tick_workflow_schedules(
     conn: &mut AsyncPgConnection,
@@ -3236,20 +3461,7 @@ async fn tick_workflow_schedules(
 
     let now = Utc::now();
 
-    let due: Vec<HarvestSchedule> = dsl::harvest_schedules
-        .filter(dsl::workflow_name.is_not_null())
-        .filter(dsl::is_paused.eq(false))
-        // Auto-paused schedules (issue #360) are excluded from the due list.
-        .filter(dsl::auto_paused_at.is_null())
-        // Exhausted schedules (issue #478) are permanently terminal — never re-fire.
-        .filter(dsl::exhausted_at.is_null())
-        .filter(dsl::next_run_at.is_not_null())
-        .filter(dsl::next_run_at.le(now))
-        .order(dsl::next_run_at.asc())
-        .select(HarvestSchedule::as_select())
-        .load(conn)
-        .await
-        .map_err(crate::error::database_error)?;
+    let due = due_workflow_schedules(conn, now).await?;
 
     for schedule in due {
         let Some(ref wf_name) = schedule.workflow_name else {
@@ -3638,6 +3850,9 @@ async fn cancel_in_flight_runs(
     for raw_id in running_ids {
         let exec_id = ExecutionId::from_uuid(raw_id);
         match cancel_workflow_execution(conn, exec_id, reason, metrics).await {
+            // Issue #1984: a deferred cancel frees no slot until the run's
+            // open non-cancellable block closes.
+            Ok(cancelled) if cancelled.deferred => {}
             Ok(_) => count += 1,
             Err(error) => {
                 tracing::warn!(
@@ -4254,10 +4469,17 @@ async fn tick_one_workflow_schedule(
     // Tick-exact running basis (RUNNING/PAUSED count, `schedule_id`-scoped
     // cross-type successors included per issue #1160, plus the #607 pending-
     // throttle backlog) -- see `schedule_running_basis`.
-    let mut running: i64 = schedule_running_basis(conn, wf_name, schedule.id).await?;
+    // `AllowAll` ignores `max_active_runs`, so it skips the count (issue
+    // #1985). A failed count query then cannot block its firing.
+    let overlap_policy = OverlapPolicy::from_db(&schedule.overlap_policy);
+    let allow_all = overlap_policy == OverlapPolicy::AllowAll;
+    let mut running: i64 = if allow_all {
+        0
+    } else {
+        schedule_running_basis(conn, wf_name, schedule.id).await?
+    };
 
-    if running >= i64::from(schedule.max_active_runs) {
-        let overlap_policy = OverlapPolicy::from_db(&schedule.overlap_policy);
+    if !allow_all && running >= i64::from(schedule.max_active_runs) {
         let mut buffered = parse_buffered_runs(&schedule.buffered_runs);
         let buffer_all_max = usize::try_from(schedule.buffer_all_max.max(1)).unwrap_or(usize::MAX);
 
@@ -4402,6 +4624,7 @@ async fn tick_one_workflow_schedule(
                 return Ok(());
             }
             OverlapAction::CancelAndProceed => {
+                ensure_schedule_input_decodes(schedule, registry.payload_codecs())?;
                 // Cancel only the oldest scheduled runs needed to free one slot,
                 // then fall through to dispatch. Subtract the cancelled count so
                 // the dispatch loop sees the correct remaining capacity.
@@ -4419,6 +4642,7 @@ async fn tick_one_workflow_schedule(
                 running -= i64::from(cancelled);
             }
             OverlapAction::TerminateAndProceed => {
+                ensure_schedule_input_decodes(schedule, registry.payload_codecs())?;
                 // Terminate only the minimum needed to free one slot.
                 let needed =
                     u32::try_from(running.saturating_sub(i64::from(schedule.max_active_runs)) + 1)
@@ -4433,6 +4657,9 @@ async fn tick_one_workflow_schedule(
                 .await?;
                 running -= i64::from(terminated);
             }
+            // `AllowAll` keeps the in-flight runs. The dispatch loop below
+            // also skips its `max_active_runs` check for this policy.
+            OverlapAction::Proceed => {}
         }
     }
 
@@ -4485,12 +4712,26 @@ async fn tick_one_workflow_schedule(
         };
         let scheduled_for = &effective_scheduled_for;
 
-        if running + i64::from(dispatched) >= i64::from(schedule.max_active_runs) {
+        // `AllowAll` ignores `max_active_runs`. Its own per-tick limit stops
+        // one tick from starting every slot of a long outage (issue #1985).
+        let (at_limit, limit_reason) = if allow_all {
+            (
+                dispatched >= ALLOW_ALL_MAX_STARTS_PER_TICK,
+                "allow_all_tick_limit",
+            )
+        } else {
+            (
+                running + i64::from(dispatched) >= i64::from(schedule.max_active_runs),
+                "max_active_runs_reached",
+            )
+        };
+        if at_limit {
             deferred_next_run_at = Some(*original_slot);
             tracing::info!(
                 workflow_name = %wf_name,
                 max_active_runs = schedule.max_active_runs,
-                "harvest workflow schedule: max_active_runs reached during catchup; deferring remaining"
+                reason = limit_reason,
+                "harvest workflow schedule: start limit reached during catchup; deferring remaining"
             );
             crate::schedule_decision::record_decision_graceful(
                 conn,
@@ -4499,9 +4740,10 @@ async fn tick_one_workflow_schedule(
                 wf_name,
                 "workflow",
                 "skipped",
-                "max_active_runs_reached",
+                limit_reason,
                 Some(serde_json::json!({
-                    "running_runs": running,
+                    // `AllowAll` does not count its running runs.
+                    "running_runs": (!allow_all).then_some(running),
                     "dispatched_runs": dispatched,
                     "max_active_runs": schedule.max_active_runs,
                     "deferred_slot": original_slot,
@@ -4587,10 +4829,12 @@ async fn tick_one_workflow_schedule(
         // duplication stays.
         let workflow_id = scheduled_workflow_id(schedule.id, wf_name, *original_slot);
         let exec_id = scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
-        let input = schedule
-            .workflow_input
-            .clone()
-            .unwrap_or(serde_json::Value::Null);
+        // A stored input that does not decode never starts a run. The error
+        // leaves the slot unclaimed, so the next tick retries it (issue #2043).
+        let input = match schedule.workflow_input.as_ref() {
+            Some(stored) => registry.payload_codecs().decode_column(stored)?,
+            None => serde_json::Value::Null,
+        };
         let wf_info = registry.workflows.get(wf_name);
         let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
             wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
@@ -4736,7 +4980,7 @@ async fn tick_one_workflow_schedule(
                     start_source_ref: Some(schedule.id.to_string()),
                     started_by: None,
                 };
-                match crate::throttle::reserve_or_defer(
+                match crate::throttle::reserve_or_defer_with_codecs(
                     conn,
                     crate::throttle::AdmitThrottleParams {
                         workflow_name: wf_name,
@@ -4750,6 +4994,7 @@ async fn tick_one_workflow_schedule(
                         schedule_to_start: throttle_policy.schedule_to_start,
                         shard_id: current_shard.as_i32(),
                     },
+                    registry.payload_codecs(),
                 )
                 .await
                 {
@@ -5123,52 +5368,7 @@ fn rebase_logical_date(
 }
 
 fn next_run_after(schedule: Option<&Schedule>, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
-    match schedule {
-        Some(Schedule::Cron(expr)) => Cron::new(expr)
-            .with_seconds_optional()
-            .parse()
-            .ok()
-            .and_then(|cron| cron.find_next_occurrence(&reference, false).ok()),
-        Some(Schedule::CronInTimezone { expr, tz }) => {
-            // Parse the IANA timezone; if it's invalid we return None so the
-            // schedule simply doesn't fire (validation should have caught this).
-            let tz: chrono_tz::Tz = tz.parse().ok()?;
-            let cron = Cron::new(expr).with_seconds_optional().parse().ok()?;
-            // Convert the reference instant into the schedule's local timezone.
-            let local_ref = reference.with_timezone(&tz);
-            // First pass: find the candidate next occurrence strictly after the
-            // reference time.
-            let candidate = cron.find_next_occurrence(&local_ref, false).ok()?;
-            // DST spring-forward correction: when `croner` computes a next
-            // occurrence that falls inside a gap (e.g. "02:30 AM" on a day
-            // where 02:00–03:00 is skipped), `chrono_tz` silently advances the
-            // non-existent local time to the first valid second after the gap
-            // (e.g. 03:00:00 PDT).  That instant does NOT match the cron
-            // pattern, so calling `find_next_occurrence` again with
-            // `include_current = true` from the candidate advances to the
-            // actual next matching wall-clock time (e.g. 02:30 on the next day)
-            // without double-advancing on ordinary (non-gap) results.
-            //
-            // Fall-back is handled correctly by the strict `false` on the first
-            // call: `croner` advances past the first occurrence of the repeated
-            // hour when called from it, producing the next-day result.  Calling
-            // `find_next_occurrence(&candidate, true)` on a genuine match
-            // returns the same instant, preserving that behavior.
-            let local_next = cron.find_next_occurrence(&candidate, true).ok()?;
-            Some(local_next.with_timezone(&Utc))
-        }
-        Some(Schedule::Interval(interval)) => chrono::Duration::from_std(*interval)
-            .ok()
-            // A zero (or non-positive) interval would return `reference` unchanged,
-            // which spins any catchup walk forever and makes a due tick loop
-            // indefinitely (issue #484 / Codex #3223). Treat a non-advancing
-            // interval as "no next occurrence" so every caller terminates; such a
-            // schedule simply never fires. (`validate_schedule` also rejects it at
-            // registration time.)
-            .filter(|duration| *duration > chrono::Duration::zero())
-            .map(|duration| reference + duration),
-        Some(Schedule::Manual) | None => None,
-    }
+    schedule.and_then(|schedule| crate::schedule_plan::next_fire_after(schedule, reference))
 }
 
 // ── Overdue-schedule detection (issue #696) ──────────────────────────────────
@@ -5297,7 +5497,8 @@ pub struct OverdueInputs<'a> {
 /// `retain_for_retry = catchup && reason == "max_active_runs_reached"`, and only
 /// `OverlapPolicy::Skip` produces that reason. Every other config *advances*
 /// `next_run_at`: non-catchup Skip drops-and-advances, BufferOne/BufferAll
-/// advance, CancelOther/TerminateOther cancel/terminate and proceed. So the
+/// advance, CancelOther/TerminateOther cancel/terminate and proceed.
+/// `AllowAll` proceeds too (issue #1985). So the
 /// `at_capacity` suppression applies **only** when
 /// `overlap_policy == Skip && catchup && at_capacity` — for every other config a
 /// past `next_run_at` while at capacity is a GENUINE stall the gauge must flag.
@@ -5910,10 +6111,11 @@ fn due_run_plan(
         // does not drift the schedule (interval schedules: next = first_due +
         // period, not now + period). Fall back to next_run_after(now) when the
         // slot-anchored next is already in the past to preserve the non-catchup
-        // skip-overdue-slots semantics for very late dispatchers.
-        let next = next_run_after(schedule, first_due)
-            .filter(|&t| t > now)
-            .or_else(|| next_run_after(schedule, now));
+        // skip-overdue-slots semantics for very late dispatchers. The SQLite
+        // backend shares this rule (issue #2031).
+        let next = schedule.and_then(|schedule| {
+            crate::schedule_plan::next_slot_after_fire(schedule, first_due, now)
+        });
         return (vec![first_due], next);
     }
 
@@ -6218,7 +6420,21 @@ pub(crate) enum OverlapAction {
     CancelAndProceed,
     /// Terminate all in-flight runs for this workflow, then start the new firing.
     TerminateAndProceed,
+    /// Start the new firing and keep the in-flight runs (`AllowAll`).
+    Proceed,
 }
+
+/// Most runs that one dispatch phase starts for an
+/// [`OverlapPolicy::AllowAll`] schedule (issue #1985).
+///
+/// `AllowAll` ignores `max_active_runs`. After an outage, an unbounded
+/// catch-up can list one slot per missed interval. This limit defers the
+/// rest to the next tick, as the `max_active_runs` gate does.
+///
+/// A tick has two dispatch phases: the buffered drain and the fire. Each
+/// phase takes its own fire claim, and each applies this limit. The limit
+/// keeps each phase well inside its claim lease.
+pub const ALLOW_ALL_MAX_STARTS_PER_TICK: u32 = 100;
 
 /// Decide what to do with a new firing that can't run immediately.
 ///
@@ -6255,6 +6471,7 @@ pub(crate) fn apply_overlap_policy(
         }
         OverlapPolicy::CancelOther => OverlapAction::CancelAndProceed,
         OverlapPolicy::TerminateOther => OverlapAction::TerminateAndProceed,
+        OverlapPolicy::AllowAll => OverlapAction::Proceed,
     }
 }
 
@@ -6383,6 +6600,7 @@ async fn drain_buffered_schedule_runs(
 /// Return the free run slots of a buffered row, or `None` if it cannot drain.
 ///
 /// A row cannot drain when its buffer is empty or it is at `max_active_runs`.
+/// An `AllowAll` row always drains.
 #[cfg(feature = "db")]
 async fn buffered_drain_capacity(
     conn: &mut AsyncPgConnection,
@@ -6391,6 +6609,12 @@ async fn buffered_drain_capacity(
 ) -> HarvestResult<Option<i64>> {
     if parse_buffered_runs(&schedule.buffered_runs).is_empty() {
         return Ok(None);
+    }
+    // `AllowAll` ignores `max_active_runs` (issue #1985). A policy switch
+    // clears the buffer, but a tick that races the switch can still leave a
+    // slot in it. Drain it under the per-tick limit.
+    if OverlapPolicy::from_db(&schedule.overlap_policy) == OverlapPolicy::AllowAll {
+        return Ok(Some(i64::from(ALLOW_ALL_MAX_STARTS_PER_TICK)));
     }
     // Tick-exact running basis (RUNNING/PAUSED count, `schedule_id`-scoped
     // cross-type successors included per issue #1160, plus the #607
@@ -6607,10 +6831,12 @@ async fn drain_claimed_buffered_schedule(
         // `tick_one_workflow_schedule`.
         let workflow_id = scheduled_workflow_id(schedule.id, wf_name, scheduled_for);
         let exec_id = scheduled_fire_exec_id(wf_name, schedule.dag_name.is_some(), current_shard);
-        let input = schedule
-            .workflow_input
-            .clone()
-            .unwrap_or(serde_json::Value::Null);
+        // A stored input that does not decode never starts a run. The error
+        // leaves the slot unclaimed, so the next tick retries it (issue #2043).
+        let input = match schedule.workflow_input.as_ref() {
+            Some(stored) => registry.payload_codecs().decode_column(stored)?,
+            None => serde_json::Value::Null,
+        };
         let wf_info = registry.workflows.get(wf_name);
         let (concurrency_key, concurrency_limit, concurrency_on_conflict) =
             wf_info.and_then(|info| info.concurrency.as_ref()).map_or(
@@ -6764,7 +6990,7 @@ async fn drain_claimed_buffered_schedule(
                     start_source_ref: Some(schedule.id.to_string()),
                     started_by: None,
                 };
-                match crate::throttle::reserve_or_defer(
+                match crate::throttle::reserve_or_defer_with_codecs(
                     conn,
                     crate::throttle::AdmitThrottleParams {
                         workflow_name: wf_name,
@@ -6778,6 +7004,7 @@ async fn drain_claimed_buffered_schedule(
                         schedule_to_start: throttle_policy.schedule_to_start,
                         shard_id: current_shard.as_i32(),
                     },
+                    registry.payload_codecs(),
                 )
                 .await
                 {
@@ -8258,6 +8485,33 @@ mod tests {
         assert_eq!(timestamps.len(), 169); // 0h..168h inclusive = 169 slots
     }
 
+    #[test]
+    fn plan_backfill_timestamps_huge_interval_returns_only_the_first_slot() {
+        // The second slot is past the last date chrono holds (issue #2048).
+        let from = parse_utc("2026-04-01T00:00:00Z");
+        let to = parse_utc("2026-04-08T00:00:00Z");
+        for secs in [9_000_000_000_000_000, u64::MAX] {
+            let schedule = Schedule::Interval(Duration::from_secs(secs));
+
+            let timestamps = plan_backfill_timestamps(Some(&schedule), from, to, 100)
+                .expect("a huge interval must not fail the plan");
+
+            assert_eq!(timestamps, vec![from], "{secs} s");
+        }
+    }
+
+    #[test]
+    fn plan_backfill_timestamps_interval_stops_at_the_end_of_time() {
+        let schedule = Schedule::Interval(Duration::from_secs(60));
+        let from = DateTime::<Utc>::MAX_UTC - chrono::Duration::seconds(30);
+
+        let timestamps =
+            plan_backfill_timestamps(Some(&schedule), from, DateTime::<Utc>::MAX_UTC, 100)
+                .expect("the end of time must not fail the plan");
+
+        assert_eq!(timestamps, vec![from]);
+    }
+
     // ── apply_overlap_policy ──────────────────────────────────────────────────
 
     #[test]
@@ -8357,6 +8611,15 @@ mod tests {
     }
 
     #[test]
+    fn overlap_allow_all_returns_proceed_even_with_a_full_buffer() {
+        let fire = parse_utc("2026-05-01T10:00:00Z");
+        let existing = [parse_utc("2026-05-01T09:00:00Z")];
+        let action =
+            apply_overlap_policy(crate::policy::OverlapPolicy::AllowAll, fire, &existing, 1);
+        assert_eq!(action, OverlapAction::Proceed);
+    }
+
+    #[test]
     fn parse_buffered_runs_parses_json_array_of_timestamps() {
         let json = serde_json::json!(["2026-05-01T08:00:00Z", "2026-05-01T09:00:00Z",]);
         let parsed = parse_buffered_runs(&json);
@@ -8450,6 +8713,85 @@ mod tests {
     }
 
     #[test]
+    fn next_run_after_huge_interval_is_none_not_a_panic() {
+        // chrono panics on `reference + duration` past year 262143 (issue #2048).
+        let now = parse_utc("2026-01-01T00:00:00Z");
+        for secs in [8_300_000_000_000, 9_000_000_000_000_000, u64::MAX] {
+            let schedule = Schedule::Interval(Duration::from_secs(secs));
+            assert_eq!(next_run_after(Some(&schedule), now), None, "{secs} s");
+        }
+    }
+
+    #[test]
+    fn next_run_after_interval_at_the_end_of_time_is_none() {
+        let schedule = Schedule::Interval(Duration::from_secs(1));
+        assert_eq!(
+            next_run_after(Some(&schedule), DateTime::<Utc>::MAX_UTC),
+            None
+        );
+    }
+
+    #[test]
+    fn next_run_after_sum_stops_exactly_at_the_last_date() {
+        // The sum is valid up to the last date that chrono holds, and no further.
+        let now = parse_utc("2026-01-01T00:00:00Z");
+        let span = u64::try_from((DateTime::<Utc>::MAX_UTC - now).num_seconds()).unwrap();
+        let fits = Schedule::Interval(Duration::from_secs(span));
+        let over = Schedule::Interval(Duration::from_secs(span + 1));
+        assert!(next_run_after(Some(&fits), now).is_some());
+        assert_eq!(next_run_after(Some(&over), now), None);
+
+        let one_second = Schedule::Interval(Duration::from_secs(1));
+        let last_second = DateTime::<Utc>::MAX_UTC - chrono::Duration::seconds(1);
+        assert_eq!(
+            next_run_after(Some(&one_second), last_second),
+            Some(DateTime::<Utc>::MAX_UTC)
+        );
+    }
+
+    #[test]
+    fn stored_huge_interval_walks_end() {
+        // A row stored before the cap can hold any period, and the parser does
+        // not validate. The catchup walks must end on their own (issue #2048).
+        let schedule = parse_schedule_from_expr("interval:9000000000000000")
+            .expect("a stored interval parses");
+        let first_due = parse_utc("2026-01-01T00:00:00Z");
+        let now = first_due + chrono::Duration::hours(1);
+
+        assert_eq!(next_run_after(Some(&schedule), first_due), None);
+        assert_eq!(
+            due_run_plan(Some(&schedule), first_due, now, true),
+            (vec![first_due], None)
+        );
+        let summary = eligible_slot_summary(Some(&schedule), first_due, now, None);
+        assert_eq!(summary.eligible_count, 1);
+        assert_eq!(summary.last_eligible, Some(first_due));
+        assert_eq!(summary.next_run_at, None);
+    }
+
+    #[test]
+    fn next_run_after_gives_a_next_run_up_to_the_interval_cap() {
+        // Oracle (issue #2048): an interval that `validate_schedule` accepts
+        // has a next run from a current reference.
+        let now = parse_utc("2026-01-01T00:00:00Z");
+        for secs in [
+            1,
+            3_600,
+            31_536_000,
+            crate::policy::MAX_INTERVAL_PERIOD.as_secs(),
+        ] {
+            let schedule = Schedule::Interval(Duration::from_secs(secs));
+            assert!(crate::policy::validate_schedule(&schedule).is_ok());
+            let expected = now + chrono::Duration::seconds(i64::try_from(secs).unwrap());
+            assert_eq!(
+                next_run_after(Some(&schedule), now),
+                Some(expected),
+                "{secs} s"
+            );
+        }
+    }
+
+    #[test]
     fn schedule_expr_and_parse_round_trip_cron_in_timezone() {
         let schedule = Schedule::CronInTimezone {
             expr: "0 9 * * 1-5".to_string(),
@@ -8470,7 +8812,7 @@ mod tests {
         for interval in [
             Duration::from_secs(1),
             Duration::from_secs(60),
-            Duration::from_secs(u64::MAX),
+            crate::policy::MAX_INTERVAL_PERIOD,
             Duration::from_nanos(1),
             Duration::from_millis(500),
             Duration::from_millis(1_500),
@@ -8986,6 +9328,8 @@ mod tests {
             (OverlapPolicy::BufferOne, false),
             (OverlapPolicy::BufferAll, true),
             (OverlapPolicy::BufferAll, false),
+            (OverlapPolicy::AllowAll, true), // proceed past the cap
+            (OverlapPolicy::AllowAll, false),
         ];
         for (policy, catchup) in non_deferring {
             let v = schedule_overdue(&OverdueInputs {

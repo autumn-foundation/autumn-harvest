@@ -18,8 +18,8 @@ use crate::schema::{
     harvest_events, harvest_execution_summaries, harvest_external_tasks, harvest_mutex_locks,
     harvest_mutex_waiters, harvest_payload_refs, harvest_rate_limit_buckets,
     harvest_schedule_decisions, harvest_schedules, harvest_sessions, harvest_signals,
-    harvest_task_queue, harvest_timers, harvest_wasm_modules, harvest_workers,
-    harvest_workflow_executions, harvest_workflow_logs,
+    harvest_stream_chunks, harvest_task_queue, harvest_timers, harvest_wasm_modules,
+    harvest_workers, harvest_workflow_executions, harvest_workflow_logs,
 };
 use crate::shared_json::SharedJson;
 
@@ -630,6 +630,10 @@ pub struct TaskQueueItem {
     /// #1824). See [`crate::queue::CLAIM_ORDER_DUE_SQL`].
     #[serde(default)]
     pub new_start: bool,
+    /// The fairness key of the task (issue #1976). `None` is the default
+    /// key. See [`crate::queue_fairness::FairClock`].
+    #[serde(default)]
+    pub fairness_key: Option<String>,
 }
 
 /// Insert struct for enqueuing a new task.
@@ -674,6 +678,8 @@ pub struct NewTaskQueueItem<'a> {
     /// `true` on the first workflow task of a freshly admitted run (issue
     /// #1824).
     pub new_start: bool,
+    /// The fairness key of the task (issue #1976).
+    pub fairness_key: Option<&'a str>,
 }
 
 /// Database representation of a rate limit bucket.
@@ -1535,6 +1541,8 @@ pub struct CrossShardChildRow {
     pub attempts: i32,
     pub last_error: Option<String>,
     pub last_attempt_at: Option<DateTime<Utc>>,
+    /// The reason that the parent gave its cancel. `None` = the generic text.
+    pub cancel_reason: Option<String>,
 }
 
 /// Insertable form of [`CrossShardChildRow`], written inside the parent's own
@@ -1613,7 +1621,8 @@ pub struct CompletionDelivery {
     pub target_url: String,
     pub event_filter: serde_json::Value,
     pub terminal_state: String,
-    /// Frozen `CompletionEnvelope` JSON, signed and `POSTed` verbatim on every
+    /// Frozen `CompletionEnvelope` JSON in the column form (issue #2043). The
+    /// scanner decodes it, then signs and `POST`s the plain body on every
     /// attempt, including redeliveries.
     pub payload: serde_json::Value,
     /// `PENDING` | `INFLIGHT` | `DELIVERED` | `FAILED`.
@@ -1938,6 +1947,29 @@ pub struct NewHarvestWorkflowLog {
     pub seq: i64,
     pub level: String,
     pub message: String,
+}
+
+/// One stored durable output-stream chunk (issue #1974).
+#[derive(Debug, Clone, Queryable, Selectable, serde::Serialize, serde::Deserialize)]
+#[diesel(table_name = harvest_stream_chunks)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct HarvestStreamChunk {
+    pub id: i64,
+    pub workflow_exec_id: Uuid,
+    pub stream_offset: i64,
+    pub chunk: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Insert struct for one durable output-stream chunk (issue #1974).
+///
+/// Postgres fills `id` and `created_at`.
+#[derive(Debug, Insertable)]
+#[diesel(table_name = harvest_stream_chunks)]
+pub struct NewHarvestStreamChunk<'a> {
+    pub workflow_exec_id: Uuid,
+    pub stream_offset: i64,
+    pub chunk: &'a serde_json::Value,
 }
 
 #[cfg(test)]

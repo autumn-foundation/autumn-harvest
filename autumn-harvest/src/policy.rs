@@ -49,6 +49,9 @@ pub enum JitterPolicy {
     Decorrelated,
 }
 
+/// The `SplitMix64` finalizer.
+///
+/// It is a bijection on `u64`. `formal/verus/src/mixers.rs` proves it.
 const fn mix64(mut x: u64) -> u64 {
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -57,6 +60,10 @@ const fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+/// A value in `[lo, hi]` that `seed` selects.
+///
+/// `formal/verus/src/jitter.rs` proves the range for every input, with the
+/// real mixer.
 const fn uniform_inclusive(seed: u64, lo: u64, hi: u64) -> u64 {
     let range = hi.wrapping_sub(lo).wrapping_add(1);
     let offset = if range == 0 {
@@ -68,13 +75,16 @@ const fn uniform_inclusive(seed: u64, lo: u64, hi: u64) -> u64 {
 }
 
 /// Full jitter in nanoseconds: a value in `[0, hi]`.
+///
+/// `formal/verus/src/jitter.rs` proves the range for every input.
 const fn full_jitter_nanos(hi: u64, seed: u64) -> u64 {
     uniform_inclusive(seed, 0, hi)
 }
 
 /// Equal jitter in nanoseconds: a value in `[hi/2, hi]`.
 ///
-/// For `hi <= 1` the value is `hi`.
+/// For `hi <= 1` the value is `hi`. `formal/verus/src/jitter.rs` proves
+/// the range for every input.
 const fn equal_jitter_nanos(hi: u64, seed: u64) -> u64 {
     if hi <= 1 {
         return hi;
@@ -737,7 +747,8 @@ pub enum Schedule {
     Cron(String),
     /// Fixed interval from the end of the previous run.
     ///
-    /// The period must be a whole number of seconds greater than zero.
+    /// The period must be a whole number of seconds. It must be greater than
+    /// zero and at most [`MAX_INTERVAL_PERIOD`].
     Interval(Duration),
     /// Only runs when triggered manually via API.
     Manual,
@@ -807,6 +818,7 @@ impl Schedule {
 /// | `BufferAll` | Backfill/replay; every missed slot must eventually run | Continues | Queued (up to `buffer_all_max`) | Dropped past cap | Durable in DB |
 /// | `CancelOther` | Wedged runs; always prefer the latest firing | Cancelled gracefully | Started immediately | Normal | N/A |
 /// | `TerminateOther` | Same as `CancelOther` but with immediate force-stop | Terminated immediately | Started immediately | Normal | N/A |
+/// | `AllowAll` | Independent runs that may overlap (issue #1985) | Continues | Started immediately | Each started | N/A |
 ///
 /// The default is [`Skip`](OverlapPolicy::Skip), which preserves pre-existing behaviour.
 ///
@@ -815,6 +827,12 @@ impl Schedule {
 ///
 /// `CancelOther` / `TerminateOther` require the cancellation contract from
 /// issue #238, which is implemented in this codebase.
+///
+/// `AllowAll` ignores `max_active_runs`, as Temporal does. Each tick phase starts
+/// at most `scheduler::ALLOW_ALL_MAX_STARTS_PER_TICK` runs. Per-workflow
+/// concurrency limits, throttles and admission gates still apply. A throttle
+/// slower than the schedule cadence lets its pending backlog grow. Runs can
+/// overlap, so `last_completion_result` carryover can be stale.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlapPolicy {
@@ -831,9 +849,16 @@ pub enum OverlapPolicy {
     CancelOther,
     /// Terminate the in-flight run immediately and start the new one.
     TerminateOther,
+    /// Start the new run and keep the in-flight runs (issue #1985).
+    AllowAll,
 }
 
 impl OverlapPolicy {
+    /// Every accepted value, in declaration order. Error messages and API
+    /// docs quote this list.
+    pub const VALID_VALUES: &'static str =
+        "skip, buffer_one, buffer_all, cancel_other, terminate_other, allow_all";
+
     /// The `snake_case` string used to store this policy in `harvest_schedules`.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -843,6 +868,7 @@ impl OverlapPolicy {
             Self::BufferAll => "buffer_all",
             Self::CancelOther => "cancel_other",
             Self::TerminateOther => "terminate_other",
+            Self::AllowAll => "allow_all",
         }
     }
 
@@ -858,6 +884,7 @@ impl OverlapPolicy {
             "buffer_all" => Self::BufferAll,
             "cancel_other" => Self::CancelOther,
             "terminate_other" => Self::TerminateOther,
+            "allow_all" => Self::AllowAll,
             _ => Self::Skip,
         }
     }
@@ -878,6 +905,7 @@ impl OverlapPolicy {
             "buffer_all" => Ok(Self::BufferAll),
             "cancel_other" => Ok(Self::CancelOther),
             "terminate_other" => Ok(Self::TerminateOther),
+            "allow_all" => Ok(Self::AllowAll),
             _ => Err(s),
         }
     }
@@ -1565,17 +1593,26 @@ impl WorkflowSchedule {
     }
 }
 
+/// Longest accepted [`Schedule::Interval`] period: 100 years of 365 days.
+///
+/// A period of about 8.2e12 seconds or more pushes the next fire time past
+/// the last date that `chrono` holds (issue #2048). The cap sits far below
+/// that limit and far above any real cadence. [`validate_schedule`] rejects a
+/// longer period.
+pub const MAX_INTERVAL_PERIOD: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
 /// Validate a [`Schedule`] value, returning an error string if it is invalid.
 ///
 /// For [`Schedule::Cron`] expressions this parses the expression using
 /// `croner` (5-field or 6-field with seconds). A [`Schedule::Interval`] period
-/// must be a whole number of seconds greater than zero.
+/// must be a whole number of seconds. It must be greater than zero and at most
+/// [`MAX_INTERVAL_PERIOD`].
 ///
 /// # Errors
 ///
 /// Returns a human-readable error string if the cron expression is
-/// syntactically invalid. Also returns one if the interval is zero or has a
-/// fractional second.
+/// syntactically invalid. Also returns one if the interval is zero, has a
+/// fractional second, or is longer than [`MAX_INTERVAL_PERIOD`].
 pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
     match schedule {
         Schedule::Cron(expr) => Cron::new(expr)
@@ -1608,6 +1645,14 @@ pub fn validate_schedule(schedule: &Schedule) -> Result<(), String> {
         // cannot keep a shorter cadence.
         Schedule::Interval(period) if period.subsec_nanos() != 0 => Err(format!(
             "interval schedule period must be a whole number of seconds, got {period:?}"
+        )),
+        // The scheduler adds the period to a timestamp. chrono cannot hold a
+        // date past year 262143. The cap keeps the sum in range (issue #2048).
+        Schedule::Interval(period) if *period > MAX_INTERVAL_PERIOD => Err(format!(
+            "interval schedule period must not exceed {} seconds, got {} seconds. \
+             Use a manual schedule to stop automatic runs.",
+            MAX_INTERVAL_PERIOD.as_secs(),
+            period.as_secs()
         )),
         Schedule::Interval(_) | Schedule::Manual => Ok(()),
     }
@@ -2453,6 +2498,7 @@ mod tests {
             (OverlapPolicy::BufferAll, "buffer_all"),
             (OverlapPolicy::CancelOther, "cancel_other"),
             (OverlapPolicy::TerminateOther, "terminate_other"),
+            (OverlapPolicy::AllowAll, "allow_all"),
         ];
         for (policy, s) in cases {
             assert_eq!(policy.as_str(), s, "as_str mismatch for {policy:?}");
@@ -2462,6 +2508,42 @@ mod tests {
                 "from_db mismatch for {s}"
             );
         }
+    }
+
+    #[test]
+    fn overlap_policy_from_user_input_accepts_every_variant() {
+        let cases = [
+            ("skip", OverlapPolicy::Skip),
+            ("buffer_one", OverlapPolicy::BufferOne),
+            ("buffer_all", OverlapPolicy::BufferAll),
+            ("cancel_other", OverlapPolicy::CancelOther),
+            ("terminate_other", OverlapPolicy::TerminateOther),
+            ("allow_all", OverlapPolicy::AllowAll),
+        ];
+        for (s, policy) in cases {
+            assert_eq!(OverlapPolicy::from_user_input(s), Ok(policy));
+        }
+        assert_eq!(OverlapPolicy::from_user_input("bogus"), Err("bogus"));
+    }
+
+    #[test]
+    fn overlap_policy_valid_values_names_every_variant() {
+        let all = [
+            OverlapPolicy::Skip,
+            OverlapPolicy::BufferOne,
+            OverlapPolicy::BufferAll,
+            OverlapPolicy::CancelOther,
+            OverlapPolicy::TerminateOther,
+            OverlapPolicy::AllowAll,
+        ];
+        let listed: Vec<&str> = OverlapPolicy::VALID_VALUES.split(", ").collect();
+        assert_eq!(listed, all.map(OverlapPolicy::as_str));
+    }
+
+    #[test]
+    fn overlap_policy_allow_all_serialises_as_snake_case() {
+        let json = serde_json::to_string(&OverlapPolicy::AllowAll).expect("serialize");
+        assert_eq!(json, "\"allow_all\"");
     }
 
     #[test]
@@ -2541,6 +2623,7 @@ mod tests {
             OverlapPolicy::BufferAll,
             OverlapPolicy::CancelOther,
             OverlapPolicy::TerminateOther,
+            OverlapPolicy::AllowAll,
         ];
         for policy in policies {
             let json = serde_json::to_string(&policy).expect("serialize");
@@ -2609,7 +2692,42 @@ mod tests {
                 "{interval:?} must be rejected: {err}"
             );
         }
-        assert!(validate_schedule(&Schedule::Interval(Duration::from_secs(u64::MAX))).is_ok());
+    }
+
+    #[test]
+    fn interval_schedule_over_the_cap_is_rejected() {
+        // Adding this period to a timestamp overflows chrono (issue #2048).
+        for secs in [
+            MAX_INTERVAL_PERIOD.as_secs() + 1,
+            8_000_000_000_000,
+            8_300_000_000_000,
+            9_000_000_000_000_000,
+            u64::MAX,
+        ] {
+            let err =
+                validate_schedule(&Schedule::Interval(Duration::from_secs(secs))).unwrap_err();
+            assert!(
+                err.contains("must not exceed"),
+                "{secs} s must be rejected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn interval_schedule_at_the_cap_is_accepted() {
+        assert!(validate_schedule(&Schedule::Interval(MAX_INTERVAL_PERIOD)).is_ok());
+        let one_below = Duration::from_secs(MAX_INTERVAL_PERIOD.as_secs() - 1);
+        assert!(validate_schedule(&Schedule::Interval(one_below)).is_ok());
+    }
+
+    #[test]
+    fn interval_schedule_cap_is_100_years() {
+        // The changelog fragment states this value (issue #2048). Change both together.
+        assert_eq!(MAX_INTERVAL_PERIOD.as_secs(), 3_153_600_000);
+        for secs in [1, 31_536_000] {
+            let schedule = Schedule::Interval(Duration::from_secs(secs));
+            assert!(validate_schedule(&schedule).is_ok(), "{secs} s");
+        }
     }
 
     #[test]

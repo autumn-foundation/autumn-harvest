@@ -238,6 +238,7 @@ fn default_params(exec_id: ExecutionId, workflow_id: &str) -> StartWorkflowParam
         start_source: StartSource::Api,
         start_source_ref: None,
         started_by: None,
+        fairness_key: None,
         tenant: None,
     }
 }
@@ -799,7 +800,6 @@ async fn reset_re_anchors_chain_deadline_to_the_fork_start() {
             operator_id: "test-operator".to_string(),
             signal_reapply: ResetSignalReapplyPolicy::default(),
             allow_terminal_source: false,
-            refuse_erased_source: false,
         },
         None,
     )

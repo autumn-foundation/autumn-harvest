@@ -1,9 +1,17 @@
 # Deterministic simulation, nightly (issue #1830).
 #
 # - `sweep`: the oracle seed sweep of the `dst` target, in release mode.
-#   Four shards run 1000000 seeds each.
+#   Four shards run 1000000 seeds each. The owner-lease sweep of issue
+#   #2250 then runs on the same seeds.
 # - `differential`: replays oracle runs on Postgres. Four shards run 500
 #   seeds each.
+# - `world`: the world simulation of issue #2002. It runs the real worker
+#   loop, the resident path, timers and the scheduler fire claim on
+#   Postgres. Four shards run 250 seeds each.
+# - `autoresearch`: the seeded simulation sweeps (issue #2033) of the
+#   autoresearch example, widened from 64 seeds to 5000 per sweep. It has
+#   its own seed space: its base is run_number * 5000, and it ignores the
+#   `seeds` input.
 # - `alert`: a failed scheduled run opens an issue, or comments on the open
 #   one. GitHub tells only the last editor of a cron about a failure.
 #
@@ -59,7 +67,7 @@ jobs:
       RUN_NUMBER: ${{ github.run_number }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -86,6 +94,17 @@ jobs:
       - name: Run the sweep
         timeout-minutes: 40
         run: cargo test --release -p autumn-harvest --no-default-features --test dst seed_sweep -- --nocapture
+      # Issue #2250: the owner-lease simulation runs on the same seeds.
+      # 1000000 seeds take about 3 minutes. The two step timeouts sum to
+      # less than the job timeout.
+      # It runs even when the sweep above fails, so both results show.
+      - name: Run the owner-lease sweep
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        env:
+          HARVEST_DST_OWNER_SEED_BASE: ${{ env.HARVEST_DST_SEED_BASE }}
+          HARVEST_DST_OWNER_SEEDS: ${{ env.HARVEST_DST_SEEDS }}
+        run: cargo test --release -p autumn-harvest --no-default-features --test dst owner_sweep -- --nocapture
 
   differential:
     name: Postgres differential (shard ${{ matrix.shard }})
@@ -102,7 +121,7 @@ jobs:
       RUN_NUMBER: ${{ github.run_number }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -132,9 +151,90 @@ jobs:
         timeout-minutes: 60
         run: 'cargo test -p autumn-harvest --test integration dst_differential_tests:: -- --nocapture --test-threads=1'
 
+  world:
+    name: Worker world (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      SEEDS: "250"
+      SEED_BASE: ${{ github.event.inputs.seed_base || '' }}
+      SHARD: ${{ matrix.shard }}
+      RUN_NUMBER: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Pick the seeds
+        run: |
+          for value in "$SEEDS" "$SEED_BASE"; do
+            case "$value" in
+              *[!0-9]*) echo "not a decimal number: '$value'" >&2; exit 1 ;;
+            esac
+          done
+          # Bash arithmetic is signed 64-bit with no overflow check. These
+          # bounds keep every value below i64::MAX.
+          if [ "${#SEEDS}" -gt 9 ] || [ "${#SEED_BASE}" -gt 18 ]; then
+            echo "seeds must have at most 9 digits, seed_base at most 18" >&2
+            exit 1
+          fi
+          # Force base 10. Bash reads a leading 0 as octal.
+          SEEDS=$((10#$SEEDS))
+          if [ -n "$SEED_BASE" ]; then SEED_BASE=$((10#$SEED_BASE)); fi
+          # A fixed stride per run: 4 shards of the largest allowed size.
+          base="${SEED_BASE:-$((RUN_NUMBER * 4 * 999999999))}"
+          echo "HARVEST_DST_SEED_BASE=$((base + SHARD * SEEDS))" >> "$GITHUB_ENV"
+          echo "HARVEST_DST_SEEDS=$SEEDS" >> "$GITHUB_ENV"
+      - name: Build the integration tests
+        # A separate step, so a slow build does not count against the
+        # sweep timeout. Debug mode, as in `differential`: Postgres bounds
+        # the run time, and a release build of this target is large.
+        timeout-minutes: 40
+        run: cargo test -p autumn-harvest --test integration --no-run
+      - name: Run the worker loop under the seeded world
+        # The test owns a Postgres container (testcontainers), so the
+        # runner needs only Docker. Each run clones a fresh database.
+        timeout-minutes: 70
+        run: 'cargo test -p autumn-harvest --test integration dst_world_tests::world_seed_sweep -- --nocapture --test-threads=1'
+
+  autoresearch:
+    name: autoresearch workflow sweeps
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      SEED_BASE: ${{ github.event.inputs.seed_base || '' }}
+      RUN_NUMBER: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Pick the seeds
+        run: |
+          case "$SEED_BASE" in
+            *[!0-9]*) echo "not a decimal number: '$SEED_BASE'" >&2; exit 1 ;;
+          esac
+          if [ "${#SEED_BASE}" -gt 18 ]; then
+            echo "seed_base must have at most 18 digits" >&2
+            exit 1
+          fi
+          if [ -n "$SEED_BASE" ]; then SEED_BASE=$((10#$SEED_BASE)); fi
+          # Each run explores 5000 new seeds.
+          echo "HARVEST_SIM_SEED_BASE=${SEED_BASE:-$((RUN_NUMBER * 5000))}" >> "$GITHUB_ENV"
+          echo "HARVEST_SIM_SEEDS=5000" >> "$GITHUB_ENV"
+      - name: Sweep the session and experiment workflows
+        timeout-minutes: 40
+        run: cargo test --release -p autoresearch --test simulation -- --nocapture
+
   alert:
     name: Report a failed nightly
-    needs: [sweep, differential]
+    needs: [sweep, differential, world, autoresearch]
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 10

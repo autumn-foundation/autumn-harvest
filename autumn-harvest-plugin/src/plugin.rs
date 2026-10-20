@@ -225,6 +225,10 @@ pub struct HarvestPlugin {
     mcp_tools_enabled: bool,
     /// Optional prefix override for the generated MCP tool routes.
     mcp_tools_prefix: Option<String>,
+    /// Serve the MCP Tasks route (issue #2005). Set via [`Self::mcp_tasks`].
+    mcp_tasks_enabled: bool,
+    /// Optional path override for the MCP Tasks route.
+    mcp_tasks_path: Option<String>,
     /// Deployment-level opt-in for operator read-path payload decoding
     /// (issue #608). Set via [`Self::decode_payloads_on_read`]; default off.
     decode_payloads_on_read: bool,
@@ -280,6 +284,15 @@ pub struct HarvestPlugin {
     /// startup gate already refuses this case earlier. It only matters if
     /// ambient configuration changed in the narrow window since.
     require_embedded_harvest_mode: bool,
+    /// The cap on durable-route requests that wait at the same time. Set via
+    /// [`Self::durable_route_max_waiters`].
+    durable_route_max_waiters: usize,
+    /// The cap on the continue-as-new steps of one durable-route wait. Set
+    /// via [`Self::durable_route_max_chain_steps`].
+    durable_route_max_chain_steps: usize,
+    /// The cap on live durable streams. Set via
+    /// [`Self::durable_route_max_streams`].
+    durable_route_max_streams: usize,
 }
 
 /// One registered broker connector: a binding plus the source that feeds it.
@@ -347,6 +360,8 @@ impl HarvestPlugin {
             mcp_tool_middleware: None,
             mcp_tools_enabled: false,
             mcp_tools_prefix: None,
+            mcp_tasks_enabled: false,
+            mcp_tasks_path: None,
             decode_payloads_on_read: false,
             role_auth_enabled: false,
             api_tokens_enabled: false,
@@ -365,6 +380,9 @@ impl HarvestPlugin {
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled: false,
             require_embedded_harvest_mode: false,
+            durable_route_max_waiters: crate::durable_route::DEFAULT_MAX_WAITERS,
+            durable_route_max_chain_steps: crate::durable_route::DEFAULT_MAX_CHAIN_STEPS,
+            durable_route_max_streams: crate::durable_route::DEFAULT_MAX_STREAMS,
         }
     }
 
@@ -467,6 +485,54 @@ impl HarvestPlugin {
     #[must_use]
     pub fn start_idempotency_window(mut self, window: std::time::Duration) -> Self {
         self.builder = self.builder.start_idempotency_window(window);
+        self
+    }
+
+    /// Cap the durable-route requests that wait for a result at the same time
+    /// in this process. The default is
+    /// [`DEFAULT_MAX_WAITERS`](crate::durable_route::DEFAULT_MAX_WAITERS).
+    ///
+    /// Each waiting request holds one Postgres `LISTEN` connection. A request
+    /// that finds the cap full answers pending at once. `0` means that no
+    /// request waits. A completed run needs no wait, so its retry still gets
+    /// the result.
+    #[must_use]
+    pub const fn durable_route_max_waiters(mut self, max_waiters: usize) -> Self {
+        self.durable_route_max_waiters = max_waiters;
+        self
+    }
+
+    /// Cap the continue-as-new steps that one durable-route request follows.
+    /// The default is
+    /// [`DEFAULT_MAX_CHAIN_STEPS`](crate::durable_route::DEFAULT_MAX_CHAIN_STEPS).
+    ///
+    /// Each step is one successor lookup. A step follows a chain to its newest
+    /// run of the same type, or across one change of workflow type or one
+    /// workflow-level retry. A chain needs at most one step more than its
+    /// changes of type and its retries. Past the cap, a walk that met a live
+    /// run answers pending. A walk that read only ended runs answers `500`
+    /// `result-unavailable`, because every retry repeats it. A value below 1
+    /// counts as 1, so a finished chain of one type resolves.
+    ///
+    /// A durable stream counts one step for each run of the lineage, a
+    /// same-type successor too. Past the cap, the stream ends with
+    /// `result-unavailable`.
+    #[must_use]
+    pub const fn durable_route_max_chain_steps(mut self, steps: usize) -> Self {
+        self.durable_route_max_chain_steps = if steps == 0 { 1 } else { steps };
+        self
+    }
+
+    /// Cap the durable streams in this process. The default is
+    /// [`DEFAULT_MAX_STREAMS`](crate::durable_route::DEFAULT_MAX_STREAMS).
+    ///
+    /// Each stream takes a slot, and a stream of a live run also holds one
+    /// Postgres `LISTEN` connection. A stream request that finds the cap
+    /// full answers `202` pending with `Retry-After: 1`. `0` turns streams
+    /// off. The cap is for each process, not for each principal.
+    #[must_use]
+    pub const fn durable_route_max_streams(mut self, max_streams: usize) -> Self {
+        self.durable_route_max_streams = max_streams;
         self
     }
 
@@ -759,6 +825,28 @@ impl HarvestPlugin {
     pub fn mcp_tools_at(mut self, prefix: impl Into<String>) -> Self {
         self.mcp_tools_enabled = true;
         self.mcp_tools_prefix = Some(prefix.into());
+        self
+    }
+
+    /// Serve each `#[workflow(mcp)]` workflow as an MCP Task (issue #2005).
+    ///
+    /// The route speaks JSON-RPC at `{tools prefix}/tasks`, default
+    /// `/api/harvest/mcp/tasks`. Point an MCP client with the
+    /// `io.modelcontextprotocol/tasks` extension at it. See
+    /// `docs/mcp-tools.md`.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub const fn mcp_tasks(mut self) -> Self {
+        self.mcp_tasks_enabled = true;
+        self
+    }
+
+    /// Like [`Self::mcp_tasks`], with the route at `path`.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_tasks_at(mut self, path: impl Into<String>) -> Self {
+        self.mcp_tasks_enabled = true;
+        self.mcp_tasks_path = Some(path.into());
         self
     }
 
@@ -1254,6 +1342,8 @@ impl Plugin for HarvestPlugin {
             mcp_tool_middleware,
             mcp_tools_enabled,
             mcp_tools_prefix,
+            mcp_tasks_enabled,
+            mcp_tasks_path,
             decode_payloads_on_read,
             role_auth_enabled,
             api_tokens_enabled,
@@ -1272,9 +1362,18 @@ impl Plugin for HarvestPlugin {
             #[cfg(feature = "metrics")]
             metrics_scrape_enabled,
             require_embedded_harvest_mode,
+            durable_route_max_waiters,
+            durable_route_max_chain_steps,
+            durable_route_max_streams,
         } = self;
         #[cfg(not(feature = "mcp"))]
-        let _ = (mcp_tool_middleware, mcp_tools_enabled, mcp_tools_prefix);
+        let _ = (
+            mcp_tool_middleware,
+            mcp_tools_enabled,
+            mcp_tools_prefix,
+            mcp_tasks_enabled,
+            mcp_tasks_path,
+        );
         // Issue #1978: an OIDC login brings its own role set. A later
         // `api_with_auth` clears the login, and with it these roles.
         #[cfg(feature = "oidc")]
@@ -1528,7 +1627,7 @@ impl Plugin for HarvestPlugin {
         // `mount_mcp` can project them into the tool catalog; handlers fail
         // closed until `on_startup` installs the runtime.
         #[cfg(feature = "mcp")]
-        let mcp_routes = if mcp_tools_enabled {
+        let mcp_routes = if mcp_tools_enabled || mcp_tasks_enabled {
             // Codex review (PR #908, P1): `HarvestPlugin` cannot detect or
             // intercept `AppBuilder::secure_mcp(...)` -- that's configured on
             // the outer app builder, after this `Plugin::build` call returns
@@ -1559,6 +1658,14 @@ impl Plugin for HarvestPlugin {
                      Configure HarvestPlugin::api_with_auth(path, mw) to protect them."
                 );
             }
+            // Issue #2005: `secure_mcp` never covers the task route either.
+            if mcp_tools_unprotected(mcp_tasks_enabled, mcp_tool_middleware.is_some()) {
+                tracing::warn!(
+                    "HarvestPlugin::mcp_tasks() is enabled with no HarvestPlugin::api_with_auth(..) \
+                     configured. Outside the dev profile the task route answers 401 to a caller \
+                     with no admin session. Configure api_with_auth(path, mw) to protect it."
+                );
+            }
             let prefix =
                 crate::mcp_tools::tools_prefix(api_path.as_deref(), mcp_tools_prefix.as_deref());
             // A unified DAG's shadow `WorkflowInfo` (auto-registered by
@@ -1572,18 +1679,40 @@ impl Plugin for HarvestPlugin {
                 builder.update_handlers(),
                 builder.dag_infos(),
             );
-            crate::mcp_tools::record_schemas(&descriptors);
-            Some(crate::mcp_tools::build_mcp_tool_routes(
-                &prefix,
-                &descriptors,
-                &api_state,
-                mcp_tool_middleware.as_ref(),
-                // Issue #776 (F1): gate mutating MCP tools for read-only
-                // principals. These routes are app-level (outside the
-                // `enforce_read_only_class` layer on the nested management
-                // router), so the read-only class boundary is applied here too.
-                role_auth_enabled,
-            ))
+            let mut routes = if mcp_tools_enabled {
+                crate::mcp_tools::record_schemas(&descriptors);
+                crate::mcp_tools::build_mcp_tool_routes(
+                    &prefix,
+                    &descriptors,
+                    &api_state,
+                    mcp_tool_middleware.as_ref(),
+                    // Issue #776 (F1): gate mutating MCP tools for read-only
+                    // principals. These routes are app-level (outside the
+                    // `enforce_read_only_class` layer on the nested management
+                    // router), so the read-only class boundary is applied here too.
+                    role_auth_enabled,
+                )
+            } else {
+                Vec::new()
+            };
+            if mcp_tasks_enabled {
+                let path = mcp_tasks_path.unwrap_or_else(|| crate::mcp_tasks::tasks_path(&prefix));
+                // The task route exposes only `start_{wf}`, so a collision
+                // among the other `/mcp` tool names must not drop a workflow.
+                let task_descriptors = crate::mcp_tools::collect_task_descriptors(
+                    builder.workflow_infos(),
+                    builder.update_handlers(),
+                    builder.dag_infos(),
+                );
+                routes.push(crate::mcp_tasks::build_mcp_task_route(
+                    &path,
+                    &task_descriptors,
+                    &api_state,
+                    mcp_tool_middleware.as_ref(),
+                    role_auth_enabled,
+                ));
+            }
+            Some(routes)
         } else {
             None
         };
@@ -1625,16 +1754,40 @@ impl Plugin for HarvestPlugin {
         let shutdown_slot = Arc::clone(&slot);
         let startup_api_state = api_state.clone();
         let shutdown_api_state = api_state.clone();
+        // One waiter cap and one stream cap for the process. They outlive a
+        // runtime restart.
+        let durable_waiters = Arc::new(tokio::sync::Semaphore::new(
+            durable_route_max_waiters.min(tokio::sync::Semaphore::MAX_PERMITS),
+        ));
+        let durable_streams = Arc::new(tokio::sync::Semaphore::new(
+            durable_route_max_streams.min(tokio::sync::Semaphore::MAX_PERMITS),
+        ));
 
         let app = app
             .on_startup(move |state| {
                 let slot = Arc::clone(&startup_slot);
                 let api_state = startup_api_state.clone();
+                let durable_waiters = Arc::clone(&durable_waiters);
+                let durable_streams = Arc::clone(&durable_streams);
                 async move {
                     tracing::info!("on_startup hook: executing start_harvest_runtime");
                     // `start_harvest_runtime` returns a large future (clippy::large_futures under
                     // the workspace pedantic lints); box it to keep this closure's future small.
                     let res = Box::pin(start_harvest_runtime(&state, &slot, &api_state)).await;
+                    // Durable routes answer 503 until the runtime is ready.
+                    let limits = crate::durable_route::DurableRouteLimits {
+                        waiters: durable_waiters,
+                        streams: durable_streams,
+                        max_chain_steps: durable_route_max_chain_steps,
+                    };
+                    // A stream without this URL polls the table.
+                    let notify_url = |shard| api_state.sse_notification_url(shard).ok();
+                    if res.is_ok() && !crate::durable_route::install(&state, limits, notify_url) {
+                        tracing::warn!(
+                            "on_startup hook: durable routes are off; the Harvest client or pool \
+                             is missing"
+                        );
+                    }
                     match &res {
                         Ok(()) => tracing::info!(
                             "on_startup hook: start_harvest_runtime completed successfully"
@@ -3130,6 +3283,8 @@ mod tests {
             circuit_breaker: None,
             requires: None,
             handler: |_ctx, input| Box::pin(async move { Ok(input) }),
+            input_schema: None,
+            output_schema: None,
         }
     }
 
@@ -4366,5 +4521,37 @@ mod tests {
             "the FIRST registration would have resolved differently -- which is \
              exactly the silent bug last-wins resolution prevents",
         );
+    }
+
+    // AC-78
+    #[test]
+    fn durable_route_limits_have_defaults_and_a_floor() {
+        let plugin = HarvestPlugin::new();
+        assert_eq!(crate::durable_route::DEFAULT_MAX_WAITERS, 32);
+        assert_eq!(crate::durable_route::DEFAULT_MAX_CHAIN_STEPS, 1024);
+        assert_eq!(
+            plugin.durable_route_max_waiters,
+            crate::durable_route::DEFAULT_MAX_WAITERS
+        );
+        assert_eq!(
+            plugin.durable_route_max_chain_steps,
+            crate::durable_route::DEFAULT_MAX_CHAIN_STEPS
+        );
+        let set = HarvestPlugin::new()
+            .durable_route_max_waiters(0)
+            .durable_route_max_chain_steps(7);
+        assert_eq!(set.durable_route_max_waiters, 0);
+        assert_eq!(set.durable_route_max_chain_steps, 7);
+        // Zero steps would answer pending for every run, so it counts as one.
+        let floor = HarvestPlugin::new().durable_route_max_chain_steps(0);
+        assert_eq!(floor.durable_route_max_chain_steps, 1);
+        // SAC-20: the stream cap.
+        assert_eq!(crate::durable_route::DEFAULT_MAX_STREAMS, 32);
+        assert_eq!(
+            plugin.durable_route_max_streams,
+            crate::durable_route::DEFAULT_MAX_STREAMS
+        );
+        let none = HarvestPlugin::new().durable_route_max_streams(0);
+        assert_eq!(none.durable_route_max_streams, 0);
     }
 }
