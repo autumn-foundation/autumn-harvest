@@ -1587,6 +1587,13 @@ pub const METRIC_SCANNER_PASS: &str = "harvest.scanner.pass";
 /// lease flaps or a frozen owner. See ADR 0009 decision 7.
 pub const METRIC_DECISION_OWNER_FENCED: &str = "harvest.decision_owner.fenced";
 
+/// Counter: a foreign write woke the owner of its partition (issue #2253).
+///
+/// Labels: `shard` and `kind`. The kind is `wake` for a plain wake, or
+/// `evict` for a state change that dropped a cache entry. A steady `evict`
+/// rate points to operator actions or foreign terminals. See ADR 0009.
+pub const METRIC_DECISION_OWNER_WOKEN: &str = "harvest.decision_owner.woken";
+
 /// Counter: a pool acquire hit its bound (issue #1788).
 ///
 /// Labelled `{site}`: `claim` or `heartbeat_flush`. A steady rate means the
@@ -3292,6 +3299,14 @@ pub trait MetricsRecorder: Send + Sync {
     /// See [`METRIC_DECISION_OWNER_FENCED`]. Additive with a no-op default.
     fn record_decision_owner_fenced(&self, shard: &str) {
         let _ = shard;
+    }
+
+    /// A foreign write woke the owner on `shard` (issue #2253). `kind` is
+    /// `wake` or `evict`.
+    ///
+    /// See [`METRIC_DECISION_OWNER_WOKEN`]. Additive with a no-op default.
+    fn record_decision_owner_woken(&self, shard: &str, kind: &str) {
+        let _ = (shard, kind);
     }
 
     /// A background control loop registered itself, before its first

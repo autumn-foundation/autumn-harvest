@@ -24,6 +24,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -463,6 +464,28 @@ pub enum DecisionPin {
 #[derive(Debug, Default)]
 pub struct OwnedPartitions {
     state: Mutex<Owned>,
+    /// Counts each change of the tenure set (issue #2253). The owner wake
+    /// listener reads it to know when to change its channels.
+    version: AtomicU64,
+}
+
+/// Owner wakes are on in this process (issue #2253).
+static OWNER_WAKES: AtomicBool = AtomicBool::new(false);
+
+/// Turn owner wakes on for this process (issue #2253).
+///
+/// A foreign write then wakes the owner of its partition after it commits.
+/// [`OwnedPartitions::set_owner_mode`] calls this. A process that only
+/// writes, such as an API server, calls it itself. Issue #2252 replaces the
+/// flag with the switch row of each database.
+pub fn enable_owner_wakes() {
+    OWNER_WAKES.store(true, Ordering::Relaxed);
+}
+
+/// Whether owner wakes are on in this process (issue #2253).
+#[must_use]
+pub fn owner_wakes_enabled() -> bool {
+    OWNER_WAKES.load(Ordering::Relaxed)
 }
 
 #[derive(Debug, Default)]
@@ -483,6 +506,7 @@ impl OwnedPartitions {
     pub fn set_owner_mode(&self, shard: ShardId, on: bool) {
         let mut state = self.state();
         if on {
+            enable_owner_wakes();
             state.owner_mode.insert(shard);
         } else {
             state.owner_mode.remove(&shard);
@@ -500,7 +524,9 @@ impl OwnedPartitions {
     /// The caller drops the resident state of the partition first. A new
     /// tenure starts cold (rule R4 of ADR 0010).
     pub fn adopt(&self, tenure: OwnerTenure) -> Option<OwnerTenure> {
-        self.state().tenures.insert(tenure.key(), tenure)
+        let replaced = self.state().tenures.insert(tenure.key(), tenure);
+        self.version.fetch_add(1, Ordering::Release);
+        replaced
     }
 
     /// The tenure of `key`, if this worker holds one.
@@ -531,6 +557,9 @@ impl OwnedPartitions {
             state.tenures.remove(&key);
         }
         drop(state);
+        if current {
+            self.version.fetch_add(1, Ordering::Release);
+        }
         current
     }
 
@@ -545,6 +574,23 @@ impl OwnedPartitions {
             || !state.owner_mode.contains(&key.shard),
             |epoch| state.tenures.get(&key).is_some_and(|t| t.epoch == epoch),
         )
+    }
+
+    /// A count that changes with each change of the tenure set.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Acquire)
+    }
+
+    /// The partitions of the tenures on `shard`, in ascending order.
+    #[must_use]
+    pub fn partitions_on(&self, shard: ShardId) -> Vec<DecisionPartition> {
+        self.state()
+            .tenures
+            .keys()
+            .filter(|key| key.shard == shard)
+            .map(|key| key.partition)
+            .collect()
     }
 
     /// Every tenure, in key order.
@@ -1092,6 +1138,34 @@ mod tests {
             OwnerEpoch::new(epoch),
             OwnerLeaseTtl::DEFAULT,
         )
+    }
+
+    /// Issue #2253: the owner wake task follows the tenure set through
+    /// its version.
+    #[test]
+    fn the_version_changes_with_the_tenure_set() {
+        let owned = OwnedPartitions::default();
+        let start = owned.version();
+        owned.adopt(tenure(4, 1));
+        owned.adopt(tenure(2, 1));
+        assert_ne!(owned.version(), start, "an adopt changes the version");
+        let shard = ShardId::new(0);
+        let p = |n| DecisionPartition::new(n).expect("in range");
+        assert_eq!(owned.partitions_on(shard), [p(2), p(4)]);
+        assert!(owned.partitions_on(ShardId::new(1)).is_empty());
+        let adopted = owned.version();
+        assert!(!owned.unload(tenure(4, 1).key(), OwnerEpoch::new(9)));
+        assert_eq!(owned.version(), adopted, "a stale unload changes nothing");
+        assert!(owned.unload(tenure(4, 1).key(), OwnerEpoch::new(1)));
+        assert_ne!(owned.version(), adopted, "an unload changes the version");
+        assert_eq!(owned.partitions_on(shard), [p(2)]);
+    }
+
+    /// Issue #2253: owner mode turns owner wakes on for the process.
+    #[test]
+    fn owner_mode_turns_owner_wakes_on() {
+        OwnedPartitions::default().set_owner_mode(ShardId::new(0), true);
+        assert!(owner_wakes_enabled());
     }
 
     #[test]

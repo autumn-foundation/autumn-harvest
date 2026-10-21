@@ -1278,6 +1278,24 @@ impl WorkflowEvent {
         )
     }
 
+    /// Whether this event changes the state of the run, so the owner drops
+    /// its cache entry (issue #2253).
+    ///
+    /// A terminal, a pause, a resume and a redrive change the run row as
+    /// well as its history. A foreign writer appends each of them. A cache
+    /// hit whose delta holds one replays cold, so a lost wake cannot leave a
+    /// stale entry in use.
+    #[must_use]
+    pub const fn evicts_owner_cache(&self) -> bool {
+        self.is_terminal_lifecycle()
+            || matches!(
+                self,
+                Self::WorkflowExecutionPaused { .. }
+                    | Self::WorkflowExecutionResumed { .. }
+                    | Self::WorkflowRedriven { .. }
+            )
+    }
+
     /// The payload field that `key` names on this variant, if it has one.
     ///
     /// `key` is one of [`crate::payload_store::PAYLOAD_FIELD_KEYS`], the wire
@@ -1393,6 +1411,42 @@ mod tests {
     use super::*;
     use crate::types::ActivityExecId;
     use chrono::Utc;
+
+    /// Issue #2253: a state change evicts the owner's cache entry. A plain
+    /// result does not.
+    #[test]
+    fn a_state_change_evicts_the_owner_cache() {
+        let now = Utc::now();
+        let evicting = [
+            WorkflowEvent::WorkflowExecutionPaused {
+                paused_at: now,
+                reason: None,
+                actor: "oncall".into(),
+            },
+            WorkflowEvent::WorkflowCancelled {
+                reason: "stop".into(),
+            },
+            WorkflowEvent::WorkflowCompleted {
+                output: serde_json::Value::Null,
+            },
+        ];
+        for event in &evicting {
+            assert!(event.evicts_owner_cache(), "{}", event.type_name());
+        }
+        let plain = [
+            WorkflowEvent::ActivityCompleted {
+                activity_id: ActivityExecId::new(),
+                output: serde_json::Value::Null,
+            },
+            WorkflowEvent::MarkerRecorded {
+                name: "m".into(),
+                details: serde_json::Value::Null,
+            },
+        ];
+        for event in &plain {
+            assert!(!event.evicts_owner_cache(), "{}", event.type_name());
+        }
+    }
 
     // ── WorkflowFailed / ChildWorkflowFailed typed-failure tests (issue #767) ─
 

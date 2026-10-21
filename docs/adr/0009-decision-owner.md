@@ -4,7 +4,7 @@
 
 Accepted (issue #2249).
 
-Issues #2250 to #2254 build it. [ADR 0010](0010-fenced-owner-lease.md)
+Issues #2250 to #2254 build it. Issue #2253 adds decision 12. [ADR 0010](0010-fenced-owner-lease.md)
 holds the lease rules R1 to R7 that the model forces. The planning record is
 [`DESIGN-2249.md`](../../DESIGN-2249.md). The source is the stage 1 section of
 `reports/Actor ownership prior art for Harvest.md`.
@@ -349,6 +349,70 @@ modes.
 The disable step clears the switch row first, then removes the guard.
 Issue #2252 picks the exact signal that the guard reads.
 
+### 12. Foreign writers: wake the owner, evict on a state change
+
+Issue #2253 builds this decision.
+
+- A foreign writer takes no owner row (decision 6). The execution row lock
+  serializes it with the decision, as before.
+- After its commit, the write wakes the owner of the run's partition. The
+  wake is a `NOTIFY` on the channel `harvest_owner_p{n}` of that database.
+- Each owner listens on the channels of the partitions that it holds. A
+  worker that holds no tenure on a database opens no connection for it.
+- Two chokepoints stage the wake. `wake_workflow_task` and `enqueue` stage
+  a plain wake when a workflow task of the run becomes claimable.
+- The event append functions of `store.rs` stage an evict wake for a state
+  change: a terminal, a pause, a resume or a redrive.
+- The post-commit sender of `notify.rs` reads the `workflow_id` of each
+  woken run on its own connection. The write path pays nothing.
+- A plain wake to the partition of the writer's own pinned decision is not
+  sent, because its owner is the writer.
+- An evict wake drops the cache entry and its parked future. A plain wake
+  only ends the idle wait of the claim loop.
+- A foreign append does not evict. The next decision loads the delta, so a
+  child terminal written into its parent reaches the parent's owner.
+- A `NOTIFY` can be lost. A cache hit whose delta holds a state change
+  replays cold. A hit whose entry has another owner key replays cold too.
+- Until issue #2252 adds the switch row, owner mode turns owner wakes on
+  for the process. A writer-only process calls `enable_owner_wakes`.
+
+The writer classes, from the inventory of issue #2253:
+
+| Class | Writer | Wake | Evicts |
+|---|---|---|---|
+| Activity result | `worker.rs`: `finalize_activity_completion_write`, `finalize_activity_failure_write`, `record_schedule_to_close_activity_timeout`. `context.rs`: `run_transactional` | `wake_workflow_task` | No |
+| Activity start | `worker.rs`: `append_activity_started_if_pending` | None. Nothing becomes claimable. | No |
+| Child terminal into parent | `worker.rs`: `wake_parent_for_child_completion_with_codecs`, `wake_parent_for_child_failure`, `materialize_due_child_timeout_deadlines`. `execution.rs`: `notify_awaited_parent_of_child_terminal` | `wake_workflow_task` | No |
+| Activity and outbox timeouts | `timeout.rs`: `enforce_activity_timeout`, `force_fail_activity`, `enforce_external_task_timeouts`, `wake_parent_for_child_timeout`, `enforce_external_signals_outbox`, `enforce_external_cancels_outbox`, `enforce_external_awaits_outbox` | `wake_workflow_task` | No |
+| Run timeouts | `timeout.rs`: `commit_workflow_execution_timeout`, `enforce_workflow_timeout`, `enforce_workflow_history_ceiling_with_codecs` | Store append of a terminal | Yes |
+| Cancel and terminate | `execution.rs`: `cancel_workflow_execution_collect_mode`, `inline_cancel`, `terminate_workflow_execution_collect` | Store append of a terminal | Yes |
+| Deferred cancel | `execution.rs`: `defer_cancel_for_open_block` | None. The open block reads it. | No |
+| Pause and resume | `execution.rs`: `pause_workflow_execution`, `resume_workflow_execution` | Store append. A resume also calls `wake_workflow_task`. | Yes |
+| Reactivate | `execution.rs`: `reactivate_failed_execution_at`. `dlq.rs`: `redrive_dead_letter_at` | Store append, then `enqueue` | Yes |
+| Parent close cascade | `execution.rs`: `apply_parent_close_cascade`, `cascade_cancel_detached_child`, `cascade_terminate_detached_child` | Store append of a terminal | Yes |
+| Cross-shard relay | `cross_shard_child.rs`: `deliver_terminal`, `apply_cascade_bookkeeping`, `start_child_on_target` | `wake_workflow_task`, store append, `enqueue` | Cascade only |
+| External tasks | `external_task.rs`: `complete_externally_with_codecs`, `fail_externally` | `wake_workflow_task` | No |
+| External deadline | `external_task.rs`: `extend_deadline` | None. Nothing becomes claimable. | No |
+| Sessions | `sessions.rs`: `break_session_and_fail_members` | `wake_workflow_task` | No |
+| Reset | `reset.rs`: `terminate_source_execution`, `copy_carried_events`, `append_fork_marker`, `enqueue_fork_workflow_task` | Store append for the source, `enqueue` for the fork | The source |
+| Fork | `fork.rs`: `fork_in_transaction`, `copy_prefix` | `enqueue` | No. A new run. |
+| Poison pill | `poison_pill.rs`: `fail_owning_workflow` | Store append of a terminal, `wake_workflow_task` for the parent | Yes |
+| Update admission | `store.rs`: `admit_update_event_with_codecs` | Each caller then calls `wake_workflow_task` | No |
+| Signals | `signal.rs`: `send_signal_idempotent_with_codecs`. `execution.rs`: `stage_signal_with_idempotency` | `wake_workflow_task` | No |
+| Mutex release | `mutex.rs`: `release_lock`, `reclaim_expired_leases_and_wake` | `wake_workflow_task` | No |
+| Start and continue-as-new | `execution.rs`: `start_or_load_workflow_execution`, `replace_execution` | `enqueue` | No |
+| Rebalance | `shard_rebalance.rs`: `commit_cutover`, `activate_target_inner` | `notify_owner` on each database | Yes |
+| Partition layout | `partition.rs`: `disable_partitioning`, `drain_default_bounded_inner` | None | No. Each row keeps its id and bytes. |
+| Retention | `retention.rs`: `delete_candidate_execution` | None | No. It deletes terminal runs only. |
+
+A durable timer is not a foreign write. The decision that starts it also
+schedules its task with `reschedule_task`. The two in-place rewriters of
+`CLAUDE.md` keep the decoded history. Erasure acts on terminal runs only.
+
+`owner_wake_worker_tests.rs` runs an owner and a non-owner per writer
+class. `owner_wake_db_tests.rs` checks the wake of each class on its
+channel.
+
 ## Flows
 
 ```mermaid
@@ -394,8 +458,8 @@ here.
 | Tenant cells | How do partitions work with tenant cells and `with_shard_assignments`? | Answered. Partitions follow the effective assignments. See decision 10. |
 | Drain | Does a graceful drain hand partitions over to a named successor? | Answered. No. One statement releases all partitions. See decision 9. |
 | Lease TTL | Which lease TTL? | Answered. 10 s, renewed every TTL / 3. See decision 8. |
-| Foreign writers | How do writers outside the decision reach the owner? | Deferred to #2253. They take no owner row (decision 6). Issue #2253 sends their wake to the owner. |
-| Cache invalidation | How does a foreign write invalidate another owner's cache? | Deferred to #2253. A child terminal written into its parent is the main case. |
+| Foreign writers | How do writers outside the decision reach the owner? | Answered. They take no owner row. A post-commit wake on the partition channel reaches the owner. See decision 12. |
+| Cache invalidation | How does a foreign write invalidate another owner's cache? | Answered. An append wakes the owner, and its next decision loads the delta. A state change evicts. See decision 12. |
 | Acknowledgement | Can owner memory acknowledge work? | Answered. No. An acknowledgement follows a durable write. `CLAUDE.md` makes this an invariant. |
 | Lease expiry mid-decision | What happens when the lease lapses during a long decision? | Answered. The commit checks the epoch. The transaction aborts only when another worker acquired. See decision 5. |
 | Cost of two fences | What do two fence row locks per commit cost? | Deferred to #2248. Its benchmark gates stage 1b (#2255). |
