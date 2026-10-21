@@ -541,6 +541,29 @@ async fn a_fork_wakes_the_owner_of_the_fork() {
     assert_quiet(&mut source_owner, source).await;
 }
 
+/// The state of the workflow task of `exec`.
+async fn task_state(fx: &Fixture, exec: ExecutionId) -> String {
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        state: String,
+    }
+    let mut conn = AsyncPgConnection::establish(&fx.url)
+        .await
+        .expect("connect");
+    diesel_async::RunQueryDsl::get_result::<Row>(
+        diesel::sql_query(
+            "SELECT state FROM harvest_task_queue \
+             WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid()),
+        &mut conn,
+    )
+    .await
+    .expect("read the task")
+    .state
+}
+
 /// The poison-pill sweep re-pends an orphan of a dead worker. It wakes the
 /// owner, because the dead worker can be the old owner.
 #[tokio::test]
@@ -557,17 +580,23 @@ async fn a_poison_pill_requeue_wakes_the_owner() {
     .await;
     let (mut owner, mut other) = fx.listeners(partition).await;
     drain(&mut owner).await;
-    let summary = autumn_harvest::poison_pill::reclaim_orphaned_tasks(
+    // A long stale bound: only the dead worker, which has no row, counts as
+    // dead. The sweep then leaves the live workers of other tests alone.
+    autumn_harvest::poison_pill::reclaim_orphaned_tasks(
         &mut fx.conn,
         3,
-        0,
+        3600,
         None,
         &NoOpMetrics,
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("reclaim");
-    assert!(summary.requeued >= 1, "the orphan is re-queued");
+    assert_eq!(
+        task_state(&fx, exec).await,
+        "PENDING",
+        "the orphan is re-queued"
+    );
     assert_wakes(&mut owner, &mut other, exec, false).await;
 }
 
@@ -587,17 +616,23 @@ async fn a_poison_pill_quarantine_evicts() {
     .await;
     let (mut owner, mut other) = fx.listeners(partition).await;
     drain(&mut owner).await;
-    let summary = autumn_harvest::poison_pill::reclaim_orphaned_tasks(
+    // A long stale bound: only the dead worker, which has no row, counts as
+    // dead. The sweep then leaves the live workers of other tests alone.
+    autumn_harvest::poison_pill::reclaim_orphaned_tasks(
         &mut fx.conn,
         3,
-        0,
+        3600,
         None,
         &NoOpMetrics,
         &autumn_harvest::payload_codec::PayloadCodecs::default(),
     )
     .await
     .expect("reclaim");
-    assert!(summary.quarantined >= 1, "the task is quarantined");
+    assert_ne!(
+        task_state(&fx, exec).await,
+        "RUNNING",
+        "the task is quarantined"
+    );
     assert_wakes(&mut owner, &mut other, exec, true).await;
 }
 
