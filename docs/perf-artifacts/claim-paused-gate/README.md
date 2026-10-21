@@ -35,17 +35,20 @@ a PAUSED run.
 
 ## Write cost
 
-Bulk updates, WAL bytes (`write_cost.sql`, 300k executions). The first two move 5,000 rows each.
-The last moves 5,300: the fixture starts with 300 PAUSED runs, and the script pauses 5,000 more.
+Bulk updates, WAL bytes (`write_cost.sql`, 300k executions). The snapshots use
+`pg_current_wal_insert_lsn()`, because the write position lags the insertion position and can
+shift records between windows. The first two transitions move 5,000 rows each. The last moves
+5,300: the fixture starts with 300 PAUSED runs, and the script pauses 5,000 more. Each cell is
+two runs after a checkpoint, and `after/write_cost.txt` holds the raw output.
 
-| transition | without index | with index |
-|:--|--:|--:|
-| RUNNING to COMPLETED | 82,430,680 | 82,448,848 |
-| COMPLETED to PAUSED | 10,280,960 | 10,731,520 |
-| PAUSED to RUNNING (5,300 rows) | 11,763,712 | 10,592,256 |
+| transition | without index | with index | difference |
+|:--|--:|--:|--:|
+| RUNNING to COMPLETED (5,000 rows) | 86,608,136 / 86,610,528 | 86,610,608 / 86,612,672 | +2,000 B (+0.002%) |
+| COMPLETED to PAUSED (5,000 rows) | 10,280,008 / 10,280,008 | 10,733,904 / 10,733,920 | +453,900 B (+4.4%, about 91 B per row) |
+| PAUSED to RUNNING (5,300 rows) | 8,100,960 / 8,100,960 | 8,100,976 / 8,100,960 | 0 |
 
-The first update after a checkpoint pays full-page writes, so read the columns as a comparison
-and not as a per-row cost.
+Only a transition into PAUSED pays: the new row version enters the partial index. Every other
+transition leaves the row outside the index predicate.
 
 ## Migration
 

@@ -1,6 +1,12 @@
-== without index
-wal_running_to_completed_5000|wal_completed_to_paused_5000|wal_paused_to_running
-82430680|10280960|11763712
-== with index
-wal_running_to_completed_5000|wal_completed_to_paused_5000|wal_paused_to_running
-82448848|10731520|10592256
+== run 1, without index
+wal_running_to_completed_5000|wal_completed_to_paused_5000|wal_paused_to_running_5300
+86608136|10280008|8100960
+== run 1, with index
+wal_running_to_completed_5000|wal_completed_to_paused_5000|wal_paused_to_running_5300
+86610608|10733904|8100976
+== run 2, without index
+wal_running_to_completed_5000|wal_completed_to_paused_5000|wal_paused_to_running_5300
+86610528|10280008|8100960
+== run 2, with index
+wal_running_to_completed_5000|wal_completed_to_paused_5000|wal_paused_to_running_5300
+86612672|10733920|8100960
