@@ -1492,8 +1492,10 @@ mod db {
     /// commits later fails the guard, because the holder changed. A claim
     /// that committed before is `RUNNING` here, so this statement re-pends
     /// it. Its decision then fails its fence and writes nothing. This also
-    /// covers a claim of an older process with the same worker id. The rows
-    /// lock in id order, so two such statements cannot deadlock.
+    /// covers a claim of an older process with the same worker id. The loop
+    /// runs it before the worker adopts the tenures, so no claim of the new
+    /// owner is in them yet. The rows lock in id order, so two such
+    /// statements cannot deadlock.
     const REPEND_FOREIGN_SQL: &str = "UPDATE harvest_task_queue \
          SET state = 'PENDING', worker_id = NULL, started_at = NULL, \
              last_heartbeat_at = NULL, scheduled_at = NOW(), \
@@ -1833,8 +1835,6 @@ mod db {
         /// Tenures that this loop stopped using, released on the next tick.
         /// The delay lets their decisions in flight commit first.
         releasing: Vec<OwnerTenure>,
-        /// Acquired partitions whose foreign claims still need a re-pend.
-        repending: Vec<i16>,
     }
 
     impl OwnerLoop {
@@ -1863,7 +1863,6 @@ mod db {
                 active: false,
                 stopped: false,
                 releasing: Vec::new(),
-                repending: Vec::new(),
             }
         }
 
@@ -1928,7 +1927,6 @@ mod db {
             self.release_pending(conn).await;
             self.renew_if_due(conn, &mut tick).await?;
             self.drop_expired(&mut tick);
-            self.repend_foreign(conn).await;
             self.balance(conn, &mut tick).await?;
             Ok(tick)
         }
@@ -2018,26 +2016,6 @@ mod db {
             }
         }
 
-        /// Re-pend the foreign claims of acquired partitions. A failure
-        /// keeps the partitions for the next tick.
-        async fn repend_foreign(&mut self, conn: &mut AsyncPgConnection) {
-            if self.repending.is_empty() {
-                return;
-            }
-            let result = diesel::sql_query(REPEND_FOREIGN_SQL)
-                .bind::<Array<SmallInt>, _>(&self.repending)
-                .execute(conn)
-                .await;
-            match result {
-                Ok(_) => self.repending.clear(),
-                Err(error) => tracing::warn!(
-                    holder = %self.holder,
-                    error = %error,
-                    "failed to re-pend the workflow tasks of acquired partitions; retrying"
-                ),
-            }
-        }
-
         async fn balance(
             &mut self,
             conn: &mut AsyncPgConnection,
@@ -2087,7 +2065,7 @@ mod db {
         }
 
         async fn acquire_some(
-            &mut self,
+            &self,
             conn: &mut AsyncPgConnection,
             count: usize,
             tick: &mut OwnerTick,
@@ -2097,21 +2075,47 @@ mod db {
                 .load(conn)
                 .await
                 .map_err(database_error)?;
+            let mut acquired = Vec::new();
             for pick in picks {
                 let partition = partition_of(pick.partition)?;
                 let sent = std::time::Instant::now();
                 match acquire(conn, self.shard, &self.holder, partition, &self.config).await {
                     Ok(Acquisition::Acquired(tenure)) => {
                         let deadline = tenure.ttl().local_deadline(sent);
-                        self.repending.push(partition.as_i16());
-                        tick.acquired.push((tenure, deadline));
+                        acquired.push((tenure, deadline));
                     }
                     Ok(Acquisition::Held | Acquisition::Busy) => {}
                     Err(HarvestError::ShardFenced { .. }) => break,
                     Err(e) => return Err(e),
                 }
             }
-            self.repend_foreign(conn).await;
+            if acquired.is_empty() {
+                return Ok(());
+            }
+            // The worker has not adopted these tenures yet, so no claim of
+            // its own is in them. The re-pend touches foreign claims only.
+            let taken: Vec<i16> = acquired
+                .iter()
+                .map(|(t, _)| t.partition().as_i16())
+                .collect();
+            let repended = diesel::sql_query(REPEND_FOREIGN_SQL)
+                .bind::<Array<SmallInt>, _>(&taken)
+                .execute(conn)
+                .await;
+            if let Err(error) = repended {
+                // A tenure must not serve claims before its foreign claims
+                // are re-pended. Give the partitions back. A later scan
+                // acquires them again, at a new epoch.
+                tracing::warn!(
+                    holder = %self.holder,
+                    error = %error,
+                    "failed to re-pend the workflow tasks of acquired partitions; releasing them"
+                );
+                let tenures: Vec<OwnerTenure> = acquired.into_iter().map(|(t, _)| t).collect();
+                let _ = release_all(conn, self.shard, &tenures, self.config.lock_timeout).await;
+                return Ok(());
+            }
+            tick.acquired.extend(acquired);
             Ok(())
         }
 

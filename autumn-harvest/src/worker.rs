@@ -34285,15 +34285,15 @@ struct OwnerGroup<P> {
 }
 
 /// Group the claim `targets` by database. `all` lists every shard of the
-/// process pool, and `same` says whether two pools reach one database.
+/// process pool, and `same` says whether two shards reach one database.
 fn owner_groups<P: Clone>(
     targets: &[(crate::types::ShardId, P)],
-    all: &[(crate::types::ShardId, P)],
-    same: impl Fn(&P, &P) -> bool,
+    all: &[crate::types::ShardId],
+    same: impl Fn(crate::types::ShardId, crate::types::ShardId) -> bool,
 ) -> Vec<OwnerGroup<P>> {
     let mut groups: Vec<OwnerGroup<P>> = Vec::new();
     for (shard, pool) in targets {
-        if let Some(group) = groups.iter_mut().find(|g| same(&g.pool, pool)) {
+        if let Some(group) = groups.iter_mut().find(|g| same(g.canonical, *shard)) {
             group.members.push(*shard);
             group.canonical = group.canonical.min(*shard);
         } else {
@@ -34308,7 +34308,7 @@ fn owner_groups<P: Clone>(
     for group in &mut groups {
         group.split = all
             .iter()
-            .any(|(shard, pool)| same(&group.pool, pool) && !group.members.contains(shard));
+            .any(|shard| same(group.canonical, *shard) && !group.members.contains(shard));
     }
     groups
 }
@@ -36546,6 +36546,9 @@ impl Worker {
 
     /// Whether the database of `pool` serves a shard of the process pool
     /// that this worker does not target (ADR 0009 decision 10).
+    ///
+    /// Several assignments of one plain pool share its database, so they
+    /// form one group.
     fn single_pool_splits_a_group(&self, pool: &DbPool) -> bool {
         let Some(sharded) = self.config.sharded_pool.as_ref() else {
             return false;
@@ -36556,16 +36559,12 @@ impl Worker {
             .iter()
             .map(|shard| (*shard, pool.clone()))
             .collect();
-        let all: Vec<(crate::types::ShardId, DbPool)> = sharded
-            .shard_ids()
-            .into_iter()
-            .filter_map(|shard| sharded.exact_pool_for(shard).map(|p| (shard, p.clone())))
-            .collect();
-        owner_groups(
-            &targets,
-            &all,
-            crate::external_target_location::same_underlying_pool,
-        )
+        let assigned = &self.config.shard_assignments;
+        owner_groups(&targets, &sharded.shard_ids(), |a, b| {
+            a == b
+                || (assigned.contains(&a) && assigned.contains(&b))
+                || sharded.same_physical_pool(a, b)
+        })
         .iter()
         .any(|group| group.split)
     }
@@ -36575,23 +36574,15 @@ impl Worker {
         &self,
         targets: &[(crate::types::ShardId, DbPool)],
     ) -> Vec<(DbPool, OwnerLoopHandle)> {
-        let all: Vec<(crate::types::ShardId, DbPool)> = self
-            .config
-            .sharded_pool
-            .as_ref()
-            .map(|sharded| {
-                sharded
-                    .shard_ids()
-                    .into_iter()
-                    .filter_map(|shard| sharded.exact_pool_for(shard).map(|p| (shard, p.clone())))
-                    .collect()
-            })
+        // `same_physical_pool` reads the DSN groups of the pool. Two pools
+        // that `from_dsns` built for one database are one group there.
+        let sharded = self.config.sharded_pool.as_ref();
+        let all = sharded
+            .map(crate::shard::ShardedDbPool::shard_ids)
             .unwrap_or_default();
-        let groups = owner_groups(
-            targets,
-            &all,
-            crate::external_target_location::same_underlying_pool,
-        );
+        let groups = owner_groups(targets, &all, |a, b| {
+            a == b || sharded.is_some_and(|pool| pool.same_physical_pool(a, b))
+        });
         let mut map = std::collections::HashMap::new();
         let mut handles = Vec::with_capacity(groups.len());
         for group in groups {
@@ -50589,7 +50580,9 @@ mod tests {
             (ShardId::new(1), "a"),
             (ShardId::new(3), "b"),
         ];
-        let groups = owner_groups(&targets, &targets, |x, y| x == y);
+        let db = |s: ShardId| if s.as_i32() == 3 { "b" } else { "a" };
+        let all = [ShardId::new(1), ShardId::new(2), ShardId::new(3)];
+        let groups = owner_groups(&targets, &all, |x, y| db(x) == db(y));
         assert_eq!(groups.len(), 2);
         assert_eq!(
             groups[0].canonical,
@@ -50604,13 +50597,10 @@ mod tests {
     #[test]
     fn a_split_colocated_group_refuses_owner_mode() {
         use crate::types::ShardId;
-        let all = [
-            (ShardId::new(1), "a"),
-            (ShardId::new(2), "a"),
-            (ShardId::new(3), "b"),
-        ];
+        let all = [ShardId::new(1), ShardId::new(2), ShardId::new(3)];
         let targets = [(ShardId::new(1), "a"), (ShardId::new(3), "b")];
-        let groups = owner_groups(&targets, &all, |x, y| x == y);
+        let db = |s: ShardId| if s.as_i32() == 3 { "b" } else { "a" };
+        let groups = owner_groups(&targets, &all, |x, y| db(x) == db(y));
         assert!(
             groups[0].split,
             "shard 2 shares database a but is not a target"
