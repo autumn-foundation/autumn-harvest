@@ -471,6 +471,25 @@ impl LeaseWrite {
 tokio::task_local! {
     /// The tenure of the decision that this task runs, if any.
     static DECISION: RefCell<Option<OwnerTenure>>;
+
+    /// The tenures of the worker that runs this task (issue #2252).
+    static OWNED: Arc<OwnedPartitions>;
+}
+
+/// Run `body` in a decision scope of the worker that holds `owned`.
+///
+/// Each worker holds its own tenures. Two workers can share one handler
+/// registry, so the registry cannot hold them for both. Inside the scope,
+/// [`current_owned`] returns `owned`.
+pub async fn scope_decision_for<F: Future>(owned: Arc<OwnedPartitions>, body: F) -> F::Output {
+    OWNED.scope(owned, scope_decision(body)).await
+}
+
+/// The tenures of the worker that runs this task, inside
+/// [`scope_decision_for`].
+#[must_use]
+pub fn current_owned() -> Option<Arc<OwnedPartitions>> {
+    OWNED.try_with(Arc::clone).ok()
 }
 
 /// Run `body` in a decision scope. [`pin_decision`] sets its tenure.
@@ -515,6 +534,9 @@ pub enum DecisionPin {
 #[derive(Debug, Default)]
 pub struct OwnedPartitions {
     state: Mutex<Owned>,
+    /// A worker uses these tenures. A second worker on the same registry
+    /// takes a set of its own.
+    claimed: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -541,6 +563,12 @@ impl Owned {
 impl OwnedPartitions {
     fn state(&self) -> std::sync::MutexGuard<'_, Owned> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take these tenures for one worker. Returns `false` when another
+    /// worker took them first.
+    pub fn try_claim(&self) -> bool {
+        !self.claimed.swap(true, std::sync::atomic::Ordering::AcqRel)
     }
 
     /// Turn owner mode on or off for `shard`.
@@ -2506,6 +2534,27 @@ mod tests {
             DecisionPartition::new(511).map(DecisionPartition::as_i16),
             Some(511)
         );
+    }
+
+    #[test]
+    fn only_one_worker_takes_a_set_of_tenures() {
+        let owned = OwnedPartitions::default();
+        assert!(owned.try_claim(), "the first worker takes the set");
+        assert!(!owned.try_claim(), "a second worker takes its own set");
+    }
+
+    #[tokio::test]
+    async fn a_worker_scope_names_its_own_tenures() {
+        assert!(current_owned().is_none());
+        let mine = Arc::new(OwnedPartitions::default());
+        mine.set_owner_mode(ShardId::new(0), true);
+        let seen = scope_decision_for(Arc::clone(&mine), async {
+            // A nested scope of a local activity keeps the worker's set.
+            scope_decision(async { current_owned().map(|o| o.owner_mode(ShardId::new(0))) }).await
+        })
+        .await;
+        assert_eq!(seen, Some(true));
+        assert!(current_owned().is_none());
     }
 
     #[test]

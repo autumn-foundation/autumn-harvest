@@ -1531,7 +1531,9 @@ impl HandlerRegistry {
     /// when a commit is fenced.
     #[must_use]
     pub fn decision_owner(&self) -> Arc<crate::decision_owner::OwnedPartitions> {
-        Arc::clone(&self.decision_owner)
+        // Issue #2252: inside a decision, the tenures of the worker that runs
+        // it. Two workers can share this registry.
+        crate::decision_owner::current_owned().unwrap_or_else(|| Arc::clone(&self.decision_owner))
     }
 
     /// History-size guardrails applied to workflow contexts run by this registry.
@@ -32852,6 +32854,10 @@ pub struct Worker {
     /// A target with no entry keys by itself.
     owner_shards:
         std::sync::RwLock<std::collections::HashMap<crate::types::ShardId, crate::types::ShardId>>,
+    /// The owner tenures of this worker (issue #2252). The first worker on a
+    /// registry takes the registry's set. Another worker takes its own, so
+    /// two workers never share a holder token.
+    decision_owner: Arc<crate::decision_owner::OwnedPartitions>,
     /// In-process consecutive-timeout strike counter per workflow execution
     /// (issue #494).
     ///
@@ -35103,6 +35109,18 @@ impl Worker {
         let task_outcomes = crate::worker_outlier::TaskOutcomeWindow::for_heartbeat(
             config.worker_heartbeat_interval,
         );
+        // Issue #2252: the first worker on a registry takes its tenures. A
+        // second worker on the same registry takes a set of its own.
+        let decision_owner = {
+            let shared = registry.decision_owner();
+            if shared.try_claim() {
+                shared
+            } else {
+                let own = Arc::new(crate::decision_owner::OwnedPartitions::default());
+                let _ = own.try_claim();
+                own
+            }
+        };
         Ok(Self {
             config,
             registry,
@@ -35129,6 +35147,7 @@ impl Worker {
             drain_deadline_max: Arc::new(Mutex::new(None)),
             workflow_cache,
             owner_shards: std::sync::RwLock::default(),
+            decision_owner,
             workflow_task_timeout_strikes: Arc::default(),
             workflow_panic_strikes: Arc::default(),
             workflow_deadlock_strikes: Arc::default(),
@@ -36464,10 +36483,15 @@ impl Worker {
             owner_shard,
             &self.config.worker_id,
             crate::decision_owner::OwnerLeaseConfig::default(),
-            self.registry.decision_owner(),
+            Arc::clone(&self.decision_owner),
         )
+        // Peers are judged on the fleet-wide cadence, as the capability-miss
+        // lookup does. A fast local heartbeat must not make a peer look dead.
         .with_live_within(Duration::from_secs(
-            u64::try_from(worker_stale_secs(self.config.worker_heartbeat_interval)).unwrap_or(1),
+            u64::try_from(capability_miss_fleet_stale_secs(
+                self.config.worker_heartbeat_interval,
+            ))
+            .unwrap_or(1),
         ));
         // A worker that cannot run a workflow task must not own partitions.
         // It still claims in the owned form, so the guard never blocks its
@@ -36482,7 +36506,7 @@ impl Worker {
             let stop = stop.clone();
             let pool = pool.clone();
             let cache = Arc::clone(&self.workflow_cache);
-            let owned = self.registry.decision_owner();
+            let owned = Arc::clone(&self.decision_owner);
             let worker_id = self.config.worker_id.clone();
             AbortOnDrop::new(tokio::spawn(async move {
                 loop {
@@ -39295,9 +39319,7 @@ impl Worker {
     /// The owned claim of claim target `shard`, or `None` when owner mode is
     /// off there (issue #2252).
     fn owned_claim(&self, shard: Option<crate::types::ShardId>) -> Option<queue::OwnedClaim> {
-        self.registry
-            .decision_owner()
-            .owned_claim(self.owner_shard_of(shard))
+        self.decision_owner.owned_claim(self.owner_shard_of(shard))
     }
 
     /// The activity names that a claim must skip: the names with unmet
@@ -39823,6 +39845,7 @@ impl Worker {
         };
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
+        let decision_owner = Arc::clone(&self.decision_owner);
         let task_outcomes = Arc::clone(&self.task_outcomes);
 
         // Monotonic instant captured the moment this worker received the claimed
@@ -39933,32 +39956,35 @@ impl Worker {
                 // quarantine unloads the partition from this cache.
                 #[cfg(feature = "db")]
                 let quarantine_cache = Arc::clone(&workflow_cache);
-                let outcome = Box::pin(crate::decision_owner::scope_decision(process_task(
-                    &pool,
-                    Arc::clone(&registry),
-                    task,
-                    &worker_id,
-                    &build_id,
-                    cancellation_grace_period,
-                    sticky_timeout,
-                    max_local_activity_start_to_close,
-                    workflow_cache,
-                    dispatched_at,
-                    max_concurrent_sessions,
-                    &session_slots_in_use,
-                    &shutdown,
-                    Arc::clone(&panic_strikes),
-                    workflow_panic_max_attempts,
-                    Arc::clone(&deadlock_strikes),
-                    workflow_task_deadline,
-                    capability_miss_policy,
-                    Some(workflow_task_timeout),
-                    &task_outcomes,
-                    &deferred_failure,
-                    &pool_labels,
-                    &drain_cancel,
-                    owner_shard,
-                )))
+                let outcome = Box::pin(crate::decision_owner::scope_decision_for(
+                    Arc::clone(&decision_owner),
+                    process_task(
+                        &pool,
+                        Arc::clone(&registry),
+                        task,
+                        &worker_id,
+                        &build_id,
+                        cancellation_grace_period,
+                        sticky_timeout,
+                        max_local_activity_start_to_close,
+                        workflow_cache,
+                        dispatched_at,
+                        max_concurrent_sessions,
+                        &session_slots_in_use,
+                        &shutdown,
+                        Arc::clone(&panic_strikes),
+                        workflow_panic_max_attempts,
+                        Arc::clone(&deadlock_strikes),
+                        workflow_task_deadline,
+                        capability_miss_policy,
+                        Some(workflow_task_timeout),
+                        &task_outcomes,
+                        &deferred_failure,
+                        &pool_labels,
+                        &drain_cancel,
+                        owner_shard,
+                    ),
+                ))
                 .await;
                 // Issue #1815: a success counts now. A failure counts after
                 // its claim-fenced recovery, below.
@@ -40168,7 +40194,7 @@ impl Worker {
                                 }
                                 // Issue #2251: the terminal write fences the
                                 // run's tenure.
-                                let owned = telemetry.decision_owner();
+                                let owned = Arc::clone(&decision_owner);
                                 let recovery = quarantine_workflow_task_timeout_owned(
                                     &pool,
                                     task_id,
@@ -40230,36 +40256,39 @@ impl Worker {
             } else {
                 // No timeout configured, or not a workflow task: run unbounded.
                 // Issue #2251: the decision scope, as on the timed arm.
-                let outcome = Box::pin(crate::decision_owner::scope_decision(process_task(
-                    &pool,
-                    registry,
-                    task,
-                    &worker_id,
-                    &build_id,
-                    cancellation_grace_period,
-                    sticky_timeout,
-                    max_local_activity_start_to_close,
-                    workflow_cache,
-                    dispatched_at,
-                    max_concurrent_sessions,
-                    &session_slots_in_use,
-                    &shutdown,
-                    panic_strikes,
-                    workflow_panic_max_attempts,
-                    deadlock_strikes,
-                    // No enclosing workflow-task budget on this arm, so the
-                    // local per-attempt budget is the only clock (issue #783).
-                    None,
-                    capability_miss_policy,
-                    // Same reason: this arm is the "no timeout configured, or
-                    // not a workflow task" path, which was never wrapped.
-                    None,
-                    &task_outcomes,
-                    &deferred_failure,
-                    &pool_labels,
-                    &drain_cancel,
-                    owner_shard,
-                )))
+                let outcome = Box::pin(crate::decision_owner::scope_decision_for(
+                    Arc::clone(&decision_owner),
+                    process_task(
+                        &pool,
+                        registry,
+                        task,
+                        &worker_id,
+                        &build_id,
+                        cancellation_grace_period,
+                        sticky_timeout,
+                        max_local_activity_start_to_close,
+                        workflow_cache,
+                        dispatched_at,
+                        max_concurrent_sessions,
+                        &session_slots_in_use,
+                        &shutdown,
+                        panic_strikes,
+                        workflow_panic_max_attempts,
+                        deadlock_strikes,
+                        // No enclosing workflow-task budget on this arm, so the
+                        // local per-attempt budget is the only clock (issue #783).
+                        None,
+                        capability_miss_policy,
+                        // Same reason: this arm is the "no timeout configured, or
+                        // not a workflow task" path, which was never wrapped.
+                        None,
+                        &task_outcomes,
+                        &deferred_failure,
+                        &pool_labels,
+                        &drain_cancel,
+                        owner_shard,
+                    ),
+                ))
                 .await;
                 // An activity records its own attempt in `process_activity_task`.
                 // Issue #1815: a workflow success counts now. A workflow
