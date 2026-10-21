@@ -603,14 +603,9 @@ const fn valid_channel(channel: &str) -> bool {
 /// Task notes merge per channel. One task keeps its id. Several tasks give
 /// the nil id, as [`notify_tasks_enqueued`] does. Event notes merge per
 /// execution: the counts add up, and the last type wins. Stream notes merge
-/// per channel. A note on a channel that Postgres rejects is dropped.
+/// per channel. Owner notes merge per execution, and an evict wins. A note
+/// on a channel that Postgres rejects is dropped.
 fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
-    enum Merged {
-        Task(String, Uuid),
-        Events(Uuid, usize, String),
-        Stream(String),
-        Owner(String, Uuid, bool),
-    }
     let mut merged: Vec<Merged> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for note in notes {
@@ -684,13 +679,25 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
             }
         }
     }
-    merged
-        .into_iter()
-        .filter_map(|m| match m {
-            Merged::Task(channel, task_id) => serde_json::to_string(&NotifyPayload { task_id })
+    merged.into_iter().filter_map(Merged::into_wake).collect()
+}
+
+/// One merged wake of [`coalesce`].
+enum Merged {
+    Task(String, Uuid),
+    Events(Uuid, usize, String),
+    Stream(String),
+    Owner(String, Uuid, bool),
+}
+
+impl Merged {
+    /// The `(channel, payload)` pair of the wake.
+    fn into_wake(self) -> Option<(String, String)> {
+        match self {
+            Self::Task(channel, task_id) => serde_json::to_string(&NotifyPayload { task_id })
                 .ok()
                 .map(|payload| (channel, payload)),
-            Merged::Events(workflow_exec_id, event_count, last_event_type) => {
+            Self::Events(workflow_exec_id, event_count, last_event_type) => {
                 serde_json::to_string(&WorkflowEventNotifyPayload {
                     workflow_exec_id,
                     event_count,
@@ -699,8 +706,8 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
                 .ok()
                 .map(|payload| (workflow_events_channel().to_string(), payload))
             }
-            Merged::Stream(channel) => Some((channel, String::new())),
-            Merged::Owner(channel, workflow_exec_id, evict) => {
+            Self::Stream(channel) => Some((channel, String::new())),
+            Self::Owner(channel, workflow_exec_id, evict) => {
                 serde_json::to_string(&OwnerWakePayload {
                     workflow_exec_id,
                     evict,
@@ -708,8 +715,8 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
                 .ok()
                 .map(|payload| (channel, payload))
             }
-        })
-        .collect()
+        }
+    }
 }
 
 /// An owner note for a foreign write to `exec_id`, when owner wakes are on

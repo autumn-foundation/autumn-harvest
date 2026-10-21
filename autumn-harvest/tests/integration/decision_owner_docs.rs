@@ -591,7 +591,10 @@ fn foreign_writer_table_cites_real_functions() {
         let writer = rest.split('|').next().unwrap_or_default();
         let mut file: Option<String> = None;
         for symbol in writer.split('`').skip(1).step_by(2) {
-            if symbol.ends_with(".rs") {
+            if std::path::Path::new(symbol)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+            {
                 file = Some(read(&format!("autumn-harvest/src/{symbol}")));
                 continue;
             }

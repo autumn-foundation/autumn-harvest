@@ -610,7 +610,7 @@ async fn an_unlisten_stops_the_wakes_of_a_partition() {
     let (mut owner, _) = fx.listeners(partition).await;
     drain(&mut owner).await;
     owner.unlisten(partition).await.expect("unlisten");
-    assert!(owner.partitions().is_empty());
+    assert_eq!(owner.partitions(), Vec::<DecisionPartition>::new());
     autumn_harvest::signal::send_signal(&mut fx.conn, exec, "go", Value::Null)
         .await
         .expect("signal");

@@ -52,7 +52,7 @@ async fn owner_wake_signal_flow(ctx: &WorkflowContext, input: String) -> Result<
 
 #[workflow]
 async fn owner_wake_activity_flow(ctx: &WorkflowContext, queue: String) -> Result<String, String> {
-    let key = ctx.info().workflow_id.clone();
+    let key = ctx.info().workflow_id;
     let out = ctx
         .execute_activity_raw("owner_wake_echo", Value::String(key), &queue)
         .await

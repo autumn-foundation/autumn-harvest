@@ -1165,7 +1165,10 @@ mod tests {
         let shard = ShardId::new(0);
         let p = |n| DecisionPartition::new(n).expect("in range");
         assert_eq!(owned.partitions_on(shard), [p(2), p(4)]);
-        assert!(owned.partitions_on(ShardId::new(1)).is_empty());
+        assert_eq!(
+            owned.partitions_on(ShardId::new(1)),
+            Vec::<DecisionPartition>::new()
+        );
         let adopted = owned.version();
         assert!(!owned.unload(tenure(4, 1).key(), OwnerEpoch::new(9)));
         assert_eq!(owned.version(), adopted, "a stale unload changes nothing");
