@@ -34338,16 +34338,16 @@ async fn owner_scan(
     owned: &crate::decision_owner::OwnedPartitions,
     worker_id: &str,
 ) {
-    let mut conn = match pool.get().await {
+    // The loop lock stays held until the adoption ends. A release then
+    // never runs between an acquisition and its adoption.
+    let (conn, mut owner_loop) = conn_then_loop_lock(pool.get(), state).await;
+    let mut conn = match conn {
         Ok(conn) => conn,
         Err(e) => {
             tracing::warn!(worker_id = %worker_id, error = %e, "owner loop: no connection");
             return;
         }
     };
-    // The loop lock stays held until the adoption ends. A release then
-    // never runs between an acquisition and its adoption.
-    let mut owner_loop = state.lock().await;
     let tick = owner_loop.tick(&mut conn).await;
     drop(conn);
     match tick {
@@ -34364,6 +34364,19 @@ async fn owner_scan(
         }
     }
     drop(owner_loop);
+}
+
+/// Take a pool connection, then the owner-loop lock (issue #2252).
+///
+/// The scan and the release both use this order. A release that took the lock
+/// first could wait for the last connection. A scan could hold that connection
+/// and wait for the lock.
+async fn conn_then_loop_lock<C, S>(
+    conn: impl std::future::Future<Output = C>,
+    state: &tokio::sync::Mutex<S>,
+) -> (C, tokio::sync::MutexGuard<'_, S>) {
+    let conn = conn.await;
+    (conn, state.lock().await)
 }
 
 /// Drop the cache entries of each partition of `keys`.
@@ -36545,17 +36558,19 @@ impl Worker {
         acquire_bound: Option<Duration>,
     ) {
         handle.stop.cancel();
-        let mut owner_loop = handle.state.lock().await;
-        let conn = match acquire_bound {
-            Some(bound) => tokio::time::timeout(bound, pool.get())
-                .await
-                .map_err(|_| HarvestError::Database("owner release: pool timeout".to_string()))
-                .and_then(|r| r.map_err(|e| HarvestError::Database(e.to_string()))),
-            None => pool
-                .get()
-                .await
-                .map_err(|e| HarvestError::Database(e.to_string())),
+        let conn = async {
+            match acquire_bound {
+                Some(bound) => tokio::time::timeout(bound, pool.get())
+                    .await
+                    .map_err(|_| HarvestError::Database("owner release: pool timeout".to_string()))
+                    .and_then(|r| r.map_err(|e| HarvestError::Database(e.to_string()))),
+                None => pool
+                    .get()
+                    .await
+                    .map_err(|e| HarvestError::Database(e.to_string())),
+            }
         };
+        let (conn, mut owner_loop) = conn_then_loop_lock(conn, &handle.state).await;
         let released = match conn {
             Ok(mut conn) => owner_loop.release_everything(&mut conn).await,
             Err(e) => Err(e),
@@ -50638,6 +50653,38 @@ mod tests {
             "shard 2 shares database a but is not a target"
         );
         assert!(!groups[1].split);
+    }
+
+    /// A scan and a release share a one-connection pool (issue #2252). The
+    /// scan waits for the connection first. Each takes the connection, then
+    /// the loop lock, so neither waits on the other forever.
+    #[tokio::test]
+    async fn the_scan_and_the_release_take_the_connection_before_the_loop_lock() {
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = Arc::new(tokio::sync::Mutex::new(0_u32));
+        let held = Arc::clone(&pool).acquire_owned().await.expect("permit");
+        let user = |pool: Arc<tokio::sync::Semaphore>, state: Arc<tokio::sync::Mutex<u32>>| {
+            tokio::spawn(async move {
+                let (conn, mut guard) =
+                    conn_then_loop_lock(pool.acquire_owned(), state.as_ref()).await;
+                *guard += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                drop(conn);
+            })
+        };
+        let scan = user(Arc::clone(&pool), Arc::clone(&state));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let release = user(Arc::clone(&pool), Arc::clone(&state));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            scan.await.expect("scan");
+            release.await.expect("release");
+        })
+        .await
+        .expect("the scan and the release both finish");
+        assert_eq!(*state.lock().await, 2);
     }
 
     #[test]
