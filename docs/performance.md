@@ -2561,3 +2561,8 @@ standalone note rather than part of the claim-path attribution table above:
   — before issue #2126, the four task-timeout lanes read one page of live
   rows four times per pass. Lanes at one position now share one refill
   statement (refill buffers -75% at 100,000 live rows, `pg_stat_statements`).
+* [`docs/performance-sla-breach-scan.md`](performance-sla-breach-scan.md)
+  — the soft-SLA breach scan read the whole executions table on every timeout
+  tick, because the planner could not prove its predicate implies the partial
+  index's. It now repeats the index clause and uses the index (buffers
+  19,887 → 1 at 1,000,000 executions, `EXPLAIN (ANALYZE, BUFFERS)`).
