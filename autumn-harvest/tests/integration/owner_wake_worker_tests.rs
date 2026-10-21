@@ -380,14 +380,38 @@ async fn start_signal_flow(fx: &mut Fixture, workflow_id: &str) -> ExecutionId {
     .exec_id()
 }
 
-/// Start the signal flow and wait until A caches its suspension.
+/// Start the signal flow and wait until A caches its suspension and parks
+/// its task.
+///
+/// A write before the park finds the task still held by the decision. The
+/// write then sets `wake_requested` and wakes no one, because the owner is
+/// mid-decision. The tests write after the park.
 async fn start_cached(fx: &mut Fixture, workflow_id: &str, a: &Node) -> ExecutionId {
     let exec = start_signal_flow(fx, workflow_id).await;
     eventually("the owner caches the suspension", async || {
         a.worker.has_cached_execution(exec).await
     })
     .await;
+    eventually("the owner parks the task", async || parked(fx, exec).await).await;
     exec
+}
+
+/// Whether the workflow task of `exec` is parked: `RUNNING` with no worker.
+async fn parked(fx: &Fixture, exec: ExecutionId) -> bool {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Bool)]
+        parked: bool,
+    }
+    let mut conn = fx.conn().await;
+    diesel::sql_query(
+        "SELECT bool_or(state = 'RUNNING' AND worker_id IS NULL) AS parked \
+         FROM harvest_task_queue WHERE workflow_exec_id = $1 AND task_type = 'workflow'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid())
+    .get_result::<Row>(&mut conn)
+    .await
+    .is_ok_and(|row| row.parked)
 }
 
 async fn signal(fx: &Fixture, exec: ExecutionId) {
@@ -799,6 +823,9 @@ async fn a_child_terminal_wakes_and_invalidates_the_parent_owner_elsewhere() {
         a.worker.has_cached_execution(child).await
     })
     .await;
+    // A write before the park wakes no one. See `start_cached`.
+    eventually("the parent task parks", async || parked(&fx, parent).await).await;
+    eventually("the child task parks", async || parked(&fx, child).await).await;
     let woken = b.metrics.woken("wake");
     signal(&fx, child).await;
 

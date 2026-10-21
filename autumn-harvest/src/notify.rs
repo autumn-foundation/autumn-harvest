@@ -266,21 +266,36 @@ pub(crate) async fn notify_task_enqueued_stamped(
     queue_name: &str,
     task_id: Uuid,
 ) -> HarvestResult<()> {
+    notify_task_enqueued_for(conn, stamp, queue_name, task_id, None).await
+}
+
+/// [`notify_task_enqueued_stamped`] that also wakes the owner of the run
+/// `owner_exec`, when the new task is a workflow task (issue #2253).
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub(crate) async fn notify_task_enqueued_for(
+    conn: &mut AsyncPgConnection,
+    stamp: Option<Stamp>,
+    queue_name: &str,
+    task_id: Uuid,
+    owner_exec: Option<Uuid>,
+) -> HarvestResult<()> {
     // Chaos: drop this wake (issue #940 AC1(c)). The poll loop still finds the
     // task, because NOTIFY only reduces latency.
     if crate::chaos_drop_notify!(NOTIFY_TASK_ENQUEUED) {
         return Ok(());
     }
 
-    stage(
-        conn,
-        vec![Note::Task {
-            channel: queue_channel(queue_name),
-            task_id,
-        }],
-        stamp,
-    )
-    .await
+    let mut notes = vec![Note::Task {
+        channel: queue_channel(queue_name),
+        task_id,
+    }];
+    if let Some(exec_id) = owner_exec {
+        notes.extend(owner_note(exec_id, false));
+    }
+    stage(conn, notes, stamp).await
 }
 
 /// Wake the workers of several queues, after the write commits.

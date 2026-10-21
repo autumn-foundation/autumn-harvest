@@ -534,26 +534,12 @@ async fn notify_enqueued(
     params: &EnqueueParams,
     task_id: Uuid,
 ) -> HarvestResult<()> {
-    match (params.task_type, params.workflow_exec_id) {
-        (TaskType::Workflow, Some(exec_id)) => {
-            // The same chaos drop as `notify_task_enqueued` (issue #940).
-            if crate::chaos_drop_notify!(NOTIFY_TASK_ENQUEUED) {
-                return Ok(());
-            }
-            crate::notify::notify_workflow_task_woken(
-                conn,
-                stamp,
-                std::slice::from_ref(&params.queue_name),
-                task_id,
-                exec_id,
-            )
-            .await
-        }
-        _ => {
-            crate::notify::notify_task_enqueued_stamped(conn, stamp, &params.queue_name, task_id)
-                .await
-        }
-    }
+    let owner_exec = match params.task_type {
+        TaskType::Workflow => params.workflow_exec_id,
+        TaskType::Activity => None,
+    };
+    crate::notify::notify_task_enqueued_for(conn, stamp, &params.queue_name, task_id, owner_exec)
+        .await
 }
 
 /// Insert a new task into the work queue and return its ID.

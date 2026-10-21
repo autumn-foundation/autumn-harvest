@@ -570,6 +570,9 @@ async fn task_state(fx: &Fixture, exec: ExecutionId) -> String {
 async fn a_poison_pill_requeue_wakes_the_owner() {
     let (mut fx, _container) = Fixture::new().await;
     let (exec, partition) = fx.start().await;
+    // Listen first. A live worker's own sweep can take the orphan at once.
+    let (mut owner, mut other) = fx.listeners(partition).await;
+    drain(&mut owner).await;
     fixture_sql(
         &fx,
         "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'owner-wake-dead', \
@@ -578,8 +581,6 @@ async fn a_poison_pill_requeue_wakes_the_owner() {
         exec,
     )
     .await;
-    let (mut owner, mut other) = fx.listeners(partition).await;
-    drain(&mut owner).await;
     // A long stale bound: only the dead worker, which has no row, counts as
     // dead. The sweep then leaves the live workers of other tests alone.
     autumn_harvest::poison_pill::reclaim_orphaned_tasks(
@@ -606,6 +607,9 @@ async fn a_poison_pill_requeue_wakes_the_owner() {
 async fn a_poison_pill_quarantine_evicts() {
     let (mut fx, _container) = Fixture::new().await;
     let (exec, partition) = fx.start().await;
+    // Listen first. A live worker's own sweep can take the orphan at once.
+    let (mut owner, mut other) = fx.listeners(partition).await;
+    drain(&mut owner).await;
     fixture_sql(
         &fx,
         "UPDATE harvest_task_queue SET state = 'RUNNING', worker_id = 'owner-wake-dead', \
@@ -614,8 +618,6 @@ async fn a_poison_pill_quarantine_evicts() {
         exec,
     )
     .await;
-    let (mut owner, mut other) = fx.listeners(partition).await;
-    drain(&mut owner).await;
     // A long stale bound: only the dead worker, which has no row, counts as
     // dead. The sweep then leaves the live workers of other tests alone.
     autumn_harvest::poison_pill::reclaim_orphaned_tasks(
