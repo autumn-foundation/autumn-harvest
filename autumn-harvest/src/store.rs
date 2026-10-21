@@ -242,7 +242,13 @@ async fn insert_event_rows(
     // opens a savepoint and the outer lock already covers this. The wrapper is
     // skipped entirely when fencing is off, so the pre-#954 path is unchanged:
     // no fence read, no savepoint, one INSERT.
-    if crate::replication::FenceRegistry::is_enabled() {
+    //
+    // A decision that pinned an owner tenure takes the same path (issue
+    // #2251). `assert_fence` then also fences the owner row, so a stale owner
+    // inserts nothing, also with the DR fence off.
+    if crate::replication::FenceRegistry::is_enabled()
+        || crate::decision_owner::pinned_decision().is_some()
+    {
         Box::pin(
             conn.transaction::<_, crate::error::HarvestError, _>(async |conn| {
                 crate::replication::assert_fence(conn, exec_id.shard()).await?;
@@ -406,10 +412,14 @@ pub async fn append_events_offloaded_with_codecs(
 
     let mut rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
     let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
+    // Issue #2251: a pinned decision can upload inside its transaction. The
+    // owner fence bounds idle time by the TTL, so widen it for the upload.
+    crate::decision_owner::start_upload_allowance(conn).await?;
     for row in &mut rows {
         let refs = offloader.offload_event_value(&mut row.event_data).await?;
         all_refs.extend(refs);
     }
+    crate::decision_owner::end_upload_allowance(conn).await?;
 
     // Wrap the event INSERT and the ref INSERT in one transaction so that a
     // failed ref INSERT cannot leave events with offload envelopes but no
@@ -487,10 +497,13 @@ pub(crate) async fn append_events_offloaded_with_codecs_and_patch(
     let mut rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
     let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
     if let Some(offloader) = offloader {
+        // Issue #2251: widen the idle bound for the upload, as above.
+        crate::decision_owner::start_upload_allowance(conn).await?;
         for row in &mut rows {
             let refs = offloader.offload_event_value(&mut row.event_data).await?;
             all_refs.extend(refs);
         }
+        crate::decision_owner::end_upload_allowance(conn).await?;
     }
     patch(&mut rows);
 
@@ -1054,7 +1067,8 @@ pub async fn append_single_event_with_codecs(
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the query fails, or
 /// [`crate::error::HarvestError::NotFound`] if the execution does not exist.
-pub(crate) async fn next_event_id_for(
+#[doc(hidden)]
+pub async fn next_event_id_for(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<i32> {

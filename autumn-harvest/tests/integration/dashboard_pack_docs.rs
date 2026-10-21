@@ -93,6 +93,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_quota_supersede_credit_not_shed_total",
     "harvest_scanner_tick_total",
     "harvest_scanner_pass_total",
+    "harvest_decision_owner_fenced_total",
     "harvest_db_pool_acquire_timeout_total",
     "harvest_db_transaction_retry_total",
     "harvest_db_transaction_retry_exhausted_total",
@@ -349,6 +350,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_scanner_tick", &["scanner", "shard"]),
     // Scanner election role per tick (issue #1795). Bounded labels.
     ("harvest_scanner_pass", &["scanner", "shard", "role"]),
+    ("harvest_decision_owner_fenced", &["shard"]),
     ("harvest_db_pool_acquire_timeout", &["site"]),
     ("harvest_db_transaction_retry", &["site", "reason"]),
     (

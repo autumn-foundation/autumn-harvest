@@ -1567,6 +1567,10 @@ mod db {
     /// that lost its guard stop before the bump commits. See
     /// [`BUMP_WRITER_GRACE`].
     ///
+    /// The bump also ends every decision owner lease on the database, in
+    /// the same transaction (issue #2251, ADR 0009 decision 4). The holders
+    /// and epochs stay. Workers of the promoted region then acquire at once.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::error::HarvestError::Database`] on query failure, or
@@ -1607,7 +1611,7 @@ mod db {
                     .execute(conn)
                     .await
                     .map_err(database_error)?;
-                diesel::sql_query(
+                let rows: Vec<GenerationRow> = diesel::sql_query(
                     "UPDATE harvest_shard_generation \
                      SET generation = generation + 1, fenced_at = NOW(), \
                          fenced_reason = $2, fenced_by = $3 \
@@ -1619,7 +1623,22 @@ mod db {
                 .bind::<Text, _>(actor)
                 .load(conn)
                 .await
-                .map_err(database_error)
+                .map_err(database_error)?;
+                // A shard with no row bumps nothing. Roll back, so the
+                // leases below stay too.
+                if rows.is_empty() {
+                    return Err(crate::error::HarvestError::NotFound(format!(
+                        "no harvest_shard_generation row for shard {shard_id} — provision it \
+                         before fencing"
+                    )));
+                }
+                // ADR 0009 decision 4: end every owner lease in the same
+                // transaction. The old region cannot commit past the new
+                // generation, so the promoted region may acquire at once.
+                // The owner rows serve the whole database, so a bump of one
+                // shard ends the leases of its colocated shards too.
+                crate::decision_owner::expire_all(conn).await?;
+                Ok(rows)
             }),
         )
         .await?;
@@ -2875,17 +2894,65 @@ mod db {
     /// check is a very tight read rather than a barrier — the claim gate, not
     /// this assert, is the structural guarantee for work that has not started.
     ///
+    /// Inside a decision that pinned an owner tenure, it also fences the
+    /// owner row, after the generation row (issue #2251). A caller can hold
+    /// other row locks by now, so the owner lock waits at most 250 ms and
+    /// then fails closed. See [`assert_decision_fence`] for the check at the
+    /// start of a decision.
+    ///
     /// # Errors
     ///
     /// [`crate::error::HarvestError::ShardFenced`] when the pinned epoch is not
     /// the database's current one, **including when the row is absent** (fail
-    /// closed). [`crate::error::HarvestError::Database`] on query failure.
+    /// closed). [`crate::error::HarvestError::OwnershipLost`] when a pinned
+    /// owner tenure moved. [`crate::error::HarvestError::Database`] on query
+    /// failure.
     pub async fn assert_fence(conn: &mut AsyncPgConnection, shard: ShardId) -> HarvestResult<()> {
+        assert_generation_fence(conn, shard).await?;
+        crate::decision_owner::fence_pinned(conn).await
+    }
+
+    /// The DR generation check of [`assert_fence`] alone.
+    ///
+    /// The owner lease statements call it. They take the generation row
+    /// first, then the owner rows (ADR 0009 decision 6).
+    ///
+    /// # Errors
+    ///
+    /// As [`assert_fence`], with no owner check.
+    pub async fn assert_generation_fence(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+    ) -> HarvestResult<()> {
         let Some(pinned) = FenceRegistry::expected(shard) else {
             return Ok(());
         };
         let resolved = FenceRegistry::resolve_shard(shard).unwrap_or(shard);
         assert_generation(conn, resolved, pinned).await
+    }
+
+    /// The fence at the start of a decision transaction (issue #2251).
+    ///
+    /// With an owner tenure pinned, it takes the DR generation row, then
+    /// the owner row `FOR KEY SHARE`. Both come before the execution row,
+    /// as ADR 0009 decision 6 orders them. Call it first in each decision
+    /// transaction.
+    ///
+    /// The generation check uses the shard of the pinned tenure. With no
+    /// tenure pinned, it does nothing and sends no query. The legacy persist
+    /// keeps its lock order.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::error::HarvestError::ShardFenced`] as [`assert_fence`].
+    /// [`crate::error::HarvestError::OwnershipLost`] when the owner row
+    /// moved. [`crate::error::HarvestError::Database`] on query failure.
+    pub async fn assert_decision_fence(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
+        let Some(tenure) = crate::decision_owner::pinned_decision() else {
+            return Ok(());
+        };
+        assert_generation_fence(conn, tenure.shard()).await?;
+        crate::decision_owner::fence(conn, &tenure).await
     }
 
     /// Fail with `ShardFenced` unless `shard` is at `expected`.
@@ -4351,13 +4418,14 @@ mod db {
 pub use db::{
     CheckoutElapsed, FENCE_GUARD_LIMIT, FENCED_CHECKOUT_BOUND, FencePassGuard, FencedConn,
     PassMember, abandon_fenced_pass, advance_sequences_after_promotion,
-    assert_admin_write_authority, assert_database_fence, assert_fence, assert_fence_group,
-    begin_fenced_group, begin_fenced_groups, begin_fenced_pass, begin_fenced_pass_at,
-    begin_fenced_pass_on, begin_fenced_tick, begin_shard_tick, bump_generation, current_generation,
-    ensure_generation_row, fenced_acquire, fenced_acquire_with_retries, fenced_checkout,
-    fenced_get_within, fenced_wait, freeze_generation_rows_on, join_fenced_pass,
-    join_fenced_pass_direct, measure_rpo, pin_process_fence, pin_worker_fence, probe_dr_markers,
-    query_replication_status, record_replication_heartbeat, resolve_held, run_fenced_pass,
+    assert_admin_write_authority, assert_database_fence, assert_decision_fence, assert_fence,
+    assert_fence_group, assert_generation_fence, begin_fenced_group, begin_fenced_groups,
+    begin_fenced_pass, begin_fenced_pass_at, begin_fenced_pass_on, begin_fenced_tick,
+    begin_shard_tick, bump_generation, current_generation, ensure_generation_row, fenced_acquire,
+    fenced_acquire_with_retries, fenced_checkout, fenced_get_within, fenced_wait,
+    freeze_generation_rows_on, join_fenced_pass, join_fenced_pass_direct, measure_rpo,
+    pin_process_fence, pin_worker_fence, probe_dr_markers, query_replication_status,
+    record_replication_heartbeat, resolve_held, run_fenced_pass,
 };
 
 #[cfg(test)]

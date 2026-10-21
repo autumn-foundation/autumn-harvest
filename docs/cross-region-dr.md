@@ -371,6 +371,11 @@ the lock, it waits 6 more seconds before it commits. A pass that lost its
 barrier stops in that time, and it ends the backends of the statements it
 sent.
 
+The bump also ends every decision owner lease on the database, in the same
+transaction (issue #2251, ADR 0009 decision 4). Workers of the promoted
+region then acquire at once. The role that runs the bump needs `SELECT` and
+`UPDATE` on `harvest_decision_owner`.
+
 These direct-database commands are exempt, by design:
 
 | Command | Why it is not fenced |

@@ -4,7 +4,8 @@
 
 Accepted (issue #2249).
 
-Issues #2250 to #2254 build it. The planning record is
+Issues #2250 to #2254 build it. [ADR 0010](0010-fenced-owner-lease.md)
+holds the lease rules R1 to R7 that the model forces. The planning record is
 [`DESIGN-2249.md`](../../DESIGN-2249.md). The source is the stage 1 section of
 `reports/Actor ownership prior art for Harvest.md`.
 
@@ -74,9 +75,14 @@ keeps its meaning. Docs, metrics and logs say "decision partition", or
 
 ### 4. Lease placement: the history's own database
 
-- Each physical database holds one owner row per partition: partition,
-  holder, epoch and lease end. Issue #2251 names the table and fixes its
-  schema.
+- Each physical database holds one owner row per partition:
+  `harvest_decision_owner(partition, holder, epoch, lease_until)` (issue
+  #2251). The migration seeds rows 0 to 511 at epoch 0. A trigger refuses
+  an epoch that falls or grows by more than 1, a new holder at the old
+  epoch, and a changed partition.
+- A worker keys each tenure by the shard of the claim's pool and the
+  partition (`OwnerKey`), because it can serve several databases. The pool
+  names the database of the owner row. The bits of an execution id do not.
 - The row is in the database that holds the history it fences. It fails
   over with the data, and its check is atomic with the append.
 - The DR fence rejects a TTL lease because the lease fails over with the
@@ -158,7 +164,7 @@ Rules:
   A plain `UPDATE ... WHERE partition = ANY(...)` does not do that. It
   locks rows in scan order.
 - Use a locking `SELECT ... ORDER BY partition` first, then the `UPDATE`.
-  Issue #2251 pins this with a test.
+  `a_multi_row_renewal_locks_rows_in_ascending_order` pins this.
 - A foreign writer takes no owner row. The execution row lock serializes
   it, as today.
 - Offloaded payloads upload before the fenced transaction opens, as each
@@ -191,8 +197,32 @@ no edge to that cycle.
 Owner mode changes one path. Today the workflow-task persist locks the
 execution row first (`check_paused_and_park`). It checks the generation row
 at its first append. Owner mode moves both fence reads to the start of the
-transaction. Issue #2251 adds the owner row to the lock-order table, with
-its pin test.
+transaction (`assert_decision_fence`). Row 19 of the lock-order table holds
+the owner row. `a_decision_takes_the_owner_row_before_the_execution_row`
+pins it.
+
+Every transaction of a decision starts with `assert_decision_fence`. That
+covers the wake ingest and the inline local activity and signal writes. It
+also covers the suspension and terminal persists and the projection writes.
+The decision pins its
+tenure in a task-local, so a foreign writer in another task takes no owner
+row. A local activity handler is user code. It runs in a nested scope that
+pins nothing, so its own writes are foreign writes. The body-timeout
+quarantine pins the tenure of the run and fences too.
+
+Each event insert calls `assert_fence` too, which fences the pinned tenure
+again. That covers a write that a future path adds without a start fence.
+A transaction that already holds the row passes at once.
+
+The fence is the migration's function `harvest_decision_owner_fence`. Its
+lock wait is at most 250 ms, set on the function. A failed acquisition
+recheck holds the row `FOR UPDATE` for a moment, even on a live lease, so a
+healthy owner must wait briefly. A longer hold is a takeover, so the fence
+fails closed. The wait is short and ends in a refusal, so a late fence
+after other row locks cannot deadlock. A wait for the table lock counts too.
+So a migration that queues an `ACCESS EXCLUSIVE` lock on
+`harvest_decision_owner` fences every commit until its `lock_timeout` ends.
+Keep that timeout short, as `online-migrations.md` requires.
 
 ### 7. Fenced commit: unload, never retry
 
@@ -205,7 +235,7 @@ When the holder or the epoch differs:
   execution in the partition.
 - It never retries at the stale epoch. It can acquire the partition again
   later, at a new epoch.
-- It counts the fence on a metric. Issue #2251 names the metric.
+- It counts the fence on `harvest.decision_owner.fenced{shard}`.
 - The execution row lock and `UNIQUE(workflow_exec_id, event_id)` stay as
   the backstop.
 
@@ -218,7 +248,10 @@ No task stays `RUNNING` with no worker to finish it:
   `FOR UPDATE`.
 - A fenced worker re-pends its own claim under its claim token, as
   `requeue_claimed_workflow_task_*` does today.
-- Issue #2252 builds these three steps.
+- Issue #2252 builds the first two steps. Issue #2251 builds the third
+  (`requeue_claimed_workflow_task_after_fence`).
+- With owner mode on and no tenure, a decision fails closed with
+  `OwnershipLost` and writes nothing.
 
 ### 8. Lease TTL: 10 s, renewed every TTL / 3
 
@@ -252,7 +285,7 @@ On a graceful stop, a worker:
 1. Stops new claims and new commits in every partition.
 2. Waits for its in-flight decisions, up to the drain bound.
 3. Releases every partition in one statement. The statement sets the lease
-   end to `clock_timestamp()` and keeps the epoch.
+   end to `clock_timestamp()` and keeps the holder and the epoch.
 
 Standbys acquire on their next scan. A decision still in flight at the
 bound keeps its row lock, and the acquisition waits for it. There is no
@@ -291,8 +324,8 @@ database. The enable step:
 1. Refuses while a live worker on the database cannot run owner mode, or
    covers only part of a colocated group (decision 10). Issue #2252 picks
    the signal, because `harvest_workers` has no capability column today.
-2. Writes the partition of each execution and adds the owner rows and the
-   count.
+2. Writes the partition of each execution and the count. The migration of
+   issue #2251 already seeds the owner rows.
 3. Installs a database guard on the claim of a workflow task. The guard
    refuses a claim that carries no owner epoch.
 4. Re-pends each workflow task that is `RUNNING` under a legacy claim,

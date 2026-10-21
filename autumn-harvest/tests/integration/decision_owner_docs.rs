@@ -109,6 +109,26 @@ const RISK_COUNT: usize = 5;
 /// Symbols the ADR cites: the symbol, its source file, and its declaration.
 const CITED_CODE: &[(&str, &str, &str)] = &[
     (
+        "assert_decision_fence",
+        "autumn-harvest/src/replication.rs",
+        "pub async fn assert_decision_fence(",
+    ),
+    (
+        "requeue_claimed_workflow_task_after_fence",
+        "autumn-harvest/src/queue.rs",
+        "pub async fn requeue_claimed_workflow_task_after_fence(",
+    ),
+    (
+        "harvest_decision_owner_fence",
+        "autumn-harvest/migrations/20261020132402_harvest_decision_owner/up.sql",
+        "CREATE OR REPLACE FUNCTION harvest_decision_owner_fence(",
+    ),
+    (
+        "OwnerKey",
+        "autumn-harvest/src/decision_owner.rs",
+        "pub struct OwnerKey {",
+    ),
+    (
         "DEFAULT_SCANNER_LEASE_TTL",
         "autumn-harvest/src/scanner_lease.rs",
         "pub const DEFAULT_SCANNER_LEASE_TTL: Duration = Duration::from_secs(10);",
@@ -161,6 +181,13 @@ const CITED_CODE: &[(&str, &str, &str)] = &[
 ];
 
 /// The lock-mode tests that prove the renewal and takeover rules.
+/// The owner pin tests that the ADR cites, in the issue #2251 suite.
+const OWNER_TEST: &str = "autumn-harvest/tests/integration/decision_owner_db_tests.rs";
+const OWNER_TESTS: &[&str] = &[
+    "a_decision_takes_the_owner_row_before_the_execution_row",
+    "a_multi_row_renewal_locks_rows_in_ascending_order",
+];
+
 const LOCK_TESTS: &[&str] = &[
     "a_renewal_does_not_wait_for_an_in_flight_commit",
     "a_commit_does_not_wait_for_an_in_flight_renewal",
@@ -391,6 +418,17 @@ fn adr_cites_only_real_code() {
         read("docs/architecture.md").contains("| `workflow_id`, shard, queue | **Kept** |"),
         "{ADR} relies on continue-as-new keeping `workflow_id`, shard and queue"
     );
+    let owner_suite = read(OWNER_TEST);
+    for test in OWNER_TESTS {
+        assert!(
+            adr.contains(&format!("`{test}`")),
+            "{ADR} must cite `{test}`"
+        );
+        assert!(
+            owner_suite.contains(&format!("async fn {test}(")),
+            "{OWNER_TEST} lacks `{test}`"
+        );
+    }
     let suite = read(LOCK_TEST);
     for test in LOCK_TESTS {
         assert!(

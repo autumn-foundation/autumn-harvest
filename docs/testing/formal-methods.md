@@ -32,7 +32,7 @@ scripts/check-formal-models.sh
 
 The script downloads `tla2tools.jar` 1.7.4 and checks its SHA-256. To use a
 local jar, set `TLA2TOOLS_JAR=/path/to/tla2tools.jar`. A full run takes about
-2 minutes on 4 cores. The `OwnerLease` design config takes about 75 seconds
+3 minutes on 4 cores. The `OwnerLease` design config takes about 2 minutes
 of it.
 
 To run one config by hand:
@@ -218,15 +218,17 @@ completion or the unresolved count.
 #### `OwnerLease` — model (e)
 
 The prose spec is [ADR 0010](../adr/0010-fenced-owner-lease.md). Stage 1a
-(issue #2251) has no code yet, so this model is the spec. The model has one
+(issue #2251) implements the model in `decision_owner.rs`.
+`decision_owner_sim_db_tests.rs` runs the simulator on that code. A renewal
+needs a live lease, as in the code. The model has one
 partition, one owner row and the history of one execution. Its actions:
 
 | Action | Planned code |
 |---|---|
 | `Acquire` | The takeover: `SELECT ... FOR UPDATE`, then the write. Adds 1 to the epoch. Waits for every fence lock. Then loads the resident state. |
-| `Release` | The graceful release. Frees the row and unloads the worker. |
+| `Release` | The graceful release. Ends the lease, keeps the holder and the epoch, and unloads the worker. |
 | `Expire` | The lease time runs out: a pause or a clock jump. A lock does not stop it. |
-| `Renew` | The renewal `UPDATE` of `lease_until`. Matches the holder and the epoch. A miss unloads the worker. |
+| `Renew` | The renewal `UPDATE` of `lease_until`. Matches the holder and the epoch, and needs a live lease. A miss unloads the worker. |
 | `Write`, `Ack` | The `harvest_signals` insert, then the HTTP 202. |
 | `Receive` | The `memory-ack` defect only: an ack from owner memory. |
 | `Begin` | A decision reads its resident state and pins the owner's epoch. |
@@ -284,8 +286,9 @@ ADR. Its config lists only the invariant that it must break:
 
 `OwnerLease.cfg` checks the design with 3 workers, 2 signals and 4 epochs.
 The workers are interchangeable, so the config sets
-`SYMMETRY WorkerSymmetry`. TLC finds 5,629,559 distinct states and no
-error, in about 75 seconds on 4 cores. The two signals limit the history to
+`SYMMETRY WorkerSymmetry`. TLC finds 4,980,851 distinct states and no
+error, in about 2 minutes on 4 cores. Since issue #2251, a renewal needs a
+live lease, and a release keeps the holder, as the code does. The two signals limit the history to
 two events.
 
 `OwnerLeaseReach.cfg` must violate `SomeNemesisUnseen`. The violation is
@@ -690,6 +693,7 @@ copy matches. Port the change, then run the script.
 | `mixers.rs` | `mix64` in `policy.rs` and `dlq.rs`, `splitmix64` in `chaos.rs` | Each mixer is a bijection on `u64`. An explicit inverse undoes it. |
 | `jitter.rs` | `uniform_inclusive`, `full_jitter_nanos`, `equal_jitter_nanos` in `policy.rs` | The jitter stays in its range for every input, with the real mixer. |
 | `dlq_spread.rs` | `spread_offset_nanos` in `dlq.rs` | No step overflows. The jitter is exact and below one slot. Row `index` of `count` stays in its slot and in the window. |
+| `owner_fence.rs` | `next_epoch` and `fence_passes` in `decision_owner.rs` | The next epoch is the epoch + 1 and never wraps. The fence passes a commit only at the epoch of the row, so never at an older one. Only an acquisition moves the epoch, so after a takeover the fence refuses every commit of the old tenure (issue #2251). |
 
 **The mixer inverse.** Each step of the `SplitMix64` finalizer has an
 inverse. A right xor-shift by `s` bits is undone by shifts of `s` and

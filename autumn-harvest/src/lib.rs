@@ -305,6 +305,8 @@ pub mod debounce;
 /// feature (which enables `testing`).
 #[cfg(feature = "debugger")]
 pub mod debugger;
+/// The fenced owner lease of each decision partition (issue #2251).
+pub mod decision_owner;
 /// Deterministic workflow guardrails: static source-level check for replay-breaking patterns.
 pub mod det_check;
 pub mod diagnostic;

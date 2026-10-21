@@ -148,12 +148,13 @@ Acquire(w) ==
                ELSE seen
     /\ UNCHANGED <<decs, history, inbox, written, mem, acked>>
 
-\* A graceful release: the holder frees the row and unloads.
+\* A graceful release: the holder ends its lease and unloads. The holder
+\* and the epoch stay, as in a lapse (issue #2251).
 Release(w) ==
     /\ pinned[w] # 0
     /\ lease.holder = w
     /\ lease.epoch = pinned[w]
-    /\ lease' = [lease EXCEPT !.holder = NoWorker, !.live = FALSE]
+    /\ lease' = [lease EXCEPT !.live = FALSE]
     /\ Unload(w)
     /\ UNCHANGED <<owners, held, decs, history, inbox, written, acked, seen>>
 
@@ -166,12 +167,14 @@ Expire ==
     /\ UNCHANGED <<owners, pinned, held, cache, decs, history, inbox, written,
                    mem, acked, seen>>
 
-\* The renewal UPDATE. It matches the holder and the pinned epoch. It does
-\* not wait for a fence lock: the fence takes FOR KEY SHARE, and the
-\* renewal changes no key column. A failed renewal unloads the worker.
+\* The renewal UPDATE. It matches the holder and the pinned epoch, and it
+\* needs a live lease (ADR 0009 decision 5). It does not wait for a fence
+\* lock: the fence takes FOR KEY SHARE, and the renewal changes no key
+\* column. A failed renewal unloads the worker. A lapsed holder acquires
+\* again, at a new epoch.
 Renew(w) ==
     /\ pinned[w] # 0
-    /\ IF lease.holder = w /\ lease.epoch = pinned[w]
+    /\ IF lease.holder = w /\ lease.epoch = pinned[w] /\ lease.live
        THEN /\ IF Defect = "renew-bumps"
                THEN /\ lease.epoch < MaxEpoch
                     /\ NoLocks

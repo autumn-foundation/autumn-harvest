@@ -233,11 +233,13 @@ pub trait OwnerStore {
     /// lock.
     fn acquire(&mut self, worker: WorkerId) -> Option<Epoch>;
 
-    /// The graceful release. It frees the row when `worker` holds `epoch`.
-    /// Returns `false` when the row moved.
+    /// The graceful release. It ends the lease when `worker` holds `epoch`,
+    /// and keeps the holder and the epoch. Returns `false` when the row
+    /// moved.
     fn release(&mut self, worker: WorkerId, epoch: Epoch) -> bool;
 
-    /// The renewal `UPDATE`. It matches `worker` and `epoch`.
+    /// The renewal `UPDATE`. It matches `worker` and `epoch`, and needs a
+    /// live lease.
     fn renew(&mut self, worker: WorkerId, epoch: Epoch) -> Renewal;
 
     /// The lease time runs out. The holder and the epoch stay.
@@ -318,13 +320,15 @@ impl OwnerStore for OracleOwnerStore {
         if self.row.holder != Some(worker) || self.row.epoch != epoch {
             return false;
         }
-        self.row.holder = None;
+        // A release ends the lease and keeps the holder, as a lapse does.
         self.row.live = false;
         true
     }
 
     fn renew(&mut self, worker: WorkerId, epoch: Epoch) -> Renewal {
-        if self.row.holder != Some(worker) || self.row.epoch != epoch {
+        // ADR 0009 decision 5: a renewal also needs a live lease. A lapsed
+        // holder acquires again, at a new epoch.
+        if self.row.holder != Some(worker) || self.row.epoch != epoch || !self.row.live {
             return Renewal::Lost;
         }
         if self.defect == Defect::RenewBumps {

@@ -5719,6 +5719,31 @@ pub async fn requeue_claimed_workflow_task_after_panic(
     requeue_claimed_workflow_task_with_backoff(conn, claim, delay, reason).await
 }
 
+/// Re-pend a workflow task whose decision lost its owner fence (issue #2251).
+///
+/// The decision wrote nothing. The task is due after `delay`, and the new
+/// owner of the partition takes it. The update requires `claim` to be
+/// current, as on the deadlock path, so a stale dispatcher writes nothing.
+///
+/// Returns `Ok(false)` when the claim is no longer held.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_claimed_workflow_task_after_fence(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    delay: chrono::Duration,
+) -> HarvestResult<bool> {
+    requeue_claimed_workflow_task_with_backoff(
+        conn,
+        claim,
+        delay,
+        "the decision lost its owner fence (issue #2251)",
+    )
+    .await
+}
+
 /// The claim-fenced backoff re-pend behind the deadlock and panic paths.
 ///
 /// Returns `Ok(false)` when the claim is no longer held.
