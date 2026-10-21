@@ -2608,7 +2608,14 @@ pub struct OwnerWakeListener {
     rx: tokio::sync::mpsc::Receiver<tokio_postgres::Notification>,
     _connection_handle: tokio::task::JoinHandle<()>,
     listening: std::collections::BTreeSet<crate::decision_owner::DecisionPartition>,
+    /// Wakes that arrived while a `LISTEN` or `UNLISTEN` ran. `run_verb`
+    /// fills it, and `wait` reads it first.
+    pending: std::collections::VecDeque<tokio_postgres::Notification>,
 }
+
+/// The most wakes that [`OwnerWakeListener`] holds while a command runs. A
+/// wake over the bound is dropped. A lost wake costs latency only.
+const OWNER_PENDING_MAX: usize = 4096;
 
 impl OwnerWakeListener {
     /// Open a LISTEN connection. It listens on no channel yet.
@@ -2627,6 +2634,7 @@ impl OwnerWakeListener {
             rx,
             _connection_handle: driver,
             listening: std::collections::BTreeSet::new(),
+            pending: std::collections::VecDeque::new(),
         })
     }
 
@@ -2668,18 +2676,44 @@ impl OwnerWakeListener {
         self.listening.iter().copied().collect()
     }
 
+    /// Run `LISTEN` or `UNLISTEN` on the channel of `partition`.
+    ///
+    /// The driver task forwards wakes through a bounded channel. When that
+    /// channel is full, the driver stops reading the connection, so the
+    /// command reply never arrives. The command therefore drains wakes into
+    /// `pending` while it runs.
     async fn run_verb(
-        &self,
+        &mut self,
         verb: &str,
         partition: crate::decision_owner::DecisionPartition,
     ) -> HarvestResult<()> {
         let channel = quote_pg_identifier(&owner_channel(partition));
-        self.client
-            .batch_execute(&format!("{verb} {channel}"))
-            .await
-            .map_err(|e| {
-                HarvestError::Database(format!("{verb} {channel} failed: {}", error_chain(&e)))
-            })
+        let sql = format!("{verb} {channel}");
+        let Self {
+            client,
+            rx,
+            pending,
+            ..
+        } = self;
+        let command = client.batch_execute(&sql);
+        tokio::pin!(command);
+        loop {
+            tokio::select! {
+                result = &mut command => {
+                    return result.map_err(|e| {
+                        HarvestError::Database(format!(
+                            "{verb} {channel} failed: {}",
+                            error_chain(&e)
+                        ))
+                    });
+                }
+                Some(notification) = rx.recv() => {
+                    if pending.len() < OWNER_PENDING_MAX {
+                        pending.push_back(notification);
+                    }
+                }
+            }
+        }
     }
 
     /// Wait up to `timeout` for one owner wake.
@@ -2687,6 +2721,11 @@ impl OwnerWakeListener {
     /// The wait skips a payload or a channel that does not parse, and
     /// continues.
     pub async fn wait(&mut self, timeout: Duration) -> OwnerWakeWait {
+        while let Some(notification) = self.pending.pop_front() {
+            if let Some(wake) = parse_owner_wake(&notification) {
+                return OwnerWakeWait::Woken(wake);
+            }
+        }
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             match tokio::time::timeout_at(deadline, self.rx.recv()).await {

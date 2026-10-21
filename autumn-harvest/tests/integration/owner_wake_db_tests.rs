@@ -651,3 +651,44 @@ async fn an_unlisten_stops_the_wakes_of_a_partition() {
         .expect("signal");
     assert_quiet(&mut owner, exec).await;
 }
+
+/// A burst of wakes larger than the forward buffer must not stall a later
+/// `LISTEN` on the same connection. The listener drains wakes while its
+/// command runs.
+#[tokio::test]
+async fn a_wake_burst_does_not_stall_a_listen() {
+    let (fx, _container) = Fixture::new().await;
+    let busy = DecisionPartition::new(299).expect("in range");
+    let next = DecisionPartition::new(298).expect("in range");
+    let mut owner = OwnerWakeListener::connect(&fx.url).await.expect("listen");
+    owner.listen(busy).await.expect("listen");
+    // More wakes than the 128-slot forward buffer holds.
+    let mut conn = AsyncPgConnection::establish(&fx.url)
+        .await
+        .expect("connect");
+    // Postgres folds equal payloads of one transaction, so each one differs.
+    diesel_async::RunQueryDsl::execute(
+        diesel::sql_query(
+            "SELECT pg_notify($1, json_build_object( \
+                 'workflow_exec_id', gen_random_uuid(), 'evict', false, 'n', g.n)::text) \
+             FROM generate_series(1, 400) AS g(n)",
+        )
+        .bind::<diesel::sql_types::Text, _>(autumn_harvest::notify::owner_channel(busy)),
+        &mut conn,
+    )
+    .await
+    .expect("send the burst");
+    // Let the driver fill its buffer before the next command.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::timeout(Duration::from_secs(10), owner.listen(next))
+        .await
+        .expect("the LISTEN does not stall behind the burst")
+        .expect("listen");
+    assert!(
+        matches!(
+            owner.wait(Duration::from_secs(5)).await,
+            OwnerWakeWait::Woken(_)
+        ),
+        "the burst is still delivered"
+    );
+}
