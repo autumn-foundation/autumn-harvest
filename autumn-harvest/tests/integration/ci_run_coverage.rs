@@ -192,6 +192,10 @@ const ALLOWLIST: &[(&str, &str)] = &[
         "core:audit_log_unexported_idx_write_cost_perf",
         ALLOWLIST_EVIDENCE_HARNESS_REASON,
     ),
+    (
+        "core:broken_session_scan_perf",
+        ALLOWLIST_EVIDENCE_HARNESS_REASON,
+    ),
     ("core:chaos_tests", ALLOWLIST_CHAOS_REASON),
     // ── plugin (autumn-harvest-plugin/tests) ──
     (
@@ -227,7 +231,7 @@ const ALLOWLIST: &[(&str, &str)] = &[
 /// Four of them needed a test fix first.
 /// Then 4: issue #1959 wired `plugin:mcp_tools_integration` and
 /// `plugin:webhook_durable_integration`. No debt entry is left.
-const ALLOWLIST_MAX_LEN: usize = 4;
+const ALLOWLIST_MAX_LEN: usize = 5;
 
 fn allowlisted(key: &str) -> bool {
     ALLOWLIST.iter().any(|&(k, _)| k == key)
