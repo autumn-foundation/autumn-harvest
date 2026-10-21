@@ -1,0 +1,23 @@
+                    note                    | expected | flagged 
+--------------------------------------------+----------+---------
+ already breached                           | f        | f
+ cancelled late                             | t        | t
+ completed 1 microsecond late               | t        | t
+ completed exactly at the deadline          | f        | f
+ completed late                             | t        | t
+ completed on time                          | f        | f
+ continued as new late                      | t        | t
+ failed with no completed_at, deadline past | t        | t
+ no deadline                                | f        | f
+ paused, deadline past                      | f        | f
+ running, deadline ahead                    | f        | f
+ running, deadline past                     | t        | t
+ terminated late                            | t        | t
+ timed out late                             | t        | t
+(14 rows)
+
+ flagged_total |           flagged_md5            
+---------------+----------------------------------
+             8 | b866cb7a4fc9f159864b262dfa834034
+(1 row)
+
