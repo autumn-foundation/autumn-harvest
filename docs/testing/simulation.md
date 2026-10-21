@@ -171,6 +171,9 @@ test.
 - `world`: 1,000 world seeds on Postgres, in 4 shards.
 - `autoresearch`: the workflow sweeps of the autoresearch example, 5,000
   seeds each. See [`workflow-simulation.md`](workflow-simulation.md).
+- `stateright`: the Stateright models of the oracles, at their nightly
+  bounds. A sweep samples schedules, and these models visit every schedule
+  within a bound. See [`stateright.md`](stateright.md).
 - `alert`: a failed scheduled run opens an issue, or comments on the open
   one. A step timeout counts as a failure.
 

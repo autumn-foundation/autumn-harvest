@@ -151,7 +151,7 @@ impl fmt::Display for SignalId {
 }
 
 /// The owner row of the partition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseRow {
     /// The worker that holds the row, or `None`.
     pub holder: Option<WorkerId>,
@@ -162,7 +162,7 @@ pub struct LeaseRow {
 }
 
 /// The result of a renewal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Renewal {
     /// The lease is extended. The worker holds this epoch.
     Renewed(Epoch),
@@ -173,7 +173,7 @@ pub enum Renewal {
 }
 
 /// The result of the fence check in a commit transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Fence {
     /// The check passed. The commit may append.
     Held,
@@ -182,7 +182,7 @@ pub enum Fence {
 }
 
 /// A decision that a commit appends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Decision {
     /// The deciding worker.
     pub worker: WorkerId,
@@ -195,7 +195,7 @@ pub struct Decision {
 }
 
 /// One decision event, as the simulator records it at the commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Event {
     /// The worker that committed it.
     pub by: WorkerId,
@@ -270,7 +270,7 @@ pub trait OwnerStore {
 ///
 /// It applies the store side of a [`Defect`]: `no-fence`, `unlocked-fence`,
 /// `holder-fence` and `renew-bumps`. The simulator applies the owner side.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OracleOwnerStore {
     defect: Defect,
     row: LeaseRow,

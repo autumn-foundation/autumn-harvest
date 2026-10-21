@@ -13,7 +13,7 @@ use std::fmt;
 use super::store::{Claim, Row, TaskState, WriteOutcome};
 
 /// A safety property of the activity claim protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Invariant {
     /// At most one terminal write takes effect per task.
     AtMostOneTerminal,
@@ -102,7 +102,7 @@ impl fmt::Display for Violation {
 }
 
 /// The kind of an owner write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WriteKind {
     /// The start fence.
     Start,
@@ -117,12 +117,14 @@ pub enum WriteKind {
 /// A claim that a worker still acts on, with its ghost sequence number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Live<'a> {
+    /// The fencing token that the worker writes with.
     pub claim: &'a Claim,
+    /// The ghost sequence number of the claim.
     pub seq: u64,
 }
 
 /// The ghost state: which claim each row holds, and the terminal writes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Ghost {
     holders: Vec<Option<u64>>,
     terminals: Vec<Vec<u64>>,
@@ -130,6 +132,7 @@ pub struct Ghost {
 
 impl Ghost {
     /// Ghost state for `tasks` rows.
+    #[must_use]
     pub fn new(tasks: usize) -> Self {
         Self {
             holders: vec![None; tasks],
@@ -187,6 +190,7 @@ impl Ghost {
     }
 
     /// Check that each completed row has exactly one terminal write.
+    #[must_use]
     pub fn terminal_states(&self, rows: &[Row]) -> Option<(Invariant, String)> {
         rows.iter().enumerate().find_map(|(task, row)| {
             let writes = self.terminals[task].len();
@@ -198,6 +202,7 @@ impl Ghost {
     }
 
     /// Check that no two live claims share a fencing token.
+    #[must_use]
     pub fn unique_ids(live: &[Live<'_>]) -> Option<(Invariant, String)> {
         live.iter().enumerate().find_map(|(i, a)| {
             live[i + 1..]
