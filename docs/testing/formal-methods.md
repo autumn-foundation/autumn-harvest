@@ -16,6 +16,9 @@ design. The integration tests check that the SQL implements it.
 [`simulation.md`](simulation.md) covers a seeded harness that checks the
 `ActivityClaim` invariants on an oracle. A differential test checks the
 oracle against Postgres.
+[`stateright.md`](stateright.md) covers Stateright models that visit every
+schedule of that oracle within a bound. They must break each TLA+
+counter-example on the same invariant.
 [`concurrency-model-checking.md`](concurrency-model-checking.md) covers loom
 and Shuttle, which check in-process concurrency.
 
