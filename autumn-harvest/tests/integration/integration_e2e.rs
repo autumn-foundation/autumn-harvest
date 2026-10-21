@@ -172,6 +172,8 @@ const LEGACY_INIT_SQL: &str = concat!(
     // issue #1976: the fairness key on harvest_task_queue. Every enqueue
     // inserts it and `TaskQueueItem` selects it.
     "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS fairness_key TEXT;\n",
+    // issue #2252: each enqueue inserts the decision partition.
+    "ALTER TABLE harvest_task_queue ADD COLUMN IF NOT EXISTS decision_partition SMALLINT;\n",
     // issue #946: WorkflowExecution::as_select() (the modern start path's
     // read-back) references the quota_key column even for a fresh (no quota
     // policy configured) execution.

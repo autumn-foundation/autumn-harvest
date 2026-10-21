@@ -38,9 +38,19 @@ extra ones and releases them one scan later. A worker with no workflow
 slot or type is a participant: it claims in the owned form and owns
 nothing. Any owner takes a partition whose
 lease ended over one renewal interval ago. An acquisition re-pends the
-workflow tasks that another worker holds `RUNNING` there. A graceful stop
+workflow tasks that a dead worker left `RUNNING` there. A graceful stop
 releases every partition after the drain. Colocated shards share one key. A
 worker that covers part of a colocated group refuses owner mode there.
+
+**Terminal guard.** The extra cold decisions of issue #2007 came from
+`queue::claim_still_held_for_update`, in both modes. A peer claim scans the
+queue head `FOR UPDATE SKIP LOCKED` and can lock a row just after another
+loop claimed it. Postgres keeps that lock until the peer claim transaction
+ends. The final decision of a run read the lock as a lost claim. It rolled
+back, released the task, and the retry replayed cold. A skip now retries
+once with a blocking lock in a savepoint, bounded by
+`CLAIM_GUARD_LOCK_WAIT` (100 ms). A transfer still reads as lost. The bound
+is far below `deadlock_timeout`, so the guard still ends an ABBA cycle.
 
 **Evidence.** Unit tests for the splice, the balance plan, the local
 deadline and the colocated groups. Postgres tests for the guard, the owned

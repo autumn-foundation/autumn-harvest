@@ -7051,6 +7051,24 @@ pub async fn read_capability_miss_state(
 /// escalation is re-decided on the next redelivery. Withdrawing is always the
 /// safe direction.
 ///
+/// # The bounded wait after a skip (issue #2252)
+///
+/// A skip is often not a transfer. A peer claim scans the queue head with
+/// `FOR UPDATE SKIP LOCKED`. It can lock this row just after this claim
+/// commits. Its recheck then drops the row, but Postgres keeps the lock until
+/// that claim transaction ends. A terminal write that read this as a lost
+/// claim rolled back a finished decision. The retry then replayed cold.
+///
+/// So a skip retries once with a blocking `FOR UPDATE` in a savepoint. The
+/// savepoint sets `lock_timeout` to [`CLAIM_GUARD_LOCK_WAIT`]. A transfer
+/// changes `worker_id`, `attempt` or `crash_strikes`. After the wait,
+/// Postgres re-checks the predicate on the new row version, so a transfer
+/// still reads as lost. The bound is far below the default
+/// `deadlock_timeout` of 1 s. So in the ABBA cycle above, this wait ends
+/// first and the guard withdraws as before. A timeout or a deadlock error
+/// reads as "not held". It rolls back the savepoint only, so the caller's
+/// transaction stays usable. The caller's `lock_timeout` is restored.
+///
 /// # Errors
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the query fails.
@@ -7061,20 +7079,94 @@ pub async fn claim_still_held_for_update(
     crash_strikes: i32,
     attempt: i32,
 ) -> HarvestResult<bool> {
-    use crate::schema::harvest_task_queue::dsl;
+    use diesel_async::AsyncConnection as _;
 
-    // `claim_held` is the claim-epoch predicate that activity writes use.
-    dsl::harvest_task_queue
-        .find(task_id)
-        .filter(claim_held(worker_id, attempt))
-        .filter(dsl::crash_strikes.eq(crash_strikes))
-        .select(dsl::id)
-        .for_update()
-        .skip_locked()
-        .first::<Uuid>(conn)
+    let claim = HeldClaim {
+        task_id,
+        worker_id,
+        crash_strikes,
+        attempt,
+    };
+    if claim.lock(conn, true).await? {
+        return Ok(true);
+    }
+    let waited = conn
+        .transaction::<_, crate::error::HarvestError, _>(async |tx| {
+            let prior: LockTimeoutSetting =
+                diesel::sql_query("SELECT current_setting('lock_timeout') AS lock_timeout")
+                    .get_result(tx)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            set_local_lock_timeout(tx, CLAIM_GUARD_LOCK_WAIT).await?;
+            let held = claim.lock(tx, false).await?;
+            set_local_lock_timeout(tx, &prior.lock_timeout).await?;
+            Ok(held)
+        })
+        .await;
+    match waited {
+        Err(crate::error::HarvestError::Database(msg))
+            if crate::partition::is_lock_timeout(&msg) || crate::partition::is_deadlock(&msg) =>
+        {
+            Ok(false)
+        }
+        other => other,
+    }
+}
+
+/// The longest wait of [`claim_still_held_for_update`] for a locked row
+/// (issue #2252).
+///
+/// A peer claim transaction holds a stray lock for a few milliseconds. The
+/// bound must stay far below `deadlock_timeout`.
+pub const CLAIM_GUARD_LOCK_WAIT: &str = "100ms";
+
+/// The claim token that [`claim_still_held_for_update`] checks.
+#[derive(Clone, Copy)]
+struct HeldClaim<'a> {
+    task_id: Uuid,
+    worker_id: &'a str,
+    crash_strikes: i32,
+    attempt: i32,
+}
+
+impl HeldClaim<'_> {
+    /// Lock the row `FOR UPDATE` if this claim is current.
+    ///
+    /// `claim_held` is the claim-epoch predicate that activity writes use.
+    async fn lock(self, conn: &mut AsyncPgConnection, skip_locked: bool) -> HarvestResult<bool> {
+        use crate::schema::harvest_task_queue::dsl;
+
+        let query = dsl::harvest_task_queue
+            .find(self.task_id)
+            .filter(claim_held(self.worker_id, self.attempt))
+            .filter(dsl::crash_strikes.eq(self.crash_strikes))
+            .select(dsl::id)
+            .for_update();
+        let row = if skip_locked {
+            query.skip_locked().first::<Uuid>(conn).await
+        } else {
+            query.first::<Uuid>(conn).await
+        };
+        row.optional()
+            .map(|row| row.is_some())
+            .map_err(crate::error::database_error)
+    }
+}
+
+/// The session `lock_timeout`, as `current_setting` reports it.
+#[derive(diesel::QueryableByName)]
+struct LockTimeoutSetting {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    lock_timeout: String,
+}
+
+/// Set `lock_timeout` for the rest of the current transaction.
+async fn set_local_lock_timeout(conn: &mut AsyncPgConnection, value: &str) -> HarvestResult<()> {
+    diesel::sql_query("SELECT set_config('lock_timeout', $1, true)")
+        .bind::<diesel::sql_types::Text, _>(value)
+        .execute(conn)
         .await
-        .optional()
-        .map(|row| row.is_some())
+        .map(drop)
         .map_err(crate::error::database_error)
 }
 

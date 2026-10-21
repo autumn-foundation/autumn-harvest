@@ -97,6 +97,17 @@ owned claim, a database guard on the legacy claim and the acquisition loop.
 - One worker with two claim loops made 800 decisions for 200 runs in a
   debug build, with or without owner mode. The extra cold decisions of the
   R&D record show only under release timing. The e2e bench measures them.
+- The release e2e bench shows them: 81 extra cold decisions at 2 loops
+  without owner mode and 52 with it. A trace of each task-row write found
+  one shape. The final decision of a run claims its task, then releases it
+  with no new event, and a second claim completes the run.
+- `pgrowlocks` named the cause. The peer claim loop held the row lock. Its
+  head scan locks a row `FOR UPDATE SKIP LOCKED` just after the other loop
+  claimed it. The recheck drops the row, but the lock stays until that
+  claim transaction ends. The terminal guard `claim_still_held_for_update`
+  read the lock as a lost claim. The decision rolled back, released the
+  task, and the retry replayed cold. A park waits for the lock, so only the
+  terminal write lost. Owner mode does not change this race.
 - A wake re-arms a sticky pin. So an activity that outlives the window
   does not lose its pin. A timer does: no wake re-arms it. With 200 ms
   windows and one-second timers on two workers, sticky routing resumed 40
@@ -121,6 +132,11 @@ owned claim, a database guard on the legacy claim and the acquisition loop.
 7. Docs: the ADR, `sticky-routing.md`, the `CLAUDE.md` invariant, the
    upgrade guide, the telemetry table and a changelog fragment.
 8. The e2e bench: `HARVEST_BENCH_OWNER_MODE=1` and a decision note.
+9. `claim_still_held_for_update`: after a skip, one blocking retry in a
+   savepoint, bounded by `CLAIM_GUARD_LOCK_WAIT` (100 ms). The bound is far
+   below `deadlock_timeout`, so the guard still ends an ABBA cycle first.
+10. The legacy schemas of `integration_e2e` and the plugin timeline suite
+    gain the `decision_partition` column.
 
 ## 2. Review findings
 
