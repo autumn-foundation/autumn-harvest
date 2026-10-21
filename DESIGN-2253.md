@@ -97,12 +97,11 @@ decision.
 
 ## 1. Change
 
-1. `notify.rs`: `Note::Owner`, the sender lookup and the per-partition
-   channel.
-2. `owner_wake.rs`: the channel name, the payload, the listener and the
-   worker task.
-3. `store.rs` and `queue.rs`: stage an owner note with each append and each
-   wake of a workflow task.
+1. `notify.rs`: `Note::Owner`, the sender lookup, the per-partition
+   channel, the payload and `OwnerWakeListener`.
+2. `worker.rs`: the owner wake task `OwnerWakes` per shard pool.
+3. `store.rs` and `queue.rs`: stage an owner note with each state-change
+   append and each wake of a workflow task.
 4. `event.rs`: `WorkflowEvent::evicts_owner_cache`.
 5. `worker.rs`: the listener task per shard pool, the eviction, the wake of
    the poll loop and the cold rule of a cache hit.
@@ -112,7 +111,46 @@ decision.
 8. Docs: the writer table in ADR 0009, a changelog fragment and the
    telemetry table.
 
-## 2. Out of scope
+## 2. Review findings
+
+The inventory agent and four review agents checked the notify pipeline,
+the worker and cache, the tests and the docs. Nothing was blocking. The
+fixes:
+
+- The poison-pill sweep re-pended a workflow task with no owner wake. A dead
+  worker can be the old owner, so the re-pend now wakes the owner.
+- The sender sent an evict wake to the owner for its own terminal. It now
+  skips each wake to the partition that the writer pinned.
+- The owner lookup ran before every wake of the tick. The other wakes now
+  go first, and the lookup has a 500 ms `statement_timeout`.
+- A runtime stop during the lookup lost notes with no count. A guard now
+  counts them.
+- The fallback counted each dropped owner note in `send_failures`. That
+  fired alerts on a healthy process, so it now logs at debug level.
+- The cold rule of a cache hit applied with owner mode off. It is now
+  gated on owner mode, so a legacy hit behaves as before.
+- The owner wake task polled every 250 ms with no tenure. It now waits for
+  a tenure change.
+- The task reconnected at once after a failed `LISTEN`. It now waits first.
+- A multi-shard owner wake did not settle, and a multi-shard turn could take
+  the wake of another shard. Both match the queue wake now.
+- The tests raced the wake of a resume and missed early wakes. The signal
+  now goes in before the resume, and each test waits for the listener.
+- The activity test did not isolate the activity result. A held activity
+  now makes its result a separate write.
+- The ADR table gained the poison-pill and queue-resume rows. The
+  changelog claim about owner mode off was wrong.
+
+Accepted as is:
+
+- The self-skip compares the partition number only. A wake to the same
+  number on another database is lost. That costs latency only.
+- The owner-wake flag is process-wide and never turns off. Issue #2252
+  replaces it with the switch row. CI runs each suite in its own process.
+- Session breaks and the cross-shard relay have no test of their own. They
+  use the chokepoints of an activity failure and a child terminal.
+
+## 3. Out of scope
 
 - The owned claim and the switch row: #2252. Until then a non-owner can
   still claim a workflow task. It fails closed and re-pends it.

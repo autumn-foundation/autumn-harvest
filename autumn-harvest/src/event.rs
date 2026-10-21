@@ -1429,6 +1429,15 @@ mod tests {
             WorkflowEvent::WorkflowCompleted {
                 output: serde_json::Value::Null,
             },
+            WorkflowEvent::WorkflowExecutionResumed {
+                resumed_at: now,
+                actor: "oncall".into(),
+            },
+            WorkflowEvent::WorkflowRedriven {
+                redriven_at: now,
+                dead_letter_id: uuid::Uuid::nil(),
+                reason: None,
+            },
         ];
         for event in &evicting {
             assert!(event.evicts_owner_cache(), "{}", event.type_name());

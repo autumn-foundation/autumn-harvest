@@ -198,6 +198,7 @@ async fn a_signal_wakes_the_owner() {
     let (mut fx, _container) = Fixture::new().await;
     let (exec, partition) = fx.start().await;
     let (mut owner, mut other) = fx.listeners(partition).await;
+    drain(&mut owner).await;
     autumn_harvest::signal::send_signal(&mut fx.conn, exec, "go", Value::Null)
         .await
         .expect("signal");
@@ -459,7 +460,8 @@ async fn an_external_task_result_wakes_the_owner() {
 }
 
 /// An update admission appends `UpdateAdmitted`, and its caller re-pends the
-/// task. It wakes the owner.
+/// task. It wakes the owner. The test takes the edge path of each caller, as
+/// `declarative_update_tests` does.
 #[tokio::test]
 async fn an_update_admission_wakes_the_owner() {
     let (mut fx, _container) = Fixture::new().await;
@@ -597,4 +599,20 @@ async fn a_poison_pill_quarantine_evicts() {
     .expect("reclaim");
     assert!(summary.quarantined >= 1, "the task is quarantined");
     assert_wakes(&mut owner, &mut other, exec, true).await;
+}
+
+/// An `UNLISTEN` stops the wakes of a partition. The owner wake task uses it
+/// when a tenure ends.
+#[tokio::test]
+async fn an_unlisten_stops_the_wakes_of_a_partition() {
+    let (mut fx, _container) = Fixture::new().await;
+    let (exec, partition) = fx.start().await;
+    let (mut owner, _) = fx.listeners(partition).await;
+    drain(&mut owner).await;
+    owner.unlisten(partition).await.expect("unlisten");
+    assert!(owner.partitions().is_empty());
+    autumn_harvest::signal::send_signal(&mut fx.conn, exec, "go", Value::Null)
+        .await
+        .expect("signal");
+    assert_quiet(&mut owner, exec).await;
 }

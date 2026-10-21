@@ -467,6 +467,9 @@ pub struct OwnedPartitions {
     /// Counts each change of the tenure set (issue #2253). The owner wake
     /// listener reads it to know when to change its channels.
     version: AtomicU64,
+    /// Fires at each change of the tenure set (issue #2253). An owner wake
+    /// task with no tenure waits on it, so it does not poll.
+    changed: tokio::sync::Notify,
 }
 
 /// Owner wakes are on in this process (issue #2253).
@@ -526,6 +529,7 @@ impl OwnedPartitions {
     pub fn adopt(&self, tenure: OwnerTenure) -> Option<OwnerTenure> {
         let replaced = self.state().tenures.insert(tenure.key(), tenure);
         self.version.fetch_add(1, Ordering::Release);
+        self.changed.notify_waiters();
         replaced
     }
 
@@ -559,6 +563,7 @@ impl OwnedPartitions {
         drop(state);
         if current {
             self.version.fetch_add(1, Ordering::Release);
+            self.changed.notify_waiters();
         }
         current
     }
@@ -580,6 +585,14 @@ impl OwnedPartitions {
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version.load(Ordering::Acquire)
+    }
+
+    /// A future that completes at the next change of the tenure set.
+    ///
+    /// Call [`tokio::sync::futures::Notified::enable`] on it before reading
+    /// [`Self::version`]. A change after the read then still completes it.
+    pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
     }
 
     /// The partitions of the tenures on `shard`, in ascending order.

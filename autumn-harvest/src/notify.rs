@@ -390,7 +390,8 @@ pub(crate) async fn notify_history_appended(
 /// after the write commits (issue #2253).
 ///
 /// A foreign writer calls this when it makes a workflow task of the run
-/// claimable. With no queue, nothing became claimable, so nothing is sent.
+/// claimable. With no queue, nothing became claimable, so the function sends
+/// nothing.
 ///
 /// # Errors
 ///
@@ -486,6 +487,11 @@ pub(crate) const GATE_RETRY_MAX: Duration = Duration::from_millis(25);
 /// How often an idle sender samples the queue usage and checks its pool.
 const IDLE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The `statement_timeout` of the owner wake lookup (issue #2253). A lookup
+/// that waits for a lock must not hold back the next tick. The server ends
+/// it, so the connection stays usable.
+const OWNER_LOOKUP_TIMEOUT: &str = "SET LOCAL statement_timeout = '500ms'";
+
 /// The sender drops a note whose transaction stays open longer than this.
 const MAX_GATE_WAIT: Duration = Duration::from_secs(60);
 
@@ -565,9 +571,8 @@ pub(crate) enum Note {
         /// The write changed the state of the run. The owner drops its
         /// cache entry.
         evict: bool,
-        /// The partition of the decision that wrote, if one is pinned. A plain
-        /// wake to that partition is not sent, because its owner is the
-        /// writer.
+        /// The partition that the writing decision pinned, if any. The
+        /// sender sends no wake to that partition. The writer owns it.
         writer: Option<crate::decision_owner::DecisionPartition>,
         /// The channel from [`owner_channel`]. Empty until the sender
         /// resolves the partition.
@@ -730,10 +735,12 @@ struct OwnerRow {
 /// Fill in the channel of each owner note (issue #2253).
 ///
 /// One statement reads the `workflow_id` of each execution. The sender runs
-/// it on its own connection, after the write commits. A note whose run is
-/// gone is dropped, because no owner decides for it. A plain wake to the
-/// partition that the writer pinned is dropped too, because its owner is the
-/// writer. Returns the number of notes that a failed lookup lost.
+/// it on its own connection, after the write commits, with a short
+/// `statement_timeout`. The function drops a note whose run is gone, because
+/// no owner decides for it. It also drops a note to the partition that the
+/// writer's decision pinned. The writer owns that partition and decides
+/// what happens to its own entries. Returns the number of notes that a
+/// failed lookup lost.
 async fn resolve_owner_notes(conn: &mut AsyncPgConnection, notes: &mut Vec<Note>) -> usize {
     let mut ids: Vec<Uuid> = notes
         .iter()
@@ -747,12 +754,20 @@ async fn resolve_owner_notes(conn: &mut AsyncPgConnection, notes: &mut Vec<Note>
     }
     ids.sort_unstable();
     ids.dedup();
-    let rows = diesel::sql_query(
-        "SELECT id, workflow_id FROM harvest_workflow_executions WHERE id = ANY($1::uuid[])",
-    )
-    .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
-    .load::<OwnerRow>(conn)
-    .await;
+    let rows = conn
+        .transaction::<Vec<OwnerRow>, diesel::result::Error, _>(async |conn| {
+            diesel::sql_query(OWNER_LOOKUP_TIMEOUT)
+                .execute(conn)
+                .await?;
+            diesel::sql_query(
+                "SELECT id, workflow_id FROM harvest_workflow_executions \
+                 WHERE id = ANY($1::uuid[])",
+            )
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+            .load::<OwnerRow>(conn)
+            .await
+        })
+        .await;
     let partitions: HashMap<Uuid, crate::decision_owner::DecisionPartition> = match rows {
         Ok(rows) => rows
             .into_iter()
@@ -772,9 +787,9 @@ async fn resolve_owner_notes(conn: &mut AsyncPgConnection, notes: &mut Vec<Note>
     notes.retain_mut(|note| {
         let Note::Owner {
             exec_id,
-            evict,
             writer,
             channel,
+            ..
         } = note
         else {
             return true;
@@ -782,7 +797,7 @@ async fn resolve_owner_notes(conn: &mut AsyncPgConnection, notes: &mut Vec<Note>
         let Some(&partition) = partitions.get(exec_id) else {
             return false;
         };
-        if !*evict && *writer == Some(partition) {
+        if *writer == Some(partition) {
             return false;
         }
         *channel = owner_channel(partition);
@@ -1459,13 +1474,24 @@ async fn send_on_write_connection(
 ) -> HarvestResult<()> {
     // Issue #2253: an owner wake needs a lookup after the commit. Only a
     // sender can make it, so the fallback drops the note. A cache hit checks
-    // its delta, so a lost wake costs latency only.
-    let before = notes.len();
-    let notes: Vec<Note> = notes
-        .into_iter()
-        .filter(|note| !matches!(note, Note::Owner { .. }))
-        .collect();
-    record_failures(before - notes.len(), &"an owner wake needs a ready sender");
+    // its delta, so the loss costs latency only. It is no send failure, so
+    // `send_failures` does not count it.
+    let notes: Vec<Note> = if crate::decision_owner::owner_wakes_enabled() {
+        let before = notes.len();
+        let kept: Vec<Note> = notes
+            .into_iter()
+            .filter(|note| !matches!(note, Note::Owner { .. }))
+            .collect();
+        if kept.len() < before {
+            tracing::debug!(
+                dropped = before - kept.len(),
+                "harvest: no ready notify sender for an owner wake; it is dropped"
+            );
+        }
+        kept
+    } else {
+        notes
+    };
     let rejected = notes.iter().filter(|n| !valid_channel(n.channel())).count();
     record_failures(rejected, &"Postgres rejects the channel name");
     let wakes = coalesce(notes);
@@ -1866,10 +1892,11 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
     sink.record(stale, &"a write transaction stays open too long");
     sink.record(moved, &"the database of the notify sender changed");
 
-    // Issue #2253: the commit is visible now, so the lookup sees the run.
-    let lost = resolve_owner_notes(conn, &mut ready_notes).await;
-    sink.record(lost, &"the owner wake lookup failed");
-
+    // Issue #2253: the owner notes need a lookup. The other wakes go first,
+    // so a slow lookup delays no queue or event wake.
+    let (mut owner_notes, ready_notes): (Vec<Note>, Vec<Note>) = ready_notes
+        .into_iter()
+        .partition(|note| matches!(note, Note::Owner { .. }));
     let rejected = ready_notes
         .iter()
         .filter(|n| !valid_channel(n.channel()))
@@ -1879,6 +1906,22 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
     let count = wakes.len();
     if count > 0 {
         send_counted(sink, count, send_wakes(conn, wakes)).await;
+    }
+    if !owner_notes.is_empty() {
+        // The commit is visible now, so the lookup sees the run. The guard
+        // counts the notes when the runtime stops during the lookup.
+        let mut unsent = Unsent {
+            sink,
+            count: owner_notes.len(),
+        };
+        let lost = resolve_owner_notes(conn, &mut owner_notes).await;
+        unsent.count = 0;
+        sink.record(lost, &"the owner wake lookup failed");
+        let wakes = coalesce(owner_notes);
+        let count = wakes.len();
+        if count > 0 {
+            send_counted(sink, count, send_wakes(conn, wakes)).await;
+        }
     }
     true
 }
@@ -2634,8 +2677,8 @@ impl OwnerWakeListener {
 
     /// Wait up to `timeout` for one owner wake.
     ///
-    /// A payload or a channel that does not parse is skipped, and the wait
-    /// goes on.
+    /// The wait skips a payload or a channel that does not parse, and
+    /// continues.
     pub async fn wait(&mut self, timeout: Duration) -> OwnerWakeWait {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -2885,8 +2928,7 @@ mod tests {
     }
 
     /// Issue #2253: owner wakes merge per execution, and an evict in any
-    /// note wins. A note that the sender did not resolve has no channel, so
-    /// it is dropped.
+    /// note wins. The merge keeps the channel of the first note.
     #[test]
     fn coalesce_merges_owner_wakes_per_execution() {
         let exec = Uuid::new_v4();

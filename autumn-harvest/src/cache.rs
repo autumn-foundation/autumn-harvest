@@ -527,7 +527,6 @@ mod tests {
             Some(key),
         );
         assert!(cache.contains(&id), "contains keeps the entry");
-        assert!(cache.contains(&id));
         let (_, _, _, taken) = cache.take_entry(&id).expect("entry");
         assert_eq!(taken, Some(key));
         assert!(!cache.contains(&id), "a take removes the entry");

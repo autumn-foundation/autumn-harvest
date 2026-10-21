@@ -207,7 +207,8 @@ pub async fn append_events_with_codecs(
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
-            events.iter().any(WorkflowEvent::evicts_owner_cache),
+            crate::decision_owner::owner_wakes_enabled()
+                && events.iter().any(WorkflowEvent::evicts_owner_cache),
         )
         .await?;
     }
@@ -459,7 +460,8 @@ pub async fn append_events_offloaded_with_codecs(
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
-            events.iter().any(WorkflowEvent::evicts_owner_cache),
+            crate::decision_owner::owner_wakes_enabled()
+                && events.iter().any(WorkflowEvent::evicts_owner_cache),
         )
         .await?;
     }
@@ -535,7 +537,8 @@ pub(crate) async fn append_events_offloaded_with_codecs_and_patch(
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
-            events.iter().any(WorkflowEvent::evicts_owner_cache),
+            crate::decision_owner::owner_wakes_enabled()
+                && events.iter().any(WorkflowEvent::evicts_owner_cache),
         )
         .await?;
     }

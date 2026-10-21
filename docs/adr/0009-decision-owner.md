@@ -4,10 +4,11 @@
 
 Accepted (issue #2249).
 
-Issues #2250 to #2254 build it. Issue #2253 adds decision 12. [ADR 0010](0010-fenced-owner-lease.md)
-holds the lease rules R1 to R7 that the model forces. The planning record is
-[`DESIGN-2249.md`](../../DESIGN-2249.md). The source is the stage 1 section of
-`reports/Actor ownership prior art for Harvest.md`.
+Issues #2250 to #2254 build it. Issue #2253 adds decision 12.
+[ADR 0010](0010-fenced-owner-lease.md) holds the lease rules R1 to R7 that
+the model forces. The planning record is
+[`DESIGN-2249.md`](../../DESIGN-2249.md). The source is the stage 1 section
+of `reports/Actor ownership prior art for Harvest.md`.
 
 ## Context
 
@@ -359,22 +360,30 @@ Issue #2253 builds this decision.
   wake is a `NOTIFY` on the channel `harvest_owner_p{n}` of that database.
 - Each owner listens on the channels of the partitions that it holds. A
   worker that holds no tenure on a database opens no connection for it.
-- Two chokepoints stage the wake. `wake_workflow_task` and `enqueue` stage
-  a plain wake when a workflow task of the run becomes claimable.
+- Three paths stage the wake. `wake_workflow_task` and `enqueue` stage a
+  plain wake when a workflow task of the run becomes claimable.
 - The event append functions of `store.rs` stage an evict wake for a state
   change: a terminal, a pause, a resume or a redrive.
+- `notify_owner` stages a wake for a change that appends no event: a
+  rebalance, or a re-pend after a dead or stuck worker.
 - The post-commit sender of `notify.rs` reads the `workflow_id` of each
   woken run on its own connection. The write path pays nothing.
-- A plain wake to the partition of the writer's own pinned decision is not
-  sent, because its owner is the writer.
+- The sender skips each wake to the partition that the writer's decision
+  pinned. The writer owns that partition, and it decides for its entries.
+- The skip compares the partition number only. A wake to the same number
+  on another database is then lost. That costs latency only.
 - An evict wake drops the cache entry and its parked future. A plain wake
   only ends the idle wait of the claim loop.
 - A foreign append does not evict. The next decision loads the delta, so a
   child terminal written into its parent reaches the parent's owner.
-- A `NOTIFY` can be lost. A cache hit whose delta holds a state change
-  replays cold. A hit whose entry has another owner key replays cold too.
+- A `NOTIFY` can be lost. An evict wake can also come while a decision
+  holds the entry, and that decision then puts the entry back.
+- So in owner mode, a cache hit whose delta holds a state change replays
+  cold. A hit whose entry has another owner key replays cold too.
 - Until issue #2252 adds the switch row, owner mode turns owner wakes on
   for the process. A writer-only process calls `enable_owner_wakes`.
+- That process also needs a post-commit sender (`register_pool`). Without
+  one, the fallback drops each owner note.
 
 The writer classes, from the inventory of issue #2253:
 
@@ -402,16 +411,20 @@ The writer classes, from the inventory of issue #2253:
 | Mutex release | `mutex.rs`: `release_lock`, `reclaim_expired_leases_and_wake` | `wake_workflow_task` | No |
 | Start and continue-as-new | `execution.rs`: `start_or_load_workflow_execution`, `replace_execution` | `enqueue` | No |
 | Rebalance | `shard_rebalance.rs`: `commit_cutover`, `activate_target_inner` | `notify_owner` on each database | Yes |
+| Dead or stuck worker re-pend | `poison_pill.rs`: `requeue_orphan`, `requeue_stuck_task` | `notify_owner` | No |
+| Queue resume | `queue_pause.rs`: `notify_resumed_queue` | None. The queue wake reaches each claim loop. | No |
 | Partition layout | `partition.rs`: `disable_partitioning`, `drain_default_bounded_inner` | None | No. Each row keeps its id and bytes. |
 | Retention | `retention.rs`: `delete_candidate_execution` | None | No. It deletes terminal runs only. |
 
 A durable timer is not a foreign write. The decision that starts it also
-schedules its task with `reschedule_task`. The two in-place rewriters of
-`CLAUDE.md` keep the decoded history. Erasure acts on terminal runs only.
+schedules its task with `reschedule_task`. The two sanctioned `event_data`
+writers of `CLAUDE.md` keep the decoded history, so they need no wake.
+Erasure acts on terminal runs only.
 
-`owner_wake_worker_tests.rs` runs an owner and a non-owner per writer
-class. `owner_wake_db_tests.rs` checks the wake of each class on its
-channel.
+`owner_wake_worker_tests.rs` runs an owner and a non-owner worker for the
+main writer classes. `owner_wake_db_tests.rs` checks the wake and its evict
+flag on the channel for more classes. Session breaks and the cross-shard
+relay use the chokepoints of an activity failure and a child terminal.
 
 ## Flows
 

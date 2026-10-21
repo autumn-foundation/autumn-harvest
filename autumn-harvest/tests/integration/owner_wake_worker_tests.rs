@@ -52,8 +52,9 @@ async fn owner_wake_signal_flow(ctx: &WorkflowContext, input: String) -> Result<
 
 #[workflow]
 async fn owner_wake_activity_flow(ctx: &WorkflowContext, queue: String) -> Result<String, String> {
+    let key = ctx.info().workflow_id.clone();
     let out = ctx
-        .execute_activity_raw("owner_wake_echo", Value::String("x".into()), &queue)
+        .execute_activity_raw("owner_wake_echo", Value::String(key), &queue)
         .await
         .map_err(|e| e.to_string())?;
     Ok(format!("echo:{}", out.as_str().unwrap_or_default()))
@@ -68,9 +69,36 @@ async fn owner_wake_parent_flow(ctx: &WorkflowContext, input: String) -> Result<
     Ok(format!("parent:{}", out.as_str().unwrap_or_default()))
 }
 
+#[update(workflow = "owner_wake_signal_flow")]
+async fn owner_wake_bump(_ctx: &WorkflowContext, by: i64) -> Result<i64, String> {
+    Ok(by + 1)
+}
+
+/// The activity keys that a test released. A held activity waits, so the
+/// test can see its result as a separate foreign write.
+static RELEASED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn release(key: &str) {
+    RELEASED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(key.to_string());
+}
+
 #[activity]
-async fn owner_wake_echo(_ctx: &ActivityContext, input: Value) -> Result<Value, String> {
-    Ok(input)
+async fn owner_wake_echo(_ctx: &ActivityContext, key: Value) -> Result<Value, String> {
+    let key = key.as_str().unwrap_or_default().to_string();
+    for _ in 0..1200 {
+        let released = RELEASED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key);
+        if released {
+            return Ok(Value::String("x".into()));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    Err("never released".into())
 }
 
 /// Counts decisions, fences and owner wakes of one worker.
@@ -208,6 +236,7 @@ impl Fixture {
                 owner_wake_parent_flow
             ])
             .activities(activities![owner_wake_echo])
+            .updates(updates![owner_wake_bump])
             .worker(WorkerConfig::default().with_queues([self.queue.as_str()]))
             .telemetry(
                 TelemetryConfig::builder()
@@ -273,6 +302,7 @@ impl Fixture {
         self.take(&a, partition).await;
         self.run(&mut a);
         self.run(&mut b);
+        listening(&a, partition).await;
         (workflow_id, a, b)
     }
 
@@ -281,6 +311,19 @@ impl Fixture {
             .await
             .expect("connect")
     }
+}
+
+/// Wait until the owner wake task of `node` listens on `partition`. A wake
+/// before that would be lost.
+async fn listening(node: &Node, partition: DecisionPartition) {
+    let key = OwnerKey {
+        shard: shard(),
+        partition,
+    };
+    eventually("the owner listens on its partition", async || {
+        node.worker.owner_wake_listening(key)
+    })
+    .await;
 }
 
 /// Wait until `check` holds, up to [`WAIT`].
@@ -374,11 +417,22 @@ async fn an_activity_result_wakes_the_owner_and_no_non_owner_decides() {
     .await
     .expect("start")
     .exec_id();
+    // The run waits for the held activity. Its result is the write under test.
+    eventually("the owner caches the activity wait", async || {
+        a.worker.has_cached_execution(exec).await
+    })
+    .await;
+    let before = a.metrics.woken("wake");
+    release(&workflow_id);
 
     let done = wait_for_execution_state_with_timeout(&fx.url, exec, "COMPLETED", WAIT).await;
     assert_eq!(
         done.output.as_ref().map(ToString::to_string),
         Some(r#""echo:x""#.to_string())
+    );
+    assert!(
+        a.metrics.woken("wake") > before,
+        "the activity result woke the owner"
     );
     assert_only_the_owner_decided(&a, &b);
     a.stop().await;
@@ -413,7 +467,7 @@ async fn a_timeout_scanner_write_evicts_the_owner_entry() {
     let (mut fx, _container) = Fixture::new().await;
     let (workflow_id, a, b) = fx.pair(2).await;
     let (client, mut opts) = (fx.client(), fx.opts());
-    opts.execution_timeout = Some(Duration::from_secs(6));
+    opts.execution_timeout = Some(Duration::from_secs(15));
     let exec = OwnerWakeSignalFlowStub::start_with_options(
         &mut fx.conn,
         &client,
@@ -462,6 +516,56 @@ async fn a_cancel_wakes_the_owner_and_no_non_owner_decides() {
     b.stop().await;
 }
 
+/// An update admission appends `UpdateAdmitted`, and its caller re-pends
+/// the task. It wakes the owner. The admission takes the edge path of each
+/// caller, as `declarative_update_tests` does.
+#[tokio::test]
+async fn an_update_admission_wakes_the_owner_and_no_non_owner_decides() {
+    let (mut fx, _container) = Fixture::new().await;
+    let (workflow_id, a, b) = fx.pair(9).await;
+    let exec = start_cached(&mut fx, &workflow_id, &a).await;
+    let before = a.metrics.woken("wake");
+    let mut conn = fx.conn().await;
+    let update_id = autumn_harvest::types::UpdateId::new();
+    autumn_harvest::store::admit_update_event(
+        &mut conn,
+        exec,
+        update_id,
+        "owner_wake_bump".to_string(),
+        serde_json::json!(41),
+        None,
+    )
+    .await
+    .expect("admit");
+    autumn_harvest::queue::wake_workflow_task(&mut conn, exec)
+        .await
+        .expect("wake");
+
+    eventually("the owner runs the update", async || {
+        crate::integration_e2e::load_history_from_url(&fx.url, exec)
+            .await
+            .events
+            .iter()
+            .any(|event| {
+                matches!(
+                    event,
+                    autumn_harvest::event::WorkflowEvent::UpdateCompleted { update_id: id, .. }
+                        if *id == update_id
+                )
+            })
+    })
+    .await;
+    assert!(
+        a.metrics.woken("wake") > before,
+        "the admission woke the owner"
+    );
+    signal(&fx, exec).await;
+    wait_for_execution_state_with_timeout(&fx.url, exec, "COMPLETED", WAIT).await;
+    assert_only_the_owner_decided(&a, &b);
+    a.stop().await;
+    b.stop().await;
+}
+
 // ---------------------------------------------------------------------------
 // State changes from another process evict the owner's entry
 // ---------------------------------------------------------------------------
@@ -490,11 +594,13 @@ async fn a_pause_from_another_process_evicts_and_the_next_decision_replays_cold(
     .await;
     assert!(a.metrics.woken("evict") > 0, "an evict wake reached A");
 
+    // Signal while paused. The resume then wakes one decision, which reads
+    // the signal and completes.
     let (hits, misses) = (a.metrics.hits(), a.metrics.misses());
+    signal(&fx, exec).await;
     autumn_harvest::execution::resume_workflow_execution(&mut conn, exec, "oncall", &NoOpMetrics)
         .await
         .expect("resume");
-    signal(&fx, exec).await;
     wait_for_execution_state_with_timeout(&fx.url, exec, "COMPLETED", WAIT).await;
     assert_eq!(a.metrics.hits(), hits, "no decision used the old entry");
     assert!(
@@ -603,16 +709,16 @@ async fn a_lost_evict_wake_still_replays_cold() {
     )
     .await
     .expect("pause");
-    autumn_harvest::execution::resume_workflow_execution(&mut conn, exec, "oncall", &NoOpMetrics)
-        .await
-        .expect("resume");
+    // A paused run claims no task, so the entry stays in place.
     assert!(
         a.worker.has_cached_execution(exec).await,
         "no wake evicted the entry"
     );
-
     let (hits, misses) = (a.metrics.hits(), a.metrics.misses());
     signal(&fx, exec).await;
+    autumn_harvest::execution::resume_workflow_execution(&mut conn, exec, "oncall", &NoOpMetrics)
+        .await
+        .expect("resume");
     wait_for_execution_state_with_timeout(&fx.url, exec, "COMPLETED", WAIT).await;
     assert_eq!(a.metrics.hits(), hits, "the stale entry is not used");
     assert!(a.metrics.misses() > misses, "the decision replays cold");
@@ -654,6 +760,7 @@ async fn a_child_terminal_wakes_and_invalidates_the_parent_owner_elsewhere() {
     let (parent, child) = loop {
         let (workflow_id, partition) = workflow_id_in(8);
         fx.take(&b, partition).await;
+        listening(&b, partition).await;
         let (client, opts) = (fx.client(), fx.opts());
         let parent = OwnerWakeParentFlowStub::start_with_options(
             &mut fx.conn,
@@ -670,6 +777,7 @@ async fn a_child_terminal_wakes_and_invalidates_the_parent_owner_elsewhere() {
         let child_partition = DecisionPartition::for_workflow_id(&execution.workflow_id);
         if child_partition != partition && !OTHER_SUITES.contains(&child_partition.get()) {
             fx.take(&a, child_partition).await;
+            listening(&a, child_partition).await;
             break (parent, child);
         }
         // The child landed in a partition another suite uses. Try again.
