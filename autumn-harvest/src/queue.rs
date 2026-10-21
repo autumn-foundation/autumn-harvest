@@ -397,6 +397,9 @@ pub struct EnqueueParams {
     /// The fairness key of the task (issue #1976). `None` is the default
     /// key. A worker with fairness keys on rotates claims across keys.
     pub fairness_key: Option<String>,
+    /// The decision partition of a workflow task (issue #2252). An owned
+    /// claim reads it. Set it with [`Self::with_decision_partition`].
+    pub decision_partition: Option<crate::decision_owner::DecisionPartition>,
 }
 
 impl EnqueueParams {
@@ -437,7 +440,20 @@ impl EnqueueParams {
             session_id: None,
             new_start: false,
             fairness_key: None,
+            decision_partition: None,
         }
+    }
+
+    /// Stamp the decision partition of `workflow_id` (issue #2252).
+    ///
+    /// Each writer of a workflow-task row calls this. An unstamped row still
+    /// runs: an owner claims it, stamps it and re-pends it to its owner.
+    #[must_use]
+    pub fn with_decision_partition(mut self, workflow_id: &str) -> Self {
+        self.decision_partition = Some(crate::decision_owner::DecisionPartition::for_workflow_id(
+            workflow_id,
+        ));
+        self
     }
 
     /// Set the task priority, overriding the `Normal` default.
@@ -587,6 +603,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         session_id: params.session_id,
         new_start: params.new_start,
         fairness_key: params.fairness_key.as_deref(),
+        decision_partition: params.decision_partition.map(|p| p.as_i16()),
     };
 
     let stamp = insert_task_rows(conn, std::slice::from_ref(&row)).await?;
@@ -634,7 +651,7 @@ const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
 /// number by exhaustive field destructure. Adding or removing a
 /// `NewTaskQueueItem` field breaks that test at compile time until this
 /// constant is updated too, so it cannot silently drift.
-const NEW_TASK_QUEUE_ITEM_COLUMNS: usize = 29;
+const NEW_TASK_QUEUE_ITEM_COLUMNS: usize = 30;
 
 /// Largest row count one `enqueue_batch` `INSERT` may carry.
 ///
@@ -852,6 +869,7 @@ pub async fn enqueue_batch(
                     session_id: p.session_id,
                     new_start: p.new_start,
                     fairness_key: p.fairness_key.as_deref(),
+                    decision_partition: p.decision_partition.map(|p| p.as_i16()),
                 }
             })
             .collect();
@@ -1894,6 +1912,11 @@ struct CachedClaimQuery<'a> {
     circuit_breaker_activities: &'a [String],
     ineligible_activities: &'a [String],
     fence: Option<(Vec<i32>, Vec<i64>)>,
+    /// The named row of a by-id claim (issue #1312). It binds after the
+    /// fence.
+    by_id: Option<Uuid>,
+    /// The owned claim (issue #2252). It binds last.
+    owned: Option<&'a OwnedClaim>,
 }
 
 impl diesel::query_builder::QueryId for CachedClaimQuery<'_> {
@@ -1910,7 +1933,7 @@ impl diesel::query_builder::QueryFragment<diesel::pg::Pg> for CachedClaimQuery<'
         &'b self,
         mut out: diesel::query_builder::AstPass<'_, 'b, diesel::pg::Pg>,
     ) -> diesel::QueryResult<()> {
-        use diesel::sql_types::{Array, BigInt, Integer, Nullable, Text};
+        use diesel::sql_types::{Array, BigInt, Integer, Nullable, SmallInt, Text};
         if self.ageing {
             out.push_sql(CLAIM_AGEING_MARKER);
         }
@@ -1924,6 +1947,13 @@ impl diesel::query_builder::QueryFragment<diesel::pg::Pg> for CachedClaimQuery<'
         if let Some((shards, generations)) = &self.fence {
             out.push_bind_param_value_only::<Array<Integer>, _>(shards)?;
             out.push_bind_param_value_only::<Array<BigInt>, _>(generations)?;
+        }
+        if let Some(task_id) = &self.by_id {
+            out.push_bind_param_value_only::<diesel::sql_types::Uuid, _>(task_id)?;
+        }
+        if let Some(owned) = self.owned {
+            out.push_bind_param_value_only::<Text, _>(&owned.holder)?;
+            out.push_bind_param_value_only::<Array<SmallInt>, _>(&owned.partitions)?;
         }
         Ok(())
     }
@@ -2234,6 +2264,45 @@ pub async fn claim_task_with_fairness(
     kind: Option<TaskType>,
     fairness: ClaimFairness,
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    claim_task_with_owner(
+        conn,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        kind,
+        fairness,
+        None,
+    )
+    .await
+}
+
+/// [`claim_task_with_fairness`] with an owned claim (issue #2252).
+///
+/// `None` issues the legacy statement. `Some` issues the owned form of the
+/// same statement: see [`owned_claim_query_for`]. A worker passes `Some`
+/// only while owner mode is on for the shard of `conn`.
+///
+/// # Errors
+///
+/// As [`claim_task_with_fairness`].
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_with_owner(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    kind: Option<TaskType>,
+    fairness: ClaimFairness,
+    owned: Option<&OwnedClaim>,
+) -> HarvestResult<Option<TaskQueueItem>> {
     if fairness == ClaimFairness::Keys {
         for queue in queues {
             crate::queue_fairness::validate_fairness_queue_name(queue)?;
@@ -2255,6 +2324,7 @@ pub async fn claim_task_with_fairness(
                 shard,
                 kind,
                 fairness,
+                owned,
             )
             .await?;
             if claimed.is_some() {
@@ -2274,6 +2344,7 @@ pub async fn claim_task_with_fairness(
         shard,
         kind,
         fairness,
+        owned,
     )
     .await
 }
@@ -2291,6 +2362,7 @@ async fn claim_task_one_statement(
     shard: Option<crate::types::ShardId>,
     kind: Option<TaskType>,
     fairness: ClaimFairness,
+    owned: Option<&OwnedClaim>,
 ) -> HarvestResult<Option<TaskQueueItem>> {
     // Two-phase claim using a CTE to avoid holding advisory locks during
     // broad WHERE filtering.
@@ -2444,7 +2516,13 @@ async fn claim_task_one_statement(
                 // without a boxed builder, so neither form pays a heap
                 // allocation per bind.
                 let fence = fence_binding(shard);
-                let sql = claim_query_for(kind, fence.is_some(), fairness);
+                // An activity-only claim never takes a workflow row, so it
+                // keeps the legacy text (issue #2252).
+                let owned = owned.filter(|_| kind != Some(TaskType::Activity));
+                let sql = match owned {
+                    Some(_) => owned_claim_query_for(kind, fence.is_some(), fairness),
+                    None => claim_query_for(kind, fence.is_some(), fairness),
+                };
                 let result: Vec<TaskQueueItem> = CachedClaimQuery {
                     sql,
                     ageing,
@@ -2455,6 +2533,8 @@ async fn claim_task_one_statement(
                     circuit_breaker_activities,
                     ineligible_activities,
                     fence,
+                    by_id: None,
+                    owned,
                 }
                 .load(conn)
                 .await
@@ -2673,6 +2753,115 @@ fn fair_variant(kind: Option<TaskType>, fenced: bool) -> &'static str {
         Some(TaskType::Activity) => 4,
     } + usize::from(fenced);
     &FAIR[slot]
+}
+
+pub use crate::decision_owner::OwnedClaim;
+
+/// The sticky gate, in each candidate scan and each head scan.
+const OWNER_STICKY_ANCHOR: &str = "AND ( sticky_worker_id IS NULL ";
+
+/// The session gate, in each candidate scan and each head scan. The owned
+/// gate goes after it.
+const OWNER_SESSION_ANCHOR: &str = "AND ( session_id IS NULL OR sticky_worker_id = $1 ) ";
+
+/// Splice the owned gate into every scan of `base` (issue #2252).
+///
+/// Three changes, and no other text changes:
+///
+/// - A first CTE, `owner_gate`. It sets `harvest.owner_claim` to the holder
+///   token for this transaction, and it reads the owner-mode switch. The
+///   claim guard reads the setting. The CTE is `MATERIALIZED`, so it runs
+///   once, before the first workflow row passes its gate.
+/// - The sticky gate passes each workflow row. The owner is the affinity.
+/// - The owned gate: a workflow row passes only with the switch on, and only
+///   when it is unstamped or in an owned partition.
+///
+/// The assertions make an edit that breaks an anchor panic at first use.
+fn splice_owner_gate(base: &str, holder_bind: &str, partitions_bind: &str) -> String {
+    let sticky = base.matches(OWNER_STICKY_ANCHOR).count();
+    let session = base.matches(OWNER_SESSION_ANCHOR).count();
+    assert!(
+        sticky > 0 && sticky == session,
+        "claim query owner anchors must appear once per scan: {sticky} sticky, {session} session"
+    );
+    #[expect(clippy::expect_used, reason = "every claim query is a constant")]
+    let rest = base
+        .strip_prefix("WITH ")
+        .expect("claim query starts with WITH");
+    let gate_cte = format!(
+        "WITH owner_gate AS MATERIALIZED ( \
+             SELECT set_config('harvest.owner_claim', {holder_bind}::text, true) AS owner_token, \
+                    COALESCE((SELECT enabled FROM harvest_decision_owner_mode \
+                              WHERE singleton), FALSE) AS owner_on \
+         ), "
+    );
+    let owned_gate = format!(
+        "{OWNER_SESSION_ANCHOR}AND ( task_type <> 'workflow' \
+             OR ( (SELECT owner_on FROM owner_gate) \
+                  AND ( decision_partition IS NULL \
+                        OR decision_partition = ANY({partitions_bind}::int2[]) ) ) ) "
+    );
+    format!("{gate_cte}{rest}")
+        .replace(
+            OWNER_STICKY_ANCHOR,
+            "AND ( task_type = 'workflow' OR sticky_worker_id IS NULL ",
+        )
+        .replace(OWNER_SESSION_ANCHOR, &owned_gate)
+}
+
+/// The owned form of each claim statement (issue #2252).
+///
+/// It is [`claim_query_for`] with the owned gate spliced in. The holder and
+/// the partitions bind after the fence: `$7` and `$8`, or `$9` and `$10`
+/// with the fence.
+#[must_use]
+pub fn owned_claim_query_for(
+    kind: Option<TaskType>,
+    fenced: bool,
+    fairness: ClaimFairness,
+) -> &'static str {
+    use std::sync::LazyLock;
+    static OWNED: LazyLock<Vec<String>> = LazyLock::new(|| {
+        let mut variants = Vec::with_capacity(12);
+        for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+            for fenced in [false, true] {
+                for fairness in [ClaimFairness::Off, ClaimFairness::Keys] {
+                    let (holder, partitions) = if fenced { ("$9", "$10") } else { ("$7", "$8") };
+                    variants.push(splice_owner_gate(
+                        claim_query_for(kind, fenced, fairness),
+                        holder,
+                        partitions,
+                    ));
+                }
+            }
+        }
+        variants
+    });
+    let slot = match kind {
+        None => 0,
+        Some(TaskType::Workflow) => 4,
+        Some(TaskType::Activity) => 8,
+    } + 2 * usize::from(fenced)
+        + usize::from(fairness == ClaimFairness::Keys);
+    &OWNED[slot]
+}
+
+/// The owned form of the by-id claim (issue #2252).
+///
+/// The id binds `$7`, or `$9` with the fence. The holder and the partitions
+/// bind after it.
+#[must_use]
+pub fn owned_claim_by_id_query(fenced: bool) -> &'static str {
+    use std::sync::LazyLock;
+    static OWNED_BY_ID: LazyLock<String> =
+        LazyLock::new(|| splice_owner_gate(claim_task_by_id_query(), "$8", "$9"));
+    static OWNED_BY_ID_FENCED: LazyLock<String> =
+        LazyLock::new(|| splice_owner_gate(claim_task_by_id_query_fenced(), "$10", "$11"));
+    if fenced {
+        &OWNED_BY_ID_FENCED
+    } else {
+        &OWNED_BY_ID
+    }
 }
 
 /// The lag of a candidate row's key: `max(pass - V, 0)` (issue #1976).
@@ -3142,6 +3331,41 @@ pub async fn claim_task_by_id_with_fairness(
     shard: Option<crate::types::ShardId>,
     fairness: ClaimFairness,
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    claim_task_by_id_with_owner(
+        conn,
+        task_id,
+        queues,
+        worker_id,
+        worker_build_id,
+        priority_aging_secs,
+        circuit_breaker_activities,
+        ineligible_activities,
+        shard,
+        fairness,
+        None,
+    )
+    .await
+}
+
+/// [`claim_task_by_id_with_fairness`] with an owned claim (issue #2252).
+///
+/// # Errors
+///
+/// As [`claim_task_by_id_with_fairness`].
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_task_by_id_with_owner(
+    conn: &mut AsyncPgConnection,
+    task_id: Uuid,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    priority_aging_secs: Option<u32>,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    fairness: ClaimFairness,
+    owned: Option<&OwnedClaim>,
+) -> HarvestResult<Option<TaskQueueItem>> {
     if fairness == ClaimFairness::Keys {
         for queue in queues {
             crate::queue_fairness::validate_fairness_queue_name(queue)?;
@@ -3153,53 +3377,28 @@ pub async fn claim_task_by_id_with_fairness(
     let outcome: ClaimOutcome = tx
         .run(
             async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
-                // Two fully separate arms for the same reason
-                // `claim_task_on_shard` uses them: a boxed builder
-                // heap-allocates per bind and dispatches dynamically.
-                let result: Vec<TaskQueueItem> = match fence_binding(shard) {
-                    None => {
-                        diesel::sql_query(claim_by_id_query_for(false, fairness))
-                            .bind::<diesel::sql_types::Text, _>(worker_id)
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-                            .bind::<diesel::sql_types::Text, _>(worker_build_id)
-                            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
-                                aging_secs_i64,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                circuit_breaker_activities,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                ineligible_activities,
-                            )
-                            .bind::<diesel::sql_types::Uuid, _>(task_id)
-                            .load(conn)
-                            .await
-                    }
-                    Some((fence_shards, generations)) => {
-                        diesel::sql_query(claim_by_id_query_for(true, fairness))
-                            .bind::<diesel::sql_types::Text, _>(worker_id)
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-                            .bind::<diesel::sql_types::Text, _>(worker_build_id)
-                            .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(
-                                aging_secs_i64,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                circuit_breaker_activities,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(
-                                ineligible_activities,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(
-                                fence_shards,
-                            )
-                            .bind::<diesel::sql_types::Array<diesel::sql_types::BigInt>, _>(
-                                generations,
-                            )
-                            .bind::<diesel::sql_types::Uuid, _>(task_id)
-                            .load(conn)
-                            .await
-                    }
+                // `CachedClaimQuery` binds without a boxed builder, so no
+                // bind pays a heap allocation. The id binds after the fence.
+                let fence = fence_binding(shard);
+                let sql = match owned {
+                    Some(_) => owned_claim_by_id_query(fence.is_some()),
+                    None => claim_by_id_query_for(fence.is_some(), fairness),
+                };
+                let result: Vec<TaskQueueItem> = CachedClaimQuery {
+                    sql,
+                    ageing: false,
+                    worker_id,
+                    queues,
+                    worker_build_id,
+                    aging_secs: aging_secs_i64,
+                    circuit_breaker_activities,
+                    ineligible_activities,
+                    fence,
+                    by_id: Some(task_id),
+                    owned,
                 }
+                .load(conn)
+                .await
                 .map_err(crate::error::database_error)?;
 
                 let Some(task) = result.into_iter().next() else {
@@ -5695,7 +5894,7 @@ pub async fn requeue_claimed_workflow_task_after_deadlock(
     delay: chrono::Duration,
     reason: &str,
 ) -> HarvestResult<bool> {
-    requeue_claimed_workflow_task_with_backoff(conn, claim, delay, reason).await
+    requeue_claimed_workflow_task_with_backoff(conn, claim, delay, reason, None).await
 }
 
 /// Re-pend a panicked workflow task under its claim (issues #782, #1815).
@@ -5716,7 +5915,7 @@ pub async fn requeue_claimed_workflow_task_after_panic(
     delay: chrono::Duration,
     reason: &str,
 ) -> HarvestResult<bool> {
-    requeue_claimed_workflow_task_with_backoff(conn, claim, delay, reason).await
+    requeue_claimed_workflow_task_with_backoff(conn, claim, delay, reason, None).await
 }
 
 /// Re-pend a workflow task whose decision lost its owner fence (issue #2251).
@@ -5740,6 +5939,36 @@ pub async fn requeue_claimed_workflow_task_after_fence(
         claim,
         delay,
         "the decision lost its owner fence (issue #2251)",
+        None,
+    )
+    .await
+}
+
+/// Re-pend a workflow task that this worker does not own (issue #2252).
+///
+/// [`requeue_claimed_workflow_task_after_fence`], and the row takes
+/// `partition` when it has no stamp. An owned claim may take an unstamped
+/// row, because an old binary or a redriven dead letter wrote it with no
+/// stamp. The owner of `partition` then takes it. An unstamped row is due
+/// at once, because its owner can take it now. A stamped row keeps `delay`.
+///
+/// Returns `Ok(false)` when the claim is no longer held.
+///
+/// # Errors
+///
+/// Returns [`crate::error::HarvestError::Database`] on update failure.
+pub async fn requeue_unowned_workflow_task(
+    conn: &mut AsyncPgConnection,
+    claim: &TaskClaim,
+    partition: crate::decision_owner::DecisionPartition,
+    delay: chrono::Duration,
+) -> HarvestResult<bool> {
+    requeue_claimed_workflow_task_with_backoff(
+        conn,
+        claim,
+        delay,
+        "the worker does not own the decision partition (issue #2252)",
+        Some(partition.as_i16()),
     )
     .await
 }
@@ -5752,10 +5981,12 @@ async fn requeue_claimed_workflow_task_with_backoff(
     claim: &TaskClaim,
     delay: chrono::Duration,
     reason: &str,
+    // Issue #2252: the partition to stamp on an unstamped row.
+    stamp: Option<i16>,
 ) -> HarvestResult<bool> {
     use crate::schema::harvest_task_queue::dsl;
     use diesel::dsl::sql;
-    use diesel::sql_types::{Double, Timestamptz};
+    use diesel::sql_types::{Double, Nullable, SmallInt, Timestamptz};
 
     let changeset = PendingRequeueChangeset::new(reason.to_string());
 
@@ -5767,11 +5998,17 @@ async fn requeue_claimed_workflow_task_with_backoff(
     )
     .set((
         changeset,
-        dsl::scheduled_at.eq(
-            sql::<Timestamptz>("clock_timestamp() + make_interval(secs => ")
-                .bind::<Double, _>(delay_secs(delay))
-                .sql(")"),
-        ),
+        dsl::scheduled_at.eq(sql::<Timestamptz>(
+            "clock_timestamp() + make_interval(secs => \
+                 CASE WHEN decision_partition IS NULL AND ",
+        )
+        .bind::<Nullable<SmallInt>, _>(stamp)
+        .sql(" IS NOT NULL THEN 0 ELSE ")
+        .bind::<Double, _>(delay_secs(delay))
+        .sql(" END)")),
+        dsl::decision_partition.eq(sql::<Nullable<SmallInt>>("COALESCE(decision_partition, ")
+            .bind::<Nullable<SmallInt>, _>(stamp)
+            .sql(")")),
         dsl::sticky_worker_id.eq(None::<String>),
         dsl::sticky_until.eq(None::<chrono::DateTime<Utc>>),
         dsl::sticky_timeout.eq(None::<chrono::Duration>),
@@ -7235,6 +7472,9 @@ async fn park_workflow_task_inner(
     // (AC4). A kill here (owned conn in the reproducer's spawned task) rolls the
     // park back, leaving the task RUNNING with a dead worker.
     crate::chaos_point!(QUEUE_PARK_BEFORE_UPDATE);
+    // Issue #2252: the owner of the partition is the affinity of an owned
+    // decision. Its row keeps no sticky pin, and the park clears an old one.
+    let sticky = sticky.filter(|_| crate::decision_owner::pinned_decision().is_none());
     let rows: Vec<WakeRequestedRow> = if let Some(hint) = sticky {
         let timeout = hint.chrono_timeout()?;
         diesel::sql_query(park_workflow_task_sticky_query(reset_capability_misses))
@@ -7262,7 +7502,6 @@ async fn park_workflow_task_inner(
             "workflow task queue item {task_id} is not running"
         )));
     };
-
     Ok(row.had_wake_requested)
 }
 
@@ -10639,6 +10878,99 @@ mod tests {
         }
     }
 
+    /// Undo the owned splice of issue #2252.
+    fn unsplice_owner(owned: &str, holder: &str, partitions: &str) -> String {
+        let gate_cte = format!(
+            "WITH owner_gate AS MATERIALIZED ( \
+                 SELECT set_config('harvest.owner_claim', {holder}::text, true) AS owner_token, \
+                        COALESCE((SELECT enabled FROM harvest_decision_owner_mode \
+                                  WHERE singleton), FALSE) AS owner_on \
+             ), "
+        );
+        let gate = format!(
+            "AND ( task_type <> 'workflow' \
+                 OR ( (SELECT owner_on FROM owner_gate) \
+                      AND ( decision_partition IS NULL \
+                            OR decision_partition = ANY({partitions}::int2[]) ) ) ) "
+        );
+        let rest = owned
+            .strip_prefix(&gate_cte)
+            .expect("the owned claim starts with its gate");
+        format!("WITH {rest}").replace(&gate, "").replace(
+            "AND ( task_type = 'workflow' OR sticky_worker_id IS NULL ",
+            OWNER_STICKY_ANCHOR,
+        )
+    }
+
+    /// Each owned form is its legacy form plus the splice, and nothing else
+    /// (issue #2252). So every gate pinned on the legacy form holds.
+    #[test]
+    fn every_owned_claim_query_is_its_legacy_query_plus_the_owner_gate() {
+        for kind in [None, Some(TaskType::Workflow), Some(TaskType::Activity)] {
+            for fenced in [false, true] {
+                for fairness in [ClaimFairness::Off, ClaimFairness::Keys] {
+                    let legacy = claim_query_for(kind, fenced, fairness);
+                    let owned = owned_claim_query_for(kind, fenced, fairness);
+                    let (holder, partitions) = if fenced { ("$9", "$10") } else { ("$7", "$8") };
+                    assert_eq!(
+                        unsplice_owner(owned, holder, partitions),
+                        legacy,
+                        "{kind:?} fenced={fenced} {fairness:?}"
+                    );
+                    assert!(!owned.contains(&format!("${}", if fenced { 11 } else { 9 })));
+                }
+            }
+        }
+        for fenced in [false, true] {
+            let (legacy, holder, partitions) = if fenced {
+                (claim_task_by_id_query_fenced(), "$10", "$11")
+            } else {
+                (claim_task_by_id_query(), "$8", "$9")
+            };
+            assert_eq!(
+                unsplice_owner(owned_claim_by_id_query(fenced), holder, partitions),
+                legacy
+            );
+        }
+    }
+
+    /// The owned gate reaches every scan: both candidate scans and both head
+    /// scans of the default claim. A missed scan could take a workflow task
+    /// of another owner.
+    #[test]
+    fn the_owned_gate_reaches_every_scan() {
+        let legacy = claim_task_query();
+        let owned = owned_claim_query_for(None, false, ClaimFairness::Off);
+        let scans = legacy.matches(OWNER_SESSION_ANCHOR).count();
+        assert_eq!(scans, 4, "two candidate scans and two head scans");
+        assert_eq!(
+            owned
+                .matches("decision_partition = ANY($8::int2[])")
+                .count(),
+            scans
+        );
+        assert_eq!(
+            owned
+                .matches("task_type = 'workflow' OR sticky_worker_id IS NULL")
+                .count(),
+            scans,
+            "the sticky gate passes a workflow row in every scan"
+        );
+        assert_eq!(owned.matches("set_config('harvest.owner_claim'").count(), 1);
+        let by_id = owned_claim_by_id_query(false);
+        assert_eq!(
+            by_id
+                .matches("decision_partition = ANY($9::int2[])")
+                .count(),
+            1
+        );
+        // The legacy text never mentions owner mode.
+        for text in [legacy, claim_task_by_id_query()] {
+            assert!(!text.contains("owner_gate"));
+            assert!(!text.contains("decision_partition"));
+        }
+    }
+
     /// The fenced batch scan is the base scan plus the splice, and nothing
     /// else (issue #1823).
     #[test]
@@ -11482,6 +11814,8 @@ mod tests {
                 circuit_breaker_activities: &[],
                 ineligible_activities: &[],
                 fence: None,
+                by_id: None,
+                owned: None,
             };
             diesel::debug_query::<diesel::pg::Pg, _>(&query).to_string()
         };
@@ -14566,6 +14900,7 @@ mod tests {
             session_id: None,
             new_start: false,
             fairness_key: None,
+            decision_partition: None,
         };
         let NewTaskQueueItem {
             id: _,
@@ -14597,13 +14932,14 @@ mod tests {
             session_id: _,
             new_start: _,
             fairness_key: _,
+            decision_partition: _,
         } = sample;
         // The field destructure above is the compile-time proof that
         // NEW_TASK_QUEUE_ITEM_COLUMNS counts every field. This const block
         // is a second, independent compile-time check: the chunk size
         // computed from that count never crosses Postgres's ceiling.
         const {
-            assert!(NEW_TASK_QUEUE_ITEM_COLUMNS == 29);
+            assert!(NEW_TASK_QUEUE_ITEM_COLUMNS == 30);
             assert!(
                 ROWS_PER_INSERT_CHUNK * NEW_TASK_QUEUE_ITEM_COLUMNS <= POSTGRES_MAX_BIND_PARAMS
             );

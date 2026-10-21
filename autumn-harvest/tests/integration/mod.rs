@@ -141,6 +141,7 @@ mod debugger_tests;
 mod decision_boundary_db_tests;
 #[cfg(feature = "testing")]
 mod decision_boundary_replay_tests;
+mod decision_owner_claim_tests;
 mod decision_owner_db_tests;
 mod decision_owner_docs;
 #[cfg(feature = "db")]

@@ -445,6 +445,10 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     // renewal updates rows. The migration seeds every row, so no INSERT is
     // needed.
     ("harvest_decision_owner", &["SELECT", "UPDATE"]),
+    // Each owned claim reads the owner-mode switch, and each owner loop
+    // reads it once a second (issue #2252). Only the operator's enable step
+    // writes it.
+    ("harvest_decision_owner_mode", &["SELECT"]),
     // Every completion that recorded an LLM call inserts here, in the
     // completion transaction (issue #1996). A missing grant rolls back the
     // completion, and the activity runs and pays again. `GET /admin/usage`

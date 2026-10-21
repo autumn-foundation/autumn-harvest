@@ -12717,6 +12717,8 @@ async fn persist_all_started_child_workflows(
                 registry.payload_codecs().encode_column(&child.input)?,
             );
             params.workflow_exec_id = Some(child.child_id.as_uuid());
+            // A child's workflow id is its execution id.
+            params = params.with_decision_partition(&child.child_id.to_string());
             params.required_build_id = parent_execution.assigned_build_id.clone();
             (params.concurrency_key, params.max_concurrent) =
                 resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
@@ -12859,6 +12861,8 @@ async fn persist_all_started_child_workflows(
                         registry.payload_codecs().encode_column(&child.input)?,
                     );
                     params.workflow_exec_id = Some(child.child_id.as_uuid());
+                    // A child's workflow id is its execution id.
+                    params = params.with_decision_partition(&child.child_id.to_string());
                     params
                         .required_build_id
                         .clone_from(&parent_execution.assigned_build_id);
@@ -13632,6 +13636,8 @@ async fn insert_awaited_child_execution(
         registry.payload_codecs().encode_column(&child.input)?,
     );
     params.workflow_exec_id = Some(child.child_id.as_uuid());
+    // A child's workflow id is its execution id.
+    params = params.with_decision_partition(&child.child_id.to_string());
     params.required_build_id = parent_execution.assigned_build_id.clone();
     (params.concurrency_key, params.max_concurrent) =
         resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
@@ -16220,6 +16226,7 @@ async fn create_detached_child_executions(
             registry.payload_codecs().encode_column(input)?,
         );
         params.workflow_exec_id = Some(child_id.as_uuid());
+        params = params.with_decision_partition(&child_workflow_id);
         params.required_build_id = parent_execution.assigned_build_id.clone();
         (params.concurrency_key, params.max_concurrent) =
             resolve_workflow_concurrency(registry, workflow_name, input);
@@ -24299,6 +24306,9 @@ async fn persist_workflow_continue_as_new_with_verdict(
         registry.payload_codecs().encode_column(&input)?,
     );
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
+    // Continue-as-new keeps the workflow id, so the successor keeps the
+    // partition (ADR 0009 decision 3).
+    enqueue = enqueue.with_decision_partition(&execution.workflow_id);
     enqueue.required_build_id = execution.assigned_build_id.clone();
     enqueue.concurrency_key = successor_concurrency_key;
     enqueue.max_concurrent = successor_concurrency_cap;
@@ -29780,7 +29790,9 @@ async fn unload_fenced_partition(
         return Ok(TaskDispatchOutcome::ClaimLostAfterFailure);
     };
     let delay = fence_repend_delay(pinned);
-    if queue::requeue_claimed_workflow_task_after_fence(conn, &claim, delay).await? {
+    // Issue #2252: an owned claim may take an unstamped row. Stamp it, so
+    // the owner of its partition takes it next.
+    if queue::requeue_unowned_workflow_task(conn, &claim, key.partition, delay).await? {
         Ok(TaskDispatchOutcome::Fenced)
     } else {
         Ok(TaskDispatchOutcome::ClaimLostAfterFailure)
@@ -32835,6 +32847,11 @@ pub struct Worker {
     /// Wrapped in `Arc<tokio::sync::Mutex<_>>` so it can be shared across
     /// concurrently-running task handler futures without cloning the events.
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
+    /// The shard that keys the owner tenures of each claim target (issue
+    /// #2252). Colocated shards share one database, so they share one key.
+    /// A target with no entry keys by itself.
+    owner_shards:
+        std::sync::RwLock<std::collections::HashMap<crate::types::ShardId, crate::types::ShardId>>,
     /// In-process consecutive-timeout strike counter per workflow execution
     /// (issue #494).
     ///
@@ -34248,6 +34265,116 @@ impl UnstartedClaim {
     }
 }
 
+/// How often the owner loop scans its database (ADR 0009 decision 8).
+const OWNER_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One database of a multi-shard worker (issue #2252).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnerGroup<P> {
+    /// The lowest claim target on the database. It keys the tenures of every
+    /// target there.
+    canonical: crate::types::ShardId,
+    /// The pool of the database.
+    pool: P,
+    /// The claim targets on the database.
+    members: Vec<crate::types::ShardId>,
+    /// The database also serves a shard that this worker does not target.
+    /// Its 512 owner rows serve that shard too, so this worker must not own
+    /// them (ADR 0009 decision 10).
+    split: bool,
+}
+
+/// Group the claim `targets` by database. `all` lists every shard of the
+/// process pool, and `same` says whether two pools reach one database.
+fn owner_groups<P: Clone>(
+    targets: &[(crate::types::ShardId, P)],
+    all: &[(crate::types::ShardId, P)],
+    same: impl Fn(&P, &P) -> bool,
+) -> Vec<OwnerGroup<P>> {
+    let mut groups: Vec<OwnerGroup<P>> = Vec::new();
+    for (shard, pool) in targets {
+        if let Some(group) = groups.iter_mut().find(|g| same(&g.pool, pool)) {
+            group.members.push(*shard);
+            group.canonical = group.canonical.min(*shard);
+        } else {
+            groups.push(OwnerGroup {
+                canonical: *shard,
+                pool: pool.clone(),
+                members: vec![*shard],
+                split: false,
+            });
+        }
+    }
+    for group in &mut groups {
+        group.split = all
+            .iter()
+            .any(|(shard, pool)| same(&group.pool, pool) && !group.members.contains(shard));
+    }
+    groups
+}
+
+/// The owner loop of one database, as the run path holds it (issue #2252).
+struct OwnerLoopHandle {
+    state: Arc<tokio::sync::Mutex<crate::decision_owner::OwnerLoop>>,
+    stop: CancellationToken,
+    _task: AbortOnDrop,
+}
+
+/// One scan of an owner loop (issue #2252).
+///
+/// The cache entries of each dropped tenure go first. Each new tenure then
+/// drops the entries of its partition before the worker adopts it, so a new
+/// tenure starts cold (rule R4 of ADR 0010).
+async fn owner_scan(
+    state: &tokio::sync::Mutex<crate::decision_owner::OwnerLoop>,
+    pool: &DbPool,
+    cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    owned: &crate::decision_owner::OwnedPartitions,
+    worker_id: &str,
+) {
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::warn!(worker_id = %worker_id, error = %e, "owner loop: no connection");
+            return;
+        }
+    };
+    let tick = state.lock().await.tick(&mut conn).await;
+    drop(conn);
+    match tick {
+        Ok(tick) => {
+            evict_owner_keys(cache, &tick.dropped).await;
+            let keys: Vec<_> = tick.acquired.iter().map(|(t, _)| t.key()).collect();
+            evict_owner_keys(cache, &keys).await;
+            for (tenure, deadline) in tick.acquired {
+                owned.adopt_until(tenure, deadline);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(worker_id = %worker_id, error = %e, "owner loop scan failed");
+        }
+    }
+}
+
+/// Drop the cache entries of each partition of `keys`.
+async fn evict_owner_keys(
+    cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    keys: &[crate::decision_owner::OwnerKey],
+) {
+    if keys.is_empty() {
+        return;
+    }
+    let mut closed = Vec::with_capacity(keys.len());
+    {
+        let mut guard = cache.lock().await;
+        for key in keys {
+            closed.push(guard.evict_partition(*key));
+        }
+    }
+    // Each entry can hold a parked handler future. Drop them outside the lock.
+    drop(closed);
+}
+
 /// Owns a task handle and aborts the task when dropped (issue #1552).
 ///
 /// A bare `JoinHandle` detaches its task on drop. Cancelling the future that
@@ -35003,6 +35130,7 @@ impl Worker {
             remote_drain_deadline: Arc::new(Mutex::new(None)),
             drain_deadline_max: Arc::new(Mutex::new(None)),
             workflow_cache,
+            owner_shards: std::sync::RwLock::default(),
             workflow_task_timeout_strikes: Arc::default(),
             workflow_panic_strikes: Arc::default(),
             workflow_deadlock_strikes: Arc::default(),
@@ -35653,6 +35781,10 @@ impl Worker {
             })
             .collect();
 
+        // Issue #2252: one owner loop per database. Colocated targets share
+        // its key.
+        let owner_loops = self.spawn_owner_loops(&shard_targets);
+
         let shard_listeners = self.build_shard_listeners(&shard_targets).await;
 
         // Use each assigned shard's dispatch channel, captured once by
@@ -35705,6 +35837,9 @@ impl Worker {
         let shutdown_acquire_bound = shard_acquire_bound(true, self.config.poll_interval);
         self.drain_releasing_sticky_pins(&shard_targets, shutdown_acquire_bound)
             .await;
+        for (pool, handle) in &owner_loops {
+            self.release_owner_partitions(pool, handle).await;
+        }
 
         // Stopped: mark every shard pool's worker row stopped, then cancel heartbeats.
         for (shard, shard_pool) in &shard_targets {
@@ -36182,6 +36317,13 @@ impl Worker {
             [shard, ..] => Some(*shard),
             [] => None,
         };
+        // Issue #2252: the owner loop of this pool's database. Every
+        // assignment of a single pool shares it, so one key serves them all.
+        let owner_loop = self.spawn_owner_loop(
+            pool,
+            crate::decision_owner::OwnerKey::pool_shard(poll_shard),
+            false,
+        );
 
         // Decide the dispatch span once, here, and hold it for the whole loop
         // (issue #1312). It stops a wide-span worker from using a global
@@ -36215,6 +36357,9 @@ impl Worker {
         };
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         tokio::join!(bookkeeping, self.drain_in_flight());
+        // Issue #2252: no decision of this worker runs now, so hand the
+        // partitions over in one statement.
+        self.release_owner_partitions(pool, &owner_loop).await;
         // A single pool names its shard through the default pin.
         self.keep_lease_while_handlers_run(vec![(None, pool.clone())]);
 
@@ -36309,6 +36454,125 @@ impl Worker {
     /// that now carries a DR marker stops the worker, so it restarts and pins.
     /// The task ends with the run, because the guard aborts it on drop.
     #[cfg(feature = "db")]
+    /// Start the owner loop of one database (issue #2252).
+    ///
+    /// `owner_shard` keys the tenures of the database. `refuse` keeps owner
+    /// mode off for this worker there, for a split colocated group (ADR 0009
+    /// decision 10). The loop scans every [`OWNER_SCAN_INTERVAL`]. It stops
+    /// at shutdown. [`Self::release_owner_partitions`] then releases its
+    /// partitions after the drain.
+    fn spawn_owner_loop(
+        &self,
+        pool: &DbPool,
+        owner_shard: crate::types::ShardId,
+        refuse: bool,
+    ) -> OwnerLoopHandle {
+        let mut owner_loop = crate::decision_owner::OwnerLoop::new(
+            owner_shard,
+            &self.config.worker_id,
+            crate::decision_owner::OwnerLeaseConfig::default(),
+            self.registry.decision_owner(),
+            Duration::from_secs(
+                u64::try_from(worker_stale_secs(self.config.worker_heartbeat_interval))
+                    .unwrap_or(1),
+            ),
+        );
+        if refuse {
+            owner_loop.refuse();
+        }
+        let state = Arc::new(tokio::sync::Mutex::new(owner_loop));
+        let stop = CancellationToken::new();
+        let task = {
+            let state = Arc::clone(&state);
+            let stop = stop.clone();
+            let pool = pool.clone();
+            let cache = Arc::clone(&self.workflow_cache);
+            let owned = self.registry.decision_owner();
+            let worker_id = self.config.worker_id.clone();
+            AbortOnDrop::new(tokio::spawn(async move {
+                loop {
+                    owner_scan(&state, &pool, &cache, &owned, &worker_id).await;
+                    tokio::select! {
+                        () = stop.cancelled() => return,
+                        () = tokio::time::sleep(OWNER_SCAN_INTERVAL) => {}
+                    }
+                }
+            }))
+        };
+        OwnerLoopHandle {
+            state,
+            stop,
+            _task: task,
+        }
+    }
+
+    /// Start one owner loop per database of `targets` (issue #2252).
+    fn spawn_owner_loops(
+        &self,
+        targets: &[(crate::types::ShardId, DbPool)],
+    ) -> Vec<(DbPool, OwnerLoopHandle)> {
+        let all: Vec<(crate::types::ShardId, DbPool)> = self
+            .config
+            .sharded_pool
+            .as_ref()
+            .map(|sharded| {
+                sharded
+                    .shard_ids()
+                    .into_iter()
+                    .filter_map(|shard| sharded.exact_pool_for(shard).map(|p| (shard, p.clone())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let groups = owner_groups(
+            targets,
+            &all,
+            crate::external_target_location::same_underlying_pool,
+        );
+        let mut map = std::collections::HashMap::new();
+        let mut handles = Vec::with_capacity(groups.len());
+        for group in groups {
+            if group.split {
+                tracing::error!(
+                    worker_id = %self.config.worker_id,
+                    shards = ?group.members.iter().map(|s| s.as_i32()).collect::<Vec<_>>(),
+                    "owner mode refused on a database: this worker covers only part of its \
+                     colocated shards (ADR 0009 decision 10)"
+                );
+            }
+            for member in &group.members {
+                map.insert(*member, group.canonical);
+            }
+            let handle = self.spawn_owner_loop(&group.pool, group.canonical, group.split);
+            handles.push((group.pool, handle));
+        }
+        if let Ok(mut owner_shards) = self.owner_shards.write() {
+            *owner_shards = map;
+        }
+        handles
+    }
+
+    /// Release every owned partition of `handle` (ADR 0009 decision 9).
+    ///
+    /// The worker calls this after its drain, so no decision of its own still
+    /// runs. A failed release lapses within one TTL.
+    async fn release_owner_partitions(&self, pool: &DbPool, handle: &OwnerLoopHandle) {
+        handle.stop.cancel();
+        let owner_loop = handle.state.lock().await;
+        let released = match pool.get().await {
+            Ok(mut conn) => owner_loop.release_everything(&mut conn).await,
+            Err(e) => Err(HarvestError::Database(e.to_string())),
+        };
+        drop(owner_loop);
+        match released {
+            Ok(keys) => evict_owner_keys(&self.workflow_cache, &keys).await,
+            Err(e) => tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %e,
+                "failed to release decision partitions; their leases lapse within one TTL"
+            ),
+        }
+    }
+
     fn spawn_held_resolver(
         &self,
         held: Vec<(crate::types::ShardId, DbPool)>,
@@ -37744,10 +38008,11 @@ impl Worker {
 
         let circuit_breakers = self.registry.circuit_breakers();
         let exclusions = self.claim_exclusions();
+        let owned = self.owned_claim(shard);
         let claim_started = std::time::Instant::now();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
-                queue::claim_task_by_id_with_fairness(
+                queue::claim_task_by_id_with_owner(
                     conn,
                     lease.task_id,
                     &self.config.queues,
@@ -37758,6 +38023,7 @@ impl Worker {
                     &exclusions,
                     shard,
                     self.claim_fairness(),
+                    owned.as_ref(),
                 )
                 .await
             })
@@ -38976,6 +39242,25 @@ impl Worker {
 
     /// The activity names that a claim must skip: the names with unmet
     /// requirements, plus the types at their adaptive limit (issue #1836).
+    /// The shard that keys the owner tenures of claim target `shard` (issue
+    /// #2252).
+    fn owner_shard_of(&self, shard: Option<crate::types::ShardId>) -> crate::types::ShardId {
+        let key = crate::decision_owner::OwnerKey::pool_shard(shard);
+        self.owner_shards
+            .read()
+            .ok()
+            .and_then(|map| map.get(&key).copied())
+            .unwrap_or(key)
+    }
+
+    /// The owned claim of claim target `shard`, or `None` when owner mode is
+    /// off there (issue #2252).
+    fn owned_claim(&self, shard: Option<crate::types::ShardId>) -> Option<queue::OwnedClaim> {
+        self.registry
+            .decision_owner()
+            .owned_claim(self.owner_shard_of(shard))
+    }
+
     fn claim_exclusions(&self) -> std::borrow::Cow<'_, [String]> {
         let limits = &self.registry.adaptive_limits;
         // The common case reads one atomic and takes no lock.
@@ -39210,6 +39495,9 @@ impl Worker {
         let circuit_breakers = self.registry.circuit_breakers();
         let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
         let exclusions = self.claim_exclusions();
+        // Issue #2252: in owner mode, claim workflow tasks of owned
+        // partitions only.
+        let owned = self.owned_claim(shard);
 
         // --- Weighted queue selection (issue #515) ---
         //
@@ -39243,7 +39531,7 @@ impl Worker {
                 let claim_started = std::time::Instant::now();
                 let claimed = self
                     .claim_with_conflict_retry(&mut conn, async |conn| {
-                        queue::claim_task_with_fairness(
+                        queue::claim_task_with_owner(
                             conn,
                             &single_queue,
                             &self.config.worker_id,
@@ -39254,6 +39542,7 @@ impl Worker {
                             shard,
                             kind,
                             self.claim_fairness(),
+                            owned.as_ref(),
                         )
                         .await
                     })
@@ -39296,7 +39585,7 @@ impl Worker {
         let claim_started = std::time::Instant::now();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
-                queue::claim_task_with_fairness(
+                queue::claim_task_with_owner(
                     conn,
                     &self.config.queues,
                     &self.config.worker_id,
@@ -39307,6 +39596,7 @@ impl Worker {
                     shard,
                     kind,
                     self.claim_fairness(),
+                    owned.as_ref(),
                 )
                 .await
             })
@@ -39434,7 +39724,7 @@ impl Worker {
         let pool = pool.clone();
         let pool_labels = self.pool_labels(shard);
         // Issue #2251: the owner key names the database of the claim.
-        let owner_shard = crate::decision_owner::OwnerKey::pool_shard(shard);
+        let owner_shard = self.owner_shard_of(shard);
         let registry = Arc::clone(&self.registry);
         let task_id = task.id;
         let task_type = task.task_type.clone();
@@ -50241,6 +50531,44 @@ mod tests {
         };
         assert!(!registered(&metrics));
         assert!(!registered(&other_metrics));
+    }
+
+    #[test]
+    fn colocated_targets_share_one_owner_key() {
+        use crate::types::ShardId;
+        // Shards 1 and 2 share database "a". Shard 3 has database "b".
+        let targets = [
+            (ShardId::new(2), "a"),
+            (ShardId::new(1), "a"),
+            (ShardId::new(3), "b"),
+        ];
+        let groups = owner_groups(&targets, &targets, |x, y| x == y);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0].canonical,
+            ShardId::new(1),
+            "the lowest shard keys the database"
+        );
+        assert_eq!(groups[0].members, vec![ShardId::new(2), ShardId::new(1)]);
+        assert!(!groups[0].split);
+        assert_eq!(groups[1].canonical, ShardId::new(3));
+    }
+
+    #[test]
+    fn a_split_colocated_group_refuses_owner_mode() {
+        use crate::types::ShardId;
+        let all = [
+            (ShardId::new(1), "a"),
+            (ShardId::new(2), "a"),
+            (ShardId::new(3), "b"),
+        ];
+        let targets = [(ShardId::new(1), "a"), (ShardId::new(3), "b")];
+        let groups = owner_groups(&targets, &all, |x, y| x == y);
+        assert!(
+            groups[0].split,
+            "shard 2 shares database a but is not a target"
+        );
+        assert!(!groups[1].split);
     }
 
     #[test]

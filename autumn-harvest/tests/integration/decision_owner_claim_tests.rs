@@ -1,0 +1,963 @@
+#![cfg(feature = "db")]
+//! Owned workflow-task claims and the owner-mode switch (issue #2252).
+//!
+//! Owner mode is a per-database switch, so each test here runs on its own
+//! database. With `HARVEST_TEST_DATABASE_URL` set, a test creates a fresh
+//! database on that server and drops it at the end. Without it, each test
+//! starts its own container.
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use autumn_harvest::decision_owner::{
+    self, Acquisition, DecisionPartition, EnableOwnerMode, OwnedPartitions, OwnerHolder, OwnerKey,
+    OwnerLeaseConfig, OwnerLoop,
+};
+use autumn_harvest::prelude::*;
+use autumn_harvest::queue::{self, EnqueueParams, OwnedClaim, TaskType};
+use autumn_harvest::telemetry::{MetricsRecorder, ResidentOutcome, TelemetryConfig};
+use autumn_harvest::types::{ExecutionId, ShardId};
+use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
+use diesel::QueryableByName;
+use diesel::sql_types::{BigInt, Integer, Text};
+use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use testcontainers::ContainerAsync;
+use testcontainers_modules::postgres::Postgres;
+
+use crate::integration_e2e::{
+    build_test_pool, setup_test_database_url, spawn_test_worker,
+    wait_for_execution_state_with_timeout,
+};
+
+const STEPS: [&str; 3] = ["owner_step_a", "owner_step_b", "owner_step_c"];
+
+// ── Database ────────────────────────────────────────────────────────────────
+
+/// A migrated database that one test owns, and how to drop it.
+struct OwnDb {
+    url: String,
+    _container: Option<ContainerAsync<Postgres>>,
+    name: Option<String>,
+}
+
+impl OwnDb {
+    async fn new() -> Self {
+        let Ok(shared) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
+            let (url, container) = setup_test_database_url().await;
+            return Self {
+                url,
+                _container: Some(container),
+                name: None,
+            };
+        };
+        let name = format!("harvest_owner_{}", uuid::Uuid::new_v4().simple());
+        let mut admin = AsyncPgConnection::establish(&shared)
+            .await
+            .expect("connect");
+        diesel::sql_query(format!("CREATE DATABASE {name}"))
+            .execute(&mut admin)
+            .await
+            .expect("create the database");
+        let url = with_database(&shared, &name);
+        let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+        conn.batch_execute(&autumn_harvest::test_init_sql())
+            .await
+            .expect("apply migrations");
+        Self {
+            url,
+            _container: None,
+            name: Some(name),
+        }
+    }
+
+    async fn conn(&self) -> AsyncPgConnection {
+        AsyncPgConnection::establish(&self.url)
+            .await
+            .expect("connect")
+    }
+
+    /// Drop the database. A panicking test leaks it; the prefix names it.
+    async fn drop_db(self) {
+        let (Some(name), Ok(shared)) = (self.name, std::env::var("HARVEST_TEST_DATABASE_URL"))
+        else {
+            return;
+        };
+        if let Ok(mut admin) = AsyncPgConnection::establish(&shared).await {
+            let _ = diesel::sql_query(format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                .execute(&mut admin)
+                .await;
+        }
+    }
+}
+
+fn with_database(url: &str, database: &str) -> String {
+    let (base, query) = url
+        .split_once('?')
+        .map_or((url, None), |(b, q)| (b, Some(q)));
+    let (prefix, _) = base.rsplit_once('/').expect("a database URL has a path");
+    query.map_or_else(
+        || format!("{prefix}/{database}"),
+        |query| format!("{prefix}/{database}?{query}"),
+    )
+}
+
+fn unique(prefix: &str) -> String {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    format!("{prefix}-{}", &suffix[..12])
+}
+
+fn partition(n: u16) -> DecisionPartition {
+    DecisionPartition::new(n).expect("in range")
+}
+
+/// Turn owner mode on. No worker is live, so no check refuses.
+async fn enable(conn: &mut AsyncPgConnection) {
+    decision_owner::enable_owner_mode(conn, &EnableOwnerMode::default())
+        .await
+        .expect("enable owner mode");
+}
+
+/// Enqueue a workflow task in `partition`, or with no stamp.
+async fn workflow_task(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+    partition: Option<DecisionPartition>,
+) -> uuid::Uuid {
+    let mut params = EnqueueParams::new(queue_name, TaskType::Workflow, serde_json::json!({}));
+    params.decision_partition = partition;
+    queue::enqueue(conn, &params).await.expect("enqueue")
+}
+
+async fn activity_task(conn: &mut AsyncPgConnection, queue_name: &str) -> uuid::Uuid {
+    let mut params = EnqueueParams::new(queue_name, TaskType::Activity, serde_json::json!({}));
+    params.activity_name = Some("owner_any".to_string());
+    queue::enqueue(conn, &params).await.expect("enqueue")
+}
+
+/// The legacy claim of a worker that knows nothing of owner mode.
+async fn legacy_claim(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+) -> Option<autumn_harvest::models::TaskQueueItem> {
+    queue::claim_task(
+        conn,
+        &[queue_name.to_string()],
+        "legacy-worker",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("legacy claim")
+}
+
+async fn owned_claim(
+    conn: &mut AsyncPgConnection,
+    queue_name: &str,
+    owned: &OwnedClaim,
+) -> Option<autumn_harvest::models::TaskQueueItem> {
+    queue::claim_task_with_owner(
+        conn,
+        &[queue_name.to_string()],
+        "owner-worker",
+        "",
+        None,
+        &[],
+        &[],
+        None,
+        None,
+        queue::ClaimFairness::Off,
+        Some(owned),
+    )
+    .await
+    .expect("owned claim")
+}
+
+/// Acquire `p` for a new holder of `worker`.
+async fn take(
+    conn: &mut AsyncPgConnection,
+    worker: &str,
+    p: DecisionPartition,
+) -> decision_owner::OwnerTenure {
+    let holder = OwnerHolder::for_worker(worker);
+    match decision_owner::acquire(
+        conn,
+        ShardId::UNENCODED,
+        &holder,
+        p,
+        &OwnerLeaseConfig::default(),
+    )
+    .await
+    .expect("acquire")
+    {
+        Acquisition::Acquired(tenure) => tenure,
+        other => panic!("acquire {p}: {other:?}"),
+    }
+}
+
+#[derive(QueryableByName)]
+struct StateRow {
+    #[diesel(sql_type = Text)]
+    state: String,
+    #[diesel(sql_type = Integer)]
+    attempt: i32,
+}
+
+async fn task_state(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> (String, i32) {
+    let row: StateRow =
+        diesel::sql_query("SELECT state, attempt FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(id)
+            .get_result(conn)
+            .await
+            .expect("read the task");
+    (row.state, row.attempt)
+}
+
+// ── The claim guard ─────────────────────────────────────────────────────────
+
+/// Done-when item 4: a legacy-mode worker cannot claim a workflow task on
+/// an owner-mode shard. The guard is the structural part, so the claim runs
+/// the unchanged legacy statement, as an old binary does.
+#[tokio::test]
+async fn a_legacy_claim_cannot_take_a_workflow_task_on_an_owner_mode_shard() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let q = unique("owner-legacy");
+    enable(&mut conn).await;
+    let wf = workflow_task(&mut conn, &q, Some(partition(7))).await;
+    let unstamped = workflow_task(&mut conn, &q, None).await;
+
+    assert!(
+        legacy_claim(&mut conn, &q).await.is_none(),
+        "the guard refuses a legacy workflow claim"
+    );
+    assert_eq!(task_state(&mut conn, wf).await, ("PENDING".to_string(), 0));
+    assert_eq!(
+        task_state(&mut conn, unstamped).await,
+        ("PENDING".to_string(), 0)
+    );
+
+    // Activities stay on the shared claim in both modes. A legacy claim that
+    // picks a workflow row gets nothing, so an old binary can also miss an
+    // activity behind it. That is why the enable step refuses while one is
+    // live.
+    let act = activity_task(&mut conn, &q).await;
+    let claimed = queue::claim_task_of_kind_on_shard(
+        &mut conn,
+        &[q.clone()],
+        "legacy-worker",
+        "",
+        None,
+        &[],
+        &[],
+        None,
+        Some(TaskType::Activity),
+    )
+    .await
+    .expect("legacy activity claim");
+    assert_eq!(claimed.map(|t| t.id), Some(act));
+    assert!(legacy_claim(&mut conn, &q).await.is_none());
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn an_owned_claim_takes_only_owned_and_unstamped_workflow_tasks() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let q = unique("owner-owned");
+    enable(&mut conn).await;
+    let tenure = take(&mut conn, "owner-worker", partition(11)).await;
+    let mine = workflow_task(&mut conn, &q, Some(partition(11))).await;
+    let other = workflow_task(&mut conn, &q, Some(partition(12))).await;
+    let unstamped = workflow_task(&mut conn, &q, None).await;
+    let claim = OwnedClaim {
+        holder: tenure.holder().as_str().to_string(),
+        partitions: vec![partition(11).as_i16()],
+    };
+
+    let mut claimed = Vec::new();
+    while let Some(task) = owned_claim(&mut conn, &q, &claim).await {
+        claimed.push(task.id);
+    }
+    claimed.sort();
+    let mut expected = vec![mine, unstamped];
+    expected.sort();
+    assert_eq!(
+        claimed, expected,
+        "the owned partition and the unstamped row"
+    );
+    assert_eq!(
+        task_state(&mut conn, other).await,
+        ("PENDING".to_string(), 0)
+    );
+    db.drop_db().await;
+}
+
+/// The guard matches the holder of the owner row, so a stale owner cannot
+/// claim after a takeover, even when its local list is wrong.
+#[tokio::test]
+async fn the_guard_refuses_a_holder_that_does_not_own_the_partition() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let q = unique("owner-stale");
+    enable(&mut conn).await;
+    let _owner = take(&mut conn, "real-owner", partition(21)).await;
+    let wf = workflow_task(&mut conn, &q, Some(partition(21))).await;
+    let stale = OwnedClaim {
+        holder: OwnerHolder::for_worker("stale-owner").as_str().to_string(),
+        partitions: vec![partition(21).as_i16()],
+    };
+    assert!(owned_claim(&mut conn, &q, &stale).await.is_none());
+    assert_eq!(task_state(&mut conn, wf).await, ("PENDING".to_string(), 0));
+    db.drop_db().await;
+}
+
+/// With the switch off, the owned claim takes no workflow task, so two
+/// claim forms never run at once.
+#[tokio::test]
+async fn an_owned_claim_takes_no_workflow_task_with_the_switch_off() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let q = unique("owner-off");
+    let tenure = take(&mut conn, "owner-worker", partition(31)).await;
+    let wf = workflow_task(&mut conn, &q, Some(partition(31))).await;
+    let claim = OwnedClaim {
+        holder: tenure.holder().as_str().to_string(),
+        partitions: vec![partition(31).as_i16()],
+    };
+    assert!(owned_claim(&mut conn, &q, &claim).await.is_none());
+    let legacy = legacy_claim(&mut conn, &q).await.expect("the legacy claim");
+    assert_eq!(legacy.id, wf);
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn the_owned_by_id_claim_obeys_the_same_gate() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let q = unique("owner-by-id");
+    enable(&mut conn).await;
+    let tenure = take(&mut conn, "owner-worker", partition(41)).await;
+    let mine = workflow_task(&mut conn, &q, Some(partition(41))).await;
+    let other = workflow_task(&mut conn, &q, Some(partition(42))).await;
+    let claim = OwnedClaim {
+        holder: tenure.holder().as_str().to_string(),
+        partitions: vec![partition(41).as_i16()],
+    };
+    let by_id = |id| {
+        let q = q.clone();
+        let claim = claim.clone();
+        let url = db.url.clone();
+        async move {
+            let mut conn = AsyncPgConnection::establish(&url).await.expect("connect");
+            queue::claim_task_by_id_with_owner(
+                &mut conn,
+                id,
+                &[q],
+                "owner-worker",
+                "",
+                None,
+                &[],
+                &[],
+                None,
+                queue::ClaimFairness::Off,
+                Some(&claim),
+            )
+            .await
+            .expect("by-id claim")
+        }
+    };
+    assert!(by_id(other).await.is_none(), "not an owned partition");
+    assert_eq!(by_id(mine).await.map(|t| t.id), Some(mine));
+    // A legacy by-id claim of a stamped row is refused by the guard.
+    let late = workflow_task(&mut conn, &q, Some(partition(41))).await;
+    let legacy = queue::claim_task_by_id_on_shard(
+        &mut conn,
+        late,
+        &[q.clone()],
+        "legacy-worker",
+        "",
+        None,
+        &[],
+        &[],
+        None,
+    )
+    .await
+    .expect("legacy by-id claim");
+    assert!(legacy.is_none());
+    db.drop_db().await;
+}
+
+// ── Enable and disable ──────────────────────────────────────────────────────
+
+async fn register_worker(conn: &mut AsyncPgConnection, worker_id: &str, capable: bool) {
+    let labels = if capable {
+        decision_owner::advertise_owner_capability(&serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    diesel::sql_query(
+        "INSERT INTO harvest_workers (worker_id, started_at, last_heartbeat_at, queues, \
+             shard_assignments, max_concurrency, in_flight_count, host, version, status, labels) \
+         VALUES ($1, NOW(), NOW(), '[\"q\"]'::jsonb, '[]'::jsonb, 1, 0, 'h', 'v', 'Active', $2)",
+    )
+    .bind::<Text, _>(worker_id)
+    .bind::<diesel::sql_types::Jsonb, _>(labels)
+    .execute(conn)
+    .await
+    .expect("register a worker");
+}
+
+#[tokio::test]
+async fn enable_refuses_while_a_live_worker_cannot_run_owner_mode() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    register_worker(&mut conn, "old-binary", false).await;
+    register_worker(&mut conn, "new-binary", true).await;
+    let refused = decision_owner::enable_owner_mode(&mut conn, &EnableOwnerMode::default()).await;
+    let message = refused
+        .expect_err("a live legacy worker blocks owner mode")
+        .to_string();
+    assert!(message.contains("old-binary"), "{message}");
+    assert!(!message.contains("new-binary"), "{message}");
+    let mode = decision_owner::read_owner_mode(&mut conn)
+        .await
+        .expect("mode");
+    assert!(!mode.enabled && !mode.guard_installed, "{mode:?}");
+
+    let forced = decision_owner::enable_owner_mode(
+        &mut conn,
+        &EnableOwnerMode {
+            force: true,
+            ..EnableOwnerMode::default()
+        },
+    )
+    .await
+    .expect("forced enable");
+    assert_eq!(forced.legacy_workers, vec!["old-binary".to_string()]);
+    let mode = decision_owner::read_owner_mode(&mut conn)
+        .await
+        .expect("mode");
+    assert!(mode.enabled && mode.guard_installed, "{mode:?}");
+    db.drop_db().await;
+}
+
+/// The enable step stamps each live workflow task and re-pends each legacy
+/// claim that does not end within the drain bound.
+#[tokio::test]
+async fn enable_stamps_rows_and_repends_a_legacy_claim_left_running() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let q = unique("owner-enable");
+    let exec = uuid::Uuid::new_v4();
+    let workflow_id = "owner-enable-wf";
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions (id, workflow_name, workflow_id, shard_id, input) \
+         VALUES ($1, 'owner_enable', $2, 0, '{}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec)
+    .bind::<Text, _>(workflow_id)
+    .execute(&mut conn)
+    .await
+    .expect("insert an execution");
+    let mut params = EnqueueParams::new(&q, TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(exec);
+    let task = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+    let legacy = legacy_claim(&mut conn, &q).await.expect("a legacy claim");
+    assert_eq!(legacy.id, task);
+
+    let report = decision_owner::enable_owner_mode(
+        &mut conn,
+        &EnableOwnerMode {
+            drain_timeout: Duration::from_millis(200),
+            ..EnableOwnerMode::default()
+        },
+    )
+    .await
+    .expect("enable");
+    assert_eq!(report.stamped, 1);
+    assert_eq!(report.repended, 1);
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = Text)]
+        state: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::SmallInt>)]
+        decision_partition: Option<i16>,
+    }
+    let row: Row =
+        diesel::sql_query("SELECT state, decision_partition FROM harvest_task_queue WHERE id = $1")
+            .bind::<diesel::sql_types::Uuid, _>(task)
+            .get_result(&mut conn)
+            .await
+            .expect("read the task");
+    assert_eq!(row.state, "PENDING");
+    assert_eq!(
+        row.decision_partition,
+        Some(DecisionPartition::for_workflow_id(workflow_id).as_i16())
+    );
+    let again = decision_owner::enable_owner_mode(&mut conn, &EnableOwnerMode::default())
+        .await
+        .expect("enable again");
+    assert!(again.already_on);
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn disable_drops_the_guard_and_the_legacy_claim_works_again() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let q = unique("owner-disable");
+    enable(&mut conn).await;
+    let wf = workflow_task(&mut conn, &q, Some(partition(51))).await;
+    assert!(legacy_claim(&mut conn, &q).await.is_none());
+    decision_owner::disable_owner_mode(&mut conn, Duration::from_secs(5))
+        .await
+        .expect("disable");
+    let mode = decision_owner::read_owner_mode(&mut conn)
+        .await
+        .expect("mode");
+    assert!(!mode.enabled && !mode.guard_installed, "{mode:?}");
+    assert_eq!(legacy_claim(&mut conn, &q).await.map(|t| t.id), Some(wf));
+    db.drop_db().await;
+}
+
+// ── The owner loop ──────────────────────────────────────────────────────────
+
+#[derive(QueryableByName)]
+struct HeldRow {
+    #[diesel(sql_type = Text)]
+    holder: String,
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
+async fn held_by_worker(conn: &mut AsyncPgConnection) -> BTreeMap<String, i64> {
+    let rows: Vec<HeldRow> = diesel::sql_query(
+        "SELECT holder, count(*)::bigint AS n FROM harvest_decision_owner \
+         WHERE holder IS NOT NULL AND lease_until > clock_timestamp() GROUP BY holder",
+    )
+    .load(conn)
+    .await
+    .expect("read the holders");
+    rows.into_iter()
+        .map(|r| {
+            let worker = r
+                .holder
+                .rsplit_once('/')
+                .map_or(r.holder.clone(), |(w, _)| w.to_string());
+            (worker, r.n)
+        })
+        .collect()
+}
+
+fn new_loop(worker: &str) -> (OwnerLoop, Arc<OwnedPartitions>) {
+    let owned = Arc::new(OwnedPartitions::default());
+    let owner_loop = OwnerLoop::new(
+        ShardId::UNENCODED,
+        worker,
+        OwnerLeaseConfig::default(),
+        Arc::clone(&owned),
+        Duration::from_secs(30),
+    );
+    (owner_loop, owned)
+}
+
+async fn tick(owner_loop: &mut OwnerLoop, owned: &OwnedPartitions, conn: &mut AsyncPgConnection) {
+    let tick = owner_loop.tick(conn).await.expect("tick");
+    for (tenure, deadline) in tick.acquired {
+        owned.adopt_until(tenure, deadline);
+    }
+}
+
+/// Workers rebalance on join and leave (ADR 0009 decision 9).
+#[tokio::test]
+async fn owner_loops_rebalance_on_join_and_leave() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    enable(&mut conn).await;
+    register_worker(&mut conn, "loop-a", true).await;
+    let (mut a, owned_a) = new_loop("loop-a");
+
+    tick(&mut a, &owned_a, &mut conn).await;
+    assert_eq!(owned_a.len(), 512, "a lone worker owns every partition");
+    assert!(owned_a.owner_mode(ShardId::UNENCODED));
+    let claim = owned_a.owned_claim(ShardId::UNENCODED).expect("owner mode");
+    assert_eq!(claim.partitions.len(), 512);
+
+    // Worker B joins.
+    register_worker(&mut conn, "loop-b", true).await;
+    let (mut b, owned_b) = new_loop("loop-b");
+    tick(&mut b, &owned_b, &mut conn).await;
+    assert!(owned_b.is_empty(), "no partition is free yet");
+    tick(&mut a, &owned_a, &mut conn).await;
+    assert_eq!(owned_a.len(), 256, "A releases down to the target");
+    tick(&mut b, &owned_b, &mut conn).await;
+    assert_eq!(owned_b.len(), 256, "B acquires the released partitions");
+    let held = held_by_worker(&mut conn).await;
+    assert_eq!(held.get("loop-a"), Some(&256), "{held:?}");
+    assert_eq!(held.get("loop-b"), Some(&256), "{held:?}");
+
+    // Worker B leaves gracefully.
+    let released = b.release_everything(&mut conn).await.expect("release");
+    assert_eq!(released.len(), 256);
+    diesel::sql_query("UPDATE harvest_workers SET status = 'Stopped' WHERE worker_id = 'loop-b'")
+        .execute(&mut conn)
+        .await
+        .expect("stop B");
+    tick(&mut a, &owned_a, &mut conn).await;
+    assert_eq!(owned_a.len(), 512, "A takes the partitions back");
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn an_owner_loop_releases_everything_when_the_switch_goes_off() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    enable(&mut conn).await;
+    let (mut a, owned_a) = new_loop("loop-off");
+    tick(&mut a, &owned_a, &mut conn).await;
+    assert_eq!(owned_a.len(), 512);
+    decision_owner::disable_owner_mode(&mut conn, Duration::from_secs(5))
+        .await
+        .expect("disable");
+    let report = a.tick(&mut conn).await.expect("tick");
+    assert!(!report.owner_mode);
+    assert_eq!(report.dropped.len(), 512);
+    assert!(owned_a.is_empty());
+    assert!(owned_a.owned_claim(ShardId::UNENCODED).is_none());
+    assert!(held_by_worker(&mut conn).await.is_empty());
+    let key = OwnerKey {
+        shard: ShardId::UNENCODED,
+        partition: partition(0),
+    };
+    assert_eq!(owned_a.pin_for(key), decision_owner::DecisionPin::Legacy);
+    db.drop_db().await;
+}
+
+// ── Workers ─────────────────────────────────────────────────────────────────
+
+#[activity(start_to_close = "30s")]
+async fn owner_step_a(_ctx: &ActivityContext, pause_ms: u64) -> Result<serde_json::Value, String> {
+    tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+    Ok(serde_json::Value::Null)
+}
+
+#[activity(start_to_close = "30s")]
+async fn owner_step_b(_ctx: &ActivityContext, pause_ms: u64) -> Result<serde_json::Value, String> {
+    tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+    Ok(serde_json::Value::Null)
+}
+
+#[activity(start_to_close = "30s")]
+async fn owner_step_c(_ctx: &ActivityContext, pause_ms: u64) -> Result<serde_json::Value, String> {
+    tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+    Ok(serde_json::Value::Null)
+}
+
+/// Three activities in sequence, as the e2e throughput bench runs. Each run
+/// makes four decisions.
+#[workflow]
+async fn owner_three_steps(ctx: &WorkflowContext, input: (String, u64)) -> Result<String, String> {
+    let (queue_name, pause_ms) = input;
+    for name in STEPS {
+        ctx.execute_activity_raw(name, serde_json::json!(pause_ms), &queue_name)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok("done".to_string())
+}
+
+/// Three one-second timers in sequence. Each run makes four decisions. A
+/// timer fires after a short sticky window, and no wake re-arms the pin.
+#[workflow]
+async fn owner_three_timers(ctx: &WorkflowContext, _input: String) -> Result<String, String> {
+    for name in ["owner_t1", "owner_t2", "owner_t3"] {
+        ctx.timer(name, 1).await.map_err(|e| e.to_string())?;
+    }
+    Ok("done".to_string())
+}
+
+/// Counts each resident outcome of one worker.
+#[derive(Default, Clone)]
+struct Outcomes(Arc<Mutex<BTreeMap<String, u64>>>);
+
+impl Outcomes {
+    fn snapshot(&self) -> BTreeMap<String, u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl MetricsRecorder for Outcomes {
+    fn record_workflow_resident(&self, _workflow: &str, _queue: &str, outcome: ResidentOutcome) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(outcome.as_str().to_string())
+            .or_default() += 1;
+    }
+}
+
+struct Spec {
+    claim_loops: usize,
+    sticky: Duration,
+}
+
+fn build_worker(queue_name: &str, outcomes: &Outcomes, spec: &Spec) -> Arc<Worker> {
+    let built = HarvestBuilder::new()
+        .workflows(workflows![owner_three_steps, owner_three_timers])
+        .activities(activities![owner_step_a, owner_step_b, owner_step_c])
+        .worker(
+            WorkerConfig::default()
+                .with_queues([queue_name])
+                .with_sticky_routing(autumn_harvest::StickyRoutingConfig {
+                    lease_ttl: spec.sticky,
+                }),
+        )
+        .telemetry(
+            TelemetryConfig::builder()
+                .metrics(Arc::new(outcomes.clone()))
+                .build(),
+        )
+        .build();
+    let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
+    let mut runtime: WorkerRuntimeConfig = worker_config.into();
+    runtime.worker_id = unique("owner-claim-worker");
+    runtime.poll_interval = Duration::from_millis(25);
+    runtime.max_concurrent_workflows = 8;
+    runtime.max_concurrent_activities = 16;
+    runtime.max_concurrent_claims = spec.claim_loops;
+    runtime.worker_heartbeat_interval = Duration::from_secs(1);
+    Arc::new(Worker::new(runtime, Arc::new(registry)).expect("worker"))
+}
+
+/// Run `runs` workflows with at most `inflight` at once.
+async fn run_workflows(
+    url: &str,
+    pool: &DbPool,
+    queue_name: &str,
+    runs: usize,
+    inflight: usize,
+    pause_ms: u64,
+) {
+    let client = WorkflowHandleClient::single(pool.clone(), url.to_string());
+    let mut conn = AsyncPgConnection::establish(url).await.expect("connect");
+    let mut started = 0;
+    let mut waiting: std::collections::VecDeque<ExecutionId> = std::collections::VecDeque::new();
+    while started < runs || !waiting.is_empty() {
+        while started < runs && waiting.len() < inflight {
+            let opts = TypedStartOptions {
+                queue_name: Some(queue_name.to_string()),
+                ..Default::default()
+            };
+            let exec = OwnerThreeStepsStub::start_with_options(
+                &mut conn,
+                &client,
+                &unique("owner-claim-wf"),
+                (queue_name.to_string(), pause_ms),
+                opts,
+            )
+            .await
+            .expect("start")
+            .exec_id();
+            started += 1;
+            waiting.push_back(exec);
+        }
+        if let Some(exec) = waiting.pop_front() {
+            wait_for_execution_state_with_timeout(url, exec, "COMPLETED", Duration::from_secs(90))
+                .await;
+        }
+    }
+}
+
+/// Start `runs` timer workflows at once and wait for each.
+async fn run_timer_workflows(url: &str, pool: &DbPool, queue_name: &str, runs: usize) {
+    let client = WorkflowHandleClient::single(pool.clone(), url.to_string());
+    let mut conn = AsyncPgConnection::establish(url).await.expect("connect");
+    let mut started = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let opts = TypedStartOptions {
+            queue_name: Some(queue_name.to_string()),
+            ..Default::default()
+        };
+        let exec = OwnerThreeTimersStub::start_with_options(
+            &mut conn,
+            &client,
+            &unique("owner-timer-wf"),
+            String::new(),
+            opts,
+        )
+        .await
+        .expect("start")
+        .exec_id();
+        started.push(exec);
+    }
+    for exec in started {
+        wait_for_execution_state_with_timeout(url, exec, "COMPLETED", Duration::from_secs(90))
+            .await;
+    }
+}
+
+/// Wait until owners hold every partition, `n` each at least.
+async fn wait_for_owners(conn: &mut AsyncPgConnection, workers: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let held = held_by_worker(conn).await;
+        let total: i64 = held.values().sum();
+        if held.len() == workers && total == 512 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "owners did not settle: {held:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// One worker with two claim loops runs `runs` workflows. Returns its
+/// resident outcomes.
+async fn two_loop_outcomes(owner_mode: bool, runs: usize) -> BTreeMap<String, u64> {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    if owner_mode {
+        enable(&mut conn).await;
+    }
+    let pool: DbPool = build_test_pool(&db.url);
+    let q = unique("owner-cold");
+    let outcomes = Outcomes::default();
+    let spec = Spec {
+        claim_loops: 2,
+        sticky: autumn_harvest::builder::DEFAULT_STICKY_TIMEOUT,
+    };
+    let worker = build_worker(&q, &outcomes, &spec);
+    let handle = spawn_test_worker(Arc::clone(&worker), pool.clone());
+    if owner_mode {
+        wait_for_owners(&mut conn, 1).await;
+    }
+    run_workflows(&db.url, &pool, &q, runs, 32, 0).await;
+    worker.shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+    db.drop_db().await;
+    outcomes.snapshot()
+}
+
+/// Done-when item 1: with two claim loops and owner mode on, the worker
+/// makes no extra cold decision. Each run makes exactly four decisions, and
+/// only the first decision of each run is cold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_claim_loops_in_owner_mode_make_no_extra_cold_decisions() {
+    let runs = 200;
+    let seen = two_loop_outcomes(true, runs).await;
+    let total: u64 = seen.values().sum();
+    let runs = u64::try_from(runs).expect("fits");
+    assert_eq!(total, 4 * runs, "four decisions per run: {seen:?}");
+    assert_eq!(seen.get("cold").copied().unwrap_or(0), runs, "{seen:?}");
+    assert_eq!(seen.get("hit").copied().unwrap_or(0), 3 * runs, "{seen:?}");
+}
+
+/// The legacy measurement of the test above. The extra decisions depend on
+/// timing, so it prints the counts and asserts nothing. The e2e bench
+/// records them in a release build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, not a gate"]
+async fn two_claim_loops_without_owner_mode_measurement() {
+    let seen = two_loop_outcomes(false, 200).await;
+    eprintln!("legacy mode, two claim loops: {seen:?}");
+}
+
+/// Two workers, two claim loops each, and timers longer than a 200 ms
+/// sticky window. Returns the resident outcomes of both workers and the
+/// number of runs.
+async fn sticky_window_outcomes(owner_mode: bool) -> (BTreeMap<String, u64>, Vec<u64>, u64) {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    if owner_mode {
+        enable(&mut conn).await;
+    }
+    let pool: DbPool = build_test_pool(&db.url);
+    let q = unique("owner-window");
+    let spec = Spec {
+        claim_loops: 2,
+        sticky: Duration::from_millis(200),
+    };
+    let outcomes = [Outcomes::default(), Outcomes::default()];
+    let workers: Vec<Arc<Worker>> = outcomes
+        .iter()
+        .map(|o| build_worker(&q, o, &spec))
+        .collect();
+    let handles: Vec<_> = workers
+        .iter()
+        .map(|w| spawn_test_worker(Arc::clone(w), pool.clone()))
+        .collect();
+    if owner_mode {
+        wait_for_owners(&mut conn, 2).await;
+    }
+
+    let runs = 24;
+    run_timer_workflows(&db.url, &pool, &q, runs).await;
+    for worker in &workers {
+        worker.shutdown();
+    }
+    for handle in handles {
+        let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
+    }
+    let mut seen: BTreeMap<String, u64> = BTreeMap::new();
+    let mut per_worker = Vec::new();
+    for o in &outcomes {
+        let snapshot = o.snapshot();
+        per_worker.push(snapshot.values().sum());
+        for (k, v) in snapshot {
+            *seen.entry(k).or_default() += v;
+        }
+    }
+    db.drop_db().await;
+    (seen, per_worker, u64::try_from(runs).expect("fits"))
+}
+
+/// The hits over the decisions after the first of each run.
+fn continuation_hits(seen: &BTreeMap<String, u64>, runs: u64) -> (u64, u64) {
+    let total: u64 = seen.values().sum();
+    (
+        seen.get("hit").copied().unwrap_or(0),
+        total.saturating_sub(runs),
+    )
+}
+
+/// Done-when item 2: resident hits survive the sticky window. Each timer
+/// fires after the window. Two workers own half of the partitions
+/// each. Every decision after the first of a run resumes on its owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resident_hits_survive_the_sticky_window_in_owner_mode() {
+    let (seen, per_worker, runs) = sticky_window_outcomes(true).await;
+    eprintln!("owner mode, outcomes across the sticky window: {seen:?}");
+    let total: u64 = seen.values().sum();
+    assert_eq!(total, 4 * runs, "four decisions per run: {seen:?}");
+    let (hits, continuations) = continuation_hits(&seen, runs);
+    assert!(
+        hits * 100 >= continuations * 95,
+        "continuation hit rate below 95%: {seen:?}"
+    );
+    assert!(
+        per_worker.iter().all(|n| *n > 0),
+        "both owners decide: {per_worker:?}"
+    );
+}
+
+/// The control for the test above: with sticky routing alone, a decision
+/// after the window lands on either worker, so many replay cold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resident_hits_drop_after_the_sticky_window_without_owner_mode() {
+    let (seen, _per_worker, runs) = sticky_window_outcomes(false).await;
+    eprintln!("legacy mode, outcomes across the sticky window: {seen:?}");
+    let (hits, continuations) = continuation_hits(&seen, runs);
+    assert!(
+        hits * 100 < continuations * 95,
+        "the control should miss: {seen:?}"
+    );
+}

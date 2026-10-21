@@ -4372,6 +4372,7 @@ pub mod db {
             session_id: None,
             new_start: false,
             fairness_key: None,
+            decision_partition: None,
         }
     }
 

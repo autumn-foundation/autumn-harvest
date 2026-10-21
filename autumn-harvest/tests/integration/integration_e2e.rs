@@ -1996,6 +1996,7 @@ async fn full_workflow_lifecycle() {
     // 8. Verify the completed task in the queue has COMPLETED state
     let task: Vec<autumn_harvest::models::TaskQueueItem> = harvest_task_queue::table
         .filter(harvest_task_queue::id.eq(task_id))
+        .select(autumn_harvest::models::TaskQueueItem::as_select())
         .load(&mut conn)
         .await
         .expect("failed to query task");

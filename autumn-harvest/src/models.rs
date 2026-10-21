@@ -680,6 +680,9 @@ pub struct NewTaskQueueItem<'a> {
     pub new_start: bool,
     /// The fairness key of the task (issue #1976).
     pub fairness_key: Option<&'a str>,
+    /// The decision partition of a workflow task (issue #2252). `None` for
+    /// an activity, or when the writer does not know the workflow id.
+    pub decision_partition: Option<i16>,
 }
 
 /// Database representation of a rate limit bucket.

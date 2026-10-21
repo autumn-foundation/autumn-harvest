@@ -47,6 +47,37 @@ Any other delta declines. A decline drops the resident workflow and runs a cold 
 - A resident future keeps the state of a foreign future, such as a raw `tokio::time::sleep` in a `select!`. Such a workflow is not deterministic on a cold worker either. Use a Harvest timer instead.
 - A join branch that runs a command after its own await, while a later branch has a command event, fails a cold replay. A warm decision cannot always see this shape. When the earlier branch's result arrives last, the warm decision runs on, and the failure shows at the next cold replay. Issue #1798 has the same limit for a single wait. Run the next command after the join, or check in-flight histories with `ReplayVerifier`.
 
+## Owner mode replaces stickiness
+
+Owner mode (issue #2252, [ADR 0009](adr/0009-decision-owner.md)) gives each execution one owner worker. It replaces the sticky lease for workflow tasks. Activity tasks do not change.
+
+- **One owner per partition.** Each database has 512 decision partitions. The partition of an execution is a hash of its `workflow_id`. A worker holds a lease on each partition that it owns.
+- **Owned claim.** An owner claims a workflow task only from its own partitions. The sticky gate does not apply to a workflow row, and the park writes no pin. So no window expires, and every decision of an execution runs on its owner.
+- **Resident hits survive.** The owner keeps the resident workflow between decisions, however long the next activity, timer or signal takes. A decision replays cold only after an eviction, a restart or a change of owner.
+- **Balance.** Each worker targets `⌈512 / live owners⌉` partitions. A worker that joins takes free partitions. A worker above its target plus one releases the extra ones. A graceful stop releases every partition in one statement.
+- **Failover.** A crashed owner's leases lapse after the TTL, 10 s by default. Another worker then acquires its partitions within about one second. A new owner starts cold.
+- **Fence.** Each decision commit checks the owner's lease epoch. A stale owner cannot write. See [ADR 0009](adr/0009-decision-owner.md).
+
+| | Sticky routing | Owner mode |
+|---|---|---|
+| Affinity | 5 s lease on the task row | Lease on the decision partition |
+| After the window | Any worker claims, and the decision replays cold | The owner claims, and the decision resumes |
+| Claim cost | A sticky predicate in each scan | A partition test in each scan |
+| Crash recovery | Up to one sticky window | Up to one lease TTL, plus one scan |
+
+### Turning owner mode on
+
+Owner mode is a switch per database. It is off by default. Turn it on with `decision_owner::enable_owner_mode`. The step:
+
+1. Refuses while a live worker cannot run owner mode, or while live workers poll different queues or run different builds. An owner claims every workflow task of its partitions, so each owner must be able to run each of them.
+2. Stamps the partition of each live workflow task.
+3. Installs a guard on the claim of a workflow task. A claim with no owner token then takes no workflow task. A binary from before owner mode sends no token, so a fleet can never mix the two claim styles.
+4. Waits for in-flight legacy decisions, re-pends any that remain, and sets the switch.
+
+`decision_owner::disable_owner_mode` clears the switch and drops the guard in one transaction. Owners then release their partitions and claim as before.
+
+Workers read the switch about once a second. A worker in owner mode still caches workflow state and still needs `sticky_timeout` above zero. `harvest.workflow.resident` keeps the same labels in both modes.
+
 ## Configuration
 
 Sticky routing is **on by default**. `WorkerConfig::default()` sets `sticky_timeout` to `DEFAULT_STICKY_TIMEOUT` (5 s), the same fallback window that Temporal uses for its sticky queue. Change the window per worker with `WorkerConfig::with_sticky_routing`:
