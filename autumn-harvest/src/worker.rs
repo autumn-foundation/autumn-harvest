@@ -34322,8 +34322,8 @@ struct OwnerLoopHandle {
 
 /// One scan of an owner loop (issue #2252).
 ///
-/// The cache entries of each dropped tenure go first. Each new tenure then
-/// drops the entries of its partition before the worker adopts it, so a new
+/// The cache entries of each dropped tenure go first. Then the entries of
+/// each new partition go, before the worker adopts its tenure. So a new
 /// tenure starts cold (rule R4 of ADR 0010).
 async fn owner_scan(
     state: &tokio::sync::Mutex<crate::decision_owner::OwnerLoop>,
