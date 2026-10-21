@@ -1562,6 +1562,12 @@ without a capped key pay nothing.
   head makes each claim read the whole run. Live pins last one sticky
   timeout, so they follow the claim rate. Session pins and paused
   activities do not.
+- **Workflow rows of other owners.** In owner mode (issue #2252), the
+  owned claim skips each workflow row of another owner's partition. With N
+  owners, a workflow head reads about 32 × N rows. A dead owner's rows wait
+  at the head until a peer acquires its partitions, so each claim reads
+  them until then. A review run on PG16 read 381 buffers against 119 for
+  the legacy claim, with 4,900 foreign rows ahead of 100 owned ones.
 - **A large live pin set.** The pin head reads every live pin of this
   worker. More than 32 of them that pass the gates also make every rank-0
   row wait for the fallback.

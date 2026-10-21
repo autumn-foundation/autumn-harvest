@@ -34339,7 +34339,10 @@ async fn owner_scan(
             return;
         }
     };
-    let tick = state.lock().await.tick(&mut conn).await;
+    // The loop lock stays held until the adoption ends. A release then
+    // never runs between an acquisition and its adoption.
+    let mut owner_loop = state.lock().await;
+    let tick = owner_loop.tick(&mut conn).await;
     drop(conn);
     match tick {
         Ok(tick) => {
@@ -34354,6 +34357,7 @@ async fn owner_scan(
             tracing::warn!(worker_id = %worker_id, error = %e, "owner loop scan failed");
         }
     }
+    drop(owner_loop);
 }
 
 /// Drop the cache entries of each partition of `keys`.
@@ -34364,13 +34368,7 @@ async fn evict_owner_keys(
     if keys.is_empty() {
         return;
     }
-    let mut closed = Vec::with_capacity(keys.len());
-    {
-        let mut guard = cache.lock().await;
-        for key in keys {
-            closed.push(guard.evict_partition(*key));
-        }
-    }
+    let closed = cache.lock().await.evict_partitions(keys);
     // Each entry can hold a parked handler future. Drop them outside the lock.
     drop(closed);
 }
@@ -35838,7 +35836,8 @@ impl Worker {
         self.drain_releasing_sticky_pins(&shard_targets, shutdown_acquire_bound)
             .await;
         for (pool, handle) in &owner_loops {
-            self.release_owner_partitions(pool, handle).await;
+            self.release_owner_partitions(pool, handle, shutdown_acquire_bound)
+                .await;
         }
 
         // Stopped: mark every shard pool's worker row stopped, then cancel heartbeats.
@@ -36322,7 +36321,7 @@ impl Worker {
         let owner_loop = self.spawn_owner_loop(
             pool,
             crate::decision_owner::OwnerKey::pool_shard(poll_shard),
-            false,
+            self.single_pool_splits_a_group(pool),
         );
 
         // Decide the dispatch span once, here, and hold it for the whole loop
@@ -36359,7 +36358,7 @@ impl Worker {
         tokio::join!(bookkeeping, self.drain_in_flight());
         // Issue #2252: no decision of this worker runs now, so hand the
         // partitions over in one statement.
-        self.release_owner_partitions(pool, &owner_loop).await;
+        self.release_owner_partitions(pool, &owner_loop, None).await;
         // A single pool names its shard through the default pin.
         self.keep_lease_while_handlers_run(vec![(None, pool.clone())]);
 
@@ -36448,12 +36447,6 @@ impl Worker {
         })
     }
 
-    /// Re-probe the shards this worker held at startup (issue #1823).
-    ///
-    /// Retries with backoff until every held shard is released. A held shard
-    /// that now carries a DR marker stops the worker, so it restarts and pins.
-    /// The task ends with the run, because the guard aborts it on drop.
-    #[cfg(feature = "db")]
     /// Start the owner loop of one database (issue #2252).
     ///
     /// `owner_shard` keys the tenures of the database. `refuse` keeps owner
@@ -36472,12 +36465,11 @@ impl Worker {
             &self.config.worker_id,
             crate::decision_owner::OwnerLeaseConfig::default(),
             self.registry.decision_owner(),
-            Duration::from_secs(
-                u64::try_from(worker_stale_secs(self.config.worker_heartbeat_interval))
-                    .unwrap_or(1),
-            ),
         );
-        if refuse {
+        // A worker that cannot run a workflow task must not own partitions.
+        // It still claims in the owned form, so the guard never blocks its
+        // activity claims.
+        if refuse || !self.can_own_partitions() {
             owner_loop.refuse();
         }
         let state = Arc::new(tokio::sync::Mutex::new(owner_loop));
@@ -36504,6 +36496,78 @@ impl Worker {
             stop,
             _task: task,
         }
+    }
+
+    /// Whether this worker can own decision partitions (issue #2252).
+    ///
+    /// An owner claims every workflow task of its partitions. A worker with
+    /// no workflow slot or no workflow type would strand them.
+    fn can_own_partitions(&self) -> bool {
+        self.config.max_concurrent_workflows > 0 && !self.registry.workflows.is_empty()
+    }
+
+    /// Release every owned partition of `handle` (ADR 0009 decision 9).
+    ///
+    /// The worker calls this after its drain, so no decision of its own still
+    /// runs. The loop lock waits for a scan in progress, and the release
+    /// stops the loop for good. A failed release lapses within one TTL.
+    async fn release_owner_partitions(
+        &self,
+        pool: &DbPool,
+        handle: &OwnerLoopHandle,
+        acquire_bound: Option<Duration>,
+    ) {
+        handle.stop.cancel();
+        let mut owner_loop = handle.state.lock().await;
+        let conn = match acquire_bound {
+            Some(bound) => tokio::time::timeout(bound, pool.get())
+                .await
+                .map_err(|_| HarvestError::Database("owner release: pool timeout".to_string()))
+                .and_then(|r| r.map_err(|e| HarvestError::Database(e.to_string()))),
+            None => pool
+                .get()
+                .await
+                .map_err(|e| HarvestError::Database(e.to_string())),
+        };
+        let released = match conn {
+            Ok(mut conn) => owner_loop.release_everything(&mut conn).await,
+            Err(e) => Err(e),
+        };
+        drop(owner_loop);
+        match released {
+            Ok(keys) => evict_owner_keys(&self.workflow_cache, &keys).await,
+            Err(e) => tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %e,
+                "failed to release decision partitions; their leases lapse within one TTL"
+            ),
+        }
+    }
+
+    /// Whether the database of `pool` serves a shard of the process pool
+    /// that this worker does not target (ADR 0009 decision 10).
+    fn single_pool_splits_a_group(&self, pool: &DbPool) -> bool {
+        let Some(sharded) = self.config.sharded_pool.as_ref() else {
+            return false;
+        };
+        let targets: Vec<(crate::types::ShardId, DbPool)> = self
+            .config
+            .shard_assignments
+            .iter()
+            .map(|shard| (*shard, pool.clone()))
+            .collect();
+        let all: Vec<(crate::types::ShardId, DbPool)> = sharded
+            .shard_ids()
+            .into_iter()
+            .filter_map(|shard| sharded.exact_pool_for(shard).map(|p| (shard, p.clone())))
+            .collect();
+        owner_groups(
+            &targets,
+            &all,
+            crate::external_target_location::same_underlying_pool,
+        )
+        .iter()
+        .any(|group| group.split)
     }
 
     /// Start one owner loop per database of `targets` (issue #2252).
@@ -36551,28 +36615,12 @@ impl Worker {
         handles
     }
 
-    /// Release every owned partition of `handle` (ADR 0009 decision 9).
+    /// Re-probe the shards this worker held at startup (issue #1823).
     ///
-    /// The worker calls this after its drain, so no decision of its own still
-    /// runs. A failed release lapses within one TTL.
-    async fn release_owner_partitions(&self, pool: &DbPool, handle: &OwnerLoopHandle) {
-        handle.stop.cancel();
-        let owner_loop = handle.state.lock().await;
-        let released = match pool.get().await {
-            Ok(mut conn) => owner_loop.release_everything(&mut conn).await,
-            Err(e) => Err(HarvestError::Database(e.to_string())),
-        };
-        drop(owner_loop);
-        match released {
-            Ok(keys) => evict_owner_keys(&self.workflow_cache, &keys).await,
-            Err(e) => tracing::warn!(
-                worker_id = %self.config.worker_id,
-                error = %e,
-                "failed to release decision partitions; their leases lapse within one TTL"
-            ),
-        }
-    }
-
+    /// Retries with backoff until every held shard is released. A held shard
+    /// that now carries a DR marker stops the worker, so it restarts and pins.
+    /// The task ends with the run, because the guard aborts it on drop.
+    #[cfg(feature = "db")]
     fn spawn_held_resolver(
         &self,
         held: Vec<(crate::types::ShardId, DbPool)>,
@@ -38008,7 +38056,6 @@ impl Worker {
 
         let circuit_breakers = self.registry.circuit_breakers();
         let exclusions = self.claim_exclusions();
-        let owned = self.owned_claim(shard);
         let claim_started = std::time::Instant::now();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
@@ -38023,7 +38070,7 @@ impl Worker {
                     &exclusions,
                     shard,
                     self.claim_fairness(),
-                    owned.as_ref(),
+                    self.owned_claim(shard).as_ref(),
                 )
                 .await
             })
@@ -39240,8 +39287,6 @@ impl Worker {
         }
     }
 
-    /// The activity names that a claim must skip: the names with unmet
-    /// requirements, plus the types at their adaptive limit (issue #1836).
     /// The shard that keys the owner tenures of claim target `shard` (issue
     /// #2252).
     fn owner_shard_of(&self, shard: Option<crate::types::ShardId>) -> crate::types::ShardId {
@@ -39261,6 +39306,8 @@ impl Worker {
             .owned_claim(self.owner_shard_of(shard))
     }
 
+    /// The activity names that a claim must skip: the names with unmet
+    /// requirements, plus the types at their adaptive limit (issue #1836).
     fn claim_exclusions(&self) -> std::borrow::Cow<'_, [String]> {
         let limits = &self.registry.adaptive_limits;
         // The common case reads one atomic and takes no lock.

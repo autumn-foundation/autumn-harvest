@@ -107,15 +107,24 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{}", &suffix[..12])
 }
 
-fn partition(n: u16) -> DecisionPartition {
-    DecisionPartition::new(n).expect("in range")
+const fn partition(n: u16) -> DecisionPartition {
+    match DecisionPartition::new(n) {
+        Some(p) => p,
+        None => panic!("partition out of range"),
+    }
 }
 
-/// Turn owner mode on. No worker is live, so no check refuses.
+/// Turn owner mode on. A test may have no live owner loop yet, so it forces.
 async fn enable(conn: &mut AsyncPgConnection) {
-    decision_owner::enable_owner_mode(conn, &EnableOwnerMode::default())
-        .await
-        .expect("enable owner mode");
+    decision_owner::enable_owner_mode(
+        conn,
+        &EnableOwnerMode {
+            force: true,
+            ..EnableOwnerMode::default()
+        },
+    )
+    .await
+    .expect("enable owner mode");
 }
 
 /// Enqueue a workflow task in `partition`, or with no stamp.
@@ -205,6 +214,30 @@ struct StateRow {
     attempt: i32,
 }
 
+#[derive(QueryableByName)]
+struct StampRow {
+    #[diesel(sql_type = Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::SmallInt>)]
+    decision_partition: Option<i16>,
+}
+
+#[derive(QueryableByName)]
+struct StampDueRow {
+    #[diesel(sql_type = Text)]
+    state: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::SmallInt>)]
+    decision_partition: Option<i16>,
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    due: bool,
+}
+
+#[derive(QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = BigInt)]
+    n: i64,
+}
+
 async fn task_state(conn: &mut AsyncPgConnection, id: uuid::Uuid) -> (String, i32) {
     let row: StateRow =
         diesel::sql_query("SELECT state, attempt FROM harvest_task_queue WHERE id = $1")
@@ -246,7 +279,7 @@ async fn a_legacy_claim_cannot_take_a_workflow_task_on_an_owner_mode_shard() {
     let act = activity_task(&mut conn, &q).await;
     let claimed = queue::claim_task_of_kind_on_shard(
         &mut conn,
-        &[q.clone()],
+        std::slice::from_ref(&q),
         "legacy-worker",
         "",
         None,
@@ -376,7 +409,7 @@ async fn the_owned_by_id_claim_obeys_the_same_gate() {
     let legacy = queue::claim_task_by_id_on_shard(
         &mut conn,
         late,
-        &[q.clone()],
+        std::slice::from_ref(&q),
         "legacy-worker",
         "",
         None,
@@ -444,8 +477,8 @@ async fn enable_refuses_while_a_live_worker_cannot_run_owner_mode() {
     db.drop_db().await;
 }
 
-/// The enable step stamps each live workflow task and re-pends each legacy
-/// claim that does not end within the drain bound.
+/// The enable step stamps each live workflow task. It re-pends the legacy
+/// claim of a worker that is not live. A live worker keeps its claim.
 #[tokio::test]
 async fn enable_stamps_rows_and_repends_a_legacy_claim_left_running() {
     let db = OwnDb::new().await;
@@ -467,26 +500,47 @@ async fn enable_stamps_rows_and_repends_a_legacy_claim_left_running() {
     let task = queue::enqueue(&mut conn, &params).await.expect("enqueue");
     let legacy = legacy_claim(&mut conn, &q).await.expect("a legacy claim");
     assert_eq!(legacy.id, task);
+    // A second run, claimed by a live worker.
+    register_worker(&mut conn, "live-legacy", true).await;
+    let live_exec = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions (id, workflow_name, workflow_id, shard_id, input) \
+         VALUES ($1, 'owner_enable', 'owner-enable-live', 0, '{}'::jsonb)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(live_exec)
+    .execute(&mut conn)
+    .await
+    .expect("insert an execution");
+    let mut params = EnqueueParams::new(&q, TaskType::Workflow, serde_json::json!({}));
+    params.workflow_exec_id = Some(live_exec);
+    let live_task = queue::enqueue(&mut conn, &params).await.expect("enqueue");
+    let live = queue::claim_task(
+        &mut conn,
+        std::slice::from_ref(&q),
+        "live-legacy",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("the live worker claims");
+    assert_eq!(live.id, live_task);
 
     let report = decision_owner::enable_owner_mode(
         &mut conn,
         &EnableOwnerMode {
-            drain_timeout: Duration::from_millis(200),
+            force: true,
             ..EnableOwnerMode::default()
         },
     )
     .await
     .expect("enable");
-    assert_eq!(report.stamped, 1);
-    assert_eq!(report.repended, 1);
-    #[derive(QueryableByName)]
-    struct Row {
-        #[diesel(sql_type = Text)]
-        state: String,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::SmallInt>)]
-        decision_partition: Option<i16>,
-    }
-    let row: Row =
+    assert_eq!(report.stamped, 2);
+    assert_eq!(report.repended, 1, "only the claim of the dead worker");
+    assert_eq!(task_state(&mut conn, live_task).await.0, "RUNNING");
+    let row: StampRow =
         diesel::sql_query("SELECT state, decision_partition FROM harvest_task_queue WHERE id = $1")
             .bind::<diesel::sql_types::Uuid, _>(task)
             .get_result(&mut conn)
@@ -500,6 +554,7 @@ async fn enable_stamps_rows_and_repends_a_legacy_claim_left_running() {
     let again = decision_owner::enable_owner_mode(&mut conn, &EnableOwnerMode::default())
         .await
         .expect("enable again");
+    assert_eq!(again.repended, 0);
     assert!(again.already_on);
     db.drop_db().await;
 }
@@ -520,6 +575,126 @@ async fn disable_drops_the_guard_and_the_legacy_claim_works_again() {
         .expect("mode");
     assert!(!mode.enabled && !mode.guard_installed, "{mode:?}");
     assert_eq!(legacy_claim(&mut conn, &q).await.map(|t| t.id), Some(wf));
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn enable_refuses_a_fleet_that_polls_different_queues() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    register_worker(&mut conn, "queue-a", true).await;
+    register_worker(&mut conn, "queue-b", true).await;
+    diesel::sql_query(
+        "UPDATE harvest_workers SET queues = '[\"other\"]'::jsonb WHERE worker_id = 'queue-b'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("change the queues of one worker");
+    let refused = decision_owner::enable_owner_mode(&mut conn, &EnableOwnerMode::default()).await;
+    let message = refused
+        .expect_err("a mixed fleet blocks owner mode")
+        .to_string();
+    assert!(message.contains("different queues"), "{message}");
+    let mode = decision_owner::read_owner_mode(&mut conn)
+        .await
+        .expect("mode");
+    assert!(!mode.enabled && !mode.guard_installed, "{mode:?}");
+    db.drop_db().await;
+}
+
+/// An unowned decision stamps an unstamped row and re-pends it at once, so
+/// the owner of its partition takes it next.
+#[tokio::test]
+async fn an_unowned_claim_stamps_and_repends_its_row() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let q = unique("owner-stamp");
+    enable(&mut conn).await;
+    let tenure = take(&mut conn, "owner-worker", partition(61)).await;
+    let unstamped = workflow_task(&mut conn, &q, None).await;
+    let claim = OwnedClaim {
+        holder: tenure.holder().as_str().to_string(),
+        partitions: vec![partition(61).as_i16()],
+    };
+    let task = owned_claim(&mut conn, &q, &claim)
+        .await
+        .expect("the unstamped row");
+    assert_eq!(task.id, unstamped);
+    let claim_token = queue::TaskClaim::new(task.id, "owner-worker", task.attempt);
+    let repended = queue::requeue_unowned_workflow_task(
+        &mut conn,
+        &claim_token,
+        partition(62),
+        chrono::Duration::seconds(30),
+    )
+    .await
+    .expect("re-pend");
+    assert!(repended);
+    let read = async |conn: &mut AsyncPgConnection| -> StampDueRow {
+        diesel::sql_query(
+            "SELECT state, decision_partition, scheduled_at <= NOW() + interval '1 second' AS due \
+             FROM harvest_task_queue WHERE id = $1",
+        )
+        .bind::<diesel::sql_types::Uuid, _>(unstamped)
+        .get_result(conn)
+        .await
+        .expect("read the task")
+    };
+    let row = read(&mut conn).await;
+    assert_eq!(row.state, "PENDING");
+    assert_eq!(row.decision_partition, Some(partition(62).as_i16()));
+    assert!(
+        row.due,
+        "an unstamped row is due at once, not after the delay"
+    );
+    // A stamped row keeps its stamp and its delay.
+    let stale = OwnedClaim {
+        holder: claim.holder.clone(),
+        partitions: vec![],
+    };
+    assert!(
+        owned_claim(&mut conn, &q, &stale).await.is_none(),
+        "now stamped for p62"
+    );
+    db.drop_db().await;
+}
+
+/// The guard skips a claim while an acquisition holds the owner row. It
+/// never waits for it.
+#[tokio::test]
+async fn the_guard_skips_while_an_acquisition_holds_the_owner_row() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let q = unique("owner-skip");
+    enable(&mut conn).await;
+    let tenure = take(&mut conn, "owner-worker", partition(71)).await;
+    let wf = workflow_task(&mut conn, &q, Some(partition(71))).await;
+    let mut holder_conn = db.conn().await;
+    holder_conn
+        .batch_execute(
+            "BEGIN; SELECT 1 FROM harvest_decision_owner WHERE partition = 71 FOR UPDATE",
+        )
+        .await
+        .expect("hold the owner row");
+    let claim = OwnedClaim {
+        holder: tenure.holder().as_str().to_string(),
+        partitions: vec![partition(71).as_i16()],
+    };
+    let started = std::time::Instant::now();
+    assert!(owned_claim(&mut conn, &q, &claim).await.is_none());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the claim did not wait"
+    );
+    assert_eq!(task_state(&mut conn, wf).await, ("PENDING".to_string(), 0));
+    holder_conn
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("release");
+    assert_eq!(
+        owned_claim(&mut conn, &q, &claim).await.map(|t| t.id),
+        Some(wf)
+    );
     db.drop_db().await;
 }
 
@@ -546,7 +721,7 @@ async fn held_by_worker(conn: &mut AsyncPgConnection) -> BTreeMap<String, i64> {
             let worker = r
                 .holder
                 .rsplit_once('/')
-                .map_or(r.holder.clone(), |(w, _)| w.to_string());
+                .map_or_else(|| r.holder.clone(), |(w, _)| w.to_string());
             (worker, r.n)
         })
         .collect()
@@ -559,7 +734,6 @@ fn new_loop(worker: &str) -> (OwnerLoop, Arc<OwnedPartitions>) {
         worker,
         OwnerLeaseConfig::default(),
         Arc::clone(&owned),
-        Duration::from_secs(30),
     );
     (owner_loop, owned)
 }
@@ -577,22 +751,32 @@ async fn owner_loops_rebalance_on_join_and_leave() {
     let db = OwnDb::new().await;
     let mut conn = db.conn().await;
     enable(&mut conn).await;
-    register_worker(&mut conn, "loop-a", true).await;
     let (mut a, owned_a) = new_loop("loop-a");
 
     tick(&mut a, &owned_a, &mut conn).await;
     assert_eq!(owned_a.len(), 512, "a lone worker owns every partition");
     assert!(owned_a.owner_mode(ShardId::UNENCODED));
-    let claim = owned_a.owned_claim(ShardId::UNENCODED).expect("owner mode");
+    let claim = owned_a
+        .owned_claim(ShardId::UNENCODED)
+        .expect("owned claims");
     assert_eq!(claim.partitions.len(), 512);
 
-    // Worker B joins.
-    register_worker(&mut conn, "loop-b", true).await;
+    // Worker B joins. Its first tick makes it a candidate.
     let (mut b, owned_b) = new_loop("loop-b");
     tick(&mut b, &owned_b, &mut conn).await;
     assert!(owned_b.is_empty(), "no partition is free yet");
     tick(&mut a, &owned_a, &mut conn).await;
-    assert_eq!(owned_a.len(), 256, "A releases down to the target");
+    assert_eq!(
+        owned_a.len(),
+        256,
+        "A stops claiming the extra partitions at once"
+    );
+    assert_eq!(
+        held_by_worker(&mut conn).await.get("loop-a"),
+        Some(&512),
+        "and releases them next tick"
+    );
+    tick(&mut a, &owned_a, &mut conn).await;
     tick(&mut b, &owned_b, &mut conn).await;
     assert_eq!(owned_b.len(), 256, "B acquires the released partitions");
     let held = held_by_worker(&mut conn).await;
@@ -602,12 +786,129 @@ async fn owner_loops_rebalance_on_join_and_leave() {
     // Worker B leaves gracefully.
     let released = b.release_everything(&mut conn).await.expect("release");
     assert_eq!(released.len(), 256);
-    diesel::sql_query("UPDATE harvest_workers SET status = 'Stopped' WHERE worker_id = 'loop-b'")
-        .execute(&mut conn)
-        .await
-        .expect("stop B");
+    let after = b.tick(&mut conn).await.expect("a stopped loop");
+    assert!(
+        after.acquired.is_empty() && !after.owner_mode,
+        "a stopped loop does nothing"
+    );
     tick(&mut a, &owned_a, &mut conn).await;
     assert_eq!(owned_a.len(), 512, "A takes the partitions back");
+    db.drop_db().await;
+}
+
+/// A refused loop is a participant. It claims in the owned form, so the
+/// guard never blocks it. It is no candidate and owns nothing.
+#[tokio::test]
+async fn a_refused_loop_claims_in_the_owned_form_and_owns_nothing() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    enable(&mut conn).await;
+    let (mut a, owned_a) = new_loop("loop-refused");
+    a.refuse();
+    tick(&mut a, &owned_a, &mut conn).await;
+    assert!(owned_a.is_empty());
+    let claim = owned_a
+        .owned_claim(ShardId::UNENCODED)
+        .expect("owned claims");
+    assert_eq!(claim.partitions, Vec::<i16>::new());
+    let candidates: CountRow =
+        diesel::sql_query("SELECT count(*)::bigint AS n FROM harvest_decision_owner_candidates")
+            .get_result(&mut conn)
+            .await
+            .expect("count candidates");
+    assert_eq!(candidates.n, 0, "a refused loop is no candidate");
+    // Its activity claim passes a workflow row at the queue head.
+    let q = unique("owner-refused");
+    let _wf = workflow_task(&mut conn, &q, Some(partition(91))).await;
+    let act = activity_task(&mut conn, &q).await;
+    let got = owned_claim(&mut conn, &q, &claim).await.map(|t| t.id);
+    assert_eq!(got, Some(act));
+    db.drop_db().await;
+}
+
+/// Enable refuses while no owner loop is live, so no workflow task waits for
+/// an owner that does not exist.
+#[tokio::test]
+async fn enable_refuses_while_no_owner_loop_is_live() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let refused = decision_owner::enable_owner_mode(&mut conn, &EnableOwnerMode::default()).await;
+    let message = refused.expect_err("no candidate").to_string();
+    assert!(message.contains("no owner loop is live"), "{message}");
+    let (mut a, owned_a) = new_loop("loop-first");
+    tick(&mut a, &owned_a, &mut conn).await;
+    assert!(
+        owned_a.is_empty(),
+        "the switch is off, so the loop only registers"
+    );
+    decision_owner::enable_owner_mode(&mut conn, &EnableOwnerMode::default())
+        .await
+        .expect("a live candidate lets enable pass");
+    db.drop_db().await;
+}
+
+/// A stale local list names a partition that another holder owns. The
+/// claim skips that row and takes the next owned row. It does not return
+/// empty.
+#[tokio::test]
+async fn a_stale_partition_list_skips_the_row_and_takes_the_next() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let q = unique("owner-stale-list");
+    enable(&mut conn).await;
+    let mine = take(&mut conn, "owner-worker", partition(101)).await;
+    let _theirs = take(&mut conn, "other-worker", partition(102)).await;
+    let head = workflow_task(&mut conn, &q, Some(partition(102))).await;
+    let next = workflow_task(&mut conn, &q, Some(partition(101))).await;
+    let stale = OwnedClaim {
+        holder: mine.holder().as_str().to_string(),
+        partitions: vec![partition(101).as_i16(), partition(102).as_i16()],
+    };
+    assert_eq!(
+        owned_claim(&mut conn, &q, &stale).await.map(|t| t.id),
+        Some(next)
+    );
+    assert_eq!(
+        task_state(&mut conn, head).await,
+        ("PENDING".to_string(), 0)
+    );
+    db.drop_db().await;
+}
+
+/// An acquisition re-pends each workflow task that another worker holds
+/// `RUNNING` in the partition (ADR 0009 decision 7).
+#[tokio::test]
+async fn an_acquisition_repends_a_task_another_worker_left_running() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let q = unique("owner-foreign");
+    enable(&mut conn).await;
+    let old = take(&mut conn, "old-owner", partition(81)).await;
+    let wf = workflow_task(&mut conn, &q, Some(partition(81))).await;
+    let claim = OwnedClaim {
+        holder: old.holder().as_str().to_string(),
+        partitions: vec![partition(81).as_i16()],
+    };
+    let task = owned_claim(&mut conn, &q, &claim)
+        .await
+        .expect("the old owner claims");
+    assert_eq!(task.id, wf);
+    // The old owner's lease lapses with the task still RUNNING.
+    diesel::sql_query(
+        "UPDATE harvest_decision_owner SET lease_until = clock_timestamp() - interval '1 minute'",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("lapse every lease");
+    let (mut a, owned_a) = new_loop("new-owner");
+    tick(&mut a, &owned_a, &mut conn).await;
+    assert_eq!(owned_a.len(), 512);
+    let (state, attempt) = task_state(&mut conn, wf).await;
+    assert_eq!(
+        state, "PENDING",
+        "the acquisition re-pends the foreign claim"
+    );
+    assert_eq!(attempt, 1);
     db.drop_db().await;
 }
 
@@ -672,7 +973,8 @@ async fn owner_three_steps(ctx: &WorkflowContext, input: (String, u64)) -> Resul
 /// Three one-second timers in sequence. Each run makes four decisions. A
 /// timer fires after a short sticky window, and no wake re-arms the pin.
 #[workflow]
-async fn owner_three_timers(ctx: &WorkflowContext, _input: String) -> Result<String, String> {
+async fn owner_three_timers(ctx: &WorkflowContext, input: String) -> Result<String, String> {
+    let _ = input;
     for name in ["owner_t1", "owner_t2", "owner_t3"] {
         ctx.timer(name, 1).await.map_err(|e| e.to_string())?;
     }

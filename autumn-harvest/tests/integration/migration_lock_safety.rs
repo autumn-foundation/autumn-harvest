@@ -69,6 +69,7 @@ const HOT_TABLES: &[&str] = &[
     "harvest_activity_pauses",
     "harvest_audit_log",
     "harvest_decision_owner",
+    "harvest_decision_owner_mode",
     "harvest_events",
     "harvest_fairness_state",
     "harvest_fairness_weights",

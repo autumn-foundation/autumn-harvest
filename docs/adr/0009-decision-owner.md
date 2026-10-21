@@ -155,6 +155,9 @@ Rules:
 
 - Each transaction that takes an owner row takes the generation row first.
   This covers acquisition, renewal, release, revoke and the DR bump.
+- The owned claim is the exception (issue #2252). It reads the generation
+  row without a lock, as every claim does. Its owner row lock uses
+  `SKIP LOCKED`, so it never waits.
 - A decision commit or an owned claim takes at most one owner row.
 - A decision commit takes that row before any execution row, task row or
   advisory lock.
@@ -305,14 +308,18 @@ the partition first, as in steps 1 and 2.
 
 Issue #2252 fixes the balance policy (`decision_owner::plan_balance`):
 
-- Live owners are this worker, each holder of a live lease, and each live
-  worker that advertises the owner-mode label.
+- Live owners are the owner loops that wrote their candidate row in the
+  last 3 s (`harvest_decision_owner_candidates`). A loop writes it on each
+  scan. A crashed worker drops out within 3 s.
+- A worker that cannot run a workflow task is no candidate. This covers
+  a worker with no workflow slot or type, and a split colocated group.
+  It still claims in the owned form, so the guard never blocks it.
 - A worker below the target acquires free partitions up to the target.
-- A worker above target + 1 stops claiming the extra partitions, then
-  releases them in one statement.
+- A worker above target + 1 stops claiming the extra partitions at once.
+  It releases them on its next scan, so their decisions in flight can
+  commit. That is the drain.
 - Any worker acquires an orphan: a free partition whose lease ended more
-  than one renewal interval ago. A crashed peer can look live for one
-  heartbeat window, so this rule keeps its partitions from waiting.
+  than one renewal interval ago.
 
 ### 10. Tenant cells: partitions follow shard assignments
 
@@ -372,14 +379,25 @@ Issue #2252 builds the step as `decision_owner::enable_owner_mode`:
   worker then stamps it and re-pends it to its owner.
 - **Claim signal.** The owned claim sets the transaction setting
   `harvest.owner_claim` to its holder token. A binary from before owner
-  mode never sets it. This is the owner epoch that the guard reads.
+  mode never sets it. The guard reads this token in place of an epoch.
+  It checks neither the epoch nor the lease end. A released lease keeps
+  its holder, so the releaser's local deadline stops its claims.
 - **Guard.** The trigger `harvest_task_queue_owner_claim_guard_trg` runs
   for the claim of a workflow task only. With no token, it skips the row,
   so a legacy claim selects nothing. For a stamped row, it takes the owner
   row `FOR KEY SHARE SKIP LOCKED` and matches the holder.
-- **Order.** Step 3 commits first, so legacy claims stop. Step 4 waits up
-  to a drain bound for legacy decisions to end. One transaction then
-  re-pends what is left and sets the switch. A failure drops the guard.
+- **Order.** Steps 3 to 5 run in one transaction, which first locks the
+  switch row. A failure leaves owner mode off and the guard off. There is
+  no window in which no claim can take a workflow task.
+- **Step 4.** The transaction re-pends only the legacy claims of workers
+  that are not live. A live worker finishes its own decision and parks
+  the task, and then an owner claims it. So no legacy decision runs next
+  to an owner on one execution.
+- **Live owners.** Step 1 also refuses while no owner loop is live.
+- **Locks.** `CREATE TRIGGER` and `ENABLE TRIGGER` take `SHARE ROW
+  EXCLUSIVE` on `harvest_task_queue`, which does not block a reader. A
+  `lock_timeout` bounds each wait. These statements need ownership of the
+  table.
 
 After step 3, no task can be claimed in two ways. An old binary can still
 finish a decision that it claimed before step 3. Step 4 and the execution
@@ -387,7 +405,9 @@ row lock bound that case. Activities stay on the shared claim in both
 modes.
 
 The disable step clears the switch row first, then removes the guard.
-`decision_owner::disable_owner_mode` does both in one transaction.
+`decision_owner::disable_owner_mode` does both in one transaction. It
+turns the trigger off with `DISABLE TRIGGER`, not `DROP TRIGGER`, so it
+takes no `ACCESS EXCLUSIVE` lock.
 
 ## Flows
 

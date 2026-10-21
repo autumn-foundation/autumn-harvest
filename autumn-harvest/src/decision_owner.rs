@@ -524,6 +524,9 @@ struct Owned {
     /// with no entry has no deadline.
     deadlines: BTreeMap<OwnerKey, Instant>,
     owner_mode: std::collections::BTreeSet<ShardId>,
+    /// The shards whose claims use the owned form. Only the owner loop sets
+    /// it, when the switch of the database is on.
+    claim_shards: std::collections::BTreeSet<ShardId>,
     holder: Option<OwnerHolder>,
 }
 
@@ -608,14 +611,26 @@ impl OwnedPartitions {
         self.state().holder.clone()
     }
 
-    /// The owned claim of `shard`, or `None` when owner mode is off there.
+    /// Claim in the owned form on `shard`, or in the legacy form.
+    ///
+    /// The owner loop turns it on when the switch of the database is on.
+    pub fn set_owned_claims(&self, shard: ShardId, on: bool) {
+        let mut state = self.state();
+        if on {
+            state.claim_shards.insert(shard);
+        } else {
+            state.claim_shards.remove(&shard);
+        }
+    }
+
+    /// The owned claim of `shard`, or `None` for the legacy claim.
     ///
     /// The partitions hold each live tenure of the shard. A tenure past its
     /// local deadline is left out.
     #[must_use]
     pub fn owned_claim(&self, shard: ShardId) -> Option<OwnedClaim> {
         let state = self.state();
-        if !state.owner_mode.contains(&shard) {
+        if !state.claim_shards.contains(&shard) {
             return None;
         }
         let holder = state.holder.as_ref()?.as_str().to_string();
@@ -723,6 +738,26 @@ pub struct OwnedClaim {
     pub partitions: Vec<i16>,
 }
 
+impl OwnedClaim {
+    /// The partitions as a 64-byte bit mask, as the claim binds them.
+    ///
+    /// Bit `p` is bit `p % 8` of byte `p / 8`, as Postgres `get_bit` on
+    /// `bytea` reads it. A test of one bit costs the same for any number of
+    /// partitions. An array test costs one comparison per element.
+    #[must_use]
+    pub fn mask(&self) -> Vec<u8> {
+        let mut mask = vec![0u8; usize::from(DECISION_PARTITIONS / 8)];
+        for p in &self.partitions {
+            if let Ok(p) = usize::try_from(*p)
+                && let Some(byte) = mask.get_mut(p / 8)
+            {
+                *byte |= 1 << (p % 8);
+            }
+        }
+        mask
+    }
+}
+
 /// What one balance step does (issue #2252, ADR 0009 decision 9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BalancePlan {
@@ -788,12 +823,11 @@ impl OwnerMode {
 pub struct EnableOwnerMode {
     /// A worker with a heartbeat this recent is live.
     pub live_within: Duration,
-    /// Enable even when a live worker cannot run owner mode.
+    /// Enable even when a check refuses: a live worker cannot run owner
+    /// mode, the fleet is mixed, or no owner loop is live.
     pub force: bool,
     /// The lock wait of each statement on `harvest_task_queue`.
     pub lock_timeout: Duration,
-    /// The longest wait for legacy workflow claims to finish.
-    pub drain_timeout: Duration,
     /// The rows per stamp batch.
     pub batch: i64,
 }
@@ -804,7 +838,6 @@ impl Default for EnableOwnerMode {
             live_within: Duration::from_secs(30),
             force: false,
             lock_timeout: Duration::from_secs(5),
-            drain_timeout: Duration::from_secs(30),
             batch: 1000,
         }
     }
@@ -817,7 +850,8 @@ pub struct EnableReport {
     pub already_on: bool,
     /// Workflow-task rows that the call stamped with their partition.
     pub stamped: u64,
-    /// Legacy claims that did not finish in time. The call re-pended them.
+    /// Legacy claims of workers that are not live. The call re-pended them.
+    /// A live worker finishes its own legacy decision.
     pub repended: u64,
     /// Live workers that cannot run owner mode. `force` was set.
     pub legacy_workers: Vec<String>,
@@ -1338,12 +1372,17 @@ mod db {
             .map_err(database_error)
     }
 
-    /// Read the switch row and whether the claim guard is installed.
+    /// Read the switch row and whether the claim guard is on.
     const MODE_SQL: &str = "SELECT m.enabled, m.partitions, \
              EXISTS (SELECT 1 FROM pg_trigger t \
                      WHERE t.tgname = 'harvest_task_queue_owner_claim_guard_trg' \
-                       AND t.tgrelid = 'harvest_task_queue'::regclass) AS guard_installed \
+                       AND t.tgrelid = 'harvest_task_queue'::regclass \
+                       AND t.tgenabled <> 'D') AS guard_installed \
          FROM harvest_decision_owner_mode m WHERE m.singleton";
+
+    /// Lock the switch row, so enable and disable run one at a time.
+    const LOCK_MODE_SQL: &str =
+        "SELECT enabled FROM harvest_decision_owner_mode WHERE singleton FOR UPDATE";
 
     /// Live workers whose labels lack the owner-mode capability.
     const LEGACY_WORKERS_SQL: &str = "SELECT worker_id FROM harvest_workers \
@@ -1352,7 +1391,7 @@ mod db {
            AND COALESCE((labels->>'decision_owner_version')::int, 0) < $2 \
          ORDER BY worker_id";
 
-    /// Live workers whose queues or build differ from the first live worker.
+    /// Live workers whose queues or build differ from each other.
     ///
     /// An owner claims every workflow task of its partitions. A partition of
     /// a worker that does not poll a queue, or cannot run a build, would
@@ -1375,49 +1414,68 @@ mod db {
          FROM unnest($1::uuid[], $2::int2[]) AS u(id, p) \
          WHERE t.id = u.id AND t.decision_partition IS NULL";
 
-    /// The claim guard (issue #2252). Its `WHEN` clause runs the function
-    /// only for the claim of a workflow task.
-    const INSTALL_GUARD_SQL: &str = "DROP TRIGGER IF EXISTS \
-             harvest_task_queue_owner_claim_guard_trg ON harvest_task_queue; \
-         CREATE TRIGGER harvest_task_queue_owner_claim_guard_trg \
-             BEFORE UPDATE ON harvest_task_queue \
-             FOR EACH ROW \
-             WHEN (OLD.state = 'PENDING' AND NEW.state = 'RUNNING' \
-                   AND NEW.task_type = 'workflow') \
-             EXECUTE FUNCTION harvest_task_queue_owner_claim_guard()";
-
-    const DROP_GUARD_SQL: &str =
-        "DROP TRIGGER IF EXISTS harvest_task_queue_owner_claim_guard_trg ON harvest_task_queue";
-
-    /// Legacy workflow claims still in flight.
-    const LEGACY_RUNNING_SQL: &str = "SELECT count(*)::bigint AS n FROM harvest_task_queue \
-         WHERE task_type = 'workflow' AND state = 'RUNNING' AND worker_id IS NOT NULL";
-
-    /// Re-pend each legacy workflow claim that did not finish in time.
+    /// Install the claim guard, or turn it on again (issue #2252).
     ///
-    /// The claim of each row ends. The execution row lock and
-    /// `UNIQUE(workflow_exec_id, event_id)` bound a decision that its old
-    /// worker still runs (ADR 0009 decision 11).
-    const REPEND_LEGACY_SQL: &str = "UPDATE harvest_task_queue \
+    /// Its `WHEN` clause runs the function only for the claim of a workflow
+    /// task. `CREATE TRIGGER` and `ENABLE TRIGGER` take `SHARE ROW
+    /// EXCLUSIVE`, which does not block a reader of the table.
+    const INSTALL_GUARD_SQL: &str = "DO $$ BEGIN \
+             IF NOT EXISTS (SELECT 1 FROM pg_trigger \
+                            WHERE tgname = 'harvest_task_queue_owner_claim_guard_trg' \
+                              AND tgrelid = 'harvest_task_queue'::regclass) THEN \
+                 CREATE TRIGGER harvest_task_queue_owner_claim_guard_trg \
+                     BEFORE UPDATE ON harvest_task_queue \
+                     FOR EACH ROW \
+                     WHEN (OLD.state = 'PENDING' AND NEW.state = 'RUNNING' \
+                           AND NEW.task_type = 'workflow') \
+                     EXECUTE FUNCTION harvest_task_queue_owner_claim_guard(); \
+             END IF; \
+         END $$; \
+         ALTER TABLE harvest_task_queue ENABLE TRIGGER harvest_task_queue_owner_claim_guard_trg";
+
+    /// Turn the claim guard off. `DISABLE TRIGGER` takes `SHARE ROW
+    /// EXCLUSIVE`. A `DROP TRIGGER` would take `ACCESS EXCLUSIVE`.
+    const DISABLE_GUARD_SQL: &str = "DO $$ BEGIN \
+             IF EXISTS (SELECT 1 FROM pg_trigger \
+                        WHERE tgname = 'harvest_task_queue_owner_claim_guard_trg' \
+                          AND tgrelid = 'harvest_task_queue'::regclass) THEN \
+                 ALTER TABLE harvest_task_queue \
+                     DISABLE TRIGGER harvest_task_queue_owner_claim_guard_trg; \
+             END IF; \
+         END $$";
+
+    /// Re-pend each legacy workflow claim of a worker that is not live.
+    ///
+    /// No owner exists while the switch is off, so each `RUNNING` claim is a
+    /// legacy claim. A live worker finishes its own decision and parks the
+    /// task. Then an owner claims it. A dead worker never parks it, so this
+    /// statement re-pends it.
+    const REPEND_DEAD_LEGACY_SQL: &str = "UPDATE harvest_task_queue t \
          SET state = 'PENDING', worker_id = NULL, started_at = NULL, \
              last_heartbeat_at = NULL, scheduled_at = NOW(), \
              sticky_worker_id = NULL, sticky_until = NULL, sticky_timeout = NULL, \
              wake_requested = FALSE \
-         WHERE task_type = 'workflow' AND state = 'RUNNING' AND worker_id IS NOT NULL";
+         WHERE t.task_type = 'workflow' AND t.state = 'RUNNING' AND t.worker_id IS NOT NULL \
+           AND NOT EXISTS (SELECT 1 FROM harvest_workers w \
+                           WHERE w.worker_id = t.worker_id \
+                             AND w.status <> 'Stopped' \
+                             AND w.last_heartbeat_at > NOW() - make_interval(secs => $1))";
 
     const SET_MODE_SQL: &str = "UPDATE harvest_decision_owner_mode \
          SET enabled = $1, changed_at = NOW() WHERE singleton";
 
-    /// The live holders and how many partitions each holds.
-    const HOLDERS_SQL: &str = "SELECT holder, count(*)::bigint AS n FROM harvest_decision_owner \
-         WHERE holder IS NOT NULL AND lease_until > clock_timestamp() \
-         GROUP BY holder";
+    /// Record this loop as a live owner candidate.
+    const UPSERT_CANDIDATE_SQL: &str = "INSERT INTO harvest_decision_owner_candidates \
+             (holder, seen_at) VALUES ($1, clock_timestamp()) \
+         ON CONFLICT (holder) DO UPDATE SET seen_at = EXCLUDED.seen_at";
 
-    /// Live workers that can run owner mode.
-    const CAPABLE_WORKERS_SQL: &str = "SELECT worker_id FROM harvest_workers \
-         WHERE status = 'Active' \
-           AND last_heartbeat_at > NOW() - make_interval(secs => $1) \
-           AND COALESCE((labels->>'decision_owner_version')::int, 0) >= $2";
+    /// Forget this loop as a candidate, and every long-dead one.
+    const DELETE_CANDIDATE_SQL: &str = "DELETE FROM harvest_decision_owner_candidates \
+         WHERE holder = $1 OR seen_at < clock_timestamp() - interval '10 minutes'";
+
+    /// The live candidates of this database.
+    const LIVE_CANDIDATES_SQL: &str = "SELECT holder FROM harvest_decision_owner_candidates \
+         WHERE seen_at > clock_timestamp() - make_interval(secs => $1)";
 
     /// Free partitions, and the free partitions whose lease ended before
     /// `$1` seconds ago.
@@ -1427,26 +1485,33 @@ mod db {
          FROM harvest_decision_owner \
          WHERE holder IS NULL OR lease_until <= clock_timestamp()";
 
-    /// Re-pend each workflow task that another worker holds `RUNNING` in a
-    /// newly acquired partition (ADR 0009 decision 7).
+    /// Re-pend each workflow task held `RUNNING` in a newly acquired
+    /// partition (ADR 0009 decision 7).
     ///
     /// It runs after the acquisitions commit. A claim of the old owner that
     /// commits later fails the guard, because the holder changed. A claim
     /// that committed before is `RUNNING` here, so this statement re-pends
-    /// it. The old owner's decision then fails its fence and writes nothing.
+    /// it. Its decision then fails its fence and writes nothing. This also
+    /// covers a claim of an older process with the same worker id. The rows
+    /// lock in id order, so two such statements cannot deadlock.
     const REPEND_FOREIGN_SQL: &str = "UPDATE harvest_task_queue \
          SET state = 'PENDING', worker_id = NULL, started_at = NULL, \
              last_heartbeat_at = NULL, scheduled_at = NOW(), \
              sticky_worker_id = NULL, sticky_until = NULL, sticky_timeout = NULL, \
              wake_requested = FALSE \
-         WHERE task_type = 'workflow' AND state = 'RUNNING' \
-           AND worker_id IS NOT NULL AND worker_id <> $2 \
-           AND decision_partition = ANY($1::int2[])";
+         WHERE id IN (SELECT id FROM harvest_task_queue \
+                      WHERE task_type = 'workflow' AND state = 'RUNNING' \
+                        AND worker_id IS NOT NULL \
+                        AND decision_partition = ANY($1::int2[]) \
+                      ORDER BY id FOR UPDATE)";
 
     /// Free partitions to try, in random order, so that peers spread.
     const FREE_PICK_SQL: &str = "SELECT partition FROM harvest_decision_owner \
          WHERE holder IS NULL OR lease_until <= clock_timestamp() \
          ORDER BY random() LIMIT $1";
+
+    /// How long a candidate row counts as live: three scans.
+    const CANDIDATE_WINDOW: Duration = Duration::from_secs(3);
 
     #[derive(QueryableByName)]
     struct ModeRow {
@@ -1459,9 +1524,22 @@ mod db {
     }
 
     #[derive(QueryableByName)]
+    struct EnabledRow {
+        #[diesel(sql_type = Bool)]
+        #[allow(dead_code)]
+        enabled: bool,
+    }
+
+    #[derive(QueryableByName)]
     struct WorkerRow {
         #[diesel(sql_type = Text)]
         worker_id: String,
+    }
+
+    #[derive(QueryableByName)]
+    struct HolderRow {
+        #[diesel(sql_type = Text)]
+        holder: String,
     }
 
     #[derive(QueryableByName)]
@@ -1476,14 +1554,6 @@ mod db {
         id: uuid::Uuid,
         #[diesel(sql_type = Text)]
         workflow_id: String,
-    }
-
-    #[derive(QueryableByName)]
-    struct HolderRow {
-        #[diesel(sql_type = Text)]
-        holder: String,
-        #[diesel(sql_type = BigInt)]
-        n: i64,
     }
 
     #[derive(QueryableByName)]
@@ -1512,25 +1582,23 @@ mod db {
         })
     }
 
-    fn secs(d: Duration) -> f64 {
+    const fn secs(d: Duration) -> f64 {
         d.as_secs_f64()
     }
 
     /// Turn owner mode on for the database of `conn` (ADR 0009 decision 11).
     ///
-    /// 1. Refuse while a live worker cannot run owner mode, unless `force`
-    ///    is set. Refuse while live workers poll different queues or run
-    ///    different builds. This check is a courtesy: the guard is the
-    ///    structural part.
+    /// 1. Refuse unless `force` is set: while a live worker cannot run owner
+    ///    mode, while live workers poll different queues or run different
+    ///    builds, or while no owner loop is live. These checks are a
+    ///    courtesy. The guard is the structural part.
     /// 2. Stamp the partition of each live workflow task.
-    /// 3. Install the claim guard. From then on, a claim with no owner
-    ///    token takes no workflow task.
-    /// 4. Wait up to `drain_timeout` for each legacy workflow claim to end.
-    ///    Then, in one transaction, re-pend each one that is left, stamp
-    ///    the rows that arrived since step 2 and set the switch.
+    /// 3. In one transaction: lock the switch row, install the claim guard,
+    ///    re-pend each legacy claim of a worker that is not live, and set
+    ///    the switch. A live worker finishes its own legacy decision.
+    /// 4. Stamp the rows that arrived since step 2.
     ///
-    /// A failure after step 3 drops the guard again, so workflow tasks never
-    /// wait for a switch that is off.
+    /// Step 3 is atomic. A failure leaves owner mode off and no guard on.
     ///
     /// # Errors
     ///
@@ -1554,83 +1622,25 @@ mod db {
                 ..EnableReport::default()
             });
         }
-        let legacy: Vec<WorkerRow> = diesel::sql_query(LEGACY_WORKERS_SQL)
-            .bind::<Double, _>(secs(options.live_within))
-            .bind::<Integer, _>(i32::try_from(OWNER_MODE_CAPABILITY_VERSION).unwrap_or(i32::MAX))
-            .load(conn)
-            .await
-            .map_err(database_error)?;
-        let legacy: Vec<String> = legacy.into_iter().map(|w| w.worker_id).collect();
-        if !legacy.is_empty() && !options.force {
-            return Err(HarvestError::Config(format!(
-                "owner mode refused: live workers cannot run it: {}",
-                legacy.join(", ")
-            )));
-        }
-        let mixed: CountRow = diesel::sql_query(MIXED_FLEET_SQL)
-            .bind::<Double, _>(secs(options.live_within))
-            .get_result(conn)
-            .await
-            .map_err(database_error)?;
-        if mixed.n > 1 && !options.force {
-            return Err(HarvestError::Config(
-                "owner mode refused: live workers poll different queues or run different \
-                 builds, so an owner could strand a workflow task"
-                    .to_string(),
-            ));
-        }
+        let legacy = check_fleet(conn, options).await?;
         let mut stamped = stamp_unstamped(conn, options).await?;
-        conn.batch_execute(&format!(
-            "{}; {INSTALL_GUARD_SQL}",
-            lock_timeout_sql(options.lock_timeout).replace("SET LOCAL", "SET")
-        ))
-        .await
-        .map_err(database_error)?;
-        let finished = finish_enable(conn, options).await;
-        let _ = conn.batch_execute("RESET lock_timeout").await;
-        match finished {
-            Ok((late, repended)) => {
-                stamped += late;
-                Ok(EnableReport {
-                    already_on: false,
-                    stamped,
-                    repended,
-                    legacy_workers: legacy,
-                })
-            }
-            Err(e) => {
-                // Workflow tasks must not wait for a switch that stays off.
-                let _ = conn.batch_execute(DROP_GUARD_SQL).await;
-                Err(e)
-            }
-        }
-    }
-
-    /// Steps 4 and 5 of [`enable_owner_mode`]: drain, then switch on.
-    async fn finish_enable(
-        conn: &mut AsyncPgConnection,
-        options: &EnableOwnerMode,
-    ) -> HarvestResult<(u64, u64)> {
-        let deadline = std::time::Instant::now() + options.drain_timeout;
-        loop {
-            let running: CountRow = diesel::sql_query(LEGACY_RUNNING_SQL)
-                .get_result(conn)
-                .await
-                .map_err(database_error)?;
-            if running.n == 0 || std::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let late = stamp_unstamped(conn, options).await?;
         let lock = lock_timeout_sql(options.lock_timeout);
+        let live = secs(options.live_within);
         let repended = conn
             .transaction::<usize, HarvestError, _>(async |conn| {
                 diesel::sql_query(lock)
                     .execute(conn)
                     .await
                     .map_err(database_error)?;
-                let repended = diesel::sql_query(REPEND_LEGACY_SQL)
+                diesel::sql_query(LOCK_MODE_SQL)
+                    .get_result::<EnabledRow>(conn)
+                    .await
+                    .map_err(database_error)?;
+                conn.batch_execute(INSTALL_GUARD_SQL)
+                    .await
+                    .map_err(database_error)?;
+                let repended = diesel::sql_query(REPEND_DEAD_LEGACY_SQL)
+                    .bind::<Double, _>(live)
                     .execute(conn)
                     .await
                     .map_err(database_error)?;
@@ -1642,7 +1652,63 @@ mod db {
                 Ok(repended)
             })
             .await?;
-        Ok((late, u64::try_from(repended).unwrap_or(u64::MAX)))
+        stamped += stamp_unstamped(conn, options).await?;
+        Ok(EnableReport {
+            already_on: false,
+            stamped,
+            repended: u64::try_from(repended).unwrap_or(u64::MAX),
+            legacy_workers: legacy,
+        })
+    }
+
+    /// The courtesy checks of [`enable_owner_mode`]. Returns the live
+    /// workers that cannot run owner mode, when `force` lets them pass.
+    async fn check_fleet(
+        conn: &mut AsyncPgConnection,
+        options: &EnableOwnerMode,
+    ) -> HarvestResult<Vec<String>> {
+        let live = secs(options.live_within);
+        let legacy: Vec<WorkerRow> = diesel::sql_query(LEGACY_WORKERS_SQL)
+            .bind::<Double, _>(live)
+            .bind::<Integer, _>(i32::try_from(OWNER_MODE_CAPABILITY_VERSION).unwrap_or(i32::MAX))
+            .load(conn)
+            .await
+            .map_err(database_error)?;
+        let legacy: Vec<String> = legacy.into_iter().map(|w| w.worker_id).collect();
+        if options.force {
+            return Ok(legacy);
+        }
+        if !legacy.is_empty() {
+            return Err(HarvestError::Config(format!(
+                "owner mode refused: live workers cannot run it: {}",
+                legacy.join(", ")
+            )));
+        }
+        let mixed: CountRow = diesel::sql_query(MIXED_FLEET_SQL)
+            .bind::<Double, _>(live)
+            .get_result(conn)
+            .await
+            .map_err(database_error)?;
+        if mixed.n > 1 {
+            return Err(HarvestError::Config(
+                "owner mode refused: live workers poll different queues or run different \
+                 builds, so an owner could strand a workflow task"
+                    .to_string(),
+            ));
+        }
+        let candidates: Vec<HolderRow> = diesel::sql_query(LIVE_CANDIDATES_SQL)
+            .bind::<Double, _>(secs(CANDIDATE_WINDOW))
+            .load(conn)
+            .await
+            .map_err(database_error)?;
+        if candidates.is_empty() {
+            return Err(HarvestError::Config(
+                "owner mode refused: no owner loop is live on this database, so no worker \
+                 would claim a workflow task"
+                    .to_string(),
+            ));
+        }
+        Ok(legacy)
     }
 
     /// Stamp each live workflow-task row that has no partition.
@@ -1689,10 +1755,11 @@ mod db {
 
     /// Turn owner mode off for the database of `conn` (issue #2252).
     ///
-    /// One transaction clears the switch and drops the guard. Owners see the
-    /// switch on their next scan, release their partitions and claim as
-    /// before. An owned claim selects no workflow task with the switch off,
-    /// so the two claim forms never take the same task.
+    /// One transaction locks the switch row, clears it and turns the guard
+    /// off. Owners see the switch on their next scan, release their
+    /// partitions and claim as before. An owned claim selects no workflow
+    /// task with the switch off, so the two claim forms never take the same
+    /// task.
     ///
     /// # Errors
     ///
@@ -1707,13 +1774,16 @@ mod db {
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
+            diesel::sql_query(LOCK_MODE_SQL)
+                .get_result::<EnabledRow>(conn)
+                .await
+                .map_err(database_error)?;
             diesel::sql_query(SET_MODE_SQL)
                 .bind::<Bool, _>(false)
                 .execute(conn)
                 .await
                 .map_err(database_error)?;
-            diesel::sql_query(DROP_GUARD_SQL)
-                .execute(conn)
+            conn.batch_execute(DISABLE_GUARD_SQL)
                 .await
                 .map_err(database_error)?;
             Ok(())
@@ -1738,29 +1808,38 @@ mod db {
 
     /// The acquisition loop of one worker on one database (issue #2252).
     ///
-    /// The worker calls [`Self::tick`] about once a second. Each tick reads
-    /// the switch, renews when a renewal is due, drops each tenure past its
-    /// local deadline, and balances by [`super::plan_balance`].
+    /// The worker calls [`Self::tick`] about once a second. Each tick records
+    /// the loop as a live candidate and reads the switch. With the switch
+    /// on, it renews when a renewal is due, drops each tenure past its local
+    /// deadline, and balances by [`super::plan_balance`].
+    ///
+    /// A refused loop is a participant, not an owner. It turns the owned
+    /// claim on with the switch, so it claims activities and unstamped
+    /// rows. It is never a candidate and acquires nothing.
     #[derive(Debug)]
     pub struct OwnerLoop {
         shard: ShardId,
-        worker_id: String,
         holder: OwnerHolder,
         config: OwnerLeaseConfig,
         owned: std::sync::Arc<super::OwnedPartitions>,
-        live_within: Duration,
         last_renewal: Option<std::time::Instant>,
         refused: bool,
         /// This loop turned owner mode on. Only then does it turn owner mode
         /// off again and release, so it never clears state that it did not
         /// set.
         active: bool,
+        /// The loop stopped for good. A later tick does nothing.
+        stopped: bool,
+        /// Tenures that this loop stopped using, released on the next tick.
+        /// The delay lets their decisions in flight commit first.
+        releasing: Vec<OwnerTenure>,
+        /// Acquired partitions whose foreign claims still need a re-pend.
+        repending: Vec<i16>,
     }
 
     impl OwnerLoop {
         /// A loop for `worker_id` on the database of `shard`.
         ///
-        /// `live_within` is the heartbeat age under which a peer is live.
         /// The loop sets the holder of `owned` when it has none.
         #[must_use]
         pub fn new(
@@ -1768,7 +1847,6 @@ mod db {
             worker_id: &str,
             config: OwnerLeaseConfig,
             owned: std::sync::Arc<super::OwnedPartitions>,
-            live_within: Duration,
         ) -> Self {
             let holder = owned.holder().unwrap_or_else(|| {
                 let holder = OwnerHolder::for_worker(worker_id);
@@ -1777,14 +1855,15 @@ mod db {
             });
             Self {
                 shard,
-                worker_id: worker_id.to_string(),
                 holder,
                 config,
                 owned,
-                live_within,
                 last_renewal: None,
                 refused: false,
                 active: false,
+                stopped: false,
+                releasing: Vec::new(),
+                repending: Vec::new(),
             }
         }
 
@@ -1794,11 +1873,12 @@ mod db {
             self.shard
         }
 
-        /// Refuse owner mode on this database for the life of the loop.
+        /// Make this loop a participant, not an owner.
         ///
-        /// A worker whose shard assignments split a colocated group must not
-        /// own partitions there (ADR 0009 decision 10).
-        pub fn refuse(&mut self) {
+        /// A worker that cannot run workflow tasks, or whose shard
+        /// assignments split a colocated group, must not own partitions
+        /// (ADR 0009 decision 10).
+        pub const fn refuse(&mut self) {
             self.refused = true;
         }
 
@@ -1820,28 +1900,60 @@ mod db {
         /// deadline, so a failing database stops the claims in time.
         pub async fn tick(&mut self, conn: &mut AsyncPgConnection) -> HarvestResult<OwnerTick> {
             let mut tick = OwnerTick::default();
+            if self.stopped {
+                return Ok(tick);
+            }
+            if !self.refused {
+                diesel::sql_query(UPSERT_CANDIDATE_SQL)
+                    .bind::<Text, _>(self.holder.as_str())
+                    .execute(conn)
+                    .await
+                    .map_err(database_error)?;
+            }
             let mode = read_owner_mode(conn).await?;
-            let on = mode.enabled && mode.count_matches() && !self.refused;
+            let on = mode.enabled && mode.guard_installed && mode.count_matches();
             if !on {
                 if self.active {
-                    self.active = false;
-                    self.owned.set_owner_mode(self.shard, false);
-                    let held = self.owned.tenures_of(self.shard);
-                    self.drop_all(&mut tick);
-                    if !held.is_empty() {
-                        let _ =
-                            release_all(conn, self.shard, &held, self.config.lock_timeout).await;
-                    }
+                    self.deactivate(conn, &mut tick).await;
                 }
                 return Ok(tick);
             }
             self.active = true;
             self.owned.set_owner_mode(self.shard, true);
+            self.owned.set_owned_claims(self.shard, true);
             tick.owner_mode = true;
+            if self.refused {
+                return Ok(tick);
+            }
+            self.release_pending(conn).await;
             self.renew_if_due(conn, &mut tick).await?;
             self.drop_expired(&mut tick);
+            self.repend_foreign(conn).await;
             self.balance(conn, &mut tick).await?;
             Ok(tick)
+        }
+
+        /// Owner mode went off: claim and decide as before.
+        async fn deactivate(&mut self, conn: &mut AsyncPgConnection, tick: &mut OwnerTick) {
+            self.active = false;
+            self.owned.set_owned_claims(self.shard, false);
+            self.owned.set_owner_mode(self.shard, false);
+            let mut held = self.owned.tenures_of(self.shard);
+            self.drop_all(tick);
+            held.append(&mut self.releasing);
+            if !held.is_empty() {
+                let _ = release_all(conn, self.shard, &held, self.config.lock_timeout).await;
+            }
+        }
+
+        /// Release the tenures that the last tick stopped using.
+        async fn release_pending(&mut self, conn: &mut AsyncPgConnection) {
+            if self.releasing.is_empty() {
+                return;
+            }
+            let releasing = std::mem::take(&mut self.releasing);
+            // A failed release lapses within one TTL. Peers then acquire.
+            let _ = release_all(conn, self.shard, &releasing, self.config.lock_timeout).await;
         }
 
         async fn renew_if_due(
@@ -1906,45 +2018,54 @@ mod db {
             }
         }
 
+        /// Re-pend the foreign claims of acquired partitions. A failure
+        /// keeps the partitions for the next tick.
+        async fn repend_foreign(&mut self, conn: &mut AsyncPgConnection) {
+            if self.repending.is_empty() {
+                return;
+            }
+            let result = diesel::sql_query(REPEND_FOREIGN_SQL)
+                .bind::<Array<SmallInt>, _>(&self.repending)
+                .execute(conn)
+                .await;
+            match result {
+                Ok(_) => self.repending.clear(),
+                Err(error) => tracing::warn!(
+                    holder = %self.holder,
+                    error = %error,
+                    "failed to re-pend the workflow tasks of acquired partitions; retrying"
+                ),
+            }
+        }
+
         async fn balance(
             &mut self,
             conn: &mut AsyncPgConnection,
             tick: &mut OwnerTick,
         ) -> HarvestResult<()> {
-            let holders: Vec<HolderRow> = diesel::sql_query(HOLDERS_SQL)
+            let candidates: Vec<HolderRow> = diesel::sql_query(LIVE_CANDIDATES_SQL)
+                .bind::<Double, _>(secs(CANDIDATE_WINDOW))
                 .load(conn)
                 .await
                 .map_err(database_error)?;
-            let capable: Vec<WorkerRow> = diesel::sql_query(CAPABLE_WORKERS_SQL)
-                .bind::<Double, _>(self.live_within.as_secs_f64())
-                .bind::<Integer, _>(
-                    i32::try_from(OWNER_MODE_CAPABILITY_VERSION).unwrap_or(i32::MAX),
-                )
-                .load(conn)
-                .await
-                .map_err(database_error)?;
+            let peers = candidates
+                .iter()
+                .filter(|c| c.holder != self.holder.as_str())
+                .count();
             let free: FreeRow = diesel::sql_query(FREE_SQL)
                 .bind::<Double, _>(self.config.ttl.renew_interval().as_secs_f64())
                 .get_result(conn)
                 .await
                 .map_err(database_error)?;
-            let mut peers: std::collections::BTreeSet<String> =
-                capable.into_iter().map(|w| w.worker_id).collect();
-            for row in &holders {
-                if row.n > 0 && row.holder != self.holder.as_str() {
-                    peers.insert(worker_of(&row.holder).to_string());
-                }
-            }
-            peers.remove(&self.worker_id);
             let held = self.owned.tenures_of(self.shard);
             let plan = super::plan_balance(
                 held.len(),
-                peers.len(),
+                peers,
                 usize::try_from(free.free).unwrap_or(0),
                 usize::try_from(free.orphans).unwrap_or(0),
             );
             if plan.release > 0 {
-                self.release_some(conn, held, plan.release, tick).await;
+                self.stop_using(held, plan.release, tick);
             }
             if plan.acquire > 0 {
                 self.acquire_some(conn, plan.acquire, tick).await?;
@@ -1952,28 +2073,21 @@ mod db {
             Ok(())
         }
 
-        /// Release `count` held partitions, highest first. The worker stops
-        /// claiming them first, so a release never races a new claim.
-        async fn release_some(
-            &self,
-            conn: &mut AsyncPgConnection,
-            mut held: Vec<OwnerTenure>,
-            count: usize,
-            tick: &mut OwnerTick,
-        ) {
+        /// Stop claiming `count` held partitions, highest first. The next
+        /// tick releases them, so their decisions in flight can commit
+        /// (ADR 0009 decision 9).
+        fn stop_using(&mut self, mut held: Vec<OwnerTenure>, count: usize, tick: &mut OwnerTick) {
             let keep = held.len().saturating_sub(count);
-            let released = held.split_off(keep);
-            for tenure in &released {
+            for tenure in held.split_off(keep) {
                 if self.owned.unload(tenure.key(), tenure.epoch()) {
                     tick.dropped.push(tenure.key());
+                    self.releasing.push(tenure);
                 }
             }
-            // A failed release lapses within one TTL. Peers then acquire.
-            let _ = release_all(conn, self.shard, &released, self.config.lock_timeout).await;
         }
 
         async fn acquire_some(
-            &self,
+            &mut self,
             conn: &mut AsyncPgConnection,
             count: usize,
             tick: &mut OwnerTick,
@@ -1983,14 +2097,13 @@ mod db {
                 .load(conn)
                 .await
                 .map_err(database_error)?;
-            let mut taken: Vec<i16> = Vec::new();
             for pick in picks {
                 let partition = partition_of(pick.partition)?;
                 let sent = std::time::Instant::now();
                 match acquire(conn, self.shard, &self.holder, partition, &self.config).await {
                     Ok(Acquisition::Acquired(tenure)) => {
                         let deadline = tenure.ttl().local_deadline(sent);
-                        taken.push(partition.as_i16());
+                        self.repending.push(partition.as_i16());
                         tick.acquired.push((tenure, deadline));
                     }
                     Ok(Acquisition::Held | Acquisition::Busy) => {}
@@ -1998,52 +2111,44 @@ mod db {
                     Err(e) => return Err(e),
                 }
             }
-            if !taken.is_empty()
-                && let Err(error) = diesel::sql_query(REPEND_FOREIGN_SQL)
-                    .bind::<Array<SmallInt>, _>(&taken)
-                    .bind::<Text, _>(&self.worker_id)
-                    .execute(conn)
-                    .await
-            {
-                // The tenures stay. A task left RUNNING fails its old owner's
-                // fence, or the stuck-task sweep frees it.
-                tracing::warn!(
-                    worker_id = %self.worker_id,
-                    error = %error,
-                    "failed to re-pend the workflow tasks of acquired partitions"
-                );
-            }
+            self.repend_foreign(conn).await;
             Ok(())
         }
 
-        /// Release every partition of this loop's shard (ADR 0009 decision
-        /// 9). The worker calls it once its in-flight decisions end.
+        /// Stop for good and release every partition of this loop's shard
+        /// (ADR 0009 decision 9). The worker calls it once its in-flight
+        /// decisions end. A later tick does nothing.
         ///
         /// # Errors
         ///
         /// [`HarvestError::Database`] on a query failure. A lease that a
         /// failed release leaves lapses within one TTL.
         pub async fn release_everything(
-            &self,
+            &mut self,
             conn: &mut AsyncPgConnection,
         ) -> HarvestResult<Vec<super::OwnerKey>> {
+            self.stopped = true;
+            if !self.refused {
+                let _ = diesel::sql_query(DELETE_CANDIDATE_SQL)
+                    .bind::<Text, _>(self.holder.as_str())
+                    .execute(conn)
+                    .await;
+            }
             if !self.active {
                 return Ok(Vec::new());
             }
-            let held = self.owned.tenures_of(self.shard);
+            self.active = false;
+            self.owned.set_owned_claims(self.shard, false);
+            let mut held = self.owned.tenures_of(self.shard);
             let mut tick = OwnerTick::default();
             self.drop_all(&mut tick);
             self.owned.set_owner_mode(self.shard, false);
+            held.append(&mut self.releasing);
             if !held.is_empty() {
                 release_all(conn, self.shard, &held, self.config.lock_timeout).await?;
             }
             Ok(tick.dropped)
         }
-    }
-
-    /// The worker id of a holder token `worker_id/nonce`.
-    fn worker_of(holder: &str) -> &str {
-        holder.rsplit_once('/').map_or(holder, |(worker, _)| worker)
     }
 }
 
@@ -2301,8 +2406,14 @@ mod tests {
     fn the_owned_claim_lists_live_tenures_of_one_shard() {
         let owned = OwnedPartitions::default();
         let shard = ShardId::new(0);
-        assert_eq!(owned.owned_claim(shard), None, "owner mode is off");
+        assert_eq!(owned.owned_claim(shard), None, "owned claims are off");
         owned.set_owner_mode(shard, true);
+        assert_eq!(
+            owned.owned_claim(shard),
+            None,
+            "owner mode alone keeps the legacy claim"
+        );
+        owned.set_owned_claims(shard, true);
         assert_eq!(owned.owned_claim(shard), None, "no holder yet");
         let holder = OwnerHolder::for_worker("w");
         owned.set_holder(holder.clone());
@@ -2325,11 +2436,8 @@ mod tests {
         assert_eq!(owned.pin_for(expired.key()), DecisionPin::Unowned);
         assert_eq!(owned.pin_for(live.key()), DecisionPin::Owned(live.clone()));
         // A renewal moves the deadline of the current tenure only.
-        owned.extend(&[expired.clone()], later);
-        assert_eq!(
-            owned.pin_for(expired.key()),
-            DecisionPin::Owned(expired.clone())
-        );
+        owned.extend(std::slice::from_ref(&expired), later);
+        assert_eq!(owned.pin_for(expired.key()), DecisionPin::Owned(expired));
         let stale = tenure(3, 0);
         owned.extend(&[stale], Instant::now());
         assert_eq!(owned.pin_for(live.key()), DecisionPin::Owned(live));
@@ -2351,6 +2459,20 @@ mod tests {
             replaced[OWNER_MODE_CAPABILITY_LABEL],
             OWNER_MODE_CAPABILITY_VERSION
         );
+    }
+
+    #[test]
+    fn the_owned_mask_sets_one_bit_per_partition() {
+        let claim = OwnedClaim {
+            holder: "w".to_string(),
+            partitions: vec![0, 9, 511],
+        };
+        let mask = claim.mask();
+        assert_eq!(mask.len(), 64);
+        assert_eq!(mask[0], 0b0000_0001);
+        assert_eq!(mask[1], 0b0000_0010);
+        assert_eq!(mask[63], 0b1000_0000);
+        assert_eq!(mask.iter().map(|b| b.count_ones()).sum::<u32>(), 3);
     }
 
     #[test]

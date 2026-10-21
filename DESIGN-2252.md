@@ -61,7 +61,7 @@ owned claim, a database guard on the legacy claim and the acquisition loop.
 | H1 | An old binary claims a workflow task on an owner-mode shard. | The guard skips a claim with no signal. A test runs the legacy claim against the guard. |
 | H2 | An owner claims with the switch off, and two claim styles run at once. | The owned claim reads the switch row in its statement. With the switch off, it selects no workflow row. |
 | H3 | A stale owner claims after a takeover. | The guard takes the owner row `FOR KEY SHARE` and matches the holder. The commit fence stays the backstop. |
-| H4 | The guard waits on the owner row while it holds the task row, and deadlocks. | The wait is bounded at 250 ms and ends in a skip. The acquisition re-pend skips a row whose committed state is `PENDING`. |
+| H4 | The guard waits on the owner row while it holds the task row, and deadlocks. | The guard uses `SKIP LOCKED`, so it never waits. A skip skips the task row too. |
 | H5 | A task with no partition is never claimed. | Any owner may claim it. The worker stamps it and re-pends it at once. |
 | H6 | A rebalance strands a partition. | A release keeps holder and epoch and ends the lease. Peers acquire on their next scan. |
 | H7 | A worker keeps deciding past its local deadline. | `pin_for` and the claim list skip a tenure past its deadline. |
@@ -69,7 +69,9 @@ owned claim, a database guard on the legacy claim and the acquisition loop.
 | H9 | The claim gets slower. | The owned claim drops the sticky gate for workflow rows. Benchmarks compare 1, 2 and 4 loops. |
 | H10 | The extra cold decisions stay, because one worker still races itself. | Measure the cause first. Fix it in the owned path. |
 | H11 | Colocated shards map to two tenure keys. | One canonical shard keys each database. |
-| H12 | The enable step races a live legacy decision. | The enable step re-pends each legacy `RUNNING` workflow task. The execution row lock and `UNIQUE(workflow_exec_id, event_id)` stay the backstop. |
+| H12 | The enable step races a live legacy decision. | The enable step re-pends only the claims of dead workers. A live worker finishes its decision and parks the task. |
+| H13 | A failed enable leaves the guard on and the switch off, so no claim takes a workflow task. | Guard, re-pend and switch are one transaction. |
+| H14 | A peer that never acquires keeps the balance flapping. | Peers are owner loops that wrote a candidate row in the last 3 s. A worker that cannot own is no candidate. |
 
 ### 0.4 Six thinking hats
 
@@ -120,7 +122,37 @@ owned claim, a database guard on the legacy claim and the acquisition loop.
    upgrade guide, the telemetry table and a changelog fragment.
 8. The e2e bench: `HARVEST_BENCH_OWNER_MODE=1` and a decision note.
 
-## 2. Limits
+## 2. Review findings
+
+Four review agents checked locking, worker liveness, the claim SQL and the
+tests and docs. The fixes:
+
+- A failed enable could strand every workflow task. Enable is now one
+  transaction. It re-pends only the claims of dead workers.
+- Disable used `DROP TRIGGER` and its `ACCESS EXCLUSIVE` lock. It now uses
+  `DISABLE TRIGGER`.
+- The guard could refuse the head row that the SQL gate passed, so the
+  claim returned empty. Each candidate scan now checks the holder too.
+- The partition test was an array, so its cost grew with the partition
+  count. It is now one bit of a 64-byte mask.
+- Peers came from heartbeat labels, so a worker that never acquires made
+  the balance flap. Peers now come from a candidate table that live
+  owner loops write each second.
+- A worker with no workflow slot or type owned partitions. It is now a
+  participant: owned claims, no partitions.
+- The single-pool path skipped the split-group check. It runs it now.
+- Shutdown could race a scan. The scan adopts under the loop lock, and the
+  release stops the loop for good.
+- A release now waits one scan, so decisions in flight can commit.
+- The foreign re-pend locks rows in id order, covers a restarted process
+  with the same id, and retries on failure.
+- Owner mode alone no longer turns the owned claim on. Only the loop does,
+  with the switch. The #2251 fail-closed test keeps its meaning.
+- One pass evicts many partitions from the cache.
+- Docs: the claim exception in the lock order, failover bounds, limits,
+  grants and hot tables.
+
+## 3. Limits
 
 - An owner claims every workflow task of its partitions. So owner mode
   needs one queue set and one build on the database. The enable step
@@ -129,11 +161,13 @@ owned claim, a database guard on the legacy claim and the acquisition loop.
 - A legacy claim whose best row is a workflow task gets nothing. So an old
   binary can miss an activity behind it. The enable step refuses while an
   old binary is live.
-- A crashed owner can look live for one heartbeat window. Its partitions
-  then wait for the orphan rule: one renewal interval after its leases
-  end.
+- An unstamped row taken by a non-owner counts on
+  `harvest.decision_owner.fenced`, as #2251 counts every fail-closed
+  decision.
+- The owned claim reads past the workflow rows of other owners at a queue
+  head. Each owner then reads about N times as many head rows.
 
-## 3. Out of scope
+## 4. Out of scope
 
 - Foreign-writer routing and cache invalidation: #2253.
 - The crash bound and a shorter TTL: #2254.

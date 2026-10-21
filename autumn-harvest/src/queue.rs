@@ -603,7 +603,9 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         session_id: params.session_id,
         new_start: params.new_start,
         fairness_key: params.fairness_key.as_deref(),
-        decision_partition: params.decision_partition.map(|p| p.as_i16()),
+        decision_partition: params
+            .decision_partition
+            .map(crate::decision_owner::DecisionPartition::as_i16),
     };
 
     let stamp = insert_task_rows(conn, std::slice::from_ref(&row)).await?;
@@ -869,7 +871,9 @@ pub async fn enqueue_batch(
                     session_id: p.session_id,
                     new_start: p.new_start,
                     fairness_key: p.fairness_key.as_deref(),
-                    decision_partition: p.decision_partition.map(|p| p.as_i16()),
+                    decision_partition: p
+                        .decision_partition
+                        .map(crate::decision_owner::DecisionPartition::as_i16),
                 }
             })
             .collect();
@@ -1915,8 +1919,9 @@ struct CachedClaimQuery<'a> {
     /// The named row of a by-id claim (issue #1312). It binds after the
     /// fence.
     by_id: Option<Uuid>,
-    /// The owned claim (issue #2252). It binds last.
-    owned: Option<&'a OwnedClaim>,
+    /// The holder and the partition mask of an owned claim (issue #2252).
+    /// They bind last.
+    owned: Option<(&'a str, Vec<u8>)>,
 }
 
 impl diesel::query_builder::QueryId for CachedClaimQuery<'_> {
@@ -1933,7 +1938,7 @@ impl diesel::query_builder::QueryFragment<diesel::pg::Pg> for CachedClaimQuery<'
         &'b self,
         mut out: diesel::query_builder::AstPass<'_, 'b, diesel::pg::Pg>,
     ) -> diesel::QueryResult<()> {
-        use diesel::sql_types::{Array, BigInt, Integer, Nullable, SmallInt, Text};
+        use diesel::sql_types::{Array, BigInt, Binary, Integer, Nullable, Text};
         if self.ageing {
             out.push_sql(CLAIM_AGEING_MARKER);
         }
@@ -1951,9 +1956,9 @@ impl diesel::query_builder::QueryFragment<diesel::pg::Pg> for CachedClaimQuery<'
         if let Some(task_id) = &self.by_id {
             out.push_bind_param_value_only::<diesel::sql_types::Uuid, _>(task_id)?;
         }
-        if let Some(owned) = self.owned {
-            out.push_bind_param_value_only::<Text, _>(&owned.holder)?;
-            out.push_bind_param_value_only::<Array<SmallInt>, _>(&owned.partitions)?;
+        if let Some((holder, mask)) = &self.owned {
+            out.push_bind_param_value_only::<Text, _>(*holder)?;
+            out.push_bind_param_value_only::<Binary, _>(mask)?;
         }
         Ok(())
     }
@@ -2534,7 +2539,7 @@ async fn claim_task_one_statement(
                     ineligible_activities,
                     fence,
                     by_id: None,
-                    owned,
+                    owned: owned.map(|o| (o.holder.as_str(), o.mask())),
                 }
                 .load(conn)
                 .await
@@ -2764,17 +2769,27 @@ const OWNER_STICKY_ANCHOR: &str = "AND ( sticky_worker_id IS NULL ";
 /// gate goes after it.
 const OWNER_SESSION_ANCHOR: &str = "AND ( session_id IS NULL OR sticky_worker_id = $1 ) ";
 
+/// The workflow pause gate, once in each candidate scan. The holder check
+/// goes before it.
+const OWNER_CANDIDATE_ANCHOR: &str = "AND ( task_type <> 'workflow' OR workflow_exec_id IS NULL ";
+
 /// Splice the owned gate into every scan of `base` (issue #2252).
 ///
-/// Three changes, and no other text changes:
+/// Four changes, and no other text changes:
 ///
 /// - A first CTE, `owner_gate`. It sets `harvest.owner_claim` to the holder
 ///   token for this transaction, and it reads the owner-mode switch. The
 ///   claim guard reads the setting. The CTE is `MATERIALIZED`, so it runs
 ///   once, before the first workflow row passes its gate.
 /// - The sticky gate passes each workflow row. The owner is the affinity.
-/// - The owned gate: a workflow row passes only with the switch on, and only
-///   when it is unstamped or in an owned partition.
+/// - The owned gate, in each scan: a workflow row passes only with the
+///   switch on, and only when it is unstamped or in an owned partition. The
+///   partitions are a 64-byte mask, so one bit test serves any count.
+/// - The holder check, in each candidate scan: a stamped row passes only
+///   when its owner row names this holder. A stale local list then skips a
+///   row that the guard would refuse, and the claim takes the next row. The
+///   head scans keep no such check, so each head gate is still implied by a
+///   row gate.
 ///
 /// The assertions make an edit that breaks an anchor panic at first use.
 fn splice_owner_gate(base: &str, holder_bind: &str, partitions_bind: &str) -> String {
@@ -2783,6 +2798,11 @@ fn splice_owner_gate(base: &str, holder_bind: &str, partitions_bind: &str) -> St
     assert!(
         sticky > 0 && sticky == session,
         "claim query owner anchors must appear once per scan: {sticky} sticky, {session} session"
+    );
+    assert_eq!(
+        base.matches(OWNER_CANDIDATE_ANCHOR).count(),
+        base.matches("CROSS JOIN worker_info").count(),
+        "claim query holder anchor must appear once per candidate scan"
     );
     #[expect(clippy::expect_used, reason = "every claim query is a constant")]
     let rest = base
@@ -2799,7 +2819,14 @@ fn splice_owner_gate(base: &str, holder_bind: &str, partitions_bind: &str) -> St
         "{OWNER_SESSION_ANCHOR}AND ( task_type <> 'workflow' \
              OR ( (SELECT owner_on FROM owner_gate) \
                   AND ( decision_partition IS NULL \
-                        OR decision_partition = ANY({partitions_bind}::int2[]) ) ) ) "
+                        OR get_bit({partitions_bind}::bytea, decision_partition) = 1 ) ) ) "
+    );
+    let holder_check = format!(
+        "AND ( task_type <> 'workflow' OR decision_partition IS NULL \
+             OR EXISTS ( SELECT 1 FROM harvest_decision_owner o \
+                         WHERE o.partition = harvest_task_queue.decision_partition \
+                           AND o.holder = {holder_bind}::text ) ) \
+         {OWNER_CANDIDATE_ANCHOR}"
     );
     format!("{gate_cte}{rest}")
         .replace(
@@ -2807,6 +2834,7 @@ fn splice_owner_gate(base: &str, holder_bind: &str, partitions_bind: &str) -> St
             "AND ( task_type = 'workflow' OR sticky_worker_id IS NULL ",
         )
         .replace(OWNER_SESSION_ANCHOR, &owned_gate)
+        .replace(OWNER_CANDIDATE_ANCHOR, &holder_check)
 }
 
 /// The owned form of each claim statement (issue #2252).
@@ -3395,7 +3423,7 @@ pub async fn claim_task_by_id_with_owner(
                     ineligible_activities,
                     fence,
                     by_id: Some(task_id),
-                    owned,
+                    owned: owned.map(|o| (o.holder.as_str(), o.mask())),
                 }
                 .load(conn)
                 .await
@@ -10891,15 +10919,24 @@ mod tests {
             "AND ( task_type <> 'workflow' \
                  OR ( (SELECT owner_on FROM owner_gate) \
                       AND ( decision_partition IS NULL \
-                            OR decision_partition = ANY({partitions}::int2[]) ) ) ) "
+                            OR get_bit({partitions}::bytea, decision_partition) = 1 ) ) ) "
+        );
+        let holder_check = format!(
+            "AND ( task_type <> 'workflow' OR decision_partition IS NULL \
+                 OR EXISTS ( SELECT 1 FROM harvest_decision_owner o \
+                             WHERE o.partition = harvest_task_queue.decision_partition \
+                               AND o.holder = {holder}::text ) ) "
         );
         let rest = owned
             .strip_prefix(&gate_cte)
             .expect("the owned claim starts with its gate");
-        format!("WITH {rest}").replace(&gate, "").replace(
-            "AND ( task_type = 'workflow' OR sticky_worker_id IS NULL ",
-            OWNER_STICKY_ANCHOR,
-        )
+        format!("WITH {rest}")
+            .replace(&gate, "")
+            .replace(&holder_check, "")
+            .replace(
+                "AND ( task_type = 'workflow' OR sticky_worker_id IS NULL ",
+                OWNER_STICKY_ANCHOR,
+            )
     }
 
     /// Each owned form is its legacy form plus the splice, and nothing else
@@ -10945,9 +10982,14 @@ mod tests {
         assert_eq!(scans, 4, "two candidate scans and two head scans");
         assert_eq!(
             owned
-                .matches("decision_partition = ANY($8::int2[])")
+                .matches("get_bit($8::bytea, decision_partition)")
                 .count(),
             scans
+        );
+        assert_eq!(
+            owned.matches("o.holder = $7::text").count(),
+            2,
+            "the holder check reaches both candidate scans, not the heads"
         );
         assert_eq!(
             owned
@@ -10960,10 +11002,11 @@ mod tests {
         let by_id = owned_claim_by_id_query(false);
         assert_eq!(
             by_id
-                .matches("decision_partition = ANY($9::int2[])")
+                .matches("get_bit($9::bytea, decision_partition)")
                 .count(),
             1
         );
+        assert_eq!(by_id.matches("o.holder = $8::text").count(), 1);
         // The legacy text never mentions owner mode.
         for text in [legacy, claim_task_by_id_query()] {
             assert!(!text.contains("owner_gate"));

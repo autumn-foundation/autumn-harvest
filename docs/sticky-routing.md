@@ -53,9 +53,11 @@ Owner mode (issue #2252, [ADR 0009](adr/0009-decision-owner.md)) gives each exec
 
 - **One owner per partition.** Each database has 512 decision partitions. The partition of an execution is a hash of its `workflow_id`. A worker holds a lease on each partition that it owns.
 - **Owned claim.** An owner claims a workflow task only from its own partitions. The sticky gate does not apply to a workflow row, and the park writes no pin. So no window expires, and every decision of an execution runs on its owner.
+- **Unstamped rows.** Each new workflow task carries its partition. A row with none, from an old binary or a dead-letter redrive, is claimable by any owner. That owner stamps the row and re-pends it to the right owner.
 - **Resident hits survive.** The owner keeps the resident workflow between decisions, however long the next activity, timer or signal takes. A decision replays cold only after an eviction, a restart or a change of owner.
-- **Balance.** Each worker targets `⌈512 / live owners⌉` partitions. A worker that joins takes free partitions. A worker above its target plus one releases the extra ones. A graceful stop releases every partition in one statement.
-- **Failover.** A crashed owner's leases lapse after the TTL, 10 s by default. Another worker then acquires its partitions within about one second. A new owner starts cold.
+- **Balance.** Each worker targets `⌈512 / live owners⌉` partitions. A live owner is a worker whose owner loop scanned in the last 3 s. A worker that joins takes free partitions. A worker above its target plus one stops claiming the extra ones and releases them one scan later. A graceful stop releases every partition in one statement.
+- **Who owns.** A worker with no workflow slot or no workflow type never owns a partition. It still claims activity tasks.
+- **Failover.** A crashed owner drops out of the live owners within 3 s. Its leases lapse after the TTL, 10 s by default. Peers then acquire its partitions on their next scan. A new owner starts cold.
 - **Fence.** Each decision commit checks the owner's lease epoch. A stale owner cannot write. See [ADR 0009](adr/0009-decision-owner.md).
 
 | | Sticky routing | Owner mode |
@@ -69,12 +71,19 @@ Owner mode (issue #2252, [ADR 0009](adr/0009-decision-owner.md)) gives each exec
 
 Owner mode is a switch per database. It is off by default. Turn it on with `decision_owner::enable_owner_mode`. The step:
 
-1. Refuses while a live worker cannot run owner mode, or while live workers poll different queues or run different builds. An owner claims every workflow task of its partitions, so each owner must be able to run each of them.
+1. Refuses while a live worker cannot run owner mode, while live workers poll different queues or run different builds, or while no owner loop is live. An owner claims every workflow task of its partitions, so each owner must be able to run each of them.
 2. Stamps the partition of each live workflow task.
-3. Installs a guard on the claim of a workflow task. A claim with no owner token then takes no workflow task. A binary from before owner mode sends no token, so a fleet can never mix the two claim styles.
-4. Waits for in-flight legacy decisions, re-pends any that remain, and sets the switch.
+3. In one transaction, installs a guard on the claim of a workflow task, re-pends the legacy claims of dead workers, and sets the switch. A claim with no owner token then takes no workflow task. A binary from before owner mode sends no token, so a fleet can never mix the two claim styles. A live worker finishes its own legacy decision.
 
-`decision_owner::disable_owner_mode` clears the switch and drops the guard in one transaction. Owners then release their partitions and claim as before.
+The guard statements take a `SHARE ROW EXCLUSIVE` lock on `harvest_task_queue`, bounded by a lock timeout. That lock does not block a reader. Run the step as the owner of the table.
+
+`decision_owner::disable_owner_mode` clears the switch and turns the guard off in one transaction. Owners then release their partitions and claim as before.
+
+**Limits.**
+
+- The enable step checks queues and builds once. A worker that starts later with other queues or another build is not stopped. Its partitions can then hold workflow tasks that it cannot claim. Keep one queue set and one build per database while owner mode is on.
+- For a rolling deploy of a new build, turn owner mode off first, deploy, then turn it on again.
+- A binary from before owner mode claims no workflow task. Its claim can also miss an activity task behind a workflow task. So the enable step refuses while such a binary is live.
 
 Workers read the switch about once a second. A worker in owner mode still caches workflow state and still needs `sticky_timeout` above zero. `harvest.workflow.resident` keeps the same labels in both modes.
 

@@ -9,7 +9,7 @@
 -- it to its owner.
 --
 -- `harvest_decision_owner_mode` is the per-database switch. It has exactly
--- one row. `partitions` is the partition count of this database. A process
+-- one row. `harvest_decision_owner_candidates` lists the live owner loops. `partitions` is the partition count of this database. A process
 -- that reads another count refuses owner mode.
 --
 -- `harvest_task_queue_owner_claim_guard` is the guard on the claim of a
@@ -38,14 +38,23 @@ CREATE TABLE IF NOT EXISTS harvest_decision_owner_mode (
 INSERT INTO harvest_decision_owner_mode (singleton) VALUES (TRUE)
 ON CONFLICT (singleton) DO NOTHING;
 
+-- The owner candidates of this database. Each owner loop writes its holder
+-- token here on each scan, about once a second. The balance counts the
+-- candidates seen in the last few seconds. A crashed worker drops out
+-- quickly, and a worker that cannot own partitions never writes a row.
+CREATE TABLE IF NOT EXISTS harvest_decision_owner_candidates (
+    holder  TEXT        PRIMARY KEY,
+    seen_at TIMESTAMPTZ NOT NULL
+);
+
 -- The claim guard. It runs only for a claim of a workflow task, through the
 -- `WHEN` clause of the trigger that the enable step creates.
 --
 -- An owned claim sets `harvest.owner_claim` to its holder token for its own
 -- transaction. A claim with no token is a legacy claim, so the guard skips
 -- the row: the claim then selects nothing. `RETURN NULL` skips the row and
--- raises no error, so a new binary with a stale view of the switch only
--- misses one claim.
+-- raises no error. A new binary with a stale view of the switch misses its
+-- workflow claims until its next scan, about one second.
 --
 -- For a stamped row, the guard takes the owner row FOR KEY SHARE and matches
 -- the holder. SKIP LOCKED means the claim never waits for an owner row. Only
@@ -78,5 +87,7 @@ $$;
 
 COMMENT ON COLUMN harvest_task_queue.decision_partition IS
     'The decision partition of a workflow task (issue #2252). NULL: not stamped.';
+COMMENT ON TABLE harvest_decision_owner_candidates IS
+    'The live owner loops of this database (issue #2252). The balance counts them.';
 COMMENT ON TABLE harvest_decision_owner_mode IS
     'The owner-mode switch of this database (issue #2252, ADR 0009 decision 11).';

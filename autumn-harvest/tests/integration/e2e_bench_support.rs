@@ -3721,6 +3721,7 @@ pub mod db {
         let total: u64 = after.keys().map(|key| delta(key)).sum();
         let hits = delta("hit");
         let extra = i128::from(total) - i128::from(runs * per_run);
+        let extra_cold = i128::from(delta("cold")) - i128::from(runs);
         let continuations = total.saturating_sub(runs);
         #[allow(
             clippy::cast_precision_loss,
@@ -3732,8 +3733,8 @@ pub mod db {
             format!("{:.1}%", hits as f64 * 100.0 / continuations as f64)
         };
         format!(
-            "decisions (issue #2252, measured loop): {total} for {runs} runs, {extra} extra; \
-             continuation hit rate {rate}"
+            "decisions (issue #2252, measured loop): {total} for {runs} runs, {extra} extra, \
+             {extra_cold} extra cold; continuation hit rate {rate}"
         )
     }
 
@@ -3749,13 +3750,13 @@ pub mod db {
         }
         assert_eq!(
             decision_note(&before, &counts.snapshot(), 2, 4),
-            "decisions (issue #2252, measured loop): 8 for 2 runs, 0 extra; \
+            "decisions (issue #2252, measured loop): 8 for 2 runs, 0 extra, 0 extra cold; \
              continuation hit rate 100.0%"
         );
         counts.record_workflow_resident("wf", "q", ResidentOutcome::Cold);
         assert!(
             decision_note(&before, &counts.snapshot(), 2, 4)
-                .ends_with("9 for 2 runs, 1 extra; continuation hit rate 85.7%")
+                .ends_with("9 for 2 runs, 1 extra, 1 extra cold; continuation hit rate 85.7%")
         );
     }
 
