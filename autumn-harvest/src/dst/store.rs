@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 /// The predicate that guards an owner write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Fencing {
     /// The claim epoch of issue #1789: `state`, `worker_id` and `attempt`.
     ClaimEpoch,
@@ -42,7 +42,7 @@ impl Fencing {
 }
 
 /// The `state` column of a task row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TaskState {
     /// Ready to claim.
     Pending,
@@ -65,7 +65,7 @@ impl TaskState {
 }
 
 /// One claim of a task row. It is the fencing token of issue #1789.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Claim {
     /// The task index.
     pub task: usize,
@@ -76,7 +76,7 @@ pub struct Claim {
 }
 
 /// A row that the orphan scan found.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Orphan {
     /// The task index.
     pub task: usize,
@@ -87,7 +87,7 @@ pub struct Orphan {
 }
 
 /// The columns of a task row that the simulator compares.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Row {
     /// The `state` column.
     pub state: TaskState,
@@ -252,7 +252,7 @@ pub trait ClaimStore {
 ///
 /// Each operation follows the SQL statement that [`Op`] names. The
 /// differential test checks this against Postgres.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OracleStore {
     fencing: Fencing,
     stale_after_ms: u64,

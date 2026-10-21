@@ -26,6 +26,10 @@
 //! The [`speculate`] module models speculative decisions over an in-flight
 //! commit (issue #2011). It is an R&D spike with no database.
 //!
+//! The `stateright` test target visits every schedule of [`OracleStore`] and
+//! [`owner::OracleOwnerStore`] within a bound. A sweep here picks one
+//! schedule per seed. The models judge a run with [`Ghost`], as [`run`] does.
+//!
 //! See `docs/testing/simulation.md` and
 //! `docs/adr/0004-deterministic-simulation-testing.md`.
 
@@ -41,7 +45,7 @@ mod store;
 mod sweep;
 pub mod world;
 
-pub use invariant::{Invariant, Violation};
+pub use invariant::{Ghost, Invariant, Live, Violation, WriteKind};
 pub use rng::SplitMix64;
 pub use sim::{SimConfig, SimReport, SimStats, StepRecord, run, run_with};
 pub use store::{
