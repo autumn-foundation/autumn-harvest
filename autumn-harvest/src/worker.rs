@@ -22798,9 +22798,9 @@ fn pin_owner_tenure(
 /// from the cached `next_event_id` with no gap.
 ///
 /// In owner mode, a hit replays cold when its delta holds a state change,
-/// such as a pause, or when its entry has another owner key (issue #2253).
-/// A foreign writer made that change. The owner wake was lost, or it came
-/// while a decision held the entry.
+/// such as a pause (issue #2253). It also replays cold when its entry has
+/// another owner key. A foreign writer made that change. The owner wake was
+/// lost, or it came while a decision held the entry.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn prepare_workflow_task_with_cache(
     conn: &mut AsyncPgConnection,
