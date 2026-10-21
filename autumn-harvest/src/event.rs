@@ -1244,8 +1244,7 @@ impl WorkflowEvent {
             | Self::WorkflowRedriven { .. }
             | Self::WorkflowResetFork { .. }
             | Self::WorkflowResetTerminated { .. }
-            | Self::WorkflowRetryScheduled { .. }
-            | Self::WorkflowCancelRequested { .. } => None,
+            | Self::WorkflowRetryScheduled { .. } => None,
         }
     }
 
@@ -1365,8 +1364,7 @@ impl WorkflowEvent {
             | Self::ExternalAwaitRequested { .. }
             | Self::MutexGranted { .. }
             | Self::DecisionCommitted { .. }
-            | Self::WorkflowForked { .. }
-            | Self::WorkflowCancelRequested { .. } => None,
+            | Self::WorkflowForked { .. } => None,
         }
     }
 }

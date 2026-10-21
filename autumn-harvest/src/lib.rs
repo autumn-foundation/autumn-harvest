@@ -419,6 +419,9 @@ pub mod partition;
 /// Export of aged event partitions to object storage (issue #2009).
 pub mod partition_archive;
 pub mod payload_codec;
+/// The depth cap on payloads that Harvest keeps, shared by both backends (issues
+/// #2224, #2225).
+pub mod payload_depth;
 /// Sweep of payload blobs that no execution references (issue #2123).
 #[cfg(feature = "db")]
 pub mod payload_orphans;

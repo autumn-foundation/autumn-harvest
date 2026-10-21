@@ -376,6 +376,8 @@ Explicitly **not** provided by the best-effort mode (see the issue for rationale
 
 ## See also
 
+- [Durable streaming routes](durable-routes.md#stream-the-run) — an app route
+  that streams the durable chunks of a keyed run, behind the app's own auth.
 - `autumn-harvest/examples/streaming_agent.rs` — a worked AI-agent-shaped example
   that publishes per-step chunks and documents the `curl -N` consumer.
 - [`set_current_details`](architecture.md#current-details--operator-status-breadcrumb-issue-593) (#473/#593) — the single-value pull status

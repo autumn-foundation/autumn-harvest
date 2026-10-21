@@ -50,6 +50,8 @@ mod backup_verify_tests;
 mod batch_executor_pool_exhaustion_tests;
 mod benchmarks_docs;
 #[cfg(feature = "db")]
+mod broken_session_scan_perf;
+#[cfg(feature = "db")]
 mod build_reachability_fanout_perf;
 #[cfg(feature = "db")]
 mod build_routing_tests;
@@ -139,6 +141,9 @@ mod debugger_tests;
 mod decision_boundary_db_tests;
 #[cfg(feature = "testing")]
 mod decision_boundary_replay_tests;
+mod decision_owner_docs;
+#[cfg(feature = "db")]
+mod decision_owner_lock_modes_db_tests;
 mod declarative_update_tests;
 #[cfg(feature = "db")]
 mod deep_backlog_fixture_tests;
@@ -241,6 +246,8 @@ mod partitioned_events_docs;
 mod pause_tests;
 #[cfg(feature = "testing")]
 mod payload_cap_tests;
+#[cfg(feature = "db")]
+mod payload_depth_tests;
 #[cfg(feature = "db")]
 mod payload_offload_db_tests;
 #[cfg(feature = "testing")]

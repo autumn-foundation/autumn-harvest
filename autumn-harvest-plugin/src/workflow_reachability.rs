@@ -415,18 +415,10 @@ async fn observe_shard(
         Ok(conn) => conn,
         Err(observation) => return observation,
     };
-    match non_terminal_counts_by_workflow_name(&mut conn, Some(shard_id), filter.as_deref()).await {
-        Ok(rows) => ShardObservation {
-            shard_id,
-            rows,
-            error: None,
-        },
-        Err(error) => ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(error.to_string()),
-        },
-    }
+    shard_fanout::observe_shard_result(
+        shard_id,
+        non_terminal_counts_by_workflow_name(&mut conn, Some(shard_id), filter.as_deref()).await,
+    )
 }
 
 fn build_report_from_observations(

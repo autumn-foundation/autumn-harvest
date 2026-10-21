@@ -187,6 +187,32 @@ in `autumn-harvest-sqlite/src/schema.rs`. It has no sanctioned writer, so it
 refuses every `UPDATE`, and an `INSERT OR REPLACE` over a stored event. A
 test fixture calls `autumn_harvest_sqlite::append_only::with_guard_off`.
 
+### Decision owner fence (issue #2249)
+
+[ADR 0009](docs/adr/0009-decision-owner.md) defines owner mode. Issue #2251
+builds it. Code for owner mode follows these rules:
+
+- A decision commit or an owned claim takes the generation row, then its
+  owner row `FOR KEY SHARE`. It takes the owner row before any execution
+  row, task row or advisory lock.
+- The commit compares holder and epoch. A mismatch aborts the whole
+  transaction. The commit never checks the lease end.
+- An acquisition takes the owner row `FOR UPDATE`, then increments the
+  epoch. Never change the epoch with a plain `UPDATE` or an upsert. Neither
+  one drains in-flight commits.
+- A renewal changes the lease end only. Renewal, release and revoke match
+  holder and epoch. A release keeps the epoch.
+- A statement on many owner rows locks them in ascending partition order.
+- A fenced owner unloads the partition and never retries at the stale
+  epoch.
+- A commit or an owned claim takes one owner row only. A foreign writer
+  takes none.
+- An acknowledgement never comes from owner memory. It follows a durable
+  write.
+- List, search and describe read Postgres, never an owner cache.
+
+`decision_owner_lock_modes_db_tests.rs` proves the lock modes.
+
 ## Performance Agents
 
 Do not profile the strict replay path again (`WorkflowReplayer::replay_from_events`,

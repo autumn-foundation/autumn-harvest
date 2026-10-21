@@ -235,18 +235,7 @@ async fn observe_shard(
     };
     filters.shard_id = Some(shard_id);
 
-    match load_retirement_check(&mut conn, &filters).await {
-        Ok(rows) => ShardObservation {
-            shard_id,
-            rows,
-            error: None,
-        },
-        Err(error) => ShardObservation {
-            shard_id,
-            rows: Vec::new(),
-            error: Some(error.to_string()),
-        },
-    }
+    shard_fanout::observe_shard_result(shard_id, load_retirement_check(&mut conn, &filters).await)
 }
 
 fn build_report_from_observations(

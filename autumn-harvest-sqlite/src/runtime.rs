@@ -16,6 +16,9 @@ use autumn_harvest::executor::{
     QueryReplayOutcome, WorkflowExecuteSpanMeta, drive_query_replay_async,
     run_workflow_with_state_history_policy_and_caps,
 };
+use autumn_harvest::payload_depth::{
+    MAX_PAYLOAD_DEPTH, PAYLOAD_TOO_DEEP_ERROR_TYPE, nests_past_cap,
+};
 use autumn_harvest::policy::WorkflowSchedule;
 use autumn_harvest::{
     ActivityExecId, ActivityHandlerFn, ActivityInfo, ExecutionId, NoOpMetrics, TimerId,
@@ -343,13 +346,6 @@ pub struct SignalWithStartOutcome {
 /// The `error_type` of the `WorkflowFailed` event that seals an execution
 /// which reached an unsupported feature (issue #1834).
 pub const UNSUPPORTED_FEATURE_ERROR_TYPE: &str = "UnsupportedFeature";
-
-/// The `error_type` of the activity failure that replaces a result nested past
-/// [`MAX_PAYLOAD_DEPTH`] (issue #2216). The failure is non-retryable.
-///
-/// A local activity failure keeps only its message, as every local failure
-/// does. So the workflow sees the error type `Error` for a local activity.
-pub const PAYLOAD_TOO_DEEP_ERROR_TYPE: &str = "PayloadTooDeep";
 
 /// The time limit for the replay that rebuilds update handlers, and the
 /// default limit for an update handler (issue #2025). It matches the
@@ -3175,6 +3171,32 @@ impl SqliteRuntime {
         }
         self.workflow_panic_strikes.remove(&exec);
 
+        // Issue #2224: a result nested past the cap cannot be read back. The
+        // body has already returned, so it cannot handle the error. The run
+        // fails with a typed failure instead of storing the value.
+        let outcome = match outcome {
+            WorkflowOutcome::Completed {
+                output,
+                unhandled_signals,
+            } if nests_past_cap(&output) => {
+                tracing::warn!(%exec, "workflow result nests past the depth cap; failing the run");
+                let failure = autumn_harvest::failure::WorkflowFailure::new(
+                    PAYLOAD_TOO_DEEP_ERROR_TYPE,
+                    format!("workflow result nests more than {MAX_PAYLOAD_DEPTH} levels"),
+                )
+                .non_retryable();
+                WorkflowOutcome::Failed {
+                    error: autumn_harvest::failure::IntoWorkflowErrorString::into_workflow_error_payload(
+                        failure,
+                    ),
+                    non_deterministic_details: None,
+                    handler_panic: false,
+                    unhandled_signals,
+                }
+            }
+            other => other,
+        };
+
         // Issue #2021: a pending cancel request ends the run here.
         // - A body that returns `Ok` or `Err` has done its cleanup. Its
         //   bookkeeping commands persist before the terminal event.
@@ -4358,64 +4380,6 @@ fn start_in_tx(
     }
 }
 
-/// The deepest nesting that ingress accepts in a payload (issue #2157).
-///
-/// `serde_json` reads at most 128 levels. Event storage wraps a payload in a
-/// few more levels. The cap leaves room for that wrapping.
-pub const MAX_PAYLOAD_DEPTH: usize = 100;
-
-/// The children of a JSON container, as one iterator type.
-enum Children<'a> {
-    Array(std::slice::Iter<'a, Value>),
-    Object(serde_json::map::Values<'a>),
-}
-
-impl<'a> Iterator for Children<'a> {
-    type Item = &'a Value;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Array(items) => items.next(),
-            Self::Object(values) => values.next(),
-        }
-    }
-}
-
-/// The children of `value`, or `None` for a scalar.
-fn children(value: &Value) -> Option<Children<'_>> {
-    match value {
-        Value::Array(items) => Some(Children::Array(items.iter())),
-        Value::Object(map) => Some(Children::Object(map.values())),
-        _ => None,
-    }
-}
-
-/// Returns `true` when `value` has more than [`MAX_PAYLOAD_DEPTH`] open
-/// arrays and objects on a path.
-///
-/// The walk keeps one iterator per open container. A recursive walk would
-/// overflow the call stack on the input it must refuse. Memory use is bound
-/// by the cap, not by the width of the value.
-///
-/// Call it before any code that recurses over the value, such as a schema check
-/// or a settlement decoder.
-pub fn nests_past_cap(value: &Value) -> bool {
-    let mut open: Vec<Children<'_>> = children(value).into_iter().collect();
-    while let Some(top) = open.last_mut() {
-        let Some(child) = top.next() else {
-            open.pop();
-            continue;
-        };
-        if let Some(inner) = children(child) {
-            if open.len() >= MAX_PAYLOAD_DEPTH {
-                return true;
-            }
-            open.push(inner);
-        }
-    }
-    false
-}
-
 /// Returns `Ok` only when `value` nests at most [`MAX_PAYLOAD_DEPTH`] levels.
 /// `kind` names the ingress boundary in the error.
 fn check_depth(kind: &'static str, value: &Value) -> SqliteResult<()> {
@@ -4814,6 +4778,8 @@ fn retry_plan(
     let error_type = failure.error_type.as_deref();
     if config.attempt >= policy.max_attempts
         || error_type == Some(autumn_harvest::failure::ERROR_TYPE_HANDLER_PANIC)
+        // A deep result is the same on every attempt (issue #2224).
+        || error_type == Some(PAYLOAD_TOO_DEEP_ERROR_TYPE)
     {
         return Ok(None);
     }

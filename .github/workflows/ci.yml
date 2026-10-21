@@ -328,6 +328,13 @@ jobs:
       - name: Run docs/alerts SLO pack guards (also on docs-only PRs)
         run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration slo_pack_docs::"
 
+      # Issue #2249: ADR 0009 records the decision owner model. A docs-only
+      # PR skips the `test` matrix, so its guards run here.
+      # `decision_owner_docs::guards_run_on_docs_only_changes` checks that
+      # this step exists. Quoted for the trailing-`::` reason above.
+      - name: Run the decision owner ADR guards (also on docs-only PRs)
+        run: "cargo test -p autumn-harvest --no-default-features --features testing --test integration decision_owner_docs::"
+
       # Issue #1816: load and unit-test the SLO burn-rate rules. The pinned
       # tarball and its checksum keep a new promtool release from reddening
       # lint, and a tampered download fails the checksum.
@@ -763,9 +770,12 @@ jobs:
       # macOS and Windows legs too. Its ALLOWLIST entry in `ci_run_coverage.rs`
       # points here. (The SQS broker suite IS a manifest row — `aws-sdk-sqs` is
       # pure Rust and compiles everywhere.)
+      # A third-party apt source on the runner image can fail `apt-get
+      # update` (packages.microsoft.com returned 403). The other lists still
+      # refresh, so the install goes on. A failed install still fails the step.
       - name: Install librdkafka build deps (Linux)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+        run: (sudo apt-get update || echo "::warning::apt-get update failed for a mirror; installing from the lists it fetched") && sudo apt-get install -y libcurl4-openssl-dev
       - name: Run plugin Kafka broker connector tests (issue #944)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true'
         run: cargo test -p autumn-harvest-plugin --features kafka --test connector_kafka_broker -- --test-threads=1
@@ -990,7 +1000,7 @@ jobs:
       - name: Compile plugin Kafka connector example (issue #944, Linux)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 0
         run: |
-          sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+          (sudo apt-get update || echo "::warning::apt-get update failed for a mirror; installing from the lists it fetched") && sudo apt-get install -y libcurl4-openssl-dev
           cargo build -p autumn-harvest-plugin --example kafka_connector_quickstart --features kafka
       - name: Run macros tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 1
@@ -2018,7 +2028,7 @@ jobs:
       - name: Clippy autumn-harvest-plugin (redis feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features redis -- -D warnings
       - name: Install librdkafka build deps
-        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+        run: (sudo apt-get update || echo "::warning::apt-get update failed for a mirror; installing from the lists it fetched") && sudo apt-get install -y libcurl4-openssl-dev
       - name: Clippy autumn-harvest-plugin (kafka feature)
         run: cargo clippy -p autumn-harvest-plugin --all-targets --features kafka -- -D warnings
 
@@ -2422,7 +2432,7 @@ jobs:
       (github.event_name != 'pull_request' || github.event.pull_request.draft == false) &&
       needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    # The models take about 40 seconds and the trace fixtures about 10.
+    # The models take about 2 minutes and the trace fixtures about 10 seconds.
     # The runner image has Java and Python.
     timeout-minutes: 15
     steps:

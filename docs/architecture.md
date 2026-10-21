@@ -228,6 +228,8 @@ The capability-miss release keys on `(worker_id, crash_strikes, attempt)` (issue
 
 *Simulation.* `autumn_harvest::dst` drives the same protocol from a seed, with 3 workers, stalls and crashes (issue #1830). A differential test replays each run on Postgres through the production statements. With the fence off, a sweep reproduces the #1789 bug. The world simulation runs the real worker loop, timers and the scheduler fire claim under a seed (issue #2002). See [`simulation.md`](testing/simulation.md).
 
+*Exhaustive oracle check.* Stateright visits every schedule of the same oracle within a bound. With the fence off, it finds the #1789 trace in 7 steps. See [`stateright.md`](testing/stateright.md).
+
 **10. Suspension readiness (issue #1797)**
 
 A decision cycle suspends when the workflow is blocked on Harvest futures. No clock decides a suspension. A clock bounds only waits on foreign futures. `executor::run_workflow_handler_cycle` applies this rule.
@@ -340,6 +342,13 @@ Against a dependency whose latency grows in proportion to the concurrency above 
 
 *Metrics.* Three gauges, each labeled by `activity`: `harvest.activity.concurrency_limit`, `harvest.activity.concurrency_in_flight` and `harvest.activity.latency_baseline_seconds`. The registry publishes them under its lock after every change. A call that changes nothing publishes nothing. The counter `harvest.activity.concurrency_deferred{activity}` counts deferrals. Prometheus exports it as `harvest_activity_concurrency_deferred_total`. See [`telemetry.md`](telemetry.md#metric-catalogue-adr-0001-7).
 
+### Terms
+
+A **decision partition** is a fixed hash bucket of executions inside one
+shard database, with one owner at a time.
+[ADR 0009](adr/0009-decision-owner.md) records it. The glossary of shard
+and owner terms is in [`sharding.md`](sharding.md#glossary).
+
 ### Sharding
 
 Harvest can spread workflow state across N independent Postgres databases. A single workflow's event log, task queue rows, timers, signals, and DLQ entries all live on the same shard, so per-workflow ACID guarantees are preserved without cross-shard transactions. An operator can move a quiescent workflow to another shard (`shard_rebalance.rs`, issue #964). A running workflow does not move. See [`sharding.md`](sharding.md#shard-rebalancing--migrating-quiescent-workflows-issue-964).
@@ -436,6 +445,7 @@ An agent loop can spend without limit. A budget caps the LLM tokens or the cost 
 | `remote_task.rs` | 3.x | Durable outbound MCP/A2A task calls (issue #2006, [guide](remote-tasks.md)): `ctx.call_remote_task(&RemoteTaskCall)` starts a remote task with the `harvest_remote_task_start` activity, then journals its handle as an external task token (`harvest_remote_task_await`). `RemoteTaskPoller` reads the handle from history and settles the token; `resolve` is the push form. A tool result with `isError: true` completes the call. `RemoteTaskTransport` is the client seam; the plugin ships `HttpRemoteTasks`. No new event variant, no migration. |
 | `erase.rs` | 3.30 | Targeted PII erasure (issue #495): `ERASURE_TOMBSTONE_KEY`, `erasure_tombstone()`, `tombstone_payload_fields(event_value)` (pure, no-DB), `is_terminal_state(state)`, `EraseOutcome`/`SkippedChild`/`EraseFailure`; DB-gated `erase_workflow_payloads(conn, exec_id, reason)`. **Sanctioned in-place mutation exception** to the append-only invariant (alongside codec key re-encryption): only `data` field contents are mutated, never event structure. Terminal-only, irreversible, idempotent, cascades to terminal children on the same shard. |
 | `payload_codec.rs` | 3.40 | Payload encryption/compression boundary at the event-write path (`PayloadCodec` trait, `PayloadCodecs` registry, `IdentityCodec`; see [ADR-0003](adr/0003-payload-codec-event-boundary.md)). Key rotation (issue #948): `register_key`/`set_active_key`/`active_key_id`/`retire_key_local`, `CODEC_LEGACY_KEY_ID`. The `_harvest_codec_envelope` shape (`codec_envelope_parts`): a genuinely rotated key still writes the flat version-2 shape unchanged; only `encode_payload`'s collision-escape guard (issue #1253, `CODEC_ENVELOPE_VERSION_NESTED`) writes the new nested shape, deliberately un-gated (see that method's doc for why nesting a keyed write instead would reopen a rollout hazard). Decode reads all three shapes. `advertise_codec_capability` (issue #1244) merges this build's `CODEC_ENVELOPE_VERSION_KEYED` support into a worker's `harvest_workers.labels`, consumed by `codec_rotation::activate_codec_key`'s reader-capability handshake — unchanged by issue #1253. |
+| `payload_depth.rs` | 3.40 | Depth cap for workflow-side payloads (issue #2224): `MAX_PAYLOAD_DEPTH` and the non-recursive `nests_past_cap` walk. `WorkflowContext` returns `HarvestError::PayloadTooDeep` at the call site. |
 | `aead_codec.rs` | 3.x | Production AES-256-GCM payload codec (issue #1825). `AeadCodec`: `codec_id` `aes-256-gcm`, a random 96-bit nonce, and an authenticated header with the format version and key id. Also `DataKey` (zeroized on drop), the `KeyProvider` trait and `EnvKeyProvider`/`FileKeyProvider`/`KmsKeyProvider`. The plugin crate's `aws-kms` feature adds `aws_kms::AwsKms`, and its `vault-transit` feature adds `vault_transit::VaultTransit` (issue #1981). Both implement `KmsDecrypt`, so the core crate has no cloud dependency. Both pass one shared `kms_conformance` test suite. `AeadCodec::register_with` and `HarvestBuilder::aead_payload_codec_key` register one codec per key id, so the issue #948 sweep rotates it. See [`docs/security-posture.md`](security-posture.md#payload-encryption-at-rest-issue-1825). |
 | `codec_rotation.rs` | 3.40 | Lazy re-encryption sweep for payload-codec key rotation (issue #948): `sweep_codec_reencryption`/`sweep_codec_reencryption_once` (folded into `timeout::enforce_timeouts_once`, shard-local, batched via `harvest_codec_rotation_cursor`), `load_shard_rotation_progress` (census), `retire_codec_key` (fail-closed retirement gate). **Sanctioned in-place mutation exception #3** — see CLAUDE.md's Engine Invariants. Issue #1244 adds the two structural fleet-wide preconditions #948 left to operator discipline: `activate_codec_key` (refuses while any live worker cannot read the keyed envelope; durably records the key lifecycle in `harvest_codec_key_state`) and `refresh_active_codec_key` (bounded-staleness refresh, folded into the same scanner tick beside the sweep). `retire_codec_key`'s `FleetWriteFence::NotConfirmed` path now reads that durable table instead of trusting an operator attestation alone; `ConfirmedByOperator` remains as a single-process-embedder escape hatch. See [`docs/operations/codec-key-rotation.md`](operations/codec-key-rotation.md). |
 | `append_only.rs` | 3.x | Database guard on append-only `harvest_events` (issue #1817): `EventRewrite` (`Erase`, `CodecRotation`), `sanction`/`revoke` for the transaction-local `harvest.sanctioned_event_rewrite` setting, the guard trigger's names, and `with_guard_off` for test fixtures only. See Key Design Decisions. |
@@ -472,6 +482,13 @@ An agent loop can spend without limit. A budget caps the LLM tokens or the cost 
 | `collect.rs` | `workflows_macro` / `activities_macro` / `webhooks_macro` — expand to `vec![companion_calls...]` |
 | `query.rs` | `query_macro` — pass-through attribute that validates the annotated item is a function; used for documentation and future typed query discovery |
 | `webhook.rs` | `webhook_macro` (issue #344) — emits user fn + companion `WebhookTriggerInfo` fn + public `{fn}_info()` alias; rejects `verifier =`/`idempotency_header =` at compile time (superseded by autumn-web's `[security.webhooks]`) |
+
+### Plugin Modules (`autumn-harvest-plugin`)
+
+| File | Purpose |
+|------|---------|
+| `durable_route.rs` | Durable routes: the `DurableRoute` extractor runs an Autumn route as a workflow keyed by the request's `Idempotency-Key`. A retry attaches to the same run through the start-idempotency claim. No migration and no new event. See [`docs/durable-routes.md`](durable-routes.md). |
+| `durable_route/stream.rs` | Durable streaming: `DurableCall::stream()` answers with a resumable SSE stream of the run's `publish_durable_progress` chunks. The SSE id is `<attempt>.<offset>`. No migration and no new event. See [`docs/durable-routes.md`](durable-routes.md#stream-the-run). |
 
 ---
 
@@ -2008,6 +2025,8 @@ randomized- and model-checking-based testing layers, and CI run coverage:
   deterministic simulation of the activity claim protocol, with a Postgres
   differential test (issue #1830). The world simulation runs the real
   worker loop under a seed (issue #2002).
+* [`docs/testing/stateright.md`](testing/stateright.md) — Stateright model
+  checks that visit every schedule of the DST oracles within a bound.
 * [`docs/testing/ci-db-suite-allowlist.md`](testing/ci-db-suite-allowlist.md)
   — the DB suites that CI does not run from the manifest, each with a
   reason, and an owner for debt (issue #1799).

@@ -119,8 +119,8 @@ fn experiment_env() -> WorkflowTestEnv {
                 return Ok(json!(BASE));
             }
             Ok(match mock.rng().below(100) {
-                0..10 => json!(KEPT),
-                10..14 => json!(LOST),
+                0..15 => json!(KEPT),
+                15..30 => json!(LOST),
                 _ => json!(BASE),
             })
         })
@@ -133,7 +133,7 @@ fn experiment_env() -> WorkflowTestEnv {
         })
         .mock_activity_seeded("commit", |input, mock| {
             let call = mock.call();
-            let changed = !(call == 1 && mock.rng().below(100) < 10);
+            let changed = !(call == 1 && mock.rng().below(100) < 20);
             Ok(json!({
                 "commit": if changed { format!("c{call:06}{:0>33}", "") } else { input["parent"].as_str().unwrap_or(BASE).to_string() },
                 "parent": input["parent"],
@@ -145,13 +145,21 @@ fn experiment_env() -> WorkflowTestEnv {
         .mock_activity_seeded("train", |_, mock| {
             let roll = mock.rng().below(100);
             let bpb = 0.9900 + f64::from(u32::try_from(roll).unwrap()) / 10_000.0;
+            // MAX_FIXES is 1, so the run after a fix is the last run. It takes
+            // the two crashes with a summary more often, so each crash target
+            // is common.
+            let (oom, budget, teardown) = if mock.call() == 1 {
+                (30, 45, 60)
+            } else {
+                (10, 40, 70)
+            };
             Ok(match roll {
-                0..25 => json!({"exit_code": 1, "timed_out": false,
+                r if r < oom => json!({"exit_code": 1, "timed_out": false,
                                 "log_tail": "torch.OutOfMemoryError: CUDA out of memory.\n"}),
                 // Killed at the budget after it printed a summary.
-                25..32 => json!({"exit_code": null, "timed_out": true, "log_tail": summary_log(bpb)}),
+                r if r < budget => json!({"exit_code": null, "timed_out": true, "log_tail": summary_log(bpb)}),
                 // Failed after it printed a summary, such as at its teardown.
-                32..38 => json!({"exit_code": 1, "timed_out": false, "log_tail": summary_log(bpb)}),
+                r if r < teardown => json!({"exit_code": 1, "timed_out": false, "log_tail": summary_log(bpb)}),
                 _ => json!({"exit_code": 0, "timed_out": false, "log_tail": summary_log(bpb)}),
             })
         })
@@ -661,6 +669,9 @@ fn check_experiments(
     // crash or a failure never moves it.
     let mut best = inputs.first().and_then(|i| i.best.clone());
     let mut tainted = inputs.first().is_some_and(|i| !i.flow_labels.is_empty());
+    // A cause counts only when it is the first taint. Then the label on a
+    // later experiment comes from that cause.
+    let (mut by_paper, mut by_failure) = (false, false);
     let mut tighter_seen = false;
     for (i, input) in inputs.iter().enumerate() {
         if labelled_from == Some(i) {
@@ -673,8 +684,11 @@ fn check_experiments(
                 input.flow_labels.contains(UNTRUSTED_INPUT) == tainted,
                 "an experiment carries a label after a paper or a failure, and only then"
             );
-            if tainted {
-                sometimes!(true, "a paper or a failure taints a later experiment");
+            if by_paper {
+                sometimes!(true, "a paper taints a later experiment");
+            }
+            if by_failure {
+                sometimes!(true, "a failure taints a later experiment");
             }
         }
         let tighter = input.policy != KeepPolicy::default();
@@ -690,6 +704,7 @@ fn check_experiments(
                 }
             }
             Some(None) => {
+                by_failure |= !tainted;
                 tainted = true;
                 sometimes!(true, "a failed experiment becomes a crash row");
             }
@@ -700,6 +715,9 @@ fn check_experiments(
             .as_ref()
             .is_some_and(|h| h.text.starts_with("paper:"))
         {
+            // A failed child took the failure arm first, so only a paper
+            // that completed counts.
+            by_paper |= !tainted;
             tainted = true;
         }
     }
@@ -797,20 +815,61 @@ fn check_hand_off(
     sometimes!(true, "the session continues as new");
 }
 
+/// The seeds after [`SEEDS`]. A target that only a lucky window reaches
+/// fails here (issue #2280). The nightly seed variables override both
+/// windows, so there this test repeats the first one.
+const SECOND_WINDOW: SeedPlan = SeedPlan {
+    first: SEEDS.first + SEEDS.count,
+    count: SEEDS.count,
+};
+
 #[tokio::test]
 async fn a_session_holds_its_invariants_under_signals_and_faults() {
+    sweep_session_under_signals(SEEDS).await;
+}
+
+#[tokio::test]
+async fn a_session_reaches_its_targets_in_a_second_window() {
+    use autumn_harvest::testing::sim::{SEED_BASE_VAR, SEED_VAR, SEEDS_VAR};
+    if [SEED_VAR, SEEDS_VAR, SEED_BASE_VAR]
+        .iter()
+        .any(|var| std::env::var(var).is_ok())
+    {
+        eprintln!("a seed variable is set, so the first session test covers these seeds");
+        return;
+    }
+    sweep_session_under_signals(SECOND_WINDOW).await;
+}
+
+/// The policy signals that go before the stop. The session reads signals
+/// only between experiments. Setup and the baseline take many tasks, so a
+/// lone stop nearly always lands before the first experiment. The first
+/// signal sets the policy. The others change nothing and spread the stop
+/// over later tasks (issue #2280).
+const POLICY_SIGNALS: usize = 13;
+
+/// Sweep `plan` with a hint, the policy signals and a stop, and check each
+/// run.
+///
+/// A paper taints a later experiment only when the stop arrives after the
+/// second experiment starts. That is too rare for a 64-seed window, so
+/// `a_paper_or_a_failure_taints_a_clean_session` requires the taint
+/// targets.
+async fn sweep_session_under_signals(plan: SeedPlan) {
     let env = session_env();
-    let tighter = KeepPolicy {
+    let tighter = serde_json::to_value(KeepPolicy {
         min_improvement: 0.0005,
         ..KeepPolicy::default()
-    };
-    env.simulation()
-        .seeds(SEEDS)
-        .signal("hint", json!({"text": "paper:warmdown", "from": "human"}))
-        .signal("policy", serde_json::to_value(tighter).unwrap())
+    })
+    .unwrap();
+    let sim = env
+        .simulation()
+        .seeds(plan)
+        .signal("hint", json!({"text": "paper:warmdown", "from": "human"}));
+    (0..POLICY_SIGNALS)
+        .fold(sim, |sim, _| sim.signal("policy", tighter.clone()))
         .signal("stop", json!({"reason": "bed time"}))
         .faults(FaultPlan::new().transient("setup", 1, 2))
-        .require_reached("a paper or a failure taints a later experiment")
         .require_reached("a policy reaches an experiment")
         .require_reached("a hint reaches an experiment")
         .require_reached("a stop ends the night early")
@@ -895,7 +954,6 @@ async fn a_session_hands_off_its_carry_past_a_failed_experiment() {
         )
         .signal("policy", serde_json::to_value(tighter).unwrap())
         .require_reached("a failed experiment becomes a crash row")
-        .require_reached("a paper or a failure taints a later experiment")
         .require_reached("the labels of a sibling reach a later experiment")
         .require_reached("a tainted session shares its labels")
         .require_reached("a hint is carried across the hand-off")
@@ -918,6 +976,40 @@ async fn a_session_hands_off_its_carry_past_a_failed_experiment() {
         )
         .await
         .unwrap_or_else(|failure| panic!("{failure}"));
+}
+
+/// With no sibling and no stop, a paper or a failure is the first taint of
+/// the night. Then the label on a later experiment comes from that cause.
+///
+/// - A paper hint that reaches experiment 1 taints experiment 2.
+/// - With no hint, experiment 2 fails, so experiment 3 carries the label.
+///
+/// A mutation that drops either label fails this sweep.
+#[tokio::test]
+async fn a_paper_or_a_failure_taints_a_clean_session() {
+    let paper = json!({"text": "paper:warmdown", "from": "human"});
+    for (hint, target) in [
+        (Some(paper), "a paper taints a later experiment"),
+        (None, "a failure taints a later experiment"),
+    ] {
+        let env = session_env();
+        let mut sim = env.simulation().seeds(SEEDS);
+        if let Some(hint) = hint {
+            sim = sim.signal("hint", hint);
+        }
+        sim.require_reached(target)
+            .sweep(
+                research_session_info().handler,
+                serde_json::to_value(SessionInput {
+                    config: session_config(),
+                    carry: None,
+                })
+                .unwrap(),
+                |run| check_session(run, 3),
+            )
+            .await
+            .unwrap_or_else(|failure| panic!("{failure}"));
+    }
 }
 
 #[tokio::test]

@@ -260,7 +260,15 @@ An oversized start input (over the 2 MiB default cap) is rejected with
 
 A start input, memo, signal payload or update input nested over
 `MAX_PAYLOAD_DEPTH` (100) levels is rejected with `SqliteError::PayloadTooDeep` before anything is
-persisted. Postgres has no such cap.
+persisted. Postgres has no such cap at ingress.
+
+A value from workflow code has the same cap (issue #2224). The core context
+refuses it at the call site with `HarvestError::PayloadTooDeep`, on every
+backend. That covers activity, local activity, child and continue-as-new input,
+external signal payloads and side-effect values. The workflow can handle the
+error. A workflow result or an update result has no call site. A deep workflow
+result fails the run with a non-retryable `PayloadTooDeep` failure. A deep update
+result fails the update.
 
 An activity result nested over the same cap is not stored. It becomes a
 non-retryable `ActivityFailed` with `error_type = "PayloadTooDeep"`, as an
@@ -270,6 +278,9 @@ and ends on its first attempt with `LocalActivityExhausted`. A local failure
 keeps no error type, so the workflow sees `Error` and the message. The workflow
 sees the failure and can handle it. A heartbeat nested over the cap is dropped with
 a warning, and the last good checkpoint stays.
+
+Postgres applies the same cap to activity results, external completions and
+heartbeats (issue #2225).
 
 ---
 

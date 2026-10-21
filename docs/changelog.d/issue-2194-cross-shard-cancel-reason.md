@@ -22,9 +22,14 @@ with the stored reason. Without one, it keeps its own born-cancelled text.
 
 No `WorkflowEvent` variant changes. No replay impact.
 
-Open item: the scope-cancel path lands with #2071. It passes its own reason to
-the same parameter. Until then, a scope cancel of a cross-shard child keeps the
-generic text.
+The race-loser and scope-cancel paths share one call site. It passes the
+`LoserCancelReason` text, so a scope cancel gives a cross-shard child
+`cancelled by its cancellation scope` (follow-up to #2204, after #2071).
+
+The relay reads the stored reason again just before it delivers the cancel. A
+caller that mixes `None` and `Some` can store a reason after a sweep loaded the
+row, and the re-read picks it up. A reason stored after that read is too late,
+because the child is then terminal.
 
 Tests: `a_cross_shard_cancel_carries_the_parents_reason`,
 `a_cross_shard_cancel_without_a_reason_uses_the_generic_text`,
@@ -32,3 +37,6 @@ Tests: `a_cross_shard_cancel_carries_the_parents_reason`,
 `a_blank_cancel_reason_counts_as_none`, the two
 `a_child_cancelled_before_creation_*` tests, the clear-on-delivery check in their helper, and the reason check in
 `a_cross_shard_race_loser_is_cancelled_on_its_own_shard`.
+
+Follow-up tests: `a_scope_cancel_gives_a_cross_shard_child_the_scope_reason`
+and `the_relay_rereads_a_reason_stored_after_the_sweep_loaded_the_row`.
