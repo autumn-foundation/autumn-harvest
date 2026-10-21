@@ -2782,7 +2782,7 @@ const OWNER_CANDIDATE_ANCHOR: &str = "AND ( task_type <> 'workflow' OR workflow_
 ///   claim guard reads the setting. The CTE is `MATERIALIZED`, so it runs
 ///   once, before the first workflow row passes its gate.
 /// - The sticky gate passes each workflow row. The owner is the affinity.
-/// - The owned gate, in each scan: a workflow row passes only with the
+/// - The owned gate, in each scan. A workflow row passes only with the
 ///   switch on, and only when it is unstamped or in an owned partition. The
 ///   partitions are a 64-byte mask, so one bit test serves any count.
 /// - The holder check, in each candidate scan: a stamped row passes only

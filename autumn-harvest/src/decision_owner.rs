@@ -1588,14 +1588,14 @@ mod db {
 
     /// Turn owner mode on for the database of `conn` (ADR 0009 decision 11).
     ///
-    /// 1. Refuse unless `force` is set: while a live worker cannot run owner
-    ///    mode, while live workers poll different queues or run different
-    ///    builds, or while no owner loop is live. These checks are a
-    ///    courtesy. The guard is the structural part.
+    /// 1. Refuse unless `force` is set. Three cases refuse: a live worker
+    ///    cannot run owner mode, live workers differ in queues or build, or
+    ///    no owner loop is live. These checks are a courtesy. The guard is
+    ///    the structural part.
     /// 2. Stamp the partition of each live workflow task.
-    /// 3. In one transaction: lock the switch row, install the claim guard,
-    ///    re-pend each legacy claim of a worker that is not live, and set
-    ///    the switch. A live worker finishes its own legacy decision.
+    /// 3. Run one transaction. It locks the switch row and installs the
+    ///    claim guard. It re-pends each legacy claim of a dead worker, and
+    ///    sets the switch. A live worker finishes its own legacy decision.
     /// 4. Stamp the rows that arrived since step 2.
     ///
     /// Step 3 is atomic. A failure leaves owner mode off and no guard on.
