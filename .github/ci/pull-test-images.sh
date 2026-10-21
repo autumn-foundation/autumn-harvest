@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Pre-pull the Docker images that this shard's `linux` manifest rows need.
+# Pre-pull the named Docker images, or the ones that this shard's `linux`
+# manifest rows need.
 #
 # `testcontainers` retries nothing on a pull, so a registry blip fails a
 # live-DB test. This script retries each pull. It reads SEMAPHORE_SHARD_COUNT
 # and SEMAPHORE_SHARD_INDEX through `run-suites.sh`, as the suite step does.
-# `ci.yml` (`test-db-linux`) and `coverage-nightly.yml` (`db`) call it.
+# `ci.yml` (`test-db-linux`), `coverage-nightly.yml` (`db`) and
+# `dst-nightly.yml` (`differential`, `world`) call it.
 #
 # Every tag the suites actually request, not just the testcontainers-modules
 # default (Codex review: the default alone left the suites that override it
@@ -24,25 +26,38 @@
 #   PR #1773 because it was not pre-pulled.
 # - The MinIO and fake-gcs-server emulators: only on the shards that run
 #   their suites (issue #1983).
+#
+# With arguments, the script pulls only those images and skips the shard
+# plan. `dst-nightly.yml` passes `postgres:16` (issue #2280).
 set -euo pipefail
 
-images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0 redis:7.4-alpine"
-# Pull ElasticMQ only on the shard that runs `connector_sqs_broker`.
-# The dry run prints this shard's cargo invocations without running
-# them, so no shard number is hardcoded here. It is captured first:
-# `grep -q` closing a pipe early would trip `pipefail`.
-plan="$(DRY_RUN=1 bash .github/ci/run-suites.sh run linux)"
-if grep -q -- '--test connector_sqs_broker' <<<"$plan"; then
-  images="$images softwaremill/elasticmq:1.5.2"
-fi
-# Issue #1983: the object-store emulators, only on the shards that
-# run their suites. The official MinIO images are no longer
-# published, so the suite uses the `pgsty/minio` community build.
-if grep -q -- '--test object_store_s3_minio' <<<"$plan"; then
-  images="$images pgsty/minio:RELEASE.2026-08-04T00-00-00Z"
-fi
-if grep -q -- '--test object_store_gcs_emulator' <<<"$plan"; then
-  images="$images fsouza/fake-gcs-server:1.56.1"
+if [ "$#" -gt 0 ]; then
+  for image in "$@"; do
+    if [ -z "$image" ]; then
+      echo "::error::an image argument is empty"
+      exit 1
+    fi
+  done
+  images="$*"
+else
+  images="postgres:11-alpine postgres:16 postgres:16-alpine redis:5.0 redis:7.4-alpine"
+  # Pull ElasticMQ only on the shard that runs `connector_sqs_broker`.
+  # The dry run prints this shard's cargo invocations without running
+  # them, so no shard number is hardcoded here. It is captured first:
+  # `grep -q` closing a pipe early would trip `pipefail`.
+  plan="$(DRY_RUN=1 bash .github/ci/run-suites.sh run linux)"
+  if grep -q -- '--test connector_sqs_broker' <<<"$plan"; then
+    images="$images softwaremill/elasticmq:1.5.2"
+  fi
+  # Issue #1983: the object-store emulators, only on the shards that
+  # run their suites. The official MinIO images are no longer
+  # published, so the suite uses the `pgsty/minio` community build.
+  if grep -q -- '--test object_store_s3_minio' <<<"$plan"; then
+    images="$images pgsty/minio:RELEASE.2026-08-04T00-00-00Z"
+  fi
+  if grep -q -- '--test object_store_gcs_emulator' <<<"$plan"; then
+    images="$images fsouza/fake-gcs-server:1.56.1"
+  fi
 fi
 # Docker Hub rate-limits anonymous pulls, and the ECR Public mirror
 # has a data limit. An official image (no slash in its name) comes

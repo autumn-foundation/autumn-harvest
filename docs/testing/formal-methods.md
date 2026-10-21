@@ -16,6 +16,9 @@ design. The integration tests check that the SQL implements it.
 [`simulation.md`](simulation.md) covers a seeded harness that checks the
 `ActivityClaim` invariants on an oracle. A differential test checks the
 oracle against Postgres.
+[`stateright.md`](stateright.md) covers Stateright models that visit every
+schedule of that oracle within a bound. They must break each TLA+
+counter-example on the same invariant.
 [`concurrency-model-checking.md`](concurrency-model-checking.md) covers loom
 and Shuttle, which check in-process concurrency.
 
@@ -214,7 +217,7 @@ completion or the unresolved count.
 
 #### `OwnerLease` — model (e)
 
-The prose spec is [ADR 0009](../adr/0009-fenced-owner-lease.md). Stage 1a
+The prose spec is [ADR 0010](../adr/0010-fenced-owner-lease.md). Stage 1a
 (issue #2251) has no code yet, so this model is the spec. The model has one
 partition, one owner row and the history of one execution. Its actions:
 
