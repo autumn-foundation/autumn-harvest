@@ -52,6 +52,35 @@ pub const OWNER_MODE_CAPABILITY_LABEL: &str = "decision_owner_version";
 /// The value of [`OWNER_MODE_CAPABILITY_LABEL`] for this binary.
 pub const OWNER_MODE_CAPABILITY_VERSION: i64 = 1;
 
+/// The worker label that names the workflow types an owner can run (issue
+/// #2252).
+///
+/// An owner claims every workflow task of its partitions. So the enable step
+/// refuses while live owners advertise different values. The value is
+/// [`workflow_set_fingerprint`], or [`NO_OWNED_WORKFLOWS`] for a worker that
+/// owns no partition.
+pub const OWNER_WORKFLOWS_LABEL: &str = "decision_owner_workflows";
+
+/// The [`OWNER_WORKFLOWS_LABEL`] value of a worker that owns no partition.
+///
+/// The enable step skips such a worker in the workflow type check.
+pub const NO_OWNED_WORKFLOWS: &str = "none";
+
+/// A fingerprint of a set of workflow type names (issue #2252).
+///
+/// Order and duplicates do not change it. Each name ends with a NUL byte, so
+/// two different sets never join into the same bytes.
+#[must_use]
+pub fn workflow_set_fingerprint<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let set: std::collections::BTreeSet<&str> = names.into_iter().collect();
+    let mut bytes = Vec::new();
+    for name in set {
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+    }
+    format!("{:016x}", seahash::hash(&bytes))
+}
+
 /// The labels `labels` with the owner-mode capability of this binary.
 ///
 /// The engine writes the label, so a value in `labels` never survives.
@@ -1424,10 +1453,22 @@ mod db {
     /// An owner claims every workflow task of its partitions. A partition of
     /// a worker that does not poll a queue, or cannot run a build, would
     /// strand those tasks. So owner mode needs one queue set and one build.
+    /// [`MIXED_WORKFLOWS_SQL`] checks the workflow types.
     const MIXED_FLEET_SQL: &str = "SELECT count(DISTINCT (queues, build_id))::bigint AS n \
          FROM harvest_workers \
          WHERE status <> 'Stopped' \
            AND last_heartbeat_at > NOW() - make_interval(secs => $1)";
+
+    /// The number of workflow type sets that live owners advertise.
+    ///
+    /// A worker that owns no partition is skipped. A missing label counts as
+    /// its own set, so an unknown worker never passes as a match.
+    const MIXED_WORKFLOWS_SQL: &str = "SELECT count(DISTINCT \
+             COALESCE(labels->>'decision_owner_workflows', ''))::bigint AS n \
+         FROM harvest_workers \
+         WHERE status <> 'Stopped' \
+           AND last_heartbeat_at > NOW() - make_interval(secs => $1) \
+           AND COALESCE(labels->>'decision_owner_workflows', '') <> 'none'";
 
     /// Workflow-task rows with no stamp, and their workflow ids.
     const UNSTAMPED_SQL: &str = "SELECT t.id, e.workflow_id FROM harvest_task_queue t \
@@ -1728,6 +1769,18 @@ mod db {
             return Err(HarvestError::Config(
                 "owner mode refused: live workers poll different queues or run different \
                  builds, so an owner could strand a workflow task"
+                    .to_string(),
+            ));
+        }
+        let types: CountRow = diesel::sql_query(MIXED_WORKFLOWS_SQL)
+            .bind::<Double, _>(live)
+            .get_result(conn)
+            .await
+            .map_err(database_error)?;
+        if types.n > 1 {
+            return Err(HarvestError::Config(
+                "owner mode refused: live workers register different workflow types, so an \
+                 owner could hold a workflow task that it cannot run"
                     .to_string(),
             ));
         }

@@ -13,7 +13,9 @@ table `harvest_decision_owner_mode`, the candidate table
 
 **Switch.** `decision_owner::enable_owner_mode` refuses while a live worker
 lacks the `decision_owner_version` label, while live workers poll different
-queues or run different builds, or while no owner loop is live. It stamps
+queues or run different builds, while live owners register different
+workflow types, or while no owner loop is live. Each worker advertises a
+fingerprint of its workflow types in the `decision_owner_workflows` label. It stamps
 live workflow tasks. Then one transaction installs the claim guard,
 re-pends the legacy claims of dead workers and sets the switch.
 `disable_owner_mode` clears the switch and turns the guard off in one

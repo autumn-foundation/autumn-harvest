@@ -602,6 +602,75 @@ async fn enable_refuses_a_fleet_that_polls_different_queues() {
     db.drop_db().await;
 }
 
+/// Set the workflow fingerprint label of one registered worker.
+async fn set_workflows_label(conn: &mut AsyncPgConnection, worker_id: &str, value: &str) {
+    diesel::sql_query(
+        "UPDATE harvest_workers SET labels = labels || jsonb_build_object($2::text, $3::text) \
+         WHERE worker_id = $1",
+    )
+    .bind::<Text, _>(worker_id)
+    .bind::<Text, _>(decision_owner::OWNER_WORKFLOWS_LABEL)
+    .bind::<Text, _>(value)
+    .execute(conn)
+    .await
+    .expect("set the workflows label");
+}
+
+/// An owner claims every workflow task of its partitions. Two live owners
+/// that register different workflow types could each hold a workflow that
+/// only the other can run. A worker that cannot own does not count.
+#[tokio::test]
+async fn enable_refuses_a_fleet_that_registers_different_workflow_types() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    for worker in ["types-a", "types-b", "activities-only"] {
+        register_worker(&mut conn, worker, true).await;
+    }
+    let one = decision_owner::workflow_set_fingerprint(["checkout", "refund"]);
+    let other = decision_owner::workflow_set_fingerprint(["checkout"]);
+    set_workflows_label(&mut conn, "types-a", &one).await;
+    set_workflows_label(&mut conn, "types-b", &other).await;
+    set_workflows_label(
+        &mut conn,
+        "activities-only",
+        decision_owner::NO_OWNED_WORKFLOWS,
+    )
+    .await;
+
+    let refused = decision_owner::enable_owner_mode(&mut conn, &EnableOwnerMode::default()).await;
+    let message = refused
+        .expect_err("different workflow types block owner mode")
+        .to_string();
+    assert!(message.contains("different workflow types"), "{message}");
+
+    set_workflows_label(&mut conn, "types-b", &one).await;
+    let next = decision_owner::enable_owner_mode(&mut conn, &EnableOwnerMode::default()).await;
+    let message = next.expect_err("still no live owner loop").to_string();
+    assert!(
+        message.contains("no owner loop is live"),
+        "one type set passes the type check: {message}"
+    );
+    db.drop_db().await;
+}
+
+/// The fingerprint ignores order and duplicates.
+#[test]
+fn the_workflow_fingerprint_is_a_set() {
+    assert_eq!(
+        decision_owner::workflow_set_fingerprint(["b", "a", "b"]),
+        decision_owner::workflow_set_fingerprint(["a", "b"])
+    );
+    assert_ne!(
+        decision_owner::workflow_set_fingerprint(["a"]),
+        decision_owner::workflow_set_fingerprint(["a", "b"])
+    );
+    assert_ne!(
+        decision_owner::workflow_set_fingerprint(["ab"]),
+        decision_owner::workflow_set_fingerprint(["a", "b"]),
+        "names are separated, so no two sets join into one string"
+    );
+}
+
 /// An unowned decision stamps an unstamped row and re-pends it at once, so
 /// the owner of its partition takes it next.
 #[tokio::test]

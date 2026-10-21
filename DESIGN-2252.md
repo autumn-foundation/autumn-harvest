@@ -171,8 +171,8 @@ tests and docs. The fixes:
 ## 3. Limits
 
 - An owner claims every workflow task of its partitions. So owner mode
-  needs one queue set and one build on the database. The enable step
-  checks this once. A worker that starts later with other queues is not
+  needs one queue set, one build and one workflow type set on the
+  database. The enable step checks this once. A worker that starts later with other queues is not
   stopped.
 - A legacy claim whose best row is a workflow task gets nothing. So an old
   binary can miss an activity behind it. The enable step refuses while an

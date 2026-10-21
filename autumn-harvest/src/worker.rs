@@ -36538,6 +36538,27 @@ impl Worker {
         }
     }
 
+    /// The labels this worker writes to `harvest_workers` (issue #2252).
+    ///
+    /// They are the configured labels plus
+    /// [`crate::decision_owner::OWNER_WORKFLOWS_LABEL`]. The enable step of
+    /// owner mode compares that label across the live fleet.
+    fn fleet_labels(&self) -> std::collections::HashMap<String, String> {
+        let mut labels = self.config.labels.clone();
+        let workflows = if self.can_own_partitions() {
+            crate::decision_owner::workflow_set_fingerprint(
+                self.registry.workflows.keys().map(String::as_str),
+            )
+        } else {
+            crate::decision_owner::NO_OWNED_WORKFLOWS.to_string()
+        };
+        labels.insert(
+            crate::decision_owner::OWNER_WORKFLOWS_LABEL.to_string(),
+            workflows,
+        );
+        labels
+    }
+
     /// Whether this worker can own decision partitions (issue #2252).
     ///
     /// An owner claims every workflow task of its partitions. A worker with
@@ -37457,7 +37478,7 @@ impl Worker {
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 build_id: self.config.build_id.clone(),
                 deployment_name: self.config.deployment_name.clone(),
-                labels: self.config.labels.clone(),
+                labels: self.fleet_labels(),
                 max_concurrent_sessions: self.config.max_concurrent_sessions,
             },
             Arc::clone(&self.workflow_semaphore),
@@ -38807,7 +38828,7 @@ impl Worker {
             version: Some(version.to_string()),
             build_id: self.config.build_id.clone(),
             deployment_name: self.config.deployment_name.clone(),
-            labels: self.config.labels.clone(),
+            labels: self.fleet_labels(),
             max_concurrent_sessions: self.config.max_concurrent_sessions,
         };
         match acquire_shard_conn(pool, acquire_bound).await {

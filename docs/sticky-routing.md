@@ -71,7 +71,7 @@ Owner mode (issue #2252, [ADR 0009](adr/0009-decision-owner.md)) gives each exec
 
 Owner mode is a switch per database. It is off by default. Turn it on with `decision_owner::enable_owner_mode`. The step:
 
-1. Refuses while a live worker cannot run owner mode, while live workers poll different queues or run different builds, or while no owner loop is live. An owner claims every workflow task of its partitions, so each owner must be able to run each of them.
+1. Refuses while a live worker cannot run owner mode, while live workers poll different queues or run different builds, while live owners register different workflow types, or while no owner loop is live. An owner claims every workflow task of its partitions, so each owner must be able to run each of them.
 2. Stamps the partition of each live workflow task.
 3. In one transaction, installs a guard on the claim of a workflow task, re-pends the legacy claims of dead workers, and sets the switch. A claim with no owner token then takes no workflow task. A binary from before owner mode sends no token, so a fleet can never mix the two claim styles. A live worker finishes its own legacy decision.
 
@@ -81,7 +81,7 @@ The guard statements take a `SHARE ROW EXCLUSIVE` lock on `harvest_task_queue`, 
 
 **Limits.**
 
-- The enable step checks queues and builds once. A worker that starts later with other queues or another build is not stopped. Its partitions can then hold workflow tasks that it cannot claim. Keep one queue set and one build per database while owner mode is on.
+- The enable step checks queues, builds and workflow types once. A worker that starts later with other queues, another build or other workflow types is not stopped. Its partitions can then hold workflow tasks that it cannot claim. Keep one queue set, one build and one workflow type set per database while owner mode is on.
 - For a rolling deploy of a new build, turn owner mode off first, deploy, then turn it on again.
 - A binary from before owner mode claims no workflow task. Its claim can also miss an activity task behind a workflow task. So the enable step refuses while such a binary is live.
 

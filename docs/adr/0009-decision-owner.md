@@ -374,8 +374,10 @@ Issue #2252 builds the step as `decision_owner::enable_owner_mode`:
   `decision_owner_version` into `harvest_workers.labels`. Step 1 refuses
   while a live worker lacks it.
 - **Mixed fleet.** Step 1 also refuses while live workers poll different
-  queues or run different builds. An owner claims every workflow task of
-  its partitions, so it must be able to run each one.
+  queues or run different builds. It refuses while live owners register
+  different workflow types, from the label `decision_owner_workflows`. An
+  owner claims every workflow task of its partitions, so it must be able to
+  run each one.
 - **Partition.** The column `harvest_task_queue.decision_partition` holds
   the partition of a workflow task. Each writer stamps it at insert. Step
   2 stamps the live rows. An owned claim may take an unstamped row. The
