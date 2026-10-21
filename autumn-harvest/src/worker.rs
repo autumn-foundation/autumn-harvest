@@ -36465,7 +36465,10 @@ impl Worker {
             &self.config.worker_id,
             crate::decision_owner::OwnerLeaseConfig::default(),
             self.registry.decision_owner(),
-        );
+        )
+        .with_live_within(Duration::from_secs(
+            u64::try_from(worker_stale_secs(self.config.worker_heartbeat_interval)).unwrap_or(1),
+        ));
         // A worker that cannot run a workflow task must not own partitions.
         // It still claims in the owned form, so the guard never blocks its
         // activity claims.

@@ -906,9 +906,40 @@ async fn an_acquisition_repends_a_task_another_worker_left_running() {
     let (state, attempt) = task_state(&mut conn, wf).await;
     assert_eq!(
         state, "PENDING",
-        "the acquisition re-pends the foreign claim"
+        "the acquisition re-pends the claim of a dead worker"
     );
     assert_eq!(attempt, 1);
+    db.drop_db().await;
+}
+
+/// An acquisition leaves the claim of a live worker alone. A live legacy
+/// worker finishes its decision and parks the task. A live old owner fails
+/// its fence and re-pends its own claim.
+#[tokio::test]
+async fn an_acquisition_keeps_the_claim_of_a_live_worker() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let q = unique("owner-live");
+    let wf = workflow_task(&mut conn, &q, Some(partition(111))).await;
+    register_worker(&mut conn, "live-legacy", true).await;
+    let task = queue::claim_task(
+        &mut conn,
+        std::slice::from_ref(&q),
+        "live-legacy",
+        "",
+        None,
+        &[],
+        &[],
+    )
+    .await
+    .expect("claim")
+    .expect("the live legacy worker claims");
+    assert_eq!(task.id, wf);
+    enable(&mut conn).await;
+    let (mut a, owned_a) = new_loop("new-owner");
+    tick(&mut a, &owned_a, &mut conn).await;
+    assert_eq!(owned_a.len(), 512);
+    assert_eq!(task_state(&mut conn, wf).await, ("RUNNING".to_string(), 1));
     db.drop_db().await;
 }
 

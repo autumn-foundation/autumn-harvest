@@ -1485,27 +1485,32 @@ mod db {
          FROM harvest_decision_owner \
          WHERE holder IS NULL OR lease_until <= clock_timestamp()";
 
-    /// Re-pend each workflow task held `RUNNING` in a newly acquired
-    /// partition (ADR 0009 decision 7).
+    /// Re-pend each workflow task that a dead worker holds `RUNNING` in a
+    /// newly acquired partition (ADR 0009 decision 7).
     ///
     /// It runs after the acquisitions commit. A claim of the old owner that
-    /// commits later fails the guard, because the holder changed. A claim
-    /// that committed before is `RUNNING` here, so this statement re-pends
-    /// it. Its decision then fails its fence and writes nothing. This also
-    /// covers a claim of an older process with the same worker id. The loop
-    /// runs it before the worker adopts the tenures, so no claim of the new
-    /// owner is in them yet. The rows lock in id order, so two such
-    /// statements cannot deadlock.
+    /// commits later fails the guard, because the holder changed. A live
+    /// worker keeps its claim. A live old owner's decision fails its fence
+    /// and re-pends its own claim. A live legacy worker finishes its decision
+    /// and parks the task. Only a dead worker never releases its claim, so
+    /// this statement re-pends it. The loop runs it before the worker adopts
+    /// the tenures. The rows lock in id order, so two such statements cannot
+    /// deadlock.
     const REPEND_FOREIGN_SQL: &str = "UPDATE harvest_task_queue \
          SET state = 'PENDING', worker_id = NULL, started_at = NULL, \
              last_heartbeat_at = NULL, scheduled_at = NOW(), \
              sticky_worker_id = NULL, sticky_until = NULL, sticky_timeout = NULL, \
              wake_requested = FALSE \
-         WHERE id IN (SELECT id FROM harvest_task_queue \
-                      WHERE task_type = 'workflow' AND state = 'RUNNING' \
-                        AND worker_id IS NOT NULL \
-                        AND decision_partition = ANY($1::int2[]) \
-                      ORDER BY id FOR UPDATE)";
+         WHERE id IN (SELECT t.id FROM harvest_task_queue t \
+                      WHERE t.task_type = 'workflow' AND t.state = 'RUNNING' \
+                        AND t.worker_id IS NOT NULL \
+                        AND t.decision_partition = ANY($1::int2[]) \
+                        AND NOT EXISTS ( \
+                            SELECT 1 FROM harvest_workers w \
+                            WHERE w.worker_id = t.worker_id \
+                              AND w.status <> 'Stopped' \
+                              AND w.last_heartbeat_at > NOW() - make_interval(secs => $2)) \
+                      ORDER BY t.id FOR UPDATE)";
 
     /// Free partitions to try, in random order, so that peers spread.
     const FREE_PICK_SQL: &str = "SELECT partition FROM harvest_decision_owner \
@@ -1835,6 +1840,8 @@ mod db {
         /// Tenures that this loop stopped using, released on the next tick.
         /// The delay lets their decisions in flight commit first.
         releasing: Vec<OwnerTenure>,
+        /// A worker with a heartbeat this recent is live.
+        live_within: Duration,
     }
 
     impl OwnerLoop {
@@ -1863,7 +1870,16 @@ mod db {
                 active: false,
                 stopped: false,
                 releasing: Vec::new(),
+                live_within: Duration::from_secs(30),
             }
+        }
+
+        /// This loop with `live_within`: a worker with a heartbeat this recent
+        /// is live, so the loop never re-pends its claim.
+        #[must_use]
+        pub const fn with_live_within(mut self, live_within: Duration) -> Self {
+            self.live_within = live_within;
+            self
         }
 
         /// The shard that keys this loop's tenures.
@@ -2100,6 +2116,7 @@ mod db {
                 .collect();
             let repended = diesel::sql_query(REPEND_FOREIGN_SQL)
                 .bind::<Array<SmallInt>, _>(&taken)
+                .bind::<Double, _>(secs(self.live_within))
                 .execute(conn)
                 .await;
             if let Err(error) = repended {

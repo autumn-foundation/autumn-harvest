@@ -253,9 +253,12 @@ No task stays `RUNNING` with no worker to finish it:
   holder. A stale owner cannot claim after a takeover. A holder that takes
   back its own row needs no epoch check: its later decisions fence.
 - The acquisition re-pends each `RUNNING` workflow task of the partition
-  that another worker holds. Issue #2252 does this in one statement per
+  that a dead worker holds. Issue #2252 does this in one statement per
   scan, after the acquisitions commit. A claim of the old owner that
   commits later fails the guard.
+- A live worker keeps its claim. A live old owner fails its fence and
+  re-pends its own claim. A live legacy worker finishes its decision. So
+  no decision runs twice at once.
 - A fenced worker re-pends its own claim under its claim token, as
   `requeue_claimed_workflow_task_*` does today.
 - Issue #2252 builds the first two steps. Issue #2251 builds the third
