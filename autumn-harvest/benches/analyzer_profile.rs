@@ -8,9 +8,9 @@
 //!
 //! An operator lints a long production history with the full built-in rule
 //! set. The history holds `ANALYZER_PROFILE_N` events (default 6,000). It is
-//! activity-heavy, with JSON payloads from tens of bytes to a few KiB, a
-//! few retried activities, a few zero-second timers and a few payloads over
-//! the large-payload threshold.
+//! activity-heavy. JSON payloads range from tens of bytes to a few KiB.
+//! A few activities retry, a few timers last zero seconds, and a few payloads
+//! exceed the large-payload threshold.
 //!
 //! # Running
 //!
