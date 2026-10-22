@@ -1181,8 +1181,47 @@ fn side_effect_shapes(
 /// approach `harvest history sample`'s own redaction warning takes.
 #[must_use]
 pub fn is_redacted_export(json: &str) -> bool {
-    serde_json::from_str::<Value>(json)
-        .is_ok_and(|doc| doc.get("payload_policy").and_then(Value::as_str) == Some("redacted"))
+    serde_json::from_str::<RedactionProbe>(json).is_ok_and(|probe| probe.0)
+}
+
+/// Reads `payload_policy` from a top-level JSON object without building the document.
+///
+/// A history export holds every payload of the run. The CLI parses it again
+/// right after this probe, so building a [`Value`] tree here doubled the work.
+/// The visitor skips every other key with [`IgnoredAny`](serde::de::IgnoredAny).
+/// It still checks the whole document for valid JSON. A repeated key keeps the
+/// last value, as a [`Value`] map does. A document that is not an object fails to parse.
+struct RedactionProbe(bool);
+
+impl<'de> serde::Deserialize<'de> for RedactionProbe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ProbeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ProbeVisitor {
+            type Value = RedactionProbe;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut redacted = false;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "payload_policy" {
+                        redacted = map.next_value::<Value>()?.as_str() == Some("redacted");
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(RedactionProbe(redacted))
+            }
+        }
+
+        deserializer.deserialize_map(ProbeVisitor)
+    }
 }
 
 /// Why a debugger trace could not be produced.
@@ -2525,8 +2564,52 @@ fn external_target_label(target: &crate::types::ExternalTarget) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ENGINE_MINTED_ID_FIELDS, PATCH_MARKER_PREFIX, VERSION_MARKER_PREFIX};
+    use super::{
+        ENGINE_MINTED_ID_FIELDS, PATCH_MARKER_PREFIX, VERSION_MARKER_PREFIX, is_redacted_export,
+    };
     use crate::replay::{patch_marker_name, version_marker_name};
+
+    /// The probe must answer as a full parse into a `Value` did.
+    #[test]
+    fn redaction_probe_matches_a_full_value_parse() {
+        let cases = [
+            (
+                r#"{"payload_policy":"redacted","events":[1,{"a":[]}]}"#,
+                true,
+            ),
+            (r#"{"events":[{"payload_policy":"redacted"}]}"#, false),
+            (r#"{"payload_policy":"full","events":[]}"#, false),
+            (r#"{"payload_policy":null}"#, false),
+            (r#"{"payload_policy":["redacted"]}"#, false),
+            (
+                r#"{"payload_policy":"redacted","payload_policy":"full"}"#,
+                false,
+            ),
+            (
+                r#"{"payload_policy":"full","payload_policy":"redacted"}"#,
+                true,
+            ),
+            (r#"{"events":[]}"#, false),
+            (r#"["redacted"]"#, false),
+            (r#""redacted""#, false),
+            (r#"{"payload_policy":"redacted"} trailing"#, false),
+            (r#"{"payload_policy":"redacted","events":[1,"#, false),
+            ("", false),
+        ];
+        for (json, expected) in cases {
+            let reference = serde_json::from_str::<serde_json::Value>(json).is_ok_and(|doc| {
+                doc.get("payload_policy")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("redacted")
+            });
+            assert_eq!(reference, expected, "reference disagrees for {json}");
+            assert_eq!(
+                is_redacted_export(json),
+                expected,
+                "probe disagrees for {json}"
+            );
+        }
+    }
 
     /// The field types `WorkflowEvent` uses for values the engine mints fresh
     /// on every run.

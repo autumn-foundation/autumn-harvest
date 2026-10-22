@@ -433,6 +433,13 @@ name = "history_fingerprint_profile"
 required-features = ["testing"]
 harness = false
 
+# Deterministic profiling harness for `debugger::diff_traces`, the engine
+# behind `harvest debug diff`. See `benches/debugger_diff_profile.rs`.
+[[bench]]
+name = "debugger_diff_profile"
+required-features = ["debugger"]
+harness = false
+
 # Isolates build_history's own inclusive cost (see the doc comment) so
 # history_fingerprint_profile.rs's workload-share claim in
 # docs/performance-history-fingerprint.md rests on a real measurement, not a
