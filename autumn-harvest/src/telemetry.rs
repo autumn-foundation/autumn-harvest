@@ -2877,6 +2877,8 @@ impl PersistPhase {
     ];
 
     /// The phases that a timer measures inside the transaction body.
+    // Only the persist path of the `db` feature reads it.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) const TIMED: [Self; 4] = [Self::Fence, Self::Events, Self::Tasks, Self::Notify];
 
     /// Stable string representation, suitable for metric tag values.
@@ -2895,6 +2897,7 @@ impl PersistPhase {
     /// The index of a timed phase in [`Self::TIMED`]. `None` for the
     /// commit and the rest.
     #[must_use]
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
     pub(crate) const fn timed_index(self) -> Option<usize> {
         match self {
             Self::Fence => Some(0),
@@ -2913,6 +2916,7 @@ impl PersistPhase {
 /// `total`. Clock reads can make the parts exceed `total` by a little, so
 /// `other` is never below zero.
 #[must_use]
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
 pub(crate) fn persist_phase_breakdown(
     total: f64,
     timed: [f64; PersistPhase::TIMED.len()],
