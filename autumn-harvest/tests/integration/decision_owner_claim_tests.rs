@@ -602,72 +602,86 @@ async fn enable_refuses_a_fleet_that_polls_different_queues() {
     db.drop_db().await;
 }
 
-/// Set the workflow fingerprint label of one registered worker.
-async fn set_workflows_label(conn: &mut AsyncPgConnection, worker_id: &str, value: &str) {
+/// Set the handler fingerprint label of one registered worker.
+async fn set_handlers_label(conn: &mut AsyncPgConnection, worker_id: &str, value: &str) {
     diesel::sql_query(
         "UPDATE harvest_workers SET labels = labels || jsonb_build_object($2::text, $3::text) \
          WHERE worker_id = $1",
     )
     .bind::<Text, _>(worker_id)
-    .bind::<Text, _>(decision_owner::OWNER_WORKFLOWS_LABEL)
+    .bind::<Text, _>(decision_owner::OWNER_HANDLERS_LABEL)
     .bind::<Text, _>(value)
     .execute(conn)
     .await
-    .expect("set the workflows label");
+    .expect("set the handlers label");
 }
 
-/// An owner claims every workflow task of its partitions. Two live owners
-/// that register different workflow types could each hold a workflow that
-/// only the other can run. A worker that cannot own does not count.
-#[tokio::test]
-async fn enable_refuses_a_fleet_that_registers_different_workflow_types() {
+/// Enable while three workers advertise `a`, `b` and `none`. Return the
+/// error text, or `None` when the handler check passes.
+async fn enable_with_handlers(a: &str, b: &str) -> Option<String> {
     let db = OwnDb::new().await;
     let mut conn = db.conn().await;
-    for worker in ["types-a", "types-b", "activities-only"] {
+    for worker in ["owner-a", "owner-b", "participant"] {
         register_worker(&mut conn, worker, true).await;
     }
-    let one = decision_owner::workflow_set_fingerprint(["checkout", "refund"]);
-    let other = decision_owner::workflow_set_fingerprint(["checkout"]);
-    set_workflows_label(&mut conn, "types-a", &one).await;
-    set_workflows_label(&mut conn, "types-b", &other).await;
-    set_workflows_label(
-        &mut conn,
-        "activities-only",
-        decision_owner::NO_OWNED_WORKFLOWS,
-    )
-    .await;
-
-    let refused = decision_owner::enable_owner_mode(&mut conn, &EnableOwnerMode::default()).await;
-    let message = refused
-        .expect_err("different workflow types block owner mode")
+    set_handlers_label(&mut conn, "owner-a", a).await;
+    set_handlers_label(&mut conn, "owner-b", b).await;
+    set_handlers_label(&mut conn, "participant", decision_owner::NO_OWNED_HANDLERS).await;
+    let message = decision_owner::enable_owner_mode(&mut conn, &EnableOwnerMode::default())
+        .await
+        .expect_err("no owner loop is live, so enable fails either way")
         .to_string();
-    assert!(message.contains("different workflow types"), "{message}");
-
-    set_workflows_label(&mut conn, "types-b", &one).await;
-    let next = decision_owner::enable_owner_mode(&mut conn, &EnableOwnerMode::default()).await;
-    let message = next.expect_err("still no live owner loop").to_string();
-    assert!(
-        message.contains("no owner loop is live"),
-        "one type set passes the type check: {message}"
-    );
     db.drop_db().await;
+    (!message.contains("no owner loop is live")).then_some(message)
 }
 
-/// The fingerprint ignores order and duplicates.
-#[test]
-fn the_workflow_fingerprint_is_a_set() {
+/// An owner claims every workflow task of its partitions, and a decision can
+/// run any registered activity inline. Two live owners with different
+/// workflow or activity types could each hold a task that only the other
+/// can finish. A worker that owns nothing does not count.
+#[tokio::test]
+async fn enable_refuses_owners_with_different_handlers() {
+    let both = decision_owner::handler_set_fingerprint(["checkout"], ["charge", "ship"]);
+    let fewer_workflows =
+        decision_owner::handler_set_fingerprint(std::iter::empty(), ["charge", "ship"]);
+    let fewer_activities = decision_owner::handler_set_fingerprint(["checkout"], ["charge"]);
+    for other in [&fewer_workflows, &fewer_activities] {
+        let message = enable_with_handlers(&both, other)
+            .await
+            .expect("different handlers block owner mode");
+        assert!(
+            message.contains("different workflow or activity types"),
+            "{message}"
+        );
+    }
     assert_eq!(
-        decision_owner::workflow_set_fingerprint(["b", "a", "b"]),
-        decision_owner::workflow_set_fingerprint(["a", "b"])
+        enable_with_handlers(&both, &both).await,
+        None,
+        "one handler set passes the check"
+    );
+}
+
+/// The fingerprint ignores order and duplicates, and keeps the two kinds
+/// apart.
+#[test]
+fn the_handler_fingerprint_is_a_pair_of_sets() {
+    let fp = |workflows: &[&str], activities: &[&str]| {
+        decision_owner::handler_set_fingerprint(
+            workflows.iter().copied(),
+            activities.iter().copied(),
+        )
+    };
+    assert_eq!(fp(&["b", "a", "b"], &["x"]), fp(&["a", "b"], &["x", "x"]));
+    assert_ne!(fp(&["a"], &[]), fp(&["a", "b"], &[]));
+    assert_ne!(
+        fp(&["ab"], &[]),
+        fp(&["a", "b"], &[]),
+        "names stay separate"
     );
     assert_ne!(
-        decision_owner::workflow_set_fingerprint(["a"]),
-        decision_owner::workflow_set_fingerprint(["a", "b"])
-    );
-    assert_ne!(
-        decision_owner::workflow_set_fingerprint(["ab"]),
-        decision_owner::workflow_set_fingerprint(["a", "b"]),
-        "names are separated, so no two sets join into one string"
+        fp(&["a"], &[]),
+        fp(&[], &["a"]),
+        "a workflow is not an activity"
     );
 }
 

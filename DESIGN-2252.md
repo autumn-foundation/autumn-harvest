@@ -179,7 +179,7 @@ tests and docs. The fixes:
 ## 3. Limits
 
 - An owner claims every workflow task of its partitions. So owner mode
-  needs one queue set, one build and one workflow type set on the
+  needs one queue set, one build and one handler set on the
   database. The enable step checks this once. A worker that starts later with other queues is not
   stopped.
 - A legacy claim whose best row is a workflow task gets nothing. So an old
@@ -191,7 +191,31 @@ tests and docs. The fixes:
 - The owned claim reads past the workflow rows of other owners at a queue
   head. Each owner then reads about N times as many head rows.
 
-## 4. Out of scope
+## 4. Measurements
+
+The e2e `throughput` bench, release build, one worker, 8 workflow and 16
+activity slots, 32 connections, a 25 ms poll and a three-activity
+workflow. It ran on a shared 4-vCPU host, with Postgres on the same host.
+Each cell is the mean of six runs: three with legacy first and three with
+owner mode first and a `CHECKPOINT` before each run.
+
+| Claim loops | Legacy wf/s | Owner wf/s | Change |
+|---:|---:|---:|---:|
+| 1 | 28.74 | 27.98 | −2.6% |
+| 2 | 37.82 | 37.06 | −2.0% |
+| 4 | 43.95 | 41.79 | −4.9% |
+
+- The run order moves the 1 and 2 loop results by more than the change.
+  Owner mode won both cells when it ran first. At 4 loops it lost in both
+  orders.
+- Every run made 4 decisions per workflow: 0 extra, 0 extra cold, and a
+  continuation hit rate of 100%. Before the terminal guard fix, legacy
+  made 81 to 82 extra cold decisions at 2 and 4 loops, and owner mode 52
+  to 59.
+- Owner mode still sends one commit fence per decision. That is about 2%
+  of the statements of a decision. ADR 0009 decision 6 requires it.
+
+## 5. Out of scope
 
 - Foreign-writer routing and cache invalidation: #2253.
 - The crash bound and a shorter TTL: #2254.

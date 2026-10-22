@@ -28651,7 +28651,7 @@ async fn process_workflow_task(
             // Issue #2252: the rest of this transaction counts as fenced, so
             // its nested writes send no second fence.
             let fenced = crate::decision_owner::conn_id(conn);
-            crate::decision_owner::fenced_scope(
+            Box::pin(crate::decision_owner::fenced_scope(
                 fenced,
                 crate::notify::coalesced(conn, async |conn| {
                     if check_paused_and_park(
@@ -28864,7 +28864,7 @@ async fn process_workflow_task(
                         deferred_cancel_ended_run,
                     })
                 }),
-            )
+            ))
             .await
         },
     ))
@@ -36548,20 +36548,21 @@ impl Worker {
     /// The labels this worker writes to `harvest_workers` (issue #2252).
     ///
     /// They are the configured labels plus
-    /// [`crate::decision_owner::OWNER_WORKFLOWS_LABEL`]. The enable step of
+    /// [`crate::decision_owner::OWNER_HANDLERS_LABEL`]. The enable step of
     /// owner mode compares that label across the live fleet.
     fn fleet_labels(&self) -> std::collections::HashMap<String, String> {
         let mut labels = self.config.labels.clone();
-        let workflows = if self.can_own_partitions() {
-            crate::decision_owner::workflow_set_fingerprint(
+        let handlers = if self.can_own_partitions() {
+            crate::decision_owner::handler_set_fingerprint(
                 self.registry.workflows.keys().map(String::as_str),
+                self.registry.activities.keys().map(String::as_str),
             )
         } else {
-            crate::decision_owner::NO_OWNED_WORKFLOWS.to_string()
+            crate::decision_owner::NO_OWNED_HANDLERS.to_string()
         };
         labels.insert(
-            crate::decision_owner::OWNER_WORKFLOWS_LABEL.to_string(),
-            workflows,
+            crate::decision_owner::OWNER_HANDLERS_LABEL.to_string(),
+            handlers,
         );
         labels
     }

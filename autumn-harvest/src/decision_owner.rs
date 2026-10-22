@@ -52,29 +52,39 @@ pub const OWNER_MODE_CAPABILITY_LABEL: &str = "decision_owner_version";
 /// The value of [`OWNER_MODE_CAPABILITY_LABEL`] for this binary.
 pub const OWNER_MODE_CAPABILITY_VERSION: i64 = 1;
 
-/// The worker label that names the workflow types an owner can run (issue
-/// #2252).
+/// The worker label that names the handlers an owner can run (issue #2252).
 ///
-/// An owner claims every workflow task of its partitions. So the enable step
+/// An owner claims every workflow task of its partitions. A decision can run
+/// any registered activity inline, as a local activity. So the enable step
 /// refuses while live owners advertise different values. The value is
-/// [`workflow_set_fingerprint`], or [`NO_OWNED_WORKFLOWS`] for a worker that
+/// [`handler_set_fingerprint`], or [`NO_OWNED_HANDLERS`] for a worker that
 /// owns no partition.
-pub const OWNER_WORKFLOWS_LABEL: &str = "decision_owner_workflows";
+pub const OWNER_HANDLERS_LABEL: &str = "decision_owner_handlers";
 
-/// The [`OWNER_WORKFLOWS_LABEL`] value of a worker that owns no partition.
+/// The [`OWNER_HANDLERS_LABEL`] value of a worker that owns no partition.
 ///
-/// The enable step skips such a worker in the workflow type check.
-pub const NO_OWNED_WORKFLOWS: &str = "none";
+/// The enable step skips such a worker in the handler check.
+pub const NO_OWNED_HANDLERS: &str = "none";
 
-/// A fingerprint of a set of workflow type names (issue #2252).
+/// A fingerprint of a set of workflow types and a set of activity types
+/// (issue #2252).
 ///
-/// Order and duplicates do not change it. Each name ends with a NUL byte, so
-/// two different sets never join into the same bytes.
+/// Order and duplicates do not change it. Each name carries a tag for its
+/// kind and ends with a NUL byte, so two different sets never give the same
+/// bytes.
 #[must_use]
-pub fn workflow_set_fingerprint<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
-    let set: std::collections::BTreeSet<&str> = names.into_iter().collect();
+pub fn handler_set_fingerprint<'a>(
+    workflows: impl IntoIterator<Item = &'a str>,
+    activities: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let set: std::collections::BTreeSet<(u8, &str)> = workflows
+        .into_iter()
+        .map(|name| (b'w', name))
+        .chain(activities.into_iter().map(|name| (b'a', name)))
+        .collect();
     let mut bytes = Vec::new();
-    for name in set {
+    for (kind, name) in set {
+        bytes.push(kind);
         bytes.extend_from_slice(name.as_bytes());
         bytes.push(0);
     }
@@ -1354,6 +1364,15 @@ mod db {
             .map_err(database_error)
     }
 
+    /// The id of `conn` for [`super::fenced_scope`] (issue #2252).
+    ///
+    /// It is the address of the connection. The scope borrows the
+    /// connection, so no other connection can take that address meanwhile.
+    #[must_use]
+    pub fn conn_id(conn: &AsyncPgConnection) -> usize {
+        std::ptr::from_ref(conn).addr()
+    }
+
     /// The commit fence: check `tenure` against its owner row.
     ///
     /// Call it inside the decision transaction, first after the DR
@@ -1375,15 +1394,6 @@ mod db {
     /// or epoch, when the row is missing, or when the lock wait ends. The
     /// caller aborts the transaction and does not retry.
     /// [`HarvestError::Database`] on a query failure.
-    /// The id of `conn` for [`super::fenced_scope`] (issue #2252).
-    ///
-    /// It is the address of the connection. The scope borrows the
-    /// connection, so no other connection can take that address meanwhile.
-    #[must_use]
-    pub fn conn_id(conn: &AsyncPgConnection) -> usize {
-        std::ptr::from_ref(conn).addr()
-    }
-
     pub async fn fence(conn: &mut AsyncPgConnection, tenure: &OwnerTenure) -> HarvestResult<()> {
         let idle = format!("{}ms", tenure.ttl().get().as_millis());
         let lost = |current: Option<i64>| HarvestError::OwnershipLost {
@@ -1491,22 +1501,22 @@ mod db {
     /// An owner claims every workflow task of its partitions. A partition of
     /// a worker that does not poll a queue, or cannot run a build, would
     /// strand those tasks. So owner mode needs one queue set and one build.
-    /// [`MIXED_WORKFLOWS_SQL`] checks the workflow types.
+    /// [`MIXED_HANDLERS_SQL`] checks the handlers.
     const MIXED_FLEET_SQL: &str = "SELECT count(DISTINCT (queues, build_id))::bigint AS n \
          FROM harvest_workers \
          WHERE status <> 'Stopped' \
            AND last_heartbeat_at > NOW() - make_interval(secs => $1)";
 
-    /// The number of workflow type sets that live owners advertise.
+    /// The number of handler sets that live owners advertise.
     ///
     /// A worker that owns no partition is skipped. A missing label counts as
     /// its own set, so an unknown worker never passes as a match.
-    const MIXED_WORKFLOWS_SQL: &str = "SELECT count(DISTINCT \
-             COALESCE(labels->>'decision_owner_workflows', ''))::bigint AS n \
+    const MIXED_HANDLERS_SQL: &str = "SELECT count(DISTINCT \
+             COALESCE(labels->>'decision_owner_handlers', ''))::bigint AS n \
          FROM harvest_workers \
          WHERE status <> 'Stopped' \
            AND last_heartbeat_at > NOW() - make_interval(secs => $1) \
-           AND COALESCE(labels->>'decision_owner_workflows', '') <> 'none'";
+           AND COALESCE(labels->>'decision_owner_handlers', '') <> 'none'";
 
     /// Workflow-task rows with no stamp, and their workflow ids.
     const UNSTAMPED_SQL: &str = "SELECT t.id, e.workflow_id FROM harvest_task_queue t \
@@ -1810,15 +1820,15 @@ mod db {
                     .to_string(),
             ));
         }
-        let types: CountRow = diesel::sql_query(MIXED_WORKFLOWS_SQL)
+        let types: CountRow = diesel::sql_query(MIXED_HANDLERS_SQL)
             .bind::<Double, _>(live)
             .get_result(conn)
             .await
             .map_err(database_error)?;
         if types.n > 1 {
             return Err(HarvestError::Config(
-                "owner mode refused: live workers register different workflow types, so an \
-                 owner could hold a workflow task that it cannot run"
+                "owner mode refused: live workers register different workflow or activity \
+                 types, so an owner could hold a workflow task that it cannot run"
                     .to_string(),
             ));
         }

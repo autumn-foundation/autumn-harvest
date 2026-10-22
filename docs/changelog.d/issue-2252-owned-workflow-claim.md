@@ -14,8 +14,10 @@ table `harvest_decision_owner_mode`, the candidate table
 **Switch.** `decision_owner::enable_owner_mode` refuses while a live worker
 lacks the `decision_owner_version` label, while live workers poll different
 queues or run different builds, while live owners register different
-workflow types, or while no owner loop is live. Each worker advertises a
-fingerprint of its workflow types in the `decision_owner_workflows` label. It stamps
+workflow or activity types, or while no owner loop is live. A decision can
+run any activity inline, as a local activity. Each worker advertises a
+fingerprint of its workflow and activity types in the
+`decision_owner_handlers` label. It stamps
 live workflow tasks. Then one transaction installs the claim guard,
 re-pends the legacy claims of dead workers and sets the switch.
 `disable_owner_mode` clears the switch and turns the guard off in one
@@ -61,7 +63,10 @@ ends, so the others could not fail. `decision_owner::fenced_scope` marks
 the rest of a fenced transaction. Inside it, a fence of the same connection
 and tenure sends no query, and the event insert needs no savepoint. The
 worker persist transaction uses it. At four claim loops, the extra round
-trips had cost owner mode about 10% of its throughput.
+trips had cost owner mode about 10% of its throughput. After the change,
+owner mode ran 2.6%, 2.0% and 4.9% below legacy at 1, 2 and 4 claim
+loops. The 1 and 2 loop results are within the effect of run order.
+`DESIGN-2252.md` section 4 has the runs.
 
 **Evidence.** Unit tests for the splice, the balance plan, the local
 deadline and the colocated groups. Postgres tests for the guard, the owned
