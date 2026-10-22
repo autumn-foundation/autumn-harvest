@@ -2951,6 +2951,11 @@ mod db {
         let Some(tenure) = crate::decision_owner::pinned_decision() else {
             return Ok(());
         };
+        // Issue #2252: the first fence of this transaction holds both rows
+        // until it ends, so a second fence would send a query that cannot fail.
+        if crate::decision_owner::already_fenced(crate::decision_owner::conn_id(conn), &tenure) {
+            return Ok(());
+        }
         assert_generation_fence(conn, tenure.shard()).await?;
         crate::decision_owner::fence(conn, &tenure).await
     }

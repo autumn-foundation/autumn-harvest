@@ -246,9 +246,15 @@ async fn insert_event_rows(
     // A decision that pinned an owner tenure takes the same path (issue
     // #2251). `assert_fence` then also fences the owner row, so a stale owner
     // inserts nothing, also with the DR fence off.
-    if crate::replication::FenceRegistry::is_enabled()
-        || crate::decision_owner::pinned_decision().is_some()
-    {
+    //
+    // Inside a fenced scope of this connection, the start fence of the
+    // transaction already holds the owner row (issue #2252). With the DR
+    // fence off, the insert then needs no savepoint and no second fence.
+    let pinned = crate::decision_owner::pinned_decision();
+    let fenced_here = pinned.as_ref().is_some_and(|tenure| {
+        crate::decision_owner::already_fenced(crate::decision_owner::conn_id(conn), tenure)
+    });
+    if crate::replication::FenceRegistry::is_enabled() || (pinned.is_some() && !fenced_here) {
         Box::pin(
             conn.transaction::<_, crate::error::HarvestError, _>(async |conn| {
                 crate::replication::assert_fence(conn, exec_id.shard()).await?;

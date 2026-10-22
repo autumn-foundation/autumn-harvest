@@ -54,6 +54,15 @@ once with a blocking lock in a savepoint, bounded by
 `CLAIM_GUARD_LOCK_WAIT` (100 ms). A transfer still reads as lost. The bound
 is far below `deadlock_timeout`, so the guard still ends an ABBA cycle.
 
+**One fence per transaction.** A decision transaction fenced up to three
+times: at its start, in a nested write and in its event insert, which also
+opened a savepoint. The first fence holds its rows until the transaction
+ends, so the others could not fail. `decision_owner::fenced_scope` marks
+the rest of a fenced transaction. Inside it, a fence of the same connection
+and tenure sends no query, and the event insert needs no savepoint. The
+worker persist transaction uses it. At four claim loops, the extra round
+trips had cost owner mode about 10% of its throughput.
+
 **Evidence.** Unit tests for the splice, the balance plan, the local
 deadline and the colocated groups. Postgres tests for the guard, the owned
 claim, enable, disable and rebalance. Worker tests for zero extra cold

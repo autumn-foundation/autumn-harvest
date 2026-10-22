@@ -210,6 +210,10 @@ builds it. Code for owner mode follows these rules:
   epoch.
 - A commit or an owned claim takes one owner row only. A foreign writer
   takes none.
+- A decision transaction fences once. `decision_owner::fenced_scope` marks
+  the rest of that transaction as fenced. Wrap only the body after a passed
+  fence. A nested fence of the same connection then sends no query (issue
+  #2252).
 - An acknowledgement never comes from owner memory. It follows a durable
   write.
 - List, search and describe read Postgres, never an owner cache.

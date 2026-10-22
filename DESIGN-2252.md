@@ -108,6 +108,11 @@ owned claim, a database guard on the legacy claim and the acquisition loop.
   read the lock as a lost claim. The decision rolled back, released the
   task, and the retry replayed cold. A park waits for the lock, so only the
   terminal write lost. Owner mode does not change this race.
+- At four claim loops, owner mode ran about 10% below legacy. Logged
+  statement durations showed equal database time but 13% more statements.
+  Each decision fenced three times and opened one more savepoint. Neither
+  the claim guard trigger, its lock, the fence lock nor the sticky pin
+  explained the gap; each was tested on its own.
 - A wake re-arms a sticky pin. So an activity that outlives the window
   does not lose its pin. A timer does: no wake re-arms it. With 200 ms
   windows and one-second timers on two workers, sticky routing resumed 40
@@ -137,6 +142,9 @@ owned claim, a database guard on the legacy claim and the acquisition loop.
    below `deadlock_timeout`, so the guard still ends an ABBA cycle first.
 10. The legacy schemas of `integration_e2e` and the plugin timeline suite
     gain the `decision_partition` column.
+11. `decision_owner::fenced_scope`: one fence per decision transaction. The
+    worker persist transaction marks its body as fenced, so nested fences
+    and the savepoint of the event insert send no query.
 
 ## 2. Review findings
 

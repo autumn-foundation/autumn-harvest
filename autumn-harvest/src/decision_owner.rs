@@ -503,6 +503,35 @@ tokio::task_local! {
 
     /// The tenures of the worker that runs this task (issue #2252).
     static OWNED: Arc<OwnedPartitions>;
+
+    /// The connection and the tenure that the current transaction fenced
+    /// (issue #2252).
+    static FENCED: (usize, OwnerTenure);
+}
+
+/// Run `body` as the rest of a transaction whose decision fence passed.
+///
+/// `conn` names the connection of that transaction, as `conn_id` gives
+/// it. Inside `body`, a fence of that connection
+/// for the pinned tenure sends no query. The first fence holds its row
+/// locks until the transaction ends, so no takeover and no generation bump
+/// can commit before then. A fence of any other connection still runs. The
+/// scope ends with `body`, so wrap only the rest of the fenced transaction.
+/// With no tenure pinned, this only runs `body`.
+pub async fn fenced_scope<F: Future>(conn: usize, body: F) -> F::Output {
+    match pinned_decision() {
+        Some(tenure) => FENCED.scope((conn, tenure), body).await,
+        None => body.await,
+    }
+}
+
+/// Whether connection `conn` fenced `tenure` in the current transaction,
+/// inside [`fenced_scope`].
+#[must_use]
+pub fn already_fenced(conn: usize, tenure: &OwnerTenure) -> bool {
+    FENCED
+        .try_with(|(fenced, held)| *fenced == conn && held == tenure)
+        .unwrap_or(false)
 }
 
 /// Run `body` in a decision scope of the worker that holds `owned`.
@@ -916,9 +945,9 @@ pub struct EnableReport {
 
 #[cfg(feature = "db")]
 pub use db::{
-    OwnerLoop, OwnerTick, acquire, disable_owner_mode, enable_owner_mode, end_upload_allowance,
-    expire_all, fence, fence_pinned, is_lock_miss, read_owner_mode, release_all, renew_all,
-    start_upload_allowance,
+    OwnerLoop, OwnerTick, acquire, conn_id, disable_owner_mode, enable_owner_mode,
+    end_upload_allowance, expire_all, fence, fence_pinned, is_lock_miss, read_owner_mode,
+    release_all, renew_all, start_upload_allowance,
 };
 
 #[cfg(feature = "db")]
@@ -1346,6 +1375,15 @@ mod db {
     /// or epoch, when the row is missing, or when the lock wait ends. The
     /// caller aborts the transaction and does not retry.
     /// [`HarvestError::Database`] on a query failure.
+    /// The id of `conn` for [`super::fenced_scope`] (issue #2252).
+    ///
+    /// It is the address of the connection. The scope borrows the
+    /// connection, so no other connection can take that address meanwhile.
+    #[must_use]
+    pub fn conn_id(conn: &AsyncPgConnection) -> usize {
+        std::ptr::from_ref(conn).addr()
+    }
+
     pub async fn fence(conn: &mut AsyncPgConnection, tenure: &OwnerTenure) -> HarvestResult<()> {
         let idle = format!("{}ms", tenure.ttl().get().as_millis());
         let lost = |current: Option<i64>| HarvestError::OwnershipLost {
@@ -2266,6 +2304,35 @@ mod tests {
             OwnerEpoch::new(epoch),
             OwnerLeaseTtl::DEFAULT,
         )
+    }
+
+    /// A fenced scope covers one connection and one tenure, and only inside
+    /// the scope (issue #2252).
+    #[tokio::test]
+    async fn a_fenced_scope_covers_one_connection_and_one_tenure() {
+        let held = tenure(4, 7);
+        let other = tenure(4, 8);
+        fenced_scope(1, async {
+            assert!(!already_fenced(1, &held), "no pin, no scope");
+        })
+        .await;
+        scope_decision(async {
+            assert!(pin_decision(Some(held.clone())));
+            assert!(!already_fenced(1, &held), "no scope yet");
+            fenced_scope(1, async {
+                assert!(already_fenced(1, &held));
+                assert!(!already_fenced(2, &held), "another connection fences");
+                assert!(!already_fenced(1, &other), "another tenure fences");
+                let spawned = tokio::spawn({
+                    let held = held.clone();
+                    async move { already_fenced(1, &held) }
+                });
+                assert!(!spawned.await.expect("join"), "a spawned task fences");
+            })
+            .await;
+            assert!(!already_fenced(1, &held), "the scope ends with its body");
+        })
+        .await;
     }
 
     #[test]

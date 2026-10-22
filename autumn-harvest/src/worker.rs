@@ -28648,216 +28648,223 @@ async fn process_workflow_task(
             // Issue #2251: in owner mode, the DR generation row and the owner
             // row come first, before the execution row (ADR 0009 decision 6).
             crate::replication::assert_decision_fence(conn).await?;
-            crate::notify::coalesced(conn, async |conn| {
-                if check_paused_and_park(
-                    conn,
-                    exec_uuid,
-                    task.id,
-                    worker_id,
-                    task.crash_strikes,
-                    task.attempt,
-                    sticky_timeout,
-                )
-                .await?
-                {
-                    // Inline local activities can have appended events already.
-                    record_decision_boundary(
+            // Issue #2252: the rest of this transaction counts as fenced, so
+            // its nested writes send no second fence.
+            let fenced = crate::decision_owner::conn_id(conn);
+            crate::decision_owner::fenced_scope(
+                fenced,
+                crate::notify::coalesced(conn, async |conn| {
+                    if check_paused_and_park(
                         conn,
-                        registry,
-                        prepared.exec_id,
-                        decision_start_event_id,
-                        inline_appends,
-                        true,
+                        exec_uuid,
+                        task.id,
                         worker_id,
-                        build_id,
+                        task.crash_strikes,
+                        task.attempt,
+                        sticky_timeout,
                     )
-                    .await?;
-                    return Ok(WorkflowPersistFlow::ParkedPaused);
-                }
-
-                // Issue #2079: do not seal a run over a signal it never read.
-                if matches!(
-                    &outcome,
-                    WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
-                ) && repend_for_late_signals(
-                    conn,
-                    prepared.exec_id,
-                    task.id,
-                    worker_id,
-                    task.crash_strikes,
-                    task.attempt,
-                    sticky_timeout,
-                )
-                .await?
-                {
-                    record_decision_boundary(
-                        conn,
-                        registry,
-                        prepared.exec_id,
-                        decision_start_event_id,
-                        inline_appends,
-                        true,
-                        worker_id,
-                        build_id,
-                    )
-                    .await?;
-                    return Ok(WorkflowPersistFlow::RependedForSignals);
-                }
-
-                // Issue #1833: the boundary follows only rows this decision
-                // writes. The execution row is locked now, and every history
-                // writer takes that lock. So a row past this id is this
-                // transaction's own. A row another writer committed after the
-                // decision start does not count. Inline steps wrote before
-                // the lock, so they keep the decision start.
-                let boundary_floor =
-                    if inline_appends || !registry.history_policy().decision_boundaries() {
-                        decision_start_event_id
-                    } else {
-                        store::next_event_id_for(conn, prepared.exec_id).await?
-                    };
-
-                // Issue #603: this cycle replayed cleanly (the ND gate above
-                // did not fire), so if the execution was previously blocked on
-                // replay non-determinism the offending build has been rolled
-                // back or fixed — clear the block marker atomically with the
-                // recovered cycle's persisted outcome. Guarded on
-                // `was_nd_blocked` (captured *before* the in-memory mutation
-                // above) rather than re-reading `execution_ref.nd_blocked_at`,
-                // which is already `None` here by the time this runs — so
-                // never-blocked executions still pay nothing, and a
-                // previously-blocked one still gets its DB row cleared.
-                if was_nd_blocked {
-                    clear_nd_block(conn, persistence.exec_id).await?;
-                }
-
-                let mut pending_cancel_metrics = Vec::new();
-                if let Some(reason) = &deferred_cancel_ends_run {
-                    // The cycle's commands persist as for a terminal cycle:
-                    // update results, race-loser teardown, detached children,
-                    // search attributes, details, logs and progress. The run
-                    // then ends cancelled instead of with its outcome.
-                    let mut redirected = false;
-                    let (_, deferred_checks, race_deferred_triggers) =
-                        persist_terminal_outcome_commands(
+                    .await?
+                    {
+                        // Inline local activities can have appended events already.
+                        record_decision_boundary(
                             conn,
                             registry,
-                            execution_ref,
-                            persistence,
-                            outcome,
-                            &pending_cmds,
-                            &recorded_dispatches,
-                            &execute_span,
-                            &mut pending_cancel_metrics,
-                            &mut redirected,
-                            resolved_router.as_ref(),
-                            TerminalSeal::DeferredCancel(reason),
+                            prepared.exec_id,
+                            decision_start_event_id,
+                            inline_appends,
+                            true,
+                            worker_id,
+                            build_id,
                         )
                         .await?;
-                    return Ok(WorkflowPersistFlow::Persisted {
-                        retry_scheduled: false,
+                        return Ok(WorkflowPersistFlow::ParkedPaused);
+                    }
+
+                    // Issue #2079: do not seal a run over a signal it never read.
+                    if matches!(
+                        &outcome,
+                        WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
+                    ) && repend_for_late_signals(
+                        conn,
+                        prepared.exec_id,
+                        task.id,
+                        worker_id,
+                        task.crash_strikes,
+                        task.attempt,
+                        sticky_timeout,
+                    )
+                    .await?
+                    {
+                        record_decision_boundary(
+                            conn,
+                            registry,
+                            prepared.exec_id,
+                            decision_start_event_id,
+                            inline_appends,
+                            true,
+                            worker_id,
+                            build_id,
+                        )
+                        .await?;
+                        return Ok(WorkflowPersistFlow::RependedForSignals);
+                    }
+
+                    // Issue #1833: the boundary follows only rows this decision
+                    // writes. The execution row is locked now, and every history
+                    // writer takes that lock. So a row past this id is this
+                    // transaction's own. A row another writer committed after the
+                    // decision start does not count. Inline steps wrote before
+                    // the lock, so they keep the decision start.
+                    let boundary_floor =
+                        if inline_appends || !registry.history_policy().decision_boundaries() {
+                            decision_start_event_id
+                        } else {
+                            store::next_event_id_for(conn, prepared.exec_id).await?
+                        };
+
+                    // Issue #603: this cycle replayed cleanly (the ND gate above
+                    // did not fire), so if the execution was previously blocked on
+                    // replay non-determinism the offending build has been rolled
+                    // back or fixed — clear the block marker atomically with the
+                    // recovered cycle's persisted outcome. Guarded on
+                    // `was_nd_blocked` (captured *before* the in-memory mutation
+                    // above) rather than re-reading `execution_ref.nd_blocked_at`,
+                    // which is already `None` here by the time this runs — so
+                    // never-blocked executions still pay nothing, and a
+                    // previously-blocked one still gets its DB row cleared.
+                    if was_nd_blocked {
+                        clear_nd_block(conn, persistence.exec_id).await?;
+                    }
+
+                    let mut pending_cancel_metrics = Vec::new();
+                    if let Some(reason) = &deferred_cancel_ends_run {
+                        // The cycle's commands persist as for a terminal cycle:
+                        // update results, race-loser teardown, detached children,
+                        // search attributes, details, logs and progress. The run
+                        // then ends cancelled instead of with its outcome.
+                        let mut redirected = false;
+                        let (_, deferred_checks, race_deferred_triggers) =
+                            persist_terminal_outcome_commands(
+                                conn,
+                                registry,
+                                execution_ref,
+                                persistence,
+                                outcome,
+                                &pending_cmds,
+                                &recorded_dispatches,
+                                &execute_span,
+                                &mut pending_cancel_metrics,
+                                &mut redirected,
+                                resolved_router.as_ref(),
+                                TerminalSeal::DeferredCancel(reason),
+                            )
+                            .await?;
+                        return Ok(WorkflowPersistFlow::Persisted {
+                            retry_scheduled: false,
+                            deferred_checks,
+                            race_deferred_triggers,
+                            pending_cancel_metrics,
+                            continue_as_new_redirected_to_failure: false,
+                            deferred_cancel_ended_run: true,
+                        });
+                    }
+                    // Issue #1161: `false` unless the ContinuedAsNew outcome below
+                    // (reached via either branch) redirects to a terminal failure —
+                    // see `persist_workflow_outcome`'s parameter doc.
+                    let mut continue_as_new_redirected_to_failure = false;
+                    let (retry_scheduled, mut deferred_checks, mut race_deferred_triggers) =
+                        if is_terminal_with_commands {
+                            persist_terminal_outcome_commands(
+                                conn,
+                                registry,
+                                execution_ref,
+                                persistence,
+                                outcome,
+                                &pending_cmds,
+                                &recorded_dispatches,
+                                &execute_span,
+                                &mut pending_cancel_metrics,
+                                &mut continue_as_new_redirected_to_failure,
+                                resolved_router.as_ref(),
+                                TerminalSeal::Outcome,
+                            )
+                            .await?
+                        } else {
+                            let (retry_scheduled, deferred_checks) = persist_workflow_outcome(
+                                conn,
+                                registry,
+                                execution_ref,
+                                persistence,
+                                outcome,
+                                &execute_span,
+                                false,
+                                // Issue #678: carries any external-op terminal
+                                // resolved inline this cycle into the Suspended arm
+                                // so a mixed timer + external op self-wakes.
+                                resolved_inline_external,
+                                &mut pending_cancel_metrics,
+                                &mut continue_as_new_redirected_to_failure,
+                                resolved_router.as_ref(),
+                                // This path never computes an abandoned-dispatch
+                                // decision ahead of time (`is_terminal_with_commands`
+                                // is false here), so the arm resolves its own verdict.
+                                None,
+                            )
+                            .await?;
+                            (retry_scheduled, deferred_checks, Vec::new())
+                        };
+                    record_decision_boundary(
+                        conn,
+                        registry,
+                        prepared.exec_id,
+                        boundary_floor,
+                        decision_appends,
+                        stays_running,
+                        worker_id,
+                        build_id,
+                    )
+                    .await?;
+                    // Issue #1984: a cancel is pending. When no block is open after
+                    // this cycle, cancel the run in this same transaction.
+                    let mut deferred_cancel_ended_run = false;
+                    if check_deferred_cancel
+                        && let Some((_, starts, checks, terminal_metric)) =
+                            crate::execution::complete_deferred_cancel(
+                                conn,
+                                prepared.exec_id,
+                                Some(telemetry.metrics.as_ref()),
+                            )
+                            .await?
+                    {
+                        deferred_cancel_ended_run = true;
+                        race_deferred_triggers.extend(starts);
+                        deferred_checks
+                            .extend(checks.into_iter().map(|(id, name)| (id, Some(name))));
+                        if let Some((workflow_name, queue_name)) = terminal_metric {
+                            pending_cancel_metrics.push(
+                                crate::execution::StartCancelledRun::terminated(
+                                    workflow_name,
+                                    queue_name,
+                                ),
+                            );
+                        }
+                    }
+                    // Chaos: kill/delay inside the persist transaction, after the
+                    // outcome is written but before the outer commit — the #367 window
+                    // (worker dies after claim, before the terminal is durable). A kill
+                    // (owned conn in the reproducer's spawned task) rolls the persist
+                    // back, leaving the task RUNNING with a dead worker (AC4).
+                    crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
+                    Ok(WorkflowPersistFlow::Persisted {
+                        retry_scheduled,
                         deferred_checks,
                         race_deferred_triggers,
                         pending_cancel_metrics,
-                        continue_as_new_redirected_to_failure: false,
-                        deferred_cancel_ended_run: true,
-                    });
-                }
-                // Issue #1161: `false` unless the ContinuedAsNew outcome below
-                // (reached via either branch) redirects to a terminal failure —
-                // see `persist_workflow_outcome`'s parameter doc.
-                let mut continue_as_new_redirected_to_failure = false;
-                let (retry_scheduled, mut deferred_checks, mut race_deferred_triggers) =
-                    if is_terminal_with_commands {
-                        persist_terminal_outcome_commands(
-                            conn,
-                            registry,
-                            execution_ref,
-                            persistence,
-                            outcome,
-                            &pending_cmds,
-                            &recorded_dispatches,
-                            &execute_span,
-                            &mut pending_cancel_metrics,
-                            &mut continue_as_new_redirected_to_failure,
-                            resolved_router.as_ref(),
-                            TerminalSeal::Outcome,
-                        )
-                        .await?
-                    } else {
-                        let (retry_scheduled, deferred_checks) = persist_workflow_outcome(
-                            conn,
-                            registry,
-                            execution_ref,
-                            persistence,
-                            outcome,
-                            &execute_span,
-                            false,
-                            // Issue #678: carries any external-op terminal
-                            // resolved inline this cycle into the Suspended arm
-                            // so a mixed timer + external op self-wakes.
-                            resolved_inline_external,
-                            &mut pending_cancel_metrics,
-                            &mut continue_as_new_redirected_to_failure,
-                            resolved_router.as_ref(),
-                            // This path never computes an abandoned-dispatch
-                            // decision ahead of time (`is_terminal_with_commands`
-                            // is false here), so the arm resolves its own verdict.
-                            None,
-                        )
-                        .await?;
-                        (retry_scheduled, deferred_checks, Vec::new())
-                    };
-                record_decision_boundary(
-                    conn,
-                    registry,
-                    prepared.exec_id,
-                    boundary_floor,
-                    decision_appends,
-                    stays_running,
-                    worker_id,
-                    build_id,
-                )
-                .await?;
-                // Issue #1984: a cancel is pending. When no block is open after
-                // this cycle, cancel the run in this same transaction.
-                let mut deferred_cancel_ended_run = false;
-                if check_deferred_cancel
-                    && let Some((_, starts, checks, terminal_metric)) =
-                        crate::execution::complete_deferred_cancel(
-                            conn,
-                            prepared.exec_id,
-                            Some(telemetry.metrics.as_ref()),
-                        )
-                        .await?
-                {
-                    deferred_cancel_ended_run = true;
-                    race_deferred_triggers.extend(starts);
-                    deferred_checks.extend(checks.into_iter().map(|(id, name)| (id, Some(name))));
-                    if let Some((workflow_name, queue_name)) = terminal_metric {
-                        pending_cancel_metrics.push(
-                            crate::execution::StartCancelledRun::terminated(
-                                workflow_name,
-                                queue_name,
-                            ),
-                        );
-                    }
-                }
-                // Chaos: kill/delay inside the persist transaction, after the
-                // outcome is written but before the outer commit — the #367 window
-                // (worker dies after claim, before the terminal is durable). A kill
-                // (owned conn in the reproducer's spawned task) rolls the persist
-                // back, leaving the task RUNNING with a dead worker (AC4).
-                crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
-                Ok(WorkflowPersistFlow::Persisted {
-                    retry_scheduled,
-                    deferred_checks,
-                    race_deferred_triggers,
-                    pending_cancel_metrics,
-                    continue_as_new_redirected_to_failure,
-                    deferred_cancel_ended_run,
-                })
-            })
+                        continue_as_new_redirected_to_failure,
+                        deferred_cancel_ended_run,
+                    })
+                }),
+            )
             .await
         },
     ))
