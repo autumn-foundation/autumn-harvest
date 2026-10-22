@@ -523,6 +523,25 @@ async fn insert_task_rows(
     Ok(stamps.into_iter().next())
 }
 
+/// Stage the wake of one new task row.
+///
+/// A workflow task of a run also wakes the owner of the run's partition
+/// (issue #2253). An activity task wakes its queue only, because activities
+/// stay on the shared claim.
+async fn notify_enqueued(
+    conn: &mut AsyncPgConnection,
+    stamp: Option<crate::notify::Stamp>,
+    params: &EnqueueParams,
+    task_id: Uuid,
+) -> HarvestResult<()> {
+    let owner_exec = match params.task_type {
+        TaskType::Workflow => params.workflow_exec_id,
+        TaskType::Activity => None,
+    };
+    crate::notify::notify_task_enqueued_for(conn, stamp, &params.queue_name, task_id, owner_exec)
+        .await
+}
+
 /// Insert a new task into the work queue and return its ID.
 ///
 /// # Errors
@@ -607,7 +626,7 @@ pub async fn enqueue(conn: &mut AsyncPgConnection, params: &EnqueueParams) -> Ha
         .map_err(crate::error::database_error)?;
     }
 
-    crate::notify::notify_task_enqueued_stamped(conn, stamp, &params.queue_name, task_id).await?;
+    notify_enqueued(conn, stamp, params, task_id).await?;
 
     // Dispatch hint (issue #1312). The row is `PENDING`, so the channel gets a
     // reference to it. A row scheduled in the future is still recorded; the
@@ -887,8 +906,7 @@ pub async fn enqueue_batch(
     }
 
     for (p, &task_id) in params.iter().zip(&task_ids) {
-        crate::notify::notify_task_enqueued_stamped(conn, stamp.clone(), &p.queue_name, task_id)
-            .await?;
+        notify_enqueued(conn, stamp.clone(), p, task_id).await?;
     }
 
     for (p, &task_id) in params.iter().zip(&task_ids) {
@@ -7557,7 +7575,15 @@ pub async fn wake_workflow_task(
     queue_names.sort();
     queue_names.dedup();
 
-    crate::notify::notify_tasks_enqueued(conn, &queue_names, Uuid::nil()).await?;
+    // Issue #2253: the owner of the run's partition wakes too.
+    crate::notify::notify_workflow_task_woken(
+        conn,
+        None,
+        &queue_names,
+        Uuid::nil(),
+        exec_id.as_uuid(),
+    )
+    .await?;
 
     Ok(())
 }

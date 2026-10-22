@@ -573,6 +573,45 @@ fn prose_sentences_stay_short() {
     );
 }
 
+/// The foreign writer table of decision 12 (issue #2253) cites each writer
+/// by file and function. The ADR cites no line numbers, so this guard
+/// checks that each cited function is still declared in its file.
+#[test]
+fn foreign_writer_table_cites_real_functions() {
+    let adr = read(ADR);
+    let decision = section(&adr, "\n### 12. Foreign writers", "\n## ")
+        .unwrap_or_else(|| panic!("{ADR} has no decision 12"));
+    let rows = table_rows(decision);
+    assert!(
+        rows.len() >= 20,
+        "{ADR} decision 12 lists each writer class"
+    );
+    let mut checked = 0;
+    for (class, rest) in &rows {
+        let writer = rest.split('|').next().unwrap_or_default();
+        let mut file: Option<String> = None;
+        for symbol in writer.split('`').skip(1).step_by(2) {
+            if std::path::Path::new(symbol)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+            {
+                file = Some(read(&format!("autumn-harvest/src/{symbol}")));
+                continue;
+            }
+            let source = file
+                .as_deref()
+                .unwrap_or_else(|| panic!("the `{class}` row names a function before a file"));
+            assert!(
+                source.contains(&format!("fn {symbol}("))
+                    || source.contains(&format!("fn {symbol}<")),
+                "the `{class}` row cites `{symbol}`, which its file does not declare"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked >= 40, "the table cites each writer function");
+}
+
 /// A docs-only change skips the `test` matrix, so `lint` must run these guards.
 #[test]
 fn guards_run_on_docs_only_changes() {

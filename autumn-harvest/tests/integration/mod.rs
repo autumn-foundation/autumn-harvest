@@ -241,6 +241,8 @@ mod notify_post_commit_tests;
 mod notify_stage_probe_tests;
 mod otel_semconv_docs;
 mod otel_workflow_semconv_docs;
+mod owner_wake_db_tests;
+mod owner_wake_worker_tests;
 mod panic_containment_tests;
 #[cfg(feature = "db")]
 mod parent_close_cascade_unfinished_handlers_perf;
