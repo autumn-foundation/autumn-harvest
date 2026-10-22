@@ -2856,7 +2856,7 @@ pub enum PersistPhase {
     Events,
     /// The inserts into `harvest_task_queue`.
     Tasks,
-    /// The stage of the post-commit wakes, the `pg_notify` fallback, and
+    /// The stage of the post-commit wakes, the in-transaction fallback, and
     /// the progress wakes of a stream.
     Notify,
     /// The `COMMIT` or `ROLLBACK` statement.
