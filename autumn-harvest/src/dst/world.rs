@@ -29,6 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 
+use super::fair::Waits;
 use super::rng::SplitMix64;
 use super::sweep::{Nondeterminism, SEED_VAR, SeedPlan, TAIL_LINES, diverged};
 use crate::event::WorkflowEvent;
@@ -835,7 +836,7 @@ struct Driver<'a, W> {
     fired_slots: BTreeSet<u64>,
     seen: BTreeMap<String, Seen>,
     /// The step from which each enabled action waits for a run.
-    waiting: BTreeMap<WorldAction, usize>,
+    waiting: Waits<WorldAction>,
     report: WorldReport,
 }
 
@@ -858,7 +859,7 @@ impl<'a, W: World> Driver<'a, W> {
             held: vec![false; config.schedulers],
             fired_slots: BTreeSet::new(),
             seen: BTreeMap::new(),
-            waiting: BTreeMap::new(),
+            waiting: Waits::new(),
             report: WorldReport {
                 config: config.clone(),
                 trace: Vec::new(),
@@ -1007,17 +1008,13 @@ impl<'a, W: World> Driver<'a, W> {
         let action = self
             .overdue(&actions)
             .unwrap_or_else(|| self.draw(&actions));
-        self.waiting.remove(&action);
+        self.waiting.ran(&action);
         action
     }
 
     /// Start the wait of each newly enabled action. Drop each disabled one.
     fn track_waits(&mut self, actions: &[(u64, WorldAction)]) {
-        let enabled: BTreeSet<WorldAction> = actions.iter().map(|(_, action)| *action).collect();
-        self.waiting.retain(|action, _| enabled.contains(action));
-        for action in enabled {
-            self.waiting.entry(action).or_insert(self.step);
-        }
+        self.waiting.track(self.step, &unweighted(actions));
     }
 
     /// In the drain phase, the action that waited longest, if it waited
@@ -1030,12 +1027,8 @@ impl<'a, W: World> Driver<'a, W> {
         if !self.draining() {
             return None;
         }
-        actions
-            .iter()
-            .filter_map(|(_, action)| Some((*action, *self.waiting.get(action)?)))
-            .filter(|(_, since)| self.step - since >= FAIR_STEPS)
-            .min_by_key(|(_, since)| *since)
-            .map(|(action, _)| action)
+        self.waiting
+            .overdue(self.step, FAIR_STEPS, &unweighted(actions))
     }
 
     /// One weighted draw from `actions`.
@@ -1332,6 +1325,11 @@ fn check_exec(exec: &ExecFacts, ticks: &[u64], first_new: usize) -> Vec<(WorldIn
     found
 }
 
+/// The actions of `actions`, in order, without their weights.
+fn unweighted(actions: &[(u64, WorldAction)]) -> Vec<WorldAction> {
+    actions.iter().map(|(_, action)| *action).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1398,10 +1396,13 @@ mod tests {
         driver.step = FAIR_STEPS + 5;
         assert_eq!(driver.overdue(&ACTIONS), Some(WorldAction::Reclaim));
 
-        driver.waiting.remove(&WorldAction::Reclaim);
+        driver.waiting.ran(&WorldAction::Reclaim);
         driver.track_waits(&ACTIONS);
         assert_eq!(driver.overdue(&ACTIONS), Some(WorldAction::Sweep));
-        assert_eq!(driver.waiting[&WorldAction::Reclaim], FAIR_STEPS + 5);
+        assert_eq!(
+            driver.waiting.since(&WorldAction::Reclaim),
+            Some(FAIR_STEPS + 5)
+        );
     }
 
     #[test]
@@ -1411,6 +1412,6 @@ mod tests {
         driver.track_waits(&ACTIONS[..1]);
         driver.track_waits(&ACTIONS);
         assert_eq!(driver.overdue(&ACTIONS), Some(WorldAction::Advance));
-        assert_eq!(driver.waiting[&WorldAction::Sweep], FAIR_STEPS);
+        assert_eq!(driver.waiting.since(&WorldAction::Sweep), Some(FAIR_STEPS));
     }
 }

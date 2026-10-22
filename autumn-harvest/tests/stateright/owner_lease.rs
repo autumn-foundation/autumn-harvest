@@ -436,6 +436,13 @@ impl Model for OwnerLease {
                 OwnerInvariant::OwnerNeverFencesItself.as_str(),
                 |_, s: &State| !s.seen.contains(&Tag::SelfFence),
             ),
+            Property::always(LIVE_ROW_HAS_A_PINNED_HOLDER, |_, s: &State| {
+                let row = s.store.row();
+                !row.live
+                    || row
+                        .holder
+                        .is_some_and(|h| s.workers[h.0].pinned == Some(row.epoch))
+            }),
             Property::sometimes(EVERY_NEMESIS_SEEN, |_, s: &State| {
                 Tag::WITNESSES.iter().all(|tag| s.seen.contains(tag))
             }),
@@ -445,6 +452,10 @@ impl Model for OwnerLease {
 
 /// One behavior reaches every nemesis.
 const EVERY_NEMESIS_SEEN: &str = "EveryNemesisSeen";
+/// The holder of a live row is pinned at the epoch of the row. So the
+/// fault-free drain of `dst::owner` cannot stop: either a worker can take
+/// the row, or its holder can commit (issue #2294).
+const LIVE_ROW_HAS_A_PINNED_HOLDER: &str = "LiveRowHasAPinnedHolder";
 /// The invariant that `OwnerLeaseReach.cfg` must break. It is the negation
 /// of [`EVERY_NEMESIS_SEEN`].
 const TLA_REACH: &str = "SomeNemesisUnseen";

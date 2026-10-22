@@ -138,6 +138,12 @@ The models check safety only. Two liveness rules follow from R2:
 - The takeover sets `lock_timeout` too. A lock miss is a failed attempt,
   and the worker tries again on its next tick.
 
+No lease makes progress while its lease ends at every step. So the
+simulator checks progress only after the faults stop. Its drain injects no
+fault and is weakly fair. Each run must consume every signal before the
+drain ends (issue #2294). The Stateright lemma `LiveRowHasAPinnedHolder`
+shows that the drain cannot stop with work left.
+
 ## Consequences
 
 - Stage 1a (#2251) implements `dst::owner::OwnerStore` on Postgres. It runs

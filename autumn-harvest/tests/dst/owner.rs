@@ -32,6 +32,21 @@ const COVER_SEEDS: SeedPlan = SeedPlan {
 /// The table that stage 1a adds. ADR 0009 decision 4 names it.
 const OWNER_TABLE: &str = "harvest_decision_owner";
 
+/// The seeds that failed the nightly run of issue #2294, one per shard.
+/// The faults ended the lease before a decision could commit.
+const NIGHTLY_2294: [u64; 4] = [
+    68_000_179_911,
+    68_001_309_850,
+    68_002_005_924,
+    68_003_071_396,
+];
+
+/// The seeds of the test that cuts the fault phase at every step.
+const CUT_SEEDS: SeedPlan = SeedPlan {
+    first: 0,
+    count: 12,
+};
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -303,6 +318,88 @@ fn a_store_that_makes_no_progress_fails_the_sweep() {
 }
 
 #[test]
+fn the_failure_of_a_run_that_does_not_converge_names_the_drain() {
+    let config = OwnerConfig::new(0);
+    let stuck = owner::run_with(
+        &config,
+        &mut StuckStore(OracleOwnerStore::new(config.defect)),
+    );
+    assert_eq!(stuck.violation, None);
+    let reason = stuck.failure().expect("a stuck run fails");
+    assert!(reason.contains("did not consume every signal"), "{reason}");
+    assert_eq!(owner::run(&config).failure(), None);
+}
+
+#[test]
+fn the_seeds_of_issue_2294_converge_in_the_drain() {
+    for seed in NIGHTLY_2294 {
+        let config = OwnerConfig::new(seed);
+        let report = owner::run_twice(&config).unwrap_or_else(|n| panic!("{n}"));
+        assert_eq!(
+            report.failure(),
+            None,
+            "seed {seed}:\n{}",
+            report.trace_tail(40)
+        );
+        // The fault phase alone does not consume every signal.
+        assert!(
+            report.trace.len() > config.fault_steps,
+            "seed {seed} needs no drain"
+        );
+    }
+}
+
+/// The step number at the start of a trace line.
+fn step_of(line: &str) -> usize {
+    line.split_whitespace()
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no step in {line:?}"))
+}
+
+#[test]
+fn the_drain_converges_from_every_fault_step() {
+    for seed in CUT_SEEDS.seeds() {
+        for fault_steps in 0..=OwnerConfig::new(seed).fault_steps {
+            let config = OwnerConfig {
+                fault_steps,
+                ..OwnerConfig::new(seed)
+            };
+            let report = owner::run(&config);
+            assert_eq!(
+                report.failure(),
+                None,
+                "seed {seed}, drain at {fault_steps}:\n{}",
+                report.trace_tail(40)
+            );
+        }
+    }
+}
+
+#[test]
+fn the_drain_injects_no_fault() {
+    let mut drained = 0;
+    for seed in COVER_SEEDS.seeds() {
+        let config = OwnerConfig {
+            fault_steps: 20,
+            ..OwnerConfig::new(seed)
+        };
+        let report = owner::run(&config);
+        assert!(report.completed, "seed {seed}:\n{}", report.trace_tail(40));
+        for line in report.trace.iter().filter(|l| step_of(l) >= 20) {
+            drained += 1;
+            assert!(
+                !line.contains("expire")
+                    && !line.contains(" release ")
+                    && !line.contains(" stall "),
+                "seed {seed}: a fault in the drain: {line}"
+            );
+        }
+    }
+    assert!(drained > 0, "no seed reaches the drain");
+}
+
+#[test]
 fn config_vars_parse_and_reject_unknown_names() {
     let config = owner::config_from_vars(3, Some("memory-ack"), Some("ack-before-bump"), None)
         .expect("known names");
@@ -341,8 +438,8 @@ fn replay_one_owner_seed() {
     let config = owner::config_from_env(seed).unwrap_or_else(|e| panic!("{e}"));
     let report = owner::run_twice(&config).unwrap_or_else(|n| panic!("{n}"));
     println!("{}", report.trace.join("\n"));
-    if let Some(violation) = report.violation {
-        panic!("{violation}");
+    if let Some(reason) = report.failure() {
+        panic!("{reason}");
     }
 }
 

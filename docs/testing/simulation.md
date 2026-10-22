@@ -402,6 +402,26 @@ nemeses bias the scheduler. Each one acts when its trigger holds:
 | `renew-in-flight` | The holder holds the fence lock. | The holder renews. | `renew-in-flight` |
 | `ack-before-bump` | An acked signal is pending. | End the lease, so the epoch bumps first. | `ack-before-bump` |
 
+A run has two phases, as a world run has. The fault phase runs the nemeses
+for 400 steps. The drain then runs for at most 400 steps. It injects no
+fault: no nemesis, no expiry, no release and no stall. A stalled worker
+wakes when the drain starts.
+
+The drain is weakly fair. An action that stays enabled for `FAIR_STEPS` (8)
+steps without a run is overdue. Each step runs the overdue action that
+waited longest. A run that ends in the fault phase keeps its trace.
+
+Issue #2294 adds the drain. Before it, the run had to consume every signal
+while the faults went on. In about one seed in a million, the lease ended
+every few steps for all 400 steps. No lease makes progress then, so the
+nightly failed and the engine was not at fault.
+
+The `OwnerConfig::drain_steps` doc gives the bound. In the drain, the row
+stays with the first worker that takes it. Then each signal needs a begin,
+a lock and a commit. The Stateright property `LiveRowHasAPinnedHolder`
+shows that the drain cannot stop with work left. See
+[`stateright.md`](stateright.md).
+
 ### The tests
 
 - `every_tla_defect_fails_here_on_the_same_invariant` reads the
@@ -413,9 +433,15 @@ nemeses bias the scheduler. Each one acts when its trigger holds:
   design reaches each nemesis and never fences itself.
 - `each_nemesis_fires_and_adds_its_fault` runs each nemesis alone. It must
   fire, and its fault counter must be above the run with no nemesis.
-- A sweep fails a seed that does not consume every signal within the
-  step limit. So a store that makes no progress cannot pass.
+- A sweep fails a seed that does not consume every signal before the
+  drain ends. So a store that makes no progress cannot pass.
   `a_store_that_makes_no_progress_fails_the_sweep` checks this.
+- `the_seeds_of_issue_2294_converge_in_the_drain` runs the four nightly
+  seeds of issue #2294. Each one needs the drain.
+- `the_drain_converges_from_every_fault_step` starts the drain at each step
+  from 0 to 400, over 12 seeds.
+- `the_drain_injects_no_fault` checks that no drain step ends the lease,
+  releases the row or stalls a worker.
 
 With every check on, a defect can fail first on another invariant. For
 example, `memory-ack` fails first on `AckAfterDurableWrite`. Set
@@ -438,7 +464,9 @@ HARVEST_DST_OWNER_SEEDS=100000 \
 ```
 
 A failure prints the replay command. It runs `owner::replay_one_owner_seed`
-and prints the trace.
+and prints the trace. The sweep and the replay use the same verdict,
+`OwnerReport::failure`. So the replay also fails a run that does not
+consume every signal. Before issue #2294, it failed on an invariant only.
 
 ## The speculation model
 

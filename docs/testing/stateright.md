@@ -115,9 +115,16 @@ and no stall.
 
 The actions are those of `formal/tla/OwnerLease.tla`: `Acquire`, `Release`,
 `Renew`, `Begin`, `Lock`, `Commit`, `Write`, `Ack`, `Receive` and `Expire`.
-The invariants are the seven `OwnerInvariant` values. The bound is 2
-workers and 2 signals. The epoch stops at 3 per PR, about 658,000 states,
-and at 4 nightly, about 7,100,000 states.
+The invariants are the seven `OwnerInvariant` values and
+`LiveRowHasAPinnedHolder`. The bound is 2 workers and 2 signals. The epoch
+stops at 3 per PR, about 658,000 states, and at 4 nightly, about 7,100,000
+states.
+
+`LiveRowHasAPinnedHolder` is the lemma of the owner drain (issue #2294).
+The holder of a live row is pinned at the epoch of the row. So the drain of
+`dst::owner` cannot stop with work left. Either the row is free to take,
+or its holder can begin, lock and commit. The simulator checks the bound
+of that drain.
 
 `EveryNemesisSeen` must hold in one behavior of the design. It is the
 negation of `SomeNemesisUnseen`, which `OwnerLeaseReach.cfg` must break. The
@@ -163,6 +170,9 @@ Two mutations of the oracles show that the passing checks can fail:
   requeued row again, so the worker id alone cannot tell the claims apart.
 - Remove the fence-lock check from `OracleOwnerStore::acquire`. The owner
   design check breaks `OneOwnerPerEpoch`.
+- Unload a worker on every fenced commit, not only at its pinned epoch. The
+  owner design check breaks `LiveRowHasAPinnedHolder` in 20 steps. The
+  owner drain in `dst::owner` then stops with work left.
 
 ## Limits
 
