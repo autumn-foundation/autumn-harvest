@@ -925,3 +925,120 @@ async fn a_fence_of_a_missing_row_fails_closed() {
         other => panic!("a missing row fences: {other:?}"),
     }
 }
+
+/// The fence calls of this backend that are not yet flushed to the
+/// cumulative statistics.
+async fn fence_calls(conn: &mut AsyncPgConnection) -> Result<i64, HarvestError> {
+    #[derive(QueryableByName)]
+    struct Calls {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    let calls: Calls = diesel::sql_query(
+        "SELECT COALESCE(SUM(calls), 0)::bigint AS n FROM pg_stat_xact_user_functions \
+         WHERE funcname = 'harvest_decision_owner_fence'",
+    )
+    .get_result(conn)
+    .await
+    .map_err(autumn_harvest::error::database_error)?;
+    Ok(calls.n)
+}
+
+/// One decision transaction, shaped as the worker persist: a start fence,
+/// then a nested write with its own fence and an event insert. `scoped`
+/// marks the rest of the transaction as fenced (issue #2252). Returns the
+/// fence calls that the transaction made.
+async fn persist_shaped(
+    conn: &mut AsyncPgConnection,
+    owner: &OwnerTenure,
+    exec_id: ExecutionId,
+    n: u32,
+    scoped: bool,
+) -> Result<i64, HarvestError> {
+    decision_owner::scope_decision(async {
+        let _ = decision_owner::pin_decision(Some(owner.clone()));
+        conn.transaction::<_, HarvestError, _>(async |conn| {
+            // A backend can hold unflushed counts of an earlier transaction,
+            // so count the difference.
+            let before = fence_calls(conn).await?;
+            autumn_harvest::replication::assert_decision_fence(conn).await?;
+            let nested = async |conn: &mut AsyncPgConnection| {
+                conn.transaction::<_, HarvestError, _>(async |conn| {
+                    autumn_harvest::replication::assert_decision_fence(conn).await?;
+                    let next = store::next_event_id_for(conn, exec_id).await?;
+                    store::append_events(conn, exec_id, &[signal(n)], next).await
+                })
+                .await
+            };
+            if scoped {
+                let id = decision_owner::conn_id(conn);
+                decision_owner::fenced_scope(id, nested(conn)).await?;
+            } else {
+                nested(conn).await?;
+            }
+            Ok(fence_calls(conn).await? - before)
+        })
+        .await
+    })
+    .await
+}
+
+/// Inside one transaction, the first fence holds its row lock until the end.
+/// So a scoped transaction fences once. A transaction with no scope still
+/// fences each nested write and its event insert (issue #2252).
+#[tokio::test]
+async fn a_fenced_scope_sends_one_fence_per_transaction() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    conn.batch_execute("SET track_functions = 'all'")
+        .await
+        .expect("count function calls");
+    let p = partition(431);
+    free(&mut conn, p).await;
+    let exec_id = seed_execution(&mut conn).await;
+    let owner = acquire(&mut conn, &holder("scoped"), p).await;
+
+    let unscoped = persist_shaped(&mut conn, &owner, exec_id, 0, false)
+        .await
+        .expect("the owner commits");
+    let scoped = persist_shaped(&mut conn, &owner, exec_id, 1, true)
+        .await
+        .expect("the owner commits");
+
+    assert_eq!(
+        unscoped, 3,
+        "start, nested write and event insert each fence"
+    );
+    assert_eq!(scoped, 1, "the start fence covers the whole transaction");
+    assert_eq!(event_count(&mut conn, exec_id).await, 2);
+}
+
+/// The scope ends with its transaction. A later transaction on the same
+/// connection that skips the start fence still meets the late fence.
+#[tokio::test]
+async fn a_fenced_scope_ends_with_its_transaction() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let p = partition(432);
+    free(&mut conn, p).await;
+    let exec_id = seed_execution(&mut conn).await;
+    let owner = acquire(&mut conn, &holder("scope-end-a"), p).await;
+    persist_shaped(&mut conn, &owner, exec_id, 0, true)
+        .await
+        .expect("the owner commits");
+
+    lapse(&mut conn, p).await;
+    let _new = acquire(&mut conn, &holder("scope-end-b"), p).await;
+    let result = decision_owner::scope_decision(async {
+        let _ = decision_owner::pin_decision(Some(owner.clone()));
+        conn.transaction::<(), HarvestError, _>(async |conn| {
+            let next = store::next_event_id_for(conn, exec_id).await?;
+            store::append_events(conn, exec_id, &[signal(1)], next).await?;
+            Ok(())
+        })
+        .await
+    })
+    .await;
+    assert!(error_is_ownership_lost(&result), "{result:?}");
+    assert_eq!(event_count(&mut conn, exec_id).await, 1);
+}

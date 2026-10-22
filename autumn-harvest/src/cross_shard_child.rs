@@ -1700,6 +1700,7 @@ async fn start_child_on_target(
                     codecs.encode_column(&spec.input)?,
                 );
                 params.workflow_exec_id = Some(child_exec_id.as_uuid());
+                params = params.with_decision_partition(&child_workflow_id);
                 params.required_build_id = spec.assigned_build_id.clone();
                 params.concurrency_key = spec.concurrency_key.clone();
                 params.max_concurrent = spec.max_concurrent;

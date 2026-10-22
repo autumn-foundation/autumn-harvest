@@ -313,6 +313,31 @@ impl WorkflowCache {
         ClosedEntries(evicted)
     }
 
+    /// Drop every entry of each partition in `keys`, in one pass (issue
+    /// #2252).
+    ///
+    /// The owner loop drops many partitions at once on a release or a
+    /// switch-off. One pass keeps the cache lock short.
+    #[must_use = "drop the evicted entries outside the cache lock"]
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker unloads a partition.
+    pub(crate) fn evict_partitions(&mut self, keys: &[OwnerKey]) -> ClosedEntries {
+        let keys: std::collections::HashSet<OwnerKey> = keys.iter().copied().collect();
+        let doomed: Vec<Uuid> = self
+            .inner
+            .iter()
+            .filter(|(_, entry)| entry.owner_key.is_some_and(|k| keys.contains(&k)))
+            .map(|(id, _)| *id)
+            .collect();
+        let cap = NonZeroUsize::new(doomed.len()).unwrap_or(NonZeroUsize::MIN);
+        let mut evicted = LruCache::new(cap);
+        for id in doomed {
+            if let Some(entry) = self.inner.pop(&id) {
+                evicted.push(id, entry);
+            }
+        }
+        ClosedEntries(evicted)
+    }
+
     /// Look up a cached workflow state, marking it as recently used.
     ///
     /// Returns `None` if the execution ID is not in the cache.
@@ -530,6 +555,33 @@ mod tests {
         let (_, _, _, taken) = cache.take_entry(&id).expect("entry");
         assert_eq!(taken, Some(key));
         assert!(!cache.contains(&id), "a take removes the entry");
+    }
+
+    #[test]
+    fn evict_partitions_drops_each_listed_partition_in_one_pass() {
+        use crate::decision_owner::DecisionPartition;
+        use crate::types::ShardId;
+        let key = |p| OwnerKey {
+            shard: ShardId::new(0),
+            partition: DecisionPartition::new(p).expect("in range"),
+        };
+        let mut cache = WorkflowCache::new(8);
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for (id, p) in ids.iter().zip([1, 2, 3]) {
+            let _ = cache.insert_resident_with_history_bytes(
+                *id,
+                make_state(1),
+                Residency::Unknown,
+                None,
+                Some(key(p)),
+            );
+        }
+        let evicted = cache.evict_partitions(&[key(1), key(3)]);
+        assert_eq!(evicted.len(), 2);
+        drop(evicted);
+        assert!(cache.get(&ids[0]).is_none());
+        assert!(cache.get(&ids[1]).is_some());
+        assert!(cache.get(&ids[2]).is_none());
     }
 
     #[test]

@@ -156,8 +156,16 @@ Rules:
 
 - Each transaction that takes an owner row takes the generation row first.
   This covers acquisition, renewal, release, revoke and the DR bump.
+- The owned claim is the exception (issue #2252). It reads the generation
+  row without a lock, as every claim does. Its owner row lock uses
+  `SKIP LOCKED`, so it never waits.
 - A decision commit or an owned claim takes at most one owner row.
-- It takes that row before any execution row, task row or advisory lock.
+- A decision commit takes that row before any execution row, task row or
+  advisory lock.
+- An owned claim takes its owner row in the claim guard, after its task
+  row. It uses `SKIP LOCKED`, so it never waits for the owner row. A
+  skipped row is a takeover, and the claim takes no task. So the late
+  order adds no wait edge (issue #2252).
 - Renewal, release and revoke take the generation row and owner rows
   only. An acquisition takes them, then locks the workflow task rows that
   it re-pends (decision 7).
@@ -242,11 +250,16 @@ When the holder or the epoch differs:
 
 No task stays `RUNNING` with no worker to finish it:
 
-- The owned claim takes the owner row `FOR KEY SHARE` and matches holder
-  and epoch. A stale owner cannot claim after a takeover.
+- The owned claim takes the owner row `FOR KEY SHARE` and matches the
+  holder. A stale owner cannot claim after a takeover. A holder that takes
+  back its own row needs no epoch check: its later decisions fence.
 - The acquisition re-pends each `RUNNING` workflow task of the partition
-  that another worker holds. It does this in its own transaction, after its
-  `FOR UPDATE`.
+  that a dead worker holds. Issue #2252 does this in one statement per
+  scan, after the acquisitions commit. A claim of the old owner that
+  commits later fails the guard.
+- A live worker keeps its claim. A live old owner fails its fence and
+  re-pends its own claim. A live legacy worker finishes its decision. So
+  no decision runs twice at once.
 - A fenced worker re-pends its own claim under its claim token, as
   `requeue_claimed_workflow_task_*` does today.
 - Issue #2252 builds the first two steps. Issue #2251 builds the third
@@ -295,8 +308,22 @@ shard 5 s and failed (golemcloud/golem#3766).
 
 A worker targets ⌈512 / live owners on the database⌉ partitions. It
 releases a partition when it holds more than that target + 1. It drains
-the partition first, as in steps 1 and 2. Issue #2252 fixes the balance
-policy.
+the partition first, as in steps 1 and 2.
+
+Issue #2252 fixes the balance policy (`decision_owner::plan_balance`):
+
+- Live owners are the owner loops that wrote their candidate row in the
+  last 3 s (`harvest_decision_owner_candidates`). A loop writes it on each
+  scan. A crashed worker drops out within 3 s.
+- A worker that cannot run a workflow task is no candidate. This covers
+  a worker with no workflow slot or type, and a split colocated group.
+  It still claims in the owned form, so the guard never blocks it.
+- A worker below the target acquires free partitions up to the target.
+- A worker above target + 1 stops claiming the extra partitions at once.
+  It releases them on its next scan, so their decisions in flight can
+  commit. That is the drain.
+- Any worker acquires an orphan: a free partition whose lease ended more
+  than one renewal interval ago.
 
 ### 10. Tenant cells: partitions follow shard assignments
 
@@ -342,13 +369,52 @@ statement, as the DR claim gate does. With the switch on, the legacy
 workflow-task claim selects nothing. With it off, the owned claim selects
 nothing.
 
+Issue #2252 builds the step as `decision_owner::enable_owner_mode`:
+
+- **Capability signal.** Each registration and heartbeat writes the label
+  `decision_owner_version` into `harvest_workers.labels`. Step 1 refuses
+  while a live worker lacks it.
+- **Mixed fleet.** Step 1 also refuses while live workers poll different
+  queues or run different builds. It refuses while live owners register
+  different workflow or activity types, from the label
+  `decision_owner_handlers`. A decision can run any activity inline. An
+  owner claims every workflow task of its partitions, so it must be able to
+  run each one.
+- **Partition.** The column `harvest_task_queue.decision_partition` holds
+  the partition of a workflow task. Each writer stamps it at insert. Step
+  2 stamps the live rows. An owned claim may take an unstamped row. The
+  worker then stamps it and re-pends it to its owner.
+- **Claim signal.** The owned claim sets the transaction setting
+  `harvest.owner_claim` to its holder token. A binary from before owner
+  mode never sets it. The guard reads this token in place of an epoch.
+  It checks neither the epoch nor the lease end. A released lease keeps
+  its holder, so the releaser's local deadline stops its claims.
+- **Guard.** The trigger `harvest_task_queue_owner_claim_guard_trg` runs
+  for the claim of a workflow task only. With no token, it skips the row,
+  so a legacy claim selects nothing. For a stamped row, it takes the owner
+  row `FOR KEY SHARE SKIP LOCKED` and matches the holder.
+- **Order.** Steps 3 to 5 run in one transaction, which first locks the
+  switch row. A failure leaves owner mode off and the guard off. There is
+  no window in which no claim can take a workflow task.
+- **Step 4.** The transaction re-pends only the legacy claims of workers
+  that are not live. A live worker finishes its own decision and parks
+  the task, and then an owner claims it. So no legacy decision runs next
+  to an owner on one execution.
+- **Live owners.** Step 1 also refuses while no owner loop is live.
+- **Locks.** `CREATE TRIGGER` and `ENABLE TRIGGER` take `SHARE ROW
+  EXCLUSIVE` on `harvest_task_queue`, which does not block a reader. A
+  `lock_timeout` bounds each wait. These statements need ownership of the
+  table.
+
 After step 3, no task can be claimed in two ways. An old binary can still
 finish a decision that it claimed before step 3. Step 4 and the execution
 row lock bound that case. Activities stay on the shared claim in both
 modes.
 
 The disable step clears the switch row first, then removes the guard.
-Issue #2252 picks the exact signal that the guard reads.
+`decision_owner::disable_owner_mode` does both in one transaction. It
+turns the trigger off with `DISABLE TRIGGER`, not `DROP TRIGGER`, so it
+takes no `ACCESS EXCLUSIVE` lock.
 
 ### 12. Foreign writers: wake the owner, evict on a state change
 
@@ -477,7 +543,7 @@ here.
 | Lease expiry mid-decision | What happens when the lease lapses during a long decision? | Answered. The commit checks the epoch. The transaction aborts only when another worker acquired. See decision 5. |
 | Cost of two fences | What do two fence row locks per commit cost? | Deferred to #2248. Its benchmark gates stage 1b (#2255). |
 | Mixed fleet | How is a mixed fleet made impossible? | Answered. A per-database switch and a database guard. See decision 11. |
-| Routing | How does the claim find owned work in stages 1a and 1b? | Deferred to #2252. Stage 1a filters the claim to owned partitions. Stage 1b moves off the claim (#2255). |
+| Routing | How does the claim find owned work in stages 1a and 1b? | Answered for stage 1a by #2252: the claim filters workflow rows to owned partitions. Stage 1b moves off the claim (#2255). |
 | Group commit | Do decisions of one partition share a commit? | Deferred to #2256. |
 | Serialization unit | Does the owner serialize per partition or per execution? | Answered. Per execution. A single-threaded owner caps throughput, as at Durable Objects. |
 | Model nemeses | Which nemeses do the TLA+ model and the simulator cover? | Deferred to #2250. Stale commit after takeover, lease flap during an append, renewal during commits, and a signal before an epoch bump. |

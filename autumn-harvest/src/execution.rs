@@ -1769,6 +1769,7 @@ pub(crate) async fn start_or_load_workflow_execution_collect_with_codecs_and_quo
         row.input.clone(),
     );
     enqueue.workflow_exec_id = Some(exec_id.as_uuid());
+    enqueue = enqueue.with_decision_partition(request.workflow_id);
     enqueue.required_build_id = assigned_build.clone();
     // ADR-0001 §3: store the caller's trace context so the worker can restore it.
     enqueue.trace_context.clone_from(&request.trace_context);

@@ -130,6 +130,7 @@ linux        autumn-harvest         integration                      -          
 linux        autumn-harvest         integration                      -                          ctx_info_tests
 linux        autumn-harvest         integration                      -                          dag_execution_timeout_tests
 linux        autumn-harvest         integration                      -                          debounce_tests
+linux        autumn-harvest         integration                      -                          decision_owner_claim_tests
 linux        autumn-harvest         integration                      -                          decision_owner_db_tests
 linux        autumn-harvest         integration                      -                          decision_owner_lock_modes_db_tests
 linux        autumn-harvest         integration                      -                          decision_owner_sim_db_tests

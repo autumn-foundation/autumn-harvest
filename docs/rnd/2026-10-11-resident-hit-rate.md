@@ -135,4 +135,6 @@ No outcome other than `hit` and `cold` occurred in any run.
 ## Next step
 
 - Find the cause of the extra cold decisions under two claim loops (#2106).
+  Issue #2252 found it: the terminal claim guard read a stray lock of the
+  peer claim loop as a lost claim. Its changelog fragment has the detail.
 - Read the counter on a real fleet before choosing between the two bets.

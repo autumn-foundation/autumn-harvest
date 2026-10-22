@@ -192,9 +192,12 @@ test fixture calls `autumn_harvest_sqlite::append_only::with_guard_off`.
 [ADR 0009](docs/adr/0009-decision-owner.md) defines owner mode. Issue #2251
 builds it. Code for owner mode follows these rules:
 
-- A decision commit or an owned claim takes the generation row, then its
-  owner row `FOR KEY SHARE`. It takes the owner row before any execution
-  row, task row or advisory lock.
+- A decision commit takes the generation row, then its owner row
+  `FOR KEY SHARE`. It takes the owner row before any execution row, task
+  row or advisory lock.
+- An owned claim takes its owner row `FOR KEY SHARE SKIP LOCKED` in the
+  claim guard, after its task row. It never waits for that row (issue
+  #2252).
 - The commit compares holder and epoch. A mismatch aborts the whole
   transaction. The commit never checks the lease end.
 - An acquisition takes the owner row `FOR UPDATE`, then increments the
@@ -207,6 +210,10 @@ builds it. Code for owner mode follows these rules:
   epoch.
 - A commit or an owned claim takes one owner row only. A foreign writer
   takes none.
+- A decision transaction fences once. `decision_owner::fenced_scope` marks
+  the rest of that transaction as fenced. Wrap only the body after a passed
+  fence. A nested fence of the same connection then sends no query (issue
+  #2252).
 - An acknowledgement never comes from owner memory. It follows a durable
   write.
 - List, search and describe read Postgres, never an owner cache.
