@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use autumn_harvest::decision_owner::{
     self, Acquisition, DecisionPartition, EnableOwnerMode, OwnedPartitions, OwnerHolder, OwnerKey,
-    OwnerLeaseConfig, OwnerLoop,
+    OwnerLeaseConfig, OwnerLeaseTtl, OwnerLoop,
 };
 use autumn_harvest::prelude::*;
 use autumn_harvest::queue::{self, EnqueueParams, OwnedClaim, TaskType};
@@ -35,14 +35,14 @@ const STEPS: [&str; 3] = ["owner_step_a", "owner_step_b", "owner_step_c"];
 // ── Database ────────────────────────────────────────────────────────────────
 
 /// A migrated database that one test owns, and how to drop it.
-struct OwnDb {
-    url: String,
+pub(crate) struct OwnDb {
+    pub(crate) url: String,
     _container: Option<ContainerAsync<Postgres>>,
     name: Option<String>,
 }
 
 impl OwnDb {
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let Ok(shared) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
             let (url, container) = setup_test_database_url().await;
             return Self {
@@ -71,14 +71,14 @@ impl OwnDb {
         }
     }
 
-    async fn conn(&self) -> AsyncPgConnection {
+    pub(crate) async fn conn(&self) -> AsyncPgConnection {
         AsyncPgConnection::establish(&self.url)
             .await
             .expect("connect")
     }
 
     /// Drop the database. A panicking test leaks it; the prefix names it.
-    async fn drop_db(self) {
+    pub(crate) async fn drop_db(self) {
         let (Some(name), Ok(shared)) = (self.name, std::env::var("HARVEST_TEST_DATABASE_URL"))
         else {
             return;
@@ -1023,6 +1023,86 @@ async fn an_acquisition_keeps_the_claim_of_a_live_worker() {
     tick(&mut a, &owned_a, &mut conn).await;
     assert_eq!(owned_a.len(), 512);
     assert_eq!(task_state(&mut conn, wf).await, ("RUNNING".to_string(), 1));
+    db.drop_db().await;
+}
+
+/// A tick reports when a foreign partition next becomes free or an orphan.
+/// The worker then scans at that time, so a takeover follows a lease end by
+/// milliseconds (issue #2254).
+#[tokio::test]
+async fn a_tick_reports_the_next_foreign_lease_change() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    enable(&mut conn).await;
+    let _other = take(&mut conn, "other-owner", partition(7)).await;
+    let set_lease = async |conn: &mut AsyncPgConnection, offset: &str| {
+        diesel::sql_query(format!(
+            "UPDATE harvest_decision_owner \
+             SET lease_until = clock_timestamp() + interval '{offset}' WHERE partition = 7"
+        ))
+        .execute(conn)
+        .await
+        .expect("move the lease end");
+    };
+    set_lease(&mut conn, "60 seconds").await;
+    let (mut a, owned_a) = new_loop("loop-next");
+    let report = a.tick(&mut conn).await.expect("tick");
+    let next = report.next_change.expect("a foreign lease");
+    assert!(
+        next > Duration::from_secs(30) && next <= Duration::from_secs(60),
+        "the live lease ends next: {next:?}"
+    );
+    for (tenure, deadline) in report.acquired {
+        owned_a.adopt_until(tenure, deadline);
+    }
+    assert_eq!(owned_a.len(), 511, "its own rows never count");
+
+    // A lapsed lease becomes an orphan one TTL after its end.
+    set_lease(&mut conn, "-1 second").await;
+    let report = a.tick(&mut conn).await.expect("tick");
+    let orphan = OwnerLeaseTtl::DEFAULT.orphan_after();
+    let next = report.next_change.expect("a lapsed foreign lease");
+    assert!(
+        next < orphan && next > orphan / 2,
+        "the orphan time is next: {next:?}"
+    );
+    assert_eq!(report.acquired.len(), 1, "a lone owner takes the free row");
+    for (tenure, deadline) in report.acquired {
+        owned_a.adopt_until(tenure, deadline);
+    }
+    let report = a.tick(&mut conn).await.expect("tick");
+    assert_eq!(report.next_change, None, "no foreign row is left");
+    db.drop_db().await;
+}
+
+/// With a chunk, a tick acquires at most that many partitions and asks
+/// for another scan at once while free partitions remain (issue #2254).
+#[tokio::test]
+async fn a_chunked_loop_acquires_in_steps_and_asks_for_more() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    enable(&mut conn).await;
+    let owned = Arc::new(OwnedPartitions::default());
+    let mut chunked = OwnerLoop::new(
+        ShardId::UNENCODED,
+        "loop-chunked",
+        OwnerLeaseConfig::default(),
+        Arc::clone(&owned),
+    )
+    .with_acquire_chunk(200);
+    let mut steps = Vec::new();
+    loop {
+        let report = chunked.tick(&mut conn).await.expect("tick");
+        steps.push((report.acquired.len(), report.more));
+        for (tenure, deadline) in report.acquired {
+            owned.adopt_until(tenure, deadline);
+        }
+        if !report.more {
+            break;
+        }
+    }
+    assert_eq!(steps, vec![(200, true), (200, true), (112, false)]);
+    assert_eq!(owned.len(), 512);
     db.drop_db().await;
 }
 

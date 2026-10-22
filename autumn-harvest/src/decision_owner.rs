@@ -248,7 +248,8 @@ impl fmt::Display for OwnerHolder {
 pub struct OwnerLeaseTtl(Duration);
 
 impl OwnerLeaseTtl {
-    /// The shortest TTL. Issue #2254 measures whether a shorter one is safe.
+    /// The shortest TTL. Issue #2254 measured the crash bound at the default
+    /// TTL only.
     pub const MIN: Duration = Duration::from_secs(3);
     /// The longest TTL, the same as the longest scanner lease.
     pub const MAX: Duration = Duration::from_secs(300);
@@ -282,6 +283,17 @@ impl OwnerLeaseTtl {
     #[must_use]
     pub fn renew_interval(self) -> Duration {
         self.0 / 3
+    }
+
+    /// How long a free partition waits before any owner takes it as an
+    /// orphan (issue #2254).
+    ///
+    /// It is one TTL. A joiner under load can need more than one renewal
+    /// interval to take its share. A shorter wait lets owners at their
+    /// target take it, and the fleet then churns.
+    #[must_use]
+    pub const fn orphan_after(self) -> Duration {
+        self.0
     }
 
     /// The local deadline of a lease request sent at `sent_at`.
@@ -937,7 +949,8 @@ pub struct BalancePlan {
 /// - `peers` is the number of other live owners on the database.
 /// - `free` is the number of partitions with no live lease.
 /// - `orphans` is the number of free partitions whose lease ended more than
-///   one renewal interval ago. No peer took them, so any owner may.
+///   one TTL ago ([`OwnerLeaseTtl::orphan_after`]). No peer took them, so
+///   any owner may.
 ///
 /// A worker below the target acquires up to the target. A worker above
 /// `target + 1` releases down to the target. Any worker acquires orphans,
@@ -959,6 +972,27 @@ pub fn plan_balance(held: usize, peers: usize, free: usize, orphans: usize) -> B
         acquire: below.max(orphans.min(free)),
         release: 0,
     }
+}
+
+/// The slack after a lease end before the next owner scan (issue #2254).
+///
+/// The scan then reads the lease as ended.
+pub const SCAN_SLACK: Duration = Duration::from_millis(10);
+
+/// The sleep of an owner loop after a scan (issue #2254).
+///
+/// `next_change` is the time until a partition that the loop does not hold
+/// becomes free or an orphan. The loop wakes just after that time when it
+/// is sooner than `interval`. So a takeover follows a lease end by
+/// milliseconds, not by up to one interval.
+#[must_use]
+pub fn next_scan_wait(next_change: Option<Duration>, interval: Duration) -> Duration {
+    next_change.map_or(interval, |change| {
+        change
+            .saturating_add(SCAN_SLACK)
+            .min(interval)
+            .max(SCAN_SLACK.min(interval))
+    })
 }
 
 /// The owner-mode switch of one database (issue #2252).
@@ -1663,11 +1697,20 @@ mod db {
 
     /// Free partitions, and the free partitions whose lease ended before
     /// `$1` seconds ago.
-    const FREE_SQL: &str = "SELECT count(*)::bigint AS free, \
-             count(*) FILTER (WHERE lease_until <= clock_timestamp() - make_interval(secs => $1))::bigint \
-                 AS orphans \
-         FROM harvest_decision_owner \
-         WHERE holder IS NULL OR lease_until <= clock_timestamp()";
+    ///
+    /// `next_change` is the seconds until the next row that holder `$2` does
+    /// not hold becomes free or an orphan (issue #2254). It is `NULL` when
+    /// no such row exists.
+    const FREE_SQL: &str = "WITH c AS (SELECT clock_timestamp() AS now, \
+                               make_interval(secs => $1) AS orphan) \
+         SELECT count(*) FILTER (WHERE o.holder IS NULL OR o.lease_until <= c.now)::bigint AS free, \
+             count(*) FILTER (WHERE (o.holder IS NULL OR o.lease_until <= c.now) \
+                                AND o.lease_until <= c.now - c.orphan)::bigint AS orphans, \
+             extract(epoch FROM min((CASE WHEN o.lease_until > c.now THEN o.lease_until \
+                                          ELSE o.lease_until + c.orphan END) - c.now) \
+                 FILTER (WHERE o.holder IS DISTINCT FROM $2 \
+                           AND o.lease_until + c.orphan > c.now))::float8 AS next_change \
+         FROM harvest_decision_owner o CROSS JOIN c";
 
     /// Re-pend each workflow task that a dead worker holds `RUNNING` in a
     /// newly acquired partition (ADR 0009 decision 7).
@@ -1753,6 +1796,8 @@ mod db {
         free: i64,
         #[diesel(sql_type = BigInt)]
         orphans: i64,
+        #[diesel(sql_type = Nullable<Double>)]
+        next_change: Option<f64>,
     }
 
     /// Read the owner-mode switch of the database of `conn` (issue #2252).
@@ -2007,6 +2052,16 @@ mod db {
         /// worker drops their cache entries first, then adopts them, so a
         /// new tenure starts cold.
         pub acquired: Vec<(OwnerTenure, std::time::Instant)>,
+        /// The time until a partition that this loop does not hold becomes
+        /// free or an orphan (issue #2254). The worker scans again then, when
+        /// that is sooner than its scan interval. It is `None` after a tick
+        /// that stopped using partitions, so their release waits a full
+        /// interval.
+        pub next_change: Option<Duration>,
+        /// The tick reached its acquisition chunk, and more free partitions
+        /// are due to this loop (issue #2254). The worker adopts this chunk
+        /// and scans again at once.
+        pub more: bool,
     }
 
     /// The acquisition loop of one worker on one database (issue #2252).
@@ -2038,6 +2093,8 @@ mod db {
         releasing: Vec<OwnerTenure>,
         /// A worker with a heartbeat this recent is live.
         live_within: Duration,
+        /// The most partitions that one tick acquires. `None` means no limit.
+        acquire_chunk: Option<usize>,
     }
 
     impl OwnerLoop {
@@ -2067,7 +2124,20 @@ mod db {
                 stopped: false,
                 releasing: Vec::new(),
                 live_within: Duration::from_secs(30),
+                acquire_chunk: None,
             }
+        }
+
+        /// This loop with at most `chunk` acquisitions per tick (issue #2254).
+        ///
+        /// Each acquisition is its own transaction. The worker adopts the
+        /// tenures of a tick only when the tick ends. So with a chunk, a
+        /// takeover decides after its first chunk, not after its last. The
+        /// tick sets [`OwnerTick::more`] when free partitions remain.
+        #[must_use]
+        pub const fn with_acquire_chunk(mut self, chunk: usize) -> Self {
+            self.acquire_chunk = Some(chunk);
+            self
         }
 
         /// This loop with `live_within`: a worker with a heartbeat this recent
@@ -2140,6 +2210,12 @@ mod db {
             self.renew_if_due(conn, &mut tick).await?;
             self.drop_expired(&mut tick);
             self.balance(conn, &mut tick).await?;
+            if !self.releasing.is_empty() {
+                // The release waits one full scan interval, so the decisions
+                // in flight in those partitions can commit first.
+                tick.next_change = None;
+                tick.more = false;
+            }
             Ok(tick)
         }
 
@@ -2243,10 +2319,15 @@ mod db {
                 .filter(|c| c.holder != self.holder.as_str())
                 .count();
             let free: FreeRow = diesel::sql_query(FREE_SQL)
-                .bind::<Double, _>(self.config.ttl.renew_interval().as_secs_f64())
+                .bind::<Double, _>(self.config.ttl.orphan_after().as_secs_f64())
+                .bind::<Text, _>(self.holder.as_str())
                 .get_result(conn)
                 .await
                 .map_err(database_error)?;
+            tick.next_change = free
+                .next_change
+                .filter(|secs| secs.is_finite() && *secs >= 0.0)
+                .map(Duration::from_secs_f64);
             let held = self.owned.tenures_of(self.shard);
             let plan = super::plan_balance(
                 held.len(),
@@ -2257,9 +2338,13 @@ mod db {
             if plan.release > 0 {
                 self.stop_using(held, plan.release, tick);
             }
-            if plan.acquire > 0 {
-                self.acquire_some(conn, plan.acquire, tick).await?;
+            let want = self
+                .acquire_chunk
+                .map_or(plan.acquire, |chunk| plan.acquire.min(chunk.max(1)));
+            if want > 0 {
+                self.acquire_some(conn, want, tick).await?;
             }
+            tick.more = want < plan.acquire && !tick.acquired.is_empty();
             Ok(())
         }
 
@@ -2664,6 +2749,41 @@ mod tests {
         );
         let plan = plan_balance(258, 1, 0, 0);
         assert_eq!(plan.release, 2);
+    }
+
+    #[test]
+    fn a_scan_wakes_just_after_a_lease_end_sooner_than_the_interval() {
+        let second = Duration::from_secs(1);
+        assert_eq!(next_scan_wait(None, second), second, "no foreign lease");
+        assert_eq!(
+            next_scan_wait(Some(Duration::from_secs(7)), second),
+            second,
+            "a healthy lease ends after the next scan"
+        );
+        assert_eq!(
+            next_scan_wait(Some(Duration::from_millis(300)), second),
+            Duration::from_millis(300) + SCAN_SLACK,
+            "a lease that ends first sets the wake"
+        );
+        assert_eq!(
+            next_scan_wait(Some(Duration::ZERO), second),
+            SCAN_SLACK,
+            "the slack keeps the loop from spinning"
+        );
+        assert_eq!(
+            next_scan_wait(Some(Duration::MAX), second),
+            second,
+            "no overflow"
+        );
+        let short = Duration::from_millis(5);
+        assert_eq!(next_scan_wait(Some(Duration::ZERO), short), short);
+    }
+
+    #[test]
+    fn an_orphan_waits_one_ttl_so_a_slow_joiner_keeps_its_share() {
+        let ttl = OwnerLeaseTtl::DEFAULT;
+        assert_eq!(ttl.orphan_after(), ttl.get());
+        assert!(ttl.orphan_after() > ttl.renew_interval());
     }
 
     #[test]

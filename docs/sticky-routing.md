@@ -57,7 +57,7 @@ Owner mode (issue #2252, [ADR 0009](adr/0009-decision-owner.md)) gives each exec
 - **Resident hits survive.** The owner keeps the resident workflow between decisions, however long the next activity, timer or signal takes. A decision replays cold only after an eviction, a restart or a change of owner.
 - **Balance.** Each worker targets `⌈512 / live owners⌉` partitions. A live owner is a worker whose owner loop scanned in the last 3 s. A worker that joins takes free partitions. A worker above its target plus one stops claiming the extra ones and releases them one scan later. A graceful stop releases every partition in one statement.
 - **Who owns.** A worker with no workflow slot or no workflow type never owns a partition. It still claims activity tasks.
-- **Failover.** A crashed owner drops out of the live owners within 3 s. Its leases lapse after the TTL, 10 s by default. Peers then acquire its partitions on their next scan. A new owner starts cold.
+- **Failover.** A crashed owner drops out of the live owners within 3 s. Its leases lapse after the TTL, 10 s by default. A peer scans just after that lease end and acquires its partitions. A new owner starts cold. [`performance-owner-failover.md`](performance-owner-failover.md) records the measured bounds.
 - **Fence.** Each decision commit checks the owner's lease epoch. A stale owner cannot write. See [ADR 0009](adr/0009-decision-owner.md).
 
 | | Sticky routing | Owner mode |
@@ -65,7 +65,7 @@ Owner mode (issue #2252, [ADR 0009](adr/0009-decision-owner.md)) gives each exec
 | Affinity | 5 s lease on the task row | Lease on the decision partition |
 | After the window | Any worker claims, and the decision replays cold | The owner claims, and the decision resumes |
 | Claim cost | A sticky predicate in each scan | A partition test in each scan |
-| Crash recovery | Up to one sticky window | Up to one lease TTL, plus one scan |
+| Crash recovery | Up to one sticky window | Up to one lease TTL |
 
 ### Turning owner mode on
 
