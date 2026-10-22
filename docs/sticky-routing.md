@@ -65,7 +65,7 @@ Owner mode (issue #2252, [ADR 0009](adr/0009-decision-owner.md)) gives each exec
 | Affinity | 5 s lease on the task row | Lease on the decision partition |
 | After the window | Any worker claims, and the decision replays cold | The owner claims, and the decision resumes |
 | Claim cost | A sticky predicate in each scan | A partition test in each scan |
-| Crash recovery | Up to one sticky window | Up to one lease TTL |
+| Crash recovery | Up to one sticky window | About one lease TTL |
 
 ### Turning owner mode on
 

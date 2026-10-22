@@ -8,9 +8,9 @@ the test binary, against real Postgres. It stops the owner with `SIGSTOP`
 inside a decision and inside an open commit. In both cases the standby
 takes the partition and completes the run. The woken owner writes nothing.
 It kills the owner with `SIGKILL` just after a renewal. The next decision
-on its partitions runs 10.2 s to 10.4 s after the kill, under the 11 s
+on its partitions runs 10.2 s to 10.3 s after the kill, under the 11 s
 bound. It grows the fleet from 4 to 8 workers under load. The fleet
-recovers in 7.6 s to 8.6 s, under the 20 s bound, with no fenced commit
+recovers in 8.4 s to 9.8 s, under the 20 s bound, with no fenced commit
 after the settle. `docs/performance-owner-failover.md` records the results
 beside the stage 1 table.
 
@@ -26,5 +26,5 @@ scale-out. Four changes fix that:
   renewal interval (`OwnerLeaseTtl::orphan_after`).
 
 A tick that stops using partitions still waits a full scan interval before
-the release, so decisions in flight commit first. ADR 0009 decisions 8 and
+the release, so decisions in flight can commit first. ADR 0009 decisions 8 and
 9 and its stage 1 table record the change.

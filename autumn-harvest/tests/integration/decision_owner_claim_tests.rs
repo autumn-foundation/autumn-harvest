@@ -35,14 +35,14 @@ const STEPS: [&str; 3] = ["owner_step_a", "owner_step_b", "owner_step_c"];
 // ── Database ────────────────────────────────────────────────────────────────
 
 /// A migrated database that one test owns, and how to drop it.
-pub(crate) struct OwnDb {
-    pub(crate) url: String,
+pub struct OwnDb {
+    pub url: String,
     _container: Option<ContainerAsync<Postgres>>,
     name: Option<String>,
 }
 
 impl OwnDb {
-    pub(crate) async fn new() -> Self {
+    pub async fn new() -> Self {
         let Ok(shared) = std::env::var("HARVEST_TEST_DATABASE_URL") else {
             let (url, container) = setup_test_database_url().await;
             return Self {
@@ -71,14 +71,14 @@ impl OwnDb {
         }
     }
 
-    pub(crate) async fn conn(&self) -> AsyncPgConnection {
+    pub async fn conn(&self) -> AsyncPgConnection {
         AsyncPgConnection::establish(&self.url)
             .await
             .expect("connect")
     }
 
     /// Drop the database. A panicking test leaks it; the prefix names it.
-    pub(crate) async fn drop_db(self) {
+    pub async fn drop_db(self) {
         let (Some(name), Ok(shared)) = (self.name, std::env::var("HARVEST_TEST_DATABASE_URL"))
         else {
             return;
@@ -1103,6 +1103,44 @@ async fn a_chunked_loop_acquires_in_steps_and_asks_for_more() {
     }
     assert_eq!(steps, vec![(200, true), (200, true), (112, false)]);
     assert_eq!(owned.len(), 512);
+    db.drop_db().await;
+}
+
+/// A chunked loop rescans at once only below its target. Orphans past the
+/// target wait a full scan, so the loop does not take them and then release
+/// them on the next tick (issue #2254).
+#[tokio::test]
+async fn a_chunked_loop_stops_asking_for_more_at_its_target() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    enable(&mut conn).await;
+    let owned = Arc::new(OwnedPartitions::default());
+    let mut chunked = OwnerLoop::new(
+        ShardId::UNENCODED,
+        "loop-target",
+        OwnerLeaseConfig::default(),
+        Arc::clone(&owned),
+    )
+    .with_acquire_chunk(64);
+    // A live peer that never acquires. Each fresh row is an orphan.
+    let mut more = true;
+    while more {
+        diesel::sql_query(
+            "INSERT INTO harvest_decision_owner_candidates (holder, seen_at) \
+             VALUES ('idle-peer/0', clock_timestamp()) \
+             ON CONFLICT (holder) DO UPDATE SET seen_at = EXCLUDED.seen_at",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("keep the peer live");
+        let report = chunked.tick(&mut conn).await.expect("tick");
+        more = report.more;
+        for (tenure, deadline) in report.acquired {
+            owned.adopt_until(tenure, deadline);
+        }
+        assert!(owned.len() <= 256, "a chunk never passes the target");
+    }
+    assert_eq!(owned.len(), 256, "the loop stops at its target of 256");
     db.drop_db().await;
 }
 

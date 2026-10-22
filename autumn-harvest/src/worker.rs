@@ -36768,8 +36768,9 @@ impl Worker {
     /// `owner_shard` keys the tenures of the database. `refuse` keeps owner
     /// mode off for this worker there, for a split colocated group (ADR 0009
     /// decision 10). The loop scans every [`OWNER_SCAN_INTERVAL`], or sooner
-    /// when a foreign lease ends first (issue #2254). It stops at shutdown. [`Self::release_owner_partitions`] then releases its
-    /// partitions after the drain.
+    /// when a foreign lease ends first (issue #2254). It stops at shutdown.
+    /// [`Self::release_owner_partitions`] then releases its partitions after
+    /// the drain.
     fn spawn_owner_loop(
         &self,
         pool: &DbPool,
@@ -36810,7 +36811,9 @@ impl Worker {
             AbortOnDrop::new(tokio::spawn(async move {
                 loop {
                     let wait = owner_scan(&state, &pool, &cache, &owned, &woken, &worker_id).await;
+                    // A zero wait is ready at once. The stop must still win.
                     tokio::select! {
+                        biased;
                         () = stop.cancelled() => return,
                         () = tokio::time::sleep(wait) => {}
                     }

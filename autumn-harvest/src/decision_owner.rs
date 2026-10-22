@@ -248,8 +248,8 @@ impl fmt::Display for OwnerHolder {
 pub struct OwnerLeaseTtl(Duration);
 
 impl OwnerLeaseTtl {
-    /// The shortest TTL. Issue #2254 measured the crash bound at the default
-    /// TTL only.
+    /// The shortest TTL. No test measures a shorter one. Issue #2254
+    /// measured the crash bound at the default TTL only.
     pub const MIN: Duration = Duration::from_secs(3);
     /// The longest TTL, the same as the longest scanner lease.
     pub const MAX: Duration = Duration::from_secs(300);
@@ -1239,6 +1239,9 @@ mod db {
                     .execute(conn)
                     .await
                     .map_err(database_error)?;
+                // A frozen holder of this row lock blocks every takeover. The
+                // database ends the transaction after one TTL (issue #2254).
+                set_idle(conn, format!("{}ms", config.ttl.get().as_millis())).await?;
                 crate::replication::assert_generation_fence(conn, shard).await?;
                 let p = i32::from(partition.get());
                 let locked: Option<EpochRow> = diesel::sql_query(ACQUIRE_LOCK_SQL)
@@ -1334,12 +1337,20 @@ mod db {
             RowsWrite::Renew => RENEW_LOCK_SQL,
             RowsWrite::Release => RELEASE_LOCK_SQL,
         };
+        // A frozen holder of these row locks blocks every takeover. The
+        // database ends the transaction after one TTL (issue #2254).
+        let idle = tenures
+            .iter()
+            .map(|t| t.ttl().get())
+            .max()
+            .unwrap_or(super::OwnerLeaseTtl::DEFAULT.get());
         let result = conn
             .transaction::<Vec<i32>, HarvestError, _>(async |conn| {
                 diesel::sql_query(lock_timeout_sql(lock_timeout))
                     .execute(conn)
                     .await
                     .map_err(database_error)?;
+                set_idle(conn, format!("{}ms", idle.as_millis())).await?;
                 crate::replication::assert_generation_fence(conn, shard).await?;
                 let locked: Vec<PartitionRow> = diesel::sql_query(lock_sql)
                     .bind::<Array<Integer>, _>(&partitions)
@@ -2329,8 +2340,9 @@ mod db {
                 .filter(|secs| secs.is_finite() && *secs >= 0.0)
                 .map(Duration::from_secs_f64);
             let held = self.owned.tenures_of(self.shard);
+            let held_count = held.len();
             let plan = super::plan_balance(
-                held.len(),
+                held_count,
                 peers,
                 usize::try_from(free.free).unwrap_or(0),
                 usize::try_from(free.orphans).unwrap_or(0),
@@ -2344,7 +2356,12 @@ mod db {
             if want > 0 {
                 self.acquire_some(conn, want, tick).await?;
             }
-            tick.more = want < plan.acquire && !tick.acquired.is_empty();
+            // Rescan at once only below the target. An owner at its target
+            // that takes orphans waits a full scan. Otherwise the next tick
+            // finds it over target + 1 and releases at once.
+            tick.more = want < plan.acquire
+                && !tick.acquired.is_empty()
+                && held_count + tick.acquired.len() < plan.target;
             Ok(())
         }
 

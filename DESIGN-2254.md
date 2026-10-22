@@ -57,13 +57,13 @@ real Postgres before an operator turns owner mode on.
 | # | How to make the tests lie | Counter-measure |
 |---|---------------------------|-----------------|
 | H1 | The frozen owner never decides, so no fence is needed. | The test waits for the hold marker. Then the decision holds a pinned tenure. |
-| H2 | The fence is never hit, because the decision times out first. | The child raises the workflow-task budget to 60 s. The test asserts a fence count of at least 1. |
+| H2 | The fence is never hit, because the decision times out first. | Each worker sets the workflow-task budget to 90 s, longer than any hold. The test asserts exactly one fence. |
 | H3 | The standby decides before the takeover, so the fence is moot. | The test reads the owner row. It asserts a new holder and a new epoch while the owner is still stopped. |
 | H4 | The new owner never decides the frozen run, so a duplicate cannot show. | The test waits until the new owner completes the run, before `SIGCONT`. |
 | H5 | The kill lands just before a renewal, so the residual lease is short. | The test kills just after a renewal moves the lease end. It records the residual lease. |
 | H6 | The kill is a clean exit, not a crash. | The test asserts signal 9 on the child status. |
 | H7 | Scale-out never moves a partition, so no fence can occur. | The test asserts that each new worker holds partitions after the settle. |
-| H8 | "Settled" is defined so that it hides late fences. | Settle is the first time that each worker holds its target, by the owner rows. Fences after that time count. |
+| H8 | "Settled" is defined so that it hides late fences. | Settle is the first time that balance asks no worker to act: all 512 partitions have an owner, and none holds more than its target + 1. Fences after that time count. |
 | H9 | A lost or duplicated event hides in a long history. | Each history must match the history of the same run shape on one worker, event by event. |
 | H10 | A child outlives a failed test. | A guard kills the child on drop. The child exits on its own after 300 s. |
 | H11 | The test passes on a slow machine by chance and fails in CI. | Each bound has a margin from the design, not from one run. The page records the measured values. |
@@ -120,8 +120,8 @@ real Postgres before an operator turns owner mode on.
 
 ### 2.2 GREEN
 
-- Kill -9: 10.20 s to 10.40 s after a kill with a full TTL left.
-- Scale-out: recovery in 7.6 s to 8.6 s. No fence after the settle.
+- Kill -9: 10.18 s to 10.30 s after a kill with a full TTL left.
+- Scale-out: recovery in 8.4 s to 9.8 s. No fence after the settle.
 - `docs/performance-owner-failover.md` has the tables.
 
 ## 3. Out of scope

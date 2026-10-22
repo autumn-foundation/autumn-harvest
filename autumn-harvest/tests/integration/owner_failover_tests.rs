@@ -422,26 +422,37 @@ async fn eventually(what: &str, mut check: impl AsyncFnMut() -> bool) {
     }
 }
 
-/// Wait until each of `workers` holds partitions and together they hold all
-/// 512, `low` to `high` each.
-async fn wait_for_spread(conn: &mut AsyncPgConnection, workers: &[&str], low: i64, high: i64) {
-    let what = format!(
-        "{} workers hold {low} to {high} partitions each",
-        workers.len()
-    );
-    eventually(&what, async || {
+/// Wait until `workers` settle: they hold all 512 partitions, each holds
+/// one at least, and none holds more than its target + 1.
+///
+/// Balance then asks no worker to act. No partition is free, and a worker
+/// releases only above target + 1. So a worker can stay below its target,
+/// by up to one partition for each peer.
+async fn wait_for_spread(conn: &mut AsyncPgConnection, workers: &[&str]) {
+    let deadline = Instant::now() + WAIT;
+    loop {
         let held = held_by_worker(conn).await;
-        spread_holds(&held, workers, low, high)
-    })
-    .await;
+        if spread_holds(&held, workers) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out: {} workers do not settle: {held:?}",
+            workers.len()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
-fn spread_holds(held: &BTreeMap<String, i64>, workers: &[&str], low: i64, high: i64) -> bool {
-    held.values().sum::<i64>() == 512
+fn spread_holds(held: &BTreeMap<String, i64>, workers: &[&str]) -> bool {
+    let partitions = i64::from(autumn_harvest::decision_owner::DECISION_PARTITIONS);
+    let count = i64::try_from(workers.len()).expect("fits").max(1);
+    let target = (partitions + count - 1) / count;
+    held.values().sum::<i64>() == partitions
         && held.len() == workers.len()
         && workers
             .iter()
-            .all(|w| held.get(*w).is_some_and(|n| (low..=high).contains(n)))
+            .all(|w| held.get(*w).is_some_and(|n| (1..=target + 1).contains(n)))
 }
 
 async fn enable_owner_mode(conn: &mut AsyncPgConnection) {
@@ -482,7 +493,7 @@ async fn history(conn: &mut AsyncPgConnection, exec: ExecutionId) -> Vec<(i32, S
 async fn assert_history(conn: &mut AsyncPgConnection, exec: ExecutionId, expected: &[String]) {
     let events = history(conn, exec).await;
     let ids: Vec<i32> = events.iter().map(|(id, _)| *id).collect();
-    let first = ids.iter().next().copied().unwrap_or(1);
+    let first = <[i32]>::first(&ids).copied().unwrap_or(1);
     let gapless: Vec<i32> = (first..).take(ids.len()).collect();
     assert_eq!(ids, gapless, "event ids of {exec} have a gap: {events:?}");
     let types: Vec<String> = events.into_iter().map(|(_, t)| t).collect();
@@ -564,7 +575,7 @@ impl Frozen {
         let queue = unique("failover-q");
         let child = Child::start(&db.url, &queue);
         let child_id = child.id.clone();
-        wait_for_spread(&mut conn, &[child_id.as_str()], 512, 512).await;
+        wait_for_spread(&mut conn, &[child_id.as_str()]).await;
         let workflow_id = unique("failover-frozen");
         let partition = DecisionPartition::for_workflow_id(&workflow_id);
         let client = WorkflowHandleClient::single(pool(&db.url, 2), db.url.clone());
@@ -660,6 +671,13 @@ async fn a_frozen_owner_is_fenced_after_a_takeover() {
     t.child.signal("CONT");
     let child = &t.child;
     eventually("the woken owner is fenced", async || child.fences() >= 1).await;
+    // Only the one decision in flight can be fenced. Wait for a late second.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        t.child.fences(),
+        1,
+        "exactly the in-flight commit is fenced"
+    );
 
     assert_eq!(
         history(&mut t.conn, t.exec).await,
@@ -677,56 +695,52 @@ async fn a_frozen_owner_is_fenced_after_a_takeover() {
     t.db.drop_db().await;
 }
 
-/// The owner stops inside its open commit transaction, while it holds the
-/// owner row `FOR KEY SHARE`. The idle timeout that the fence sets must end
-/// that transaction, so the standby takes the partition while the owner is
-/// still stopped. The woken owner then writes nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_frozen_commit_transaction_does_not_block_the_takeover() {
-    let mut t = Frozen::start("signal").await;
-    // The fence sets `idle_in_transaction_session_timeout`. So a transaction
-    // with another value than this session has passed the fence. The first
-    // event insert of such a transaction for the run sleeps for 2 s. The
-    // sequence is not transactional, so the sleep happens only once.
-    let idle: String = {
-        #[derive(QueryableByName)]
-        struct Setting {
-            #[diesel(sql_type = Text)]
-            v: String,
-        }
+/// Make the first fenced event insert of `exec` sleep for 2 s.
+///
+/// The fence sets `idle_in_transaction_session_timeout`. So a transaction
+/// with another value than this session has passed the fence. The sequence
+/// is not transactional, so the sleep happens only once.
+async fn install_hold_trigger(conn: &mut AsyncPgConnection, exec: ExecutionId) {
+    let idle =
         diesel::sql_query("SELECT current_setting('idle_in_transaction_session_timeout') AS v")
-            .get_result::<Setting>(&mut t.conn)
+            .get_result::<Setting>(conn)
             .await
             .expect("read the setting")
-            .v
-    };
-    t.conn
-        .batch_execute(&format!(
-            "CREATE SEQUENCE failover_hold_once; \
-             CREATE FUNCTION failover_hold() RETURNS trigger LANGUAGE plpgsql AS $$ \
-             BEGIN \
-                 IF NEW.workflow_exec_id = '{exec}'::uuid \
-                    AND current_setting('idle_in_transaction_session_timeout') <> '{idle}' THEN \
-                     IF nextval('failover_hold_once') = 1 THEN \
-                         PERFORM pg_sleep(2); \
-                     END IF; \
+            .v;
+    conn.batch_execute(&format!(
+        "CREATE SEQUENCE failover_hold_once; \
+         CREATE FUNCTION failover_hold() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+             IF NEW.workflow_exec_id = '{exec}'::uuid \
+                AND current_setting('idle_in_transaction_session_timeout') <> '{idle}' THEN \
+                 IF nextval('failover_hold_once') = 1 THEN \
+                     PERFORM pg_sleep(2); \
                  END IF; \
-                 RETURN NEW; \
-             END $$; \
-             CREATE TRIGGER failover_hold_trg BEFORE INSERT ON harvest_events \
-                 FOR EACH ROW EXECUTE FUNCTION failover_hold();",
-            exec = t.exec.as_uuid(),
-        ))
-        .await
-        .expect("install the hold trigger");
-    t.send_go().await;
+             END IF; \
+             RETURN NEW; \
+         END $$; \
+         CREATE TRIGGER failover_hold_trg BEFORE INSERT ON harvest_events \
+             FOR EACH ROW EXECUTE FUNCTION failover_hold();",
+        exec = exec.as_uuid(),
+    ))
+    .await
+    .expect("install the hold trigger");
+}
 
-    #[derive(QueryableByName)]
-    struct Pid {
-        #[diesel(sql_type = Integer)]
-        pid: i32,
-    }
-    let conn = &mut t.conn;
+#[derive(QueryableByName)]
+struct Setting {
+    #[diesel(sql_type = Text)]
+    v: String,
+}
+
+#[derive(QueryableByName)]
+struct Pid {
+    #[diesel(sql_type = Integer)]
+    pid: i32,
+}
+
+/// Wait until a backend sleeps in the hold trigger. Returns its pid.
+async fn wait_for_sleeper(conn: &mut AsyncPgConnection) -> i32 {
     let mut sleeper = None;
     eventually("the owner's commit sleeps in the trigger", async || {
         let rows: Vec<Pid> = diesel::sql_query(
@@ -736,15 +750,32 @@ async fn a_frozen_commit_transaction_does_not_block_the_takeover() {
         .load(conn)
         .await
         .expect("read the backends");
-        sleeper = rows.iter().next().map(|r| r.pid);
+        sleeper = <[Pid]>::first(&rows).map(|r| r.pid);
         sleeper.is_some()
     })
     .await;
-    let sleeper = sleeper.expect("a sleeping backend");
+    sleeper.expect("a sleeping backend")
+}
+
+/// The owner stops inside its open commit transaction, while it holds the
+/// owner row `FOR KEY SHARE`. The idle timeout that the fence sets must end
+/// that transaction, so the standby takes the partition while the owner is
+/// still stopped.
+///
+/// The database ends the frozen session. So the woken owner cannot commit,
+/// and no epoch check is needed. The test proves that the frozen lock does
+/// not block the takeover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frozen_commit_transaction_does_not_block_the_takeover() {
+    let mut t = Frozen::start("signal").await;
+    install_hold_trigger(&mut t.conn, t.exec).await;
+    t.send_go().await;
+    let sleeper = wait_for_sleeper(&mut t.conn).await;
 
     let (standby, takeover) = t.stop_and_take_over().await;
+    // A backend frees its locks before its row leaves `pg_stat_activity`.
     let conn = &mut t.conn;
-    let gone: bool = {
+    eventually("the idle timeout ends the frozen transaction", async || {
         #[derive(QueryableByName)]
         struct Alive {
             #[diesel(sql_type = BigInt)]
@@ -757,8 +788,8 @@ async fn a_frozen_commit_transaction_does_not_block_the_takeover() {
             .expect("read the backend")
             .n
             == 0
-    };
-    assert!(gone, "the idle timeout ended the frozen transaction");
+    })
+    .await;
     wait_completed(&mut t.conn, t.exec).await;
     let before = history(&mut t.conn, t.exec).await;
 
@@ -869,35 +900,32 @@ async fn after_kill_9_the_next_decision_runs_within_ttl_plus_one_second() {
     let queue = unique("failover-kill-q");
     let mut child = Child::start(&db.url, &queue);
     let child_id = child.id.clone();
-    wait_for_spread(&mut conn, &[child_id.as_str()], 512, 512).await;
+    wait_for_spread(&mut conn, &[child_id.as_str()]).await;
     let standby = Node::start(&db.url, "failover-survivor", &queue);
-    wait_for_spread(
-        &mut conn,
-        &[child_id.as_str(), standby.id.as_str()],
-        256,
-        256,
-    )
-    .await;
+    wait_for_spread(&mut conn, &[child_id.as_str(), standby.id.as_str()]).await;
 
-    // Half of the runs in each owner's partitions.
+    // Most runs are in the child's partitions. The survivor acquires 32
+    // partitions per scan, so its first chunk then almost surely holds one.
     let theirs = partitions_of(&mut conn, &child_id).await;
     let ours = partitions_of(&mut conn, &standby.id).await;
     let client = WorkflowHandleClient::single(pool(&db.url, 2), db.url.clone());
     let mut doomed = Vec::new();
+    let mut doomed_partitions = BTreeSet::new();
     let mut kept = Vec::new();
-    for i in 0..24 {
-        let (set, list) = if i % 2 == 0 {
-            (&theirs, &mut doomed)
-        } else {
-            (&ours, &mut kept)
-        };
+    for i in 0..DOOMED_RUNS + KEPT_RUNS {
+        let set = if i < DOOMED_RUNS { &theirs } else { &ours };
         let id = workflow_id_in("failover-kill", set);
         let exec =
             FailoverTimersStub::start_with_options(&mut conn, &client, &id, TIMERS, opts(&queue))
                 .await
                 .expect("start")
                 .exec_id();
-        list.push(exec);
+        if i < DOOMED_RUNS {
+            doomed.push(exec);
+            doomed_partitions.insert(DecisionPartition::for_workflow_id(&id).get());
+        } else {
+            kept.push(exec);
+        }
     }
     // Let the runs reach their timer loops on both owners.
     let started = db_now(&mut conn).await;
@@ -922,9 +950,16 @@ async fn after_kill_9_the_next_decision_runs_within_ttl_plus_one_second() {
     let lease_end = lease_end_of(&mut conn, &child_id)
         .await
         .expect("the child held partitions");
+    // The leases of the dead child are still live. So no run of the child
+    // moved to the survivor before the kill.
+    let still_theirs = partitions_of(&mut conn, &child_id).await;
+    assert!(
+        doomed_partitions.is_subset(&still_theirs),
+        "each run of the child stays in its partitions until the kill"
+    );
 
     let survivor = standby.id.clone();
-    wait_for_spread(&mut conn, &[survivor.as_str()], 512, 512).await;
+    wait_for_spread(&mut conn, &[survivor.as_str()]).await;
     // The survivor has not renewed yet, so each new lease end is its
     // acquisition time + TTL.
     let taken = first_acquisition(&mut conn, &theirs).await - TTL.as_secs_f64() - killed_at;
@@ -963,6 +998,10 @@ async fn after_kill_9_the_next_decision_runs_within_ttl_plus_one_second() {
 
 /// The timers of each run in the kill test. The run outlives the takeover.
 const TIMERS: u32 = 25;
+/// The runs in the partitions of the killed child.
+const DOOMED_RUNS: usize = 40;
+/// The runs in the partitions of the survivor.
+const KEPT_RUNS: usize = 12;
 
 /// The history of a [`failover_timers`] run on one worker.
 fn timer_history(n: u32) -> Vec<String> {
@@ -979,6 +1018,12 @@ fn timer_history(n: u32) -> Vec<String> {
 
 /// Runs in flight during the scale-out test.
 const INFLIGHT: usize = 32;
+
+#[derive(QueryableByName)]
+struct Done {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: uuid::Uuid,
+}
 
 /// Keep [`INFLIGHT`] runs of [`failover_steps`] in flight until `stop`.
 /// Returns every run that it started.
@@ -1005,11 +1050,6 @@ async fn drive_load(url: String, queue: String, stop: Arc<AtomicBool>) -> Vec<Ex
             all.push(exec);
         }
         let ids: Vec<uuid::Uuid> = open.iter().map(ExecutionId::as_uuid).collect();
-        #[derive(QueryableByName)]
-        struct Done {
-            #[diesel(sql_type = diesel::sql_types::Uuid)]
-            id: uuid::Uuid,
-        }
         let done: BTreeSet<uuid::Uuid> = diesel::sql_query(
             "SELECT id FROM harvest_workflow_executions \
              WHERE id = ANY($1) AND state = 'COMPLETED'",
@@ -1074,14 +1114,21 @@ struct ScaleOut {
     fences_after: usize,
 }
 
-/// The first second from which each 3 s window holds at least 80% of
-/// `level`, up to second `end`.
+/// The windows that must hold in a row for a recovery.
+const SUSTAIN: i32 = 5;
+
+/// The first second from which [`SUSTAIN`] 3 s windows in a row hold at
+/// least 80% of `level`. Each window ends before second `end`.
+///
+/// A later slow second does not undo the recovery. A long stall after it
+/// still fails the steady-rate check of the test.
 fn recovery_second(series: &BTreeMap<i32, i64>, level: f64, end: i32) -> Option<i32> {
     let rate = |b: i32| series.get(&b).copied().unwrap_or(0);
     // Precision loss is fine: these are small counts.
     #[allow(clippy::cast_precision_loss)]
     let window = |b: i32| (rate(b) + rate(b + 1) + rate(b + 2)) as f64 / 3.0;
-    (0..end - 2).find(|start| (*start..end - 2).all(|b| window(b) >= 0.8 * level))
+    (0..=end - 2 - SUSTAIN)
+        .find(|start| (*start..*start + SUSTAIN).all(|b| window(b) >= 0.8 * level))
 }
 
 /// The mean rate of the seconds `from..to`.
@@ -1112,7 +1159,7 @@ async fn run_scale_out(owner_mode: bool) -> ScaleOut {
     let first: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let first_ids: Vec<&str> = first.iter().map(String::as_str).collect();
     if owner_mode {
-        wait_for_spread(&mut conn, &first_ids, 128, 128).await;
+        wait_for_spread(&mut conn, &first_ids).await;
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -1125,9 +1172,7 @@ async fn run_scale_out(owner_mode: bool) -> ScaleOut {
     let all: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
     let all_ids: Vec<&str> = all.iter().map(String::as_str).collect();
     if owner_mode {
-        // Each worker holds its target of 64. A worker may keep one more
-        // until its next scan.
-        wait_for_spread(&mut conn, &all_ids, 63, 65).await;
+        wait_for_spread(&mut conn, &all_ids).await;
     }
     let settled = scaled.elapsed();
     let settled_at = scaled + settled;
@@ -1200,6 +1245,12 @@ async fn scale_out_from_4_to_8_workers_recovers_within_two_ttls() {
         report.recovered <= TTL * 2,
         "recovery took over two TTLs: {report:?}"
     );
+    // Recovery is to the lower of the two rates. A floor keeps a stalled
+    // fleet from passing with a low rate after the scale-out.
+    assert!(
+        report.steady >= STEADY_FLOOR * report.baseline,
+        "the rate after the scale-out collapsed: {report:?}"
+    );
     assert_eq!(
         report.fences_after, 0,
         "a commit was fenced after the settle"
@@ -1215,6 +1266,10 @@ async fn scale_out_without_owner_mode_measurement() {
     eprintln!("legacy scale-out: {report:?}");
 }
 
+/// The lowest rate after the scale-out, as a share of the baseline. The
+/// control without owner mode measured 69% to 78%.
+const STEADY_FLOOR: f64 = 0.5;
+
 /// The load runs this long before the baseline window.
 const WARM_UP: Duration = Duration::from_secs(5);
 /// The baseline window, just before the scale-out.
@@ -1228,11 +1283,14 @@ fn baseline_secs() -> i32 {
 
 #[test]
 fn recovery_second_finds_the_first_sustained_window() {
-    let series: BTreeMap<i32, i64> = [(0, 10), (1, 2), (2, 2), (3, 9), (4, 10), (5, 10), (6, 10)]
-        .into_iter()
-        .collect();
-    assert_eq!(recovery_second(&series, 10.0, 7), Some(3));
-    assert_eq!(recovery_second(&series, 100.0, 7), None);
+    // A slow start, then a recovery at second 3, then one slow second.
+    let mut series: BTreeMap<i32, i64> = (0..13).map(|b| (b, 10)).collect();
+    series.insert(1, 2);
+    series.insert(2, 2);
+    series.insert(3, 9);
+    series.insert(11, 0);
+    assert_eq!(recovery_second(&series, 10.0, 13), Some(3));
+    assert_eq!(recovery_second(&series, 100.0, 13), None);
     assert!((mean_rate(&series, 4, 7) - 10.0).abs() < f64::EPSILON);
     assert!(
         mean_rate(&series, 9, 9).abs() < f64::EPSILON,
@@ -1241,15 +1299,26 @@ fn recovery_second_finds_the_first_sustained_window() {
 }
 
 #[test]
-fn spread_holds_needs_every_partition_and_each_worker_in_range() {
-    let held: BTreeMap<String, i64> = [("a".to_string(), 256), ("b".to_string(), 256)]
-        .into_iter()
-        .collect();
-    assert!(spread_holds(&held, &["a", "b"], 256, 256));
-    assert!(!spread_holds(&held, &["a"], 256, 256));
-    assert!(!spread_holds(&held, &["a", "b"], 300, 512));
-    let short: BTreeMap<String, i64> = [("a".to_string(), 256)].into_iter().collect();
-    assert!(!spread_holds(&short, &["a"], 0, 512));
+fn spread_holds_when_balance_has_nothing_left_to_do() {
+    let held = |counts: &[i64]| -> BTreeMap<String, i64> {
+        counts
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (format!("w{i}"), *n))
+            .collect()
+    };
+    let four = ["w0", "w1", "w2", "w3"];
+    assert!(spread_holds(&held(&[128, 128, 128, 128]), &four));
+    // Three workers at target + 1 leave 125. Nothing is free, and nobody
+    // is over target + 1, so balance stops there.
+    assert!(spread_holds(&held(&[129, 129, 129, 125]), &four));
+    assert!(!spread_holds(&held(&[130, 128, 128, 126]), &four), "over");
+    assert!(!spread_holds(&held(&[128, 128, 128, 127]), &four), "free");
+    assert!(
+        !spread_holds(&held(&[256, 256]), &four),
+        "a worker owns none"
+    );
+    assert!(spread_holds(&held(&[512]), &["w0"]));
 }
 
 #[test]
