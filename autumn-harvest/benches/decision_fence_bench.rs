@@ -2,22 +2,29 @@
 //!
 //! Owner mode adds a second locked row to each decision. The DR generation
 //! row takes `FOR SHARE`. The owner row takes `FOR KEY SHARE`. This bench
-//! times one decision transaction in four fence modes:
+//! times one decision transaction in these fence modes:
 //!
 //! - `none`: no DR pin and no owner tenure. No fence row.
 //! - `generation`: a DR pin only. Each append takes the generation row.
 //! - `owner`: an owner tenure only. The start fence takes the owner row.
 //! - `generation_owner`: both. The start fence takes both rows.
+//! - `generation_owner_refence`: both, and the owner fence again after each
+//!   append. It models the code before issue #2248.
+//! - `generation_plain_owner_row`: a DR pin, and a plain `FOR KEY SHARE` of
+//!   the owner row with no fence function. It isolates the cost of the row
+//!   lock from the cost of the function.
 //!
 //! The stage 1b pass condition compares `generation_owner` with
 //! `generation`. The delta must stay under 10%.
 //!
-//! Each decision is a model of the worker persist, made of public engine
-//! calls: the decision fence, two appends, one activity task enqueue and an
-//! execution update, all in one transaction. The post-commit wake sender is
+//! Each decision models the worker persist with public engine calls. One
+//! transaction holds the decision fence, two appends, one activity task
+//! enqueue and an execution update. The post-commit wake sender is
 //! registered, as in a worker. Each writer owns one execution. All writers
-//! share the generation row and one owner row, so concurrent locks become
-//! multixacts.
+//! share the generation row. In a `shared` case all writers also share one
+//! owner row, so concurrent locks become multixacts. In a `spread` case
+//! each writer has its own owner row, as decisions of many partitions do.
+//! Each case starts on empty event and task tables.
 //!
 //! # Running
 //!
@@ -32,7 +39,9 @@
 //!
 //! With no URL the bench starts a Docker Postgres. With no Docker it prints a
 //! skip notice and exits 0. `HARVEST_FENCE_BENCH_WRITERS` sets the writer
-//! counts as a comma list. The default is `1,8`.
+//! counts as a comma list. The default is `1,8`. `HARVEST_FENCE_BENCH_ORDER`
+//! sets the order of the modes as a comma list of labels. A run in another
+//! order shows drift.
 
 use std::time::{Duration, Instant};
 
@@ -59,8 +68,12 @@ const SHARD: ShardId = ShardId::new(0);
 /// The queue of the enqueued activity tasks.
 const QUEUE: &str = "fence_bench";
 
-/// The owner row that every decision fences.
-const PARTITION: u16 = 7;
+/// The owner row of writer 0. Writer `n` of a spread case uses this plus `n`.
+const FIRST_PARTITION: u16 = 7;
+
+/// A plain lock of the owner row, with no fence function.
+const PLAIN_OWNER_LOCK: &str =
+    "SELECT holder FROM harvest_decision_owner WHERE partition = $1 FOR KEY SHARE";
 
 /// The fence rows that one decision takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,27 +82,88 @@ enum Fence {
     Generation,
     Owner,
     GenerationOwner,
+    GenerationOwnerRefence,
+    GenerationPlainOwnerRow,
 }
 
 impl Fence {
+    const ALL: [Self; 6] = [
+        Self::None,
+        Self::Owner,
+        Self::Generation,
+        Self::GenerationOwner,
+        Self::GenerationOwnerRefence,
+        Self::GenerationPlainOwnerRow,
+    ];
+
     const fn label(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Generation => "generation",
             Self::Owner => "owner",
             Self::GenerationOwner => "generation_owner",
+            Self::GenerationOwnerRefence => "generation_owner_refence",
+            Self::GenerationPlainOwnerRow => "generation_plain_owner_row",
         }
     }
 
+    /// Whether the decision pins an owner tenure, so the engine fences it.
     const fn pins_a_tenure(self) -> bool {
-        matches!(self, Self::Owner | Self::GenerationOwner)
+        matches!(
+            self,
+            Self::Owner | Self::GenerationOwner | Self::GenerationOwnerRefence
+        )
+    }
+
+    /// Whether the decision locks an owner row at all.
+    const fn locks_an_owner_row(self) -> bool {
+        self.pins_a_tenure() || matches!(self, Self::GenerationPlainOwnerRow)
+    }
+
+    const fn pins_dr(self) -> bool {
+        !matches!(self, Self::None | Self::Owner)
     }
 }
 
-/// One writer: its connection and its execution.
+/// The fence modes to run, in order, from `HARVEST_FENCE_BENCH_ORDER`.
+fn fence_order() -> Vec<Fence> {
+    std::env::var("HARVEST_FENCE_BENCH_ORDER")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|label| Fence::ALL.into_iter().find(|f| f.label() == label.trim()))
+                .collect::<Vec<Fence>>()
+        })
+        .filter(|order| !order.is_empty())
+        .unwrap_or_else(|| Fence::ALL.to_vec())
+}
+
+/// One writer: its connection, its execution and its own owner tenure.
 struct Writer {
     conn: AsyncPgConnection,
     exec_id: ExecutionId,
+    tenure: OwnerTenure,
+}
+
+/// One timed case: a fence mode, a writer count and the owner row layout.
+#[derive(Debug, Clone, Copy)]
+struct Case {
+    fence: Fence,
+    writers: usize,
+    /// Each writer locks its own owner row.
+    spread: bool,
+}
+
+impl Case {
+    fn id(self) -> String {
+        if self.writers == 1 {
+            "1".to_owned()
+        } else if self.spread {
+            format!("{}-spread", self.writers)
+        } else {
+            format!("{}-shared", self.writers)
+        }
+    }
 }
 
 fn main() {
@@ -108,30 +182,37 @@ fn main() {
         .measurement_time(Duration::from_secs(6))
         .configure_from_args();
     let writer_counts = writer_counts();
-    // The DR pin is process-wide and stays, so the modes with no pin run
-    // first.
-    for fence in [
-        Fence::None,
-        Fence::Owner,
-        Fence::Generation,
-        Fence::GenerationOwner,
-    ] {
-        if fence == Fence::Generation {
+    for fence in fence_order() {
+        // The DR pin is process-wide. Each mode sets it or clears it.
+        FenceRegistry::clear();
+        if fence.pins_dr() {
             FenceRegistry::register(SHARD, ShardGeneration::new(0))
                 .expect("no other pin in this process");
         }
         let mut group = criterion.benchmark_group(format!("decision_persist/{}", fence.label()));
         for &writers in &writer_counts {
-            group.bench_with_input(
-                BenchmarkId::new("writers", writers),
-                &writers,
-                |b, &writers| {
+            // One writer has one layout. A mode with no owner row has one too.
+            let layouts: &[bool] = if writers > 1 && fence.locks_an_owner_row() {
+                &[false, true]
+            } else {
+                &[false]
+            };
+            for &spread in layouts {
+                let case = Case {
+                    fence,
+                    writers,
+                    spread,
+                };
+                // Each case starts on empty tables, so a later case does not
+                // pay for the rows of an earlier one.
+                runtime.block_on(bench.reset());
+                group.bench_with_input(BenchmarkId::new("writers", case.id()), &case, |b, case| {
                     b.to_async(&runtime).iter_custom(|iters| {
                         let bench = &bench;
-                        async move { bench.run(fence, writers, iters).await }
+                        async move { bench.run(*case, iters).await }
                     });
-                },
-            );
+                });
+            }
         }
         group.finish();
     }
@@ -154,12 +235,13 @@ fn writer_counts() -> Vec<usize> {
         .unwrap_or_else(|| vec![1, 8])
 }
 
-/// The bench database, its writers and the owner tenure.
+/// The bench database and its writers.
 struct Bench {
     admin_url: String,
     database: String,
     writers: Vec<Mutex<Writer>>,
-    tenure: OwnerTenure,
+    /// The tenure that every writer of a shared case fences.
+    shared: OwnerTenure,
     _sink_pool: DbPool,
     _sink: autumn_harvest::notify::NotifySink,
     _container: Option<ContainerAsync<Postgres>>,
@@ -170,12 +252,17 @@ impl Bench {
         let (admin_url, container) = admin_url().await?;
         let database = format!("harvest_fence_bench_{}", std::process::id());
         let mut admin = AsyncPgConnection::establish(&admin_url).await.ok()?;
-        admin
-            .batch_execute(&format!(
-                "DROP DATABASE IF EXISTS {database}; CREATE DATABASE {database}"
-            ))
-            .await
-            .expect("create the bench database");
+        // A batch of two statements runs as one transaction, and neither
+        // statement may run inside one. So each runs alone.
+        for statement in [
+            format!("DROP DATABASE IF EXISTS {database}"),
+            format!("CREATE DATABASE {database}"),
+        ] {
+            admin
+                .batch_execute(&statement)
+                .await
+                .expect("create the bench database");
+        }
         let url = with_database(&admin_url, &database);
         let mut conn = AsyncPgConnection::establish(&url)
             .await
@@ -186,17 +273,22 @@ impl Bench {
         replication::ensure_generation_row(&mut conn, SHARD)
             .await
             .expect("provision the generation row");
-        let tenure = acquire(&mut conn).await;
 
         let max_writers = writer_counts().into_iter().max().unwrap_or(1);
         let mut writers = Vec::with_capacity(max_writers);
         for n in 0..max_writers {
+            let tenure = acquire(&mut conn, n).await;
             let mut conn = AsyncPgConnection::establish(&url)
                 .await
                 .expect("connect a writer");
             let exec_id = seed_execution(&mut conn, n).await;
-            writers.push(Mutex::new(Writer { conn, exec_id }));
+            writers.push(Mutex::new(Writer {
+                conn,
+                exec_id,
+                tenure,
+            }));
         }
+        let shared = writers[0].lock().await.tenure.clone();
         let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url);
         let sink_pool: DbPool = deadpool::managed::Pool::builder(manager)
             .max_size(2)
@@ -207,37 +299,55 @@ impl Bench {
             admin_url,
             database,
             writers,
-            tenure,
+            shared,
             _sink_pool: sink_pool,
             _sink: sink,
             _container: container,
         })
     }
 
-    /// Run `iters` decisions over `writers` concurrent writers. Returns the
-    /// sum of the decision latencies, scaled to `iters` decisions, so
-    /// criterion reports the mean latency of one decision.
-    async fn run(&self, fence: Fence, writers: usize, iters: u64) -> Duration {
-        let per_writer = iters.div_ceil(writers as u64).max(1);
-        let tenure = fence.pins_a_tenure().then(|| self.tenure.clone());
-        let runs = self.writers[..writers].iter().map(|writer| {
-            let tenure = tenure.clone();
-            async move {
+    /// Run `iters` decisions over the writers of `case`. Returns the sum of
+    /// the decision latencies, scaled to `iters` decisions, so criterion
+    /// reports the mean latency of one decision.
+    async fn run(&self, case: Case, iters: u64) -> Duration {
+        let per_writer = iters.div_ceil(case.writers as u64).max(1);
+        let runs = self.writers[..case.writers]
+            .iter()
+            .map(|writer| async move {
                 let mut writer = writer.lock().await;
+                let tenure = if case.spread {
+                    writer.tenure.clone()
+                } else {
+                    self.shared.clone()
+                };
                 let mut total = Duration::ZERO;
                 for _ in 0..per_writer {
                     let started = Instant::now();
-                    decide(&mut writer, tenure.clone())
+                    decide(&mut writer, &tenure, case.fence)
                         .await
                         .expect("the decision commits");
                     total += started.elapsed();
                 }
                 total
-            }
-        });
+            });
         let total: Duration = futures::future::join_all(runs).await.into_iter().sum();
-        let done = per_writer * writers as u64;
+        let done = per_writer * case.writers as u64;
         total.mul_f64(iters as f64 / done as f64)
+    }
+
+    /// Empty the event and task tables and refresh their statistics.
+    async fn reset(&self) {
+        let mut writer = self.writers[0].lock().await;
+        for statement in [
+            "TRUNCATE harvest_events, harvest_task_queue CASCADE",
+            "VACUUM ANALYZE harvest_events, harvest_task_queue, harvest_workflow_executions",
+        ] {
+            writer
+                .conn
+                .batch_execute(statement)
+                .await
+                .expect("reset the bench tables");
+        }
     }
 
     async fn teardown(self) {
@@ -254,19 +364,33 @@ impl Bench {
 }
 
 /// One decision transaction, shaped as the worker persist.
-async fn decide(writer: &mut Writer, tenure: Option<OwnerTenure>) -> Result<(), HarvestError> {
+async fn decide(
+    writer: &mut Writer,
+    tenure: &OwnerTenure,
+    fence: Fence,
+) -> Result<(), HarvestError> {
     let exec_id = writer.exec_id;
+    let pinned = fence.pins_a_tenure().then(|| tenure.clone());
+    let refence = (fence == Fence::GenerationOwnerRefence).then_some(tenure);
+    let plain = (fence == Fence::GenerationPlainOwnerRow).then(|| tenure.partition());
     decision_owner::scope_decision(async {
-        let _ = decision_owner::pin_decision(tenure);
+        let _ = decision_owner::pin_decision(pinned);
         writer
             .conn
             .transaction::<_, HarvestError, _>(async |conn| {
                 replication::assert_decision_fence(conn).await?;
+                if let Some(partition) = plain {
+                    diesel::sql_query(PLAIN_OWNER_LOCK)
+                        .bind::<diesel::sql_types::Integer, _>(i32::from(partition.get()))
+                        .execute(conn)
+                        .await
+                        .map_err(autumn_harvest::error::database_error)?;
+                }
                 let id = decision_owner::conn_id(conn);
                 decision_owner::fenced_scope(
                     id,
                     autumn_harvest::notify::coalesced(conn, async |conn| {
-                        decision_body(conn, exec_id).await
+                        decision_body(conn, exec_id, refence).await
                     }),
                 )
                 .await
@@ -277,10 +401,12 @@ async fn decide(writer: &mut Writer, tenure: Option<OwnerTenure>) -> Result<(), 
 }
 
 /// The writes of one decision: two appends, one activity task and the
-/// execution update.
+/// execution update. With `refence`, each append also sends the owner
+/// fence again, as the code before issue #2248 did with DR fencing on.
 async fn decision_body(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
+    refence: Option<&OwnerTenure>,
 ) -> Result<(), HarvestError> {
     let next = autumn_harvest::store::next_event_id_for(conn, exec_id).await?;
     let scheduled = WorkflowEvent::ActivityScheduled {
@@ -290,28 +416,38 @@ async fn decision_body(
         queue: QUEUE.to_string(),
     };
     autumn_harvest::store::append_events(conn, exec_id, &[scheduled], next).await?;
+    if let Some(tenure) = refence {
+        decision_owner::fence(conn, tenure).await?;
+    }
     let boundary = WorkflowEvent::SignalReceived {
         signal_name: "fence_bench".to_string(),
         payload: serde_json::Value::Null,
     };
     autumn_harvest::store::append_events(conn, exec_id, &[boundary], next + 1).await?;
+    if let Some(tenure) = refence {
+        decision_owner::fence(conn, tenure).await?;
+    }
     let params = EnqueueParams {
         workflow_exec_id: Some(exec_id.as_uuid()),
         activity_name: Some("fence_bench_step".to_string()),
         ..EnqueueParams::new(QUEUE, TaskType::Activity, serde_json::Value::Null)
     };
     queue::enqueue(conn, &params).await?;
-    diesel::sql_query("UPDATE harvest_workflow_executions SET updated_at = NOW() WHERE id = $1")
-        .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
-        .execute(conn)
-        .await
-        .map_err(autumn_harvest::error::database_error)?;
+    // A suspended decision rewrites the sticky worker of its execution.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET sticky_worker_id = 'fence-bench' WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .execute(conn)
+    .await
+    .map_err(autumn_harvest::error::database_error)?;
     Ok(())
 }
 
-/// Acquire the owner row that every decision fences.
-async fn acquire(conn: &mut AsyncPgConnection) -> OwnerTenure {
-    let partition = DecisionPartition::new(PARTITION).expect("a bench partition is in range");
+/// Acquire the owner row of writer `n`.
+async fn acquire(conn: &mut AsyncPgConnection, n: usize) -> OwnerTenure {
+    let number = FIRST_PARTITION + u16::try_from(n).expect("a small writer count");
+    let partition = DecisionPartition::new(number).expect("a bench partition is in range");
     let holder = OwnerHolder::for_worker("fence-bench");
     // The commit fence checks the holder and the epoch, not the lease end.
     // So the lease can lapse during the run.

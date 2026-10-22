@@ -1,0 +1,85 @@
+Gnuplot not found, using plotters backend
+Benchmarking decision_persist/none/writers/1
+decision_persist/none/writers/1
+                        time:   [3.7796 ms 3.8628 ms 3.9473 ms]
+Benchmarking decision_persist/none/writers/8-shared
+decision_persist/none/writers/8-shared
+                        time:   [4.4277 ms 4.6212 ms 4.8438 ms]
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+
+Benchmarking decision_persist/owner/writers/1
+decision_persist/owner/writers/1
+                        time:   [4.1891 ms 4.2864 ms 4.3908 ms]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high severe
+Benchmarking decision_persist/owner/writers/8-shared
+decision_persist/owner/writers/8-shared
+                        time:   [9.8371 ms 10.190 ms 10.527 ms]
+Benchmarking decision_persist/owner/writers/8-spread
+decision_persist/owner/writers/8-spread
+                        time:   [9.1438 ms 9.5144 ms 9.8796 ms]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+
+Benchmarking decision_persist/generation/writers/1
+decision_persist/generation/writers/1
+                        time:   [4.0397 ms 4.1165 ms 4.1967 ms]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking decision_persist/generation/writers/8-shared
+decision_persist/generation/writers/8-shared
+                        time:   [10.160 ms 10.617 ms 11.056 ms]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+
+Benchmarking decision_persist/generation_owner/writers/1
+decision_persist/generation_owner/writers/1
+                        time:   [5.0761 ms 5.1813 ms 5.2924 ms]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking decision_persist/generation_owner/writers/8-shared
+
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.5s, enable flat sampling, or reduce sample count to 60.
+decision_persist/generation_owner/writers/8-shared
+                        time:   [9.6367 ms 10.134 ms 10.713 ms]
+Found 5 outliers among 100 measurements (5.00%)
+  4 (4.00%) high mild
+  1 (1.00%) high severe
+Benchmarking decision_persist/generation_owner/writers/8-spread
+decision_persist/generation_owner/writers/8-spread
+                        time:   [11.631 ms 12.011 ms 12.385 ms]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking decision_persist/generation_owner_refence/writers/1
+decision_persist/generation_owner_refence/writers/1
+                        time:   [5.5566 ms 5.6695 ms 5.7919 ms]
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+Benchmarking decision_persist/generation_owner_refence/writers/8-shared
+
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 7.3s, enable flat sampling, or reduce sample count to 60.
+decision_persist/generation_owner_refence/writers/8-shared
+                        time:   [11.137 ms 11.584 ms 12.047 ms]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking decision_persist/generation_owner_refence/writers/8-spread
+
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.1s, enable flat sampling, or reduce sample count to 60.
+decision_persist/generation_owner_refence/writers/8-spread
+                        time:   [11.013 ms 11.422 ms 11.821 ms]
+
+Benchmarking decision_persist/generation_plain_owner_row/writers/1
+decision_persist/generation_plain_owner_row/writers/1
+                        time:   [4.9601 ms 5.0763 ms 5.1951 ms]
+Benchmarking decision_persist/generation_plain_owner_row/writers/8-shared
+
+Warning: Unable to complete 100 samples in 6.0s. You may wish to increase target time to 6.1s, enable flat sampling, or reduce sample count to 60.
+decision_persist/generation_plain_owner_row/writers/8-shared
+                        time:   [9.0150 ms 9.3851 ms 9.7361 ms]
+Benchmarking decision_persist/generation_plain_owner_row/writers/8-spread
+decision_persist/generation_plain_owner_row/writers/8-spread
+                        time:   [7.7081 ms 8.1267 ms 8.5943 ms]
+
