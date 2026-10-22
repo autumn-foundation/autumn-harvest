@@ -21,7 +21,7 @@ they fix.
 ## Beside the stage 1 table
 
 The stage 1 table is in
-[`reports/Actor ownership prior art for Harvest.md`](../reports/Actor%20ownership%20prior%20art%20for%20Harvest.md).
+`reports/Actor ownership prior art for Harvest.md`.
 Issue #2248 records its baselines. This page fills its two failover rows.
 
 | Stage 1 measurement | Pass condition | Issue #2254 result |
