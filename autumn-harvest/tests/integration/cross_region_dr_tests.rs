@@ -312,6 +312,101 @@ async fn a_bump_expires_every_owner_lease_and_keeps_the_epochs() {
     }
 }
 
+/// Issue #2248: with DR fencing on, an owner decision sends the owner fence
+/// once. Each append still takes the generation row, because a colocated
+/// shard can use another row. The start fence holds the owner row until the
+/// commit, so a second owner fence cannot fail (issue #2252).
+#[tokio::test]
+async fn a_dr_fenced_owner_decision_sends_one_owner_fence() {
+    use autumn_harvest::decision_owner::{
+        self, Acquisition, DecisionPartition, OwnerHolder, OwnerLeaseConfig,
+    };
+    use autumn_harvest::error::HarvestError;
+    #[derive(diesel::QueryableByName)]
+    struct Calls {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    async fn fence_calls(conn: &mut AsyncPgConnection) -> Result<i64, HarvestError> {
+        let calls: Calls = diesel::sql_query(
+            "SELECT COALESCE(SUM(calls), 0)::bigint AS n FROM pg_stat_xact_user_functions \
+             WHERE funcname = 'harvest_decision_owner_fence'",
+        )
+        .get_result(conn)
+        .await
+        .map_err(autumn_harvest::error::database_error)?;
+        Ok(calls.n)
+    }
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("owner_once");
+    let mut conn = connect(&url).await;
+    conn.batch_execute("SET track_functions = 'all'")
+        .await
+        .expect("count function calls");
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .expect("provision");
+    let p = DecisionPartition::new(17).expect("in range");
+    let owner = match decision_owner::acquire(
+        &mut conn,
+        ShardId::new(0),
+        &OwnerHolder::for_worker("once"),
+        p,
+        &OwnerLeaseConfig::default(),
+    )
+    .await
+    .expect("acquire")
+    {
+        Acquisition::Acquired(t) => t,
+        other => panic!("acquire {p}: {other:?}"),
+    };
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, run_id, shard_id, input, queue_name, state) \
+         VALUES ($1, 'once', $2, gen_random_uuid(), 0, '{}'::jsonb, 'once', 'RUNNING')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(format!("once-{}", uuid::Uuid::new_v4()))
+    .execute(&mut conn)
+    .await
+    .expect("seed an execution");
+
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    let calls = decision_owner::scope_decision(async {
+        let _ = decision_owner::pin_decision(Some(owner.clone()));
+        conn.transaction::<_, HarvestError, _>(async |conn| {
+            let before = fence_calls(conn).await?;
+            autumn_harvest::replication::assert_decision_fence(conn).await?;
+            let id = decision_owner::conn_id(conn);
+            decision_owner::fenced_scope(id, async {
+                for n in 0..2 {
+                    let next = autumn_harvest::store::next_event_id_for(conn, exec_id).await?;
+                    let event = autumn_harvest::event::WorkflowEvent::SignalReceived {
+                        signal_name: "once".to_string(),
+                        payload: serde_json::json!(n),
+                    };
+                    autumn_harvest::store::append_events(conn, exec_id, &[event], next).await?;
+                }
+                Ok::<_, HarvestError>(())
+            })
+            .await?;
+            Ok(fence_calls(conn).await? - before)
+        })
+        .await
+    })
+    .await;
+    FenceRegistry::clear();
+    assert_eq!(
+        calls.expect("the owner commits"),
+        1,
+        "the start fence covers both appends"
+    );
+}
+
 // ── AC2 / AC6(a): the fence ────────────────────────────────────────────────
 
 #[tokio::test]

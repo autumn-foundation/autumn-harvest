@@ -457,6 +457,13 @@ name = "notify_commit_bench"
 required-features = ["db"]
 harness = false
 
+# Decision persist latency with zero, one and two fence rows (issue #2248).
+# Criterion repeats an append safely: each run adds rows and drains nothing.
+[[bench]]
+name = "decision_fence_bench"
+required-features = ["db"]
+harness = false
+
 # Claim latency after 1M terminal task rows, before and after the task-queue
 # hygiene fix (issue #1811). `harness = false` for the same reason as
 # `claim_bench`: claims and the janitor sweep are destructive.

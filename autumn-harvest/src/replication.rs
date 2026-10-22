@@ -2410,6 +2410,7 @@ mod db {
         if !FenceRegistry::is_enabled() {
             return Ok(());
         }
+        let _phase = crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Fence);
         let rows: Vec<PinnedRow> = diesel::sql_query(
             "SELECT shard_id, generation FROM harvest_shard_generation \
              ORDER BY shard_id FOR SHARE",
@@ -2970,6 +2971,7 @@ mod db {
         shard: ShardId,
         expected: ShardGeneration,
     ) -> HarvestResult<()> {
+        let _phase = crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Fence);
         let rows: Vec<GenerationRow> = diesel::sql_query(
             "SELECT generation FROM harvest_shard_generation WHERE shard_id = $1 FOR SHARE",
         )

@@ -523,6 +523,7 @@ async fn insert_task_rows(
 ) -> HarvestResult<Option<crate::notify::Stamp>> {
     use crate::schema::harvest_task_queue;
 
+    let _phase = crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Tasks);
     let insert = diesel::insert_into(harvest_task_queue::table).values(rows);
     if !crate::notify::stamp_wanted(conn) {
         insert

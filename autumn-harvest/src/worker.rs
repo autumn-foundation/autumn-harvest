@@ -52,8 +52,8 @@ use crate::signal;
 use crate::store;
 use crate::telemetry::{
     ATTR_ACTIVITY_NAME, ATTR_ATTEMPT, ATTR_EXECUTION_ID, ATTR_QUEUE, ATTR_SHARD_ID,
-    ATTR_WORKFLOW_ID, ActivityStatus, DbOp, ResidentOutcome, SlotType, TraceContextCarrier,
-    WorkflowStatus,
+    ATTR_WORKFLOW_ID, ActivityStatus, ClaimKind, DbOp, PersistPhase, ResidentOutcome, SlotType,
+    TraceContextCarrier, WorkflowStatus,
 };
 use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, IdempotencyKey, ParentClosePolicy, ShardId,
@@ -28669,6 +28669,8 @@ async fn process_workflow_task(
     // Issue #1833: one merged wake per execution, also on the fallback path.
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
+            // Issue #2248: the body ends when this guard drops.
+            let _body = PersistBodyEnd;
             // Issue #2251: in owner mode, the DR generation row and the owner
             // row come first, before the execution row (ADR 0009 decision 6).
             crate::replication::assert_decision_fence(conn).await?;
@@ -32235,6 +32237,16 @@ impl Drop for PollerGuard {
     }
 }
 
+/// The kind of task that one claim returned (issue #2248).
+fn claim_kind(claimed: &HarvestResult<Option<TaskQueueItem>>) -> ClaimKind {
+    match claimed {
+        Ok(Some(task)) if task.task_type == TaskType::Workflow.as_str() => ClaimKind::Workflow,
+        Ok(Some(_)) => ClaimKind::Activity,
+        Ok(None) => ClaimKind::Empty,
+        Err(_) => ClaimKind::Error,
+    }
+}
+
 /// How one workflow-task cycle times its outcome persists (issue #1815).
 ///
 /// The dispatcher sets it around the cycle. The main persist transaction
@@ -32248,6 +32260,15 @@ struct PersistTiming {
     /// Set while a timer of the cycle runs. A write nested in a timed
     /// transaction is part of that sample, so it does not start another.
     running: std::cell::Cell<bool>,
+    /// Issue #2248: the seconds of each timed phase of the running timer,
+    /// in the order of [`PersistPhase::TIMED`].
+    phases: std::cell::Cell<[f64; 4]>,
+    /// The phase that a phase timer times now. A nested phase timer records
+    /// nothing, so no time counts twice.
+    phase: std::cell::Cell<Option<PersistPhase>>,
+    /// When the body of the decision transaction ended. Only the decision
+    /// persist sets it, so only that persist records its phases.
+    body_end: std::cell::Cell<Option<std::time::Instant>>,
 }
 
 impl PersistTiming {
@@ -32256,6 +32277,9 @@ impl PersistTiming {
             metrics: Arc::clone(metrics),
             labels: Arc::clone(labels),
             running: std::cell::Cell::new(false),
+            phases: std::cell::Cell::new([0.0; 4]),
+            phase: std::cell::Cell::new(None),
+            body_end: std::cell::Cell::new(None),
         }
     }
 }
@@ -32281,10 +32305,15 @@ impl PersistTimer {
     fn start() -> Option<Self> {
         PERSIST_TIMING
             .try_with(|timing| {
-                (!timing.running.replace(true)).then(|| Self {
-                    metrics: Arc::clone(&timing.metrics),
-                    labels: Arc::clone(&timing.labels),
-                    started: std::time::Instant::now(),
+                (!timing.running.replace(true)).then(|| {
+                    timing.phases.set([0.0; 4]);
+                    timing.phase.set(None);
+                    timing.body_end.set(None);
+                    Self {
+                        metrics: Arc::clone(&timing.metrics),
+                        labels: Arc::clone(&timing.labels),
+                        started: std::time::Instant::now(),
+                    }
                 })
             })
             .ok()
@@ -32300,7 +32329,75 @@ impl Drop for PersistTimer {
                 .record_db_query_duration(DbOp::Persist, *label, elapsed);
         }
         // Outside the scope there is nothing to reset.
-        let _ = PERSIST_TIMING.try_with(|timing| timing.running.set(false));
+        let _ = PERSIST_TIMING.try_with(|timing| {
+            timing.running.set(false);
+            // Issue #2248: diesel sends `COMMIT` after the body ends.
+            let Some(body_end) = timing.body_end.take() else {
+                return;
+            };
+            let commit = body_end.elapsed().as_secs_f64();
+            let parts =
+                crate::telemetry::persist_phase_breakdown(elapsed, timing.phases.get(), commit);
+            for label in self.labels.iter() {
+                for (phase, seconds) in parts {
+                    self.metrics.record_persist_phase(phase, *label, seconds);
+                }
+            }
+        });
+    }
+}
+
+/// Times one phase of a running decision persist (issue #2248).
+///
+/// Each chokepoint of a phase starts one. Outside a persist timer, or inside
+/// another phase timer, it is `None` and times nothing.
+pub(crate) struct PersistPhaseTimer {
+    index: usize,
+    started: std::time::Instant,
+}
+
+impl PersistPhaseTimer {
+    /// Start a timer for `phase`, a phase of [`PersistPhase::TIMED`].
+    pub(crate) fn start(phase: PersistPhase) -> Option<Self> {
+        let index = phase.timed_index()?;
+        PERSIST_TIMING
+            .try_with(|timing| {
+                (timing.running.get() && timing.phase.get().is_none()).then(|| {
+                    timing.phase.set(Some(phase));
+                    Self {
+                        index,
+                        started: std::time::Instant::now(),
+                    }
+                })
+            })
+            .ok()
+            .flatten()
+    }
+}
+
+impl Drop for PersistPhaseTimer {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed().as_secs_f64();
+        let _ = PERSIST_TIMING.try_with(|timing| {
+            timing.phase.set(None);
+            let mut phases = timing.phases.get();
+            phases[self.index] += elapsed;
+            timing.phases.set(phases);
+        });
+    }
+}
+
+/// Marks the end of the decision transaction body when it drops (issue
+/// #2248). The persist timer then counts the rest as the commit.
+struct PersistBodyEnd;
+
+impl Drop for PersistBodyEnd {
+    fn drop(&mut self) {
+        let _ = PERSIST_TIMING.try_with(|timing| {
+            if timing.running.get() {
+                timing.body_end.set(Some(std::time::Instant::now()));
+            }
+        });
     }
 }
 
@@ -38399,7 +38496,7 @@ impl Worker {
                 .await
             })
             .await;
-        self.record_db_op(DbOp::Claim, shard, claim_started);
+        self.record_claim(shard, claim_started, &claimed);
 
         match claimed {
             Ok(Some(task)) => {
@@ -39558,20 +39655,22 @@ impl Worker {
         PollerGuard::new(&self.config.queues, &self.registry.telemetry().metrics)
     }
 
-    /// Record the duration of one database op on `shard` that began at
-    /// `started` (issue #1815). The shard labels match the pool-wait ones.
-    fn record_db_op(
+    /// Record one claim on `shard` that began at `started` (issues #1815
+    /// and #2248). The shard labels match the pool-wait ones. The `kind`
+    /// label names what the claim returned.
+    fn record_claim(
         &self,
-        op: DbOp,
         shard: Option<crate::types::ShardId>,
         started: std::time::Instant,
+        claimed: &HarvestResult<Option<TaskQueueItem>>,
     ) {
+        let kind = claim_kind(claimed);
         let elapsed = started.elapsed().as_secs_f64();
         for label in self.pool_labels(shard).iter() {
             self.registry
                 .telemetry()
                 .metrics
-                .record_db_query_duration(op, *label, elapsed);
+                .record_claim_duration(kind, *label, elapsed);
         }
     }
 
@@ -39918,7 +40017,7 @@ impl Worker {
                         .await
                     })
                     .await;
-                self.record_db_op(DbOp::Claim, shard, claim_started);
+                self.record_claim(shard, claim_started, &claimed);
                 match claimed {
                     Ok(Some(task)) => {
                         tracing::debug!(
@@ -39972,7 +40071,7 @@ impl Worker {
                 .await
             })
             .await;
-        self.record_db_op(DbOp::Claim, shard, claim_started);
+        self.record_claim(shard, claim_started, &claimed);
         match claimed {
             Ok(Some(task)) => {
                 tracing::debug!(

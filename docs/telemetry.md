@@ -166,6 +166,11 @@ metrics_exporter_prometheus::PrometheusBuilder::new()
         LATENCY_BUCKETS,
     )
     .expect("valid bucket boundaries")
+    .set_buckets_for_metric(
+        Matcher::Full("harvest_db_persist_phase_duration".into()),
+        LATENCY_BUCKETS,
+    )
+    .expect("valid bucket boundaries")
     // history-size is a *count* histogram (durable events), not seconds — give
     // it its own boundaries so it stays usable for count dashboards/alerts.
     .set_buckets_for_metric(
@@ -384,7 +389,8 @@ metric is emitted in the source code.
 | `harvest.db.pool.in_use` | Gauge | `worker.rs` — `spawn_db_pool_sampler`, periodic (`poll_interval`). Connections each shard pool lends out now, read from the deadpool status. No query runs. Runtimes in one process that share a sink report the sum of their distinct pools for the shard (issue #1815) |
 | `harvest.db.pool.idle` | Gauge | `worker.rs` — `spawn_db_pool_sampler`, alongside `in_use`. Open connections that wait idle in the pool. Runtimes in one process that share a sink report the sum of their distinct pools, or 0 while any of them is exhausted (issue #1815) |
 | `harvest.db.pool.wait_duration` | Histogram | `worker.rs` — `Worker::acquire_timed` on the claim path; `timeout.rs` — the timeout scanner's acquire (a single-pool scanner reports each assigned shard, as its pool gauges do); `heartbeat.rs` — the activity heartbeat flush. Seconds to get a pooled connection, recorded on success and on failure. A worker without a sharded pool records each wait under each assigned shard, as its pool gauges do (issue #1815) |
-| `harvest.db.query.duration` | Histogram | One sample per op (issue #1815): `claim` in `poll_once` and `consume_reference`; `persist` around the workflow-task persist transaction, COMMIT included, and around a terminal failure write that an early error path or a history-cap breach commits instead; `scan` per `enforce_timeouts_once` pass; `heartbeat` per activity heartbeat write. A guard records a persist that a timeout cancels, too. A worker without a sharded pool records each sample under each assigned shard, as its pool gauges do. A direct `enforce_timeouts_once` call labels its `scan` with the shard assignments it is given. Not `harvest.query.duration`, which times workflow query handlers |
+| `harvest.db.query.duration` | Histogram | One sample per op (issue #1815): `claim` in `poll_once` and `consume_reference`; `persist` around the workflow-task persist transaction, COMMIT included, and around a terminal failure write that an early error path or a history-cap breach commits instead; `scan` per `enforce_timeouts_once` pass; `heartbeat` per activity heartbeat write. A guard records a persist that a timeout cancels, too. A worker without a sharded pool records each sample under each assigned shard, as its pool gauges do. A direct `enforce_timeouts_once` call labels its `scan` with the shard assignments it is given. Not `harvest.query.duration`, which times workflow query handlers. A `claim` sample also has a `kind` label: `workflow`, `activity`, `empty` or `error` (issue #2248). The shipped panels and alerts sum by `op` and `shard`, so the label does not split them |
+| `harvest.db.persist.phase_duration` | Histogram | `worker.rs` — `PersistTimer`, once per phase at the end of each decision persist (issue #2248). Phase timers in `replication.rs` and `decision_owner.rs` (`fence`), `store.rs` (`events`), `queue.rs` (`tasks`) and `notify.rs` (`notify`) add up their time. `commit` is the time after the transaction body. `other` is the rest of the persist. The six phases of one persist add up to its `persist` sample. A terminal failure write records no phase |
 | `harvest.worker.pollers` | Gauge | `worker.rs` — `PollerGuard`, set when a claim loop starts and when it ends. Each loop claims from all the worker's queues. A worker runs `max_concurrent_claims` loops, so the default worker counts 2. An idle extra loop still counts. The count covers every worker that shares the metrics recorder, so a second worker's drain does not hide the first. A runtime with its own recorder keeps its own count. A drained process reads 0 (issue #1815) |
 | `harvest.worker.outlier` | Gauge | `workers.rs` — `run_outlier_tick`, on each liveness heartbeat of the worker. Each heartbeat merges the peer rows of all the worker's shards, so all of them see the same peers. `1` when this worker is an outlier against the median of its live peers on the same queues, else `0`. A draining worker clears its verdict. A tick that cannot compare clears it only when no other shard heartbeat of the worker is healthy. A stopped or aborted worker's verdict is removed, and a shard view that stops refreshing expires. The series has no worker label, so it reports the OR of the verdicts of every local worker that shares the recorder. See `worker_outlier.rs` for the rules (issue #1815) |
 | `harvest.worker.tuner_decisions` | Counter | `slot_tuner.rs` — `spawn_slot_tuner_loop`, once per control-loop tick, with the decision that actually took effect after band clamping (issue #548) |
@@ -480,7 +486,8 @@ metric is emitted in the source code.
 | `harvest.db.pool.in_use` | `shard` |
 | `harvest.db.pool.idle` | `shard` |
 | `harvest.db.pool.wait_duration` | `shard` |
-| `harvest.db.query.duration` | `op` (`claim\|persist\|scan\|heartbeat`), `shard` |
+| `harvest.db.query.duration` | `op` (`claim\|persist\|scan\|heartbeat`), `shard`; a `claim` sample also has `kind` (`workflow\|activity\|empty\|error`) |
+| `harvest.db.persist.phase_duration` | `phase` (`fence\|events\|tasks\|notify\|commit\|other`), `shard` |
 | `harvest.worker.pollers` | `queue` |
 | `harvest.worker.outlier` | `dimension` (`failure_ratio\|latency_p99`) |
 | `harvest.workflow.active` | `workflow`, `state` (`running\|paused`) |
