@@ -38,7 +38,8 @@ use crate::integration_e2e::{
 };
 
 /// Partitions that other owner suites use. This suite picks another one.
-const RESERVED: std::ops::RangeInclusive<u16> = 400..=499;
+/// `owner_wake_worker_tests` uses 300 to 399.
+const RESERVED: std::ops::RangeInclusive<u16> = 300..=499;
 
 #[workflow]
 async fn owner_fenced_flow(ctx: &WorkflowContext, input: String) -> Result<String, String> {

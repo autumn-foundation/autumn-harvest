@@ -248,9 +248,31 @@ impl WorkflowCache {
         &mut self,
         exec_id: &Uuid,
     ) -> Option<(CachedWorkflowState, Residency, Option<HistoryBytesMark>)> {
-        self.inner
-            .pop(exec_id)
-            .map(|entry| (entry.state, entry.resident, entry.history_bytes))
+        self.take_entry(exec_id)
+            .map(|(state, resident, history_bytes, _)| (state, resident, history_bytes))
+    }
+
+    /// [`Self::take_with_history_bytes`] that also returns the owner key of
+    /// the entry (issue #2253). A decision of another key must not use the
+    /// entry: the run moved to another database.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker takes entries.
+    pub(crate) fn take_entry(
+        &mut self,
+        exec_id: &Uuid,
+    ) -> Option<(
+        CachedWorkflowState,
+        Residency,
+        Option<HistoryBytesMark>,
+        Option<OwnerKey>,
+    )> {
+        self.inner.pop(exec_id).map(|entry| {
+            (
+                entry.state,
+                entry.resident,
+                entry.history_bytes,
+                entry.owner_key,
+            )
+        })
     }
 
     /// Closes the cache when the worker stops (issue #1798).
@@ -332,6 +354,23 @@ impl WorkflowCache {
     #[must_use]
     pub fn get(&mut self, exec_id: &Uuid) -> Option<&CachedWorkflowState> {
         self.inner.get(exec_id).map(|entry| &entry.state)
+    }
+
+    /// Whether the cache holds an entry for `exec_id`. The check does not
+    /// change the LRU order.
+    ///
+    /// ## Examples
+    ///
+    /// ```rust
+    /// use uuid::Uuid;
+    /// use autumn_harvest::cache::WorkflowCache;
+    ///
+    /// let cache = WorkflowCache::new(10);
+    /// assert!(!cache.contains(&Uuid::new_v4()));
+    /// ```
+    #[must_use]
+    pub fn contains(&self, exec_id: &Uuid) -> bool {
+        self.inner.contains(exec_id)
     }
 
     /// Remove a cached workflow state, returning it if present.
@@ -491,6 +530,31 @@ mod tests {
         cache.insert(id, make_state(8));
         let (_, _, taken) = cache.take_with_history_bytes(&id).expect("entry");
         assert_eq!(taken, None, "a plain insert stores no mark");
+    }
+
+    /// Issue #2253: a take returns the owner key, so a decision can refuse
+    /// an entry of another database. `contains` keeps the entry.
+    #[test]
+    fn take_entry_returns_the_owner_key() {
+        use crate::decision_owner::DecisionPartition;
+        use crate::types::ShardId;
+        let key = OwnerKey {
+            shard: ShardId::new(1),
+            partition: DecisionPartition::new(3).expect("in range"),
+        };
+        let mut cache = WorkflowCache::new(4);
+        let id = Uuid::new_v4();
+        let _ = cache.insert_resident_with_history_bytes(
+            id,
+            make_state(2),
+            Residency::Unknown,
+            None,
+            Some(key),
+        );
+        assert!(cache.contains(&id), "contains keeps the entry");
+        let (_, _, _, taken) = cache.take_entry(&id).expect("entry");
+        assert_eq!(taken, Some(key));
+        assert!(!cache.contains(&id), "a take removes the entry");
     }
 
     #[test]

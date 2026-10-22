@@ -22805,6 +22805,11 @@ fn pin_owner_tenure(
 ///
 /// A hit keeps its resident workflow only when the delta event ids run on
 /// from the cached `next_event_id` with no gap.
+///
+/// In owner mode, a hit replays cold when its delta holds a state change,
+/// such as a pause (issue #2253). It also replays cold when its entry has
+/// another owner key. A foreign writer made that change. The owner wake was
+/// lost, or it came while a decision held the entry.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn prepare_workflow_task_with_cache(
     conn: &mut AsyncPgConnection,
@@ -22835,10 +22840,7 @@ async fn prepare_workflow_task_with_cache(
     } else {
         // Brief lock to take the entry without holding it during DB work.
         let mut guard = workflow_cache.lock().await;
-        (
-            guard.take_with_history_bytes(&exec_uuid),
-            guard.resident_enabled(),
-        )
+        (guard.take_entry(&exec_uuid), guard.resident_enabled())
     };
 
     // Issue #2251: in owner mode, a load failure re-pends instead of failing.
@@ -22852,12 +22854,19 @@ async fn prepare_workflow_task_with_cache(
     // Issue #2251: pin the tenure before the first history write. The wake
     // ingest below then fences it too.
     pin_owner_tenure(owned, owner_shard, &execution.workflow_id)?;
+    let key = crate::decision_owner::OwnerKey::of(owner_shard, &execution.workflow_id);
+    // Issue #2253: in owner mode, a foreign writer can leave an entry stale.
+    // With owner mode off, a hit behaves as before.
+    let owner_mode = owned.owner_mode(owner_shard);
+    // An entry of another database is stale. The run moved.
+    let cached =
+        cached.filter(|(.., entry_key)| !owner_mode || entry_key.is_none_or(|entry| entry == key));
 
-    if let Some((cached_state, mut resident, cached_history_bytes)) = cached {
-        // Cache hit path: first load any events already appended since the
-        // cache snapshot (e.g. by timeout.rs/external_task.rs via
-        // append_single_event), then ingest timers/signals at the REAL current
-        // next_event_id to avoid a unique-constraint collision on event_id.
+    // Cache hit path. Load the delta first: other writers can append after
+    // the snapshot. Then ingest timers and signals at the real
+    // `next_event_id`. This avoids a unique-key collision on `event_id`.
+    let mut hit = None;
+    if let Some((cached_state, resident, cached_history_bytes, _)) = cached {
         let existing_delta_result = store::load_history_since_inflated(
             conn,
             exec_id,
@@ -22868,7 +22877,22 @@ async fn prepare_workflow_task_with_cache(
         .await;
         let existing_delta =
             fail_execution_on_error(conn, task, worker_id, existing_delta_result, codecs).await?;
+        // Issue #2253: a foreign writer changed the state of the run, for
+        // example a pause. The wake was lost, or it came while this decision
+        // held the entry. The decision drops the entry and replays cold.
+        if owner_mode
+            && existing_delta
+                .events
+                .iter()
+                .any(crate::event::WorkflowEvent::evicts_owner_cache)
+        {
+            drop((cached_state, resident));
+        } else {
+            hit = Some((cached_state, resident, cached_history_bytes, existing_delta));
+        }
+    }
 
+    if let Some((cached_state, mut resident, cached_history_bytes, existing_delta)) = hit {
         // Single chronological ingest of due timers + pending signals (see
         // merge_wake_events for the occurrence-order contract). A transient
         // event-id conflict with a concurrent append_single_event committer
@@ -22893,7 +22917,7 @@ async fn prepare_workflow_task_with_cache(
                 resident,
                 cached_history_bytes,
                 CacheOwner {
-                    key: crate::decision_owner::OwnerKey::of(owner_shard, &execution.workflow_id),
+                    key,
                     pinned: crate::decision_owner::pinned_decision().map(|t| t.epoch()),
                     owned,
                 },
@@ -29764,6 +29788,167 @@ async fn drop_fenced_tenure(
     unloaded
 }
 
+/// The longest single wait of the owner wake task for a wake (issue #2253).
+/// A tenure change ends the wait sooner.
+const OWNER_WAKE_TICK: Duration = Duration::from_secs(1);
+
+/// How long the owner wake task waits after a failed connection.
+const OWNER_WAKE_RETRY: Duration = Duration::from_secs(1);
+
+/// What the owner wake task of one shard pool needs (issue #2253).
+struct OwnerWakes {
+    url: String,
+    shard: crate::types::ShardId,
+    owned: Arc<crate::decision_owner::OwnedPartitions>,
+    workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
+    woken: Arc<tokio::sync::Notify>,
+    metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
+    shutdown: CancellationToken,
+    listening: Arc<std::sync::Mutex<std::collections::BTreeSet<crate::decision_owner::OwnerKey>>>,
+}
+
+impl OwnerWakes {
+    /// Listen on the owner channel of each partition that this worker owns
+    /// on `shard`, until shutdown (issue #2253).
+    ///
+    /// The task connects only while the worker holds a tenure on the shard.
+    /// With no tenure, it waits for a tenure change and does not poll. A
+    /// wake that it misses while it reconnects costs latency only. The poll
+    /// loop still claims, and a cache hit checks its delta.
+    async fn run(self) {
+        let mut listener: Option<crate::notify::OwnerWakeListener> = None;
+        let mut synced: Option<u64> = None;
+        while !self.shutdown.is_cancelled() {
+            // Arm the change wait first, then read the version. A change
+            // after the read still ends the wait below.
+            let changed = self.owned.changed();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let version = self.owned.version();
+            let wanted = self.owned.partitions_on(self.shard);
+            if wanted.is_empty() {
+                listener = None;
+                synced = None;
+                self.set_listening(&[]);
+                // No tenure: wait for one, with no poll.
+                tokio::select! {
+                    () = self.shutdown.cancelled() => break,
+                    () = changed => {}
+                }
+                continue;
+            }
+            let Some(open) = listener.as_mut() else {
+                match crate::notify::OwnerWakeListener::connect(&self.url).await {
+                    Ok(open) => listener = Some(open),
+                    Err(error) => {
+                        tracing::warn!(
+                            shard = self.shard.as_i32(),
+                            error = %error,
+                            "harvest: the owner wake listener cannot connect; retrying"
+                        );
+                        self.pause(OWNER_WAKE_RETRY).await;
+                    }
+                }
+                synced = None;
+                continue;
+            };
+            if synced != Some(version) {
+                if let Err(error) = sync_owner_channels(open, &wanted).await {
+                    tracing::warn!(
+                        shard = self.shard.as_i32(),
+                        error = %error,
+                        "harvest: the owner wake listener failed; reconnecting"
+                    );
+                    listener = None;
+                    self.set_listening(&[]);
+                    self.pause(OWNER_WAKE_RETRY).await;
+                    continue;
+                }
+                synced = Some(version);
+                self.set_listening(&wanted);
+            }
+            let wait = tokio::select! {
+                () = self.shutdown.cancelled() => break,
+                // A tenure change syncs the channels at once.
+                () = changed.as_mut() => continue,
+                wait = open.wait(OWNER_WAKE_TICK) => wait,
+            };
+            match wait {
+                crate::notify::OwnerWakeWait::Woken(wake) => self.handle(&wake).await,
+                crate::notify::OwnerWakeWait::TimedOut => {}
+                // A server that drops each connection must not cause a
+                // reconnect loop, so the retry waits first.
+                crate::notify::OwnerWakeWait::ChannelClosed => {
+                    listener = None;
+                    self.set_listening(&[]);
+                    self.pause(OWNER_WAKE_RETRY).await;
+                }
+            }
+        }
+    }
+
+    /// Publish the partitions that the listener listens on, for tests.
+    fn set_listening(&self, partitions: &[crate::decision_owner::DecisionPartition]) {
+        let mut listening = self
+            .listening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        listening.retain(|key| key.shard != self.shard);
+        listening.extend(
+            partitions
+                .iter()
+                .map(|&partition| crate::decision_owner::OwnerKey {
+                    shard: self.shard,
+                    partition,
+                }),
+        );
+    }
+
+    /// Sleep for `wait`, or less at shutdown.
+    async fn pause(&self, wait: Duration) {
+        tokio::select! {
+            () = self.shutdown.cancelled() => {}
+            () = tokio::time::sleep(wait) => {}
+        }
+    }
+
+    /// Evict the entry of an evict wake, count the wake and wake the poll
+    /// loop.
+    async fn handle(&self, wake: &crate::notify::OwnerWake) {
+        let kind = if wake.payload.evict {
+            // Drop the parked future outside the cache lock.
+            let taken = self
+                .workflow_cache
+                .lock()
+                .await
+                .take(&wake.payload.workflow_exec_id);
+            drop(taken);
+            "evict"
+        } else {
+            "wake"
+        };
+        self.metrics
+            .record_decision_owner_woken(&self.shard.as_i32().to_string(), kind);
+        self.woken.notify_one();
+    }
+}
+
+/// Make `listener` listen on exactly the channels of `wanted`.
+async fn sync_owner_channels(
+    listener: &mut crate::notify::OwnerWakeListener,
+    wanted: &[crate::decision_owner::DecisionPartition],
+) -> HarvestResult<()> {
+    for stale in listener.partitions() {
+        if !wanted.contains(&stale) {
+            listener.unlisten(stale).await?;
+        }
+    }
+    for &partition in wanted {
+        listener.listen(partition).await?;
+    }
+    Ok(())
+}
+
 /// Unload a fenced partition and re-pend its task (issue #2251).
 ///
 /// The decision transaction rolled back, so it wrote nothing. The worker
@@ -32797,6 +32982,12 @@ pub struct Worker {
     /// Wakes every idle wait when a task deferred at its adaptive limit is
     /// due (issue #1836). Unlike `capacity_freed`, no gate holds it back.
     deferral_due: Arc<tokio::sync::Notify>,
+    /// Wakes every idle wait when a foreign write wakes this owner (issue
+    /// #2253). See [`OwnerWakes`].
+    owner_woken: Arc<tokio::sync::Notify>,
+    /// The partitions that the owner wake tasks listen on (issue #2253).
+    owner_listening:
+        Arc<std::sync::Mutex<std::collections::BTreeSet<crate::decision_owner::OwnerKey>>>,
     /// Kinds the poll gate refused since the last claim of that kind (issue
     /// #1787). The slot tuner counts a claimed task's queue wait only when
     /// the gate held its kind back. Otherwise a NOTIFY delay reads as a
@@ -35155,6 +35346,8 @@ impl Worker {
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
             capacity_freed,
             deferral_due,
+            owner_woken: Arc::new(tokio::sync::Notify::new()),
+            owner_listening: Arc::default(),
             gate_refused: Arc::new(GateRefused::default()),
             limit_refused: AtomicBool::new(false),
             pool_refused: AtomicBool::new(false),
@@ -35177,6 +35370,45 @@ impl Worker {
             shard_dispatch,
             global_dispatch,
         })
+    }
+
+    /// Start the owner wake task of the pool of `shard` on `url` (issue
+    /// #2253). The task ends at shutdown or when the guard drops.
+    fn spawn_owner_wakes(&self, url: &str, shard: Option<crate::types::ShardId>) -> AbortOnDrop {
+        // Issue #2252: the tenures are per worker, keyed by the canonical
+        // shard of the database. The owner loops record that key first.
+        let wakes = OwnerWakes {
+            url: url.to_string(),
+            shard: self.owner_shard_of(shard),
+            owned: Arc::clone(&self.decision_owner),
+            workflow_cache: Arc::clone(&self.workflow_cache),
+            woken: Arc::clone(&self.owner_woken),
+            metrics: Arc::clone(&self.registry.telemetry().metrics),
+            shutdown: self.shutdown.clone(),
+            listening: Arc::clone(&self.owner_listening),
+        };
+        AbortOnDrop::new(tokio::spawn(wakes.run()))
+    }
+
+    /// Whether an owner wake task listens on the channel of `key` (issue
+    /// #2253). Tests wait for it before a foreign write.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn owner_wake_listening(&self, key: crate::decision_owner::OwnerKey) -> bool {
+        self.owner_listening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+    }
+
+    /// Whether the workflow cache holds an entry for `exec_id` (issue
+    /// #2253). Tests use it to see an owner eviction.
+    #[doc(hidden)]
+    pub async fn has_cached_execution(&self, exec_id: ExecutionId) -> bool {
+        self.workflow_cache
+            .lock()
+            .await
+            .contains(&exec_id.as_uuid())
     }
 
     /// The global channel this worker is bound to (issue #1431).
@@ -35582,6 +35814,13 @@ impl Worker {
                 }
                 None => None,
             };
+            // Issue #2253: the owner wakes use the URL of the queue
+            // listener, and the shard of the claim loop.
+            let poll_shard = match self.config.shard_assignments.as_slice() {
+                [shard, ..] => Some(*shard),
+                [] => None,
+            };
+            let _owner_wakes = listener_url.map(|url| self.spawn_owner_wakes(url, poll_shard));
             self.run_with_listener_bound(claim_pool, listener).await;
         }
     }
@@ -35823,6 +36062,14 @@ impl Worker {
         let owner_loops = self.spawn_owner_loops(&shard_targets);
 
         let shard_listeners = self.build_shard_listeners(&shard_targets).await;
+        // Issue #2253: one owner wake task per shard with a listener URL.
+        let _owner_wakes: Vec<AbortOnDrop> = shard_targets
+            .iter()
+            .filter_map(|(shard, _)| {
+                multi_shard_listener_url(&self.config.shard_notification_database_urls, *shard)
+                    .map(|url| self.spawn_owner_wakes(url, Some(*shard)))
+            })
+            .collect();
 
         // Use each assigned shard's dispatch channel, captured once by
         // `Worker::new` and held for the whole loop (Codex review, issue
@@ -36018,6 +36265,7 @@ impl Worker {
                     () = shutdown.cancelled() => break,
                     () = capacity.woken() => {}
                     () = self.deferral_due.notified() => {}
+                    () = self.owner_woken.notified() => {}
                     () = tokio::time::sleep(poll_interval) => {}
                 }
             } else {
@@ -36052,6 +36300,11 @@ impl Worker {
                 break 'notify_wait;
             }
             if futures::FutureExt::now_or_never(self.deferral_due.notified()).is_some() {
+                break 'notify_wait;
+            }
+            // An owner wake is a NOTIFY too, so it settles (issue #2253).
+            if futures::FutureExt::now_or_never(self.owner_woken.notified()).is_some() {
+                notified = true;
                 break 'notify_wait;
             }
             let mut broken_idx: Option<usize> = None;
@@ -38036,6 +38289,15 @@ impl Worker {
                     }
                 } => {}
                 () = self.deferral_due.notified() => {}
+                // A multi-shard turn leaves the owner wake to the idle wait
+                // of its round, as it does the capacity wake (issue #2253).
+                () = async {
+                    if shard_count == 1 {
+                        self.owner_woken.notified().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {}
                 () = tokio::time::sleep(wait) => {}
             }
         }
@@ -38551,6 +38813,8 @@ impl Worker {
         let notified = tokio::select! {
             () = capacity.woken() => false,
             () = self.deferral_due.notified() => false,
+            // An owner wake is a NOTIFY too, so it settles (issue #2253).
+            () = self.owner_woken.notified() => true,
             notified = idle => notified,
         };
         if notified {

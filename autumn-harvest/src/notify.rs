@@ -266,21 +266,36 @@ pub(crate) async fn notify_task_enqueued_stamped(
     queue_name: &str,
     task_id: Uuid,
 ) -> HarvestResult<()> {
+    notify_task_enqueued_for(conn, stamp, queue_name, task_id, None).await
+}
+
+/// [`notify_task_enqueued_stamped`] that also wakes the owner of the run
+/// `owner_exec`, when the new task is a workflow task (issue #2253).
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub(crate) async fn notify_task_enqueued_for(
+    conn: &mut AsyncPgConnection,
+    stamp: Option<Stamp>,
+    queue_name: &str,
+    task_id: Uuid,
+    owner_exec: Option<Uuid>,
+) -> HarvestResult<()> {
     // Chaos: drop this wake (issue #940 AC1(c)). The poll loop still finds the
     // task, because NOTIFY only reduces latency.
     if crate::chaos_drop_notify!(NOTIFY_TASK_ENQUEUED) {
         return Ok(());
     }
 
-    stage(
-        conn,
-        vec![Note::Task {
-            channel: queue_channel(queue_name),
-            task_id,
-        }],
-        stamp,
-    )
-    .await
+    let mut notes = vec![Note::Task {
+        channel: queue_channel(queue_name),
+        task_id,
+    }];
+    if let Some(exec_id) = owner_exec {
+        notes.extend(owner_note(exec_id, false));
+    }
+    stage(conn, notes, stamp).await
 }
 
 /// Wake the workers of several queues, after the write commits.
@@ -346,16 +361,95 @@ pub(crate) async fn notify_workflow_events_appended_stamped(
     event_count: usize,
     last_event_type: &str,
 ) -> HarvestResult<()> {
-    stage(
+    notify_history_appended(
         conn,
-        vec![Note::Events {
-            exec_id: workflow_exec_id,
-            count: event_count,
-            last_event_type: last_event_type.to_string(),
-        }],
         stamp,
+        workflow_exec_id,
+        event_count,
+        last_event_type,
+        false,
     )
     .await
+}
+
+/// [`notify_workflow_events_appended_stamped`] for an append to history
+/// (issue #2253).
+///
+/// With `evict`, the append changed the state of the run. The owner of its
+/// partition then gets a wake that drops its cache entry. One stage holds
+/// both notes, so the write pays one stage.
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub(crate) async fn notify_history_appended(
+    conn: &mut AsyncPgConnection,
+    stamp: Option<Stamp>,
+    workflow_exec_id: Uuid,
+    event_count: usize,
+    last_event_type: &str,
+    evict: bool,
+) -> HarvestResult<()> {
+    let mut notes = vec![Note::Events {
+        exec_id: workflow_exec_id,
+        count: event_count,
+        last_event_type: last_event_type.to_string(),
+    }];
+    if evict {
+        notes.extend(owner_note(workflow_exec_id, true));
+    }
+    stage(conn, notes, stamp).await
+}
+
+/// Wake the workers of `queue_names` and the owner of `workflow_exec_id`,
+/// after the write commits (issue #2253).
+///
+/// A foreign writer calls this when it makes a workflow task of the run
+/// claimable. With no queue, nothing became claimable, so the function sends
+/// nothing.
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub(crate) async fn notify_workflow_task_woken(
+    conn: &mut AsyncPgConnection,
+    stamp: Option<Stamp>,
+    queue_names: &[String],
+    task_id: Uuid,
+    workflow_exec_id: Uuid,
+) -> HarvestResult<()> {
+    if queue_names.is_empty() {
+        return Ok(());
+    }
+    let mut notes: Vec<Note> = queue_names
+        .iter()
+        .map(|queue_name| Note::Task {
+            channel: queue_channel(queue_name),
+            task_id,
+        })
+        .collect();
+    notes.extend(owner_note(workflow_exec_id, false));
+    stage(conn, notes, stamp).await
+}
+
+/// Wake the owner of `workflow_exec_id` after the write commits (issue
+/// #2253).
+///
+/// A state change that appends no event calls this, for example a
+/// rebalance cutover. With `evict`, the owner drops its cache entry.
+///
+/// # Errors
+///
+/// Same as [`notify_task_enqueued`].
+pub(crate) async fn notify_owner(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+    evict: bool,
+) -> HarvestResult<()> {
+    match owner_note(workflow_exec_id, evict) {
+        Some(note) => stage(conn, vec![note], None).await,
+        None => Ok(()),
+    }
 }
 
 /// Add trailing events to the next wake of [`workflow_events_channel`].
@@ -407,6 +501,11 @@ pub(crate) const GATE_RETRY_MAX: Duration = Duration::from_millis(25);
 
 /// How often an idle sender samples the queue usage and checks its pool.
 const IDLE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The `statement_timeout` of the owner wake lookup (issue #2253). A lookup
+/// that waits for a lock must not hold back the next tick. The server ends
+/// it, so the connection stays usable.
+const OWNER_LOOKUP_TIMEOUT: &str = "SET LOCAL statement_timeout = '500ms'";
 
 /// The sender drops a note whose transaction stays open longer than this.
 const MAX_GATE_WAIT: Duration = Duration::from_secs(60);
@@ -475,13 +574,34 @@ pub(crate) enum Note {
         /// The channel from [`durable_stream_channel`].
         channel: String,
     },
+    /// A foreign write to one execution (issue #2253). It wakes the owner of
+    /// the partition of the execution.
+    ///
+    /// The note does not know the partition, because the partition is a hash
+    /// of the `workflow_id`. The sender reads the `workflow_id` after the
+    /// commit, on its own connection. The write path pays nothing.
+    Owner {
+        /// The execution.
+        exec_id: Uuid,
+        /// The write changed the state of the run. The owner drops its
+        /// cache entry.
+        evict: bool,
+        /// The partition that the writing decision pinned, if any. The
+        /// sender sends no wake to that partition. The writer owns it.
+        writer: Option<crate::decision_owner::DecisionPartition>,
+        /// The channel from [`owner_channel`]. Empty until the sender
+        /// resolves the partition.
+        channel: String,
+    },
 }
 
 impl Note {
     /// The channel the note goes to.
     fn channel(&self) -> &str {
         match self {
-            Self::Task { channel, .. } | Self::Stream { channel } => channel,
+            Self::Task { channel, .. } | Self::Stream { channel } | Self::Owner { channel, .. } => {
+                channel
+            }
             Self::Events { .. } | Self::Trailing { .. } => workflow_events_channel(),
         }
     }
@@ -498,13 +618,9 @@ const fn valid_channel(channel: &str) -> bool {
 /// Task notes merge per channel. One task keeps its id. Several tasks give
 /// the nil id, as [`notify_tasks_enqueued`] does. Event notes merge per
 /// execution: the counts add up, and the last type wins. Stream notes merge
-/// per channel. A note on a channel that Postgres rejects is dropped.
+/// per channel. Owner notes merge per execution, and an evict wins. A note
+/// on a channel that Postgres rejects is dropped.
 fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
-    enum Merged {
-        Task(String, Uuid),
-        Events(Uuid, usize, String),
-        Stream(String),
-    }
     let mut merged: Vec<Merged> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for note in notes {
@@ -559,15 +675,44 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
                     merged.push(Merged::Stream(channel));
                 }
             }
+            // One owner wake per execution. An evict in any note wins.
+            Note::Owner {
+                exec_id,
+                evict,
+                channel,
+                ..
+            } => {
+                let key = format!("owner:{exec_id}");
+                if let Some(&i) = index.get(&key) {
+                    if let Merged::Owner(_, _, merged_evict) = &mut merged[i] {
+                        *merged_evict |= evict;
+                    }
+                } else {
+                    index.insert(key, merged.len());
+                    merged.push(Merged::Owner(channel, exec_id, evict));
+                }
+            }
         }
     }
-    merged
-        .into_iter()
-        .filter_map(|m| match m {
-            Merged::Task(channel, task_id) => serde_json::to_string(&NotifyPayload { task_id })
+    merged.into_iter().filter_map(Merged::into_wake).collect()
+}
+
+/// One merged wake of [`coalesce`].
+enum Merged {
+    Task(String, Uuid),
+    Events(Uuid, usize, String),
+    Stream(String),
+    Owner(String, Uuid, bool),
+}
+
+impl Merged {
+    /// The `(channel, payload)` pair of the wake.
+    fn into_wake(self) -> Option<(String, String)> {
+        match self {
+            Self::Task(channel, task_id) => serde_json::to_string(&NotifyPayload { task_id })
                 .ok()
                 .map(|payload| (channel, payload)),
-            Merged::Events(workflow_exec_id, event_count, last_event_type) => {
+            Self::Events(workflow_exec_id, event_count, last_event_type) => {
                 serde_json::to_string(&WorkflowEventNotifyPayload {
                     workflow_exec_id,
                     event_count,
@@ -576,9 +721,111 @@ fn coalesce(notes: Vec<Note>) -> Vec<(String, String)> {
                 .ok()
                 .map(|payload| (workflow_events_channel().to_string(), payload))
             }
-            Merged::Stream(channel) => Some((channel, String::new())),
+            Self::Stream(channel) => Some((channel, String::new())),
+            Self::Owner(channel, workflow_exec_id, evict) => {
+                serde_json::to_string(&OwnerWakePayload {
+                    workflow_exec_id,
+                    evict,
+                })
+                .ok()
+                .map(|payload| (channel, payload))
+            }
+        }
+    }
+}
+
+/// An owner note for a foreign write to `exec_id`, when owner wakes are on
+/// (issue #2253).
+fn owner_note(exec_id: Uuid, evict: bool) -> Option<Note> {
+    crate::decision_owner::owner_wakes_enabled().then(|| Note::Owner {
+        exec_id,
+        evict,
+        writer: crate::decision_owner::pinned_decision().map(|t| t.partition()),
+        channel: String::new(),
+    })
+}
+
+/// A row of the owner lookup.
+#[derive(diesel::QueryableByName)]
+struct OwnerRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: Uuid,
+    #[diesel(sql_type = Text)]
+    workflow_id: String,
+}
+
+/// Fill in the channel of each owner note (issue #2253).
+///
+/// One statement reads the `workflow_id` of each execution. The sender runs
+/// it on its own connection, after the write commits, with a short
+/// `statement_timeout`. The function drops a note whose run is gone, because
+/// no owner decides for it. It also drops a note to the partition that the
+/// writer's decision pinned. The writer owns that partition and decides
+/// what happens to its own entries. Returns the number of notes that a
+/// failed lookup lost.
+async fn resolve_owner_notes(conn: &mut AsyncPgConnection, notes: &mut Vec<Note>) -> usize {
+    let mut ids: Vec<Uuid> = notes
+        .iter()
+        .filter_map(|note| match note {
+            Note::Owner { exec_id, .. } => Some(*exec_id),
+            _ => None,
         })
-        .collect()
+        .collect();
+    if ids.is_empty() {
+        return 0;
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let rows = conn
+        .transaction::<Vec<OwnerRow>, diesel::result::Error, _>(async |conn| {
+            diesel::sql_query(OWNER_LOOKUP_TIMEOUT)
+                .execute(conn)
+                .await?;
+            diesel::sql_query(
+                "SELECT id, workflow_id FROM harvest_workflow_executions \
+                 WHERE id = ANY($1::uuid[])",
+            )
+            .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(ids)
+            .load::<OwnerRow>(conn)
+            .await
+        })
+        .await;
+    let partitions: HashMap<Uuid, crate::decision_owner::DecisionPartition> = match rows {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|row| {
+                let partition =
+                    crate::decision_owner::DecisionPartition::for_workflow_id(&row.workflow_id);
+                (row.id, partition)
+            })
+            .collect(),
+        Err(error) => {
+            let before = notes.len();
+            notes.retain(|note| !matches!(note, Note::Owner { .. }));
+            tracing::debug!(error = %error, "harvest: the owner wake lookup failed");
+            return before - notes.len();
+        }
+    };
+    notes.retain_mut(|note| {
+        let Note::Owner {
+            exec_id,
+            writer,
+            channel,
+            ..
+        } = note
+        else {
+            return true;
+        };
+        let Some(&partition) = partitions.get(exec_id) else {
+            return false;
+        };
+        if *writer == Some(partition) {
+            return false;
+        }
+        *channel = owner_channel(partition);
+        true
+    });
+    0
 }
 
 /// A random delay from [`SETTLE_DELAY_MIN`] to [`SETTLE_DELAY_MAX`].
@@ -1247,6 +1494,26 @@ async fn send_on_write_connection(
     notes: Vec<Note>,
     raw_block: RawBlock,
 ) -> HarvestResult<()> {
+    // Issue #2253: an owner wake needs a lookup after the commit. Only a
+    // sender can make it, so the fallback drops the note. A cache hit checks
+    // its delta, so the loss costs latency only. It is no send failure, so
+    // `send_failures` does not count it.
+    let notes: Vec<Note> = if crate::decision_owner::owner_wakes_enabled() {
+        let before = notes.len();
+        let kept: Vec<Note> = notes
+            .into_iter()
+            .filter(|note| !matches!(note, Note::Owner { .. }))
+            .collect();
+        if kept.len() < before {
+            tracing::debug!(
+                dropped = before - kept.len(),
+                "harvest: no ready notify sender for an owner wake; it is dropped"
+            );
+        }
+        kept
+    } else {
+        notes
+    };
     let rejected = notes.iter().filter(|n| !valid_channel(n.channel())).count();
     record_failures(rejected, &"Postgres rejects the channel name");
     let wakes = coalesce(notes);
@@ -1647,6 +1914,11 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
     sink.record(stale, &"a write transaction stays open too long");
     sink.record(moved, &"the database of the notify sender changed");
 
+    // Issue #2253: the owner notes need a lookup. The other wakes go first,
+    // so a slow lookup delays no queue or event wake.
+    let (mut owner_notes, ready_notes): (Vec<Note>, Vec<Note>) = ready_notes
+        .into_iter()
+        .partition(|note| matches!(note, Note::Owner { .. }));
     let rejected = ready_notes
         .iter()
         .filter(|n| !valid_channel(n.channel()))
@@ -1656,6 +1928,22 @@ async fn tick(sink: &SinkShared, conn: &mut AsyncPgConnection, held: &mut Vec<St
     let count = wakes.len();
     if count > 0 {
         send_counted(sink, count, send_wakes(conn, wakes)).await;
+    }
+    if !owner_notes.is_empty() {
+        // The commit is visible now, so the lookup sees the run. The guard
+        // counts the notes when the runtime stops during the lookup.
+        let mut unsent = Unsent {
+            sink,
+            count: owner_notes.len(),
+        };
+        let lost = resolve_owner_notes(conn, &mut owner_notes).await;
+        unsent.count = 0;
+        sink.record(lost, &"the owner wake lookup failed");
+        let wakes = coalesce(owner_notes);
+        let count = wakes.len();
+        if count > 0 {
+            send_counted(sink, count, send_wakes(conn, wakes)).await;
+        }
     }
     true
 }
@@ -2273,6 +2561,214 @@ impl DurableStreamListener {
 }
 
 // ---------------------------------------------------------------------------
+// Owner wakes (issue #2253)
+// ---------------------------------------------------------------------------
+
+/// The `NOTIFY` channel of one decision partition (issue #2253).
+///
+/// A foreign write to an execution wakes the owner of its partition on this
+/// channel. Each physical database has its own channels, as it has its own
+/// partitions.
+///
+/// # Examples
+///
+/// ```
+/// # use autumn_harvest::decision_owner::DecisionPartition;
+/// # use autumn_harvest::notify::owner_channel;
+/// let p = DecisionPartition::new(7).unwrap();
+/// assert_eq!(owner_channel(p), "harvest_owner_p7");
+/// ```
+#[must_use]
+pub fn owner_channel(partition: crate::decision_owner::DecisionPartition) -> String {
+    format!("harvest_owner_p{}", partition.get())
+}
+
+/// The payload of an owner wake (issue #2253).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OwnerWakePayload {
+    /// The execution that a foreign writer changed.
+    pub workflow_exec_id: Uuid,
+    /// The write changed the state of the run, for example a pause or a
+    /// terminal. The owner drops its cache entry.
+    pub evict: bool,
+}
+
+/// One owner wake, with the partition of its channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerWake {
+    /// The partition of the channel.
+    pub partition: crate::decision_owner::DecisionPartition,
+    /// The payload.
+    pub payload: OwnerWakePayload,
+}
+
+/// The result of a wait on an [`OwnerWakeListener`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerWakeWait {
+    /// A wake arrived.
+    Woken(OwnerWake),
+    /// No wake arrived before the timeout.
+    TimedOut,
+    /// The LISTEN connection closed.
+    ChannelClosed,
+}
+
+/// A LISTEN connection on the owner channels of some partitions (issue
+/// #2253).
+///
+/// The owner listens on each partition that it holds a tenure for. It
+/// changes the set with [`Self::listen`] and [`Self::unlisten`].
+pub struct OwnerWakeListener {
+    client: tokio_postgres::Client,
+    rx: tokio::sync::mpsc::Receiver<tokio_postgres::Notification>,
+    _connection_handle: tokio::task::JoinHandle<()>,
+    listening: std::collections::BTreeSet<crate::decision_owner::DecisionPartition>,
+    /// Wakes that arrived while a `LISTEN` or `UNLISTEN` ran. `run_verb`
+    /// fills it, and `wait` reads it first.
+    pending: std::collections::VecDeque<tokio_postgres::Notification>,
+}
+
+/// The most wakes that [`OwnerWakeListener`] holds while a command runs. A
+/// wake over the bound is dropped. A lost wake costs latency only.
+const OWNER_PENDING_MAX: usize = 4096;
+
+impl OwnerWakeListener {
+    /// Open a LISTEN connection. It listens on no channel yet.
+    ///
+    /// TLS follows the `sslmode` rules of [`QueueListener::connect`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] if the connection fails, or
+    /// [`HarvestError::Config`] if the URL or its TLS settings are not valid.
+    pub async fn connect(database_url: &str) -> HarvestResult<Self> {
+        let ListenConnection { client, rx, driver } =
+            open_listen_connection(database_url, "postgres owner wake listener error").await?;
+        Ok(Self {
+            client,
+            rx,
+            _connection_handle: driver,
+            listening: std::collections::BTreeSet::new(),
+            pending: std::collections::VecDeque::new(),
+        })
+    }
+
+    /// Listen on the channel of `partition`. A second call does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] if the `LISTEN` fails.
+    pub async fn listen(
+        &mut self,
+        partition: crate::decision_owner::DecisionPartition,
+    ) -> HarvestResult<()> {
+        if self.listening.contains(&partition) {
+            return Ok(());
+        }
+        self.run_verb("LISTEN", partition).await?;
+        self.listening.insert(partition);
+        Ok(())
+    }
+
+    /// Stop listening on the channel of `partition`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HarvestError::Database`] if the `UNLISTEN` fails.
+    pub async fn unlisten(
+        &mut self,
+        partition: crate::decision_owner::DecisionPartition,
+    ) -> HarvestResult<()> {
+        if self.listening.remove(&partition) {
+            self.run_verb("UNLISTEN", partition).await?;
+        }
+        Ok(())
+    }
+
+    /// The partitions this listener listens on, in ascending order.
+    #[must_use]
+    pub fn partitions(&self) -> Vec<crate::decision_owner::DecisionPartition> {
+        self.listening.iter().copied().collect()
+    }
+
+    /// Run `LISTEN` or `UNLISTEN` on the channel of `partition`.
+    ///
+    /// The driver task forwards wakes through a bounded channel. When that
+    /// channel is full, the driver stops reading the connection, so the
+    /// command reply never arrives. The command therefore drains wakes into
+    /// `pending` while it runs.
+    async fn run_verb(
+        &mut self,
+        verb: &str,
+        partition: crate::decision_owner::DecisionPartition,
+    ) -> HarvestResult<()> {
+        let channel = quote_pg_identifier(&owner_channel(partition));
+        let sql = format!("{verb} {channel}");
+        let Self {
+            client,
+            rx,
+            pending,
+            ..
+        } = self;
+        let command = client.batch_execute(&sql);
+        tokio::pin!(command);
+        loop {
+            tokio::select! {
+                result = &mut command => {
+                    return result.map_err(|e| {
+                        HarvestError::Database(format!(
+                            "{verb} {channel} failed: {}",
+                            error_chain(&e)
+                        ))
+                    });
+                }
+                Some(notification) = rx.recv() => {
+                    if pending.len() < OWNER_PENDING_MAX {
+                        pending.push_back(notification);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wait up to `timeout` for one owner wake.
+    ///
+    /// The wait skips a payload or a channel that does not parse, and
+    /// continues.
+    pub async fn wait(&mut self, timeout: Duration) -> OwnerWakeWait {
+        while let Some(notification) = self.pending.pop_front() {
+            if let Some(wake) = parse_owner_wake(&notification) {
+                return OwnerWakeWait::Woken(wake);
+            }
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            match tokio::time::timeout_at(deadline, self.rx.recv()).await {
+                Err(_elapsed) => return OwnerWakeWait::TimedOut,
+                Ok(None) => return OwnerWakeWait::ChannelClosed,
+                Ok(Some(notification)) => {
+                    if let Some(wake) = parse_owner_wake(&notification) {
+                        return OwnerWakeWait::Woken(wake);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Parse one owner wake, or `None` for another channel or a bad payload.
+fn parse_owner_wake(notification: &tokio_postgres::Notification) -> Option<OwnerWake> {
+    let n: u16 = notification
+        .channel()
+        .strip_prefix("harvest_owner_p")?
+        .parse()
+        .ok()?;
+    let partition = crate::decision_owner::DecisionPartition::new(n)?;
+    let payload: OwnerWakePayload = serde_json::from_str(notification.payload()).ok()?;
+    Some(OwnerWake { partition, payload })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2490,6 +2986,62 @@ mod tests {
         ]);
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, "harvest_queue_default");
+    }
+
+    /// Issue #2253: owner wakes merge per execution, and an evict in any
+    /// note wins. The merge keeps the channel of the first note.
+    #[test]
+    fn coalesce_merges_owner_wakes_per_execution() {
+        let exec = Uuid::new_v4();
+        let owner = |evict: bool, channel: &str| Note::Owner {
+            exec_id: exec,
+            evict,
+            writer: None,
+            channel: channel.to_string(),
+        };
+        let sent = coalesce(vec![
+            owner(false, "harvest_owner_p7"),
+            owner(true, "harvest_owner_p7"),
+            owner(false, ""),
+        ]);
+        assert_eq!(sent.len(), 1, "one wake per execution: {sent:?}");
+        assert_eq!(sent[0].0, "harvest_owner_p7");
+        let payload: OwnerWakePayload = serde_json::from_str(&sent[0].1).expect("payload");
+        assert_eq!(
+            payload,
+            OwnerWakePayload {
+                workflow_exec_id: exec,
+                evict: true,
+            }
+        );
+    }
+
+    /// Issue #2253: every owner channel is a valid Postgres channel.
+    #[test]
+    fn every_owner_channel_is_valid() {
+        for n in 0..crate::decision_owner::DECISION_PARTITIONS {
+            let partition = crate::decision_owner::DecisionPartition::new(n).expect("in range");
+            assert!(valid_channel(&owner_channel(partition)));
+        }
+    }
+
+    /// Issue #2253: with owner wakes off, no owner note is staged.
+    #[test]
+    fn no_owner_note_while_owner_wakes_are_off() {
+        if !crate::decision_owner::owner_wakes_enabled() {
+            assert!(owner_note(Uuid::new_v4(), true).is_none());
+        }
+        crate::decision_owner::enable_owner_wakes();
+        let note = owner_note(Uuid::new_v4(), true).expect("a note");
+        assert!(matches!(
+            note,
+            Note::Owner {
+                evict: true,
+                writer: None,
+                ref channel,
+                ..
+            } if channel.is_empty()
+        ));
     }
 
     /// Issue #1974: durable stream wakes merge per execution, with an empty

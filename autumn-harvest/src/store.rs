@@ -200,12 +200,15 @@ pub async fn append_events_with_codecs(
     let (inserted, stamp) = insert_event_rows(conn, exec_id, &rows).await?;
 
     if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended_stamped(
+        // Issue #2253: a state change also evicts the owner's cache entry.
+        crate::notify::notify_history_appended(
             conn,
             stamp,
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
+            crate::decision_owner::owner_wakes_enabled()
+                && events.iter().any(WorkflowEvent::evicts_owner_cache),
         )
         .await?;
     }
@@ -456,12 +459,15 @@ pub async fn append_events_offloaded_with_codecs(
     .await?;
 
     if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended_stamped(
+        // Issue #2253: a state change also evicts the owner's cache entry.
+        crate::notify::notify_history_appended(
             conn,
             stamp,
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
+            crate::decision_owner::owner_wakes_enabled()
+                && events.iter().any(WorkflowEvent::evicts_owner_cache),
         )
         .await?;
     }
@@ -530,12 +536,15 @@ pub(crate) async fn append_events_offloaded_with_codecs_and_patch(
     .await?;
 
     if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended_stamped(
+        // Issue #2253: a state change also evicts the owner's cache entry.
+        crate::notify::notify_history_appended(
             conn,
             stamp,
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
+            crate::decision_owner::owner_wakes_enabled()
+                && events.iter().any(WorkflowEvent::evicts_owner_cache),
         )
         .await?;
     }

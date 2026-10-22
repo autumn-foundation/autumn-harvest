@@ -2918,6 +2918,10 @@ mod db {
                              record was no longer VERIFIED; rolling back"
                         )));
                     }
+                    // Issue #2253: the run left this database. The owner of
+                    // its partition here drops its cache entry. The seal
+                    // appends no event, so the store sends no owner wake.
+                    crate::notify::notify_owner(conn, exec_id.as_uuid(), true).await?;
                 }
                 Ok(row)
             },
@@ -3246,6 +3250,10 @@ mod db {
                     .execute(&mut *conn)
                     .await
                     .map_err(database_error)?;
+                    // Issue #2253: the run arrived on this database. Its
+                    // owner here wakes, and drops any entry from an earlier
+                    // stay of the run.
+                    crate::notify::notify_owner(conn, exec_id.as_uuid(), true).await?;
                 }
                 Ok(())
             }
