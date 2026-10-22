@@ -11,7 +11,10 @@ come from these files (issue #2248). Non-production. One box, one shape.
 | `grade.py` | prints the tables from the raw output |
 | `results/raw/` | the verbatim output of the sweep |
 | `results/graded.md` | the output of `grade.py` |
-| `results/fence-bench.txt` | the output of `benches/decision_fence_bench.rs` |
+| `grade_fence.py` | prints the fence tables from the bench output |
+| `results/fence-bench/` | the output of three runs of `benches/decision_fence_bench.rs`, each in another mode order |
+| `results/fence-graded.md` | the output of `grade_fence.py` |
+| `results/pg-stat-statements-*.txt` | one diagnostic run with `pg_stat_statements` on, at one loop and depth 1,000 |
 
 ## Prerequisites
 
@@ -37,12 +40,21 @@ DOB_BIN=target/dob/tgt/release/harvest_vs_temporal_070_assay \
   ./docs/perf-artifacts/decision-owner-baseline/run.sh
 ```
 
-The fence bench:
+The fence bench, three runs in rotated mode order:
 
 ```bash
-HARVEST_FENCE_BENCH_URL=postgres://postgres@127.0.0.1:5432/postgres \
-  cargo bench -p autumn-harvest --features db --bench decision_fence_bench
+for order in \
+  none,owner,generation,generation_owner,generation_owner_refence,generation_plain_owner_row \
+  generation_plain_owner_row,generation_owner_refence,generation_owner,generation,owner,none \
+  generation,generation_owner,none,generation_plain_owner_row,generation_owner_refence,owner
+do
+  HARVEST_FENCE_BENCH_ORDER="$order" \
+  HARVEST_FENCE_BENCH_URL=postgres://postgres@127.0.0.1:5432/postgres \
+    cargo bench -p autumn-harvest --features db --bench decision_fence_bench -- --noplot
+done
 ```
+
+Save each run to a file, then run `grade_fence.py` on the files.
 
 Run nothing else on the box during a sweep. `run.sh` refuses to write into
 a `results/raw` that is not empty.

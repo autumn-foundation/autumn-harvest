@@ -1,0 +1,44 @@
+ calls | total_ms | mean_ms |                                                                         query                                                                          
+-------+----------+---------+--------------------------------------------------------------------------------------------------------------------------------------------------------
+ 27495 |     88.6 |   0.003 | SELECT $1
+ 22667 |     23.3 |   0.001 | COMMIT
+ 15664 |     12.2 |   0.001 | BEGIN
+ 15000 |    179.3 |   0.012 | SELECT $2 FROM ONLY "public"."harvest_workflow_executions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHARE OF x
+ 11545 |    125.7 |   0.011 | SELECT pg_notify(t.c, t.p) FROM unnest($1::text[], $2::text[]) AS t(c, p)
+ 10331 |     67.4 |   0.007 | SELECT to_regclass($1) IS NOT NULL AS present
+ 10000 |   1430.8 |   0.143 | INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, $4) RETURNING txid_current(), current_da
+  9766 |    209.1 |   0.021 | SELECT current_database()::text AS database, pg_postmaster_start_time() AS started_at, pg_notification_queue_usage() AS queue_usage, ARRAY(SELECT CASE
+  8000 |    345.4 |   0.043 | SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+  7003 |     14.6 |   0.002 | SET LOCAL plan_cache_mode = force_generic_plan
+  7003 |     69.8 |   0.010 | BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+  7003 |   4689.4 |   0.670 | WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS labels ), paused_queues AS MATERIALIZED
+  7003 |     30.6 |   0.004 | SET LOCAL jit = off
+  7003 |      7.8 |   0.001 | SET LOCAL enable_bitmapscan = off
+  7000 |    237.7 |   0.034 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8 AND worke
+  7000 |     41.2 |   0.006 | SELECT pg_try_advisory_xact_lock_shared($1, $2) AS acquired
+  6000 |      7.2 |   0.001 | RELEASE SAVEPOINT diesel_savepoint_1
+  6000 |      5.8 |   0.001 | SAVEPOINT diesel_savepoint_1
+  6000 |    169.8 |   0.028 | SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_events"."event_type", "harvest_events"."event
+  6000 |    199.8 |   0.033 | SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+  6000 |    136.1 |   0.023 | SELECT "harvest_task_queue"."state", ((("harvest_task_queue"."state" = $1) AND ("harvest_task_queue"."worker_id" = $2)) AND ("harvest_task_queue"."att
+  6000 |    260.7 |   0.043 | SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_executions"."workflow_id", "harvest_workfl
+  4000 |     21.2 |   0.005 | UPDATE harvest_mutex_locks SET lease_expires_at = now() + make_interval(secs => $2) WHERE holder_exec_id = $1
+  4000 |     85.6 |   0.021 | SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LIMIT $2 FOR UPDATE
+  4000 |     64.2 |   0.016 | SELECT "harvest_workflow_executions"."state" FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) LIMIT $2
+  4000 |     95.0 |   0.024 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8 AND worke
+  4000 |     41.6 |   0.010 | SELECT "harvest_timers"."id", "harvest_timers"."workflow_exec_id", "harvest_timers"."timer_id", "harvest_timers"."fires_at", "harvest_timers"."fired" 
+  4000 |     28.1 |   0.007 | SELECT "harvest_signals"."id", "harvest_signals"."workflow_exec_id", "harvest_signals"."signal_name", "harvest_signals"."payload", "harvest_signals"."
+  4000 |    557.1 |   0.139 | UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "completed_at" = $5 WHERE (("harvest_task_queue".
+  3000 |    420.2 |   0.140 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, scheduled_at = $2, created_at = clock_timestamp(), activity_name = $6, time
+  3000 |    265.9 |   0.089 | UPDATE "harvest_task_queue" SET "handler_started_attempt" = $1, "handler_started_at" = clock_timestamp() WHERE (("harvest_task_queue"."id" = $2) AND (
+  3000 |    399.5 |   0.133 | WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND task_type = $4 AND state = $5 FOR UPDATE ), updated AS ( UPDAT
+  3000 |    608.4 |   0.203 | INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activity_id", "input", "priority", "max_attem
+  3000 |     74.7 |   0.025 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7) WHERE id = $1 AND state = $8 AND worke
+  3000 |     81.2 |   0.027 | SELECT COALESCE(SUM(pg_column_size(event_data)), $5)::bigint FROM "harvest_events" WHERE ((("harvest_events"."workflow_exec_id" = $1) AND ("harvest_ev
+  3000 |     64.3 |   0.021 | SELECT id, queue_name, scheduled_at, priority, task_type FROM harvest_task_queue WHERE workflow_exec_id = $1 AND task_type = $3 AND state = $4 AND sch
+  1998 |     10.8 |   0.005 | SELECT e.* FROM harvest_events e JOIN LATERAL ( SELECT $3 AS running_exec FROM harvest_workflow_executions x WHERE x.id = e.workflow_exec_id AND x.sta
+  1000 |    365.2 |   0.365 | INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard_id", "input", "parent_id", "queue_name", "execution_
+  1000 |     16.3 |   0.016 | SELECT ("harvest_workflow_executions"."nd_blocked_at" IS NOT NULL) FROM "harvest_workflow_executions" WHERE ("harvest_workflow_executions"."id" = $1) 
+  1000 |      9.2 |   0.009 | SELECT lock_key FROM harvest_mutex_locks WHERE holder_exec_id = $1 ORDER BY lock_key
+(40 rows)
+
