@@ -303,6 +303,8 @@ fn parse_manifest() -> Vec<SuiteRow> {
         "autumn-harvest-conformance",
         "autumn-harvest-plugin",
         "autumn-harvest-redis",
+        // Issue #2257: the measurement crate's Postgres suite.
+        "history-load-gate",
         // Issue #1615: the example's live-Postgres acceptance suite.
         "standalone-runner",
     ];
@@ -950,6 +952,32 @@ fn standalone_runner_test_targets_have_a_running_row() {
                 && r.osclass == "linux"
                 && r.filter == "-"),
             "examples/standalone-runner/tests/{target}.rs needs a `linux standalone-runner {target}` row"
+        );
+    }
+}
+
+/// Issue #2257. The Postgres suite of the `history-load-gate` example runs
+/// from a manifest row. Without one, its tests never run in CI.
+#[test]
+fn history_load_gate_postgres_suite_has_a_running_row() {
+    let rows = parse_manifest();
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/history-load-gate/tests");
+    let targets: Vec<String> = std::fs::read_dir(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "rs").then(|| path.file_stem()?.to_str().map(str::to_owned))?
+        })
+        .collect();
+    assert!(!targets.is_empty(), "the example has a Postgres suite");
+    for target in targets {
+        assert!(
+            rows.iter().any(|r| r.krate == "history-load-gate"
+                && r.target == target
+                && r.osclass == "linux"
+                && r.filter == "-"),
+            "examples/history-load-gate/tests/{target}.rs needs a `linux history-load-gate {target}` row"
         );
     }
 }

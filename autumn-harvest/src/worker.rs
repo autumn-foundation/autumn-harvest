@@ -26851,6 +26851,9 @@ async fn process_workflow_task(
             resident: iter_resident,
             updates_deferred,
         } = drive;
+        // Issue #2257: stop the clock at the end of the drive, before any
+        // write below.
+        let resident_secs = prepare_started.elapsed().as_secs_f64();
         // Issue #2035: the dispatch window closed with updates left. This
         // claimed row only records the wake. The park that ends the cycle then
         // re-pends the task, and the next cycle runs the rest. A failed wake
@@ -26871,7 +26874,7 @@ async fn process_workflow_task(
                 &prepared.execution.workflow_name,
                 &task.queue_name,
                 outcome,
-                prepare_started.elapsed().as_secs_f64(),
+                resident_secs,
             );
         }
 

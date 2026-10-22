@@ -6,8 +6,9 @@
 //! ```
 //!
 //! The binary applies the Harvest migrations, seeds the histories, times
-//! the loads and prints Markdown tables. It deletes each seeded run at the
-//! end. `README.md` lists the variables.
+//! the loads and prints Markdown tables. It deletes each seeded run, also
+//! after a failed step. With `SIZES` and `RUNS` empty it opens no database
+//! and only applies the gate. `README.md` lists the variables.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,7 +19,7 @@ use autumn_harvest::types::ExecutionId;
 use diesel_async::{AsyncConnection, AsyncPgConnection};
 use history_load_gate::cache_model::{self, Pattern};
 use history_load_gate::gate::{self, Observed, Thresholds, Trip, Verdict};
-use history_load_gate::sqlite_side::SqliteStore;
+use history_load_gate::sqlite_side::{SqliteReader, SqliteStore};
 use history_load_gate::stats::{self, Summary};
 use history_load_gate::{BoxError, pg_side, seed};
 
@@ -30,7 +31,7 @@ const CACHE_ENTRIES: usize = 1_000;
 
 /// The settings that the environment gives.
 struct Config {
-    url: String,
+    url: Option<String>,
     sizes: Vec<usize>,
     reps: usize,
     payload_bytes: usize,
@@ -43,21 +44,32 @@ struct Config {
 
 impl Config {
     fn from_env() -> Result<Self, BoxError> {
-        let fleet_p99 = env_opt::<f64>("FLEET_COLD_P99_MS")?;
-        Ok(Self {
-            url: std::env::var("DATABASE_URL").map_err(|_| "set DATABASE_URL")?,
-            sizes: env_list("SIZES", &[10_000, 50_000])?,
-            reps: env_opt("REPS")?.unwrap_or(30),
+        let mut sizes = env_list("SIZES", &[10_000, 50_000])?;
+        sizes.sort_unstable();
+        let config = Self {
+            url: std::env::var("DATABASE_URL").ok(),
+            sizes,
+            reps: env_opt("REPS")?.unwrap_or(100),
             payload_bytes: env_opt("PAYLOAD_BYTES")?.unwrap_or(256),
             runs: env_list("RUNS", &[1_000, 10_000, 100_000])?,
             run_events: env_opt("RUN_EVENTS")?.unwrap_or(21),
             concurrency: env_opt("CONCURRENCY")?.unwrap_or(8),
             model_runs: env_list("MODEL_RUNS", &[500, 1_000, 1_250, 2_000, 10_000, 100_000])?,
-            fleet: Observed {
-                cold_share: env_opt("FLEET_COLD_SHARE")?,
-                cold_p99: fleet_p99.map(|ms| Duration::from_secs_f64(ms / 1_000.0)),
-            },
-        })
+            fleet: Observed::from_fleet(
+                env_opt("FLEET_COLD_SHARE")?,
+                env_opt("FLEET_COLD_P99_MS")?,
+            )?,
+        };
+        if config.sizes.contains(&0) || config.run_events == 0 {
+            return Err("a history needs at least one event".into());
+        }
+        if config.reps == 0 || config.concurrency == 0 {
+            return Err("REPS and CONCURRENCY must be at least 1".into());
+        }
+        if config.url.is_none() && !(config.sizes.is_empty() && config.runs.is_empty()) {
+            return Err("set DATABASE_URL, or set SIZES and RUNS empty".into());
+        }
+        Ok(config)
     }
 }
 
@@ -101,23 +113,28 @@ struct WarmupResult {
     pg_serial: Duration,
     pg_parallel: Duration,
     sqlite_serial: Duration,
+    sqlite_parallel: Duration,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
     let config = Config::from_env()?;
-    let mut conn = AsyncPgConnection::establish(&config.url).await?;
-    migrate::apply_to_connection(&mut conn, &migrate::embedded()).await?;
-    let dir = tempfile::tempdir()?;
-    let mut sqlite = SqliteStore::open(&dir.path().join("history-cache.db"))?;
-
     let mut sizes = Vec::new();
-    for &events in &config.sizes {
-        sizes.push(measure_size(&mut conn, &mut sqlite, &config, events).await?);
-    }
     let mut warmups = Vec::new();
-    for &runs in &config.runs {
-        warmups.push(measure_warmup(&mut conn, &mut sqlite, &config, runs).await?);
+    // The gate alone needs no database, so a fleet URL never gets migrated.
+    if let Some(url) = &config.url
+        && !(config.sizes.is_empty() && config.runs.is_empty())
+    {
+        let mut conn = AsyncPgConnection::establish(url).await?;
+        migrate::apply_to_connection(&mut conn, &migrate::embedded()).await?;
+        let dir = tempfile::tempdir()?;
+        let mut sqlite = SqliteStore::open(&dir.path().join("history-cache.db"))?;
+        for &events in &config.sizes {
+            sizes.push(measure_size(&mut conn, &mut sqlite, &config, events).await?);
+        }
+        for &runs in &config.runs {
+            warmups.push(measure_warmup(&mut conn, &mut sqlite, &config, url, runs).await?);
+        }
     }
 
     print_sizes(&sizes, &config);
@@ -128,6 +145,10 @@ async fn main() -> Result<(), BoxError> {
 }
 
 /// Times `config.reps` loads of one history of `events` events.
+#[allow(
+    clippy::future_not_send,
+    reason = "`main` awaits it on its own task, and the store is not `Sync`"
+)]
 async fn measure_size(
     conn: &mut AsyncPgConnection,
     sqlite: &mut SqliteStore,
@@ -140,8 +161,44 @@ async fn measure_size(
         .map(|event| serde_json::to_string(event).map(|text| text.len()))
         .sum::<Result<usize, _>>()?;
     let pg_run = pg_side::seed(conn, &history, QUEUE).await?;
-    let lite_run = sqlite.seed(&history)?;
+    let lite_run = match sqlite.seed(&history) {
+        Ok(run) => run,
+        Err(error) => {
+            pg_side::delete_runs(conn, &[pg_run]).await?;
+            return Err(error);
+        }
+    };
+    let timed = time_size(conn, sqlite, config, events, pg_run, lite_run).await;
+    // Delete the runs on success and on failure alike.
+    pg_side::delete_runs(conn, &[pg_run]).await?;
+    sqlite.delete_runs(&[lite_run])?;
+    let (pg_read, pg_cold_path, sqlite_read) = timed?;
+    Ok(SizeResult {
+        events,
+        stored_bytes,
+        pg_read: stats::summarize(&pg_read).ok_or("no samples")?,
+        pg_cold_path: stats::summarize(&pg_cold_path).ok_or("no samples")?,
+        sqlite_read: stats::summarize(&sqlite_read).ok_or("no samples")?,
+    })
+}
 
+/// The load samples of one size: one Postgres read, the two-read cold path
+/// and one `SQLite` read.
+type SizeSamples = (Vec<Duration>, Vec<Duration>, Vec<Duration>);
+
+/// Times the loads of the seeded runs `pg_run` and `lite_run`.
+#[allow(
+    clippy::future_not_send,
+    reason = "`main` awaits it on its own task, and the store is not `Sync`"
+)]
+async fn time_size(
+    conn: &mut AsyncPgConnection,
+    sqlite: &SqliteStore,
+    config: &Config,
+    events: usize,
+    pg_run: ExecutionId,
+    lite_run: ExecutionId,
+) -> Result<SizeSamples, BoxError> {
     // One untimed load of each warms both caches.
     check_len(pg_side::load(conn, pg_run).await?.events.len(), events)?;
     check_len(sqlite.load(lite_run)?.len(), events)?;
@@ -154,29 +211,23 @@ async fn measure_size(
         let loaded = pg_side::load(conn, pg_run).await?;
         pg_read.push(started.elapsed());
         check_len(loaded.events.len(), events)?;
+        drop(loaded);
 
-        // The cold path of the worker reads the history twice.
+        // The worker keeps the first history while it reads the second. Its
+        // second read also sums the stored bytes, which this one skips.
         let started = Instant::now();
         let first = pg_side::load(conn, pg_run).await?;
         let second = pg_side::load(conn, pg_run).await?;
         pg_cold_path.push(started.elapsed());
         check_len(first.events.len() + second.events.len(), 2 * events)?;
+        drop((first, second));
 
         let started = Instant::now();
         let loaded = sqlite.load(lite_run)?;
         sqlite_read.push(started.elapsed());
         check_len(loaded.len(), events)?;
     }
-
-    pg_side::delete_runs(conn, &[pg_run]).await?;
-    sqlite.delete_runs(&[lite_run])?;
-    Ok(SizeResult {
-        events,
-        stored_bytes,
-        pg_read: stats::summarize(&pg_read).ok_or("no samples")?,
-        pg_cold_path: stats::summarize(&pg_cold_path).ok_or("no samples")?,
-        sqlite_read: stats::summarize(&sqlite_read).ok_or("no samples")?,
-    })
+    Ok((pg_read, pg_cold_path, sqlite_read))
 }
 
 /// Times the cold load of `runs` live runs, as after an owner restart.
@@ -184,34 +235,59 @@ async fn measure_warmup(
     conn: &mut AsyncPgConnection,
     sqlite: &mut SqliteStore,
     config: &Config,
+    url: &str,
     runs: usize,
 ) -> Result<WarmupResult, BoxError> {
     let history = seed::history(config.run_events, config.payload_bytes);
     let pg_template = pg_side::seed(conn, &history, QUEUE).await?;
-    let pg_runs = Arc::new(pg_side::clone_runs(conn, pg_template, runs).await?);
-    let lite_template = sqlite.seed(&history)?;
-    let lite_runs = sqlite.clone_runs(lite_template, runs)?;
+    let mut pg_all = vec![pg_template];
+    let mut lite_all = Vec::new();
+    let timed = time_warmup(
+        conn,
+        sqlite,
+        config,
+        url,
+        runs,
+        &history,
+        (&mut pg_all, &mut lite_all),
+    )
+    .await;
+    // Delete the runs on success and on failure alike.
+    pg_side::delete_runs(conn, &pg_all).await?;
+    sqlite.delete_runs(&lite_all)?;
+    timed
+}
+
+/// Seeds `runs` copies on both stores and times one pass over them. Each
+/// seeded id goes into `seeded`, so the caller can delete it.
+async fn time_warmup(
+    conn: &mut AsyncPgConnection,
+    sqlite: &mut SqliteStore,
+    config: &Config,
+    url: &str,
+    runs: usize,
+    history: &[autumn_harvest::WorkflowEvent],
+    seeded: (&mut Vec<ExecutionId>, &mut Vec<ExecutionId>),
+) -> Result<WarmupResult, BoxError> {
+    let (pg_all, lite_all) = seeded;
+    let pg_runs = Arc::new(pg_side::clone_runs(conn, pg_all[0], runs).await?);
+    pg_all.extend(pg_runs.iter().copied());
+    let lite_template = sqlite.seed(history)?;
+    lite_all.push(lite_template);
+    let lite_runs = Arc::new(sqlite.clone_runs(lite_template, runs)?);
+    lite_all.extend(lite_runs.iter().copied());
 
     // A first pass warms the buffers of both stores. A restarted owner
     // process loses its own memory, not the page cache of the database.
     load_pg_serial(conn, &pg_runs, config.run_events).await?;
-    load_sqlite(sqlite, &lite_runs, config.run_events)?;
+    load_sqlite_serial(sqlite, &lite_runs, config.run_events)?;
 
-    let pg_serial = load_pg_serial(conn, &pg_runs, config.run_events).await?;
-    let pg_parallel = load_pg_parallel(config, &pg_runs).await?;
-    let sqlite_serial = load_sqlite(sqlite, &lite_runs, config.run_events)?;
-
-    let mut pg_all: Vec<ExecutionId> = pg_runs.as_ref().clone();
-    pg_all.push(pg_template);
-    pg_side::delete_runs(conn, &pg_all).await?;
-    let mut lite_all = lite_runs;
-    lite_all.push(lite_template);
-    sqlite.delete_runs(&lite_all)?;
     Ok(WarmupResult {
         runs,
-        pg_serial,
-        pg_parallel,
-        sqlite_serial,
+        pg_serial: load_pg_serial(conn, &pg_runs, config.run_events).await?,
+        pg_parallel: load_pg_parallel(config, url, &pg_runs).await?,
+        sqlite_serial: load_sqlite_serial(sqlite, &lite_runs, config.run_events)?,
+        sqlite_parallel: load_sqlite_parallel(config, sqlite, &lite_runs)?,
     })
 }
 
@@ -232,11 +308,12 @@ async fn load_pg_serial(
 /// wall time.
 async fn load_pg_parallel(
     config: &Config,
+    url: &str,
     ids: &Arc<Vec<ExecutionId>>,
 ) -> Result<Duration, BoxError> {
     let mut conns = Vec::with_capacity(config.concurrency);
-    for _ in 0..config.concurrency.max(1) {
-        conns.push(AsyncPgConnection::establish(&config.url).await?);
+    for _ in 0..config.concurrency {
+        conns.push(AsyncPgConnection::establish(url).await?);
     }
     let next = Arc::new(AtomicUsize::new(0));
     let events = config.run_events;
@@ -261,8 +338,9 @@ async fn load_pg_parallel(
     Ok(started.elapsed())
 }
 
-/// Loads each run in `ids` from `SQLite`. Returns the wall time.
-fn load_sqlite(
+/// Loads each run in `ids` from `SQLite` on one connection. Returns the
+/// wall time.
+fn load_sqlite_serial(
     sqlite: &SqliteStore,
     ids: &[ExecutionId],
     events: usize,
@@ -271,6 +349,40 @@ fn load_sqlite(
     for id in ids {
         check_len(sqlite.load(*id)?.len(), events)?;
     }
+    Ok(started.elapsed())
+}
+
+/// Loads each run in `ids` from `SQLite` on `config.concurrency` threads,
+/// each with its own connection. Returns the wall time.
+fn load_sqlite_parallel(
+    config: &Config,
+    sqlite: &SqliteStore,
+    ids: &[ExecutionId],
+) -> Result<Duration, BoxError> {
+    let readers: Vec<SqliteReader> = (0..config.concurrency)
+        .map(|_| sqlite.reader())
+        .collect::<Result<_, _>>()?;
+    let next = AtomicUsize::new(0);
+    let events = config.run_events;
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = readers
+            .into_iter()
+            .map(|reader| {
+                let next = &next;
+                scope.spawn(move || -> Result<(), BoxError> {
+                    while let Some(id) = ids.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        check_len(reader.load(*id)?.len(), events)?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().map_err(|_| "a reader thread panicked")??;
+        }
+        Ok::<(), BoxError>(())
+    })?;
     Ok(started.elapsed())
 }
 
@@ -305,7 +417,8 @@ fn print_sizes(sizes: &[SizeResult], config: &Config) {
     }
     println!("## History load, one run\n");
     println!(
-        "{} reps per size. Payload text {} bytes per event. Milliseconds, p50 / p99.\n",
+        "{} reps per size. Payload text {} bytes per event. Milliseconds, p50 / p99, \
+         nearest rank.\n",
         config.reps, config.payload_bytes
     );
     println!(
@@ -333,24 +446,25 @@ fn print_warmups(warmups: &[WarmupResult], config: &Config) {
     if warmups.is_empty() {
         return;
     }
+    let conns = config.concurrency;
     println!("## Owner-restart warm-up\n");
     println!(
-        "Each live run holds {} events. The time is the wall time to load every run once. \
-         Postgres runs on 1 and on {} connections. SQLite runs on 1 connection.\n",
-        config.run_events, config.concurrency
+        "Each live run holds {} events. The time is the wall time to load every run once, \
+         on 1 connection and on {conns}.\n",
+        config.run_events
     );
     println!(
-        "| Live runs | Postgres, 1 conn | Postgres, {} conns | SQLite, 1 conn | Runs past the {CACHE_ENTRIES}-entry cache |",
-        config.concurrency
+        "| Live runs | Postgres, 1 conn | Postgres, {conns} conns | SQLite, 1 conn | SQLite, {conns} conns | Runs past the {CACHE_ENTRIES}-entry cache |"
     );
-    println!("|---:|---:|---:|---:|---:|");
+    println!("|---:|---:|---:|---:|---:|---:|");
     for warmup in warmups {
         println!(
-            "| {} | {} ms | {} ms | {} ms | {} |",
+            "| {} | {} ms | {} ms | {} ms | {} ms | {} |",
             warmup.runs,
             ms(warmup.pg_serial),
             ms(warmup.pg_parallel),
             ms(warmup.sqlite_serial),
+            ms(warmup.sqlite_parallel),
             warmup.runs.saturating_sub(CACHE_ENTRIES),
         );
     }
@@ -395,17 +509,19 @@ fn print_verdict(sizes: &[SizeResult], config: &Config) {
         ms(thresholds.cold_p99)
     );
     // The bench times one history size at a time, so it shows which sizes
-    // pass the p99 threshold. Only a fleet week gives the p99 itself.
+    // pass the p99 threshold. Only a fleet week gives the p99 itself. The
+    // sizes are sorted, so the first match is the smallest.
     match sizes
         .iter()
         .find(|size| size.pg_cold_path.p99 > thresholds.cold_p99)
     {
         Some(size) => println!(
-            "- Bench: the cold path of {} events takes {} ms at p99, above the threshold. \
-             A fleet whose cold p99 decision loads that many events trips the gate.",
+            "- Bench: the smallest measured size whose cold path passes the threshold at p99 \
+             is {} events, at {} ms.",
             size.events,
             ms(size.pg_cold_path.p99)
         ),
+        None if sizes.is_empty() => println!("- Bench: not run."),
         None => println!("- Bench: no measured size passes the p99 threshold."),
     }
     let shown = |value: Option<String>| value.unwrap_or_else(|| "not given".to_owned());

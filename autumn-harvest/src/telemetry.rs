@@ -641,12 +641,14 @@ pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 /// workflow. Each other value names why it replayed.
 pub const METRIC_WORKFLOW_RESIDENT: &str = "harvest.workflow.resident";
 
-/// Histogram: seconds from the start of the history load to the end of the
-/// first drive of one decision (issue #2257).
+/// Histogram: seconds from the start of a decision to the end of its first
+/// drive (issue #2257).
 ///
 /// Labels: those of [`METRIC_WORKFLOW_RESIDENT`]. The worker records one
-/// sample with each count. The stage 2 gate reads the p99 of
-/// `outcome="cold"`.
+/// sample with each count. The window holds the cache take, the history
+/// load, the wake ingest, the pre-drive writes and the first drive. The
+/// stage 2 gate reads the p99 of `outcome="cold"`. The `hit` p99 shows the
+/// part that a disk cache does not save.
 pub const METRIC_WORKFLOW_RESIDENT_DURATION: &str = "harvest.workflow.resident.duration";
 
 /// Counter: incremented once per `signal_external_workflow` call after the
@@ -3997,8 +3999,9 @@ pub trait MetricsRecorder: Send + Sync {
     /// The time of one decision up to the end of its first drive (issue
     /// #2257).
     ///
-    /// The clock starts before the history load. The worker calls this with
-    /// each [`Self::record_workflow_resident`] call and the same `outcome`.
+    /// The clock starts before the history load and stops before any write
+    /// after the drive. The worker calls this with each
+    /// [`Self::record_workflow_resident`] call and the same `outcome`.
     ///
     /// Maps to the histogram [`METRIC_WORKFLOW_RESIDENT_DURATION`], in
     /// seconds.

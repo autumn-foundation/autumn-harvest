@@ -53,7 +53,10 @@ pub async fn seed(
 /// Copies the run `template` and its events into `count` new runs.
 ///
 /// The copy runs in SQL, so a seed of 100k runs takes seconds. Each copy
-/// gets a new id, run id and workflow id. Returns the new ids.
+/// gets a new id, run id and workflow id. The events go in run by run, as
+/// on the `SQLite` side, so both stores keep the rows of one run together.
+/// A busy fleet scatters them. Each copied event takes the default
+/// `cohort`. That fits the flat layout only. Returns the new ids.
 ///
 /// # Errors
 ///
@@ -84,7 +87,8 @@ pub async fn clone_runs(
            (workflow_exec_id, event_id, event_type, event_data, timestamp) \
          SELECT c.id, ev.event_id, ev.event_type, ev.event_data, ev.timestamp \
          FROM harvest_events ev CROSS JOIN unnest($2::uuid[]) AS c(id) \
-         WHERE ev.workflow_exec_id = $1",
+         WHERE ev.workflow_exec_id = $1 \
+         ORDER BY c.id, ev.event_id",
     )
     .bind::<SqlUuid, _>(template.as_uuid())
     .bind::<Array<SqlUuid>, _>(&uuids)

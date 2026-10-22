@@ -16,18 +16,21 @@ records its bench half in `docs/rnd/2026-10-22-stage-2-gate.md`.
   p99".
 - **`examples/history-load-gate`.** A new measurement crate. It times one
   history load from Postgres, through the worker load path, and from a
-  local SQLite file, through `SqliteRuntime::load_history`. It times the
-  cold load of every live run after an owner restart. It drives the real
-  `WorkflowCache` to model the cold share of the 1,000-entry cap. It
-  applies the thresholds to fleet values: one trip gives `go`, both values
-  with no trip give `no-go`, anything else is `undecided`. CI lints it and
-  runs its tests.
+  local SQLite file, with the schema and query of `autumn-harvest-sqlite`.
+  Both sides decode each row through `PayloadCodecs::decode_event`. It
+  times the cold load of every live run after an owner restart. It drives
+  the real `WorkflowCache` to model the cold share of the 1,000-entry cap.
+  It applies the thresholds to fleet values: one trip gives `go`, both
+  values with no trip give `no-go`, anything else is `undecided`. With no
+  sizes and no runs, it opens no database. CI lints it, runs its unit
+  tests, and runs its Postgres test from a `linux` manifest row.
 
-**Results.** One Postgres read of a 10,000-event history takes about
-55 ms. The cold path reads the history twice, about 140 ms. At the
-50,000-event cap it reads for about 0.9 s. A local SQLite read is 1.9 to
-3.6 times faster than one Postgres read. Under owner mode, more than 1,250
-live runs per owner give a cold share above 20% from the cache cap alone.
+**Results.** One Postgres read of a 10,000-event history takes 44 to
+64 ms at p50. The cold path reads the history twice, 100 to 138 ms. Its
+p99 passes 50 ms near 3,400 events. A local SQLite read is 2.2 to 3.3
+times faster than one Postgres read. Under a uniform load and owner mode,
+more than 1,250 live runs per owner give a cold share above 20% from the
+cache cap alone.
 
 **Finding.** The cold path decodes the full history twice. A single read
 would halve it with no new store.

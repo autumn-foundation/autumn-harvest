@@ -3587,6 +3587,8 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
  "tokio",
  "uuid",
 ]

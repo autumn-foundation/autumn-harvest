@@ -1,8 +1,8 @@
 //! The stage 2 thresholds of `docs/rnd/typed-state-snapshots.md`.
 //!
-//! Either threshold trips the gate. Each rule is a strict `>`, as the spike
-//! wrote it. So one trip decides, even when the other value is missing.
-//! Only complete data with no trip gives a no-go.
+//! Either threshold trips the gate, so one trip decides even when the other
+//! value is missing. Only complete data with no trip gives a no-go. Each
+//! rule is a strict `>`, as the spike wrote it.
 
 use std::time::Duration;
 
@@ -52,6 +52,33 @@ pub enum Verdict {
     NoGo,
     /// No value tripped, and a value is missing.
     Undecided,
+}
+
+impl Observed {
+    /// Builds an observation from raw fleet values: a share from 0 to 1, and
+    /// a p99 in milliseconds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a share outside 0 to 1, or a p99 that is
+    /// negative, not a number or too large.
+    pub fn from_fleet(share: Option<f64>, p99_ms: Option<f64>) -> Result<Self, String> {
+        if let Some(share) = share
+            && !(0.0..=1.0).contains(&share)
+        {
+            return Err(format!("a cold share is from 0 to 1, not {share}"));
+        }
+        let cold_p99 = p99_ms
+            .map(|ms| {
+                Duration::try_from_secs_f64(ms / 1_000.0)
+                    .map_err(|error| format!("a cold p99 of {ms} ms is not valid: {error}"))
+            })
+            .transpose()?;
+        Ok(Self {
+            cold_share: share,
+            cold_p99,
+        })
+    }
 }
 
 /// Applies `thresholds` to `observed`.
@@ -135,6 +162,33 @@ mod tests {
             verdict(&Thresholds::default(), &share_only),
             Verdict::Go(vec![Trip::ColdShare(0.4)])
         );
+    }
+
+    #[test]
+    fn fleet_values_parse_into_an_observation() {
+        let observed = Observed::from_fleet(Some(0.07), Some(41.5)).expect("valid");
+        assert_eq!(observed.cold_share, Some(0.07));
+        assert_eq!(observed.cold_p99, Some(Duration::from_micros(41_500)));
+        assert_eq!(
+            Observed::from_fleet(None, None).expect("valid"),
+            Observed::default()
+        );
+    }
+
+    #[test]
+    fn a_share_outside_zero_to_one_is_refused() {
+        // `7` most likely means 7%, which would read as 700%.
+        for share in [7.0, -0.1, f64::NAN] {
+            assert!(Observed::from_fleet(Some(share), None).is_err(), "{share}");
+        }
+        assert!(Observed::from_fleet(Some(1.0), None).is_ok());
+    }
+
+    #[test]
+    fn a_bad_p99_is_refused_without_a_panic() {
+        for p99 in [-1.0, f64::NAN, f64::INFINITY, 1e300] {
+            assert!(Observed::from_fleet(None, Some(p99)).is_err(), "{p99}");
+        }
     }
 
     #[test]

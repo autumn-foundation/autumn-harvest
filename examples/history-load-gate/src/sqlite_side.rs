@@ -1,32 +1,77 @@
 //! The local `SQLite` side: a prototype disk cache read.
 //!
-//! The file has the schema of `autumn-harvest-sqlite`. A second connection
-//! writes the rows, and the runtime reads them back through
-//! `SqliteRuntime::load_history`. That is the real read path of the
-//! backend: one ordered scan of `harvest_events` and a JSON decode of each
-//! row.
+//! The file has the schema of `autumn-harvest-sqlite`, which the runtime
+//! applies. The read runs the query of that backend: one ordered scan of
+//! `harvest_events`. Each row then goes through `PayloadCodecs::decode_event`,
+//! as on the Postgres side. A disk cache holds codec-encoded payloads, so it
+//! pays that decode too.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use autumn_harvest::WorkflowEvent;
+use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::types::ExecutionId;
 use autumn_harvest_sqlite::SqliteRuntime;
 use rusqlite::Connection;
 
 use crate::BoxError;
 
-/// A `SQLite` file with a runtime that reads and a connection that writes.
+/// A `SQLite` file with a connection that writes and one that reads.
 pub struct SqliteStore {
-    runtime: SqliteRuntime,
+    // The runtime applies the schema and holds the single-writer lock.
+    _runtime: SqliteRuntime,
+    path: PathBuf,
     writer: Connection,
+    reader: SqliteReader,
+}
+
+/// One read connection. Each thread of a parallel load opens its own.
+pub struct SqliteReader {
+    conn: Connection,
+    codecs: PayloadCodecs,
+}
+
+impl SqliteReader {
+    /// Opens a read connection to the file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be opened.
+    pub fn open(path: &Path) -> Result<Self, BoxError> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
+        Ok(Self {
+            conn,
+            codecs: PayloadCodecs::default(),
+        })
+    }
+
+    /// Loads the history of `exec_id` with the backend query and the codec
+    /// decode. An unknown run gives an empty history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query fails or a row does not decode.
+    pub fn load(&self, exec_id: ExecutionId) -> Result<Vec<WorkflowEvent>, BoxError> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT event_json FROM harvest_events WHERE exec_id = ?1 ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([exec_id.to_string()], |row| row.get::<_, String>(0))?;
+        let mut events = Vec::new();
+        for row in rows {
+            let value: serde_json::Value = serde_json::from_str(&row?)?;
+            events.push(self.codecs.decode_event(value)?);
+        }
+        Ok(events)
+    }
 }
 
 impl SqliteStore {
     /// Opens or creates the file at `path`.
     ///
     /// The runtime applies the schema and takes the single-writer lock. The
-    /// writer is a plain second connection. The lock is a separate file, so
-    /// it does not block the writer.
+    /// writer and the readers are plain connections. The lock is a separate
+    /// file, so it does not block them.
     ///
     /// # Errors
     ///
@@ -35,7 +80,21 @@ impl SqliteStore {
         let runtime = SqliteRuntime::open(path)?;
         let writer = Connection::open(path)?;
         writer.execute_batch("PRAGMA busy_timeout = 5000;")?;
-        Ok(Self { runtime, writer })
+        Ok(Self {
+            _runtime: runtime,
+            path: path.to_path_buf(),
+            writer,
+            reader: SqliteReader::open(path)?,
+        })
+    }
+
+    /// Opens another read connection to the same file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be opened.
+    pub fn reader(&self) -> Result<SqliteReader, BoxError> {
+        SqliteReader::open(&self.path)
     }
 
     /// Stores `events` as one new run. Returns its id.
@@ -105,13 +164,13 @@ impl SqliteStore {
         Ok(ids)
     }
 
-    /// Loads the history of `exec_id` through the runtime read path.
+    /// Loads the history of `exec_id` on the store's own reader.
     ///
     /// # Errors
     ///
-    /// Returns an error for an unknown run or a row that does not decode.
+    /// Returns an error when the query fails or a row does not decode.
     pub fn load(&self, exec_id: ExecutionId) -> Result<Vec<WorkflowEvent>, BoxError> {
-        Ok(self.runtime.load_history(exec_id)?)
+        self.reader.load(exec_id)
     }
 
     /// Deletes the runs `ids` and their events.
@@ -170,8 +229,16 @@ mod tests {
                 values(&history)
             );
         }
+        let reader = store.reader().expect("reader");
+        assert_eq!(
+            values(&reader.load(template).expect("load")),
+            values(&history)
+        );
         store.delete_runs(&clones).expect("delete");
-        assert!(store.load(clones[0]).is_err(), "a deleted run is unknown");
+        assert!(
+            store.load(clones[0]).expect("load").is_empty(),
+            "a deleted run has no events"
+        );
         assert_eq!(
             values(&store.load(template).expect("load")),
             values(&history)

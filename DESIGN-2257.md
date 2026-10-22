@@ -43,7 +43,7 @@ decision path.**
 | # | Idea | Verdict |
 |---|------|---------|
 | B1 | Read the cold share from the existing counter. | **Adopted.** It needs no code. |
-| B2 | A new histogram `harvest.workflow.resident.duration{workflow, queue, outcome}`. It times the history load and the first drive of each decision. | **Adopted.** It gives the cold p99 on a fleet. |
+| B2 | A new histogram `harvest.workflow.resident.duration{workflow, queue, outcome}`. It times each decision from the start of the history load to the end of the first drive. | **Adopted.** It gives the cold p99 on a fleet. |
 | B3 | Add `outcome` to `harvest.workflow.duration`. | Rejected. That metric starts after the load. A label change also breaks dashboards. |
 | B4 | A histogram of the history load only. | Rejected for now. B2 covers the load. The bench splits load from replay. |
 | B5 | A bench in `autumn-harvest/benches`. | Rejected. The core crate cannot depend on `autumn-harvest-sqlite`. |
@@ -54,24 +54,27 @@ decision path.**
 | B10 | A dashboard panel with both gate lines. | **Adopted.** The guard needs a panel anyway. |
 | B11 | A Prometheus recording-rule pack for the gate. | Rejected. The record doc gives the two 7-day queries. A rule pack needs its own guard suite. |
 | B12 | Remove the first full read of the cold path. | Rejected here. It changes the decision path. It is a follow-up finding. |
-| B13 | Drive the real `WorkflowCache` over more live runs than its cap. | **Adopted.** Under owner mode, the cap alone sets a floor for the cold share. |
+| B13 | Drive the real `WorkflowCache` over more live runs than its cap. | **Adopted.** Under owner mode, the cap alone causes cold decisions. The model gives the share for a uniform and a round-robin load. |
 
 ### 0.3 Reverse brainstorm: how can the gate mislead?
 
 | # | How to make it wrong | Counter-measure |
 |---|----------------------|-----------------|
-| H1 | Time only the drive, so a disk cache looks useless. | B2 starts the clock before the history load. |
+| H1 | Time only the drive, so a disk cache looks useless. | B2 starts the clock before the history load. It stops the clock before any write after the drive. |
 | H2 | Time different work for each store. | Both sides load the same events and decode them into `WorkflowEvent`. |
 | H3 | Compare a warm SQLite page cache with a cold Postgres. | Both stores run warm. The record says so, and says that both stay warm after an owner restart. |
 | H4 | A seed that does not decode. | A unit test round-trips the generated events. Each timed load checks the event count. |
-| H5 | One sample per size. | Each size runs many reps. The crate prints p50 and p99. |
-| H6 | A verdict from bench data alone. A bench worst case posed as a fleet p99 always says go. | Only fleet values feed the verdict. With no trip and a missing value, it reads `undecided`. The bench prints the history size that passes 50 ms. |
+| H5 | One sample per size, or a p99 that is the largest of a few samples. | Each size runs 100 loads. The crate prints the nearest-rank p50 and p99. |
+| H6 | A verdict from bench data alone. A bench worst case posed as a fleet p99 always says go. | Only fleet values feed the verdict. With no trip and a missing value, it reads `undecided`. The bench prints the smallest measured size that passes 50 ms. |
 | H7 | Buckets too coarse to resolve 50 ms. | The telemetry docs ask for a bucket bound at 0.05 s. |
-| H8 | The histogram adds cost to each decision. | One `Instant` and one record per decision, next to the counter. The no-op default costs nothing. |
+| H8 | The histogram adds cost to each decision. | One `Instant` and one record per decision, next to the counter. The no-op default costs one clock read. |
 | H9 | High label cardinality. | Same labels as the counter, all bounded. |
 | H10 | A partial run counts as a cold sample. | The worker records the duration with the counter, once per decision attempt. |
-| H11 | The seed leaks into a shared database. | The crate tags its runs and deletes them at the end. |
+| H11 | The seed leaks into a shared database. | The crate needs a dedicated database. It deletes its runs after each step, also after a failure. |
 | H12 | A threshold edge flips the verdict. | The rule is strict `>`, as the spike wrote it. Tests pin 20% and 50 ms exactly. |
+| H13 | Time live work, so a disk cache looks needed. | The docs name each part of the window. Read the `hit` p99 beside the cold p99. |
+| H14 | Compare different decode work. | Both stores decode each row through `PayloadCodecs::decode_event`. |
+| H15 | Point the gate command at the fleet, so it migrates production. | With `SIZES` and `RUNS` empty, the crate opens no database. |
 
 ### 0.4 Six thinking hats
 

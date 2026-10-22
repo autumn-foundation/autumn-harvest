@@ -1,11 +1,12 @@
 //! The cold share that the entry cap of `WorkflowCache` alone causes.
 //!
-//! Under owner mode, an owner keeps each run of its partitions for good. A
-//! decision replays cold only after an eviction, a restart or a change of
-//! owner. This model drives the real `WorkflowCache` as the worker does: a
-//! decision takes the entry of its run, and the commit puts it back. It
-//! counts the decisions that find no entry. The model has no restart and
-//! no change of owner, so it gives a floor for the fleet cold share.
+//! Under owner mode, an owner keeps the runs of its partitions until a
+//! restart or a change of owner. A decision then replays cold only after an
+//! eviction. This model drives the real `WorkflowCache` as the worker does:
+//! a decision takes the entry of its run, and the commit puts it back. It
+//! counts the decisions that find no entry. For a given access pattern,
+//! restarts and owner changes only add cold decisions. A skewed load misses
+//! less than a uniform one.
 
 use autumn_harvest::cache::{CachedWorkflowState, WorkflowCache};
 use uuid::Uuid;

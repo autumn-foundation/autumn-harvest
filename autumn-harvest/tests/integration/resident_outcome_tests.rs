@@ -66,6 +66,25 @@ impl OutcomeLog {
             .collect()
     }
 
+    /// The outcomes and the durations of `workflow`, read under both locks
+    /// at once (issue #2257).
+    fn paired_of(&self, workflow: &str) -> (Vec<ResidentOutcome>, Vec<(ResidentOutcome, f64)>) {
+        let outcomes = self.outcomes.lock().expect("outcome log lock");
+        let durations = self.durations.lock().expect("duration log lock");
+        (
+            outcomes
+                .iter()
+                .filter(|(name, _)| name == workflow)
+                .map(|(_, outcome)| *outcome)
+                .collect(),
+            durations
+                .iter()
+                .filter(|(name, ..)| name == workflow)
+                .map(|(_, outcome, seconds)| (*outcome, *seconds))
+                .collect(),
+        )
+    }
+
     /// Each duration sample of `workflow`, in order (issue #2257).
     fn durations_of(&self, workflow: &str) -> Vec<(ResidentOutcome, f64)> {
         self.durations
@@ -643,11 +662,19 @@ async fn a_sequential_run_records_a_duration_per_decision() {
     wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
         .await;
 
-    let durations = log.durations_of(SEQUENTIAL);
+    // The worker records the count, then the duration. Wait until the last
+    // duration lands, so one snapshot holds both.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (counted, durations) = loop {
+        let (counted, durations) = log.paired_of(SEQUENTIAL);
+        if counted.len() == durations.len() || Instant::now() > deadline {
+            break (counted, durations);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     let outcomes: Vec<ResidentOutcome> = durations.iter().map(|(outcome, _)| *outcome).collect();
     assert_eq!(
-        outcomes,
-        log.of(SEQUENTIAL),
+        outcomes, counted,
         "one duration per outcome, with the same outcome"
     );
     assert_eq!(outcomes.first(), Some(&ResidentOutcome::Cold));
