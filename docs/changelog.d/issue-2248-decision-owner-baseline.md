@@ -6,8 +6,8 @@ inputs that the formula did not have. Results:
 [`docs/performance-decision-owner-baseline.md`](../performance-decision-owner-baseline.md).
 A workflow claim costs about what an activity claim costs (4.33 ms against
 4.07 ms at one loop). Event and task inserts take 14% of the persist each,
-the commit 6%. The second fence row adds 21% to the persist at one writer,
-so it fails the stage 1b bar of 10%.
+the commit 6%. Owner mode with DR on adds two statements and about 20% to
+the persist at one writer, so it fails the stage 1b bar of 10%.
 
 **No migration. No `WorkflowEvent` variant. No replay impact.** The claim
 and persist SQL do not change.
@@ -17,7 +17,9 @@ and persist SQL do not change.
 method `MetricsRecorder::record_claim_duration` defaults to
 `record_db_query_duration(DbOp::Claim, ..)`, so a recorder written before
 this change still sees every claim. The shipped panels and alerts sum by
-`op` and `shard`, so the label does not split them.
+`op` and `shard`, so the label does not split them. A recorder that wraps
+another recorder and forwards only `record_db_query_duration` loses the
+label, and should forward the two new methods too.
 
 **Persist phases.** The new histogram
 `harvest.db.persist.phase_duration{phase, shard}` splits each decision

@@ -1,0 +1,26 @@
+Gnuplot not found, using plotters backend
+Benchmarking decision_persist/generation/writers/1
+decision_persist/generation/writers/1
+                        time:   [4.4006 ms 4.5107 ms 4.6231 ms]
+                        change: [+18.388% +22.306% +26.072%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking decision_persist/generation_owner/writers/1
+decision_persist/generation_owner/writers/1
+                        time:   [4.9098 ms 5.2598 ms 5.8640 ms]
+                        change: [−11.771% −4.8417% +9.5081%] (p = 0.42 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 100 measurements (2.00%)
+  1 (1.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking decision_persist/generation_plain_owner_row/writers/1
+decision_persist/generation_plain_owner_row/writers/1
+                        time:   [4.5620 ms 4.6654 ms 4.7744 ms]
+                        change: [−7.3297% −3.2161% +0.6508%] (p = 0.12 > 0.05)
+                        No change in performance detected.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+

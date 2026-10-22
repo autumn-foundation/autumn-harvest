@@ -28665,7 +28665,7 @@ async fn process_workflow_task(
 
     // Issue #1815: the `persist` op spans the whole transaction, COMMIT
     // included. The guard also records a transaction that a timeout cancels.
-    let persist_timer = PersistTimer::start();
+    let persist_timer = PersistTimer::start_decision();
     // Issue #1833: one merged wake per execution, also on the fallback path.
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
@@ -32262,12 +32262,12 @@ struct PersistTiming {
     running: std::cell::Cell<bool>,
     /// Issue #2248: the seconds of each timed phase of the running timer,
     /// in the order of [`PersistPhase::TIMED`].
-    phases: std::cell::Cell<[f64; 4]>,
+    phases: std::cell::Cell<[f64; PersistPhase::TIMED.len()]>,
     /// The phase that a phase timer times now. A nested phase timer records
     /// nothing, so no time counts twice.
     phase: std::cell::Cell<Option<PersistPhase>>,
-    /// When the body of the decision transaction ended. Only the decision
-    /// persist sets it, so only that persist records its phases.
+    /// When the body of the decision transaction ended. Diesel sends
+    /// `COMMIT` or `ROLLBACK` after it.
     body_end: std::cell::Cell<Option<std::time::Instant>>,
 }
 
@@ -32277,7 +32277,7 @@ impl PersistTiming {
             metrics: Arc::clone(metrics),
             labels: Arc::clone(labels),
             running: std::cell::Cell::new(false),
-            phases: std::cell::Cell::new([0.0; 4]),
+            phases: std::cell::Cell::new([0.0; PersistPhase::TIMED.len()]),
             phase: std::cell::Cell::new(None),
             body_end: std::cell::Cell::new(None),
         }
@@ -32297,22 +32297,34 @@ struct PersistTimer {
     metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
     labels: Arc<[u16]>,
     started: std::time::Instant,
+    /// Issue #2248: the timer of a decision persist records its phases too.
+    decision: bool,
 }
 
 impl PersistTimer {
     /// Start a timer for this cycle. It is `None` outside a workflow-task
     /// cycle, and while another timer of the cycle runs.
     fn start() -> Option<Self> {
+        Self::start_as(false)
+    }
+
+    /// [`Self::start`] for the decision persist, which records its phases.
+    fn start_decision() -> Option<Self> {
+        Self::start_as(true)
+    }
+
+    fn start_as(decision: bool) -> Option<Self> {
         PERSIST_TIMING
             .try_with(|timing| {
                 (!timing.running.replace(true)).then(|| {
-                    timing.phases.set([0.0; 4]);
+                    timing.phases.set([0.0; PersistPhase::TIMED.len()]);
                     timing.phase.set(None);
                     timing.body_end.set(None);
                     Self {
                         metrics: Arc::clone(&timing.metrics),
                         labels: Arc::clone(&timing.labels),
                         started: std::time::Instant::now(),
+                        decision,
                     }
                 })
             })
@@ -32323,27 +32335,34 @@ impl PersistTimer {
 
 impl Drop for PersistTimer {
     fn drop(&mut self) {
-        let elapsed = self.started.elapsed().as_secs_f64();
+        // One clock read for the total and the commit, so the phases add up
+        // to the total. Recording time then counts in neither.
+        let now = std::time::Instant::now();
+        let elapsed = now.saturating_duration_since(self.started).as_secs_f64();
+        // Outside the scope there is nothing to reset.
+        let body_end = PERSIST_TIMING
+            .try_with(|timing| {
+                timing.running.set(false);
+                (timing.phases.get(), timing.body_end.take())
+            })
+            .ok();
         for label in self.labels.iter() {
             self.metrics
                 .record_db_query_duration(DbOp::Persist, *label, elapsed);
         }
-        // Outside the scope there is nothing to reset.
-        let _ = PERSIST_TIMING.try_with(|timing| {
-            timing.running.set(false);
-            // Issue #2248: diesel sends `COMMIT` after the body ends.
-            let Some(body_end) = timing.body_end.take() else {
-                return;
-            };
-            let commit = body_end.elapsed().as_secs_f64();
-            let parts =
-                crate::telemetry::persist_phase_breakdown(elapsed, timing.phases.get(), commit);
-            for label in self.labels.iter() {
-                for (phase, seconds) in parts {
-                    self.metrics.record_persist_phase(phase, *label, seconds);
-                }
+        // Issue #2248: diesel sends `COMMIT` after the body ends. A persist
+        // that never reached its body, such as a failed `BEGIN`, has no
+        // commit time, and all its time counts as `other`.
+        let Some((phases, body_end)) = body_end.filter(|_| self.decision) else {
+            return;
+        };
+        let commit = body_end.map_or(0.0, |end| now.saturating_duration_since(end).as_secs_f64());
+        let parts = crate::telemetry::persist_phase_breakdown(elapsed, phases, commit);
+        for label in self.labels.iter() {
+            for (phase, seconds) in parts {
+                self.metrics.record_persist_phase(phase, *label, seconds);
             }
-        });
+        }
     }
 }
 
@@ -32398,6 +32417,117 @@ impl Drop for PersistBodyEnd {
                 timing.body_end.set(Some(std::time::Instant::now()));
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod persist_phase_tests {
+    use super::*;
+    use crate::telemetry::MetricsRecorder;
+
+    /// Keeps the persist totals and the phases of each persist.
+    #[derive(Default)]
+    struct Phases {
+        persists: std::sync::Mutex<Vec<f64>>,
+        phases: std::sync::Mutex<Vec<(PersistPhase, f64)>>,
+    }
+
+    impl MetricsRecorder for Phases {
+        fn record_db_query_duration(&self, op: DbOp, _shard: u16, seconds: f64) {
+            if op == DbOp::Persist {
+                self.persists.lock().expect("lock").push(seconds);
+            }
+        }
+
+        fn record_persist_phase(&self, phase: PersistPhase, _shard: u16, seconds: f64) {
+            self.phases.lock().expect("lock").push((phase, seconds));
+        }
+    }
+
+    impl Phases {
+        fn of(&self, phase: PersistPhase) -> Vec<f64> {
+            self.phases
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(p, _)| *p == phase)
+                .map(|(_, s)| *s)
+                .collect()
+        }
+    }
+
+    /// Run `body` inside a persist timing scope with one shard label.
+    async fn timed(recorder: &Arc<Phases>, body: impl std::future::Future<Output = ()>) {
+        let metrics: Arc<dyn MetricsRecorder> = Arc::clone(recorder) as Arc<dyn MetricsRecorder>;
+        let labels: Arc<[u16]> = Arc::from([0_u16]);
+        PERSIST_TIMING
+            .scope(PersistTiming::new(&metrics, &labels), body)
+            .await;
+    }
+
+    fn spin(micros: u64) {
+        let until = std::time::Instant::now() + std::time::Duration::from_micros(micros);
+        while std::time::Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// A nested phase timer records nothing, so the outer phase keeps the
+    /// time. The six phases add up to the persist total.
+    #[tokio::test]
+    async fn a_nested_phase_counts_once_and_the_phases_add_up() {
+        let recorder = Arc::new(Phases::default());
+        timed(&recorder, async {
+            let timer = PersistTimer::start_decision();
+            {
+                let _events = PersistPhaseTimer::start(PersistPhase::Events);
+                assert!(
+                    PersistPhaseTimer::start(PersistPhase::Fence).is_none(),
+                    "a nested phase timer times nothing"
+                );
+                spin(500);
+            }
+            drop(PersistBodyEnd);
+            spin(200);
+            drop(timer);
+        })
+        .await;
+        assert_eq!(recorder.of(PersistPhase::Fence), [0.0]);
+        assert!(recorder.of(PersistPhase::Events)[0] >= 0.000_5);
+        assert!(recorder.of(PersistPhase::Commit)[0] >= 0.000_2);
+        let total = recorder.persists.lock().expect("lock")[0];
+        let sum: f64 = recorder
+            .phases
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(_, s)| s)
+            .sum();
+        assert!((sum - total).abs() < 1e-9, "{sum} against {total}");
+    }
+
+    /// A decision persist that never reaches its body still records every
+    /// phase. A failure write records none. A phase timer outside a persist
+    /// times nothing.
+    #[tokio::test]
+    async fn only_a_decision_persist_records_phases_and_always_all_of_them() {
+        let recorder = Arc::new(Phases::default());
+        timed(&recorder, async {
+            assert!(PersistPhaseTimer::start(PersistPhase::Tasks).is_none());
+            drop(PersistTimer::start_decision());
+            drop(PersistTimer::start());
+        })
+        .await;
+        assert_eq!(recorder.persists.lock().expect("lock").len(), 2);
+        for phase in PersistPhase::ALL {
+            assert_eq!(recorder.of(phase).len(), 1, "{phase:?} once");
+        }
+        assert_eq!(
+            recorder.of(PersistPhase::Commit),
+            [0.0],
+            "no body, no commit"
+        );
+        assert!(PersistPhaseTimer::start(PersistPhase::Events).is_none());
     }
 }
 
@@ -49177,6 +49307,30 @@ mod tests {
                 assert_eq!(delay, nd_block_backoff_jittered(count, &test_task(exec)));
             }
         }
+    }
+
+    fn claim_task(task_type: &str) -> TaskQueueItem {
+        TaskQueueItem {
+            task_type: task_type.to_owned(),
+            ..retry_after_test_task(1, 3)
+        }
+    }
+
+    /// Issue #2248: the claim kind follows the claimed row.
+    #[test]
+    fn a_claim_kind_names_what_the_claim_returned() {
+        assert_eq!(
+            claim_kind(&Ok(Some(claim_task("workflow")))),
+            crate::telemetry::ClaimKind::Workflow
+        );
+        assert_eq!(
+            claim_kind(&Ok(Some(claim_task("activity")))),
+            crate::telemetry::ClaimKind::Activity
+        );
+        assert_eq!(claim_kind(&Ok(None)), crate::telemetry::ClaimKind::Empty);
+        let failed: HarvestResult<Option<TaskQueueItem>> =
+            Err(crate::error::HarvestError::Database("boom".to_owned()));
+        assert_eq!(claim_kind(&failed), crate::telemetry::ClaimKind::Error);
     }
 
     /// A workflow task for execution `n`, like the task an ND block or a panic sees.

@@ -7,6 +7,15 @@
 | 1000 | 32.26 (3) | 40.33 (3) | 45.99 (3) |
 | 2000 | 31.29 (3) | 41.21 (3) | 47.44 (3) |
 
+### Claims in flight (claim count x mean claim time / elapsed)
+
+| depth | claims1 | claims2 | claims4 |
+|--:|--:|--:|--:|
+| 250 | 0.89 | 1.80 | 3.16 |
+| 500 | 0.92 | 1.84 | 3.18 |
+| 1000 | 0.94 | 1.86 | 3.23 |
+| 2000 | 0.94 | 1.87 | 3.39 |
+
 ### Claim split (mean over depths and runs)
 
 | claim loops | workflow claims per workflow | workflow ms | activity claims per workflow | activity ms | empty claims per workflow | empty ms | workflow share of claim time |

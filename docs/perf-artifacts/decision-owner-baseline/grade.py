@@ -6,6 +6,7 @@ Usage: grade.py <raw directory>
 Prints one Markdown table per measure, over valid runs only:
 
 - workflows/sec per depth and claim cap;
+- claims in flight per depth and claim cap;
 - the claim split: count per workflow and mean time of each claim kind;
 - the share of claim time that workflow claims take;
 - the persist phases: mean per decision persist and share of the persist.
@@ -66,6 +67,17 @@ def main(argv):
         for tree in trees:
             runs = cells.get((tree, depth), [])
             row.append(f"{mean_of(runs, lambda kv: num(kv, 'wfps')):.2f} ({len(runs)})" if runs else "—")
+        print("| " + " | ".join(row) + " |")
+
+    print("\n### Claims in flight (claim count x mean claim time / elapsed)\n")
+    print("| depth | " + " | ".join(trees) + " |")
+    print("|--:|" + "--:|" * len(trees))
+    for depth in depths:
+        row = [str(depth)]
+        for tree in trees:
+            runs = cells.get((tree, depth), [])
+            row.append(f"{mean_of(runs, lambda kv: time_ms(kv, 'claim') / 1000 / num(kv, 'elapsed')):.2f}"
+                       if runs else "—")
         print("| " + " | ".join(row) + " |")
 
     print("\n### Claim split (mean over depths and runs)\n")

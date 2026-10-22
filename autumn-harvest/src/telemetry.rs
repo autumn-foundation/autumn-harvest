@@ -322,7 +322,8 @@ pub const METRIC_DB_POOL_WAIT: &str = "harvest.db.pool.wait_duration";
 /// Histogram: seconds that one database operation takes (issue #1815).
 ///
 /// Labelled `{op}`, one of [`DbOp::as_str`]. Each op times one unit of work,
-/// not one SQL statement. Do not mix this up with [`METRIC_QUERY_DURATION`],
+/// not one SQL statement. A `claim` sample also carries `kind`, one of
+/// [`ClaimKind::as_str`] (issue #2248). Do not mix this up with [`METRIC_QUERY_DURATION`],
 /// which times workflow query handlers.
 pub const METRIC_DB_QUERY_DURATION: &str = "harvest.db.query.duration";
 
@@ -332,7 +333,8 @@ pub const METRIC_DB_QUERY_DURATION: &str = "harvest.db.query.duration";
 /// Labelled `{phase, shard}`, one of [`PersistPhase::as_str`]. Each decision
 /// persist records every phase once, so the phases of one persist add up to
 /// its `persist` sample on [`METRIC_DB_QUERY_DURATION`]. A terminal failure
-/// write records no phase.
+/// write records no phase, so the phase count can be lower than the
+/// `persist` count.
 pub const METRIC_DB_PERSIST_PHASE_DURATION: &str = "harvest.db.persist.phase_duration";
 
 /// Gauge: claim loops that claim work from a queue on this worker (issue #1815).
@@ -2821,7 +2823,8 @@ pub enum ClaimKind {
     Workflow,
     /// The claim returned an activity task.
     Activity,
-    /// The claim found no task.
+    /// The claim found no task. A claim by id of a row that another worker
+    /// took also reads as empty.
     Empty,
     /// The claim failed.
     Error,
@@ -2853,7 +2856,8 @@ pub enum PersistPhase {
     Events,
     /// The inserts into `harvest_task_queue`.
     Tasks,
-    /// The stage of the post-commit wakes, or the `pg_notify` fallback.
+    /// The stage of the post-commit wakes, the `pg_notify` fallback, and
+    /// the progress wakes of a stream.
     Notify,
     /// The `COMMIT` or `ROLLBACK` statement.
     Commit,
@@ -2873,7 +2877,7 @@ impl PersistPhase {
     ];
 
     /// The phases that a timer measures inside the transaction body.
-    pub const TIMED: [Self; 4] = [Self::Fence, Self::Events, Self::Tasks, Self::Notify];
+    pub(crate) const TIMED: [Self; 4] = [Self::Fence, Self::Events, Self::Tasks, Self::Notify];
 
     /// Stable string representation, suitable for metric tag values.
     #[must_use]
@@ -2891,7 +2895,7 @@ impl PersistPhase {
     /// The index of a timed phase in [`Self::TIMED`]. `None` for the
     /// commit and the rest.
     #[must_use]
-    pub const fn timed_index(self) -> Option<usize> {
+    pub(crate) const fn timed_index(self) -> Option<usize> {
         match self {
             Self::Fence => Some(0),
             Self::Events => Some(1),
@@ -2909,9 +2913,9 @@ impl PersistPhase {
 /// `total`. Clock reads can make the parts exceed `total` by a little, so
 /// `other` is never below zero.
 #[must_use]
-pub fn persist_phase_breakdown(
+pub(crate) fn persist_phase_breakdown(
     total: f64,
-    timed: [f64; 4],
+    timed: [f64; PersistPhase::TIMED.len()],
     commit: f64,
 ) -> [(PersistPhase, f64); 6] {
     let measured: f64 = timed.iter().sum::<f64>() + commit;

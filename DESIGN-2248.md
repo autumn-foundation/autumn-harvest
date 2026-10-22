@@ -52,7 +52,7 @@ owner fence that DR fencing caused.
 | B2 | A `kind` label on claim samples, through a new trait method that defaults to the old one. | **Adopted.** Old recorders still see every claim. |
 | B3 | Classify each SQL statement with diesel instrumentation in the apparatus. | Rejected. An activity result also appends events, so a statement cannot tell a decision persist from another write. |
 | B4 | `tracing` spans around each phase. | Rejected. A span needs a subscriber to sum it, and the apparatus reads `MetricsRecorder`. |
-| B5 | Phase timers at the five chokepoints that add into `PersistTiming`. | **Adopted.** One timer per chokepoint covers every call site. |
+| B5 | Phase timers at the chokepoints that add into `PersistTiming`: eight sites in five files. | **Adopted.** One timer per chokepoint covers every call site. |
 | B6 | Commit time as the time from the end of the transaction body to the end of the timer. | **Adopted.** Diesel sends `COMMIT` in that gap only. |
 | B7 | Record `other` as the total minus the measured phases. | **Adopted.** The phases of one persist then add up to its total. |
 | B8 | Phases for every persist timer, the failure writes included. | Rejected. A failure write has no body marker, so its commit is unknown. Phases cover the main decision persist only. |
@@ -115,7 +115,31 @@ owner fence that DR fencing caused.
 
 ## 2. Review findings
 
-Filled in after the review.
+Four review agents checked the engine code, the metrics surface, the
+measurement and the tests. Nothing was blocking. The fixes:
+
+- The persist timer read the clock twice. The recorder time then counted as
+  commit time. One clock read now gives the total and the commit, so the
+  phases add up to the total.
+- A decision persist that failed before its body recorded no phase. The
+  decision timer now records every phase, with a zero commit.
+- A progress wake sent `pg_notify` outside `stage_now`, so its time counted
+  as `other`. It now counts as `notify`.
+- No test covered the error claim kind, nested phase timers or the `fence`
+  phase of a real worker. Unit tests and a DR worker test cover them now.
+- The page said that the second row adds 21%. Owner mode with DR on adds
+  two statements, not one row. The page now says so, gives the delta of
+  each run and adds six runs of the one-writer cases.
+- The page read a direction into the 8-writer cells. They change sign
+  between runs on this host, so the page now keeps them as raw output only.
+- The claims-in-flight query in `performance.md` now sums over `kind`.
+
+Accepted as is:
+
+- A claim by id of a row that another worker took reads as `empty`. The
+  doc of `ClaimKind::Empty` says so.
+- CI clippy lints no bench target, so it does not lint the fence bench.
+  A local clippy run of the bench with `-D warnings` is clean.
 
 ## 3. Out of scope
 

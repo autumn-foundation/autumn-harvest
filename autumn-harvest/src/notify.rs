@@ -2000,6 +2000,9 @@ pub async fn notify_workflow_progress(
     seq: u64,
     chunk: &serde_json::Value,
 ) -> HarvestResult<()> {
+    // Issue #2248: a progress wake inside a decision persist counts as the
+    // notify phase.
+    let _phase = crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Notify);
     let channel = workflow_progress_channel(workflow_exec_id);
     let payload = serde_json::to_string(&ProgressNotifyPayload {
         seq,

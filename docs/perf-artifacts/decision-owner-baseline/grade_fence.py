@@ -18,6 +18,22 @@ TIME = re.compile(r"time:\s+\[\S+ \S+ (\S+) (\S+) \S+ \S+\]")
 UNITS = {"ns": 1e-6, "µs": 1e-3, "us": 1e-3, "ms": 1.0, "s": 1e3}
 
 
+def load_run(path):
+    """The point estimate of each case in one run, in ms."""
+    run = {}
+    case = None
+    for line in open(path, encoding="utf-8"):
+        m = CASE.match(line.strip())
+        if m:
+            case = (m.group(1), m.group(2))
+            continue
+        m = TIME.search(line)
+        if m and case:
+            run[case] = float(m.group(1)) * UNITS[m.group(2)]
+            case = None
+    return run
+
+
 def load(paths):
     cases = defaultdict(list)
     for path in paths:
@@ -46,16 +62,20 @@ def main(paths):
         row = [f"`{mode}`"]
         for w in layouts:
             runs = cases.get((mode, w), [])
+            mark = ""
             if not runs and "-spread" in w:
                 runs = cases.get((mode, w.replace("spread", "shared")), [])
-            row.append(f"{statistics.mean(runs):.2f} ({len(runs)})" if runs else "—")
+                mark = "*"
+            row.append(f"{statistics.mean(runs):.2f} ({len(runs)}){mark}" if runs else "—")
         print("| " + " | ".join(row) + " |")
 
     def mean(mode, w):
         runs = cases.get((mode, w)) or cases.get((mode, w.replace("spread", "shared")))
         return statistics.mean(runs) if runs else None
 
-    print("\n### Deltas\n")
+    print("\n_A cell marked * reuses the shared case: the mode locks no owner row._")
+
+    print("\n### Deltas of the pooled means\n")
     print("| delta | " + " | ".join(f"writers {w}" for w in layouts) + " |")
     print("|:--|" + "--:|" * len(layouts))
     for name, top, base in [
@@ -72,6 +92,27 @@ def main(paths):
             a, b = mean(top, w), mean(base, w)
             row.append(f"{100 * (a - b) / b:+.1f}%" if a and b else "—")
         print("| " + " | ".join(row) + " |")
+
+    print("\n### Deltas within each run, 1 writer\n")
+    print("| run | `generation` ms | `generation_owner` ms | `generation_plain_owner_row` ms "
+          "| second row | plain row lock |")
+    print("|:--|--:|--:|--:|--:|--:|")
+    second, plain = [], []
+    for path in paths:
+        run = load_run(path)
+        g = run.get(("generation", "1"))
+        go = run.get(("generation_owner", "1"))
+        pl = run.get(("generation_plain_owner_row", "1"))
+        if not (g and go and pl):
+            continue
+        second.append(100 * (go - g) / g)
+        plain.append(100 * (pl - g) / g)
+        name = path.rsplit("/", 1)[-1]
+        print(f"| {name} | {g:.2f} | {go:.2f} | {pl:.2f} | {second[-1]:+.1f}% | {plain[-1]:+.1f}% |")
+    if second:
+        print(f"| median | | | | {statistics.median(second):+.1f}% | {statistics.median(plain):+.1f}% |")
+        over = sum(1 for d in second if d >= 10)
+        print(f"\nThe second-row delta is 10% or more in {over} of {len(second)} runs.")
 
 
 if __name__ == "__main__":

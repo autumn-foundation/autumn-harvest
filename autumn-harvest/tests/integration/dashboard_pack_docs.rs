@@ -408,7 +408,7 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_db_pool_in_use", &["shard"]),
     ("harvest_db_pool_idle", &["shard"]),
     ("harvest_db_pool_wait_duration", &["shard"]),
-    ("harvest_db_query_duration", &["op"]),
+    ("harvest_db_query_duration", &["op", "kind"]),
     // Issue #2248. `phase` is bounded by the `PersistPhase` enum.
     ("harvest_db_persist_phase_duration", &["phase"]),
     ("harvest_worker_pollers", &["queue"]),

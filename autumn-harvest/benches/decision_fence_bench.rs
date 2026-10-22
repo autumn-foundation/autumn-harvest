@@ -11,8 +11,7 @@
 //! - `generation_owner_refence`: both, and the owner fence again after each
 //!   append. It models the code before issue #2248.
 //! - `generation_plain_owner_row`: a DR pin, and a plain `FOR KEY SHARE` of
-//!   the owner row with no fence function. It isolates the cost of the row
-//!   lock from the cost of the function.
+//!   the owner row with no fence function. It adds one statement only.
 //!
 //! The stage 1b pass condition compares `generation_owner` with
 //! `generation`. The delta must stay under 10%.
@@ -309,6 +308,10 @@ impl Bench {
     /// Run `iters` decisions over the writers of `case`. Returns the sum of
     /// the decision latencies, scaled to `iters` decisions, so criterion
     /// reports the mean latency of one decision.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "decision counts here are far below 2^52"
+    )]
     async fn run(&self, case: Case, iters: u64) -> Duration {
         let per_writer = iters.div_ceil(case.writers as u64).max(1);
         let runs = self.writers[..case.writers]
@@ -348,6 +351,7 @@ impl Bench {
                 .await
                 .expect("reset the bench tables");
         }
+        drop(writer);
     }
 
     async fn teardown(self) {

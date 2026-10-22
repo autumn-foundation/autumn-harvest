@@ -14,13 +14,15 @@ inputs that the formula did not have:
 **Result in one line each:**
 
 - A workflow claim costs about what an activity claim costs: 4.33 ms
-  against 4.07 ms at one claim loop. Workflow claims take 58% of the claim
+  against 4.07 ms at one claim loop. Workflow claims take 59% of the claim
   time, because a workflow makes 4 of them and 3 activity claims.
 - The decision persist takes 4.14 ms at one claim loop. Event inserts take
   14%, task inserts 14%, the commit 6%, the notify stage 0%. The other 67%
   is the rest of the transaction.
-- **The second fence row fails the stage 1b pass condition.** It adds 21%
-  to the persist at one writer. The condition is under 10%.
+- **The second fence row fails the stage 1b pass condition.** Owner mode
+  with DR on adds two statements to each decision: a second check of the
+  generation row and the owner fence. Together they add 20% to the persist
+  at one writer. The condition is under 10%.
 
 ## The workload and the host
 
@@ -65,8 +67,10 @@ Claims per workflow and the mean time of each kind, over all depths:
 | 2 | 4.00 | 6.61 | 3.00 | 6.28 | 0.02 | 3.01 | 58.4% |
 | 4 | 4.00 | 10.01 | 3.00 | 9.60 | 0.65 | 4.15 | 55.8% |
 
-Each depth reads the same. The claims in flight are 0.92, 1.84 and 3.24 at
-1, 2 and 4 loops, as the claim-concurrency page found.
+Each depth reads the same. The claims in flight, the claim count times the
+mean claim time over the elapsed time, are 0.92, 1.84 and 3.24 at 1, 2 and 4
+loops, as the claim-concurrency page found. `graded.md` gives them per
+depth.
 
 What the split shows:
 
@@ -118,14 +122,14 @@ Each workflow makes 4.00 decision persists. The phases are:
 - `other`: the rest of the transaction. That is `BEGIN`, the execution row
   lock, the pause check, the reads and the task and execution updates.
 
-**The rest is most of the persist, and it is round trips.** One
-diagnostic run at depth 1,000 and one loop kept `pg_stat_statements`
-([output](perf-artifacts/decision-owner-baseline/results/pg-stat-statements-claims1-d1000.txt)).
-The server runs each persist statement in 0.001 ms to 0.2 ms. The run sent
-about 294 statements per workflow, the seed included. So the persist time is mostly the
-number of statements and their round trips, not their execution. The same
-holds for the claim: the server runs the claim statement in 0.67 ms of its
-4.33 ms.
+**The rest is most of the persist.** One diagnostic run at depth 1,000 and
+one loop kept `pg_stat_statements`
+([top 40 statements](perf-artifacts/decision-owner-baseline/results/pg-stat-statements-claims1-d1000.txt)).
+The server runs each persist statement in 0.001 ms to 0.2 ms. In the same
+run, the server ran the claim statement in 0.67 ms of a 4.33 ms claim. So
+the time in `other` is consistent with round trips and client work, not
+with slow statements. This run does not split `other` further, and CPU
+contention on 4 cores can add to it.
 
 ## 3. The fence cost
 
@@ -136,61 +140,76 @@ execution update. The post-commit sender is registered. The bench uses the
 real owner row and the real `harvest_decision_owner_fence` function of
 issue #2251, so it needs no prototype row.
 
-| mode | fence rows |
+| mode | statements that lock a fence row |
 |:--|:--|
 | `none` | none |
-| `generation` | the DR generation row `FOR SHARE`, once per append, as today |
+| `generation` | the DR generation row `FOR SHARE`, once per append in a savepoint, as today |
 | `owner` | the owner row `FOR KEY SHARE`, once, through the fence function |
-| `generation_owner` | both, as owner mode with DR on runs them |
-| `generation_plain_owner_row` | the generation row, and a plain `FOR KEY SHARE` of the owner row with no function |
+| `generation_owner` | as owner mode with DR on runs them: the generation row and the owner fence at the start, then the generation row once per append |
+| `generation_plain_owner_row` | `generation`, and one plain `FOR KEY SHARE` of the owner row with no function |
 | `generation_owner_refence` | `generation_owner`, and the owner fence again after each append: the code before this issue |
+
+So `generation_owner` adds two statements to `generation`, and
+`generation_plain_owner_row` adds one. The owner row takes `FOR KEY SHARE`,
+not the `FOR SHARE` that the issue names.
 
 With 8 writers, `shared` makes every writer lock one owner row. `spread`
 gives each writer its own owner row, as decisions of many partitions have.
-Each case starts on empty event and task tables. Three runs on 2026-10-22,
-each in another mode order, on the same host and server. Raw output:
+Each case starts on empty event and task tables. Nine runs on 2026-10-22,
+each in another mode order. Runs r0 to r2 time every case. Runs r3 to r8
+time the three one-writer cases that the pass condition reads. Raw output:
 [`results/fence-bench/`](perf-artifacts/decision-owner-baseline/results/fence-bench/).
 Graded: [`results/fence-graded.md`](perf-artifacts/decision-owner-baseline/results/fence-graded.md).
 
-The mean persist latency, ms:
+The delta of each run at one writer, against `generation` in the same run:
+
+| run | `generation` ms | `generation_owner` ms | `generation_plain_owner_row` ms | two statements | one statement |
+|:--|--:|--:|--:|--:|--:|
+| r0 | 4.12 | 5.18 | 5.08 | +25.9% | +23.3% |
+| r1 | 4.33 | 5.44 | 4.64 | +25.6% | +7.1% |
+| r2 | 4.34 | 4.81 | 4.80 | +10.8% | +10.5% |
+| r3 | 4.28 | 5.08 | 5.10 | +18.6% | +19.1% |
+| r4 | 4.65 | 5.01 | 4.63 | +7.7% | −0.5% |
+| r5 | 3.69 | 5.53 | 4.82 | +49.9% | +30.7% |
+| r6 | 4.51 | 5.26 | 4.67 | +16.6% | +3.4% |
+| r7 | 4.11 | 4.84 | 4.85 | +17.8% | +18.0% |
+| r8 | 4.47 | 5.22 | 4.46 | +16.6% | −0.4% |
+| **median** | | | | **+17.8%** | **+10.5%** |
+
+**The stage 1b pass condition fails.** It asks for a delta under 10%. Owner
+mode with DR on adds +17.8% in the median run, and 10% or more in 8 of 9
+runs. The pooled means give +20.4%. The one-statement case is not clear: its
+median is +10.5%, and four runs fall under 10%.
+
+The criterion interval of each case is within ±5% of its estimate. The same
+mode moves by up to ±15% between runs, so read single runs with care.
+
+The pooled means over all runs, ms:
 
 | mode | 1 writer | 8 writers, shared | 8 writers, spread |
 |:--|--:|--:|--:|
-| `none` | 3.75 | 6.19 | 6.19 |
-| `generation` | 4.26 | 8.23 | 8.23 |
+| `none` | 3.75 | 6.19 | 6.19 * |
+| `generation` | 4.28 | 8.23 | 8.23 * |
 | `owner` | 4.26 | 9.86 | 9.80 |
-| `generation_owner` | 5.14 | 10.28 | 11.75 |
-| `generation_plain_owner_row` | 4.84 | 9.02 | 9.65 |
+| `generation_owner` | 5.15 | 10.28 | 11.75 |
+| `generation_plain_owner_row` | 4.78 | 9.02 | 9.65 |
 | `generation_owner_refence` | 5.99 | 11.75 | 11.05 |
 
-The deltas:
+\* The mode locks no owner row, so the cell repeats the shared case.
 
-| delta | 1 writer | 8 writers, shared | 8 writers, spread |
-|:--|--:|--:|--:|
-| **second row: `generation_owner` over `generation`** | **+20.7%** | +24.9% | +42.7% |
-| plain row lock: `generation_plain_owner_row` over `generation` | +13.5% | +9.6% | +17.2% |
-| first row: `generation` over `none` | +13.7% | +32.9% | +32.9% |
-| the fix: `generation_owner` over `generation_owner_refence` | −14.2% | −12.5% | +6.3% |
+**The 8-writer cells show nothing on this host.** Eight writers and the
+server share 4 CPUs. A case moves by up to 2x between runs, and the
+second-row delta changes sign between runs. They are kept as raw output
+only.
 
-**The stage 1b pass condition fails.** It asks for a delta under 10% for
-the second row. At one writer the delta is +20.7%. No pairing of the three
-runs falls under 10%: the lowest is +10.8%, the highest +32%. At one writer
-each criterion interval is within ±5% of its mean.
+What the bench shows at one writer:
 
-The 8-writer cases put 8 writers and the server on 4 CPUs. Their runs vary
-by up to ±20% between rounds, so read them as a direction only: contention
-raises every fence cost.
-
-What the bench shows:
-
-- **One more statement costs about 0.6 ms.** The plain row lock adds one
-  statement and +13.5%. A persist that is mostly round trips pays for each
-  statement it adds.
-- **Owner mode with DR on adds two statements.** The start fence takes the
-  generation row once more, then calls the fence function. Each append
-  still takes the generation row again.
-- **The fix of this issue saves 14%.** Before it, each append also sent the
-  owner fence again. See the next section.
+- **Each added statement costs about 0.5 ms here.** The persist is mostly
+  round trips, so each statement that it adds costs about as much as one.
+  `generation` adds six statements to `none` for 0.53 ms.
+- **The fix of this issue saves 14% at one writer.** Before it, each append
+  also sent the owner fence again. At 8 writers the effect is lost in the
+  noise. See the next section.
 
 ### The fence fix
 
@@ -208,26 +227,40 @@ proves it: a decision with two appends made 3 fence calls before, and makes
 
 ## What stage 1b can do
 
-These are proposals, not measured fixes.
+These are proposals, not measured fixes. Stage 1b needs the first two
+together to remove both added statements.
 
 1. **Fence both rows in one statement.** One function can check the
-   generation row and the owner row. That removes one round trip.
+   generation row and the owner row. That removes the second check of the
+   generation row.
 2. **Skip the per-append generation check inside a fenced scope** when the
    start fence took the same generation row. A colocated shard can use
    another row, so the skip must compare the rows. That removes two
-   statements and a savepoint per append.
-3. **Cut statements in the rest of the persist.** It is 67% of the persist
-   and it is round trips. Each statement that the owner can skip, such as a
-   read that its cache already holds, is worth about as much as a fence row.
+   statements and a savepoint per append, more than the owner fence adds.
+3. **Cut statements in the rest of the persist.** It is 67% of the persist.
+   Each statement that the owner can skip, such as a read that its cache
+   already holds, is worth about as much as a fence row.
 
 ## What the measurement does not establish
 
 - One box, one shape and one Postgres version. The host has 4 CPUs, so the
   8-writer cases and the 4-loop cells are CPU-bound.
+- The one-writer delta moves between runs, from +7.7% to +49.9%. Nine runs
+  give a clear verdict for two statements, not a precise size.
+- No case adds the owner row alone with DR on. The one-statement case has
+  no function and no clear verdict.
+- Each run times the modes in blocks, in a rotated order. Alternating modes
+  inside one case would separate drift from mode better.
 - The fence bench models the persist. It does not run the worker. Its base
-  is 3.75 ms, near the assay persist of 4.14 ms, but its statements are
-  fewer.
+  is 3.75 ms, near the assay persist of 4.14 ms, but it sends fewer
+  statements.
 - The assay runs no DR fence and no owner mode. Its `fence` phase is zero.
+- `other` is not split into its statements.
+- The cost of the phase capture is not measured. At 4 loops the sweep reads
+  45.3 workflows/sec, against 48 to 51 on the claim-concurrency page. That
+  page ran in another session, so the gap is not attributed.
+- The `pg_stat_statements` run counts every statement of the run, the seed
+  and the health checks included.
 - `fsync=off` hides the commit cost of a durable server. A durable commit
   makes the persist longer and each fence row a smaller share.
 

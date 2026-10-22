@@ -1919,7 +1919,7 @@ mod tests {
         assert!(notes[0].contains("mean 5.00 ms"), "{notes:?}");
         assert!(notes[1].contains("1 activity claims"), "{notes:?}");
         assert!(notes[2].contains("1 empty claims"), "{notes:?}");
-        assert!(claim_kind_notes(&[]).is_empty());
+        assert_eq!(claim_kind_notes(&[]), Vec::<String>::new());
     }
 
     /// Issue #2248: the phase note gives the mean of each phase per persist
@@ -1935,7 +1935,7 @@ mod tests {
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("2 decision persists"), "{notes:?}");
         assert!(notes[0].contains("commit 2.00 ms (16.7%)"), "{notes:?}");
-        assert!(persist_phase_notes(&[]).is_empty());
+        assert_eq!(persist_phase_notes(&[]), Vec::<String>::new());
     }
 
     #[test]
