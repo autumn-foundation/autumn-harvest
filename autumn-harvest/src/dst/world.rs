@@ -1004,15 +1004,17 @@ impl<'a, W: World> Driver<'a, W> {
     fn choose(&mut self) -> WorldAction {
         self.wake_stalled();
         let actions = self.enabled();
-        self.track_waits(&actions);
+        let unweighted = unweighted(&actions);
+        self.waiting.track(self.step, &unweighted);
         let action = self
-            .overdue(&actions)
+            .overdue(&unweighted)
             .unwrap_or_else(|| self.draw(&actions));
         self.waiting.ran(&action);
         action
     }
 
     /// Start the wait of each newly enabled action. Drop each disabled one.
+    #[cfg(test)]
     fn track_waits(&mut self, actions: &[(u64, WorldAction)]) {
         self.waiting.track(self.step, &unweighted(actions));
     }
@@ -1023,12 +1025,11 @@ impl<'a, W: World> Driver<'a, W> {
     /// A weighted draw alone can skip a rare action for the whole drain. In
     /// issue #2217, a drain of 400 steps ran no reclaimer pass. This rule
     /// needs no draw, so a run with no overdue action keeps its trace.
-    fn overdue(&self, actions: &[(u64, WorldAction)]) -> Option<WorldAction> {
+    fn overdue(&self, actions: &[WorldAction]) -> Option<WorldAction> {
         if !self.draining() {
             return None;
         }
-        self.waiting
-            .overdue(self.step, FAIR_STEPS, &unweighted(actions))
+        self.waiting.overdue(self.step, FAIR_STEPS, actions)
     }
 
     /// One weighted draw from `actions`.
@@ -1373,17 +1374,20 @@ mod tests {
     fn an_action_is_overdue_at_fair_steps_and_not_before() {
         let drain = config(0);
         let early = waiting_from_zero(&drain, FAIR_STEPS - 1);
-        assert_eq!(early.overdue(&ACTIONS), None);
+        assert_eq!(early.overdue(&unweighted(&ACTIONS)), None);
         // Equal waits go to the first action in the list.
         let due = waiting_from_zero(&drain, FAIR_STEPS);
-        assert_eq!(due.overdue(&ACTIONS), Some(WorldAction::Advance));
+        assert_eq!(
+            due.overdue(&unweighted(&ACTIONS)),
+            Some(WorldAction::Advance)
+        );
     }
 
     #[test]
     fn the_fault_phase_forces_no_action() {
         let fault = config(10 * FAIR_STEPS);
         let driver = waiting_from_zero(&fault, 2 * FAIR_STEPS);
-        assert_eq!(driver.overdue(&ACTIONS), None);
+        assert_eq!(driver.overdue(&unweighted(&ACTIONS)), None);
     }
 
     #[test]
@@ -1394,11 +1398,17 @@ mod tests {
         driver.step = 5;
         driver.track_waits(&ACTIONS);
         driver.step = FAIR_STEPS + 5;
-        assert_eq!(driver.overdue(&ACTIONS), Some(WorldAction::Reclaim));
+        assert_eq!(
+            driver.overdue(&unweighted(&ACTIONS)),
+            Some(WorldAction::Reclaim)
+        );
 
         driver.waiting.ran(&WorldAction::Reclaim);
         driver.track_waits(&ACTIONS);
-        assert_eq!(driver.overdue(&ACTIONS), Some(WorldAction::Sweep));
+        assert_eq!(
+            driver.overdue(&unweighted(&ACTIONS)),
+            Some(WorldAction::Sweep)
+        );
         assert_eq!(
             driver.waiting.since(&WorldAction::Reclaim),
             Some(FAIR_STEPS + 5)
@@ -1411,7 +1421,10 @@ mod tests {
         let mut driver = waiting_from_zero(&drain, FAIR_STEPS);
         driver.track_waits(&ACTIONS[..1]);
         driver.track_waits(&ACTIONS);
-        assert_eq!(driver.overdue(&ACTIONS), Some(WorldAction::Advance));
+        assert_eq!(
+            driver.overdue(&unweighted(&ACTIONS)),
+            Some(WorldAction::Advance)
+        );
         assert_eq!(driver.waiting.since(&WorldAction::Sweep), Some(FAIR_STEPS));
     }
 }

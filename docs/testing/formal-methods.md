@@ -255,6 +255,9 @@ fields:
   memory of the worker that holds the row at its epoch. A stale owner can
   never commit from memory, so its memory does not count.
 - `OwnerNeverFencesItself`: only a takeover fences a commit.
+- `LiveRowHasAPinnedHolder`: the holder of a live row is pinned at the
+  epoch of the row. Without it, a drain with no fault can stop with work
+  left (issue #2294).
 
 In the design, `AckAfterDurableWrite` restates the guard of `Ack`. It
 matters only for the `memory-ack` mutant. `OneOwnerPerEpoch`,
@@ -274,6 +277,7 @@ ADR. Its config lists only the invariant that it must break:
 | `OwnerLeaseRenewBumps.cfg` | `renew-bumps`: a renewal adds 1 to the epoch | R5 | 3 | `OwnerNeverFencesItself` |
 | `OwnerLeaseMemoryAck.cfg` | `memory-ack`: an ack from memory (restate#4566) | R6 | 4 | `NoAckedSignalLost` |
 | `OwnerLeasePipeline.cfg` | `pipeline`: two decisions in one tenure | R7 | — | `DecisionOnFreshHistory` |
+| `OwnerLeaseUnloadOnAnyFence.cfg` | `unload-on-any-fence`: a fence unloads a newer tenure | R8 | 2 | `LiveRowHasAPinnedHolder` |
 
 `OwnerLeaseNoFence.cfg` gives this trace:
 

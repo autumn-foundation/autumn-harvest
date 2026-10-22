@@ -24,8 +24,8 @@
 //! [`OwnerConfig::fault_steps`] steps. The drain then injects no fault: no
 //! nemesis, no expiry, no release and no stall. It is weakly fair, as the
 //! world drain is. A run must consume every signal before the drain ends.
-//! No lease makes progress while its lease ends at every step, so liveness
-//! needs the drain (issue #2294).
+//! No owner makes progress while the faults end its lease every few steps.
+//! So liveness needs the drain (issue #2294).
 //!
 //! An unloaded worker keeps its decisions in flight, as a paused thread
 //! does. A new tenure of that worker can begin a decision beside them. The
@@ -93,6 +93,9 @@ named! {
         RenewBumps => "renew-bumps",
         /// The owner acknowledges a signal from memory (restate#4566).
         MemoryAck => "memory-ack",
+        /// A fenced commit unloads its worker, even when the worker pins a
+        /// newer epoch (issue #2294).
+        UnloadOnAnyFence => "unload-on-any-fence",
     }
 }
 
@@ -128,6 +131,9 @@ named! {
         NoAckedSignalLost => "NoAckedSignalLost",
         /// Only a takeover fences a commit.
         OwnerNeverFencesItself => "OwnerNeverFencesItself",
+        /// The holder of a live row is pinned at the epoch of the row. So
+        /// the drain cannot stop with work left (issue #2294).
+        LiveRowHasAPinnedHolder => "LiveRowHasAPinnedHolder",
     }
 }
 
@@ -415,12 +421,24 @@ pub struct OwnerConfig {
     pub fault_steps: usize,
     /// The step limit of the drain, which injects no fault.
     ///
-    /// In the drain, the row stays with the first worker that takes it.
-    /// That takes at most 3 waits. Each signal then takes 3 more: a begin,
-    /// a lock and a commit. A wait is at most `FAIR_STEPS + k - 1` steps,
-    /// with `k` enabled actions. So 15 waits fit in 400 steps for `k` up to
-    /// 19. In 110,000 drains, `k` was at most 11, and no drain took more
-    /// than 57 steps.
+    /// The drain needs a chain of at most `3 + 3 * signals` waits. A live
+    /// row stays with its holder. Otherwise a held lock, its commit and an
+    /// acquisition take the row. Each signal then needs a begin, a lock and
+    /// a commit. When the old holder commits first, that commit consumes a
+    /// signal, so the chain does not grow.
+    ///
+    /// A wait takes `FAIR_STEPS` steps, plus 1 step to run, plus the overdue
+    /// actions that run first. A renewal or a busy acquisition runs first
+    /// at most once per wait. A one-shot action runs first at most once per
+    /// drain: a stale lock, a commit, a write or an ack. So a drain takes at
+    /// most `15 * (8 + 1 + 3) = 180` steps with the defaults, plus 2 steps
+    /// per decision in flight, worker and signal. [`Self::drain_bound`]
+    /// computes it.
+    ///
+    /// The decisions in flight have no fixed bound, so the drain logs their
+    /// number when it starts. The limit of 400 allows 103. When issue #2294
+    /// landed, a million drains had at most 7, and none took more than 60
+    /// steps.
     pub drain_steps: usize,
     /// The fault schedules.
     pub nemeses: Vec<Nemesis>,
@@ -443,6 +461,15 @@ impl OwnerConfig {
             nemeses: Nemesis::ALL.to_vec(),
             checks: OwnerInvariant::ALL.to_vec(),
         }
+    }
+
+    /// The most steps that a drain needs when it starts with `flights`
+    /// decisions in flight. See [`Self::drain_steps`].
+    #[must_use]
+    pub const fn drain_bound(&self, flights: usize) -> usize {
+        let chain = 3 + 3 * self.signals;
+        let wait = FAIR_STEPS + 1 + self.workers;
+        chain * wait + 2 * (flights + self.workers + self.signals)
     }
 
     /// This config with `defect`.
@@ -494,6 +521,16 @@ pub struct OwnerStats {
     pub acks_before_bump: u64,
     /// Commits that the holder fenced in its own tenure.
     pub self_fences: u64,
+    /// Runs that reached the drain.
+    pub drains: u64,
+    /// The most steps that one drain took.
+    pub drain_steps_max: u64,
+    /// The most decisions in flight when a drain started.
+    pub drain_flights_max: u64,
+    /// The most actions that a drain step had enabled.
+    pub drain_enabled_max: u64,
+    /// The longest wait of an action that ran in a drain, in steps.
+    pub drain_wait_max: u64,
     /// The steps that each nemesis took, in [`Nemesis::ALL`] order.
     pub fired: [u64; Nemesis::ALL.len()],
 }
@@ -513,6 +550,11 @@ impl OwnerStats {
         self.renewals_in_flight += other.renewals_in_flight;
         self.acks_before_bump += other.acks_before_bump;
         self.self_fences += other.self_fences;
+        self.drains += other.drains;
+        self.drain_steps_max = self.drain_steps_max.max(other.drain_steps_max);
+        self.drain_flights_max = self.drain_flights_max.max(other.drain_flights_max);
+        self.drain_enabled_max = self.drain_enabled_max.max(other.drain_enabled_max);
+        self.drain_wait_max = self.drain_wait_max.max(other.drain_wait_max);
         for (mine, theirs) in self.fired.iter_mut().zip(other.fired) {
             *mine += theirs;
         }
@@ -898,13 +940,16 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
     /// overdue action, one uniform draw picks the step.
     fn pick_fair(&mut self) -> Action {
         let enabled = self.enabled();
+        raise(&mut self.stats.drain_enabled_max, enabled.len());
         self.waiting.track(self.step, &enabled);
         let action = match self.waiting.overdue(self.step, FAIR_STEPS, &enabled) {
             Some(action) => action,
             None if enabled.is_empty() => Action::Tick,
             None => enabled[self.pick_index(enabled.len())],
         };
-        self.waiting.ran(&action);
+        if let Some(since) = self.waiting.ran(&action) {
+            raise(&mut self.stats.drain_wait_max, self.step - since);
+        }
         action
     }
 
@@ -1096,7 +1141,8 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
                     "flap"
                 };
                 self.drop_flight(flight_id);
-                if self.worker(id).pinned == Some(decision.epoch) {
+                let any_fence = self.config.defect == Defect::UnloadOnAnyFence;
+                if any_fence || self.worker(id).pinned == Some(decision.epoch) {
                     self.unload(id);
                 }
                 self.log(&format!(
@@ -1219,6 +1265,21 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
                         return fail(*invariant, "the holder fenced its own commit".to_string());
                     }
                 }
+                OwnerInvariant::LiveRowHasAPinnedHolder => {
+                    let pinned = row.holder.and_then(|h| self.worker(h).pinned);
+                    if row.live && pinned != Some(row.epoch) {
+                        let holder = row
+                            .holder
+                            .map_or_else(|| "nobody".to_string(), |h| h.to_string());
+                        return fail(
+                            *invariant,
+                            format!(
+                                "the row is live at {}, and {holder} does not pin it",
+                                row.epoch
+                            ),
+                        );
+                    }
+                }
             }
         }
         None
@@ -1234,8 +1295,17 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
             "run_with needs an empty store"
         );
         let mut violation = None;
-        let limit = self.config.fault_steps + self.config.drain_steps;
+        let limit = self
+            .config
+            .fault_steps
+            .saturating_add(self.config.drain_steps);
         while self.step < limit && !self.quiescent() {
+            if self.step == self.config.fault_steps {
+                let flights = self.decisions.len();
+                self.stats.drains += 1;
+                raise(&mut self.stats.drain_flights_max, flights);
+                self.log(&format!("drain starts, {flights} decisions in flight"));
+            }
             let action = self.pick();
             self.apply(action);
             if let Some(found) = self.check() {
@@ -1245,6 +1315,9 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
                 break;
             }
             self.step += 1;
+        }
+        if let Some(drained) = self.step.checked_sub(self.config.fault_steps) {
+            raise(&mut self.stats.drain_steps_max, drained);
         }
         let completed = self.quiescent();
         OwnerReport {
@@ -1256,6 +1329,11 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
             completed,
         }
     }
+}
+
+/// Raise the counter `max` to `value`.
+fn raise(max: &mut u64, value: usize) {
+    *max = (*max).max(u64::try_from(value).unwrap_or(u64::MAX));
 }
 
 /// Run `config` on a fresh [`OracleOwnerStore`].

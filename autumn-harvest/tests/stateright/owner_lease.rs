@@ -275,7 +275,8 @@ impl OwnerLease {
                 };
                 state.seen.insert(tag);
                 state.decisions.remove(index);
-                if state.workers[id.0].pinned == Some(decision.epoch) {
+                let any_fence = self.defect == Defect::UnloadOnAnyFence;
+                if any_fence || state.workers[id.0].pinned == Some(decision.epoch) {
                     self.unload(state, id);
                 }
             }
@@ -300,6 +301,41 @@ impl OwnerLease {
         let worker = &mut state.workers[decision.worker.0];
         worker.cache = index + 1;
         worker.memory.remove(&decision.signal);
+    }
+}
+
+impl OwnerLease {
+    /// Every signal is sent, acknowledged and consumed, and no decision is
+    /// in flight. The run of `dst::owner` ends here.
+    fn quiescent(self, state: &State) -> bool {
+        state.sent.len() == self.signals
+            && state.acked.len() == self.signals
+            && state.store.pending().is_empty()
+            && state.decisions.is_empty()
+            && state.workers.iter().all(|w| w.memory.is_empty())
+    }
+
+    /// The state is quiescent, or a step that is not a fault changes it.
+    /// `Expire` and `Release` are the faults that the drain leaves out.
+    ///
+    /// The drain may acquire past `max_epoch`, so a free row at the bound
+    /// does not count as a stop.
+    fn drain_can_progress(self, state: &State) -> bool {
+        if self.quiescent(state) {
+            return true;
+        }
+        let mut actions = Vec::new();
+        self.actions(state, &mut actions);
+        actions.extend(
+            (0..self.workers)
+                .map(WorkerId)
+                .filter(|w| state.workers[w.0].pinned.is_none())
+                .map(Action::Acquire),
+        );
+        actions
+            .into_iter()
+            .filter(|a| !matches!(a, Action::Expire | Action::Release(_)))
+            .any(|a| self.next_state(state, a).is_some())
     }
 }
 
@@ -436,12 +472,18 @@ impl Model for OwnerLease {
                 OwnerInvariant::OwnerNeverFencesItself.as_str(),
                 |_, s: &State| !s.seen.contains(&Tag::SelfFence),
             ),
-            Property::always(LIVE_ROW_HAS_A_PINNED_HOLDER, |_, s: &State| {
-                let row = s.store.row();
-                !row.live
-                    || row
-                        .holder
-                        .is_some_and(|h| s.workers[h.0].pinned == Some(row.epoch))
+            Property::always(
+                OwnerInvariant::LiveRowHasAPinnedHolder.as_str(),
+                |_, s: &State| {
+                    let row = s.store.row();
+                    !row.live
+                        || row
+                            .holder
+                            .is_some_and(|h| s.workers[h.0].pinned == Some(row.epoch))
+                },
+            ),
+            Property::always(DRAIN_CAN_PROGRESS, |model, s: &State| {
+                model.drain_can_progress(s)
             }),
             Property::sometimes(EVERY_NEMESIS_SEEN, |_, s: &State| {
                 Tag::WITNESSES.iter().all(|tag| s.seen.contains(tag))
@@ -452,10 +494,9 @@ impl Model for OwnerLease {
 
 /// One behavior reaches every nemesis.
 const EVERY_NEMESIS_SEEN: &str = "EveryNemesisSeen";
-/// The holder of a live row is pinned at the epoch of the row. So the
-/// fault-free drain of `dst::owner` cannot stop: either a worker can take
-/// the row, or its holder can commit (issue #2294).
-const LIVE_ROW_HAS_A_PINNED_HOLDER: &str = "LiveRowHasAPinnedHolder";
+/// Every state that is not quiescent has a step that is not a fault. So
+/// the drain of `dst::owner` never stops with work left (issue #2294).
+const DRAIN_CAN_PROGRESS: &str = "DrainCanProgress";
 /// The invariant that `OwnerLeaseReach.cfg` must break. It is the negation
 /// of [`EVERY_NEMESIS_SEEN`].
 const TLA_REACH: &str = "SomeNemesisUnseen";
@@ -576,4 +617,14 @@ fn every_simulator_invariant_is_a_property() {
             invariant.as_str()
         );
     }
+}
+
+#[test]
+fn a_worker_that_unloads_on_any_fence_stops_the_drain() {
+    let model = OwnerLease::with_defect(Defect::UnloadOnAnyFence);
+    let checker = check_until(model, DRAIN_CAN_PROGRESS);
+    let path = checker.assert_any_discovery(DRAIN_CAN_PROGRESS);
+    let row = path.last_state().store.row();
+    // The row stays live, and its holder no longer owns it.
+    assert!(row.live, "{row:?}");
 }

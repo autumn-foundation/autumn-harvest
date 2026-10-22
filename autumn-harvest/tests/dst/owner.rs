@@ -41,7 +41,7 @@ const NIGHTLY_2294: [u64; 4] = [
     68_003_071_396,
 ];
 
-/// The seeds of the test that cuts the fault phase at every step.
+/// The seeds of the test that cuts the fault phase at every third step.
 const CUT_SEEDS: SeedPlan = SeedPlan {
     first: 0,
     count: 12,
@@ -327,7 +327,20 @@ fn the_failure_of_a_run_that_does_not_converge_names_the_drain() {
     assert_eq!(stuck.violation, None);
     let reason = stuck.failure().expect("a stuck run fails");
     assert!(reason.contains("did not consume every signal"), "{reason}");
+    assert!(reason.contains("400 drain steps"), "{reason}");
     assert_eq!(owner::run(&config).failure(), None);
+}
+
+#[test]
+fn the_replay_fails_a_run_that_does_not_converge() {
+    let stuck = OwnerConfig {
+        fault_steps: 0,
+        drain_steps: 1,
+        ..OwnerConfig::new(0)
+    };
+    let reason = replay(&stuck).expect_err("one drain step consumes no signal");
+    assert!(reason.contains("did not consume every signal"), "{reason}");
+    assert!(replay(&OwnerConfig::new(0)).is_ok());
 }
 
 #[test]
@@ -341,11 +354,26 @@ fn the_seeds_of_issue_2294_converge_in_the_drain() {
             "seed {seed}:\n{}",
             report.trace_tail(40)
         );
-        // The fault phase alone does not consume every signal.
-        assert!(
-            report.trace.len() > config.fault_steps,
-            "seed {seed} needs no drain"
-        );
+        assert_eq!(report.stats.drains, 1, "seed {seed}");
+        // The run failed before the drain existed.
+        let undrained = OwnerConfig {
+            drain_steps: 0,
+            ..config
+        };
+        assert!(!owner::run(&undrained).completed, "seed {seed}");
+    }
+}
+
+#[test]
+fn the_drain_leaves_the_fault_phase_unchanged() {
+    for seed in COVER_SEEDS.seeds() {
+        let config = OwnerConfig::new(seed);
+        let full = owner::run(&config);
+        let cut = owner::run(&OwnerConfig {
+            drain_steps: 0,
+            ..config
+        });
+        assert!(full.trace.starts_with(&cut.trace), "seed {seed}");
     }
 }
 
@@ -358,9 +386,10 @@ fn step_of(line: &str) -> usize {
 }
 
 #[test]
-fn the_drain_converges_from_every_fault_step() {
+fn the_drain_converges_fairly_within_its_bound() {
+    let mut stats = OwnerStats::default();
     for seed in CUT_SEEDS.seeds() {
-        for fault_steps in 0..=OwnerConfig::new(seed).fault_steps {
+        for fault_steps in (0..=OwnerConfig::new(seed).fault_steps).step_by(3) {
             let config = OwnerConfig {
                 fault_steps,
                 ..OwnerConfig::new(seed)
@@ -372,8 +401,86 @@ fn the_drain_converges_from_every_fault_step() {
                 "seed {seed}, drain at {fault_steps}:\n{}",
                 report.trace_tail(40)
             );
+            stats.merge(&report.stats);
         }
     }
+    let wide = |n: u64| usize::try_from(n).expect("a small count");
+    assert!(stats.drains > 0, "{stats:?}");
+    // Weak fairness: no wait is longer than `FAIR_STEPS + k - 1`.
+    let fair = owner::FAIR_STEPS + wide(stats.drain_enabled_max) - 1;
+    assert!(wide(stats.drain_wait_max) <= fair, "{stats:?}");
+    // The bound of the `drain_steps` doc holds and fits the limit.
+    let config = OwnerConfig::new(0);
+    let bound = config.drain_bound(wide(stats.drain_flights_max));
+    assert!(wide(stats.drain_steps_max) <= bound, "{stats:?}");
+    assert!(bound <= config.drain_steps, "{bound}");
+}
+
+#[test]
+fn the_default_drain_limit_holds_the_bound_for_103_decisions_in_flight() {
+    let config = OwnerConfig::new(0);
+    assert_eq!(config.drain_bound(0), 180 + 2 * 7);
+    assert!(config.drain_bound(103) <= config.drain_steps);
+    assert!(config.drain_bound(104) > config.drain_steps);
+}
+
+/// The worker and the step of the first stall in `trace`, and its length.
+fn first_stall(trace: &[String]) -> Option<(String, usize, usize)> {
+    trace.iter().find_map(|line| {
+        let mut words = line.split_whitespace();
+        let step = words.next()?.parse().ok()?;
+        let worker = words.next()?.to_string();
+        (words.next()? == "stall").then_some(())?;
+        let steps = words.next()?.parse().ok()?;
+        Some((worker, step, steps))
+    })
+}
+
+#[test]
+fn the_drain_ends_every_stall() {
+    let mut early = 0;
+    for seed in COVER_SEEDS.seeds() {
+        let Some((worker, step, steps)) = first_stall(&owner::run(&OwnerConfig::new(seed)).trace)
+        else {
+            continue;
+        };
+        let config = OwnerConfig {
+            fault_steps: step + 1,
+            ..OwnerConfig::new(seed)
+        };
+        let report = owner::run(&config);
+        assert!(report.completed, "seed {seed}:\n{}", report.trace_tail(40));
+        // The stalled worker acts in the drain before its stall would end.
+        let prefix = |line: &&String| line.split_whitespace().nth(1) == Some(worker.as_str());
+        early += usize::from(
+            report
+                .trace
+                .iter()
+                .filter(prefix)
+                .any(|line| (step + 1..step + steps).contains(&step_of(line))),
+        );
+    }
+    assert!(early > 0, "no stalled worker acts early in the drain");
+}
+
+#[test]
+fn a_worker_that_unloads_on_any_fence_stops_the_drain() {
+    // The lease churn of a long fault phase hides the stop, so cut it short.
+    let stopped = RED_SEEDS.seeds().find_map(|seed| {
+        (0..=100).step_by(10).find_map(|fault_steps| {
+            let config = OwnerConfig {
+                fault_steps,
+                ..OwnerConfig::new(seed)
+                    .with_defect(Defect::UnloadOnAnyFence)
+                    .checking(&[])
+            };
+            let report = owner::run(&config);
+            (!report.completed).then_some(report)
+        })
+    });
+    let report = stopped.expect("the mutant stops a drain");
+    assert_eq!(report.violation, None);
+    assert_eq!(report.stats.drains, 1, "{:?}", report.stats);
 }
 
 #[test]
@@ -436,11 +543,15 @@ fn replay_one_owner_seed() {
     };
     let seed: u64 = seed.trim().parse().expect("a decimal seed");
     let config = owner::config_from_env(seed).unwrap_or_else(|e| panic!("{e}"));
-    let report = owner::run_twice(&config).unwrap_or_else(|n| panic!("{n}"));
+    replay(&config).unwrap_or_else(|reason| panic!("{reason}"));
+}
+
+/// Run `config` twice and print the trace. The sweep and the replay give
+/// the same verdict.
+fn replay(config: &OwnerConfig) -> Result<OwnerReport, String> {
+    let report = owner::run_twice(config).map_err(|n| n.to_string())?;
     println!("{}", report.trace.join("\n"));
-    if let Some(reason) = report.failure() {
-        panic!("{reason}");
-    }
+    report.failure().map_or(Ok(report), Err)
 }
 
 /// Every file under `dir`, in a fixed order.

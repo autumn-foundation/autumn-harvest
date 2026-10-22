@@ -48,9 +48,10 @@ impl<A: Ord + Copy> Waits<A> {
             .map(|(action, _)| action)
     }
 
-    /// `action` ran, so its wait ends.
-    pub(super) fn ran(&mut self, action: &A) {
-        self.since.remove(action);
+    /// `action` ran, so its wait ends. Returns the step at which the wait
+    /// began, if the action waited.
+    pub(super) fn ran(&mut self, action: &A) -> Option<usize> {
+        self.since.remove(action)
     }
 
     /// The step at which `action` began to wait, if it waits.
@@ -62,6 +63,7 @@ impl<A: Ord + Copy> Waits<A> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::rng::SplitMix64;
     use super::*;
 
     const FAIR: usize = 10;
@@ -102,6 +104,31 @@ mod tests {
         waits.track(FAIR, &ACTIONS);
         assert_eq!(waits.overdue(FAIR, FAIR, &ACTIONS), Some('a'));
         assert_eq!(waits.since(&'c'), Some(FAIR));
+    }
+
+    #[test]
+    fn a_wait_stays_within_the_bound_as_actions_come_and_go() {
+        // Each step enables a random subset of 6 actions, and a draw runs one
+        // of them when none is overdue. A wait counts only while its action
+        // stays enabled, so no run may have waited past `FAIR + 6 - 1`.
+        const K: u64 = 6;
+        let mut rng = SplitMix64::new(2294);
+        let mut waits = Waits::new();
+        let mut longest = 0;
+        for step in 0..20_000 {
+            let enabled: Vec<u64> = (0..K).filter(|_| rng.chance(90)).collect();
+            waits.track(step, &enabled);
+            let action = match waits.overdue(step, FAIR, &enabled) {
+                Some(action) => action,
+                None if enabled.is_empty() => continue,
+                None => enabled[usize::try_from(rng.below(K)).unwrap_or(0) % enabled.len()],
+            };
+            if let Some(since) = waits.ran(&action) {
+                longest = longest.max(step - since);
+            }
+        }
+        assert!(longest >= FAIR, "the draw alone never makes a wait overdue");
+        assert!(longest < FAIR + 6, "{longest}");
     }
 
     #[test]
