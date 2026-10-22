@@ -298,6 +298,9 @@ rest.
 ## See also
 
 - `docs/sticky-routing.md`: the resident path and its counter.
+- `docs/rnd/2026-10-22-stage-2-gate.md`: the gate measurements (issue #2257).
+  A cold decision also reads its history. That read costs far more than
+  the replay.
 - `docs/why-deterministic-replay.md`: replay against checkpoint-only models.
 - `docs/adr/0006-keyed-entity.md`: typed state over continue-as-new.
 - `docs/upgrade-check.md`: the pre-deploy upgrade verdict.

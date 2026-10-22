@@ -1,0 +1,22 @@
+[package]
+name = "history-load-gate"
+description = "Measures cold history loads from Postgres and local SQLite for the stage 2 gate (issue #2257)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", features = ["db"] }
+autumn-harvest-sqlite = { version = "0.7.0", path = "../../autumn-harvest-sqlite" }
+chrono = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

@@ -16,6 +16,7 @@ members = [
     "autumn-harvest-verify/corpus/helpers",
     "autumn-harvest-verify/corpus/helpers-deep",
     "examples/agent-loop-hit-rate",
+    "examples/history-load-gate",
     "examples/autoresearch",
     "examples/billing-autumn-web",
     "examples/claude-agent-daemon",

@@ -162,6 +162,9 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_workflow_duration_bucket",
     "harvest_workflow_duration_count",
     "harvest_workflow_duration_sum",
+    "harvest_workflow_resident_duration_bucket",
+    "harvest_workflow_resident_duration_count",
+    "harvest_workflow_resident_duration_sum",
     "harvest_workflow_history_size_bucket",
     "harvest_workflow_history_size_count",
     "harvest_workflow_history_size_sum",
@@ -302,6 +305,10 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_workflow_cache_miss", &["workflow", "queue"]),
     (
         "harvest_workflow_resident",
+        &["workflow", "queue", "outcome"],
+    ),
+    (
+        "harvest_workflow_resident_duration",
         &["workflow", "queue", "outcome"],
     ),
     (

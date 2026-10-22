@@ -1073,6 +1073,12 @@ jobs:
       - name: "Run agent-loop-hit-rate example tests (issue #2007)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p agent-loop-hit-rate --bins
+      # Issue #2257. The unit tests and the SQLite tests run offline. The
+      # Postgres tests skip without `HARVEST_TEST_DATABASE_URL`, and the
+      # measurement runs by hand (see the crate README).
+      - name: "Run history-load-gate example tests (issue #2257)"
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p history-load-gate
       # The autoresearch capstone. Its suite is offline: a simulated
       # trainer, a scripted researcher, seeded simulation sweeps and SQLite
       # end-to-end runs. Linux only, because the tests drive `git` and `sh`.
@@ -2160,6 +2166,11 @@ jobs:
         run: cargo clippy -p standalone-quickstart --all-targets -- -D warnings
       - name: "Clippy agent-loop-hit-rate example (issue #2007)"
         run: cargo clippy -p agent-loop-hit-rate --all-targets -- -D warnings
+      # `--no-deps` scopes the deny to the example. It depends on
+      # `autumn-harvest` with `db` only, where the core crate carries
+      # pre-existing warnings.
+      - name: "Clippy history-load-gate example (issue #2257)"
+        run: cargo clippy -p history-load-gate --all-targets --no-deps -- -D warnings
       # Same issue #962 rule as the verify and redis crates in `clippy-crates`:
       # a new workspace member gets NO clippy coverage without its own step.
       # `--no-deps` scopes the deny to the example, because it depends on

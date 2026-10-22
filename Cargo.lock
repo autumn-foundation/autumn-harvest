@@ -3576,6 +3576,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "history-load-gate"
+version = "0.7.0"
+dependencies = [
+ "autumn-harvest",
+ "autumn-harvest-sqlite",
+ "chrono",
+ "diesel",
+ "diesel-async",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

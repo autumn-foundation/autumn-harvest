@@ -102,11 +102,11 @@ use crate::telemetry::{
     METRIC_WORKFLOW_HISTORY_BLOAT, METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE,
     METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC,
     METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RESIDENT,
-    METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED,
-    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
-    METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, PoisonReason,
-    ResidentOutcome, SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome,
-    WorkflowStatus,
+    METRIC_WORKFLOW_RESIDENT_DURATION, METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED,
+    METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
+    METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
+    MetricsRecorder, PoisonReason, ResidentOutcome, SessionAcquisitionOutcome, SlotType,
+    TunerDecision, WebhookOutcome, WorkflowStatus,
 };
 use crate::telemetry::{
     DbOp, METRIC_DB_POOL_IDLE, METRIC_DB_POOL_IN_USE, METRIC_DB_POOL_WAIT,
@@ -1032,6 +1032,22 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_workflow_resident_duration(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        outcome: ResidentOutcome,
+        seconds: f64,
+    ) {
+        histogram!(
+            METRIC_WORKFLOW_RESIDENT_DURATION,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_OUTCOME => outcome.as_str(),
+        )
+        .record(seconds);
+    }
+
     fn record_external_signal_sent(&self, outcome: &str, reason_code: Option<&str>) {
         if let Some(reason) = reason_code {
             counter!(
@@ -1805,6 +1821,7 @@ mod tests {
         rec.record_workflow_cache_hit("wf", "q");
         rec.record_workflow_cache_miss("wf", "q");
         rec.record_workflow_resident("wf", "q", ResidentOutcome::Hit);
+        rec.record_workflow_resident_duration("wf", "q", ResidentOutcome::Hit, 0.001);
         rec.record_rate_limit_tokens_available("rl", 10.0);
         rec.record_rate_limit_refill_rate("rl", 2.0);
         rec.record_rate_limit_throttled("rl");
@@ -1871,6 +1888,7 @@ mod tests {
     #[derive(Default)]
     struct CapturingRecorder {
         counters: std::sync::Mutex<Vec<CounterKey>>,
+        histograms: std::sync::Mutex<Vec<CounterKey>>,
     }
 
     /// Every `Scanner` variant's expected `harvest.scanner.tick` counter key.
@@ -1932,11 +1950,41 @@ mod tests {
         }
         fn register_histogram(
             &self,
-            _: &metrics::Key,
+            key: &metrics::Key,
             _: &metrics::Metadata<'_>,
         ) -> metrics::Histogram {
+            self.histograms.lock().unwrap().push((
+                key.name().to_owned(),
+                key.labels()
+                    .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                    .collect(),
+            ));
             metrics::Histogram::noop()
         }
+    }
+
+    /// Issue #2257: the duration takes the labels of the resident counter.
+    #[test]
+    fn bridges_workflow_resident_duration_with_outcome_labels() {
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            MetricsRsRecorder.record_workflow_resident_duration(
+                "wf",
+                "q",
+                ResidentOutcome::Cold,
+                0.012,
+            );
+        });
+        let expected: Vec<CounterKey> = vec![(
+            METRIC_WORKFLOW_RESIDENT_DURATION.to_owned(),
+            vec![
+                (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
+                (METRIC_LABEL_QUEUE.to_owned(), "q".to_owned()),
+                (METRIC_LABEL_OUTCOME.to_owned(), "cold".to_owned()),
+            ],
+        )];
+        assert_eq!(*capture.histograms.lock().unwrap(), expected);
+        assert!(capture.counters.lock().unwrap().is_empty());
     }
 
     #[test]

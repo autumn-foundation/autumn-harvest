@@ -40,6 +40,8 @@ Any other delta declines. A decline drops the resident workflow and runs a cold 
 
 **Observing it.** `harvest.workflow.resident` counts each decision attempt on a worker with resident state on (issue #2007). Its `outcome` label is `hit` for a resumed decision. Each other value names why the decision replayed: `cold`, `declined`, `multi_await`, `race`, `mutex`, `hot_swap`, `blocked` or `unsupported`. The hit rate is `hit` over all outcomes. A resumed cycle also records `harvest.replay = false` on its `harvest.workflow.execute` span. A decline logs `resident workflow declined; replaying cold (issue #1798)` at `debug` level, with the `ResumeDeclined` reason.
 
+`harvest.workflow.resident.duration` times each of these decisions, with the same labels (issue #2257). The clock starts before the history load and stops at the end of the first drive. The p99 of `outcome="cold"` is the cold p99 of the stage 2 gate in [`docs/rnd/2026-10-22-stage-2-gate.md`](rnd/2026-10-22-stage-2-gate.md).
+
 **Limits.**
 
 - Resident state lives only in worker memory. A restart, a failover, an LRU eviction or a decision that does not commit drops it. The next decision then replays cold.
