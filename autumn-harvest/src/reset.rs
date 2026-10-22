@@ -1981,6 +1981,7 @@ pub(crate) async fn enqueue_fork_workflow_task(
     };
     let mut enqueue = EnqueueParams::new(fork.queue_name.clone(), TaskType::Workflow, task_input);
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
+    enqueue = enqueue.with_decision_partition(&fork.workflow_id);
     enqueue.required_build_id = fork.assigned_build_id.clone();
     enqueue.new_start = new_start;
     enqueue.fairness_key = crate::queue_fairness::fairness_key_for(None, quota_key);

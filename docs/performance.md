@@ -1562,6 +1562,12 @@ without a capped key pay nothing.
   head makes each claim read the whole run. Live pins last one sticky
   timeout, so they follow the claim rate. Session pins and paused
   activities do not.
+- **Workflow rows of other owners.** In owner mode (issue #2252), the
+  owned claim skips each workflow row of another owner's partition. With N
+  owners, a workflow head reads about 32 × N rows. A dead owner's rows wait
+  at the head until a peer acquires its partitions, so each claim reads
+  them until then. A review run on PG16 read 381 buffers against 119 for
+  the legacy claim, with 4,900 foreign rows ahead of 100 owned ones.
 - **A large live pin set.** The pin head reads every live pin of this
   worker. More than 32 of them that pass the gates also make every rank-0
   row wait for the fallback.
@@ -2570,3 +2576,8 @@ standalone note rather than part of the claim-path attribution table above:
   — `append_stream_chunks` counted every stored chunk of a run on each append.
   It now skips the count while the offset span plus the new chunks fits the cap
   (count buffers -99.8%, total buffers -35.5% over full stream lifetimes).
+* [`docs/performance-sla-breach-scan.md`](performance-sla-breach-scan.md)
+  — the soft-SLA breach scan read the whole executions table on every timeout
+  tick, because the planner could not prove its predicate implies the partial
+  index's. It now repeats the index clause and uses the index (buffers
+  19,887 → 1 at 1,000,000 executions, `EXPLAIN (ANALYZE, BUFFERS)`).

@@ -62,8 +62,9 @@ use crate::telemetry::{
     METRIC_CONCURRENCY_RESIDUAL_OVER_LIMIT, METRIC_CONCURRENCY_SUPERSEDED,
     METRIC_CONNECTOR_DISPATCHED, METRIC_CONNECTOR_LAG, METRIC_CONNECTOR_POISONED,
     METRIC_CONNECTOR_RECEIVED, METRIC_DB_POOL_ACQUIRE_TIMEOUT, METRIC_DB_TRANSACTION_RETRY,
-    METRIC_DB_TRANSACTION_RETRY_EXHAUSTED, METRIC_DEBOUNCE_FIRED, METRIC_DISPATCH_DROPPED_HINTS,
-    METRIC_DLQ_ENTRIES, METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
+    METRIC_DB_TRANSACTION_RETRY_EXHAUSTED, METRIC_DEBOUNCE_FIRED, METRIC_DECISION_OWNER_FENCED,
+    METRIC_DECISION_OWNER_WOKEN, METRIC_DISPATCH_DROPPED_HINTS, METRIC_DLQ_ENTRIES,
+    METRIC_DLQ_REDRIVEN, METRIC_EXTERNAL_BY_ID_FOUND_OVER_INCOMPLETE_FANOUT,
     METRIC_EXTERNAL_BY_ID_INDETERMINATE_SHARD, METRIC_EXTERNAL_BY_ID_OTHER_LIVE_OBSERVED,
     METRIC_EXTERNAL_CANCEL_BY_ID_OLDEST_PENDING_AGE, METRIC_EXTERNAL_CANCEL_SENT,
     METRIC_EXTERNAL_SIGNAL_BY_ID_OLDEST_PENDING_AGE, METRIC_EXTERNAL_SIGNAL_SENT,
@@ -795,6 +796,24 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_SCANNER => scanner.to_owned(),
             METRIC_LABEL_SHARD => shard.to_owned(),
             METRIC_LABEL_ROLE => role.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_decision_owner_fenced(&self, shard: &str) {
+        counter!(
+            METRIC_DECISION_OWNER_FENCED,
+            METRIC_LABEL_SHARD => shard.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_decision_owner_woken(&self, shard: &str, kind: &str) {
+        // Bounded labels: `kind` is `wake` or `evict` (issue #2253).
+        counter!(
+            METRIC_DECISION_OWNER_WOKEN,
+            METRIC_LABEL_SHARD => shard.to_owned(),
+            METRIC_LABEL_KIND => kind.to_owned(),
         )
         .increment(1);
     }
@@ -1969,6 +1988,35 @@ mod tests {
                 )
             })
             .collect();
+        assert_eq!(*capture.counters.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn bridges_decision_owner_fenced_with_a_shard_label() {
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            MetricsRsRecorder.record_decision_owner_fenced("2");
+        });
+        let expected: Vec<CounterKey> = vec![(
+            METRIC_DECISION_OWNER_FENCED.to_owned(),
+            vec![(METRIC_LABEL_SHARD.to_owned(), "2".to_owned())],
+        )];
+        assert_eq!(*capture.counters.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn bridges_decision_owner_woken_with_shard_and_kind_labels() {
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            MetricsRsRecorder.record_decision_owner_woken("2", "evict");
+        });
+        let expected: Vec<CounterKey> = vec![(
+            METRIC_DECISION_OWNER_WOKEN.to_owned(),
+            vec![
+                (METRIC_LABEL_SHARD.to_owned(), "2".to_owned()),
+                (METRIC_LABEL_KIND.to_owned(), "evict".to_owned()),
+            ],
+        )];
         assert_eq!(*capture.counters.lock().unwrap(), expected);
     }
 

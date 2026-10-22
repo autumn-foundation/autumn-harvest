@@ -4,9 +4,11 @@
 
 Accepted (issue #2249).
 
-Issues #2250 to #2254 build it. The planning record is
-[`DESIGN-2249.md`](../../DESIGN-2249.md). The source is the stage 1 section of
-`reports/Actor ownership prior art for Harvest.md`.
+Issues #2250 to #2254 build it. Issue #2253 adds decision 12.
+[ADR 0010](0010-fenced-owner-lease.md) holds the lease rules R1 to R7 that
+the model forces. The planning record is
+[`DESIGN-2249.md`](../../DESIGN-2249.md). The source is the stage 1 section
+of `reports/Actor ownership prior art for Harvest.md`.
 
 ## Context
 
@@ -74,9 +76,14 @@ keeps its meaning. Docs, metrics and logs say "decision partition", or
 
 ### 4. Lease placement: the history's own database
 
-- Each physical database holds one owner row per partition: partition,
-  holder, epoch and lease end. Issue #2251 names the table and fixes its
-  schema.
+- Each physical database holds one owner row per partition:
+  `harvest_decision_owner(partition, holder, epoch, lease_until)` (issue
+  #2251). The migration seeds rows 0 to 511 at epoch 0. A trigger refuses
+  an epoch that falls or grows by more than 1, a new holder at the old
+  epoch, and a changed partition.
+- A worker keys each tenure by the shard of the claim's pool and the
+  partition (`OwnerKey`), because it can serve several databases. The pool
+  names the database of the owner row. The bits of an execution id do not.
 - The row is in the database that holds the history it fences. It fails
   over with the data, and its check is atomic with the append.
 - The DR fence rejects a TTL lease because the lease fails over with the
@@ -149,8 +156,16 @@ Rules:
 
 - Each transaction that takes an owner row takes the generation row first.
   This covers acquisition, renewal, release, revoke and the DR bump.
+- The owned claim is the exception (issue #2252). It reads the generation
+  row without a lock, as every claim does. Its owner row lock uses
+  `SKIP LOCKED`, so it never waits.
 - A decision commit or an owned claim takes at most one owner row.
-- It takes that row before any execution row, task row or advisory lock.
+- A decision commit takes that row before any execution row, task row or
+  advisory lock.
+- An owned claim takes its owner row in the claim guard, after its task
+  row. It uses `SKIP LOCKED`, so it never waits for the owner row. A
+  skipped row is a takeover, and the claim takes no task. So the late
+  order adds no wait edge (issue #2252).
 - Renewal, release and revoke take the generation row and owner rows
   only. An acquisition takes them, then locks the workflow task rows that
   it re-pends (decision 7).
@@ -158,7 +173,7 @@ Rules:
   A plain `UPDATE ... WHERE partition = ANY(...)` does not do that. It
   locks rows in scan order.
 - Use a locking `SELECT ... ORDER BY partition` first, then the `UPDATE`.
-  Issue #2251 pins this with a test.
+  `a_multi_row_renewal_locks_rows_in_ascending_order` pins this.
 - A foreign writer takes no owner row. The execution row lock serializes
   it, as today.
 - Offloaded payloads upload before the fenced transaction opens, as each
@@ -191,8 +206,32 @@ no edge to that cycle.
 Owner mode changes one path. Today the workflow-task persist locks the
 execution row first (`check_paused_and_park`). It checks the generation row
 at its first append. Owner mode moves both fence reads to the start of the
-transaction. Issue #2251 adds the owner row to the lock-order table, with
-its pin test.
+transaction (`assert_decision_fence`). Row 19 of the lock-order table holds
+the owner row. `a_decision_takes_the_owner_row_before_the_execution_row`
+pins it.
+
+Every transaction of a decision starts with `assert_decision_fence`. That
+covers the wake ingest and the inline local activity and signal writes. It
+also covers the suspension and terminal persists and the projection writes.
+The decision pins its
+tenure in a task-local, so a foreign writer in another task takes no owner
+row. A local activity handler is user code. It runs in a nested scope that
+pins nothing, so its own writes are foreign writes. The body-timeout
+quarantine pins the tenure of the run and fences too.
+
+Each event insert calls `assert_fence` too, which fences the pinned tenure
+again. That covers a write that a future path adds without a start fence.
+A transaction that already holds the row passes at once.
+
+The fence is the migration's function `harvest_decision_owner_fence`. Its
+lock wait is at most 250 ms, set on the function. A failed acquisition
+recheck holds the row `FOR UPDATE` for a moment, even on a live lease, so a
+healthy owner must wait briefly. A longer hold is a takeover, so the fence
+fails closed. The wait is short and ends in a refusal, so a late fence
+after other row locks cannot deadlock. A wait for the table lock counts too.
+So a migration that queues an `ACCESS EXCLUSIVE` lock on
+`harvest_decision_owner` fences every commit until its `lock_timeout` ends.
+Keep that timeout short, as `online-migrations.md` requires.
 
 ### 7. Fenced commit: unload, never retry
 
@@ -205,20 +244,28 @@ When the holder or the epoch differs:
   execution in the partition.
 - It never retries at the stale epoch. It can acquire the partition again
   later, at a new epoch.
-- It counts the fence on a metric. Issue #2251 names the metric.
+- It counts the fence on `harvest.decision_owner.fenced{shard}`.
 - The execution row lock and `UNIQUE(workflow_exec_id, event_id)` stay as
   the backstop.
 
 No task stays `RUNNING` with no worker to finish it:
 
-- The owned claim takes the owner row `FOR KEY SHARE` and matches holder
-  and epoch. A stale owner cannot claim after a takeover.
+- The owned claim takes the owner row `FOR KEY SHARE` and matches the
+  holder. A stale owner cannot claim after a takeover. A holder that takes
+  back its own row needs no epoch check: its later decisions fence.
 - The acquisition re-pends each `RUNNING` workflow task of the partition
-  that another worker holds. It does this in its own transaction, after its
-  `FOR UPDATE`.
+  that a dead worker holds. Issue #2252 does this in one statement per
+  scan, after the acquisitions commit. A claim of the old owner that
+  commits later fails the guard.
+- A live worker keeps its claim. A live old owner fails its fence and
+  re-pends its own claim. A live legacy worker finishes its decision. So
+  no decision runs twice at once.
 - A fenced worker re-pends its own claim under its claim token, as
   `requeue_claimed_workflow_task_*` does today.
-- Issue #2252 builds these three steps.
+- Issue #2252 builds the first two steps. Issue #2251 builds the third
+  (`requeue_claimed_workflow_task_after_fence`).
+- With owner mode on and no tenure, a decision fails closed with
+  `OwnershipLost` and writes nothing.
 
 ### 8. Lease TTL: 10 s, renewed every TTL / 3
 
@@ -252,7 +299,7 @@ On a graceful stop, a worker:
 1. Stops new claims and new commits in every partition.
 2. Waits for its in-flight decisions, up to the drain bound.
 3. Releases every partition in one statement. The statement sets the lease
-   end to `clock_timestamp()` and keeps the epoch.
+   end to `clock_timestamp()` and keeps the holder and the epoch.
 
 Standbys acquire on their next scan. A decision still in flight at the
 bound keeps its row lock, and the acquisition waits for it. There is no
@@ -261,8 +308,22 @@ shard 5 s and failed (golemcloud/golem#3766).
 
 A worker targets ⌈512 / live owners on the database⌉ partitions. It
 releases a partition when it holds more than that target + 1. It drains
-the partition first, as in steps 1 and 2. Issue #2252 fixes the balance
-policy.
+the partition first, as in steps 1 and 2.
+
+Issue #2252 fixes the balance policy (`decision_owner::plan_balance`):
+
+- Live owners are the owner loops that wrote their candidate row in the
+  last 3 s (`harvest_decision_owner_candidates`). A loop writes it on each
+  scan. A crashed worker drops out within 3 s.
+- A worker that cannot run a workflow task is no candidate. This covers
+  a worker with no workflow slot or type, and a split colocated group.
+  It still claims in the owned form, so the guard never blocks it.
+- A worker below the target acquires free partitions up to the target.
+- A worker above target + 1 stops claiming the extra partitions at once.
+  It releases them on its next scan, so their decisions in flight can
+  commit. That is the drain.
+- Any worker acquires an orphan: a free partition whose lease ended more
+  than one renewal interval ago.
 
 ### 10. Tenant cells: partitions follow shard assignments
 
@@ -291,8 +352,8 @@ database. The enable step:
 1. Refuses while a live worker on the database cannot run owner mode, or
    covers only part of a colocated group (decision 10). Issue #2252 picks
    the signal, because `harvest_workers` has no capability column today.
-2. Writes the partition of each execution and adds the owner rows and the
-   count.
+2. Writes the partition of each execution and the count. The migration of
+   issue #2251 already seeds the owner rows.
 3. Installs a database guard on the claim of a workflow task. The guard
    refuses a claim that carries no owner epoch.
 4. Re-pends each workflow task that is `RUNNING` under a legacy claim,
@@ -308,13 +369,128 @@ statement, as the DR claim gate does. With the switch on, the legacy
 workflow-task claim selects nothing. With it off, the owned claim selects
 nothing.
 
+Issue #2252 builds the step as `decision_owner::enable_owner_mode`:
+
+- **Capability signal.** Each registration and heartbeat writes the label
+  `decision_owner_version` into `harvest_workers.labels`. Step 1 refuses
+  while a live worker lacks it.
+- **Mixed fleet.** Step 1 also refuses while live workers poll different
+  queues or run different builds. It refuses while live owners register
+  different workflow or activity types, from the label
+  `decision_owner_handlers`. A decision can run any activity inline. An
+  owner claims every workflow task of its partitions, so it must be able to
+  run each one.
+- **Partition.** The column `harvest_task_queue.decision_partition` holds
+  the partition of a workflow task. Each writer stamps it at insert. Step
+  2 stamps the live rows. An owned claim may take an unstamped row. The
+  worker then stamps it and re-pends it to its owner.
+- **Claim signal.** The owned claim sets the transaction setting
+  `harvest.owner_claim` to its holder token. A binary from before owner
+  mode never sets it. The guard reads this token in place of an epoch.
+  It checks neither the epoch nor the lease end. A released lease keeps
+  its holder, so the releaser's local deadline stops its claims.
+- **Guard.** The trigger `harvest_task_queue_owner_claim_guard_trg` runs
+  for the claim of a workflow task only. With no token, it skips the row,
+  so a legacy claim selects nothing. For a stamped row, it takes the owner
+  row `FOR KEY SHARE SKIP LOCKED` and matches the holder.
+- **Order.** Steps 3 to 5 run in one transaction, which first locks the
+  switch row. A failure leaves owner mode off and the guard off. There is
+  no window in which no claim can take a workflow task.
+- **Step 4.** The transaction re-pends only the legacy claims of workers
+  that are not live. A live worker finishes its own decision and parks
+  the task, and then an owner claims it. So no legacy decision runs next
+  to an owner on one execution.
+- **Live owners.** Step 1 also refuses while no owner loop is live.
+- **Locks.** `CREATE TRIGGER` and `ENABLE TRIGGER` take `SHARE ROW
+  EXCLUSIVE` on `harvest_task_queue`, which does not block a reader. A
+  `lock_timeout` bounds each wait. These statements need ownership of the
+  table.
+
 After step 3, no task can be claimed in two ways. An old binary can still
 finish a decision that it claimed before step 3. Step 4 and the execution
 row lock bound that case. Activities stay on the shared claim in both
 modes.
 
 The disable step clears the switch row first, then removes the guard.
-Issue #2252 picks the exact signal that the guard reads.
+`decision_owner::disable_owner_mode` does both in one transaction. It
+turns the trigger off with `DISABLE TRIGGER`, not `DROP TRIGGER`, so it
+takes no `ACCESS EXCLUSIVE` lock.
+
+### 12. Foreign writers: wake the owner, evict on a state change
+
+Issue #2253 builds this decision.
+
+- A foreign writer takes no owner row (decision 6). The execution row lock
+  serializes it with the decision, as before.
+- After its commit, the write wakes the owner of the run's partition. The
+  wake is a `NOTIFY` on the channel `harvest_owner_p{n}` of that database.
+- Each owner listens on the channels of the partitions that it holds. A
+  worker that holds no tenure on a database opens no connection for it.
+- Three paths stage the wake. `wake_workflow_task` and `enqueue` stage a
+  plain wake when a workflow task of the run becomes claimable.
+- The event append functions of `store.rs` stage an evict wake for a state
+  change: a terminal, a pause, a resume or a redrive.
+- `notify_owner` stages a wake for a change that appends no event: a
+  rebalance, or a re-pend after a dead or stuck worker.
+- The post-commit sender of `notify.rs` reads the `workflow_id` of each
+  woken run on its own connection. The write path pays nothing.
+- The sender skips each wake to the partition that the writer's decision
+  pinned. The writer owns that partition, and it decides for its entries.
+- The skip compares the partition number only. A wake to the same number
+  on another database is then lost. That costs latency only.
+- An evict wake drops the cache entry and its parked future. A plain wake
+  only ends the idle wait of the claim loop.
+- A foreign append does not evict. The next decision loads the delta, so a
+  child terminal written into its parent reaches the parent's owner.
+- A `NOTIFY` can be lost. An evict wake can also come while a decision
+  holds the entry, and that decision then puts the entry back.
+- So in owner mode, a cache hit whose delta holds a state change replays
+  cold. A hit whose entry has another owner key replays cold too.
+- Until issue #2252 adds the switch row, owner mode turns owner wakes on
+  for the process. A writer-only process calls `enable_owner_wakes`.
+- That process also needs a post-commit sender (`register_pool`). Without
+  one, the fallback drops each owner note.
+
+The writer classes, from the inventory of issue #2253:
+
+| Class | Writer | Wake | Evicts |
+|---|---|---|---|
+| Activity result | `worker.rs`: `finalize_activity_completion_write`, `finalize_activity_failure_write`, `record_schedule_to_close_activity_timeout`. `context.rs`: `run_transactional` | `wake_workflow_task` | No |
+| Activity start | `worker.rs`: `append_activity_started_if_pending` | None. Nothing becomes claimable. | No |
+| Child terminal into parent | `worker.rs`: `wake_parent_for_child_completion_with_codecs`, `wake_parent_for_child_failure`, `materialize_due_child_timeout_deadlines`. `execution.rs`: `notify_awaited_parent_of_child_terminal` | `wake_workflow_task` | No |
+| Activity and outbox timeouts | `timeout.rs`: `enforce_activity_timeout`, `force_fail_activity`, `enforce_external_task_timeouts`, `wake_parent_for_child_timeout`, `enforce_external_signals_outbox`, `enforce_external_cancels_outbox`, `enforce_external_awaits_outbox` | `wake_workflow_task` | No |
+| Run timeouts | `timeout.rs`: `commit_workflow_execution_timeout`, `enforce_workflow_timeout`, `enforce_workflow_history_ceiling_with_codecs` | Store append of a terminal | Yes |
+| Cancel and terminate | `execution.rs`: `cancel_workflow_execution_collect_mode`, `inline_cancel`, `terminate_workflow_execution_collect` | Store append of a terminal | Yes |
+| Deferred cancel | `execution.rs`: `defer_cancel_for_open_block` | None. The open block reads it. | No |
+| Pause and resume | `execution.rs`: `pause_workflow_execution`, `resume_workflow_execution` | Store append. A resume also calls `wake_workflow_task`. | Yes |
+| Reactivate | `execution.rs`: `reactivate_failed_execution_at`. `dlq.rs`: `redrive_dead_letter_at` | Store append, then `enqueue` | Yes |
+| Parent close cascade | `execution.rs`: `apply_parent_close_cascade`, `cascade_cancel_detached_child`, `cascade_terminate_detached_child` | Store append of a terminal | Yes |
+| Cross-shard relay | `cross_shard_child.rs`: `deliver_terminal`, `apply_cascade_bookkeeping`, `start_child_on_target` | `wake_workflow_task`, store append, `enqueue` | Cascade only |
+| External tasks | `external_task.rs`: `complete_externally_with_codecs`, `fail_externally` | `wake_workflow_task` | No |
+| External deadline | `external_task.rs`: `extend_deadline` | None. Nothing becomes claimable. | No |
+| Sessions | `sessions.rs`: `break_session_and_fail_members` | `wake_workflow_task` | No |
+| Reset | `reset.rs`: `terminate_source_execution`, `copy_carried_events`, `append_fork_marker`, `enqueue_fork_workflow_task` | Store append for the source, `enqueue` for the fork | The source |
+| Fork | `fork.rs`: `fork_in_transaction`, `copy_prefix` | `enqueue` | No. A new run. |
+| Poison pill | `poison_pill.rs`: `fail_owning_workflow` | Store append of a terminal, `wake_workflow_task` for the parent | Yes |
+| Update admission | `store.rs`: `admit_update_event_with_codecs` | Each caller then calls `wake_workflow_task` | No |
+| Signals | `signal.rs`: `send_signal_idempotent_with_codecs`. `execution.rs`: `stage_signal_with_idempotency` | `wake_workflow_task` | No |
+| Mutex release | `mutex.rs`: `release_lock`, `reclaim_expired_leases_and_wake` | `wake_workflow_task` | No |
+| Start and continue-as-new | `execution.rs`: `start_or_load_workflow_execution`, `replace_execution` | `enqueue` | No |
+| Rebalance | `shard_rebalance.rs`: `commit_cutover`, `activate_target_inner` | `notify_owner` on each database | Yes |
+| Dead or stuck worker re-pend | `poison_pill.rs`: `requeue_orphan`, `requeue_stuck_task` | `notify_owner` | No |
+| Queue resume | `queue_pause.rs`: `notify_resumed_queue` | None. The queue wake reaches each claim loop. | No |
+| Partition layout | `partition.rs`: `disable_partitioning`, `drain_default_bounded_inner` | None | No. Each row keeps its id and bytes. |
+| Retention | `retention.rs`: `delete_candidate_execution` | None | No. It deletes terminal runs only. |
+
+A durable timer is not a foreign write. The decision that starts it also
+schedules its task with `reschedule_task`. The two sanctioned `event_data`
+writers of `CLAUDE.md` keep the decoded history, so they need no wake.
+Erasure acts on terminal runs only.
+
+`owner_wake_worker_tests.rs` runs an owner and a non-owner worker for the
+main writer classes. `owner_wake_db_tests.rs` checks the wake and its evict
+flag on the channel for more classes. Session breaks and the cross-shard
+relay use the chokepoints of an activity failure and a child terminal.
 
 ## Flows
 
@@ -361,13 +537,13 @@ here.
 | Tenant cells | How do partitions work with tenant cells and `with_shard_assignments`? | Answered. Partitions follow the effective assignments. See decision 10. |
 | Drain | Does a graceful drain hand partitions over to a named successor? | Answered. No. One statement releases all partitions. See decision 9. |
 | Lease TTL | Which lease TTL? | Answered. 10 s, renewed every TTL / 3. See decision 8. |
-| Foreign writers | How do writers outside the decision reach the owner? | Deferred to #2253. They take no owner row (decision 6). Issue #2253 sends their wake to the owner. |
-| Cache invalidation | How does a foreign write invalidate another owner's cache? | Deferred to #2253. A child terminal written into its parent is the main case. |
+| Foreign writers | How do writers outside the decision reach the owner? | Answered. They take no owner row. A post-commit wake on the partition channel reaches the owner. See decision 12. |
+| Cache invalidation | How does a foreign write invalidate another owner's cache? | Answered. An append wakes the owner, and its next decision loads the delta. A state change evicts. See decision 12. |
 | Acknowledgement | Can owner memory acknowledge work? | Answered. No. An acknowledgement follows a durable write. `CLAUDE.md` makes this an invariant. |
 | Lease expiry mid-decision | What happens when the lease lapses during a long decision? | Answered. The commit checks the epoch. The transaction aborts only when another worker acquired. See decision 5. |
 | Cost of two fences | What do two fence row locks per commit cost? | Deferred to #2248. Its benchmark gates stage 1b (#2255). |
 | Mixed fleet | How is a mixed fleet made impossible? | Answered. A per-database switch and a database guard. See decision 11. |
-| Routing | How does the claim find owned work in stages 1a and 1b? | Deferred to #2252. Stage 1a filters the claim to owned partitions. Stage 1b moves off the claim (#2255). |
+| Routing | How does the claim find owned work in stages 1a and 1b? | Answered for stage 1a by #2252: the claim filters workflow rows to owned partitions. Stage 1b moves off the claim (#2255). |
 | Group commit | Do decisions of one partition share a commit? | Deferred to #2256. |
 | Serialization unit | Does the owner serialize per partition or per execution? | Answered. Per execution. A single-threaded owner caps throughput, as at Durable Objects. |
 | Model nemeses | Which nemeses do the TLA+ model and the simulator cover? | Deferred to #2250. Stale commit after takeover, lease flap during an append, renewal during commits, and a signal before an epoch bump. |

@@ -629,6 +629,10 @@ pub struct HandlerRegistry {
     /// Per-activity-type adaptive concurrency limits (issue #1836). Off by
     /// default.
     adaptive_limits: Arc<crate::adaptive_limit::AdaptiveLimitRegistry>,
+    /// The owner tenures of this worker, one per decision partition (issue
+    /// #2251). Empty until the acquisition loop of issue #2252 fills it. A
+    /// decision of a held partition fences its commit with the tenure.
+    decision_owner: Arc<crate::decision_owner::OwnedPartitions>,
     /// Maximum byte length for `current_details` strings passed to the
     /// workflow context (issue #473). Default: 1 KiB.
     pub max_current_details_bytes: usize,
@@ -887,6 +891,7 @@ impl HandlerRegistry {
             )),
             retry_budgets,
             adaptive_limits,
+            decision_owner: Arc::default(),
             max_workflow_attempts_ceiling: None,
             max_workflow_chain_timeout: None,
             max_workflow_execution_timeout: None,
@@ -1520,6 +1525,17 @@ impl HandlerRegistry {
         Arc::clone(&self.adaptive_limits)
     }
 
+    /// The owner tenures of this worker (issue #2251).
+    ///
+    /// The worker reads a tenure at the start of each decision and drops it
+    /// when a commit is fenced.
+    #[must_use]
+    pub fn decision_owner(&self) -> Arc<crate::decision_owner::OwnedPartitions> {
+        // Issue #2252: inside a decision, the tenures of the worker that runs
+        // it. Two workers can share this registry.
+        crate::decision_owner::current_owned().unwrap_or_else(|| Arc::clone(&self.decision_owner))
+    }
+
     /// History-size guardrails applied to workflow contexts run by this registry.
     #[must_use]
     pub const fn history_policy(&self) -> WorkflowHistoryPolicy {
@@ -1797,6 +1813,7 @@ impl std::fmt::Debug for HandlerRegistry {
             .field("circuit_breakers", &self.circuit_breakers)
             .field("retry_budgets", &self.retry_budgets)
             .field("adaptive_limits", &self.adaptive_limits)
+            .field("decision_owner", &self.decision_owner)
             .field(
                 "max_workflow_attempts_ceiling",
                 &self.max_workflow_attempts_ceiling,
@@ -4211,6 +4228,8 @@ async fn persist_external_signal_inline(
         crate::tx_retry::TxRetryPolicy::DEFAULT,
         async |conn| Box::pin(conn
         .transaction::<InlinePersistResult, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             // For await-bearing batches, take the awaiter row `FOR UPDATE`
             // lock and read the TRUE `next_event_id` under it. Whichever of
             // inline/outbox commits first, the other observes the terminal
@@ -4344,6 +4363,8 @@ async fn persist_external_signal_inline(
                                     Err(HarvestError::Database(e)) => {
                                         return Err(HarvestError::Database(e));
                                     }
+                                    // Issue #2251: a fence is never a delivery result.
+                                    Err(e @ HarvestError::OwnershipLost { .. }) => return Err(e),
                                     // A codec failure says nothing about the
                                     // target. Leave the request to the outbox
                                     // (issue #2065).
@@ -4394,6 +4415,8 @@ async fn persist_external_signal_inline(
                                     Err(HarvestError::Database(e)) => {
                                         return Err(HarvestError::Database(e));
                                     }
+                                    // Issue #2251: a fence is never a delivery result.
+                                    Err(e @ HarvestError::OwnershipLost { .. }) => return Err(e),
                                     // No run has ever existed for this business
                                     // key, or the resolved run raced to a
                                     // CONTINUED_AS_NEW successor between
@@ -4478,6 +4501,8 @@ async fn persist_external_signal_inline(
                                     Err(HarvestError::Database(e)) => {
                                         return Err(HarvestError::Database(e));
                                     }
+                                    // Issue #2251: a fence is never a delivery result.
+                                    Err(e @ HarvestError::OwnershipLost { .. }) => return Err(e),
                                     Ok((_cancelled, deferred, checks, metrics_opt)) => {
                                         deferred_starts.extend(deferred);
                                         deferred_checks.extend(checks);
@@ -4533,6 +4558,8 @@ async fn persist_external_signal_inline(
                                     Err(HarvestError::Database(e)) => {
                                         return Err(HarvestError::Database(e));
                                     }
+                                    // Issue #2251: a fence is never a delivery result.
+                                    Err(e @ HarvestError::OwnershipLost { .. }) => return Err(e),
                                     // No run has ever existed for this business
                                     // key: leave for outbox grace window. A
                                     // resolved run that raced to a
@@ -4636,6 +4663,8 @@ async fn persist_external_signal_inline(
                             Err(HarvestError::Database(e)) => {
                                 return Err(HarvestError::Database(e));
                             }
+                            // Issue #2251: a fence is never a delivery result.
+                            Err(e @ HarvestError::OwnershipLost { .. }) => return Err(e),
                             // Still running/paused or not-found, or a non-DB
                             // read error → leave the bare Requested and let the
                             // outbox resolve it.
@@ -4892,6 +4921,8 @@ async fn append_frontier_resolution(
 ) -> HarvestResult<()> {
     let owned: Vec<WorkflowEvent> = events.to_vec();
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         store::append_events_with_codecs(conn, exec_id, &owned, event_start, codecs).await?;
         if let Some((activity_name, calls)) = ledger {
             crate::llm_ledger::insert_ledger_rows(conn, exec_id, event_start, activity_name, calls)
@@ -5073,6 +5104,8 @@ async fn run_local_activity_inline(
             .map_err(|_| HarvestError::Config("event count overflow".into()))?;
         let (deferred, loser_events) =
             Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+                // Issue #2251: the owner fence comes first.
+                crate::replication::assert_decision_fence(conn).await?;
                 store::append_events_with_codecs(
                     conn,
                     exec_id,
@@ -5250,9 +5283,14 @@ async fn run_local_activity_inline(
             }
             Ok(fut) => {
                 use futures::FutureExt as _;
+                // Issue #2251: the handler is user code. It runs in a decision
+                // scope of its own that pins nothing, so its own writes are
+                // foreign writes and take no owner row.
                 let caught = tokio::time::timeout(
                     per_attempt_timeout,
-                    std::panic::AssertUnwindSafe(fut).catch_unwind(),
+                    crate::decision_owner::scope_decision(
+                        std::panic::AssertUnwindSafe(fut).catch_unwind(),
+                    ),
                 )
                 .await;
                 match caught {
@@ -9409,6 +9447,8 @@ async fn block_workflow_for_non_determinism(
 
     let parked_paused = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
         use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
+        // Issue #2251: a block is a decision outcome, so it is fenced too.
+        crate::replication::assert_decision_fence(conn).await?;
         let error_owned = error_owned.clone();
         let patch = patch.clone();
         if check_paused_and_park(
@@ -9581,6 +9621,8 @@ pub async fn persist_workflow_completion(
     };
     let (deferred, closed_children, tx_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             // Issue #1184: re-derive the task-row claim under its own lock
             // before committing this completion. The execution row lock this
             // transaction holds says nothing about `harvest_task_queue`
@@ -9840,6 +9882,8 @@ pub async fn persist_workflow_failure(
             Vec<(ExecutionId, String)>,
             Vec<crate::execution::StartCancelledRun>,
         ), HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let decoded = decoded.clone();
             let retry_fire_info = retry_fire_info.clone();
             let exec_ref = execution;
@@ -10046,6 +10090,8 @@ pub async fn persist_workflow_failure(
     // report a terminal write that never landed.
     for check in deferred_checks {
         let _ = Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             check_and_report_unfinished_handlers(conn, check.0, &check.1, metrics).await
         }))
         .await;
@@ -10481,7 +10527,16 @@ async fn persist_search_attrs_from_commands(
         _ => return Ok(()),
     };
 
-    store::update_search_attrs(conn, exec_id, &merged).await
+    // Issue #2251: a pinned decision writes the projection under its owner
+    // fence, so a stale owner cannot overwrite a newer value.
+    if crate::decision_owner::pinned_decision().is_none() {
+        return store::update_search_attrs(conn, exec_id, &merged).await;
+    }
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        crate::replication::assert_decision_fence(conn).await?;
+        store::update_search_attrs(conn, exec_id, &merged).await
+    }))
+    .await
 }
 
 /// The effective DB write resolved from the last `SetCurrentDetails` command
@@ -10551,16 +10606,20 @@ async fn persist_current_details_from_commands(
     exec_id: ExecutionId,
     commands: &[WorkflowCommand],
 ) -> HarvestResult<()> {
-    match latest_current_details_update(commands) {
-        CurrentDetailsUpdate::NoOp => {}
-        CurrentDetailsUpdate::Clear => {
-            store::update_current_details(conn, exec_id, None).await?;
-        }
-        CurrentDetailsUpdate::Set(details) => {
-            store::update_current_details(conn, exec_id, Some(details)).await?;
-        }
+    let details = match latest_current_details_update(commands) {
+        CurrentDetailsUpdate::NoOp => return Ok(()),
+        CurrentDetailsUpdate::Clear => None,
+        CurrentDetailsUpdate::Set(details) => Some(details),
+    };
+    // Issue #2251: under the owner fence, as for the search attributes.
+    if crate::decision_owner::pinned_decision().is_none() {
+        return store::update_current_details(conn, exec_id, details).await;
     }
-    Ok(())
+    Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        crate::replication::assert_decision_fence(conn).await?;
+        store::update_current_details(conn, exec_id, details).await
+    }))
+    .await
 }
 
 /// Collect this cycle's [`WorkflowCommand::RecordLog`] commands into the
@@ -10625,6 +10684,8 @@ async fn persist_workflow_logs_from_commands(
         return;
     }
     let result = Box::pin(conn.transaction::<(), HarvestError, _>(async |c| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(c).await?;
         store::append_workflow_logs(c, exec_id, &lines, max_lines).await?;
         Ok(())
     }))
@@ -10745,6 +10806,8 @@ async fn persist_durable_stream_from_commands(
     // on a bare connection, and inside a persist transaction it is a
     // savepoint.
     Box::pin(conn.transaction::<(), HarvestError, _>(async |c| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(c).await?;
         store::append_stream_chunks(
             c,
             exec_id,
@@ -10800,6 +10863,8 @@ async fn persist_signal_wait_park(
     // silently discarded here.
     let (deferred, had_wake_requested) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             // Cancellable/renewable timer bookkeeping (issue #768): resolve
             // the ArmTimer/CancelTimer row mutations FIRST, then interleave
             // their TimerStarted/TimerCancelled events into the suspension
@@ -10956,6 +11021,8 @@ async fn process_mutex_releases_from_commands(
     // `ctx.run_transactional`'s own transactional-activity wake.
     let held_secs = crate::dispatch::buffered_checkpoint(Box::pin(
         conn.transaction::<Vec<f64>, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let releases = releases.clone();
             let mut held = Vec::new();
             for (key, lock_seq) in releases {
@@ -11050,6 +11117,8 @@ async fn persist_mutex_acquire_park(
             Vec<crate::completion_trigger::DeferredTriggerStart>,
             MutexParkOutcome,
         ), HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let key = key.clone();
             // Persist bookkeeping events (markers/side-effects/detached-spawn
             // + interleaved timer-lifecycle) in command order, mirroring the
@@ -11156,6 +11225,8 @@ async fn persist_activity_wait_park(
     let registry = detached_spawns.registry;
 
     let deferred = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         harvest_workflow_executions::table
             .find(exec_id.as_uuid())
             .for_update()
@@ -11812,6 +11883,8 @@ async fn persist_scheduled_activities(
     // check exists to catch it.
     let (deferred, had_wake_requested, synthesized_outcome) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             // Cancellable/renewable timer bookkeeping (issue #768): resolve
             // the ArmTimer/CancelTimer row mutations FIRST, then build the
             // event list in command emission order -- markers, detached-spawn
@@ -11961,6 +12034,8 @@ async fn persist_started_timer(
     let (deferred, had_wake_requested) = Box::pin(conn
         .transaction::<_, HarvestError, _>(async |conn| {
         use crate::schema::harvest_task_queue::dsl as queue_dsl;
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
 
         // Cancellable/renewable timer bookkeeping (issue #768) for any
         // *other* timers' ArmTimer/CancelTimer commands in this batch (the
@@ -12286,6 +12361,8 @@ async fn persist_all_started_child_workflows(
     let execute_span = execute_span.clone();
 
     let deferred = match Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         let children = children.clone();
         let pre_events_by_pos = pre_events_by_pos.clone();
         let start_child_cmd_indices = start_child_cmd_indices.clone();
@@ -12642,6 +12719,8 @@ async fn persist_all_started_child_workflows(
                 registry.payload_codecs().encode_column(&child.input)?,
             );
             params.workflow_exec_id = Some(child.child_id.as_uuid());
+            // A child's workflow id is its execution id.
+            params = params.with_decision_partition(&child.child_id.to_string());
             params.required_build_id = parent_execution.assigned_build_id.clone();
             (params.concurrency_key, params.max_concurrent) =
                 resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
@@ -12784,6 +12863,8 @@ async fn persist_all_started_child_workflows(
                         registry.payload_codecs().encode_column(&child.input)?,
                     );
                     params.workflow_exec_id = Some(child.child_id.as_uuid());
+                    // A child's workflow id is its execution id.
+                    params = params.with_decision_partition(&child.child_id.to_string());
                     params
                         .required_build_id
                         .clone_from(&parent_execution.assigned_build_id);
@@ -13557,6 +13638,8 @@ async fn insert_awaited_child_execution(
         registry.payload_codecs().encode_column(&child.input)?,
     );
     params.workflow_exec_id = Some(child.child_id.as_uuid());
+    // A child's workflow id is its execution id.
+    params = params.with_decision_partition(&child.child_id.to_string());
     params.required_build_id = parent_execution.assigned_build_id.clone();
     (params.concurrency_key, params.max_concurrent) =
         resolve_workflow_concurrency(registry, &child.workflow_name, &child.input);
@@ -13656,6 +13739,8 @@ async fn persist_child_timeout_race(
     let (deferred, had_wake_requested) =
         match Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
             use crate::schema::harvest_task_queue::dsl as queue_dsl;
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let telemetry = telemetry.clone();
             let execute_span = execute_span.clone();
 
@@ -14057,6 +14142,8 @@ async fn persist_mixed_suspension_batch(
 
     let outcome = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
         use crate::schema::harvest_task_queue::dsl as queue_dsl;
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         let execute_span = owned_execute_span.clone();
         let telemetry = telemetry.clone();
 
@@ -14610,6 +14697,8 @@ pub async fn ingest_due_timers_and_signals(
     let events = merge_wake_events(timer_entries, signal_entries);
 
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         store::append_events_with_codecs(conn, exec_id, &events, next_event_id, codecs).await?;
         if !timer_row_ids.is_empty() {
             diesel::update(dsl::harvest_timers.filter(dsl::id.eq_any(&timer_row_ids)))
@@ -14892,6 +14981,8 @@ pub async fn fail_task_and_execution_with_history(
     // transaction), so this is safe to call unconditionally regardless of
     // caller context.
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         // Issue #1184 self-review finding: `Unavailable`/`Loaded` both touch
         // the execution row (directly here, or via `persist_workflow_failure`
         // below), and this function is reached from callers -- notably
@@ -15608,6 +15699,8 @@ pub async fn persist_child_workflow_completion(
 
     let (deferred, closed_children, tx_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let output = output.clone();
             // Issue #1184: same task-row ownership recheck as
             // `persist_workflow_completion` -- see its guard for the
@@ -15698,6 +15791,8 @@ pub async fn persist_child_workflow_failure(
 
     let (deferred, closed_children, tx_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let raw_error = error.to_string();
             let message = decoded.message.clone();
             // Issue #1184: same task-row ownership recheck as
@@ -16133,6 +16228,7 @@ async fn create_detached_child_executions(
             registry.payload_codecs().encode_column(input)?,
         );
         params.workflow_exec_id = Some(child_id.as_uuid());
+        params = params.with_decision_partition(&child_workflow_id);
         params.required_build_id = parent_execution.assigned_build_id.clone();
         (params.concurrency_key, params.max_concurrent) =
             resolve_workflow_concurrency(registry, workflow_name, input);
@@ -20761,6 +20857,8 @@ async fn persist_scheduled_external_activity(
         let token = scheduled.token;
         let registry = detached_spawns.registry;
         let deferred = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             let locked = external_task::find_by_token_locked(conn, token).await?;
 
             // Recompute the event offset inside the transaction: external
@@ -20834,6 +20932,8 @@ async fn persist_scheduled_external_activity(
     let registry = detached_spawns.registry;
     let (deferred, had_wake_requested) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             // Cancellable/renewable timer bookkeeping (issue #768): resolve
             // ArmTimer/CancelTimer row mutations FIRST, then build the event
             // list in command emission order so ScheduleExternalActivity's
@@ -20914,6 +21014,8 @@ async fn persist_bookkeeping_and_requeue_workflow(
     let registry = detached_spawns.registry;
 
     let deferred = Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         // Cancellable/renewable timer bookkeeping (issue #768): resolve
         // the ArmTimer/CancelTimer row mutations FIRST, then interleave
         // their TimerStarted/TimerCancelled events into the suspension
@@ -22100,6 +22202,11 @@ pub async fn fail_execution_on_error<T>(
     if error.handler_not_registered().is_some() {
         return Err(error);
     }
+    // Issue #2251: a fenced decision wrote nothing, and another owner decides
+    // now. Failing the run here would be the stale write the fence stops.
+    if error.ownership_lost().is_some() {
+        return Err(error);
+    }
     // Issue #1182 (Codex review round 2): an ambiguous suspended-dispatch
     // claim is the identical "blameless, no decision made" shape as a
     // capability miss -- pass it through un-failed so the caller can roll
@@ -22414,17 +22521,105 @@ async fn fail_workflow_execution_clearing_strikes<T>(
     fail_execution_on_error(conn, task, worker_id, result, codecs).await
 }
 
+/// Load the run of a task. A failed load fails the task.
+///
+/// Issue #2251: with owner mode on, a failed load can only re-pend the task.
+/// See [`load_failure_fails_task`]. `Ok(None)` is that re-pend.
 async fn load_task_execution(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
     exec_id: ExecutionId,
-) -> HarvestResult<WorkflowExecution> {
+    owner_mode: bool,
+) -> HarvestResult<Option<WorkflowExecution>> {
     let error = match load_workflow_execution(conn, exec_id).await {
-        Ok(val) => return Ok(val),
+        Ok(val) => return Ok(Some(val)),
         Err(e) => e,
     };
+    if !load_failure_fails_task(owner_mode, &error) {
+        let Some(claim) = queue::TaskClaim::of(task) else {
+            return Err(error);
+        };
+        tracing::warn!(
+            task_id = %task.id,
+            error = %error,
+            "harvest: a run did not load in owner mode; the task is re-pended (issue #2251)"
+        );
+        let delay = fence_repend_delay(crate::decision_owner::OwnerEpoch::new(0));
+        queue::requeue_claimed_workflow_task_after_fence(conn, &claim, delay).await?;
+        return Ok(None);
+    }
     fail_task_only(conn, task.id, &error.to_string()).await?;
     Err(error)
+}
+
+/// Whether a failed run load may fail its task (issue #2251).
+///
+/// The fail write needs the tenure of the run. The tenure needs the workflow
+/// id, which the load did not return. With owner mode on, the write cannot
+/// fence, so the task re-pends. A missing run has no history to protect, so
+/// its task still fails. A re-pend of it would repeat forever.
+const fn load_failure_fails_task(owner_mode: bool, error: &HarvestError) -> bool {
+    !owner_mode || matches!(error, HarvestError::NotFound(_))
+}
+
+/// The delay of a re-pend after a fence (issue #2251).
+///
+/// A fence of a held tenure re-pends at once, for the new owner. With no
+/// tenure at all (epoch 0), this worker would claim the task again at once,
+/// so it waits a second. The owned claim of issue #2252 then skips such
+/// tasks.
+fn fence_repend_delay(pinned: crate::decision_owner::OwnerEpoch) -> chrono::Duration {
+    if pinned == crate::decision_owner::OwnerEpoch::new(0) {
+        chrono::Duration::seconds(1)
+    } else {
+        chrono::Duration::zero()
+    }
+}
+
+#[cfg(test)]
+mod owner_load_failure_tests {
+    use super::{HarvestError, fence_repend_delay, load_failure_fails_task};
+    use crate::decision_owner::OwnerEpoch;
+
+    #[test]
+    fn a_legacy_load_failure_fails_the_task() {
+        assert!(load_failure_fails_task(
+            false,
+            &HarvestError::Config("boom".into())
+        ));
+        assert!(load_failure_fails_task(
+            false,
+            &HarvestError::NotFound("run".into())
+        ));
+    }
+
+    #[test]
+    fn an_owner_mode_load_failure_repends_the_task() {
+        assert!(!load_failure_fails_task(
+            true,
+            &HarvestError::Config("boom".into())
+        ));
+    }
+
+    #[test]
+    fn an_owner_mode_missing_run_still_fails_its_task() {
+        assert!(load_failure_fails_task(
+            true,
+            &HarvestError::NotFound("run".into())
+        ));
+    }
+
+    #[test]
+    fn only_an_ownerless_fence_waits_before_the_repend() {
+        assert_eq!(
+            fence_repend_delay(OwnerEpoch::new(0)),
+            chrono::Duration::seconds(1)
+        );
+        assert_eq!(
+            fence_repend_delay(OwnerEpoch::new(7)),
+            chrono::Duration::zero()
+        );
+    }
 }
 
 async fn load_workflow_replay_state(
@@ -22513,12 +22708,81 @@ async fn put_back_cache_entry(
     state: crate::cache::CachedWorkflowState,
     resident: crate::resident::Residency,
     history_bytes: Option<crate::cache::HistoryBytesMark>,
+    // Issue #2251: the partition tag, so a fenced owner can drop the entry.
+    owner: CacheOwner<'_>,
 ) {
-    let displaced = workflow_cache
-        .lock()
-        .await
-        .insert_resident_with_history_bytes(exec_uuid, state, resident, history_bytes);
+    let displaced = {
+        let mut guard = workflow_cache.lock().await;
+        if owner.may_cache() {
+            guard.insert_resident_with_history_bytes(
+                exec_uuid,
+                state,
+                resident,
+                history_bytes,
+                Some(owner.key),
+            )
+        } else {
+            guard.take(&exec_uuid)
+        }
+    };
     drop(displaced);
+}
+
+/// The owner side of a cache write (issue #2251).
+///
+/// The cache tags each entry with its partition. A decision whose tenure a
+/// fence dropped, or a newer tenure replaced, writes no entry. The check
+/// runs under the cache lock, so it cannot race the unload's eviction.
+#[derive(Clone, Copy)]
+struct CacheOwner<'a> {
+    key: crate::decision_owner::OwnerKey,
+    pinned: Option<crate::decision_owner::OwnerEpoch>,
+    owned: &'a crate::decision_owner::OwnedPartitions,
+}
+
+impl CacheOwner<'_> {
+    fn may_cache(&self) -> bool {
+        self.owned.may_cache(self.key, self.pinned)
+    }
+}
+
+/// Pin the owner tenure of an execution for its decision (issue #2251).
+///
+/// With a tenure, each history write of the decision fences it. With owner
+/// mode on and no tenure, the decision must not write, so this fails closed
+/// with [`HarvestError::OwnershipLost`]. With owner mode off, it pins
+/// nothing and the decision runs as before.
+fn pin_owner_tenure(
+    owned: &crate::decision_owner::OwnedPartitions,
+    owner_shard: crate::types::ShardId,
+    workflow_id: &str,
+) -> HarvestResult<()> {
+    use crate::decision_owner::{DecisionPin, OwnerEpoch, OwnerKey, pin_decision};
+    let key = OwnerKey::of(owner_shard, workflow_id);
+    match owned.pin_for(key) {
+        DecisionPin::Legacy => {
+            let _ = pin_decision(None);
+            Ok(())
+        }
+        DecisionPin::Owned(tenure) => {
+            // Outside a decision scope a pin does nothing, so a held tenure
+            // would decide unfenced. Fail closed instead.
+            if pin_decision(Some(tenure.clone())) {
+                Ok(())
+            } else {
+                Err(HarvestError::OwnershipLost {
+                    partition: key.partition,
+                    pinned: tenure.epoch(),
+                    current: None,
+                })
+            }
+        }
+        DecisionPin::Unowned => Err(HarvestError::OwnershipLost {
+            partition: key.partition,
+            pinned: OwnerEpoch::new(0),
+            current: None,
+        }),
+    }
 }
 
 /// Prepare the workflow task, checking the in-process LRU cache first.
@@ -22541,7 +22805,12 @@ async fn put_back_cache_entry(
 ///
 /// A hit keeps its resident workflow only when the delta event ids run on
 /// from the cached `next_event_id` with no gap.
-#[allow(clippy::too_many_lines)]
+///
+/// In owner mode, a hit replays cold when its delta holds a state change,
+/// such as a pause (issue #2253). It also replays cold when its entry has
+/// another owner key. A foreign writer made that change. The owner wake was
+/// lost, or it came while a decision held the entry.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn prepare_workflow_task_with_cache(
     conn: &mut AsyncPgConnection,
     task: &TaskQueueItem,
@@ -22551,6 +22820,10 @@ async fn prepare_workflow_task_with_cache(
     offloader: Option<&crate::payload_store::PayloadOffloader>,
     // Issue #1243: see `load_workflow_replay_state`.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Issue #2251: the owner tenures of this worker, and the shard of the
+    // claim's pool that keys them.
+    owned: &crate::decision_owner::OwnedPartitions,
+    owner_shard: crate::types::ShardId,
 ) -> HarvestResult<Option<PreparedWorkflowTask>> {
     let Some(exec_uuid) = task.workflow_exec_id else {
         let error = HarvestError::Config("workflow task missing workflow_exec_id".into());
@@ -22567,19 +22840,33 @@ async fn prepare_workflow_task_with_cache(
     } else {
         // Brief lock to take the entry without holding it during DB work.
         let mut guard = workflow_cache.lock().await;
-        (
-            guard.take_with_history_bytes(&exec_uuid),
-            guard.resident_enabled(),
-        )
+        (guard.take_entry(&exec_uuid), guard.resident_enabled())
     };
 
-    let execution = load_task_execution(conn, task, exec_id).await?;
+    // Issue #2251: in owner mode, a load failure re-pends instead of failing.
+    let Some(execution) =
+        load_task_execution(conn, task, exec_id, owned.owner_mode(owner_shard)).await?
+    else {
+        // A taken entry never outlives a cycle that did not commit.
+        drop(cached);
+        return Ok(None);
+    };
+    // Issue #2251: pin the tenure before the first history write. The wake
+    // ingest below then fences it too.
+    pin_owner_tenure(owned, owner_shard, &execution.workflow_id)?;
+    let key = crate::decision_owner::OwnerKey::of(owner_shard, &execution.workflow_id);
+    // Issue #2253: in owner mode, a foreign writer can leave an entry stale.
+    // With owner mode off, a hit behaves as before.
+    let owner_mode = owned.owner_mode(owner_shard);
+    // An entry of another database is stale. The run moved.
+    let cached =
+        cached.filter(|(.., entry_key)| !owner_mode || entry_key.is_none_or(|entry| entry == key));
 
-    if let Some((cached_state, mut resident, cached_history_bytes)) = cached {
-        // Cache hit path: first load any events already appended since the
-        // cache snapshot (e.g. by timeout.rs/external_task.rs via
-        // append_single_event), then ingest timers/signals at the REAL current
-        // next_event_id to avoid a unique-constraint collision on event_id.
+    // Cache hit path. Load the delta first: other writers can append after
+    // the snapshot. Then ingest timers and signals at the real
+    // `next_event_id`. This avoids a unique-key collision on `event_id`.
+    let mut hit = None;
+    if let Some((cached_state, resident, cached_history_bytes, _)) = cached {
         let existing_delta_result = store::load_history_since_inflated(
             conn,
             exec_id,
@@ -22590,7 +22877,22 @@ async fn prepare_workflow_task_with_cache(
         .await;
         let existing_delta =
             fail_execution_on_error(conn, task, worker_id, existing_delta_result, codecs).await?;
+        // Issue #2253: a foreign writer changed the state of the run, for
+        // example a pause. The wake was lost, or it came while this decision
+        // held the entry. The decision drops the entry and replays cold.
+        if owner_mode
+            && existing_delta
+                .events
+                .iter()
+                .any(crate::event::WorkflowEvent::evicts_owner_cache)
+        {
+            drop((cached_state, resident));
+        } else {
+            hit = Some((cached_state, resident, cached_history_bytes, existing_delta));
+        }
+    }
 
+    if let Some((cached_state, mut resident, cached_history_bytes, existing_delta)) = hit {
         // Single chronological ingest of due timers + pending signals (see
         // merge_wake_events for the occurrence-order contract). A transient
         // event-id conflict with a concurrent append_single_event committer
@@ -22614,6 +22916,11 @@ async fn prepare_workflow_task_with_cache(
                 cached_state,
                 resident,
                 cached_history_bytes,
+                CacheOwner {
+                    key,
+                    pinned: crate::decision_owner::pinned_decision().map(|t| t.epoch()),
+                    owned,
+                },
             )
             .await;
             return Ok(None);
@@ -24025,6 +24332,9 @@ async fn persist_workflow_continue_as_new_with_verdict(
         registry.payload_codecs().encode_column(&input)?,
     );
     enqueue.workflow_exec_id = Some(new_exec_id.as_uuid());
+    // Continue-as-new keeps the workflow id, so the successor keeps the
+    // partition (ADR 0009 decision 3).
+    enqueue = enqueue.with_decision_partition(&execution.workflow_id);
     enqueue.required_build_id = execution.assigned_build_id.clone();
     enqueue.concurrency_key = successor_concurrency_key;
     enqueue.max_concurrent = successor_concurrency_cap;
@@ -24037,6 +24347,8 @@ async fn persist_workflow_continue_as_new_with_verdict(
     );
 
     Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         // Issue #1184: this transaction seals the predecessor
         // (CONTINUED_AS_NEW) and completes its task row -- an ordinary
         // terminal write not enumerated by name in the issue, but the same
@@ -25366,6 +25678,8 @@ async fn dead_letter_for_history_cap(
 
     let (deferred, closed_children, pending_cancel_metrics) =
         Box::pin(conn.transaction::<_, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             crate::notify::coalesced(conn, async |conn| {
                 use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
                 let reason = reason.clone();
@@ -26032,6 +26346,8 @@ async fn process_workflow_task(
     // deadlock or a contained panic. The run stays RUNNING, but the task
     // failed, so the worker's outcome window counts it unless the claim is lost.
     cycle_failure: &CycleFailure,
+    // Issue #2251: the shard of the claim's pool. See `process_task`.
+    owner_shard: crate::types::ShardId,
 ) -> HarvestResult<()> {
     let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
@@ -26041,6 +26357,8 @@ async fn process_workflow_task(
         sticky_timeout,
         registry.payload_offloader(),
         registry.payload_codecs(),
+        &registry.decision_owner(),
+        owner_shard,
     )
     .await?
     else {
@@ -26050,6 +26368,11 @@ async fn process_workflow_task(
         // load that advances past the winner's committed event.
         return Ok(());
     };
+    // Issue #2251: the cache tag of this run, and the epoch that `prepare`
+    // pinned.
+    let owner_key =
+        crate::decision_owner::OwnerKey::of(owner_shard, &prepared.execution.workflow_id);
+    let pinned_epoch = crate::decision_owner::pinned_decision().map(|t| t.epoch());
     let Some(workflow) = registry.workflows.get(&prepared.execution.workflow_name) else {
         // Issue #804 (AC1): this worker cannot run this type, but a peer on the
         // same queue may well be able to (a rolling deploy that introduces a new
@@ -27549,6 +27872,8 @@ async fn process_workflow_task(
             // `resume_workflow_execution`'s own lock. A concurrent resume
             // therefore always commits its own wake after this park commits.
             let still_paused = Box::pin(conn.transaction::<bool, HarvestError, _>(async |conn| {
+                // Issue #2251: the owner fence comes before the row lock.
+                crate::replication::assert_decision_fence(conn).await?;
                 let parked = check_paused_and_park(
                     conn,
                     prepared.exec_id.as_uuid(),
@@ -28344,216 +28669,226 @@ async fn process_workflow_task(
     // Issue #1833: one merged wake per execution, also on the fallback path.
     let persist_flow = Box::pin(conn.transaction::<WorkflowPersistFlow, HarvestError, _>(
         async |conn| {
-            crate::notify::coalesced(conn, async |conn| {
-                if check_paused_and_park(
-                    conn,
-                    exec_uuid,
-                    task.id,
-                    worker_id,
-                    task.crash_strikes,
-                    task.attempt,
-                    sticky_timeout,
-                )
-                .await?
-                {
-                    // Inline local activities can have appended events already.
-                    record_decision_boundary(
+            // Issue #2251: in owner mode, the DR generation row and the owner
+            // row come first, before the execution row (ADR 0009 decision 6).
+            crate::replication::assert_decision_fence(conn).await?;
+            // Issue #2252: the rest of this transaction counts as fenced, so
+            // its nested writes send no second fence.
+            let fenced = crate::decision_owner::conn_id(conn);
+            Box::pin(crate::decision_owner::fenced_scope(
+                fenced,
+                crate::notify::coalesced(conn, async |conn| {
+                    if check_paused_and_park(
                         conn,
-                        registry,
-                        prepared.exec_id,
-                        decision_start_event_id,
-                        inline_appends,
-                        true,
+                        exec_uuid,
+                        task.id,
                         worker_id,
-                        build_id,
+                        task.crash_strikes,
+                        task.attempt,
+                        sticky_timeout,
                     )
-                    .await?;
-                    return Ok(WorkflowPersistFlow::ParkedPaused);
-                }
-
-                // Issue #2079: do not seal a run over a signal it never read.
-                if matches!(
-                    &outcome,
-                    WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
-                ) && repend_for_late_signals(
-                    conn,
-                    prepared.exec_id,
-                    task.id,
-                    worker_id,
-                    task.crash_strikes,
-                    task.attempt,
-                    sticky_timeout,
-                )
-                .await?
-                {
-                    record_decision_boundary(
-                        conn,
-                        registry,
-                        prepared.exec_id,
-                        decision_start_event_id,
-                        inline_appends,
-                        true,
-                        worker_id,
-                        build_id,
-                    )
-                    .await?;
-                    return Ok(WorkflowPersistFlow::RependedForSignals);
-                }
-
-                // Issue #1833: the boundary follows only rows this decision
-                // writes. The execution row is locked now, and every history
-                // writer takes that lock. So a row past this id is this
-                // transaction's own. A row another writer committed after the
-                // decision start does not count. Inline steps wrote before
-                // the lock, so they keep the decision start.
-                let boundary_floor =
-                    if inline_appends || !registry.history_policy().decision_boundaries() {
-                        decision_start_event_id
-                    } else {
-                        store::next_event_id_for(conn, prepared.exec_id).await?
-                    };
-
-                // Issue #603: this cycle replayed cleanly (the ND gate above
-                // did not fire), so if the execution was previously blocked on
-                // replay non-determinism the offending build has been rolled
-                // back or fixed — clear the block marker atomically with the
-                // recovered cycle's persisted outcome. Guarded on
-                // `was_nd_blocked` (captured *before* the in-memory mutation
-                // above) rather than re-reading `execution_ref.nd_blocked_at`,
-                // which is already `None` here by the time this runs — so
-                // never-blocked executions still pay nothing, and a
-                // previously-blocked one still gets its DB row cleared.
-                if was_nd_blocked {
-                    clear_nd_block(conn, persistence.exec_id).await?;
-                }
-
-                let mut pending_cancel_metrics = Vec::new();
-                if let Some(reason) = &deferred_cancel_ends_run {
-                    // The cycle's commands persist as for a terminal cycle:
-                    // update results, race-loser teardown, detached children,
-                    // search attributes, details, logs and progress. The run
-                    // then ends cancelled instead of with its outcome.
-                    let mut redirected = false;
-                    let (_, deferred_checks, race_deferred_triggers) =
-                        persist_terminal_outcome_commands(
+                    .await?
+                    {
+                        // Inline local activities can have appended events already.
+                        record_decision_boundary(
                             conn,
                             registry,
-                            execution_ref,
-                            persistence,
-                            outcome,
-                            &pending_cmds,
-                            &recorded_dispatches,
-                            &execute_span,
-                            &mut pending_cancel_metrics,
-                            &mut redirected,
-                            resolved_router.as_ref(),
-                            TerminalSeal::DeferredCancel(reason),
+                            prepared.exec_id,
+                            decision_start_event_id,
+                            inline_appends,
+                            true,
+                            worker_id,
+                            build_id,
                         )
                         .await?;
-                    return Ok(WorkflowPersistFlow::Persisted {
-                        retry_scheduled: false,
+                        return Ok(WorkflowPersistFlow::ParkedPaused);
+                    }
+
+                    // Issue #2079: do not seal a run over a signal it never read.
+                    if matches!(
+                        &outcome,
+                        WorkflowOutcome::Completed { .. } | WorkflowOutcome::Failed { .. }
+                    ) && repend_for_late_signals(
+                        conn,
+                        prepared.exec_id,
+                        task.id,
+                        worker_id,
+                        task.crash_strikes,
+                        task.attempt,
+                        sticky_timeout,
+                    )
+                    .await?
+                    {
+                        record_decision_boundary(
+                            conn,
+                            registry,
+                            prepared.exec_id,
+                            decision_start_event_id,
+                            inline_appends,
+                            true,
+                            worker_id,
+                            build_id,
+                        )
+                        .await?;
+                        return Ok(WorkflowPersistFlow::RependedForSignals);
+                    }
+
+                    // Issue #1833: the boundary follows only rows this decision
+                    // writes. The execution row is locked now, and every history
+                    // writer takes that lock. So a row past this id is this
+                    // transaction's own. A row another writer committed after the
+                    // decision start does not count. Inline steps wrote before
+                    // the lock, so they keep the decision start.
+                    let boundary_floor =
+                        if inline_appends || !registry.history_policy().decision_boundaries() {
+                            decision_start_event_id
+                        } else {
+                            store::next_event_id_for(conn, prepared.exec_id).await?
+                        };
+
+                    // Issue #603: this cycle replayed cleanly (the ND gate above
+                    // did not fire), so if the execution was previously blocked on
+                    // replay non-determinism the offending build has been rolled
+                    // back or fixed — clear the block marker atomically with the
+                    // recovered cycle's persisted outcome. Guarded on
+                    // `was_nd_blocked` (captured *before* the in-memory mutation
+                    // above) rather than re-reading `execution_ref.nd_blocked_at`,
+                    // which is already `None` here by the time this runs — so
+                    // never-blocked executions still pay nothing, and a
+                    // previously-blocked one still gets its DB row cleared.
+                    if was_nd_blocked {
+                        clear_nd_block(conn, persistence.exec_id).await?;
+                    }
+
+                    let mut pending_cancel_metrics = Vec::new();
+                    if let Some(reason) = &deferred_cancel_ends_run {
+                        // The cycle's commands persist as for a terminal cycle:
+                        // update results, race-loser teardown, detached children,
+                        // search attributes, details, logs and progress. The run
+                        // then ends cancelled instead of with its outcome.
+                        let mut redirected = false;
+                        let (_, deferred_checks, race_deferred_triggers) =
+                            persist_terminal_outcome_commands(
+                                conn,
+                                registry,
+                                execution_ref,
+                                persistence,
+                                outcome,
+                                &pending_cmds,
+                                &recorded_dispatches,
+                                &execute_span,
+                                &mut pending_cancel_metrics,
+                                &mut redirected,
+                                resolved_router.as_ref(),
+                                TerminalSeal::DeferredCancel(reason),
+                            )
+                            .await?;
+                        return Ok(WorkflowPersistFlow::Persisted {
+                            retry_scheduled: false,
+                            deferred_checks,
+                            race_deferred_triggers,
+                            pending_cancel_metrics,
+                            continue_as_new_redirected_to_failure: false,
+                            deferred_cancel_ended_run: true,
+                        });
+                    }
+                    // Issue #1161: `false` unless the ContinuedAsNew outcome below
+                    // (reached via either branch) redirects to a terminal failure —
+                    // see `persist_workflow_outcome`'s parameter doc.
+                    let mut continue_as_new_redirected_to_failure = false;
+                    let (retry_scheduled, mut deferred_checks, mut race_deferred_triggers) =
+                        if is_terminal_with_commands {
+                            persist_terminal_outcome_commands(
+                                conn,
+                                registry,
+                                execution_ref,
+                                persistence,
+                                outcome,
+                                &pending_cmds,
+                                &recorded_dispatches,
+                                &execute_span,
+                                &mut pending_cancel_metrics,
+                                &mut continue_as_new_redirected_to_failure,
+                                resolved_router.as_ref(),
+                                TerminalSeal::Outcome,
+                            )
+                            .await?
+                        } else {
+                            let (retry_scheduled, deferred_checks) = persist_workflow_outcome(
+                                conn,
+                                registry,
+                                execution_ref,
+                                persistence,
+                                outcome,
+                                &execute_span,
+                                false,
+                                // Issue #678: carries any external-op terminal
+                                // resolved inline this cycle into the Suspended arm
+                                // so a mixed timer + external op self-wakes.
+                                resolved_inline_external,
+                                &mut pending_cancel_metrics,
+                                &mut continue_as_new_redirected_to_failure,
+                                resolved_router.as_ref(),
+                                // This path never computes an abandoned-dispatch
+                                // decision ahead of time (`is_terminal_with_commands`
+                                // is false here), so the arm resolves its own verdict.
+                                None,
+                            )
+                            .await?;
+                            (retry_scheduled, deferred_checks, Vec::new())
+                        };
+                    record_decision_boundary(
+                        conn,
+                        registry,
+                        prepared.exec_id,
+                        boundary_floor,
+                        decision_appends,
+                        stays_running,
+                        worker_id,
+                        build_id,
+                    )
+                    .await?;
+                    // Issue #1984: a cancel is pending. When no block is open after
+                    // this cycle, cancel the run in this same transaction.
+                    let mut deferred_cancel_ended_run = false;
+                    if check_deferred_cancel
+                        && let Some((_, starts, checks, terminal_metric)) =
+                            crate::execution::complete_deferred_cancel(
+                                conn,
+                                prepared.exec_id,
+                                Some(telemetry.metrics.as_ref()),
+                            )
+                            .await?
+                    {
+                        deferred_cancel_ended_run = true;
+                        race_deferred_triggers.extend(starts);
+                        deferred_checks
+                            .extend(checks.into_iter().map(|(id, name)| (id, Some(name))));
+                        if let Some((workflow_name, queue_name)) = terminal_metric {
+                            pending_cancel_metrics.push(
+                                crate::execution::StartCancelledRun::terminated(
+                                    workflow_name,
+                                    queue_name,
+                                ),
+                            );
+                        }
+                    }
+                    // Chaos: kill/delay inside the persist transaction, after the
+                    // outcome is written but before the outer commit — the #367 window
+                    // (worker dies after claim, before the terminal is durable). A kill
+                    // (owned conn in the reproducer's spawned task) rolls the persist
+                    // back, leaving the task RUNNING with a dead worker (AC4).
+                    crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
+                    Ok(WorkflowPersistFlow::Persisted {
+                        retry_scheduled,
                         deferred_checks,
                         race_deferred_triggers,
                         pending_cancel_metrics,
-                        continue_as_new_redirected_to_failure: false,
-                        deferred_cancel_ended_run: true,
-                    });
-                }
-                // Issue #1161: `false` unless the ContinuedAsNew outcome below
-                // (reached via either branch) redirects to a terminal failure —
-                // see `persist_workflow_outcome`'s parameter doc.
-                let mut continue_as_new_redirected_to_failure = false;
-                let (retry_scheduled, mut deferred_checks, mut race_deferred_triggers) =
-                    if is_terminal_with_commands {
-                        persist_terminal_outcome_commands(
-                            conn,
-                            registry,
-                            execution_ref,
-                            persistence,
-                            outcome,
-                            &pending_cmds,
-                            &recorded_dispatches,
-                            &execute_span,
-                            &mut pending_cancel_metrics,
-                            &mut continue_as_new_redirected_to_failure,
-                            resolved_router.as_ref(),
-                            TerminalSeal::Outcome,
-                        )
-                        .await?
-                    } else {
-                        let (retry_scheduled, deferred_checks) = persist_workflow_outcome(
-                            conn,
-                            registry,
-                            execution_ref,
-                            persistence,
-                            outcome,
-                            &execute_span,
-                            false,
-                            // Issue #678: carries any external-op terminal
-                            // resolved inline this cycle into the Suspended arm
-                            // so a mixed timer + external op self-wakes.
-                            resolved_inline_external,
-                            &mut pending_cancel_metrics,
-                            &mut continue_as_new_redirected_to_failure,
-                            resolved_router.as_ref(),
-                            // This path never computes an abandoned-dispatch
-                            // decision ahead of time (`is_terminal_with_commands`
-                            // is false here), so the arm resolves its own verdict.
-                            None,
-                        )
-                        .await?;
-                        (retry_scheduled, deferred_checks, Vec::new())
-                    };
-                record_decision_boundary(
-                    conn,
-                    registry,
-                    prepared.exec_id,
-                    boundary_floor,
-                    decision_appends,
-                    stays_running,
-                    worker_id,
-                    build_id,
-                )
-                .await?;
-                // Issue #1984: a cancel is pending. When no block is open after
-                // this cycle, cancel the run in this same transaction.
-                let mut deferred_cancel_ended_run = false;
-                if check_deferred_cancel
-                    && let Some((_, starts, checks, terminal_metric)) =
-                        crate::execution::complete_deferred_cancel(
-                            conn,
-                            prepared.exec_id,
-                            Some(telemetry.metrics.as_ref()),
-                        )
-                        .await?
-                {
-                    deferred_cancel_ended_run = true;
-                    race_deferred_triggers.extend(starts);
-                    deferred_checks.extend(checks.into_iter().map(|(id, name)| (id, Some(name))));
-                    if let Some((workflow_name, queue_name)) = terminal_metric {
-                        pending_cancel_metrics.push(
-                            crate::execution::StartCancelledRun::terminated(
-                                workflow_name,
-                                queue_name,
-                            ),
-                        );
-                    }
-                }
-                // Chaos: kill/delay inside the persist transaction, after the
-                // outcome is written but before the outer commit — the #367 window
-                // (worker dies after claim, before the terminal is durable). A kill
-                // (owned conn in the reproducer's spawned task) rolls the persist
-                // back, leaving the task RUNNING with a dead worker (AC4).
-                crate::chaos_point!(WORKER_PERSIST_BEFORE_COMMIT);
-                Ok(WorkflowPersistFlow::Persisted {
-                    retry_scheduled,
-                    deferred_checks,
-                    race_deferred_triggers,
-                    pending_cancel_metrics,
-                    continue_as_new_redirected_to_failure,
-                    deferred_cancel_ended_run,
-                })
-            })
+                        continue_as_new_redirected_to_failure,
+                        deferred_cancel_ended_run,
+                    })
+                }),
+            ))
             .await
         },
     ))
@@ -28641,6 +28976,11 @@ async fn process_workflow_task(
                 },
                 std::mem::take(&mut final_resident),
                 history_bytes,
+                CacheOwner {
+                    key: owner_key,
+                    pinned: pinned_epoch,
+                    owned: &registry.decision_owner(),
+                },
             )
             .await;
 
@@ -28886,14 +29226,22 @@ async fn store_cache_entry(
     resident: crate::resident::Residency,
     // Issue #1804: the byte mark measured at the start of this decision.
     history_bytes: Option<crate::cache::HistoryBytesMark>,
+    // Issue #2251: the partition tag, so a fenced owner can drop the entry.
+    owner: CacheOwner<'_>,
 ) {
     let Some(suspended) = suspended else {
         return;
     };
     let displaced = {
         let mut guard = workflow_cache.lock().await;
-        if suspended {
-            guard.insert_resident_with_history_bytes(exec_uuid, state, resident, history_bytes)
+        if suspended && owner.may_cache() {
+            guard.insert_resident_with_history_bytes(
+                exec_uuid,
+                state,
+                resident,
+                history_bytes,
+                Some(owner.key),
+            )
         } else {
             guard.take(&exec_uuid)
         }
@@ -28977,6 +29325,10 @@ enum TaskDispatchOutcome {
     /// terminally (issue #1815). The failure is already persisted, so the
     /// dispatch site only counts it.
     FailedTerminally,
+    /// The decision commit lost its owner fence (issue #2251). It wrote
+    /// nothing, and the task is re-pended under its claim. The worker made
+    /// no error, so the dispatch site does not count it.
+    Fenced,
 }
 
 /// How a workflow cycle that returned `Ok` ended its task (issue #1815).
@@ -29228,6 +29580,9 @@ async fn process_task(
     pool_labels: &Arc<[u16]>,
     // Issue #1813: the drain's cancel for running activities.
     drain_cancel: &CancellationToken,
+    // Issue #2251: the shard of the pool that this task came from. It keys
+    // the owner tenure, because it names the database of the owner row.
+    owner_shard: crate::types::ShardId,
 ) -> HarvestResult<TaskDispatchOutcome> {
     // Issue #804 (Codex round-22 P2): the workflow path sets this when a
     // frontier reset commits, so the capability-miss interception below knows
@@ -29255,6 +29610,8 @@ async fn process_task(
                 // Issue #1815: every outcome persist of the cycle is timed
                 // under the pool's labels. See `PersistTiming`.
                 let timing = PersistTiming::new(&registry.telemetry().metrics, pool_labels);
+                // Issue #2251: the dispatch site opened the decision scope.
+                // The cycle pins its tenure there.
                 let outcome = Box::pin(PERSIST_TIMING.scope(
                     timing,
                     process_workflow_task(
@@ -29265,7 +29622,7 @@ async fn process_task(
                         build_id,
                         sticky_timeout,
                         max_local_activity_start_to_close,
-                        workflow_cache,
+                        Arc::clone(&workflow_cache),
                         dispatched_at,
                         &workflow_panic_strikes,
                         workflow_panic_max_attempts,
@@ -29273,6 +29630,7 @@ async fn process_task(
                         workflow_task_deadline,
                         &frontier_reset_committed,
                         &cycle_failure,
+                        owner_shard,
                     ),
                 ))
                 .await;
@@ -29339,6 +29697,16 @@ async fn process_task(
     let Err(error) = &outcome else {
         return Ok(cycle_failure.outcome());
     };
+    // Issue #2251: a fenced decision wrote nothing. Unload the partition and
+    // give the task back. Never retry at the stale epoch.
+    if let Some((partition, pinned)) = error.ownership_lost() {
+        let key = crate::decision_owner::OwnerKey {
+            shard: owner_shard,
+            partition,
+        };
+        return unload_fenced_partition(&mut conn, &registry, &workflow_cache, &task, key, pinned)
+            .await;
+    }
     // Issue #1182 (Codex review round 3): an ambiguous suspended-dispatch
     // claim is intercepted HERE -- after `run_under_workflow_body_budget`
     // has already returned -- rather than inside `process_workflow_task`.
@@ -29392,6 +29760,237 @@ async fn process_task(
         &resolved,
     );
     resolved
+}
+
+/// Drop a fenced tenure and the cache entries of its partition (issue #2251).
+///
+/// The worker drops its tenure when the tenure still pins `pinned`. It drops
+/// every cache entry of the partition unless a newer tenure holds it. A new
+/// tenure then starts cold. Returns `true` when this call dropped the tenure.
+async fn drop_fenced_tenure(
+    owned: &crate::decision_owner::OwnedPartitions,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    key: crate::decision_owner::OwnerKey,
+    pinned: crate::decision_owner::OwnerEpoch,
+) -> bool {
+    // The decision is over. Later writes of this dispatch fence nothing.
+    let _ = crate::decision_owner::pin_decision(None);
+    let unloaded = owned.unload(key, pinned);
+    // Keep the entries of a newer tenure. Drop them in every other case, so
+    // a later tenure starts cold.
+    if unloaded || owned.tenure_for(key).is_none() {
+        // Drop the parked futures outside the cache lock.
+        let evicted = workflow_cache.lock().await.evict_partition(key);
+        drop(evicted);
+    }
+    metrics.record_decision_owner_fenced(&key.shard.as_i32().to_string());
+    unloaded
+}
+
+/// The longest single wait of the owner wake task for a wake (issue #2253).
+/// A tenure change ends the wait sooner.
+const OWNER_WAKE_TICK: Duration = Duration::from_secs(1);
+
+/// How long the owner wake task waits after a failed connection.
+const OWNER_WAKE_RETRY: Duration = Duration::from_secs(1);
+
+/// What the owner wake task of one shard pool needs (issue #2253).
+struct OwnerWakes {
+    url: String,
+    shard: crate::types::ShardId,
+    owned: Arc<crate::decision_owner::OwnedPartitions>,
+    workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
+    woken: Arc<tokio::sync::Notify>,
+    metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
+    shutdown: CancellationToken,
+    listening: Arc<std::sync::Mutex<std::collections::BTreeSet<crate::decision_owner::OwnerKey>>>,
+}
+
+impl OwnerWakes {
+    /// Listen on the owner channel of each partition that this worker owns
+    /// on `shard`, until shutdown (issue #2253).
+    ///
+    /// The task connects only while the worker holds a tenure on the shard.
+    /// With no tenure, it waits for a tenure change and does not poll. A
+    /// wake that it misses while it reconnects costs latency only. The poll
+    /// loop still claims, and a cache hit checks its delta.
+    async fn run(self) {
+        let mut listener: Option<crate::notify::OwnerWakeListener> = None;
+        let mut synced: Option<u64> = None;
+        while !self.shutdown.is_cancelled() {
+            // Arm the change wait first, then read the version. A change
+            // after the read still ends the wait below.
+            let changed = self.owned.changed();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let version = self.owned.version();
+            let wanted = self.owned.partitions_on(self.shard);
+            if wanted.is_empty() {
+                listener = None;
+                synced = None;
+                self.set_listening(&[]);
+                // No tenure: wait for one, with no poll.
+                tokio::select! {
+                    () = self.shutdown.cancelled() => break,
+                    () = changed => {}
+                }
+                continue;
+            }
+            let Some(open) = listener.as_mut() else {
+                match crate::notify::OwnerWakeListener::connect(&self.url).await {
+                    Ok(open) => listener = Some(open),
+                    Err(error) => {
+                        tracing::warn!(
+                            shard = self.shard.as_i32(),
+                            error = %error,
+                            "harvest: the owner wake listener cannot connect; retrying"
+                        );
+                        self.pause(OWNER_WAKE_RETRY).await;
+                    }
+                }
+                synced = None;
+                continue;
+            };
+            if synced != Some(version) {
+                if let Err(error) = sync_owner_channels(open, &wanted).await {
+                    tracing::warn!(
+                        shard = self.shard.as_i32(),
+                        error = %error,
+                        "harvest: the owner wake listener failed; reconnecting"
+                    );
+                    listener = None;
+                    self.set_listening(&[]);
+                    self.pause(OWNER_WAKE_RETRY).await;
+                    continue;
+                }
+                synced = Some(version);
+                self.set_listening(&wanted);
+            }
+            let wait = tokio::select! {
+                () = self.shutdown.cancelled() => break,
+                // A tenure change syncs the channels at once.
+                () = changed.as_mut() => continue,
+                wait = open.wait(OWNER_WAKE_TICK) => wait,
+            };
+            match wait {
+                crate::notify::OwnerWakeWait::Woken(wake) => self.handle(&wake).await,
+                crate::notify::OwnerWakeWait::TimedOut => {}
+                // A server that drops each connection must not cause a
+                // reconnect loop, so the retry waits first.
+                crate::notify::OwnerWakeWait::ChannelClosed => {
+                    listener = None;
+                    self.set_listening(&[]);
+                    self.pause(OWNER_WAKE_RETRY).await;
+                }
+            }
+        }
+    }
+
+    /// Publish the partitions that the listener listens on, for tests.
+    fn set_listening(&self, partitions: &[crate::decision_owner::DecisionPartition]) {
+        let mut listening = self
+            .listening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        listening.retain(|key| key.shard != self.shard);
+        listening.extend(
+            partitions
+                .iter()
+                .map(|&partition| crate::decision_owner::OwnerKey {
+                    shard: self.shard,
+                    partition,
+                }),
+        );
+    }
+
+    /// Sleep for `wait`, or less at shutdown.
+    async fn pause(&self, wait: Duration) {
+        tokio::select! {
+            () = self.shutdown.cancelled() => {}
+            () = tokio::time::sleep(wait) => {}
+        }
+    }
+
+    /// Evict the entry of an evict wake, count the wake and wake the poll
+    /// loop.
+    async fn handle(&self, wake: &crate::notify::OwnerWake) {
+        let kind = if wake.payload.evict {
+            // Drop the parked future outside the cache lock.
+            let taken = self
+                .workflow_cache
+                .lock()
+                .await
+                .take(&wake.payload.workflow_exec_id);
+            drop(taken);
+            "evict"
+        } else {
+            "wake"
+        };
+        self.metrics
+            .record_decision_owner_woken(&self.shard.as_i32().to_string(), kind);
+        self.woken.notify_one();
+    }
+}
+
+/// Make `listener` listen on exactly the channels of `wanted`.
+async fn sync_owner_channels(
+    listener: &mut crate::notify::OwnerWakeListener,
+    wanted: &[crate::decision_owner::DecisionPartition],
+) -> HarvestResult<()> {
+    for stale in listener.partitions() {
+        if !wanted.contains(&stale) {
+            listener.unlisten(stale).await?;
+        }
+    }
+    for &partition in wanted {
+        listener.listen(partition).await?;
+    }
+    Ok(())
+}
+
+/// Unload a fenced partition and re-pend its task (issue #2251).
+///
+/// The decision transaction rolled back, so it wrote nothing. The worker
+/// drops its tenure when the tenure still pins `pinned`. It drops every
+/// cache entry of the partition unless a newer tenure holds it. A new
+/// tenure then starts cold. The task goes back to `PENDING` under its
+/// claim, so the new owner can take it. A stale claim writes nothing.
+async fn unload_fenced_partition(
+    conn: &mut AsyncPgConnection,
+    registry: &HandlerRegistry,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    task: &TaskQueueItem,
+    key: crate::decision_owner::OwnerKey,
+    pinned: crate::decision_owner::OwnerEpoch,
+) -> HarvestResult<TaskDispatchOutcome> {
+    let unloaded = drop_fenced_tenure(
+        &registry.decision_owner(),
+        workflow_cache,
+        &*registry.telemetry().metrics,
+        key,
+        pinned,
+    )
+    .await;
+    tracing::warn!(
+        task_id = %task.id,
+        %key,
+        %pinned,
+        unloaded,
+        "harvest: a decision lost its owner fence; the partition is unloaded and the task is \
+         re-pended (issue #2251)"
+    );
+    let Some(claim) = queue::TaskClaim::of(task) else {
+        return Ok(TaskDispatchOutcome::ClaimLostAfterFailure);
+    };
+    let delay = fence_repend_delay(pinned);
+    // Issue #2252: an owned claim may take an unstamped row. Stamp it, so
+    // the owner of its partition takes it next.
+    if queue::requeue_unowned_workflow_task(conn, &claim, key.partition, delay).await? {
+        Ok(TaskDispatchOutcome::Fenced)
+    } else {
+        Ok(TaskDispatchOutcome::ClaimLostAfterFailure)
+    }
 }
 
 /// The handler a claiming worker turned out not to register (issue #804).
@@ -30380,6 +30979,8 @@ where
     let error = error.to_string();
     Box::pin(
         conn.transaction::<TerminalWriteOutcome, HarvestError, _>(async |conn| {
+            // Issue #2251: the owner fence comes first.
+            crate::replication::assert_decision_fence(conn).await?;
             // Lock the execution row FIRST (the documented execution -> task
             // order) and re-derive the event id under that lock. The preloaded
             // id was read *before* this transaction opened, so a parallel
@@ -31739,7 +32340,8 @@ pub enum ClaimRecovery {
 /// A completion is a success. An error, a body timeout, a re-pended failure
 /// and a terminal handler panic are failures. A release is neither, because
 /// the task did not run to a decision here. A failure whose claim a peer took
-/// is neither too, because a peer owns it.
+/// is neither too, because a peer owns it. A fenced decision is neither, as
+/// another owner decides now (issue #2251).
 const fn workflow_task_failed(outcome: &HarvestResult<TaskDispatchOutcome>) -> Option<bool> {
     match outcome {
         Ok(TaskDispatchOutcome::Completed) => Some(false),
@@ -31749,9 +32351,11 @@ const fn workflow_task_failed(outcome: &HarvestResult<TaskDispatchOutcome>) -> O
             | TaskDispatchOutcome::FailedTerminally,
         )
         | Err(_) => Some(true),
-        Ok(TaskDispatchOutcome::Released { .. } | TaskDispatchOutcome::ClaimLostAfterFailure) => {
-            None
-        }
+        Ok(
+            TaskDispatchOutcome::Released { .. }
+            | TaskDispatchOutcome::ClaimLostAfterFailure
+            | TaskDispatchOutcome::Fenced,
+        ) => None,
     }
 }
 
@@ -32378,6 +32982,12 @@ pub struct Worker {
     /// Wakes every idle wait when a task deferred at its adaptive limit is
     /// due (issue #1836). Unlike `capacity_freed`, no gate holds it back.
     deferral_due: Arc<tokio::sync::Notify>,
+    /// Wakes every idle wait when a foreign write wakes this owner (issue
+    /// #2253). See [`OwnerWakes`].
+    owner_woken: Arc<tokio::sync::Notify>,
+    /// The partitions that the owner wake tasks listen on (issue #2253).
+    owner_listening:
+        Arc<std::sync::Mutex<std::collections::BTreeSet<crate::decision_owner::OwnerKey>>>,
     /// Kinds the poll gate refused since the last claim of that kind (issue
     /// #1787). The slot tuner counts a claimed task's queue wait only when
     /// the gate held its kind back. Otherwise a NOTIFY delay reads as a
@@ -32437,6 +33047,15 @@ pub struct Worker {
     /// Wrapped in `Arc<tokio::sync::Mutex<_>>` so it can be shared across
     /// concurrently-running task handler futures without cloning the events.
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
+    /// The shard that keys the owner tenures of each claim target (issue
+    /// #2252). Colocated shards share one database, so they share one key.
+    /// A target with no entry keys by itself.
+    owner_shards:
+        std::sync::RwLock<std::collections::HashMap<crate::types::ShardId, crate::types::ShardId>>,
+    /// The owner tenures of this worker (issue #2252). The first worker on a
+    /// registry takes the registry's set. Another worker takes its own, so
+    /// two workers never share a holder token.
+    decision_owner: Arc<crate::decision_owner::OwnedPartitions>,
     /// In-process consecutive-timeout strike counter per workflow execution
     /// (issue #494).
     ///
@@ -33850,6 +34469,127 @@ impl UnstartedClaim {
     }
 }
 
+/// How often the owner loop scans its database (ADR 0009 decision 8).
+const OWNER_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One database of a multi-shard worker (issue #2252).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnerGroup<P> {
+    /// The lowest claim target on the database. It keys the tenures of every
+    /// target there.
+    canonical: crate::types::ShardId,
+    /// The pool of the database.
+    pool: P,
+    /// The claim targets on the database.
+    members: Vec<crate::types::ShardId>,
+    /// The database also serves a shard that this worker does not target.
+    /// Its 512 owner rows serve that shard too, so this worker must not own
+    /// them (ADR 0009 decision 10).
+    split: bool,
+}
+
+/// Group the claim `targets` by database. `all` lists every shard of the
+/// process pool, and `same` says whether two shards reach one database.
+fn owner_groups<P: Clone>(
+    targets: &[(crate::types::ShardId, P)],
+    all: &[crate::types::ShardId],
+    same: impl Fn(crate::types::ShardId, crate::types::ShardId) -> bool,
+) -> Vec<OwnerGroup<P>> {
+    let mut groups: Vec<OwnerGroup<P>> = Vec::new();
+    for (shard, pool) in targets {
+        if let Some(group) = groups.iter_mut().find(|g| same(g.canonical, *shard)) {
+            group.members.push(*shard);
+            group.canonical = group.canonical.min(*shard);
+        } else {
+            groups.push(OwnerGroup {
+                canonical: *shard,
+                pool: pool.clone(),
+                members: vec![*shard],
+                split: false,
+            });
+        }
+    }
+    for group in &mut groups {
+        group.split = all
+            .iter()
+            .any(|shard| same(group.canonical, *shard) && !group.members.contains(shard));
+    }
+    groups
+}
+
+/// The owner loop of one database, as the run path holds it (issue #2252).
+struct OwnerLoopHandle {
+    state: Arc<tokio::sync::Mutex<crate::decision_owner::OwnerLoop>>,
+    stop: CancellationToken,
+    _task: AbortOnDrop,
+}
+
+/// One scan of an owner loop (issue #2252).
+///
+/// The cache entries of each dropped tenure go first. Then the entries of
+/// each new partition go, before the worker adopts its tenure. So a new
+/// tenure starts cold (rule R4 of ADR 0010).
+async fn owner_scan(
+    state: &tokio::sync::Mutex<crate::decision_owner::OwnerLoop>,
+    pool: &DbPool,
+    cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    owned: &crate::decision_owner::OwnedPartitions,
+    worker_id: &str,
+) {
+    // The loop lock stays held until the adoption ends. A release then
+    // never runs between an acquisition and its adoption.
+    let (conn, mut owner_loop) = conn_then_loop_lock(pool.get(), state).await;
+    let mut conn = match conn {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::warn!(worker_id = %worker_id, error = %e, "owner loop: no connection");
+            return;
+        }
+    };
+    let tick = owner_loop.tick(&mut conn).await;
+    drop(conn);
+    match tick {
+        Ok(tick) => {
+            evict_owner_keys(cache, &tick.dropped).await;
+            let keys: Vec<_> = tick.acquired.iter().map(|(t, _)| t.key()).collect();
+            evict_owner_keys(cache, &keys).await;
+            for (tenure, deadline) in tick.acquired {
+                owned.adopt_until(tenure, deadline);
+            }
+        }
+        Err(e) => {
+            tracing::warn!(worker_id = %worker_id, error = %e, "owner loop scan failed");
+        }
+    }
+    drop(owner_loop);
+}
+
+/// Take a pool connection, then the owner-loop lock (issue #2252).
+///
+/// The scan and the release both use this order. A release that took the lock
+/// first could wait for the last connection. A scan could hold that connection
+/// and wait for the lock.
+async fn conn_then_loop_lock<C, S>(
+    conn: impl std::future::Future<Output = C>,
+    state: &tokio::sync::Mutex<S>,
+) -> (C, tokio::sync::MutexGuard<'_, S>) {
+    let conn = conn.await;
+    (conn, state.lock().await)
+}
+
+/// Drop the cache entries of each partition of `keys`.
+async fn evict_owner_keys(
+    cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    keys: &[crate::decision_owner::OwnerKey],
+) {
+    if keys.is_empty() {
+        return;
+    }
+    let closed = cache.lock().await.evict_partitions(keys);
+    // Each entry can hold a parked handler future. Drop them outside the lock.
+    drop(closed);
+}
+
 /// Owns a task handle and aborts the task when dropped (issue #1552).
 ///
 /// A bare `JoinHandle` detaches its task on drop. Cancelling the future that
@@ -34580,6 +35320,18 @@ impl Worker {
         let task_outcomes = crate::worker_outlier::TaskOutcomeWindow::for_heartbeat(
             config.worker_heartbeat_interval,
         );
+        // Issue #2252: the first worker on a registry takes its tenures. A
+        // second worker on the same registry takes a set of its own.
+        let decision_owner = {
+            let shared = registry.decision_owner();
+            if shared.try_claim() {
+                shared
+            } else {
+                let own = Arc::new(crate::decision_owner::OwnedPartitions::default());
+                let _ = own.try_claim();
+                own
+            }
+        };
         Ok(Self {
             config,
             registry,
@@ -34594,6 +35346,8 @@ impl Worker {
             dispatch_reserved_activity: Arc::new(AtomicUsize::new(0)),
             capacity_freed,
             deferral_due,
+            owner_woken: Arc::new(tokio::sync::Notify::new()),
+            owner_listening: Arc::default(),
             gate_refused: Arc::new(GateRefused::default()),
             limit_refused: AtomicBool::new(false),
             pool_refused: AtomicBool::new(false),
@@ -34605,6 +35359,8 @@ impl Worker {
             remote_drain_deadline: Arc::new(Mutex::new(None)),
             drain_deadline_max: Arc::new(Mutex::new(None)),
             workflow_cache,
+            owner_shards: std::sync::RwLock::default(),
+            decision_owner,
             workflow_task_timeout_strikes: Arc::default(),
             workflow_panic_strikes: Arc::default(),
             workflow_deadlock_strikes: Arc::default(),
@@ -34614,6 +35370,45 @@ impl Worker {
             shard_dispatch,
             global_dispatch,
         })
+    }
+
+    /// Start the owner wake task of the pool of `shard` on `url` (issue
+    /// #2253). The task ends at shutdown or when the guard drops.
+    fn spawn_owner_wakes(&self, url: &str, shard: Option<crate::types::ShardId>) -> AbortOnDrop {
+        // Issue #2252: the tenures are per worker, keyed by the canonical
+        // shard of the database. The owner loops record that key first.
+        let wakes = OwnerWakes {
+            url: url.to_string(),
+            shard: self.owner_shard_of(shard),
+            owned: Arc::clone(&self.decision_owner),
+            workflow_cache: Arc::clone(&self.workflow_cache),
+            woken: Arc::clone(&self.owner_woken),
+            metrics: Arc::clone(&self.registry.telemetry().metrics),
+            shutdown: self.shutdown.clone(),
+            listening: Arc::clone(&self.owner_listening),
+        };
+        AbortOnDrop::new(tokio::spawn(wakes.run()))
+    }
+
+    /// Whether an owner wake task listens on the channel of `key` (issue
+    /// #2253). Tests wait for it before a foreign write.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn owner_wake_listening(&self, key: crate::decision_owner::OwnerKey) -> bool {
+        self.owner_listening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&key)
+    }
+
+    /// Whether the workflow cache holds an entry for `exec_id` (issue
+    /// #2253). Tests use it to see an owner eviction.
+    #[doc(hidden)]
+    pub async fn has_cached_execution(&self, exec_id: ExecutionId) -> bool {
+        self.workflow_cache
+            .lock()
+            .await
+            .contains(&exec_id.as_uuid())
     }
 
     /// The global channel this worker is bound to (issue #1431).
@@ -35019,6 +35814,13 @@ impl Worker {
                 }
                 None => None,
             };
+            // Issue #2253: the owner wakes use the URL of the queue
+            // listener, and the shard of the claim loop.
+            let poll_shard = match self.config.shard_assignments.as_slice() {
+                [shard, ..] => Some(*shard),
+                [] => None,
+            };
+            let _owner_wakes = listener_url.map(|url| self.spawn_owner_wakes(url, poll_shard));
             self.run_with_listener_bound(claim_pool, listener).await;
         }
     }
@@ -35255,7 +36057,19 @@ impl Worker {
             })
             .collect();
 
+        // Issue #2252: one owner loop per database. Colocated targets share
+        // its key.
+        let owner_loops = self.spawn_owner_loops(&shard_targets);
+
         let shard_listeners = self.build_shard_listeners(&shard_targets).await;
+        // Issue #2253: one owner wake task per shard with a listener URL.
+        let _owner_wakes: Vec<AbortOnDrop> = shard_targets
+            .iter()
+            .filter_map(|(shard, _)| {
+                multi_shard_listener_url(&self.config.shard_notification_database_urls, *shard)
+                    .map(|url| self.spawn_owner_wakes(url, Some(*shard)))
+            })
+            .collect();
 
         // Use each assigned shard's dispatch channel, captured once by
         // `Worker::new` and held for the whole loop (Codex review, issue
@@ -35307,6 +36121,10 @@ impl Worker {
         let shutdown_acquire_bound = shard_acquire_bound(true, self.config.poll_interval);
         self.drain_releasing_sticky_pins(&shard_targets, shutdown_acquire_bound)
             .await;
+        for (pool, handle) in &owner_loops {
+            self.release_owner_partitions(pool, handle, shutdown_acquire_bound)
+                .await;
+        }
 
         // Stopped: mark every shard pool's worker row stopped, then cancel heartbeats.
         for (shard, shard_pool) in &shard_targets {
@@ -35447,6 +36265,7 @@ impl Worker {
                     () = shutdown.cancelled() => break,
                     () = capacity.woken() => {}
                     () = self.deferral_due.notified() => {}
+                    () = self.owner_woken.notified() => {}
                     () = tokio::time::sleep(poll_interval) => {}
                 }
             } else {
@@ -35481,6 +36300,11 @@ impl Worker {
                 break 'notify_wait;
             }
             if futures::FutureExt::now_or_never(self.deferral_due.notified()).is_some() {
+                break 'notify_wait;
+            }
+            // An owner wake is a NOTIFY too, so it settles (issue #2253).
+            if futures::FutureExt::now_or_never(self.owner_woken.notified()).is_some() {
+                notified = true;
                 break 'notify_wait;
             }
             let mut broken_idx: Option<usize> = None;
@@ -35784,6 +36608,13 @@ impl Worker {
             [shard, ..] => Some(*shard),
             [] => None,
         };
+        // Issue #2252: the owner loop of this pool's database. Every
+        // assignment of a single pool shares it, so one key serves them all.
+        let owner_loop = self.spawn_owner_loop(
+            pool,
+            crate::decision_owner::OwnerKey::pool_shard(poll_shard),
+            self.single_pool_splits_a_group(pool),
+        );
 
         // Decide the dispatch span once, here, and hold it for the whole loop
         // (issue #1312). It stops a wide-span worker from using a global
@@ -35817,6 +36648,9 @@ impl Worker {
         };
         tracing::info!(worker_id = %self.config.worker_id, "draining in-flight tasks");
         tokio::join!(bookkeeping, self.drain_in_flight());
+        // Issue #2252: no decision of this worker runs now, so hand the
+        // partitions over in one statement.
+        self.release_owner_partitions(pool, &owner_loop, None).await;
         // A single pool names its shard through the default pin.
         self.keep_lease_while_handlers_run(vec![(None, pool.clone())]);
 
@@ -35903,6 +36737,197 @@ impl Worker {
                 "refusing to start: cross-region DR fencing could not be resolved"
             );
         })
+    }
+
+    /// Start the owner loop of one database (issue #2252).
+    ///
+    /// `owner_shard` keys the tenures of the database. `refuse` keeps owner
+    /// mode off for this worker there, for a split colocated group (ADR 0009
+    /// decision 10). The loop scans every [`OWNER_SCAN_INTERVAL`]. It stops
+    /// at shutdown. [`Self::release_owner_partitions`] then releases its
+    /// partitions after the drain.
+    fn spawn_owner_loop(
+        &self,
+        pool: &DbPool,
+        owner_shard: crate::types::ShardId,
+        refuse: bool,
+    ) -> OwnerLoopHandle {
+        let mut owner_loop = crate::decision_owner::OwnerLoop::new(
+            owner_shard,
+            &self.config.worker_id,
+            crate::decision_owner::OwnerLeaseConfig::default(),
+            Arc::clone(&self.decision_owner),
+        )
+        // Peers are judged on the fleet-wide cadence, as the capability-miss
+        // lookup does. A fast local heartbeat must not make a peer look dead.
+        .with_live_within(Duration::from_secs(
+            u64::try_from(capability_miss_fleet_stale_secs(
+                self.config.worker_heartbeat_interval,
+            ))
+            .unwrap_or(1),
+        ));
+        // A worker that cannot run a workflow task must not own partitions.
+        // It still claims in the owned form, so the guard never blocks its
+        // activity claims.
+        if refuse || !self.can_own_partitions() {
+            owner_loop.refuse();
+        }
+        let state = Arc::new(tokio::sync::Mutex::new(owner_loop));
+        let stop = CancellationToken::new();
+        let task = {
+            let state = Arc::clone(&state);
+            let stop = stop.clone();
+            let pool = pool.clone();
+            let cache = Arc::clone(&self.workflow_cache);
+            let owned = Arc::clone(&self.decision_owner);
+            let worker_id = self.config.worker_id.clone();
+            AbortOnDrop::new(tokio::spawn(async move {
+                loop {
+                    owner_scan(&state, &pool, &cache, &owned, &worker_id).await;
+                    tokio::select! {
+                        () = stop.cancelled() => return,
+                        () = tokio::time::sleep(OWNER_SCAN_INTERVAL) => {}
+                    }
+                }
+            }))
+        };
+        OwnerLoopHandle {
+            state,
+            stop,
+            _task: task,
+        }
+    }
+
+    /// The labels this worker writes to `harvest_workers` (issue #2252).
+    ///
+    /// They are the configured labels plus
+    /// [`crate::decision_owner::OWNER_HANDLERS_LABEL`]. The enable step of
+    /// owner mode compares that label across the live fleet.
+    fn fleet_labels(&self) -> std::collections::HashMap<String, String> {
+        let mut labels = self.config.labels.clone();
+        let handlers = if self.can_own_partitions() {
+            crate::decision_owner::handler_set_fingerprint(
+                self.registry.workflows.keys().map(String::as_str),
+                self.registry.activities.keys().map(String::as_str),
+            )
+        } else {
+            crate::decision_owner::NO_OWNED_HANDLERS.to_string()
+        };
+        labels.insert(
+            crate::decision_owner::OWNER_HANDLERS_LABEL.to_string(),
+            handlers,
+        );
+        labels
+    }
+
+    /// Whether this worker can own decision partitions (issue #2252).
+    ///
+    /// An owner claims every workflow task of its partitions. A worker with
+    /// no workflow slot or no workflow type would strand them.
+    fn can_own_partitions(&self) -> bool {
+        self.config.max_concurrent_workflows > 0 && !self.registry.workflows.is_empty()
+    }
+
+    /// Release every owned partition of `handle` (ADR 0009 decision 9).
+    ///
+    /// The worker calls this after its drain, so no decision of its own still
+    /// runs. The loop lock waits for a scan in progress, and the release
+    /// stops the loop for good. A failed release lapses within one TTL.
+    async fn release_owner_partitions(
+        &self,
+        pool: &DbPool,
+        handle: &OwnerLoopHandle,
+        acquire_bound: Option<Duration>,
+    ) {
+        handle.stop.cancel();
+        let conn = async {
+            match acquire_bound {
+                Some(bound) => tokio::time::timeout(bound, pool.get())
+                    .await
+                    .map_err(|_| HarvestError::Database("owner release: pool timeout".to_string()))
+                    .and_then(|r| r.map_err(|e| HarvestError::Database(e.to_string()))),
+                None => pool
+                    .get()
+                    .await
+                    .map_err(|e| HarvestError::Database(e.to_string())),
+            }
+        };
+        let (conn, mut owner_loop) = conn_then_loop_lock(conn, &handle.state).await;
+        let released = match conn {
+            Ok(mut conn) => owner_loop.release_everything(&mut conn).await,
+            Err(e) => Err(e),
+        };
+        drop(owner_loop);
+        match released {
+            Ok(keys) => evict_owner_keys(&self.workflow_cache, &keys).await,
+            Err(e) => tracing::warn!(
+                worker_id = %self.config.worker_id,
+                error = %e,
+                "failed to release decision partitions; their leases lapse within one TTL"
+            ),
+        }
+    }
+
+    /// Whether the database of `pool` serves a shard of the process pool
+    /// that this worker does not target (ADR 0009 decision 10).
+    ///
+    /// Several assignments of one plain pool share its database, so they
+    /// form one group.
+    fn single_pool_splits_a_group(&self, pool: &DbPool) -> bool {
+        let Some(sharded) = self.config.sharded_pool.as_ref() else {
+            return false;
+        };
+        let targets: Vec<(crate::types::ShardId, DbPool)> = self
+            .config
+            .shard_assignments
+            .iter()
+            .map(|shard| (*shard, pool.clone()))
+            .collect();
+        let assigned = &self.config.shard_assignments;
+        owner_groups(&targets, &sharded.shard_ids(), |a, b| {
+            a == b
+                || (assigned.contains(&a) && assigned.contains(&b))
+                || sharded.same_physical_pool(a, b)
+        })
+        .iter()
+        .any(|group| group.split)
+    }
+
+    /// Start one owner loop per database of `targets` (issue #2252).
+    fn spawn_owner_loops(
+        &self,
+        targets: &[(crate::types::ShardId, DbPool)],
+    ) -> Vec<(DbPool, OwnerLoopHandle)> {
+        // `same_physical_pool` reads the DSN groups of the pool. Two pools
+        // that `from_dsns` built for one database are one group there.
+        let sharded = self.config.sharded_pool.as_ref();
+        let all = sharded
+            .map(crate::shard::ShardedDbPool::shard_ids)
+            .unwrap_or_default();
+        let groups = owner_groups(targets, &all, |a, b| {
+            a == b || sharded.is_some_and(|pool| pool.same_physical_pool(a, b))
+        });
+        let mut map = std::collections::HashMap::new();
+        let mut handles = Vec::with_capacity(groups.len());
+        for group in groups {
+            if group.split {
+                tracing::error!(
+                    worker_id = %self.config.worker_id,
+                    shards = ?group.members.iter().map(|s| s.as_i32()).collect::<Vec<_>>(),
+                    "owner mode refused on a database: this worker covers only part of its \
+                     colocated shards (ADR 0009 decision 10)"
+                );
+            }
+            for member in &group.members {
+                map.insert(*member, group.canonical);
+            }
+            let handle = self.spawn_owner_loop(&group.pool, group.canonical, group.split);
+            handles.push((group.pool, handle));
+        }
+        if let Ok(mut owner_shards) = self.owner_shards.write() {
+            *owner_shards = map;
+        }
+        handles
     }
 
     /// Re-probe the shards this worker held at startup (issue #1823).
@@ -36714,7 +37739,7 @@ impl Worker {
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 build_id: self.config.build_id.clone(),
                 deployment_name: self.config.deployment_name.clone(),
-                labels: self.config.labels.clone(),
+                labels: self.fleet_labels(),
                 max_concurrent_sessions: self.config.max_concurrent_sessions,
             },
             Arc::clone(&self.workflow_semaphore),
@@ -37264,6 +38289,15 @@ impl Worker {
                     }
                 } => {}
                 () = self.deferral_due.notified() => {}
+                // A multi-shard turn leaves the owner wake to the idle wait
+                // of its round, as it does the capacity wake (issue #2253).
+                () = async {
+                    if shard_count == 1 {
+                        self.owner_woken.notified().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {}
                 () = tokio::time::sleep(wait) => {}
             }
         }
@@ -37349,7 +38383,7 @@ impl Worker {
         let claim_started = std::time::Instant::now();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
-                queue::claim_task_by_id_with_fairness(
+                queue::claim_task_by_id_with_owner(
                     conn,
                     lease.task_id,
                     &self.config.queues,
@@ -37360,6 +38394,7 @@ impl Worker {
                     &exclusions,
                     shard,
                     self.claim_fairness(),
+                    self.owned_claim(shard).as_ref(),
                 )
                 .await
             })
@@ -37778,6 +38813,8 @@ impl Worker {
         let notified = tokio::select! {
             () = capacity.woken() => false,
             () = self.deferral_due.notified() => false,
+            // An owner wake is a NOTIFY too, so it settles (issue #2253).
+            () = self.owner_woken.notified() => true,
             notified = idle => notified,
         };
         if notified {
@@ -38063,7 +39100,7 @@ impl Worker {
             version: Some(version.to_string()),
             build_id: self.config.build_id.clone(),
             deployment_name: self.config.deployment_name.clone(),
-            labels: self.config.labels.clone(),
+            labels: self.fleet_labels(),
             max_concurrent_sessions: self.config.max_concurrent_sessions,
         };
         match acquire_shard_conn(pool, acquire_bound).await {
@@ -38576,6 +39613,23 @@ impl Worker {
         }
     }
 
+    /// The shard that keys the owner tenures of claim target `shard` (issue
+    /// #2252).
+    fn owner_shard_of(&self, shard: Option<crate::types::ShardId>) -> crate::types::ShardId {
+        let key = crate::decision_owner::OwnerKey::pool_shard(shard);
+        self.owner_shards
+            .read()
+            .ok()
+            .and_then(|map| map.get(&key).copied())
+            .unwrap_or(key)
+    }
+
+    /// The owned claim of claim target `shard`, or `None` when owner mode is
+    /// off there (issue #2252).
+    fn owned_claim(&self, shard: Option<crate::types::ShardId>) -> Option<queue::OwnedClaim> {
+        self.decision_owner.owned_claim(self.owner_shard_of(shard))
+    }
+
     /// The activity names that a claim must skip: the names with unmet
     /// requirements, plus the types at their adaptive limit (issue #1836).
     fn claim_exclusions(&self) -> std::borrow::Cow<'_, [String]> {
@@ -38812,6 +39866,9 @@ impl Worker {
         let circuit_breakers = self.registry.circuit_breakers();
         let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
         let exclusions = self.claim_exclusions();
+        // Issue #2252: in owner mode, claim workflow tasks of owned
+        // partitions only.
+        let owned = self.owned_claim(shard);
 
         // --- Weighted queue selection (issue #515) ---
         //
@@ -38845,7 +39902,7 @@ impl Worker {
                 let claim_started = std::time::Instant::now();
                 let claimed = self
                     .claim_with_conflict_retry(&mut conn, async |conn| {
-                        queue::claim_task_with_fairness(
+                        queue::claim_task_with_owner(
                             conn,
                             &single_queue,
                             &self.config.worker_id,
@@ -38856,6 +39913,7 @@ impl Worker {
                             shard,
                             kind,
                             self.claim_fairness(),
+                            owned.as_ref(),
                         )
                         .await
                     })
@@ -38898,7 +39956,7 @@ impl Worker {
         let claim_started = std::time::Instant::now();
         let claimed = self
             .claim_with_conflict_retry(&mut conn, async |conn| {
-                queue::claim_task_with_fairness(
+                queue::claim_task_with_owner(
                     conn,
                     &self.config.queues,
                     &self.config.worker_id,
@@ -38909,6 +39967,7 @@ impl Worker {
                     shard,
                     kind,
                     self.claim_fairness(),
+                    owned.as_ref(),
                 )
                 .await
             })
@@ -39035,6 +40094,8 @@ impl Worker {
 
         let pool = pool.clone();
         let pool_labels = self.pool_labels(shard);
+        // Issue #2251: the owner key names the database of the claim.
+        let owner_shard = self.owner_shard_of(shard);
         let registry = Arc::clone(&self.registry);
         let task_id = task.id;
         let task_type = task.task_type.clone();
@@ -39092,6 +40153,7 @@ impl Worker {
         };
         let exec_id_for_timeout = task.workflow_exec_id;
         let telemetry = Arc::clone(&self.registry);
+        let decision_owner = Arc::clone(&self.decision_owner);
         let task_outcomes = Arc::clone(&self.task_outcomes);
 
         // Monotonic instant captured the moment this worker received the claimed
@@ -39197,31 +40259,40 @@ impl Worker {
                 // blameless cleanup cancelled — banking a timeout strike it did
                 // not earn and, at `poison_pill_threshold`, terminally failing
                 // an execution whose body had completed.
-                let outcome = process_task(
-                    &pool,
-                    Arc::clone(&registry),
-                    task,
-                    &worker_id,
-                    &build_id,
-                    cancellation_grace_period,
-                    sticky_timeout,
-                    max_local_activity_start_to_close,
-                    workflow_cache,
-                    dispatched_at,
-                    max_concurrent_sessions,
-                    &session_slots_in_use,
-                    &shutdown,
-                    Arc::clone(&panic_strikes),
-                    workflow_panic_max_attempts,
-                    Arc::clone(&deadlock_strikes),
-                    workflow_task_deadline,
-                    capability_miss_policy,
-                    Some(workflow_task_timeout),
-                    &task_outcomes,
-                    &deferred_failure,
-                    &pool_labels,
-                    &drain_cancel,
-                )
+                // Issue #2251: one decision scope covers the cycle and the
+                // terminal writes that follow it in `process_task`. A fenced
+                // quarantine unloads the partition from this cache.
+                #[cfg(feature = "db")]
+                let quarantine_cache = Arc::clone(&workflow_cache);
+                let outcome = Box::pin(crate::decision_owner::scope_decision_for(
+                    Arc::clone(&decision_owner),
+                    process_task(
+                        &pool,
+                        Arc::clone(&registry),
+                        task,
+                        &worker_id,
+                        &build_id,
+                        cancellation_grace_period,
+                        sticky_timeout,
+                        max_local_activity_start_to_close,
+                        workflow_cache,
+                        dispatched_at,
+                        max_concurrent_sessions,
+                        &session_slots_in_use,
+                        &shutdown,
+                        Arc::clone(&panic_strikes),
+                        workflow_panic_max_attempts,
+                        Arc::clone(&deadlock_strikes),
+                        workflow_task_deadline,
+                        capability_miss_policy,
+                        Some(workflow_task_timeout),
+                        &task_outcomes,
+                        &deferred_failure,
+                        &pool_labels,
+                        &drain_cancel,
+                        owner_shard,
+                    ),
+                ))
                 .await;
                 // Issue #1815: a success counts now. A failure counts after
                 // its claim-fenced recovery, below.
@@ -39260,10 +40331,14 @@ impl Worker {
                             dispatched_at.elapsed(),
                         );
                     }
-                    Ok(TaskDispatchOutcome::ClaimLostAfterFailure) => {
+                    Ok(
+                        TaskDispatchOutcome::ClaimLostAfterFailure | TaskDispatchOutcome::Fenced,
+                    ) => {
                         // Issue #1815: the failed task's re-pend found a peer
                         // owns the claim, so the window skips it. It is not a
-                        // timeout, so the timeout strike still clears.
+                        // timeout, so the timeout strike still clears. A
+                        // fenced decision takes this arm too (issue #2251).
+                        // It is not a timeout either.
                         if let Some(exec_id) = exec_id_for_timeout {
                             timeout_strikes
                                 .lock()
@@ -39425,7 +40500,10 @@ impl Worker {
                                         exec_id,
                                     );
                                 }
-                                let recovery = quarantine_workflow_task_timeout_outcome(
+                                // Issue #2251: the terminal write fences the
+                                // run's tenure.
+                                let owned = Arc::clone(&decision_owner);
+                                let recovery = quarantine_workflow_task_timeout_owned(
                                     &pool,
                                     task_id,
                                     exec_id_for_timeout,
@@ -39441,6 +40519,9 @@ impl Worker {
                                     // `telemetry` is the Arc<HandlerRegistry>
                                     // captured above (issue #1243).
                                     telemetry.payload_codecs(),
+                                    &owned,
+                                    owner_shard,
+                                    &quarantine_cache,
                                 )
                                 .await;
                                 // No commit: put the strikes back so the next
@@ -39482,35 +40563,40 @@ impl Worker {
                 }
             } else {
                 // No timeout configured, or not a workflow task: run unbounded.
-                let outcome = process_task(
-                    &pool,
-                    registry,
-                    task,
-                    &worker_id,
-                    &build_id,
-                    cancellation_grace_period,
-                    sticky_timeout,
-                    max_local_activity_start_to_close,
-                    workflow_cache,
-                    dispatched_at,
-                    max_concurrent_sessions,
-                    &session_slots_in_use,
-                    &shutdown,
-                    panic_strikes,
-                    workflow_panic_max_attempts,
-                    deadlock_strikes,
-                    // No enclosing workflow-task budget on this arm, so the
-                    // local per-attempt budget is the only clock (issue #783).
-                    None,
-                    capability_miss_policy,
-                    // Same reason: this arm is the "no timeout configured, or
-                    // not a workflow task" path, which was never wrapped.
-                    None,
-                    &task_outcomes,
-                    &deferred_failure,
-                    &pool_labels,
-                    &drain_cancel,
-                )
+                // Issue #2251: the decision scope, as on the timed arm.
+                let outcome = Box::pin(crate::decision_owner::scope_decision_for(
+                    Arc::clone(&decision_owner),
+                    process_task(
+                        &pool,
+                        registry,
+                        task,
+                        &worker_id,
+                        &build_id,
+                        cancellation_grace_period,
+                        sticky_timeout,
+                        max_local_activity_start_to_close,
+                        workflow_cache,
+                        dispatched_at,
+                        max_concurrent_sessions,
+                        &session_slots_in_use,
+                        &shutdown,
+                        panic_strikes,
+                        workflow_panic_max_attempts,
+                        deadlock_strikes,
+                        // No enclosing workflow-task budget on this arm, so the
+                        // local per-attempt budget is the only clock (issue #783).
+                        None,
+                        capability_miss_policy,
+                        // Same reason: this arm is the "no timeout configured, or
+                        // not a workflow task" path, which was never wrapped.
+                        None,
+                        &task_outcomes,
+                        &deferred_failure,
+                        &pool_labels,
+                        &drain_cancel,
+                        owner_shard,
+                    ),
+                ))
                 .await;
                 // An activity records its own attempt in `process_activity_task`.
                 // Issue #1815: a workflow success counts now. A workflow
@@ -40237,9 +41323,73 @@ pub async fn quarantine_workflow_task_timeout(
         queue_name,
         metrics,
         codecs,
+        None,
     )
     .await
         == ClaimRecovery::Applied
+}
+
+/// The quarantine that the worker runs, in the decision scope of the run
+/// (issue #2251).
+///
+/// The terminal write fences the tenure of the run in `owned`, keyed by the
+/// shard of the claim's pool. With owner mode on and no tenure, it writes
+/// nothing and re-pends the task under its claim. A fenced tenure also
+/// re-pends the task, after the worker unloads the partition from `owned`
+/// and `workflow_cache`. Both return [`ClaimRecovery::ClaimLost`], because
+/// the next owner decides.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn quarantine_workflow_task_timeout_owned(
+    pool: &DbPool,
+    task_id: uuid::Uuid,
+    exec_id_opt: Option<uuid::Uuid>,
+    worker_id: &str,
+    attempt: i32,
+    build_id: &str,
+    new_strikes: i32,
+    timeout_secs: u64,
+    workflow_name: &str,
+    queue_name: &str,
+    metrics: &dyn crate::telemetry::MetricsRecorder,
+    codecs: &crate::payload_codec::PayloadCodecs,
+    owned: &crate::decision_owner::OwnedPartitions,
+    owner_shard: crate::types::ShardId,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+) -> ClaimRecovery {
+    Box::pin(crate::decision_owner::scope_decision(
+        quarantine_workflow_task_timeout_outcome(
+            pool,
+            task_id,
+            exec_id_opt,
+            worker_id,
+            attempt,
+            build_id,
+            new_strikes,
+            timeout_secs,
+            workflow_name,
+            queue_name,
+            metrics,
+            codecs,
+            Some(QuarantineOwner {
+                owned,
+                shard: owner_shard,
+                workflow_cache,
+            }),
+        ),
+    ))
+    .await
+}
+
+/// The owner side of a body-timeout quarantine (issue #2251).
+///
+/// `owned` holds the tenures, keyed by `shard`. A fence unloads the tenure
+/// and drops the cache entries of its partition from `workflow_cache`.
+#[derive(Clone, Copy)]
+struct QuarantineOwner<'a> {
+    owned: &'a crate::decision_owner::OwnedPartitions,
+    shard: crate::types::ShardId,
+    workflow_cache: &'a tokio::sync::Mutex<crate::cache::WorkflowCache>,
 }
 
 /// [`quarantine_workflow_task_timeout`], which also tells a lost claim from
@@ -40261,6 +41411,9 @@ async fn quarantine_workflow_task_timeout_outcome(
     // Issue #1243: the configured payload-codec registry, so this write
     // encodes under the same codecs replay decodes with.
     codecs: &crate::payload_codec::PayloadCodecs,
+    // Issue #2251: the owner side. The terminal write is a decision write,
+    // so it fences the tenure of the run.
+    owner_scope: Option<QuarantineOwner<'_>>,
 ) -> ClaimRecovery {
     use crate::schema::harvest_task_queue::dsl as task_dsl;
     use crate::schema::harvest_workflow_executions::dsl as exec_dsl;
@@ -40385,6 +41538,22 @@ async fn quarantine_workflow_task_timeout_outcome(
         None => (None, None),
     };
 
+    // Issue #2251: pin the tenure of the run before its terminal write. With
+    // owner mode on and no tenure, another owner decides. Write nothing, and
+    // re-pend the task under its claim for that owner. A claim left RUNNING
+    // would wait for the stuck-task sweep.
+    if let Some(owner) = owner_scope
+        && exec_exists
+        && let Err(error) = pin_owner_tenure(owner.owned, owner.shard, &workflow_id_str)
+    {
+        let pinned = match error {
+            HarvestError::OwnershipLost { pinned, .. } => pinned,
+            _ => crate::decision_owner::OwnerEpoch::new(0),
+        };
+        let claim = queue::TaskClaim::new(task_id, worker_id, attempt);
+        return repend_fenced_quarantine(&mut conn, &claim, pinned).await;
+    }
+
     let entry = crate::dlq::NewDeadLetterEntry {
         original_task_id: task_id,
         queue_name: queue_name.to_string(),
@@ -40405,6 +41574,8 @@ async fn quarantine_workflow_task_timeout_outcome(
         Vec<(ExecutionId, String)>,
         Vec<crate::execution::StartCancelledRun>,
     )>, HarvestError, _>(async |conn| {
+        // Issue #2251: the owner fence comes first.
+        crate::replication::assert_decision_fence(conn).await?;
         let error_msg = error_msg.clone();
         let entry = entry.clone();
         let worker_id = worker_id.to_string();
@@ -40640,6 +41811,32 @@ async fn quarantine_workflow_task_timeout_outcome(
                 start.spawn();
             }
         }
+        // Issue #2251: a takeover fenced the pinned tenure after the pin.
+        // The transaction wrote nothing. Unload the partition, as the
+        // dispatcher does, and re-pend the task for the new owner.
+        Err(HarvestError::OwnershipLost {
+            partition, pinned, ..
+        }) => {
+            // With no owner side, nothing pins a tenure, so no fence fails.
+            let Some(owner) = owner_scope else {
+                return ClaimRecovery::Failed;
+            };
+            let key = crate::decision_owner::OwnerKey {
+                shard: owner.shard,
+                partition,
+            };
+            let unloaded =
+                drop_fenced_tenure(owner.owned, owner.workflow_cache, metrics, key, pinned).await;
+            tracing::warn!(
+                task_id = %task_id,
+                %key,
+                %pinned,
+                unloaded,
+                "workflow task timeout quarantine: the owner fence failed; the partition is \
+                 unloaded and the task is re-pended (issue #2251)"
+            );
+            return repend_fenced_quarantine(&mut conn, &claim, pinned).await;
+        }
         Err(e) => {
             tracing::error!(
                 task_id = %task_id,
@@ -40650,6 +41847,30 @@ async fn quarantine_workflow_task_timeout_outcome(
         }
     }
     ClaimRecovery::Applied
+}
+
+/// Re-pend a fenced quarantine under its claim (issue #2251).
+///
+/// The task is then no longer this worker's, so a done re-pend returns
+/// [`ClaimRecovery::ClaimLost`]. So does a claim that a peer already holds.
+/// A failed write returns [`ClaimRecovery::Failed`].
+async fn repend_fenced_quarantine(
+    conn: &mut AsyncPgConnection,
+    claim: &queue::TaskClaim,
+    pinned: crate::decision_owner::OwnerEpoch,
+) -> ClaimRecovery {
+    let delay = fence_repend_delay(pinned);
+    match queue::requeue_claimed_workflow_task_after_fence(conn, claim, delay).await {
+        Ok(_) => ClaimRecovery::ClaimLost,
+        Err(error) => {
+            tracing::error!(
+                task_id = %claim.task_id,
+                error = %error,
+                "workflow task timeout quarantine: the fenced re-pend failed"
+            );
+            ClaimRecovery::Failed
+        }
+    }
 }
 
 /// Whether the dispatch error path releases the claim after `error`.
@@ -40995,6 +42216,7 @@ pub async fn chaos_drive_one_workflow_task(
             None,
             &frontier_reset_committed,
             &cycle_failure,
+            crate::types::ShardId::UNENCODED,
         ))
         .await
     })
@@ -41063,6 +42285,7 @@ pub async fn chaos_drive_one_workflow_task_cancel_at_hold(
             None,
             &frontier_reset_committed,
             &cycle_failure,
+            crate::types::ShardId::UNENCODED,
         ));
         let cancelled_at_hold = tokio::select! {
             () = hold.reached() => true,
@@ -49686,6 +50909,75 @@ mod tests {
         };
         assert!(!registered(&metrics));
         assert!(!registered(&other_metrics));
+    }
+
+    #[test]
+    fn colocated_targets_share_one_owner_key() {
+        use crate::types::ShardId;
+        // Shards 1 and 2 share database "a". Shard 3 has database "b".
+        let targets = [
+            (ShardId::new(2), "a"),
+            (ShardId::new(1), "a"),
+            (ShardId::new(3), "b"),
+        ];
+        let db = |s: ShardId| if s.as_i32() == 3 { "b" } else { "a" };
+        let all = [ShardId::new(1), ShardId::new(2), ShardId::new(3)];
+        let groups = owner_groups(&targets, &all, |x, y| db(x) == db(y));
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            groups[0].canonical,
+            ShardId::new(1),
+            "the lowest shard keys the database"
+        );
+        assert_eq!(groups[0].members, vec![ShardId::new(2), ShardId::new(1)]);
+        assert!(!groups[0].split);
+        assert_eq!(groups[1].canonical, ShardId::new(3));
+    }
+
+    #[test]
+    fn a_split_colocated_group_refuses_owner_mode() {
+        use crate::types::ShardId;
+        let all = [ShardId::new(1), ShardId::new(2), ShardId::new(3)];
+        let targets = [(ShardId::new(1), "a"), (ShardId::new(3), "b")];
+        let db = |s: ShardId| if s.as_i32() == 3 { "b" } else { "a" };
+        let groups = owner_groups(&targets, &all, |x, y| db(x) == db(y));
+        assert!(
+            groups[0].split,
+            "shard 2 shares database a but is not a target"
+        );
+        assert!(!groups[1].split);
+    }
+
+    /// A scan and a release share a one-connection pool (issue #2252). The
+    /// scan waits for the connection first. Each takes the connection, then
+    /// the loop lock, so neither waits on the other forever.
+    #[tokio::test]
+    async fn the_scan_and_the_release_take_the_connection_before_the_loop_lock() {
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let state = Arc::new(tokio::sync::Mutex::new(0_u32));
+        let held = Arc::clone(&pool).acquire_owned().await.expect("permit");
+        let user = |pool: Arc<tokio::sync::Semaphore>, state: Arc<tokio::sync::Mutex<u32>>| {
+            tokio::spawn(async move {
+                let (conn, mut guard) =
+                    conn_then_loop_lock(pool.acquire_owned(), state.as_ref()).await;
+                *guard += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                drop(conn);
+            })
+        };
+        let scan = user(Arc::clone(&pool), Arc::clone(&state));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let release = user(Arc::clone(&pool), Arc::clone(&state));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            scan.await.expect("scan");
+            release.await.expect("release");
+        })
+        .await
+        .expect("the scan and the release both finish");
+        assert_eq!(*state.lock().await, 2);
     }
 
     #[test]

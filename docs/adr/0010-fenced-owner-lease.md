@@ -50,9 +50,9 @@ simulator must reject each mutant on the named invariant.
 |---|---|---|---|
 | R1 | The commit checks the epoch in its own transaction. A lease check outside the commit is not a fence. | `no-fence` | `OneOwnerPerEpoch` |
 | R2 | The fence reads the owner row `FOR KEY SHARE` and keeps the lock until the commit ends. A takeover runs `SELECT ... FOR UPDATE` on the row before it writes, so it waits for every commit in flight. | `unlocked-fence` | `OneOwnerPerEpoch` |
-| R3 | The fence compares the epoch that the decision pinned when it began. It does not compare the holder. | `holder-fence` | `DecisionOnFreshHistory` |
+| R3 | The fence compares the epoch that the decision pinned when it began. A holder check alone is not a fence. | `holder-fence` | `DecisionOnFreshHistory` |
 | R4 | Each acquisition adds 1 to the epoch. The owner then loads its resident state, after the acquisition commits. This is also true when the same worker takes the row back. | `keep-cache` | `DecisionOnFreshHistory` |
-| R5 | A renewal never changes the epoch. | `renew-bumps` | `OwnerNeverFencesItself` |
+| R5 | A renewal never changes the epoch. It needs a live lease. A lapsed holder acquires again. | `renew-bumps` | `OwnerNeverFencesItself` |
 | R6 | The server acknowledges a signal only after its durable write. The owner never acknowledges from memory. | `memory-ack` | `NoAckedSignalLost` |
 | R7 | A tenure runs one decision of an execution at a time. The next decision starts from the state after the last commit. | `pipeline` | `DecisionOnFreshHistory` |
 
@@ -130,9 +130,11 @@ fence alone keeps every invariant.
 The models check safety only. Two liveness rules follow from R2:
 
 - A paused owner can hold `FOR KEY SHARE` in an open transaction. The
-  takeover `FOR UPDATE` then waits for ever. The commit transaction sets
-  `idle_in_transaction_session_timeout` and `lock_timeout`, so the lock
-  ends.
+  takeover `FOR UPDATE` then waits for ever. The fence sets
+  `idle_in_transaction_session_timeout` to the TTL, so the lock ends. An
+  offload upload inside the transaction widens that bound while it runs.
+- The fence itself waits at most 250 ms for the row. A longer wait means a
+  takeover, so the fence fails closed.
 - The takeover sets `lock_timeout` too. A lock miss is a failed attempt,
   and the worker tries again on its next tick.
 

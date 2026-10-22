@@ -200,12 +200,15 @@ pub async fn append_events_with_codecs(
     let (inserted, stamp) = insert_event_rows(conn, exec_id, &rows).await?;
 
     if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended_stamped(
+        // Issue #2253: a state change also evicts the owner's cache entry.
+        crate::notify::notify_history_appended(
             conn,
             stamp,
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
+            crate::decision_owner::owner_wakes_enabled()
+                && events.iter().any(WorkflowEvent::evicts_owner_cache),
         )
         .await?;
     }
@@ -242,7 +245,19 @@ async fn insert_event_rows(
     // opens a savepoint and the outer lock already covers this. The wrapper is
     // skipped entirely when fencing is off, so the pre-#954 path is unchanged:
     // no fence read, no savepoint, one INSERT.
-    if crate::replication::FenceRegistry::is_enabled() {
+    //
+    // A decision that pinned an owner tenure takes the same path (issue
+    // #2251). `assert_fence` then also fences the owner row, so a stale owner
+    // inserts nothing, also with the DR fence off.
+    //
+    // Inside a fenced scope of this connection, the start fence of the
+    // transaction already holds the owner row (issue #2252). With the DR
+    // fence off, the insert then needs no savepoint and no second fence.
+    let pinned = crate::decision_owner::pinned_decision();
+    let fenced_here = pinned.as_ref().is_some_and(|tenure| {
+        crate::decision_owner::already_fenced(crate::decision_owner::conn_id(conn), tenure)
+    });
+    if crate::replication::FenceRegistry::is_enabled() || (pinned.is_some() && !fenced_here) {
         Box::pin(
             conn.transaction::<_, crate::error::HarvestError, _>(async |conn| {
                 crate::replication::assert_fence(conn, exec_id.shard()).await?;
@@ -406,10 +421,14 @@ pub async fn append_events_offloaded_with_codecs(
 
     let mut rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
     let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
+    // Issue #2251: a pinned decision can upload inside its transaction. The
+    // owner fence bounds idle time by the TTL, so widen it for the upload.
+    crate::decision_owner::start_upload_allowance(conn).await?;
     for row in &mut rows {
         let refs = offloader.offload_event_value(&mut row.event_data).await?;
         all_refs.extend(refs);
     }
+    crate::decision_owner::end_upload_allowance(conn).await?;
 
     // Wrap the event INSERT and the ref INSERT in one transaction so that a
     // failed ref INSERT cannot leave events with offload envelopes but no
@@ -440,12 +459,15 @@ pub async fn append_events_offloaded_with_codecs(
     .await?;
 
     if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended_stamped(
+        // Issue #2253: a state change also evicts the owner's cache entry.
+        crate::notify::notify_history_appended(
             conn,
             stamp,
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
+            crate::decision_owner::owner_wakes_enabled()
+                && events.iter().any(WorkflowEvent::evicts_owner_cache),
         )
         .await?;
     }
@@ -487,10 +509,13 @@ pub(crate) async fn append_events_offloaded_with_codecs_and_patch(
     let mut rows = events_to_insert_rows_from_with_codecs(exec_id, events, start_id, codecs)?;
     let mut all_refs: Vec<crate::payload_store::OffloadedRef> = Vec::new();
     if let Some(offloader) = offloader {
+        // Issue #2251: widen the idle bound for the upload, as above.
+        crate::decision_owner::start_upload_allowance(conn).await?;
         for row in &mut rows {
             let refs = offloader.offload_event_value(&mut row.event_data).await?;
             all_refs.extend(refs);
         }
+        crate::decision_owner::end_upload_allowance(conn).await?;
     }
     patch(&mut rows);
 
@@ -511,12 +536,15 @@ pub(crate) async fn append_events_offloaded_with_codecs_and_patch(
     .await?;
 
     if let Some(last_event) = events.last() {
-        crate::notify::notify_workflow_events_appended_stamped(
+        // Issue #2253: a state change also evicts the owner's cache entry.
+        crate::notify::notify_history_appended(
             conn,
             stamp,
             exec_id.as_uuid(),
             inserted,
             last_event.type_name(),
+            crate::decision_owner::owner_wakes_enabled()
+                && events.iter().any(WorkflowEvent::evicts_owner_cache),
         )
         .await?;
     }
@@ -1054,7 +1082,8 @@ pub async fn append_single_event_with_codecs(
 ///
 /// Returns [`crate::error::HarvestError::Database`] if the query fails, or
 /// [`crate::error::HarvestError::NotFound`] if the execution does not exist.
-pub(crate) async fn next_event_id_for(
+#[doc(hidden)]
+pub async fn next_event_id_for(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
 ) -> HarvestResult<i32> {

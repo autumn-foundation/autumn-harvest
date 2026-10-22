@@ -816,6 +816,28 @@ pub enum HarvestError {
         current: Option<i64>,
     },
 
+    /// The decision partition moved to another owner (issue #2251).
+    ///
+    /// The commit fence raises it when the owner row holds another holder
+    /// or another epoch than the decision pinned. The decision transaction
+    /// rolls back as a whole, so it writes nothing. It is terminal for the
+    /// tenure, not for the workflow. The worker unloads the partition and
+    /// never retries at the stale epoch. `current` is `None` when the row
+    /// is missing, or when the late fence could not lock it.
+    #[error(
+        "decision partition {partition} is fenced: this owner pinned epoch {pinned}, the row \
+         is at {}; unload the partition and do not retry",
+        current.map_or_else(|| "an unknown epoch".to_string(), |e| e.to_string())
+    )]
+    OwnershipLost {
+        /// The fenced partition.
+        partition: crate::decision_owner::DecisionPartition,
+        /// The epoch that the decision pinned.
+        pinned: crate::decision_owner::OwnerEpoch,
+        /// The epoch of the owner row, when the fence read it.
+        current: Option<crate::decision_owner::OwnerEpoch>,
+    },
+
     /// A shard this operation must reach is not available from this process.
     ///
     /// Raised when an opt-in cross-shard child placement (issue #956) resolves
@@ -1598,6 +1620,26 @@ impl HarvestError {
     pub const fn suspended_claim_ambiguous(&self) -> Option<Uuid> {
         match self {
             Self::SuspendedClaimAmbiguous { task_id } => Some(*task_id),
+            _ => None,
+        }
+    }
+
+    /// Classify this error as a fenced decision (issue #2251).
+    ///
+    /// Returns the partition and the pinned epoch for
+    /// [`Self::OwnershipLost`], and `None` for every other variant. The
+    /// dispatcher unloads that tenure. No path fails the run on it.
+    #[must_use]
+    pub const fn ownership_lost(
+        &self,
+    ) -> Option<(
+        crate::decision_owner::DecisionPartition,
+        crate::decision_owner::OwnerEpoch,
+    )> {
+        match self {
+            Self::OwnershipLost {
+                partition, pinned, ..
+            } => Some((*partition, *pinned)),
             _ => None,
         }
     }

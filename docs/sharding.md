@@ -15,7 +15,8 @@ provisioning a second shard.
 
 ## Glossary
 
-Epic #2247 plans owner mode. Harvest does not implement it yet.
+Epic #2247 adds owner mode. Issues #2251 and #2252 build stage 1a. It is
+off until an operator turns it on per database.
 [ADR 0009](adr/0009-decision-owner.md) records the decisions behind it.
 
 - **Shard**: a logical shard, usually one Postgres database. An

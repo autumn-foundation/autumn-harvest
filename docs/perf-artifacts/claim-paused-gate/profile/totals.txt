@@ -1,0 +1,2 @@
+total calls=382934 blks=3866865 wal_bytes=51105641 temp_written=0
+claim: calls=10162 rows=10131 blks=1942494 pct_blks=50.2 pct_calls=2.7

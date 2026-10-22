@@ -439,6 +439,22 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
     // (issue #1795). A missing grant does not stop enforcement: the worker
     // fails open and every replica runs every pass, as before the lease.
     ("harvest_scanner_leases", &["SELECT", "INSERT", "UPDATE"]),
+    // The DR bump ends every owner lease in its transaction (issue #2251). A
+    // missing grant fails the bump. In owner mode (issue #2252), each
+    // decision locks a row FOR KEY SHARE, which needs UPDATE, and each
+    // renewal updates rows. The migration seeds every row, so no INSERT is
+    // needed.
+    ("harvest_decision_owner", &["SELECT", "UPDATE"]),
+    // Each owned claim reads the owner-mode switch, and each owner loop
+    // reads it once a second (issue #2252). Only the operator's enable step
+    // writes it.
+    ("harvest_decision_owner_mode", &["SELECT"]),
+    // Each owner loop records itself as a live candidate once a second, and
+    // deletes its row at shutdown (issue #2252).
+    (
+        "harvest_decision_owner_candidates",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
     // Every completion that recorded an LLM call inserts here, in the
     // completion transaction (issue #1996). A missing grant rolls back the
     // completion, and the activity runs and pays again. `GET /admin/usage`

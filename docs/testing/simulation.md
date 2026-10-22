@@ -359,14 +359,16 @@ activity of its execution.
 Issue #2250. `autumn_harvest::dst::owner` is the simulator half of
 `formal/tla/OwnerLease.tla`. It has the same actions, defects and
 invariants. [ADR 0010](../adr/0010-fenced-owner-lease.md) is the prose
-spec. Stage 1a (issue #2251) has no code yet.
+spec. Stage 1a (issue #2251) implements `OwnerStore` on Postgres in
+`decision_owner_sim_db_tests.rs`.
 
 ### The store seam
 
 `OwnerStore` is the seam for stage 1a. `OracleOwnerStore` keeps the owner
-row, the signal rows and the consumed signals in memory. Stage 1a
-implements the trait on Postgres and passes it to `owner::run_with` or
-`owner::sweep_with`.
+row, the signal rows and the consumed signals in memory.
+`decision_owner_sim_db_tests.rs` implements the trait on Postgres with the
+engine code and passes it to `owner::sweep_with`. A copy of that store with
+no fence must fail the sweep.
 
 - The store reports only durable facts: the row, the pending signals, the
   consumed signals and the epoch that each commit saw. The simulator keeps

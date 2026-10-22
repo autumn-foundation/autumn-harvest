@@ -342,6 +342,9 @@ diesel::table! {
         /// The fairness key of the task (issue #1976). `NULL` is the
         /// default key.
         fairness_key -> Nullable<Text>,
+        /// The decision partition of a workflow task (issue #2252). `NULL`
+        /// means not stamped. An owned claim may take such a row.
+        decision_partition -> Nullable<Int2>,
     }
 }
 
