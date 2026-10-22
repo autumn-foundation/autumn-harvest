@@ -1,0 +1,17 @@
+                                                                                                                                                                                          QUERY PLAN                                                                                                                                                                                           
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.harvest_workflow_executions  (cost=0.12..4411.21 rows=22725 width=15) (actual time=0.010..0.011 rows=0 loops=1)
+   Output: id, workflow_name, queue_name
+   Buffers: shared hit=1
+   ->  Index Scan using idx_harvest_executions_sla_deadline on public.harvest_workflow_executions  (cost=0.12..4411.21 rows=22725 width=15) (actual time=0.008..0.008 rows=0 loops=1)
+         Output: true, now(), ctid
+         Index Cond: (harvest_workflow_executions.sla_deadline_at IS NOT NULL)
+         Filter: ((NOT harvest_workflow_executions.sla_breached) AND (harvest_workflow_executions.state <> 'PAUSED'::text) AND ((harvest_workflow_executions.completed_at IS NULL) OR (harvest_workflow_executions.completed_at > harvest_workflow_executions.sla_deadline_at)) AND (harvest_workflow_executions.sla_deadline_at < COALESCE(harvest_workflow_executions.completed_at, now())))
+         Buffers: shared hit=1
+ Query Identifier: -5483313899849956077
+ Planning:
+   Buffers: shared hit=743 read=1
+ Planning Time: 2.180 ms
+ Execution Time: 0.112 ms
+(13 rows)
+

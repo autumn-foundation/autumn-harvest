@@ -2311,6 +2311,11 @@ jobs:
         # in a `HarvestResult` function (E0277; no `From<String>`).
         # See scripts/check-child-idempotency-examples.sh.
         run: ./scripts/check-child-idempotency-examples.sh
+      - name: Check chapter 3 flagship examples compile
+        # Chapter 3 shows three timer workflows a reader pastes verbatim.
+        # Nothing compiled them. The guard keeps them in step with the API.
+        # See scripts/check-durable-timers-examples.sh.
+        run: ./scripts/check-durable-timers-examples.sh
 
   # One check for branch protection to require in place of every leg above.
   # A skipped leg (a draft PR) counts as a pass, as a skipped job does

@@ -1990,8 +1990,7 @@ fn scheduled_occurrence(
     events: &[WorkflowEvent],
     matches: impl Fn(ActivityExecId) -> bool,
 ) -> Option<(&str, u32, &Value)> {
-    let mut counts = HashMap::<&str, u32>::new();
-    events.iter().find_map(|event| {
+    let (index, name, input) = events.iter().enumerate().find_map(|(index, event)| {
         let WorkflowEvent::ActivityScheduled {
             activity_id,
             name,
@@ -2001,10 +2000,13 @@ fn scheduled_occurrence(
         else {
             return None;
         };
-        let count = counts.entry(name.as_str()).or_default();
-        *count += 1;
-        matches(*activity_id).then_some((name.as_str(), *count, input))
-    })
+        matches(*activity_id).then_some((index, name.as_str(), input))
+    })?;
+    let earlier = events[..index]
+        .iter()
+        .filter(|event| matches!(event, WorkflowEvent::ActivityScheduled { name: other, .. } if other == name))
+        .count();
+    Some((name, u32::try_from(earlier + 1).unwrap_or(u32::MAX), input))
 }
 
 /// The indices of the overrides that belong to the last marker in `events`.
