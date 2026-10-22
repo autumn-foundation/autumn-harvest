@@ -1,0 +1,17 @@
+                                                                                                                                               QUERY PLAN                                                                                                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.harvest_workflow_executions  (cost=0.00..37553.24 rows=66496 width=15) (actual time=137.745..137.747 rows=0 loops=1)
+   Output: id, workflow_name, queue_name
+   Buffers: shared hit=4217 read=15670
+   ->  Seq Scan on public.harvest_workflow_executions  (cost=0.00..37553.24 rows=66496 width=15) (actual time=137.741..137.742 rows=0 loops=1)
+         Output: true, now(), ctid
+         Filter: ((harvest_workflow_executions.sla_deadline_at IS NOT NULL) AND (NOT harvest_workflow_executions.sla_breached) AND (harvest_workflow_executions.state <> 'PAUSED'::text) AND (harvest_workflow_executions.sla_deadline_at < COALESCE(harvest_workflow_executions.completed_at, now())))
+         Rows Removed by Filter: 1000000
+         Buffers: shared hit=4217 read=15670
+ Query Identifier: 2920307896340946452
+ Planning:
+   Buffers: shared hit=740 read=1
+ Planning Time: 1.483 ms
+ Execution Time: 137.845 ms
+(13 rows)
+

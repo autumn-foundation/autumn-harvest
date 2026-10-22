@@ -3629,8 +3629,16 @@ pub async fn enforce_workflow_sla_breaches(
             // RUNNING rows compare against NOW(); terminal rows against their
             // actual completion instant, so finishing before the deadline never
             // counts as a breach.
+            //
+            // The second clause repeats the tail of the predicate of
+            // `idx_harvest_executions_sla_deadline`. The first clause implies
+            // it, but Postgres cannot prove that. Without the repeat the
+            // index is never a candidate and the scan reads the whole table.
+            // The clause never changes the result set: a NULL `completed_at`
+            // passes, and a set one passes exactly when the first clause does.
             .filter(sql::<Bool>(
-                "sla_deadline_at < COALESCE(completed_at, NOW())",
+                "sla_deadline_at < COALESCE(completed_at, NOW()) \
+                 AND (completed_at IS NULL OR completed_at > sla_deadline_at)",
             ))
             .set((
                 harvest_workflow_executions::sla_breached.eq(true),
