@@ -692,6 +692,9 @@ fn push_histogram(
     push_histogram_rows(out, name, help, rows);
 }
 
+/// One histogram row: its label pairs, its sample count and its sum.
+type HistogramRow = (Vec<(String, String)>, (u64, f64));
+
 /// [`push_histogram`] for rows that carry their own label pairs. One family
 /// can then hold samples with different label sets (issue #2248).
 #[allow(clippy::cast_precision_loss)]
@@ -699,7 +702,7 @@ fn push_histogram_rows(
     out: &mut Vec<MetricFamily>,
     name: &str,
     help: &str,
-    rows: Vec<(Vec<(String, String)>, (u64, f64))>,
+    rows: Vec<HistogramRow>,
 ) {
     if rows.is_empty() {
         return;
