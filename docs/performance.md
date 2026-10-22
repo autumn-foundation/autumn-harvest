@@ -2566,3 +2566,7 @@ standalone note rather than part of the claim-path attribution table above:
   — before issue #2126, the four task-timeout lanes read one page of live
   rows four times per pass. Lanes at one position now share one refill
   statement (refill buffers -75% at 100,000 live rows, `pg_stat_statements`).
+* [`docs/performance-analyzer-large-payload.md`](performance-analyzer-large-payload.md)
+  — `LargePayloadRule` measured each payload with `Value::to_string().len()`,
+  which built and dropped a `String`. It now counts bytes through a writer
+  (instructions -77.5%, allocated bytes -97.6%).
