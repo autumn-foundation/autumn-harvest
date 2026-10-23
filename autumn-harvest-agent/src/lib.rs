@@ -77,6 +77,7 @@ pub mod heartbeat;
 pub mod loop_guard;
 pub mod memory;
 pub mod mesh;
+pub mod mesh_control;
 pub mod message;
 pub mod model;
 pub mod policy;
@@ -109,6 +110,7 @@ pub use heartbeat::{
 pub use loop_guard::LoopGuard;
 pub use memory::{EditKey, InMemoryMemoryStore, MemoryBlock, MemoryScope, MemoryStore};
 pub use mesh::{DelegationRecord, MANDATE_META_KEY, Mandate, Peer, Refusal};
+pub use mesh_control::{BudgetPeriod, MeshBudget, MeshPause, MeshSpend, Spend};
 pub use message::{
     ChatMessage, ChatRole, ContentPart, RunId, SessionId, StopReason, TokenUsage, ToolCall,
     ToolDefinition,

@@ -99,6 +99,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::harness::{AgentHarness, fit_turn};
+use crate::memory::MemorySnapshot;
 use crate::mesh::Peer;
 use crate::message::{ContentPart, StopReason, ToolCall};
 use crate::policy::ToolDecision;
@@ -448,7 +449,7 @@ pub async fn evaluate(
         let session = Arc::clone(&session);
         move |_scope: Value| -> Result<Value, String> {
             let snapshot = lock(&session).snapshots.pop_front();
-            encode(&snapshot.unwrap_or_else(|| Ok(String::new()))?)
+            encode(&snapshot.unwrap_or_else(|| Ok(MemorySnapshot::Text(String::new())))?)
         }
     };
 
@@ -594,7 +595,7 @@ struct Recording {
     tools: Vec<RecordedTool>,
     /// The recorded snapshots, and the error of a snapshot that failed for
     /// good.
-    snapshots: Vec<Result<String, String>>,
+    snapshots: Vec<Result<MemorySnapshot, String>>,
     /// Signals for waits that the source opened, received in time, in order.
     signals: Vec<(String, Value)>,
     /// The recorded peer lookups: the names asked and the peers found.
@@ -798,7 +799,7 @@ struct Effects {
     tools: Vec<RecordedTool>,
     /// The recorded snapshots, and the error of a snapshot that failed for
     /// good.
-    snapshots: Vec<Result<String, String>>,
+    snapshots: Vec<Result<MemorySnapshot, String>>,
     peers: Vec<RecordedPeers>,
 }
 
@@ -960,7 +961,7 @@ struct Session {
     max_turns: usize,
     cap_reached: bool,
     tools: Vec<RecordedTool>,
-    snapshots: VecDeque<Result<String, String>>,
+    snapshots: VecDeque<Result<MemorySnapshot, String>>,
     peers: Vec<RecordedPeers>,
     /// The run id of the candidate root agent: the run id of its first model
     /// request.

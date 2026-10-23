@@ -894,8 +894,8 @@ the signal payload. Pass the message id as the idempotency key.
 | `user_message` | Runs one segment with the text as the user message. |
 | `control: pause` | Holds each later message in the state. |
 | `control: resume` | Runs the held messages in order, then takes new ones. |
-| `control: reset_memory` | Clears the memory scope `agent:<id>`. |
-| `control: clear_transcript` | Clears the transcript. The flow labels stay. |
+| `control: reset_memory` | Clears the memory: the scope `agent:<id>`, or the state memory. |
+| `control: clear_transcript` | Clears the transcript. Only the labels of the memory stay (issue #2272). |
 
 A control op applies at once, also while the agent is paused. The kernel
 `agent::inbox::admit` makes the choice. Verus proves it, see
@@ -976,6 +976,22 @@ The race records its winner, so replay takes the same branch and asks no
 model again. An interrupt that arrives while no op runs is stale, and the
 next op drops it. On SQLite a running activity never sees a cancel: the
 workflow takes the interrupt, and the activity result is dropped.
+
+### Memory as state (issue #2273)
+
+`AgentProfile::memory(AgentMemory::State)` keeps the memory blocks in
+`AgentState::memory`. The workflow runs the `memory` tool itself. An edit is
+part of the op, so it commits with the op snapshot. A crash replays the op,
+and the edit lands once. No store and no edit key are involved.
+
+- The system prompt of an op holds the memory as it was when the op
+  started. An edit shows from the next op, so a provider prompt cache keeps
+  its prefix.
+- The memory lives in the entity snapshot events and in the
+  `harvest_entity_state` projection. Erasure and codec rotation cover both
+  (issue #2259).
+- `AgentMemory::Store` keeps the `MemoryStore` of the harness for an agent
+  that shares memory with other runs.
 
 `autumn-harvest-agent/examples/agent_session_entity.rs` runs a chat session
 as an agent.

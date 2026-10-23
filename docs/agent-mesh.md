@@ -397,8 +397,6 @@ calls per subtree.
   deployment still does: use `ctx.call_remote_task` and the wire form above.
 - Flow rules are only as good as the tool labels. A tool with no label adds
   only its effect label.
-- A memory note carries no label. A later run reads it with no labels. Keep
-  memory writes off in a run that reads untrusted input.
 - A run whose run id is a workflow id that ends in `:d<number>` can share
   tool idempotency keys with a child run id. New tasks use the execution id,
   so they are not affected.
@@ -512,3 +510,41 @@ let task = AgentTask::new("plan the trip")
   as before.
 - `eval::evaluate` answers each child run of a source with its recorded
   report.
+
+## 16. Mesh-wide controls (issue #2272)
+
+A mesh is a set of durable agents that share an id. A long-lived mesh needs
+controls that span time and agents.
+
+```rust
+use autumn_harvest_agent::{AgentHarness, AgentProfile, MeshBudget, sqlite};
+
+let harness = AgentHarness::new(model)
+    .agent(AgentProfile::new("triage").mesh("support"))
+    .agent(AgentProfile::new("research").mesh("support"))
+    .mesh_budget(MeshBudget::daily("support").max_tokens(2_000_000))
+    .mesh_spend(Arc::new(sqlite::LedgerSpend::open(&db)));
+```
+
+| Control | What happens |
+|---|---|
+| Mesh id | `AgentProfile::mesh` names it. Each run, model turn and peer message carries it. A run publishes it as the search attribute `agent_mesh`. |
+| Period budget | `MeshBudget` caps tokens or cost for each day, month or fixed window, in UTC. The model-turn activity sums the spend of the mesh with a `MeshSpend` source before the call. A spent budget refuses the turn with `MeshBudgetExceeded`. |
+| Parking | A refused durable agent parks until the period ends. Its work waits, first the refused message, and its ticks are skipped. A wake at the period end opens it. |
+| Kill switch | `sqlite::pause_mesh(rt, mesh, reason)` sends an interrupt and `Control::Pause` to every running agent of the mesh. It returns a `MeshPause` audit record and logs it to the target `harvest.audit`. |
+| Labelled memory | A memory entry keeps the flow labels of the run that wrote it. A run that reads the entry takes the labels. |
+
+- `sqlite::LedgerSpend` sums the cost ledger of every run with the mesh
+  attribute, child runs included. On Postgres, implement `MeshSpend` over
+  `harvest_llm_ledger`.
+- The budget is a soft cap, as the run budgets are. Turns that start before
+  any of them records can all pass the check.
+- A refused message runs again only when no tool ran in its op. Any other
+  op ends as `budget_exceeded`.
+- An interrupt stops an op in flight, such as an approval wait. A paused
+  agent takes the pause before its held work.
+- A store that cannot keep labels refuses a write from a run with labels,
+  so no note loses its taint. The default `MemoryStore::apply_labelled`
+  does this. `InMemoryMemoryStore` keeps labels.
+- `Control::ClearTranscript` drops the taint of the transcript. The labels
+  of the memory stay, and the next op reads them again.

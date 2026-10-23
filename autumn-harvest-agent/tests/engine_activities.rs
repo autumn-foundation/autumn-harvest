@@ -66,6 +66,7 @@ fn turn_request() -> ModelTurnRequest {
         flow_released: autumn_harvest_agent::Released::new(),
         interruptible: false,
         model: None,
+        mesh: None,
         prefix: None,
         remember: false,
     }
@@ -156,6 +157,7 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
         read_only: false,
         allowed_tools: None,
         labels: None,
+        flow_labels: std::collections::BTreeSet::new(),
         call: ToolCall {
             id: "c1".into(),
             name: "read".into(),
@@ -370,6 +372,7 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
             read_only: false,
             allowed_tools: None,
             labels: None,
+            flow_labels: std::collections::BTreeSet::new(),
             call: ToolCall {
                 id: "c".into(),
                 name: "fail".into(),
@@ -597,6 +600,7 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
             read_only: true,
             allowed_tools: None,
             labels: None,
+            flow_labels: std::collections::BTreeSet::new(),
             call: ToolCall {
                 id: "c".into(),
                 name: "write".into(),
@@ -727,6 +731,7 @@ async fn a_zero_result_cap_leaves_a_big_reply_and_a_big_tool_result_alone() {
             read_only: false,
             allowed_tools: None,
             labels: None,
+            flow_labels: std::collections::BTreeSet::new(),
             call: ToolCall {
                 id: "c".into(),
                 name: "big".into(),

@@ -17,8 +17,9 @@ use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
 use crate::flow::{FlowRules, Released, call_labels};
 use crate::heartbeat::{HeartbeatTask, Precheck};
-use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
+use crate::memory::{MEMORY_TOOL, MemoryScope, MemorySnapshot, MemoryStore, MemoryTool};
 use crate::mesh::{DELEGATE_TOOL, Peer, delegate_definition, valid_name};
+use crate::mesh_control::{MESH_BUDGET_EXCEEDED, MeshBudget, MeshBudgetExceeded, MeshSpend};
 use crate::message::{ChatMessage, ContentPart, RunId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
@@ -115,6 +116,8 @@ pub struct AgentHarness {
     flow: FlowRules,
     profiles: Vec<AgentProfile>,
     transcripts: Arc<dyn TranscriptStore>,
+    mesh_budgets: Vec<MeshBudget>,
+    mesh_spend: Option<Arc<dyn MeshSpend>>,
 }
 
 impl AgentHarness {
@@ -125,6 +128,8 @@ impl AgentHarness {
             client,
             models: BTreeMap::new(),
             transcripts: Arc::new(InMemoryTranscriptStore::default()),
+            mesh_budgets: Vec::new(),
+            mesh_spend: None,
             tools: Vec::new(),
             policy: Arc::new(AllowAll),
             temperature: None,
@@ -304,6 +309,69 @@ impl AgentHarness {
                 .into_error_payload()
             }),
         }
+    }
+
+    /// Cap the spend of a mesh in each period (issue #2272). A spent budget
+    /// refuses the model turns of the mesh. Set the spend source with
+    /// [`mesh_spend`](Self::mesh_spend).
+    #[must_use]
+    pub fn mesh_budget(mut self, budget: MeshBudget) -> Self {
+        self.mesh_budgets.push(budget);
+        self
+    }
+
+    /// Read the spend of a mesh from `source`, such as the cost ledger.
+    #[must_use]
+    pub fn mesh_spend(mut self, source: Arc<dyn MeshSpend>) -> Self {
+        self.mesh_spend = Some(source);
+        self
+    }
+
+    /// Refuse a turn of `mesh` when a budget of the mesh is spent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable [`MESH_BUDGET_EXCEEDED`] payload with the
+    /// period end. A budget with no spend source fails closed as a config
+    /// error. A failed read is retryable.
+    async fn check_mesh_budget(&self, mesh: Option<&str>) -> Result<(), String> {
+        let Some(mesh) = mesh else {
+            return Ok(());
+        };
+        let budgets = self
+            .mesh_budgets
+            .iter()
+            .filter(|budget| budget.mesh == mesh);
+        for budget in budgets {
+            let Some(source) = &self.mesh_spend else {
+                return Err(ActivityFailure::non_retryable(
+                    "MeshSpendMissing",
+                    "a mesh budget needs a spend source: call AgentHarness::mesh_spend",
+                )
+                .into_error_payload());
+            };
+            let (since, until) = budget.period.window(autumn_harvest::chrono::Utc::now());
+            let spend = tokio::time::timeout(self.budget_timeout, source.spent(mesh, since))
+                .await
+                .map_err(|_| "the read took longer than the budget timeout".to_owned())
+                .and_then(|read| read.map_err(|err| err.to_string()))
+                .map_err(|reason| {
+                    autumn_harvest::llm_budget::check_failed(&reason).into_error_payload()
+                })?;
+            if budget.is_spent(&spend) {
+                let details = MeshBudgetExceeded {
+                    mesh: mesh.to_owned(),
+                    until_ms: until.timestamp_millis(),
+                };
+                return Err(ActivityFailure::non_retryable(
+                    MESH_BUDGET_EXCEEDED,
+                    format!("the mesh {mesh:?} has spent its budget for this period"),
+                )
+                .with_details(serde_json::to_value(details).unwrap_or_default())
+                .into_error_payload());
+            }
+        }
+        Ok(())
     }
 
     /// Keep the windows of model turns in `store`, so a later turn records
@@ -552,6 +620,7 @@ impl AgentHarness {
         mut prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let client = self.model(request.model.as_deref())?;
+        self.check_mesh_budget(request.mesh.as_deref()).await?;
         let mut request = request;
         let messages = self.window(&mut request)?;
         let mut builtins = self.builtins(
@@ -928,7 +997,11 @@ impl AgentHarness {
     /// the activity signature.
     pub async fn tool_call(&self, request: ToolCallRequest) -> Result<ToolOutcome, String> {
         let call = request.call;
-        let builtins = self.builtins(request.memory_scope.as_ref(), std::iter::empty());
+        let builtins = self.builtins_labelled(
+            request.memory_scope.as_ref(),
+            std::iter::empty(),
+            &request.flow_labels,
+        );
         // A second check of the mandate. The decision and the call can run on
         // workers with different tool lists.
         if !permits(&builtins, request.allowed_tools.as_ref(), &call.name) {
@@ -998,7 +1071,7 @@ impl AgentHarness {
     ///
     /// Returns a non-retryable error when no store is installed, and the
     /// store error otherwise.
-    pub async fn memory_snapshot(&self, scope: MemoryScope) -> Result<String, String> {
+    pub async fn memory_snapshot(&self, scope: MemoryScope) -> Result<MemorySnapshot, String> {
         let Some(store) = &self.memory else {
             return Err(ActivityFailure::non_retryable(
                 "MemoryStoreMissing",
@@ -1010,7 +1083,16 @@ impl AgentHarness {
             .await
             .map_err(|_| self.hook_timed_out("MemoryTimeout", "the memory store"))?
             .map_err(|err| model_failure(&err))?;
-        Ok(fit_result(render_snapshot(&blocks), self.max_result_bytes))
+        // The labels go with the text, so a cut text keeps every label.
+        Ok(match MemorySnapshot::of(&blocks) {
+            MemorySnapshot::Text(text) => {
+                MemorySnapshot::Text(fit_result(text, self.max_result_bytes))
+            }
+            MemorySnapshot::Labelled { text, labels } => MemorySnapshot::Labelled {
+                text: fit_result(text, self.max_result_bytes),
+                labels,
+            },
+        })
     }
 
     /// Clear the memory of `scope`.
@@ -1083,10 +1165,21 @@ impl AgentHarness {
         scope: Option<&MemoryScope>,
         extra: impl Iterator<Item = ToolDefinition>,
     ) -> Vec<Arc<dyn Tool>> {
-        let memory =
-            self.memory.as_ref().zip(scope).map(|(store, scope)| {
-                Arc::new(MemoryTool::new(Arc::clone(store), scope.clone())) as _
-            });
+        self.builtins_labelled(scope, extra, &BTreeSet::new())
+    }
+
+    /// [`builtins`](Self::builtins), with the flow labels that a memory
+    /// write keeps (issue #2272).
+    fn builtins_labelled(
+        &self,
+        scope: Option<&MemoryScope>,
+        extra: impl Iterator<Item = ToolDefinition>,
+        labels: &BTreeSet<String>,
+    ) -> Vec<Arc<dyn Tool>> {
+        let memory = self.memory.as_ref().zip(scope).map(|(store, scope)| {
+            Arc::new(MemoryTool::new(Arc::clone(store), scope.clone()).with_labels(labels.clone()))
+                as _
+        });
         memory
             .into_iter()
             .chain(extra.map(|definition| Arc::new(WorkflowTool(definition)) as _))

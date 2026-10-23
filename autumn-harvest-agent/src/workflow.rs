@@ -37,11 +37,15 @@ use crate::followup::{self, FOLLOWUP_TOOL, Planned};
 use crate::harness::{AgentHarness, CacheTenant, DEFAULT_TOOL_OUTPUT_LIMIT, truncate};
 use crate::heartbeat::{HeartbeatTask, agent_heartbeat_info};
 use crate::loop_guard::{LoopTracker, LoopVerdict, warning_note};
-use crate::memory::MemoryScope;
+use crate::memory::{
+    MEMORY_TOOL, MemoryBlock, MemoryOp, MemoryScope, MemorySnapshot, MemoryTool, apply_to,
+    edit_result,
+};
 use crate::mesh::{
     DELEGATE_TOOL, DelegateArgs, DelegationRecord, INVALID_NAME, Mandate, Peer, Refusal,
     delegate_definition, valid_name,
 };
+use crate::mesh_control::{MESH_ATTR, MESH_BUDGET_EXCEEDED, MeshBudgetExceeded};
 use crate::message::{
     ChatMessage, ChatRole, ContentPart, RunId, StopReason, TokenUsage, ToolCall, ToolDefinition,
 };
@@ -100,6 +104,12 @@ pub(crate) struct Progress {
     pub(crate) delta: bool,
     /// The last window that a turn sent, when `delta` is on.
     pub(crate) sent: Option<Sent>,
+    /// The memory blocks of a durable agent with state memory (issue
+    /// #2273). The workflow runs the `memory` tool on them.
+    pub(crate) memory: Option<Vec<MemoryBlock>>,
+    /// A mesh budget refused a turn. The period ends then, in epoch
+    /// milliseconds (issue #2272).
+    pub(crate) parked_until: Option<i64>,
 }
 
 /// The steer messages of a durable agent (issue #2265).
@@ -159,6 +169,8 @@ impl Progress {
             interrupted: false,
             delta: false,
             sent: None,
+            memory: None,
+            parked_until: None,
         }
     }
 
@@ -321,6 +333,10 @@ impl Run<'_> {
             .map(|_| followup::definition())
             .into_iter()
             .chain(self.agent.and_then(Member::delegate_tool))
+            .chain(
+                (self.task.memory_in_state && self.task.memory_writable())
+                    .then(MemoryTool::definition),
+            )
             .collect()
     }
 }
@@ -354,6 +370,7 @@ fn next_request(
         flow_labels: tree.exercised.clone(),
         flow_released: tree.released.clone(),
         interruptible: run.live,
+        mesh: task.mesh.clone(),
         prefix: None,
         remember: false,
         model: task.model.clone(),
@@ -412,6 +429,14 @@ pub(crate) async fn drive(
     progress.final_turn_rules = ctx.patched(FINAL_TURN_PATCH);
     // A task recorded before the delta form has no flag, so it asks no gate.
     progress.delta = task.transcript_delta && ctx.patched(TRANSCRIPT_DELTA_PATCH);
+    // A mesh budget sums the ledger rows of every run of the mesh, child
+    // runs included. The upsert appends no event.
+    if let Some(mesh) = &task.mesh
+        && let Err(err) =
+            ctx.upsert_search_attrs([(MESH_ATTR.to_owned(), Some(serde_json::json!(mesh)))])
+    {
+        tracing::warn!(error = %err, "the mesh search attribute was not set");
+    }
     let mut tree = root_tree(ctx, task, &progress.run_id);
     let agent = match &task.mandate {
         Some(mandate) => {
@@ -568,8 +593,8 @@ async fn open_segment(
     task: &AgentTask,
     progress: &mut Progress,
     input: &str,
-) -> Result<(), String> {
-    let system = system_prompt(ctx, task).await?;
+) -> Result<BTreeSet<String>, String> {
+    let (system, labels) = system_prompt(ctx, task).await?;
     let mut messages = Vec::with_capacity(progress.messages.len() + 2);
     if let Some(system) = system {
         messages.push(ChatMessage::text(ChatRole::System, system));
@@ -584,7 +609,7 @@ async fn open_segment(
     {
         progress.sent = None;
     }
-    Ok(())
+    Ok(labels)
 }
 
 /// Check the model of `run` against its mandate (issue #2271).
@@ -614,7 +639,9 @@ pub(crate) async fn run_segment(
 ) -> Result<AgentStop, String> {
     let task = run.task;
     check_model(run)?;
-    open_segment(ctx, task, progress, input).await?;
+    // The run read the memory entries, so it takes their labels.
+    let read = open_segment(ctx, task, progress, input).await?;
+    tree.exercised.extend(read);
     let extra_tools = run.extra_tools();
 
     loop {
@@ -653,6 +680,12 @@ pub(crate) async fn run_segment(
             Ok(None) => {
                 progress.interrupted = true;
                 return Ok(AgentStop::Interrupted);
+            }
+            // A spent mesh budget parks a durable agent until the period
+            // ends (issue #2272).
+            Err(error) if error.activity_error_type() == Some(MESH_BUDGET_EXCEEDED) => {
+                progress.parked_until = mesh_refusal_until(&error);
+                return Ok(AgentStop::BudgetExceeded);
             }
             // A spent LLM budget is a bound, so the run ends normally.
             Err(error) if LlmBudgetExceeded::is_refusal(&error) => {
@@ -806,6 +839,19 @@ async fn send_turn(
     turn
 }
 
+/// The period end of a mesh budget refusal, from its recorded details.
+fn mesh_refusal_until(error: &HarvestError) -> Option<i64> {
+    match error {
+        HarvestError::ActivityFailed {
+            details: Some(details),
+            ..
+        } => serde_json::from_value::<MeshBudgetExceeded>(details.clone())
+            .ok()
+            .map(|refusal| refusal.until_ms),
+        _ => None,
+    }
+}
+
 /// Take one waiting interrupt. Returns `true` when one was waiting.
 fn take_interrupt(ctx: &WorkflowContext) -> Result<bool, String> {
     Ok(ctx
@@ -844,18 +890,25 @@ fn take_steers(
 ///
 /// The snapshot is read once per segment, by an activity, so the prompt does
 /// not change inside the segment and replay reads the recorded snapshot.
-async fn system_prompt(ctx: &WorkflowContext, task: &AgentTask) -> Result<Option<String>, String> {
+///
+/// Returns the prompt and the flow labels of the memory entries that it
+/// holds (issue #2272).
+async fn system_prompt(
+    ctx: &WorkflowContext,
+    task: &AgentTask,
+) -> Result<(Option<String>, BTreeSet<String>), String> {
     let Some(scope) = &task.memory_scope else {
-        return Ok(task.system.clone());
+        return Ok((task.system.clone(), BTreeSet::new()));
     };
-    let snapshot: String = ctx
+    let snapshot: MemorySnapshot = ctx
         .execute_activity(&agent_memory_snapshot_info(), scope.clone())
         .await
         .map_err(|e| e.to_string())?;
-    Ok(Some(match &task.system {
-        Some(system) => format!("{system}\n\n{snapshot}"),
-        None => snapshot,
-    }))
+    let prompt = task.system.as_ref().map_or_else(
+        || snapshot.text().to_owned(),
+        |system| format!("{system}\n\n{}", snapshot.text()),
+    );
+    Ok((Some(prompt), snapshot.labels()))
 }
 
 /// How one tool round ended.
@@ -1416,11 +1469,25 @@ async fn run_tool(
             Err(reason) => ToolOutcome::error(&reason),
         });
     }
+    // State memory is edited in the workflow, so the edit commits with the
+    // op (issue #2273).
+    if call.name == MEMORY_TOOL
+        && task.memory_in_state
+        && let Some(blocks) = progress.memory.as_mut()
+    {
+        return Ok(state_memory_edit(blocks, &call, &tree.exercised));
+    }
     // Under a mandate, the workflow owns the name `delegate`, even with no
     // peer to ask. Such a call gets a named refusal.
     if let Some(agent) = run.agent.filter(|_| call.name == DELEGATE_TOOL) {
         return delegate(ctx, run, agent, progress, tree, &call).await;
     }
+    // A memory note keeps the labels of the tree (issue #2272).
+    let flow_labels = if call.name == MEMORY_TOOL {
+        tree.exercised.clone()
+    } else {
+        BTreeSet::new()
+    };
     let request = ToolCallRequest {
         run_id: progress.run_id.clone(),
         session_id: task.session_id.clone(),
@@ -1430,6 +1497,7 @@ async fn run_tool(
         read_only: task.read_only,
         allowed_tools: run.allowed_tools(),
         labels: slot.labels.cloned(),
+        flow_labels,
     };
     // Only a tool that opts in races an interrupt. Any other call runs to
     // its end, because its side effect may be half done.
@@ -1450,6 +1518,21 @@ async fn run_tool(
     ctx.execute_activity(&agent_tool_call_info(), request)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Apply one `memory` call to state memory, with the labels of the tree.
+fn state_memory_edit(
+    blocks: &mut [MemoryBlock],
+    call: &ToolCall,
+    labels: &BTreeSet<String>,
+) -> ToolOutcome {
+    let edit = serde_json::from_value::<MemoryOp>(call.arguments.clone())
+        .map_err(|err| format!("not a valid memory edit: {err}"))
+        .and_then(|op| apply_to(blocks, &op, labels).map_err(|err| err.to_string()));
+    match edit {
+        Ok(block) => ToolOutcome::ok(edit_result(&block).to_string()),
+        Err(reason) => ToolOutcome::error(&reason),
+    }
 }
 
 /// The arguments of a `delegate` call, or `None` when they are not exactly
@@ -1965,6 +2048,9 @@ fn child_task(
         mandate: Some(mandate),
         // The tree holds the labels, so the child task carries none.
         flow_labels: BTreeSet::new(),
+        mesh: task.mesh.clone(),
+        // A child never edits the memory of its parent.
+        memory_in_state: false,
         transcript_delta: task.transcript_delta,
         parallel_children: task.parallel_children,
         model: peer.model.clone().or_else(|| task.model.clone()),
@@ -2186,7 +2272,7 @@ pub async fn agent_tool_call(
 pub async fn agent_memory_snapshot(
     ctx: &ActivityContext,
     scope: MemoryScope,
-) -> Result<String, String> {
+) -> Result<MemorySnapshot, String> {
     harness(ctx)?.memory_snapshot(scope).await
 }
 

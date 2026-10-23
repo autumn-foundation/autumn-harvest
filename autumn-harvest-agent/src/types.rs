@@ -128,6 +128,14 @@ pub struct AgentTask {
     /// the history. See [`flow`](crate::flow).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
+    /// The mesh of the run (issue #2272). Each model turn carries it, so a
+    /// mesh budget applies to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
+    /// The memory lives in the state of a durable agent (issue #2273). The
+    /// workflow runs the `memory` tool itself.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub memory_in_state: bool,
     /// Record only the messages that each model turn adds (issue #2264).
     /// [`AgentTask::new`] turns it on. A recorded task with no field sends
     /// the whole transcript, so a run started before the change replays as
@@ -185,6 +193,8 @@ impl AgentTask {
             tenant: None,
             mandate: None,
             flow_labels: BTreeSet::new(),
+            mesh: None,
+            memory_in_state: false,
             transcript_delta: true,
             parallel_children: 0,
             model: None,
@@ -278,11 +288,15 @@ impl AgentTask {
 
     /// The memory scope whose `memory` tool this task offers, if any.
     pub(crate) fn memory_tool_scope(&self) -> Option<MemoryScope> {
-        if (self.read_only || self.unattended) && !self.unattended_memory_writes {
-            None
-        } else {
-            self.memory_scope.clone()
-        }
+        self.memory_writable()
+            .then(|| self.memory_scope.clone())
+            .flatten()
+    }
+
+    /// Whether this run may write its memory. A read-only or unattended
+    /// segment writes only with `unattended_memory_writes`.
+    pub(crate) const fn memory_writable(&self) -> bool {
+        !(self.read_only || self.unattended) || self.unattended_memory_writes
     }
 
     /// Mark the run as one that no person watches.
@@ -426,6 +440,9 @@ pub struct ModelTurnRequest {
     /// durable agent sets it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub interruptible: bool,
+    /// The mesh of the run (issue #2272). A mesh budget checks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
     /// The prefix of the window that `messages` follow (issue #2264). With
     /// a prefix, `messages` holds only the messages after it. The activity
     /// reads the prefix from the transcript store of the harness.
@@ -564,6 +581,10 @@ pub struct ToolCallRequest {
     /// when the decision had no flow rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels: Option<BTreeSet<String>>,
+    /// The flow labels of the run tree, for a `memory` call. A note keeps
+    /// them (issue #2272).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]

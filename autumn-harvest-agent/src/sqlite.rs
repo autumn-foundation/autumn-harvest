@@ -19,25 +19,29 @@ use autumn_harvest::entity::{ENTITY_OP_SIGNAL, ENTITY_STATE_QUERY};
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest_sqlite::{
-    ExecutionFilter, ExecutionId, RunState, SignalWithStart, SignalWithStartOutcome, SqliteResult,
-    SqliteRuntime,
+    ExecutionFilter, ExecutionId, RunState, SignalWithStart, SignalWithStartOutcome, SqliteReader,
+    SqliteResult, SqliteRuntime,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::agent::{
-    AGENT_WORKFLOW_NAME, Agent, AgentId, AgentOp, AgentState, agent_info, agent_memory_reset_info,
-    agent_profile_info,
+    AGENT_WORKFLOW_NAME, Agent, AgentId, AgentOp, AgentState, Control, INTERRUPT_SIGNAL, Interrupt,
+    agent_info, agent_memory_reset_info, agent_profile_info,
 };
 use crate::approval::Approval;
+use crate::error::{AgentError, ErrorKind};
 use crate::harness::{AgentHarness, CacheTenant};
 use crate::heartbeat::{HEARTBEAT_WORKFLOW_NAME, HeartbeatTask, agent_heartbeat_info};
+use crate::mesh_control::{MESH_ATTR, MeshPause, MeshSpend, Spend};
+use crate::model::BoxFuture;
 use crate::types::{AgentTask, ModelTurnRequest};
 use crate::workflow::{
     WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
     agent_memory_snapshot_info, agent_model_turn_info, agent_precheck_info, agent_tool_call_info,
 };
+use autumn_harvest::chrono::{DateTime, Utc};
 
 /// Register the agent workflows and their activities against `harness`.
 ///
@@ -245,6 +249,141 @@ pub fn state(
         };
         Ok(Some(serde_json::from_value(query.await?)?))
     }
+}
+
+/// The spend of a mesh from the cost ledger of a SQLite file (issue #2272).
+///
+/// It sums the ledger rows of every run whose search attribute
+/// [`MESH_ATTR`] names the mesh. Each read opens its own read-only handle,
+/// so it sees what the runtime committed.
+#[derive(Debug, Clone)]
+pub struct LedgerSpend {
+    path: std::path::PathBuf,
+}
+
+impl LedgerSpend {
+    /// Read the ledger of the database file at `path`.
+    #[must_use]
+    pub fn open(path: impl AsRef<std::path::Path>) -> Self {
+        Self {
+            path: path.as_ref().to_owned(),
+        }
+    }
+
+    fn read(&self, mesh: &str, since: DateTime<Utc>) -> SqliteResult<Spend> {
+        let reader = SqliteReader::open(&self.path)?;
+        let filter = ExecutionFilter::new().search_attribute(MESH_ATTR, serde_json::json!(mesh));
+        let mut runs = std::collections::HashSet::new();
+        let mut cursor = None;
+        loop {
+            let page =
+                cursor.map_or_else(|| filter.clone(), |cursor| filter.clone().before(cursor));
+            let found = reader.list_executions(&page)?;
+            runs.extend(
+                found
+                    .executions
+                    .iter()
+                    .filter_map(autumn_harvest_sqlite::ExecutionSummary::execution_id),
+            );
+            match found.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let rows = reader.llm_ledger_between(since, Utc::now())?;
+        let spend = rows.iter().filter(|row| runs.contains(&row.exec_id)).fold(
+            Spend::default(),
+            |spend, row| Spend {
+                tokens: spend
+                    .tokens
+                    .saturating_add(row.input_tokens)
+                    .saturating_add(row.output_tokens),
+                cost_usd_micros: spend
+                    .cost_usd_micros
+                    .saturating_add(row.cost_usd_micros.unwrap_or(0)),
+            },
+        );
+        Ok(spend)
+    }
+}
+
+impl MeshSpend for LedgerSpend {
+    fn spent<'a>(
+        &'a self,
+        mesh: &'a str,
+        since: DateTime<Utc>,
+    ) -> BoxFuture<'a, Result<Spend, AgentError>> {
+        let read = self
+            .read(mesh, since)
+            .map_err(|err| AgentError::new(ErrorKind::Transport, err.to_string()));
+        Box::pin(std::future::ready(read))
+    }
+}
+
+/// Pause every running agent of `mesh`, and return the audit record (issue
+/// #2272).
+///
+/// Each agent gets an interrupt, so an op in flight stops, and then a
+/// `Control::Pause` with `reason`. A paused agent holds its work and skips its
+/// ticks until a `Control::Resume`. The record also goes to the tracing
+/// target `harvest.audit`.
+///
+/// # Errors
+///
+/// Returns a list or a send error. Agents that got the pause before it stay
+/// paused.
+pub fn pause_mesh(rt: &mut SqliteRuntime, mesh: &str, reason: &str) -> SqliteResult<MeshPause> {
+    let at_ms = Utc::now().timestamp_millis();
+    let filter = ExecutionFilter::new()
+        .workflow_name(AGENT_WORKFLOW_NAME)
+        .state("RUNNING")
+        .search_attribute(MESH_ATTR, serde_json::json!(mesh));
+    let mut targets = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = cursor.map_or_else(|| filter.clone(), |cursor| filter.clone().before(cursor));
+        let found = rt.list_executions(&page)?;
+        for summary in &found.executions {
+            let id = summary
+                .workflow_id
+                .value()
+                .and_then(|id| AgentId::parse(id).ok());
+            if let (Some(exec), Some(id)) = (summary.execution_id(), id) {
+                targets.push((exec, id));
+            }
+        }
+        match found.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    let key = format!("pause-mesh:{mesh}:{at_ms}");
+    let pause = AgentOp::Control(Control::Pause {
+        reason: Some(reason.to_owned()),
+    });
+    let mut agents = Vec::with_capacity(targets.len());
+    for (exec, id) in targets {
+        let interrupt = serde_json::to_value(Interrupt { message_id: None })?;
+        let signal_key = format!("{INTERRUPT_SIGNAL}:{key}");
+        rt.send_signal_idempotent(exec, INTERRUPT_SIGNAL, interrupt, Some(&signal_key))?;
+        send(rt, &id, &pause, Some(&key))?;
+        agents.push(id);
+    }
+    agents.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    let record = MeshPause {
+        mesh: mesh.to_owned(),
+        reason: reason.to_owned(),
+        at_ms,
+        agents,
+    };
+    tracing::info!(
+        target: "harvest.audit",
+        mesh = %record.mesh,
+        reason = %record.reason,
+        agents = record.agents.len(),
+        "a mesh was paused"
+    );
+    Ok(record)
 }
 
 /// Decode `input`, run `body` to completion, and encode its result.

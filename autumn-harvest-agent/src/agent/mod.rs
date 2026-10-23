@@ -443,6 +443,10 @@ pub enum AgentOp {
     /// A booked follow-up is due (issue #2266). Only the wake hook makes it.
     #[serde(skip_deserializing)]
     FollowupDue,
+    /// The period of a spent mesh budget ended (issue #2272). Only the wake
+    /// hook makes it.
+    #[serde(skip_deserializing)]
+    Unpark,
 }
 
 impl AgentOp {
@@ -491,7 +495,7 @@ impl AgentOp {
     pub const fn class(&self) -> OpClass {
         match self {
             Self::UserMessage(_) | Self::PeerMessage(_) => OpClass::Work,
-            Self::Control(_) => OpClass::Control,
+            Self::Control(_) | Self::Unpark => OpClass::Control,
             Self::HeartbeatTick | Self::FollowupDue => OpClass::Tick,
         }
     }
@@ -507,6 +511,10 @@ pub enum AgentMemory {
     None,
     /// The `MemoryStore` of the harness, in the scope `agent:<id>`.
     Store,
+    /// The blocks in the state of the agent (issue #2273). The workflow runs
+    /// the `memory` tool itself, so an edit commits with the op. No store
+    /// and no edit key are involved.
+    State,
 }
 
 /// The config of one kind of agent.
@@ -581,6 +589,9 @@ pub struct AgentProfile {
     /// (issue #2270). See [`AgentTask::parallel_children`].
     #[serde(default, skip_serializing_if = "crate::types::is_zero")]
     pub parallel_children: u32,
+    /// The mesh of the agents of the kind (issue #2272).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
 }
 
 const fn default_max_steps() -> u32 {
@@ -619,6 +630,7 @@ impl AgentProfile {
             followups: None,
             model: None,
             parallel_children: 0,
+            mesh: None,
         }
     }
 
@@ -727,12 +739,19 @@ impl AgentProfile {
         self
     }
 
+    /// Put the agents of the kind in the mesh `mesh` (issue #2272).
+    #[must_use]
+    pub fn mesh(mut self, mesh: impl Into<String>) -> Self {
+        self.mesh = Some(mesh.into());
+        self
+    }
+
     /// The memory scope of the agent `id`, when the profile keeps memory in a
     /// store.
     #[must_use]
     pub fn memory_scope(&self, id: &AgentId) -> Option<MemoryScope> {
         match self.memory {
-            AgentMemory::None => None,
+            AgentMemory::None | AgentMemory::State => None,
             AgentMemory::Store => Some(MemoryScope::new(format!("agent:{id}"))),
         }
     }
@@ -771,6 +790,8 @@ impl AgentProfile {
         task.followups = self.followups;
         task.model.clone_from(&self.model);
         task.parallel_children = self.parallel_children;
+        task.mesh.clone_from(&self.mesh);
+        task.memory_in_state = self.memory == AgentMemory::State;
         if let Mode::Heartbeat(beat) = mode {
             if beat.model.is_some() {
                 task.model.clone_from(&beat.model);
@@ -824,6 +845,12 @@ pub enum AgentStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// The mesh of the agent spent its budget (issue #2272). Work waits,
+    /// and ticks are skipped, until the period ends.
+    Parked {
+        /// When the period ends, in epoch milliseconds.
+        until_ms: i64,
+    },
 }
 
 impl AgentStatus {
@@ -833,16 +860,19 @@ impl AgentStatus {
         match self {
             Self::Open => InboxStatus::Open,
             Self::Paused { .. } => InboxStatus::Paused,
+            Self::Parked { .. } => InboxStatus::Parked,
         }
     }
 
-    /// The status name for listing: `idle` or `paused`. A running op lists
-    /// as `running`, and an approval wait as `waiting_approval`.
+    /// The status name for listing: `idle`, `paused` or `parked`. A
+    /// running op lists as `running`, and an approval wait as
+    /// `waiting_approval`.
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Open => "idle",
             Self::Paused { .. } => "paused",
+            Self::Parked { .. } => "parked",
         }
     }
 }
@@ -905,6 +935,10 @@ pub struct AgentState {
     pub outbound_seq: BTreeMap<String, u64>,
     /// The applied peer messages of each sender.
     pub inbound: Inbound,
+    /// The memory blocks, when the profile keeps memory in the state (issue
+    /// #2273). Empty until the first op.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub memory: Vec<crate::memory::MemoryBlock>,
 }
 
 impl AgentState {
@@ -925,6 +959,9 @@ impl AgentState {
     /// op. A paused agent has none.
     #[must_use]
     pub fn next_wake(&self, profile: Option<&AgentProfile>) -> Option<(i64, AgentOp)> {
+        if let AgentStatus::Parked { until_ms } = self.status {
+            return Some((until_ms, AgentOp::Unpark));
+        }
         if self.status != AgentStatus::Open {
             return None;
         }
@@ -1092,11 +1129,11 @@ impl AgentRun<'_> {
         self.publish(&state, "running", now);
         let mut ticked = false;
         match admit(state.status.inbox(), op.class()) {
-            Admit::Apply => {
-                if let AgentOp::Control(control) = op {
-                    state = self.control(state, control, now).await;
-                }
-            }
+            Admit::Apply => match op {
+                AgentOp::Control(control) => state = self.control(state, control, now).await,
+                AgentOp::Unpark => state = self.unpark(state, now).await,
+                _ => {}
+            },
             Admit::Hold => hold(&mut state, op),
             Admit::Run => {
                 ticked = matches!(op, AgentOp::HeartbeatTick);
@@ -1151,6 +1188,12 @@ impl AgentRun<'_> {
                 "agent_tokens_used",
                 Some(serde_json::json!(state.tokens_used)),
             ),
+            (
+                crate::mesh_control::MESH_ATTR,
+                profile
+                    .and_then(|profile| profile.mesh.as_ref())
+                    .map(|mesh| serde_json::json!(mesh)),
+            ),
         ];
         if let Err(err) = self
             .ctx
@@ -1176,11 +1219,35 @@ impl AgentRun<'_> {
                 state.next_heartbeat_ms = None;
             }
             Control::ResetMemory => {
+                state.memory.clear();
                 if let Err(err) = self.reset_memory().await {
                     fail(&mut state, &err);
                 }
             }
-            Control::ClearTranscript => state.transcript.clear(),
+            Control::ClearTranscript => {
+                state.transcript.clear();
+                // The transcript took its taint with it. A memory note keeps
+                // its own labels, and the next op reads a store note again
+                // (issue #2272).
+                state.flow_labels = crate::memory::snapshot_labels(&state.memory);
+            }
+        }
+        state
+    }
+
+    /// Open a parked agent when its period ends, and run the held work.
+    async fn unpark(&self, mut state: AgentState, now: i64) -> AgentState {
+        if matches!(state.status, AgentStatus::Parked { .. }) {
+            state.status = AgentStatus::Open;
+            while let Some(op) = state.held.pop_front() {
+                if state.status != AgentStatus::Open {
+                    // The budget is still spent: the op waits for the next
+                    // period, first in line.
+                    state.held.push_front(op);
+                    break;
+                }
+                state = self.work(state, op, now).await;
+            }
         }
         state
     }
@@ -1203,7 +1270,7 @@ impl AgentRun<'_> {
     async fn work(&self, mut state: AgentState, op: AgentOp, now: i64) -> AgentState {
         match op {
             AgentOp::UserMessage(message) => {
-                if let (Urgency::Steer, Some(id)) = (message.urgency, message.message_id) {
+                if let (Urgency::Steer, Some(id)) = (message.urgency, message.message_id.clone()) {
                     // A running segment took the steer signal, so the op is done.
                     if SteerBook::take(&mut state.steer.steered, &id) {
                         return state;
@@ -1213,8 +1280,17 @@ impl AgentRun<'_> {
                 }
                 // A person is present, so a new follow-up chain starts.
                 state.chain = 0;
-                self.segment(state, &message.text, Mode::Attended, now)
-                    .await
+                let rounds = state.rounds;
+                let retry = message.clone();
+                let mut state = self
+                    .segment(state, &message.text, Mode::Attended, now)
+                    .await;
+                // A mesh budget refused the first turn, so no tool ran. The
+                // message waits for the next period, first in line.
+                if matches!(state.status, AgentStatus::Parked { .. }) && state.rounds == rounds {
+                    hold_first(&mut state, AgentOp::UserMessage(retry));
+                }
+                state
             }
             AgentOp::PeerMessage(envelope) => self.peer_message(state, *envelope, now).await,
             AgentOp::HeartbeatTick => self.tick(state, now).await,
@@ -1225,7 +1301,7 @@ impl AgentRun<'_> {
                 state.chain = state.chain.saturating_add(1);
                 self.segment(state, WAKE_MESSAGE, Mode::Followup, now).await
             }
-            AgentOp::Control(_) => state,
+            AgentOp::Control(_) | AgentOp::Unpark => state,
         }
     }
 
@@ -1435,9 +1511,12 @@ impl AgentRun<'_> {
                     .as_ref()
                     .map_or_else(Vec::new, |peer| peer.waiting.to_vec()),
                 sent: std::mem::take(&mut state.outbound_seq),
-                mesh: None,
+                mesh: profile.mesh.clone(),
             },
         };
+        if task.memory_in_state {
+            progress.memory = Some(open_memory(&mut state, &mut task, &mut tree));
+        }
         let run = Run {
             task: &task,
             agent: peer
@@ -1446,16 +1525,7 @@ impl AgentRun<'_> {
             live: true,
         };
         let result = run_segment(self.ctx, run, &mut progress, &mut tree, input).await;
-        state.steer = progress.steer.take().unwrap_or_default();
-        state.sent = progress.sent.take();
-        // A failed op keeps what its tools and turns did to the labels and
-        // the tokens. Only the transcript stays as it was.
-        state.rounds = tree.rounds;
-        state.outbound_seq = tree.outbox.sent;
-        state.flow_labels = tree.exercised;
-        state.tokens_used = state
-            .tokens_used
-            .saturating_add(u64::from(progress.usage.total()));
+        fold_segment(&mut state, &mut progress, tree);
         match result {
             Ok(stop) => {
                 let answer = progress.delivered_text(&progress.last_text).to_owned();
@@ -1531,6 +1601,64 @@ struct Sent<'a> {
 ///
 /// The queue has a bound. An op past it fails, and the error names it, so
 /// no op leaves without a trace.
+/// Keep what a segment did in the state, whether it failed or not.
+///
+/// A failed op keeps what its tools and turns did to the labels, the tokens
+/// and the memory. Only the transcript stays as it was.
+fn fold_segment(state: &mut AgentState, progress: &mut Progress, tree: Tree) {
+    state.steer = progress.steer.take().unwrap_or_default();
+    state.sent = progress.sent.take();
+    // A memory edit is part of the op, so it commits with the snapshot.
+    if let Some(memory) = progress.memory.take() {
+        state.memory = memory;
+    }
+    if let Some(until_ms) = progress.parked_until.take() {
+        state.status = AgentStatus::Parked { until_ms };
+    }
+    state.rounds = tree.rounds;
+    state.outbound_seq = tree.outbox.sent;
+    state.flow_labels = tree.exercised;
+    state.tokens_used = state
+        .tokens_used
+        .saturating_add(u64::from(progress.usage.total()));
+}
+
+/// Put the state memory of the agent into the system prompt of a segment.
+///
+/// The prompt is fixed for the segment, so a provider prompt cache keeps
+/// it. The run reads every entry, so it takes their labels. The labels of
+/// the agent hold them already, because only a run of the agent writes its
+/// memory. The extend keeps the rule when a later control resets the labels.
+fn open_memory(
+    state: &mut AgentState,
+    task: &mut AgentTask,
+    tree: &mut Tree,
+) -> Vec<crate::memory::MemoryBlock> {
+    if state.memory.is_empty() {
+        state.memory = crate::memory::MemoryBlock::defaults();
+    }
+    let snapshot = crate::memory::render_snapshot(&state.memory);
+    task.system = Some(match task.system.take() {
+        Some(system) => format!("{system}\n\n{snapshot}"),
+        None => snapshot,
+    });
+    tree.exercised
+        .extend(crate::memory::snapshot_labels(&state.memory));
+    state.memory.clone()
+}
+
+/// Hold `op` first in line, within the bound of the inbox.
+fn hold_first(state: &mut AgentState, op: AgentOp) {
+    let before = state.held.len();
+    hold(state, op);
+    // A full queue refuses the op, and the order stays as it was.
+    if state.held.len() > before
+        && let Some(last) = state.held.pop_back()
+    {
+        state.held.push_front(last);
+    }
+}
+
 fn hold(state: &mut AgentState, op: AgentOp) {
     if state.held.len() < MAX_HELD_OPS {
         state.held.push_back(op);

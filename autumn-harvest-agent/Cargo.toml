@@ -106,6 +106,14 @@ required-features = ["sqlite"]
 name = "transcript_delta"
 required-features = ["sqlite", "eval"]
 
+[[test]]
+name = "memory_state"
+required-features = ["sqlite"]
+
+[[test]]
+name = "mesh_controls"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 

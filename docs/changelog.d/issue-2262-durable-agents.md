@@ -312,3 +312,55 @@ full form; the cache key is the same in both forms; eval gives the same
 result; a durable agent sends deltas across ops; a trimmed transcript is
 sent in the full form; the request cap measures the whole window; the
 in-memory store has a byte bound.
+
+### Mesh-wide controls (issue #2272)
+
+- `AgentProfile::mesh` and `AgentTask::mesh` name the mesh of an agent. Each
+  model turn and peer message carries it, and each run publishes the search
+  attribute `agent_mesh`.
+- `MeshBudget` caps the tokens or the cost of a mesh for each day, month or
+  fixed window. `AgentHarness::mesh_budget` and `AgentHarness::mesh_spend`
+  set it up. The model-turn activity refuses a turn of a spent mesh with
+  `MeshBudgetExceeded` before the model call.
+- A refused durable agent parks (`AgentStatus::Parked`). Its work waits, the
+  refused message first, its ticks are skipped, and a wake at the period
+  end opens it.
+- `sqlite::LedgerSpend` sums the cost ledger of the runs of a mesh.
+- `sqlite::pause_mesh` interrupts and pauses every running agent of a mesh,
+  and returns a `MeshPause` audit record.
+- A memory entry keeps the flow labels of the run that wrote it
+  (`MemoryBlock::labels`). A run that reads the snapshot takes them. The
+  snapshot activity records `MemorySnapshot`, which is plain text when it
+  has no labels, so an old history still reads.
+- `MemoryStore::apply_labelled` refuses a write from a run with labels by
+  default, so a store that cannot keep labels never holds an untainted
+  copy. `InMemoryMemoryStore` keeps labels.
+- `Control::ClearTranscript` keeps only the labels of the memory.
+- The §12 limit "A memory note carries no label" in `docs/agent-mesh.md` is
+  removed.
+
+**Tests.** `autumn-harvest-agent/tests/mesh_controls.rs`: a mesh over its
+daily budget parks every agent's next turn; a parked agent opens when the
+period ends; another mesh keeps its own budget; a pause stops every agent
+of a mesh within one tick; a pause stops an agent that waits for an
+approval; a pause leaves other meshes alone; a note written under
+untrusted input taints the run that reads it, for a store and for state
+memory; a store that cannot keep labels refuses a labelled write. Unit
+tests in `mesh_control.rs` cover the period windows and the caps.
+
+### Agent memory as entity state (issue #2273)
+
+- `AgentMemory::State` keeps the memory blocks in `AgentState::memory`. The
+  workflow runs the `memory` tool itself, so an edit commits with the op
+  snapshot. No store and no edit key are involved.
+- The system prompt of an op holds the memory as it was when the op
+  started, so a provider prompt cache keeps its prefix.
+- The memory lives in the entity snapshot events and the
+  `harvest_entity_state` projection, which erasure and codec rotation cover
+  (issue #2259).
+
+**Tests.** `autumn-harvest-agent/tests/memory_state.rs`: an edit commits
+with the op and shows in the next op; memory reads are stable within a
+segment; the memory is in the entity snapshot; `ResetMemory` clears it; a
+crash in a child process after the memory call leaves memory and history
+consistent, with the edit applied once.
