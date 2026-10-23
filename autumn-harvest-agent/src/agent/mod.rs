@@ -577,6 +577,10 @@ pub struct AgentProfile {
     /// [`DEFAULT_MODEL`](crate::DEFAULT_MODEL).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The most delegations of one model turn that run at the same time
+    /// (issue #2270). See [`AgentTask::parallel_children`].
+    #[serde(default, skip_serializing_if = "crate::types::is_zero")]
+    pub parallel_children: u32,
 }
 
 const fn default_max_steps() -> u32 {
@@ -614,7 +618,15 @@ impl AgentProfile {
             heartbeat: None,
             followups: None,
             model: None,
+            parallel_children: 0,
         }
+    }
+
+    /// Run up to `n` delegations of one model turn at the same time.
+    #[must_use]
+    pub const fn parallel_children(mut self, n: u32) -> Self {
+        self.parallel_children = n;
+        self
     }
 
     /// Run the agents of the kind on the harness model `name`.
@@ -758,6 +770,7 @@ impl AgentProfile {
         task.mandate.clone_from(&self.mandate);
         task.followups = self.followups;
         task.model.clone_from(&self.model);
+        task.parallel_children = self.parallel_children;
         if let Mode::Heartbeat(beat) = mode {
             if beat.model.is_some() {
                 task.model.clone_from(&beat.model);

@@ -1705,3 +1705,63 @@ async fn one_agent_of_a_tree_runs_on_another_model() {
     assert!(!evaluation.diverged(), "{evaluation:#?}");
     assert_eq!((root.calls(), planner.calls()), (2, 1));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fan_out_source_answers_each_child_from_its_recorded_run() {
+    use autumn_harvest_agent::mesh::DELEGATE_TOOL;
+    use autumn_harvest_agent::{Mandate, Peer};
+
+    // Issue #2270: two delegations of one turn run as child runs.
+    let fan = || {
+        calls(
+            &[
+                (
+                    "d1",
+                    DELEGATE_TOOL,
+                    json!({"agent": "flights", "task": "fly"}),
+                ),
+                (
+                    "d2",
+                    DELEGATE_TOOL,
+                    json!({"agent": "hotels", "task": "stay"}),
+                ),
+            ],
+            2,
+        )
+    };
+    let (_dir, db) = fresh_db();
+    let harness = AgentHarness::new(ScriptedModel::new(vec![
+        fan(),
+        answer("a flight", 1),
+        answer("a hotel", 1),
+        answer("booked", 1),
+    ]))
+    .peer(Peer::new("flights", "Flies."))
+    .peer(Peer::new("hotels", "Stays."));
+    let mut rt = runtime(&db, harness);
+    let task = AgentTask::new("book")
+        .mandate(Mandate::new("planner").peers(["flights", "hotels"]))
+        .parallel_children(2);
+    let exec = sqlite::start(&mut rt, &task).unwrap();
+    let state = rt.run_until_blocked(exec).await.unwrap();
+    assert!(matches!(state, RunState::Completed(_)), "{state:?}");
+    let source = rt.load_history(exec).unwrap();
+
+    // The candidate asks only for the root turns. The children answer from
+    // the recorded runs.
+    let model = ScriptedModel::new(vec![fan(), answer("booked", 1)]);
+    let evaluation = evaluate(&source, &Candidate::new(AgentHarness::new(model.clone())))
+        .await
+        .unwrap();
+
+    assert!(!evaluation.diverged(), "{evaluation:#?}");
+    assert_eq!(model.calls(), 2, "no child turn runs live");
+    let RunEnd::Completed(report) = &evaluation.candidate else {
+        panic!("the candidate completes: {:?}", evaluation.candidate);
+    };
+    let answers = tool_results(report);
+    assert!(
+        answers[0].contains("a flight") || answers[0].contains("a hotel"),
+        "{answers:?}"
+    );
+}

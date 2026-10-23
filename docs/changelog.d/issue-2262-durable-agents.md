@@ -235,3 +235,28 @@ profile and its heartbeat name their models. `durable_peers.rs`: a receiver
 on a forbidden model refuses the message. `eval.rs`: two models compared on
 one source, and one agent of a tree on another model. Mandate property
 tests cover the allowlist.
+
+### Concurrent children (issue #2270)
+
+- `AgentTask::parallel_children` and `AgentProfile::parallel_children` let
+  one model turn run up to that many delegations at the same time, bounded
+  by `MAX_PARALLEL_CHILDREN`.
+- Each child of a batch runs as a child `agent_loop` run. The parent joins
+  the runs and merges their usage, steps, labels and records in call order.
+- The siblings split the token remainder and the delegation remainder with
+  `bounds::sibling_cap`. Each child starts with the labels of the tree.
+- `AgentReport::run_id` names the run, so a parent records the run id of a
+  child run.
+- `eval::evaluate` answers each child run of a source with its recorded
+  report.
+- ADR 0013 records why a child is a child run: two joined branches that
+  each take many steps can swap results on replay. The §12 limit "children
+  never run at the same time" in `docs/agent-mesh.md` is narrowed.
+
+**Tests.** `autumn-harvest-agent/tests/fan_out.rs`: three children as child
+runs with exact replay; no bound keeps the inline path; the bound splits a
+batch; the token split; the delegation split; the labels of every sibling
+reach the parent; a child starts with the labels of its parent; a durable
+agent fans out; a simulator sweep over completion orders. `eval.rs`: a
+fan-out source evaluates from its recorded children. The wall-time test
+runs on Postgres workers in the `examples/agent-mesh` suite.

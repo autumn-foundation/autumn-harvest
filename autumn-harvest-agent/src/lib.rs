@@ -119,8 +119,8 @@ pub use response_cache::{
 };
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
 pub use types::{
-    AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, RunIdSource, ToolCallRequest,
-    ToolOutcome,
+    AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
+    RunIdSource, ToolCallRequest, ToolOutcome,
 };
 pub use workflow::{
     WORKFLOW_NAME, activities, agent_deliver, agent_deliver_info, agent_discover_peers,

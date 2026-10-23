@@ -457,7 +457,20 @@ pub async fn evaluate(
         move |names: Value| -> Result<Value, String> { encode(&lock(&session).lookup(&names)?) }
     };
 
+    // A child run of a fan-out takes the recorded result of the child at the
+    // same place. No child runs live.
+    let children = {
+        let recorded = Mutex::new(recording.children.clone().into_iter());
+        move |_task: Value| -> Result<Value, String> {
+            lock(&recorded)
+                .next()
+                .flatten()
+                .unwrap_or_else(|| Err("the source has no child run here".to_owned()))
+        }
+    };
+
     let mut env = engine()
+        .mock_child_workflow(WORKFLOW_NAME, children)
         .mock_activity(agent_discover_peers_info().name, peers)
         .mock_activity(agent_model_turn_info().name, model)
         .mock_activity(agent_tool_call_info().name, tool)
@@ -588,6 +601,9 @@ struct Recording {
     peers: Vec<RecordedPeers>,
     /// The agent of each recorded model turn, in order.
     turn_agents: Vec<AgentKey>,
+    /// The result of each child run of a fan-out, in start order (issue
+    /// #2270). `None` for a child that has no result yet.
+    children: Vec<Option<Result<Value, String>>>,
     end: RunEnd,
 }
 
@@ -625,6 +641,7 @@ impl Recording {
         let mut opened: HashSet<&str> = HashSet::new();
         let mut timed_out: HashSet<&str> = HashSet::new();
         let mut signals = Vec::new();
+        let mut children = Children::default();
         let mut end = None;
         // The last tool or snapshot failure with no later completion. A
         // failed source can end on it.
@@ -632,6 +649,9 @@ impl Recording {
         for event in history {
             if matches!(event, WorkflowEvent::ActivityCompleted { .. }) {
                 last_failure = None;
+            }
+            if children.read(event) {
+                continue;
             }
             match event {
                 WorkflowEvent::ActivityScheduled {
@@ -709,16 +729,7 @@ impl Recording {
         signals.retain(|(name, _)| opened.contains(name.as_str()));
         let turns = model_turns(history)?;
         let turn_agents = model_turn_agents(history, run_id.as_deref())?;
-        // One lane holds one agent in a run, so its model turns name it.
-        let names: HashMap<&str, &Option<String>> = turn_agents
-            .iter()
-            .map(|agent| (agent.lane.as_str(), &agent.name))
-            .collect();
-        for tool in &mut effects.tools {
-            tool.agent.name = names
-                .get(tool.agent.lane.as_str())
-                .and_then(|name| (*name).clone());
-        }
+        name_tool_agents(&mut effects.tools, &turn_agents);
         Ok(Self {
             task,
             run_id,
@@ -728,8 +739,56 @@ impl Recording {
             signals,
             peers: effects.peers,
             turn_agents,
+            children: children.results,
             end: end.ok_or(EvalError::InFlightSource)?,
         })
+    }
+}
+
+/// Name the agent of each recorded tool call from the model turns of its
+/// lane. One lane holds one agent in a run, so its model turns name it.
+fn name_tool_agents(tools: &mut [RecordedTool], turn_agents: &[AgentKey]) {
+    let names: HashMap<&str, &Option<String>> = turn_agents
+        .iter()
+        .map(|agent| (agent.lane.as_str(), &agent.name))
+        .collect();
+    for tool in tools {
+        tool.agent.name = names
+            .get(tool.agent.lane.as_str())
+            .and_then(|name| (*name).clone());
+    }
+}
+
+/// The child runs of the fan-outs of a source run (issue #2270).
+#[derive(Default)]
+struct Children {
+    /// The result of each child run, in start order.
+    results: Vec<Option<Result<Value, String>>>,
+    /// The place of each child run in `results`, by child id.
+    index: HashMap<String, usize>,
+}
+
+impl Children {
+    /// Read one event. Returns `true` when it is a child-run event.
+    fn read(&mut self, event: &WorkflowEvent) -> bool {
+        let (child_id, result) = match event {
+            WorkflowEvent::ChildWorkflowStarted { child_id, .. } => {
+                self.index.insert(child_id.to_string(), self.results.len());
+                self.results.push(None);
+                return true;
+            }
+            WorkflowEvent::ChildWorkflowCompleted { child_id, output } => {
+                (child_id, Ok(output.clone()))
+            }
+            WorkflowEvent::ChildWorkflowFailed {
+                child_id, error, ..
+            } => (child_id, Err(error.clone())),
+            _ => return false,
+        };
+        if let Some(&at) = self.index.get(&child_id.to_string()) {
+            self.results[at] = Some(result);
+        }
+        true
     }
 }
 
@@ -1622,6 +1681,7 @@ mod tests {
                 followup_dropped: false,
                 delegations: Vec::new(),
                 flow_labels: std::collections::BTreeSet::new(),
+                run_id: None,
             })
         };
         let done = report(crate::AgentStop::Completed);

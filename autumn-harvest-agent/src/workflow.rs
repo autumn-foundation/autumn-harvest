@@ -17,7 +17,7 @@
 //! The loop reads no clock and no state outside its input and the recorded
 //! results. That keeps replay deterministic.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use autumn_harvest::llm_budget::LlmBudgetExceeded;
@@ -30,7 +30,7 @@ use crate::agent::{
 };
 use crate::agent::{agent_info, agent_memory_reset_info, agent_profile_info};
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
-use crate::bounds::{RoundBudget, exceeds_bytes, json_len};
+use crate::bounds::{RoundBudget, exceeds_bytes, json_len, sibling_cap};
 use crate::delivery::{Report, ReportSource, report_text};
 use crate::flow::Released;
 use crate::followup::{self, FOLLOWUP_TOOL, Planned};
@@ -47,8 +47,8 @@ use crate::message::{
 };
 use crate::policy::ToolDecision;
 use crate::types::{
-    AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, RunIdSource, ToolCallRequest,
-    ToolOutcome, without_system,
+    AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
+    RunIdSource, ToolCallRequest, ToolOutcome, without_system,
 };
 use autumn_harvest::durable_promise::PromiseSettlement;
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, EntityMessage};
@@ -192,6 +192,7 @@ impl Progress {
             followup_dropped: false,
             delegations: tree.records.clone(),
             flow_labels: tree.exercised.clone(),
+            run_id: Some(self.run_id.clone()),
         }
     }
 }
@@ -905,77 +906,79 @@ async fn run_round(
 ) -> Result<RoundEnd, String> {
     let task = run.task;
     let mut budget = round_budget(run, progress, tree, turn, &calls);
+    let batches = fan_out_batches(&calls, &turn.decisions, run.agent, task.parallel_children);
     let mut results = Vec::with_capacity(calls.len());
     let mut full = false;
     let mut looped = false;
     let mut stale = false;
-    for (position, call) in calls.into_iter().enumerate() {
+    // The outcomes of the rest of a fan-out that ran (issue #2270).
+    let mut fanned: VecDeque<ToolOutcome> = VecDeque::new();
+    for (position, call) in calls.iter().enumerate() {
         progress.tool_calls = progress.tool_calls.saturating_add(1);
-        let call_id = call.id.clone();
+        let ran = fanned.pop_front();
         // A durable agent takes an interrupt before each call. No later call
-        // of the round runs after one.
-        if run.live && !progress.interrupted && !full && !looped && take_interrupt(ctx)? {
+        // of the round runs after one. A call of a fan-out ran already.
+        if ran.is_none()
+            && run.live
+            && !progress.interrupted
+            && !full
+            && !looped
+            && take_interrupt(ctx)?
+        {
             progress.interrupted = true;
         }
-        let content = if full {
+        let mut guard = Settle {
+            task,
+            budget: &mut budget,
+            full: &mut full,
+            looped: &mut looped,
+        };
+        let content = if let Some(outcome) = ran {
+            guard.settle(progress, call, outcome.content)
+        } else if *guard.full {
             ToolOutcome::error(NOT_RUN_FULL).content
-        } else if looped {
+        } else if *guard.looped {
             ToolOutcome::error(NOT_RUN_LOOP).content
         } else if progress.interrupted {
             ToolOutcome::error(NOT_RUN_INTERRUPTED).content
         } else if stale {
             ToolOutcome::error(NOT_RUN_STALE).content
-        } else if !budget.can_run() {
+        } else if !guard.budget.can_run() {
             // A placeholder for each call exceeds the cap. No result could
             // reach the model, so no call runs.
-            full = true;
+            *guard.full = true;
             ToolOutcome::error(NOT_RUN_FULL).content
         } else {
-            // A recorded turn always holds one decision per call. A missing
-            // one denies the call rather than guess.
-            let decision =
-                turn.decisions
-                    .get(position)
-                    .cloned()
-                    .unwrap_or_else(|| ToolDecision::Deny {
-                        reason: "no recorded decision".to_owned(),
-                    });
-            let labels = turn.labels.get(position);
+            let batch = batches
+                .iter()
+                .find(|(start, _)| *start == position)
+                .map(|&(start, len)| start..start + len);
+            let span = batch.clone().unwrap_or(position..position + 1);
             // With flow rules, the turn decided each call against the labels
             // before the round. A delegation can add the labels of its child.
             // The calls after it then hold a stale decision, so they do not run.
-            let expected: Option<BTreeSet<String>> =
-                labels.map(|labels| tree.exercised.union(labels).cloned().collect());
-            let name = call.name.clone();
-            let arguments = call.arguments.clone();
-            let at = Slot {
-                position,
-                labels,
-                releases: turn.releases.get(position),
-                interruptible: turn.interruptible.get(position).copied().unwrap_or(false),
-                ..slot
-            };
-            let mut content = decide(ctx, run, progress, tree, at, call, decision)
-                .await?
-                .content;
+            let expected = recorded_labels(turn, span.clone()).map(|labels| {
+                tree.exercised
+                    .union(&labels)
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            });
+            let (outcome, rest) = act(
+                ctx, run, progress, tree, slot, turn, &calls, position, batch,
+            )
+            .await?;
+            fanned = rest;
             stale = expected.is_some_and(|expected| !tree.exercised.is_subset(&expected));
-            match progress
-                .tracker
-                .record(&task.loop_guard, &name, &arguments, &content)
-            {
-                LoopVerdict::Ok => {}
-                LoopVerdict::Warn(repeats) => content.push_str(&warning_note(&name, repeats)),
-                LoopVerdict::Stop(_) => looped = true,
-            }
-            if budget.admit(json_len(&content)) {
-                content
-            } else {
-                full = true;
-                ToolOutcome::error(DROPPED_FULL).content
-            }
+            let mut guard = Settle {
+                task,
+                budget: &mut budget,
+                full: &mut full,
+                looped: &mut looped,
+            };
+            guard.settle(progress, call, outcome.content)
         };
         results.push(ContentPart::ToolResult {
-            tool_call_id: call_id,
+            tool_call_id: call.id.clone(),
             content,
         });
     }
@@ -992,6 +995,149 @@ async fn run_round(
     } else {
         RoundEnd::Continue
     })
+}
+
+/// Run the call at `position`, or the fan-out `batch` that starts there.
+///
+/// Returns the outcome of the call, and the outcomes of the rest of the
+/// batch.
+#[allow(clippy::too_many_arguments)]
+async fn act(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    progress: &mut Progress,
+    tree: &mut Tree,
+    slot: Slot<'_>,
+    turn: &ModelTurn,
+    calls: &[ToolCall],
+    position: usize,
+    batch: Option<std::ops::Range<usize>>,
+) -> Result<(ToolOutcome, VecDeque<ToolOutcome>), String> {
+    if let (Some(span), Some(agent)) = (batch, run.agent) {
+        for at in span.clone() {
+            Slot {
+                position: at,
+                labels: turn.labels.get(at),
+                ..slot
+            }
+            .exercise(tree);
+        }
+        let mut outcomes: VecDeque<ToolOutcome> =
+            fan_out(ctx, run, agent, progress, tree, &calls[span])
+                .await?
+                .into();
+        let first = outcomes
+            .pop_front()
+            .unwrap_or_else(|| ToolOutcome::error(NOT_RUN_FULL));
+        return Ok((first, outcomes));
+    }
+    // A recorded turn always holds one decision per call. A missing one
+    // denies the call rather than guess.
+    let decision = turn
+        .decisions
+        .get(position)
+        .cloned()
+        .unwrap_or_else(|| ToolDecision::Deny {
+            reason: "no recorded decision".to_owned(),
+        });
+    let at = Slot {
+        position,
+        labels: turn.labels.get(position),
+        releases: turn.releases.get(position),
+        interruptible: turn.interruptible.get(position).copied().unwrap_or(false),
+        ..slot
+    };
+    let call = calls[position].clone();
+    let outcome = decide(ctx, run, progress, tree, at, call, decision).await?;
+    Ok((outcome, VecDeque::new()))
+}
+
+/// The union of the recorded labels of the calls in `span`, or `None` when
+/// the turn recorded no labels.
+fn recorded_labels(turn: &ModelTurn, span: std::ops::Range<usize>) -> Option<BTreeSet<String>> {
+    let mut union: Option<BTreeSet<String>> = None;
+    for labels in span.filter_map(|at| turn.labels.get(at)) {
+        union
+            .get_or_insert_with(BTreeSet::new)
+            .extend(labels.iter().cloned());
+    }
+    union
+}
+
+/// The checks that each answered call of a round passes: the loop guard and
+/// the request cap.
+struct Settle<'a, 'b> {
+    task: &'a AgentTask,
+    budget: &'b mut RoundBudget,
+    full: &'b mut bool,
+    looped: &'b mut bool,
+}
+
+impl Settle<'_, '_> {
+    /// Record the call with the loop guard, then fit its result to the
+    /// request cap. A result that does not fit is dropped.
+    fn settle(&mut self, progress: &mut Progress, call: &ToolCall, mut content: String) -> String {
+        match progress
+            .tracker
+            .record(&self.task.loop_guard, &call.name, &call.arguments, &content)
+        {
+            LoopVerdict::Ok => {}
+            LoopVerdict::Warn(repeats) => content.push_str(&warning_note(&call.name, repeats)),
+            LoopVerdict::Stop(_) => *self.looped = true,
+        }
+        if !*self.full && self.budget.admit(json_len(&content)) {
+            content
+        } else {
+            *self.full = true;
+            ToolOutcome::error(DROPPED_FULL).content
+        }
+    }
+}
+
+/// The fan-out batches of one round (issue #2270). Returns `(start, len)`
+/// pairs.
+///
+/// A batch is two or more calls in a row. The policy allows each call, and
+/// each call delegates to an inline peer. A batch holds at most `bound`
+/// calls.
+///
+/// A gated delegation, or one to a durable peer, runs alone, as before.
+fn fan_out_batches(
+    calls: &[ToolCall],
+    decisions: &[ToolDecision],
+    agent: Option<&Member>,
+    bound: u32,
+) -> Vec<(usize, usize)> {
+    let bound = usize::try_from(bound.min(MAX_PARALLEL_CHILDREN)).unwrap_or(1);
+    // A bound under 2 never extends a batch past one call.
+    let Some(agent) = agent else {
+        return Vec::new();
+    };
+    let batchable = |position: usize| {
+        let call = &calls[position];
+        call.name == DELEGATE_TOOL
+            && matches!(decisions.get(position), Some(ToolDecision::Allow))
+            && delegate_args(&call.arguments)
+                .and_then(|args| agent.peers.iter().find(|peer| peer.name == args.agent))
+                .is_some_and(|peer| peer.agent.is_none())
+    };
+    let mut batches = Vec::new();
+    let mut start = 0;
+    while start < calls.len() {
+        if !batchable(start) {
+            start += 1;
+            continue;
+        }
+        let mut end = start + 1;
+        while end < calls.len() && end - start < bound && batchable(end) {
+            end += 1;
+        }
+        if end - start >= 2 {
+            batches.push((start, end - start));
+        }
+        start = end;
+    }
+    batches
 }
 
 /// The longest answer that the round writes for a call with no result.
@@ -1261,27 +1407,7 @@ async fn delegate(
         });
     let (child, child_input) = match admitted {
         Ok(admitted) => admitted,
-        Err((refusal, name)) => {
-            // The model wrote the name, so a record keeps it only when it is
-            // a valid agent name.
-            let shown = if valid_name(&name) {
-                name.clone()
-            } else {
-                INVALID_NAME.to_owned()
-            };
-            let mut chain = agent.mandate.chain.clone();
-            chain.push(shown);
-            tree.records.push(DelegationRecord {
-                chain,
-                run_id: None,
-                stop: None,
-                refusal: Some(refusal),
-                usage: TokenUsage::default(),
-                steps_used: 0,
-                tool_calls: 0,
-            });
-            return Ok(refused(refusal, &name));
-        }
+        Err((refusal, name)) => return Ok(refuse_delegation(agent, tree, refusal, &name)),
     };
     let Admitted {
         mandate,
@@ -1347,6 +1473,192 @@ async fn delegate(
         content: outcome,
         is_error: stop != AgentStop::Completed,
     })
+}
+
+/// Record a refused delegation and answer the model.
+fn refuse_delegation(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &str) -> ToolOutcome {
+    // The model wrote the name, so a record keeps it only when it is a valid
+    // agent name.
+    let shown = if valid_name(name) {
+        name.to_owned()
+    } else {
+        INVALID_NAME.to_owned()
+    };
+    let mut chain = agent.mandate.chain.clone();
+    chain.push(shown);
+    tree.records.push(DelegationRecord {
+        chain,
+        run_id: None,
+        stop: None,
+        refusal: Some(refusal),
+        usage: TokenUsage::default(),
+        steps_used: 0,
+        tool_calls: 0,
+    });
+    refused(refusal, name)
+}
+
+/// One delegation of a fan-out that passed the mandate checks.
+struct Sibling<'a> {
+    position: usize,
+    mandate: Mandate,
+    peer: &'a Peer,
+    input: String,
+}
+
+/// Run a batch of delegations at the same time (issue #2270).
+///
+/// Each child runs as a child `agent_loop` run, with its own history. One
+/// history cannot hold two children that each take many steps. Replay pairs
+/// each command with the next recorded event, so two children could swap
+/// their results. A child run holds one result for the parent.
+///
+/// The siblings split the token remainder and the delegation remainder of
+/// the tree with [`sibling_cap`], so the batch never spends more than one
+/// child could. Each child starts with the labels of the tree. Its labels
+/// join the tree when the batch ends.
+///
+/// Returns one outcome per call, in order.
+async fn fan_out(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    agent: &Member,
+    progress: &mut Progress,
+    tree: &mut Tree,
+    calls: &[ToolCall],
+) -> Result<Vec<ToolOutcome>, String> {
+    let task = run.task;
+    let mut outcomes: Vec<Option<ToolOutcome>> = vec![None; calls.len()];
+    let mut siblings = Vec::new();
+    for (position, call) in calls.iter().enumerate() {
+        let taken = u32::try_from(siblings.len()).unwrap_or(u32::MAX);
+        let used = tree.delegations.saturating_add(taken);
+        let admitted = delegate_args(&call.arguments)
+            .ok_or((Refusal::InvalidArguments, String::new()))
+            .and_then(|args| {
+                sibling(agent, used, &args.agent)
+                    .map(|(mandate, peer)| Sibling {
+                        position,
+                        mandate,
+                        peer,
+                        input: args.task,
+                    })
+                    .map_err(|refusal| (refusal, args.agent))
+            });
+        match admitted {
+            Ok(admitted) => siblings.push(admitted),
+            Err((refusal, name)) => {
+                outcomes[position] = Some(refuse_delegation(agent, tree, refusal, &name));
+            }
+        }
+    }
+    let count = u32::try_from(siblings.len()).unwrap_or(u32::MAX);
+    let tokens_left = task
+        .max_total_tokens
+        .map(|max| max.saturating_sub(progress.usage.total()));
+    let delegations_left = agent
+        .mandate
+        .max_delegations
+        .saturating_sub(tree.delegations.saturating_add(count));
+    let mut children = Vec::new();
+    for (index, sibling) in (0_u32..).zip(siblings) {
+        let share = tokens_left.map(|left| sibling_cap(left, count, index));
+        let cap = match (share, sibling.peer.max_total_tokens) {
+            (Some(share), Some(own)) => Some(share.min(own)),
+            (share, own) => share.or(own),
+        };
+        // A cap of zero would still let the child make one model call.
+        if cap == Some(0) {
+            let refusal =
+                refuse_delegation(agent, tree, Refusal::BudgetExhausted, &sibling.peer.name);
+            outcomes[sibling.position] = Some(refusal);
+            continue;
+        }
+        let mut mandate = sibling.mandate;
+        // The child run counts its own delegations from zero.
+        mandate.max_delegations = sibling_cap(delegations_left, count, index);
+        tree.delegations = tree.delegations.saturating_add(1);
+        let mut child = child_task(task, sibling.peer, sibling.input, mandate, cap);
+        child.run_id_source = RunIdSource::ExecutionId;
+        child.flow_labels.clone_from(&tree.exercised);
+        children.push((sibling.position, sibling.peer, child));
+    }
+    // Each future sends its start command at its first poll, in order.
+    let started = children.iter().map(|(_, _, child)| async move {
+        let input = serde_json::to_value(child).map_err(|err| err.to_string())?;
+        ctx.spawn_child_workflow_raw(WORKFLOW_NAME, input)
+            .await
+            .map_err(|err| err.to_string())
+    });
+    let ended = futures::future::join_all(started).await;
+    for ((position, peer, child), output) in children.into_iter().zip(ended) {
+        let report: AgentReport = serde_json::from_value(output?).map_err(|err| err.to_string())?;
+        outcomes[position] = Some(merge_child(progress, tree, peer, child, &report));
+    }
+    Ok(outcomes
+        .into_iter()
+        .map(|outcome| outcome.unwrap_or_else(|| ToolOutcome::error(NOT_RUN_FULL)))
+        .collect())
+}
+
+/// The mandate checks of one sibling. Returns its mandate and its peer.
+fn sibling<'a>(agent: &'a Member, used: u32, name: &str) -> Result<(Mandate, &'a Peer), Refusal> {
+    if !agent.mandate.peers.contains(name) {
+        return Err(Refusal::NotPermitted);
+    }
+    let peer = agent
+        .peers
+        .iter()
+        .find(|peer| peer.name == name)
+        .ok_or(Refusal::UnknownPeer)?;
+    Ok((agent.mandate.delegate(peer, used)?, peer))
+}
+
+/// Add the report of one child run to the parent, and answer the model.
+fn merge_child(
+    progress: &mut Progress,
+    tree: &mut Tree,
+    peer: &Peer,
+    child: AgentTask,
+    report: &AgentReport,
+) -> ToolOutcome {
+    progress.usage = progress.usage.saturating_add(report.usage);
+    progress.delegated_steps = progress.delegated_steps.saturating_add(report.steps_used);
+    progress.delegated_tool_calls = progress
+        .delegated_tool_calls
+        .saturating_add(report.tool_calls);
+    tree.exercised.extend(report.flow_labels.iter().cloned());
+    let nested = report
+        .delegations
+        .iter()
+        .filter(|record| record.run_id.is_some())
+        .count();
+    tree.delegations = tree
+        .delegations
+        .saturating_add(u32::try_from(nested).unwrap_or(u32::MAX));
+    tree.records.extend(report.delegations.iter().cloned());
+    tree.records.push(DelegationRecord {
+        chain: child
+            .mandate
+            .map(|mandate| mandate.chain)
+            .unwrap_or_default(),
+        run_id: report.run_id.clone(),
+        stop: Some(report.stop),
+        refusal: None,
+        usage: report.usage,
+        steps_used: report.steps_used,
+        tool_calls: report.tool_calls,
+    });
+    let outcome = serde_json::json!({
+        "agent": peer.name,
+        "stop": report.stop,
+        "answer": truncate(&report.text, DEFAULT_TOOL_OUTPUT_LIMIT),
+    })
+    .to_string();
+    ToolOutcome {
+        content: outcome,
+        is_error: report.stop != AgentStop::Completed,
+    }
 }
 
 /// Send one task to a durable peer and wait for its reply (issue #2269).
@@ -1570,6 +1882,7 @@ fn child_task(
         mandate: Some(mandate),
         // The tree holds the labels, so the child task carries none.
         flow_labels: BTreeSet::new(),
+        parallel_children: task.parallel_children,
         model: peer.model.clone().or_else(|| task.model.clone()),
     }
 }

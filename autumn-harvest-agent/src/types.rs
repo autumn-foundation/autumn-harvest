@@ -27,6 +27,10 @@ pub const DEFAULT_MAX_STEPS: u32 = 8;
 /// The default time a gated call waits for a decision: one hour.
 pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 3_600;
 
+/// The bound on [`AgentTask::parallel_children`]. A larger value counts as
+/// this one.
+pub const MAX_PARALLEL_CHILDREN: u32 = 16;
+
 /// The input of one agent run: the workflow input.
 // The flags are independent switches on a recorded payload. A flat bool per
 // switch keeps the wire shape plain, so the lint is allowed here.
@@ -124,6 +128,12 @@ pub struct AgentTask {
     /// the history. See [`flow`](crate::flow).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
+    /// The most delegations of one model turn that run at the same time
+    /// (issue #2270). Each runs as a child `agent_loop` run. Zero or one runs
+    /// them one after another, inline. The bound is
+    /// [`MAX_PARALLEL_CHILDREN`].
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub parallel_children: u32,
     /// The name of the harness model that runs this task (issue #2271).
     /// `None` is [`DEFAULT_MODEL`](crate::DEFAULT_MODEL). A delegated child
     /// keeps it unless its peer names a model.
@@ -169,8 +179,17 @@ impl AgentTask {
             tenant: None,
             mandate: None,
             flow_labels: BTreeSet::new(),
+            parallel_children: 0,
             model: None,
         }
+    }
+
+    /// Run up to `n` delegations of one model turn at the same time. See
+    /// [`parallel_children`](Self::parallel_children).
+    #[must_use]
+    pub const fn parallel_children(mut self, n: u32) -> Self {
+        self.parallel_children = n;
+        self
     }
 
     /// Run the task on the harness model `name`. See [`model`](Self::model).
@@ -528,6 +547,11 @@ pub(crate) const fn is_false(value: &bool) -> bool {
     !*value
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) const fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 /// The recorded result of one tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolOutcome {
@@ -621,6 +645,10 @@ pub struct AgentReport {
     /// task. Pass them to the next run of this conversation.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
+    /// The run id of the run, as tools and the policy saw it. A parent reads
+    /// it from the report of a child run (issue #2270).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// The transcript without system messages.

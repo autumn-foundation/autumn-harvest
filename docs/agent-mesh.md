@@ -389,8 +389,8 @@ calls per subtree.
 
 ## 12. Limits
 
-- A child runs inline, on the worker of the parent. It cannot run on another
-  worker, and children never run at the same time.
+- A child runs inline, on the worker of the parent, unless it is part of a
+  fan-out (section 15). Inline children run one after another.
 - Each child turn adds to the history of the parent. Keep `max_delegations`
   and the peer step bounds low.
 - A durable peer (section 13) needs no manual step. A peer in another
@@ -473,3 +473,42 @@ let task = AgentTask::new("triage this")
   model of a durable peer, so the receiver checks it.
 - `eval::compare` runs two candidates on one recorded run.
   `Candidate::agent_model` sets the model of one agent of the tree.
+
+## 15. Concurrent children (issue #2270)
+
+`AgentTask::parallel_children(n)` lets one model turn run up to `n`
+delegations at the same time. `AgentProfile::parallel_children` does the
+same for a durable agent. [ADR 0013](adr/0013-concurrent-agent-children.md)
+records the design.
+
+```rust
+use autumn_harvest_agent::{AgentTask, Mandate};
+
+let task = AgentTask::new("plan the trip")
+    .mandate(Mandate::new("planner").peers(["flights", "hotels", "visas"]))
+    .parallel_children(3);
+```
+
+| Rule | What happens |
+|---|---|
+| Batch | Two or more `delegate` calls in a row, each allowed by the policy, each to an inline peer. At most `n` calls, and at most `MAX_PARALLEL_CHILDREN`. |
+| Child | Each call of a batch runs as a child `agent_loop` run, with its own history. |
+| Tokens | The siblings split the token remainder of the tree with `sibling_cap`. The caps of a batch sum to the remainder. |
+| Delegations | The siblings split the delegation remainder. Each child run counts its own delegations from zero. |
+| Labels | Each child starts with the labels of the tree. The labels of every child join the tree when the batch ends. |
+| Records | The parent adds the usage, the steps and the records of each child, in call order. |
+
+- One history cannot hold two children that each take many steps. Replay
+  pairs a command with the next recorded event, so two children could swap
+  their results. A child run keeps each child in its own history.
+- A sibling does not see the labels of another sibling. They share no
+  context, so no data flows between them.
+- Each child stops after the call that passes its cap, as any run does.
+- A gated call in a child run waits on the child run. Send its approval to
+  that run. The record of the delegation names its run id.
+- A child run starts with no released flow rules.
+- A durable agent takes an interrupt only after the batch ends.
+- A single delegation, a gated one, or one to a durable peer runs inline,
+  as before.
+- `eval::evaluate` answers each child run of a source with its recorded
+  report.

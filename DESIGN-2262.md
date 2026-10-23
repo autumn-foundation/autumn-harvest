@@ -299,11 +299,18 @@ Every steer and every op is a staged signal before it is acknowledged.
 ## 8. Concurrent children (#2270)
 
 - The `delegate` calls of one turn run at the same time, up to
-  `Mandate::max_concurrent`. The tree state is shared, so the round
-  counter and the labels stay consistent.
-- Siblings split the token remainder. `sibling_cap` gives each its share,
-  and Verus proves the shares sum to the remainder.
-- `agent_loop` gates the fan-out with a patch marker.
+  `AgentTask::parallel_children`. A task with no setting runs as before,
+  so no patch marker is needed.
+- **Changed in the build.** The plan was one shared tree in one history.
+  A simulator run showed that replay swaps the results of two joined
+  branches that each take many steps. So each child of a batch is a child
+  `agent_loop` run. [ADR 0013](docs/adr/0013-concurrent-agent-children.md)
+  records the decision.
+- Siblings split the token remainder and the delegation remainder.
+  `sibling_cap` gives each its share, and Verus proves the shares sum to
+  the remainder.
+- Each child starts with the labels of the tree. The labels of each child
+  join the tree when the batch ends.
 
 ---
 
