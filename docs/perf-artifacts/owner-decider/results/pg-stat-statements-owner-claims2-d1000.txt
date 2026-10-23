@@ -1,0 +1,29 @@
+ calls |  ms  | mean  |                                                       q                                                        
+-------+------+-------+----------------------------------------------------------------------------------------------------------------
+  4045 | 4300 | 1.063 | WITH owner_gate AS MATERIALIZED ( SELECT set_config($10, $8::text, $11) AS owner_token, COALESCE((SELECT enabl
+  3002 | 3569 | 1.189 | WITH worker_info AS ( SELECT COALESCE((SELECT labels FROM harvest_workers WHERE worker_id = $1), $7::jsonb) AS
+ 10000 | 1655 | 0.165 | INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, 
+  6000 | 1539 | 0.256 | SELECT "harvest_task_queue"."state", ((("harvest_task_queue"."state" = $1) AND ("harvest_task_queue"."worker_i
+  3000 | 1490 | 0.497 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, scheduled_at = $2, created_at = clo
+  4000 |  947 | 0.237 | UPDATE "harvest_task_queue" SET "state" = $1, "output" = $2, "heartbeat_details" = $3, "error" = $4, "complete
+  3000 |  775 | 0.258 | INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activ
+   232 |  679 | 2.927 | WITH page AS MATERIALIZED (SELECT id, state, queue_name, task_type, activity_name, workflow_exec_id, scheduled
+  3000 |  658 | 0.219 | SELECT id, queue_name, scheduled_at, priority, task_type FROM harvest_task_queue WHERE workflow_exec_id = $1 A
+  3000 |  604 | 0.201 | WITH candidate AS ( SELECT id, wake_requested FROM harvest_task_queue WHERE id = $1 AND task_type = $2 AND sta
+  4000 |  494 | 0.123 | SELECT out_holder AS holder, out_epoch AS epoch, out_locked AS locked FROM harvest_decision_owner_fence($1, $2
+  7000 |  490 | 0.070 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7
+  3000 |  451 | 0.150 | UPDATE "harvest_task_queue" SET "handler_started_attempt" = $1, "handler_started_at" = clock_timestamp() WHERE
+  1000 |  451 | 0.451 | UPDATE "harvest_workflow_executions" SET "state" = $1, "output" = $2, "error" = $3, "sticky_worker_id" = $4, "
+  8000 |  450 | 0.056 | SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_event
+  1000 |  356 | 0.356 | INSERT INTO "harvest_workflow_executions" ("id", "workflow_name", "workflow_id", "run_id", "shard_id", "input"
+   257 |  316 | 1.230 | WITH paused AS MATERIALIZED ( SELECT COALESCE(array_agg(queue_name), ARRAY[]::text[]) AS names FROM harvest_qu
+  4000 |  243 | 0.061 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7
+  6000 |  236 | 0.039 | SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_ex
+  1000 |  233 | 0.233 | INSERT INTO "harvest_task_queue" ("id", "queue_name", "task_type", "workflow_exec_id", "activity_name", "activ
+  6000 |  201 | 0.033 | SELECT "harvest_events"."id", "harvest_events"."workflow_exec_id", "harvest_events"."event_id", "harvest_event
+  1000 |  195 | 0.195 | INSERT INTO "harvest_events" ("workflow_exec_id", "event_id", "event_type", "event_data") VALUES ($1, $2, $3, 
+ 15000 |  192 | 0.013 | SELECT $2 FROM ONLY "public"."harvest_workflow_executions" x WHERE "id" OPERATOR(pg_catalog.=) $1 FOR KEY SHAR
+  6000 |  184 | 0.031 | SELECT "harvest_workflow_executions"."id", "harvest_workflow_executions"."workflow_name", "harvest_workflow_ex
+  3000 |  168 | 0.056 | UPDATE harvest_task_queue SET state = $3, worker_id = $4, started_at = $5, attempt = GREATEST(attempt - $6, $7
+(25 rows)
+

@@ -2994,22 +2994,14 @@ mod db {
         // scope records the row that it locked.
         let shard = tenure.shard();
         let id = crate::decision_owner::conn_id(conn);
-        let held = match FenceRegistry::expected(shard) {
-            Some(pinned) => {
-                let resolved = FenceRegistry::resolve_shard(shard).unwrap_or(shard);
-                crate::decision_owner::fence_with_generation(
-                    conn,
-                    &tenure,
-                    resolved,
-                    pinned.as_i64(),
-                )
+        let held = if let Some(pinned) = FenceRegistry::expected(shard) {
+            let resolved = FenceRegistry::resolve_shard(shard).unwrap_or(shard);
+            crate::decision_owner::fence_with_generation(conn, &tenure, resolved, pinned.as_i64())
                 .await?;
-                Some((resolved, pinned.as_i64()))
-            }
-            None => {
-                crate::decision_owner::fence(conn, &tenure).await?;
-                None
-            }
+            Some((resolved, pinned.as_i64()))
+        } else {
+            crate::decision_owner::fence(conn, &tenure).await?;
+            None
         };
         crate::decision_owner::record_start_fence(id, crate::decision_owner::StartFence::new(held));
         Ok(())

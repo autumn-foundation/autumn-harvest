@@ -3590,7 +3590,7 @@ pub async fn claim_workflow_task_of_execution(
 }
 
 /// What one [`owner_scan`] found (issue #2255).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OwnerScan {
     /// The executions whose workflow task is due, by due time.
     pub due: Vec<Uuid>,

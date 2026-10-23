@@ -2584,3 +2584,8 @@ standalone note rather than part of the claim-path attribution table above:
   a criterion bench of the second fence row. Owner mode with DR on adds
   two statements and about 20% to the persist at one writer, so it fails
   the stage 1b bar of 10%.
+* [`docs/performance-owner-decider.md`](performance-owner-decider.md)
+  — stage 1b of the decision owner (issue #2255). The owner decider takes
+  workflow tasks by execution, so the claim loops claim 3 tasks per
+  3-activity workflow instead of 7. On a 4-CPU host the CPU limits the gain
+  to 1.27x at one claim loop. The fused fence result is on the page.

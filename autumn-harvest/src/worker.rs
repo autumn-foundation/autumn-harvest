@@ -35101,7 +35101,7 @@ impl DeciderState {
     }
 
     /// Owner mode is on. On the change from off, scan at once.
-    fn activate(&mut self, now: std::time::Instant) {
+    const fn activate(&mut self, now: std::time::Instant) {
         if !self.active {
             self.active = true;
             self.scan_at = now;
@@ -35236,7 +35236,7 @@ fn owner_take_backoff(poll: Duration, misses: u32) -> Duration {
 /// What one owner take returned (issue #2255).
 enum OwnerTake {
     /// The take claimed the row. The permit goes to its dispatch.
-    Taken(TaskQueueItem, tokio::sync::OwnedSemaphorePermit),
+    Taken(Box<TaskQueueItem>, tokio::sync::OwnedSemaphorePermit),
     /// No row was `PENDING` and due, or a gate refused it.
     Empty,
     /// The take failed.
@@ -40467,6 +40467,9 @@ impl Worker {
     /// The decider holds execution ids only. It acknowledges nothing, so a
     /// lost hint costs latency, not work (restate#4566). With owner mode off
     /// on its database, it waits and sends no query.
+    // too_many_lines: one loop arms the wakes, starts the scans and takes, and
+    // waits. Split, the arming and the wait would sit apart from each other.
+    #[allow(clippy::too_many_lines)]
     async fn run_owner_decider(&self, target: &DeciderTarget<'_>) {
         use futures::StreamExt as _;
         let owner_shard = self.owner_shard_of(target.shard);
@@ -40649,7 +40652,7 @@ impl Worker {
                 .record_owner_take_duration(kind, *label, elapsed);
         }
         match taken {
-            Ok(Some(task)) => OwnerTake::Taken(task, permit),
+            Ok(Some(task)) => OwnerTake::Taken(Box::new(task), permit),
             Ok(None) => OwnerTake::Empty,
             Err(error) => OwnerTake::Failed(error),
         }
@@ -40707,7 +40710,7 @@ impl Worker {
                 if let Some(shard) = target.shard {
                     self.record_shard_dispatched_many(shard, 1);
                 }
-                self.dispatch_task(task, target.pool, target.shard, None, Some(permit), None);
+                self.dispatch_task(*task, target.pool, target.shard, None, Some(permit), None);
             }
             DeciderEvent::Taken(exec, OwnerTake::Empty) => {
                 state.missed(exec, now);

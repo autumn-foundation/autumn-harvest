@@ -193,3 +193,20 @@ Accepted as is:
   It races the decider, and one of them takes the row.
 - No worker switch turns the decider off. Owner mode off is the fallback.
 
+## 5. Measurements
+
+[`performance-owner-decider.md`](docs/performance-owner-decider.md) has the
+tables. In short, on a 4-CPU host with Postgres on the same host:
+
+| Done-when item | Result |
+|---|---|
+| 7 claims to 3 | Pass. 3.00 task claims and 4.00 takes per workflow, at 1, 2 and 4 claim loops. |
+| 1.5x workflows/s | Not met. 1.27x at 1 loop, 1.19x at 2, 1.05x at 4. The CPU limits both modes at about 53 workflows/s. |
+| Signal before an epoch bump | Pass. Two tests, with and without a live old owner. |
+| Fence cost under 10% | Pass. −9.3% against DR alone (median of six runs), and +1.1% against the owner fence alone. |
+
+The 1.5x item came from the claim-loop formula. `pg_stat_statements` shows
+the same statements in both modes. Owner mode runs more decisions at once,
+so on 4 shared cores each statement slows, and the CPU becomes the limit.
+A host with the database apart, a cheaper take, eager activity dispatch
+and group commit (#2256) are the next levers.

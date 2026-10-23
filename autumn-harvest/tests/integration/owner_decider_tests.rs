@@ -31,16 +31,19 @@ const STEPS: [&str; 3] = ["decider_step_a", "decider_step_b", "decider_step_c"];
 
 #[activity(start_to_close = "30s")]
 async fn decider_step_a(_ctx: &ActivityContext, n: u64) -> Result<u64, String> {
+    tokio::task::yield_now().await;
     Ok(n)
 }
 
 #[activity(start_to_close = "30s")]
 async fn decider_step_b(_ctx: &ActivityContext, n: u64) -> Result<u64, String> {
+    tokio::task::yield_now().await;
     Ok(n)
 }
 
 #[activity(start_to_close = "30s")]
 async fn decider_step_c(_ctx: &ActivityContext, n: u64) -> Result<u64, String> {
+    tokio::task::yield_now().await;
     Ok(n)
 }
 
