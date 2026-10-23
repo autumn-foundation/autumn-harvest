@@ -1161,13 +1161,22 @@ async fn a_joiner_takes_each_chunk_in_one_transaction() {
     db.drop_db().await;
 }
 
-/// Issue #2296: a batch that names a missing row fails and changes no row.
+/// Issue #2296: a batch that names a missing row fails, and it takes no
+/// other row. The batch checks its rows before its one write.
 #[tokio::test]
-async fn a_batch_acquisition_of_a_missing_row_changes_nothing() {
+async fn a_batch_acquisition_of_a_missing_row_takes_no_row() {
     #[derive(QueryableByName)]
-    struct Holder {
+    struct Row {
         #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
         holder: Option<String>,
+        #[diesel(sql_type = BigInt)]
+        epoch: i64,
+    }
+    async fn row_6(conn: &mut AsyncPgConnection) -> Row {
+        diesel::sql_query("SELECT holder, epoch FROM harvest_decision_owner WHERE partition = 6")
+            .get_result(conn)
+            .await
+            .expect("read the row")
     }
     let db = OwnDb::new().await;
     let mut conn = db.conn().await;
@@ -1175,6 +1184,7 @@ async fn a_batch_acquisition_of_a_missing_row_changes_nothing() {
         .execute(&mut conn)
         .await
         .expect("drop one owner row");
+    let before = row_6(&mut conn).await;
     let ps = [
         DecisionPartition::new(6).expect("in range"),
         DecisionPartition::new(7).expect("in range"),
@@ -1191,12 +1201,9 @@ async fn a_batch_acquisition_of_a_missing_row_changes_nothing() {
         matches!(result, Err(HarvestError::NotFound(_))),
         "{result:?}"
     );
-    let row: Holder =
-        diesel::sql_query("SELECT holder FROM harvest_decision_owner WHERE partition = 6")
-            .get_result(&mut conn)
-            .await
-            .expect("read the row");
-    assert_eq!(row.holder, None, "the batch rolled back");
+    let after = row_6(&mut conn).await;
+    assert_eq!(after.holder, None, "the batch took no row");
+    assert_eq!(after.epoch, before.epoch, "the batch kept the epoch");
     db.drop_db().await;
 }
 

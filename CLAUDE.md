@@ -204,8 +204,8 @@ builds it. Code for owner mode follows these rules:
   epoch. Never change the epoch with a plain `UPDATE` or an upsert. Neither
   one drains in-flight commits.
 - A batch acquisition takes its rows `FOR UPDATE SKIP LOCKED`, in
-  ascending partition order. It bumps only the rows that it locked
-  (issue #2296).
+  ascending partition order. It increments the epoch only on the rows
+  that it locked (issue #2296).
 - A renewal changes the lease end only. Renewal, release and revoke match
   holder and epoch. A release keeps the epoch.
 - A statement on many owner rows locks them in ascending partition order.

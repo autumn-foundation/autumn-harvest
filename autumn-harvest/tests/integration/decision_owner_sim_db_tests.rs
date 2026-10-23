@@ -6,7 +6,8 @@
 //! `store::append_single_event` inside a pinned decision. The sweep runs all
 //! four nemeses of `formal/tla/OwnerLease.tla` and checks every invariant.
 //! A second sweep acquires with `acquire_many`, as the owner loop does
-//! (issue #2296).
+//! (issue #2296). The simulator models one row, so each batch holds one
+//! partition. That sweep checks the invariants, not the batch size.
 //!
 //! The simulator drives the store from one thread. Each decision in flight
 //! keeps its own connection and its own open transaction, so a fence lock

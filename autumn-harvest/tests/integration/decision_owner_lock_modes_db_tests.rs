@@ -5,16 +5,20 @@
 //! * A decision commit takes the owner row `FOR KEY SHARE`.
 //! * A renewal updates `lease_until` only, so it takes `FOR NO KEY UPDATE`.
 //! * An acquisition takes the row `FOR UPDATE` before it bumps the epoch.
-//! * A batch acquisition takes it `FOR UPDATE SKIP LOCKED` (issue #2296).
+//! * A batch acquisition takes its rows `FOR UPDATE SKIP LOCKED` (issue
+//!   #2296).
 //!
 //! A renewal must not wait for a commit. An acquisition must wait for every
 //! commit in flight, because that wait is the drain. A batch acquisition
-//! skips a row that a commit holds, so it never bumps that epoch. These tests prove each
-//! rule on a real database. One test proves the trap: an `UPDATE` of the
-//! epoch alone does not wait, so the explicit `FOR UPDATE` is required.
+//! skips a row that a commit holds, so it never changes that epoch. These
+//! tests prove each rule on a real database. One test proves the trap: an
+//! `UPDATE` of the epoch alone does not wait, so the explicit `FOR UPDATE`
+//! is required.
 //!
 //! No Harvest schema is needed. Each test makes its own probe table. Each
 //! statement must touch exactly one row, so a "ran" result is never vacuous.
+//! The `SKIP LOCKED` probe counts its rows instead, because a skip touches
+//! none.
 #![cfg(feature = "db")]
 
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};

@@ -130,8 +130,8 @@ pub proof fn theorem_a_takeover_fences_the_old_tenure(
 
 /// The epochs of the owner rows after one batched acquisition (issue
 /// #2296). `epochs[p]` is the epoch of row `p`. `locked` holds the rows that
-/// the batch locked `FOR UPDATE`. Each locked row takes one `Acquire` step.
-/// Each other row keeps its epoch.
+/// the batch locked `FOR UPDATE SKIP LOCKED`. Each locked row takes one
+/// `Acquire` step. Each other row keeps its epoch.
 pub open spec fn batch(epochs: Seq<int>, locked: Set<int>) -> Seq<int> {
     Seq::new(
         epochs.len(),
@@ -144,7 +144,7 @@ pub open spec fn batch(epochs: Seq<int>, locked: Set<int>) -> Seq<int> {
     )
 }
 
-/// A batch acts on each row as one single acquisition, or as no statement.
+/// A batch acts on each row as one acquisition, or leaves the row as it is.
 /// So each theorem above holds for each row of a batch.
 pub proof fn theorem_a_batch_is_one_acquisition_per_locked_row(
     epochs: Seq<int>,
@@ -176,6 +176,40 @@ pub proof fn theorem_a_batch_fences_only_its_locked_rows(
     ensures
         locked.contains(p) ==> !(holder_matches && epochs[p] == batch(epochs, locked)[p]),
         !locked.contains(p) ==> epochs[p] == batch(epochs, locked)[p],
+{
+}
+
+/// The rows that the batch lock statement locks (issue #2296).
+///
+/// It names each row of `wanted` that is `takeable`: free, or its lease
+/// ended. `SKIP LOCKED` then drops each row in `busy`, which another
+/// transaction locks. A commit in flight holds its row `FOR KEY SHARE`, so
+/// its row is in `busy`.
+pub open spec fn skip_locked(wanted: Set<int>, takeable: Set<int>, busy: Set<int>) -> Set<int> {
+    wanted.intersect(takeable).difference(busy)
+}
+
+/// The drain holds for a batch. The batch keeps the epoch of each row that
+/// a commit holds, so that commit still passes its fence. The batch changes
+/// only a row that the caller named, that was takeable and that was free of
+/// locks.
+pub proof fn theorem_a_batch_keeps_each_epoch_under_a_commit(
+    epochs: Seq<int>,
+    wanted: Set<int>,
+    takeable: Set<int>,
+    busy: Set<int>,
+    p: int,
+    pinned: int,
+    holder_matches: bool,
+)
+    requires
+        0 <= p < epochs.len(),
+    ensures
+        busy.contains(p) ==> batch(epochs, skip_locked(wanted, takeable, busy))[p] == epochs[p],
+        busy.contains(p) && holder_matches && pinned == epochs[p] ==> (holder_matches && pinned
+            == batch(epochs, skip_locked(wanted, takeable, busy))[p]),
+        batch(epochs, skip_locked(wanted, takeable, busy))[p] != epochs[p] ==> (wanted.contains(p)
+            && takeable.contains(p) && !busy.contains(p)),
 {
 }
 

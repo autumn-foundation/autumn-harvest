@@ -498,8 +498,9 @@ pub struct Acquisitions {
     pub acquired: Vec<OwnerTenure>,
     /// The partitions with a live lease. Nothing changed.
     pub held: Vec<DecisionPartition>,
-    /// The partitions whose row another transaction locks. Nothing changed.
-    /// Try again later.
+    /// The partitions that the batch did not lock, and whose lease is not
+    /// live. Another transaction locks the row, or its lease ended during
+    /// the batch. Nothing changed. Try again later.
     pub busy: Vec<DecisionPartition>,
 }
 
@@ -1109,7 +1110,11 @@ mod db {
     ///
     /// `SKIP LOCKED` skips each row that another transaction locks. So a
     /// batch never waits for an owner row. A commit holds its row
-    /// `FOR KEY SHARE`, so the batch never bumps an epoch under a commit.
+    /// `FOR KEY SHARE`, so the batch never increments an epoch under a
+    /// commit.
+    ///
+    /// Postgres can keep the lock on a row that the recheck drops. That
+    /// lock lasts until the batch commits.
     const ACQUIRE_MANY_LOCK_SQL: &str = "SELECT partition, epoch FROM harvest_decision_owner \
          WHERE partition = ANY($1::int[]) \
            AND (holder IS NULL OR lease_until <= clock_timestamp()) \
@@ -1296,6 +1301,9 @@ mod db {
     /// The statement runs in its own transaction. It takes the DR
     /// generation row first, then the owner row (ADR 0009 decision 6).
     ///
+    /// This form waits for a commit in flight on the row. The owner loop
+    /// uses [`acquire_many`], which skips that row.
+    ///
     /// # Errors
     ///
     /// [`HarvestError::ShardFenced`] when this process lost DR write
@@ -1373,7 +1381,10 @@ mod db {
     ///
     /// The batch never waits for an owner row. [`acquire`] waits for a
     /// commit in flight. The batch skips that row and lists it as busy.
-    /// Nothing changed on a busy row, so a later scan takes it.
+    /// Nothing changed on a busy row, so a later scan can take it.
+    ///
+    /// The generation row is the only lock wait. A wait that hits the lock
+    /// timeout lists each partition as busy.
     ///
     /// # Errors
     ///
@@ -1416,8 +1427,8 @@ mod db {
                         if locked.iter().any(|r| r.partition == *key) {
                             continue;
                         }
-                        // A row whose lease ended after the lock reads as
-                        // busy. Either way, the batch did not take it.
+                        // A takeable row that the lock skipped is busy. So
+                        // is a row whose lease ended after the lock.
                         match states.iter().find(|r| r.partition == *key) {
                             None => {
                                 return Err(HarvestError::NotFound(format!(
@@ -2332,9 +2343,10 @@ mod db {
         /// This loop with at most `chunk` acquisitions per tick (issue #2254).
         ///
         /// A tick takes its chunk in one transaction (issue #2296). The
-        /// worker adopts the tenures of a tick only when the tick ends. So with a chunk, a
-        /// takeover decides after its first chunk, not after its last. The
-        /// tick sets [`OwnerTick::more`] when free partitions remain.
+        /// worker adopts the tenures of a tick only when the tick ends. So
+        /// with a chunk, a takeover decides after its first chunk, not after
+        /// its last. The tick sets [`OwnerTick::more`] when free partitions
+        /// remain.
         #[must_use]
         pub const fn with_acquire_chunk(mut self, chunk: usize) -> Self {
             self.acquire_chunk = Some(chunk);

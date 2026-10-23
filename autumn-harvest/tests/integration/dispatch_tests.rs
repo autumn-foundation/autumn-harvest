@@ -1166,6 +1166,9 @@ async fn the_by_id_claim_honours_the_dr_fence() {
     };
 
     let _serial = DISPATCH_SERIAL.lock().await;
+    // The fence registry is global. Hold its guard, so a DR test that
+    // writes on shard 0 does not run under this pin.
+    let _fence_serial = crate::cross_region_dr_tests::registry_guard().await;
     let (url, _c) = setup_test_database_url_or_env().await;
     let mut conn = connect(&url).await;
 
