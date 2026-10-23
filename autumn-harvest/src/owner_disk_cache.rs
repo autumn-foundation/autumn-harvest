@@ -395,8 +395,8 @@ impl OwnerDiskCache {
     /// # Errors
     ///
     /// Returns [`HarvestError::Config`] when another process holds the lock,
-    /// when the directory is open to other users, and when the directory or a
-    /// file cannot be created or deleted.
+    /// or when the directory is open to other users. It also returns it when
+    /// the directory or a file cannot be created or deleted.
     pub fn open(dir: impl AsRef<Path>) -> HarvestResult<Self> {
         let dir = dir.as_ref().to_path_buf();
         prepare_dir(&dir)?;
