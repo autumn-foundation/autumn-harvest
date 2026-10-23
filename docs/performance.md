@@ -2584,3 +2584,11 @@ standalone note rather than part of the claim-path attribution table above:
   a criterion bench of the second fence row. Owner mode with DR on adds
   two statements and about 20% to the persist at one writer, so it fails
   the stage 1b bar of 10%.
+* [`docs/performance-analyzer-large-payload.md`](performance-analyzer-large-payload.md)
+  — `LargePayloadRule` measured each payload with `value.to_string().len()`,
+  which built the JSON text and dropped it. It now counts the bytes without
+  the text (instructions -77.5%, bytes allocated -97.6%, `HistoryAnalyzer::analyze`).
+* [`docs/performance-debug-diff-redaction-probe.md`](performance-debug-diff-redaction-probe.md)
+  — `harvest debug diff` parsed each snapshot file into a `serde_json::Value`
+  tree just to read one key. It now probes that key without the tree
+  (instructions -23.7%, allocation blocks -16.5%).
