@@ -76,6 +76,13 @@ pub trait Tool: Send + Sync + std::fmt::Debug {
         &[]
     }
 
+    /// Whether an interrupt may cancel a call that already started (issue
+    /// #2265). The default is `false`: a side effect may be half done. Opt in
+    /// only for a tool that is safe to stop at any point.
+    fn interruptible(&self) -> bool {
+        false
+    }
+
     /// The metadata the model sees.
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
@@ -102,6 +109,7 @@ pub struct FnTool {
     schema: serde_json::Value,
     effect: ToolEffect,
     labels: Vec<String>,
+    interruptible: bool,
     run: ToolFn,
 }
 
@@ -132,6 +140,7 @@ impl FnTool {
             schema,
             effect: ToolEffect::Write,
             labels: Vec::new(),
+            interruptible: false,
             run: Box::new(move |input, _ctx| Box::pin(run(input))),
         }
     }
@@ -154,6 +163,7 @@ impl FnTool {
             schema,
             effect: ToolEffect::Write,
             labels: Vec::new(),
+            interruptible: false,
             run: Box::new(move |input, ctx| Box::pin(run(input, ctx))),
         }
     }
@@ -169,6 +179,14 @@ impl FnTool {
     #[must_use]
     pub fn label(mut self, label: impl Into<String>) -> Self {
         self.labels.push(label.into());
+        self
+    }
+
+    /// Let an interrupt cancel a call that already started. See
+    /// [`Tool::interruptible`].
+    #[must_use]
+    pub const fn interruptible(mut self) -> Self {
+        self.interruptible = true;
         self
     }
 
@@ -206,6 +224,10 @@ impl Tool for FnTool {
 
     fn labels(&self) -> &[String] {
         &self.labels
+    }
+
+    fn interruptible(&self) -> bool {
+        self.interruptible
     }
 }
 

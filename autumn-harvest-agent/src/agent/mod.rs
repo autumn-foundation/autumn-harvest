@@ -49,7 +49,9 @@ use crate::memory::MemoryScope;
 use crate::mesh::Mandate;
 use crate::message::{ChatMessage, ChatRole, RunId, SessionId};
 use crate::types::{AgentStop, AgentTask, DEFAULT_APPROVAL_TIMEOUT_SECS, DEFAULT_MAX_STEPS};
-use crate::workflow::{Member, Progress, Run, Tree, deliver, discover, harness, run_segment};
+use crate::workflow::{
+    Member, Progress, Run, SteerBook, Tree, deliver, discover, harness, run_segment,
+};
 use inbox::{Admit, InboxStatus, OpClass, admit};
 
 /// The registered workflow name of a durable agent.
@@ -67,6 +69,16 @@ pub const DEFAULT_WINDOW: u32 = 200;
 
 /// The longest agent name, in bytes.
 pub const MAX_AGENT_NAME_BYTES: usize = 200;
+
+/// The signal that interrupts the op that an agent runs (issue #2265).
+///
+/// Its payload is an [`Interrupt`]. An interrupt that arrives while no op
+/// runs is dropped when the next op starts.
+pub const INTERRUPT_SIGNAL: &str = "agent.interrupt";
+
+/// The signal that adds a message to the op that an agent runs (issue
+/// #2265). Its payload is a [`Steer`].
+pub const STEER_SIGNAL: &str = "agent.steer";
 
 /// Why a text is not a valid [`AgentId`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -160,12 +172,55 @@ impl std::fmt::Display for AgentId {
     }
 }
 
+/// How a message treats the op that runs when it arrives (issue #2265).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Urgency {
+    /// Run after the current op.
+    #[default]
+    Queue,
+    /// Join the current op before its next model turn. With no op running,
+    /// run as a queued message. It needs a message id.
+    Steer,
+    /// Stop the current op, then run.
+    Interrupt,
+}
+
+impl Urgency {
+    /// `true` for [`Urgency::Queue`], the default.
+    #[must_use]
+    pub const fn is_queue(&self) -> bool {
+        matches!(self, Self::Queue)
+    }
+}
+
 /// A message from a person.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserMessage {
     /// The text for the agent.
     pub text: String,
     /// An id that the client chose. Use it as the idempotency key of the send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// How the message treats the op that runs.
+    #[serde(default, skip_serializing_if = "Urgency::is_queue")]
+    pub urgency: Urgency,
+}
+
+/// The payload of [`STEER_SIGNAL`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Steer {
+    /// The text for the agent.
+    pub text: String,
+    /// The id of the message. The op with this id is then a no-op.
+    pub message_id: String,
+}
+
+/// The payload of [`INTERRUPT_SIGNAL`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interrupt {
+    /// The id of the message that comes with the interrupt, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
 }
@@ -210,6 +265,7 @@ impl AgentOp {
         Self::UserMessage(UserMessage {
             text: text.into(),
             message_id: None,
+            urgency: Urgency::Queue,
         })
     }
 
@@ -219,6 +275,21 @@ impl AgentOp {
         Self::UserMessage(UserMessage {
             text: text.into(),
             message_id: Some(message_id.into()),
+            urgency: Urgency::Queue,
+        })
+    }
+
+    /// A message with an id and an urgency. See [`Urgency`].
+    #[must_use]
+    pub fn urgent(
+        text: impl Into<String>,
+        message_id: impl Into<String>,
+        urgency: Urgency,
+    ) -> Self {
+        Self::UserMessage(UserMessage {
+            text: text.into(),
+            message_id: Some(message_id.into()),
+            urgency,
         })
     }
 
@@ -518,6 +589,8 @@ pub struct AgentState {
     pub last_stop: Option<AgentStop>,
     /// The answer of the last segment.
     pub last_answer: Option<String>,
+    /// The steer messages that wait for their other half (issue #2265).
+    pub steer: SteerBook,
 }
 
 /// A durable agent: its address and the ops it takes.
@@ -549,6 +622,33 @@ impl Agent {
     #[must_use]
     pub fn delete_payload() -> serde_json::Value {
         serde_json::json!(EntityMessage::<AgentOp>::delete())
+    }
+
+    /// The extra signal that goes before `op`, if its urgency needs one.
+    ///
+    /// Send the signal first, then the op. A [`Urgency::Steer`] message with
+    /// no id needs no signal: it runs as a queued message.
+    #[must_use]
+    pub fn urgency_signal(op: &AgentOp) -> Option<(&'static str, serde_json::Value)> {
+        let AgentOp::UserMessage(message) = op else {
+            return None;
+        };
+        match (message.urgency, &message.message_id) {
+            (Urgency::Steer, Some(id)) => Some((
+                STEER_SIGNAL,
+                serde_json::json!(Steer {
+                    text: message.text.clone(),
+                    message_id: id.clone(),
+                }),
+            )),
+            (Urgency::Interrupt, id) => Some((
+                INTERRUPT_SIGNAL,
+                serde_json::json!(Interrupt {
+                    message_id: id.clone(),
+                }),
+            )),
+            _ => None,
+        }
     }
 }
 
@@ -677,9 +777,19 @@ impl AgentRun<'_> {
     }
 
     /// Run one work op as a segment.
-    async fn work(&self, state: AgentState, op: AgentOp) -> AgentState {
+    async fn work(&self, mut state: AgentState, op: AgentOp) -> AgentState {
         match op {
-            AgentOp::UserMessage(message) => self.segment(state, &message.text, false).await,
+            AgentOp::UserMessage(message) => {
+                if let (Urgency::Steer, Some(id)) = (message.urgency, message.message_id) {
+                    // A running segment took the steer signal, so the op is done.
+                    if SteerBook::take(&mut state.steer.steered, &id) {
+                        return state;
+                    }
+                    // The op runs first. Its steer signal is then a no-op.
+                    SteerBook::note(&mut state.steer.ran, id);
+                }
+                self.segment(state, &message.text, false).await
+            }
             AgentOp::Control(_) => state,
         }
     }
@@ -700,11 +810,17 @@ impl AgentRun<'_> {
             );
             return state;
         }
+        // An interrupt that arrived while no op ran is stale.
+        if let Err(err) = self.ctx.drain_signals_raw(INTERRUPT_SIGNAL) {
+            fail(&mut state, &err.to_string());
+            return state;
+        }
         let task = profile.segment_task(id, input, unattended);
         let run_id = format!("{}:s{}", state.incarnation, state.segments);
         state.segments = state.segments.saturating_add(1);
         let mut progress = Progress::new(run_id.clone(), state.transcript.clone());
         progress.final_turn_rules = true;
+        progress.steer = Some(std::mem::take(&mut state.steer));
         let mut tree = Tree {
             root: run_id.clone(),
             rounds: state.rounds,
@@ -721,8 +837,10 @@ impl AgentRun<'_> {
         let run = Run {
             task: &task,
             agent: self.member.as_ref(),
+            live: true,
         };
         let result = run_segment(self.ctx, run, &mut progress, &mut tree, input).await;
+        state.steer = progress.steer.take().unwrap_or_default();
         // A failed op keeps what its tools and turns did to the labels and
         // the tokens. Only the transcript stays as it was.
         state.rounds = tree.rounds;

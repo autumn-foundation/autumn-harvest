@@ -130,6 +130,14 @@ pub fn send(
     op: &AgentOp,
     idempotency_key: Option<&str>,
 ) -> SqliteResult<SignalWithStartOutcome> {
+    // A steer or an interrupt goes first, to the run that is in flight. With
+    // no run, nothing is in flight, and the op alone is enough.
+    if let Some((name, payload)) = Agent::urgency_signal(op)
+        && let Some(exec) = current_run(rt, id)?
+    {
+        let key = idempotency_key.map(|key| format!("{name}:{key}"));
+        rt.send_signal_idempotent(exec, name, payload, key.as_deref())?;
+    }
     signal(rt, id, Agent::payload(op), idempotency_key)
 }
 

@@ -24,8 +24,9 @@ use autumn_harvest::llm_budget::LlmBudgetExceeded;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 
+use crate::agent::{INTERRUPT_SIGNAL, STEER_SIGNAL, Steer};
 use crate::agent::{agent_info, agent_memory_reset_info, agent_profile_info};
-use crate::approval::{Approval, Decision, approval_signal, await_decision};
+use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
 use crate::bounds::{RoundBudget, exceeds_bytes, json_len};
 use crate::delivery::{Report, ReportSource, report_text};
 use crate::flow::Released;
@@ -85,6 +86,45 @@ pub(crate) struct Progress {
     /// The run records the final-turn marker. An older history does not, and
     /// replays under the rules it ran with.
     pub(crate) final_turn_rules: bool,
+    /// The steer book of a durable agent segment. `None` takes no steer.
+    pub(crate) steer: Option<SteerBook>,
+    /// An interrupt ended the work of this segment (issue #2265).
+    pub(crate) interrupted: bool,
+}
+
+/// The steer messages of a durable agent (issue #2265).
+///
+/// A client sends a steer as a steer signal and as an op with one message
+/// id. A running segment takes the signal, so the op is then a no-op. An op
+/// that runs first marks its id, so its signal is then a no-op.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SteerBook {
+    /// Ids of steer signals that a segment took. Their ops are no-ops.
+    pub steered: std::collections::VecDeque<String>,
+    /// Ids of steer ops that ran. Their signals are no-ops.
+    pub ran: std::collections::VecDeque<String>,
+}
+
+impl SteerBook {
+    /// The most ids that each list keeps. A full list drops its oldest id.
+    pub const MAX_IDS: usize = 256;
+
+    /// Take the id `id` from `list`. Returns `true` when it was there.
+    pub(crate) fn take(list: &mut std::collections::VecDeque<String>, id: &str) -> bool {
+        list.iter()
+            .position(|held| held == id)
+            .and_then(|at| list.remove(at))
+            .is_some()
+    }
+
+    /// Add `id` to `list`. A full list drops its oldest id.
+    pub(crate) fn note(list: &mut std::collections::VecDeque<String>, id: String) {
+        if list.len() >= Self::MAX_IDS {
+            list.pop_front();
+        }
+        list.push_back(id);
+    }
 }
 
 impl Progress {
@@ -105,6 +145,8 @@ impl Progress {
             followup: None,
             chain: 0,
             final_turn_rules: false,
+            steer: None,
+            interrupted: false,
         }
     }
 
@@ -193,6 +235,9 @@ impl Member {
 pub(crate) struct Run<'a> {
     pub(crate) task: &'a AgentTask,
     pub(crate) agent: Option<&'a Member>,
+    /// The run is a segment of a durable agent. It takes interrupts and
+    /// records which tool calls opt in to them (issue #2265).
+    pub(crate) live: bool,
 }
 
 impl Run<'_> {
@@ -241,6 +286,7 @@ fn next_request(
         allowed_tools: run.allowed_tools(),
         flow_labels: tree.exercised.clone(),
         flow_released: tree.released.clone(),
+        interruptible: run.live,
     }
 }
 
@@ -340,6 +386,7 @@ pub(crate) async fn drive(
         let run = Run {
             task: &segment,
             agent: agent.as_ref(),
+            live: false,
         };
         let stop = run_segment(ctx, run, &mut progress, &mut tree, input).await?;
         let mut report = progress.report(stop, &tree);
@@ -448,6 +495,16 @@ pub(crate) async fn run_segment(
     let extra_tools = run.extra_tools();
 
     loop {
+        // A durable agent takes an interrupt and each steer before a turn.
+        if run.live {
+            if take_interrupt(ctx)? {
+                progress.interrupted = true;
+                return Ok(AgentStop::Interrupted);
+            }
+            if let Some(book) = progress.steer.as_mut() {
+                take_steers(ctx, book, &mut progress.messages)?;
+            }
+        }
         // A delegation adds the child usage after a turn. A tree over its cap
         // makes no further call. A run with no delegation never starts a turn
         // over its cap, so this check changes nothing for it.
@@ -468,11 +525,12 @@ pub(crate) async fn run_segment(
         if legacy_zero_cap || exceeds_bytes(&request, cap) {
             return Ok(AgentStop::TranscriptFull);
         }
-        let turn: ModelTurn = match ctx
-            .execute_activity(&agent_model_turn_info(), request)
-            .await
-        {
-            Ok(turn) => turn,
+        let turn: ModelTurn = match model_turn(ctx, run.live, request).await {
+            Ok(Some(turn)) => turn,
+            Ok(None) => {
+                progress.interrupted = true;
+                return Ok(AgentStop::Interrupted);
+            }
             // A spent LLM budget is a bound, so the run ends normally.
             Err(error) if LlmBudgetExceeded::is_refusal(&error) => {
                 return Ok(AgentStop::BudgetExceeded);
@@ -523,6 +581,7 @@ pub(crate) async fn run_segment(
             position: 0,
             labels: None,
             releases: None,
+            interruptible: false,
         };
         progress.steps = progress.steps.saturating_add(1);
         tree.rounds = tree.rounds.saturating_add(1);
@@ -538,8 +597,74 @@ pub(crate) async fn run_segment(
                 return Ok(AgentStop::TranscriptFull);
             }
             RoundEnd::Loop => return Ok(AgentStop::LoopDetected),
+            RoundEnd::Interrupted => {
+                // The text of the turn can claim work that never ran.
+                progress.last_text = narration;
+                return Ok(AgentStop::Interrupted);
+            }
         }
     }
+}
+
+/// One model turn. A durable agent races it against an interrupt.
+///
+/// Returns `None` when an interrupt won. The race cancels the turn and
+/// records the winner, so replay takes the same branch.
+async fn model_turn(
+    ctx: &WorkflowContext,
+    live: bool,
+    request: ModelTurnRequest,
+) -> HarvestResult<Option<ModelTurn>> {
+    if !live {
+        return ctx
+            .execute_activity(&agent_model_turn_info(), request)
+            .await
+            .map(Some);
+    }
+    let winner = ctx
+        .race()
+        .activity(&agent_model_turn_info(), request)
+        .signal(INTERRUPT_SIGNAL)
+        .run()
+        .await?;
+    if winner.index == 0 {
+        winner.decode().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// Take one waiting interrupt. Returns `true` when one was waiting.
+fn take_interrupt(ctx: &WorkflowContext) -> Result<bool, String> {
+    Ok(ctx
+        .try_wait_for_signal(INTERRUPT_SIGNAL)
+        .map_err(|err| err.to_string())?
+        .is_some())
+}
+
+/// Add each waiting steer to the transcript as a user message.
+///
+/// A steer whose op already ran is a no-op. A payload that does not decode
+/// is dropped: it carries no message id to keep.
+fn take_steers(
+    ctx: &WorkflowContext,
+    book: &mut SteerBook,
+    messages: &mut Vec<ChatMessage>,
+) -> Result<(), String> {
+    for raw in ctx
+        .drain_signals_raw(STEER_SIGNAL)
+        .map_err(|err| err.to_string())?
+    {
+        let Ok(steer) = serde_json::from_value::<Steer>(raw) else {
+            continue;
+        };
+        if SteerBook::take(&mut book.ran, &steer.message_id) {
+            continue;
+        }
+        messages.push(ChatMessage::text(ChatRole::User, steer.text));
+        SteerBook::note(&mut book.steered, steer.message_id);
+    }
+    Ok(())
 }
 
 /// The system prompt of one segment: the task prompt and the memory
@@ -569,6 +694,8 @@ enum RoundEnd {
     Full,
     /// The loop guard stopped the run.
     Loop,
+    /// An interrupt ended the round (issue #2265).
+    Interrupted,
 }
 
 /// Where one call sits in its run and in the tree, with its recorded flow
@@ -587,6 +714,8 @@ struct Slot<'a> {
     /// The flow rules that an approval of the call releases. `None` when no
     /// rule of the deciding worker can be released.
     releases: Option<&'a Released>,
+    /// An interrupt may cancel the call once it started (issue #2265).
+    interruptible: bool,
 }
 
 impl Slot<'_> {
@@ -694,10 +823,17 @@ async fn run_round(
     for (position, call) in calls.into_iter().enumerate() {
         progress.tool_calls = progress.tool_calls.saturating_add(1);
         let call_id = call.id.clone();
+        // A durable agent takes an interrupt before each call. No later call
+        // of the round runs after one.
+        if run.live && !progress.interrupted && !full && !looped && take_interrupt(ctx)? {
+            progress.interrupted = true;
+        }
         let content = if full {
             ToolOutcome::error(NOT_RUN_FULL).content
         } else if looped {
             ToolOutcome::error(NOT_RUN_LOOP).content
+        } else if progress.interrupted {
+            ToolOutcome::error(NOT_RUN_INTERRUPTED).content
         } else if stale {
             ToolOutcome::error(NOT_RUN_STALE).content
         } else if !budget.can_run() {
@@ -727,6 +863,7 @@ async fn run_round(
                 position,
                 labels,
                 releases: turn.releases.get(position),
+                interruptible: turn.interruptible.get(position).copied().unwrap_or(false),
                 ..slot
             };
             let mut content = decide(ctx, run, progress, tree, at, call, decision)
@@ -761,6 +898,8 @@ async fn run_round(
         RoundEnd::Full
     } else if looped {
         RoundEnd::Loop
+    } else if progress.interrupted {
+        RoundEnd::Interrupted
     } else {
         RoundEnd::Continue
     })
@@ -771,11 +910,19 @@ async fn run_round(
 /// The round budget reserves it for every call, so any fixed answer fits the
 /// next request in its place.
 fn placeholder() -> String {
-    [DROPPED_FULL, NOT_RUN_FULL, NOT_RUN_LOOP, NOT_RUN_STALE]
-        .into_iter()
-        .map(|message| ToolOutcome::error(message).content)
-        .max_by_key(json_len)
-        .unwrap_or_default()
+    [
+        DROPPED_FULL,
+        NOT_RUN_FULL,
+        NOT_RUN_LOOP,
+        NOT_RUN_STALE,
+        NOT_RUN_INTERRUPTED,
+        INTERRUPTED_CALL,
+        INTERRUPTED_APPROVAL,
+    ]
+    .into_iter()
+    .map(|message| ToolOutcome::error(message).content)
+    .max_by_key(json_len)
+    .unwrap_or_default()
 }
 
 /// The answer to a call whose result would exceed the request cap.
@@ -789,6 +936,17 @@ const NOT_RUN_FULL: &str = "the call did not run: the next request would exceed 
 /// The answer to a call that did not run because the loop guard stopped the
 /// run.
 const NOT_RUN_LOOP: &str = "the call did not run: the loop guard stopped the run";
+
+/// The answer to a call that did not run because a person interrupted the op.
+const NOT_RUN_INTERRUPTED: &str = "the call did not run: a person interrupted this op";
+
+/// The answer to a call that an interrupt cancelled while it ran. Only a tool
+/// that opts in can get it.
+const INTERRUPTED_CALL: &str = "the call was cancelled: a person interrupted this op";
+
+/// The answer to a gated call whose approval wait an interrupt ended.
+const INTERRUPTED_APPROVAL: &str =
+    "denied: a person interrupted this op while the call waited for an approval";
 
 /// The answer to a call that did not run because a delegation earlier in the
 /// round added flow labels after the decision.
@@ -837,12 +995,17 @@ async fn gated_call(
     mut call: ToolCall,
 ) -> Result<ToolOutcome, String> {
     let task = run.task;
-    let decision = await_decision::<Approval>(
-        ctx,
-        &approval_signal(slot.round, slot.position, &call.id),
-        Duration::from_secs(task.approval_timeout_secs),
-    )
-    .await?;
+    let name = approval_signal(slot.round, slot.position, &call.id);
+    let timeout = Duration::from_secs(task.approval_timeout_secs);
+    let decision = if run.live {
+        let Some(decision) = live_decision(ctx, &name, timeout).await? else {
+            progress.interrupted = true;
+            return Ok(ToolOutcome::error(INTERRUPTED_APPROVAL));
+        };
+        decision
+    } else {
+        await_decision::<Approval>(ctx, &name, timeout).await?
+    };
     match decision {
         Decision::Decided(Approval::Approve) => {
             slot.exercise(tree);
@@ -866,6 +1029,29 @@ async fn gated_call(
             task.approval_timeout_secs
         ))),
     }
+}
+
+/// Wait for a decision on one gated call of a durable agent, or an interrupt.
+///
+/// Returns `None` when an interrupt won the race.
+async fn live_decision(
+    ctx: &WorkflowContext,
+    name: &str,
+    timeout: Duration,
+) -> Result<Option<Decision<Approval>>, String> {
+    let winner = ctx
+        .race()
+        .signal(name)
+        .signal(INTERRUPT_SIGNAL)
+        .timer(timeout)
+        .run()
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(match winner.index {
+        0 => Some(decode_decision(Some(winner.value))),
+        1 => None,
+        _ => Some(Decision::TimedOut),
+    })
 }
 
 /// Run one tool call.
@@ -909,21 +1095,35 @@ async fn run_tool(
     if let Some(agent) = run.agent.filter(|_| call.name == DELEGATE_TOOL) {
         return delegate(ctx, run, agent, progress, tree, &call).await;
     }
-    ctx.execute_activity(
-        &agent_tool_call_info(),
-        ToolCallRequest {
-            run_id: progress.run_id.clone(),
-            session_id: task.session_id.clone(),
-            step: progress.step_base.saturating_add(slot.step),
-            call,
-            memory_scope: task.memory_tool_scope(),
-            read_only: task.read_only,
-            allowed_tools: run.allowed_tools(),
-            labels: slot.labels.cloned(),
-        },
-    )
-    .await
-    .map_err(|e| e.to_string())
+    let request = ToolCallRequest {
+        run_id: progress.run_id.clone(),
+        session_id: task.session_id.clone(),
+        step: progress.step_base.saturating_add(slot.step),
+        call,
+        memory_scope: task.memory_tool_scope(),
+        read_only: task.read_only,
+        allowed_tools: run.allowed_tools(),
+        labels: slot.labels.cloned(),
+    };
+    // Only a tool that opts in races an interrupt. Any other call runs to
+    // its end, because its side effect may be half done.
+    if run.live && slot.interruptible {
+        let winner = ctx
+            .race()
+            .activity(&agent_tool_call_info(), request)
+            .signal(INTERRUPT_SIGNAL)
+            .run()
+            .await
+            .map_err(|e| e.to_string())?;
+        if winner.index == 0 {
+            return winner.decode().map_err(|e| e.to_string());
+        }
+        progress.interrupted = true;
+        return Ok(ToolOutcome::error(INTERRUPTED_CALL));
+    }
+    ctx.execute_activity(&agent_tool_call_info(), request)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The arguments of a `delegate` call, or `None` when they are not exactly
@@ -998,6 +1198,7 @@ async fn delegate(
     let child_run = Run {
         task: &child_task,
         agent: Some(&child_agent),
+        live: run.live,
     };
     let stop = Box::pin(run_segment(
         ctx,
@@ -1007,6 +1208,10 @@ async fn delegate(
         &child_task.input,
     ))
     .await?;
+    // An interrupt that ended the child ends the round of the parent too.
+    if child.interrupted {
+        progress.interrupted = true;
+    }
     // The parent counts the whole subtree, as it does for usage.
     let steps = child.steps.saturating_add(child.delegated_steps);
     let tool_calls = child.tool_calls.saturating_add(child.delegated_tool_calls);
@@ -1387,6 +1592,7 @@ mod tests {
             labels: vec![labels(&["a"]), labels(&["denied"]), labels(&["c"])],
             releases: vec![rule(&["x"]), rule(&["denied"]), rule(&["y"])],
             oversized: false,
+            interruptible: Vec::new(),
         };
         let (exercised, released) = flow_after(&tree, &turn);
         assert_eq!(
@@ -1402,7 +1608,15 @@ mod tests {
         // The round reserves one placeholder per call. Any fixed answer that
         // replaces it must not grow the next request.
         let reserved = json_len(&placeholder());
-        for message in [DROPPED_FULL, NOT_RUN_FULL, NOT_RUN_LOOP, NOT_RUN_STALE] {
+        for message in [
+            DROPPED_FULL,
+            NOT_RUN_FULL,
+            NOT_RUN_LOOP,
+            NOT_RUN_STALE,
+            NOT_RUN_INTERRUPTED,
+            INTERRUPTED_CALL,
+            INTERRUPTED_APPROVAL,
+        ] {
             let answer = ToolOutcome::error(message).content;
             assert!(json_len(&answer) <= reserved, "{message}");
         }

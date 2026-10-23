@@ -511,6 +511,7 @@ impl AgentHarness {
                 labels: Vec::new(),
                 releases: Vec::new(),
                 oversized: false,
+                interruptible: Vec::new(),
             };
             let info = RunInfo {
                 run_id: RunId::new(request.run_id.clone()),
@@ -532,6 +533,9 @@ impl AgentHarness {
                 &mut policy_budget,
             )
             .await;
+            if request.interruptible {
+                turn.interruptible = self.interruptible_calls(&turn, &builtins);
+            }
             // The cache serves and keeps only an answer whose whole turn fits.
             // The check uses the turn before the cut below. A cached turn that
             // exceeds the cap would end every identical run as
@@ -686,6 +690,19 @@ impl AgentHarness {
             turn.decisions.push(decision);
         }
         *budget = budget.saturating_sub(started.elapsed());
+    }
+
+    /// For each tool call of `turn`, whether its tool opts in to an
+    /// interrupt (issue #2265). An unknown tool does not.
+    fn interruptible_calls(&self, turn: &ModelTurn, builtins: &[Arc<dyn Tool>]) -> Vec<bool> {
+        turn.calls()
+            .iter()
+            .map(|call| {
+                self.visible(builtins)
+                    .find(|tool| tool.name() == call.name)
+                    .is_some_and(Tool::interruptible)
+            })
+            .collect()
     }
 
     /// Send `chat` to the model within the model time budget.
@@ -1245,6 +1262,7 @@ mod tests {
             labels: Vec::new(),
             releases: Vec::new(),
             oversized: false,
+            interruptible: Vec::new(),
         }
     }
 

@@ -91,8 +91,9 @@ pub mod workflow;
 
 pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentId, AgentIdError, AgentMemory, AgentOp, AgentProfile,
-    AgentState, AgentStatus, Control, UserMessage, agent, agent_info, agent_memory_reset,
-    agent_memory_reset_info, agent_profile, agent_profile_info,
+    AgentState, AgentStatus, Control, INTERRUPT_SIGNAL, Interrupt, STEER_SIGNAL, Steer, Urgency,
+    UserMessage, agent, agent_info, agent_memory_reset, agent_memory_reset_info, agent_profile,
+    agent_profile_info,
 };
 pub use approval::Approval;
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};

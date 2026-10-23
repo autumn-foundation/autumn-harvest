@@ -862,5 +862,31 @@ A control op applies at once, also while the agent is paused. The kernel
 - The transcript keeps at most `AgentProfile::window` messages. The cut
   lands on a user message.
 
+### Mid-turn messages (issue #2265)
+
+A message carries an `Urgency`. `sqlite::send` sends the extra signal first,
+then the op. On Postgres, send the signal of `Agent::urgency_signal(&op)` to
+the running run, then the op.
+
+| Urgency | Signal | Effect |
+|---|---|---|
+| `queue` | none | The message runs after the current op. |
+| `steer` | `agent.steer` | A running segment adds the text before its next model turn. The op is then a no-op. With no op running, the op runs the message once. |
+| `interrupt` | `agent.interrupt` | The current op stops. The message runs next. |
+
+What an interrupt does to the work in flight:
+
+| In flight | Effect |
+|---|---|
+| A model turn | The race cancels it. The op ends as `interrupted`. |
+| A tool call whose tool opts in (`Tool::interruptible`) | The race cancels it. The call answers that it was cancelled. |
+| Any other tool call | It runs to its end. No later call of the round runs. |
+| An approval wait | It ends as a rejection. The tool does not run. |
+
+The race records its winner, so replay takes the same branch and asks no
+model again. An interrupt that arrives while no op runs is stale, and the
+next op drops it. On SQLite a running activity never sees a cancel: the
+workflow takes the interrupt, and the activity result is dropped.
+
 `autumn-harvest-agent/examples/agent_session_entity.rs` runs a chat session
 as an agent.

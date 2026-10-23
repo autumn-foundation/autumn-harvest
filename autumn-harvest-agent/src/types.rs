@@ -375,6 +375,10 @@ pub struct ModelTurnRequest {
     /// turn. See [`Recheck::UntilApproved`](crate::Recheck::UntilApproved).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_released: Released,
+    /// Record which tool calls opt in to an interrupt (issue #2265). Only a
+    /// durable agent sets it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub interruptible: bool,
 }
 
 /// The recorded result of one model-turn activity.
@@ -411,6 +415,10 @@ pub struct ModelTurn {
     /// [`AgentStop::ReplyTooLarge`].
     #[serde(default, skip_serializing_if = "is_false")]
     pub oversized: bool,
+    /// For each tool call, whether an interrupt may cancel it (issue #2265).
+    /// Empty unless the request set `interruptible`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interruptible: Vec<bool>,
 }
 
 impl ModelTurn {
@@ -429,6 +437,7 @@ impl ModelTurn {
             labels: Vec::new(),
             releases: Vec::new(),
             oversized: true,
+            interruptible: Vec::new(),
         }
     }
 
@@ -556,6 +565,8 @@ pub enum AgentStop {
     BudgetExceeded,
     /// The model repeated the same tool call with the same result too often.
     LoopDetected,
+    /// A person interrupted a durable agent mid-op (issue #2265).
+    Interrupted,
 }
 
 /// The workflow output: how the run ended and what it produced.
@@ -679,6 +690,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&decoded).unwrap(), turn);
         let dropped = ModelTurn {
             oversized: true,
+            interruptible: Vec::new(),
             ..decoded
         };
         let value = serde_json::to_value(&dropped).unwrap();
@@ -728,6 +740,7 @@ mod tests {
             labels: Vec::new(),
             releases: Vec::new(),
             oversized: false,
+            interruptible: Vec::new(),
         };
         assert_eq!(turn.text(), "ab");
         let calls = turn.calls();

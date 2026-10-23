@@ -1292,6 +1292,7 @@ mod tests {
             labels: Vec::new(),
             releases: Vec::new(),
             oversized: false,
+            interruptible: Vec::new(),
         }
     }
 

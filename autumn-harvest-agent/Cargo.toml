@@ -77,6 +77,10 @@ required-features = ["sqlite"]
 name = "durable_agent"
 required-features = ["sqlite"]
 
+[[test]]
+name = "agent_interrupts"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 

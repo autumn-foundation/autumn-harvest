@@ -1095,6 +1095,7 @@ async fn a_turn_records_labels_only_with_flow_rules() {
         allowed_tools: None,
         flow_labels: BTreeSet::new(),
         flow_released: autumn_harvest_agent::Released::new(),
+        interruptible: false,
     };
     let plain = AgentHarness::new(model.clone()).tool(inbox());
     let turn = plain.model_turn(request.clone()).await.unwrap();
@@ -1391,6 +1392,7 @@ fn turn_request() -> ModelTurnRequest {
         allowed_tools: None,
         flow_labels: BTreeSet::new(),
         flow_released: autumn_harvest_agent::Released::new(),
+        interruptible: false,
     }
 }
 

@@ -35,3 +35,25 @@ restart at an approval, a process crash inside a model call, labels across
 a checkpoint, pause and resume, a failed op, approval names, an unknown kind,
 delete and a new life, reset memory, replay). Each guarantee was checked by a
 mutation that turns its test red.
+
+### Mid-turn messages: queue, steer and interrupt (issue #2265)
+
+- `UserMessage::urgency`: `queue` (the default), `steer` and `interrupt`.
+  `Agent::urgency_signal` names the signal that goes before the op:
+  `agent.steer` with a `Steer`, or `agent.interrupt` with an `Interrupt`.
+- A durable agent races each model turn against `agent.interrupt`. The race
+  records its winner, so replay takes the same branch.
+- `Tool::interruptible` (default `false`) and `FnTool::interruptible`. Only
+  an opted-in tool call races an interrupt. Any other call runs to its end,
+  and no later call of the round runs.
+- An approval wait ends as a rejection on an interrupt.
+- `AgentStop::Interrupted`. `ModelTurnRequest::interruptible` and
+  `ModelTurn::interruptible` are left out at their defaults, so an
+  `agent_loop` request records the same bytes as before.
+- A steer and its op dedupe through `AgentState::steer`, so each steer runs
+  once.
+
+Tests: `autumn-harvest-agent/tests/agent_interrupts.rs` (9 tests). Two are
+simulator sweeps. In every seed a write tool is never cancelled halfway, and
+some seeds cancel an opted-in tool. Each guarantee was checked by a mutation
+that turns its test red.
