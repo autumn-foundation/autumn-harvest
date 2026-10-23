@@ -99,9 +99,10 @@ let worker = WorkerConfig::default().with_owner_disk_cache("/var/cache/harvest")
 
 - **Opt-in.** It needs the `owner-disk-cache` feature, owner mode and `sticky_timeout` above zero. Give each process its own directory. A second process on the same directory fails to start.
 - **Sealed.** Each row is sealed under a key that lives in memory only. The cache stores decoded events, so no codec ciphertext reaches the disk.
-- **Disposable.** The worker deletes every cache file at start, on a lost tenure and at shutdown. A terminal commit and an evict wake purge the run. A reconcile pass every 30 s purges each cached run that is no longer `RUNNING`.
+- **Disposable.** The worker deletes every cache file at start. A lost tenure deletes the file of its partition. A stopped worker deletes the files that it wrote. A terminal commit and an evict wake purge the run, and an erasure sends the owner an evict wake. The owner scan runs a reconcile pass at most once in 30 s per shard. It purges each cached run that is not `RUNNING`, and each file of an older codec key generation.
 - **Checked.** A read compares the last cached event with Postgres. A mismatch, another epoch, another codec key generation or a damaged row purges the entry. The decision then replays cold from Postgres.
 - **Metric.** `harvest.workflow.disk_cache{workflow, queue, outcome}` counts each read: `hit`, `miss`, `stale` or `corrupt`. A disk hit counts as a memory miss in `harvest.workflow.cache_miss`.
+- **Effective config.** The view reports `owner_disk_cache` as `true` when a directory is set. It does not report the path.
 
 ## Configuration
 

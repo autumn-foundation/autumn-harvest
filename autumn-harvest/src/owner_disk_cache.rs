@@ -361,7 +361,13 @@ pub struct OwnerDiskCache {
     partitions: Mutex<HashMap<OwnerKey, Arc<Mutex<Partition>>>>,
     /// The partition of each cached run. It routes a purge by run id.
     index: Mutex<HashMap<Uuid, OwnerKey>>,
+    /// The runs that an evict wake purged, and when. A store refuses such a
+    /// run for [`EVICT_HOLD`], so an in-flight store cannot write it back.
+    evicted: Mutex<HashMap<Uuid, std::time::Instant>>,
 }
+
+/// How long a store refuses a run after an evict wake purged it.
+pub const EVICT_HOLD: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl std::fmt::Debug for OwnerDiskCache {
     /// Prints the directory only. The node key never prints.
@@ -379,24 +385,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl OwnerDiskCache {
     /// Open the cache in `dir`, and delete every cache file in it.
     ///
-    /// The open creates `dir` when it is missing. On Unix it sets the mode
-    /// `0700`. It takes an exclusive lock on [`LOCK_FILE_NAME`] first, so a
-    /// second process cannot delete the files of a live one. Files with
-    /// other names stay.
+    /// The open creates `dir` when it is missing, with the mode `0700` on
+    /// Unix. On Unix it refuses an existing directory that its group or other
+    /// users can reach. It never changes the mode of an existing directory.
+    /// It takes an exclusive lock on [`LOCK_FILE_NAME`] first, so a second
+    /// process cannot delete the files of a live one. Files with other names
+    /// stay.
     ///
     /// # Errors
     ///
     /// Returns [`HarvestError::Config`] when another process holds the lock,
-    /// and when the directory or a file cannot be created or deleted.
+    /// when the directory is open to other users, and when the directory or a
+    /// file cannot be created or deleted.
     pub fn open(dir: impl AsRef<Path>) -> HarvestResult<Self> {
         let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&dir).map_err(|e| io_config(&dir, &e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|e| io_config(&dir, &e))?;
-        }
+        prepare_dir(&dir)?;
         let lock = lock_dir(&dir)?;
         wipe_dir(&dir)?;
         Ok(Self {
@@ -405,6 +408,7 @@ impl OwnerDiskCache {
             sealer: Sealer::new(),
             partitions: Mutex::new(HashMap::new()),
             index: Mutex::new(HashMap::new()),
+            evicted: Mutex::new(HashMap::new()),
         })
     }
 
@@ -465,8 +469,10 @@ impl OwnerDiskCache {
             return DiskLoad::Miss;
         };
         let outcome = self.read_run(conn, slot.key, exec);
-        if !matches!(outcome, DiskLoad::Hit(_) | DiskLoad::Miss) {
-            self.delete_run(conn, slot.key, exec);
+        if !matches!(outcome, DiskLoad::Hit(_) | DiskLoad::Miss)
+            && !self.delete_run(conn, slot.key, exec)
+        {
+            self.close_partition(slot.key, &partition, &mut guard);
         }
         drop(guard);
         outcome
@@ -514,9 +520,13 @@ impl OwnerDiskCache {
         }
         let partition = self.partition(slot.key);
         let mut guard = lock(&partition);
-        if guard.closed || !still_owned() {
-            if let Some(conn) = guard.conn.as_ref() {
-                self.delete_run(conn, slot.key, exec);
+        if guard.closed || self.held_back(exec) || !still_owned() {
+            let deleted = guard
+                .conn
+                .as_ref()
+                .is_none_or(|conn| self.delete_run(conn, slot.key, exec));
+            if !deleted {
+                self.close_partition(slot.key, &partition, &mut guard);
             }
             return DiskStore::Refused;
         }
@@ -526,20 +536,36 @@ impl OwnerDiskCache {
         let Some(conn) = guard.conn.as_mut() else {
             return DiskStore::Failed;
         };
-        let outcome = self
-            .write_run(conn, slot.key, exec, state, history_bytes)
-            .map_or_else(
-                || {
-                    self.delete_run(conn, slot.key, exec);
-                    DiskStore::Failed
-                },
-                |appended| {
-                    lock(&self.index).insert(exec, slot.key);
-                    DiskStore::Written { appended }
-                },
-            );
+        let written = self.write_run(conn, slot.key, exec, state, history_bytes);
+        if written.is_some() {
+            lock(&self.index).insert(exec, slot.key);
+        } else if !self.delete_run(conn, slot.key, exec) {
+            self.close_partition(slot.key, &partition, &mut guard);
+        }
         drop(guard);
-        outcome
+        written.map_or(DiskStore::Failed, |appended| DiskStore::Written { appended })
+    }
+
+    /// Delete the entry of `exec`, and refuse to store it for
+    /// [`EVICT_HOLD`]. An evict wake calls this. Returns `true` when the
+    /// cache held an entry.
+    ///
+    /// The hold starts before the purge takes the partition lock. So a store
+    /// in flight either writes before the purge deletes, or is refused.
+    pub fn purge_evicted(&self, exec: Uuid) -> bool {
+        let now = std::time::Instant::now();
+        let mut evicted = lock(&self.evicted);
+        evicted.retain(|_, at| now.duration_since(*at) < EVICT_HOLD);
+        evicted.insert(exec, now);
+        drop(evicted);
+        self.purge(exec)
+    }
+
+    /// Whether an evict wake purged `exec` within [`EVICT_HOLD`].
+    fn held_back(&self, exec: Uuid) -> bool {
+        lock(&self.evicted)
+            .get(&exec)
+            .is_some_and(|at| at.elapsed() < EVICT_HOLD)
     }
 
     /// Delete the entry of `exec`. Returns `true` when the cache held one.
@@ -548,10 +574,15 @@ impl OwnerDiskCache {
             return false;
         };
         if let Some(partition) = self.existing_partition(key) {
-            let guard = lock(&partition);
-            if let Some(conn) = guard.conn.as_ref() {
-                self.delete_run(conn, key, exec);
+            let mut guard = lock(&partition);
+            let deleted = guard
+                .conn
+                .as_ref()
+                .is_none_or(|conn| self.delete_run(conn, key, exec));
+            if !deleted {
+                self.close_partition(key, &partition, &mut guard);
             }
+            drop(guard);
         }
         let mut index = lock(&self.index);
         if index.get(&exec) == Some(&key) {
@@ -566,10 +597,12 @@ impl OwnerDiskCache {
     /// [`Self::store`].
     pub fn drop_partitions(&self, keys: &[OwnerKey]) {
         for &key in keys {
-            let partition = lock(&self.partitions).remove(&key);
-            if let Some(partition) = partition {
+            // Lock the current partition before it leaves the map. A store
+            // then cannot open a second partition for the key in between.
+            if let Some(partition) = self.existing_partition(key) {
                 let mut guard = lock(&partition);
                 self.close_partition(key, &partition, &mut guard);
+                drop(guard);
             } else {
                 remove_cache_file(&self.file_path(key));
             }
@@ -634,6 +667,11 @@ impl OwnerDiskCache {
         partition: &Arc<Mutex<Partition>>,
         guard: &mut MutexGuard<'_, Partition>,
     ) {
+        // A closed partition already left the map. Its path can now belong to
+        // a newer partition, so it deletes nothing.
+        if guard.closed {
+            return;
+        }
         guard.closed = true;
         drop(guard.conn.take());
         remove_cache_file(&guard.path);
@@ -869,8 +907,9 @@ impl OwnerDiskCache {
         Some(state.events.len() - start)
     }
 
-    /// Delete the rows of `exec`. A failed delete deletes the whole file.
-    fn delete_run(&self, conn: &Connection, key: OwnerKey, exec: Uuid) {
+    /// Delete the rows of `exec`. Returns `false` when the delete failed.
+    /// The caller then closes the partition, which deletes the whole file.
+    fn delete_run(&self, conn: &Connection, key: OwnerKey, exec: Uuid) -> bool {
         let exec_text = exec.to_string();
         let deleted = conn
             .execute(
@@ -888,12 +927,10 @@ impl OwnerDiskCache {
             index.remove(&exec);
         }
         drop(index);
-        if let Err(err) = deleted {
+        if let Err(err) = &deleted {
             tracing::warn!(error = %err, "owner disk cache: a purge failed; the file is deleted");
-            // The caller holds the partition lock, so this cannot race a write.
-            remove_cache_file(&self.file_path(key));
-            lock(&self.index).retain(|_, k| *k != key);
         }
+        deleted.is_ok()
     }
 }
 
@@ -935,6 +972,40 @@ fn io_config(path: &Path, err: &std::io::Error) -> HarvestError {
         "owner disk cache: {} failed: {err}",
         path.display()
     ))
+}
+
+/// Create `dir` with the mode `0700`, or check an existing one.
+///
+/// On Unix an existing directory must give its group and other users no
+/// access. The open never changes the mode of a directory that it did not
+/// create.
+fn prepare_dir(dir: &Path) -> HarvestResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if !dir.exists() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir)
+                .map_err(|e| io_config(dir, &e))?;
+        }
+        let mode = std::fs::metadata(dir)
+            .map_err(|e| io_config(dir, &e))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(HarvestError::Config(format!(
+                "owner disk cache: {} is open to other users (mode {:o}); use a private \
+                 directory with mode 0700",
+                dir.display(),
+                mode & 0o777
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(dir).map_err(|e| io_config(dir, &e))?;
+    Ok(())
 }
 
 /// Take the exclusive lock on the sidecar file of `dir`.
@@ -993,6 +1064,9 @@ pub(crate) struct DiskTier {
     cache: Arc<OwnerDiskCache>,
     codecs: crate::payload_codec::PayloadCodecs,
     last_reconcile: Arc<Mutex<HashMap<Option<ShardId>, std::time::Instant>>>,
+    /// The partitions that this worker wrote. Workers of one registry share
+    /// the cache, so a shutdown drops only these.
+    written: Arc<Mutex<std::collections::HashSet<OwnerKey>>>,
 }
 
 /// What a disk read gives a decision.
@@ -1012,6 +1086,7 @@ impl DiskTier {
             cache,
             codecs,
             last_reconcile: Arc::default(),
+            written: Arc::default(),
         }
     }
 
@@ -1116,8 +1191,14 @@ impl DiskTier {
         .await;
         match written {
             Ok((state, outcome)) => {
-                if outcome == DiskStore::Failed {
-                    tracing::warn!(%key, "owner disk cache: a write failed; the entry is purged");
+                match outcome {
+                    DiskStore::Written { .. } => {
+                        lock(&self.written).insert(key);
+                    }
+                    DiskStore::Failed => {
+                        tracing::warn!(%key, "owner disk cache: a write failed; the entry is purged");
+                    }
+                    DiskStore::Refused => {}
                 }
                 Some(state)
             }
@@ -1140,6 +1221,23 @@ impl DiskTier {
             .unwrap_or(false)
     }
 
+    /// Delete the entry of `exec` for an evict wake, and hold back its
+    /// stores for [`EVICT_HOLD`].
+    pub(crate) async fn purge_evicted(&self, exec: Uuid) {
+        let cache = Arc::clone(&self.cache);
+        if let Err(err) = tokio::task::spawn_blocking(move || cache.purge_evicted(exec)).await {
+            tracing::warn!(error = %err, "owner disk cache: an evict purge task died");
+        }
+    }
+
+    /// Delete the file of each partition that this worker wrote. A stopped
+    /// worker then keeps no disk file. Other workers of the registry keep
+    /// theirs.
+    pub(crate) async fn close(&self) {
+        let keys: Vec<OwnerKey> = lock(&self.written).drain().collect();
+        self.drop_partitions(&keys).await;
+    }
+
     /// Delete the file of each partition in `keys`.
     pub(crate) async fn drop_partitions(&self, keys: &[OwnerKey]) {
         if keys.is_empty() {
@@ -1149,14 +1247,6 @@ impl DiskTier {
         let keys = keys.to_vec();
         if let Err(err) = tokio::task::spawn_blocking(move || cache.drop_partitions(&keys)).await {
             tracing::warn!(error = %err, "owner disk cache: a partition drop task died");
-        }
-    }
-
-    /// Delete every cache file.
-    pub(crate) async fn wipe(&self) {
-        let cache = Arc::clone(&self.cache);
-        if let Err(err) = tokio::task::spawn_blocking(move || cache.wipe()).await {
-            tracing::warn!(error = %err, "owner disk cache: a wipe task died");
         }
     }
 
@@ -1322,6 +1412,18 @@ mod tests {
         true
     }
 
+    /// A temporary directory with the mode `0700`, as the open requires.
+    fn private_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod");
+        }
+        dir
+    }
+
     /// Bump the file change counter in the SQLite header, bytes 24 to 27.
     /// An open connection then drops its page cache, as after any outside
     /// write.
@@ -1334,7 +1436,7 @@ mod tests {
 
     #[test]
     fn a_stored_run_loads_back() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let exec = Uuid::new_v4();
         let stored = cache.store(&slot(1), exec, &state(3), owned);
@@ -1351,7 +1453,7 @@ mod tests {
 
     #[test]
     fn a_later_store_appends_only_new_events() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let exec = Uuid::new_v4();
         let _ = cache.store(&slot(1), exec, &state(3), owned);
@@ -1365,7 +1467,7 @@ mod tests {
 
     #[test]
     fn a_changed_prefix_rewrites_the_run() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let exec = Uuid::new_v4();
         let _ = cache.store(&slot(1), exec, &state(3), owned);
@@ -1381,7 +1483,7 @@ mod tests {
 
     #[test]
     fn a_state_with_a_gap_is_refused() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let exec = Uuid::new_v4();
         let mut gap = state(3);
@@ -1392,7 +1494,7 @@ mod tests {
 
     #[test]
     fn an_ended_tenure_is_refused_and_purged() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let exec = Uuid::new_v4();
         let _ = cache.store(&slot(1), exec, &state(2), owned);
@@ -1406,7 +1508,7 @@ mod tests {
 
     #[test]
     fn a_new_epoch_finds_the_file_stale_and_deletes_it() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let exec = Uuid::new_v4();
         let _ = cache.store(&slot(1), exec, &state(2), owned);
@@ -1421,7 +1523,7 @@ mod tests {
 
     #[test]
     fn a_new_codec_generation_finds_the_file_stale() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let exec = Uuid::new_v4();
         let _ = cache.store(&slot(1), exec, &state(2), owned);
@@ -1435,7 +1537,7 @@ mod tests {
 
     #[test]
     fn retain_codec_generation_drops_each_older_file() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         let _ = cache.store(&slot(1), a, &state(2), owned);
@@ -1448,7 +1550,7 @@ mod tests {
 
     #[test]
     fn a_flipped_byte_is_corrupt_and_purges_the_run() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let exec = Uuid::new_v4();
         let _ = cache.store(&slot(1), exec, &state(3), owned);
@@ -1468,7 +1570,7 @@ mod tests {
 
     #[test]
     fn swapped_rows_are_corrupt() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let exec = Uuid::new_v4();
         let _ = cache.store(&slot(1), exec, &state(3), owned);
@@ -1485,7 +1587,7 @@ mod tests {
 
     #[test]
     fn a_row_of_another_run_does_not_open() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         let _ = cache.store(&slot(1), a, &state(2), owned);
@@ -1505,7 +1607,7 @@ mod tests {
 
     #[test]
     fn a_broken_file_stamp_deletes_the_file() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let exec = Uuid::new_v4();
         let _ = cache.store(&slot(1), exec, &state(2), owned);
@@ -1519,7 +1621,7 @@ mod tests {
 
     #[test]
     fn no_plaintext_reaches_the_disk() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let _ = cache.store(&slot(1), Uuid::new_v4(), &state(3), owned);
         let raw = cache_bytes(&cache);
@@ -1531,7 +1633,7 @@ mod tests {
     /// AC 1 at the module level: a purge leaves no byte of the run.
     #[test]
     fn a_purged_run_leaves_no_local_bytes() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let (gone, kept) = (Uuid::new_v4(), Uuid::new_v4());
         let _ = cache.store(&slot(1), kept, &state(2), owned);
@@ -1553,7 +1655,7 @@ mod tests {
 
     #[test]
     fn a_dropped_partition_deletes_its_file() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
         let _ = cache.store(&slot(1), a, &state(2), owned);
@@ -1568,7 +1670,7 @@ mod tests {
 
     #[test]
     fn open_wipes_cache_files_and_keeps_other_files() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         for name in ["s0-p1.hcache", "s7-p3.hcache-journal", "notes.txt"] {
             std::fs::write(dir.path().join(name), b"old").expect("seed");
         }
@@ -1581,7 +1683,7 @@ mod tests {
 
     #[test]
     fn a_second_open_of_one_directory_is_refused() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let first = OwnerDiskCache::open(dir.path()).expect("open");
         let exec = Uuid::new_v4();
         let _ = first.store(&slot(1), exec, &state(2), owned);
@@ -1592,7 +1694,7 @@ mod tests {
 
     #[test]
     fn a_drop_wipes_the_directory() {
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let _ = cache.store(&slot(1), Uuid::new_v4(), &state(2), owned);
         let path = cache.file_path(key(1));
@@ -1632,6 +1734,72 @@ mod tests {
         assert!(!is_cache_file("data.sqlite"));
     }
 
+    #[test]
+    fn an_evicted_run_is_held_back_from_a_late_store() {
+        let dir = private_dir();
+        let cache = OwnerDiskCache::open(dir.path()).expect("open");
+        let exec = Uuid::new_v4();
+        let _ = cache.store(&slot(1), exec, &state(2), owned);
+        assert!(cache.purge_evicted(exec));
+        // A decision in flight commits after the evict wake.
+        assert_eq!(
+            cache.store(&slot(1), exec, &state(3), owned),
+            DiskStore::Refused
+        );
+        assert!(!cache.contains(exec));
+        let other = Uuid::new_v4();
+        assert!(matches!(
+            cache.store(&slot(1), other, &state(2), owned),
+            DiskStore::Written { .. }
+        ));
+    }
+
+    #[test]
+    fn a_closed_partition_never_deletes_a_newer_file() {
+        let dir = private_dir();
+        let cache = OwnerDiskCache::open(dir.path()).expect("open");
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let _ = cache.store(&slot(1), a, &state(2), owned);
+        let old = cache.existing_partition(key(1)).expect("partition");
+        cache.drop_partitions(&[key(1)]);
+        // A new tenure opens a new file for the same key.
+        let _ = cache.store(&slot(1), b, &state(2), owned);
+        let mut guard = lock(&old);
+        cache.close_partition(key(1), &old, &mut guard);
+        drop(guard);
+        assert!(cache.file_path(key(1)).exists());
+        assert!(cache.contains(b));
+        assert!(matches!(cache.load(&slot(1), b), DiskLoad::Hit(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_refuses_a_directory_that_others_can_reach() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_dir();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let err = OwnerDiskCache::open(dir.path()).expect_err("an open directory");
+        assert!(err.to_string().contains("open to other users"), "{err}");
+        let mode = std::fs::metadata(dir.path())
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "the open never changes the mode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = private_dir();
+        let dir = parent.path().join("cache");
+        let cache = OwnerDiskCache::open(&dir).expect("open");
+        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        drop(cache);
+    }
+
     /// AC 3 at the module level. The cache stores decoded events, so no
     /// codec ciphertext reaches the disk. A key change makes each file
     /// stale.
@@ -1652,13 +1820,16 @@ mod tests {
             .map(|e| codecs.encode_event(e).expect("encode"))
             .collect();
         let envelope = stored[0]["data"]["input"].to_string();
-        assert!(envelope.contains("k1") || envelope.len() > 40, "{envelope}");
+        assert!(
+            crate::payload_codec::codec_envelope_key_id(&stored[0]["data"]["input"]) == Some("k1"),
+            "the stored input is a k1 envelope: {envelope}"
+        );
         let decoded: Vec<WorkflowEvent> = stored
             .into_iter()
             .map(|v| codecs.decode_event(v).expect("decode"))
             .collect();
 
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let cache = OwnerDiskCache::open(dir.path()).expect("open");
         let exec = Uuid::new_v4();
         let generation = codecs.key_state().epoch.generation;
@@ -1672,21 +1843,27 @@ mod tests {
         };
         let _ = cache.store(&at, exec, &cached, owned);
         let raw = cache_bytes(&cache);
-        let ciphertext = envelope.trim_matches('"');
-        for part in ciphertext.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let mut checked = 0;
+        for part in envelope.split(|c: char| !c.is_ascii_alphanumeric() && c != '+' && c != '/') {
             if part.len() >= 16 {
+                checked += 1;
                 assert!(!contains(&raw, part.as_bytes()), "codec ciphertext on disk");
             }
         }
+        assert!(checked > 0, "the envelope holds a ciphertext segment");
 
         AeadCodec::new("k2", &DataKey::generate())
             .expect("codec")
             .register_with(&codecs)
             .expect("register k2");
         codecs.set_active_key("k2").expect("activate k2");
+        let activated = codecs.key_state().epoch.generation;
         codecs.retire_key_local("k1").expect("retire k1");
         let rotated = codecs.key_state().epoch.generation;
-        assert_ne!(rotated, generation);
+        assert_ne!(
+            rotated, activated,
+            "the retirement alone changes the generation"
+        );
         assert_eq!(cache.retain_codec_generation(rotated), 1);
         assert_eq!(cache_bytes(&cache).len(), 0, "no cache bytes remain");
         assert!(!cache.contains(exec));
@@ -1717,7 +1894,7 @@ mod tests {
     #[test]
     fn a_killed_owner_leaves_no_readable_bytes() {
         use std::io::BufRead as _;
-        let dir = tempfile::tempdir().expect("dir");
+        let dir = private_dir();
         let exe = std::env::current_exe().expect("test binary");
         let mut child = std::process::Command::new(exe)
             .args([
@@ -1732,11 +1909,19 @@ mod tests {
             .spawn()
             .expect("spawn the owner");
         let stdout = child.stdout.take().expect("stdout");
-        let ready = std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-            .any(|line| line.contains("CHILD-READY"));
-        assert!(ready, "the child stored a run");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let ready = std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+                .any(|line| line.contains("CHILD-READY"));
+            let _ = ready_tx.send(ready);
+        });
+        let ready = ready_rx.recv_timeout(std::time::Duration::from_secs(60));
+        if ready != Ok(true) {
+            let _ = child.kill();
+            panic!("the child did not store a run in time: {ready:?}");
+        }
         child.kill().expect("kill the owner");
         let _ = child.wait();
 

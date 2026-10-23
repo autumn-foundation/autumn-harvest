@@ -100,9 +100,9 @@ gate (#2257) is still undecided, so the cache ships as an opt-in.
 1. `owner_disk_cache.rs`: the directory lock, the wipe, the node key, the
    sealed rows, the stamp, load, store, purge, drop and reconcile.
 2. `store.rs`: `load_event_inflated` reads one event for the anchor check.
-3. `worker.rs`: the disk read on a memory miss, the write after a
-   suspension, the purge points, the reconcile in the owner scan and the
-   wipe at shutdown.
+3. `worker.rs`: the disk read on a memory miss and the write after a
+   suspension. Also the purge points, the reconcile in the owner scan and
+   the drop at shutdown.
 4. `WorkerConfig::with_owner_disk_cache`.
 5. The counter `harvest.workflow.disk_cache` and its dashboard panel.
 6. `examples/history-load-gate`: the warm-up with the disk cache.
@@ -119,7 +119,45 @@ gate (#2257) is still undecided, so the cache ships as an opt-in.
 | `a_corrupt_file_replays_cold` | A damaged file purges the entry. The run completes with no non-determinism block. |
 | module unit tests | Seal, stamp, wipe, lock, epoch, anchor and reconcile rules. |
 
-## 3. Out of scope
+## 3. Review findings
+
+Four review agents read the change: correctness, security, tests and docs.
+The fixes:
+
+- The default build did not compile. One `cfg` covered a `let` but not the
+  `if let` after it.
+- An evict wake could lose a race with a store in flight, which then wrote
+  a terminal run back. A purge from an evict wake now holds back stores of
+  that run for 30 s.
+- A run whose purge was lost stayed on disk until the reconcile pass. An
+  erasure now sends the owner an evict wake.
+- An owner cut off from Postgres kept the files of expired tenures. The
+  owner scan now deletes them when it cannot reach the database.
+- A late close of an old partition could delete the file of a new one. A
+  close now locks the current partition first, and a closed one deletes
+  nothing.
+- A failed delete left a partition half closed. It now closes the
+  partition, which deletes the whole file.
+- One worker's shutdown deleted the files of every worker on the registry.
+  A worker now deletes only the files that it wrote.
+- The open set the mode of any directory to `0700`. It now creates a new
+  directory with `0700` and refuses an existing one that other users can
+  reach.
+- The tests raced the purge after a commit. They now wait for it. New
+  tests cover the evict hold, the erasure wake, a stale partition close,
+  the directory check and a codec rotation in a real worker.
+- The docs said that a lost tenure deletes every file. They now say what
+  the code does.
+
+Accepted as is:
+
+- A core dump or swap can hold the key. ADR 0012 says so.
+- `ghash` 0.5 does not clear its key on drop. That predates this change.
+- The restart warm-up is not faster: the open wipes the cache. The gain is
+  on the next decision of each run past the memory cache. Section 4 gives
+  the numbers.
+
+## 4. Out of scope
 
 - A cache that survives a restart.
 - The go or no-go of the stage 2 gate.

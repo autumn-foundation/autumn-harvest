@@ -35,7 +35,8 @@ impl DiskSide {
     /// Returns an error when the directory or the cache cannot be made.
     pub fn open() -> Result<Self, BoxError> {
         let dir = tempfile::tempdir()?;
-        let cache = Arc::new(OwnerDiskCache::open(dir.path())?);
+        // The cache makes this subdirectory with the mode `0700`.
+        let cache = Arc::new(OwnerDiskCache::open(dir.path().join("cache"))?);
         Ok(Self { cache, _dir: dir })
     }
 
@@ -81,8 +82,8 @@ impl DiskSide {
         }
     }
 
-    /// Read the run `exec` at `index`, then check its last event against
-    /// Postgres. Returns the event count.
+    /// Read the run `exec` at `index`, check its last event against
+    /// Postgres and load the Postgres delta. Returns the event count.
     ///
     /// # Errors
     ///
@@ -107,7 +108,16 @@ impl DiskSide {
         if event_hash(&event)? != entry.last_event_hash {
             return Err("the anchor check failed".into());
         }
-        Ok(entry.state.events.len())
+        // A disk hit then loads the delta, as a memory hit does.
+        let delta = store::load_history_since_inflated(
+            conn,
+            exec,
+            entry.state.next_event_id,
+            &codecs,
+            None,
+        )
+        .await?;
+        Ok(entry.state.events.len() + delta.events.len())
     }
 
     /// The cache, for a blocking task.

@@ -30150,7 +30150,12 @@ impl OwnerWakes {
             // Issue #2258: a state change, a terminal one included, purges
             // the disk entry. An erasure then finds no local copy.
             #[cfg(feature = "owner-disk-cache")]
-            purge_disk_entry(&self.workflow_cache, wake.payload.workflow_exec_id).await;
+            {
+                let disk = self.workflow_cache.lock().await.disk();
+                if let Some(disk) = disk {
+                    disk.purge_evicted(wake.payload.workflow_exec_id).await;
+                }
+            }
             "evict"
         } else {
             "wake"
@@ -35008,6 +35013,14 @@ async fn owner_scan(
         Ok(conn) => conn,
         Err(e) => {
             tracing::warn!(worker_id = %worker_id, error = %e, "owner loop: no connection");
+            // Issue #2258: a tenure past its local deadline keeps no disk
+            // file, even when the database is out of reach.
+            #[cfg(feature = "owner-disk-cache")]
+            {
+                let shard = owner_loop.shard();
+                drop(owner_loop);
+                drop_expired_disk_partitions(cache, owned, shard).await;
+            }
             return OWNER_SCAN_INTERVAL;
         }
     };
@@ -35032,6 +35045,10 @@ async fn owner_scan(
         }
         Err(e) => {
             tracing::warn!(worker_id = %worker_id, error = %e, "owner loop scan failed");
+            // Issue #2258: a failed tick drops no expired tenure. Drop the
+            // disk files of those tenures here.
+            #[cfg(feature = "owner-disk-cache")]
+            drop_expired_disk_partitions(cache, owned, owner_loop.shard()).await;
         }
     }
     #[cfg(feature = "owner-disk-cache")]
@@ -35057,6 +35074,32 @@ async fn conn_then_loop_lock<C, S>(
 ) -> (C, tokio::sync::MutexGuard<'_, S>) {
     let conn = conn.await;
     (conn, state.lock().await)
+}
+
+/// Delete the disk file of each tenure of `shard` whose local deadline has
+/// passed (issue #2258).
+///
+/// The scan calls this when it cannot reach the database. Such a tenure can
+/// no longer decide, so its partition may now have another owner. No write
+/// can follow: a decision under an expired tenure fails closed.
+#[cfg(feature = "owner-disk-cache")]
+async fn drop_expired_disk_partitions(
+    cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    owned: &crate::decision_owner::OwnedPartitions,
+    shard: crate::types::ShardId,
+) {
+    let expired: Vec<crate::decision_owner::OwnerKey> = owned
+        .tenures_of(shard)
+        .iter()
+        .map(crate::decision_owner::OwnerTenure::key)
+        .filter(|key| {
+            matches!(
+                owned.pin_for(*key),
+                crate::decision_owner::DecisionPin::Unowned
+            )
+        })
+        .collect();
+    drop_disk_partitions(cache, &expired).await;
 }
 
 /// Reconcile the disk cache of `shard` when its interval is due (issue
@@ -41557,9 +41600,11 @@ impl Worker {
         // Issue #2258: a stopped worker owns no partition, so it keeps no
         // disk file.
         #[cfg(feature = "owner-disk-cache")]
-        let disk = self.workflow_cache.lock().await.disk();
-        if let Some(disk) = disk {
-            disk.wipe().await;
+        {
+            let disk = self.workflow_cache.lock().await.disk();
+            if let Some(disk) = disk {
+                disk.close().await;
+            }
         }
     }
 

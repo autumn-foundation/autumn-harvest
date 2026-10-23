@@ -22,10 +22,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use autumn_harvest::aead_codec::{AeadCodec, DataKey};
 use autumn_harvest::decision_owner::{
     self, Acquisition, DecisionPartition, OwnedPartitions, OwnerHolder, OwnerKey, OwnerLeaseConfig,
 };
 use autumn_harvest::owner_disk_cache;
+use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::prelude::*;
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
@@ -126,6 +128,7 @@ struct Node {
     worker: Arc<Worker>,
     owned: Arc<OwnedPartitions>,
     outcomes: Outcomes,
+    codecs: PayloadCodecs,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -133,7 +136,10 @@ impl Node {
     async fn stop(mut self) {
         self.worker.shutdown();
         if let Some(task) = self.task.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+            tokio::time::timeout(Duration::from_secs(30), task)
+                .await
+                .expect("the worker stops in time")
+                .expect("the worker task ends cleanly");
         }
     }
 }
@@ -157,7 +163,7 @@ impl Fixture {
                 pool,
                 conn,
                 queue: unique("disk-cache-q"),
-                dir: tempfile::tempdir().expect("cache dir"),
+                dir: private_dir(),
             },
             container,
         )
@@ -174,8 +180,18 @@ impl Fixture {
     /// A worker in owner mode with a disk cache. With `listen`, it gets the
     /// notify URL, so it hears owner wakes.
     fn node(&self, listen: bool) -> Node {
+        self.node_with(listen, None)
+    }
+
+    /// [`Self::node`], with `codec` as the active payload codec key.
+    fn node_with(&self, listen: bool, codec: Option<AeadCodec>) -> Node {
         let outcomes = Outcomes::default();
-        let built = HarvestBuilder::new()
+        let mut builder = HarvestBuilder::new();
+        let key_id = codec.as_ref().map(|c| c.key_id().to_string());
+        if let Some(codec) = codec {
+            builder = builder.aead_payload_codec_key(codec);
+        }
+        let built = builder
             .workflows(workflows![disk_cache_flow, disk_cache_activity_flow])
             .activities(activities![disk_cache_echo])
             .worker(
@@ -190,6 +206,13 @@ impl Fixture {
             )
             .build();
         let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
+        if let Some(key_id) = key_id {
+            registry
+                .payload_codecs()
+                .set_active_key(&key_id)
+                .expect("activate the codec key");
+        }
+        let codecs = registry.payload_codecs().clone();
         let owned = registry.decision_owner();
         owned.set_owner_mode(shard(), true);
         let mut runtime_config: WorkerRuntimeConfig = worker_config.into();
@@ -203,6 +226,7 @@ impl Fixture {
             worker,
             owned,
             outcomes,
+            codecs,
             task: None,
         }
     }
@@ -232,8 +256,18 @@ impl Fixture {
 
     /// An owner of `slot`, running.
     async fn owner(&mut self, slot: u16, listen: bool) -> (String, DecisionPartition, Node) {
+        self.owner_with(slot, listen, None).await
+    }
+
+    /// [`Self::owner`], with `codec` as the active payload codec key.
+    async fn owner_with(
+        &mut self,
+        slot: u16,
+        listen: bool,
+        codec: Option<AeadCodec>,
+    ) -> (String, DecisionPartition, Node) {
         let (workflow_id, partition) = workflow_id_in(slot);
-        let mut node = self.node(listen);
+        let mut node = self.node_with(listen, codec);
         self.take(&node, partition).await;
         self.run(&mut node);
         if listen {
@@ -256,6 +290,25 @@ impl Fixture {
             &client,
             workflow_id,
             format!("secret:{MARKER}"),
+            opts,
+        )
+        .await
+        .expect("start")
+        .exec_id()
+    }
+
+    /// Start the activity flow. Its activity input carries the marker.
+    async fn start_activity_flow(&mut self, workflow_id: &str) -> ExecutionId {
+        let client = WorkflowHandleClient::single(self.pool.clone(), self.url.clone());
+        let opts = TypedStartOptions {
+            queue_name: Some(self.queue.clone()),
+            ..Default::default()
+        };
+        DiskCacheActivityFlowStub::start_with_options(
+            &mut self.conn,
+            &client,
+            workflow_id,
+            self.queue.clone(),
             opts,
         )
         .await
@@ -297,6 +350,18 @@ impl Fixture {
             wait_for_execution_state_with_timeout(&self.url, exec, "COMPLETED", WAIT).await;
         assert_eq!(execution.state, "COMPLETED", "the run completes");
     }
+}
+
+/// A temporary directory with the mode `0700`, as the cache requires.
+fn private_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("cache dir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+    }
+    dir
 }
 
 async fn free_row(conn: &mut AsyncPgConnection, partition: DecisionPartition) {
@@ -442,7 +507,10 @@ async fn a_memory_miss_reads_the_disk() {
 
     assert_eq!(node.outcomes.count("hit"), 1, "the decision reads the disk");
     assert_eq!(node.outcomes.count("corrupt"), 0);
-    assert!(!node.worker.has_disk_cached_execution(exec).await);
+    eventually("the terminal commit purges the disk entry", async || {
+        !node.worker.has_disk_cached_execution(exec).await
+    })
+    .await;
     node.stop().await;
 }
 
@@ -452,21 +520,7 @@ async fn a_memory_miss_reads_the_disk() {
 async fn a_decided_history_reads_back_from_the_disk() {
     let (mut fx, _container) = Fixture::new().await;
     let (workflow_id, partition, node) = fx.owner(8, false).await;
-    let client = WorkflowHandleClient::single(fx.pool.clone(), fx.url.clone());
-    let opts = TypedStartOptions {
-        queue_name: Some(fx.queue.clone()),
-        ..Default::default()
-    };
-    let exec = DiskCacheActivityFlowStub::start_with_options(
-        &mut fx.conn,
-        &client,
-        &workflow_id,
-        fx.queue.clone(),
-        opts,
-    )
-    .await
-    .expect("start")
-    .exec_id();
+    let exec = fx.start_activity_flow(&workflow_id).await;
     // The activity result needs a second decision, which appends to disk.
     eventually("the run waits for its signal on disk", async || {
         node.worker.has_disk_cached_execution(exec).await
@@ -503,11 +557,49 @@ async fn an_erased_run_leaves_no_local_bytes() {
 
     fx.signal(exec).await;
     fx.completed(exec).await;
+    // The purge follows the commit. Wait for it before the erasure.
+    eventually("the terminal commit purges the disk entry", async || {
+        !node.worker.has_disk_cached_execution(exec).await
+    })
+    .await;
     autumn_harvest::erase::erase_workflow_payloads(&mut fx.conn, exec, "gdpr")
         .await
         .expect("erase");
 
-    assert!(!node.worker.has_disk_cached_execution(exec).await);
+    assert_no_local_bytes(fx.dir(), exec, &rows);
+    node.stop().await;
+}
+
+/// AC 1 for a missed purge. The run ended with no wake, so its rows stay on
+/// disk. The erasure wakes the owner, which purges them.
+#[tokio::test]
+async fn an_erasure_purges_a_run_that_a_missed_purge_left() {
+    let (mut fx, _container) = Fixture::new().await;
+    let (workflow_id, partition, node) = fx.owner(9, true).await;
+    let exec = fx.start_on_disk(&workflow_id, &node).await;
+    let rows = sealed_rows(&fx.file(partition), exec);
+
+    // A terminal write that wakes no one, as after a lost `NOTIFY`.
+    diesel::sql_query(
+        "UPDATE harvest_workflow_executions SET state = 'TERMINATED', \
+         completed_at = now() WHERE id = $1",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid())
+    .execute(&mut fx.conn)
+    .await
+    .expect("end the run");
+    assert!(
+        node.worker.has_disk_cached_execution(exec).await,
+        "no purge ran"
+    );
+
+    autumn_harvest::erase::erase_workflow_payloads(&mut fx.conn, exec, "gdpr")
+        .await
+        .expect("erase");
+    eventually("the erasure wake purges the disk entry", async || {
+        !node.worker.has_disk_cached_execution(exec).await
+    })
+    .await;
     assert_no_local_bytes(fx.dir(), exec, &rows);
     node.stop().await;
 }
@@ -562,14 +654,96 @@ async fn the_reconcile_pass_purges_a_run_that_is_not_running() {
         "no wake came"
     );
 
+    // The owner scan can run a pass first, so the count is 0 or 1.
     let purged = node
         .worker
         .reconcile_owner_disk_cache(&fx.pool)
         .await
         .expect("reconcile");
-    assert_eq!(purged, 1);
+    assert!(purged <= 1, "one run to purge, got {purged}");
     assert!(!node.worker.has_disk_cached_execution(exec).await);
     assert_no_local_bytes(fx.dir(), exec, &rows);
+    node.stop().await;
+}
+
+/// The stored input of the `ActivityScheduled` event of `exec`, as Postgres
+/// holds it. The worker encodes that input with its own codecs.
+async fn stored_input(conn: &mut AsyncPgConnection, exec: ExecutionId) -> Value {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Jsonb)]
+        input: Value,
+    }
+    diesel::sql_query(
+        "SELECT event_data->'data'->'input' AS input FROM harvest_events \
+         WHERE workflow_exec_id = $1 AND event_data->>'type' = 'ActivityScheduled'",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec.as_uuid())
+    .get_result::<Row>(conn)
+    .await
+    .expect("read the stored input")
+    .input
+}
+
+/// AC 3 in a real worker. The worker hands decoded events to the disk, so
+/// no codec ciphertext reaches it. A key change and a reconcile pass delete
+/// each file of the old generation.
+#[tokio::test]
+async fn a_rotated_codec_key_leaves_no_ciphertext_on_disk() {
+    let (mut fx, _container) = Fixture::new().await;
+    let k1 = AeadCodec::new("disk-k1", &DataKey::generate()).expect("codec");
+    let (workflow_id, partition, node) = fx.owner_with(10, false, Some(k1)).await;
+    let exec = fx.start_activity_flow(&workflow_id).await;
+    // The second decision appends the activity result to the disk entry.
+    eventually("the run waits for its signal on disk", async || {
+        node.worker.has_disk_cached_execution(exec).await
+            && parked(&fx.url, exec).await
+            && sealed_rows(&fx.file(partition), exec).len() >= 4
+    })
+    .await;
+
+    let envelope = stored_input(&mut fx.conn, exec).await;
+    assert_eq!(
+        autumn_harvest::payload_codec::codec_envelope_key_id(&envelope),
+        Some("disk-k1"),
+        "Postgres holds k1 ciphertext"
+    );
+    let raw = dir_bytes(fx.dir());
+    let mut checked = 0;
+    for part in envelope
+        .to_string()
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '+' && c != '/')
+    {
+        if part.len() >= 16 {
+            checked += 1;
+            assert!(!contains(&raw, part.as_bytes()), "codec ciphertext on disk");
+        }
+    }
+    assert!(checked > 0, "the envelope holds a ciphertext segment");
+    assert!(!contains(&raw, MARKER.as_bytes()), "plaintext on disk");
+
+    // Rotate onto k2 and retire k1 in this process.
+    AeadCodec::new("disk-k2", &DataKey::generate())
+        .expect("codec")
+        .register_with(&node.codecs)
+        .expect("register k2");
+    node.codecs.set_active_key("disk-k2").expect("activate k2");
+    // The worker's re-encryption sweep pins k1 while a batch runs. Retry, as
+    // the rotation runbook says.
+    eventually("k1 retires once no sweep batch pins it", async || {
+        node.codecs.retire_key_local("disk-k1").is_ok()
+    })
+    .await;
+    node.worker
+        .reconcile_owner_disk_cache(&fx.pool)
+        .await
+        .expect("reconcile");
+
+    assert!(
+        !fx.file(partition).exists(),
+        "the old generation is deleted"
+    );
+    assert!(!node.worker.has_disk_cached_execution(exec).await);
     node.stop().await;
 }
 

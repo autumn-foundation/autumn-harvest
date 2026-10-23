@@ -118,8 +118,8 @@ struct WarmupResult {
     /// The first pass after a restart with the disk cache: a Postgres load
     /// and a disk write per run.
     disk_fill: Duration,
-    /// The next pass with the disk cache: a disk read and an anchor check
-    /// per run.
+    /// The next pass with the disk cache: a disk read, an anchor check and
+    /// a delta load per run.
     disk_pass: Duration,
 }
 
@@ -545,8 +545,8 @@ fn print_warmups(warmups: &[WarmupResult], config: &Config) {
     println!(
         "{conns} connections and {conns} workers. The fill is the first decision of each run \
          after a restart: a Postgres load and a sealed disk write. The next pass is the next \
-         decision of each run past the {CACHE_ENTRIES}-entry memory cache: a disk read and an \
-         anchor check, against a Postgres load without the cache.\n"
+         decision of each run past the {CACHE_ENTRIES}-entry memory cache: a disk read, an \
+         anchor check and a delta load, against a Postgres load without the cache.\n"
     );
     println!(
         "| Live runs | Fill, disk cache | Next pass, Postgres | Next pass, disk cache | Postgres / disk |"

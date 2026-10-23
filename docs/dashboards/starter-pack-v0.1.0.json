@@ -3965,7 +3965,7 @@
           "description": "The stage 2 gate of epic #2247. A disk cache (#2258) goes ahead when the 7-day cold share passes 0.2, or the 7-day cold p99 passes 0.05 s. This panel shows rates. The record doc gives the 7-day queries (docs/rnd/2026-10-22-stage-2-gate.md). The p99 and the average are seconds from the history load to the end of the first drive. The p99 needs a bucket bound at 0.05 s. The average works without buckets."
         },
         {
-          "id": 225801,
+          "id": 930258,
           "type": "timeseries",
           "title": "Owner disk cache reads by outcome (issue #2258)",
           "datasource": {

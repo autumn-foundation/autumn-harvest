@@ -5048,8 +5048,9 @@ impl WorkerConfig {
     /// A cold decision then reads a local file and the Postgres delta. The
     /// cache acts only in owner mode, on the partitions that this worker
     /// owns. Each row is sealed under a key that lives in memory only. The
-    /// worker deletes every cache file in `dir` at start, on a lost tenure
-    /// and at shutdown. Give each process its own directory.
+    /// worker deletes every cache file in `dir` at start. A lost tenure
+    /// deletes the file of its partition. Give each process its own private
+    /// directory.
     ///
     /// The worker fails to start when the crate lacks the
     /// `owner-disk-cache` feature. See `docs/adr/0012-owner-disk-cache.md`.

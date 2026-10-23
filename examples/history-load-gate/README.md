@@ -19,8 +19,8 @@ cold p99 above 50 ms. This binary measures the bench half of that gate:
    With the owner disk cache (#2258), it also times two passes on 8
    connections. The fill is the first decision of each run after a
    restart: a Postgres load and a sealed disk write. The next pass is the
-   next decision of each run past the memory cache: a disk read and an
-   anchor check.
+   next decision of each run past the memory cache: a disk read, an anchor
+   check and a Postgres delta load.
 3. **Cache cap.** It drives the real `WorkflowCache` with 1,000 entries
    over more live runs than that. It prints the cold share that the cap
    alone causes.

@@ -12,10 +12,12 @@ Postgres delta, not the full Postgres history. See
 - **Encrypted.** AES-256-GCM seals every row under a node key that lives
   in memory only. The cache stores decoded events, so no codec ciphertext
   reaches the disk.
-- **Disposable.** The worker deletes every cache file at start, on a lost
-  tenure and at shutdown. A terminal commit and an evict wake purge the
-  run. A reconcile pass every 30 s purges each cached run that is no
-  longer `RUNNING`.
+- **Disposable.** The worker deletes every cache file at start. A lost
+  tenure deletes the file of its partition. A stopped worker deletes the
+  files that it wrote. A terminal commit and an evict wake purge the run.
+  An erasure sends the owner an evict wake. The owner scan runs a reconcile
+  pass at most once in 30 s per shard. It purges each cached run that is
+  not `RUNNING`, and each file of an older codec key generation.
 - **Validity stamps.** Each file holds the owner epoch and the codec key
   generation. Each run holds its state and the hash of its last event. A
   mismatch or a damaged row purges the entry, and the decision replays
@@ -28,5 +30,12 @@ Postgres delta, not the full Postgres history. See
   checks its last event with it.
 - **`examples/history-load-gate`.** The warm-up step also times the disk
   cache.
+
+**Tests.** `an_erased_run_leaves_no_local_bytes`,
+`an_erasure_purges_a_run_that_a_missed_purge_left`,
+`a_killed_owner_leaves_no_readable_bytes`,
+`a_retired_codec_key_leaves_no_ciphertext`,
+`a_rotated_codec_key_leaves_no_ciphertext_on_disk` and
+`a_corrupt_file_replays_cold` cover the four red tests of the issue.
 
 No migration. No new `WorkflowEvent` variant. Off by default.
