@@ -32,6 +32,7 @@
 //! signal-with-start to the workflow `agent`. Use the agent id as the
 //! workflow id, `{}` as the input, and [`Agent::payload`] as the payload.
 
+pub mod dedupe;
 pub mod inbox;
 pub mod wake;
 
@@ -49,12 +50,13 @@ use crate::followup::{Followups, WAKE_MESSAGE};
 use crate::heartbeat::{DEFAULT_HEARTBEAT_PROMPT, HeartbeatTask};
 use crate::loop_guard::LoopGuard;
 use crate::memory::MemoryScope;
-use crate::mesh::Mandate;
+use crate::mesh::{Mandate, Refusal};
 use crate::message::{ChatMessage, ChatRole, RunId, SessionId};
 use crate::types::{AgentStop, AgentTask, DEFAULT_APPROVAL_TIMEOUT_SECS, DEFAULT_MAX_STEPS};
 use crate::workflow::{
-    Member, Progress, Run, SteerBook, Tree, deliver, discover, harness, run_segment,
+    Member, Outbox, Progress, Run, SteerBook, Tree, deliver, discover, harness, run_segment,
 };
+use dedupe::Inbound;
 use inbox::{Admit, InboxStatus, OpClass, admit};
 
 /// The registered workflow name of a durable agent.
@@ -355,6 +357,59 @@ pub enum HeartbeatSetting {
     },
 }
 
+/// A message from another agent (issue #2269).
+///
+/// The sender sends it with the key `<from>:<seq>`. The engine dedupes that
+/// key across the run chain of the receiver. The receiver also keeps the
+/// applied numbers of each sender, see [`dedupe`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerEnvelope {
+    /// The sender id that the receiver dedupes on: the agent id of a durable
+    /// sender, or the run id of an `agent_loop` sender.
+    pub from: String,
+    /// The name of the sending agent, from its mandate.
+    pub sender: String,
+    /// The number of the message, from 1 for each sender.
+    pub seq: u64,
+    /// The task for the receiver.
+    pub text: String,
+    /// The authority of the receiver, from `Mandate::outbound`. The receiver
+    /// can only narrow it.
+    pub mandate: Mandate,
+    /// The flow labels of the sender. They taint the receiver.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub flow_labels: BTreeSet<String>,
+    /// The durable promise that takes the reply, if the sender waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    /// The workflow ids that wait on this message, the sender last. A send
+    /// to one of them is a deadlock.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting: Vec<String>,
+    /// The mesh of the sender (issue #2272).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh: Option<String>,
+}
+
+/// The reply to a [`PeerEnvelope`]. It settles the promise of the sender.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PeerReply {
+    /// How the segment of the receiver ended, when it ran.
+    pub stop: Option<AgentStop>,
+    /// The answer of the receiver.
+    pub answer: String,
+    /// Why the receiver refused the message, if it did.
+    pub refusal: Option<Refusal>,
+    /// The error of a failed segment.
+    pub error: Option<String>,
+    /// The flow labels of the receiver after the segment. They taint the
+    /// sender.
+    pub flow_labels: BTreeSet<String>,
+    /// The tokens of the segment of the receiver.
+    pub tokens: u64,
+}
+
 /// One op in the inbox of an agent.
 ///
 /// The wire form is internally tagged by `type`. A tick op does not decode
@@ -367,6 +422,8 @@ pub enum AgentOp {
     UserMessage(UserMessage),
     /// A control op.
     Control(Control),
+    /// A message from another agent (issue #2269).
+    PeerMessage(Box<PeerEnvelope>),
     /// A heartbeat tick (issue #2266). Only the wake hook makes it, so it
     /// does not decode from a signal.
     #[serde(skip_deserializing)]
@@ -397,6 +454,12 @@ impl AgentOp {
         })
     }
 
+    /// A message from another agent.
+    #[must_use]
+    pub fn peer(envelope: PeerEnvelope) -> Self {
+        Self::PeerMessage(Box::new(envelope))
+    }
+
     /// A message with an id and an urgency. See [`Urgency`].
     #[must_use]
     pub fn urgent(
@@ -415,7 +478,7 @@ impl AgentOp {
     #[must_use]
     pub const fn class(&self) -> OpClass {
         match self {
-            Self::UserMessage(_) => OpClass::Work,
+            Self::UserMessage(_) | Self::PeerMessage(_) => OpClass::Work,
             Self::Control(_) => OpClass::Control,
             Self::HeartbeatTick | Self::FollowupDue => OpClass::Tick,
         }
@@ -652,6 +715,8 @@ impl AgentProfile {
                 self.followups
                     .is_some_and(|settings| settings.allow_actions),
             ),
+            // The mandate of the message bounds a peer, not a read-only rule.
+            Mode::Peer => (true, true),
         };
         let mut task = AgentTask::new(input).max_steps(self.max_steps);
         task.system.clone_from(&self.system);
@@ -688,6 +753,8 @@ enum Mode<'a> {
     Heartbeat(&'a AgentHeartbeat),
     /// A booked follow-up.
     Followup,
+    /// A message from another agent. No person is present.
+    Peer,
 }
 
 impl Mode<'_> {
@@ -697,6 +764,7 @@ impl Mode<'_> {
             Self::Attended => ReportSource::Run,
             Self::Heartbeat(_) => ReportSource::Heartbeat,
             Self::Followup => ReportSource::Followup,
+            Self::Peer => ReportSource::Peer,
         }
     }
 }
@@ -787,6 +855,10 @@ pub struct AgentState {
     pub ticks: u64,
     /// When the last op ended, in epoch milliseconds.
     pub last_active_ms: Option<i64>,
+    /// The number of the last peer message that this agent sent.
+    pub outbound_seq: u64,
+    /// The applied peer messages of each sender.
+    pub inbound: Inbound,
 }
 
 impl AgentState {
@@ -1098,6 +1170,7 @@ impl AgentRun<'_> {
                 self.segment(state, &message.text, Mode::Attended, now)
                     .await
             }
+            AgentOp::PeerMessage(envelope) => self.peer_message(state, *envelope, now).await,
             AgentOp::HeartbeatTick => self.tick(state, now).await,
             AgentOp::FollowupDue => {
                 if state.followup_due_ms.take().is_none() {
@@ -1107,6 +1180,91 @@ impl AgentRun<'_> {
                 self.segment(state, WAKE_MESSAGE, Mode::Followup, now).await
             }
             AgentOp::Control(_) => state,
+        }
+    }
+
+    /// Handle one message from another agent (issue #2269).
+    ///
+    /// A duplicate is a no-op. The receiver runs under the meet of its own
+    /// mandate and the inbound one, and starts with the labels of the sender.
+    /// Its answer settles the promise of the sender.
+    async fn peer_message(
+        &self,
+        mut state: AgentState,
+        envelope: PeerEnvelope,
+        now: i64,
+    ) -> AgentState {
+        if !state.inbound.apply(&envelope.from, envelope.seq) {
+            return state;
+        }
+        state
+            .flow_labels
+            .extend(envelope.flow_labels.iter().cloned());
+        let accepted = match &self.id {
+            Ok(id) => self.local_mandate(id).accept(&envelope.mandate),
+            Err(_) => Err(Refusal::InvalidMandate),
+        };
+        let reply = match accepted {
+            Err(refusal) => PeerReply {
+                refusal: Some(refusal),
+                flow_labels: state.flow_labels.clone(),
+                ..PeerReply::default()
+            },
+            Ok(mandate) => {
+                let member = self.member.as_ref().map_or_else(
+                    || Member::bare(mandate.clone()),
+                    |member| member.narrowed(mandate.clone()),
+                );
+                let input = format!(
+                    "[A message from the agent {:?}]\n{}",
+                    envelope.sender, envelope.text
+                );
+                let failures = state.failures;
+                let before = state.tokens_used;
+                let peer = PeerSegment {
+                    member: &member,
+                    waiting: &envelope.waiting,
+                };
+                state = self
+                    .run_segment_as(state, &input, Mode::Peer, now, Some(peer))
+                    .await;
+                PeerReply {
+                    stop: state.last_stop,
+                    answer: state.last_answer.clone().unwrap_or_default(),
+                    refusal: None,
+                    error: (state.failures > failures)
+                        .then(|| state.last_error.clone())
+                        .flatten(),
+                    flow_labels: state.flow_labels.clone(),
+                    tokens: state.tokens_used.saturating_sub(before),
+                }
+            }
+        };
+        if let Some(reply_to) = &envelope.reply_to {
+            self.reply(reply_to, reply).await;
+        }
+        state
+    }
+
+    /// The local root mandate of the agent `id`: its profile mandate, or a
+    /// bare one named after its kind.
+    fn local_mandate(&self, id: &AgentId) -> Mandate {
+        self.profile
+            .as_ref()
+            .ok()
+            .and_then(|profile| profile.mandate.clone())
+            .unwrap_or_else(|| Mandate::new(id.kind()))
+    }
+
+    /// Settle the promise `reply_to` with `reply`. A sender that stopped
+    /// waiting makes the settle fail. That is not an error of this agent.
+    async fn reply(&self, reply_to: &str, reply: PeerReply) {
+        let Ok(promise) = reply_to.parse::<autumn_harvest::durable_promise::PromiseId>() else {
+            tracing::warn!("a peer message has a reply token that does not parse");
+            return;
+        };
+        if let Err(err) = self.ctx.resolve_promise(&promise, reply).await {
+            tracing::warn!(error = %err, "the sender of a peer message took no reply");
         }
     }
 
@@ -1151,10 +1309,23 @@ impl AgentRun<'_> {
     /// Run one segment with `input` and fold it into `state`.
     async fn segment(
         &self,
+        state: AgentState,
+        input: &str,
+        mode: Mode<'_>,
+        now: i64,
+    ) -> AgentState {
+        self.run_segment_as(state, input, mode, now, None).await
+    }
+
+    /// Run one segment, as [`Self::segment`] does. A peer message passes
+    /// its narrowed member and its waiting chain.
+    async fn run_segment_as(
+        &self,
         mut state: AgentState,
         input: &str,
         mode: Mode<'_>,
         now: i64,
+        peer: Option<PeerSegment<'_>>,
     ) -> AgentState {
         let (id, profile) = match (&self.id, &self.profile) {
             (Ok(id), Ok(profile)) => (id, profile),
@@ -1175,7 +1346,10 @@ impl AgentRun<'_> {
             fail(&mut state, &err.to_string());
             return state;
         }
-        let task = profile.segment_task(id, input, mode);
+        let mut task = profile.segment_task(id, input, mode);
+        if let Some(peer) = &peer {
+            task.mandate = Some(peer.member.mandate().clone());
+        }
         let run_id = format!("{}:s{}", state.incarnation, state.segments);
         state.segments = state.segments.saturating_add(1);
         let mut progress = Progress::new(run_id.clone(), state.transcript.clone());
@@ -1194,10 +1368,21 @@ impl AgentRun<'_> {
                 .collect(),
             released: Released::new(),
             records: Vec::new(),
+            outbox: Outbox {
+                from: id.as_str().to_owned(),
+                self_id: id.as_str().to_owned(),
+                waiting: peer
+                    .as_ref()
+                    .map_or_else(Vec::new, |peer| peer.waiting.to_vec()),
+                next_seq: state.outbound_seq.saturating_add(1),
+                mesh: None,
+            },
         };
         let run = Run {
             task: &task,
-            agent: self.member.as_ref(),
+            agent: peer
+                .as_ref()
+                .map_or(self.member.as_ref(), |peer| Some(peer.member)),
             live: true,
         };
         let result = run_segment(self.ctx, run, &mut progress, &mut tree, input).await;
@@ -1205,6 +1390,7 @@ impl AgentRun<'_> {
         // A failed op keeps what its tools and turns did to the labels and
         // the tokens. Only the transcript stays as it was.
         state.rounds = tree.rounds;
+        state.outbound_seq = tree.outbox.next_seq.saturating_sub(1);
         state.flow_labels = tree.exercised;
         state.tokens_used = state
             .tokens_used
@@ -1262,6 +1448,15 @@ impl AgentRun<'_> {
     }
 }
 
+/// What a peer message changes in its segment.
+#[derive(Debug, Clone, Copy)]
+struct PeerSegment<'a> {
+    /// The member under the narrowed mandate.
+    member: &'a Member,
+    /// The workflow ids that wait on the message.
+    waiting: &'a [String],
+}
+
 /// The parts of one report.
 #[derive(Debug, Clone, Copy)]
 struct Sent<'a> {
@@ -1282,6 +1477,7 @@ fn hold(state: &mut AgentState, op: AgentOp) {
     }
     let id = match &op {
         AgentOp::UserMessage(message) => message.message_id.clone(),
+        AgentOp::PeerMessage(envelope) => Some(format!("{}:{}", envelope.from, envelope.seq)),
         _ => None,
     };
     fail(

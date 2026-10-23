@@ -24,7 +24,10 @@ use autumn_harvest::llm_budget::LlmBudgetExceeded;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 
-use crate::agent::{INTERRUPT_SIGNAL, STEER_SIGNAL, Steer};
+use crate::agent::{
+    AGENT_WORKFLOW_NAME, AgentId, AgentOp, INTERRUPT_SIGNAL, PeerEnvelope, PeerReply, STEER_SIGNAL,
+    Steer,
+};
 use crate::agent::{agent_info, agent_memory_reset_info, agent_profile_info};
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
 use crate::bounds::{RoundBudget, exceeds_bytes, json_len};
@@ -47,6 +50,8 @@ use crate::types::{
     AgentReport, AgentStop, AgentTask, ModelTurn, ModelTurnRequest, RunIdSource, ToolCallRequest,
     ToolOutcome, without_system,
 };
+use autumn_harvest::durable_promise::PromiseSettlement;
+use autumn_harvest::entity::{ENTITY_OP_SIGNAL, EntityMessage};
 
 /// The replay gate of the final-turn delivery and the raw follow-up length.
 const FINAL_TURN_PATCH: &str = "agent_final_turn_rules";
@@ -214,16 +219,60 @@ pub(crate) struct Tree {
     pub(crate) released: Released,
     /// Each delegation, in the order it ended.
     pub(crate) records: Vec<DelegationRecord>,
+    /// The sender side of durable peer messages (issue #2269).
+    pub(crate) outbox: Outbox,
+}
+
+/// The sender side of durable peer messages (issue #2269).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Outbox {
+    /// The sender id that a receiver dedupes on.
+    pub(crate) from: String,
+    /// The workflow id of this agent.
+    pub(crate) self_id: String,
+    /// The workflow ids that wait on the op of this agent. A send to one of
+    /// them, or to this agent, is a deadlock.
+    pub(crate) waiting: Vec<String>,
+    /// The number of the next message.
+    pub(crate) next_seq: u64,
+    /// The mesh of the sender (issue #2272).
+    pub(crate) mesh: Option<String>,
 }
 
 /// One agent of a run tree: its mandate, and the peers that its recorded
 /// lookup found.
+#[derive(Debug)]
 pub(crate) struct Member {
     mandate: Mandate,
     peers: Vec<Peer>,
 }
 
 impl Member {
+    /// A member with `mandate` and no peer.
+    pub(crate) const fn bare(mandate: Mandate) -> Self {
+        Self {
+            mandate,
+            peers: Vec::new(),
+        }
+    }
+
+    /// This member under `mandate`, which is never wider. It keeps only the
+    /// peers that `mandate` names.
+    pub(crate) fn narrowed(&self, mandate: Mandate) -> Self {
+        let peers = self
+            .peers
+            .iter()
+            .filter(|peer| mandate.peers.contains(&peer.name))
+            .cloned()
+            .collect();
+        Self { mandate, peers }
+    }
+
+    /// The mandate of the member.
+    pub(crate) const fn mandate(&self) -> &Mandate {
+        &self.mandate
+    }
+
     /// The `delegate` tool, when the agent has a peer to ask.
     fn delegate_tool(&self) -> Option<crate::message::ToolDefinition> {
         (!self.peers.is_empty()).then(|| delegate_definition(&self.peers))
@@ -340,19 +389,7 @@ pub(crate) async fn drive(
     let mut progress = Progress::new(run_id, without_system(&task.history));
     // Gate the final-turn rules. A run recorded before them replays as it ran.
     progress.final_turn_rules = ctx.patched(FINAL_TURN_PATCH);
-    let mut tree = Tree {
-        root: progress.run_id.clone(),
-        rounds: 0,
-        delegations: 0,
-        exercised: task
-            .flow_labels
-            .iter()
-            .chain(task.mandate.iter().flat_map(|mandate| &mandate.flow_labels))
-            .cloned()
-            .collect(),
-        released: Released::new(),
-        records: Vec::new(),
-    };
+    let mut tree = root_tree(ctx, task, &progress.run_id);
     let agent = match &task.mandate {
         Some(mandate) => {
             mandate
@@ -432,6 +469,30 @@ pub(crate) async fn drive(
         progress.last_text.clear();
         progress.answer = None;
         input = followup::WAKE_MESSAGE;
+    }
+}
+
+/// The tree of an `agent_loop` run: its root and the labels of the task.
+fn root_tree(ctx: &WorkflowContext, task: &AgentTask, run_id: &str) -> Tree {
+    Tree {
+        root: run_id.to_owned(),
+        rounds: 0,
+        delegations: 0,
+        exercised: task
+            .flow_labels
+            .iter()
+            .chain(task.mandate.iter().flat_map(|mandate| &mandate.flow_labels))
+            .cloned()
+            .collect(),
+        released: Released::new(),
+        records: Vec::new(),
+        outbox: Outbox {
+            from: run_id.to_owned(),
+            self_id: ctx.workflow_id().to_owned(),
+            waiting: Vec::new(),
+            next_seq: 1,
+            mesh: None,
+        },
     }
 }
 
@@ -1199,6 +1260,18 @@ async fn delegate(
         peer,
         max_total_tokens,
     } = child;
+    if peer.agent.is_some() {
+        return Box::pin(durable_peer(
+            ctx,
+            run,
+            agent,
+            progress,
+            tree,
+            peer,
+            child_input,
+        ))
+        .await;
+    }
     tree.delegations = tree.delegations.saturating_add(1);
     let run_id = format!("{}:d{}", tree.root, tree.delegations);
     let child_agent = discover(ctx, &mandate).await?;
@@ -1246,6 +1319,194 @@ async fn delegate(
         content: outcome,
         is_error: stop != AgentStop::Completed,
     })
+}
+
+/// Send one task to a durable peer and wait for its reply (issue #2269).
+///
+/// The send is recorded with the key `<from>:<seq>`, so replay does not send
+/// it again. The reply is a durable promise. The caller races it against the
+/// reply deadline, and a durable agent also races it against an interrupt.
+async fn durable_peer(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    agent: &Member,
+    progress: &mut Progress,
+    tree: &mut Tree,
+    peer: &Peer,
+    text: String,
+) -> Result<ToolOutcome, String> {
+    let target = peer.agent.as_deref().and_then(|id| AgentId::parse(id).ok());
+    let Some(target) = target else {
+        return Ok(refuse(agent, tree, Refusal::PeerUnavailable, &peer.name));
+    };
+    let target_id = target.as_str();
+    if target_id == tree.outbox.self_id || tree.outbox.waiting.iter().any(|id| id == target_id) {
+        return Ok(refuse(agent, tree, Refusal::Deadlock, &peer.name));
+    }
+    let mandate = match agent
+        .mandate
+        .outbound(peer, tree.delegations, &tree.exercised)
+    {
+        Ok(mandate) => mandate,
+        Err(refusal) => return Ok(refuse(agent, tree, refusal, &peer.name)),
+    };
+    tree.delegations = tree.delegations.saturating_add(1);
+    let seq = tree.outbox.next_seq;
+    tree.outbox.next_seq = seq.saturating_add(1);
+    let mut promise = ctx.new_promise().map_err(|err| err.to_string())?;
+    let mut waiting = tree.outbox.waiting.clone();
+    waiting.push(tree.outbox.self_id.clone());
+    let envelope = PeerEnvelope {
+        from: tree.outbox.from.clone(),
+        sender: agent.mandate.holder().to_owned(),
+        seq,
+        text,
+        mandate: mandate.clone(),
+        flow_labels: tree.exercised.clone(),
+        reply_to: Some(promise.id().to_string()),
+        waiting,
+        mesh: tree.outbox.mesh.clone(),
+    };
+    let key = format!("{}:{seq}", envelope.from);
+    let sent = ctx
+        .signal_external_workflow_by_id_with_idempotency(
+            AGENT_WORKFLOW_NAME,
+            target_id,
+            ENTITY_OP_SIGNAL,
+            EntityMessage::op(AgentOp::PeerMessage(Box::new(envelope))),
+            key,
+        )
+        .await;
+    match sent {
+        Ok(()) => {}
+        Err(HarvestError::ExternalSignalFailed { .. }) => {
+            return Ok(refuse(agent, tree, Refusal::PeerUnavailable, &peer.name));
+        }
+        Err(other) => return Err(other.to_string()),
+    }
+    let timeout = Duration::from_secs(
+        peer.reply_timeout_secs
+            .unwrap_or(crate::mesh::DEFAULT_REPLY_TIMEOUT_SECS),
+    );
+    let outcome = await_reply(ctx, run.live, progress, &mut promise, timeout).await?;
+    let mut chain = mandate.chain;
+    if chain.last().is_none_or(|last| *last != peer.name) {
+        chain.push(peer.name.clone());
+    }
+    Ok(peer_outcome(tree, peer, target_id, chain, outcome))
+}
+
+/// Record one exchange with a durable peer and answer the model.
+fn peer_outcome(
+    tree: &mut Tree,
+    peer: &Peer,
+    target_id: &str,
+    chain: Vec<String>,
+    outcome: Result<PeerReply, String>,
+) -> ToolOutcome {
+    match outcome {
+        Ok(reply) => {
+            // The answer enters this context, so the labels of the peer count.
+            tree.exercised.extend(reply.flow_labels.iter().cloned());
+            tree.records.push(DelegationRecord {
+                chain,
+                run_id: Some(target_id.to_owned()),
+                stop: reply.stop,
+                refusal: reply.refusal,
+                usage: TokenUsage::new(u32::try_from(reply.tokens).unwrap_or(u32::MAX), 0),
+                steps_used: 0,
+                tool_calls: 0,
+            });
+            if let Some(refusal) = reply.refusal {
+                refused(refusal, &peer.name)
+            } else {
+                let content = serde_json::json!({
+                    "agent": peer.name,
+                    "stop": reply.stop,
+                    "answer": truncate(&reply.answer, DEFAULT_TOOL_OUTPUT_LIMIT),
+                    "error": reply.error,
+                })
+                .to_string();
+                ToolOutcome {
+                    content,
+                    is_error: reply.stop != Some(AgentStop::Completed),
+                }
+            }
+        }
+        Err(error) => {
+            tree.records.push(DelegationRecord {
+                chain,
+                run_id: Some(target_id.to_owned()),
+                stop: None,
+                refusal: None,
+                usage: TokenUsage::default(),
+                steps_used: 0,
+                tool_calls: 0,
+            });
+            ToolOutcome::error(&format!(
+                "the durable agent {:?} gave no answer: {error}",
+                peer.name
+            ))
+        }
+    }
+}
+
+/// Wait for the reply of a durable peer until `timeout`.
+///
+/// A durable agent also races the wait against an interrupt. Returns the
+/// reply, or why there is none.
+async fn await_reply(
+    ctx: &WorkflowContext,
+    live: bool,
+    progress: &mut Progress,
+    promise: &mut autumn_harvest::durable_promise::DurablePromise<'_>,
+    timeout: Duration,
+) -> Result<Result<PeerReply, String>, String> {
+    let timed_out = || format!("no reply arrived within {}s", timeout.as_secs());
+    if !live {
+        let settled = promise
+            .wait_timeout::<PeerReply>(timeout)
+            .await
+            .map_err(|err| err.to_string())?;
+        return Ok(settled.map_or_else(
+            || Err(timed_out()),
+            |settled| settled.map_err(|rejected| rejected.error),
+        ));
+    }
+    let winner = ctx
+        .race()
+        .signal(&promise.id().signal_name())
+        .signal(INTERRUPT_SIGNAL)
+        .timer(timeout)
+        .run()
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok(match winner.index {
+        0 => PromiseSettlement::decode::<PeerReply>(winner.value)
+            .map_err(|err| err.to_string())?
+            .map_err(|rejected| rejected.error),
+        1 => {
+            progress.interrupted = true;
+            Err("a person interrupted this op while it waited for the reply".to_owned())
+        }
+        _ => Err(timed_out()),
+    })
+}
+
+/// Record a refused delegation to `name` and answer the model.
+fn refuse(agent: &Member, tree: &mut Tree, refusal: Refusal, name: &str) -> ToolOutcome {
+    let mut chain = agent.mandate.chain.clone();
+    chain.push(name.to_owned());
+    tree.records.push(DelegationRecord {
+        chain,
+        run_id: None,
+        stop: None,
+        refusal: Some(refusal),
+        usage: TokenUsage::default(),
+        steps_used: 0,
+        tool_calls: 0,
+    });
+    refused(refusal, name)
 }
 
 /// The task of a delegated child. It keeps the bounds of the parent task and
@@ -1585,6 +1846,7 @@ mod tests {
             exercised: labels(&["old"]),
             released: Released::new(),
             records: Vec::new(),
+            outbox: Outbox::default(),
         };
         let ask = ToolDecision::RequireApproval {
             reason: "ask".into(),

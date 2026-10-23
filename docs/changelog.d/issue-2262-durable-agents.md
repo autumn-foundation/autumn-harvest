@@ -83,6 +83,31 @@ agent skips ticks and catches up once. The follow-up chain cap holds across
 checkpoints. The next wake is listed. Unit and property tests pin the wake
 kernel.
 
+### Durable peers with exactly-once messages that carry mandates (issue #2269)
+
+- `Peer::agent(name, description, &id)` and `Peer::reply_timeout`. A
+  `delegate` call to a durable peer sends `AgentOp::PeerMessage` with a
+  `PeerEnvelope` and waits on a durable promise for a `PeerReply`.
+- The send is `signal_external_workflow_by_id_with_idempotency` with the key
+  `<from>:<seq>`. `AgentState::outbound_seq` keeps the sequence.
+- The receiver keeps an applied set of each sender
+  (`agent::dedupe::Inbound`): a floor and a set above it. It never drops a
+  number for being under a high-water mark.
+- The receiver runs under `Mandate::accept` of its local mandate and the
+  inbound one, and starts with the labels of the sender. The reply carries
+  its labels back.
+- Each envelope carries the waiting chain. `Refusal::Deadlock` refuses a send
+  to an agent that waits. `Refusal::PeerUnavailable` refuses a send to an
+  agent with no run.
+- `ReportSource::Peer`.
+
+Tests: `autumn-harvest-agent/tests/durable_peers.rs` (8 tests): delivery once
+across a restart, a duplicate dropped and a late message kept, a mandate that
+cannot widen in either direction, labels that taint the receiver, an A→B→A
+request that ends as a deadlock with no timer, an agent with no run, and the
+reply deadline. Unit and property tests pin the applied set. Each guarantee
+was checked by a mutation that turns its test red.
+
 ### Keyed-entity wakes: run an op at a deadline (issue #2266, engine part)
 
 Part of epic #2262. ADR 0006 records the

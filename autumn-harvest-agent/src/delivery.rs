@@ -47,6 +47,8 @@ pub enum ReportSource {
     Heartbeat,
     /// A follow-up that the agent scheduled.
     Followup,
+    /// A message from another durable agent (issue #2269).
+    Peer,
 }
 
 /// One answer to deliver.

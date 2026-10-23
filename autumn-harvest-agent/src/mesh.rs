@@ -120,7 +120,19 @@ pub struct Peer {
     /// Refuse every tool call of the peer that writes or acts outside.
     #[serde(default, skip_serializing_if = "is_false")]
     pub read_only: bool,
+    /// The durable agent that answers for this peer (issue #2269). `None`
+    /// runs the peer inline, as a sub-agent of the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// How long a caller waits for the reply of a durable peer, in seconds.
+    /// `None` waits [`DEFAULT_REPLY_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_timeout_secs: Option<u64>,
 }
+
+/// The default time a caller waits for the reply of a durable peer: ten
+/// minutes.
+pub const DEFAULT_REPLY_TIMEOUT_SECS: u64 = 600;
 
 impl Peer {
     /// A peer with every harness tool, no peers of its own, and the default
@@ -136,7 +148,32 @@ impl Peer {
             max_steps: crate::types::DEFAULT_MAX_STEPS,
             max_total_tokens: None,
             read_only: false,
+            agent: None,
+            reply_timeout_secs: None,
         }
+    }
+
+    /// A peer that a durable agent answers for (issue #2269).
+    ///
+    /// A `delegate` call to it sends a peer message to the agent `id` and
+    /// waits for the reply. The agent must run already.
+    #[must_use]
+    pub fn agent(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        id: &crate::agent::AgentId,
+    ) -> Self {
+        Self {
+            agent: Some(id.as_str().to_owned()),
+            ..Self::new(name, description)
+        }
+    }
+
+    /// Set how long a caller waits for the reply of a durable peer.
+    #[must_use]
+    pub const fn reply_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.reply_timeout_secs = Some(crate::types::AgentTask::new_timeout_secs(timeout));
+        self
     }
 
     /// Set the system prompt.
@@ -530,6 +567,12 @@ pub enum Refusal {
     BudgetExhausted,
     /// An inbound mandate is malformed.
     InvalidMandate,
+    /// The durable peer waits on this agent, so a request would never get a
+    /// reply (issue #2269).
+    Deadlock,
+    /// The durable peer has no running run, or the roster names no valid
+    /// agent id for it (issue #2269).
+    PeerUnavailable,
 }
 
 impl Refusal {
@@ -545,6 +588,8 @@ impl Refusal {
             Self::FanOutExhausted => "fan_out_exhausted",
             Self::BudgetExhausted => "budget_exhausted",
             Self::InvalidMandate => "invalid_mandate",
+            Self::Deadlock => "deadlock",
+            Self::PeerUnavailable => "peer_unavailable",
         }
     }
 
@@ -566,6 +611,10 @@ impl Refusal {
             }
             Self::BudgetExhausted => format!("no tokens are left for {peer:?}"),
             Self::InvalidMandate => format!("the mandate for {peer:?} is not valid"),
+            Self::Deadlock => {
+                format!("{peer:?} waits on this agent; a request would wait for ever")
+            }
+            Self::PeerUnavailable => format!("the durable agent {peer:?} is not running"),
         }
     }
 }
@@ -769,6 +818,8 @@ mod tests {
             Refusal::FanOutExhausted,
             Refusal::BudgetExhausted,
             Refusal::InvalidMandate,
+            Refusal::Deadlock,
+            Refusal::PeerUnavailable,
         ];
         let codes: BTreeSet<&str> = all.iter().map(|refusal| refusal.code()).collect();
         assert_eq!(codes.len(), all.len());

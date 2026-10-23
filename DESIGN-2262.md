@@ -73,7 +73,8 @@ gaps. This note is the spec for all of them. Each section names its issue.
 | R3 | Reuse a tool idempotency key after a delete and a new start. | The run id holds the incarnation, the execution id of the first run. |
 | R4 | Lose the taint of a tool that ran in a failed op. | A failed op restores the transcript only. It keeps the labels and the usage. |
 | R5 | Let a client forge a heartbeat or a follow-up op. | Wake ops do not deserialize. Only the wake hook makes them. |
-| R6 | Deliver a peer message twice after a crash. | The engine dedupes the send key. The receiver also dedupes by sender sequence. |
+| R6 | Deliver a peer message twice after a crash. | The engine dedupes the send key. The receiver also keeps the applied set of each sender. |
+| R6b | Drop a real message as a duplicate. | The receiver never drops a number for being under its high-water mark. The TLA+ model found that loss: the outbox can deliver 2 before 1. |
 | R7 | Widen a mandate through a peer message. | The receiver takes `local.accept(inbound)`, which only narrows. |
 | R8 | Hang on an A→B→A request. | Each request carries the waiting chain. A send to a waiting agent fails at once as a deadlock. A deadline ends any other wait. |
 | R9 | Interrupt a write tool halfway. | A tool call races the interrupt only when its tool opts in. |
@@ -274,8 +275,13 @@ Every steer and every op is a staged signal before it is acknowledged.
 
 - `Peer::agent(name, id)` names a durable peer. A `delegate` call to it
   sends a `PeerMessage` to that agent and waits for the reply.
-- The send key is `<sender run id>:<seq>`. The receiver also keeps the
-  highest sequence of each sender.
+- The send key is `<from>:<seq>`. `from` is the agent id of a durable
+  sender, and the run id of an `agent_loop` sender. The sequence lives in the
+  durable state of the sender.
+- The receiver keeps the applied numbers of each sender: a floor, and a set
+  above it. A number is a duplicate only when it is in that set. A
+  high-water mark would drop message 1 after message 2, and the outbox can
+  deliver them in that order. `AgentMeshLastSeq.cfg` shows the loss.
 - The envelope carries `Mandate::outbound` and the tree labels. The receiver
   runs under `local.accept(inbound)` and starts with the labels.
 - The reply is a durable promise. The caller races it against the deadline

@@ -388,8 +388,8 @@ calls per subtree.
 - Each child turn adds to the history of the parent. Keep `max_delegations`
   and the peer step bounds low.
 - All agents use the one model of the harness.
-- Delegation to a remote peer is a manual step: use `ctx.call_remote_task`
-  and the wire form above.
+- A durable peer (section 13) needs no manual step. A peer in another
+  deployment still does: use `ctx.call_remote_task` and the wire form above.
 - Flow rules are only as good as the tool labels. A tool with no label adds
   only its effect label.
 - A memory note carries no label. A later run reads it with no labels. Keep
@@ -398,3 +398,38 @@ calls per subtree.
   tool idempotency keys with a child run id. New tasks use the execution id,
   so they are not affected.
 - The mesh has no handoff. A peer cannot take over the rest of the run.
+
+## 13. Durable peers (issue #2269)
+
+A peer can be a durable `Agent` with its own identity, inbox, history, budget
+and memory. A `delegate` call to it sends a message and waits for the reply.
+Inline delegation stays for short, bounded sub-tasks.
+
+```rust
+use autumn_harvest_agent::{AgentHarness, AgentId, AgentProfile, Mandate, Peer};
+
+let researcher = AgentId::new("research", "r1")?;
+let harness = AgentHarness::new(model)
+    .peer(Peer::agent("researcher", "Finds facts.", &researcher))
+    .agent(AgentProfile::new("triage").mandate(Mandate::new("triage").peers(["researcher"])))
+    .agent(AgentProfile::new("research").mandate(Mandate::new("researcher")));
+```
+
+| Step | What happens |
+|---|---|
+| Send | The sender signals the agent by workflow id with the key `<from>:<seq>`. On one shard the send commits with the decision. Across shards it goes through the outbox. Replay does not send it again. |
+| Dedupe | The engine dedupes the key across the run chain of the receiver. The receiver also keeps the applied numbers of each sender, as a floor and a set above it. |
+| Mandate | The message carries `Mandate::outbound`. The receiver runs under `local.accept(inbound)`, so it can only narrow its own mandate. |
+| Labels | The message carries the labels of the sender. They taint the receiver. The reply carries the labels of the receiver back. |
+| Reply | A durable promise. The sender races it against the reply deadline, and a durable agent also against an interrupt. |
+| Deadlock | Each message carries the agents that wait on it. A send to one of them is refused at once as `deadlock`. |
+
+- The receiver never drops a number for being at or under the highest one
+  it saw. The outbox can deliver message 2 before message 1. The TLA+ model
+  `formal/tla/AgentMesh.tla` finds that loss with `AgentMeshLastSeq.cfg`.
+- A send needs a running target. A send to an agent with no run is refused
+  as `peer_unavailable`. Start each agent of a mesh first.
+- The reply deadline is `Peer::reply_timeout`, ten minutes by default. A
+  reply after the deadline is not read.
+- A durable peer runs on its own worker, in its own history, under its own
+  profile budget. Its tokens are not added to the budget of the sender.
