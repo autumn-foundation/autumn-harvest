@@ -356,6 +356,23 @@ pub trait MemoryStore: Send + Sync + std::fmt::Debug {
         op: MemoryOp,
         key: &'a EditKey,
     ) -> BoxFuture<'a, Result<MemoryBlock, AgentError>>;
+
+    /// Remove every entry of a scope and every applied key of it.
+    ///
+    /// A durable agent calls it on `Control::ResetMemory` and on an erase.
+    /// The default refuses, so a store that cannot clear never reports a
+    /// clear that did not happen.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot clear.
+    fn clear<'a>(&'a self, scope: &'a MemoryScope) -> BoxFuture<'a, Result<(), AgentError>> {
+        let _ = scope;
+        Box::pin(std::future::ready(Err(AgentError::new(
+            ErrorKind::Config,
+            "this memory store cannot clear a scope: implement MemoryStore::clear",
+        ))))
+    }
 }
 
 /// A [`MemoryStore`] in process memory. Its contents go when the process
@@ -445,6 +462,14 @@ impl MemoryStore for InMemoryMemoryStore {
         };
         drop(state);
         Box::pin(std::future::ready(result))
+    }
+
+    fn clear<'a>(&'a self, scope: &'a MemoryScope) -> BoxFuture<'a, Result<(), AgentError>> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.scopes.remove(scope);
+        state.applied.retain(|(applied, _), _| applied != scope);
+        drop(state);
+        Box::pin(std::future::ready(Ok(())))
     }
 }
 

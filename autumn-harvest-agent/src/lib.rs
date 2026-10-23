@@ -63,6 +63,7 @@
 //!
 //! See `docs/agent-adapter.md` for the whole pattern.
 
+pub mod agent;
 pub mod approval;
 pub mod bounds;
 pub mod delivery;
@@ -88,6 +89,11 @@ pub mod tool;
 pub mod types;
 pub mod workflow;
 
+pub use agent::{
+    AGENT_WORKFLOW_NAME, Agent, AgentId, AgentIdError, AgentMemory, AgentOp, AgentProfile,
+    AgentState, AgentStatus, Control, UserMessage, agent, agent_info, agent_memory_reset,
+    agent_memory_reset_info, agent_profile, agent_profile_info,
+};
 pub use approval::Approval;
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
 pub use error::{AgentError, ErrorKind};

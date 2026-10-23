@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use tracing::Instrument;
 
+use crate::agent::AgentProfile;
 use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Delivery, LogDelivery, Report};
 use crate::error::AgentError;
@@ -104,6 +105,7 @@ pub struct AgentHarness {
     cache: Option<ResponseCache>,
     roster: Vec<Peer>,
     flow: FlowRules,
+    profiles: Vec<AgentProfile>,
 }
 
 impl AgentHarness {
@@ -129,6 +131,7 @@ impl AgentHarness {
             cache: None,
             roster: Vec::new(),
             flow: FlowRules::new(),
+            profiles: Vec::new(),
         }
     }
 
@@ -261,6 +264,24 @@ impl AgentHarness {
     pub fn peer(mut self, peer: Peer) -> Self {
         self.roster.push(peer);
         self
+    }
+
+    /// Add the profile of one kind of durable agent. When two profiles share
+    /// a kind, the later one wins.
+    #[must_use]
+    pub fn agent(mut self, profile: AgentProfile) -> Self {
+        self.profiles.push(profile);
+        self
+    }
+
+    /// The profile of the agent kind `kind`, if the harness has one.
+    #[must_use]
+    pub fn agent_profile(&self, kind: &str) -> Option<AgentProfile> {
+        self.profiles
+            .iter()
+            .rev()
+            .find(|profile| profile.kind == kind)
+            .cloned()
     }
 
     /// Install flow rules. They gate each tool call against the labels that
@@ -838,6 +859,26 @@ impl AgentHarness {
             .map_err(|_| self.hook_timed_out("MemoryTimeout", "the memory store"))?
             .map_err(|err| model_failure(&err))?;
         Ok(fit_result(render_snapshot(&blocks), self.max_result_bytes))
+    }
+
+    /// Clear the memory of `scope`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable error when no store is installed, and the
+    /// store error otherwise.
+    pub async fn memory_reset(&self, scope: MemoryScope) -> Result<(), String> {
+        let Some(store) = &self.memory else {
+            return Err(ActivityFailure::non_retryable(
+                "MemoryStoreMissing",
+                "the agent has a memory scope, but no memory store is installed: call AgentHarness::memory",
+            )
+            .into_error_payload());
+        };
+        tokio::time::timeout(self.hook_timeout, store.clear(&scope))
+            .await
+            .map_err(|_| self.hook_timed_out("MemoryTimeout", "the memory store"))?
+            .map_err(|err| model_failure(&err))
     }
 
     /// Send one report to the delivery.

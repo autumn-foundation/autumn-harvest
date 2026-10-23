@@ -24,6 +24,7 @@ use autumn_harvest::llm_budget::LlmBudgetExceeded;
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 
+use crate::agent::{agent_info, agent_memory_reset_info, agent_profile_info};
 use crate::approval::{Approval, Decision, approval_signal, await_decision};
 use crate::bounds::{RoundBudget, exceeds_bytes, json_len};
 use crate::delivery::{Report, ReportSource, report_text};
@@ -54,41 +55,41 @@ pub const WORKFLOW_NAME: &str = "agent_loop";
 
 /// The state of one agent run, carried across its segments. Every field is
 /// rebuilt from history on replay.
-struct Progress {
-    run_id: String,
-    messages: Vec<ChatMessage>,
+pub(crate) struct Progress {
+    pub(crate) run_id: String,
+    pub(crate) messages: Vec<ChatMessage>,
     /// Tokens of the whole run, earlier segments and delegations included.
-    usage: TokenUsage,
+    pub(crate) usage: TokenUsage,
     /// Tool rounds of this segment. `max_steps` bounds it.
-    steps: u32,
+    pub(crate) steps: u32,
     /// Tool rounds of the earlier segments. Tool steps add it, so they never
     /// repeat across segments.
-    step_base: u32,
+    pub(crate) step_base: u32,
     /// Tool calls of the whole run.
-    tool_calls: u32,
+    pub(crate) tool_calls: u32,
     /// Tool rounds of every agent under this one. They do not count against
     /// `max_steps`, which bounds each agent alone.
-    delegated_steps: u32,
+    pub(crate) delegated_steps: u32,
     /// Tool calls of every agent under this one.
-    delegated_tool_calls: u32,
-    last_text: String,
+    pub(crate) delegated_tool_calls: u32,
+    pub(crate) last_text: String,
     /// The text of the turn that ended the segment with no tool calls. It is
     /// `None` when the segment ended any other way.
-    answer: Option<String>,
+    pub(crate) answer: Option<String>,
     /// The loop guard history of the whole run.
-    tracker: LoopTracker,
+    pub(crate) tracker: LoopTracker,
     /// The follow-up that this segment booked.
-    followup: Option<Planned>,
+    pub(crate) followup: Option<Planned>,
     /// Follow-ups that ran before this segment.
-    chain: u32,
+    pub(crate) chain: u32,
     /// The run records the final-turn marker. An older history does not, and
     /// replays under the rules it ran with.
-    final_turn_rules: bool,
+    pub(crate) final_turn_rules: bool,
 }
 
 impl Progress {
     /// A run with `run_id` that continues `messages`.
-    fn new(run_id: String, messages: Vec<ChatMessage>) -> Self {
+    pub(crate) fn new(run_id: String, messages: Vec<ChatMessage>) -> Self {
         Self {
             run_id,
             messages,
@@ -120,7 +121,7 @@ impl Progress {
     }
 
     /// The text of a segment to deliver. `last` is the last non-empty text.
-    fn delivered_text<'a>(&'a self, last: &'a str) -> &'a str {
+    pub(crate) fn delivered_text<'a>(&'a self, last: &'a str) -> &'a str {
         match self.answer.as_deref() {
             Some(text) if self.final_turn_rules => text,
             // A history before the rules sent the last non-empty text.
@@ -129,7 +130,7 @@ impl Progress {
         }
     }
 
-    fn report(&self, stop: AgentStop, tree: &Tree) -> AgentReport {
+    pub(crate) fn report(&self, stop: AgentStop, tree: &Tree) -> AgentReport {
         AgentReport {
             stop,
             text: self.last_text.clone(),
@@ -153,34 +154,34 @@ impl Progress {
 ///
 /// The tree runs one step at a time inside one workflow, so a plain value is
 /// enough. No two children can read it at once.
-struct Tree {
+pub(crate) struct Tree {
     /// The run id of the root agent. A child run id adds an ordinal to it.
-    root: String,
+    pub(crate) root: String,
     /// Tool rounds of the whole tree. Approval names use it, so they are
     /// unique in the tree. With no delegation, it equals the round count of
     /// the root run, so the names stay as before.
-    rounds: u32,
+    pub(crate) rounds: u32,
     /// Delegations that started in the tree.
-    delegations: u32,
+    pub(crate) delegations: u32,
     /// The flow labels of the task, and of every call in the tree that the
     /// decision let run.
-    exercised: BTreeSet<String>,
+    pub(crate) exercised: BTreeSet<String>,
     /// The flow rules that a person released by an approval in this tree.
     /// Another run or a remote peer never adds one, so a carried label can
     /// never stand in for an approval.
-    released: Released,
+    pub(crate) released: Released,
     /// Each delegation, in the order it ended.
-    records: Vec<DelegationRecord>,
+    pub(crate) records: Vec<DelegationRecord>,
 }
 
 /// One agent of a run tree: its mandate, and the peers that its recorded
 /// lookup found.
-struct Agent {
+pub(crate) struct Member {
     mandate: Mandate,
     peers: Vec<Peer>,
 }
 
-impl Agent {
+impl Member {
     /// The `delegate` tool, when the agent has a peer to ask.
     fn delegate_tool(&self) -> Option<crate::message::ToolDefinition> {
         (!self.peers.is_empty()).then(|| delegate_definition(&self.peers))
@@ -189,9 +190,9 @@ impl Agent {
 
 /// One agent run: its task and its place in the tree.
 #[derive(Clone, Copy)]
-struct Run<'a> {
-    task: &'a AgentTask,
-    agent: Option<&'a Agent>,
+pub(crate) struct Run<'a> {
+    pub(crate) task: &'a AgentTask,
+    pub(crate) agent: Option<&'a Member>,
 }
 
 impl Run<'_> {
@@ -207,7 +208,7 @@ impl Run<'_> {
             .followups
             .map(|_| followup::definition())
             .into_iter()
-            .chain(self.agent.and_then(Agent::delegate_tool))
+            .chain(self.agent.and_then(Member::delegate_tool))
             .collect()
     }
 }
@@ -390,7 +391,7 @@ pub(crate) async fn drive(
 /// Read the peers that `mandate` names, through one recorded activity.
 ///
 /// A mandate with no peers needs no lookup, so it records nothing.
-async fn discover(ctx: &WorkflowContext, mandate: &Mandate) -> Result<Agent, String> {
+pub(crate) async fn discover(ctx: &WorkflowContext, mandate: &Mandate) -> Result<Member, String> {
     let peers = if mandate.peers.is_empty() {
         Vec::new()
     } else {
@@ -399,7 +400,7 @@ async fn discover(ctx: &WorkflowContext, mandate: &Mandate) -> Result<Agent, Str
             .await
             .map_err(|e| e.to_string())?
     };
-    Ok(Agent {
+    Ok(Member {
         mandate: mandate.clone(),
         peers,
     })
@@ -413,7 +414,7 @@ async fn discover(ctx: &WorkflowContext, mandate: &Mandate) -> Result<Agent, Str
 /// # Errors
 ///
 /// Returns an engine error that is not a failed send, such as a cancel.
-async fn deliver(ctx: &WorkflowContext, report: Report) -> Result<bool, String> {
+pub(crate) async fn deliver(ctx: &WorkflowContext, report: Report) -> Result<bool, String> {
     let sent: HarvestResult<()> = ctx.execute_activity(&agent_deliver_info(), report).await;
     match sent {
         Ok(()) => Ok(true),
@@ -428,7 +429,7 @@ async fn deliver(ctx: &WorkflowContext, report: Report) -> Result<bool, String> 
 
 /// Run one segment: model turns and tool rounds until the model answers or a
 /// bound ends it. Returns why the segment ended.
-async fn run_segment(
+pub(crate) async fn run_segment(
     ctx: &WorkflowContext,
     run: Run<'_>,
     progress: &mut Progress,
@@ -947,7 +948,7 @@ fn delegate_args(arguments: &serde_json::Value) -> Option<DelegateArgs> {
 async fn delegate(
     ctx: &WorkflowContext,
     run: Run<'_>,
-    agent: &Agent,
+    agent: &Member,
     progress: &mut Progress,
     tree: &mut Tree,
     call: &ToolCall,
@@ -1083,7 +1084,7 @@ struct Admitted<'a> {
 /// The checks run in a fixed order: the mandate names the peer, the roster
 /// knows it, the mandate allows the hop, and tokens are left.
 fn admit<'a>(
-    agent: &'a Agent,
+    agent: &'a Member,
     task: &AgentTask,
     progress: &Progress,
     tree: &Tree,
@@ -1129,7 +1130,7 @@ fn refused(refusal: Refusal, peer: &str) -> ToolOutcome {
 }
 
 /// The installed harness, or an error that names the fix.
-fn harness(ctx: &ActivityContext) -> Result<&AgentHarness, String> {
+pub(crate) fn harness(ctx: &ActivityContext) -> Result<&AgentHarness, String> {
     ctx.state::<AgentHarness>().ok_or_else(|| {
         ActivityFailure::non_retryable(
             "AgentHarnessMissing",
@@ -1330,11 +1331,11 @@ pub async fn agent_discover_peers(
     Ok(harness(ctx)?.discover_peers(&names))
 }
 
-/// The workflows to register on a `HarvestBuilder`: `agent_loop` and
-/// `agent_heartbeat`.
+/// The workflows to register on a `HarvestBuilder`: `agent_loop`,
+/// `agent_heartbeat` and the durable `agent`.
 #[must_use]
 pub fn workflows() -> Vec<WorkflowInfo> {
-    vec![agent_loop_info(), agent_heartbeat_info()]
+    vec![agent_loop_info(), agent_heartbeat_info(), agent_info()]
 }
 
 /// The activities to register on a `HarvestBuilder`.
@@ -1347,6 +1348,8 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_deliver_info(),
         agent_precheck_info(),
         agent_discover_peers_info(),
+        agent_profile_info(),
+        agent_memory_reset_info(),
     ]
 }
 

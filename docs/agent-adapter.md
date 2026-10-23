@@ -98,10 +98,12 @@ let built = HarvestBuilder::new()
     .build();
 ```
 
-`workflows()` returns `agent_loop` and `agent_heartbeat`. `activities()`
-returns `agent_model_turn`, `agent_tool_call`, `agent_memory_snapshot`,
-`agent_deliver`, `agent_precheck` and `agent_discover_peers`. The test
-`the_engine_registration_builds` builds this exact registration.
+`workflows()` returns `agent_loop`, `agent_heartbeat` and the durable
+`agent` (section 15). `activities()` returns `agent_model_turn`,
+`agent_tool_call`, `agent_memory_snapshot`, `agent_deliver`,
+`agent_precheck`, `agent_discover_peers`, `agent_profile` and
+`agent_memory_reset`. The test `the_engine_registration_builds` builds this
+exact registration.
 
 Start a run under the name `agent_loop` with an `AgentTask` as input. To
 decide on a gated call, send a signal to the run, with a serialised
@@ -412,7 +414,6 @@ strict replay compares each recorded input as it was written.
   list changes only later turns. Recorded turns replay as they were.
 - **A follow-up chain shares one workflow history.** Each segment adds to
   it. Keep `max_chain` low, or start a new run from the report.
-- **The session entity is separate.** It is a sibling issue.
 - **All agents share the harness model.** A peer cannot choose its own
   model. See [the agent mesh guide](agent-mesh.md).
 - **The cost ledger needs Postgres.** The SQLite path calls the model
@@ -795,3 +796,71 @@ A run can delegate a task to a peer agent. The peer runs as a sub-agent
 inside the same workflow, with its own prompt, tools and budget. A mandate
 bounds the delegation tree. Flow rules gate a dangerous sequence of tool
 calls across the tree. Read [`agent-mesh.md`](agent-mesh.md).
+
+## 15. Durable agents
+
+An `Agent` (issue #2263) is a named, long-lived actor. It owns its state,
+handles one message at a time, and survives a crash. It is the agent loop
+inside a keyed entity (ADR 0006). The design is in
+[`DESIGN-2262.md`](../DESIGN-2262.md).
+
+| Agent concept | Harvest part |
+|---|---|
+| Address | `AgentId`, `<kind>/<name>`. It is the workflow id of the workflow `agent`. |
+| Inbox | `AgentOp` values on the signal `harvest.entity.op` |
+| Config | One `AgentProfile` for each kind, on the harness |
+| One op | One segment of the agent loop, with the whole harness |
+| State | `AgentState`: the transcript, the flow labels and the counters |
+| Checkpoint | Continue-as-new. The state rides in the input. |
+
+```rust
+use autumn_harvest_agent::{AgentHarness, AgentId, AgentOp, AgentProfile, sqlite};
+
+let harness = AgentHarness::new(model)
+    .tool(lookup)
+    .agent(AgentProfile::new("support").system("You answer support mail."));
+sqlite::register(&mut rt, Arc::new(harness));
+
+let id = AgentId::new("support", "acct-42")?;
+sqlite::send(&mut rt, &id, &AgentOp::message_with_id("Where is my order?", "m-1"), Some("m-1"))?;
+sqlite::drive(&mut rt, &id).await?;
+let state = sqlite::state(&rt, &id).await?;
+```
+
+On Postgres, send a signal-with-start to the workflow `agent`. Use the agent
+id as the workflow id, `{}` as the start input, and `Agent::payload(&op)` as
+the signal payload. Pass the message id as the idempotency key.
+
+### The inbox
+
+| Op | Effect |
+|---|---|
+| `user_message` | Runs one segment with the text as the user message. |
+| `control: pause` | Holds each later message in the state. |
+| `control: resume` | Runs the held messages in order, then takes new ones. |
+| `control: reset_memory` | Clears the memory scope `agent:<id>`. |
+| `control: clear_transcript` | Clears the transcript. The flow labels stay. |
+
+A control op applies at once, also while the agent is paused. The kernel
+`agent::inbox::admit` makes the choice. Verus proves it, see
+`formal/verus/src/agent_inbox.rs`.
+
+### Guarantees
+
+- One op runs at a time. A second message waits for the first reply.
+- An acknowledged message is never lost. A paused agent holds it, and runs
+  it on resume. A full held queue (256 ops) refuses an op and names it in
+  `AgentState::last_error`.
+- Replay rebuilds the transcript. A restart asks no recorded model call
+  again.
+- A failed op keeps the transcript as it was. It keeps the flow labels and
+  the tokens that its tools and turns used.
+- Each segment gets the run id `<incarnation>:s<n>`. The incarnation is a
+  recorded id of this life of the agent, so a delete and a new start never
+  reuse a tool idempotency key. The state carries the tool-round counter, so
+  approval names never repeat.
+- The transcript keeps at most `AgentProfile::window` messages. The cut
+  lands on a user message.
+
+`autumn-harvest-agent/examples/agent_session_entity.rs` runs a chat session
+as an agent.

@@ -73,9 +73,20 @@ required-features = ["eval", "sqlite"]
 name = "mesh"
 required-features = ["sqlite"]
 
+[[test]]
+name = "durable_agent"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 
 [[example]]
 name = "sqlite_agent"
 required-features = ["sqlite"]
+
+# A session as a durable agent (issues #1975, #2263). `test = true` runs its
+# embedded tests in the crate's own `cargo test` step.
+[[example]]
+name = "agent_session_entity"
+required-features = ["sqlite"]
+test = true

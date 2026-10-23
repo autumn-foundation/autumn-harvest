@@ -241,7 +241,7 @@ fn the_engine_registration_builds() {
         .activities(activities())
         .state(AgentHarness::new(ScriptedModel::new(Vec::new())))
         .build();
-    assert_eq!(built.workflow_count(), 2);
+    assert_eq!(built.workflow_count(), 3);
     assert!(built.state::<AgentHarness>().is_some());
     let names: Vec<&str> = activities().iter().map(|a| a.name).collect();
     assert_eq!(
@@ -253,6 +253,8 @@ fn the_engine_registration_builds() {
             "agent_deliver",
             "agent_precheck",
             "agent_discover_peers",
+            "agent_profile",
+            "agent_memory_reset",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();
@@ -261,6 +263,7 @@ fn the_engine_registration_builds() {
         [
             autumn_harvest_agent::WORKFLOW_NAME,
             autumn_harvest_agent::heartbeat::HEARTBEAT_WORKFLOW_NAME,
+            autumn_harvest_agent::AGENT_WORKFLOW_NAME,
         ]
     );
 }
