@@ -78,7 +78,12 @@ impl Applied {
         }
         self.above.insert(seq);
         loop {
-            let next = next_floor(self.floor, self.above.contains(&(self.floor + 1)));
+            // A floor at the top of the range has no next number.
+            let has_next = self
+                .floor
+                .checked_add(1)
+                .is_some_and(|next| self.above.contains(&next));
+            let next = next_floor(self.floor, has_next);
             if next == self.floor {
                 break;
             }
@@ -161,6 +166,17 @@ mod tests {
         assert_eq!(applied.above.len(), MAX_ABOVE);
         assert_eq!(applied.floor, 0, "the floor never moves over a gap");
         assert!(applied.apply(1), "a very late message still applies");
+    }
+
+    #[test]
+    fn a_floor_at_the_top_of_the_range_does_not_overflow() {
+        let mut applied = Applied {
+            floor: u64::MAX - 1,
+            ..Applied::default()
+        };
+        assert!(applied.apply(u64::MAX));
+        assert_eq!(applied.floor, u64::MAX);
+        assert!(!applied.apply(u64::MAX), "a repeat is a duplicate");
     }
 
     #[test]
