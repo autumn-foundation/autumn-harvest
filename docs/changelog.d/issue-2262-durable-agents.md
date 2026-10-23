@@ -202,3 +202,29 @@ from `docs/agent-adapter.md`.
 - Unit tests in the SQLite `llm_ledger.rs` and `worker.rs`: the CHECK
   bounds match the core limits, the model id charset, the per-attempt cap,
   and a rolled-back or failed finalize writes no row.
+
+### Verus proofs of the agent kernels (epic #2262)
+
+The blue-team step of `DESIGN-2262.md` asks for Verus proofs of the pure
+kernels. Four new files in `formal/verus/src/` mirror them:
+
+- `agent_inbox.rs` proves `agent::inbox::admit`. A spec models the inbox
+  under any sequence of ops. The ops that ran, then the held ops, are
+  exactly the work ops received, in arrival order. An acknowledged op is
+  never lost, and none runs twice (invariant I2).
+- `agent_dedupe.rs` proves `is_new` and `next_floor`. After any order of
+  numbers, the floor and the set above it equal the plain applied set. So
+  the receiver never drops a new message as a duplicate. The bound on the
+  set makes no false duplicate either.
+- `agent_wake.rs` proves `next_heartbeat`. A tick books the next tick
+  strictly after the time that it ran. Messages never move a booked tick.
+- `agent_siblings.rs` proves `sibling_cap`. The shares of all siblings sum
+  to the remaining tokens, and each share is the base share or one more.
+
+`next_heartbeat` now saturates by hand, because Verus has no spec of
+`i64::saturating_add`. The result is the same for every input. The guard
+`verus_proofs_coverage.rs` now reads the doc comments of
+`autumn-harvest-agent/src` too.
+
+Each proof was checked by a mutation of its spec or its copy that Verus
+then rejects.

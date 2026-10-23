@@ -33,13 +33,15 @@ pub const MAX_ABOVE: usize = 256;
 /// Whether the number `seq` is new for a sender whose floor is `floor`.
 ///
 /// `in_above` says whether the set above the floor holds `seq`.
+/// `formal/verus/src/agent_dedupe.rs` proves it.
 #[must_use]
 pub const fn is_new(floor: u64, seq: u64, in_above: bool) -> bool {
     seq > floor && !in_above
 }
 
 /// The floor after one step: it moves up by one when the set above holds
-/// `floor + 1`.
+/// `floor + 1`. `formal/verus/src/agent_dedupe.rs` proves that the fold
+/// keeps the applied set exact.
 #[must_use]
 pub const fn next_floor(floor: u64, next_in_above: bool) -> u64 {
     if next_in_above && floor < u64::MAX {

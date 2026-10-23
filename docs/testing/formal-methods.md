@@ -648,7 +648,8 @@ The script fails when Verus reports an error, or when it verifies nothing.
 
 Verus cannot compile the engine crate, so each proof checks a copy of an
 engine function in `formal/verus/src/`. A `// mirror: <path> <fn>` line
-marks each copy. The guard suite
+marks each copy. A mirror can copy a function of `autumn-harvest/src` or
+of `autumn-harvest-agent/src`. The guard suite
 `autumn-harvest/tests/integration/verus_proofs_coverage.rs` removes
 comments, whitespace and `proof { }` blocks from both bodies. The bodies
 must then be equal. A `proof { }` block is ghost code. Verus erases it, so
@@ -698,6 +699,10 @@ copy matches. Port the change, then run the script.
 | `jitter.rs` | `uniform_inclusive`, `full_jitter_nanos`, `equal_jitter_nanos` in `policy.rs` | The jitter stays in its range for every input, with the real mixer. |
 | `dlq_spread.rs` | `spread_offset_nanos` in `dlq.rs` | No step overflows. The jitter is exact and below one slot. Row `index` of `count` stays in its slot and in the window. |
 | `owner_fence.rs` | `next_epoch` and `fence_passes` in `decision_owner.rs` | The next epoch is the epoch + 1 and never wraps. The fence passes a commit only at the epoch of the row, so never at an older one. Only an acquisition moves the epoch, so after a takeover the fence refuses every commit of the old tenure (issue #2251). A batch acquisition moves each locked row by one acquisition and leaves each other row (issue #2296). |
+| `agent_inbox.rs` | `admit` in `agent/inbox.rs` of the agent crate | A control op always applies. Work is never skipped, and runs only when the inbox is open. A tick is never held. Under any sequence of ops, the ops that ran and then the held ops are exactly the work ops received, in arrival order. So an acknowledged op is never lost, and none runs twice (issue #2263). |
+| `agent_dedupe.rs` | `is_new` and `next_floor` in `agent/dedupe.rs` of the agent crate | The floor and the set above it hold exactly the applied numbers. An apply and its fold equal the plain set insert, in any order and with any repeats. So the receiver takes no new message for a duplicate. The floor never moves over a gap, and the bound on the set forgets only an applied number (issue #2269). |
+| `agent_wake.rs` | `next_heartbeat` in `agent/wake.rs` of the agent crate | With no heartbeat, the function books nothing. A tick books the next tick strictly after the time that it ran, so a tick never runs in a loop. Any other op keeps the booked tick, so messages never starve the heartbeat (issue #2266). |
+| `agent_siblings.rs` | `sibling_cap` in `bounds.rs` of the agent crate | No step overflows. Each share is the base share or one more. The shares of all siblings sum to the remaining tokens, so concurrent children never pass the cap of the parent (issue #2270). |
 
 **The mixer inverse.** Each step of the `SplitMix64` finalizer has an
 inverse. A right xor-shift by `s` bits is undone by shifts of `s` and
@@ -705,6 +710,20 @@ inverse. A right xor-shift by `s` bits is undone by shifts of `s` and
 lemmas prove the shifts. Integer lemmas prove the multiplies. The Kani
 jitter proofs stub the mixer with any `u64`, and the bijection shows
 that the stub loses no case.
+
+**The agent kernels.** The durable agent of epic #2262 keeps its
+decisions in pure kernels, so Verus proves them as it proves the engine
+kernels. Each agent spec models the state that its kernel acts on. The
+inbox is a status, a held queue and a run list. The applied set is a plain
+set of numbers. The theorems hold for every sequence of ops. The
+inbox model has no bound on the held queue. A full queue refuses an op and
+names it in the agent state.
+
+**The heartbeat saturation.** Verus has no spec of `i64::saturating_add`,
+and the guard bans `assume_specification`. `next_heartbeat` therefore
+saturates by hand. Its step is at least 1, so only the top bound applies,
+and the result is the result of `saturating_add`. The unit test
+`the_booking_saturates_and_the_step_is_at_least_one` pins the case.
 
 **The jitter without a stub.** The Kani proofs of `uniform_inclusive`
 stub the mixer. The Verus proofs call the verified copy of `mix64`
