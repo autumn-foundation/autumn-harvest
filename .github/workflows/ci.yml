@@ -2326,6 +2326,11 @@ jobs:
         # Nothing compiled them. The guard keeps them in step with the API.
         # See scripts/check-durable-timers-examples.sh.
         run: ./scripts/check-durable-timers-examples.sh
+      - name: Check chapter 9 worker-routing snippets compile
+        # Chapter 9 shows the `requires` grammar and the `WorkerConfig` label
+        # and weight builders a reader pastes verbatim. Nothing compiled them.
+        # See scripts/check-worker-routing-examples.sh.
+        run: ./scripts/check-worker-routing-examples.sh
 
   # One check for branch protection to require in place of every leg above.
   # A skipped leg (a draft PR) counts as a pass, as a skipped job does
