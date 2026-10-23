@@ -523,11 +523,17 @@ with the shared head scan. Stage 1b moves workflow tasks off the claim loop.
 - A worker with queue weights or fairness keys runs no decider. It keeps
   the owned claim of issue #2252, so its workflow tasks follow the weighted
   queue order and the fairness lags of issue #1976.
+- A decider runs only on a database with an owner wake listener. With no
+  wake, it finds each row by a scan, and a scan with a take costs more than
+  one head claim. The claim loops then keep the owned claim.
 - The decider learns of work from two sources. An owner wake names an
   execution. A scan reads the pending workflow rows of its partitions by due
   time, with `idx_harvest_tq_owner_scan`.
 - The scan runs at each tenure change, when a permit frees after a full
-  scan, and at the next due time. The gap is at most one poll interval.
+  scan, and at the next due time. With no live wake listener, the gap is
+  at most one poll interval. While a listener receives the owner wakes,
+  the gap is at most 1 s or one poll interval, whichever is longer. A
+  listener that listens again triggers a scan at once.
 - So a lost wake, a due timer and the backlog of a new partition all reach
   the decider.
 - A take is the owned by-execution claim. Every claim gate, the claim guard

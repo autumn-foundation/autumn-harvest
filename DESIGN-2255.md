@@ -84,10 +84,10 @@ issue moves workflow tasks off the shared claim loop.
 | H2 | A paused run sits at the head of the scan and starves the rest. | The scan skips paused runs and paused queues. A take that the gates refuse backs off that execution. |
 | H3 | Two takes of one row run at once. | The row is the lock. A local in-flight set skips a second take in the same worker. |
 | H4 | A stale owner takes after a takeover. | The guard matches the holder. The mask holds live tenures only. The commit fence stays the backstop. |
-| H5 | A timer fires late. | The scan reads the next due time and sleeps until then, at most one poll interval. |
+| H5 | A timer fires late. | The scan reads the next due time and sleeps until then, at most the scan gap. |
 | H6 | The decider takes during shutdown. | It stops on the shutdown token. The drain starts after it returns. |
 | H7 | The decider starves on permits that the claim loop holds. | The claim loop takes no workflow permit where the decider runs. |
-| H8 | A worker with no listener URL never hears a wake. | The scan runs every poll interval, as the claim loop polls. |
+| H8 | A worker with no listener URL never hears a wake. | No decider runs there. The claim loops keep the owned claim. A configured listener that drops scans every poll interval until it listens again. |
 | H9 | The new index slows the hot table. | It holds pending workflow rows only. One row per run. The upgrade guide gives the out-of-band build. |
 | H10 | The fused fence changes the error of a fenced shard. | A generation mismatch still returns `ShardFenced`. A lock timeout on either row fails closed as `OwnershipLost`. |
 | H11 | The per-append skip misses a colocated shard with its own generation row. | The skip compares the resolved shard and the pinned generation of both shards. |
@@ -199,6 +199,21 @@ owned claim of #2252. `a_worker_with_queue_weights_keeps_the_owned_claim`
 proves it. The next review found the same gap for fairness keys. A worker
 with fairness keys now keeps the owned claim too.
 `a_worker_with_fairness_keys_keeps_the_owned_claim` proves it.
+
+CI then failed `scale_out_from_4_to_8_workers_recovers_within_two_ttls`.
+The decider scanned each poll interval, also with live wakes. The test
+polls every 25 ms, so 8 deciders sent about 300 scans a second.
+`pg_stat_statements` showed the scan at 3.6 times the server time of the
+takes. On one host, the rate after the scale-out fell from 0.73 of the
+baseline on `trunk-dev` to 0.62. While a listener receives the owner
+wakes, the scan gap is now 1 s or one poll interval, whichever is longer.
+With no live listener, the scan still polls (H8).
+
+The gap did not move the scan count: the test worker has no notification
+URL. With no wake, the scan is the only source of work. A scan of 4 rows
+then a take for each costs more than one head claim per task. So a decider
+now runs only on a database with an owner wake listener.
+`a_worker_with_no_wake_listener_keeps_the_owned_claim` proves it.
 
 ## 5. Measurements
 

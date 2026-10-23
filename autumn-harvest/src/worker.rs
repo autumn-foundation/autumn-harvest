@@ -33295,6 +33295,9 @@ pub struct Worker {
     /// The claim targets of the running claim loops (issue #2255). The run
     /// path sets them.
     claim_targets: std::sync::RwLock<Vec<Option<crate::types::ShardId>>>,
+    /// The owner shards with an owner wake task (issue #2255). A decider
+    /// runs only on these.
+    owner_wake_shards: std::sync::RwLock<HashSet<crate::types::ShardId>>,
     /// The partitions that the owner wake tasks listen on (issue #2253).
     owner_listening:
         Arc<std::sync::Mutex<std::collections::BTreeSet<crate::decision_owner::OwnerKey>>>,
@@ -35046,6 +35049,16 @@ struct DeciderTarget<'a> {
 /// once per batch, not once per decision.
 const OWNER_SCAN_LIMIT_MAX: usize = 64;
 
+/// The shortest gap between two safety scans of an owner decider (issue
+/// #2255).
+///
+/// While a listener receives the owner wakes, the wakes carry new work. The
+/// scan then only catches a lost wake. So a short poll interval must not
+/// scan each partition many times a second. The gap is this value or one
+/// poll interval, whichever is longer. A full scan and a due row still set
+/// an earlier scan. With no live listener, the scan polls.
+const OWNER_SCAN_SAFETY_MIN: Duration = Duration::from_secs(1);
+
 /// The longest backoff of an execution whose takes find nothing (issue
 /// #2255).
 const OWNER_TAKE_BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -35082,6 +35095,8 @@ struct DeciderState {
     scanning: bool,
     /// The time of the next scan.
     scan_at: std::time::Instant,
+    /// A listener receives the owner wakes of this shard.
+    wakes_live: bool,
     /// The last warn-level log.
     warned: Option<std::time::Instant>,
 }
@@ -35098,6 +35113,7 @@ impl DeciderState {
             backoff: HashMap::new(),
             scanning: false,
             scan_at: std::time::Instant::now(),
+            wakes_live: false,
             warned: None,
         }
     }
@@ -35185,6 +35201,33 @@ impl DeciderState {
         let misses = self.backoff.get(&exec).map_or(0, |(_, misses)| misses + 1);
         let wait = owner_take_backoff(self.poll, misses);
         self.backoff.insert(exec, (now + wait, misses));
+    }
+
+    /// Record whether a listener receives the owner wakes. When it starts to
+    /// listen again, scan at once: a wake sent in the gap is lost.
+    const fn set_wakes_live(&mut self, live: bool, now: std::time::Instant) {
+        if live && !self.wakes_live {
+            self.scan_at = now;
+        }
+        self.wakes_live = live;
+    }
+
+    /// A scan ended. A full scan scans again when the queue drains. Else the
+    /// next scan runs at the first due row or after the gap, whichever comes
+    /// first. The gap is one poll interval, or the safety gap while wakes
+    /// are live.
+    fn scanned(&mut self, now: std::time::Instant, full: bool, next_due: Option<Duration>) {
+        self.scanning = false;
+        let safety = if self.wakes_live {
+            self.poll.max(OWNER_SCAN_SAFETY_MIN)
+        } else {
+            self.poll
+        };
+        self.scan_at = if full {
+            now
+        } else {
+            now + next_due.map_or(safety, |due| due.min(safety))
+        };
     }
 
     /// Whether a scan can start now, apart from its time.
@@ -35931,6 +35974,7 @@ impl Worker {
             owner_hints: Arc::default(),
             decider_capacity: Arc::new(tokio::sync::Notify::new()),
             claim_targets: std::sync::RwLock::default(),
+            owner_wake_shards: std::sync::RwLock::default(),
             owner_listening: Arc::default(),
             gate_refused: Arc::new(GateRefused::default()),
             limit_refused: AtomicBool::new(false),
@@ -35961,9 +36005,14 @@ impl Worker {
     fn spawn_owner_wakes(&self, url: &str, shard: Option<crate::types::ShardId>) -> AbortOnDrop {
         // Issue #2252: the tenures are per worker, keyed by the canonical
         // shard of the database. The owner loops record that key first.
+        let owner_shard = self.owner_shard_of(shard);
+        self.owner_wake_shards
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(owner_shard);
         let wakes = OwnerWakes {
             url: url.to_string(),
-            shard: self.owner_shard_of(shard),
+            shard: owner_shard,
             owned: Arc::clone(&self.decision_owner),
             workflow_cache: Arc::clone(&self.workflow_cache),
             woken: Arc::clone(&self.owner_woken),
@@ -35974,6 +36023,16 @@ impl Worker {
             listening: Arc::clone(&self.owner_listening),
         };
         AbortOnDrop::new(tokio::spawn(wakes.run()))
+    }
+
+    /// Whether an owner wake task listens on a channel of `shard` (issue
+    /// #2255). The decider then scans at the safety gap only.
+    fn owner_wakes_live(&self, shard: crate::types::ShardId) -> bool {
+        self.owner_listening
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|key| key.shard == shard)
     }
 
     /// Whether an owner wake task listens on the channel of `key` (issue
@@ -40040,6 +40099,21 @@ impl Worker {
         self.config.queue_weights.is_empty() && !self.config.fairness_keys
     }
 
+    /// Whether an owner decider runs for the claim target `shard` (issue
+    /// #2255).
+    ///
+    /// It runs only where an owner wake task runs. With no wake, a decider
+    /// finds each row by a scan, and a scan with a take costs more than one
+    /// head claim. The claim loops then keep the owned claim of #2252.
+    fn decider_runs_on(&self, shard: Option<crate::types::ShardId>) -> bool {
+        self.deciders_enabled()
+            && self
+                .owner_wake_shards
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&self.owner_shard_of(shard))
+    }
+
     /// Whether an owner decider takes the workflow tasks of every claim
     /// target of this worker (issue #2255).
     fn deciders_take_every_workflow(&self) -> bool {
@@ -40047,11 +40121,10 @@ impl Worker {
             .claim_targets
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.deciders_enabled()
-            && !targets.is_empty()
+        !targets.is_empty()
             && targets
                 .iter()
-                .all(|shard| self.owned_claim(*shard).is_some())
+                .all(|shard| self.decider_runs_on(*shard) && self.owned_claim(*shard).is_some())
     }
 
     /// What a Postgres poll may claim where the owner decider runs (issue
@@ -40473,8 +40546,10 @@ impl Worker {
     /// It learns of work from two sources. An owner wake names an execution.
     /// A scan reads the pending workflow rows of its partitions by due time.
     /// The scan runs at each tenure change and after a full scan. It also
-    /// runs at the next due time, at most one poll interval apart. So a lost
-    /// wake, a due timer and the backlog of a new partition all reach it.
+    /// runs at the next due time, at most one scan gap apart. The gap is one
+    /// poll interval, or [`OWNER_SCAN_SAFETY_MIN`] while wakes are live. So
+    /// a lost wake, a due timer and the backlog of a new partition all reach
+    /// it.
     ///
     /// Each take is the owned by-execution claim. Takes and scans run as
     /// futures beside the loop, so a scan never stalls a take. The workflow
@@ -40489,6 +40564,10 @@ impl Worker {
     #[allow(clippy::too_many_lines)]
     async fn run_owner_decider(&self, target: &DeciderTarget<'_>) {
         use futures::StreamExt as _;
+        // The run path spawns the owner wake tasks before the deciders.
+        if !self.decider_runs_on(target.shard) {
+            return;
+        }
         let owner_shard = self.owner_shard_of(target.shard);
         let poll = self.config.poll_interval;
         let limit = self
@@ -40516,10 +40595,11 @@ impl Worker {
             let pending = AtomicBool::load(target.registration_pending, Ordering::Relaxed);
             let owned = self
                 .owned_claim(target.shard)
-                .filter(|_| may_claim_tasks(pending) && self.deciders_enabled());
+                .filter(|_| may_claim_tasks(pending) && self.decider_runs_on(target.shard));
             let mut blocked = false;
             if let Some(owned) = owned {
                 state.activate(now);
+                state.set_wakes_live(self.owner_wakes_live(owner_shard), now);
                 for exec in self.owner_hints.take(owner_shard) {
                     state.hint(exec);
                 }
@@ -40693,22 +40773,14 @@ impl Worker {
         let now = std::time::Instant::now();
         match event {
             DeciderEvent::Scanned(Ok(scan)) => {
-                state.scanning = false;
                 let full = scan.due.len() >= limit;
                 for exec in scan.due {
                     state.queue(exec);
                 }
-                // A full scan may leave due rows. Scan again when the queue
-                // drains.
-                state.scan_at = if full {
-                    now
-                } else {
-                    now + scan.next_due.map_or(state.poll, |due| due.min(state.poll))
-                };
+                state.scanned(now, full, scan.next_due);
             }
             DeciderEvent::Scanned(Err(error)) => {
-                state.scanning = false;
-                state.scan_at = now + state.poll;
+                state.scanned(now, false, None);
                 if state.may_warn(now) {
                     tracing::warn!(
                         worker_id = %self.config.worker_id,
@@ -40795,7 +40867,7 @@ impl Worker {
         // tasks. This poll then claims activities only, and takes no
         // workflow permit.
         let owned = self.owned_claim(shard);
-        let decider_runs = owned.is_some() && self.deciders_enabled();
+        let decider_runs = owned.is_some() && self.decider_runs_on(shard);
         let mut permits = PollPermits::acquire(
             if decider_runs {
                 self.activity_admission_now()
@@ -57229,6 +57301,45 @@ mod tests {
         assert!(!state.may_scan(now, 2), "a full queue scans no more");
         state.deactivate();
         assert!(state.ready.is_empty() && !state.active);
+    }
+
+    /// With live wakes, a scan with nothing more to find waits for the
+    /// safety gap, not one short poll. A full scan and a due row still set
+    /// the next scan. With no live wakes, the scan polls (issue #2255).
+    #[test]
+    fn decider_state_schedules_the_safety_scan_apart_from_a_short_poll() {
+        let poll = Duration::from_millis(25);
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(poll);
+        state.scanned(now, false, None);
+        assert_eq!(state.scan_at, now + poll, "no live wakes: the scan polls");
+        let later = now + Duration::from_secs(5);
+        state.set_wakes_live(true, later);
+        assert_eq!(state.scan_at, later, "live wakes again: scan at once");
+        state.set_wakes_live(true, later + poll);
+        assert_eq!(state.scan_at, later, "no change: no extra scan");
+        state.scanned(now, false, None);
+        assert_eq!(
+            state.scan_at,
+            now + OWNER_SCAN_SAFETY_MIN,
+            "the safety scan"
+        );
+        state.scanned(now, true, None);
+        assert_eq!(state.scan_at, now, "a full scan scans again at once");
+        let due = Duration::from_millis(300);
+        state.scanned(now, false, Some(due));
+        assert_eq!(state.scan_at, now + due, "a due row sets the next scan");
+        state.scanned(now, false, Some(Duration::from_secs(60)));
+        assert_eq!(
+            state.scan_at,
+            now + OWNER_SCAN_SAFETY_MIN,
+            "at most the safety interval"
+        );
+        let slow = Duration::from_secs(5);
+        let mut state = DeciderState::new(slow);
+        state.set_wakes_live(true, now);
+        state.scanned(now, false, None);
+        assert_eq!(state.scan_at, now + slow, "a longer poll interval wins");
     }
 
     /// Owner hints dedupe per shard and drain once (issue #2255).

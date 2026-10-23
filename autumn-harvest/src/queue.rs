@@ -3663,7 +3663,8 @@ const OWNER_SCAN_SQL: &str = concat!(
 /// Scan the pending workflow tasks of an owner's partitions (issue #2255).
 ///
 /// The owner decider runs it at each tenure change, after a full scan, and
-/// at the next due time, at most one poll interval apart. It finds a row
+/// at the next due time. The gap is one poll interval, or a longer safety
+/// gap while a listener receives the owner wakes. It finds a row
 /// that no wake reached: a lost `NOTIFY`, a due timer, or the backlog of a
 /// new partition. An unstamped row passes too. The take then stamps it and
 /// re-pends it to its owner.

@@ -152,6 +152,11 @@ impl Node {
     }
 
     fn with_config(url: &str, config: WorkerConfig, claim_loops: usize) -> Self {
+        Self::with_listener(url, config, claim_loops, true)
+    }
+
+    /// A node that listens for wakes on `url` only when `listen` holds.
+    fn with_listener(url: &str, config: WorkerConfig, claim_loops: usize, listen: bool) -> Self {
         let claims = Claims::default();
         let built = HarvestBuilder::new()
             .workflows(workflows![
@@ -175,7 +180,7 @@ impl Node {
         runtime.max_concurrent_activities = 16;
         runtime.max_concurrent_claims = claim_loops;
         runtime.worker_heartbeat_interval = Duration::from_secs(1);
-        runtime.notification_database_url = Some(url.to_string());
+        runtime.notification_database_url = listen.then(|| url.to_string());
         let worker = Arc::new(Worker::new(runtime, Arc::new(registry)).expect("worker"));
         Self {
             worker,
@@ -574,9 +579,11 @@ async fn the_owner_scan_reads_owned_and_unstamped_due_rows_only() {
 /// decider takes them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_with_queue_weights_keeps_the_owned_claim() {
-    assert_keeps_the_owned_claim("decider-weights", |config, queue| {
-        config.with_queue_weights([(queue, 3)])
-    })
+    assert_keeps_the_owned_claim(
+        "decider-weights",
+        |config, queue| config.with_queue_weights([(queue, 3)]),
+        true,
+    )
     .await;
 }
 
@@ -585,17 +592,29 @@ async fn a_worker_with_queue_weights_keeps_the_owned_claim() {
 /// takes a workflow task.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_with_fairness_keys_keeps_the_owned_claim() {
-    assert_keeps_the_owned_claim("decider-fairness", |config, _| {
-        config.with_fairness_keys(true)
-    })
+    assert_keeps_the_owned_claim(
+        "decider-fairness",
+        |config, _| config.with_fairness_keys(true),
+        true,
+    )
     .await;
 }
 
+/// A worker with no wake listener keeps the owned claim of issue #2252.
+/// With no wake, a decider must find each row by a scan. A scan and a take
+/// then cost more than one head claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_with_no_wake_listener_keeps_the_owned_claim() {
+    assert_keeps_the_owned_claim("decider-unlistened", |config, _| config, false).await;
+}
+
 /// Run 3-activity workflows on one owner with the configuration that
-/// `configure` sets. Assert that claims take every workflow task.
+/// `configure` sets. The owner listens for wakes when `listen` holds.
+/// Assert that claims take every workflow task.
 async fn assert_keeps_the_owned_claim(
     label: &str,
     configure: impl FnOnce(WorkerConfig, &str) -> WorkerConfig,
+    listen: bool,
 ) {
     let runs: u64 = 10;
     let db = OwnDb::new().await;
@@ -607,7 +626,7 @@ async fn assert_keeps_the_owned_claim(
         WorkerConfig::default().with_queues([queue.as_str()]),
         &queue,
     );
-    let mut node = Node::with_config(&db.url, config, 2);
+    let mut node = Node::with_listener(&db.url, config, 2, listen);
     node.run(&pool);
     eventually("the owner owns every partition", async || {
         live_partitions(&mut conn).await == 512

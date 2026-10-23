@@ -15,7 +15,10 @@ owned database, beside its claim loops. The claim loops then claim
 activities only. The decider learns of work from the owner wake of a
 partition and from a scan of its partitions by due time. The scan runs at
 each tenure change and after a full scan. It also runs at the next due
-time, at most one poll interval apart. A take is the owned
+time, at most one poll interval apart. While a listener receives the owner
+wakes, the gap grows to 1 s or one poll interval, whichever is longer. So
+a short poll interval does not scan each partition many times a second.
+A take is the owned
 by-execution claim, so every claim gate, the claim guard and the
 post-claim rechecks still apply. Each take runs in its own future, bounded
 by the workflow permits, and a scan never stalls a take. The task row
@@ -23,8 +26,10 @@ serializes the decisions of one execution. A take that finds nothing backs
 its execution off, from one poll interval up to 30 s. A wake ends the
 backoff. So a refused row cannot hold the head of the scan. The scan index
 leads with the partition, so a scan reads a few rows of each owned
-partition. With owner mode off, the decider sends no query. A worker with
-queue weights or fairness keys runs no decider. It keeps the owned claim of
+partition. With owner mode off, the decider sends no query. A decider runs
+only on a database with a wake listener, so a worker with no notification
+URL keeps the owned claim. A worker with queue weights or fairness keys
+runs no decider. It keeps the owned claim of
 issue #2252, so its workflow tasks follow the weighted queue order and the
 fairness lags of issue #1976.
 
