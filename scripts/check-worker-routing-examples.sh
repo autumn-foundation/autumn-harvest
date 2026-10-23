@@ -8,7 +8,9 @@
 #
 # The four ```rust blocks (activity `requires`, label map, `with_label`,
 # `with_queue_weights`) are extracted, wrapped with the imports and type stubs
-# the chapter implies, and checked with `cargo check`.
+# the chapter implies, and compiled. The macro copies the `requires` string
+# without parsing it, so the example also runs: it passes the string of the
+# first block to `eligibility::parse_requirements` and fails on a parse error.
 #
 # Usage: ./scripts/check-worker-routing-examples.sh
 
@@ -60,15 +62,21 @@ fi
   echo "fn weights() {"
   echo "let _ = $b4;"
   echo "}"
-  echo "fn main() {}"
+  echo "fn main() {"
+  echo "    let requires = activity_block::transcode_video_info().requires"
+  echo "        .expect(\"chapter 9 activity declares no requires\");"
+  echo "    let parsed = autumn_harvest::eligibility::parse_requirements(requires)"
+  echo "        .unwrap_or_else(|e| panic!(\"chapter 9 requires {requires:?} does not parse: {e}\"));"
+  echo "    assert!(!parsed.is_empty());"
+  echo "}"
 } >"$example_path"
 
-if output="$(cargo check --quiet -p autumn-harvest-plugin --example "$example_name" 2>&1)"; then
-  echo "OK: chapter 9 snippets compile."
+if output="$(cargo run --quiet -p autumn-harvest-plugin --example "$example_name" 2>&1)"; then
+  echo "OK: chapter 9 snippets compile and the requires string parses."
   exit 0
 fi
 
 errors="$(grep -c '^error\[' <<<"$output")"
-echo "chapter 9 snippets do not compile ($errors error(s)):" >&2
+echo "chapter 9 snippets fail ($errors compile error(s)):" >&2
 echo "$output" >&2
 exit 1
