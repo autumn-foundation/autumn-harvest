@@ -196,7 +196,9 @@ Accepted as is:
 After the PR opened, the Codex review found that the decider ignored queue
 weights. A worker with queue weights now runs no decider and keeps the
 owned claim of #2252. `a_worker_with_queue_weights_keeps_the_owned_claim`
-proves it.
+proves it. The next review found the same gap for fairness keys. A worker
+with fairness keys now keeps the owned claim too.
+`a_worker_with_fairness_keys_keeps_the_owned_claim` proves it.
 
 ## 5. Measurements
 

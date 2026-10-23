@@ -40032,11 +40032,12 @@ impl Worker {
 
     /// Whether this worker runs owner deciders at all (issue #2255).
     ///
-    /// A worker with queue weights keeps the owned claim of issue #2252. Its
-    /// claim loops then take workflow tasks in the weighted queue order. A
-    /// decider would take them by due time and ignore the weights.
+    /// A worker with queue weights or fairness keys keeps the owned claim of
+    /// issue #2252. Its claim loops then take workflow tasks in the weighted
+    /// queue order and by the fairness lags of issue #1976. A decider takes
+    /// them by due time, so it ignores both.
     fn deciders_enabled(&self) -> bool {
-        self.config.queue_weights.is_empty()
+        self.config.queue_weights.is_empty() && !self.config.fairness_keys
     }
 
     /// Whether an owner decider takes the workflow tasks of every claim
