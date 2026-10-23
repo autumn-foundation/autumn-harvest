@@ -1,0 +1,126 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -17,7 +17,7 @@
+ use autumn_harvest::builder::WorkerConfig;
+ use autumn_harvest::dispatch::DispatchSettings;
+ use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
+-use autumn_harvest::telemetry::{DbOp, MetricsRecorder, TelemetryConfig};
++use autumn_harvest::telemetry::{ClaimKind, DbOp, MetricsRecorder, PersistPhase, TelemetryConfig};
+ use autumn_harvest::types::{ExecutionId, ShardId};
+ use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
+ use autumn_harvest::{Priority, StartSource, StartWorkflowParams, WorkflowContext};
+@@ -189,6 +189,10 @@
+     scan: Vec<f64>,
+     heartbeat: Vec<f64>,
+     pool_wait: Vec<f64>,
++    // Issue #2248: claims by kind, in `ClaimKind::ALL` order.
++    claim_kind: [Vec<f64>; 4],
++    // Issue #2248: decision persist phases, in `PersistPhase::ALL` order.
++    phase: [Vec<f64>; 6],
+ }
+ 
+ static SAMPLES: Mutex<Samples> = Mutex::new(Samples {
+@@ -197,6 +201,8 @@
+     scan: Vec::new(),
+     heartbeat: Vec::new(),
+     pool_wait: Vec::new(),
++    claim_kind: [const { Vec::new() }; 4],
++    phase: [const { Vec::new() }; 6],
+ });
+ 
+ /// Keeps the per-event #1815 signals and turns off every sampler.
+@@ -222,6 +228,17 @@
+         }
+     }
+ 
++    fn record_claim_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
++        self.record_db_query_duration(DbOp::Claim, shard, seconds);
++        let index = ClaimKind::ALL.iter().position(|k| *k == kind).expect("a known kind");
++        SAMPLES.lock().expect("samples lock").claim_kind[index].push(seconds);
++    }
++
++    fn record_persist_phase(&self, phase: PersistPhase, _shard: u16, seconds: f64) {
++        let index = PersistPhase::ALL.iter().position(|p| *p == phase).expect("a known phase");
++        SAMPLES.lock().expect("samples lock").phase[index].push(seconds);
++    }
++
+     fn record_db_pool_wait(&self, _shard: u16, seconds: f64) {
+         SAMPLES
+             .lock()
+@@ -238,6 +255,8 @@
+     samples.scan.clear();
+     samples.heartbeat.clear();
+     samples.pool_wait.clear();
++    samples.claim_kind.iter_mut().for_each(Vec::clear);
++    samples.phase.iter_mut().for_each(Vec::clear);
+ }
+ 
+ /// The nearest-rank percentile of `values`, in milliseconds.
+@@ -599,6 +618,10 @@
+     config.shard_assignments = vec![ShardId::new(0)];
+     config.max_concurrent_workflows = WORKFLOW_SLOTS;
+     config.max_concurrent_activities = ACTIVITY_SLOTS;
++    // Issue #2248: unset keeps the worker default.
++    if let Ok(raw) = std::env::var("ASSAY14_MAX_CONCURRENT_CLAIMS") {
++        config.max_concurrent_claims = raw.parse().expect("a claim cap is a whole number");
++    }
+     config
+ }
+ 
+@@ -705,6 +728,9 @@
+             start_source: StartSource::Api,
+             start_source_ref: None,
+             started_by: None,
++            // Trunk added these fields after assay #14 (issues #1976, #1977).
++            fairness_key: None,
++            tenant: None,
+         },
+         None,
+     )
+@@ -885,6 +911,18 @@
+     }
+ }
+ 
++/// Issue #2248: the claim split and the persist phases as `key=value` fields.
++fn split_fields(samples: &Samples) -> String {
++    let mut fields = Vec::new();
++    for (kind, values) in ClaimKind::ALL.iter().zip(&samples.claim_kind) {
++        fields.push(signal_fields(&format!("claim_{}", kind.as_str()), values));
++    }
++    for (phase, values) in PersistPhase::ALL.iter().zip(&samples.phase) {
++        fields.push(signal_fields(&format!("phase_{}", phase.as_str()), values));
++    }
++    fields.join(" ")
++}
++
+ /// Print one run as a `cell key=value ...` line, which `grade.py` reads.
+ fn print_cell(settings: &Settings, arm: Arm, depth: usize, outcome: &RunOutcome) {
+     let samples = SAMPLES.lock().expect("samples lock");
+@@ -898,7 +936,7 @@
+         "cell tree={} arm={} depth={depth} rep={} wfps={:.6} elapsed={:.3} completed={} \
+          activities={} valid={} truncated={} residue={residue} load1={} {} {} {} {} \
+          wait_n={} wait_p99_ms={wait_p99:.3} wait_max_ms={wait_max:.3} \
+-         in_use_mean={:.3} in_use_max={}",
++         in_use_mean={:.3} in_use_max={} {}",
+         settings.tree,
+         arm.as_str(),
+         settings.round,
+@@ -916,6 +954,7 @@
+         samples.pool_wait.len(),
+         outcome.occupancy.mean(),
+         outcome.occupancy.in_use_max,
++        split_fields(&samples),
+     );
+ }
+ 
+@@ -936,6 +975,10 @@
+              slots, {POOL_SIZE} connections, {WORKER_POLL_MS} ms poll. Input `{}`. Cap {} s.\n",
+             settings.input_json, settings.cap_secs
+         );
++        println!(
++            "Claim loops: {}.\n",
++            std::env::var("ASSAY14_MAX_CONCURRENT_CLAIMS").unwrap_or_else(|_| "default".into())
++        );
+     }
+     for arm in settings.arms.clone() {
+         for depth in settings.depths.clone() {

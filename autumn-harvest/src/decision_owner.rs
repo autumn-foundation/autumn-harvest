@@ -1507,6 +1507,7 @@ mod db {
     /// caller aborts the transaction and does not retry.
     /// [`HarvestError::Database`] on a query failure.
     pub async fn fence(conn: &mut AsyncPgConnection, tenure: &OwnerTenure) -> HarvestResult<()> {
+        let _phase = crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Fence);
         let idle = format!("{}ms", tenure.ttl().get().as_millis());
         let lost = |current: Option<i64>| HarvestError::OwnershipLost {
             partition: tenure.partition(),
@@ -1537,13 +1538,17 @@ mod db {
     /// Fence the tenure that the current decision pinned, if any.
     ///
     /// Outside a decision, or with no tenure pinned, it does nothing and
-    /// sends no query.
+    /// sends no query. Inside a [`super::fenced_scope`] of `conn`, it sends
+    /// no query either. The start fence holds the owner row until the
+    /// transaction ends, so a second fence cannot fail (issues #2252 and
+    /// #2248).
     ///
     /// # Errors
     ///
     /// As [`fence`].
     pub async fn fence_pinned(conn: &mut AsyncPgConnection) -> HarvestResult<()> {
         match pinned_decision() {
+            Some(tenure) if super::already_fenced(conn_id(conn), &tenure) => Ok(()),
             Some(tenure) => fence(conn, &tenure).await,
             None => Ok(()),
         }

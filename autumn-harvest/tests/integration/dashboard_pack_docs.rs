@@ -228,6 +228,10 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_db_query_duration_bucket",
     "harvest_db_query_duration_count",
     "harvest_db_query_duration_sum",
+    // Issue #2248 — decision persist phases.
+    "harvest_db_persist_phase_duration_bucket",
+    "harvest_db_persist_phase_duration_count",
+    "harvest_db_persist_phase_duration_sum",
     "harvest_worker_pollers",
     "harvest_worker_outlier",
     // Issue #954 — cross-region DR. Four gauges (bare) and one counter.
@@ -411,7 +415,9 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ("harvest_db_pool_in_use", &["shard"]),
     ("harvest_db_pool_idle", &["shard"]),
     ("harvest_db_pool_wait_duration", &["shard"]),
-    ("harvest_db_query_duration", &["op"]),
+    ("harvest_db_query_duration", &["op", "kind"]),
+    // Issue #2248. `phase` is bounded by the `PersistPhase` enum.
+    ("harvest_db_persist_phase_duration", &["phase"]),
     ("harvest_worker_pollers", &["queue"]),
     ("harvest_worker_outlier", &["dimension"]),
     // Issue #954 — cross-region DR. All `{shard}`-only: a standby's

@@ -8117,6 +8117,104 @@
             }
           ],
           "description": "1 when a worker fails a far higher share of tasks, or has a far higher p99 task latency, than the median of its live peers on the same queues (issue #1815). The worker is alive and passes the heartbeat check, so worker health alone misses it. GET /admin/status lists the same workers under workers.outliers. Alert: harvest_worker_gray_failure (docs/runbooks/harvest-alerts.md#harvest_worker_gray_failure)."
+        },
+        {
+          "id": 261089,
+          "type": "timeseries",
+          "title": "Claim latency by kind (mean)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 249
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (instance, kind, shard) (rate(harvest_db_query_duration_sum{op=\"claim\"}[$__rate_interval])) / sum by (instance, kind, shard) (rate(harvest_db_query_duration_count{op=\"claim\"}[$__rate_interval]))",
+              "legendFormat": "{{kind}} shard {{shard}} @ {{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Mean seconds of one claim, by what it returned: workflow, activity, empty or error (issue #2248). Workflow and activity tasks share one claim statement. A rise in one kind only points at its own rows. See docs/performance-decision-owner-baseline.md."
+        },
+        {
+          "id": 258100,
+          "type": "timeseries",
+          "title": "Decision persist time by phase (mean)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 249
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (instance, phase, shard) (rate(harvest_db_persist_phase_duration_sum[$__rate_interval])) / sum by (instance, phase, shard) (rate(harvest_db_persist_phase_duration_count[$__rate_interval]))",
+              "legendFormat": "{{phase}} shard {{shard}} @ {{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Mean seconds of each phase of one decision persist: fence, events, tasks, notify, commit and other (issue #2248). The phases of one persist add up to its persist sample on harvest_db_query_duration. A terminal failure write records no phase."
         }
       ]
     }

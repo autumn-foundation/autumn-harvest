@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
-use autumn_harvest::telemetry::{DbOp, MetricsRecorder, NoOpPropagator, TelemetryConfig};
+use autumn_harvest::telemetry::{
+    ClaimKind, DbOp, MetricsRecorder, NoOpPropagator, PersistPhase, TelemetryConfig,
+};
 use autumn_harvest::types::{ExecutionId, ShardId};
 use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
 use autumn_harvest::worker_outlier::{
@@ -1815,5 +1817,103 @@ async fn status_keeps_each_cohort_for_its_own_freshness_window() {
         find(&per_cohort, &id),
         Some(stats),
         "the cohort's own 120 second limit keeps the row"
+    );
+}
+
+/// The claim kinds and persist phases that one worker records (issue #2248).
+#[derive(Default)]
+struct ClaimSplit {
+    claims: Mutex<Vec<ClaimKind>>,
+    persists: Mutex<Vec<f64>>,
+    phases: Mutex<Vec<(PersistPhase, f64)>>,
+}
+
+impl MetricsRecorder for ClaimSplit {
+    fn record_db_query_duration(&self, op: DbOp, _shard: u16, seconds: f64) {
+        if op == DbOp::Persist {
+            self.persists.lock().unwrap().push(seconds);
+        }
+    }
+
+    fn record_claim_duration(&self, kind: ClaimKind, _shard: u16, _seconds: f64) {
+        self.claims.lock().unwrap().push(kind);
+    }
+
+    fn record_persist_phase(&self, phase: PersistPhase, _shard: u16, seconds: f64) {
+        self.phases.lock().unwrap().push((phase, seconds));
+    }
+}
+
+/// Issue #2248: each claim sample names the kind of task that it claimed,
+/// and each decision persist records every phase once. The phases of all
+/// persists add up to no more than the persist totals.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_worker_splits_claims_by_kind_and_persists_by_phase() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let pool: DbPool = build_test_pool(&url);
+    let mut conn = connect(&url).await;
+    let queue = unique_id("split-q");
+    let worker_id = unique_id("split-w");
+    let recorder = Arc::new(ClaimSplit::default());
+    let worker = build_worker_on(
+        &queue,
+        &worker_id,
+        Arc::clone(&recorder) as Arc<dyn MetricsRecorder>,
+        ActivityInfo {
+            handler: uncounted_failing_activity,
+            ..activity_info()
+        },
+        None,
+    );
+
+    let exec_id = ExecutionId::new();
+    let workflow_id = unique_id("split-wf");
+    start_or_load_workflow_execution(&mut conn, start_params(exec_id, &workflow_id, &queue), None)
+        .await
+        .expect("start workflow");
+    let runner = Arc::clone(&worker);
+    let run_pool = pool.clone();
+    let handle = tokio::spawn(async move { runner.run(&run_pool).await });
+    wait_for_execution_state_with_timeout(&url, exec_id, "FAILED", Duration::from_secs(30)).await;
+    worker.shutdown();
+    handle.await.expect("worker joins");
+
+    let claims = recorder.claims.lock().unwrap().clone();
+    let count = |kind: ClaimKind| claims.iter().filter(|k| **k == kind).count();
+    assert!(count(ClaimKind::Workflow) >= 2, "{claims:?}");
+    assert_eq!(count(ClaimKind::Activity), 2, "one per attempt: {claims:?}");
+    assert!(count(ClaimKind::Empty) >= 1, "an idle poll: {claims:?}");
+
+    let phases = recorder.phases.lock().unwrap().clone();
+    let persists = recorder.persists.lock().unwrap().clone();
+    let per_phase = |phase: PersistPhase| phases.iter().filter(|(p, _)| *p == phase).count();
+    let decisions = per_phase(PersistPhase::Commit);
+    assert!(decisions >= 2, "a decision per workflow task: {phases:?}");
+    for phase in PersistPhase::ALL {
+        assert_eq!(per_phase(phase), decisions, "{phase:?} once per persist");
+    }
+    assert!(
+        decisions <= persists.len(),
+        "a phase set belongs to a persist"
+    );
+    let sum_of = |phase: PersistPhase| -> f64 {
+        phases
+            .iter()
+            .filter(|(p, _)| *p == phase)
+            .map(|(_, s)| s)
+            .sum()
+    };
+    for phase in [
+        PersistPhase::Events,
+        PersistPhase::Tasks,
+        PersistPhase::Commit,
+    ] {
+        assert!(sum_of(phase) > 0.0, "{phase:?} takes time");
+    }
+    let phase_total: f64 = phases.iter().map(|(_, s)| s).sum();
+    let persist_total: f64 = persists.iter().sum();
+    assert!(
+        phase_total <= persist_total + 1e-6,
+        "phases {phase_total} within persists {persist_total}"
     );
 }

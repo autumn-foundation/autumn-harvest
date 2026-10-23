@@ -3570,8 +3570,9 @@ are fast.
 `harvest.db.query.duration{op, shard}` times four ops (issue #1815). They
 are one claim, one workflow-task persist transaction, one timeout-scanner
 pass and one activity heartbeat write. Each op is a unit of work, not one SQL
-statement. The rule watches `claim` and `persist`, because they set
-throughput. It keeps the `instance` and `shard` labels, so one slow replica,
+statement. A `claim` sample also has a `kind` label (issue #2248). Split
+by `kind` to see whether workflow or activity claims are slow. The rule
+watches `claim` and `persist`, because they set throughput. It keeps the `instance` and `shard` labels, so one slow replica,
 or one slow shard of a multi-shard worker, fires it alone.
 
 ### Triage steps

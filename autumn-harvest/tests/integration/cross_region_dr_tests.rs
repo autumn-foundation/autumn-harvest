@@ -312,6 +312,250 @@ async fn a_bump_expires_every_owner_lease_and_keeps_the_epochs() {
     }
 }
 
+/// Issue #2248: with DR fencing on, an owner decision sends the owner fence
+/// once. Each append still takes the generation row, because a colocated
+/// shard can use another row. The start fence holds the owner row until the
+/// commit, so a second owner fence cannot fail (issue #2252).
+#[tokio::test]
+async fn a_dr_fenced_owner_decision_sends_one_owner_fence() {
+    use autumn_harvest::decision_owner::{
+        self, Acquisition, DecisionPartition, OwnerHolder, OwnerLeaseConfig,
+    };
+    use autumn_harvest::error::HarvestError;
+    #[derive(diesel::QueryableByName)]
+    struct Calls {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    async fn fence_calls(conn: &mut AsyncPgConnection) -> Result<i64, HarvestError> {
+        let calls: Calls = diesel::sql_query(
+            "SELECT COALESCE(SUM(calls), 0)::bigint AS n FROM pg_stat_xact_user_functions \
+             WHERE funcname = 'harvest_decision_owner_fence'",
+        )
+        .get_result(conn)
+        .await
+        .map_err(autumn_harvest::error::database_error)?;
+        Ok(calls.n)
+    }
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("owner_once");
+    let mut conn = connect(&url).await;
+    conn.batch_execute("SET track_functions = 'all'")
+        .await
+        .expect("count function calls");
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .expect("provision");
+    let p = DecisionPartition::new(17).expect("in range");
+    let owner = match decision_owner::acquire(
+        &mut conn,
+        ShardId::new(0),
+        &OwnerHolder::for_worker("once"),
+        p,
+        &OwnerLeaseConfig::default(),
+    )
+    .await
+    .expect("acquire")
+    {
+        Acquisition::Acquired(t) => t,
+        other => panic!("acquire {p}: {other:?}"),
+    };
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, run_id, shard_id, input, queue_name, state) \
+         VALUES ($1, 'once', $2, gen_random_uuid(), 0, '{}'::jsonb, 'once', 'RUNNING')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(format!("once-{}", uuid::Uuid::new_v4()))
+    .execute(&mut conn)
+    .await
+    .expect("seed an execution");
+
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    let calls = decision_owner::scope_decision(async {
+        let _ = decision_owner::pin_decision(Some(owner.clone()));
+        conn.transaction::<_, HarvestError, _>(async |conn| {
+            let before = fence_calls(conn).await?;
+            autumn_harvest::replication::assert_decision_fence(conn).await?;
+            let id = decision_owner::conn_id(conn);
+            decision_owner::fenced_scope(id, async {
+                for n in 0..2 {
+                    let next = autumn_harvest::store::next_event_id_for(conn, exec_id).await?;
+                    let event = autumn_harvest::event::WorkflowEvent::SignalReceived {
+                        signal_name: "once".to_string(),
+                        payload: serde_json::json!(n),
+                    };
+                    autumn_harvest::store::append_events(conn, exec_id, &[event], next).await?;
+                }
+                Ok::<_, HarvestError>(())
+            })
+            .await?;
+            Ok(fence_calls(conn).await? - before)
+        })
+        .await
+    })
+    .await;
+    FenceRegistry::clear();
+    assert_eq!(
+        calls.expect("the owner commits"),
+        1,
+        "the start fence covers both appends"
+    );
+}
+
+/// Keeps the persist phases of a worker (issue #2248).
+#[derive(Default)]
+struct PhaseRecorder {
+    phases: std::sync::Mutex<Vec<(autumn_harvest::telemetry::PersistPhase, f64)>>,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for PhaseRecorder {
+    fn record_persist_phase(
+        &self,
+        phase: autumn_harvest::telemetry::PersistPhase,
+        _shard: u16,
+        seconds: f64,
+    ) {
+        self.phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((phase, seconds));
+    }
+}
+
+fn completes_at_once(
+    _ctx: &autumn_harvest::WorkflowContext,
+    _input: serde_json::Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
+> {
+    Box::pin(async { Ok(serde_json::json!({ "ok": true })) })
+}
+
+/// Issue #2248: with DR fencing on, the decision persist of a real worker
+/// takes the generation row, and that time counts as the `fence` phase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dr_fenced_decision_persist_records_its_fence_phase() {
+    use autumn_harvest::telemetry::PersistPhase;
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("fencephase");
+    FenceRegistry::clear();
+    autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig {
+        fencing: DrFencing::Enabled,
+        sample_interval: std::time::Duration::from_millis(300),
+        watermark_retain: std::time::Duration::from_secs(3600),
+        slot_prefix: DR_PREFIX.to_string(),
+    });
+    let queue = "fence-phase";
+    let recorder = std::sync::Arc::new(PhaseRecorder::default());
+    let workflow = autumn_harvest::info::WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
+        mcp: false,
+        name: "fence_phase_wf",
+        module: "cross_region_dr_tests",
+        handler: completes_at_once,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    };
+    let built = autumn_harvest::HarvestBuilder::new()
+        .workflows(vec![workflow])
+        .telemetry(autumn_harvest::telemetry::TelemetryConfig {
+            service_name: std::sync::Arc::from("cross_region_dr_tests"),
+            propagator: std::sync::Arc::new(autumn_harvest::telemetry::NoOpPropagator),
+            metrics: std::sync::Arc::clone(&recorder)
+                as std::sync::Arc<dyn autumn_harvest::telemetry::MetricsRecorder>,
+        })
+        .worker(
+            autumn_harvest::WorkerConfig::default()
+                .with_queues([queue])
+                .with_dr_fencing(true)
+                .with_replication_sample_interval(std::time::Duration::from_millis(300)),
+        )
+        .build();
+    let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
+    let mut config: autumn_harvest::worker::WorkerRuntimeConfig = worker_config.into();
+    config.poll_interval = std::time::Duration::from_millis(50);
+    config.shutdown_timeout = std::time::Duration::from_secs(5);
+    config.shard_assignments = vec![ShardId::new(0)];
+    let worker = std::sync::Arc::new(
+        autumn_harvest::worker::Worker::new(config, std::sync::Arc::new(registry))
+            .expect("worker builds"),
+    );
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .expect("provision");
+    }
+    let pool = dr_pool(&url);
+    let runner = std::sync::Arc::clone(&worker);
+    let run_pool = pool.clone();
+    let run = tokio::spawn(async move { runner.run(&run_pool).await });
+    eventually(
+        "the worker to pin its generation",
+        std::time::Duration::from_secs(30),
+        || async {
+            assert!(!run.is_finished(), "the worker stopped before it pinned");
+            FenceRegistry::expected(ShardId::new(0)).is_some()
+        },
+    )
+    .await;
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn = connect(&url).await;
+    autumn_harvest::start_or_load_workflow_execution(
+        &mut conn,
+        autumn_harvest::StartWorkflowParams::new(
+            "fence_phase_wf",
+            "fence-phase-1",
+            exec_id,
+            serde_json::json!({}),
+            queue,
+        ),
+        None,
+    )
+    .await
+    .expect("start the workflow");
+    let fence_seen = || {
+        recorder
+            .phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(phase, seconds)| *phase == PersistPhase::Fence && *seconds > 0.0)
+    };
+    eventually(
+        "a decision persist with a fence phase",
+        std::time::Duration::from_secs(30),
+        || async { fence_seen() },
+    )
+    .await;
+    worker.shutdown();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), run).await;
+    FenceRegistry::clear();
+    autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig::default());
+}
+
 // ── AC2 / AC6(a): the fence ────────────────────────────────────────────────
 
 #[tokio::test]

@@ -1738,8 +1738,9 @@ What the tables show:
 
 The default is 2. It clears the measured ceiling at the cost of one
 connection. Raise it to 4 when the pool and the database have room. Watch
-`rate(harvest_db_query_duration_sum{op="claim"}[5m])` per worker: it is the
-mean claims in flight. Divide it by `max_concurrent_claims` for the
+`sum without (kind) (rate(harvest_db_query_duration_sum{op="claim"}[5m]))`
+per worker: it is the mean claims in flight. Each claim kind has its own
+series since issue #2248, so the sum over `kind` is needed. Divide it by `max_concurrent_claims` for the
 occupancy of each loop.
 
 ### What the measurement does not establish
@@ -2577,3 +2578,9 @@ standalone note rather than part of the claim-path attribution table above:
   tick, because the planner could not prove its predicate implies the partial
   index's. It now repeats the index clause and uses the index (buffers
   19,887 → 1 at 1,000,000 executions, `EXPLAIN (ANALYZE, BUFFERS)`).
+* [`docs/performance-decision-owner-baseline.md`](performance-decision-owner-baseline.md)
+  — the baseline for the decision owner (issue #2248): claim latency by
+  task kind on the assay #14 shape, the phases of the decision persist, and
+  a criterion bench of the second fence row. Owner mode with DR on adds
+  two statements and about 20% to the persist at one writer, so it fails
+  the stage 1b bar of 10%.

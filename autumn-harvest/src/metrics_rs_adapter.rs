@@ -109,9 +109,9 @@ use crate::telemetry::{
     TunerDecision, WebhookOutcome, WorkflowStatus,
 };
 use crate::telemetry::{
-    DbOp, METRIC_DB_POOL_IDLE, METRIC_DB_POOL_IN_USE, METRIC_DB_POOL_WAIT,
-    METRIC_DB_QUERY_DURATION, METRIC_LABEL_DIMENSION, METRIC_LABEL_OP, METRIC_WORKER_OUTLIER,
-    METRIC_WORKER_POLLERS,
+    ClaimKind, DbOp, METRIC_DB_PERSIST_PHASE_DURATION, METRIC_DB_POOL_IDLE, METRIC_DB_POOL_IN_USE,
+    METRIC_DB_POOL_WAIT, METRIC_DB_QUERY_DURATION, METRIC_LABEL_DIMENSION, METRIC_LABEL_OP,
+    METRIC_LABEL_PHASE, METRIC_WORKER_OUTLIER, METRIC_WORKER_POLLERS, PersistPhase,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -591,6 +591,25 @@ impl MetricsRecorder for MetricsRsRecorder {
         histogram!(
             METRIC_DB_QUERY_DURATION,
             METRIC_LABEL_OP => op.as_str(),
+            METRIC_LABEL_SHARD => shard.to_string()
+        )
+        .record(seconds);
+    }
+
+    fn record_claim_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+        histogram!(
+            METRIC_DB_QUERY_DURATION,
+            METRIC_LABEL_OP => DbOp::Claim.as_str(),
+            METRIC_LABEL_KIND => kind.as_str(),
+            METRIC_LABEL_SHARD => shard.to_string()
+        )
+        .record(seconds);
+    }
+
+    fn record_persist_phase(&self, phase: PersistPhase, shard: u16, seconds: f64) {
+        histogram!(
+            METRIC_DB_PERSIST_PHASE_DURATION,
+            METRIC_LABEL_PHASE => phase.as_str(),
             METRIC_LABEL_SHARD => shard.to_string()
         )
         .record(seconds);
@@ -2933,6 +2952,8 @@ mod tests {
             rec.record_db_pool(3, 4, 6);
             rec.record_db_pool_wait(3, 0.25);
             rec.record_db_query_duration(DbOp::Claim, 3, 0.5);
+            rec.record_claim_duration(ClaimKind::Activity, 3, 0.75);
+            rec.record_persist_phase(PersistPhase::Commit, 3, 0.125);
             rec.record_worker_pollers("email", 1);
             rec.record_worker_outlier(OutlierDimension::FailureRatio, true);
             rec.record_worker_outlier(OutlierDimension::LatencyP99, false);
@@ -2965,6 +2986,23 @@ mod tests {
                         (METRIC_LABEL_SHARD.to_owned(), "3".to_owned()),
                     ],
                     0.5
+                ),
+                (
+                    METRIC_DB_QUERY_DURATION.to_owned(),
+                    vec![
+                        (METRIC_LABEL_OP.to_owned(), "claim".to_owned()),
+                        (METRIC_LABEL_KIND.to_owned(), "activity".to_owned()),
+                        (METRIC_LABEL_SHARD.to_owned(), "3".to_owned()),
+                    ],
+                    0.75
+                ),
+                (
+                    METRIC_DB_PERSIST_PHASE_DURATION.to_owned(),
+                    vec![
+                        (METRIC_LABEL_PHASE.to_owned(), "commit".to_owned()),
+                        (METRIC_LABEL_SHARD.to_owned(), "3".to_owned()),
+                    ],
+                    0.125
                 ),
                 (
                     METRIC_WORKER_POLLERS.to_owned(),

@@ -48,12 +48,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use autumn_harvest::telemetry::{
-    ActivityStatus, BUILD_ID_LABEL_NONE, ConnectorOutcome, DbOp, METRIC_LABEL_ACTIVITY,
+    ActivityStatus, BUILD_ID_LABEL_NONE, ClaimKind, ConnectorOutcome, DbOp, METRIC_LABEL_ACTIVITY,
     METRIC_LABEL_BUILD_ID, METRIC_LABEL_CLIENT_KIND, METRIC_LABEL_DIMENSION, METRIC_LABEL_KIND,
-    METRIC_LABEL_NAME, METRIC_LABEL_OP, METRIC_LABEL_OUTCOME, METRIC_LABEL_QUEUE,
-    METRIC_LABEL_REASON, METRIC_LABEL_ROUTE_CLASS, METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE,
-    METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW, MetricsRecorder, PoisonReason,
-    SlotType, WorkflowStatus,
+    METRIC_LABEL_NAME, METRIC_LABEL_OP, METRIC_LABEL_OUTCOME, METRIC_LABEL_PHASE,
+    METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_ROUTE_CLASS, METRIC_LABEL_SHARD,
+    METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW,
+    MetricsRecorder, PersistPhase, PoisonReason, SlotType, WorkflowStatus,
 };
 use autumn_harvest::worker_outlier::OutlierDimension;
 use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
@@ -202,6 +202,10 @@ struct Inner {
     db_pool_idle: Gauge,
     db_pool_wait: Histogram,
     db_query_duration: Histogram,
+    // Issue #2248: claim samples keep their kind. They render in the
+    // `harvest_db_query_duration` family as `op="claim"` with a `kind` label.
+    db_claim_duration: Histogram,
+    db_persist_phase: Histogram,
     worker_pollers: Gauge,
     worker_outlier: Gauge,
     // Issue #1827: the plugin's own API rate limiter records here.
@@ -520,6 +524,18 @@ impl MetricsRecorder for HarvestMetricsRecorder {
             .observe(vec![op.as_str().to_owned(), shard.to_string()], seconds);
     }
 
+    fn record_claim_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+        self.0
+            .db_claim_duration
+            .observe(vec![kind.as_str().to_owned(), shard.to_string()], seconds);
+    }
+
+    fn record_persist_phase(&self, phase: PersistPhase, shard: u16, seconds: f64) {
+        self.0
+            .db_persist_phase
+            .observe(vec![phase.as_str().to_owned(), shard.to_string()], seconds);
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn record_worker_pollers(&self, queue: &str, pollers: u64) {
         self.0
@@ -662,7 +678,6 @@ fn push_gauge(
     });
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn push_histogram(
     out: &mut Vec<MetricFamily>,
     name: &str,
@@ -670,13 +685,31 @@ fn push_histogram(
     label_names: &[&str],
     data: Vec<(LabelValues, (u64, f64))>,
 ) {
-    if data.is_empty() {
+    let rows = data
+        .into_iter()
+        .map(|(vals, stats)| (zip_labels(label_names, vals), stats))
+        .collect();
+    push_histogram_rows(out, name, help, rows);
+}
+
+/// One histogram row: its label pairs, its sample count and its sum.
+type HistogramRow = (Vec<(String, String)>, (u64, f64));
+
+/// [`push_histogram`] for rows that carry their own label pairs. One family
+/// can then hold samples with different label sets (issue #2248).
+#[allow(clippy::cast_precision_loss)]
+fn push_histogram_rows(
+    out: &mut Vec<MetricFamily>,
+    name: &str,
+    help: &str,
+    rows: Vec<HistogramRow>,
+) {
+    if rows.is_empty() {
         return;
     }
-    let mut count_samples = Vec::with_capacity(data.len());
-    let mut sum_samples = Vec::with_capacity(data.len());
-    for (vals, (count, sum)) in data {
-        let labels = zip_labels(label_names, vals);
+    let mut count_samples = Vec::with_capacity(rows.len());
+    let mut sum_samples = Vec::with_capacity(rows.len());
+    for (labels, (count, sum)) in rows {
         count_samples.push(MetricSample {
             labels: labels.clone(),
             value: count as f64,
@@ -873,12 +906,41 @@ fn push_saturation_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
         &[METRIC_LABEL_SHARD],
         inner.db_pool_wait.snapshot(),
     );
-    push_histogram(
+    let mut query_rows: Vec<_> = inner
+        .db_query_duration
+        .snapshot()
+        .into_iter()
+        .map(|(vals, stats)| {
+            (
+                zip_labels(&[METRIC_LABEL_OP, METRIC_LABEL_SHARD], vals),
+                stats,
+            )
+        })
+        .collect();
+    query_rows.extend(
+        inner
+            .db_claim_duration
+            .snapshot()
+            .into_iter()
+            .map(|(vals, stats)| {
+                let mut labels =
+                    vec![(METRIC_LABEL_OP.to_owned(), DbOp::Claim.as_str().to_owned())];
+                labels.extend(zip_labels(&[METRIC_LABEL_KIND, METRIC_LABEL_SHARD], vals));
+                (labels, stats)
+            }),
+    );
+    push_histogram_rows(
         families,
         "harvest_db_query_duration",
         "Seconds one database operation takes",
-        &[METRIC_LABEL_OP, METRIC_LABEL_SHARD],
-        inner.db_query_duration.snapshot(),
+        query_rows,
+    );
+    push_histogram(
+        families,
+        "harvest_db_persist_phase_duration",
+        "Seconds one phase of a decision persist takes",
+        &[METRIC_LABEL_PHASE, METRIC_LABEL_SHARD],
+        inner.db_persist_phase.snapshot(),
     );
     push_gauge(
         families,
@@ -1175,6 +1237,8 @@ mod tests {
         recorder.record_db_pool_wait(2, 0.5);
         recorder.record_db_pool_wait(2, 0.25);
         recorder.record_db_query_duration(DbOp::Claim, 2, 0.125);
+        recorder.record_claim_duration(ClaimKind::Activity, 2, 0.25);
+        recorder.record_persist_phase(PersistPhase::Commit, 2, 0.0625);
         recorder.record_worker_pollers("email", 1);
         recorder.record_worker_outlier(OutlierDimension::FailureRatio, true);
         recorder.record_worker_outlier(OutlierDimension::LatencyP99, false);
@@ -1191,6 +1255,19 @@ mod tests {
         assert_eq!(sample_value(wait_sum, &[("shard", "2")]), 0.75);
         let query = family(&families, "harvest_db_query_duration_count");
         assert_eq!(sample_value(query, &[("op", "claim"), ("shard", "2")]), 1.0);
+        let query_sum = family(&families, "harvest_db_query_duration_sum");
+        assert_eq!(
+            sample_value(
+                query_sum,
+                &[("op", "claim"), ("kind", "activity"), ("shard", "2")]
+            ),
+            0.25
+        );
+        let phase = family(&families, "harvest_db_persist_phase_duration_sum");
+        assert_eq!(
+            sample_value(phase, &[("phase", "commit"), ("shard", "2")]),
+            0.0625
+        );
         let pollers = family(&families, "harvest_worker_pollers");
         assert_eq!(pollers.kind, MetricKind::Gauge);
         assert_eq!(sample_value(pollers, &[("queue", "email")]), 1.0);

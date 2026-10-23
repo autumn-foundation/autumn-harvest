@@ -279,6 +279,7 @@ async fn insert_events(
     rows: &[NewHarvestEvent<'_>],
     stamped: bool,
 ) -> HarvestResult<(usize, Option<crate::notify::Stamp>)> {
+    let _phase = crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Events);
     let insert = diesel::insert_into(harvest_events::table).values(rows);
     if !stamped {
         let inserted = insert
@@ -775,11 +776,14 @@ pub async fn append_new_execution_started_events_batch(
                 for shard in &chunk_shards {
                     crate::replication::assert_fence(conn, *shard).await?;
                 }
+                let phase =
+                    crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Events);
                 diesel::insert_into(harvest_events::table)
                     .values(&rows)
                     .execute(conn)
                     .await
                     .map_err(crate::error::database_error)?;
+                drop(phase);
 
                 for ref_chunk in ref_rows.chunks(ROWS_PER_PAYLOAD_REF_INSERT_CHUNK) {
                     diesel::insert_into(harvest_payload_refs::table)

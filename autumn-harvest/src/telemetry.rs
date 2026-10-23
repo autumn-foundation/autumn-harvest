@@ -322,9 +322,20 @@ pub const METRIC_DB_POOL_WAIT: &str = "harvest.db.pool.wait_duration";
 /// Histogram: seconds that one database operation takes (issue #1815).
 ///
 /// Labelled `{op}`, one of [`DbOp::as_str`]. Each op times one unit of work,
-/// not one SQL statement. Do not mix this up with [`METRIC_QUERY_DURATION`],
+/// not one SQL statement. A `claim` sample also carries `kind`, one of
+/// [`ClaimKind::as_str`] (issue #2248). Do not mix this up with [`METRIC_QUERY_DURATION`],
 /// which times workflow query handlers.
 pub const METRIC_DB_QUERY_DURATION: &str = "harvest.db.query.duration";
+
+/// Histogram: seconds that one phase of a decision persist takes (issue
+/// #2248).
+///
+/// Labelled `{phase, shard}`, one of [`PersistPhase::as_str`]. Each decision
+/// persist records every phase once, so the phases of one persist add up to
+/// its `persist` sample on [`METRIC_DB_QUERY_DURATION`]. A terminal failure
+/// write records no phase, so the phase count can be lower than the
+/// `persist` count.
+pub const METRIC_DB_PERSIST_PHASE_DURATION: &str = "harvest.db.persist.phase_duration";
 
 /// Gauge: claim loops that claim work from a queue on this worker (issue #1815).
 ///
@@ -2170,6 +2181,9 @@ pub const METRIC_LABEL_SLOT_TYPE: &str = "slot_type";
 pub const METRIC_LABEL_DECISION: &str = "decision";
 /// Metric label: the database operation, bounded by [`DbOp`] (issue #1815).
 pub const METRIC_LABEL_OP: &str = "op";
+/// Metric label: the phase of a decision persist, bounded by [`PersistPhase`]
+/// (issue #2248).
+pub const METRIC_LABEL_PHASE: &str = "phase";
 /// Metric label: the outlier dimension, bounded by
 /// [`OutlierDimension`](crate::worker_outlier::OutlierDimension) (issue #1815).
 pub const METRIC_LABEL_DIMENSION: &str = "dimension";
@@ -2806,6 +2820,127 @@ impl DbOp {
             Self::Heartbeat => "heartbeat",
         }
     }
+}
+
+/// What one claim returned (issue #2248), used as the bounded `kind` label of
+/// a `claim` sample on [`METRIC_DB_QUERY_DURATION`].
+///
+/// Workflow and activity tasks share one table and one claim statement. The
+/// label shows the latency of each kind apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimKind {
+    /// The claim returned a workflow task.
+    Workflow,
+    /// The claim returned an activity task.
+    Activity,
+    /// The claim found no task. A claim by id of a row that another worker
+    /// took also reads as empty.
+    Empty,
+    /// The claim failed.
+    Error,
+}
+
+impl ClaimKind {
+    /// Every kind, in a stable order.
+    pub const ALL: [Self; 4] = [Self::Workflow, Self::Activity, Self::Empty, Self::Error];
+
+    /// Stable string representation, suitable for metric tag values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Activity => "activity",
+            Self::Empty => "empty",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// One phase of a decision persist (issue #2248), used as the bounded `phase`
+/// label on [`METRIC_DB_PERSIST_PHASE_DURATION`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistPhase {
+    /// The DR generation check and the owner fence.
+    Fence,
+    /// The inserts into `harvest_events`.
+    Events,
+    /// The inserts into `harvest_task_queue`.
+    Tasks,
+    /// The stage of the post-commit wakes, the in-transaction fallback, and
+    /// the progress wakes of a stream.
+    Notify,
+    /// The `COMMIT` or `ROLLBACK` statement.
+    Commit,
+    /// The rest of the transaction: `BEGIN`, row locks, updates and reads.
+    Other,
+}
+
+impl PersistPhase {
+    /// Every phase, in a stable order.
+    pub const ALL: [Self; 6] = [
+        Self::Fence,
+        Self::Events,
+        Self::Tasks,
+        Self::Notify,
+        Self::Commit,
+        Self::Other,
+    ];
+
+    /// The phases that a timer measures inside the transaction body.
+    // Only the persist path of the `db` feature reads it.
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    pub(crate) const TIMED: [Self; 4] = [Self::Fence, Self::Events, Self::Tasks, Self::Notify];
+
+    /// Stable string representation, suitable for metric tag values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fence => "fence",
+            Self::Events => "events",
+            Self::Tasks => "tasks",
+            Self::Notify => "notify",
+            Self::Commit => "commit",
+            Self::Other => "other",
+        }
+    }
+
+    /// The index of a timed phase in [`Self::TIMED`]. `None` for the
+    /// commit and the rest.
+    #[must_use]
+    #[cfg_attr(not(feature = "db"), allow(dead_code))]
+    pub(crate) const fn timed_index(self) -> Option<usize> {
+        match self {
+            Self::Fence => Some(0),
+            Self::Events => Some(1),
+            Self::Tasks => Some(2),
+            Self::Notify => Some(3),
+            Self::Commit | Self::Other => None,
+        }
+    }
+}
+
+/// Split one persist of `total` seconds into its phases (issue #2248).
+///
+/// `timed` holds the sums of [`PersistPhase::TIMED`], in that order.
+/// `commit` is the time after the transaction body. `other` is the rest of
+/// `total`. Clock reads can make the parts exceed `total` by a little, so
+/// `other` is never below zero.
+#[must_use]
+#[cfg_attr(not(feature = "db"), allow(dead_code))]
+pub(crate) fn persist_phase_breakdown(
+    total: f64,
+    timed: [f64; PersistPhase::TIMED.len()],
+    commit: f64,
+) -> [(PersistPhase, f64); 6] {
+    let measured: f64 = timed.iter().sum::<f64>() + commit;
+    [
+        (PersistPhase::Fence, timed[0]),
+        (PersistPhase::Events, timed[1]),
+        (PersistPhase::Tasks, timed[2]),
+        (PersistPhase::Notify, timed[3]),
+        (PersistPhase::Commit, commit),
+        (PersistPhase::Other, (total - measured).max(0.0)),
+    ]
 }
 
 /// The operator action taken on an activity-type pause (issue #807), used as
@@ -3686,6 +3821,26 @@ pub trait MetricsRecorder: Send + Sync {
     /// shard keeps a slow shard of a multi-shard worker visible.
     fn record_db_query_duration(&self, op: DbOp, shard: u16, seconds: f64) {
         let _ = (op, shard, seconds);
+    }
+
+    /// The duration of one claim and the kind that it returned (issue
+    /// #2248).
+    ///
+    /// Maps to the histogram `harvest_db_query_duration{op="claim", kind,
+    /// shard}`. The default records a plain `claim` sample through
+    /// [`Self::record_db_query_duration`], so a recorder that predates the
+    /// kind still sees every claim.
+    fn record_claim_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+        let _ = kind;
+        self.record_db_query_duration(DbOp::Claim, shard, seconds);
+    }
+
+    /// The duration of one phase of a decision persist (issue #2248).
+    ///
+    /// Maps to the histogram `harvest_db_persist_phase_duration{phase,
+    /// shard}`. Each decision persist records every phase once.
+    fn record_persist_phase(&self, phase: PersistPhase, shard: u16, seconds: f64) {
+        let _ = (phase, shard, seconds);
     }
 
     /// The claim loops on this worker that claim from `queue` (issue #1815).
@@ -5081,6 +5236,101 @@ mod tests {
         rec.record_db_query_duration(DbOp::Claim, 0, 0.002);
         rec.record_worker_pollers("default", 1);
         rec.record_worker_outlier(crate::worker_outlier::OutlierDimension::FailureRatio, true);
+    }
+
+    /// Issue #2248: the claim kind and persist phase labels are bounded.
+    #[test]
+    fn claim_kind_and_persist_phase_labels_are_bounded() {
+        let kinds: Vec<&str> = ClaimKind::ALL.iter().map(|k| k.as_str()).collect();
+        assert_eq!(kinds, ["workflow", "activity", "empty", "error"]);
+        let phases: Vec<&str> = PersistPhase::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(
+            phases,
+            ["fence", "events", "tasks", "notify", "commit", "other"]
+        );
+        assert_eq!(
+            METRIC_DB_PERSIST_PHASE_DURATION,
+            "harvest.db.persist.phase_duration"
+        );
+        assert_eq!(METRIC_LABEL_PHASE, "phase");
+        assert_eq!(METRIC_LABEL_KIND, "kind");
+    }
+
+    /// A recorder that keeps the op of each query sample.
+    #[derive(Default)]
+    struct OpRecorder(std::sync::Mutex<Vec<DbOp>>);
+
+    impl MetricsRecorder for OpRecorder {
+        fn record_db_query_duration(&self, op: DbOp, _shard: u16, _seconds: f64) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(op);
+        }
+    }
+
+    /// Issue #2248: a recorder written before the claim kind still sees
+    /// every claim as a `claim` query sample.
+    #[test]
+    fn a_claim_sample_reaches_an_old_recorder_as_a_claim_query() {
+        let rec = OpRecorder::default();
+        for kind in ClaimKind::ALL {
+            rec.record_claim_duration(kind, 0, 0.001);
+        }
+        rec.record_persist_phase(PersistPhase::Commit, 0, 0.001);
+        let ops = rec.0.lock().expect("ops").clone();
+        assert_eq!(ops, [DbOp::Claim; 4], "a phase sample is no query sample");
+        NoOpMetrics.record_claim_duration(ClaimKind::Empty, 0, 0.001);
+        NoOpMetrics.record_persist_phase(PersistPhase::Fence, 0, 0.001);
+    }
+
+    /// Issue #2248: `other` is the rest of the total, and the phases add up
+    /// to the total.
+    #[test]
+    fn a_persist_breakdown_adds_up_to_its_total() {
+        let parts = persist_phase_breakdown(0.010, [0.001, 0.002, 0.003, 0.0005], 0.0015);
+        let get = |phase: PersistPhase| {
+            parts
+                .iter()
+                .find(|(p, _)| *p == phase)
+                .map(|(_, s)| *s)
+                .expect("each phase is present")
+        };
+        assert_eq!(parts.len(), PersistPhase::ALL.len());
+        assert!((get(PersistPhase::Fence) - 0.001).abs() < 1e-12);
+        assert!((get(PersistPhase::Commit) - 0.0015).abs() < 1e-12);
+        assert!((get(PersistPhase::Other) - 0.002).abs() < 1e-12);
+        let sum: f64 = parts.iter().map(|(_, s)| s).sum();
+        assert!((sum - 0.010).abs() < 1e-12, "{sum}");
+    }
+
+    /// Clock jitter can make the parts exceed the total. `other` then reads
+    /// zero, never a negative time.
+    #[test]
+    fn a_persist_breakdown_never_reports_a_negative_rest() {
+        let parts = persist_phase_breakdown(0.001, [0.001, 0.0, 0.0, 0.0], 0.0001);
+        let other = parts
+            .iter()
+            .find(|(p, _)| *p == PersistPhase::Other)
+            .map(|(_, s)| *s);
+        assert_eq!(other, Some(0.0));
+    }
+
+    proptest::proptest! {
+        /// Each part is not negative. When the timed parts fit in the total,
+        /// the parts add up to the total.
+        #[test]
+        fn persist_breakdown_bounds(
+            total in 0.0f64..1.0,
+            timed in proptest::array::uniform4(0.0f64..0.3),
+            commit in 0.0f64..0.3,
+        ) {
+            let parts = persist_phase_breakdown(total, timed, commit);
+            proptest::prop_assert!(parts.iter().all(|(_, s)| *s >= 0.0));
+            let measured: f64 = timed.iter().sum::<f64>() + commit;
+            let sum: f64 = parts.iter().map(|(_, s)| s).sum();
+            proptest::prop_assert!((sum - total.max(measured)).abs() < 1e-9);
+        }
     }
 
     #[test]
