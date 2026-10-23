@@ -26349,6 +26349,8 @@ async fn process_workflow_task(
     // Issue #2251: the shard of the claim's pool. See `process_task`.
     owner_shard: crate::types::ShardId,
 ) -> HarvestResult<()> {
+    // Issue #2257: the resident duration starts before the history load.
+    let prepare_started = std::time::Instant::now();
     let Some(mut prepared) = prepare_workflow_task_with_cache(
         conn,
         task,
@@ -26849,6 +26851,9 @@ async fn process_workflow_task(
             resident: iter_resident,
             updates_deferred,
         } = drive;
+        // Issue #2257: stop the clock at the end of the drive, before any
+        // write below.
+        let resident_secs = prepare_started.elapsed().as_secs_f64();
         // Issue #2035: the dispatch window closed with updates left. This
         // claimed row only records the wake. The park that ends the cycle then
         // re-pends the task, and the next cycle runs the rest. A failed wake
@@ -26858,11 +26863,18 @@ async fn process_workflow_task(
             queue::wake_workflow_task(conn, prepared.exec_id).await?;
         }
         // Issue #2007: one sample per decision, after its first drive.
+        // Issue #2257: its duration goes with it, under the same outcome.
         if let Some(outcome) = resident_outcome.take() {
             telemetry.metrics.record_workflow_resident(
                 &prepared.execution.workflow_name,
                 &task.queue_name,
                 outcome,
+            );
+            telemetry.metrics.record_workflow_resident_duration(
+                &prepared.execution.workflow_name,
+                &task.queue_name,
+                outcome,
+                resident_secs,
             );
         }
 

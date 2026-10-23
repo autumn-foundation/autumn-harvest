@@ -11,6 +11,7 @@
 //! 4. An agent loop with parallel tool calls hits on every decision after
 //!    the first. The test prints the hit rate, which the design records.
 //! 5. A worker with resident state off records no outcome.
+//! 6. Each outcome comes with one duration (issue #2257).
 //!
 //! Each test uses its own queue and worker id, so the tests can share one
 //! database.
@@ -51,6 +52,7 @@ const TOOL_LOOP: &str = "resident_outcome_tool_loop_wf";
 #[derive(Debug, Default)]
 struct OutcomeLog {
     outcomes: Mutex<Vec<(String, ResidentOutcome)>>,
+    durations: Mutex<Vec<(String, ResidentOutcome, f64)>>,
 }
 
 impl OutcomeLog {
@@ -61,6 +63,36 @@ impl OutcomeLog {
             .iter()
             .filter(|(name, _)| name == workflow)
             .map(|(_, outcome)| *outcome)
+            .collect()
+    }
+
+    /// The outcomes and the durations of `workflow`, read under both locks
+    /// at once (issue #2257).
+    fn paired_of(&self, workflow: &str) -> (Vec<ResidentOutcome>, Vec<(ResidentOutcome, f64)>) {
+        let outcomes = self.outcomes.lock().expect("outcome log lock");
+        let durations = self.durations.lock().expect("duration log lock");
+        (
+            outcomes
+                .iter()
+                .filter(|(name, _)| name == workflow)
+                .map(|(_, outcome)| *outcome)
+                .collect(),
+            durations
+                .iter()
+                .filter(|(name, ..)| name == workflow)
+                .map(|(_, outcome, seconds)| (*outcome, *seconds))
+                .collect(),
+        )
+    }
+
+    /// Each duration sample of `workflow`, in order (issue #2257).
+    fn durations_of(&self, workflow: &str) -> Vec<(ResidentOutcome, f64)> {
+        self.durations
+            .lock()
+            .expect("duration log lock")
+            .iter()
+            .filter(|(name, ..)| name == workflow)
+            .map(|(_, outcome, seconds)| (*outcome, *seconds))
             .collect()
     }
 }
@@ -76,6 +108,20 @@ impl MetricsRecorder for OutcomeLog {
             .lock()
             .expect("outcome log lock")
             .push((workflow_name.to_string(), outcome));
+    }
+
+    fn record_workflow_resident_duration(
+        &self,
+        workflow_name: &str,
+        _queue: &str,
+        outcome: ResidentOutcome,
+        seconds: f64,
+    ) {
+        self.durations.lock().expect("duration log lock").push((
+            workflow_name.to_string(),
+            outcome,
+            seconds,
+        ));
     }
 }
 
@@ -593,5 +639,50 @@ async fn a_worker_with_resident_state_off_records_no_outcome() {
         .await;
 
     assert!(log.of(SEQUENTIAL).is_empty(), "{:?}", log.of(SEQUENTIAL));
+    assert!(
+        log.durations_of(SEQUENTIAL).is_empty(),
+        "{:?}",
+        log.durations_of(SEQUENTIAL)
+    );
+    stop(&worker, handle).await;
+}
+
+/// AC (issue #2257): each decision records one duration with its outcome.
+/// The cold p99 of the stage 2 gate reads these samples.
+#[tokio::test]
+async fn a_sequential_run_records_a_duration_per_decision() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let (exec_id, mut conn, log, worker, handle) = start_run(&url, SEQUENTIAL).await;
+
+    wait_decisions(&log, SEQUENTIAL, 2).await;
+    wait_parked(&mut conn, exec_id).await;
+    autumn_harvest::signal::send_signal(&mut conn, exec_id, "go", json!("go"))
+        .await
+        .expect("send signal");
+    wait_for_execution_state_with_timeout(&url, exec_id, "COMPLETED", Duration::from_secs(30))
+        .await;
+
+    // The worker records the count, then the duration. Wait until the last
+    // duration lands, so one snapshot holds both.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (counted, durations) = loop {
+        let (counted, durations) = log.paired_of(SEQUENTIAL);
+        if counted.len() == durations.len() || Instant::now() > deadline {
+            break (counted, durations);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let outcomes: Vec<ResidentOutcome> = durations.iter().map(|(outcome, _)| *outcome).collect();
+    assert_eq!(
+        outcomes, counted,
+        "one duration per outcome, with the same outcome"
+    );
+    assert_eq!(outcomes.first(), Some(&ResidentOutcome::Cold));
+    for (outcome, seconds) in &durations {
+        assert!(
+            seconds.is_finite() && *seconds > 0.0 && *seconds < 30.0,
+            "{outcome} took {seconds} s"
+        );
+    }
     stop(&worker, handle).await;
 }

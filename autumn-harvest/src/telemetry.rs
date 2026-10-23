@@ -641,6 +641,16 @@ pub const METRIC_WORKFLOW_CACHE_MISS: &str = "harvest.workflow.cache_miss";
 /// workflow. Each other value names why it replayed.
 pub const METRIC_WORKFLOW_RESIDENT: &str = "harvest.workflow.resident";
 
+/// Histogram: seconds from the start of a decision to the end of its first
+/// drive (issue #2257).
+///
+/// Labels: those of [`METRIC_WORKFLOW_RESIDENT`]. The worker records one
+/// sample with each count. The window holds the cache take, the history
+/// load, the wake ingest, the pre-drive writes and the first drive. The
+/// stage 2 gate reads the p99 of `outcome="cold"`. The `hit` p99 shows the
+/// part that a disk cache does not save.
+pub const METRIC_WORKFLOW_RESIDENT_DURATION: &str = "harvest.workflow.resident.duration";
+
 /// Counter: incremented once per `signal_external_workflow` call after the
 /// terminal outcome is recorded in `harvest_events`.
 ///
@@ -3986,6 +3996,25 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue, outcome);
     }
 
+    /// The time of one decision up to the end of its first drive (issue
+    /// #2257).
+    ///
+    /// The clock starts before the history load and stops before any write
+    /// after the drive. The worker calls this with each
+    /// [`Self::record_workflow_resident`] call and the same `outcome`.
+    ///
+    /// Maps to the histogram [`METRIC_WORKFLOW_RESIDENT_DURATION`], in
+    /// seconds.
+    fn record_workflow_resident_duration(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        outcome: ResidentOutcome,
+        seconds: f64,
+    ) {
+        let _ = (workflow_name, queue, outcome, seconds);
+    }
+
     /// A workflow execution was terminated because its `deadline_at` elapsed.
     ///
     /// Maps to the counter `harvest.workflow.timeout{workflow, queue}`.
@@ -5120,6 +5149,10 @@ mod tests {
             ]
         );
         assert_eq!(METRIC_WORKFLOW_RESIDENT, "harvest.workflow.resident");
+        assert_eq!(
+            METRIC_WORKFLOW_RESIDENT_DURATION,
+            "harvest.workflow.resident.duration"
+        );
         assert_eq!(ResidentOutcome::MultiAwait.to_string(), "multi_await");
         // An exhaustive match: a new variant must join `ALL`.
         for outcome in ResidentOutcome::ALL {
