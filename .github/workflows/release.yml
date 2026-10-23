@@ -77,7 +77,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Install git-cliff
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: git-cliff
       - name: Verify CHANGELOG.md is current
@@ -166,7 +166,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
         with:
           toolchain: stable
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-auditable@0.7.7,cargo-cyclonedx@0.5.9
       - name: Build with cargo auditable
@@ -588,7 +588,7 @@ jobs:
           persist-credentials: false
       # `validate` has checked CHANGELOG.md already.
       - name: Install git-cliff
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: git-cliff
       # The notes name the image by digest, the form to pin.
