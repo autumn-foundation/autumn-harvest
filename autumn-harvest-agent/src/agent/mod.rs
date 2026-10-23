@@ -36,7 +36,7 @@ pub mod dedupe;
 pub mod inbox;
 pub mod wake;
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, Entity, EntityMessage, Wake};
@@ -364,8 +364,8 @@ pub enum HeartbeatSetting {
 /// applied numbers of each sender, see [`dedupe`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerEnvelope {
-    /// The sender id that the receiver dedupes on: the agent id of a durable
-    /// sender, or the run id of an `agent_loop` sender.
+    /// The sender id that the receiver dedupes on. A durable sender sends
+    /// `<agent id>@<incarnation>`, and an `agent_loop` sender its run id.
     pub from: String,
     /// The name of the sending agent, from its mandate.
     pub sender: String,
@@ -855,8 +855,9 @@ pub struct AgentState {
     pub ticks: u64,
     /// When the last op ended, in epoch milliseconds.
     pub last_active_ms: Option<i64>,
-    /// The number of the last peer message that this agent sent.
-    pub outbound_seq: u64,
+    /// The number of the last peer message to each receiver, by workflow id.
+    /// The peer catalog bounds the receivers.
+    pub outbound_seq: BTreeMap<String, u64>,
     /// The applied peer messages of each sender.
     pub inbound: Inbound,
 }
@@ -1369,12 +1370,13 @@ impl AgentRun<'_> {
             released: Released::new(),
             records: Vec::new(),
             outbox: Outbox {
-                from: id.as_str().to_owned(),
+                // A new life counts from 1 again, so the id holds it.
+                from: format!("{id}@{}", state.incarnation),
                 self_id: id.as_str().to_owned(),
                 waiting: peer
                     .as_ref()
                     .map_or_else(Vec::new, |peer| peer.waiting.to_vec()),
-                next_seq: state.outbound_seq.saturating_add(1),
+                sent: std::mem::take(&mut state.outbound_seq),
                 mesh: None,
             },
         };
@@ -1390,7 +1392,7 @@ impl AgentRun<'_> {
         // A failed op keeps what its tools and turns did to the labels and
         // the tokens. Only the transcript stays as it was.
         state.rounds = tree.rounds;
-        state.outbound_seq = tree.outbox.next_seq.saturating_sub(1);
+        state.outbound_seq = tree.outbox.sent;
         state.flow_labels = tree.exercised;
         state.tokens_used = state
             .tokens_used

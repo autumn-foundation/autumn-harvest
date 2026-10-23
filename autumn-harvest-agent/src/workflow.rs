@@ -17,7 +17,7 @@
 //! The loop reads no clock and no state outside its input and the recorded
 //! results. That keeps replay deterministic.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use autumn_harvest::llm_budget::LlmBudgetExceeded;
@@ -233,10 +233,20 @@ pub(crate) struct Outbox {
     /// The workflow ids that wait on the op of this agent. A send to one of
     /// them, or to this agent, is a deadlock.
     pub(crate) waiting: Vec<String>,
-    /// The number of the next message.
-    pub(crate) next_seq: u64,
+    /// The number of the last message to each receiver, by workflow id. Each
+    /// receiver counts from 1, so it sees no gaps.
+    pub(crate) sent: BTreeMap<String, u64>,
     /// The mesh of the sender (issue #2272).
     pub(crate) mesh: Option<String>,
+}
+
+impl Outbox {
+    /// Take the number of the next message to `target`.
+    fn next_seq(&mut self, target: &str) -> u64 {
+        let last = self.sent.entry(target.to_owned()).or_default();
+        *last = last.saturating_add(1);
+        *last
+    }
 }
 
 /// One agent of a run tree: its mandate, and the peers that its recorded
@@ -490,7 +500,7 @@ fn root_tree(ctx: &WorkflowContext, task: &AgentTask, run_id: &str) -> Tree {
             from: run_id.to_owned(),
             self_id: ctx.workflow_id().to_owned(),
             waiting: Vec::new(),
-            next_seq: 1,
+            sent: BTreeMap::new(),
             mesh: None,
         },
     }
@@ -1351,8 +1361,7 @@ async fn durable_peer(
         Err(refusal) => return Ok(refuse(agent, tree, refusal, &peer.name)),
     };
     tree.delegations = tree.delegations.saturating_add(1);
-    let seq = tree.outbox.next_seq;
-    tree.outbox.next_seq = seq.saturating_add(1);
+    let seq = tree.outbox.next_seq(target_id);
     let mut promise = ctx.new_promise().map_err(|err| err.to_string())?;
     let mut waiting = tree.outbox.waiting.clone();
     waiting.push(tree.outbox.self_id.clone());

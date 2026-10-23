@@ -89,7 +89,9 @@ kernel.
   `delegate` call to a durable peer sends `AgentOp::PeerMessage` with a
   `PeerEnvelope` and waits on a durable promise for a `PeerReply`.
 - The send is `signal_external_workflow_by_id_with_idempotency` with the key
-  `<from>:<seq>`. `AgentState::outbound_seq` keeps the sequence.
+  `<from>:<seq>`. A durable sender sends `from` as
+  `<agent id>@<incarnation>`. `AgentState::outbound_seq` keeps one sequence
+  for each receiver.
 - The receiver keeps an applied set of each sender
   (`agent::dedupe::Inbound`): a floor and a set above it. It never drops a
   number for being under a high-water mark.

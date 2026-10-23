@@ -214,15 +214,107 @@ async fn a_peer_message_is_delivered_once_and_answered() {
     sqlite::drive(&mut rt, &research()).await.unwrap();
     sqlite::drive(&mut rt, &triage()).await.unwrap();
 
-    let answer = state(&rt, &triage()).await.last_answer.unwrap();
+    let sender = state(&rt, &triage()).await;
+    let answer = sender.last_answer.unwrap();
     assert!(answer.contains("The answer is 42."), "{answer}");
     let received = peer_messages(&rt, &research());
     assert_eq!(received.len(), 1, "one delivery");
-    assert_eq!(received[0].from, triage().as_str());
+    assert_eq!(
+        received[0].from,
+        format!("{}@{}", triage(), sender.incarnation)
+    );
     assert_eq!(received[0].seq, 1);
     let peer_turns = model.requests().iter().filter(|r| from_peer(r)).count();
     assert_eq!(peer_turns, 1, "the researcher answered once");
-    assert_eq!(state(&rt, &triage()).await.outbound_seq, 1);
+    assert_eq!(sender.outbound_seq.get(research().as_str()), Some(&1));
+}
+
+fn critic() -> AgentId {
+    AgentId::new("critic", "c1").unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_receiver_counts_its_own_seqs() {
+    // One counter for all peers leaves gaps at each receiver. Then the
+    // floor of its applied set stops (formal-methods.md, `AgentMesh`).
+    let (_dir, db) = fresh_db();
+    let model = FnModel::new(|request| {
+        if from_peer(request) {
+            return text("noted");
+        }
+        match tool_results(request).len() {
+            0 => call(
+                "d1",
+                DELEGATE_TOOL,
+                json!({"agent": "researcher", "task": "a"}),
+            ),
+            1 => call("d2", DELEGATE_TOOL, json!({"agent": "critic", "task": "b"})),
+            _ => text("done"),
+        }
+    });
+    let harness = AgentHarness::new(model.clone())
+        .peer(Peer::agent("researcher", "Finds facts.", &research()))
+        .peer(Peer::agent("critic", "Checks facts.", &critic()))
+        .agent(
+            AgentProfile::new("triage")
+                .mandate(Mandate::new("triage").peers(["researcher", "critic"])),
+        )
+        .agent(AgentProfile::new("research").mandate(Mandate::new("researcher")))
+        .agent(AgentProfile::new("critic").mandate(Mandate::new("critic")));
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    start(&mut rt, &critic()).await;
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("go"), None).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &critic()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    assert_eq!(
+        state(&rt, &triage()).await.last_answer.as_deref(),
+        Some("done")
+    );
+    let seqs =
+        |agent: &AgentId| -> Vec<u64> { peer_messages(&rt, agent).iter().map(|m| m.seq).collect() };
+    assert_eq!(seqs(&research()), [1]);
+    assert_eq!(seqs(&critic()), [1], "the critic sees no gap");
+    let critic_state = state(&rt, &critic()).await;
+    let applied: Vec<_> = critic_state.inbound.senders.values().collect();
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].floor, 1, "the floor moves");
+    assert!(applied[0].above.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recreated_sender_is_not_taken_for_a_duplicate() {
+    // A new incarnation of the sender counts from 1 again. Its messages
+    // must not match the keys or the applied set of the old one.
+    let (_dir, db) = fresh_db();
+    let model = mesh_model();
+    let mut rt = runtime(&db, mesh_harness(model.clone()));
+    start(&mut rt, &research()).await;
+    for round in 1..=2 {
+        sqlite::send(&mut rt, &triage(), &AgentOp::message("what is it?"), None).unwrap();
+        sqlite::drive(&mut rt, &triage()).await.unwrap();
+        sqlite::drive(&mut rt, &research()).await.unwrap();
+        sqlite::drive(&mut rt, &triage()).await.unwrap();
+        let answer = state(&rt, &triage()).await.last_answer.unwrap();
+        assert!(
+            answer.contains("The answer is 42."),
+            "round {round}: {answer}"
+        );
+        if round == 1 {
+            sqlite::delete(&mut rt, &triage(), None).unwrap();
+            sqlite::drive(&mut rt, &triage()).await.unwrap();
+        }
+    }
+    let received = peer_messages(&rt, &research());
+    assert_eq!(received.len(), 2);
+    assert_ne!(received[0].from, received[1].from);
+    assert_eq!((received[0].seq, received[1].seq), (1, 1));
+    let peer_turns = model.requests().iter().filter(|r| from_peer(r)).count();
+    assert_eq!(peer_turns, 2, "the researcher answered both lives");
 }
 
 #[tokio::test(flavor = "multi_thread")]

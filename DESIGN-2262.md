@@ -275,9 +275,11 @@ Every steer and every op is a staged signal before it is acknowledged.
 
 - `Peer::agent(name, id)` names a durable peer. A `delegate` call to it
   sends a `PeerMessage` to that agent and waits for the reply.
-- The send key is `<from>:<seq>`. `from` is the agent id of a durable
-  sender, and the run id of an `agent_loop` sender. The sequence lives in the
-  durable state of the sender.
+- The send key is `<from>:<seq>`. `from` is `<agent id>@<incarnation>` for
+  a durable sender, and the run id of an `agent_loop` sender. A new life of
+  the sender counts from 1 again, so `from` must hold the incarnation.
+- The sender keeps one sequence for each receiver, in its durable state. One
+  sequence for all peers leaves gaps at each receiver, and its floor stops.
 - The receiver keeps the applied numbers of each sender: a floor, and a set
   above it. A number is a duplicate only when it is in that set. A
   high-water mark would drop message 1 after message 2, and the outbox can

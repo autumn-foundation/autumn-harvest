@@ -417,7 +417,7 @@ let harness = AgentHarness::new(model)
 
 | Step | What happens |
 |---|---|
-| Send | The sender signals the agent by workflow id with the key `<from>:<seq>`. On one shard the send commits with the decision. Across shards it goes through the outbox. Replay does not send it again. |
+| Send | The sender signals the agent by workflow id with the key `<from>:<seq>`. A durable sender sends `from` as `<agent id>@<incarnation>`, so a new life never matches the keys of the old one. `seq` counts from 1 for each receiver, so a receiver sees no gaps. On one shard the send commits with the decision. Across shards it goes through the outbox. Replay does not send it again. |
 | Dedupe | The engine dedupes the key across the run chain of the receiver. The receiver also keeps the applied numbers of each sender, as a floor and a set above it. |
 | Mandate | The message carries `Mandate::outbound`. The receiver runs under `local.accept(inbound)`, so it can only narrow its own mandate. |
 | Labels | The message carries the labels of the sender. They taint the receiver. The reply carries the labels of the receiver back. |
