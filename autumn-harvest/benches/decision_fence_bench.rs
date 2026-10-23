@@ -113,9 +113,10 @@ impl Fence {
         }
     }
 
-    /// Whether the decision fences as the code before issue #2255 did: the
-    /// generation row and the owner row in two statements, then the
-    /// generation row again in a savepoint at each append.
+    /// Whether the decision fences as the code before issue #2255 did. The
+    /// start fence takes the generation row and the owner row in two
+    /// statements. Each append checks the generation row again in a
+    /// savepoint.
     const fn splits_the_fence(self) -> bool {
         matches!(
             self,

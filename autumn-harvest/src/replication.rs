@@ -2922,10 +2922,10 @@ mod db {
     /// It holds inside a [`crate::decision_owner::fenced_scope`] of `conn`.
     /// The start fence locked the owner row and the generation row of the
     /// pinned tenure's shard, and both locks stay until the transaction
-    /// ends. A fence of `shard` then sends no query when `shard` has no DR
-    /// pin, or when it resolves to the same generation row at the same
-    /// pinned generation. A colocated shard with its own row still checks
-    /// that row.
+    /// ends. So a fence of `shard` sends no query when `shard` has no DR
+    /// pin. It sends none either when `shard` resolves to the same
+    /// generation row at the same pinned generation. A colocated shard with
+    /// its own row still checks that row.
     #[must_use]
     pub fn start_fence_covers(conn: &AsyncPgConnection, shard: ShardId) -> bool {
         let Some(tenure) = crate::decision_owner::pinned_decision() else {

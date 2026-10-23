@@ -6280,8 +6280,9 @@ async fn requeue_claimed_workflow_task_with_backoff(
     // Issue #2255: the owner decider of the row's partition takes it. A
     // fenced owner re-pends here, and the new owner learns of the row at
     // once instead of at its next scan.
-    if let Some(Some(exec_id)) = updated.first().map(|row| row.3) {
-        crate::notify::notify_owner(conn, exec_id, false).await?;
+    // A slice pattern, because Diesel's `first` shadows the slice method.
+    if let [(_, _, _, Some(exec_id)), ..] = updated.as_slice() {
+        crate::notify::notify_owner(conn, *exec_id, false).await?;
     }
     let updated = updated
         .into_iter()

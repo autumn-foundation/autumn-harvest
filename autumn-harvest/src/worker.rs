@@ -40255,10 +40255,10 @@ impl Worker {
     ///
     /// It learns of work from two sources. An owner wake names an execution.
     /// A scan reads the pending workflow rows of its partitions by due time.
-    /// The scan runs at each tenure change, when permits free up after a
-    /// full scan, and at the next due time, at most one poll interval
-    /// apart. So a lost wake, a due timer and the backlog of a new partition
-    /// all reach it.
+    /// The scan runs at each tenure change and when permits free up after a
+    /// full scan. It also runs at the next due time, at most one poll
+    /// interval apart. So a lost wake, a due timer and the backlog of a new
+    /// partition all reach it.
     ///
     /// Each take is the owned by-execution claim. It runs in its own future,
     /// bounded by the workflow permits, and dispatches as a claim does. The
