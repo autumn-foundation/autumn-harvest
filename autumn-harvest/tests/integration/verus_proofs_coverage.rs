@@ -222,9 +222,20 @@ fn every_verus_mirror_matches_its_engine_source() {
     }
 }
 
-/// The `.rs` files under `autumn-harvest/src`, relative to the repo root.
+/// The source crates that a Verus proof may mirror.
+///
+/// The agent crate holds pure kernels of the durable agent (issue #2262).
+/// A proof of one names its Verus file as an engine function does.
+const MIRRORED_CRATES: &[&str] = &["autumn-harvest/src", "autumn-harvest-agent/src"];
+
+/// The `.rs` files under each of [`MIRRORED_CRATES`], relative to the repo
+/// root.
 fn engine_files() -> Vec<String> {
-    rs_files_under("autumn-harvest/src")
+    MIRRORED_CRATES
+        .iter()
+        .copied()
+        .flat_map(rs_files_under)
+        .collect()
 }
 
 /// The `.rs` files at any depth under `dir`, relative to the repo root.

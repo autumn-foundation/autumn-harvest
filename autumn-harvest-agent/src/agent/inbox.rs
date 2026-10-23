@@ -44,7 +44,8 @@ pub enum Admit {
 ///
 /// A control op always applies, so a paused agent can resume. Work runs only
 /// when the inbox is open, and waits otherwise. A tick runs only when the
-/// inbox is open.
+/// inbox is open. `formal/verus/src/agent_inbox.rs` proves the table and the
+/// arrival order of work.
 #[must_use]
 pub const fn admit(status: InboxStatus, class: OpClass) -> Admit {
     match class {

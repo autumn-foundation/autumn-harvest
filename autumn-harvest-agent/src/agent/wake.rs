@@ -11,6 +11,9 @@
 /// that applies. `now` is the recorded time of the op. `ticked` says whether
 /// the op was a tick. With no heartbeat, nothing is booked. A tick, or a missing
 /// booking, books `now + every_ms`. Any other op keeps the booking.
+///
+/// The interval is at least 1 ms. The sum saturates at `i64::MAX`.
+/// `formal/verus/src/agent_wake.rs` proves the function for every input.
 #[must_use]
 pub const fn next_heartbeat(
     current: Option<i64>,
@@ -22,7 +25,17 @@ pub const fn next_heartbeat(
         None => None,
         Some(every) => match current {
             Some(at) if !ticked => Some(at),
-            _ => Some(now.saturating_add(if every < 1 { 1 } else { every })),
+            _ => {
+                // Verus has no spec of `i64::saturating_add`, so the sum
+                // saturates here. The step is positive, so only the top
+                // bound applies.
+                let step = if every < 1 { 1 } else { every };
+                Some(if now > i64::MAX - step {
+                    i64::MAX
+                } else {
+                    now + step
+                })
+            }
         },
     }
 }
@@ -51,6 +64,20 @@ mod tests {
             next_heartbeat(Some(5_000), Some(60_000), 9_000, false),
             Some(5_000)
         );
+    }
+
+    #[test]
+    fn the_booking_saturates_and_the_step_is_at_least_one() {
+        assert_eq!(
+            next_heartbeat(None, Some(10), i64::MAX - 5, true),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            next_heartbeat(None, Some(5), i64::MAX - 5, true),
+            Some(i64::MAX)
+        );
+        assert_eq!(next_heartbeat(Some(3), Some(0), 7, true), Some(8));
+        assert_eq!(next_heartbeat(Some(3), Some(-4), 7, true), Some(8));
     }
 
     proptest! {
