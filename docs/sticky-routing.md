@@ -89,6 +89,20 @@ The guard statements take a `SHARE ROW EXCLUSIVE` lock on `harvest_task_queue`, 
 
 Workers read the switch about once a second. A worker in owner mode still caches workflow state and still needs `sticky_timeout` above zero. `harvest.workflow.resident` keeps the same labels in both modes.
 
+### Owner disk cache
+
+An owner can also keep the history of each live run in a local file (issue #2258, [ADR 0012](adr/0012-owner-disk-cache.md)). A memory miss then reads the file and the Postgres delta, not the full history. A disk hit holds no resident workflow, so it still replays.
+
+```rust
+let worker = WorkerConfig::default().with_owner_disk_cache("/var/cache/harvest");
+```
+
+- **Opt-in.** It needs the `owner-disk-cache` feature, owner mode and `sticky_timeout` above zero. Give each process its own directory. A second process on the same directory fails to start.
+- **Sealed.** Each row is sealed under a key that lives in memory only. The cache stores decoded events, so no codec ciphertext reaches the disk.
+- **Disposable.** The worker deletes every cache file at start, on a lost tenure and at shutdown. A terminal commit and an evict wake purge the run. A reconcile pass every 30 s purges each cached run that is no longer `RUNNING`.
+- **Checked.** A read compares the last cached event with Postgres. A mismatch, another epoch, another codec key generation or a damaged row purges the entry. The decision then replays cold from Postgres.
+- **Metric.** `harvest.workflow.disk_cache{workflow, queue, outcome}` counts each read: `hit`, `miss`, `stale` or `corrupt`. A disk hit counts as a memory miss in `harvest.workflow.cache_miss`.
+
 ## Configuration
 
 Sticky routing is **on by default**. `WorkerConfig::default()` sets `sticky_timeout` to `DEFAULT_STICKY_TIMEOUT` (5 s), the same fallback window that Temporal uses for its sticky queue. Change the window per worker with `WorkerConfig::with_sticky_routing`:

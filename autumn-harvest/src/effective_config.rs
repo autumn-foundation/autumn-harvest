@@ -153,6 +153,9 @@ pub struct WorkerConfigView {
     /// Reports the effective value, so it is `false` while sticky routing is
     /// off.
     pub resident_workflows: bool,
+    /// Whether a directory for the owner-local disk cache is set (issue
+    /// #2258). The path is not reported.
+    pub owner_disk_cache: bool,
     /// Whether sticky cross-worker routing is enabled (`sticky_timeout > 0`).
     pub sticky_routing_enabled: bool,
     /// Sticky routing lease TTL, milliseconds (0 = disabled).
@@ -417,6 +420,8 @@ impl WorkerConfigView {
             shutdown_timeout,
             workflow_cache_size,
             resident_workflows,
+            // Presence only. The path is a local detail of the node.
+            owner_disk_cache,
             sticky_timeout,
             cancellation_grace_period,
             shard_assignments,
@@ -470,6 +475,7 @@ impl WorkerConfigView {
             shutdown_timeout_ms: dur_ms(*shutdown_timeout),
             workflow_cache_size: *workflow_cache_size,
             resident_workflows: *resident_workflows && !sticky_timeout.is_zero(),
+            owner_disk_cache: owner_disk_cache.is_some(),
             sticky_routing_enabled: !sticky_timeout.is_zero(),
             sticky_timeout_ms: dur_ms(*sticky_timeout),
             cancellation_grace_period_ms: dur_ms(*cancellation_grace_period),

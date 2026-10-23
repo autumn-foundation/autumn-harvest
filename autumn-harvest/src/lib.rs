@@ -417,6 +417,9 @@ pub mod metrics_rs_adapter;
 pub mod migrate;
 /// Durable mutual-exclusion locks for workflow code (`ctx.mutex`, issue #691).
 pub mod mutex;
+/// The owner-local disk cache of decided histories (issue #2258).
+#[cfg(feature = "owner-disk-cache")]
+pub mod owner_disk_cache;
 pub mod partition;
 /// Export of aged event partitions to object storage (issue #2009).
 pub mod partition_archive;

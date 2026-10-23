@@ -8,11 +8,14 @@
 //! - the same history from a local `SQLite` file, through the read path of
 //!   `autumn-harvest-sqlite`;
 //! - the cold load of every live run after an owner restart;
+//! - the same warm-up through the owner disk cache (#2258), in
+//!   [`disk_side`];
 //! - the cold share that the cache cap alone causes, in [`cache_model`].
 //!
 //! [`gate`] applies the thresholds of the typed-state-snapshot spike.
 
 pub mod cache_model;
+pub mod disk_side;
 pub mod gate;
 pub mod pg_side;
 pub mod seed;

@@ -633,6 +633,13 @@ pub struct HandlerRegistry {
     /// #2251). Empty until the acquisition loop of issue #2252 fills it. A
     /// decision of a held partition fences its commit with the tenure.
     decision_owner: Arc<crate::decision_owner::OwnedPartitions>,
+    /// The directory of the owner-local disk cache (issue #2258). `None`
+    /// turns the cache off.
+    owner_disk_cache_dir: Option<std::path::PathBuf>,
+    /// The open disk cache. The workers of this registry share it, because
+    /// a process can lock a directory only once.
+    #[cfg(feature = "owner-disk-cache")]
+    owner_disk_cache: std::sync::Mutex<Option<Arc<crate::owner_disk_cache::OwnerDiskCache>>>,
     /// Maximum byte length for `current_details` strings passed to the
     /// workflow context (issue #473). Default: 1 KiB.
     pub max_current_details_bytes: usize,
@@ -892,6 +899,9 @@ impl HandlerRegistry {
             retry_budgets,
             adaptive_limits,
             decision_owner: Arc::default(),
+            owner_disk_cache_dir: None,
+            #[cfg(feature = "owner-disk-cache")]
+            owner_disk_cache: std::sync::Mutex::new(None),
             max_workflow_attempts_ceiling: None,
             max_workflow_chain_timeout: None,
             max_workflow_execution_timeout: None,
@@ -1518,6 +1528,43 @@ impl HandlerRegistry {
         self
     }
 
+    /// Set the directory of the owner-local disk cache (issue #2258).
+    #[must_use]
+    pub fn with_owner_disk_cache(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.owner_disk_cache_dir = dir;
+        self
+    }
+
+    /// The directory of the owner-local disk cache, if set (issue #2258).
+    #[must_use]
+    pub fn owner_disk_cache_dir(&self) -> Option<&std::path::Path> {
+        self.owner_disk_cache_dir.as_deref()
+    }
+
+    /// Open the owner-local disk cache once, and share it (issue #2258).
+    ///
+    /// The open wipes the directory. A second worker on this registry gets
+    /// the same cache.
+    #[cfg(feature = "owner-disk-cache")]
+    fn open_owner_disk_cache(
+        &self,
+    ) -> HarvestResult<Option<Arc<crate::owner_disk_cache::OwnerDiskCache>>> {
+        let Some(dir) = self.owner_disk_cache_dir.as_deref() else {
+            return Ok(None);
+        };
+        let mut slot = self
+            .owner_disk_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(open) = slot.as_ref() {
+            return Ok(Some(Arc::clone(open)));
+        }
+        let open = Arc::new(crate::owner_disk_cache::OwnerDiskCache::open(dir)?);
+        *slot = Some(Arc::clone(&open));
+        drop(slot);
+        Ok(Some(open))
+    }
+
     /// Access the per-activity-type adaptive concurrency limits (issue
     /// #1836).
     #[must_use]
@@ -1853,6 +1900,16 @@ impl std::fmt::Debug for HandlerRegistry {
         // compiled-module cache, which is far more than a registry dump wants.
         #[cfg(feature = "hot-code-swap")]
         d.field("workflow_module_hosting", &self.module_host.is_some());
+        // Issue #2258: the directory, and whether a worker opened the cache.
+        d.field("owner_disk_cache_dir", &self.owner_disk_cache_dir);
+        #[cfg(feature = "owner-disk-cache")]
+        d.field(
+            "owner_disk_cache_open",
+            &self
+                .owner_disk_cache
+                .try_lock()
+                .map_or(true, |open| open.is_some()),
+        );
         d.finish()
     }
 }
@@ -2107,6 +2164,9 @@ struct PreparedWorkflowTask {
     delta_start: usize,
     /// Whether this worker keeps workflows resident (issue #1798).
     resident_enabled: bool,
+    /// The outcome of the owner disk read on a memory miss (issue #2258).
+    /// `None` when no disk read ran.
+    disk_outcome: Option<&'static str>,
 }
 
 /// `#[doc(hidden)]`: test-support-reachable, not semver-stable surface --
@@ -22700,6 +22760,113 @@ const fn final_miss(hot_swapped: bool, reason: ResidentOutcome) -> crate::reside
     })
 }
 
+/// The cache entry of a disk hit (issue #2258): the state, no resident
+/// workflow, the byte mark and the owner key.
+#[cfg(feature = "owner-disk-cache")]
+type DiskCacheEntry = (
+    crate::cache::CachedWorkflowState,
+    crate::resident::Residency,
+    Option<crate::cache::HistoryBytesMark>,
+    Option<crate::decision_owner::OwnerKey>,
+);
+
+/// Read the disk entry of a memory miss (issue #2258).
+///
+/// Only a decision with a pinned tenure reads the disk. Returns the entry
+/// and the outcome label, or no label when no disk read ran.
+#[cfg(feature = "owner-disk-cache")]
+async fn read_disk_entry(
+    conn: &mut AsyncPgConnection,
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    key: crate::decision_owner::OwnerKey,
+    execution: &WorkflowExecution,
+    offloader: Option<&crate::payload_store::PayloadOffloader>,
+) -> (Option<DiskCacheEntry>, Option<&'static str>) {
+    let Some(epoch) = crate::decision_owner::pinned_decision().map(|t| t.epoch()) else {
+        return (None, None);
+    };
+    let Some(disk) = workflow_cache.lock().await.disk() else {
+        return (None, None);
+    };
+    let exec_id = ExecutionId::from_uuid(execution.id);
+    let read = disk
+        .read(conn, key, epoch, exec_id, &execution.state, offloader)
+        .await;
+    let entry = read.entry.map(|(state, history_bytes)| {
+        (
+            state,
+            crate::resident::Residency::Unknown,
+            history_bytes,
+            Some(key),
+        )
+    });
+    (entry, Some(read.outcome))
+}
+
+/// Write the disk entry of a committed decision, or purge it (issue #2258).
+///
+/// A suspension of a held tenure writes. Any other outcome purges. Returns
+/// the state for the memory cache, or `None` when the write task died.
+#[cfg(feature = "owner-disk-cache")]
+async fn write_disk_entry(
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    exec_uuid: uuid::Uuid,
+    suspended: bool,
+    state: crate::cache::CachedWorkflowState,
+    history_bytes: Option<crate::cache::HistoryBytesMark>,
+    owner: CacheOwner<'_>,
+) -> Option<crate::cache::CachedWorkflowState> {
+    let Some(disk) = workflow_cache.lock().await.disk() else {
+        return Some(state);
+    };
+    match owner.pinned {
+        Some(epoch) if suspended && owner.may_cache() => {
+            disk.write(
+                owner.key,
+                epoch,
+                exec_uuid,
+                state,
+                history_bytes,
+                Arc::clone(owner.owned),
+            )
+            .await
+        }
+        _ => {
+            disk.purge(exec_uuid).await;
+            Some(state)
+        }
+    }
+}
+
+/// Delete the disk entry of `exec_uuid`, if any (issue #2258).
+#[cfg(feature = "owner-disk-cache")]
+async fn purge_disk_entry(
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    exec_uuid: uuid::Uuid,
+) {
+    // Clone the tier first. The cache lock must not span the disk work.
+    let disk = workflow_cache.lock().await.disk();
+    if let Some(disk) = disk {
+        disk.purge(exec_uuid).await;
+    }
+}
+
+/// Delete the disk file of each partition in `keys` (issue #2258).
+///
+/// Call it after the tenure set drops the tenures. A disk write checks the
+/// tenure under the partition lock, so no write lands after the delete.
+#[cfg(feature = "owner-disk-cache")]
+async fn drop_disk_partitions(
+    workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    keys: &[crate::decision_owner::OwnerKey],
+) {
+    // Clone the tier first. The cache lock must not span the disk work.
+    let disk = workflow_cache.lock().await.disk();
+    if let Some(disk) = disk {
+        disk.drop_partitions(keys).await;
+    }
+}
+
 /// Puts a taken cache entry back, and drops any displaced entry outside the
 /// lock (issue #1798).
 async fn put_back_cache_entry(
@@ -22711,9 +22878,10 @@ async fn put_back_cache_entry(
     // Issue #2251: the partition tag, so a fenced owner can drop the entry.
     owner: CacheOwner<'_>,
 ) {
+    let may_cache = owner.may_cache();
     let displaced = {
         let mut guard = workflow_cache.lock().await;
-        if owner.may_cache() {
+        if may_cache {
             guard.insert_resident_with_history_bytes(
                 exec_uuid,
                 state,
@@ -22726,6 +22894,11 @@ async fn put_back_cache_entry(
         }
     };
     drop(displaced);
+    // Issue #2258: a decision whose tenure ended keeps no disk entry.
+    #[cfg(feature = "owner-disk-cache")]
+    if !may_cache {
+        purge_disk_entry(workflow_cache, exec_uuid).await;
+    }
 }
 
 /// The owner side of a cache write (issue #2251).
@@ -22737,7 +22910,7 @@ async fn put_back_cache_entry(
 struct CacheOwner<'a> {
     key: crate::decision_owner::OwnerKey,
     pinned: Option<crate::decision_owner::OwnerEpoch>,
-    owned: &'a crate::decision_owner::OwnedPartitions,
+    owned: &'a Arc<crate::decision_owner::OwnedPartitions>,
 }
 
 impl CacheOwner<'_> {
@@ -22822,7 +22995,7 @@ async fn prepare_workflow_task_with_cache(
     codecs: &crate::payload_codec::PayloadCodecs,
     // Issue #2251: the owner tenures of this worker, and the shard of the
     // claim's pool that keys them.
-    owned: &crate::decision_owner::OwnedPartitions,
+    owned: &Arc<crate::decision_owner::OwnedPartitions>,
     owner_shard: crate::types::ShardId,
 ) -> HarvestResult<Option<PreparedWorkflowTask>> {
     let Some(exec_uuid) = task.workflow_exec_id else {
@@ -22861,6 +23034,15 @@ async fn prepare_workflow_task_with_cache(
     // An entry of another database is stale. The run moved.
     let cached =
         cached.filter(|(.., entry_key)| !owner_mode || entry_key.is_none_or(|entry| entry == key));
+    // Issue #2258: on a memory miss, an owner reads its disk cache. A disk
+    // entry holds no resident workflow, so the decision replays it cold.
+    #[cfg(feature = "owner-disk-cache")]
+    let (cached, disk_outcome) = match cached {
+        Some(entry) => (Some(entry), None),
+        None => read_disk_entry(conn, workflow_cache, key, &execution, offloader).await,
+    };
+    #[cfg(not(feature = "owner-disk-cache"))]
+    let disk_outcome = None;
 
     // Cache hit path. Load the delta first: other writers can append after
     // the snapshot. Then ingest timers and signals at the real
@@ -22968,6 +23150,7 @@ async fn prepare_workflow_task_with_cache(
             resident,
             delta_start,
             resident_enabled,
+            disk_outcome,
         }))
     } else {
         // Cache miss path: full history load. A transient event-id conflict
@@ -23001,6 +23184,7 @@ async fn prepare_workflow_task_with_cache(
             resident: crate::resident::Residency::Unknown,
             delta_start,
             resident_enabled,
+            disk_outcome,
         }))
     }
 }
@@ -26437,8 +26621,16 @@ async fn process_workflow_task(
 
     let telemetry = registry.telemetry().clone();
 
+    // Issue #2258: a disk hit is a memory miss. The disk counter records it.
+    if let Some(outcome) = prepared.disk_outcome {
+        telemetry.metrics.record_workflow_disk_cache(
+            &prepared.execution.workflow_name,
+            &task.queue_name,
+            outcome,
+        );
+    }
     // Emit cache hit/miss metric now that we know the workflow name.
-    if prepared.was_cache_hit {
+    if prepared.was_cache_hit && prepared.disk_outcome.is_none() {
         telemetry
             .metrics
             .record_workflow_cache_hit(&prepared.execution.workflow_name, &task.queue_name);
@@ -29246,6 +29438,21 @@ async fn store_cache_entry(
     let Some(suspended) = suspended else {
         return;
     };
+    // Issue #2258: the disk tier first. A suspension writes its new events.
+    // A terminal run, or an ended tenure, purges the disk entry.
+    #[cfg(feature = "owner-disk-cache")]
+    let Some(state) = write_disk_entry(
+        workflow_cache,
+        exec_uuid,
+        suspended,
+        state,
+        history_bytes,
+        owner,
+    )
+    .await
+    else {
+        return;
+    };
     let displaced = {
         let mut guard = workflow_cache.lock().await;
         if suspended && owner.may_cache() {
@@ -29797,6 +30004,9 @@ async fn drop_fenced_tenure(
         // Drop the parked futures outside the cache lock.
         let evicted = workflow_cache.lock().await.evict_partition(key);
         drop(evicted);
+        // Issue #2258: delete the disk file of the partition too.
+        #[cfg(feature = "owner-disk-cache")]
+        drop_disk_partitions(workflow_cache, &[key]).await;
     }
     metrics.record_decision_owner_fenced(&key.shard.as_i32().to_string());
     unloaded
@@ -29937,6 +30147,10 @@ impl OwnerWakes {
                 .await
                 .take(&wake.payload.workflow_exec_id);
             drop(taken);
+            // Issue #2258: a state change, a terminal one included, purges
+            // the disk entry. An erasure then finds no local copy.
+            #[cfg(feature = "owner-disk-cache")]
+            purge_disk_entry(&self.workflow_cache, wake.payload.workflow_exec_id).await;
             "evict"
         } else {
             "wake"
@@ -34820,7 +35034,12 @@ async fn owner_scan(
             tracing::warn!(worker_id = %worker_id, error = %e, "owner loop scan failed");
         }
     }
+    #[cfg(feature = "owner-disk-cache")]
+    let shard = owner_loop.shard();
     drop(owner_loop);
+    // Issue #2258: the backstop for a lost evict wake.
+    #[cfg(feature = "owner-disk-cache")]
+    reconcile_disk_cache(cache, pool, shard, worker_id).await;
     if more {
         return Duration::ZERO;
     }
@@ -34840,6 +35059,39 @@ async fn conn_then_loop_lock<C, S>(
     (conn, state.lock().await)
 }
 
+/// Reconcile the disk cache of `shard` when its interval is due (issue
+/// #2258).
+///
+/// The pass purges each cached run that is not `RUNNING`. It is the backstop
+/// for a lost evict wake. A failure waits for the next interval.
+#[cfg(feature = "owner-disk-cache")]
+async fn reconcile_disk_cache(
+    cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
+    pool: &DbPool,
+    shard: crate::types::ShardId,
+    worker_id: &str,
+) {
+    let Some(disk) = cache.lock().await.disk() else {
+        return;
+    };
+    if !disk.reconcile_due(shard) {
+        return;
+    }
+    let result = match pool.get().await {
+        Ok(mut conn) => disk.reconcile(&mut conn, Some(shard)).await,
+        Err(e) => Err(HarvestError::Database(e.to_string())),
+    };
+    match result {
+        Ok(0) => {}
+        Ok(purged) => {
+            tracing::info!(worker_id = %worker_id, purged, "owner disk cache: reconcile purged runs");
+        }
+        Err(e) => {
+            tracing::warn!(worker_id = %worker_id, error = %e, "owner disk cache: reconcile failed");
+        }
+    }
+}
+
 /// Drop the cache entries of each partition of `keys`.
 async fn evict_owner_keys(
     cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
@@ -34851,6 +35103,9 @@ async fn evict_owner_keys(
     let closed = cache.lock().await.evict_partitions(keys);
     // Each entry can hold a parked handler future. Drop them outside the lock.
     drop(closed);
+    // Issue #2258: delete the disk file of each partition too.
+    #[cfg(feature = "owner-disk-cache")]
+    drop_disk_partitions(cache, keys).await;
 }
 
 /// Owns a task handle and aborts the task when dropped (issue #1552).
@@ -35575,10 +35830,23 @@ impl Worker {
             build_dispatch_semaphore(config.max_concurrent_workflows, config.slot_tuner.as_ref());
         let activity_parts =
             build_dispatch_semaphore(config.max_concurrent_activities, config.slot_tuner.as_ref());
-        let workflow_cache = Arc::new(tokio::sync::Mutex::new(
-            crate::cache::WorkflowCache::new(config.workflow_cache_size)
-                .with_resident(config.resident_workflows),
-        ));
+        let workflow_cache = crate::cache::WorkflowCache::new(config.workflow_cache_size)
+            .with_resident(config.resident_workflows);
+        // Issue #2258: the owner-local disk tier. The open wipes its directory.
+        #[cfg(feature = "owner-disk-cache")]
+        let workflow_cache =
+            workflow_cache.with_disk(registry.open_owner_disk_cache()?.map(|disk| {
+                crate::owner_disk_cache::DiskTier::new(disk, registry.payload_codecs().clone())
+            }));
+        #[cfg(not(feature = "owner-disk-cache"))]
+        if let Some(dir) = registry.owner_disk_cache_dir() {
+            return Err(HarvestError::Config(format!(
+                "an owner disk cache directory is set ({}), but this build lacks the \
+                 `owner-disk-cache` feature (issue #2258)",
+                dir.display()
+            )));
+        }
+        let workflow_cache = Arc::new(tokio::sync::Mutex::new(workflow_cache));
         // The window keeps each outcome until a heartbeat can publish it.
         let task_outcomes = crate::worker_outlier::TaskOutcomeWindow::for_heartbeat(
             config.worker_heartbeat_interval,
@@ -35672,6 +35940,46 @@ impl Worker {
             .lock()
             .await
             .contains(&exec_id.as_uuid())
+    }
+
+    /// Whether the owner disk cache holds an entry for `exec_id` (issue
+    /// #2258). Tests use it.
+    #[cfg(feature = "owner-disk-cache")]
+    #[doc(hidden)]
+    pub async fn has_disk_cached_execution(&self, exec_id: ExecutionId) -> bool {
+        self.workflow_cache
+            .lock()
+            .await
+            .disk()
+            .is_some_and(|disk| disk.cache().contains(exec_id.as_uuid()))
+    }
+
+    /// Drop the memory entry of `exec_id` and keep its disk entry (issue
+    /// #2258). Tests use it to force a disk read.
+    #[cfg(feature = "owner-disk-cache")]
+    #[doc(hidden)]
+    pub async fn forget_cached_execution(&self, exec_id: ExecutionId) {
+        let taken = self.workflow_cache.lock().await.take(&exec_id.as_uuid());
+        drop(taken);
+    }
+
+    /// Run one reconcile pass of the owner disk cache on `pool`, for every
+    /// shard (issue #2258). Returns the number of runs purged. Tests use it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a pool or database error.
+    #[cfg(feature = "owner-disk-cache")]
+    #[doc(hidden)]
+    pub async fn reconcile_owner_disk_cache(&self, pool: &DbPool) -> HarvestResult<usize> {
+        let Some(disk) = self.workflow_cache.lock().await.disk() else {
+            return Ok(0);
+        };
+        let mut conn = pool
+            .get()
+            .await
+            .map_err(|e| HarvestError::Database(e.to_string()))?;
+        disk.reconcile(&mut conn, None).await
     }
 
     /// The global channel this worker is bound to (issue #1431).
@@ -41246,6 +41554,13 @@ impl Worker {
     async fn close_workflow_cache(&self) {
         let closed = self.workflow_cache.lock().await.close();
         drop(closed);
+        // Issue #2258: a stopped worker owns no partition, so it keeps no
+        // disk file.
+        #[cfg(feature = "owner-disk-cache")]
+        let disk = self.workflow_cache.lock().await.disk();
+        if let Some(disk) = disk {
+            disk.wipe().await;
+        }
     }
 
     /// Request graceful shutdown of this worker.
@@ -45144,6 +45459,7 @@ mod tests {
             shutdown_timeout: Duration::from_secs(60),
             workflow_cache_size: 500,
             resident_workflows: true,
+            owner_disk_cache: None,
             sticky_timeout: Duration::from_secs(3),
             cancellation_grace_period: Duration::from_secs(10),
             shard_assignments: vec![crate::types::ShardId::new(0)],

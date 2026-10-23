@@ -3965,6 +3965,55 @@
           "description": "The stage 2 gate of epic #2247. A disk cache (#2258) goes ahead when the 7-day cold share passes 0.2, or the 7-day cold p99 passes 0.05 s. This panel shows rates. The record doc gives the 7-day queries (docs/rnd/2026-10-22-stage-2-gate.md). The p99 and the average are seconds from the history load to the end of the first drive. The p99 needs a bucket bound at 0.05 s. The average works without buckets."
         },
         {
+          "id": 225801,
+          "type": "timeseries",
+          "title": "Owner disk cache reads by outcome (issue #2258)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 124
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (outcome) (rate(harvest_workflow_disk_cache_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Disk reads of the owner-local cache on a memory miss. `hit` served the history from the local file and the Postgres delta. `stale` and `corrupt` purged the entry and loaded from Postgres. A rising `corrupt` rate points at the disk. Empty unless the worker has the `owner-disk-cache` feature, a cache directory and owner mode."
+        },
+        {
           "id": 63,
           "type": "timeseries",
           "title": "Retention deletions by workflow type",

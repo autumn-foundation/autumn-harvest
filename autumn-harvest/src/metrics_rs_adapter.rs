@@ -98,15 +98,15 @@ use crate::telemetry::{
     METRIC_WORKER_EMPTY_BUILD_POLICY, METRIC_WORKER_SLOT_TARGET, METRIC_WORKER_SLOTS_AVAILABLE,
     METRIC_WORKER_SLOTS_IN_USE, METRIC_WORKER_TUNER_DECISIONS, METRIC_WORKFLOW_ACTIVE,
     METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CHAIN_TIMEOUT,
-    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION,
-    METRIC_WORKFLOW_HISTORY_BLOAT, METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE,
-    METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC,
-    METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RESIDENT,
-    METRIC_WORKFLOW_RESIDENT_DURATION, METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED,
-    METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT,
-    METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS,
-    MetricsRecorder, PoisonReason, ResidentOutcome, SessionAcquisitionOutcome, SlotType,
-    TunerDecision, WebhookOutcome, WorkflowStatus,
+    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DISK_CACHE,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_BLOAT, METRIC_WORKFLOW_HISTORY_OVERSIZED,
+    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM,
+    METRIC_WORKFLOW_PANIC, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
+    METRIC_WORKFLOW_RESIDENT, METRIC_WORKFLOW_RESIDENT_DURATION, METRIC_WORKFLOW_RETRIES,
+    METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED,
+    METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT,
+    METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, PoisonReason, ResidentOutcome,
+    SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
 };
 use crate::telemetry::{
     ClaimKind, DbOp, METRIC_DB_PERSIST_PHASE_DURATION, METRIC_DB_POOL_IDLE, METRIC_DB_POOL_IN_USE,
@@ -1051,6 +1051,16 @@ impl MetricsRecorder for MetricsRsRecorder {
         .increment(1);
     }
 
+    fn record_workflow_disk_cache(&self, workflow_name: &str, queue: &str, outcome: &str) {
+        counter!(
+            METRIC_WORKFLOW_DISK_CACHE,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_OUTCOME => outcome.to_owned(),
+        )
+        .increment(1);
+    }
+
     fn record_workflow_resident_duration(
         &self,
         workflow_name: &str,
@@ -1841,6 +1851,7 @@ mod tests {
         rec.record_workflow_cache_miss("wf", "q");
         rec.record_workflow_resident("wf", "q", ResidentOutcome::Hit);
         rec.record_workflow_resident_duration("wf", "q", ResidentOutcome::Hit, 0.001);
+        rec.record_workflow_disk_cache("wf", "q", "hit");
         rec.record_rate_limit_tokens_available("rl", 10.0);
         rec.record_rate_limit_refill_rate("rl", 2.0);
         rec.record_rate_limit_throttled("rl");
@@ -2004,6 +2015,25 @@ mod tests {
         )];
         assert_eq!(*capture.histograms.lock().unwrap(), expected);
         assert!(capture.counters.lock().unwrap().is_empty());
+    }
+
+    /// Issue #2258: the disk cache counter takes the workflow, the queue
+    /// and the outcome.
+    #[test]
+    fn bridges_workflow_disk_cache_with_outcome_labels() {
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            MetricsRsRecorder.record_workflow_disk_cache("wf", "q", "corrupt");
+        });
+        let expected: Vec<CounterKey> = vec![(
+            METRIC_WORKFLOW_DISK_CACHE.to_owned(),
+            vec![
+                (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
+                (METRIC_LABEL_QUEUE.to_owned(), "q".to_owned()),
+                (METRIC_LABEL_OUTCOME.to_owned(), "corrupt".to_owned()),
+            ],
+        )];
+        assert_eq!(*capture.counters.lock().unwrap(), expected);
     }
 
     #[test]
