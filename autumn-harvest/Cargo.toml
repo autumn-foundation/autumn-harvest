@@ -105,7 +105,7 @@ hmac = "0.13"
 # AES-256-GCM payload codec (issue #1825). `autumn-web` already pins 0.10.3 in
 # the lockfile. No default features: the codec reads nonces from `rand`'s
 # `OsRng`, so `aead/getrandom` is not needed.
-aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
+aes-gcm = { version = "0.11.1", default-features = false, features = ["aes", "alloc", "zeroize"] }
 # `aes-gcm`'s own `zeroize` feature clears only a temporary key. These turn on
 # `ZeroizeOnDrop` for the AES round keys and the GHASH state. All three crates
 # are already in the lockfile through `aes-gcm`.
