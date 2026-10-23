@@ -27069,7 +27069,7 @@ async fn hydrate_ctx_for_query(
     query_label: &str,
 ) -> Result<WorkflowContext, AutumnError> {
     match hydrate_or_project(api_state, exec_id, query_label, false).await? {
-        QueryTarget::Replay(ctx) => Ok(ctx),
+        QueryTarget::Replay(ctx) => Ok(*ctx),
         QueryTarget::Projected(..) => Err(map_error(HarvestError::Config(
             "a query hydrate with no projection read returned a projection".to_string(),
         ))),
@@ -27081,8 +27081,8 @@ enum QueryTarget {
     /// The entity state projection answered (issue #2259), in the given
     /// read time. No replay ran.
     Projected(Value, Duration),
-    /// The replayed context of the run.
-    Replay(WorkflowContext),
+    /// The replayed context of the run. Boxed, because a context is large.
+    Replay(Box<WorkflowContext>),
 }
 
 /// Answer `query_name` from the entity state projection when `project` is
@@ -27091,6 +27091,9 @@ enum QueryTarget {
 ///
 /// The projection read comes after the live-attempt walk and the erasure
 /// check, so it answers for the same run as a replay would.
+// The body was the query hydrate, near the line limit, before the projection
+// read. Splitting it would move the resolved connection across helpers.
+#[allow(clippy::too_many_lines)]
 async fn hydrate_or_project(
     api_state: &HarvestApiState,
     exec_id: ExecutionId,
@@ -27290,7 +27293,7 @@ async fn hydrate_or_project(
             // mid-await CANCELLED / FAILED), with all recorded non-lifecycle
             // history faithfully consumed: serve the reconstructed state at the
             // recorded terminal point.
-            TerminalQueryDecision::Serve => Ok(QueryTarget::Replay(ctx)),
+            TerminalQueryDecision::Serve => Ok(QueryTarget::Replay(Box::new(ctx))),
             TerminalQueryDecision::TimedOut => Err(map_error(HarvestError::QueryTimedOut {
                 query_name: query_label.to_string(),
                 timeout_ms: u64::try_from(api_state.query_timeout().as_millis())
@@ -27326,7 +27329,7 @@ async fn hydrate_or_project(
                 "workflow handler panicked during query replay for execution {target}"
             ))));
         }
-        Ok(QueryTarget::Replay(ctx))
+        Ok(QueryTarget::Replay(Box::new(ctx)))
     }
 }
 

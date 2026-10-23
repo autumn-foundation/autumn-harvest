@@ -8,6 +8,8 @@
 //! Set `HARVEST_TEST_DATABASE_URL` to a migrated Postgres to run these tests
 //! without Docker.
 
+#![allow(clippy::too_many_lines)]
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -51,7 +53,7 @@ fn counter<'a>(
     input: Value,
 ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>> {
     Box::pin(async move {
-        BODY_RUNS.fetch_add(1, Ordering::SeqCst);
+        AtomicUsize::fetch_add(&BODY_RUNS, 1, Ordering::SeqCst);
         let state = Entity::<i64>::from_input(ctx, input)
             .run(|count, add: i64| async move { Ok(count + add) })
             .await
@@ -247,7 +249,7 @@ async fn entity_queries_read_the_projection() {
         ],
     )
     .await;
-    BODY_RUNS.store(0, Ordering::SeqCst);
+    AtomicUsize::store(&BODY_RUNS, 0, Ordering::SeqCst);
     let (status, state) = send(
         &app,
         "GET",
@@ -257,17 +259,17 @@ async fn entity_queries_read_the_projection() {
     .await;
     assert_eq!(status, StatusCode::OK, "{state}");
     assert_eq!(state, json!(5));
-    let (status, stats) = send(
+    let (status, counters) = send(
         &app,
         "POST",
         &format!("/workflows/{projected}/query/{ENTITY_STATS_QUERY}"),
         Some(json!({"args": null})),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{stats}");
-    assert_eq!(stats["result"]["applied"], json!(1));
+    assert_eq!(status, StatusCode::OK, "{counters}");
+    assert_eq!(counters["result"]["applied"], json!(1));
     assert_eq!(
-        BODY_RUNS.load(Ordering::SeqCst),
+        AtomicUsize::load(&BODY_RUNS, Ordering::SeqCst),
         0,
         "no query replayed the body"
     );
@@ -284,12 +286,12 @@ async fn entity_queries_read_the_projection() {
     assert_eq!(status, StatusCode::OK, "{state}");
     assert_eq!(state, json!(7));
     assert!(
-        BODY_RUNS.load(Ordering::SeqCst) > 0,
+        AtomicUsize::load(&BODY_RUNS, Ordering::SeqCst) > 0,
         "a run with no row replays"
     );
 
     // Another query name is never served from the projection.
-    BODY_RUNS.store(0, Ordering::SeqCst);
+    AtomicUsize::store(&BODY_RUNS, 0, Ordering::SeqCst);
     let (status, _) = send(
         &app,
         "GET",
@@ -298,7 +300,10 @@ async fn entity_queries_read_the_projection() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(BODY_RUNS.load(Ordering::SeqCst) > 0, "it replays");
+    assert!(
+        AtomicUsize::load(&BODY_RUNS, Ordering::SeqCst) > 0,
+        "it replays"
+    );
 
     // A bad body is still a 400 on the projected path.
     let (status, _) = send(
@@ -322,6 +327,10 @@ async fn entity_queries_read_the_projection() {
             signal(4),
             snapshot(4, 1),
             checkpoint_record(),
+            WorkflowEvent::SignalReceived {
+                signal_name: ENTITY_OP_SIGNAL.to_string(),
+                payload: json!(EntityMessage::<i64>::delete()),
+            },
             WorkflowEvent::SideEffectRecorded {
                 kind: SideEffectKind::EntityState,
                 name: Some(autumn_harvest::entity::ENTITY_DELETED_SIDE_EFFECT.to_string()),
@@ -331,7 +340,7 @@ async fn entity_queries_read_the_projection() {
         ],
     )
     .await;
-    BODY_RUNS.store(0, Ordering::SeqCst);
+    AtomicUsize::store(&BODY_RUNS, 0, Ordering::SeqCst);
     let (status, state) = send(
         &app,
         "GET",
@@ -342,7 +351,7 @@ async fn entity_queries_read_the_projection() {
     assert_eq!(status, StatusCode::OK, "{state}");
     assert_eq!(state, json!(4));
     assert!(
-        BODY_RUNS.load(Ordering::SeqCst) > 0,
+        AtomicUsize::load(&BODY_RUNS, Ordering::SeqCst) > 0,
         "a terminal run replays"
     );
 

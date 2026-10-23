@@ -2405,14 +2405,16 @@ async fn refuse_if_operator_triggers(
         ]
         .into_iter()
         .filter(|(name, _)| triggers.iter().any(|t| t == name))
-        .map(|(name, what)| {
-            format!(
+        .fold(String::new(), |mut hint, (name, what)| {
+            use std::fmt::Write as _;
+            let _ = write!(
+                hint,
                 " {name} is harvest's {what} in a changed state. Re-enable it \
                  (`ALTER TABLE harvest_events ENABLE TRIGGER {name}`) or drop it. The \
                  conversion reinstalls it, so do not recreate it."
-            )
+            );
+            hint
         })
-        .collect::<String>()
     )))
 }
 

@@ -91,9 +91,12 @@ fn signal(message: &EntityMessage<i64>) -> WorkflowEvent {
 }
 
 fn snapshot_value(state: i64, applied: u64) -> Value {
-    let mut stats = EntityStats::default();
-    stats.applied = applied;
-    json!(EntitySnapshot { state, stats })
+    let mut counters = EntityStats::default();
+    counters.applied = applied;
+    json!(EntitySnapshot {
+        state,
+        stats: counters
+    })
 }
 
 fn snapshot(name: &str, state: i64, applied: u64) -> WorkflowEvent {
@@ -380,7 +383,9 @@ async fn an_aborted_copy_gives_the_row_back() {
     let codecs = PayloadCodecs::default();
     let name = "entity_state_abort";
     let key = unique("abort");
-    let kept = insert_run(&mut conn, name, &key, "COMPLETED").await;
+    // `COMPLETED` holds the active-key slot, so the kept run is sealed by a
+    // continue-as-new. The move vacates the slot the same way.
+    let kept = insert_run(&mut conn, name, &key, "CONTINUED_AS_NEW").await;
     store::append_events(
         &mut conn,
         kept,
@@ -925,8 +930,8 @@ async fn projection_tracks_history_through_a_worker_crash() {
     assert_eq!(state_of(&row).map(|log| log.len()), Some(3));
 
     stop.store(true, Ordering::SeqCst);
-    let samples = sampler.await.expect("sampler");
-    assert!(samples > 0, "the sampler saw the projection");
+    let seen = sampler.await.expect("sampler");
+    assert!(seen > 0, "the sampler saw the projection");
     assert!(
         sample_agrees(&mut conn, name, &key).await,
         "the final row agrees"
@@ -1061,6 +1066,12 @@ async fn a_reset_of_a_continued_run_rebuilds_its_starting_state() {
     let _ = tokio::time::timeout(Duration::from_secs(10), handle).await;
 }
 
+#[derive(diesel::QueryableByName)]
+struct Input {
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    input: Value,
+}
+
 /// The checkpoint input of a continued run carries the state itself. Its
 /// first snapshot equals the decoded input.
 #[tokio::test]
@@ -1082,11 +1093,6 @@ async fn the_checkpoint_input_carries_the_starting_state() {
     })
     .await;
     let continued = running_run(&mut conn, name, &key).await;
-    #[derive(diesel::QueryableByName)]
-    struct Input {
-        #[diesel(sql_type = diesel::sql_types::Jsonb)]
-        input: Value,
-    }
     let rows: Vec<Input> =
         diesel::sql_query("SELECT input FROM harvest_workflow_executions WHERE id = $1")
             .bind::<SqlUuid, _>(continued.as_uuid())

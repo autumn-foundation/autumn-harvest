@@ -2028,7 +2028,7 @@ mod tests {
     async fn a_continued_run_records_its_starting_state_first() {
         let continued = StartProvenance::continued_from(ExecutionId::new());
         let outcome = WorkflowTestEnv::new()
-            .with_start_provenance(continued.clone())
+            .with_start_provenance(continued)
             .run(counter, forged())
             .await;
         let recorded = snapshots(outcome.events());
