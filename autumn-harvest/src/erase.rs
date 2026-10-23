@@ -50,6 +50,8 @@
 //!   exhausted its retries writes a second, independent copy of the frozen
 //!   envelope here; scoped to `CALLBACK` rows only, not a general expansion
 //!   of erasure to every dead-lettered activity/task for the execution.
+//! - The `harvest_entity_state.snapshot` row that the execution wrote last
+//!   (issue #2259). It copies the payload of an entity snapshot event.
 //!
 //! Non-terminal child executions are skipped and reported in
 //! [`EraseOutcome::skipped_children`]; they must be erased separately once
@@ -310,6 +312,11 @@ pub struct EraseOutcome {
     /// like log rows. Replay never reads them.
     #[serde(default)]
     pub stream_chunks_deleted: usize,
+    /// Number of `harvest_entity_state` rows (issue #2259) whose `snapshot`
+    /// was tombstoned. A row belongs to the run that wrote it last, so an
+    /// erase of an older run of a live entity scrubs none.
+    #[serde(default)]
+    pub entity_states_scrubbed: usize,
     /// Number of `harvest_completion_deliveries` rows (issue #605) whose
     /// frozen `payload` envelope was tombstoned. The delivery row itself
     /// (state, retry schedule) is left untouched — a still-pending,
@@ -751,6 +758,9 @@ mod db {
                 // rows cascade-deleted with it, so there is nothing to remove.
                 logs_deleted: 0,
                 stream_chunks_deleted: 0,
+                // The cascade from the execution row removed its projection
+                // row (issue #2259).
+                entity_states_scrubbed: 0,
                 completion_deliveries_scrubbed,
                 dead_letters_scrubbed,
                 children,
@@ -1383,6 +1393,10 @@ mod db {
         let logs_deleted = crate::store::delete_workflow_logs(conn, exec_id).await?;
         // Durable stream chunks (issue #1974) are author output too.
         let stream_chunks_deleted = crate::store::delete_stream_chunks(conn, exec_id).await?;
+        // The entity state projection (issue #2259) copies the snapshot
+        // payloads of this run.
+        let entity_states_scrubbed =
+            crate::entity_state::erase_for_execution(conn, exec_id).await?;
 
         // Completion-callback PII (deliveries + CALLBACK DLQ), keyed only on
         // `workflow_exec_id` so it applies whether or not a live execution row
@@ -1407,6 +1421,7 @@ mod db {
             signals_scrubbed,
             logs_deleted,
             stream_chunks_deleted,
+            entity_states_scrubbed,
             completion_deliveries_scrubbed,
             dead_letters_scrubbed,
             children,
@@ -1647,6 +1662,7 @@ mod tests {
             signals_scrubbed: 2,
             logs_deleted: 4,
             stream_chunks_deleted: 6,
+            entity_states_scrubbed: 8,
             completion_deliveries_scrubbed: 3,
             dead_letters_scrubbed: 1,
             children: vec![],
@@ -1667,6 +1683,7 @@ mod tests {
         // Durable workflow logs deleted by the erase (issue #790).
         assert_eq!(v["logs_deleted"], 4);
         assert_eq!(v["stream_chunks_deleted"], 6);
+        assert_eq!(v["entity_states_scrubbed"], 8);
     }
 
     // ── summary scrub value (issue #752) ──────────────────────────────────────
@@ -1691,6 +1708,7 @@ mod tests {
             signals_scrubbed: 0,
             logs_deleted: 0,
             stream_chunks_deleted: 0,
+            entity_states_scrubbed: 0,
             completion_deliveries_scrubbed: 0,
             dead_letters_scrubbed: 0,
             children: vec![],

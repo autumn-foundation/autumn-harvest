@@ -3760,13 +3760,14 @@ const COLUMN_EXEC_HEADERS: &str = "column-exec-headers";
 const COLUMN_START_HEADERS: &str = "column-start-headers";
 const COLUMN_START_MEMO: &str = "column-start-memo";
 const COLUMN_TASK_HEADERS: &str = "column-task-headers";
+const COLUMN_ENTITY_STATE: &str = "column-entity-state";
 
 /// The cells one [`seed_codec_columns`] call writes. A workflow task row and
 /// an activity task row each hold an input and an output. The activity row
 /// also holds a heartbeat. The event batch buffer holds one element, and the
 /// census counts its row once. Every other swept column holds one cell.
 /// `the_seed_covers_every_codec_column` pins this to `CODEC_COLUMNS`.
-const CELLS_PER_SEED: usize = 27;
+const CELLS_PER_SEED: usize = 28;
 
 /// Write one envelope under `key_id` into every swept codec column.
 async fn seed_codec_columns(
@@ -3970,6 +3971,20 @@ async fn seed_short_lived_columns(
     .execute(conn)
     .await
     .expect("insert schedule");
+
+    // The entity state projection (issue #2259). A trigger writes it in
+    // production. The seed writes the cell directly.
+    diesel::sql_query(
+        "INSERT INTO harvest_entity_state \
+         (workflow_name, workflow_id, execution_id, event_id, event_row_id, snapshot) \
+         VALUES ('column_rotation', $1, $2, 0, 0, $3)",
+    )
+    .bind::<Text, _>(Uuid::new_v4().to_string())
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .bind::<Jsonb, _>(cell(COLUMN_ENTITY_STATE))
+    .execute(conn)
+    .await
+    .expect("insert entity state");
 }
 
 /// Insert one event batch row that buffers `elements` (issue #2043).

@@ -1343,6 +1343,29 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+
+    /// The keyed-entity state projection (issue #2259). A trigger on
+    /// `harvest_events` writes each row. See `crate::entity_state`.
+    harvest_entity_state (id) {
+        id -> Uuid,
+        workflow_name -> Text,
+        workflow_id -> Text,
+        /// The run that wrote the row. The row goes with its run.
+        execution_id -> Uuid,
+        /// The history position of the snapshot in that run.
+        event_id -> Int4,
+        /// `harvest_events.id` of the snapshot. It orders the runs of a key.
+        event_row_id -> Int8,
+        /// The snapshot ended the entity.
+        deleted -> Bool,
+        /// The event `value`, byte for byte. A codec envelope when a codec is set.
+        snapshot -> Jsonb,
+        updated_at -> Timestamptz,
+    }
+}
+
 diesel::joinable!(harvest_stream_chunks -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_workflow_logs -> harvest_workflow_executions (workflow_exec_id));
 diesel::joinable!(harvest_llm_ledger -> harvest_workflow_executions (workflow_exec_id));
@@ -1390,4 +1413,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     harvest_llm_ledger,
     harvest_codec_rotation_cursor,
     harvest_codec_key_state,
+    harvest_entity_state,
 );

@@ -1322,6 +1322,17 @@ impl Drop for ParkToken {
     }
 }
 
+/// The result of [`WorkflowContext::record_entity_snapshot`] (issue #2259).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EntitySnapshot {
+    /// A replay read this recorded snapshot.
+    Recorded(Value),
+    /// The live run recorded this snapshot.
+    Live(Value),
+    /// The history predates snapshots at this position. Nothing is recorded.
+    Absent,
+}
+
 // ---------------------------------------------------------------------------
 // Cancellable / renewable durable timers (issue #768)
 // ---------------------------------------------------------------------------
@@ -5207,6 +5218,42 @@ impl WorkflowContext {
                 due
             }
         }
+    }
+
+    /// Record or replay one keyed-entity state snapshot (issue #2259).
+    ///
+    /// `value` is the live snapshot. A replay returns the recorded one. A
+    /// history from before issue #2259 has no snapshot at this position, so
+    /// the call records nothing.
+    pub(crate) fn record_entity_snapshot(&self, name: &str, value: Value) -> EntitySnapshot {
+        match self.match_history(|m| m.match_entity_snapshot(name)) {
+            crate::replay::EntitySnapshotMatch::Matched { value } => {
+                EntitySnapshot::Recorded(value)
+            }
+            crate::replay::EntitySnapshotMatch::NotRecorded => EntitySnapshot::Absent,
+            crate::replay::EntitySnapshotMatch::Diverged { actual } => {
+                self.record_deferred_nd(format!(
+                    "side-effect drift mismatch: expected SideEffectRecorded(entity_state:{name}), \
+                     got SideEffectRecorded(entity_state:{actual})"
+                ));
+                EntitySnapshot::Absent
+            }
+            crate::replay::EntitySnapshotMatch::Frontier => {
+                self.push_command(WorkflowCommand::RecordSideEffect {
+                    kind: crate::event::SideEffectKind::EntityState,
+                    name: Some(name.to_string()),
+                    value: value.clone(),
+                });
+                EntitySnapshot::Live(value)
+            }
+        }
+    }
+
+    /// Record a non-determinism error that the executor reports after the
+    /// cycle. The entity loop calls it when a recorded snapshot does not
+    /// decode.
+    pub(crate) fn record_entity_drift(&self, msg: String) {
+        self.record_deferred_nd(msg);
     }
 
     fn history_size_exceeded(&self) -> bool {

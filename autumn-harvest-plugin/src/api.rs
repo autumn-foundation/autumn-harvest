@@ -8127,6 +8127,7 @@ pub const fn management_api_response_fields()
                 "signals_scrubbed",
                 "logs_deleted",
                 "stream_chunks_deleted",
+                "entity_states_scrubbed",
                 "completion_deliveries_scrubbed",
                 "dead_letters_scrubbed",
                 "children",
@@ -27067,6 +27068,34 @@ async fn hydrate_ctx_for_query(
     exec_id: ExecutionId,
     query_label: &str,
 ) -> Result<WorkflowContext, AutumnError> {
+    match hydrate_or_project(api_state, exec_id, query_label, false).await? {
+        QueryTarget::Replay(ctx) => Ok(ctx),
+        QueryTarget::Projected(_) => Err(map_error(HarvestError::Config(
+            "a query hydrate with no projection read returned a projection".to_string(),
+        ))),
+    }
+}
+
+/// How a query is served.
+enum QueryTarget {
+    /// The entity state projection answered (issue #2259). No replay ran.
+    Projected(Value),
+    /// The replayed context of the run.
+    Replay(WorkflowContext),
+}
+
+/// Answer `query_name` from the entity state projection when `project` is
+/// set and the projection row of the run can answer it (issue #2259).
+/// Otherwise hydrate the run for a replayed query.
+///
+/// The projection read comes after the live-attempt walk and the erasure
+/// check, so it answers for the same run as a replay would.
+async fn hydrate_or_project(
+    api_state: &HarvestApiState,
+    exec_id: ExecutionId,
+    query_label: &str,
+    project: bool,
+) -> Result<QueryTarget, AutumnError> {
     let runtime = api_state.runtime().map_err(map_error)?;
     let pool = api_state.storage_pool().map_err(map_error)?;
     let (mut conn, shard) = db_conn_for_execution_with_shard(api_state, exec_id).await?;
@@ -27121,6 +27150,21 @@ async fn hydrate_ctx_for_query(
             exec_id: target,
             reason: "payloads erased".to_string(),
         }));
+    }
+
+    // Issue #2259: an entity query reads the projection row of this run. It
+    // replays nothing and needs no registered handler.
+    if project
+        && let Some(answer) = autumn_harvest::entity_state::answer_query(
+            bound.as_mut(),
+            &api_state.payload_codecs(),
+            target,
+            query_label,
+        )
+        .await
+        .map_err(map_error)?
+    {
+        return Ok(QueryTarget::Projected(answer));
     }
 
     let workflow = runtime
@@ -27242,7 +27286,7 @@ async fn hydrate_ctx_for_query(
             // mid-await CANCELLED / FAILED), with all recorded non-lifecycle
             // history faithfully consumed: serve the reconstructed state at the
             // recorded terminal point.
-            TerminalQueryDecision::Serve => Ok(ctx),
+            TerminalQueryDecision::Serve => Ok(QueryTarget::Replay(ctx)),
             TerminalQueryDecision::TimedOut => Err(map_error(HarvestError::QueryTimedOut {
                 query_name: query_label.to_string(),
                 timeout_ms: u64::try_from(api_state.query_timeout().as_millis())
@@ -27278,7 +27322,7 @@ async fn hydrate_ctx_for_query(
                 "workflow handler panicked during query replay for execution {target}"
             ))));
         }
-        Ok(ctx)
+        Ok(QueryTarget::Replay(ctx))
     }
 }
 
@@ -27288,7 +27332,14 @@ async fn query_workflow(
     Path((id, query_name)): Path<(String, String)>,
 ) -> Result<Json<Value>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let ctx = hydrate_ctx_for_query(&api_state, exec_id, &query_name).await?;
+    let start_projection = Instant::now();
+    let ctx = match hydrate_or_project(&api_state, exec_id, &query_name, true).await? {
+        QueryTarget::Projected(answer) => {
+            record_projected_query(&api_state, &query_name, start_projection);
+            return Ok(Json(answer));
+        }
+        QueryTarget::Replay(ctx) => ctx,
+    };
     let start = Instant::now(); // measure handler invocation latency, not hydration cost
 
     let harvest_result = ctx.execute_query(&query_name);
@@ -27304,6 +27355,20 @@ async fn query_workflow(
         );
     }
     harvest_result.map_err(map_error).map(Json)
+}
+
+/// Record a query that the entity state projection answered (issue #2259).
+///
+/// The projection answers only the fixed entity query names, so the metric
+/// label stays bounded.
+fn record_projected_query(api_state: &HarvestApiState, query_name: &str, start: Instant) {
+    if let Ok(runtime) = api_state.runtime() {
+        runtime.registry.telemetry().metrics.record_query_completed(
+            query_name,
+            start.elapsed().as_secs_f64(),
+            true,
+        );
+    }
 }
 
 /// Request body for `POST /workflows/{id}/query/{query_name}`.
@@ -27330,7 +27395,8 @@ async fn query_workflow_post(
     body: Bytes,
 ) -> Result<Json<QueryWorkflowResponse>, AutumnError> {
     let exec_id = parse_execution_id(&id)?;
-    let ctx = hydrate_ctx_for_query(&api_state, exec_id, &query_name).await?;
+    let start_projection = Instant::now();
+    let target = hydrate_or_project(&api_state, exec_id, &query_name, true).await?;
     let start = Instant::now(); // measure handler invocation latency, not hydration cost
     let args: Value = if body.is_empty() {
         Value::Null
@@ -27338,6 +27404,14 @@ async fn query_workflow_post(
         serde_json::from_slice::<QueryWorkflowRequest>(&body)
             .map(|r| r.args)
             .map_err(|e| AutumnError::bad_request_msg(format!("invalid JSON body: {e}")))?
+    };
+    let ctx = match target {
+        // The entity queries take no args, so a projected answer ignores them.
+        QueryTarget::Projected(result) => {
+            record_projected_query(&api_state, &query_name, start_projection);
+            return Ok(Json(QueryWorkflowResponse { result }));
+        }
+        QueryTarget::Replay(ctx) => ctx,
     };
 
     let harvest_result = ctx.execute_query_with_args(&query_name, args);

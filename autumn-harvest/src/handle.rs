@@ -2392,6 +2392,18 @@ impl WorkflowHandle {
         let mut conn =
             crate::shard_rebalance::conn_for_execution_forwarded(&self.client.inner.pools, target)
                 .await?;
+        // Issue #2259: an entity query reads the projection row of this run.
+        // It replays nothing.
+        if let Some(answer) = crate::entity_state::answer_query(
+            &mut conn,
+            &self.client.inner.payload_codecs,
+            target,
+            query_name,
+        )
+        .await?
+        {
+            return Ok(answer);
+        }
         let history = crate::store::load_history_with_codecs(
             &mut conn,
             target,

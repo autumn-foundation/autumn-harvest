@@ -63,6 +63,11 @@ pub enum SideEffectKind {
     Random,
     /// `ctx.side_effect(name, f)` — an author-named one-shot value capture.
     Custom,
+    /// A keyed-entity state snapshot (issue #2259).
+    ///
+    /// Only the entity loop records it. A trigger copies it into
+    /// `harvest_entity_state`. See `docs/adr/0006-keyed-entity.md`.
+    EntityState,
 }
 
 impl SideEffectKind {
@@ -77,6 +82,7 @@ impl SideEffectKind {
             Self::Uuid => "uuid",
             Self::Random => "random",
             Self::Custom => "custom",
+            Self::EntityState => "entity_state",
         }
     }
 }
