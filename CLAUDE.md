@@ -216,6 +216,12 @@ builds it. Code for owner mode follows these rules:
   #2252).
 - An acknowledgement never comes from owner memory. It follows a durable
   write.
+- The owner decider (issue #2255) takes a workflow task with the owned
+  by-execution claim, so no claim gate is skipped. It keeps execution ids as
+  hints only. A lost hint costs latency. Its scan finds the row.
+- With a DR pin, one statement fences the generation row, then the owner
+  row. An append in the fenced scope checks neither row again only when the
+  start fence took the same generation row.
 - List, search and describe read Postgres, never an owner cache.
 
 `decision_owner_lock_modes_db_tests.rs` proves the lock modes.

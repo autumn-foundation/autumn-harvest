@@ -14699,18 +14699,23 @@ pub async fn ingest_due_timers_and_signals(
     Box::pin(conn.transaction::<(), HarvestError, _>(async |conn| {
         // Issue #2251: the owner fence comes first.
         crate::replication::assert_decision_fence(conn).await?;
-        store::append_events_with_codecs(conn, exec_id, &events, next_event_id, codecs).await?;
-        if !timer_row_ids.is_empty() {
-            diesel::update(dsl::harvest_timers.filter(dsl::id.eq_any(&timer_row_ids)))
-                .set(dsl::fired.eq(true))
-                .execute(conn)
-                .await
-                .map_err(crate::error::database_error)?;
-        }
-        if !signal_ids.is_empty() {
-            signal::mark_signals_consumed(conn, &signal_ids).await?;
-        }
-        Ok(())
+        // Issue #2255: the rest is fenced, so the append fences nothing again.
+        let fenced = crate::decision_owner::conn_id(conn);
+        crate::decision_owner::fenced_scope(fenced, async {
+            store::append_events_with_codecs(conn, exec_id, &events, next_event_id, codecs).await?;
+            if !timer_row_ids.is_empty() {
+                diesel::update(dsl::harvest_timers.filter(dsl::id.eq_any(&timer_row_ids)))
+                    .set(dsl::fired.eq(true))
+                    .execute(conn)
+                    .await
+                    .map_err(crate::error::database_error)?;
+            }
+            if !signal_ids.is_empty() {
+                signal::mark_signals_consumed(conn, &signal_ids).await?;
+            }
+            Ok(())
+        })
+        .await
     }))
     .await?;
 
@@ -29816,6 +29821,8 @@ struct OwnerWakes {
     owned: Arc<crate::decision_owner::OwnedPartitions>,
     workflow_cache: Arc<tokio::sync::Mutex<crate::cache::WorkflowCache>>,
     woken: Arc<tokio::sync::Notify>,
+    /// The hints of the owner decider of `shard` (issue #2255).
+    hints: Arc<OwnerHints>,
     metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
     shutdown: CancellationToken,
     listening: Arc<std::sync::Mutex<std::collections::BTreeSet<crate::decision_owner::OwnerKey>>>,
@@ -29926,8 +29933,8 @@ impl OwnerWakes {
         }
     }
 
-    /// Evict the entry of an evict wake, count the wake and wake the poll
-    /// loop.
+    /// Evict the entry of an evict wake, count the wake, hand the execution
+    /// to the owner decider and wake the poll loop.
     async fn handle(&self, wake: &crate::notify::OwnerWake) {
         let kind = if wake.payload.evict {
             // Drop the parked future outside the cache lock.
@@ -29943,7 +29950,57 @@ impl OwnerWakes {
         };
         self.metrics
             .record_decision_owner_woken(&self.shard.as_i32().to_string(), kind);
+        // Issue #2255: the decider takes the task of a woken run. An evict
+        // wake can mark a state change that needs a decision, such as a
+        // resume, so it is a hint too.
+        self.hints.push(self.shard, wake.payload.workflow_exec_id);
         self.woken.notify_one();
+    }
+}
+
+/// The execution ids that owner wakes name, per owner shard (issue #2255).
+///
+/// A hint is a reason to look, never a record of work. The durable record
+/// is the `PENDING` task row, and each signal is a `harvest_signals` row
+/// before its acknowledgement. A lost hint costs latency only, because the
+/// decider scans its partitions too. So the set is bounded, and a full set
+/// drops new hints.
+#[derive(Debug, Default)]
+struct OwnerHints {
+    pending: std::sync::Mutex<HashMap<crate::types::ShardId, HashSet<uuid::Uuid>>>,
+    /// Wakes the deciders. Each decider arms it before it reads the set.
+    pushed: tokio::sync::Notify,
+}
+
+/// The most hints that one owner shard keeps (issue #2255).
+const OWNER_HINTS_MAX: usize = 4096;
+
+impl OwnerHints {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<crate::types::ShardId, HashSet<uuid::Uuid>>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Add the hint `exec_id` for the decider of `shard`.
+    fn push(&self, shard: crate::types::ShardId, exec_id: uuid::Uuid) {
+        let mut pending = self.lock();
+        let set = pending.entry(shard).or_default();
+        if set.len() < OWNER_HINTS_MAX {
+            set.insert(exec_id);
+        }
+        drop(pending);
+        self.pushed.notify_waiters();
+    }
+
+    /// Take every hint of `shard`.
+    fn take(&self, shard: crate::types::ShardId) -> Vec<uuid::Uuid> {
+        self.lock()
+            .get_mut(&shard)
+            .map(|set| set.drain().collect())
+            .unwrap_or_default()
     }
 }
 
@@ -33224,6 +33281,14 @@ pub struct Worker {
     /// Wakes every idle wait when a foreign write wakes this owner (issue
     /// #2253). See [`OwnerWakes`].
     owner_woken: Arc<tokio::sync::Notify>,
+    /// The execution ids that owner wakes name, per owner shard (issue
+    /// #2255). The owner decider of that shard takes their workflow tasks.
+    owner_hints: Arc<OwnerHints>,
+    /// Wakes the owner deciders when a workflow permit frees (issue #2255).
+    decider_capacity: Arc<tokio::sync::Notify>,
+    /// The claim targets of the running claim loops (issue #2255). The run
+    /// path sets them.
+    claim_targets: std::sync::RwLock<Vec<Option<crate::types::ShardId>>>,
     /// The partitions that the owner wake tasks listen on (issue #2253).
     owner_listening:
         Arc<std::sync::Mutex<std::collections::BTreeSet<crate::decision_owner::OwnerKey>>>,
@@ -34954,6 +35019,30 @@ struct ClaimTarget<'a> {
     global_dispatch: bool,
 }
 
+/// One owned database of an owner decider (issue #2255).
+///
+/// See [`Worker::run_owner_decider`].
+struct DeciderTarget<'a> {
+    /// The claim target of `pool`. `None` on a legacy single pool.
+    shard: Option<crate::types::ShardId>,
+    /// The pool the takes and scans run on.
+    pool: &'a DbPool,
+    /// Set while this shard's registration is not verified.
+    registration_pending: &'a AtomicBool,
+    /// The pool acquisition bound. See [`shard_acquire_bound`].
+    acquire_bound: Option<Duration>,
+}
+
+/// What one owner take returned (issue #2255).
+enum OwnerTake {
+    /// The take claimed the row. The permit goes to its dispatch.
+    Taken(TaskQueueItem, tokio::sync::OwnedSemaphorePermit),
+    /// No row was `PENDING` and due, or a gate refused it.
+    Empty,
+    /// The take failed.
+    Failed(HarvestError),
+}
+
 /// What one Postgres poll may claim (issue #1787).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollAdmission {
@@ -34978,6 +35067,20 @@ const fn poll_admission(free_workflow: usize, free_activity: usize) -> PollAdmis
         (true, true) => PollAdmission::Any,
         (true, false) => PollAdmission::Only(TaskType::Workflow),
         (false, true) => PollAdmission::Only(TaskType::Activity),
+    }
+}
+
+/// The gate record of a poll that claims activities only (issue #2255).
+///
+/// The owner decider takes the workflow tasks, so this poll refuses no
+/// workflow task. Only a missing activity permit is a refusal.
+const fn decider_gate(admission: PollAdmission) -> PollAdmission {
+    match admission {
+        PollAdmission::Saturated => PollAdmission::Only(crate::queue::TaskType::Workflow),
+        PollAdmission::Only(crate::queue::TaskType::Activity) | PollAdmission::Any => {
+            PollAdmission::Any
+        }
+        PollAdmission::Only(crate::queue::TaskType::Workflow) => admission,
     }
 }
 
@@ -35050,6 +35153,9 @@ impl PollPermits {
 struct CapacityPermit {
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     freed: Arc<tokio::sync::Notify>,
+    /// Also wakes the owner deciders when a workflow permit frees (issue
+    /// #2255). A claim loop then never takes their wake.
+    decider: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl CapacityPermit {
@@ -35057,7 +35163,14 @@ impl CapacityPermit {
         Self {
             permit: Some(permit),
             freed: Arc::clone(freed),
+            decider: None,
         }
+    }
+
+    /// This permit, which also wakes the owner deciders on release.
+    fn waking_deciders(mut self, decider: Option<Arc<tokio::sync::Notify>>) -> Self {
+        self.decider = decider;
+        self
     }
 }
 
@@ -35065,6 +35178,9 @@ impl Drop for CapacityPermit {
     fn drop(&mut self) {
         drop(self.permit.take());
         self.freed.notify_one();
+        if let Some(decider) = &self.decider {
+            decider.notify_waiters();
+        }
     }
 }
 
@@ -35610,6 +35726,9 @@ impl Worker {
             capacity_freed,
             deferral_due,
             owner_woken: Arc::new(tokio::sync::Notify::new()),
+            owner_hints: Arc::default(),
+            decider_capacity: Arc::new(tokio::sync::Notify::new()),
+            claim_targets: std::sync::RwLock::default(),
             owner_listening: Arc::default(),
             gate_refused: Arc::new(GateRefused::default()),
             limit_refused: AtomicBool::new(false),
@@ -35646,6 +35765,7 @@ impl Worker {
             owned: Arc::clone(&self.decision_owner),
             workflow_cache: Arc::clone(&self.workflow_cache),
             woken: Arc::clone(&self.owner_woken),
+            hints: Arc::clone(&self.owner_hints),
             metrics: Arc::clone(&self.registry.telemetry().metrics),
             shutdown: self.shutdown.clone(),
             listening: Arc::clone(&self.owner_listening),
@@ -36366,6 +36486,22 @@ impl Worker {
             })
             .collect();
         self.warn_if_claim_loops_fill_pools(&claim_targets);
+        self.set_claim_targets(&claim_targets);
+        // Issue #2255: one owner decider per database. The canonical target
+        // of a colocated group runs it, because one scan serves the group.
+        let deciders: Vec<DeciderTarget<'_>> = claim_targets
+            .iter()
+            .filter(|target| {
+                self.owner_shard_of(target.shard)
+                    == crate::decision_owner::OwnerKey::pool_shard(target.shard)
+            })
+            .map(|target| DeciderTarget {
+                shard: target.shard,
+                pool: target.pool,
+                registration_pending: target.registration_pending,
+                acquire_bound: target.acquire_bound,
+            })
+            .collect();
         tokio::join!(
             self.run_poll_loop_multi(
                 shard_targets.clone(),
@@ -36375,6 +36511,7 @@ impl Worker {
                 &more_work,
             ),
             self.run_claim_followers(&claim_targets, &more_work),
+            self.run_owner_deciders(&deciders),
         );
 
         tracing::info!(worker_id = %self.config.worker_id, "shutdown signal received (multi-shard)");
@@ -39690,6 +39827,28 @@ impl Worker {
         }
     }
 
+    /// Whether an owner decider takes the workflow tasks of every claim
+    /// target of this worker (issue #2255).
+    fn deciders_take_every_workflow(&self) -> bool {
+        let targets = self
+            .claim_targets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !targets.is_empty()
+            && targets
+                .iter()
+                .all(|shard| self.owned_claim(*shard).is_some())
+    }
+
+    /// What a Postgres poll may claim where the owner decider runs (issue
+    /// #2255): activities only.
+    fn activity_admission_now(&self) -> PollAdmission {
+        poll_admission(
+            0,
+            Self::free_permits(&self.activity_semaphore, &self.dispatch_reserved_activity),
+        )
+    }
+
     /// What a Postgres poll may claim now. See [`poll_admission`].
     fn poll_admission_now(&self) -> PollAdmission {
         poll_admission(
@@ -39722,7 +39881,13 @@ impl Worker {
     /// `refusal_recorded`. See [`Worker::capacity_wait`].
     fn capacity_bound(&self) -> bool {
         let limit_refused = self.limit_refused.swap(false, Ordering::Relaxed);
-        let pools_full = self.poll_admission_now() != PollAdmission::Any;
+        // Issue #2255: where the owner deciders take every workflow task, a
+        // full workflow pool refuses no claim of a claim loop.
+        let pools_full = if self.deciders_take_every_workflow() {
+            self.activity_admission_now() == PollAdmission::Saturated
+        } else {
+            self.poll_admission_now() != PollAdmission::Any
+        };
         pools_full
             || limit_refused
             || AtomicBool::load(&self.pool_refused, Ordering::Relaxed)
@@ -39935,6 +40100,13 @@ impl Worker {
             global_dispatch: dispatch_allowed,
         }];
         self.warn_if_claim_loops_fill_pools(&claim_targets);
+        self.set_claim_targets(&claim_targets);
+        let deciders = [DeciderTarget {
+            shard,
+            pool,
+            registration_pending,
+            acquire_bound: shard_acquire_bound(false, self.config.poll_interval),
+        }];
         tokio::join!(
             self.run_poll_loop(
                 pool,
@@ -39945,7 +40117,17 @@ impl Worker {
                 &more_work,
             ),
             self.run_claim_followers(&claim_targets, &more_work),
+            self.run_owner_deciders(&deciders),
         );
+    }
+
+    /// Record the claim targets of the claim loops (issue #2255).
+    fn set_claim_targets(&self, targets: &[ClaimTarget<'_>]) {
+        *self
+            .claim_targets
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            targets.iter().map(|target| target.shard).collect();
     }
 
     /// Warn when the claim loops alone can hold every connection of a claim
@@ -40058,6 +40240,279 @@ impl Worker {
         false
     }
 
+    /// Run one owner decider per owned database until shutdown (issue
+    /// #2255).
+    ///
+    /// The caller joins this future with the claim loops. The drain then
+    /// starts only after every decider returns.
+    async fn run_owner_deciders(&self, targets: &[DeciderTarget<'_>]) {
+        futures::future::join_all(targets.iter().map(|target| self.run_owner_decider(target)))
+            .await;
+    }
+
+    /// One owner decider: it takes the workflow tasks of its partitions off
+    /// the claim path (issue #2255).
+    ///
+    /// It learns of work from two sources. An owner wake names an execution.
+    /// A scan reads the pending workflow rows of its partitions by due time.
+    /// The scan runs at each tenure change, when permits free up after a
+    /// full scan, and at the next due time, at most one poll interval
+    /// apart. So a lost wake, a due timer and the backlog of a new partition
+    /// all reach it.
+    ///
+    /// Each take is the owned by-execution claim. It runs in its own future,
+    /// bounded by the workflow permits, and dispatches as a claim does. The
+    /// row serializes the decisions of one execution, so the decider never
+    /// runs two at once.
+    ///
+    /// The decider holds execution ids only. It acknowledges nothing, so a
+    /// lost hint costs latency, not work (restate#4566).
+    async fn run_owner_decider(&self, target: &DeciderTarget<'_>) {
+        use futures::StreamExt as _;
+        let owner_shard = self.owner_shard_of(target.shard);
+        let mut takes = futures::stream::FuturesUnordered::new();
+        let mut in_flight: HashSet<uuid::Uuid> = HashSet::new();
+        let mut backoff: HashMap<uuid::Uuid, std::time::Instant> = HashMap::new();
+        let mut ready: std::collections::VecDeque<uuid::Uuid> = std::collections::VecDeque::new();
+        let mut scan_at = std::time::Instant::now();
+        loop {
+            // Arm each wake before the reads, so a change after a read still
+            // ends the wait below.
+            let changed = self.decision_owner.changed();
+            let pushed = self.owner_hints.pushed.notified();
+            let freed = self.decider_capacity.notified();
+            tokio::pin!(changed, pushed, freed);
+            changed.as_mut().enable();
+            pushed.as_mut().enable();
+            freed.as_mut().enable();
+            if self.shutdown.is_cancelled() {
+                break;
+            }
+            let now = std::time::Instant::now();
+            backoff.retain(|_, until| *until > now);
+            let pending = AtomicBool::load(target.registration_pending, Ordering::Relaxed);
+            let owned = self
+                .owned_claim(target.shard)
+                .filter(|_| may_claim_tasks(pending));
+            let mut blocked = false;
+            if let Some(owned) = owned {
+                // A wake is news, so it lifts the backoff of its execution.
+                for exec in self.owner_hints.take(owner_shard) {
+                    backoff.remove(&exec);
+                    if !ready.contains(&exec) {
+                        ready.push_back(exec);
+                    }
+                }
+                let free =
+                    Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow);
+                // With no permit, wait for one. A freed permit or an ended
+                // take ends the wait.
+                blocked = free == 0 && (!ready.is_empty() || now >= scan_at);
+                if ready.is_empty() && now >= scan_at && free > 0 {
+                    let skip: Vec<uuid::Uuid> =
+                        in_flight.iter().chain(backoff.keys()).copied().collect();
+                    match self.owner_scan_once(target, &owned, &skip, free).await {
+                        Ok(scan) => {
+                            let full = scan.due.len() >= free;
+                            ready.extend(scan.due);
+                            let wait = scan.next_due.map_or(self.config.poll_interval, |due| {
+                                due.min(self.config.poll_interval)
+                            });
+                            // A full scan may leave due rows. Scan again as
+                            // soon as a permit frees.
+                            scan_at = if full { now } else { now + wait };
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                worker_id = %self.config.worker_id,
+                                error = %error,
+                                "owner decider scan failed"
+                            );
+                            scan_at = now + self.config.poll_interval;
+                        }
+                    }
+                }
+                let owned = Arc::new(owned);
+                while let Some(&exec) = ready.front() {
+                    if in_flight.contains(&exec) || backoff.contains_key(&exec) {
+                        ready.pop_front();
+                        continue;
+                    }
+                    if Self::free_permits(
+                        &self.workflow_semaphore,
+                        &self.dispatch_reserved_workflow,
+                    ) == 0
+                    {
+                        blocked = true;
+                        break;
+                    }
+                    let Ok(permit) = Arc::clone(&self.workflow_semaphore).try_acquire_owned()
+                    else {
+                        blocked = true;
+                        break;
+                    };
+                    ready.pop_front();
+                    in_flight.insert(exec);
+                    takes.push(self.owner_take(target, exec, Arc::clone(&owned), permit));
+                }
+            } else {
+                // Owner mode is off here, or the registration is pending. The
+                // claim loops take the workflow tasks.
+                ready.clear();
+                let _ = self.owner_hints.take(owner_shard);
+                scan_at = now;
+            }
+            let wait = if blocked {
+                self.config.poll_interval
+            } else {
+                scan_at
+                    .saturating_duration_since(std::time::Instant::now())
+                    .min(self.config.poll_interval)
+            };
+            tokio::select! {
+                biased;
+                () = self.shutdown.cancelled() => break,
+                Some((exec, taken)) = takes.next(), if !takes.is_empty() => {
+                    in_flight.remove(&exec);
+                    self.finish_owner_take(target, exec, taken, &mut backoff);
+                }
+                () = changed => {
+                    // A new tenure brings a backlog that no wake named.
+                    scan_at = std::time::Instant::now();
+                }
+                () = pushed => {}
+                () = freed => {}
+                () = tokio::time::sleep(wait) => {}
+            }
+        }
+        // A take that already claimed its row must still dispatch it. The
+        // dispatch gives the claim back at shutdown, so the row is not lost.
+        while let Some((exec, taken)) = takes.next().await {
+            self.finish_owner_take(target, exec, taken, &mut backoff);
+        }
+    }
+
+    /// One scan of the decider's partitions (issue #2255).
+    async fn owner_scan_once(
+        &self,
+        target: &DeciderTarget<'_>,
+        owned: &queue::OwnedClaim,
+        skip: &[uuid::Uuid],
+        limit: usize,
+    ) -> HarvestResult<queue::OwnerScan> {
+        let mut conn = self
+            .acquire_timed(target.pool, target.acquire_bound, target.shard)
+            .await?;
+        queue::owner_scan(&mut conn, &self.config.queues, owned, skip, limit).await
+    }
+
+    /// One owner take of the workflow task of `exec` (issue #2255).
+    ///
+    /// The permit stays with a claimed row. It frees when the take finds no
+    /// row.
+    async fn owner_take(
+        &self,
+        target: &DeciderTarget<'_>,
+        exec: uuid::Uuid,
+        owned: Arc<queue::OwnedClaim>,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> (uuid::Uuid, OwnerTake) {
+        let started = std::time::Instant::now();
+        let mut conn = match self
+            .acquire_timed(target.pool, target.acquire_bound, target.shard)
+            .await
+        {
+            Ok(conn) => conn,
+            Err(error) => {
+                if error.is_pool_acquire_timeout() {
+                    self.registry
+                        .telemetry()
+                        .metrics
+                        .record_db_pool_acquire_timeout(SITE_CLAIM);
+                }
+                return (exec, OwnerTake::Failed(error));
+            }
+        };
+        let circuit_breakers = self.registry.circuit_breakers();
+        let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
+        let exclusions = self.claim_exclusions();
+        let taken = self
+            .claim_with_conflict_retry(&mut conn, async |conn| {
+                queue::claim_workflow_task_of_execution(
+                    conn,
+                    exec,
+                    &self.config.queues,
+                    &self.config.worker_id,
+                    &self.config.build_id,
+                    circuit_breaker_activities,
+                    &exclusions,
+                    target.shard,
+                    &owned,
+                )
+                .await
+            })
+            .await;
+        drop(conn);
+        let kind = claim_kind(&taken);
+        let elapsed = started.elapsed().as_secs_f64();
+        for label in self.pool_labels(target.shard).iter() {
+            self.registry
+                .telemetry()
+                .metrics
+                .record_owner_take_duration(kind, *label, elapsed);
+        }
+        let outcome = match taken {
+            Ok(Some(task)) => OwnerTake::Taken(task, permit),
+            Ok(None) => OwnerTake::Empty,
+            Err(error) => OwnerTake::Failed(error),
+        };
+        (exec, outcome)
+    }
+
+    /// Dispatch a taken row, or back off from an execution whose take found
+    /// nothing (issue #2255).
+    ///
+    /// A take finds nothing when a gate refused the row, or when its
+    /// decision still runs. The decider then skips the execution in its
+    /// scans for one poll interval. So a refused row cannot hold the head
+    /// of each scan. A running decision wakes its row again when it parks,
+    /// and that wake lifts the backoff.
+    fn finish_owner_take(
+        &self,
+        target: &DeciderTarget<'_>,
+        exec: uuid::Uuid,
+        taken: OwnerTake,
+        backoff: &mut HashMap<uuid::Uuid, std::time::Instant>,
+    ) {
+        match taken {
+            OwnerTake::Taken(task, permit) => {
+                tracing::debug!(
+                    task_id = %task.id,
+                    workflow_exec_id = %exec,
+                    "owner took workflow task"
+                );
+                if let Some(shard) = target.shard {
+                    self.record_shard_dispatched_many(shard, 1);
+                }
+                self.dispatch_task(task, target.pool, target.shard, None, Some(permit), None);
+            }
+            OwnerTake::Empty => {
+                backoff.insert(exec, std::time::Instant::now() + self.config.poll_interval);
+                self.decider_capacity.notify_waiters();
+            }
+            OwnerTake::Failed(error) => {
+                tracing::warn!(
+                    worker_id = %self.config.worker_id,
+                    workflow_exec_id = %exec,
+                    error = %error,
+                    "owner take failed"
+                );
+                backoff.insert(exec, std::time::Instant::now() + self.config.poll_interval);
+                self.decider_capacity.notify_waiters();
+            }
+        }
+    }
+
     /// Execute a single poll iteration.
     ///
     /// Claims one task of a kind with a free permit and dispatches it. Returns
@@ -40100,13 +40555,27 @@ impl Worker {
         // [`poll_admission`]. The read honors dispatch-channel reservations.
         // The poll then holds a real permit of each admitted kind across the
         // claim. See [`PollPermits`]. A saturated poll takes no connection.
+        //
+        // Issue #2255: in owner mode the owner decider takes the workflow
+        // tasks. This poll then claims activities only, and takes no
+        // workflow permit.
+        let owned = self.owned_claim(shard);
+        let decider_runs = owned.is_some();
         let mut permits = PollPermits::acquire(
-            self.poll_admission_now(),
+            if decider_runs {
+                self.activity_admission_now()
+            } else {
+                self.poll_admission_now()
+            },
             &self.workflow_semaphore,
             &self.activity_semaphore,
         );
         let admission = permits.admission();
-        self.record_gate_refusal(admission);
+        self.record_gate_refusal(if decider_runs {
+            decider_gate(admission)
+        } else {
+            admission
+        });
         let kind = match admission {
             PollAdmission::Saturated => return false,
             PollAdmission::Any => None,
@@ -40136,9 +40605,6 @@ impl Worker {
         let circuit_breakers = self.registry.circuit_breakers();
         let circuit_breaker_activities = circuit_breakers.tracked_activity_names();
         let exclusions = self.claim_exclusions();
-        // Issue #2252: in owner mode, claim workflow tasks of owned
-        // partitions only.
-        let owned = self.owned_claim(shard);
 
         // --- Weighted queue selection (issue #515) ---
         //
@@ -40335,6 +40801,9 @@ impl Worker {
         let shutdown = self.shutdown.clone();
         let max_concurrent_sessions = self.config.max_concurrent_sessions;
         let capacity_freed = Arc::clone(&self.capacity_freed);
+        // Issue #2255: a freed workflow permit also wakes the owner deciders.
+        let decider_wake =
+            matches!(kind, ClaimedTaskKind::Workflow).then(|| Arc::clone(&self.decider_capacity));
         // The row waited in `PENDING` from eligibility to claim. Database
         // clocks measure this wait. The poll gate holds a backlog in
         // `PENDING`, not at the permit (issue #1787). The tuner signal below
@@ -40468,7 +40937,8 @@ impl Worker {
                     }
                 },
                 &capacity_freed,
-            );
+            )
+            .waking_deciders(decider_wake);
             // The permit is held, so the reference no longer needs a
             // reservation against it (issue #1312). The early return above
             // drops it too, so a closed semaphore cannot leak one.
@@ -56450,6 +56920,44 @@ mod tests {
             "a free activity permit cannot start a workflow row"
         );
         assert_eq!(poll_admission(3, 5), PollAdmission::Any);
+    }
+
+    /// Where the owner decider runs, a poll claims activities only (issue
+    /// #2255). Only a missing activity permit counts as a gate refusal, so
+    /// a full workflow pool does not mark a refused kind.
+    #[test]
+    fn a_decider_poll_refuses_only_a_missing_activity_permit() {
+        use crate::queue::TaskType;
+        assert_eq!(
+            decider_gate(PollAdmission::Only(TaskType::Activity)),
+            PollAdmission::Any,
+            "an activity permit is all such a poll needs"
+        );
+        assert_eq!(
+            decider_gate(PollAdmission::Saturated),
+            PollAdmission::Only(TaskType::Workflow),
+            "no activity permit refuses the activity kind only"
+        );
+        assert_eq!(decider_gate(PollAdmission::Any), PollAdmission::Any);
+    }
+
+    /// Owner hints dedupe per shard and drain once (issue #2255).
+    #[test]
+    fn owner_hints_dedupe_per_shard_and_drain_once() {
+        let hints = OwnerHints::default();
+        let a = crate::types::ShardId::new(0);
+        let b = crate::types::ShardId::new(1);
+        let exec = uuid::Uuid::new_v4();
+        hints.push(a, exec);
+        hints.push(a, exec);
+        hints.push(b, uuid::Uuid::new_v4());
+        assert_eq!(hints.take(a), vec![exec]);
+        assert!(hints.take(a).is_empty(), "a take drains the set");
+        assert_eq!(hints.take(b).len(), 1, "each shard keeps its own set");
+        for _ in 0..OWNER_HINTS_MAX + 10 {
+            hints.push(a, uuid::Uuid::new_v4());
+        }
+        assert_eq!(hints.take(a).len(), OWNER_HINTS_MAX, "the set is bounded");
     }
 
     /// A poll holds one real permit of each kind it may claim. The claimed

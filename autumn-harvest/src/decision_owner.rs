@@ -1057,8 +1057,8 @@ pub struct EnableReport {
 #[cfg(feature = "db")]
 pub use db::{
     OwnerLoop, OwnerTick, acquire, conn_id, disable_owner_mode, enable_owner_mode,
-    end_upload_allowance, expire_all, fence, fence_pinned, is_lock_miss, read_owner_mode,
-    release_all, renew_all, start_upload_allowance,
+    end_upload_allowance, expire_all, fence, fence_pinned, fence_with_generation, is_lock_miss,
+    read_owner_mode, release_all, renew_all, start_upload_allowance,
 };
 
 #[cfg(feature = "db")]
@@ -1153,6 +1153,16 @@ mod db {
                  out_locked AS locked \
          FROM harvest_decision_owner_fence($1, $2)";
 
+    /// The fused fence of issue #2255: the migration's
+    /// `harvest_decision_fence`.
+    ///
+    /// It takes the DR generation row `FOR SHARE`, then the owner row `FOR
+    /// KEY SHARE`, in one statement. Each lock wait is at most 250 ms. A
+    /// lock miss returns `out_locked = false`.
+    const FENCE_BOTH_SQL: &str = "SELECT out_generation AS generation, \
+                 out_holder AS holder, out_epoch AS epoch, out_locked AS locked \
+         FROM harvest_decision_fence($1, $2, $3)";
+
     /// Set the idle bound of the current transaction.
     const IDLE_SQL: &str =
         "SELECT set_config('idle_in_transaction_session_timeout', $1, true) AS v";
@@ -1171,6 +1181,18 @@ mod db {
 
     #[derive(QueryableByName)]
     struct FenceRow {
+        #[diesel(sql_type = Nullable<Text>)]
+        holder: Option<String>,
+        #[diesel(sql_type = Nullable<BigInt>)]
+        epoch: Option<i64>,
+        #[diesel(sql_type = Bool)]
+        locked: bool,
+    }
+
+    #[derive(QueryableByName)]
+    struct FenceBothRow {
+        #[diesel(sql_type = Nullable<BigInt>)]
+        generation: Option<i64>,
         #[diesel(sql_type = Nullable<Text>)]
         holder: Option<String>,
         #[diesel(sql_type = Nullable<BigInt>)]
@@ -1525,6 +1547,62 @@ mod db {
             return Err(lost(None));
         };
         let (true, Some(epoch)) = (row.locked, row.epoch) else {
+            return Err(lost(None));
+        };
+        let holder_matches = row.holder.as_deref() == Some(tenure.holder().as_str());
+        if fence_passes(tenure.epoch().get(), epoch, holder_matches) {
+            Ok(())
+        } else {
+            Err(lost(Some(epoch)))
+        }
+    }
+
+    /// The commit fence with the DR generation check, in one statement
+    /// (issue #2255).
+    ///
+    /// It checks the generation row of `generation_shard` against
+    /// `expected`, then `tenure` against its owner row. The locks come in
+    /// the order of ADR 0009 decision 6, and both stay until the
+    /// transaction ends. Issue #2248 measured the two separate statements
+    /// at +17.8% of the persist.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::ShardFenced`] when the generation row is missing or
+    /// holds another generation. [`HarvestError::OwnershipLost`] as
+    /// [`fence`], and also when the lock wait on the generation row ends.
+    /// [`HarvestError::Database`] on a query failure.
+    pub async fn fence_with_generation(
+        conn: &mut AsyncPgConnection,
+        tenure: &OwnerTenure,
+        generation_shard: ShardId,
+        expected: i64,
+    ) -> HarvestResult<()> {
+        let _phase = crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Fence);
+        let idle = format!("{}ms", tenure.ttl().get().as_millis());
+        let lost = |current: Option<i64>| HarvestError::OwnershipLost {
+            partition: tenure.partition(),
+            pinned: tenure.epoch(),
+            current: current.map(OwnerEpoch::new),
+        };
+        let row: FenceBothRow = diesel::sql_query(FENCE_BOTH_SQL)
+            .bind::<Integer, _>(generation_shard.as_i32())
+            .bind::<Integer, _>(i32::from(tenure.partition().get()))
+            .bind::<Text, _>(idle)
+            .get_result(conn)
+            .await
+            .map_err(database_error)?;
+        if !row.locked {
+            return Err(lost(None));
+        }
+        if row.generation != Some(expected) {
+            return Err(HarvestError::ShardFenced {
+                shard_id: generation_shard.as_i32(),
+                pinned: expected,
+                current: row.generation,
+            });
+        }
+        let Some(epoch) = row.epoch else {
             return Err(lost(None));
         };
         let holder_matches = row.holder.as_deref() == Some(tenure.holder().as_str());

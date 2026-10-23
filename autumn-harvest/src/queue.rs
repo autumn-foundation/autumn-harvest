@@ -2911,6 +2911,64 @@ pub fn owned_claim_by_id_query(fenced: bool) -> &'static str {
     }
 }
 
+/// Splice the by-execution predicates into `base` (issue #2255).
+///
+/// It is [`splice_by_id_predicate`] keyed by the execution id of a
+/// workflow row. Each run has one workflow-task row, so the claim names one
+/// row. `idx_harvest_tq_workflow` finds it.
+fn splice_by_execution_predicate(base: &str, bind: &str) -> String {
+    assert_eq!(
+        base.matches(BY_ID_ANCHOR).count(),
+        1,
+        "claim query by-id anchor must appear exactly once"
+    );
+    assert_eq!(
+        base.matches(BY_ID_KEYS_ANCHOR).count(),
+        1,
+        "claim query concurrency-keys anchor must appear exactly once"
+    );
+    base.replace(
+        BY_ID_ANCHOR,
+        &format!(
+            "{BY_ID_ANCHOR}AND harvest_task_queue.workflow_exec_id = {bind} \
+             AND harvest_task_queue.task_type = 'workflow' "
+        ),
+    )
+    .replace(
+        BY_ID_KEYS_ANCHOR,
+        &format!("{BY_ID_KEYS_ANCHOR}AND workflow_exec_id = {bind} AND task_type = 'workflow' "),
+    )
+}
+
+/// The owned claim of the workflow task of one execution (issue #2255).
+///
+/// It is the full-scan claim with the by-execution predicates and the owned
+/// gate. Every gate of the claim, the guard and the post-claim rechecks
+/// still apply. The execution id binds `$7`, or `$9` with the fence. The
+/// holder and the partitions bind after it.
+#[must_use]
+pub fn owned_claim_by_execution_query(fenced: bool) -> &'static str {
+    use std::sync::LazyLock;
+    static PLAIN: LazyLock<String> = LazyLock::new(|| {
+        splice_owner_gate(
+            &splice_by_execution_predicate(claim_task_full_scan_query(), "$7"),
+            "$8",
+            "$9",
+        )
+    });
+    static FENCED: LazyLock<String> = LazyLock::new(|| {
+        splice_owner_gate(
+            &splice_by_execution_predicate(
+                &splice_dr_fence(claim_task_full_scan_query(), "$7", "$8", 1),
+                "$9",
+            ),
+            "$10",
+            "$11",
+        )
+    });
+    if fenced { &FENCED } else { &PLAIN }
+}
+
 /// The lag of a candidate row's key: `max(pass - V, 0)` (issue #1976).
 ///
 /// An uncorrelated subquery maps each queue to its keys in debt, with their
@@ -3464,6 +3522,148 @@ pub async fn claim_task_by_id_with_owner(
         // needs. A second one would only duplicate it.
         ClaimOutcome::Released(_) | ClaimOutcome::Empty => Ok(None),
     }
+}
+
+/// Take the workflow task of `exec_id` for its owner (issue #2255).
+///
+/// The owner decider calls this for an execution of an owned partition. It
+/// learned of the row from an owner wake or from [`owner_scan`]. The take
+/// reads no queue head. It runs the owned by-execution claim, so every gate
+/// of the claim, the claim guard and the post-claim rechecks apply. A row
+/// that is not `PENDING` and due, or that a gate refuses, returns `None`.
+///
+/// # Errors
+///
+/// As [`claim_task_by_id_with_fairness`].
+#[allow(clippy::too_many_arguments)]
+pub async fn claim_workflow_task_of_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: Uuid,
+    queues: &[String],
+    worker_id: &str,
+    worker_build_id: &str,
+    circuit_breaker_activities: &[String],
+    ineligible_activities: &[String],
+    shard: Option<crate::types::ShardId>,
+    owned: &OwnedClaim,
+) -> HarvestResult<Option<TaskQueueItem>> {
+    let mut tx = conn.build_transaction().read_committed();
+    let outcome: ClaimOutcome = tx
+        .run(
+            async |conn: &mut AsyncPgConnection| -> HarvestResult<ClaimOutcome> {
+                let fence = fence_binding(shard);
+                let result: Vec<TaskQueueItem> = CachedClaimQuery {
+                    sql: owned_claim_by_execution_query(fence.is_some()),
+                    ageing: false,
+                    worker_id,
+                    queues,
+                    worker_build_id,
+                    aging_secs: None,
+                    circuit_breaker_activities,
+                    ineligible_activities,
+                    fence,
+                    by_id: Some(exec_id),
+                    owned: Some((owned.holder.as_str(), owned.mask())),
+                }
+                .load(conn)
+                .await
+                .map_err(crate::error::database_error)?;
+                let Some(task) = result.into_iter().next() else {
+                    return Ok(ClaimOutcome::Empty);
+                };
+                apply_post_claim_rechecks(conn, task, worker_id).await
+            },
+        )
+        .await?;
+    match outcome {
+        ClaimOutcome::Claimed(task) => Ok(Some(*task)),
+        ClaimOutcome::Released(_) | ClaimOutcome::Empty => Ok(None),
+    }
+}
+
+/// What one [`owner_scan`] found (issue #2255).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OwnerScan {
+    /// The executions whose workflow task is due, by due time.
+    pub due: Vec<Uuid>,
+    /// The time until the next row of the scan is due. `None` when the scan
+    /// found no row that is not due yet.
+    pub next_due: Option<std::time::Duration>,
+}
+
+/// One row of [`owner_scan`].
+#[derive(diesel::QueryableByName)]
+struct OwnerScanRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    exec_id: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    wait_secs: f64,
+}
+
+/// Read the pending workflow tasks of an owner's partitions, by due time.
+///
+/// `idx_harvest_tq_owner_scan` serves the order. The scan skips a run that
+/// is `PAUSED`, a paused queue and each execution of `skip`. Those rows stay
+/// `PENDING`, so a scan that read them would return them again and starve
+/// the rows behind them.
+const OWNER_SCAN_SQL: &str = "SELECT t.workflow_exec_id AS exec_id, \
+         GREATEST(EXTRACT(EPOCH FROM (t.scheduled_at - NOW())), 0)::float8 AS wait_secs \
+     FROM harvest_task_queue t \
+     WHERE t.state = 'PENDING' AND t.task_type = 'workflow' \
+       AND t.workflow_exec_id IS NOT NULL \
+       AND t.queue_name = ANY($1) \
+       AND ( t.decision_partition IS NULL \
+             OR get_bit($2::bytea, t.decision_partition) = 1 ) \
+       AND NOT (t.workflow_exec_id = ANY($3::uuid[])) \
+       AND NOT EXISTS ( SELECT 1 FROM harvest_queue_pauses p \
+                        WHERE p.queue_name = t.queue_name ) \
+       AND NOT EXISTS ( SELECT 1 FROM harvest_workflow_executions e \
+                        WHERE e.id = t.workflow_exec_id AND e.state = 'PAUSED' ) \
+     ORDER BY t.scheduled_at \
+     LIMIT $4";
+
+/// Scan the pending workflow tasks of an owner's partitions (issue #2255).
+///
+/// The owner decider runs it at each tenure change, when its permits free
+/// up, and once per poll interval. It finds a row that no wake reached: a
+/// lost `NOTIFY`, a due timer, or the backlog of a new partition. An
+/// unstamped row passes too. The take then stamps it and re-pends it to its
+/// owner.
+///
+/// The scan returns at most `limit` due executions. The first row that is
+/// not due gives [`OwnerScan::next_due`].
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError::Database`] on a query failure.
+pub async fn owner_scan(
+    conn: &mut AsyncPgConnection,
+    queues: &[String],
+    owned: &OwnedClaim,
+    skip: &[Uuid],
+    limit: usize,
+) -> HarvestResult<OwnerScan> {
+    let rows: Vec<OwnerScanRow> = diesel::sql_query(OWNER_SCAN_SQL)
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
+        .bind::<diesel::sql_types::Bytea, _>(owned.mask())
+        .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(skip)
+        .bind::<diesel::sql_types::BigInt, _>(
+            i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX),
+        )
+        .load(conn)
+        .await
+        .map_err(crate::error::database_error)?;
+    let mut scan = OwnerScan::default();
+    for row in rows {
+        if row.wait_secs > 0.0 {
+            scan.next_due = std::time::Duration::try_from_secs_f64(row.wait_secs).ok();
+            break;
+        }
+        if scan.due.len() < limit {
+            scan.due.push(row.exec_id);
+        }
+    }
+    Ok(scan)
 }
 
 /// What a dispatch reference's row looks like right now (issue #1312).
@@ -6065,13 +6265,28 @@ async fn requeue_claimed_workflow_task_with_backoff(
     ))
     .into_boxed();
     let updated = fence(update, Some(claim))
-        .returning((dsl::queue_name, dsl::priority, dsl::scheduled_at))
-        .get_results::<(String, i32, chrono::DateTime<Utc>)>(conn)
+        .returning((
+            dsl::queue_name,
+            dsl::priority,
+            dsl::scheduled_at,
+            dsl::workflow_exec_id,
+        ))
+        .get_results::<(String, i32, chrono::DateTime<Utc>, Option<Uuid>)>(conn)
         .await
         .map_err(crate::error::database_error)?;
     if updated.is_empty() {
         return Ok(false);
     }
+    // Issue #2255: the owner decider of the row's partition takes it. A
+    // fenced owner re-pends here, and the new owner learns of the row at
+    // once instead of at its next scan.
+    if let Some(Some(exec_id)) = updated.first().map(|row| row.3) {
+        crate::notify::notify_owner(conn, exec_id, false).await?;
+    }
+    let updated = updated
+        .into_iter()
+        .map(|(queue_name, priority, scheduled_at, _)| (queue_name, priority, scheduled_at))
+        .collect();
     finish_workflow_backoff_requeue(claim.task_id, updated)?;
     Ok(true)
 }
@@ -11087,6 +11302,37 @@ mod tests {
                 unsplice_owner(owned_claim_by_id_query(fenced), holder, partitions),
                 legacy
             );
+        }
+    }
+
+    /// The owner take is the owned by-id claim keyed by the execution of a
+    /// workflow row, and nothing else (issue #2255). So every gate, the
+    /// guard and the holder check of the by-id claim hold.
+    #[test]
+    fn the_owner_take_is_the_owned_by_id_claim_keyed_by_execution() {
+        for (fenced, bind) in [(false, "$7"), (true, "$9")] {
+            let take = owned_claim_by_execution_query(fenced);
+            let by_id = owned_claim_by_id_query(fenced);
+            let rekeyed = take
+                .replace(
+                    &format!(
+                        "AND harvest_task_queue.workflow_exec_id = {bind} \
+                         AND harvest_task_queue.task_type = 'workflow' "
+                    ),
+                    &format!("AND harvest_task_queue.id = {bind} "),
+                )
+                .replace(
+                    &format!("AND workflow_exec_id = {bind} AND task_type = 'workflow' "),
+                    &format!("AND id = {bind} "),
+                );
+            assert_eq!(rekeyed, by_id, "fenced={fenced}");
+            assert_eq!(
+                take.matches("harvest_task_queue.workflow_exec_id = ")
+                    .count(),
+                1,
+                "one candidate predicate"
+            );
+            assert_eq!(take.matches("set_config('harvest.owner_claim'").count(), 1);
         }
     }
 

@@ -7,9 +7,13 @@
 //! - `none`: no DR pin and no owner tenure. No fence row.
 //! - `generation`: a DR pin only. Each append takes the generation row.
 //! - `owner`: an owner tenure only. The start fence takes the owner row.
-//! - `generation_owner`: both. The start fence takes both rows.
-//! - `generation_owner_refence`: both, and the owner fence again after each
-//!   append. It models the code before issue #2248.
+//! - `generation_owner`: both. One start statement takes both rows, and no
+//!   append checks either row again (issue #2255).
+//! - `generation_owner_split`: both, as the code before issue #2255 fenced.
+//!   The start fence takes the rows in two statements. Each append checks
+//!   the generation row again in a savepoint.
+//! - `generation_owner_refence`: `generation_owner_split`, and the owner
+//!   fence again at each append. It models the code before issue #2248.
 //! - `generation_plain_owner_row`: a DR pin, and a plain `FOR KEY SHARE` of
 //!   the owner row with no fence function. It adds one statement only.
 //!
@@ -83,16 +87,18 @@ enum Fence {
     GenerationOwner,
     GenerationOwnerRefence,
     GenerationPlainOwnerRow,
+    GenerationOwnerSplit,
 }
 
 impl Fence {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::None,
         Self::Owner,
         Self::Generation,
         Self::GenerationOwner,
         Self::GenerationOwnerRefence,
         Self::GenerationPlainOwnerRow,
+        Self::GenerationOwnerSplit,
     ];
 
     const fn label(self) -> &'static str {
@@ -103,14 +109,28 @@ impl Fence {
             Self::GenerationOwner => "generation_owner",
             Self::GenerationOwnerRefence => "generation_owner_refence",
             Self::GenerationPlainOwnerRow => "generation_plain_owner_row",
+            Self::GenerationOwnerSplit => "generation_owner_split",
         }
+    }
+
+    /// Whether the decision fences as the code before issue #2255 did: the
+    /// generation row and the owner row in two statements, then the
+    /// generation row again in a savepoint at each append.
+    const fn splits_the_fence(self) -> bool {
+        matches!(
+            self,
+            Self::GenerationOwnerSplit | Self::GenerationOwnerRefence
+        )
     }
 
     /// Whether the decision pins an owner tenure, so the engine fences it.
     const fn pins_a_tenure(self) -> bool {
         matches!(
             self,
-            Self::Owner | Self::GenerationOwner | Self::GenerationOwnerRefence
+            Self::Owner
+                | Self::GenerationOwner
+                | Self::GenerationOwnerRefence
+                | Self::GenerationOwnerSplit
         )
     }
 
@@ -375,14 +395,23 @@ async fn decide(
 ) -> Result<(), HarvestError> {
     let exec_id = writer.exec_id;
     let pinned = fence.pins_a_tenure().then(|| tenure.clone());
-    let refence = (fence == Fence::GenerationOwnerRefence).then_some(tenure);
+    let per_append = PerAppend {
+        generation: fence.splits_the_fence(),
+        owner: (fence == Fence::GenerationOwnerRefence).then_some(tenure),
+    };
     let plain = (fence == Fence::GenerationPlainOwnerRow).then(|| tenure.partition());
+    let split = fence.splits_the_fence().then_some(tenure);
     decision_owner::scope_decision(async {
         let _ = decision_owner::pin_decision(pinned);
         writer
             .conn
             .transaction::<_, HarvestError, _>(async |conn| {
-                replication::assert_decision_fence(conn).await?;
+                if let Some(tenure) = split {
+                    replication::assert_generation_fence(conn, SHARD).await?;
+                    decision_owner::fence(conn, tenure).await?;
+                } else {
+                    replication::assert_decision_fence(conn).await?;
+                }
                 if let Some(partition) = plain {
                     diesel::sql_query(PLAIN_OWNER_LOCK)
                         .bind::<diesel::sql_types::Integer, _>(i32::from(partition.get()))
@@ -394,7 +423,7 @@ async fn decide(
                 decision_owner::fenced_scope(
                     id,
                     autumn_harvest::notify::coalesced(conn, async |conn| {
-                        decision_body(conn, exec_id, refence).await
+                        decision_body(conn, exec_id, per_append).await
                     }),
                 )
                 .await
@@ -404,13 +433,37 @@ async fn decide(
     .await
 }
 
+/// The fences that one append sends again, as older code did.
+#[derive(Clone, Copy)]
+struct PerAppend<'a> {
+    /// A savepoint and the generation check, as before issue #2255.
+    generation: bool,
+    /// The owner fence, as before issue #2248.
+    owner: Option<&'a OwnerTenure>,
+}
+
+impl PerAppend<'_> {
+    async fn send(self, conn: &mut AsyncPgConnection) -> Result<(), HarvestError> {
+        if self.generation {
+            conn.transaction::<_, HarvestError, _>(async |conn| {
+                replication::assert_generation_fence(conn, SHARD).await
+            })
+            .await?;
+        }
+        if let Some(tenure) = self.owner {
+            decision_owner::fence(conn, tenure).await?;
+        }
+        Ok(())
+    }
+}
+
 /// The writes of one decision: two appends, one activity task and the
-/// execution update. With `refence`, each append also sends the owner
-/// fence again, as the code before issue #2248 did with DR fencing on.
+/// execution update. `per_append` adds the fences that older code sent at
+/// each append.
 async fn decision_body(
     conn: &mut AsyncPgConnection,
     exec_id: ExecutionId,
-    refence: Option<&OwnerTenure>,
+    per_append: PerAppend<'_>,
 ) -> Result<(), HarvestError> {
     let next = autumn_harvest::store::next_event_id_for(conn, exec_id).await?;
     let scheduled = WorkflowEvent::ActivityScheduled {
@@ -419,18 +472,14 @@ async fn decision_body(
         input: serde_json::Value::Null,
         queue: QUEUE.to_string(),
     };
+    per_append.send(conn).await?;
     autumn_harvest::store::append_events(conn, exec_id, &[scheduled], next).await?;
-    if let Some(tenure) = refence {
-        decision_owner::fence(conn, tenure).await?;
-    }
     let boundary = WorkflowEvent::SignalReceived {
         signal_name: "fence_bench".to_string(),
         payload: serde_json::Value::Null,
     };
+    per_append.send(conn).await?;
     autumn_harvest::store::append_events(conn, exec_id, &[boundary], next + 1).await?;
-    if let Some(tenure) = refence {
-        decision_owner::fence(conn, tenure).await?;
-    }
     let params = EnqueueParams {
         workflow_exec_id: Some(exec_id.as_uuid()),
         activity_name: Some("fence_bench_step".to_string()),

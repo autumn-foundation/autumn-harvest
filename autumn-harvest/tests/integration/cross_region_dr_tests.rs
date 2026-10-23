@@ -313,9 +313,9 @@ async fn a_bump_expires_every_owner_lease_and_keeps_the_epochs() {
 }
 
 /// Issue #2248: with DR fencing on, an owner decision sends the owner fence
-/// once. Each append still takes the generation row, because a colocated
-/// shard can use another row. The start fence holds the owner row until the
-/// commit, so a second owner fence cannot fail (issue #2252).
+/// once. The start fence holds the owner row until the commit, so a second
+/// owner fence cannot fail (issue #2252). Since issue #2255 the fence is the
+/// fused function, so the test counts both fence functions.
 #[tokio::test]
 async fn a_dr_fenced_owner_decision_sends_one_owner_fence() {
     use autumn_harvest::decision_owner::{
@@ -330,7 +330,7 @@ async fn a_dr_fenced_owner_decision_sends_one_owner_fence() {
     async fn fence_calls(conn: &mut AsyncPgConnection) -> Result<i64, HarvestError> {
         let calls: Calls = diesel::sql_query(
             "SELECT COALESCE(SUM(calls), 0)::bigint AS n FROM pg_stat_xact_user_functions \
-             WHERE funcname = 'harvest_decision_owner_fence'",
+             WHERE funcname IN ('harvest_decision_owner_fence', 'harvest_decision_fence')",
         )
         .get_result(conn)
         .await
@@ -405,6 +405,110 @@ async fn a_dr_fenced_owner_decision_sends_one_owner_fence() {
         1,
         "the start fence covers both appends"
     );
+}
+
+/// Issue #2255: with DR fencing on, an owner decision fences the generation
+/// row and the owner row in one statement. Its appends then check neither
+/// row again, because the start fence holds both locks until the commit.
+#[tokio::test]
+async fn a_dr_fenced_owner_decision_sends_one_fence_statement() {
+    use autumn_harvest::decision_owner::{
+        self, Acquisition, DecisionPartition, OwnerHolder, OwnerLeaseConfig,
+    };
+    use autumn_harvest::error::HarvestError;
+    #[derive(diesel::QueryableByName)]
+    struct Counts {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        fused: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        owner_only: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        generation_reads: i64,
+    }
+    async fn counts(conn: &mut AsyncPgConnection) -> Result<(i64, i64, i64), HarvestError> {
+        let c: Counts = diesel::sql_query(
+            "SELECT \
+               (SELECT COALESCE(SUM(calls), 0) FROM pg_stat_xact_user_functions \
+                 WHERE funcname = 'harvest_decision_fence')::bigint AS fused, \
+               (SELECT COALESCE(SUM(calls), 0) FROM pg_stat_xact_user_functions \
+                 WHERE funcname = 'harvest_decision_owner_fence')::bigint AS owner_only, \
+               (SELECT COALESCE(SUM(COALESCE(idx_scan, 0) + COALESCE(seq_scan, 0)), 0) \
+                  FROM pg_stat_xact_user_tables \
+                 WHERE relname = 'harvest_shard_generation')::bigint AS generation_reads",
+        )
+        .get_result(conn)
+        .await
+        .map_err(autumn_harvest::error::database_error)?;
+        Ok((c.fused, c.owner_only, c.generation_reads))
+    }
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("fused_fence");
+    let mut conn = connect(&url).await;
+    conn.batch_execute("SET track_functions = 'all'")
+        .await
+        .expect("count function calls");
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .expect("provision");
+    let p = DecisionPartition::new(19).expect("in range");
+    let owner = match decision_owner::acquire(
+        &mut conn,
+        ShardId::new(0),
+        &OwnerHolder::for_worker("fused"),
+        p,
+        &OwnerLeaseConfig::default(),
+    )
+    .await
+    .expect("acquire")
+    {
+        Acquisition::Acquired(t) => t,
+        other => panic!("acquire {p}: {other:?}"),
+    };
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, run_id, shard_id, input, queue_name, state) \
+         VALUES ($1, 'fused', $2, gen_random_uuid(), 0, '{}'::jsonb, 'fused', 'RUNNING')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(format!("fused-{}", uuid::Uuid::new_v4()))
+    .execute(&mut conn)
+    .await
+    .expect("seed an execution");
+
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    let deltas = decision_owner::scope_decision(async {
+        let _ = decision_owner::pin_decision(Some(owner.clone()));
+        conn.transaction::<_, HarvestError, _>(async |conn| {
+            let before = counts(conn).await?;
+            autumn_harvest::replication::assert_decision_fence(conn).await?;
+            let id = decision_owner::conn_id(conn);
+            decision_owner::fenced_scope(id, async {
+                for n in 0..2 {
+                    let next = autumn_harvest::store::next_event_id_for(conn, exec_id).await?;
+                    let event = autumn_harvest::event::WorkflowEvent::SignalReceived {
+                        signal_name: "fused".to_string(),
+                        payload: serde_json::json!(n),
+                    };
+                    autumn_harvest::store::append_events(conn, exec_id, &[event], next).await?;
+                }
+                Ok::<_, HarvestError>(())
+            })
+            .await?;
+            let after = counts(conn).await?;
+            Ok((after.0 - before.0, after.1 - before.1, after.2 - before.2))
+        })
+        .await
+    })
+    .await;
+    FenceRegistry::clear();
+    let (fused, owner_only, generation_reads) = deltas.expect("the owner commits");
+    assert_eq!(fused, 1, "one fused fence statement");
+    assert_eq!(owner_only, 0, "no separate owner fence");
+    assert_eq!(generation_reads, 1, "the appends do not read the row again");
 }
 
 /// Keeps the persist phases of a worker (issue #2248).

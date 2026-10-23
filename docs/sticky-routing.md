@@ -61,12 +61,13 @@ Owner mode (issue #2252, [ADR 0009](adr/0009-decision-owner.md)) gives each exec
 - **Who owns.** A worker with no workflow slot or no workflow type never owns a partition. It still claims activity tasks.
 - **Failover.** A crashed owner drops out of the live owners within 3 s. Its leases lapse after the TTL, 10 s by default. A peer scans just after that lease end and acquires its partitions. A new owner starts cold. [`performance-owner-failover.md`](performance-owner-failover.md) records the measured bounds.
 - **Fence.** Each decision commit checks the owner's lease epoch. A stale owner cannot write. See [ADR 0009](adr/0009-decision-owner.md).
+- **Decider.** The owner does not claim its workflow tasks through the claim loop (issue #2255). An owner decider takes each one by its execution, after an owner wake or a scan of its partitions. The claim loops claim activities only. [`performance-owner-decider.md`](performance-owner-decider.md) records the claim counts and the throughput.
 
 | | Sticky routing | Owner mode |
 |---|---|---|
 | Affinity | 5 s lease on the task row | Lease on the decision partition |
 | After the window | Any worker claims, and the decision replays cold | The owner claims, and the decision resumes |
-| Claim cost | A sticky predicate in each scan | A partition test in each scan |
+| Claim cost | A sticky predicate in each scan | No workflow claim. The owner takes each task by its execution |
 | Crash recovery | Up to one sticky window | About one lease TTL |
 
 ### Turning owner mode on

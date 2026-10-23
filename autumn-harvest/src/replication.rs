@@ -2909,8 +2909,38 @@ mod db {
     /// owner tenure moved. [`crate::error::HarvestError::Database`] on query
     /// failure.
     pub async fn assert_fence(conn: &mut AsyncPgConnection, shard: ShardId) -> HarvestResult<()> {
+        if start_fence_covers(conn, shard) {
+            return Ok(());
+        }
         assert_generation_fence(conn, shard).await?;
         crate::decision_owner::fence_pinned(conn).await
+    }
+
+    /// Whether the start fence of this transaction covers a fence of `shard`
+    /// (issue #2255).
+    ///
+    /// It holds inside a [`crate::decision_owner::fenced_scope`] of `conn`.
+    /// The start fence locked the owner row and the generation row of the
+    /// pinned tenure's shard, and both locks stay until the transaction
+    /// ends. A fence of `shard` then sends no query when `shard` has no DR
+    /// pin, or when it resolves to the same generation row at the same
+    /// pinned generation. A colocated shard with its own row still checks
+    /// that row.
+    #[must_use]
+    pub fn start_fence_covers(conn: &AsyncPgConnection, shard: ShardId) -> bool {
+        let Some(tenure) = crate::decision_owner::pinned_decision() else {
+            return false;
+        };
+        if !crate::decision_owner::already_fenced(crate::decision_owner::conn_id(conn), &tenure) {
+            return false;
+        }
+        let Some(pinned) = FenceRegistry::expected(shard) else {
+            return true;
+        };
+        let held = tenure.shard();
+        FenceRegistry::expected(held) == Some(pinned)
+            && FenceRegistry::resolve_shard(shard).unwrap_or(shard)
+                == FenceRegistry::resolve_shard(held).unwrap_or(held)
     }
 
     /// The DR generation check of [`assert_fence`] alone.
@@ -2936,7 +2966,8 @@ mod db {
     ///
     /// With an owner tenure pinned, it takes the DR generation row, then
     /// the owner row `FOR KEY SHARE`. Both come before the execution row,
-    /// as ADR 0009 decision 6 orders them. Call it first in each decision
+    /// as ADR 0009 decision 6 orders them. With a DR pin, one statement
+    /// takes both rows (issue #2255). Call it first in each decision
     /// transaction.
     ///
     /// The generation check uses the shard of the pinned tenure. With no
@@ -2957,8 +2988,21 @@ mod db {
         if crate::decision_owner::already_fenced(crate::decision_owner::conn_id(conn), &tenure) {
             return Ok(());
         }
-        assert_generation_fence(conn, tenure.shard()).await?;
-        crate::decision_owner::fence(conn, &tenure).await
+        // Issue #2255: with a DR pin, one statement fences both rows.
+        let shard = tenure.shard();
+        match FenceRegistry::expected(shard) {
+            Some(pinned) => {
+                let resolved = FenceRegistry::resolve_shard(shard).unwrap_or(shard);
+                crate::decision_owner::fence_with_generation(
+                    conn,
+                    &tenure,
+                    resolved,
+                    pinned.as_i64(),
+                )
+                .await
+            }
+            None => crate::decision_owner::fence(conn, &tenure).await,
+        }
     }
 
     /// Fail with `ShardFenced` unless `shard` is at `expected`.
@@ -4432,7 +4476,7 @@ pub use db::{
     fenced_acquire_with_retries, fenced_checkout, fenced_get_within, fenced_wait,
     freeze_generation_rows_on, join_fenced_pass, join_fenced_pass_direct, measure_rpo,
     pin_process_fence, pin_worker_fence, probe_dr_markers, query_replication_status,
-    record_replication_heartbeat, resolve_held, run_fenced_pass,
+    record_replication_heartbeat, resolve_held, run_fenced_pass, start_fence_covers,
 };
 
 #[cfg(test)]
