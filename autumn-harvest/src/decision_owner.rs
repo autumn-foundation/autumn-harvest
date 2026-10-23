@@ -1312,14 +1312,7 @@ mod db {
         let config = *config;
         let result = conn
             .transaction::<Acquisition, HarvestError, _>(async |conn| {
-                diesel::sql_query(lock_timeout_sql(config.lock_timeout))
-                    .execute(conn)
-                    .await
-                    .map_err(database_error)?;
-                // A frozen holder of this row lock blocks every takeover. The
-                // database ends the transaction after one TTL (issue #2254).
-                set_idle(conn, format!("{}ms", config.ttl.get().as_millis())).await?;
-                crate::replication::assert_generation_fence(conn, shard).await?;
+                open_lease_write(conn, shard, config.lock_timeout, config.ttl.get()).await?;
                 let p = i32::from(partition.get());
                 let locked: Option<EpochRow> = diesel::sql_query(ACQUIRE_LOCK_SQL)
                     .bind::<Integer, _>(p)
@@ -1536,8 +1529,6 @@ mod db {
             RowsWrite::Renew => RENEW_LOCK_SQL,
             RowsWrite::Release => RELEASE_LOCK_SQL,
         };
-        // A frozen holder of these row locks blocks every takeover. The
-        // database ends the transaction after one TTL (issue #2254).
         let idle = tenures
             .iter()
             .map(|t| t.ttl().get())
@@ -1545,12 +1536,7 @@ mod db {
             .unwrap_or(super::OwnerLeaseTtl::DEFAULT.get());
         let result = conn
             .transaction::<Vec<i32>, HarvestError, _>(async |conn| {
-                diesel::sql_query(lock_timeout_sql(lock_timeout))
-                    .execute(conn)
-                    .await
-                    .map_err(database_error)?;
-                set_idle(conn, format!("{}ms", idle.as_millis())).await?;
-                crate::replication::assert_generation_fence(conn, shard).await?;
+                open_lease_write(conn, shard, lock_timeout, idle).await?;
                 let locked: Vec<PartitionRow> = diesel::sql_query(lock_sql)
                     .bind::<Array<Integer>, _>(&partitions)
                     .bind::<Array<BigInt>, _>(&epochs)
