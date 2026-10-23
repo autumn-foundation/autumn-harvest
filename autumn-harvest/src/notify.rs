@@ -759,10 +759,12 @@ struct OwnerRow {
 /// One statement reads the `workflow_id` of each execution. The sender runs
 /// it on its own connection, after the write commits, with a short
 /// `statement_timeout`. The function drops a note whose run is gone, because
-/// no owner decides for it. It also drops a note to the partition that the
-/// writer's decision pinned. The writer owns that partition and decides
-/// what happens to its own entries. Returns the number of notes that a
-/// failed lookup lost.
+/// no owner decides for it. It also drops an evict note to the partition
+/// that the writer's decision pinned. The writer owns that partition and
+/// decides what happens to its own entries. A plain wake to that partition
+/// stays (issue #2255). It is how the owner decider learns of a row that the
+/// decision woke again, or of a successor in the same partition. Returns
+/// the number of notes that a failed lookup lost.
 async fn resolve_owner_notes(conn: &mut AsyncPgConnection, notes: &mut Vec<Note>) -> usize {
     let mut ids: Vec<Uuid> = notes
         .iter()
@@ -809,9 +811,9 @@ async fn resolve_owner_notes(conn: &mut AsyncPgConnection, notes: &mut Vec<Note>
     notes.retain_mut(|note| {
         let Note::Owner {
             exec_id,
+            evict,
             writer,
             channel,
-            ..
         } = note
         else {
             return true;
@@ -819,7 +821,7 @@ async fn resolve_owner_notes(conn: &mut AsyncPgConnection, notes: &mut Vec<Note>
         let Some(&partition) = partitions.get(exec_id) else {
             return false;
         };
-        if *writer == Some(partition) {
+        if *evict && *writer == Some(partition) {
             return false;
         }
         *channel = owner_channel(partition);

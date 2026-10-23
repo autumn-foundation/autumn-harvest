@@ -675,6 +675,58 @@ fn failover_page_cites_the_failover_tests() {
     );
 }
 
+/// The decider page of issue #2255.
+const DECIDER_PAGE: &str = "docs/performance-owner-decider.md";
+
+/// The suite that proves the decider.
+const DECIDER_SUITE: &str = "autumn-harvest/tests/integration/owner_decider_tests.rs";
+
+/// The decider tests that the page cites.
+const DECIDER_TESTS: &[&str] = &[
+    "a_signal_acknowledged_just_before_an_epoch_bump_is_never_lost",
+    "a_signal_hinted_to_an_owner_that_loses_its_epoch_is_never_lost",
+    "an_owner_takes_workflow_tasks_off_the_claim_path",
+];
+
+/// The fused fence that decision 13 cites.
+const FUSED_FENCE: (&str, &str) = (
+    "autumn-harvest/migrations/20261023015935_harvest_owner_decider/up.sql",
+    "CREATE OR REPLACE FUNCTION harvest_decision_fence(",
+);
+
+/// The decider page cites each decider test, and each test exists.
+/// Decision 13 names the suite, links the page and cites the fused fence,
+/// which its migration declares (issue #2255).
+#[test]
+fn decider_page_and_decision_13_cite_real_tests() {
+    let page = read(DECIDER_PAGE);
+    let suite = read(DECIDER_SUITE);
+    let adr = read(ADR);
+    let decision = section(&adr, "\n### 13. Owner decider", "\n## ")
+        .unwrap_or_else(|| panic!("{ADR} has no decision 13"));
+    for test in DECIDER_TESTS {
+        assert!(
+            page.contains(&format!("`{test}`")),
+            "{DECIDER_PAGE} must cite `{test}`"
+        );
+        assert!(
+            suite.contains(&format!("async fn {test}(")),
+            "{DECIDER_SUITE} lacks `{test}`"
+        );
+    }
+    for link in ["owner_decider_tests.rs", "performance-owner-decider.md"] {
+        assert!(
+            decision.contains(link),
+            "{ADR} decision 13 must cite {link}"
+        );
+    }
+    let (migration, declaration) = FUSED_FENCE;
+    assert!(
+        decision.contains("`harvest_decision_fence`") && read(migration).contains(declaration),
+        "{ADR} decision 13 cites `harvest_decision_fence`, and {migration} declares it"
+    );
+}
+
 #[test]
 fn helpers_parse_their_inputs() {
     let table = "| Key | Question | Answer |\n|---|---|---|\n| A | q? | Answered. |\n";

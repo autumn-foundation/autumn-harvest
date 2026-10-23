@@ -2829,6 +2829,10 @@ impl DbOp {
     }
 }
 
+/// The `op` label of an owner take on [`METRIC_DB_QUERY_DURATION`] (issue
+/// #2255). See [`MetricsRecorder::record_owner_take_duration`].
+pub const DB_OP_TAKE: &str = "take";
+
 /// What one claim returned (issue #2248), used as the bounded `kind` label of
 /// a `claim` sample on [`METRIC_DB_QUERY_DURATION`].
 ///
@@ -3840,6 +3844,18 @@ pub trait MetricsRecorder: Send + Sync {
     fn record_claim_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
         let _ = kind;
         self.record_db_query_duration(DbOp::Claim, shard, seconds);
+    }
+
+    /// The duration of one owner take and the kind that it returned (issue
+    /// #2255).
+    ///
+    /// An owner decider takes a known workflow task by its execution id. A
+    /// take reads no queue head, so it is not a claim. Maps to the histogram
+    /// `harvest_db_query_duration{op="take", kind, shard}`. The kind is
+    /// `workflow`, `empty` or `error`. The default records nothing, so the
+    /// claim count of an older recorder does not change.
+    fn record_owner_take_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+        let _ = (kind, shard, seconds);
     }
 
     /// The duration of one phase of a decision persist (issue #2248).
