@@ -81,6 +81,7 @@ fails in these cases:
 | `WorkflowTaskClaim` | Workflow-task terminal-write ownership (issues #1184, #1806, #1917) | fixed, pre-fix, reachability, capability-miss pre-fix |
 | `CodecRotation` | Codec re-encryption against PII erasure (issues #948, #495) | CAS, blind write, reachability |
 | `OwnerLease` | Fenced owner lease of a decision partition (issue #2250) | design, six defects, reachability |
+| `AgentMesh` | Durable peer send between two agents (issue #2269) | design, one dedupe layer each, four defects, reachability |
 
 **Ghost sequence numbers.** Each claim in the two claim models gets a ghost
 `seq`. The code has no such column. An invariant that compared
@@ -308,6 +309,133 @@ one behaviour of the design that reaches all four nemeses:
 
 `autumn_harvest::dst::owner` runs the same defects and nemeses from a seed.
 See [`simulation.md`](simulation.md#the-owner-lease-simulation).
+
+#### `AgentMesh` — model (f)
+
+The prose spec is section 7 of `DESIGN-2262.md`. Issue #2269 asks for this
+model before the code. Agent A sends `PeerMessage` ops to agent B by
+workflow id. Both agents are keyed entities. The send key is
+`<sender run id>:<seq>`. The seq is durable state of A. It moves only when
+the send commits with the decision of A. The model has one sender, so the
+seq is the key.
+
+A send takes one of two paths. On one shard, the decision of A inserts the
+signal row of B in its own transaction. Across shards, the decision writes
+an outbox row, and a relay delivers it at least once, in any order. One
+deployment takes one path for sends by workflow id. The model lets each
+send take either path, so it covers both deployments. Its actions:
+
+| Action | Planned code |
+|---|---|
+| `Decide` | A picks its next send: seq + 1, a path, and `Mandate::outbound`. |
+| `SendCommit` | The decision of A commits `signal_external_workflow_by_id_with_idempotency`. The inline path inserts the signal row of B. The outbox path writes an outbox row. |
+| `Crash` | A loses its decision in flight. Its durable seq stays, so the next decision sends the same key. |
+| `Relay` | `enforce_external_signals_outbox` delivers a row. A records `ExternalSignalDelivered`. |
+| `RelayAgain` | The relay delivers a row but loses the outcome. The row stays, so the relay delivers it again. |
+| `Begin` | The owner of B reads the head of its inbox. |
+| `Commit` | The fenced commit of B consumes the op, applies it and moves `lastSeq`. A fenced commit aborts and changes nothing. |
+| `OwnerChange` | A new owner takes B, so the epoch moves. The new owner replays B. |
+| `Checkpoint` | B continues as new. It carries its state and its waiting ops. |
+
+B dedupes in two layers. Each layer is a constant, so a config can turn it
+off:
+
+| Constant | Values | Meaning |
+|---|---|---|
+| `EngineDedupe` | `"chain"`, `"run"`, `"off"` | The engine refuses a signal key that it took before. `"chain"` keeps the keys across continue-as-new, as the engine does. `"run"` keeps the keys of one run only. |
+| `SeqDedupe` | `TRUE`, `FALSE` | B keeps `lastSeq` in its state. It consumes a message with `seq <= lastSeq` and does not apply it. |
+| `Accept` | `"meet"`, `"join"` | `"meet"` is `local.accept(inbound)`. `"join"` takes the union, which widens. |
+| `MaxInFlight` | 1, 2 | The bound on sends of A that wait for their delivery. |
+
+The fence is taken as given: a decision of B commits only at the epoch that
+it read. `OwnerLease` proves that rule. The outbound mandate is the meet of
+the mandate of A and the tools of the peer entry of B, as
+`Mandate::outbound` computes it.
+
+Invariants:
+
+- `AtMostOnce`: B applies each seq at most once.
+- `NoLostAck`: a message whose delivery A recorded is applied, or it still
+  waits in the inbox of B.
+- `MandateNarrows`: B runs each message within its local mandate, the
+  inbound mandate and the mandate of A. A replay and a duplicate run under
+  the same rule.
+- `ConsumesTheHead`: the decision of the current owner holds the head of
+  the inbox. Its commit therefore consumes the op that it read.
+
+The pass configs also check the liveness property `EventuallyApplied`: B
+applies each committed send. They use `LiveSpec`, which adds weak fairness
+for the commit of A, the relay and B. The nemeses have bounds, so each
+behaviour runs out of them. `EventuallyApplied` with `AtMostOnce` is
+exactly-once delivery.
+
+Each config changes one thing from the design. A red config lists only the
+invariant that it must break:
+
+| Config | Change from the design | Result |
+|---|---|---|
+| `AgentMesh.cfg` | None. | Pass, with `EventuallyApplied`. |
+| `AgentMeshEngineOnly.cfg` | `SeqDedupe = FALSE`, `MaxInFlight = 2` | Pass. |
+| `AgentMeshSeqOnly.cfg` | `EngineDedupe = "off"` | Pass. |
+| `AgentMeshNoDedupe.cfg` | `EngineDedupe = "off"`, `SeqDedupe = FALSE` | Violates `AtMostOnce`. |
+| `AgentMeshRunScope.cfg` | `EngineDedupe = "run"`, `SeqDedupe = FALSE` | Violates `AtMostOnce`. |
+| `AgentMeshPipeline.cfg` | `MaxInFlight = 2` | Violates `NoLostAck`. |
+| `AgentMeshWiden.cfg` | `Accept = "join"` | Violates `MandateNarrows`. |
+| `AgentMeshReach.cfg` | None. | Violates `SomeNemesisUnseen`. |
+
+Each dedupe layer alone keeps delivery exactly once. Turn both off, and the
+relay duplicate runs twice. `AgentMeshRunScope.cfg` shows why the engine
+keeps the keys of the whole chain:
+
+1. A sends seq 1 through the outbox. The relay delivers it and loses the
+   outcome.
+2. B applies seq 1.
+3. B continues as new. A dedupe of one run forgets key 1.
+4. The relay delivers seq 1 again, and B applies it again.
+
+**The `lastSeq` layer needs one send in flight for each peer.** The model
+found this before the code. `AgentMeshPipeline.cfg` gives this trace:
+
+1. A sends seq 1 through the outbox.
+2. A sends seq 2 on the inline path, so B gets it first.
+3. B applies seq 2. `lastSeq` is now 2.
+4. The relay delivers seq 1, and A records the delivery.
+5. B skips seq 1, because `1 <= lastSeq`. `NoLostAck` fails.
+
+Two outbox rows can lose a message in the same way. A sweep retries a row
+on a later tick, after a newer row. Concurrent children (issue #2270) can
+put two sends to one peer in one decision. The code must keep one send in
+flight for each peer, or B must not drop a seq that it has not applied.
+`AgentMeshEngineOnly.cfg` shows that the key dedupe alone is safe with two
+sends in flight.
+
+`AgentMesh.cfg` checks 2 sends, 2 crashes of A, 3 epochs of B, one lost
+relay outcome and one checkpoint. TLC finds 29,094 distinct states and no
+error, in under 10 seconds on 4 cores.
+
+`AgentMeshReach.cfg` must violate `SomeNemesisUnseen`. The violation is
+one behaviour of the design that reaches every tag:
+
+| Tag | Nemesis |
+|---|---|
+| `crash-before-commit` | A crashes with a send that it did not commit. |
+| `crash-before-delivery` | A crashes with its send in the outbox. |
+| `crash-after-delivery` | A crashes with its message delivered and waiting at B. |
+| `relay-duplicate` | The relay delivers one row twice. |
+| `owner-change-abort` | The fence aborts a decision of an old owner of B. |
+| `replay-after-abort` | The new owner runs that message again. |
+| `checkpoint-in-flight` | B continues as new with a message in flight. |
+
+The model has these limits:
+
+- It has one sender and one receiver, and no reply. The reply is a durable
+  promise that A races against a deadline. The deadline ends only the wait
+  of A.
+- A send needs a running target. The model has no `target_unknown` and no
+  `not_running` outcome.
+- A crash of A drops only its decision in flight. A stale writer of A is
+  the `OwnerLease` case.
+- The mandate is a set of tools. Flow labels and budgets are not modelled.
 
 ### Extend a model
 

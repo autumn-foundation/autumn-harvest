@@ -29,3 +29,11 @@ OwnerLease         OwnerLeaseRenewBumps.cfg            violation:OwnerNeverFence
 OwnerLease         OwnerLeaseMemoryAck.cfg             violation:NoAckedSignalLost
 OwnerLease         OwnerLeaseUnloadOnAnyFence.cfg      violation:LiveRowHasAPinnedHolder
 OwnerLease         OwnerLeaseReach.cfg                 violation:SomeNemesisUnseen
+AgentMesh          AgentMesh.cfg                       pass
+AgentMesh          AgentMeshEngineOnly.cfg             pass
+AgentMesh          AgentMeshSeqOnly.cfg                pass
+AgentMesh          AgentMeshNoDedupe.cfg               violation:AtMostOnce
+AgentMesh          AgentMeshRunScope.cfg               violation:AtMostOnce
+AgentMesh          AgentMeshPipeline.cfg               violation:NoLostAck
+AgentMesh          AgentMeshWiden.cfg                  violation:MandateNarrows
+AgentMesh          AgentMeshReach.cfg                  violation:SomeNemesisUnseen
