@@ -22903,6 +22903,8 @@ async fn put_back_cache_entry(
 ) {
     // The tenure check runs under the cache lock, so it cannot race the
     // unload's eviction. The disk purge below reuses its result.
+    // Only the disk tier reads `may_cache` after the lock.
+    #[cfg_attr(not(feature = "owner-disk-cache"), allow(unused_variables))]
     let (may_cache, displaced) = {
         let mut guard = workflow_cache.lock().await;
         let may_cache = owner.may_cache();
