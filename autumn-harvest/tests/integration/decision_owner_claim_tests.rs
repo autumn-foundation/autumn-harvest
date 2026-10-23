@@ -1164,6 +1164,11 @@ async fn a_joiner_takes_each_chunk_in_one_transaction() {
 /// Issue #2296: a batch that names a missing row fails and changes no row.
 #[tokio::test]
 async fn a_batch_acquisition_of_a_missing_row_changes_nothing() {
+    #[derive(QueryableByName)]
+    struct Holder {
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        holder: Option<String>,
+    }
     let db = OwnDb::new().await;
     let mut conn = db.conn().await;
     diesel::sql_query("DELETE FROM harvest_decision_owner WHERE partition = 7")
@@ -1186,11 +1191,6 @@ async fn a_batch_acquisition_of_a_missing_row_changes_nothing() {
         matches!(result, Err(HarvestError::NotFound(_))),
         "{result:?}"
     );
-    #[derive(QueryableByName)]
-    struct Holder {
-        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
-        holder: Option<String>,
-    }
     let row: Holder =
         diesel::sql_query("SELECT holder FROM harvest_decision_owner WHERE partition = 6")
             .get_result(&mut conn)

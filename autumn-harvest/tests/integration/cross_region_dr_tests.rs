@@ -241,6 +241,9 @@ async fn a_bump_expires_every_owner_lease_and_keeps_the_epochs() {
     use autumn_harvest::decision_owner::{
         self, Acquisition, DecisionPartition, OwnerHolder, OwnerLeaseConfig,
     };
+    // The registry is global. A pin of shard 0 by a parallel test would
+    // fence this test's lease writes.
+    let _serial = registry_guard().await;
     let (url, _db) = require_db!("owner_bump");
     let mut conn = connect(&url).await;
     ensure_generation_row(&mut conn, ShardId::new(0))

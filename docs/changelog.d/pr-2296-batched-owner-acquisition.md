@@ -13,6 +13,18 @@ Now the statement count of a scan does not grow with its picks.
 - `acquire` keeps its single-row, waiting form for its other callers.
 - No migration. No new `WorkflowEvent` variant. No `harvest_events` write.
 
+`pg_stat_statements` on Postgres 16.15, one fresh database per run, 512
+acquisitions on one connection:
+
+| Path | Statements | Buffers | WAL bytes |
+|:--|--:|--:|--:|
+| `acquire` per partition | 3,072 | 6,120 | 151,354 |
+| `acquire_many`, chunks of 32 (the worker default) | 96 | 3,443 | 128,431 |
+| `acquire_many`, one batch of 512 | 6 | 4,205 | 159,275 |
+
+The issue counted 5 statements per partition. Issue #2254 later added the
+idle bound, so the count is now 6.
+
 Evidence:
 
 - `decision_owner_db_tests`: one transaction writes each row of a batch

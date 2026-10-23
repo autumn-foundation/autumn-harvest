@@ -163,8 +163,8 @@ pub proof fn theorem_a_batch_is_one_acquisition_per_locked_row(
     assert(run(epochs[p], one) == run(step(epochs[p], one[0]), one.drop_first()));
 }
 
-/// After a batch, the fence refuses each old tenure of a locked row, and
-/// each tenure of a row that the batch did not lock still passes.
+/// After a batch, the fence refuses each old tenure of a locked row. Each
+/// tenure of a row that the batch did not lock still passes.
 pub proof fn theorem_a_batch_fences_only_its_locked_rows(
     epochs: Seq<int>,
     locked: Set<int>,
