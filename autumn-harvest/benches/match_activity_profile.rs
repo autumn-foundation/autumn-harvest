@@ -37,12 +37,11 @@ use autumn_harvest::types::ActivityExecId;
 use serde_json::{Value, json};
 
 fn env_usize(key: &str, default: usize) -> usize {
-    match std::env::var(key) {
-        Ok(value) => value
+    std::env::var(key).map_or(default, |value| {
+        value
             .parse()
-            .unwrap_or_else(|_| panic!("{key} must be an unsigned integer, got {value:?}")),
-        Err(_) => default,
-    }
+            .unwrap_or_else(|_| panic!("{key} must be an unsigned integer, got {value:?}"))
+    })
 }
 
 fn payload(i: usize) -> Value {
@@ -104,18 +103,18 @@ fn main() {
     let reps = env_usize("MATCH_ACTIVITY_PROFILE_REPS", 1);
     let shape = std::env::var("MATCH_ACTIVITY_PROFILE_SHAPE").unwrap_or_else(|_| "fanout".into());
 
-    let mut matched = 0usize;
+    let mut hits = 0usize;
     for _ in 0..reps {
         let mut matcher = HistoryMatcher::new(history(&shape, n));
         for _ in 0..n {
             match matcher.match_activity("charge") {
                 HistoryMatch::Matched { output } => {
                     std::hint::black_box(&output);
-                    matched += 1;
+                    hits += 1;
                 }
                 other => panic!("expected Matched, got {other:?}"),
             }
         }
     }
-    println!("match_activity_profile: shape={shape} n={n} reps={reps} matched={matched}");
+    println!("match_activity_profile: shape={shape} n={n} reps={reps} matched={hits}");
 }
