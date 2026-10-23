@@ -20,7 +20,8 @@
 //! Issue #2252 adds owner mode. A per-database switch turns it on. The
 //! enable step installs a guard on the claim, so a legacy claim takes no
 //! workflow task. Each worker then acquires partitions, renews them and
-//! claims workflow tasks of its own partitions only. See
+//! takes workflow tasks of its own partitions only. Issue #2255 moves the
+//! take off the claim loop, to the owner decider of `worker.rs`. See
 //! [`enable_owner_mode`] and [`OwnerLoop`].
 
 use std::cell::RefCell;
@@ -528,8 +529,55 @@ tokio::task_local! {
     static OWNED: Arc<OwnedPartitions>;
 
     /// The connection and the tenure that the current transaction fenced
-    /// (issue #2252).
-    static FENCED: (usize, OwnerTenure);
+    /// (issue #2252), and the generation row that the fence took (issue
+    /// #2255).
+    static FENCED: (usize, OwnerTenure, StartFence);
+
+    /// The last start fence of the current decision scope, and its
+    /// connection (issue #2255). [`fenced_scope`] reads it.
+    static START: RefCell<Option<(usize, StartFence)>>;
+}
+
+/// What the start fence of a decision transaction locked (issue #2255).
+///
+/// It holds the resolved shard and the pinned generation of the DR
+/// generation row that the fence took, or `None` with no DR pin. An append
+/// in the fenced scope skips its generation check only for that same row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StartFence {
+    generation: Option<(ShardId, i64)>,
+}
+
+impl StartFence {
+    /// A start fence that took the generation row of `generation`, if any.
+    #[must_use]
+    pub const fn new(generation: Option<(ShardId, i64)>) -> Self {
+        Self { generation }
+    }
+
+    /// The resolved shard and the pinned generation of the locked row.
+    #[must_use]
+    pub const fn generation(self) -> Option<(ShardId, i64)> {
+        self.generation
+    }
+}
+
+/// Record that connection `conn` passed a start fence that took `fence`.
+///
+/// [`crate::replication::assert_decision_fence`] calls it. The next
+/// [`fenced_scope`] of `conn` in this decision scope keeps it. Outside a
+/// decision scope it records nothing.
+pub fn record_start_fence(conn: usize, fence: StartFence) {
+    let _ = START.try_with(|start| start.replace(Some((conn, fence))));
+}
+
+/// The start fence that the current [`fenced_scope`] of `conn` holds.
+#[must_use]
+pub fn held_start_fence(conn: usize) -> Option<StartFence> {
+    FENCED
+        .try_with(|(fenced, _, held)| (*fenced == conn).then_some(*held))
+        .ok()
+        .flatten()
 }
 
 /// Run `body` as the rest of a transaction whose decision fence passed.
@@ -543,7 +591,18 @@ tokio::task_local! {
 /// With no tenure pinned, this only runs `body`.
 pub async fn fenced_scope<F: Future>(conn: usize, body: F) -> F::Output {
     match pinned_decision() {
-        Some(tenure) => FENCED.scope((conn, tenure), body).await,
+        Some(tenure) => {
+            // Issue #2255: keep what the start fence of `conn` locked. With
+            // no recorded fence, the scope covers no generation row.
+            let held = START
+                .try_with(|start| *start.borrow())
+                .ok()
+                .flatten()
+                .filter(|(fenced, _)| *fenced == conn)
+                .map(|(_, fence)| fence)
+                .unwrap_or_default();
+            FENCED.scope((conn, tenure, held), body).await
+        }
         None => body.await,
     }
 }
@@ -553,7 +612,7 @@ pub async fn fenced_scope<F: Future>(conn: usize, body: F) -> F::Output {
 #[must_use]
 pub fn already_fenced(conn: usize, tenure: &OwnerTenure) -> bool {
     FENCED
-        .try_with(|(fenced, held)| *fenced == conn && held == tenure)
+        .try_with(|(fenced, held, _)| *fenced == conn && held == tenure)
         .unwrap_or(false)
 }
 
@@ -575,7 +634,9 @@ pub fn current_owned() -> Option<Arc<OwnedPartitions>> {
 
 /// Run `body` in a decision scope. [`pin_decision`] sets its tenure.
 pub async fn scope_decision<F: Future>(body: F) -> F::Output {
-    DECISION.scope(RefCell::new(None), body).await
+    DECISION
+        .scope(RefCell::new(None), START.scope(RefCell::new(None), body))
+        .await
 }
 
 /// Pin `tenure` for the rest of the current decision scope.

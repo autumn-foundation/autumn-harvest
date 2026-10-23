@@ -8157,15 +8157,15 @@
           "targets": [
             {
               "refId": "A",
-              "expr": "sum by (instance, kind, shard) (rate(harvest_db_query_duration_sum{op=\"claim\"}[$__rate_interval])) / sum by (instance, kind, shard) (rate(harvest_db_query_duration_count{op=\"claim\"}[$__rate_interval]))",
-              "legendFormat": "{{kind}} shard {{shard}} @ {{instance}}",
+              "expr": "sum by (instance, op, kind, shard) (rate(harvest_db_query_duration_sum{op=~\"claim|take\"}[$__rate_interval])) / sum by (instance, op, kind, shard) (rate(harvest_db_query_duration_count{op=~\"claim|take\"}[$__rate_interval]))",
+              "legendFormat": "{{op}} {{kind}} shard {{shard}} @ {{instance}}",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"
               }
             }
           ],
-          "description": "Mean seconds of one claim, by what it returned: workflow, activity, empty or error (issue #2248). Workflow and activity tasks share one claim statement. A rise in one kind only points at its own rows. See docs/performance-decision-owner-baseline.md."
+          "description": "Mean seconds of one claim, by what it returned: workflow, activity, empty or error (issue #2248). Workflow and activity tasks share one claim statement. A rise in one kind only points at its own rows. In owner mode, the take series times the claim by execution of an owner decider (issue #2255). See docs/performance-decision-owner-baseline.md."
         },
         {
           "id": 258100,

@@ -3528,7 +3528,8 @@ pub async fn claim_task_by_id_with_owner(
 ///
 /// The owner decider calls this for an execution of an owned partition. It
 /// learned of the row from an owner wake or from [`owner_scan`]. The take
-/// reads no queue head. It runs the owned by-execution claim, so every gate
+/// reads no queue head. A fair worker charges the key after the rechecks,
+/// as its owned claim did. It runs the owned by-execution claim, so every gate
 /// of the claim, the claim guard and the post-claim rechecks apply. A row
 /// that is not `PENDING` and due, or that a gate refuses, returns `None`.
 ///
@@ -3545,8 +3546,14 @@ pub async fn claim_workflow_task_of_execution(
     circuit_breaker_activities: &[String],
     ineligible_activities: &[String],
     shard: Option<crate::types::ShardId>,
+    fairness: ClaimFairness,
     owned: &OwnedClaim,
 ) -> HarvestResult<Option<TaskQueueItem>> {
+    if fairness == ClaimFairness::Keys {
+        for queue in queues {
+            crate::queue_fairness::validate_fairness_queue_name(queue)?;
+        }
+    }
     let mut tx = conn.build_transaction().read_committed();
     let outcome: ClaimOutcome = tx
         .run(
@@ -3571,7 +3578,8 @@ pub async fn claim_workflow_task_of_execution(
                 let Some(task) = result.into_iter().next() else {
                     return Ok(ClaimOutcome::Empty);
                 };
-                apply_post_claim_rechecks(conn, task, worker_id).await
+                // A fair worker charges the key, as its owned claim did.
+                recheck_and_charge(conn, task, worker_id, fairness).await
             },
         )
         .await?;
@@ -3600,35 +3608,65 @@ struct OwnerScanRow {
     wait_secs: f64,
 }
 
+/// The row filter of [`OWNER_SCAN_SQL`], in each branch.
+///
+/// The scan skips a run that is `PAUSED`, a paused queue and each execution
+/// of `skip`. Those rows stay `PENDING`, so a scan that read them would
+/// return them again and starve the rows behind them. The paused queues are
+/// one array, read once, as in the claim. A join there would make the
+/// planner sort each partition instead of reading it in index order.
+macro_rules! owner_scan_filter {
+    () => {
+        "t.state = 'PENDING' AND t.task_type = 'workflow' \
+         AND t.workflow_exec_id IS NOT NULL \
+         AND t.queue_name = ANY($1) \
+         AND NOT (t.workflow_exec_id = ANY($3::uuid[])) \
+         AND NOT (t.queue_name = ANY(paused.names)) \
+         AND NOT EXISTS ( SELECT 1 FROM harvest_workflow_executions e \
+                          WHERE e.id = t.workflow_exec_id AND e.state = 'PAUSED' ) "
+    };
+}
+
 /// Read the pending workflow tasks of an owner's partitions, by due time.
 ///
-/// `idx_harvest_tq_owner_scan` serves the order. The scan skips a run that
-/// is `PAUSED`, a paused queue and each execution of `skip`. Those rows stay
-/// `PENDING`, so a scan that read them would return them again and starve
-/// the rows behind them.
-const OWNER_SCAN_SQL: &str = "SELECT t.workflow_exec_id AS exec_id, \
-         GREATEST(EXTRACT(EPOCH FROM (t.scheduled_at - NOW())), 0)::float8 AS wait_secs \
-     FROM harvest_task_queue t \
-     WHERE t.state = 'PENDING' AND t.task_type = 'workflow' \
-       AND t.workflow_exec_id IS NOT NULL \
-       AND t.queue_name = ANY($1) \
-       AND ( t.decision_partition IS NULL \
-             OR get_bit($2::bytea, t.decision_partition) = 1 ) \
-       AND NOT (t.workflow_exec_id = ANY($3::uuid[])) \
-       AND NOT EXISTS ( SELECT 1 FROM harvest_queue_pauses p \
-                        WHERE p.queue_name = t.queue_name ) \
-       AND NOT EXISTS ( SELECT 1 FROM harvest_workflow_executions e \
-                        WHERE e.id = t.workflow_exec_id AND e.state = 'PAUSED' ) \
-     ORDER BY t.scheduled_at \
-     LIMIT $4";
+/// `idx_harvest_tq_owner_scan` leads with the partition. One branch reads
+/// the first rows of each owned partition in index order. The other reads
+/// the first unstamped rows. So a scan reads at most `limit` rows per owned
+/// partition, never the rows of another owner and never a whole backlog.
+const OWNER_SCAN_SQL: &str = concat!(
+    "WITH paused AS MATERIALIZED ( \
+         SELECT COALESCE(array_agg(queue_name), ARRAY[]::text[]) AS names \
+         FROM harvest_queue_pauses WHERE queue_name = ANY($1) \
+     ) \
+     SELECT s.exec_id, \
+         GREATEST(EXTRACT(EPOCH FROM (s.scheduled_at - NOW())), 0)::float8 AS wait_secs \
+     FROM ( \
+         ( SELECT r.exec_id, r.scheduled_at \
+           FROM unnest($2::int2[]) AS owned(partition) \
+           CROSS JOIN LATERAL ( \
+               SELECT t.workflow_exec_id AS exec_id, t.scheduled_at \
+               FROM harvest_task_queue t, paused \
+               WHERE t.decision_partition = owned.partition AND ",
+    owner_scan_filter!(),
+    "ORDER BY t.scheduled_at LIMIT $4 ) r ) \
+         UNION ALL \
+         ( SELECT t.workflow_exec_id, t.scheduled_at \
+           FROM harvest_task_queue t, paused \
+           WHERE t.decision_partition IS NULL AND ",
+    owner_scan_filter!(),
+    "ORDER BY t.scheduled_at LIMIT $4 ) \
+     ) s \
+     ORDER BY s.scheduled_at \
+     LIMIT $4"
+);
 
 /// Scan the pending workflow tasks of an owner's partitions (issue #2255).
 ///
-/// The owner decider runs it at each tenure change, when its permits free
-/// up, and once per poll interval. It finds a row that no wake reached: a
-/// lost `NOTIFY`, a due timer, or the backlog of a new partition. An
-/// unstamped row passes too. The take then stamps it and re-pends it to its
-/// owner.
+/// The owner decider runs it at each tenure change, after a full scan, and
+/// at the next due time, at most one poll interval apart. It finds a row
+/// that no wake reached: a lost `NOTIFY`, a due timer, or the backlog of a
+/// new partition. An unstamped row passes too. The take then stamps it and
+/// re-pends it to its owner.
 ///
 /// The scan returns at most `limit` due executions. The first row that is
 /// not due gives [`OwnerScan::next_due`].
@@ -3645,7 +3683,7 @@ pub async fn owner_scan(
 ) -> HarvestResult<OwnerScan> {
     let rows: Vec<OwnerScanRow> = diesel::sql_query(OWNER_SCAN_SQL)
         .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queues)
-        .bind::<diesel::sql_types::Bytea, _>(owned.mask())
+        .bind::<diesel::sql_types::Array<diesel::sql_types::SmallInt>, _>(&owned.partitions)
         .bind::<diesel::sql_types::Array<diesel::sql_types::Uuid>, _>(skip)
         .bind::<diesel::sql_types::BigInt, _>(
             i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX),
@@ -6270,23 +6308,25 @@ async fn requeue_claimed_workflow_task_with_backoff(
             dsl::priority,
             dsl::scheduled_at,
             dsl::workflow_exec_id,
+            sql::<diesel::sql_types::Bool>("scheduled_at <= clock_timestamp()"),
         ))
-        .get_results::<(String, i32, chrono::DateTime<Utc>, Option<Uuid>)>(conn)
+        .get_results::<(String, i32, chrono::DateTime<Utc>, Option<Uuid>, bool)>(conn)
         .await
         .map_err(crate::error::database_error)?;
     if updated.is_empty() {
         return Ok(false);
     }
-    // Issue #2255: the owner decider of the row's partition takes it. A
-    // fenced owner re-pends here, and the new owner learns of the row at
-    // once instead of at its next scan.
-    // A slice pattern, because Diesel's `first` shadows the slice method.
-    if let [(_, _, _, Some(exec_id)), ..] = updated.as_slice() {
+    // Issue #2255: a row that is due now wakes the owner decider of its
+    // partition. A fenced owner re-pends here, and the new owner learns of
+    // the row at once. A delayed row needs no wake: the scan reads its due
+    // time. A slice pattern, because Diesel's `first` shadows the slice
+    // method.
+    if let [(_, _, _, Some(exec_id), true), ..] = updated.as_slice() {
         crate::notify::notify_owner(conn, *exec_id, false).await?;
     }
     let updated = updated
         .into_iter()
-        .map(|(queue_name, priority, scheduled_at, _)| (queue_name, priority, scheduled_at))
+        .map(|(queue_name, priority, scheduled_at, _, _)| (queue_name, priority, scheduled_at))
         .collect();
     finish_workflow_backoff_requeue(claim.task_id, updated)?;
     Ok(true)

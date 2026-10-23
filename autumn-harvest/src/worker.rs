@@ -29933,8 +29933,9 @@ impl OwnerWakes {
         }
     }
 
-    /// Evict the entry of an evict wake, count the wake, hand the execution
-    /// to the owner decider and wake the poll loop.
+    /// Evict the entry of an evict wake, count the wake and hand the
+    /// execution to the owner decider. With owner mode off, wake the poll
+    /// loop too.
     async fn handle(&self, wake: &crate::notify::OwnerWake) {
         let kind = if wake.payload.evict {
             // Drop the parked future outside the cache lock.
@@ -29952,9 +29953,12 @@ impl OwnerWakes {
             .record_decision_owner_woken(&self.shard.as_i32().to_string(), kind);
         // Issue #2255: the decider takes the task of a woken run. An evict
         // wake can mark a state change that needs a decision, such as a
-        // resume, so it is a hint too.
+        // resume, so it is a hint too. Where the decider runs, the claim
+        // loops claim activities only, so the wake does not reach them.
         self.hints.push(self.shard, wake.payload.workflow_exec_id);
-        self.woken.notify_one();
+        if self.owned.owned_claim(self.shard).is_none() {
+            self.woken.notify_one();
+        }
     }
 }
 
@@ -35019,7 +35023,8 @@ struct ClaimTarget<'a> {
     global_dispatch: bool,
 }
 
-/// One owned database of an owner decider (issue #2255).
+/// One database of an owner decider (issue #2255). The decider idles while
+/// owner mode is off there.
 ///
 /// See [`Worker::run_owner_decider`].
 struct DeciderTarget<'a> {
@@ -35031,6 +35036,201 @@ struct DeciderTarget<'a> {
     registration_pending: &'a AtomicBool,
     /// The pool acquisition bound. See [`shard_acquire_bound`].
     acquire_bound: Option<Duration>,
+}
+
+/// The most rows that one owner scan returns (issue #2255).
+///
+/// A scan returns up to the workflow slot count, so a backlog drain scans
+/// once per batch, not once per decision.
+const OWNER_SCAN_LIMIT_MAX: usize = 64;
+
+/// The longest backoff of an execution whose takes find nothing (issue
+/// #2255).
+const OWNER_TAKE_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// How often the decider logs a failure at warn level (issue #2255).
+const OWNER_DECIDER_WARN_INTERVAL: Duration = Duration::from_secs(10);
+
+/// One ended future of an owner decider (issue #2255).
+enum DeciderEvent {
+    /// A scan ended.
+    Scanned(HarvestResult<queue::OwnerScan>),
+    /// The take of one execution ended.
+    Taken(uuid::Uuid, OwnerTake),
+}
+
+/// The local state of one owner decider (issue #2255).
+///
+/// It holds execution ids only. The task rows hold the work.
+struct DeciderState {
+    poll: Duration,
+    /// Owner mode is on, and the decider runs.
+    active: bool,
+    /// The executions to take, in arrival order. `queued` dedupes them.
+    ready: std::collections::VecDeque<uuid::Uuid>,
+    queued: HashSet<uuid::Uuid>,
+    /// The executions with a take in flight.
+    in_flight: HashSet<uuid::Uuid>,
+    /// The executions that a wake named while their take ran.
+    rewake: HashSet<uuid::Uuid>,
+    /// The executions whose takes found nothing: the end of the backoff
+    /// and the number of misses in a row.
+    backoff: HashMap<uuid::Uuid, (std::time::Instant, u32)>,
+    /// A scan runs.
+    scanning: bool,
+    /// The time of the next scan.
+    scan_at: std::time::Instant,
+    /// The last warn-level log.
+    warned: Option<std::time::Instant>,
+}
+
+impl DeciderState {
+    fn new(poll: Duration) -> Self {
+        Self {
+            poll,
+            active: false,
+            ready: std::collections::VecDeque::new(),
+            queued: HashSet::new(),
+            in_flight: HashSet::new(),
+            rewake: HashSet::new(),
+            backoff: HashMap::new(),
+            scanning: false,
+            scan_at: std::time::Instant::now(),
+            warned: None,
+        }
+    }
+
+    /// Owner mode is on. On the change from off, scan at once.
+    fn activate(&mut self, now: std::time::Instant) {
+        if !self.active {
+            self.active = true;
+            self.scan_at = now;
+        }
+    }
+
+    /// Owner mode is off. Forget every hint.
+    fn deactivate(&mut self) {
+        self.active = false;
+        self.ready.clear();
+        self.queued.clear();
+        self.rewake.clear();
+        self.backoff.clear();
+    }
+
+    /// A new tenure brings a backlog that no wake named. Scan at once, with
+    /// no backoff.
+    fn tenure_changed(&mut self) {
+        self.scan_at = std::time::Instant::now();
+        self.backoff.clear();
+    }
+
+    /// Queue `exec` at the back, once. A full queue drops it: the scan
+    /// finds the row.
+    fn queue(&mut self, exec: uuid::Uuid) {
+        if self.ready.len() < OWNER_HINTS_MAX && self.queued.insert(exec) {
+            self.ready.push_back(exec);
+        }
+    }
+
+    /// Put back an execution that found no permit.
+    fn queue_front(&mut self, exec: uuid::Uuid) {
+        if self.queued.insert(exec) {
+            self.ready.push_front(exec);
+        }
+    }
+
+    /// A wake named `exec`. A wake is news, so it ends the backoff. A wake
+    /// during a take queues the execution again after the take.
+    fn hint(&mut self, exec: uuid::Uuid) {
+        self.backoff.remove(&exec);
+        if self.in_flight.contains(&exec) {
+            self.rewake.insert(exec);
+        } else {
+            self.queue(exec);
+        }
+    }
+
+    /// The next execution to take, skipping one that is in flight or backs
+    /// off.
+    fn pop(&mut self, now: std::time::Instant) -> Option<uuid::Uuid> {
+        while let Some(exec) = self.ready.pop_front() {
+            self.queued.remove(&exec);
+            let backs_off = self
+                .backoff
+                .get(&exec)
+                .is_some_and(|(until, _)| *until > now);
+            if !self.in_flight.contains(&exec) && !backs_off {
+                return Some(exec);
+            }
+        }
+        None
+    }
+
+    /// A take of `exec` claimed its row.
+    fn took(&mut self, exec: uuid::Uuid) {
+        self.in_flight.remove(&exec);
+        self.rewake.remove(&exec);
+        self.backoff.remove(&exec);
+    }
+
+    /// A take of `exec` found nothing or failed.
+    fn missed(&mut self, exec: uuid::Uuid, now: std::time::Instant) {
+        self.in_flight.remove(&exec);
+        if self.rewake.remove(&exec) {
+            self.queue(exec);
+            return;
+        }
+        let misses = self.backoff.get(&exec).map_or(0, |(_, misses)| misses + 1);
+        let wait = owner_take_backoff(self.poll, misses);
+        self.backoff.insert(exec, (now + wait, misses));
+    }
+
+    /// Whether a scan can start now, apart from its time.
+    fn can_scan(&self, limit: usize) -> bool {
+        !self.scanning && self.ready.len() < limit
+    }
+
+    /// Whether a scan starts now.
+    fn may_scan(&self, now: std::time::Instant, limit: usize) -> bool {
+        self.can_scan(limit) && now >= self.scan_at
+    }
+
+    /// The executions that a scan skips: queued, in flight or backing off.
+    /// Old backoff entries go, so the list stays bounded.
+    fn skip(&mut self, now: std::time::Instant) -> Vec<uuid::Uuid> {
+        let horizon = OWNER_TAKE_BACKOFF_MAX * 2;
+        self.backoff
+            .retain(|_, (until, _)| now.saturating_duration_since(*until) < horizon);
+        self.queued
+            .iter()
+            .chain(self.in_flight.iter())
+            .copied()
+            .chain(
+                self.backoff
+                    .iter()
+                    .filter(|(_, (until, _))| *until > now)
+                    .map(|(exec, _)| *exec),
+            )
+            .collect()
+    }
+
+    /// Whether a warn-level log is due. Other failures log at debug level.
+    fn may_warn(&mut self, now: std::time::Instant) -> bool {
+        let due = self
+            .warned
+            .is_none_or(|last| now.duration_since(last) >= OWNER_DECIDER_WARN_INTERVAL);
+        if due {
+            self.warned = Some(now);
+        }
+        due
+    }
+}
+
+/// The backoff after `misses` earlier misses in a row (issue #2255): one
+/// poll interval, doubled per miss, at most [`OWNER_TAKE_BACKOFF_MAX`].
+fn owner_take_backoff(poll: Duration, misses: u32) -> Duration {
+    poll.saturating_mul(1u32 << misses.min(16))
+        .min(OWNER_TAKE_BACKOFF_MAX)
 }
 
 /// What one owner take returned (issue #2255).
@@ -40255,26 +40455,30 @@ impl Worker {
     ///
     /// It learns of work from two sources. An owner wake names an execution.
     /// A scan reads the pending workflow rows of its partitions by due time.
-    /// The scan runs at each tenure change and when permits free up after a
-    /// full scan. It also runs at the next due time, at most one poll
-    /// interval apart. So a lost wake, a due timer and the backlog of a new
-    /// partition all reach it.
+    /// The scan runs at each tenure change and after a full scan. It also
+    /// runs at the next due time, at most one poll interval apart. So a lost
+    /// wake, a due timer and the backlog of a new partition all reach it.
     ///
-    /// Each take is the owned by-execution claim. It runs in its own future,
-    /// bounded by the workflow permits, and dispatches as a claim does. The
-    /// row serializes the decisions of one execution, so the decider never
-    /// runs two at once.
+    /// Each take is the owned by-execution claim. Takes and scans run as
+    /// futures beside the loop, so a scan never stalls a take. The workflow
+    /// permits bound the takes. The row serializes the decisions of one
+    /// execution, so the decider never runs two at once.
     ///
     /// The decider holds execution ids only. It acknowledges nothing, so a
-    /// lost hint costs latency, not work (restate#4566).
+    /// lost hint costs latency, not work (restate#4566). With owner mode off
+    /// on its database, it waits and sends no query.
     async fn run_owner_decider(&self, target: &DeciderTarget<'_>) {
         use futures::StreamExt as _;
         let owner_shard = self.owner_shard_of(target.shard);
-        let mut takes = futures::stream::FuturesUnordered::new();
-        let mut in_flight: HashSet<uuid::Uuid> = HashSet::new();
-        let mut backoff: HashMap<uuid::Uuid, std::time::Instant> = HashMap::new();
-        let mut ready: std::collections::VecDeque<uuid::Uuid> = std::collections::VecDeque::new();
-        let mut scan_at = std::time::Instant::now();
+        let poll = self.config.poll_interval;
+        let limit = self
+            .config
+            .max_concurrent_workflows
+            .clamp(1, OWNER_SCAN_LIMIT_MAX);
+        let mut events: futures::stream::FuturesUnordered<
+            std::pin::Pin<Box<dyn std::future::Future<Output = DeciderEvent> + Send + '_>>,
+        > = futures::stream::FuturesUnordered::new();
+        let mut state = DeciderState::new(poll);
         loop {
             // Arm each wake before the reads, so a change after a read still
             // ends the wait below.
@@ -40289,55 +40493,28 @@ impl Worker {
                 break;
             }
             let now = std::time::Instant::now();
-            backoff.retain(|_, until| *until > now);
             let pending = AtomicBool::load(target.registration_pending, Ordering::Relaxed);
             let owned = self
                 .owned_claim(target.shard)
                 .filter(|_| may_claim_tasks(pending));
             let mut blocked = false;
             if let Some(owned) = owned {
-                // A wake is news, so it lifts the backoff of its execution.
+                state.activate(now);
                 for exec in self.owner_hints.take(owner_shard) {
-                    backoff.remove(&exec);
-                    if !ready.contains(&exec) {
-                        ready.push_back(exec);
-                    }
-                }
-                let free =
-                    Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow);
-                // With no permit, wait for one. A freed permit or an ended
-                // take ends the wait.
-                blocked = free == 0 && (!ready.is_empty() || now >= scan_at);
-                if ready.is_empty() && now >= scan_at && free > 0 {
-                    let skip: Vec<uuid::Uuid> =
-                        in_flight.iter().chain(backoff.keys()).copied().collect();
-                    match self.owner_scan_once(target, &owned, &skip, free).await {
-                        Ok(scan) => {
-                            let full = scan.due.len() >= free;
-                            ready.extend(scan.due);
-                            let wait = scan.next_due.map_or(self.config.poll_interval, |due| {
-                                due.min(self.config.poll_interval)
-                            });
-                            // A full scan may leave due rows. Scan again as
-                            // soon as a permit frees.
-                            scan_at = if full { now } else { now + wait };
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                worker_id = %self.config.worker_id,
-                                error = %error,
-                                "owner decider scan failed"
-                            );
-                            scan_at = now + self.config.poll_interval;
-                        }
-                    }
+                    state.hint(exec);
                 }
                 let owned = Arc::new(owned);
-                while let Some(&exec) = ready.front() {
-                    if in_flight.contains(&exec) || backoff.contains_key(&exec) {
-                        ready.pop_front();
-                        continue;
-                    }
+                if state.may_scan(now, limit) {
+                    state.scanning = true;
+                    let skip = state.skip(now);
+                    let owned = Arc::clone(&owned);
+                    events.push(Box::pin(async move {
+                        DeciderEvent::Scanned(
+                            self.owner_scan_once(target, &owned, &skip, limit).await,
+                        )
+                    }));
+                }
+                while !state.ready.is_empty() {
                     if Self::free_permits(
                         &self.workflow_semaphore,
                         &self.dispatch_reserved_workflow,
@@ -40346,40 +40523,49 @@ impl Worker {
                         blocked = true;
                         break;
                     }
+                    let Some(exec) = state.pop(now) else {
+                        break;
+                    };
                     let Ok(permit) = Arc::clone(&self.workflow_semaphore).try_acquire_owned()
                     else {
+                        state.queue_front(exec);
                         blocked = true;
                         break;
                     };
-                    ready.pop_front();
-                    in_flight.insert(exec);
-                    takes.push(self.owner_take(target, exec, Arc::clone(&owned), permit));
+                    state.in_flight.insert(exec);
+                    let owned = Arc::clone(&owned);
+                    events.push(Box::pin(async move {
+                        DeciderEvent::Taken(
+                            exec,
+                            self.owner_take(target, exec, &owned, permit).await,
+                        )
+                    }));
+                }
+                if blocked {
+                    // The slot tuner reads a refused kind as backlog (#548).
+                    AtomicBool::store(&self.gate_refused.workflow, true, Ordering::Relaxed);
                 }
             } else {
                 // Owner mode is off here, or the registration is pending. The
                 // claim loops take the workflow tasks.
-                ready.clear();
+                state.deactivate();
                 let _ = self.owner_hints.take(owner_shard);
-                scan_at = now;
             }
-            let wait = if blocked {
-                self.config.poll_interval
-            } else {
-                scan_at
+            let wait = if state.active && !blocked && state.can_scan(limit) {
+                state
+                    .scan_at
                     .saturating_duration_since(std::time::Instant::now())
-                    .min(self.config.poll_interval)
+                    .min(poll)
+            } else {
+                poll
             };
             tokio::select! {
                 biased;
                 () = self.shutdown.cancelled() => break,
-                Some((exec, taken)) = takes.next(), if !takes.is_empty() => {
-                    in_flight.remove(&exec);
-                    self.finish_owner_take(target, exec, taken, &mut backoff);
+                Some(event) = events.next(), if !events.is_empty() => {
+                    self.finish_decider_event(target, event, &mut state, limit);
                 }
-                () = changed => {
-                    // A new tenure brings a backlog that no wake named.
-                    scan_at = std::time::Instant::now();
-                }
+                () = changed => state.tenure_changed(),
                 () = pushed => {}
                 () = freed => {}
                 () = tokio::time::sleep(wait) => {}
@@ -40387,8 +40573,8 @@ impl Worker {
         }
         // A take that already claimed its row must still dispatch it. The
         // dispatch gives the claim back at shutdown, so the row is not lost.
-        while let Some((exec, taken)) = takes.next().await {
-            self.finish_owner_take(target, exec, taken, &mut backoff);
+        while let Some(event) = events.next().await {
+            self.finish_decider_event(target, event, &mut state, limit);
         }
     }
 
@@ -40414,9 +40600,9 @@ impl Worker {
         &self,
         target: &DeciderTarget<'_>,
         exec: uuid::Uuid,
-        owned: Arc<queue::OwnedClaim>,
+        owned: &queue::OwnedClaim,
         permit: tokio::sync::OwnedSemaphorePermit,
-    ) -> (uuid::Uuid, OwnerTake) {
+    ) -> OwnerTake {
         let started = std::time::Instant::now();
         let mut conn = match self
             .acquire_timed(target.pool, target.acquire_bound, target.shard)
@@ -40430,7 +40616,7 @@ impl Worker {
                         .metrics
                         .record_db_pool_acquire_timeout(SITE_CLAIM);
                 }
-                return (exec, OwnerTake::Failed(error));
+                return OwnerTake::Failed(error);
             }
         };
         let circuit_breakers = self.registry.circuit_breakers();
@@ -40447,7 +40633,8 @@ impl Worker {
                     circuit_breaker_activities,
                     &exclusions,
                     target.shard,
-                    &owned,
+                    self.claim_fairness(),
+                    owned,
                 )
                 .await
             })
@@ -40461,31 +40648,57 @@ impl Worker {
                 .metrics
                 .record_owner_take_duration(kind, *label, elapsed);
         }
-        let outcome = match taken {
+        match taken {
             Ok(Some(task)) => OwnerTake::Taken(task, permit),
             Ok(None) => OwnerTake::Empty,
             Err(error) => OwnerTake::Failed(error),
-        };
-        (exec, outcome)
+        }
     }
 
-    /// Dispatch a taken row, or back off from an execution whose take found
-    /// nothing (issue #2255).
+    /// Apply one ended scan or take to the decider state (issue #2255).
     ///
-    /// A take finds nothing when a gate refused the row, or when its
-    /// decision still runs. The decider then skips the execution in its
-    /// scans for one poll interval. So a refused row cannot hold the head
-    /// of each scan. A running decision wakes its row again when it parks,
-    /// and that wake lifts the backoff.
-    fn finish_owner_take(
+    /// A taken row dispatches as a claimed row does. A take finds nothing
+    /// when a gate refused the row, when its decision still runs, or when
+    /// the row is not due yet. The decider then skips the execution in its
+    /// scans, for a time that doubles with each miss. So a refused row
+    /// cannot hold the head of each scan. A wake that came during the take
+    /// queues the execution again at once.
+    fn finish_decider_event(
         &self,
         target: &DeciderTarget<'_>,
-        exec: uuid::Uuid,
-        taken: OwnerTake,
-        backoff: &mut HashMap<uuid::Uuid, std::time::Instant>,
+        event: DeciderEvent,
+        state: &mut DeciderState,
+        limit: usize,
     ) {
-        match taken {
-            OwnerTake::Taken(task, permit) => {
+        let now = std::time::Instant::now();
+        match event {
+            DeciderEvent::Scanned(Ok(scan)) => {
+                state.scanning = false;
+                let full = scan.due.len() >= limit;
+                for exec in scan.due {
+                    state.queue(exec);
+                }
+                // A full scan may leave due rows. Scan again when the queue
+                // drains.
+                state.scan_at = if full {
+                    now
+                } else {
+                    now + scan.next_due.map_or(state.poll, |due| due.min(state.poll))
+                };
+            }
+            DeciderEvent::Scanned(Err(error)) => {
+                state.scanning = false;
+                state.scan_at = now + state.poll;
+                if state.may_warn(now) {
+                    tracing::warn!(
+                        worker_id = %self.config.worker_id,
+                        error = %error,
+                        "owner decider scan failed"
+                    );
+                }
+            }
+            DeciderEvent::Taken(exec, OwnerTake::Taken(task, permit)) => {
+                state.took(exec);
                 tracing::debug!(
                     task_id = %task.id,
                     workflow_exec_id = %exec,
@@ -40496,19 +40709,21 @@ impl Worker {
                 }
                 self.dispatch_task(task, target.pool, target.shard, None, Some(permit), None);
             }
-            OwnerTake::Empty => {
-                backoff.insert(exec, std::time::Instant::now() + self.config.poll_interval);
-                self.decider_capacity.notify_waiters();
+            DeciderEvent::Taken(exec, OwnerTake::Empty) => {
+                state.missed(exec, now);
+                self.capacity_freed.notify_one();
             }
-            OwnerTake::Failed(error) => {
-                tracing::warn!(
-                    worker_id = %self.config.worker_id,
-                    workflow_exec_id = %exec,
-                    error = %error,
-                    "owner take failed"
-                );
-                backoff.insert(exec, std::time::Instant::now() + self.config.poll_interval);
-                self.decider_capacity.notify_waiters();
+            DeciderEvent::Taken(exec, OwnerTake::Failed(error)) => {
+                state.missed(exec, now);
+                self.capacity_freed.notify_one();
+                if state.may_warn(now) {
+                    tracing::warn!(
+                        worker_id = %self.config.worker_id,
+                        workflow_exec_id = %exec,
+                        error = %error,
+                        "owner take failed"
+                    );
+                }
             }
         }
     }
@@ -56939,6 +57154,61 @@ mod tests {
             "no activity permit refuses the activity kind only"
         );
         assert_eq!(decider_gate(PollAdmission::Any), PollAdmission::Any);
+    }
+
+    /// The decider state skips an in-flight or backing-off execution, and a
+    /// wake during a take queues it again (issue #2255).
+    #[test]
+    fn decider_state_backs_off_and_requeues_a_rewoken_take() {
+        let poll = Duration::from_millis(25);
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(poll);
+        let exec = uuid::Uuid::new_v4();
+        state.queue(exec);
+        state.queue(exec);
+        assert_eq!(state.ready.len(), 1, "a queued execution is queued once");
+        assert_eq!(state.pop(now), Some(exec));
+        state.in_flight.insert(exec);
+        state.hint(exec);
+        assert!(state.ready.is_empty(), "a wake during a take waits for it");
+        state.missed(exec, now);
+        assert_eq!(state.pop(now), Some(exec), "the wake queues it again");
+        state.in_flight.insert(exec);
+        state.missed(exec, now);
+        assert!(state.skip(now).contains(&exec), "a miss backs off");
+        state.queue(exec);
+        assert_eq!(state.pop(now), None, "a backing-off execution is skipped");
+        state.hint(exec);
+        assert_eq!(state.pop(now), Some(exec), "a wake ends the backoff");
+    }
+
+    /// A miss doubles the backoff up to its cap (issue #2255).
+    #[test]
+    fn owner_take_backoff_doubles_to_its_cap() {
+        let poll = Duration::from_millis(25);
+        assert_eq!(owner_take_backoff(poll, 0), poll);
+        assert_eq!(owner_take_backoff(poll, 1), poll * 2);
+        assert_eq!(owner_take_backoff(poll, 3), poll * 8);
+        assert_eq!(owner_take_backoff(poll, 40), OWNER_TAKE_BACKOFF_MAX);
+    }
+
+    /// The decider scans when due and never while a scan runs or its queue
+    /// is full (issue #2255).
+    #[test]
+    fn decider_state_scans_only_when_it_can() {
+        let poll = Duration::from_millis(25);
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(poll);
+        state.activate(now);
+        assert!(state.may_scan(now, 2));
+        state.scanning = true;
+        assert!(!state.may_scan(now, 2), "one scan at a time");
+        state.scanning = false;
+        state.queue(uuid::Uuid::new_v4());
+        state.queue(uuid::Uuid::new_v4());
+        assert!(!state.may_scan(now, 2), "a full queue scans no more");
+        state.deactivate();
+        assert!(state.ready.is_empty() && !state.active);
     }
 
     /// Owner hints dedupe per shard and drain once (issue #2255).

@@ -54,10 +54,10 @@ Any other delta declines. A decline drops the resident workflow and runs a cold 
 Owner mode (issue #2252, [ADR 0009](adr/0009-decision-owner.md)) gives each execution one owner worker. It replaces the sticky lease for workflow tasks. Activity tasks do not change.
 
 - **One owner per partition.** Each database has 512 decision partitions. The partition of an execution is a hash of its `workflow_id`. A worker holds a lease on each partition that it owns.
-- **Owned claim.** An owner claims a workflow task only from its own partitions. The sticky gate does not apply to a workflow row, and the park writes no pin. So no window expires, and every decision of an execution runs on its owner.
+- **Owned take.** Only the owner takes a workflow task of its partitions. The sticky gate does not apply to a workflow row, and the park writes no pin. So no window expires, and every decision of an execution runs on its owner.
 - **Unstamped rows.** Each new workflow task carries its partition. A row with none, from an old binary or a dead-letter redrive, is claimable by any owner. That owner stamps the row and re-pends it to the right owner.
 - **Resident hits survive.** The owner keeps the resident workflow between decisions, however long the next activity, timer or signal takes. A decision replays cold only after an eviction, a restart or a change of owner.
-- **Balance.** Each worker targets `⌈512 / live owners⌉` partitions. A live owner is a worker whose owner loop scanned in the last 3 s. A worker that joins takes free partitions. A worker above its target plus one stops claiming the extra ones and releases them one scan later. A graceful stop releases every partition in one statement.
+- **Balance.** Each worker targets `⌈512 / live owners⌉` partitions. A live owner is a worker whose owner loop scanned in the last 3 s. A worker that joins takes free partitions. A worker above its target plus one stops taking work in the extra ones and releases them one scan later. A graceful stop releases every partition in one statement.
 - **Who owns.** A worker with no workflow slot or no workflow type never owns a partition. It still claims activity tasks.
 - **Failover.** A crashed owner drops out of the live owners within 3 s. Its leases lapse after the TTL, 10 s by default. A peer scans just after that lease end and acquires its partitions. A new owner starts cold. [`performance-owner-failover.md`](performance-owner-failover.md) records the measured bounds.
 - **Fence.** Each decision commit checks the owner's lease epoch. A stale owner cannot write. See [ADR 0009](adr/0009-decision-owner.md).
@@ -66,8 +66,8 @@ Owner mode (issue #2252, [ADR 0009](adr/0009-decision-owner.md)) gives each exec
 | | Sticky routing | Owner mode |
 |---|---|---|
 | Affinity | 5 s lease on the task row | Lease on the decision partition |
-| After the window | Any worker claims, and the decision replays cold | The owner claims, and the decision resumes |
-| Claim cost | A sticky predicate in each scan | No workflow claim. The owner takes each task by its execution |
+| After the window | Any worker claims, and the decision replays cold | The owner takes the task, and the decision resumes |
+| Claim cost | A sticky predicate in each scan | No head scan for a workflow task. The owner takes it by its execution |
 | Crash recovery | Up to one sticky window | About one lease TTL |
 
 ### Turning owner mode on

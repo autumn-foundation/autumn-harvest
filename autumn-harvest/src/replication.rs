@@ -2920,27 +2920,29 @@ mod db {
     /// (issue #2255).
     ///
     /// It holds inside a [`crate::decision_owner::fenced_scope`] of `conn`.
-    /// The start fence locked the owner row and the generation row of the
-    /// pinned tenure's shard, and both locks stay until the transaction
-    /// ends. So a fence of `shard` sends no query when `shard` has no DR
-    /// pin. It sends none either when `shard` resolves to the same
-    /// generation row at the same pinned generation. A colocated shard with
-    /// its own row still checks that row.
+    /// The start fence locked the owner row, and the generation row that it
+    /// recorded. Both locks stay until the transaction ends. So a fence of
+    /// `shard` sends no query when `shard` has no DR pin. It sends none
+    /// either when `shard` resolves to the recorded row at the recorded
+    /// generation. A colocated shard with its own row still checks that row.
+    /// A pin that appears after the start fence still checks its row.
     #[must_use]
     pub fn start_fence_covers(conn: &AsyncPgConnection, shard: ShardId) -> bool {
         let Some(tenure) = crate::decision_owner::pinned_decision() else {
             return false;
         };
-        if !crate::decision_owner::already_fenced(crate::decision_owner::conn_id(conn), &tenure) {
+        let id = crate::decision_owner::conn_id(conn);
+        if !crate::decision_owner::already_fenced(id, &tenure) {
             return false;
         }
+        let Some(held) = crate::decision_owner::held_start_fence(id) else {
+            return false;
+        };
         let Some(pinned) = FenceRegistry::expected(shard) else {
             return true;
         };
-        let held = tenure.shard();
-        FenceRegistry::expected(held) == Some(pinned)
-            && FenceRegistry::resolve_shard(shard).unwrap_or(shard)
-                == FenceRegistry::resolve_shard(held).unwrap_or(held)
+        let resolved = FenceRegistry::resolve_shard(shard).unwrap_or(shard);
+        held.generation() == Some((resolved, pinned.as_i64()))
     }
 
     /// The DR generation check of [`assert_fence`] alone.
@@ -2988,9 +2990,11 @@ mod db {
         if crate::decision_owner::already_fenced(crate::decision_owner::conn_id(conn), &tenure) {
             return Ok(());
         }
-        // Issue #2255: with a DR pin, one statement fences both rows.
+        // Issue #2255: with a DR pin, one statement fences both rows. The
+        // scope records the row that it locked.
         let shard = tenure.shard();
-        match FenceRegistry::expected(shard) {
+        let id = crate::decision_owner::conn_id(conn);
+        let held = match FenceRegistry::expected(shard) {
             Some(pinned) => {
                 let resolved = FenceRegistry::resolve_shard(shard).unwrap_or(shard);
                 crate::decision_owner::fence_with_generation(
@@ -2999,10 +3003,16 @@ mod db {
                     resolved,
                     pinned.as_i64(),
                 )
-                .await
+                .await?;
+                Some((resolved, pinned.as_i64()))
             }
-            None => crate::decision_owner::fence(conn, &tenure).await,
-        }
+            None => {
+                crate::decision_owner::fence(conn, &tenure).await?;
+                None
+            }
+        };
+        crate::decision_owner::record_start_fence(id, crate::decision_owner::StartFence::new(held));
+        Ok(())
     }
 
     /// Fail with `ShardFenced` unless `shard` is at `expected`.

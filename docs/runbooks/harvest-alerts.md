@@ -3571,8 +3571,10 @@ are fast.
 are one claim, one workflow-task persist transaction, one timeout-scanner
 pass and one activity heartbeat write. Each op is a unit of work, not one SQL
 statement. A `claim` sample also has a `kind` label (issue #2248). Split
-by `kind` to see whether workflow or activity claims are slow. The rule
-watches `claim` and `persist`, because they set throughput. It keeps the `instance` and `shard` labels, so one slow replica,
+by `kind` to see whether workflow or activity claims are slow. In owner mode
+a fifth op, `take`, times the claim by execution of an owner decider (issue
+#2255). The rule watches `claim`, `take` and `persist`, because they set
+throughput. It keeps the `instance` and `shard` labels, so one slow replica,
 or one slow shard of a multi-shard worker, fires it alone.
 
 ### Triage steps

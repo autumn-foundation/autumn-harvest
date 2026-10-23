@@ -457,8 +457,9 @@ Issue #2253 builds this decision.
   the same partition.
 - The skip compares the partition number only. A wake to the same number
   on another database is then lost. That costs latency only.
-- An evict wake drops the cache entry and its parked future. A plain wake
-  only ends the idle wait of the claim loop.
+- An evict wake drops the cache entry and its parked future. Each wake
+  names its execution to the owner decider (decision 13). With owner mode
+  off, a wake only ends the idle wait of the claim loop.
 - A foreign append does not evict. The next decision loads the delta, so a
   child terminal written into its parent reaches the parent's owner.
 - A `NOTIFY` can be lost. An evict wake can also come while a decision
@@ -497,6 +498,7 @@ The writer classes, from the inventory of issue #2253:
 | Start and continue-as-new | `execution.rs`: `start_or_load_workflow_execution`, `replace_execution` | `enqueue` | No |
 | Rebalance | `shard_rebalance.rs`: `commit_cutover`, `activate_target_inner` | `notify_owner` on each database | Yes |
 | Dead or stuck worker re-pend | `poison_pill.rs`: `requeue_orphan`, `requeue_stuck_task` | `notify_owner` | No |
+| Claim-held workflow re-pend | `queue.rs`: `requeue_claimed_workflow_task_with_backoff` | `notify_owner` when the row is due now (issue #2255) | No |
 | Queue resume | `queue_pause.rs`: `notify_resumed_queue` | None. The queue wake reaches each claim loop. | No |
 | Partition layout | `partition.rs`: `disable_partitioning`, `drain_default_bounded_inner` | None | No. Each row keeps its id and bytes. |
 | Retention | `retention.rs`: `delete_candidate_execution` | None | No. It deletes terminal runs only. |
@@ -530,19 +532,25 @@ with the shared head scan. Stage 1b moves workflow tasks off the claim loop.
 - Each take runs in its own future, bounded by the workflow permits. The
   task row serializes the decisions of one execution, so the owner
   serializes per execution, not per partition.
-- A take that a gate refuses backs its execution off for one poll interval.
-  A paused run cannot hold the head of each scan.
+- A take that finds nothing backs its execution off. The backoff starts at
+  one poll interval and doubles with each miss, up to 30 s. A wake ends it.
+  So a refused row cannot hold the head of each scan.
+- A scan reads `idx_harvest_tq_owner_scan`, which leads with the partition.
+  It reads a few rows of each owned partition, never the rows of another
+  owner. Takes and scans run beside the loop, so a scan never stalls a take.
 - The decider keeps execution ids only. A hint never acknowledges anything.
   A signal is a `harvest_signals` row before its acknowledgement
   (restate#4566).
-- A re-pend of a workflow task wakes the owner of its partition. A fenced
-  owner's re-pend then reaches the new owner at once.
+- A claim-held re-pend that is due now wakes the owner of its partition.
+  That covers a fenced owner, an unowned row and a deadlock retry. The new
+  owner then learns of the row at once.
 - With a DR pin, the start fence takes the generation row and the owner row
   in one statement, the migration's `harvest_decision_fence`. The order of
-  decision 6 holds.
+  decision 6 holds. The generation row waits with no bound, as before. The
+  owner row waits at most 250 ms.
 - Inside the fenced scope, an append checks neither row again when the start
-  fence took the same generation row. A colocated shard with its own row
-  still checks it.
+  fence took the same generation row. The scope records that row. A
+  colocated shard with its own row still checks it.
 - `owner_decider_tests.rs` proves the claim count and the signal case.
   [`performance-owner-decider.md`](../performance-owner-decider.md) has the
   measurements.

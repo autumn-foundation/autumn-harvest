@@ -1623,16 +1623,16 @@
       ],
       "prometheus": {
         "mode": "native-metric",
-        "notes": "The p99 rule needs histogram bucket boundaries on the metrics-rs Prometheus exporter (set_buckets_for_metric for harvest_db_query_duration). The built-in scrape endpoint renders no _bucket series, so use the average fallback there. The op label is bounded to claim, persist, scan and heartbeat.",
+        "notes": "The p99 rule needs histogram bucket boundaries on the metrics-rs Prometheus exporter (set_buckets_for_metric for harvest_db_query_duration). The built-in scrape endpoint renders no _bucket series, so use the average fallback there. The op label is bounded to claim, take, persist, scan and heartbeat. A take is the claim by execution of an owner decider (issue #2255).",
         "expressions": [
           {
             "kind": "promql",
-            "expr": "histogram_quantile(0.99, sum by (le, instance, op, shard) (rate(harvest_db_query_duration_bucket{op=~\"claim|persist\"}[5m]))) > 0.5",
+            "expr": "histogram_quantile(0.99, sum by (le, instance, op, shard) (rate(harvest_db_query_duration_bucket{op=~\"claim|take|persist\"}[5m]))) > 0.5",
             "for": "10m"
           },
           {
             "kind": "promql",
-            "expr": "sum by (instance, op, shard) (rate(harvest_db_query_duration_sum{op=~\"claim|persist\"}[5m])) / sum by (instance, op, shard) (rate(harvest_db_query_duration_count{op=~\"claim|persist\"}[5m])) > 0.25",
+            "expr": "sum by (instance, op, shard) (rate(harvest_db_query_duration_sum{op=~\"claim|take|persist\"}[5m])) / sum by (instance, op, shard) (rate(harvest_db_query_duration_count{op=~\"claim|take|persist\"}[5m])) > 0.25",
             "for": "10m",
             "note": "Bucket-less fallback: the average duration. Use it on the built-in scrape endpoint, which renders only _sum and _count."
           }

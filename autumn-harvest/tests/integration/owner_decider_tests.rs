@@ -2,7 +2,7 @@
 //! The owner decider of issue #2255.
 //!
 //! In owner mode, the owner of a partition takes the workflow tasks of that
-//! partition by id. The shared claim loop takes activities only. Each test
+//! partition by execution id. The shared claim loop takes activities only. Each test
 //! runs on its own database, because owner mode is a per-database switch.
 
 use std::collections::BTreeMap;
@@ -53,6 +53,16 @@ async fn decider_three_steps(ctx: &WorkflowContext, queue: String) -> Result<Str
             .map_err(|e| e.to_string())?;
     }
     Ok("done".to_string())
+}
+
+/// One one-second timer. Two decisions: the start and the fire.
+#[workflow]
+async fn decider_timer_flow(ctx: &WorkflowContext, input: String) -> Result<String, String> {
+    let _ = input;
+    ctx.timer("decider_t1", 1)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok("fired".to_string())
 }
 
 /// Wait for one signal and return its payload.
@@ -133,7 +143,11 @@ impl Node {
     fn new(url: &str, queue: &str, claim_loops: usize) -> Self {
         let claims = Claims::default();
         let built = HarvestBuilder::new()
-            .workflows(workflows![decider_three_steps, decider_signal_flow])
+            .workflows(workflows![
+                decider_three_steps,
+                decider_signal_flow,
+                decider_timer_flow
+            ])
             .activities(activities![decider_step_a, decider_step_b, decider_step_c])
             .worker(WorkerConfig::default().with_queues([queue]))
             .telemetry(
@@ -166,7 +180,10 @@ impl Node {
     async fn stop(&mut self) {
         self.worker.shutdown();
         if let Some(task) = self.task.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(15), task).await;
+            tokio::time::timeout(Duration::from_secs(15), task)
+                .await
+                .expect("the worker stops in time")
+                .expect("the worker task ends cleanly");
         }
     }
 }
@@ -329,6 +346,215 @@ async fn a_signal_acknowledged_just_before_an_epoch_bump_is_never_lost() {
         "B decided off the claim path"
     );
     assert!(b.claims.takes(ClaimKind::Workflow) >= 1, "B took the task");
+    db.drop_db().await;
+}
+
+/// Done-when item 3, with a live owner that holds the hint (restate#4566).
+///
+/// Worker A owns every partition and parks the run on its signal wait. A
+/// fixture holds the run's owner row `FOR UPDATE`, as an acquisition does.
+/// The signal commits and `send_signal` returns. A gets the wake, and its
+/// take misses, because the claim guard skips a locked owner row. Then the
+/// fixture moves the row to another holder at the next epoch. A's hint is
+/// now worthless. When the ghost lease ends, an owner acquires the row at a
+/// new epoch. Only its scan can find the run. It must deliver the signal
+/// once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signal_hinted_to_an_owner_that_loses_its_epoch_is_never_lost() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    enable(&mut conn).await;
+    let pool: DbPool = build_test_pool(&db.url);
+    let queue = unique("decider-hinted");
+    let mut a = Node::new(&db.url, &queue, 2);
+    a.run(&pool);
+    eventually("A owns every partition", async || {
+        live_partitions(&mut conn).await == 512
+    })
+    .await;
+    let workflow_id = unique("decider-hinted-wf");
+    let partition = DecisionPartition::for_workflow_id(&workflow_id);
+    let client = WorkflowHandleClient::single(pool.clone(), db.url.clone());
+    let exec = DeciderSignalFlowStub::start_with_options(
+        &mut conn,
+        &client,
+        &workflow_id,
+        String::new(),
+        TypedStartOptions {
+            queue_name: Some(queue.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("start")
+    .exec_id();
+    eventually("A parks the run on its signal wait", async || {
+        parked(&mut conn, exec).await
+    })
+    .await;
+    let before = epoch_of(&mut conn, partition).await;
+
+    let mut fixture = db.conn().await;
+    diesel_async::SimpleAsyncConnection::batch_execute(&mut fixture, "BEGIN")
+        .await
+        .expect("begin");
+    diesel::sql_query("SELECT epoch FROM harvest_decision_owner WHERE partition = $1 FOR UPDATE")
+        .bind::<Integer, _>(i32::from(partition.get()))
+        .execute(&mut fixture)
+        .await
+        .expect("hold the owner row");
+    let missed = a.claims.takes(ClaimKind::Empty);
+    autumn_harvest::signal::send_signal(&mut conn, exec, "go", serde_json::json!("hinted"))
+        .await
+        .expect("the signal is acknowledged");
+    eventually("A's take of the woken run misses", async || {
+        a.claims.takes(ClaimKind::Empty) > missed
+    })
+    .await;
+    diesel::sql_query(
+        "UPDATE harvest_decision_owner SET holder = 'decider-ghost', epoch = epoch + 1, \
+         lease_until = clock_timestamp() + interval '2 seconds' WHERE partition = $1",
+    )
+    .bind::<Integer, _>(i32::from(partition.get()))
+    .execute(&mut fixture)
+    .await
+    .expect("bump the epoch");
+    diesel_async::SimpleAsyncConnection::batch_execute(&mut fixture, "COMMIT")
+        .await
+        .expect("commit the bump");
+
+    wait_for_execution_state_with_timeout(&db.url, exec, "COMPLETED", WAIT).await;
+    let after = epoch_of(&mut conn, partition).await;
+    a.stop().await;
+    assert!(
+        after >= before + 2,
+        "the ghost and then a new owner each bumped the epoch: {before} then {after}"
+    );
+    assert_eq!(output_of(&mut conn, exec).await, "\"hinted\"");
+    assert_eq!(signal_events(&mut conn, exec).await, 1, "delivered once");
+    assert_eq!(a.claims.count(ClaimKind::Workflow), 0, "no workflow claim");
+    db.drop_db().await;
+}
+
+/// A due timer sends no wake. The owner scan finds its row at the due
+/// time, so the run completes with no workflow claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_due_timer_fires_through_the_owner_scan() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    enable(&mut conn).await;
+    let pool: DbPool = build_test_pool(&db.url);
+    let queue = unique("decider-timer");
+    let mut node = Node::new(&db.url, &queue, 1);
+    node.run(&pool);
+    eventually("the owner owns every partition", async || {
+        live_partitions(&mut conn).await == 512
+    })
+    .await;
+    let client = WorkflowHandleClient::single(pool.clone(), db.url.clone());
+    let exec = DeciderTimerFlowStub::start_with_options(
+        &mut conn,
+        &client,
+        &unique("decider-timer-wf"),
+        String::new(),
+        TypedStartOptions {
+            queue_name: Some(queue.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("start")
+    .exec_id();
+    wait_for_execution_state_with_timeout(&db.url, exec, "COMPLETED", WAIT).await;
+    node.stop().await;
+    assert_eq!(
+        node.claims.count(ClaimKind::Workflow),
+        0,
+        "no workflow claim"
+    );
+    assert!(
+        node.claims.takes(ClaimKind::Workflow) >= 2,
+        "the start and the fire are takes"
+    );
+    db.drop_db().await;
+}
+
+/// Seed one execution and its workflow task.
+async fn seed_task(
+    conn: &mut AsyncPgConnection,
+    queue: &str,
+    state: &str,
+    partition: Option<u16>,
+    due_in_secs: i64,
+) -> uuid::Uuid {
+    let exec = uuid::Uuid::new_v4();
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, run_id, shard_id, input, queue_name, state) \
+         VALUES ($1, 'decider_scan', $2, gen_random_uuid(), 0, '{}'::jsonb, $3, $4)",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec)
+    .bind::<Text, _>(unique("decider-scan-wf"))
+    .bind::<Text, _>(queue)
+    .bind::<Text, _>(state)
+    .execute(conn)
+    .await
+    .expect("seed an execution");
+    let mut params = autumn_harvest::queue::EnqueueParams::new(
+        queue,
+        autumn_harvest::queue::TaskType::Workflow,
+        serde_json::json!({}),
+    );
+    params.workflow_exec_id = Some(exec);
+    params.decision_partition = partition.map(|p| DecisionPartition::new(p).expect("in range"));
+    params.scheduled_at = chrono::Utc::now() + chrono::Duration::seconds(due_in_secs);
+    autumn_harvest::queue::enqueue(conn, &params)
+        .await
+        .expect("enqueue");
+    exec
+}
+
+/// The owner scan reads due rows of owned partitions and unstamped rows. It
+/// skips another owner's rows, a paused run and the skip list. The first
+/// row that is not due gives the next due time.
+#[tokio::test]
+async fn the_owner_scan_reads_owned_and_unstamped_due_rows_only() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    let queue = unique("decider-scan");
+    let mine = seed_task(&mut conn, &queue, "RUNNING", Some(3), -5).await;
+    let _other = seed_task(&mut conn, &queue, "RUNNING", Some(4), -5).await;
+    let unstamped = seed_task(&mut conn, &queue, "RUNNING", None, -5).await;
+    let _later = seed_task(&mut conn, &queue, "RUNNING", Some(3), 60).await;
+    let _paused = seed_task(&mut conn, &queue, "PAUSED", Some(3), -5).await;
+    let owned = autumn_harvest::queue::OwnedClaim {
+        holder: "decider-scan".to_string(),
+        partitions: vec![3],
+    };
+    let queues = [queue.clone()];
+    let scan = autumn_harvest::queue::owner_scan(&mut conn, &queues, &owned, &[], 8)
+        .await
+        .expect("scan");
+    let mut due = scan.due.clone();
+    due.sort_unstable();
+    let mut want = vec![mine, unstamped];
+    want.sort_unstable();
+    assert_eq!(due, want, "owned and unstamped due rows only");
+    let next = scan
+        .next_due
+        .expect("the later row gives the next due time");
+    assert!(
+        next > Duration::from_secs(50) && next <= Duration::from_secs(61),
+        "{next:?}"
+    );
+    let skipped = autumn_harvest::queue::owner_scan(&mut conn, &queues, &owned, &[mine], 8)
+        .await
+        .expect("scan");
+    assert_eq!(skipped.due, vec![unstamped], "the skip list holds");
+    let one = autumn_harvest::queue::owner_scan(&mut conn, &queues, &owned, &[], 1)
+        .await
+        .expect("scan");
+    assert_eq!(one.due.len(), 1, "the limit holds");
     db.drop_db().await;
 }
 

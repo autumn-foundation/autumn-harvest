@@ -74,7 +74,7 @@ issue moves workflow tasks off the shared claim loop.
 | B15 | Skip the per-append generation check inside a fenced scope that locked the same generation row. | **Adopted.** The start fence holds the row until the commit. |
 | B16 | Wrap the signal and timer ingest in the fenced scope. | **Adopted.** It then fences once. |
 | B17 | A worker switch for stage 1b. | Rejected. Owner mode is already the operator switch. Stage 1a stays as the owned claim when the decider cannot run. |
-| B18 | Record a take as a claim. | Rejected. A take does not scan the heads. It gets its own `DbOp::Take`, so the claim count and the take count stay apart. |
+| B18 | Record a take as a claim. | Rejected. A take does not scan the heads. It gets its own recorder method and the `op="take"` label, so the claim count and the take count stay apart. |
 
 ### 0.3 Reverse brainstorm: how can this change cause harm?
 
@@ -117,17 +117,18 @@ issue moves workflow tasks off the shared claim loop.
 
 ## 1. Change
 
-1. Migration `<version>_harvest_owner_decider`: the partial scan index and
-   the fused fence function.
-2. `decision_owner.rs`: `OwnerScan`, the scan statement and
-   `fence_with_generation`.
-3. `queue.rs`: `claim_workflow_task_of_execution_with_owner`.
+1. Migration `20261023015935_harvest_owner_decider`: the partial scan index
+   and the fused fence function.
+2. `decision_owner.rs`: `fence_with_generation`.
+3. `queue.rs`: `claim_workflow_task_of_execution`, `owner_scan` and
+   `OwnerScan`. A workflow re-pend wakes the owner.
 4. `worker.rs`: the owner decider per owned database, its hints from the
    owner wake task, activity-only claims where it runs, and the fenced
    ingest.
 5. `notify.rs`: a plain wake to the writer's own partition is kept.
 6. `replication.rs` and `store.rs`: the fused fence and the per-append skip.
-7. `telemetry.rs`: `DbOp::Take`.
+7. `telemetry.rs`: `MetricsRecorder::record_owner_take_duration`, recorded as
+   `op="take"`. A new `DbOp` variant would break each exhaustive match.
 8. Docs: ADR 0009, `sticky-routing.md`, the telemetry table, the upgrade
    guide, the baseline page, a performance page and a changelog fragment.
 
@@ -136,7 +137,59 @@ issue moves workflow tasks off the shared claim loop.
 | Phase | Test | Red | Green |
 |---|---|---|---|
 | Red | `a_signal_acknowledged_just_before_an_epoch_bump_is_never_lost` | Fail: the worker claims the workflow task. | Pass. |
-| Red | `an_owner_takes_workflow_tasks_off_the_claim_path` | Fail: 4 workflow claims per run. | Pass: 3 activity claims, 4 takes. |
-| Red | `a_dr_fenced_owner_decision_sends_one_fence_statement` | Fail: 2 fence statements and a check per append. | Pass. |
-| Green | Scan, backoff, self-wake and unstamped-row tests | — | Pass. |
-| Both | The owner, claim, wake, failover and DR suites | Pass. | Pass. |
+| Red | `an_owner_takes_workflow_tasks_off_the_claim_path` | Fail: 160 workflow claims for 40 runs. | Pass: 3 activity claims and 4 takes per run. |
+| Red | `a_dr_fenced_owner_decision_sends_one_fence_statement` | Fail: no fused statement, 3 generation reads. | Pass: 1 statement, 1 read. |
+| Review | `a_signal_hinted_to_an_owner_that_loses_its_epoch_is_never_lost` | — | Pass. |
+| Review | `a_due_timer_fires_through_the_owner_scan`, `the_owner_scan_reads_owned_and_unstamped_due_rows_only` | — | Pass. |
+| Review | `a_fused_fence_reports_a_bumped_generation_as_shard_fenced`, `a_fused_fence_waits_for_a_held_generation_row`, `a_colocated_shard_with_its_own_generation_row_still_checks_it` | — | Pass. |
+| Review | Unit tests: the by-execution splice, the decider state, the backoff, the hints, the gate record | — | Pass. |
+| Both | The owner, claim, wake, failover, simulator and DR suites | Pass. | Pass. |
+
+## 3. Red and green record
+
+- Red, on the engine of #2248: the three red tests failed for the planned
+  reasons. The signal reached the run, but through a workflow claim.
+- Green: the first build of the decider passed all three, and every owner
+  suite.
+
+## 4. Review findings
+
+Four review agents checked the decider loop, the fence and the SQL, the
+tests and docs, and the performance. The fixes:
+
+- With owner mode off, the decider loop slept for zero and spun. It now
+  waits for a tenure change or one poll interval, and sends no query.
+- A scan ran inside the loop, so the takes in flight stalled until it
+  ended. Scans and takes now run as futures beside the loop.
+- The scan index led with `scheduled_at`. Each owner read the rows of other
+  owners, and a timer backlog. The index now leads with the partition, and
+  the scan reads a few rows of each owned partition.
+- The fused fence waited at most 250 ms for the generation row. A DR bump
+  that queued behind a long transaction then fenced healthy owners. The
+  generation row now waits with no bound, as the separate check did.
+- The append skip read the registry again. A pin that appeared after the
+  start fence then skipped a check. The scope now records the row that the
+  start fence locked.
+- A refused row was taken again each poll interval. The backoff now doubles
+  per miss, up to 30 s. A wake during a take queues it again after the take.
+- The scan waited while hints filled the queue. It now runs at its time,
+  and the queue is bounded.
+- An owner wake still woke the activity-only claim loops. It no longer does
+  where the decider runs.
+- A delayed re-pend woke the owner, whose take then missed. Only a re-pend
+  that is due now wakes it.
+- A take skipped the fairness charge of the owned claim. It charges now.
+- The blocked decider now marks a refused workflow kind for the slot tuner.
+- The starter alert, the claim panel, the runbook, the ADR, the telemetry
+  table and the bench labels now name the take.
+
+Accepted as is:
+
+- A take is a full claim transaction. It costs the same round trips as the
+  old workflow claim. The gain is that no claim loop waits for it.
+- The scan orders by due time, not by priority. Hints come first in, first
+  out.
+- The dispatch channel can still claim a workflow row by id in owner mode.
+  It races the decider, and one of them takes the row.
+- No worker switch turns the decider off. Owner mode off is the fallback.
+
