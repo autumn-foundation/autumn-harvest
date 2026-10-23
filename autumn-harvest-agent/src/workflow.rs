@@ -346,6 +346,7 @@ fn next_request(
         flow_labels: tree.exercised.clone(),
         flow_released: tree.released.clone(),
         interruptible: run.live,
+        model: task.model.clone(),
     }
 }
 
@@ -545,6 +546,22 @@ pub(crate) async fn deliver(ctx: &WorkflowContext, report: Report) -> Result<boo
     }
 }
 
+/// Check the model of `run` against its mandate (issue #2271).
+///
+/// A delegation checks the model of its peer. This check covers a root task
+/// and a durable agent.
+fn check_model(run: Run<'_>) -> Result<(), String> {
+    let model = run.task.model.as_deref();
+    match run.agent {
+        Some(agent) if !agent.mandate.allows_model(model) => Err(format!(
+            "the mandate of {:?} forbids the model {:?}",
+            agent.mandate.holder(),
+            model.unwrap_or(crate::DEFAULT_MODEL)
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Run one segment: model turns and tool rounds until the model answers or a
 /// bound ends it. Returns why the segment ended.
 pub(crate) async fn run_segment(
@@ -555,6 +572,7 @@ pub(crate) async fn run_segment(
     input: &str,
 ) -> Result<AgentStop, String> {
     let task = run.task;
+    check_model(run)?;
     let system = system_prompt(ctx, task).await?;
     let mut messages = Vec::with_capacity(progress.messages.len() + 2);
     if let Some(system) = system {
@@ -1552,6 +1570,7 @@ fn child_task(
         mandate: Some(mandate),
         // The tree holds the labels, so the child task carries none.
         flow_labels: BTreeSet::new(),
+        model: peer.model.clone().or_else(|| task.model.clone()),
     }
 }
 
@@ -1657,11 +1676,12 @@ pub async fn agent_model_turn(
     let harness = harness(ctx)?;
     harness.check_budget(|| ctx.check_llm_budget()).await?;
     let tenant = cache_tenant(ctx, harness, &request).await;
+    let model = request.model.clone();
     let (turn, latency) = harness
         .model_turn_timed_in(request, tenant, |_content| {})
         .await?;
     if let Some(latency) = latency {
-        harness.record_turn(ctx, &turn.usage, latency);
+        harness.record_turn(ctx, model.as_deref(), &turn.usage, latency);
     }
     Ok(turn)
 }

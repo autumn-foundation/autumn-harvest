@@ -204,3 +204,34 @@ from `docs/agent-adapter.md`.
 - Unit tests in the SQLite `llm_ledger.rs` and `worker.rs`: the CHECK
   bounds match the core limits, the model id charset, the per-attempt cap,
   and a rolled-back or failed finalize writes no row.
+
+### A model per agent and per peer (issue #2271)
+
+- `AgentHarness::model_named(name, model)` adds a model to a registry.
+  `DEFAULT_MODEL` names the model of `AgentHarness::new`.
+- `AgentTask::model`, `Peer::model`, `AgentProfile::model`,
+  `AgentHeartbeat::model` and `HeartbeatTask::model` name a model. A child
+  with no model keeps the model of its parent.
+- `ModelTurnRequest::model` records the name in the turn input, so replay
+  asks the same model. An unknown name fails the turn with no retry.
+- The response cache key and the cost ledger use the id of the model that
+  answers the turn.
+- `Mandate::models` is an allowlist that only narrows. A delegation to a
+  peer on another model is refused as `Refusal::ModelForbidden`. A root run
+  on a forbidden model fails before any model call. A durable receiver
+  checks its own model against the mandate that it accepts.
+- `eval::compare` runs two candidates on one recorded run.
+  `Candidate::model` and `Candidate::agent_model` set the model of each.
+- The §9 limit "All agents share the harness model" is removed from
+  `docs/agent-adapter.md`, and the matching §12 limit from
+  `docs/agent-mesh.md`.
+
+**Tests.** `autumn-harvest-agent/tests/model_per_agent.rs`: a parent and a
+child on two models record both ids in the ledger; a child keeps the model
+of its parent; the cache never serves one model's answer to another; a
+mandate that forbids a model refuses the delegation; a root on a forbidden
+model fails before any call; an unknown model fails with no retry; a
+profile and its heartbeat name their models. `durable_peers.rs`: a receiver
+on a forbidden model refuses the message. `eval.rs`: two models compared on
+one source, and one agent of a tree on another model. Mandate property
+tests cover the allowlist.

@@ -286,6 +286,10 @@ pub struct AgentHeartbeat {
     /// The bound on tokens in one tick. `None` takes the profile bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_total_tokens: Option<u32>,
+    /// The harness model of a tick (issue #2271). `None` takes the profile
+    /// model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 fn default_heartbeat_prompt() -> String {
@@ -307,7 +311,15 @@ impl AgentHeartbeat {
             allow_memory_writes: false,
             max_steps: None,
             max_total_tokens: None,
+            model: None,
         }
+    }
+
+    /// Run each tick on the harness model `name`, such as a cheap one.
+    #[must_use]
+    pub fn model(mut self, name: impl Into<String>) -> Self {
+        self.model = Some(name.into());
+        self
     }
 
     /// Set the user message of a tick.
@@ -561,6 +573,10 @@ pub struct AgentProfile {
     /// `schedule_followup` tool, and a booked follow-up is a wake op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub followups: Option<Followups>,
+    /// The harness model of the agents of the kind (issue #2271). `None` is
+    /// [`DEFAULT_MODEL`](crate::DEFAULT_MODEL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 const fn default_max_steps() -> u32 {
@@ -597,7 +613,15 @@ impl AgentProfile {
             max_ops_per_run: None,
             heartbeat: None,
             followups: None,
+            model: None,
         }
+    }
+
+    /// Run the agents of the kind on the harness model `name`.
+    #[must_use]
+    pub fn model(mut self, name: impl Into<String>) -> Self {
+        self.model = Some(name.into());
+        self
     }
 
     /// Give each agent of the kind a heartbeat.
@@ -733,7 +757,11 @@ impl AgentProfile {
         task.tenant.clone_from(&self.tenant);
         task.mandate.clone_from(&self.mandate);
         task.followups = self.followups;
+        task.model.clone_from(&self.model);
         if let Mode::Heartbeat(beat) = mode {
+            if beat.model.is_some() {
+                task.model.clone_from(&beat.model);
+            }
             // A tick never books a follow-up.
             task.followups = None;
             task.unattended_memory_writes = beat.allow_memory_writes;
@@ -1205,6 +1233,16 @@ impl AgentRun<'_> {
             Ok(id) => self.local_mandate(id).accept(&envelope.mandate),
             Err(_) => Err(Refusal::InvalidMandate),
         };
+        // The sender cannot see the model of this agent, so the receiver
+        // checks it against the mandate that it accepts (issue #2271).
+        let model = self.profile.as_ref().ok().and_then(|p| p.model.as_deref());
+        let accepted = accepted.and_then(|mandate| {
+            if mandate.allows_model(model) {
+                Ok(mandate)
+            } else {
+                Err(Refusal::ModelForbidden)
+            }
+        });
         let reply = match accepted {
             Err(refusal) => PeerReply {
                 refusal: Some(refusal),

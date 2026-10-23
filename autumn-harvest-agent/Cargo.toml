@@ -93,6 +93,10 @@ required-features = ["sqlite"]
 name = "durable_peers"
 required-features = ["sqlite"]
 
+[[test]]
+name = "model_per_agent"
+required-features = ["sqlite"]
+
 [lints]
 workspace = true
 

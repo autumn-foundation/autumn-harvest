@@ -619,3 +619,40 @@ async fn a_reply_after_the_deadline_is_not_waited_for() {
     let answer = state(&rt, &triage()).await.last_answer.unwrap();
     assert!(answer.contains("no reply arrived within 60s"), "{answer}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_receiver_on_a_model_that_the_sender_forbids_refuses_the_message() {
+    // The sender does not know the model of a durable peer. The receiver
+    // checks its own model against the mandate that it accepts (issue #2271).
+    let (_dir, db) = fresh_db();
+    let model = mesh_model();
+    let strong = FnModel::new(|_| text("never"));
+    let harness = AgentHarness::new(model.clone())
+        .model_named("strong", strong.clone())
+        .peer(Peer::agent("researcher", "Finds facts.", &research()))
+        .agent(
+            AgentProfile::new("triage").mandate(
+                Mandate::new("triage")
+                    .peers(["researcher"])
+                    .models([autumn_harvest_agent::DEFAULT_MODEL]),
+            ),
+        )
+        .agent(
+            AgentProfile::new("research")
+                .model("strong")
+                .mandate(Mandate::new("researcher")),
+        );
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("what is it?"), None).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    let answer = state(&rt, &triage()).await.last_answer.unwrap();
+    assert!(answer.contains("model_forbidden"), "{answer}");
+    assert!(
+        strong.requests().is_empty(),
+        "the forbidden model never runs"
+    );
+}

@@ -124,6 +124,11 @@ pub struct AgentTask {
     /// the history. See [`flow`](crate::flow).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
+    /// The name of the harness model that runs this task (issue #2271).
+    /// `None` is [`DEFAULT_MODEL`](crate::DEFAULT_MODEL). A delegated child
+    /// keeps it unless its peer names a model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Where the run id of a task comes from.
@@ -164,7 +169,15 @@ impl AgentTask {
             tenant: None,
             mandate: None,
             flow_labels: BTreeSet::new(),
+            model: None,
         }
+    }
+
+    /// Run the task on the harness model `name`. See [`model`](Self::model).
+    #[must_use]
+    pub fn model(mut self, name: impl Into<String>) -> Self {
+        self.model = Some(name.into());
+        self
     }
 
     /// Start with the flow labels that earlier runs exercised. See
@@ -379,6 +392,11 @@ pub struct ModelTurnRequest {
     /// durable agent sets it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub interruptible: bool,
+    /// The name of the harness model for this turn (issue #2271). `None` is
+    /// [`DEFAULT_MODEL`](crate::DEFAULT_MODEL). The input records it, so
+    /// replay asks the same model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// The recorded result of one model-turn activity.

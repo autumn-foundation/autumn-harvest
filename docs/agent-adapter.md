@@ -422,8 +422,6 @@ strict replay compares each recorded input as it was written.
   list changes only later turns. Recorded turns replay as they were.
 - **A follow-up chain shares one workflow history.** Each segment adds to
   it. Keep `max_chain` low, or start a new run from the report.
-- **All agents share the harness model.** A peer cannot choose its own
-  model. See [the agent mesh guide](agent-mesh.md).
 
 ## 10. Always-on agents
 
@@ -767,6 +765,24 @@ final answers with the same stop reason and different text get `Reworded`.
 That is not a divergence. `end_diverged` compares how the two runs end, for
 example `Completed` and `TokensExhausted`. `diverged()` reads both.
 `stubbed_tool_calls` counts the calls with no recorded outcome.
+
+### Compare two models
+
+`eval::compare` runs two candidates on one source (issue #2271). It returns
+both evaluations and one `TurnDiff` per turn of the two candidates. In that
+diff, `recorded` holds the first candidate.
+
+```rust,ignore
+use autumn_harvest_agent::eval::{Candidate, compare};
+
+let harness = Arc::new(AgentHarness::new(fallback).model_named("a", a).model_named("b", b));
+let first = Candidate::shared(Arc::clone(&harness)).agent_model("planner", "a");
+let second = Candidate::shared(harness).agent_model("planner", "b");
+let comparison = compare(&history, &first, &second).await?;
+```
+
+`Candidate::model` sets the model of every turn. `Candidate::agent_model`
+sets the model of one agent of a delegation tree and wins over it.
 
 Each candidate turn is a live model call. `Candidate::max_turns` caps them.
 The default cap is the recorded turn count plus `DEFAULT_EXTRA_TURNS`. The

@@ -62,10 +62,11 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
         call_with_ledger(input, |request: ModelTurnRequest| async {
             // The tenant is the one `AgentHarness::model_turn` uses.
             let tenant = CacheTenant::declared(request.tenant.as_deref());
+            let model = request.model.clone();
             let (turn, latency) = h.model_turn_timed_in(request, tenant, |_| {}).await?;
             // A cache hit calls no model, so it has no latency and no call.
             let calls = latency
-                .map(|latency| h.ledger_call(&turn.usage, latency))
+                .map(|latency| h.ledger_call(model.as_deref(), &turn.usage, latency))
                 .into_iter()
                 .collect();
             Ok((turn, calls))

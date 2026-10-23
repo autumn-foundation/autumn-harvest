@@ -75,6 +75,7 @@ the task.
 | Run id | `{root run id}:d{n}`. `n` counts the delegations that ran in the tree, from 1. A refusal takes no number. |
 | Tools | The meet of the parent mandate and `Peer::tools` |
 | Steps | `Peer::max_steps` (default `DEFAULT_MAX_STEPS`) |
+| Model | `Peer::model`, else the model of the parent (section 14) |
 | Token cap | The smaller of `Peer::max_total_tokens` and the parent remainder |
 | Read-only | On when the parent, the peer or the mandate is read-only |
 | Memory, follow-ups, delivery | Off |
@@ -99,6 +100,7 @@ A mandate holds the authority of one agent:
 | `max_delegations` | The bound on delegations in the whole tree. | 16 |
 | `read_only` | Refuse every write and external call. | off |
 | `flow_labels` | The labels that a caller in another process sends. | none |
+| `models` | The harness models that the subtree may use. `None` means every model. | `None` |
 
 A mandate bounds its holder too. A root mandate with `tools(["lookup"])`
 gives the root agent only `lookup`.
@@ -109,6 +111,7 @@ gives the root agent only `lookup`.
 - `peers` is the meet of the parent peers and `Peer::peers`.
 - `tools` is the meet of the parent tools and `Peer::tools`.
 - `max_depth` and `max_delegations` stay the same. They never grow.
+- `models` stays the same. `Mandate::accept` takes the meet of both lists.
 - `read_only` stays on once it is on.
 
 Property tests prove each rule (`a_delegation_never_widens_authority`).
@@ -140,11 +143,14 @@ verdict, and the report lists it:
 | `cycle` | The peer is already in the chain. |
 | `depth_exceeded` | The delegation passes `max_depth`. |
 | `fan_out_exhausted` | The tree has used `max_delegations`. |
+| `model_forbidden` | The mandate does not allow the model of the peer. |
 | `budget_exhausted` | The child would get a token cap of zero. |
 | `invalid_mandate` | `Mandate::accept` got a malformed mandate. |
 
-A delegation runs the first seven checks in the order of the table.
-`Mandate::accept` returns `invalid_mandate`, `cycle` or `depth_exceeded`.
+A delegation runs the first eight checks in the order of the table.
+`Mandate::accept` returns `invalid_mandate`, `cycle` or `depth_exceeded`. A
+durable receiver returns `model_forbidden` when the accepted mandate does
+not allow its own model.
 `Refusal` implements `std::error::Error`.
 
 The report keeps a peer name only when it is a valid agent name. Any other
@@ -387,7 +393,6 @@ calls per subtree.
   worker, and children never run at the same time.
 - Each child turn adds to the history of the parent. Keep `max_delegations`
   and the peer step bounds low.
-- All agents use the one model of the harness.
 - A durable peer (section 13) needs no manual step. A peer in another
   deployment still does: use `ctx.call_remote_task` and the wire form above.
 - Flow rules are only as good as the tool labels. A tool with no label adds
@@ -433,3 +438,38 @@ let harness = AgentHarness::new(model)
   reply after the deadline is not read.
 - A durable peer runs on its own worker, in its own history, under its own
   profile budget. Its tokens are not added to the budget of the sender.
+
+## 14. A model per agent (issue #2271)
+
+The harness holds named models. A task, a peer, a profile or a heartbeat
+names its model. A cheap triage model can front a strong planner.
+
+```rust
+use autumn_harvest_agent::{AgentHarness, AgentTask, DEFAULT_MODEL, Mandate, Peer};
+
+let harness = AgentHarness::new(cheap)
+    .model_named("strong", strong)
+    .peer(Peer::new("planner", "Plans.").model("strong"));
+let task = AgentTask::new("triage this")
+    .mandate(Mandate::new("triage").peers(["planner"]).models([DEFAULT_MODEL, "strong"]));
+```
+
+| Setter | Scope |
+|---|---|
+| `AgentTask::model` | The root agent of a run. |
+| `Peer::model` | An inline child. A child with no model keeps the model of its parent. |
+| `AgentProfile::model` | Each durable agent of the kind. |
+| `AgentHeartbeat::model`, `HeartbeatTask::model` | Each tick. `None` takes the profile model. |
+
+- The model-turn input records the name. Replay asks the same model.
+- `DEFAULT_MODEL` names the model of `AgentHarness::new`. A task with no
+  name uses it.
+- The response cache key holds the model id. One model never reads the
+  answer of another.
+- The cost ledger records the id of the model that answered each turn.
+- An unknown name fails the turn, with no retry and no fallback.
+- A mandate checks the model at three points: a delegation to a peer, the
+  start of a root run, and a durable receiver. A sender cannot see the
+  model of a durable peer, so the receiver checks it.
+- `eval::compare` runs two candidates on one recorded run.
+  `Candidate::agent_model` sets the model of one agent of the tree.

@@ -96,6 +96,7 @@ fn agent_loop_history(filler: Filler) -> Vec<WorkflowEvent> {
             flow_labels: std::collections::BTreeSet::new(),
             flow_released: autumn_harvest_agent::Released::new(),
             interruptible: false,
+            model: None,
         };
         let call = ToolCall {
             id: format!("call-{turn}"),

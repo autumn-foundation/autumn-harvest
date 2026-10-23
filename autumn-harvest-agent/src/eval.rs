@@ -84,7 +84,7 @@
 //! async, so the harness blocks in place. Blocking in place needs a
 //! multi-thread Tokio runtime.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -141,6 +141,8 @@ pub struct Candidate {
     harness: Arc<AgentHarness>,
     system: Option<String>,
     max_turns: Option<usize>,
+    model: Option<String>,
+    agent_models: BTreeMap<String, String>,
 }
 
 impl Candidate {
@@ -157,7 +159,33 @@ impl Candidate {
             harness,
             system: None,
             max_turns: None,
+            model: None,
+            agent_models: BTreeMap::new(),
         }
+    }
+
+    /// Ask the harness model `name` for every model turn (issue #2271).
+    ///
+    /// Without it, each turn asks the model that its recorded input names.
+    #[must_use]
+    pub fn model(mut self, name: impl Into<String>) -> Self {
+        self.model = Some(name.into());
+        self
+    }
+
+    /// Ask the harness model `name` for each turn of the agent `agent` of a
+    /// delegation tree. It wins over [`model`](Self::model) for that agent.
+    #[must_use]
+    pub fn agent_model(mut self, agent: impl Into<String>, name: impl Into<String>) -> Self {
+        self.agent_models.insert(agent.into(), name.into());
+        self
+    }
+
+    /// The model name that this candidate sets for a turn of `agent`, if any.
+    fn model_for(&self, agent: Option<&str>) -> Option<&String> {
+        agent
+            .and_then(|agent| self.agent_models.get(agent))
+            .or(self.model.as_ref())
     }
 
     /// Replace the system prompt of the recorded task.
@@ -407,7 +435,7 @@ pub async fn evaluate(
         stubbed: 0,
     }));
 
-    let model = model_mock(&session, &candidate.harness, &recording, handle);
+    let model = model_mock(&session, candidate, &recording, handle);
     let tool = {
         let session = Arc::clone(&session);
         move |input: Value| -> Result<Value, String> {
@@ -464,6 +492,83 @@ pub async fn evaluate(
         replayed_tool_calls: replayed,
         stubbed_tool_calls: stubbed,
         turn_cap_reached: cap_reached,
+    })
+}
+
+/// Two candidates on one source, such as two models for one agent (issue
+/// #2271).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Comparison {
+    /// The first candidate against the source.
+    pub first: Evaluation,
+    /// The second candidate against the source.
+    pub second: Evaluation,
+    /// One comparison per model turn of the two candidates.
+    ///
+    /// In each [`TurnDiff`], `recorded` holds the decision of the first
+    /// candidate, and `candidate` holds the decision of the second.
+    /// [`Side::Recorded`] names the first candidate.
+    pub turns: Vec<TurnDiff>,
+    /// The index of the first turn where the candidates diverge.
+    pub first_divergence: Option<usize>,
+    /// `true` when the two candidates end in different ways, by the rule of
+    /// [`Evaluation::end_diverged`].
+    pub end_diverged: bool,
+}
+
+impl Comparison {
+    /// `true` when a turn diverges or the run ends differ.
+    #[must_use]
+    pub const fn diverged(&self) -> bool {
+        self.first_divergence.is_some() || self.end_diverged
+    }
+}
+
+/// Evaluate `first` and `second` against one recorded `history`, then
+/// compare the two candidates turn by turn (issue #2271).
+///
+/// Give both candidates one harness with two named models, and set
+/// [`Candidate::model`] or [`Candidate::agent_model`] on each. The two
+/// evaluations run one after the other, each with its own live model calls.
+///
+/// # Errors
+///
+/// The errors of [`evaluate`]. A refused history costs no model call.
+pub async fn compare(
+    history: &[WorkflowEvent],
+    first: &Candidate,
+    second: &Candidate,
+) -> Result<Comparison, EvalError> {
+    let first = evaluate(history, first).await?;
+    let second = evaluate(history, second).await?;
+    let decision = |evaluation: &Evaluation, turn: usize| {
+        evaluation
+            .turns
+            .get(turn)
+            .and_then(|diff| diff.candidate.clone())
+    };
+    let turns: Vec<TurnDiff> = (0..first.turns.len().max(second.turns.len()))
+        .filter_map(|turn| {
+            let (one, two) = (decision(&first, turn), decision(&second, turn));
+            // A turn that only the source has is not a candidate turn.
+            (one.is_some() || two.is_some()).then(|| TurnDiff {
+                turn,
+                verdict: verdict(one.as_ref(), two.as_ref()),
+                recorded: one,
+                candidate: two,
+            })
+        })
+        .collect();
+    let first_divergence = turns
+        .iter()
+        .position(|turn| matches!(turn.verdict, Verdict::Diverged(_)));
+    let end_diverged = ends_differ(&first.candidate, &second.candidate);
+    Ok(Comparison {
+        first,
+        second,
+        turns,
+        first_divergence,
+        end_diverged,
     })
 }
 
@@ -932,12 +1037,13 @@ fn engine() -> WorkflowTestEnv {
 /// The mock of the model activity: the live candidate turn.
 fn model_mock(
     session: &Arc<Mutex<Session>>,
-    harness: &Arc<AgentHarness>,
+    candidate: &Candidate,
     recording: &Recording,
     handle: tokio::runtime::Handle,
 ) -> impl Fn(Value) -> Result<Value, String> + Send + Sync + 'static {
     let session = Arc::clone(session);
-    let harness = Arc::clone(harness);
+    let harness = Arc::clone(&candidate.harness);
+    let models = candidate.clone();
     let run_id = recording.run_id.clone();
     let taken: HashSet<String> = recording
         .turns
@@ -950,6 +1056,9 @@ fn model_mock(
         .unwrap_or_default();
     move |input: Value| -> Result<Value, String> {
         let mut request: ModelTurnRequest = decode(input)?;
+        if let Some(name) = models.model_for(request.agent.as_deref()) {
+            request.model = Some(name.clone());
+        }
         let (index, recorded) = {
             let mut session = lock(&session);
             // The root agent makes the first model request.

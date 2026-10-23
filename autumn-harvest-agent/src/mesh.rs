@@ -45,7 +45,7 @@ pub const INVALID_NAME: &str = "_invalid";
 
 /// The keys of a mandate on the wire. [`Mandate::from_meta`] refuses any
 /// other key, because a newer sender can add a field that narrows the run.
-const WIRE_KEYS: [&str; 7] = [
+const WIRE_KEYS: [&str; 8] = [
     "chain",
     "max_depth",
     "peers",
@@ -53,6 +53,7 @@ const WIRE_KEYS: [&str; 7] = [
     "max_delegations",
     "read_only",
     "flow_labels",
+    "models",
 ];
 
 /// Whether `item` is a valid tool name or flow label: 1 to
@@ -75,8 +76,9 @@ pub fn valid_name(name: &str) -> bool {
             .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
 }
 
-/// The meet of two tool allowlists. `None` means every tool.
-fn meet_tools(
+/// The meet of two allowlists, of tools or of models. `None` means every
+/// item.
+fn meet_allowlists(
     left: Option<&BTreeSet<String>>,
     right: Option<&BTreeSet<String>>,
 ) -> Option<BTreeSet<String>> {
@@ -128,6 +130,11 @@ pub struct Peer {
     /// `None` waits [`DEFAULT_REPLY_TIMEOUT_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_timeout_secs: Option<u64>,
+    /// The harness model of an inline peer (issue #2271). `None` keeps the
+    /// model of the caller. For a durable peer, it names the model that the
+    /// caller expects, and the profile of the agent decides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// The default time a caller waits for the reply of a durable peer: ten
@@ -150,6 +157,7 @@ impl Peer {
             read_only: false,
             agent: None,
             reply_timeout_secs: None,
+            model: None,
         }
     }
 
@@ -180,6 +188,13 @@ impl Peer {
     #[must_use]
     pub fn system(mut self, system: impl Into<String>) -> Self {
         self.system = Some(system.into());
+        self
+    }
+
+    /// Run the peer on the harness model `name`. See [`model`](Self::model).
+    #[must_use]
+    pub fn model(mut self, name: impl Into<String>) -> Self {
+        self.model = Some(name.into());
         self
     }
 
@@ -257,6 +272,11 @@ pub struct Mandate {
     /// run with them.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
+    /// The harness models that the subtree may use (issue #2271). `None`
+    /// means every model. [`DEFAULT_MODEL`](crate::DEFAULT_MODEL) names the
+    /// model of [`AgentHarness::new`](crate::AgentHarness::new).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<BTreeSet<String>>,
 }
 
 impl Mandate {
@@ -272,7 +292,29 @@ impl Mandate {
             max_delegations: DEFAULT_MAX_DELEGATIONS,
             read_only: false,
             flow_labels: BTreeSet::new(),
+            models: None,
         }
+    }
+
+    /// Let the subtree use only these harness models.
+    #[must_use]
+    pub fn models<I, S>(mut self, models: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.models = Some(models.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Whether the subtree may use the harness model `name`. `None` is
+    /// [`DEFAULT_MODEL`](crate::DEFAULT_MODEL).
+    #[must_use]
+    pub fn allows_model(&self, name: Option<&str>) -> bool {
+        let name = name.unwrap_or(crate::DEFAULT_MODEL);
+        self.models
+            .as_ref()
+            .is_none_or(|models| models.contains(name))
     }
 
     /// Let the holder delegate to these peers.
@@ -346,11 +388,13 @@ impl Mandate {
             return Err("the mandate chain is empty".to_owned());
         }
         let tools = self.tools.as_ref().map_or(0, BTreeSet::len);
+        let models = self.models.as_ref().map_or(0, BTreeSet::len);
         if [
             self.chain.len(),
             self.peers.len(),
             tools,
             self.flow_labels.len(),
+            models,
         ]
         .into_iter()
         .any(|len| len > MAX_SET_LEN)
@@ -364,10 +408,11 @@ impl Mandate {
             .iter()
             .flatten()
             .chain(&self.flow_labels)
+            .chain(self.models.iter().flatten())
             .find(|item| !valid_item(item))
         {
             return Err(format!(
-                "{:?} is not a valid tool name or label",
+                "{:?} is not a valid tool name, label or model name",
                 crate::harness::truncate(bad, MAX_NAME_LEN)
             ));
         }
@@ -416,16 +461,22 @@ impl Mandate {
         if used >= self.max_delegations {
             return Err(Refusal::FanOutExhausted);
         }
+        // A peer with no model keeps the model of the holder, which this
+        // mandate already allows.
+        if peer.model.is_some() && !self.allows_model(peer.model.as_deref()) {
+            return Err(Refusal::ModelForbidden);
+        }
         let mut chain = self.chain.clone();
         chain.push(peer.name.clone());
         Ok(Self {
             chain,
             max_depth: self.max_depth,
             peers: self.peers.intersection(&peer.peers).cloned().collect(),
-            tools: meet_tools(self.tools.as_ref(), peer.tools.as_ref()),
+            tools: meet_allowlists(self.tools.as_ref(), peer.tools.as_ref()),
             max_delegations: self.max_delegations,
             read_only: self.read_only || peer.read_only,
             flow_labels: self.flow_labels.clone(),
+            models: self.models.clone(),
         })
     }
 
@@ -487,7 +538,7 @@ impl Mandate {
             chain,
             max_depth: self.max_depth.min(inbound.max_depth),
             peers: self.peers.intersection(&inbound.peers).cloned().collect(),
-            tools: meet_tools(self.tools.as_ref(), inbound.tools.as_ref()),
+            tools: meet_allowlists(self.tools.as_ref(), inbound.tools.as_ref()),
             max_delegations: self.max_delegations.min(inbound.max_delegations),
             read_only: self.read_only || inbound.read_only,
             flow_labels: self
@@ -495,6 +546,7 @@ impl Mandate {
                 .union(&inbound.flow_labels)
                 .cloned()
                 .collect(),
+            models: meet_allowlists(self.models.as_ref(), inbound.models.as_ref()),
         };
         if merged.depth() > merged.max_depth {
             return Err(Refusal::DepthExceeded);
@@ -563,6 +615,8 @@ pub enum Refusal {
     DepthExceeded,
     /// The run tree has used every delegation that its mandate allows.
     FanOutExhausted,
+    /// The mandate does not allow the model of the peer (issue #2271).
+    ModelForbidden,
     /// The run tree has no tokens left for a child.
     BudgetExhausted,
     /// An inbound mandate is malformed.
@@ -586,6 +640,7 @@ impl Refusal {
             Self::Cycle => "cycle",
             Self::DepthExceeded => "depth_exceeded",
             Self::FanOutExhausted => "fan_out_exhausted",
+            Self::ModelForbidden => "model_forbidden",
             Self::BudgetExhausted => "budget_exhausted",
             Self::InvalidMandate => "invalid_mandate",
             Self::Deadlock => "deadlock",
@@ -609,6 +664,7 @@ impl Refusal {
             Self::FanOutExhausted => {
                 format!("the run has used every delegation; {peer:?} cannot start")
             }
+            Self::ModelForbidden => format!("the mandate does not allow the model of {peer:?}"),
             Self::BudgetExhausted => format!("no tokens are left for {peer:?}"),
             Self::InvalidMandate => format!("the mandate for {peer:?} is not valid"),
             Self::Deadlock => {
@@ -816,6 +872,7 @@ mod tests {
             Refusal::Cycle,
             Refusal::DepthExceeded,
             Refusal::FanOutExhausted,
+            Refusal::ModelForbidden,
             Refusal::BudgetExhausted,
             Refusal::InvalidMandate,
             Refusal::Deadlock,
@@ -832,6 +889,39 @@ mod tests {
         }
         assert_eq!(Refusal::FanOutExhausted.code(), "fan_out_exhausted");
         assert_eq!(MANDATE_META_KEY, "io.autumn-harvest/mandate");
+    }
+
+    #[test]
+    fn a_model_allowlist_only_narrows() {
+        let parent = Mandate::new("planner")
+            .peers(["coder"])
+            .models([crate::DEFAULT_MODEL, "cheap"]);
+        assert!(parent.allows_model(None), "no name is the default model");
+        assert!(parent.allows_model(Some("cheap")));
+        assert!(!parent.allows_model(Some("strong")));
+        let strong = Peer::new("coder", "Codes.").model("strong");
+        assert_eq!(parent.delegate(&strong, 0), Err(Refusal::ModelForbidden));
+        let cheap = Peer::new("coder", "Codes.").model("cheap");
+        let child = parent.delegate(&cheap, 0).unwrap();
+        assert_eq!(child.models, parent.models, "the child keeps the allowlist");
+        // A receiver keeps the meet of both lists.
+        let local = Mandate::new("coder").models(["cheap", "strong"]);
+        let merged = local.accept(&child).unwrap();
+        assert_eq!(merged.models, Some(set(&["cheap"])));
+        assert!(
+            Mandate::new("x").allows_model(Some("any")),
+            "no list allows all"
+        );
+    }
+
+    #[test]
+    fn a_model_allowlist_crosses_the_wire_and_is_validated() {
+        let mandate = Mandate::new("planner").models(["cheap"]);
+        let mut meta = Map::new();
+        mandate.insert_into(&mut meta);
+        assert_eq!(Mandate::from_meta(&meta).unwrap(), Some(mandate));
+        let bad = Mandate::new("planner").models(["bad\u{7}"]);
+        assert!(bad.validate().is_err());
     }
 
     #[test]
@@ -1010,6 +1100,7 @@ mod tests {
             max_delegations: 3,
             read_only: true,
             flow_labels: BTreeSet::new(),
+            models: None,
         };
         let merged = local.accept(&inbound).unwrap();
         assert_eq!(merged.chain, vec!["planner", "researcher"]);
@@ -1074,6 +1165,14 @@ mod tests {
         ))
     }
 
+    fn model() -> impl Strategy<Value = String> {
+        prop::sample::select(vec![crate::DEFAULT_MODEL, "m1", "m2"]).prop_map(str::to_owned)
+    }
+
+    fn models() -> impl Strategy<Value = Option<BTreeSet<String>>> {
+        prop::option::of(prop::collection::btree_set(model(), 0..3))
+    }
+
     fn mandate() -> impl Strategy<Value = Mandate> {
         (
             prop::collection::btree_set(name(), 1..4),
@@ -1083,9 +1182,19 @@ mod tests {
             0_u32..5,
             any::<bool>(),
             names(),
+            models(),
         )
             .prop_map(
-                |(chain, max_depth, peers, tools, max_delegations, read_only, flow_labels)| {
+                |(
+                    chain,
+                    max_depth,
+                    peers,
+                    tools,
+                    max_delegations,
+                    read_only,
+                    flow_labels,
+                    models,
+                )| {
                     Mandate {
                         chain: chain.into_iter().collect(),
                         max_depth,
@@ -1094,18 +1203,27 @@ mod tests {
                         max_delegations,
                         read_only,
                         flow_labels,
+                        models,
                     }
                 },
             )
     }
 
     fn peer() -> impl Strategy<Value = Peer> {
-        (name(), names(), tools(), any::<bool>()).prop_map(|(name, peers, tools, read_only)| Peer {
-            tools,
-            peers,
-            read_only,
-            ..Peer::new(name, "A peer.")
-        })
+        (
+            name(),
+            names(),
+            tools(),
+            any::<bool>(),
+            prop::option::of(model()),
+        )
+            .prop_map(|(name, peers, tools, read_only, model)| Peer {
+                tools,
+                peers,
+                read_only,
+                model,
+                ..Peer::new(name, "A peer.")
+            })
     }
 
     /// Whether `child` grants nothing that `parent` does not.
@@ -1115,7 +1233,13 @@ mod tests {
             (None, Some(_)) => false,
             (Some(c), Some(p)) => c.is_subset(p),
         };
+        let models = match (&child.models, &parent.models) {
+            (_, None) => true,
+            (None, Some(_)) => false,
+            (Some(c), Some(p)) => c.is_subset(p),
+        };
         tools
+            && models
             && child.peers.is_subset(&parent.peers)
             && child.max_depth <= parent.max_depth
             && child.max_delegations <= parent.max_delegations
@@ -1142,6 +1266,7 @@ mod tests {
                 prop_assert!(used < parent.max_delegations);
                 prop_assert!(parent.peers.contains(&role.name));
                 prop_assert!(!parent.chain.contains(&role.name));
+                prop_assert!(child.allows_model(role.model.as_deref()) || role.model.is_none());
             }
         }
 
@@ -1163,7 +1288,8 @@ mod tests {
             let admissible = parent.peers.contains(&role.name)
                 && !parent.chain.contains(&role.name)
                 && parent.depth() < parent.max_depth
-                && used < parent.max_delegations;
+                && used < parent.max_delegations
+                && (role.model.is_none() || parent.allows_model(role.model.as_deref()));
             prop_assert_eq!(parent.delegate(&role, used).is_ok(), admissible);
         }
 

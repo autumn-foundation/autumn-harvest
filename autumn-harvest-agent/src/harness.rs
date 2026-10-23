@@ -32,6 +32,12 @@ use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
 /// The default cap on one tool result, in characters.
 pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
 
+/// The name of the model that [`AgentHarness::new`] takes (issue #2271).
+///
+/// A task, a peer or a profile with no model name uses it. A mandate
+/// allowlist names it as any other model.
+pub const DEFAULT_MODEL: &str = "default";
+
 /// The default time budget of one model call: 13 minutes.
 ///
 /// With [`DEFAULT_POLICY_TIMEOUT`], three [`DEFAULT_CACHE_TIMEOUT`] budgets
@@ -88,6 +94,7 @@ const TRUNCATED: &str = "…[truncated]";
 #[derive(Debug, Clone)]
 pub struct AgentHarness {
     client: Arc<dyn AgentModel>,
+    models: BTreeMap<String, Arc<dyn AgentModel>>,
     tools: Vec<Arc<dyn Tool>>,
     policy: Arc<dyn ToolPolicy>,
     temperature: Option<f32>,
@@ -114,6 +121,7 @@ impl AgentHarness {
     pub fn new(client: Arc<dyn AgentModel>) -> Self {
         Self {
             client,
+            models: BTreeMap::new(),
             tools: Vec::new(),
             policy: Arc::new(AllowAll),
             temperature: None,
@@ -257,6 +265,44 @@ impl AgentHarness {
         self
     }
 
+    /// Add the model `name` to the registry (issue #2271).
+    ///
+    /// A task, a peer, a profile or a heartbeat names it. The model-turn
+    /// input records the name, so replay asks the same model. The name
+    /// [`DEFAULT_MODEL`] replaces the model of [`AgentHarness::new`].
+    #[must_use]
+    pub fn model_named(mut self, name: impl Into<String>, model: Arc<dyn AgentModel>) -> Self {
+        let name = name.into();
+        if name == DEFAULT_MODEL {
+            self.client = model;
+        } else {
+            self.models.insert(name, model);
+        }
+        self
+    }
+
+    /// The model `name`. `None` is the [`DEFAULT_MODEL`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable activity error payload when the registry has
+    /// no such model. A retry cannot add it.
+    pub(crate) fn model(&self, name: Option<&str>) -> Result<&Arc<dyn AgentModel>, String> {
+        match name {
+            None | Some(DEFAULT_MODEL) => Ok(&self.client),
+            Some(name) => self.models.get(name).ok_or_else(|| {
+                ActivityFailure::non_retryable(
+                    "UnknownModel",
+                    format!(
+                        "the harness has no model named {:?}; add it with AgentHarness::model_named",
+                        truncate(name, crate::mesh::MAX_NAME_LEN)
+                    ),
+                )
+                .into_error_payload()
+            }),
+        }
+    }
+
     /// Add one peer to the roster. A run whose mandate names the peer can
     /// delegate to it. When two peers share a name, the later one wins at
     /// lookup.
@@ -349,9 +395,12 @@ impl AgentHarness {
     }
 
     /// Whether a turn can use the response cache: the harness has a cache,
-    /// and the model has an id.
+    /// and a model has an id.
     pub(crate) fn cache_active(&self) -> bool {
-        self.cache.is_some() && self.client.model_id().is_some()
+        self.cache.is_some()
+            && std::iter::once(&self.client)
+                .chain(self.models.values())
+                .any(|model| model.model_id().is_some())
     }
 
     /// The time budget of one response-cache call, the tenant read included.
@@ -448,6 +497,7 @@ impl AgentHarness {
         tenant: CacheTenant,
         mut prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<(ModelTurn, Option<Duration>), String> {
+        let client = self.model(request.model.as_deref())?;
         let mut builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
@@ -473,7 +523,9 @@ impl AgentHarness {
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,
         };
-        let key = self.cache_key(&tenant, &chat);
+        // The key holds the model id, so one model never reads the answer
+        // of another.
+        let key = self.cache_key(client.as_ref(), &tenant, &chat);
         let mut cached = match &key {
             Some(key) => self.cache_lookup(key).await,
             None => None,
@@ -495,7 +547,7 @@ impl AgentHarness {
                 }
             } else {
                 let started = std::time::Instant::now();
-                let response = self.call_model(&chat).await?;
+                let response = self.call_model(client.as_ref(), &chat).await?;
                 latency = Some(started.elapsed());
                 fresh = key.as_ref().map(|key| (key, response.clone()));
                 response
@@ -561,10 +613,11 @@ impl AgentHarness {
     pub(crate) fn record_turn(
         &self,
         ctx: &autumn_harvest::context::ActivityContext,
+        model: Option<&str>,
         usage: &TokenUsage,
         latency: Duration,
     ) {
-        if let Err(err) = ctx.record_llm_call(self.ledger_call(usage, latency)) {
+        if let Err(err) = ctx.record_llm_call(self.ledger_call(model, usage, latency)) {
             tracing::warn!(error = %err, "the agent cost ledger refused a model turn");
         }
     }
@@ -582,12 +635,16 @@ impl AgentHarness {
     /// Each refusal logs a warning.
     pub(crate) fn ledger_call(
         &self,
+        model: Option<&str>,
         usage: &TokenUsage,
         latency: Duration,
     ) -> autumn_harvest::llm_ledger::LlmCall {
         use autumn_harvest::llm_ledger::LlmCall;
 
-        let mut model = self.client.model_id().unwrap_or(UNKNOWN_MODEL_ID);
+        // A turn on an unknown model fails before its call, so the default
+        // is never priced for it.
+        let client = self.model(model).unwrap_or(&self.client);
+        let mut model = client.model_id().unwrap_or(UNKNOWN_MODEL_ID);
         if let Err(err) = LlmCall::new(model, 0, 0).validate() {
             tracing::warn!(
                 error = %err,
@@ -595,7 +652,7 @@ impl AgentHarness {
             );
             model = UNKNOWN_MODEL_ID;
         }
-        let cost = self.client.cost_usd_micros(usage).filter(|&cost| {
+        let cost = client.cost_usd_micros(usage).filter(|&cost| {
             let check = LlmCall::new(UNKNOWN_MODEL_ID, 0, 0)
                 .with_cost_usd_micros(cost)
                 .validate();
@@ -718,9 +775,13 @@ impl AgentHarness {
             .collect()
     }
 
-    /// Send `chat` to the model within the model time budget.
-    async fn call_model(&self, chat: &ChatRequest) -> Result<ChatResponse, String> {
-        tokio::time::timeout(self.model_timeout, self.client.chat(chat))
+    /// Send `chat` to `client` within the model time budget.
+    async fn call_model(
+        &self,
+        client: &dyn AgentModel,
+        chat: &ChatRequest,
+    ) -> Result<ChatResponse, String> {
+        tokio::time::timeout(self.model_timeout, client.chat(chat))
             .await
             .map_err(|_| {
                 ActivityFailure::retryable(
@@ -736,9 +797,14 @@ impl AgentHarness {
     ///
     /// The turn skips the cache when the harness has no cache, the model has
     /// no id, or the tenant says to skip.
-    fn cache_key(&self, tenant: &CacheTenant, chat: &ChatRequest) -> Option<CacheKey> {
+    fn cache_key(
+        &self,
+        client: &dyn AgentModel,
+        tenant: &CacheTenant,
+        chat: &ChatRequest,
+    ) -> Option<CacheKey> {
         let cache = self.cache.as_ref()?;
-        let model_id = self.client.model_id()?;
+        let model_id = client.model_id()?;
         let tenant = match tenant {
             CacheTenant::None => KeyTenant::None,
             CacheTenant::Verified(name) => KeyTenant::Verified(name),
