@@ -506,11 +506,13 @@ let built = HarvestBuilder::new()
     .build();
 ```
 
-The engine keeps one schedule per workflow name, so a deployment has one
-heartbeat schedule. For one heartbeat per user, start each tick from the
-app, or let one scheduled workflow start the ticks. On SQLite, pass the
-same `heartbeat::schedule` to `SqliteRuntime::upsert_schedule` (issue
-#2031). An app can also call `sqlite::start_heartbeat` on each tick.
+On SQLite, pass the same `heartbeat::schedule` to
+`SqliteRuntime::upsert_schedule` (issue #2031). An app can also call
+`sqlite::start_heartbeat` on each tick.
+
+For one heartbeat per agent, use a durable `Agent` (section 15). Each agent
+key has its own heartbeat, driven by its own durable timer, and a tick is an
+op in its inbox. A deployment can run any number of them.
 
 ### Follow-ups
 
@@ -867,6 +869,39 @@ A control op applies at once, also while the agent is paused. The kernel
   approval names never repeat.
 - The transcript keeps at most `AgentProfile::window` messages. The cut
   lands on a user message.
+
+### Heartbeats and follow-ups (issue #2266)
+
+A wake is an op in the inbox, so it never runs at the same time as a
+message. `Entity::run_with_wakes` races the op signal against the next
+deadline of the agent. A due wake runs before a waiting message.
+
+| Wake | Config | Op |
+|---|---|---|
+| Heartbeat | `AgentProfile::heartbeat`, or `Control::SetHeartbeat` for one agent | `HeartbeatTick` |
+| Follow-up | `AgentProfile::followups`, then the model calls `schedule_followup` | `FollowupDue` |
+
+- A tick is unattended. It is read-only unless `AgentHeartbeat::allow_actions`
+  is set. It can ask the harness precheck first. A silent `HEARTBEAT_OK`
+  tick leaves the transcript as it was and delivers nothing.
+- The next tick is due one interval after a tick runs. A late tick never
+  piles up. `agent::wake::next_heartbeat` books it, and a tick always books
+  the next one after the time it ran.
+- A follow-up is a deadline in the state. The chain count is state too, so
+  `Followups::max_chain` holds across a checkpoint. A message from a person
+  starts a new chain.
+- A paused agent skips its ticks, and a booked follow-up waits. On resume,
+  one due tick runs.
+- `HeartbeatTick` and `FollowupDue` do not decode from a signal.
+- A restart during a wait resumes the timer. A tick and its report happen
+  once.
+
+### Search attributes (issue #2267)
+
+Each op upserts `agent_kind`, `agent_status` (`running`,
+`waiting_approval`, `idle` or `paused`), `agent_last_active_at`,
+`agent_next_wake_at`, `agent_wake_reason`, `agent_tenant` and
+`agent_tokens_used`. Times are epoch milliseconds. A list filters on them.
 
 ### Mid-turn messages (issue #2265)
 

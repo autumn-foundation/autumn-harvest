@@ -326,9 +326,8 @@ pub async fn agent_heartbeat(
 /// `Schedule::Interval(Duration::from_secs(1_800))` for a tick every 30
 /// minutes.
 ///
-/// The engine keeps one schedule per workflow name, so a deployment has one
-/// heartbeat schedule. For one heartbeat per user, start each tick from the
-/// app, or let one scheduled workflow start the ticks.
+/// For one heartbeat per agent, use a durable [`Agent`](crate::Agent) with
+/// [`AgentProfile::heartbeat`](crate::AgentProfile::heartbeat) instead.
 ///
 /// # Errors
 ///

@@ -33,17 +33,20 @@
 //! workflow id, `{}` as the input, and [`Agent::payload`] as the payload.
 
 pub mod inbox;
+pub mod wake;
 
 use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
-use autumn_harvest::entity::{ENTITY_OP_SIGNAL, Entity, EntityMessage};
+use autumn_harvest::entity::{ENTITY_OP_SIGNAL, Entity, EntityMessage, Wake};
 use autumn_harvest::policy::RetryPolicy;
 use autumn_harvest::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::delivery::{Report, ReportSource, report_text};
+use crate::delivery::{Report, ReportSource, is_silent, report_text};
 use crate::flow::Released;
+use crate::followup::{Followups, WAKE_MESSAGE};
+use crate::heartbeat::{DEFAULT_HEARTBEAT_PROMPT, HeartbeatTask};
 use crate::loop_guard::LoopGuard;
 use crate::memory::MemoryScope;
 use crate::mesh::Mandate;
@@ -242,6 +245,114 @@ pub enum Control {
     ResetMemory,
     /// Clear the transcript. The flow labels stay.
     ClearTranscript,
+    /// Set the heartbeat of this agent (issue #2266). It overrides the
+    /// heartbeat of the profile.
+    SetHeartbeat {
+        /// The new setting.
+        setting: HeartbeatSetting,
+    },
+}
+
+/// The heartbeat of one agent (issue #2266).
+///
+/// A tick is an op in the inbox, so it never runs at the same time as a
+/// message. A tick is unattended. It is read-only unless `allow_actions` is
+/// set.
+// The flags are independent switches on a recorded payload.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentHeartbeat {
+    /// The time between two ticks, in seconds. The next tick is due one
+    /// interval after a tick runs, so a late tick never piles up.
+    pub every_secs: u64,
+    /// The user message of a tick.
+    #[serde(default = "default_heartbeat_prompt")]
+    pub prompt: String,
+    /// Ask the harness precheck before a tick. A `false` answer skips the
+    /// tick with no model call.
+    #[serde(default)]
+    pub precheck: bool,
+    /// Let a tick run tools that write or act outside. Off by default.
+    #[serde(default)]
+    pub allow_actions: bool,
+    /// Let a tick write its memory. Off by default.
+    #[serde(default)]
+    pub allow_memory_writes: bool,
+    /// The bound on tool rounds in one tick. `None` takes the profile bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<u32>,
+    /// The bound on tokens in one tick. `None` takes the profile bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_tokens: Option<u32>,
+}
+
+fn default_heartbeat_prompt() -> String {
+    DEFAULT_HEARTBEAT_PROMPT.to_owned()
+}
+
+impl AgentHeartbeat {
+    /// A read-only heartbeat every `every`, with the default prompt.
+    ///
+    /// The interval rounds up to whole seconds, and it is at least one
+    /// second.
+    #[must_use]
+    pub fn every(every: Duration) -> Self {
+        Self {
+            every_secs: AgentTask::new_timeout_secs(every).max(1),
+            prompt: default_heartbeat_prompt(),
+            precheck: false,
+            allow_actions: false,
+            allow_memory_writes: false,
+            max_steps: None,
+            max_total_tokens: None,
+        }
+    }
+
+    /// Set the user message of a tick.
+    #[must_use]
+    pub fn prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.prompt = prompt.into();
+        self
+    }
+
+    /// Ask the harness precheck before each tick.
+    #[must_use]
+    pub const fn precheck(mut self) -> Self {
+        self.precheck = true;
+        self
+    }
+
+    /// Let a tick run tools that write or act outside.
+    #[must_use]
+    pub const fn allow_actions(mut self) -> Self {
+        self.allow_actions = true;
+        self
+    }
+
+    /// The interval in milliseconds. It is at least one second.
+    #[must_use]
+    pub fn every_ms(&self) -> i64 {
+        i64::try_from(self.every_secs.max(1))
+            .unwrap_or(i64::MAX)
+            .saturating_mul(1_000)
+    }
+}
+
+/// The heartbeat setting of one agent (issue #2266).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum HeartbeatSetting {
+    /// Use the heartbeat of the profile, if any.
+    #[default]
+    Profile,
+    /// No heartbeat for this agent.
+    Off,
+    /// This heartbeat for this agent.
+    Custom {
+        /// The heartbeat.
+        heartbeat: AgentHeartbeat,
+    },
 }
 
 /// One op in the inbox of an agent.
@@ -256,6 +367,13 @@ pub enum AgentOp {
     UserMessage(UserMessage),
     /// A control op.
     Control(Control),
+    /// A heartbeat tick (issue #2266). Only the wake hook makes it, so it
+    /// does not decode from a signal.
+    #[serde(skip_deserializing)]
+    HeartbeatTick,
+    /// A booked follow-up is due (issue #2266). Only the wake hook makes it.
+    #[serde(skip_deserializing)]
+    FollowupDue,
 }
 
 impl AgentOp {
@@ -299,6 +417,7 @@ impl AgentOp {
         match self {
             Self::UserMessage(_) => OpClass::Work,
             Self::Control(_) => OpClass::Control,
+            Self::HeartbeatTick | Self::FollowupDue => OpClass::Tick,
         }
     }
 }
@@ -371,6 +490,14 @@ pub struct AgentProfile {
     /// decision to the history size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_ops_per_run: Option<u64>,
+    /// The heartbeat of each agent of the kind (issue #2266).
+    /// `Control::SetHeartbeat` overrides it for one agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<AgentHeartbeat>,
+    /// The follow-up settings. With settings, the model gets the
+    /// `schedule_followup` tool, and a booked follow-up is a wake op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followups: Option<Followups>,
 }
 
 const fn default_max_steps() -> u32 {
@@ -405,7 +532,23 @@ impl AgentProfile {
             loop_guard: LoopGuard::default(),
             window: DEFAULT_WINDOW,
             max_ops_per_run: None,
+            heartbeat: None,
+            followups: None,
         }
+    }
+
+    /// Give each agent of the kind a heartbeat.
+    #[must_use]
+    pub fn heartbeat(mut self, heartbeat: AgentHeartbeat) -> Self {
+        self.heartbeat = Some(heartbeat);
+        self
+    }
+
+    /// Let the agents of the kind book follow-ups.
+    #[must_use]
+    pub const fn followups(mut self, followups: Followups) -> Self {
+        self.followups = Some(followups);
+        self
     }
 
     /// Set the system prompt.
@@ -496,11 +639,20 @@ impl AgentProfile {
     }
 
     /// The task of one segment of the agent `id`.
-    fn segment_task(&self, id: &AgentId, input: &str, unattended: bool) -> AgentTask {
+    fn segment_task(&self, id: &AgentId, input: &str, mode: Mode<'_>) -> AgentTask {
         let mandate_read_only = self
             .mandate
             .as_ref()
             .is_some_and(|mandate| mandate.read_only);
+        let (unattended, actions) = match mode {
+            Mode::Attended => (false, true),
+            Mode::Heartbeat(beat) => (true, beat.allow_actions),
+            Mode::Followup => (
+                true,
+                self.followups
+                    .is_some_and(|settings| settings.allow_actions),
+            ),
+        };
         let mut task = AgentTask::new(input).max_steps(self.max_steps);
         task.system.clone_from(&self.system);
         task.session_id = Some(SessionId::new(id.as_str()));
@@ -511,11 +663,41 @@ impl AgentProfile {
         task.deliver = self.deliver;
         task.memory_scope = self.memory_scope(id);
         task.loop_guard = self.loop_guard;
-        task.read_only = self.read_only || mandate_read_only || unattended;
+        task.read_only = self.read_only || mandate_read_only || !actions;
         task.unattended = unattended;
         task.tenant.clone_from(&self.tenant);
         task.mandate.clone_from(&self.mandate);
+        task.followups = self.followups;
+        if let Mode::Heartbeat(beat) = mode {
+            // A tick never books a follow-up.
+            task.followups = None;
+            task.unattended_memory_writes = beat.allow_memory_writes;
+            task.max_steps = beat.max_steps.unwrap_or(self.max_steps);
+            task.max_total_tokens = beat.max_total_tokens.or(self.max_total_tokens);
+        }
         task
+    }
+}
+
+/// Who started a segment.
+#[derive(Debug, Clone, Copy)]
+enum Mode<'a> {
+    /// A message from a person or a peer.
+    Attended,
+    /// A heartbeat tick.
+    Heartbeat(&'a AgentHeartbeat),
+    /// A booked follow-up.
+    Followup,
+}
+
+impl Mode<'_> {
+    /// The delivery source of the segment.
+    const fn source(self) -> ReportSource {
+        match self {
+            Self::Attended => ReportSource::Run,
+            Self::Heartbeat(_) => ReportSource::Heartbeat,
+            Self::Followup => ReportSource::Followup,
+        }
     }
 }
 
@@ -545,11 +727,12 @@ impl AgentStatus {
         }
     }
 
-    /// The status name for listing: `open` or `paused`.
+    /// The status name for listing: `idle` or `paused`. A running op lists
+    /// as `running`, and an approval wait as `waiting_approval`.
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
-            Self::Open => "open",
+            Self::Open => "idle",
             Self::Paused { .. } => "paused",
         }
     }
@@ -591,6 +774,53 @@ pub struct AgentState {
     pub last_answer: Option<String>,
     /// The steer messages that wait for their other half (issue #2265).
     pub steer: SteerBook,
+    /// The heartbeat setting of this agent (issue #2266).
+    pub heartbeat: HeartbeatSetting,
+    /// When the next heartbeat tick is due, in epoch milliseconds.
+    pub next_heartbeat_ms: Option<i64>,
+    /// When the booked follow-up is due, in epoch milliseconds.
+    pub followup_due_ms: Option<i64>,
+    /// Follow-ups that ran since the last message from a person. The cap of
+    /// `Followups::max_chain` holds it.
+    pub chain: u32,
+    /// Heartbeat ticks that ran, prechecked ones included.
+    pub ticks: u64,
+    /// When the last op ended, in epoch milliseconds.
+    pub last_active_ms: Option<i64>,
+}
+
+impl AgentState {
+    /// The heartbeat that applies to this agent under `profile`.
+    #[must_use]
+    pub fn effective_heartbeat<'a>(
+        &'a self,
+        profile: Option<&'a AgentProfile>,
+    ) -> Option<&'a AgentHeartbeat> {
+        match &self.heartbeat {
+            HeartbeatSetting::Profile => profile.and_then(|profile| profile.heartbeat.as_ref()),
+            HeartbeatSetting::Off => None,
+            HeartbeatSetting::Custom { heartbeat } => Some(heartbeat),
+        }
+    }
+
+    /// The next wake of this agent: its time in epoch milliseconds and its
+    /// op. A paused agent has none.
+    #[must_use]
+    pub fn next_wake(&self, profile: Option<&AgentProfile>) -> Option<(i64, AgentOp)> {
+        if self.status != AgentStatus::Open {
+            return None;
+        }
+        let beat = self
+            .next_heartbeat_ms
+            .filter(|_| self.effective_heartbeat(profile).is_some())
+            .map(|at| (at, AgentOp::HeartbeatTick));
+        let followup = self.followup_due_ms.map(|at| (at, AgentOp::FollowupDue));
+        // At equal times the heartbeat goes first.
+        [beat, followup]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(at, _)| *at)
+    }
 }
 
 /// A durable agent: its address and the ops it takes.
@@ -701,8 +931,18 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
         Some(n) => entity.max_ops_per_run(n),
         None => entity,
     };
+    let profile = run.profile.as_ref().ok();
     entity
-        .run(|state, op: AgentOp| run.handle(state, op))
+        .run_with_wakes(
+            |state, op: AgentOp| run.handle(state, op),
+            |state: &AgentState| {
+                let (at, op) = state.next_wake(profile)?;
+                Some(Wake::new(
+                    autumn_harvest::chrono::DateTime::from_timestamp_millis(at)?,
+                    op,
+                ))
+            },
+        )
         .await
         .map_err(|err| err.to_string())
 }
@@ -729,28 +969,93 @@ impl AgentRun<'_> {
         if state.incarnation.is_empty() {
             state.incarnation = self.ctx.new_uuid().to_string();
         }
+        // One recorded clock read per op. Replay reads the same time.
+        let now = self.ctx.system_now().timestamp_millis();
+        self.publish(&state, "running", now);
+        let mut ticked = false;
         match admit(state.status.inbox(), op.class()) {
             Admit::Apply => {
                 if let AgentOp::Control(control) = op {
-                    state = self.control(state, control).await;
+                    state = self.control(state, control, now).await;
                 }
             }
             Admit::Hold => hold(&mut state, op),
-            Admit::Run => state = self.work(state, op).await,
+            Admit::Run => {
+                ticked = matches!(op, AgentOp::HeartbeatTick);
+                state = self.work(state, op, now).await;
+            }
             Admit::Skip => {}
         }
+        self.schedule(&mut state, now, ticked);
+        state.last_active_ms = Some(now);
+        self.publish(&state, state.status.name(), now);
         Ok(state)
     }
 
+    /// Book the next heartbeat. See [`wake::next_heartbeat`].
+    fn schedule(&self, state: &mut AgentState, now: i64, ticked: bool) {
+        let every = state
+            .effective_heartbeat(self.profile.as_ref().ok())
+            .map(AgentHeartbeat::every_ms);
+        state.next_heartbeat_ms = wake::next_heartbeat(state.next_heartbeat_ms, every, now, ticked);
+    }
+
+    /// Upsert the search attributes of the agent (issue #2267).
+    ///
+    /// A list query filters on them, for example by status and next wake.
+    /// The upsert appends no event, so replay does not change.
+    fn publish(&self, state: &AgentState, status: &str, now: i64) {
+        let profile = self.profile.as_ref().ok();
+        let wake = state.next_wake(profile);
+        let reason = wake.as_ref().map(|(_, op)| match op {
+            AgentOp::FollowupDue => "followup",
+            _ => "heartbeat",
+        });
+        let kind = self.id.as_ref().ok().map(AgentId::kind);
+        let tenant = profile.and_then(|profile| profile.tenant.clone());
+        let attrs = [
+            ("agent_kind", kind.map(|kind| serde_json::json!(kind))),
+            ("agent_status", Some(serde_json::json!(status))),
+            ("agent_last_active_at", Some(serde_json::json!(now))),
+            (
+                "agent_next_wake_at",
+                wake.map(|(at, _)| serde_json::json!(at)),
+            ),
+            (
+                "agent_wake_reason",
+                reason.map(|reason| serde_json::json!(reason)),
+            ),
+            (
+                "agent_tenant",
+                tenant.map(|tenant| serde_json::json!(tenant)),
+            ),
+            (
+                "agent_tokens_used",
+                Some(serde_json::json!(state.tokens_used)),
+            ),
+        ];
+        if let Err(err) = self
+            .ctx
+            .upsert_search_attrs(attrs.map(|(key, value)| (key.to_owned(), value)))
+        {
+            tracing::warn!(error = %err, "the agent search attributes were not set");
+        }
+    }
+
     /// Apply one control op.
-    async fn control(&self, mut state: AgentState, control: Control) -> AgentState {
+    async fn control(&self, mut state: AgentState, control: Control, now: i64) -> AgentState {
         match control {
             Control::Pause { reason } => state.status = AgentStatus::Paused { reason },
             Control::Resume => {
                 state.status = AgentStatus::Open;
                 while let Some(op) = state.held.pop_front() {
-                    state = self.work(state, op).await;
+                    state = self.work(state, op, now).await;
                 }
+            }
+            Control::SetHeartbeat { setting } => {
+                state.heartbeat = setting;
+                // The next op end books the first tick of the new setting.
+                state.next_heartbeat_ms = None;
             }
             Control::ResetMemory => {
                 if let Err(err) = self.reset_memory().await {
@@ -777,7 +1082,7 @@ impl AgentRun<'_> {
     }
 
     /// Run one work op as a segment.
-    async fn work(&self, mut state: AgentState, op: AgentOp) -> AgentState {
+    async fn work(&self, mut state: AgentState, op: AgentOp, now: i64) -> AgentState {
         match op {
             AgentOp::UserMessage(message) => {
                 if let (Urgency::Steer, Some(id)) = (message.urgency, message.message_id) {
@@ -788,14 +1093,69 @@ impl AgentRun<'_> {
                     // The op runs first. Its steer signal is then a no-op.
                     SteerBook::note(&mut state.steer.ran, id);
                 }
-                self.segment(state, &message.text, false).await
+                // A person is present, so a new follow-up chain starts.
+                state.chain = 0;
+                self.segment(state, &message.text, Mode::Attended, now)
+                    .await
+            }
+            AgentOp::HeartbeatTick => self.tick(state, now).await,
+            AgentOp::FollowupDue => {
+                if state.followup_due_ms.take().is_none() {
+                    return state;
+                }
+                state.chain = state.chain.saturating_add(1);
+                self.segment(state, WAKE_MESSAGE, Mode::Followup, now).await
             }
             AgentOp::Control(_) => state,
         }
     }
 
+    /// Run one heartbeat tick.
+    ///
+    /// The op end books the next tick, also after a failed tick, so a tick
+    /// never runs again at once.
+    async fn tick(&self, mut state: AgentState, now: i64) -> AgentState {
+        let Some(beat) = state
+            .effective_heartbeat(self.profile.as_ref().ok())
+            .cloned()
+        else {
+            return state;
+        };
+        state.ticks = state.ticks.saturating_add(1);
+        if beat.precheck {
+            match self.precheck(&beat).await {
+                Ok(true) => {}
+                Ok(false) => return state,
+                Err(err) => {
+                    fail(&mut state, &err);
+                    return state;
+                }
+            }
+        }
+        self.segment(state, &beat.prompt, Mode::Heartbeat(&beat), now)
+            .await
+    }
+
+    /// Ask the harness precheck about one tick, through the recorded activity.
+    async fn precheck(&self, beat: &AgentHeartbeat) -> Result<bool, String> {
+        let mut probe = HeartbeatTask::new().prompt(beat.prompt.clone());
+        if let Ok(id) = &self.id {
+            probe = probe.session(SessionId::new(id.as_str()));
+        }
+        self.ctx
+            .execute_activity(&crate::workflow::agent_precheck_info(), probe)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
     /// Run one segment with `input` and fold it into `state`.
-    async fn segment(&self, mut state: AgentState, input: &str, unattended: bool) -> AgentState {
+    async fn segment(
+        &self,
+        mut state: AgentState,
+        input: &str,
+        mode: Mode<'_>,
+        now: i64,
+    ) -> AgentState {
         let (id, profile) = match (&self.id, &self.profile) {
             (Ok(id), Ok(profile)) => (id, profile),
             (Err(err), _) | (_, Err(err)) => {
@@ -815,11 +1175,12 @@ impl AgentRun<'_> {
             fail(&mut state, &err.to_string());
             return state;
         }
-        let task = profile.segment_task(id, input, unattended);
+        let task = profile.segment_task(id, input, mode);
         let run_id = format!("{}:s{}", state.incarnation, state.segments);
         state.segments = state.segments.saturating_add(1);
         let mut progress = Progress::new(run_id.clone(), state.transcript.clone());
         progress.final_turn_rules = true;
+        progress.chain = state.chain;
         progress.steer = Some(std::mem::take(&mut state.steer));
         let mut tree = Tree {
             root: run_id.clone(),
@@ -850,14 +1211,31 @@ impl AgentRun<'_> {
             .saturating_add(u64::from(progress.usage.total()));
         match result {
             Ok(stop) => {
-                let messages = crate::types::without_system(&progress.messages);
-                state.transcript = trim_window(messages, profile.window);
-                state.last_stop = Some(stop);
                 let answer = progress.delivered_text(&progress.last_text).to_owned();
+                // A silent tick leaves the conversation as it was.
+                let silent = matches!(mode, Mode::Heartbeat(_)) && is_silent(&answer);
+                if !silent {
+                    let messages = crate::types::without_system(&progress.messages);
+                    state.transcript = trim_window(messages, profile.window);
+                }
+                state.last_stop = Some(stop);
                 state.last_answer = Some(answer.clone());
+                // A follow-up runs only after a segment that completed.
+                if let Some(planned) = progress.followup.take()
+                    && stop == AgentStop::Completed
+                {
+                    let delay =
+                        i64::try_from(planned.delay_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
+                    state.followup_due_ms = Some(now.saturating_add(delay));
+                }
                 if task.deliver {
-                    self.deliver(&mut state, &run_id, &task, stop, &answer)
-                        .await;
+                    let sent = Sent {
+                        source: mode.source(),
+                        run_id: &run_id,
+                        stop,
+                        answer: &answer,
+                    };
+                    self.deliver(&mut state, &task, sent).await;
                 }
             }
             Err(err) => fail(&mut state, &err),
@@ -866,29 +1244,31 @@ impl AgentRun<'_> {
     }
 
     /// Send the answer of one segment to the delivery.
-    async fn deliver(
-        &self,
-        state: &mut AgentState,
-        run_id: &str,
-        task: &AgentTask,
-        stop: AgentStop,
-        answer: &str,
-    ) {
-        let Some(text) = report_text(ReportSource::Run, stop, answer) else {
+    async fn deliver(&self, state: &mut AgentState, task: &AgentTask, sent: Sent<'_>) {
+        let Some(text) = report_text(sent.source, sent.stop, sent.answer) else {
             return;
         };
         let report = Report {
-            source: ReportSource::Run,
-            run_id: RunId::new(run_id),
+            source: sent.source,
+            run_id: RunId::new(sent.run_id),
             segment: 0,
             session_id: task.session_id.clone(),
             text,
-            stop,
+            stop: sent.stop,
         };
         if let Err(err) = deliver(self.ctx, report).await {
             fail(state, &err);
         }
     }
+}
+
+/// The parts of one report.
+#[derive(Debug, Clone, Copy)]
+struct Sent<'a> {
+    source: ReportSource,
+    run_id: &'a str,
+    stop: AgentStop,
+    answer: &'a str,
 }
 
 /// Put a work op at the end of the held queue.
@@ -902,7 +1282,7 @@ fn hold(state: &mut AgentState, op: AgentOp) {
     }
     let id = match &op {
         AgentOp::UserMessage(message) => message.message_id.clone(),
-        AgentOp::Control(_) => None,
+        _ => None,
     };
     fail(
         state,
@@ -1140,14 +1520,15 @@ mod tests {
             .system("Be brief.")
             .memory(AgentMemory::Store)
             .deliver();
-        let task = profile.segment_task(&id, "hi", false);
+        let task = profile.segment_task(&id, "hi", Mode::Attended);
         assert_eq!(task.input, "hi");
         assert_eq!(task.system.as_deref(), Some("Be brief."));
         assert_eq!(task.session_id, Some(SessionId::new("support/a")));
         assert_eq!(task.memory_scope, Some(MemoryScope::new("agent:support/a")));
         assert!(task.deliver);
         assert!(!task.read_only);
-        let unattended = profile.segment_task(&id, "tick", true);
+        let beat = AgentHeartbeat::every(Duration::from_secs(60));
+        let unattended = profile.segment_task(&id, "tick", Mode::Heartbeat(&beat));
         assert!(unattended.read_only && unattended.unattended);
     }
 }

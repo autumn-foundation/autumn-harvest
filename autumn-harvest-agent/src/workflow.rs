@@ -1039,6 +1039,14 @@ async fn live_decision(
     name: &str,
     timeout: Duration,
 ) -> Result<Option<Decision<Approval>>, String> {
+    // A list query shows the wait. The upsert appends no event.
+    let status = |name: &str| {
+        let attrs = [("agent_status".to_owned(), Some(serde_json::json!(name)))];
+        if let Err(err) = ctx.upsert_search_attrs(attrs) {
+            tracing::warn!(error = %err, "the agent status was not set");
+        }
+    };
+    status("waiting_approval");
     let winner = ctx
         .race()
         .signal(name)
@@ -1047,6 +1055,7 @@ async fn live_decision(
         .run()
         .await
         .map_err(|err| err.to_string())?;
+    status("running");
     Ok(match winner.index {
         0 => Some(decode_decision(Some(winner.value))),
         1 => None,

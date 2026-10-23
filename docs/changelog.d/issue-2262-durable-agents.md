@@ -58,6 +58,31 @@ simulator sweeps. In every seed a write tool is never cancelled halfway, and
 some seeds cancel an opted-in tool. Each guarantee was checked by a mutation
 that turns its test red.
 
+### Per-agent heartbeats and follow-ups (issue #2266)
+
+- `AgentHeartbeat`, `AgentProfile::heartbeat`, `HeartbeatSetting` and
+  `Control::SetHeartbeat`. Each agent key has its own heartbeat, driven by
+  its own durable timer through `Entity::run_with_wakes`.
+- `AgentOp::HeartbeatTick` and `AgentOp::FollowupDue` are inbox ops. They do
+  not decode from a signal.
+- `AgentProfile::followups`: a booked follow-up is a deadline in the state.
+  `AgentState::chain` keeps the chain cap across a checkpoint.
+- A tick is unattended and read-only unless it allows actions. A silent tick
+  leaves the transcript as it was. `agent::wake::next_heartbeat` books the
+  next tick strictly after the time a tick ran.
+- Each op records one `system_now` side effect and upserts the search
+  attributes, `agent_next_wake_at` and `agent_wake_reason` among them.
+- `docs/agent-adapter.md` §10 drops the "one heartbeat per deployment"
+  caveat.
+
+Tests: `autumn-harvest-agent/tests/agent_wakes.rs`. 1,000 agents with
+distinct intervals tick on their own schedule. A tick and a message never
+overlap, in either order. An unattended tick cannot run a write tool without
+`allow_actions`. A restart during a wait ticks and reports once. A paused
+agent skips ticks and catches up once. The follow-up chain cap holds across
+checkpoints. The next wake is listed. Unit and property tests pin the wake
+kernel.
+
 ### Keyed-entity wakes: run an op at a deadline (issue #2266, engine part)
 
 Part of epic #2262. ADR 0006 records the
