@@ -29823,6 +29823,8 @@ struct OwnerWakes {
     woken: Arc<tokio::sync::Notify>,
     /// The hints of the owner decider of `shard` (issue #2255).
     hints: Arc<OwnerHints>,
+    /// The worker runs owner deciders. See `Worker::deciders_enabled`.
+    deciders: bool,
     metrics: Arc<dyn crate::telemetry::MetricsRecorder>,
     shutdown: CancellationToken,
     listening: Arc<std::sync::Mutex<std::collections::BTreeSet<crate::decision_owner::OwnerKey>>>,
@@ -29956,7 +29958,7 @@ impl OwnerWakes {
         // resume, so it is a hint too. Where the decider runs, the claim
         // loops claim activities only, so the wake does not reach them.
         self.hints.push(self.shard, wake.payload.workflow_exec_id);
-        if self.owned.owned_claim(self.shard).is_none() {
+        if !self.deciders || self.owned.owned_claim(self.shard).is_none() {
             self.woken.notify_one();
         }
     }
@@ -35966,6 +35968,7 @@ impl Worker {
             workflow_cache: Arc::clone(&self.workflow_cache),
             woken: Arc::clone(&self.owner_woken),
             hints: Arc::clone(&self.owner_hints),
+            deciders: self.deciders_enabled(),
             metrics: Arc::clone(&self.registry.telemetry().metrics),
             shutdown: self.shutdown.clone(),
             listening: Arc::clone(&self.owner_listening),
@@ -40027,6 +40030,15 @@ impl Worker {
         }
     }
 
+    /// Whether this worker runs owner deciders at all (issue #2255).
+    ///
+    /// A worker with queue weights keeps the owned claim of issue #2252. Its
+    /// claim loops then take workflow tasks in the weighted queue order. A
+    /// decider would take them by due time and ignore the weights.
+    fn deciders_enabled(&self) -> bool {
+        self.config.queue_weights.is_empty()
+    }
+
     /// Whether an owner decider takes the workflow tasks of every claim
     /// target of this worker (issue #2255).
     fn deciders_take_every_workflow(&self) -> bool {
@@ -40034,7 +40046,8 @@ impl Worker {
             .claim_targets
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        !targets.is_empty()
+        self.deciders_enabled()
+            && !targets.is_empty()
             && targets
                 .iter()
                 .all(|shard| self.owned_claim(*shard).is_some())
@@ -40446,6 +40459,9 @@ impl Worker {
     /// The caller joins this future with the claim loops. The drain then
     /// starts only after every decider returns.
     async fn run_owner_deciders(&self, targets: &[DeciderTarget<'_>]) {
+        if !self.deciders_enabled() {
+            return;
+        }
         futures::future::join_all(targets.iter().map(|target| self.run_owner_decider(target)))
             .await;
     }
@@ -40499,7 +40515,7 @@ impl Worker {
             let pending = AtomicBool::load(target.registration_pending, Ordering::Relaxed);
             let owned = self
                 .owned_claim(target.shard)
-                .filter(|_| may_claim_tasks(pending));
+                .filter(|_| may_claim_tasks(pending) && self.deciders_enabled());
             let mut blocked = false;
             if let Some(owned) = owned {
                 state.activate(now);
@@ -40778,7 +40794,7 @@ impl Worker {
         // tasks. This poll then claims activities only, and takes no
         // workflow permit.
         let owned = self.owned_claim(shard);
-        let decider_runs = owned.is_some();
+        let decider_runs = owned.is_some() && self.deciders_enabled();
         let mut permits = PollPermits::acquire(
             if decider_runs {
                 self.activity_admission_now()

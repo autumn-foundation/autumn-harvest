@@ -23,7 +23,9 @@ serializes the decisions of one execution. A take that finds nothing backs
 its execution off, from one poll interval up to 30 s. A wake ends the
 backoff. So a refused row cannot hold the head of the scan. The scan index
 leads with the partition, so a scan reads a few rows of each owned
-partition. With owner mode off, the decider sends no query.
+partition. With owner mode off, the decider sends no query. A worker with
+queue weights runs no decider. It keeps the owned claim of issue #2252, so
+its workflow tasks follow the weighted queue order.
 
 **Signals.** The decider keeps execution ids only, as hints. It
 acknowledges nothing. A signal is a `harvest_signals` row before

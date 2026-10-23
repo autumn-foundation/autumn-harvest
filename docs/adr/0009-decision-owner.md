@@ -520,6 +520,8 @@ with the shared head scan. Stage 1b moves workflow tasks off the claim loop.
 
 - Each worker runs one owner decider per owned database, beside its claim
   loops. Where it runs, the claim loops claim activities only.
+- A worker with queue weights runs no decider. It keeps the owned claim of
+  issue #2252, so its workflow tasks follow the weighted queue order.
 - The decider learns of work from two sources. An owner wake names an
   execution. A scan reads the pending workflow rows of its partitions by due
   time, with `idx_harvest_tq_owner_scan`.

@@ -193,6 +193,11 @@ Accepted as is:
   It races the decider, and one of them takes the row.
 - No worker switch turns the decider off. Owner mode off is the fallback.
 
+After the PR opened, the Codex review found that the decider ignored queue
+weights. A worker with queue weights now runs no decider and keeps the
+owned claim of #2252. `a_worker_with_queue_weights_keeps_the_owned_claim`
+proves it.
+
 ## 5. Measurements
 
 [`performance-owner-decider.md`](docs/performance-owner-decider.md) has the

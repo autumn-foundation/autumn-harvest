@@ -144,6 +144,14 @@ struct Node {
 
 impl Node {
     fn new(url: &str, queue: &str, claim_loops: usize) -> Self {
+        Self::with_config(
+            url,
+            WorkerConfig::default().with_queues([queue]),
+            claim_loops,
+        )
+    }
+
+    fn with_config(url: &str, config: WorkerConfig, claim_loops: usize) -> Self {
         let claims = Claims::default();
         let built = HarvestBuilder::new()
             .workflows(workflows![
@@ -152,7 +160,7 @@ impl Node {
                 decider_timer_flow
             ])
             .activities(activities![decider_step_a, decider_step_b, decider_step_c])
-            .worker(WorkerConfig::default().with_queues([queue]))
+            .worker(config)
             .telemetry(
                 TelemetryConfig::builder()
                     .metrics(Arc::new(claims.clone()))
@@ -558,6 +566,57 @@ async fn the_owner_scan_reads_owned_and_unstamped_due_rows_only() {
         .await
         .expect("scan");
     assert_eq!(one.due.len(), 1, "the limit holds");
+    db.drop_db().await;
+}
+
+/// A worker with queue weights keeps the owned claim of issue #2252. Its
+/// claim loops take workflow tasks in the weighted queue order, and no
+/// decider takes them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_with_queue_weights_keeps_the_owned_claim() {
+    let runs: u64 = 10;
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    enable(&mut conn).await;
+    let pool: DbPool = build_test_pool(&db.url);
+    let queue = unique("decider-weights");
+    let config = WorkerConfig::default()
+        .with_queues([queue.as_str()])
+        .with_queue_weights([(queue.as_str(), 3)]);
+    let mut node = Node::with_config(&db.url, config, 2);
+    node.run(&pool);
+    eventually("the owner owns every partition", async || {
+        live_partitions(&mut conn).await == 512
+    })
+    .await;
+    let client = WorkflowHandleClient::single(pool.clone(), db.url.clone());
+    let mut started = Vec::new();
+    for _ in 0..runs {
+        let exec = DeciderThreeStepsStub::start_with_options(
+            &mut conn,
+            &client,
+            &unique("decider-weights-wf"),
+            queue.clone(),
+            TypedStartOptions {
+                queue_name: Some(queue.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("start")
+        .exec_id();
+        started.push(exec);
+    }
+    for exec in started {
+        wait_for_execution_state_with_timeout(&db.url, exec, "COMPLETED", WAIT).await;
+    }
+    node.stop().await;
+    assert_eq!(
+        node.claims.count(ClaimKind::Workflow),
+        4 * runs,
+        "the weighted claim loops take each workflow task"
+    );
+    assert_eq!(node.claims.takes(ClaimKind::Workflow), 0, "no owner take");
     db.drop_db().await;
 }
 
