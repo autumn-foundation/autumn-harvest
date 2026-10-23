@@ -14,6 +14,9 @@ The changes:
   `tokio` also changes which `windows-sys` versions some crates resolve to.
   Cargo drops `windows-sys` 0.60 and `windows-targets` 0.53, which nothing
   needs any more. These changes affect Windows targets only.
+- `sandbox/exec.rs` opens its pidfd with `AsyncFd::register_with_interest`.
+  `tokio` 1.53.3 deprecates `with_interest`, and clippy denies warnings. The
+  `AsyncFd` owns the descriptor, so the `unsafe` contract holds.
 - The workspace `tokio` floor moves from 1 to 1.53.3. A downstream consumer
   reads the manifest, not this lockfile, so only the floor keeps it off
   1.53.2 (as in PR #1303).
