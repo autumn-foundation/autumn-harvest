@@ -4067,6 +4067,7 @@ async fn codec_cells(conn: &mut AsyncPgConnection) -> Vec<(String, Value)> {
              FROM harvest_event_batches WHERE start_options -> 'context_headers' IS NOT NULL \
            UNION ALL SELECT 25, id::TEXT, 'batch_memo', start_options -> 'memo' \
              FROM harvest_event_batches WHERE start_options -> 'memo' IS NOT NULL \
+           UNION ALL SELECT 26, id::TEXT, 'entity_state', snapshot FROM harvest_entity_state \
          ) c ORDER BY ord, row_id",
     )
     .load(conn)
