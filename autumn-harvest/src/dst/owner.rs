@@ -20,6 +20,13 @@
 //! 4. [`Nemesis::AckBeforeBump`] ends the lease while an acknowledged signal
 //!    waits, so the epoch bumps before a decision consumes it.
 //!
+//! A run has two phases. The fault phase runs the nemeses for
+//! [`OwnerConfig::fault_steps`] steps. The drain then injects no fault: no
+//! nemesis, no expiry, no release and no stall. It is weakly fair, as the
+//! world drain is. A run must consume every signal before the drain ends.
+//! No owner makes progress while the faults end its lease every few steps.
+//! So liveness needs the drain (issue #2294).
+//!
 //! An unloaded worker keeps its decisions in flight, as a paused thread
 //! does. A new tenure of that worker can begin a decision beside them. The
 //! oracle has no event-id backstop, so the fence alone keeps the
@@ -30,6 +37,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use super::fair::Waits;
 use super::rng::SplitMix64;
 use super::sweep::{Nondeterminism, SeedPlan, SeedVars, TAIL_LINES, diverged};
 
@@ -61,6 +69,9 @@ const EXPIRE_PERCENT: u64 = 15;
 const RELEASE_PERCENT: u64 = 5;
 /// The shortest and the longest stall of a paused owner, in steps.
 const STALL_STEPS: (u64, u64) = (4, 16);
+/// In the drain, an action that stays enabled this many steps without a run
+/// is overdue. See [`OwnerConfig::drain_steps`] for the bound.
+pub const FAIR_STEPS: usize = 8;
 
 named! {
     /// The design rule that a run breaks. The names match the `Defect`
@@ -82,6 +93,9 @@ named! {
         RenewBumps => "renew-bumps",
         /// The owner acknowledges a signal from memory (restate#4566).
         MemoryAck => "memory-ack",
+        /// A fenced commit unloads its worker, even when the worker pins a
+        /// newer epoch (issue #2294).
+        UnloadOnAnyFence => "unload-on-any-fence",
     }
 }
 
@@ -117,6 +131,9 @@ named! {
         NoAckedSignalLost => "NoAckedSignalLost",
         /// Only a takeover fences a commit.
         OwnerNeverFencesItself => "OwnerNeverFencesItself",
+        /// The holder of a live row is pinned at the epoch of the row. So
+        /// the drain cannot stop with work left (issue #2294).
+        LiveRowHasAPinnedHolder => "LiveRowHasAPinnedHolder",
     }
 }
 
@@ -400,8 +417,29 @@ pub struct OwnerConfig {
     pub workers: usize,
     /// The number of signals that clients send.
     pub signals: usize,
-    /// The step limit.
-    pub max_steps: usize,
+    /// The length of the fault phase, in steps.
+    pub fault_steps: usize,
+    /// The step limit of the drain, which injects no fault.
+    ///
+    /// The drain needs a chain of at most `3 + 3 * signals` waits. A live
+    /// row stays with its holder. Otherwise a held lock, its commit and an
+    /// acquisition take the row. Each signal then needs a begin, a lock and
+    /// a commit. When the old holder commits first, that commit consumes a
+    /// signal, so the chain does not grow.
+    ///
+    /// A wait takes `FAIR_STEPS` steps, plus 1 step to run, plus the overdue
+    /// actions that run first. A renewal or a busy acquisition runs first
+    /// at most once per wait. A one-shot action runs first at most once per
+    /// drain: a stale lock, a commit, a write or an ack. So a drain takes at
+    /// most `15 * (8 + 1 + 3) = 180` steps with the defaults, plus 2 steps
+    /// per decision in flight, worker and signal. [`Self::drain_bound`]
+    /// computes it.
+    ///
+    /// The decisions in flight have no fixed bound, so the drain logs their
+    /// number when it starts. The limit of 400 allows 103. When issue #2294
+    /// landed, a million drains had at most 7, and none took more than 60
+    /// steps.
+    pub drain_steps: usize,
     /// The fault schedules.
     pub nemeses: Vec<Nemesis>,
     /// The invariants to check.
@@ -409,7 +447,8 @@ pub struct OwnerConfig {
 }
 
 impl OwnerConfig {
-    /// The design for `seed`: 3 workers, 4 signals and all four nemeses.
+    /// The design for `seed`: 3 workers, 4 signals, all four nemeses, 400
+    /// fault steps and 400 drain steps.
     #[must_use]
     pub fn new(seed: u64) -> Self {
         Self {
@@ -417,10 +456,20 @@ impl OwnerConfig {
             defect: Defect::None,
             workers: 3,
             signals: 4,
-            max_steps: 400,
+            fault_steps: 400,
+            drain_steps: 400,
             nemeses: Nemesis::ALL.to_vec(),
             checks: OwnerInvariant::ALL.to_vec(),
         }
+    }
+
+    /// The most steps that a drain needs when it starts with `flights`
+    /// decisions in flight. See [`Self::drain_steps`].
+    #[must_use]
+    pub const fn drain_bound(&self, flights: usize) -> usize {
+        let chain = 3 + 3 * self.signals;
+        let wait = FAIR_STEPS + 1 + self.workers;
+        chain * wait + 2 * (flights + self.workers + self.signals)
     }
 
     /// This config with `defect`.
@@ -472,6 +521,16 @@ pub struct OwnerStats {
     pub acks_before_bump: u64,
     /// Commits that the holder fenced in its own tenure.
     pub self_fences: u64,
+    /// Runs that reached the drain.
+    pub drains: u64,
+    /// The most steps that one drain took.
+    pub drain_steps_max: u64,
+    /// The most decisions in flight when a drain started.
+    pub drain_flights_max: u64,
+    /// The most actions that a drain step had enabled.
+    pub drain_enabled_max: u64,
+    /// The longest wait of an action that ran in a drain, in steps.
+    pub drain_wait_max: u64,
     /// The steps that each nemesis took, in [`Nemesis::ALL`] order.
     pub fired: [u64; Nemesis::ALL.len()],
 }
@@ -491,6 +550,11 @@ impl OwnerStats {
         self.renewals_in_flight += other.renewals_in_flight;
         self.acks_before_bump += other.acks_before_bump;
         self.self_fences += other.self_fences;
+        self.drains += other.drains;
+        self.drain_steps_max = self.drain_steps_max.max(other.drain_steps_max);
+        self.drain_flights_max = self.drain_flights_max.max(other.drain_flights_max);
+        self.drain_enabled_max = self.drain_enabled_max.max(other.drain_enabled_max);
+        self.drain_wait_max = self.drain_wait_max.max(other.drain_wait_max);
         for (mine, theirs) in self.fired.iter_mut().zip(other.fired) {
             *mine += theirs;
         }
@@ -542,11 +606,26 @@ pub struct OwnerReport {
     pub stats: OwnerStats,
     /// The first failed invariant, if any.
     pub violation: Option<OwnerViolation>,
-    /// `true` when every signal was consumed before the step limit.
+    /// `true` when every signal was consumed before the drain ended.
     pub completed: bool,
 }
 
 impl OwnerReport {
+    /// Why the run fails, if it does: a failed invariant, or a signal that
+    /// the drain did not consume. A sweep and a replay give the same result.
+    #[must_use]
+    pub fn failure(&self) -> Option<String> {
+        if let Some(violation) = &self.violation {
+            return Some(violation.to_string());
+        }
+        (!self.completed).then(|| {
+            format!(
+                "the run did not consume every signal within {} fault steps and {} drain steps",
+                self.config.fault_steps, self.config.drain_steps
+            )
+        })
+    }
+
     /// The last `lines` trace lines, joined.
     #[must_use]
     pub fn trace_tail(&self, lines: usize) -> String {
@@ -590,7 +669,7 @@ struct Worker {
 }
 
 /// One step of the scheduler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Action {
     Acquire(WorkerId),
     Release(WorkerId),
@@ -623,6 +702,8 @@ struct Sim<'a, S: OwnerStore> {
     sent: BTreeSet<SignalId>,
     acked: BTreeSet<SignalId>,
     step: usize,
+    /// In the drain, the step at which each enabled action began to wait.
+    waiting: Waits<Action>,
     trace: Vec<String>,
     stats: OwnerStats,
 }
@@ -642,6 +723,7 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
             sent: BTreeSet::new(),
             acked: BTreeSet::new(),
             step: 0,
+            waiting: Waits::new(),
             trace: Vec::new(),
             stats: OwnerStats::default(),
         }
@@ -663,8 +745,13 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
         &mut self.workers[id.0]
     }
 
+    /// The drain ends every stall.
     fn awake(&self, id: WorkerId) -> bool {
-        self.worker(id).paused_until <= self.step
+        self.draining() || self.worker(id).paused_until <= self.step
+    }
+
+    const fn draining(&self) -> bool {
+        self.step >= self.config.fault_steps
     }
 
     fn has(&self, nemesis: Nemesis) -> bool {
@@ -770,6 +857,9 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
                 actions.push(Action::Ack(signal));
             }
         }
+        if self.draining() {
+            return actions;
+        }
         if let Some(holder) = row.holder.filter(|h| self.awake(*h))
             && self.worker(holder).pinned.is_some()
             && self.rng.chance(RELEASE_PERCENT)
@@ -828,6 +918,9 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
     }
 
     fn pick(&mut self) -> Action {
+        if self.draining() {
+            return self.pick_fair();
+        }
         let triggered = self.triggered();
         if !triggered.is_empty() && self.rng.chance(NEMESIS_PERCENT) {
             let (nemesis, action) = triggered[self.pick_index(triggered.len())];
@@ -841,6 +934,23 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
             return Action::Tick;
         }
         enabled[self.pick_index(enabled.len())]
+    }
+
+    /// A drain step. The overdue action that waited longest runs. With no
+    /// overdue action, one uniform draw picks the step.
+    fn pick_fair(&mut self) -> Action {
+        let enabled = self.enabled();
+        raise(&mut self.stats.drain_enabled_max, enabled.len());
+        self.waiting.track(self.step, &enabled);
+        let action = match self.waiting.overdue(self.step, FAIR_STEPS, &enabled) {
+            Some(action) => action,
+            None if enabled.is_empty() => Action::Tick,
+            None => enabled[self.pick_index(enabled.len())],
+        };
+        if let Some(since) = self.waiting.ran(&action) {
+            raise(&mut self.stats.drain_wait_max, self.step - since);
+        }
+        action
     }
 
     fn pick_index(&mut self, len: usize) -> usize {
@@ -1031,7 +1141,8 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
                     "flap"
                 };
                 self.drop_flight(flight_id);
-                if self.worker(id).pinned == Some(decision.epoch) {
+                let any_fence = self.config.defect == Defect::UnloadOnAnyFence;
+                if any_fence || self.worker(id).pinned == Some(decision.epoch) {
                     self.unload(id);
                 }
                 self.log(&format!(
@@ -1154,6 +1265,21 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
                         return fail(*invariant, "the holder fenced its own commit".to_string());
                     }
                 }
+                OwnerInvariant::LiveRowHasAPinnedHolder => {
+                    let pinned = row.holder.and_then(|h| self.worker(h).pinned);
+                    if row.live && pinned != Some(row.epoch) {
+                        let holder = row
+                            .holder
+                            .map_or_else(|| "nobody".to_string(), |h| h.to_string());
+                        return fail(
+                            *invariant,
+                            format!(
+                                "the row is live at {}, and {holder} does not pin it",
+                                row.epoch
+                            ),
+                        );
+                    }
+                }
             }
         }
         None
@@ -1169,7 +1295,17 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
             "run_with needs an empty store"
         );
         let mut violation = None;
-        while self.step < self.config.max_steps && !self.quiescent() {
+        let limit = self
+            .config
+            .fault_steps
+            .saturating_add(self.config.drain_steps);
+        while self.step < limit && !self.quiescent() {
+            if self.step == self.config.fault_steps {
+                let flights = self.decisions.len();
+                self.stats.drains += 1;
+                raise(&mut self.stats.drain_flights_max, flights);
+                self.log(&format!("drain starts, {flights} decisions in flight"));
+            }
             let action = self.pick();
             self.apply(action);
             if let Some(found) = self.check() {
@@ -1179,6 +1315,9 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
                 break;
             }
             self.step += 1;
+        }
+        if let Some(drained) = self.step.checked_sub(self.config.fault_steps) {
+            raise(&mut self.stats.drain_steps_max, drained);
         }
         let completed = self.quiescent();
         OwnerReport {
@@ -1190,6 +1329,11 @@ impl<'a, S: OwnerStore> Sim<'a, S> {
             completed,
         }
     }
+}
+
+/// Raise the counter `max` to `value`.
+fn raise(max: &mut u64, value: usize) {
+    *max = (*max).max(u64::try_from(value).unwrap_or(u64::MAX));
 }
 
 /// Run `config` on a fresh [`OracleOwnerStore`].
@@ -1275,7 +1419,7 @@ impl fmt::Display for OwnerFailure {
 /// # Errors
 ///
 /// Returns the first seed that fails an invariant, is not deterministic,
-/// or does not consume every signal within the step limit.
+/// or does not consume every signal before the drain ends.
 pub fn sweep(
     plan: &SeedPlan,
     config: impl Fn(u64) -> OwnerConfig,
@@ -1289,7 +1433,7 @@ pub fn sweep(
 /// # Errors
 ///
 /// Returns the first seed that fails an invariant, is not deterministic,
-/// or does not consume every signal within the step limit.
+/// or does not consume every signal before the drain ends.
 pub fn sweep_with<S: OwnerStore>(
     plan: &SeedPlan,
     config: impl Fn(u64) -> OwnerConfig,
@@ -1309,20 +1453,10 @@ pub fn sweep_with<S: OwnerStore>(
                 }));
             }
         };
-        if let Some(violation) = &report.violation {
-            return Err(Box::new(OwnerFailure {
-                reason: violation.to_string(),
-                trace_tail: report.trace_tail(TAIL_LINES),
-                config,
-            }));
-        }
         // A store that makes no progress must not pass.
-        if !report.completed {
+        if let Some(reason) = report.failure() {
             return Err(Box::new(OwnerFailure {
-                reason: format!(
-                    "the run did not consume every signal within {} steps",
-                    config.max_steps
-                ),
+                reason,
                 trace_tail: report.trace_tail(TAIL_LINES),
                 config,
             }));

@@ -115,9 +115,23 @@ and no stall.
 
 The actions are those of `formal/tla/OwnerLease.tla`: `Acquire`, `Release`,
 `Renew`, `Begin`, `Lock`, `Commit`, `Write`, `Ack`, `Receive` and `Expire`.
-The invariants are the seven `OwnerInvariant` values. The bound is 2
-workers and 2 signals. The epoch stops at 3 per PR, about 658,000 states,
-and at 4 nightly, about 7,100,000 states.
+The invariants are the eight `OwnerInvariant` values and
+`DrainCanProgress`. The bound is 2 workers and 2 signals. The epoch stops
+at 3 per PR, about 658,000 states, and at 4 nightly, about 7,100,000
+states.
+
+Two properties back the fault-free drain of `dst::owner` (issue #2294):
+
+- `LiveRowHasAPinnedHolder`: the holder of a live row is pinned at the
+  epoch of the row. TLC and the simulator check it too.
+- `DrainCanProgress`: each state that is not quiescent has a step that is
+  not a fault. `Expire` and `Release` are the faults. An acquisition may
+  pass the epoch bound here, so a free row at the bound does not count as
+  a stop.
+
+`DrainCanProgress` shows that no drain stops with work left, within the
+bound. It does not show that a drain ends. The simulator checks the step
+bound of the drain.
 
 `EveryNemesisSeen` must hold in one behavior of the design. It is the
 negation of `SomeNemesisUnseen`, which `OwnerLeaseReach.cfg` must break. The
@@ -138,6 +152,7 @@ counter-example must fail here too:
 | `pipeline` | `DecisionOnFreshHistory` |
 | `renew-bumps` | `OwnerNeverFencesItself` |
 | `memory-ack` | `NoAckedSignalLost` |
+| `unload-on-any-fence` | `LiveRowHasAPinnedHolder` |
 
 ## The tests
 
@@ -153,6 +168,7 @@ counter-example must fail here too:
 | `every_tla_defect_fails_here_on_the_same_invariant` | Each red `OwnerLease` config runs here with its workers, signals, `MaxEpoch` and `Defect`. It breaks the same invariant, or reaches `EveryNemesisSeen` for the reach row. An unknown constant fails. |
 | `the_no_fence_counter_example_is_a_stale_owner_commit` | The `no-fence` event comes from a worker that pinned an older epoch. |
 | `every_simulator_invariant_is_a_property` | Each `OwnerInvariant` is an `always` property. |
+| `a_worker_that_unloads_on_any_fence_stops_the_drain` | The `unload-on-any-fence` mutant breaks `DrainCanProgress` on a live row. |
 
 ## Mutation check
 

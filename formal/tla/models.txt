@@ -27,4 +27,5 @@ OwnerLease         OwnerLeaseKeepCache.cfg             violation:DecisionOnFresh
 OwnerLease         OwnerLeasePipeline.cfg              violation:DecisionOnFreshHistory
 OwnerLease         OwnerLeaseRenewBumps.cfg            violation:OwnerNeverFencesItself
 OwnerLease         OwnerLeaseMemoryAck.cfg             violation:NoAckedSignalLost
+OwnerLease         OwnerLeaseUnloadOnAnyFence.cfg      violation:LiveRowHasAPinnedHolder
 OwnerLease         OwnerLeaseReach.cfg                 violation:SomeNemesisUnseen

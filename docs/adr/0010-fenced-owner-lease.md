@@ -55,6 +55,7 @@ simulator must reject each mutant on the named invariant.
 | R5 | A renewal never changes the epoch. It needs a live lease. A lapsed holder acquires again. | `renew-bumps` | `OwnerNeverFencesItself` |
 | R6 | The server acknowledges a signal only after its durable write. The owner never acknowledges from memory. | `memory-ack` | `NoAckedSignalLost` |
 | R7 | A tenure runs one decision of an execution at a time. The next decision starts from the state after the last commit. | `pipeline` | `DecisionOnFreshHistory` |
+| R8 | A fenced commit unloads its worker only when the worker still pins the fenced epoch. | `unload-on-any-fence` | `LiveRowHasAPinnedHolder` |
 
 The invariants:
 
@@ -71,6 +72,9 @@ The invariants:
   can never commit it.
 - `OwnerNeverFencesItself`: only a takeover fences a commit. This is an
   availability rule, not a safety rule.
+- `LiveRowHasAPinnedHolder`: the holder of a live row is pinned at the
+  epoch of the row. This is an availability rule too. With no fault, the
+  holder can then commit (issue #2294).
 
 ### Spec changes that the model forces
 
@@ -98,7 +102,8 @@ point says what checks it.
 4. **A fenced commit unloads only its own tenure.** When a fenced decision
    pinned an older epoch than the worker holds now, the worker drops that
    decision only. It unloads the partition only when it still pins the
-   fenced epoch. No mutant checks this point.
+   fenced epoch. This is R8, and the `unload-on-any-fence` mutant checks
+   it. Without R8, a live row has no owner until its lease ends.
 5. **The renewal must not wait on the commit fence.** A fence with
    `FOR SHARE` blocks a renewal `UPDATE`, so a busy owner can lose its
    lease while it commits. R2 gives the lock modes that prevent this:
@@ -127,7 +132,7 @@ fence alone keeps every invariant.
 
 ### Liveness
 
-The models check safety only. Two liveness rules follow from R2:
+The models check safety only. Three liveness rules follow from R2:
 
 - A paused owner can hold `FOR KEY SHARE` in an open transaction. The
   takeover `FOR UPDATE` then waits for ever. The fence sets
@@ -138,6 +143,17 @@ The models check safety only. Two liveness rules follow from R2:
 - The takeover sets `lock_timeout` too. A lock miss is a failed attempt,
   and the worker tries again on its next tick.
 
+No owner makes progress while the faults end its lease every few steps.
+So the simulator checks progress only after the faults stop (issue #2294).
+Its drain injects no fault and is weakly fair. Each run must consume every
+signal before the drain ends. Three checks back that drain:
+
+- `LiveRowHasAPinnedHolder` (R8) is a safety invariant of every model. It
+  is the premise of the progress argument.
+- The Stateright property `DrainCanProgress` checks, within its bound,
+  that no fault-free step sequence stops with work left.
+- The simulator checks the step bound of each drain.
+
 ## Consequences
 
 - Stage 1a (#2251) implements `dst::owner::OwnerStore` on Postgres. It runs
@@ -146,7 +162,7 @@ The models check safety only. Two liveness rules follow from R2:
   `stage_1a_owner_store_gets_a_simulator_run` fails when a migration adds
   `harvest_decision_owner` and no test outside `tests/dst` implements
   `OwnerStore` for a real store and drives it.
-- The simulator applies the owner rules R4, R6 and R7 itself. The
+- The simulator applies the owner rules R4, R6, R7 and R8 itself. The
   `OwnerStore` seam makes only the store side real. When stage 1a puts its
   owner logic in its own code, that code must keep these rules, or add
   hooks to the simulator.
