@@ -128,6 +128,12 @@ pub struct AgentTask {
     /// the history. See [`flow`](crate::flow).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
+    /// Record only the messages that each model turn adds (issue #2264).
+    /// [`AgentTask::new`] turns it on. A recorded task with no field sends
+    /// the whole transcript, so a run started before the change replays as
+    /// it ran. See [`transcript`](crate::transcript).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub transcript_delta: bool,
     /// The most delegations of one model turn that run at the same time
     /// (issue #2270). Each runs as a child `agent_loop` run. Zero or one runs
     /// them one after another, inline. The bound is
@@ -179,9 +185,18 @@ impl AgentTask {
             tenant: None,
             mandate: None,
             flow_labels: BTreeSet::new(),
+            transcript_delta: true,
             parallel_children: 0,
             model: None,
         }
+    }
+
+    /// Record only the messages that each model turn adds, or the whole
+    /// transcript. See [`transcript_delta`](Self::transcript_delta).
+    #[must_use]
+    pub const fn transcript_delta(mut self, on: bool) -> Self {
+        self.transcript_delta = on;
+        self
     }
 
     /// Run up to `n` delegations of one model turn at the same time. See
@@ -411,6 +426,15 @@ pub struct ModelTurnRequest {
     /// durable agent sets it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub interruptible: bool,
+    /// The prefix of the window that `messages` follow (issue #2264). With
+    /// a prefix, `messages` holds only the messages after it. The activity
+    /// reads the prefix from the transcript store of the harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<crate::transcript::PrefixRef>,
+    /// Keep the window of this turn in the transcript store, so the next
+    /// turn can send a delta.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub remember: bool,
     /// The name of the harness model for this turn (issue #2271). `None` is
     /// [`DEFAULT_MODEL`](crate::DEFAULT_MODEL). The input records it, so
     /// replay asks the same model.

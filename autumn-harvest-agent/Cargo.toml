@@ -102,6 +102,10 @@ required-features = ["sqlite"]
 name = "fan_out"
 required-features = ["sqlite"]
 
+[[test]]
+name = "transcript_delta"
+required-features = ["sqlite", "eval"]
+
 [lints]
 workspace = true
 

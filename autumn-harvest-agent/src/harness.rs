@@ -19,7 +19,7 @@ use crate::flow::{FlowRules, Released, call_labels};
 use crate::heartbeat::{HeartbeatTask, Precheck};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemoryStore, MemoryTool, render_snapshot};
 use crate::mesh::{DELEGATE_TOOL, Peer, delegate_definition, valid_name};
-use crate::message::{ContentPart, RunId, TokenUsage, ToolDefinition};
+use crate::message::{ChatMessage, ContentPart, RunId, TokenUsage, ToolDefinition};
 use crate::model::{AgentModel, BoxFuture, ChatRequest, ChatResponse, UNKNOWN_MODEL_ID};
 use crate::policy::{AllowAll, RunInfo, Strictest, ToolDecision, ToolPolicy, ToolRules};
 use crate::response_cache::{CacheKey, KeyTenant, ResponseCache};
@@ -27,6 +27,7 @@ use crate::tool::{Tool, ToolContext, ToolEffect};
 use autumn_harvest::builder::DEFAULT_MAX_ACTIVITY_RESULT_BYTES;
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 
+use crate::transcript::{InMemoryTranscriptStore, PREFIX_MISSING, TranscriptStore, chain};
 use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
 
 /// The default cap on one tool result, in characters.
@@ -113,6 +114,7 @@ pub struct AgentHarness {
     roster: Vec<Peer>,
     flow: FlowRules,
     profiles: Vec<AgentProfile>,
+    transcripts: Arc<dyn TranscriptStore>,
 }
 
 impl AgentHarness {
@@ -122,6 +124,7 @@ impl AgentHarness {
         Self {
             client,
             models: BTreeMap::new(),
+            transcripts: Arc::new(InMemoryTranscriptStore::default()),
             tools: Vec::new(),
             policy: Arc::new(AllowAll),
             temperature: None,
@@ -301,6 +304,57 @@ impl AgentHarness {
                 .into_error_payload()
             }),
         }
+    }
+
+    /// Keep the windows of model turns in `store`, so a later turn records
+    /// only the messages it adds (issue #2264). The default is an
+    /// [`InMemoryTranscriptStore`]. A shared store lets a delta hit on every
+    /// worker.
+    #[must_use]
+    pub fn transcript_store(mut self, store: Arc<dyn TranscriptStore>) -> Self {
+        self.transcripts = store;
+        self
+    }
+
+    /// The whole window of `request`: its prefix from the transcript store,
+    /// then its messages. A turn with `remember` keeps the window in the
+    /// store.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable [`PREFIX_MISSING`] payload when the store does
+    /// not hold the prefix. The workflow then sends the full form.
+    fn window(&self, request: &mut ModelTurnRequest) -> Result<Vec<ChatMessage>, String> {
+        let added = std::mem::take(&mut request.messages);
+        let (digest, window) = match &request.prefix {
+            None => (None, added.clone()),
+            Some(prefix) => {
+                let held = self
+                    .transcripts
+                    .get(&prefix.digest)
+                    .filter(|held| u32::try_from(held.len()).is_ok_and(|len| len == prefix.len))
+                    .ok_or_else(|| {
+                        ActivityFailure::non_retryable(
+                            PREFIX_MISSING,
+                            "the transcript store does not hold the prefix of this turn",
+                        )
+                        .into_error_payload()
+                    })?;
+                let mut window = held;
+                window.extend(added.iter().cloned());
+                (Some(prefix.digest.as_str()), window)
+            }
+        };
+        if request.remember {
+            // A chain digest of the prefix and the added messages equals the
+            // digest of the whole window, so one hash pass is enough.
+            let digest = digest.map_or_else(
+                || chain(None, &window),
+                |prefix| chain(Some(prefix), &added),
+            );
+            self.transcripts.put(&digest, &window);
+        }
+        Ok(window)
     }
 
     /// Add one peer to the roster. A run whose mandate names the peer can
@@ -498,6 +552,8 @@ impl AgentHarness {
         mut prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let client = self.model(request.model.as_deref())?;
+        let mut request = request;
+        let messages = self.window(&mut request)?;
         let mut builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
@@ -518,7 +574,7 @@ impl AgentHarness {
             .map(Tool::definition)
             .collect();
         let chat = ChatRequest {
-            messages: request.messages,
+            messages,
             tools,
             max_tokens: request.max_output_tokens,
             temperature: self.temperature,

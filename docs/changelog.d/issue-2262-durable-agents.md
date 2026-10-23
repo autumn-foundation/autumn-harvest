@@ -286,3 +286,29 @@ kernels. Four new files in `formal/verus/src/` mirror them:
 
 Each proof was checked by a mutation of its spec or its copy that Verus
 then rejects.
+
+### Each model turn records only its new messages (issue #2264)
+
+- `ModelTurnRequest::prefix` names the window that a turn adds to.
+  `ModelTurnRequest::remember` keeps the window of a turn for the next one.
+- `transcript::chain` is a chained SHA-256 digest over the messages. The
+  workflow hashes each message once.
+- `TranscriptStore`, `InMemoryTranscriptStore` and
+  `AgentHarness::transcript_store` hold the windows. On a miss, a turn fails
+  with `TranscriptPrefixMissing` before any model call, and the workflow
+  sends it again in the full form.
+- `AgentTask::transcript_delta` turns it on, and `AgentTask::new` sets it.
+  A recorded task has no flag, and `agent_loop` asks the patch gate
+  `agent.transcript-delta`, so an old run replays as it ran.
+- A durable agent keeps the last sent window in `AgentState::sent`, so a
+  later op sends a delta too.
+- The §9 limit "The transcript rides in history" in `docs/agent-adapter.md`
+  is revised.
+
+**Tests.** `autumn-harvest-agent/tests/transcript_delta.rs`: a 50-turn run
+stores at least 80% less history (86% measured); a full-form history
+replays; a delta history replays strictly; a cold store falls back to the
+full form; the cache key is the same in both forms; eval gives the same
+result; a durable agent sends deltas across ops; a trimmed transcript is
+sent in the full form; the request cap measures the whole window; the
+in-memory store has a byte bound.

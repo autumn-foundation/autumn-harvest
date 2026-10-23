@@ -349,10 +349,15 @@ async fn the_next_wake_is_listed() {
 // A tick and a message never overlap.
 // ---------------------------------------------------------------------------
 
-/// The segment number of each model turn of the agent, in history order.
+/// The segment number of each model turn of the agent, in history order,
+/// and whether the segment is a tick.
+///
+/// A turn records only the messages it adds (issue #2264), so only the
+/// first turn of a segment holds the tick prompt. The flag is per segment.
 fn turn_segments(rt: &SqliteRuntime, agent: &AgentId) -> Vec<(u64, bool)> {
     let exec = sqlite::current_run(rt, agent).unwrap().unwrap();
-    rt.load_history(exec)
+    let turns: Vec<(u64, bool)> = rt
+        .load_history(exec)
         .unwrap()
         .iter()
         .filter_map(|event| match event {
@@ -364,6 +369,15 @@ fn turn_segments(rt: &SqliteRuntime, agent: &AgentId) -> Vec<(u64, bool)> {
             }
             _ => None,
         })
+        .collect();
+    let ticks: std::collections::BTreeSet<u64> = turns
+        .iter()
+        .filter(|(_, tick)| *tick)
+        .map(|(segment, _)| *segment)
+        .collect();
+    turns
+        .into_iter()
+        .map(|(segment, _)| (segment, ticks.contains(&segment)))
         .collect()
 }
 

@@ -46,6 +46,7 @@ use crate::message::{
     ChatMessage, ChatRole, ContentPart, RunId, StopReason, TokenUsage, ToolCall, ToolDefinition,
 };
 use crate::policy::ToolDecision;
+use crate::transcript::{PREFIX_MISSING, PrefixRef, Sent, TRANSCRIPT_DELTA_PATCH};
 use crate::types::{
     AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
     RunIdSource, ToolCallRequest, ToolOutcome, without_system,
@@ -95,6 +96,10 @@ pub(crate) struct Progress {
     pub(crate) steer: Option<SteerBook>,
     /// An interrupt ended the work of this segment (issue #2265).
     pub(crate) interrupted: bool,
+    /// Send each turn as a delta on the last window (issue #2264).
+    pub(crate) delta: bool,
+    /// The last window that a turn sent, when `delta` is on.
+    pub(crate) sent: Option<Sent>,
 }
 
 /// The steer messages of a durable agent (issue #2265).
@@ -152,6 +157,8 @@ impl Progress {
             final_turn_rules: false,
             steer: None,
             interrupted: false,
+            delta: false,
+            sent: None,
         }
     }
 
@@ -347,6 +354,8 @@ fn next_request(
         flow_labels: tree.exercised.clone(),
         flow_released: tree.released.clone(),
         interruptible: run.live,
+        prefix: None,
+        remember: false,
         model: task.model.clone(),
     }
 }
@@ -401,6 +410,8 @@ pub(crate) async fn drive(
     let mut progress = Progress::new(run_id, without_system(&task.history));
     // Gate the final-turn rules. A run recorded before them replays as it ran.
     progress.final_turn_rules = ctx.patched(FINAL_TURN_PATCH);
+    // A task recorded before the delta form has no flag, so it asks no gate.
+    progress.delta = task.transcript_delta && ctx.patched(TRANSCRIPT_DELTA_PATCH);
     let mut tree = root_tree(ctx, task, &progress.run_id);
     let agent = match &task.mandate {
         Some(mandate) => {
@@ -547,6 +558,35 @@ pub(crate) async fn deliver(ctx: &WorkflowContext, report: Report) -> Result<boo
     }
 }
 
+/// Build the window of a new segment: the system prompt, the earlier
+/// messages and the input.
+///
+/// A new segment can rebuild the window, so this checks that the last sent
+/// window is still its prefix (issue #2264).
+async fn open_segment(
+    ctx: &WorkflowContext,
+    task: &AgentTask,
+    progress: &mut Progress,
+    input: &str,
+) -> Result<(), String> {
+    let system = system_prompt(ctx, task).await?;
+    let mut messages = Vec::with_capacity(progress.messages.len() + 2);
+    if let Some(system) = system {
+        messages.push(ChatMessage::text(ChatRole::System, system));
+    }
+    messages.append(&mut progress.messages);
+    messages.push(ChatMessage::text(ChatRole::User, input));
+    progress.messages = messages;
+    if progress
+        .sent
+        .as_ref()
+        .is_some_and(|sent| !sent.is_prefix_of(&progress.messages))
+    {
+        progress.sent = None;
+    }
+    Ok(())
+}
+
 /// Check the model of `run` against its mandate (issue #2271).
 ///
 /// A delegation checks the model of its peer. This check covers a root task
@@ -574,14 +614,7 @@ pub(crate) async fn run_segment(
 ) -> Result<AgentStop, String> {
     let task = run.task;
     check_model(run)?;
-    let system = system_prompt(ctx, task).await?;
-    let mut messages = Vec::with_capacity(progress.messages.len() + 2);
-    if let Some(system) = system {
-        messages.push(ChatMessage::text(ChatRole::System, system));
-    }
-    messages.append(&mut progress.messages);
-    messages.push(ChatMessage::text(ChatRole::User, input));
-    progress.messages = messages;
+    open_segment(ctx, task, progress, input).await?;
     let extra_tools = run.extra_tools();
 
     loop {
@@ -615,7 +648,7 @@ pub(crate) async fn run_segment(
         if legacy_zero_cap || exceeds_bytes(&request, cap) {
             return Ok(AgentStop::TranscriptFull);
         }
-        let turn: ModelTurn = match model_turn(ctx, run.live, request).await {
+        let turn: ModelTurn = match send_turn(ctx, run.live, progress, request).await {
             Ok(Some(turn)) => turn,
             Ok(None) => {
                 progress.interrupted = true;
@@ -722,6 +755,55 @@ async fn model_turn(
     } else {
         Ok(None)
     }
+}
+
+/// Send one model turn: as a delta on the last window when the run allows
+/// it, else in the full form (issue #2264).
+///
+/// A delta whose prefix the store does not hold fails before any model
+/// call. The turn then goes again in the full form. Both outcomes are
+/// recorded, so replay takes the same path.
+async fn send_turn(
+    ctx: &WorkflowContext,
+    live: bool,
+    progress: &mut Progress,
+    mut request: ModelTurnRequest,
+) -> HarvestResult<Option<ModelTurn>> {
+    if !progress.delta {
+        return model_turn(ctx, live, request).await;
+    }
+    request.remember = true;
+    let window = std::mem::take(&mut request.messages);
+    if let Some(sent) = progress
+        .sent
+        .clone()
+        .filter(|sent| sent.len <= window.len())
+    {
+        let delta = ModelTurnRequest {
+            prefix: Some(PrefixRef {
+                digest: sent.digest.clone(),
+                len: u32::try_from(sent.len).unwrap_or(u32::MAX),
+            }),
+            messages: window[sent.len..].to_vec(),
+            ..request.clone()
+        };
+        match model_turn(ctx, live, delta).await {
+            Err(error) if error.activity_error_type() == Some(PREFIX_MISSING) => {}
+            other => {
+                if matches!(other, Ok(Some(_))) {
+                    progress.sent = Some(sent.after(&window));
+                }
+                return other;
+            }
+        }
+    }
+    let sent = Sent::of(&window);
+    request.messages = window;
+    let turn = model_turn(ctx, live, request).await;
+    if matches!(turn, Ok(Some(_))) {
+        progress.sent = Some(sent);
+    }
+    turn
 }
 
 /// Take one waiting interrupt. Returns `true` when one was waiting.
@@ -1431,6 +1513,7 @@ async fn delegate(
     let child_agent = discover(ctx, &mandate).await?;
     let child_task = child_task(task, peer, child_input, mandate, max_total_tokens);
     let mut child = Progress::new(run_id.clone(), Vec::new());
+    child.delta = progress.delta;
     let child_run = Run {
         task: &child_task,
         agent: Some(&child_agent),
@@ -1882,6 +1965,7 @@ fn child_task(
         mandate: Some(mandate),
         // The tree holds the labels, so the child task carries none.
         flow_labels: BTreeSet::new(),
+        transcript_delta: task.transcript_delta,
         parallel_children: task.parallel_children,
         model: peer.model.clone().or_else(|| task.model.clone()),
     }

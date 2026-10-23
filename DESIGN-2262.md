@@ -204,6 +204,10 @@ survive continue-as-new.
 - `agent_loop` uses the delta only when the task sets
   `transcript_delta` and the run records the patch marker. An old history
   has neither, so it replays as it ran.
+- **Changed in the build.** A store miss fails the turn with
+  `TranscriptPrefixMissing` before the model call, and the workflow sends
+  the full form. The store holds whole windows, not links, so a lookup
+  walks no chain. The request cap still measures the whole window.
 
 ---
 

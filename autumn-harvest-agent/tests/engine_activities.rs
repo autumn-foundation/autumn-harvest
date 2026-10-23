@@ -66,6 +66,8 @@ fn turn_request() -> ModelTurnRequest {
         flow_released: autumn_harvest_agent::Released::new(),
         interruptible: false,
         model: None,
+        prefix: None,
+        remember: false,
     }
 }
 

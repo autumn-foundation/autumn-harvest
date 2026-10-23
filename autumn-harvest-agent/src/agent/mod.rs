@@ -883,6 +883,10 @@ pub struct AgentState {
     pub last_answer: Option<String>,
     /// The steer messages that wait for their other half (issue #2265).
     pub steer: SteerBook,
+    /// The last window that a model turn sent (issue #2264). The next op
+    /// sends a delta on it when its window still starts with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sent: Option<crate::transcript::Sent>,
     /// The heartbeat setting of this agent (issue #2266).
     pub heartbeat: HeartbeatSetting,
     /// When the next heartbeat tick is due, in epoch milliseconds.
@@ -1406,6 +1410,9 @@ impl AgentRun<'_> {
         state.segments = state.segments.saturating_add(1);
         let mut progress = Progress::new(run_id.clone(), state.transcript.clone());
         progress.final_turn_rules = true;
+        // The agent workflow is newer than the delta form, so it needs no gate.
+        progress.delta = task.transcript_delta;
+        progress.sent = state.sent.take();
         progress.chain = state.chain;
         progress.steer = Some(std::mem::take(&mut state.steer));
         let mut tree = Tree {
@@ -1440,6 +1447,7 @@ impl AgentRun<'_> {
         };
         let result = run_segment(self.ctx, run, &mut progress, &mut tree, input).await;
         state.steer = progress.steer.take().unwrap_or_default();
+        state.sent = progress.sent.take();
         // A failed op keeps what its tools and turns did to the labels and
         // the tokens. Only the transcript stays as it was.
         state.rounds = tree.rounds;

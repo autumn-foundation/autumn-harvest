@@ -412,10 +412,42 @@ back, so add a field only with `#[serde(default)]`. A new field of an
 activity input also needs `skip_serializing_if` at its default, because a
 strict replay compares each recorded input as it was written.
 
+### 8a. Transcript deltas (issue #2264)
+
+A model turn records only the messages that it adds. Its input names the
+earlier window with a `PrefixRef`: a chained SHA-256 digest of the messages
+and their count. The model-turn activity reads that window from the
+`TranscriptStore` of the harness, adds the new messages, and keeps the
+result for the next turn.
+
+| Case | What happens |
+|---|---|
+| First turn of a run | The full form. The activity keeps the window. |
+| A later turn | A delta on the window that the last turn sent. |
+| A new segment or op | A delta when the window still starts with the last sent window. A trimmed transcript is sent in the full form. |
+| The store misses | The turn fails with `TranscriptPrefixMissing` before any model call. The workflow sends it again in the full form. |
+
+- The model reads the same window in both forms. The response cache key
+  and provider prompt caching do not change.
+- The request cap still measures the whole window, so the full form always
+  fits.
+- `AgentTask::new` turns the delta on. `transcript_delta(false)` turns it
+  off. A task recorded before the change has no flag, so it replays as it
+  ran.
+- The default store is an `InMemoryTranscriptStore` with a 64 MiB bound. A
+  restart empties it, so each run sends the full form once. Set a shared
+  store with `AgentHarness::transcript_store` to hit on every worker.
+- A store holds transcript text outside history. Delete a run's windows
+  when you erase the run.
+
+A 50-turn run with a 1 KB tool result each turn stores about 86% less
+history (`a_50_turn_run_stores_at_least_80_percent_less_history`).
+
 ## 9. Limits
 
-- **The transcript rides in history.** Each model turn records the whole
-  conversation as its input. A long session should continue as new with the
+- **Each turn records its new messages.** A turn records a prefix
+  reference and the messages that it adds (section 8a). History still
+  grows with each turn, so a long session should continue as new with the
   report's `messages` as `history`.
 - **No streaming.** An activity result is a value, not a stream.
 - **Tool definitions are read at call time.** A deploy that changes the tool

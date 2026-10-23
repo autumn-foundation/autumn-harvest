@@ -86,6 +86,7 @@ pub mod sandbox;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod tool;
+pub mod transcript;
 pub mod types;
 pub mod workflow;
 
@@ -118,6 +119,7 @@ pub use response_cache::{
     CacheIndex, CacheKey, CacheScope, InMemoryCacheIndex, KeyTenant, ResponseCache,
 };
 pub use tool::{FnTool, Tool, ToolContext, ToolEffect};
+pub use transcript::{InMemoryTranscriptStore, PrefixRef, TranscriptStore};
 pub use types::{
     AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
     RunIdSource, ToolCallRequest, ToolOutcome,
