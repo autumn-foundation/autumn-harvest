@@ -241,6 +241,9 @@ async fn a_bump_expires_every_owner_lease_and_keeps_the_epochs() {
     use autumn_harvest::decision_owner::{
         self, Acquisition, DecisionPartition, OwnerHolder, OwnerLeaseConfig,
     };
+    // The registry is global. A pin of shard 0 by a parallel test would
+    // fence this test's lease writes.
+    let _serial = registry_guard().await;
     let (url, _db) = require_db!("owner_bump");
     let mut conn = connect(&url).await;
     ensure_generation_row(&mut conn, ShardId::new(0))
@@ -310,6 +313,145 @@ async fn a_bump_expires_every_owner_lease_and_keeps_the_epochs() {
             other => panic!("the bump frees {}: {other:?}", t.partition()),
         }
     }
+}
+
+/// The shard of the DR batch tests (issue #2296). The registry is global.
+/// A shard that no other test uses keeps their pins away from the
+/// acquisitions of other tests.
+const BATCH_SHARD: ShardId = ShardId::new(61);
+
+/// The number of owner rows of `ps` that have a holder.
+async fn held_rows(conn: &mut AsyncPgConnection, ps: &[i32]) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Held {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    diesel::sql_query(
+        "SELECT count(*) AS n FROM harvest_decision_owner \
+         WHERE partition = ANY($1) AND holder IS NOT NULL",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(ps)
+    .get_result::<Held>(conn)
+    .await
+    .expect("read the owner rows")
+    .n
+}
+
+/// Issue #2296: a batch acquisition takes the generation row first. A
+/// region that lost write authority takes no row of the batch. Its owner
+/// loop adopts nothing and asks for no rescan.
+#[tokio::test]
+async fn a_fenced_region_takes_no_row_of_a_batch() {
+    use autumn_harvest::decision_owner::{
+        self, DecisionPartition, EnableOwnerMode, OwnedPartitions, OwnerHolder, OwnerLeaseConfig,
+        OwnerLoop,
+    };
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("owner_batch_fenced");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, BATCH_SHARD)
+        .await
+        .expect("provision");
+    FenceRegistry::clear();
+    FenceRegistry::register(BATCH_SHARD, ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    let holder = OwnerHolder::for_worker("fenced-region");
+    let config = OwnerLeaseConfig::default();
+    let p = |n: u16| DecisionPartition::new(n).expect("in range");
+
+    // The control: at the pinned generation, the batch takes its row.
+    let before =
+        decision_owner::acquire_many(&mut conn, BATCH_SHARD, &holder, &[p(4)], &config).await;
+    bump_generation(&mut conn, BATCH_SHARD, "promote", "oncall")
+        .await
+        .expect("bump");
+    let after =
+        decision_owner::acquire_many(&mut conn, BATCH_SHARD, &holder, &[p(5), p(6)], &config).await;
+    decision_owner::enable_owner_mode(
+        &mut conn,
+        &EnableOwnerMode {
+            force: true,
+            ..EnableOwnerMode::default()
+        },
+    )
+    .await
+    .expect("enable owner mode");
+    let mut owner_loop = OwnerLoop::new(
+        BATCH_SHARD,
+        "fenced-loop",
+        config,
+        std::sync::Arc::new(OwnedPartitions::default()),
+    );
+    let tick = owner_loop.tick(&mut conn).await;
+    FenceRegistry::clear();
+
+    let before = before.expect("the pinned generation passes");
+    assert_eq!(before.acquired.len(), 1, "{before:?}");
+    assert!(
+        matches!(
+            after,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "{after:?}"
+    );
+    assert_eq!(
+        held_rows(&mut conn, &[5, 6]).await,
+        0,
+        "the fenced batch took no row"
+    );
+    let tick = tick.expect("a fenced tick is no error");
+    assert!(tick.acquired.is_empty(), "{:?}", tick.acquired);
+    assert!(!tick.more, "a fenced tick asks for no rescan");
+}
+
+/// Issue #2296: the generation row is the one lock wait of a batch. A
+/// bump holds it, so a batch that waits past its lock timeout lists each
+/// partition as busy and takes no row.
+#[tokio::test]
+async fn a_batch_that_waits_out_a_bump_is_busy() {
+    use autumn_harvest::decision_owner::{self, DecisionPartition, OwnerHolder, OwnerLeaseConfig};
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("owner_batch_busy");
+    let mut conn = connect(&url).await;
+    let generation = ensure_generation_row(&mut conn, BATCH_SHARD)
+        .await
+        .expect("provision");
+    FenceRegistry::clear();
+    FenceRegistry::register(BATCH_SHARD, generation).expect("no conflicting pin in this test");
+
+    let mut bump = connect(&url).await;
+    bump.batch_execute(&format!(
+        "BEGIN; SELECT 1 FROM harvest_shard_generation WHERE shard_id = {} FOR UPDATE",
+        BATCH_SHARD.as_i32()
+    ))
+    .await
+    .expect("hold the generation row");
+    let ps: Vec<DecisionPartition> = [7_u16, 8]
+        .into_iter()
+        .map(|n| DecisionPartition::new(n).expect("in range"))
+        .collect();
+    let config =
+        OwnerLeaseConfig::default().with_lock_timeout(std::time::Duration::from_millis(300));
+    let result = decision_owner::acquire_many(
+        &mut conn,
+        BATCH_SHARD,
+        &OwnerHolder::for_worker("busy-region"),
+        &ps,
+        &config,
+    )
+    .await;
+    bump.batch_execute("ROLLBACK").await.expect("release");
+    FenceRegistry::clear();
+
+    let got = result.expect("a lock miss is no error");
+    assert_eq!(got.busy, ps, "{got:?}");
+    assert!(got.acquired.is_empty() && got.held.is_empty(), "{got:?}");
+    assert_eq!(
+        held_rows(&mut conn, &[7, 8]).await,
+        0,
+        "the batch took no row"
+    );
 }
 
 /// Issue #2248: with DR fencing on, an owner decision sends the owner fence

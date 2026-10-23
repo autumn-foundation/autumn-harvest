@@ -1106,6 +1106,107 @@ async fn a_chunked_loop_acquires_in_steps_and_asks_for_more() {
     db.drop_db().await;
 }
 
+/// The number of transactions that last wrote the owner rows of `ps`.
+///
+/// Each row version keeps the id of the transaction that wrote it, as
+/// `xmin`.
+async fn owner_writers(conn: &mut AsyncPgConnection, ps: &[i32]) -> i64 {
+    #[derive(QueryableByName)]
+    struct Writers {
+        #[diesel(sql_type = BigInt)]
+        n: i64,
+    }
+    diesel::sql_query(
+        "SELECT count(DISTINCT xmin::text)::bigint AS n \
+         FROM harvest_decision_owner WHERE partition = ANY($1)",
+    )
+    .bind::<diesel::sql_types::Array<Integer>, _>(ps)
+    .get_result::<Writers>(conn)
+    .await
+    .expect("read the row versions")
+    .n
+}
+
+/// Issue #2296: a joiner takes each chunk of partitions in one
+/// transaction, not in one transaction per partition.
+#[tokio::test]
+async fn a_joiner_takes_each_chunk_in_one_transaction() {
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    enable(&mut conn).await;
+    let owned = Arc::new(OwnedPartitions::default());
+    let mut joiner = OwnerLoop::new(
+        ShardId::UNENCODED,
+        "loop-batch",
+        OwnerLeaseConfig::default(),
+        Arc::clone(&owned),
+    )
+    .with_acquire_chunk(200);
+    let mut more = true;
+    while more {
+        let report = joiner.tick(&mut conn).await.expect("tick");
+        more = report.more;
+        let chunk: Vec<i32> = report
+            .acquired
+            .iter()
+            .map(|(t, _)| i32::from(t.partition().get()))
+            .collect();
+        assert!(!chunk.is_empty(), "each tick takes a chunk");
+        assert_eq!(owner_writers(&mut conn, &chunk).await, 1, "one transaction");
+        for (tenure, deadline) in report.acquired {
+            owned.adopt_until(tenure, deadline);
+        }
+    }
+    assert_eq!(owned.len(), 512);
+    db.drop_db().await;
+}
+
+/// Issue #2296: a batch that names a missing row fails, and it takes no
+/// other row. The batch checks its rows before its one write.
+#[tokio::test]
+async fn a_batch_acquisition_of_a_missing_row_takes_no_row() {
+    #[derive(QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = diesel::sql_types::Nullable<Text>)]
+        holder: Option<String>,
+        #[diesel(sql_type = BigInt)]
+        epoch: i64,
+    }
+    async fn row_6(conn: &mut AsyncPgConnection) -> Row {
+        diesel::sql_query("SELECT holder, epoch FROM harvest_decision_owner WHERE partition = 6")
+            .get_result(conn)
+            .await
+            .expect("read the row")
+    }
+    let db = OwnDb::new().await;
+    let mut conn = db.conn().await;
+    diesel::sql_query("DELETE FROM harvest_decision_owner WHERE partition = 7")
+        .execute(&mut conn)
+        .await
+        .expect("drop one owner row");
+    let before = row_6(&mut conn).await;
+    let ps = [
+        DecisionPartition::new(6).expect("in range"),
+        DecisionPartition::new(7).expect("in range"),
+    ];
+    let result = decision_owner::acquire_many(
+        &mut conn,
+        ShardId::UNENCODED,
+        &OwnerHolder::for_worker("missing"),
+        &ps,
+        &OwnerLeaseConfig::default(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(HarvestError::NotFound(_))),
+        "{result:?}"
+    );
+    let after = row_6(&mut conn).await;
+    assert_eq!(after.holder, None, "the batch took no row");
+    assert_eq!(after.epoch, before.epoch, "the batch kept the epoch");
+    db.drop_db().await;
+}
+
 /// A chunked loop rescans at once only below its target. Orphans past the
 /// target wait a full scan, so the loop does not take them and then release
 /// them on the next tick (issue #2254).

@@ -1042,3 +1042,155 @@ async fn a_fenced_scope_ends_with_its_transaction() {
     assert!(error_is_ownership_lost(&result), "{result:?}");
     assert_eq!(event_count(&mut conn, exec_id).await, 1);
 }
+
+/// The number of transactions that last wrote the rows of `ps`.
+///
+/// Each row version keeps the id of the transaction that wrote it, as
+/// `xmin`. So one transaction that wrote every row gives 1.
+async fn writers(conn: &mut AsyncPgConnection, ps: &[DecisionPartition]) -> i64 {
+    let ps: Vec<i32> = ps.iter().map(|p| i32::from(p.get())).collect();
+    diesel::sql_query(
+        "SELECT count(DISTINCT xmin::text)::bigint AS n \
+         FROM harvest_decision_owner WHERE partition = ANY($1)",
+    )
+    .bind::<diesel::sql_types::Array<Integer>, _>(&ps)
+    .get_result::<Count>(conn)
+    .await
+    .expect("read the row versions")
+    .n
+}
+
+/// Issue #2296: a batch takes each free row in one transaction. Each epoch
+/// grows by 1. The tenures come in ascending order, with no duplicate.
+#[tokio::test]
+async fn a_batch_acquisition_takes_each_free_row_in_one_transaction() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let ps = [partition(440), partition(441), partition(442)];
+    let mut before = Vec::new();
+    for p in ps {
+        free(&mut conn, p).await;
+        before.push(row(&mut conn, p).await.epoch);
+    }
+    let a = holder("batch");
+
+    // The input is out of order and names one row twice.
+    let input = [ps[2], ps[0], ps[1], ps[0]];
+    let got = decision_owner::acquire_many(&mut conn, SHARD, &a, &input, &config())
+        .await
+        .expect("acquire");
+    assert!(got.held.is_empty() && got.busy.is_empty(), "{got:?}");
+    let taken: Vec<_> = got.acquired.iter().map(OwnerTenure::partition).collect();
+    assert_eq!(taken, ps);
+    for (tenure, epoch) in got.acquired.iter().zip(before) {
+        assert_eq!(tenure.epoch(), OwnerEpoch::new(epoch + 1));
+        assert_eq!(tenure.holder(), &a);
+        let after = row(&mut conn, tenure.partition()).await;
+        assert_eq!(after.epoch, epoch + 1);
+        assert_eq!(after.holder.as_deref(), Some(a.as_str()));
+        assert!(after.live, "a new lease is live");
+    }
+    assert_eq!(
+        writers(&mut conn, &ps).await,
+        1,
+        "one transaction wrote each row"
+    );
+}
+
+/// Issue #2296: an empty batch takes nothing.
+#[tokio::test]
+async fn an_empty_batch_acquisition_takes_nothing() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let got = decision_owner::acquire_many(&mut conn, SHARD, &holder("empty"), &[], &config())
+        .await
+        .expect("acquire");
+    assert_eq!(got, decision_owner::Acquisitions::default());
+}
+
+/// Issue #2296: a batch never waits for an owner row. A row with a live
+/// lease is held. A row that a commit locks is busy. The batch takes the
+/// rest at once, and a later batch takes the busy row.
+#[tokio::test]
+async fn a_batch_acquisition_skips_held_and_busy_rows_without_a_wait() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let live = partition(443);
+    let locked = partition(444);
+    let open = partition(445);
+    for p in [live, locked, open] {
+        free(&mut conn, p).await;
+    }
+    let _live = acquire(&mut conn, &holder("skip-live"), live).await;
+    let old = acquire(&mut conn, &holder("skip-old"), locked).await;
+    lapse(&mut conn, locked).await;
+
+    let mut commit = connect(&url).await;
+    commit
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM harvest_decision_owner WHERE partition = {} FOR KEY SHARE",
+            locked.get()
+        ))
+        .await
+        .expect("hold the commit lock");
+    // A long lock wait, so a batch that waits fails the time bound.
+    let patient = OwnerLeaseConfig::default().with_lock_timeout(Duration::from_secs(5));
+    let b = holder("skip-new");
+    let started = std::time::Instant::now();
+    let got = decision_owner::acquire_many(&mut conn, SHARD, &b, &[open, locked, live], &patient)
+        .await
+        .expect("acquire");
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_secs(2),
+        "the batch waited {waited:?}"
+    );
+    assert_eq!(got.held, vec![live]);
+    assert_eq!(got.busy, vec![locked]);
+    let taken: Vec<_> = got.acquired.iter().map(OwnerTenure::partition).collect();
+    assert_eq!(taken, vec![open]);
+    assert_eq!(
+        row(&mut conn, locked).await.epoch,
+        old.epoch().get(),
+        "a busy row keeps its epoch"
+    );
+
+    commit.batch_execute("ROLLBACK").await.expect("release");
+    let again = decision_owner::acquire_many(&mut conn, SHARD, &b, &[locked], &patient)
+        .await
+        .expect("acquire");
+    let epochs: Vec<_> = again.acquired.iter().map(OwnerTenure::epoch).collect();
+    assert_eq!(epochs, vec![old.epoch().next().expect("no overflow")]);
+}
+
+/// Issue #2296: a stale owner's commit fails after a batched takeover.
+#[tokio::test]
+async fn a_stale_owners_commit_is_rejected_after_a_batched_takeover() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let p = partition(446);
+    free(&mut conn, p).await;
+    let stale = acquire(&mut conn, &holder("batch-stale-a"), p).await;
+    lapse(&mut conn, p).await;
+    let got =
+        decision_owner::acquire_many(&mut conn, SHARD, &holder("batch-stale-b"), &[p], &config())
+            .await
+            .expect("acquire");
+    let [fresh] = got.acquired.as_slice() else {
+        panic!("expected one tenure, got {got:?}");
+    };
+    assert_eq!(Some(fresh.epoch()), stale.epoch().next());
+
+    let result = decide!(conn, Some(stale), async |_conn: &mut AsyncPgConnection| Ok(
+        ()
+    ))
+    .await;
+    assert!(error_is_ownership_lost(&result), "{result:?}");
+    decide!(
+        conn,
+        Some(fresh.clone()),
+        async |_conn: &mut AsyncPgConnection| Ok(())
+    )
+    .await
+    .expect("the new owner commits");
+}

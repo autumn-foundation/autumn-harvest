@@ -122,6 +122,14 @@ keeps its meaning. Docs, metrics and logs say "decision partition", or
 - The commit checks holder and epoch, not the lease end. Safety needs the
   epoch only. An expiry check fails a healthy commit when no other worker
   acquires.
+- A scan takes its picks in one transaction, `acquire_many` (issue #2296).
+  The statement count of a scan does not grow with its picks.
+- The batch locks its takeable rows `FOR UPDATE SKIP LOCKED`, in ascending
+  partition order. It skips each row that another transaction locks.
+- The batch increments the epoch only on the rows that it locked. So no
+  commit is in flight on them, and the drain holds. A later scan takes a skipped row.
+- So a batch never waits for an owner row. One busy row does not delay the
+  rest of the batch.
 
 `decision_owner_lock_modes_db_tests.rs` proves these lock modes on
 Postgres 16. In each row, the first transaction holds its lock while the
@@ -138,6 +146,7 @@ second statement runs.
 | Commit, `FOR KEY SHARE` | The scanner lease upsert | No. Owner code does not copy it. | `a_scanner_style_upsert_does_not_wait_for_a_commit` |
 | Commit, `FOR SHARE` | Renewal | Yes. So the commit does not use `FOR SHARE`. | `a_for_share_commit_blocks_a_renewal` |
 | A frozen commit with a local idle timeout | Acquisition, `FOR UPDATE` | No, after the timeout | `a_local_idle_timeout_frees_a_frozen_commit` |
+| Commit, `FOR KEY SHARE` | Batch acquisition, `FOR UPDATE SKIP LOCKED` | No. It skips the row and keeps its epoch. | `a_skip_locked_acquisition_skips_an_in_flight_commit` |
 
 From the scanner lease, copy the `clock_timestamp()` read after the row
 lock and the `lock_timeout`. Do not copy its upsert or its holder rule.
@@ -286,7 +295,7 @@ No task stays `RUNNING` with no worker to finish it:
 - Issue #2254 measured the next decision 0.2 s to 0.3 s after the lease
   end. See [`performance-owner-failover.md`](../performance-owner-failover.md).
 - A frozen owner can hold an open commit transaction. Its `FOR KEY SHARE`
-  then blocks each acquisition.
+  then stops each acquisition of that row.
 - So the owner-mode decision transaction sets
   `idle_in_transaction_session_timeout` to at most the TTL, with
   `SET LOCAL`. The database then ends a frozen transaction.
@@ -310,7 +319,8 @@ On a graceful stop, a worker:
    end to `clock_timestamp()` and keeps the holder and the epoch.
 
 Standbys acquire on their next scan. A decision still in flight at the
-bound keeps its row lock, and the acquisition waits for it. There is no
+bound keeps its row lock. The batch skips that row, and a later scan
+takes it (issue #2296). There is no
 named successor and no serial handover. Golem's serial drain gave each
 shard 5 s and failed (golemcloud/golem#3766).
 
@@ -327,9 +337,10 @@ Issue #2252 fixes the balance policy (`decision_owner::plan_balance`):
   a worker with no workflow slot or type, and a split colocated group.
   It still claims in the owned form, so the guard never blocks it.
 - A worker below the target acquires free partitions up to the target.
-- The worker acquires at most 32 partitions per scan. It adopts them,
-  then scans again at once while free partitions remain (issue #2254). So
-  its first decisions do not wait for its last acquisition.
+- The worker acquires at most 32 partitions per scan, in one transaction
+  (issue #2296). It adopts them, then scans again at once while free
+  partitions remain (issue #2254). So its first decisions do not wait for
+  its last acquisition.
 - A worker above target + 1 stops claiming the extra partitions at once.
   It releases them one full scan interval later, so their decisions in
   flight can commit. That is the drain.
