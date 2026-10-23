@@ -100,24 +100,17 @@ impl DiskSide {
         let DiskLoad::Hit(entry) = loaded else {
             return Err(format!("the disk read gave {}", loaded.outcome()).into());
         };
+        // One query reads the anchor event and the delta after it, as the
+        // worker does.
         let anchor = entry.state.next_event_id - 1;
         let codecs = PayloadCodecs::default();
-        let event = store::load_event_inflated(conn, exec, anchor, &codecs, None)
-            .await?
-            .ok_or("the anchor event is missing")?;
-        if event_hash(&event)? != entry.last_event_hash {
+        let tail = store::load_history_since_inflated(conn, exec, anchor, &codecs, None).await?;
+        let first = tail.events.first().ok_or("the anchor event is missing")?;
+        if event_hash(first)? != entry.last_event_hash {
             return Err("the anchor check failed".into());
         }
-        // A disk hit then loads the delta, as a memory hit does.
-        let delta = store::load_history_since_inflated(
-            conn,
-            exec,
-            entry.state.next_event_id,
-            &codecs,
-            None,
-        )
-        .await?;
-        Ok(entry.state.events.len() + delta.events.len())
+        let delta = &tail.events[1..];
+        Ok(entry.state.events.len() + delta.len())
     }
 
     /// The cache, for a blocking task.

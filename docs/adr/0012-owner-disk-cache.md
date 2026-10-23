@@ -58,8 +58,12 @@ Local disk is a cache only. Postgres stays the source of truth.
    event of the same id in Postgres. Any mismatch purges, and the decision
    loads from Postgres.
 6. **Lazy rebuild.** A file fills on the first committed suspension of each
-   run after a takeover. A later suspension appends only its new events.
-7. **One process per directory.** An exclusive OS lock on
+   run after a takeover. A later suspension appends only its new events. A
+   run with fewer than `owner_disk_cache_min_events` events, 100 by
+   default, never goes to disk. One Postgres read wins for such a run.
+7. **One query per hit.** A disk hit reads the anchor event and the delta
+   after it in one Postgres query.
+8. **One process per directory.** An exclusive OS lock on
    `owner-disk-cache.lock` keeps a second process out, as
    `autumn-harvest-sqlite/src/lock.rs` does. On Unix the open creates the
    directory with the mode `0700`. It refuses an existing directory that
@@ -81,7 +85,9 @@ passed the check finishes before the delete, and a later write is refused.
 - A damaged file fails its seal. The decision replays cold from Postgres,
   with no non-determinism error.
 - A restart starts with an empty cache. The cache helps once each run has
-  decided once: a run past the memory cap then reads the local file.
+  decided once: a run past the memory cap then reads the local file. From
+  about 100 events, that next pass is 1.5 to 1.9 times faster. See
+  `docs/rnd/2026-10-23-owner-disk-cache.md`.
 - Each committed suspension of an owned run costs one local write.
 - A finished run can stay on disk when its purge and its evict wake are
   both lost. The erasure sends a new wake. If that wake is lost too, the

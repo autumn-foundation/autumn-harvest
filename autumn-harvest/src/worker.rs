@@ -636,6 +636,8 @@ pub struct HandlerRegistry {
     /// The directory of the owner-local disk cache (issue #2258). `None`
     /// turns the cache off.
     owner_disk_cache_dir: Option<std::path::PathBuf>,
+    /// The fewest events that a run needs before the disk cache keeps it.
+    owner_disk_cache_min_events: usize,
     /// The open disk cache. The workers of this registry share it, because
     /// a process can lock a directory only once.
     #[cfg(feature = "owner-disk-cache")]
@@ -900,6 +902,7 @@ impl HandlerRegistry {
             adaptive_limits,
             decision_owner: Arc::default(),
             owner_disk_cache_dir: None,
+            owner_disk_cache_min_events: crate::builder::DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS,
             #[cfg(feature = "owner-disk-cache")]
             owner_disk_cache: std::sync::Mutex::new(None),
             max_workflow_attempts_ceiling: None,
@@ -1528,10 +1531,16 @@ impl HandlerRegistry {
         self
     }
 
-    /// Set the directory of the owner-local disk cache (issue #2258).
+    /// Set the directory of the owner-local disk cache, and the fewest
+    /// events that a run needs before the cache keeps it (issue #2258).
     #[must_use]
-    pub fn with_owner_disk_cache(mut self, dir: Option<std::path::PathBuf>) -> Self {
+    pub fn with_owner_disk_cache(
+        mut self,
+        dir: Option<std::path::PathBuf>,
+        min_events: usize,
+    ) -> Self {
         self.owner_disk_cache_dir = dir;
+        self.owner_disk_cache_min_events = min_events;
         self
     }
 
@@ -1902,6 +1911,10 @@ impl std::fmt::Debug for HandlerRegistry {
         d.field("workflow_module_hosting", &self.module_host.is_some());
         // Issue #2258: the directory, and whether a worker opened the cache.
         d.field("owner_disk_cache_dir", &self.owner_disk_cache_dir);
+        d.field(
+            "owner_disk_cache_min_events",
+            &self.owner_disk_cache_min_events,
+        );
         #[cfg(feature = "owner-disk-cache")]
         d.field(
             "owner_disk_cache_open",
@@ -22772,8 +22785,9 @@ type DiskCacheEntry = (
 
 /// Read the disk entry of a memory miss (issue #2258).
 ///
-/// Only a decision with a pinned tenure reads the disk. Returns the entry
-/// and the outcome label, or no label when no disk read ran.
+/// Only a decision with a pinned tenure reads the disk. Returns the entry,
+/// the Postgres delta after it and the outcome label. The label is `None`
+/// when no disk read ran.
 #[cfg(feature = "owner-disk-cache")]
 async fn read_disk_entry(
     conn: &mut AsyncPgConnection,
@@ -22781,26 +22795,35 @@ async fn read_disk_entry(
     key: crate::decision_owner::OwnerKey,
     execution: &WorkflowExecution,
     offloader: Option<&crate::payload_store::PayloadOffloader>,
-) -> (Option<DiskCacheEntry>, Option<&'static str>) {
+) -> (
+    Option<DiskCacheEntry>,
+    Option<store::EventHistory>,
+    Option<&'static str>,
+) {
     let Some(epoch) = crate::decision_owner::pinned_decision().map(|t| t.epoch()) else {
-        return (None, None);
+        return (None, None, None);
     };
     let Some(disk) = workflow_cache.lock().await.disk() else {
-        return (None, None);
+        return (None, None, None);
     };
     let exec_id = ExecutionId::from_uuid(execution.id);
     let read = disk
         .read(conn, key, epoch, exec_id, &execution.state, offloader)
         .await;
-    let entry = read.entry.map(|(state, history_bytes)| {
-        (
-            state,
-            crate::resident::Residency::Unknown,
-            history_bytes,
-            Some(key),
-        )
-    });
-    (entry, Some(read.outcome))
+    let (entry, delta) = read
+        .entry
+        .map_or((None, None), |(state, history_bytes, delta)| {
+            (
+                Some((
+                    state,
+                    crate::resident::Residency::Unknown,
+                    history_bytes,
+                    Some(key),
+                )),
+                Some(delta),
+            )
+        });
+    (entry, delta, Some(read.outcome))
 }
 
 /// Write the disk entry of a committed decision, or purge it (issue #2258).
@@ -23036,27 +23059,33 @@ async fn prepare_workflow_task_with_cache(
         cached.filter(|(.., entry_key)| !owner_mode || entry_key.is_none_or(|entry| entry == key));
     // Issue #2258: on a memory miss, an owner reads its disk cache. A disk
     // entry holds no resident workflow, so the decision replays it cold.
+    // The disk read also loads the delta, so the hit path skips that query.
     #[cfg(feature = "owner-disk-cache")]
-    let (cached, disk_outcome) = match cached {
-        Some(entry) => (Some(entry), None),
+    let (cached, mut disk_delta, disk_outcome) = match cached {
+        Some(entry) => (Some(entry), None, None),
         None => read_disk_entry(conn, workflow_cache, key, &execution, offloader).await,
     };
     #[cfg(not(feature = "owner-disk-cache"))]
-    let disk_outcome = None;
+    let (mut disk_delta, disk_outcome): (Option<store::EventHistory>, _) = (None, None);
 
     // Cache hit path. Load the delta first: other writers can append after
     // the snapshot. Then ingest timers and signals at the real
     // `next_event_id`. This avoids a unique-key collision on `event_id`.
     let mut hit = None;
     if let Some((cached_state, resident, cached_history_bytes, _)) = cached {
-        let existing_delta_result = store::load_history_since_inflated(
-            conn,
-            exec_id,
-            cached_state.next_event_id,
-            codecs,
-            offloader,
-        )
-        .await;
+        let existing_delta_result = match disk_delta.take() {
+            Some(delta) => Ok(delta),
+            None => {
+                store::load_history_since_inflated(
+                    conn,
+                    exec_id,
+                    cached_state.next_event_id,
+                    codecs,
+                    offloader,
+                )
+                .await
+            }
+        };
         let existing_delta =
             fail_execution_on_error(conn, task, worker_id, existing_delta_result, codecs).await?;
         // Issue #2253: a foreign writer changed the state of the run, for
@@ -35879,7 +35908,11 @@ impl Worker {
         #[cfg(feature = "owner-disk-cache")]
         let workflow_cache =
             workflow_cache.with_disk(registry.open_owner_disk_cache()?.map(|disk| {
-                crate::owner_disk_cache::DiskTier::new(disk, registry.payload_codecs().clone())
+                crate::owner_disk_cache::DiskTier::new(
+                    disk,
+                    registry.payload_codecs().clone(),
+                    registry.owner_disk_cache_min_events,
+                )
             }));
         #[cfg(not(feature = "owner-disk-cache"))]
         if let Some(dir) = registry.owner_disk_cache_dir() {
@@ -45505,6 +45538,7 @@ mod tests {
             workflow_cache_size: 500,
             resident_workflows: true,
             owner_disk_cache: None,
+            owner_disk_cache_min_events: crate::builder::DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS,
             sticky_timeout: Duration::from_secs(3),
             cancellation_grace_period: Duration::from_secs(10),
             shard_assignments: vec![crate::types::ShardId::new(0)],

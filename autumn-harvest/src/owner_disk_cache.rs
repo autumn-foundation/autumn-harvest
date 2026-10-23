@@ -543,7 +543,9 @@ impl OwnerDiskCache {
             self.close_partition(slot.key, &partition, &mut guard);
         }
         drop(guard);
-        written.map_or(DiskStore::Failed, |appended| DiskStore::Written { appended })
+        written.map_or(DiskStore::Failed, |appended| DiskStore::Written {
+            appended,
+        })
     }
 
     /// Delete the entry of `exec`, and refuse to store it for
@@ -1045,6 +1047,18 @@ fn wipe_dir(dir: &Path) -> HarvestResult<()> {
     Ok(())
 }
 
+/// Whether `tail`, read from event `anchor` on, starts with the cached last
+/// event and has no gap.
+fn anchors(tail: &crate::store::EventHistory, anchor: i32, last_event_hash: &[u8; 32]) -> bool {
+    let span = i64::from(tail.next_event_id) - i64::from(anchor);
+    let contiguous = usize::try_from(span).is_ok_and(|span| span == tail.events.len());
+    contiguous
+        && tail
+            .events
+            .first()
+            .is_some_and(|event| event_hash(event).is_ok_and(|hash| &hash == last_event_hash))
+}
+
 /// How often an owner checks its cached runs against Postgres.
 ///
 /// The check is the backstop for a lost evict wake. It purges each cached
@@ -1067,12 +1081,20 @@ pub(crate) struct DiskTier {
     /// The partitions that this worker wrote. Workers of one registry share
     /// the cache, so a shutdown drops only these.
     written: Arc<Mutex<std::collections::HashSet<OwnerKey>>>,
+    /// The fewest events that a run needs before the tier keeps it. A
+    /// shorter history loads faster from Postgres.
+    min_events: usize,
 }
 
 /// What a disk read gives a decision.
 pub(crate) struct DiskRead {
-    /// The cached state and byte mark, after every check passed.
-    pub(crate) entry: Option<(CachedWorkflowState, Option<HistoryBytesMark>)>,
+    /// The cached state, its byte mark and the Postgres delta after it,
+    /// once every check passed.
+    pub(crate) entry: Option<(
+        CachedWorkflowState,
+        Option<HistoryBytesMark>,
+        crate::store::EventHistory,
+    )>,
     /// The outcome label of `harvest.workflow.disk_cache`.
     pub(crate) outcome: &'static str,
 }
@@ -1081,12 +1103,14 @@ impl DiskTier {
     pub(crate) fn new(
         cache: Arc<OwnerDiskCache>,
         codecs: crate::payload_codec::PayloadCodecs,
+        min_events: usize,
     ) -> Self {
         Self {
             cache,
             codecs,
             last_reconcile: Arc::default(),
             written: Arc::default(),
+            min_events,
         }
     }
 
@@ -1107,8 +1131,10 @@ impl DiskTier {
     ///
     /// `run_state` is the state of the execution row. A run that is not
     /// `RUNNING` purges its entry. A hit must pass the anchor check: the
-    /// last cached event equals the stored event of the same id. Any
-    /// failure reads as no entry, so the decision loads from Postgres.
+    /// last cached event equals the stored event of the same id. One query
+    /// reads that event and the delta after it, so a hit costs one round
+    /// trip. Any failure reads as no entry, so the decision loads from
+    /// Postgres.
     pub(crate) async fn read(
         &self,
         conn: &mut diesel_async::AsyncPgConnection,
@@ -1129,6 +1155,13 @@ impl DiskTier {
                 },
             };
         }
+        // The index lives in memory, so a miss reads no file.
+        if !self.cache.contains(exec_uuid) {
+            return DiskRead {
+                entry: None,
+                outcome: "miss",
+            };
+        }
         let slot = self.slot(key, epoch);
         let cache = Arc::clone(&self.cache);
         let loaded = tokio::task::spawn_blocking(move || cache.load(&slot, exec_uuid))
@@ -1141,12 +1174,15 @@ impl DiskTier {
             };
         };
         let anchor = entry.state.next_event_id - 1;
-        match crate::store::load_event_inflated(conn, exec, anchor, &self.codecs, offloader).await {
-            Ok(Some(event))
-                if event_hash(&event).is_ok_and(|hash| hash == entry.last_event_hash) =>
-            {
+        let tail =
+            crate::store::load_history_since_inflated(conn, exec, anchor, &self.codecs, offloader)
+                .await;
+        match tail {
+            Ok(mut tail) if anchors(&tail, anchor, &entry.last_event_hash) => {
+                // The anchor is the first event. The rest is the delta.
+                tail.events.remove(0);
                 DiskRead {
-                    entry: Some((entry.state, entry.history_bytes)),
+                    entry: Some((entry.state, entry.history_bytes, tail)),
                     outcome: "hit",
                 }
             }
@@ -1180,6 +1216,11 @@ impl DiskTier {
         history_bytes: Option<HistoryBytesMark>,
         owned: Arc<crate::decision_owner::OwnedPartitions>,
     ) -> Option<CachedWorkflowState> {
+        // A short history loads faster from Postgres. Histories only grow,
+        // so a short one has no older entry to purge.
+        if state.events.len() < self.min_events {
+            return Some(state);
+        }
         let slot = self.slot(key, epoch);
         let cache = Arc::clone(&self.cache);
         let written = tokio::task::spawn_blocking(move || {
@@ -1798,6 +1839,46 @@ mod tests {
         let mode = std::fs::metadata(&dir).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
         drop(cache);
+    }
+
+    #[tokio::test]
+    async fn the_tier_keeps_no_short_history() {
+        let dir = private_dir();
+        let cache = Arc::new(OwnerDiskCache::open(dir.path()).expect("open"));
+        let tier = DiskTier::new(
+            Arc::clone(&cache),
+            crate::payload_codec::PayloadCodecs::default(),
+            4,
+        );
+        let owned = Arc::new(crate::decision_owner::OwnedPartitions::default());
+        let _ = owned.adopt(crate::decision_owner::OwnerTenure::pinned(
+            ShardId::UNENCODED,
+            key(1).partition,
+            crate::decision_owner::OwnerHolder::for_worker("disk-test"),
+            OwnerEpoch::new(1),
+            crate::decision_owner::OwnerLeaseTtl::DEFAULT,
+        ));
+        let (short, long) = (Uuid::new_v4(), Uuid::new_v4());
+        let back = tier
+            .write(
+                key(1),
+                OwnerEpoch::new(1),
+                short,
+                state(3),
+                None,
+                Arc::clone(&owned),
+            )
+            .await;
+        assert_eq!(
+            back.map(|s| s.next_event_id),
+            Some(3),
+            "the state comes back"
+        );
+        assert!(!cache.contains(short), "a short history stays in Postgres");
+        let _ = tier
+            .write(key(1), OwnerEpoch::new(1), long, state(4), None, owned)
+            .await;
+        assert!(cache.contains(long), "a history at the bound goes to disk");
     }
 
     /// AC 3 at the module level. The cache stores decoded events, so no

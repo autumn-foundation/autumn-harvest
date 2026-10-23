@@ -99,7 +99,8 @@ gate (#2257) is still undecided, so the cache ships as an opt-in.
 
 1. `owner_disk_cache.rs`: the directory lock, the wipe, the node key, the
    sealed rows, the stamp, load, store, purge, drop and reconcile.
-2. `store.rs`: `load_event_inflated` reads one event for the anchor check.
+2. The anchor check: one Postgres query reads the last cached event and
+   the delta after it. The hit path then skips its own delta query.
 3. `worker.rs`: the disk read on a memory miss and the write after a
    suspension. Also the purge points, the reconcile in the owner scan and
    the drop at shutdown.
@@ -154,8 +155,12 @@ Accepted as is:
 - A core dump or swap can hold the key. ADR 0012 says so.
 - `ghash` 0.5 does not clear its key on drop. That predates this change.
 - The restart warm-up is not faster: the open wipes the cache. The gain is
-  on the next decision of each run past the memory cache. Section 4 gives
-  the numbers.
+  on the next decision of each run past the memory cache.
+
+The bench then showed that a short history reads slower through the cache.
+One query now reads the anchor and the delta, and a run under 100 events
+stays off the disk. `docs/rnd/2026-10-23-owner-disk-cache.md` has the
+numbers.
 
 ## 4. Out of scope
 

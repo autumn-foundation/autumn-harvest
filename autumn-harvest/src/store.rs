@@ -1879,39 +1879,6 @@ pub async fn load_history_since(
     })
 }
 
-/// Load one event of `exec_id`, inflated and decoded (issue #2258).
-///
-/// The owner disk cache reads its anchor event with it. `None` means that
-/// the event does not exist.
-///
-/// # Errors
-///
-/// Returns a database error, or a decode error of the stored row.
-#[cfg(feature = "db")]
-pub async fn load_event_inflated(
-    conn: &mut AsyncPgConnection,
-    exec_id: ExecutionId,
-    event_id: i32,
-    codecs: &crate::payload_codec::PayloadCodecs,
-    offloader: Option<&crate::payload_store::PayloadOffloader>,
-) -> HarvestResult<Option<WorkflowEvent>> {
-    let data: Option<serde_json::Value> = harvest_events::table
-        .filter(harvest_events::workflow_exec_id.eq(exec_id.as_uuid()))
-        .filter(harvest_events::event_id.eq(event_id))
-        .select(harvest_events::event_data)
-        .first(conn)
-        .await
-        .optional()
-        .map_err(crate::error::database_error)?;
-    let Some(mut data) = data else {
-        return Ok(None);
-    };
-    if let Some(offloader) = offloader {
-        offloader.inflate_event_value(&mut data).await?;
-    }
-    codecs.decode_event(data).map(Some)
-}
-
 /// Delta-load companion to [`load_history_inflated`] (issue #524): load events
 /// with `event_id >= from_event_id`, inflating offloaded payloads before decode.
 ///

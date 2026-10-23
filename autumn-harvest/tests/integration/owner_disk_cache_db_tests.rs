@@ -197,7 +197,9 @@ impl Fixture {
             .worker(
                 WorkerConfig::default()
                     .with_queues([self.queue.as_str()])
-                    .with_owner_disk_cache(self.dir()),
+                    .with_owner_disk_cache(self.dir())
+                    // The test histories are short. Keep every one on disk.
+                    .with_owner_disk_cache_min_events(1),
             )
             .telemetry(
                 TelemetryConfig::builder()

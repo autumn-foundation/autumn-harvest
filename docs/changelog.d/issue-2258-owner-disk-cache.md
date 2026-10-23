@@ -18,6 +18,9 @@ Postgres delta, not the full Postgres history. See
   An erasure sends the owner an evict wake. The owner scan runs a reconcile
   pass at most once in 30 s per shard. It purges each cached run that is
   not `RUNNING`, and each file of an older codec key generation.
+- **Long histories only.** `WorkerConfig::with_owner_disk_cache_min_events`
+  sets the fewest events that a run needs before it goes to disk. The
+  default is 100. A shorter history loads faster from Postgres.
 - **Validity stamps.** Each file holds the owner epoch and the codec key
   generation. Each run holds its state and the hash of its last event. A
   mismatch or a damaged row purges the entry, and the decision replays
@@ -26,10 +29,10 @@ Postgres delta, not the full Postgres history. See
   of disk reads: `hit`, `miss`, `stale` or `corrupt`. `MetricsRecorder`
   gains `record_workflow_disk_cache` with a no-op default. The starter pack
   gains a panel.
-- **`store::load_event_inflated`.** Reads one decoded event. The cache
-  checks its last event with it.
 - **`examples/history-load-gate`.** The warm-up step also times the disk
-  cache.
+  cache. From about 100 events, the next pass after a restart is 1.5 to
+  1.9 times faster than a Postgres load. Below that, it is not faster. See
+  `docs/rnd/2026-10-23-owner-disk-cache.md`.
 
 **Tests.** `an_erased_run_leaves_no_local_bytes`,
 `an_erasure_purges_a_run_that_a_missed_purge_left`,
