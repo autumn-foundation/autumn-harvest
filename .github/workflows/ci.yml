@@ -882,6 +882,12 @@ jobs:
       # assigned one shard each (see the job comment above) ─────────────────
       - name: Compile db-backed tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
+        env:
+          # Each test target maps the large `autumn_harvest` rlib while it
+          # links. On the Linux runner, parallel links of the all-features
+          # targets ran out of memory, and the runner shut down mid-step.
+          # Two jobs keep the peak inside it, as on Windows above.
+          CARGO_BUILD_JOBS: ${{ runner.os == 'macOS' && 'default' || '2' }}
         run: cargo test -p autumn-harvest --all-features --tests --no-run
       # Issue #786: the claim/enqueue benchmark shares its harness with the
       # CI-gated budget assertion (`claim_budget_tests`, run Docker-backed via
