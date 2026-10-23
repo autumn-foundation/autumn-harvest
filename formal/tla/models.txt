@@ -32,8 +32,9 @@ OwnerLease         OwnerLeaseReach.cfg                 violation:SomeNemesisUnse
 AgentMesh          AgentMesh.cfg                       pass
 AgentMesh          AgentMeshEngineOnly.cfg             pass
 AgentMesh          AgentMeshSeqOnly.cfg                pass
+AgentMesh          AgentMeshLastSeqSerial.cfg          pass
 AgentMesh          AgentMeshNoDedupe.cfg               violation:AtMostOnce
 AgentMesh          AgentMeshRunScope.cfg               violation:AtMostOnce
-AgentMesh          AgentMeshPipeline.cfg               violation:NoLostAck
+AgentMesh          AgentMeshLastSeq.cfg                violation:NoLostAck
 AgentMesh          AgentMeshWiden.cfg                  violation:MandateNarrows
 AgentMesh          AgentMeshReach.cfg                  violation:SomeNemesisUnseen

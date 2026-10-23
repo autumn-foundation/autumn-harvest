@@ -81,7 +81,7 @@ fails in these cases:
 | `WorkflowTaskClaim` | Workflow-task terminal-write ownership (issues #1184, #1806, #1917) | fixed, pre-fix, reachability, capability-miss pre-fix |
 | `CodecRotation` | Codec re-encryption against PII erasure (issues #948, #495) | CAS, blind write, reachability |
 | `OwnerLease` | Fenced owner lease of a decision partition (issue #2250) | design, six defects, reachability |
-| `AgentMesh` | Durable peer send between two agents (issue #2269) | design, one dedupe layer each, four defects, reachability |
+| `AgentMesh` | Durable peer send between two agents (issue #2269) | design, three single-layer configs, four defects, reachability |
 
 **Ghost sequence numbers.** Each claim in the two claim models gets a ghost
 `seq`. The code has no such column. An invariant that compared
@@ -333,7 +333,7 @@ send take either path, so it covers both deployments. Its actions:
 | `Relay` | `enforce_external_signals_outbox` delivers a row. A records `ExternalSignalDelivered`. |
 | `RelayAgain` | The relay delivers a row but loses the outcome. The row stays, so the relay delivers it again. |
 | `Begin` | The owner of B reads the head of its inbox. |
-| `Commit` | The fenced commit of B consumes the op, applies it and moves `lastSeq`. A fenced commit aborts and changes nothing. |
+| `Commit` | The fenced commit of B consumes the op, applies it and updates the dedupe state of B. A fenced commit aborts and changes nothing. |
 | `OwnerChange` | A new owner takes B, so the epoch moves. The new owner replays B. |
 | `Checkpoint` | B continues as new. It carries its state and its waiting ops. |
 
@@ -343,9 +343,16 @@ off:
 | Constant | Values | Meaning |
 |---|---|---|
 | `EngineDedupe` | `"chain"`, `"run"`, `"off"` | The engine refuses a signal key that it took before. `"chain"` keeps the keys across continue-as-new, as the engine does. `"run"` keeps the keys of one run only. |
-| `SeqDedupe` | `TRUE`, `FALSE` | B keeps `lastSeq` in its state. It consumes a message with `seq <= lastSeq` and does not apply it. |
+| `SeqDedupe` | `"applied_set"`, `"last_seq"`, `"off"` | The agent layer of B dedupes by seq. `"applied_set"` is the design: B skips a seq that it applied. `"last_seq"` was the first design: B skips each seq up to the highest seq that it applied. |
 | `Accept` | `"meet"`, `"join"` | `"meet"` is `local.accept(inbound)`. `"join"` takes the union, which widens. |
-| `MaxInFlight` | 1, 2 | The bound on sends of A that wait for their delivery. |
+| `MaxInFlight` | 1, 2 | The bound on sends of A that wait for their delivery. The design allows 2. |
+
+**The applied set.** B keeps it in its state as `floor` and `above`. Each
+seq up to `floor` is applied. `above` holds the applied seqs over `floor`.
+A message is a duplicate when its seq is at most `floor`, or in `above`. To
+apply seq s, B adds s to `above`. Then `floor` moves up while `floor + 1`
+is in `above`, and those seqs leave `above`. When messages arrive in order,
+`above` stays empty.
 
 The fence is taken as given: a decision of B commits only at the epoch that
 it read. `OwnerLease` proves that rule. The outbound mandate is the meet of
@@ -362,30 +369,38 @@ Invariants:
   the same rule.
 - `ConsumesTheHead`: the decision of the current owner holds the head of
   the inbox. Its commit therefore consumes the op that it read.
+- `AppliedSetExact`: `floor` and `above` encode the applied seqs exactly.
+  `above` holds no seq at `floor + 1` or lower, so `floor` is as high as it
+  can be. A mutant that keeps the absorbed seqs in `above` fails it.
 
-The pass configs also check the liveness property `EventuallyApplied`: B
-applies each committed send. They use `LiveSpec`, which adds weak fairness
-for the commit of A, the relay and B. The nemeses have bounds, so each
-behaviour runs out of them. `EventuallyApplied` with `AtMostOnce` is
-exactly-once delivery.
+The pass configs check every invariant above. They also check the liveness
+property `EventuallyApplied`: B applies each committed send. They use
+`LiveSpec`, which adds weak fairness for the commit of A, the relay and B.
+The nemeses have bounds, so each behaviour runs out of them.
+`EventuallyApplied` with `AtMostOnce` is exactly-once delivery.
 
-Each config changes one thing from the design. A red config lists only the
-invariant that it must break:
+The table gives what each config changes from the design. A red config
+lists only the invariant that it must break:
 
 | Config | Change from the design | Result |
 |---|---|---|
-| `AgentMesh.cfg` | None. | Pass, with `EventuallyApplied`. |
-| `AgentMeshEngineOnly.cfg` | `SeqDedupe = FALSE`, `MaxInFlight = 2` | Pass. |
+| `AgentMesh.cfg` | None: `EngineDedupe = "chain"`, `SeqDedupe = "applied_set"`, `MaxInFlight = 2`. | Pass. |
+| `AgentMeshEngineOnly.cfg` | `SeqDedupe = "off"` | Pass. |
 | `AgentMeshSeqOnly.cfg` | `EngineDedupe = "off"` | Pass. |
-| `AgentMeshNoDedupe.cfg` | `EngineDedupe = "off"`, `SeqDedupe = FALSE` | Violates `AtMostOnce`. |
-| `AgentMeshRunScope.cfg` | `EngineDedupe = "run"`, `SeqDedupe = FALSE` | Violates `AtMostOnce`. |
-| `AgentMeshPipeline.cfg` | `MaxInFlight = 2` | Violates `NoLostAck`. |
+| `AgentMeshLastSeqSerial.cfg` | `EngineDedupe = "off"`, `SeqDedupe = "last_seq"`, `MaxInFlight = 1` | Pass. |
+| `AgentMeshNoDedupe.cfg` | `EngineDedupe = "off"`, `SeqDedupe = "off"` | Violates `AtMostOnce`. |
+| `AgentMeshRunScope.cfg` | `EngineDedupe = "run"`, `SeqDedupe = "off"` | Violates `AtMostOnce`. |
+| `AgentMeshLastSeq.cfg` | `SeqDedupe = "last_seq"` | Violates `NoLostAck`. |
 | `AgentMeshWiden.cfg` | `Accept = "join"` | Violates `MandateNarrows`. |
 | `AgentMeshReach.cfg` | None. | Violates `SomeNemesisUnseen`. |
 
-Each dedupe layer alone keeps delivery exactly once. Turn both off, and the
-relay duplicate runs twice. `AgentMeshRunScope.cfg` shows why the engine
-keeps the keys of the whole chain:
+Each dedupe layer alone keeps delivery exactly once with two sends in
+flight. In `AgentMesh.cfg` the engine refuses every duplicate, so the
+applied set never skips a message. `AgentMeshSeqOnly.cfg` turns the engine
+dedupe off. There the applied set skips each duplicate, in any order of
+arrival. Turn both layers off, and the relay duplicate runs twice.
+`AgentMeshRunScope.cfg` shows why the engine keeps the keys of the whole
+chain:
 
 1. A sends seq 1 through the outbox. The relay delivers it and loses the
    outcome.
@@ -393,25 +408,36 @@ keeps the keys of the whole chain:
 3. B continues as new. A dedupe of one run forgets key 1.
 4. The relay delivers seq 1 again, and B applies it again.
 
-**The `lastSeq` layer needs one send in flight for each peer.** The model
-found this before the code. `AgentMeshPipeline.cfg` gives this trace:
+**Why the design uses an applied set.** The first design kept only the
+highest applied seq, `lastSeq`. The model found that this loses a message
+when two sends are in flight. `AgentMeshLastSeq.cfg` gives this trace:
 
 1. A sends seq 1 through the outbox.
 2. A sends seq 2 on the inline path, so B gets it first.
-3. B applies seq 2. `lastSeq` is now 2.
-4. The relay delivers seq 1, and A records the delivery.
+3. The relay delivers seq 1, and A records the delivery.
+4. B applies seq 2. `lastSeq` is now 2.
 5. B skips seq 1, because `1 <= lastSeq`. `NoLostAck` fails.
 
 Two outbox rows can lose a message in the same way. A sweep retries a row
 on a later tick, after a newer row. Concurrent children (issue #2270) can
-put two sends to one peer in one decision. The code must keep one send in
-flight for each peer, or B must not drop a seq that it has not applied.
-`AgentMeshEngineOnly.cfg` shows that the key dedupe alone is safe with two
-sends in flight.
+put two sends to one peer in one decision.
+
+The applied set keeps seq 1. After step 4, `floor` is 0 and `above` is
+{2}. Seq 1 is not a duplicate, so B applies it. `floor` moves to 2, and
+`above` is empty again. `AgentMeshLastSeqSerial.cfg` shows that `last_seq`
+is safe only with one send in flight.
+
+The code must keep two rules that the model has no room to show:
+
+- A seq counts the sends of one sender to one receiver. With one counter
+  for all peers, each receiver sees gaps. Then `floor` stops, and `above`
+  grows with each send.
+- B keys the applied set by the sender run id, which holds the
+  incarnation. A new incarnation of the sender starts its seq at 1 again.
 
 `AgentMesh.cfg` checks 2 sends, 2 crashes of A, 3 epochs of B, one lost
-relay outcome and one checkpoint. TLC finds 29,094 distinct states and no
-error, in under 10 seconds on 4 cores.
+relay outcome and one checkpoint. TLC finds 60,603 distinct states and no
+error, in under 15 seconds on 4 cores.
 
 `AgentMeshReach.cfg` must violate `SomeNemesisUnseen`. The violation is
 one behaviour of the design that reaches every tag:
@@ -425,6 +451,7 @@ one behaviour of the design that reaches every tag:
 | `owner-change-abort` | The fence aborts a decision of an old owner of B. |
 | `replay-after-abort` | The new owner runs that message again. |
 | `checkpoint-in-flight` | B continues as new with a message in flight. |
+| `out-of-order-apply` | B applies a seq below one that it applied before. |
 
 The model has these limits:
 

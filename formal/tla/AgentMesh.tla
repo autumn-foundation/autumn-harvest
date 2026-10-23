@@ -21,18 +21,25 @@
 (*                 "chain" keeps the keys across continue-as-new, as the   *)
 (*                 engine does. "run" keeps the keys of one run only.      *)
 (*                 "off" keeps none.                                       *)
-(*   SeqDedupe     B keeps lastSeq in its state. It consumes a message     *)
-(*                 with seq <= lastSeq and does not apply it.              *)
+(*   SeqDedupe     The agent layer of B dedupes by seq.                    *)
+(*                 "applied_set" is the design. B keeps the set of the     *)
+(*                 seqs that it applied, as floor and above. Each seq up   *)
+(*                 to floor is applied, and above holds the applied seqs   *)
+(*                 over floor. B skips a seq in that set.                  *)
+(*                 "last_seq" keeps the highest applied seq only. B skips  *)
+(*                 each seq up to it.                                      *)
+(*                 "off" skips nothing.                                    *)
+(*                                                                         *)
+(* MaxInFlight bounds the sends of A that wait for their delivery. The     *)
+(* outbox can reorder two such sends. The "last_seq" layer then skips the  *)
+(* earlier one, which it never applied. The "applied_set" layer applies    *)
+(* it, so the design allows two sends in flight.                           *)
 (*                                                                         *)
 (* Each message carries the outbound mandate of A, a set of tools. As      *)
 (* Mandate::outbound does, it is the meet of the mandate of A and the      *)
 (* tools of the peer entry of B. B runs the message under                  *)
 (* Effective(inbound). Accept = "meet" is the design, local.accept.        *)
 (* Accept = "join" widens.                                                 *)
-(*                                                                         *)
-(* MaxInFlight bounds the sends of A that wait for their delivery. The     *)
-(* outbox can reorder two such sends. Then the lastSeq layer drops the     *)
-(* earlier one. The design therefore keeps one send in flight per peer.    *)
 (*                                                                         *)
 (* The nemeses are always on, within their bounds:                         *)
 (*   Crash        A loses its decision in flight. Its durable state stays, *)
@@ -60,13 +67,13 @@ CONSTANTS
     MaxDup,         \* The bound on lost delivery outcomes of the relay.
     MaxCheckpoint,  \* The bound on continue-as-new of B.
     EngineDedupe,   \* "chain", "run" or "off".
-    SeqDedupe,      \* TRUE: B skips a message with seq <= lastSeq.
+    SeqDedupe,      \* "applied_set", "last_seq" or "off".
     Accept          \* "meet" (the design) or "join" (a widening defect).
 
 ASSUME LocalB \subseteq Tools /\ MandateA \subseteq Tools
 ASSUME PeerTools \subseteq Tools
 ASSUME EngineDedupe \in {"chain", "run", "off"}
-ASSUME SeqDedupe \in BOOLEAN
+ASSUME SeqDedupe \in {"applied_set", "last_seq", "off"}
 ASSUME Accept \in {"meet", "join"}
 ASSUME {MaxSeq, MaxInFlight, MaxCrash, MaxEpoch, MaxDup, MaxCheckpoint}
          \subseteq Nat
@@ -82,6 +89,8 @@ VARIABLES
     inbox,     \* The signal rows of B that no decision consumed, in order.
     acked,     \* The seqs whose delivery the history of A records.
     lastSeq,   \* Durable state of B: the highest seq that it applied.
+    floor,     \* Durable state of B: each seq up to floor is applied.
+    above,     \* Durable state of B: the applied seqs over floor.
     applied,   \* Ghost: the messages that B applied, from its history.
     epoch,     \* The owner epoch of B.
     bDecs,     \* The decisions of B in flight, of every owner.
@@ -89,7 +98,11 @@ VARIABLES
     aborted,   \* Ghost: the seqs that a fenced decision of B held.
     seen       \* Ghost: the nemesis tags that the behaviour reached.
 
-vars == <<aSeq, aDec, crashes, outbox, dups, keys, inbox, acked, lastSeq,
+\* The dedupe state of B. Each mode reads its own part. The parts are
+\* functions of the applied seqs, so the unused parts add no state.
+dedupe == <<lastSeq, floor, above>>
+
+vars == <<aSeq, aDec, crashes, outbox, dups, keys, inbox, acked, dedupe,
           applied, epoch, bDecs, runs, aborted, seen>>
 
 Seqs == 1..MaxSeq
@@ -103,7 +116,7 @@ Decisions == [epoch : 1..MaxEpoch, msg : Msgs]
 WitnessTags == {"crash-before-commit", "crash-before-delivery",
                 "crash-after-delivery", "relay-duplicate",
                 "owner-change-abort", "replay-after-abort",
-                "checkpoint-in-flight"}
+                "checkpoint-in-flight", "out-of-order-apply"}
 
 \* The mandate that A sends: Mandate::outbound narrows it to the peer.
 Outbound == MandateA \cap PeerTools
@@ -125,7 +138,21 @@ AppliedSeqs == {applied[i].seq : i \in DOMAIN applied}
 Queued == {inbox[i].seq : i \in DOMAIN inbox}
 
 \* True when B consumes the message but does not apply it.
-Skips(m) == SeqDedupe /\ m.seq <= lastSeq
+Skips(m) ==
+    CASE SeqDedupe = "applied_set" -> m.seq <= floor \/ m.seq \in above
+      [] SeqDedupe = "last_seq"    -> m.seq <= lastSeq
+      [] OTHER                     -> FALSE
+
+\* The floor after B applies seq s: the end of the run of applied seqs
+\* that starts at floor + 1.
+FloorAfter(s) ==
+    LET set == above \cup {s}
+    IN  CHOOSE f \in floor..MaxSeq :
+          /\ \A k \in (floor + 1)..f : k \in set
+          /\ (f + 1) \notin set
+
+\* The applied seqs over the new floor, after B applies seq s.
+AboveAfter(s) == {k \in above \cup {s} : k > FloorAfter(s)}
 
 TypeOK ==
     /\ aSeq \in 0..MaxSeq
@@ -137,6 +164,8 @@ TypeOK ==
     /\ inbox \in Seq(Msgs)
     /\ acked \subseteq Seqs
     /\ lastSeq \in 0..MaxSeq
+    /\ floor \in 0..MaxSeq
+    /\ above \subseteq Seqs
     /\ applied \in Seq(Applications)
     /\ epoch \in 1..MaxEpoch
     /\ bDecs \subseteq Decisions
@@ -154,6 +183,8 @@ Init ==
     /\ inbox = <<>>
     /\ acked = {}
     /\ lastSeq = 0
+    /\ floor = 0
+    /\ above = {}
     /\ applied = <<>>
     /\ epoch = 1
     /\ bDecs = {}
@@ -180,7 +211,7 @@ Decide ==
     /\ Cardinality(Undelivered) < MaxInFlight
     /\ \E p \in Paths :
          aDec' = {[seq |-> aSeq + 1, mandate |-> Outbound, path |-> p]}
-    /\ UNCHANGED <<aSeq, crashes, outbox, dups, keys, inbox, acked, lastSeq,
+    /\ UNCHANGED <<aSeq, crashes, outbox, dups, keys, inbox, acked, dedupe,
                    applied, epoch, bDecs, runs, aborted, seen>>
 
 \* The decision of A commits with its send, in one transaction. The inline
@@ -197,7 +228,7 @@ SendCommit ==
              ELSE /\ outbox' = outbox \cup {m}
                   /\ UNCHANGED <<inbox, keys, acked>>
     /\ aDec' = {}
-    /\ UNCHANGED <<crashes, dups, lastSeq, applied, epoch, bDecs, runs,
+    /\ UNCHANGED <<crashes, dups, dedupe, applied, epoch, bDecs, runs,
                    aborted, seen>>
 
 \* A crashes. Its decision in flight is lost. Its durable state stays, so a
@@ -211,7 +242,7 @@ Crash ==
          \cup (IF outbox # {} THEN {"crash-before-delivery"} ELSE {})
          \cup (IF acked \cap Queued # {} THEN {"crash-after-delivery"}
                ELSE {})
-    /\ UNCHANGED <<aSeq, outbox, dups, keys, inbox, acked, lastSeq, applied,
+    /\ UNCHANGED <<aSeq, outbox, dups, keys, inbox, acked, dedupe, applied,
                    epoch, bDecs, runs, aborted>>
 
 \* The relay delivers an outbox row. The history of A records the delivery,
@@ -221,7 +252,7 @@ Relay(r) ==
     /\ Insert(r)
     /\ outbox' = outbox \ {r}
     /\ acked' = acked \cup {r.seq}
-    /\ UNCHANGED <<aSeq, aDec, crashes, dups, lastSeq, applied, epoch, bDecs,
+    /\ UNCHANGED <<aSeq, aDec, crashes, dups, dedupe, applied, epoch, bDecs,
                    runs, aborted, seen>>
 
 \* The relay delivers a row, but it loses the outcome. The row stays, so the
@@ -232,7 +263,7 @@ RelayAgain(r) ==
     /\ Insert(r)
     /\ dups' = dups + 1
     /\ seen' = seen \cup {"relay-duplicate"}
-    /\ UNCHANGED <<aSeq, aDec, crashes, outbox, acked, lastSeq, applied,
+    /\ UNCHANGED <<aSeq, aDec, crashes, outbox, acked, dedupe, applied,
                    epoch, bDecs, runs, aborted>>
 
 -----------------------------------------------------------------------------
@@ -245,30 +276,36 @@ Begin ==
     /\ ~\E d \in bDecs : d.epoch = epoch
     /\ bDecs' = bDecs \cup {[epoch |-> epoch, msg |-> Head(inbox)]}
     /\ UNCHANGED <<aSeq, aDec, crashes, outbox, dups, keys, inbox, acked,
-                   lastSeq, applied, epoch, runs, aborted, seen>>
+                   dedupe, applied, epoch, runs, aborted, seen>>
 
 \* The decision commits. The fence compares the epoch. A fenced decision
 \* aborts, so its state change and its consumption roll back. A decision
-\* that passes consumes the message and applies it in one transaction.
+\* that passes consumes the message, applies it and updates the dedupe
+\* state, in one transaction.
 Commit(d) ==
     /\ d \in bDecs
     /\ bDecs' = bDecs \ {d}
     /\ IF d.epoch = epoch
-       THEN /\ inbox' = Tail(inbox)
-            /\ IF Skips(d.msg)
-               THEN UNCHANGED <<applied, lastSeq>>
-               ELSE /\ applied' = Append(applied,
-                                   [seq |-> d.msg.seq,
-                                    inbound |-> d.msg.mandate,
-                                    eff |-> Effective(d.msg.mandate)])
-                    /\ lastSeq' = IF d.msg.seq > lastSeq THEN d.msg.seq
-                                  ELSE lastSeq
-            /\ seen' = IF d.msg.seq \in aborted
-                       THEN seen \cup {"replay-after-abort"} ELSE seen
-            /\ UNCHANGED aborted
+       THEN LET s == d.msg.seq
+            IN /\ inbox' = Tail(inbox)
+               /\ IF Skips(d.msg)
+                  THEN UNCHANGED <<applied, dedupe>>
+                  ELSE /\ applied' = Append(applied,
+                                      [seq |-> s,
+                                       inbound |-> d.msg.mandate,
+                                       eff |-> Effective(d.msg.mandate)])
+                       /\ lastSeq' = IF s > lastSeq THEN s ELSE lastSeq
+                       /\ floor' = FloorAfter(s)
+                       /\ above' = AboveAfter(s)
+               /\ seen' = seen
+                    \cup (IF s \in aborted THEN {"replay-after-abort"}
+                          ELSE {})
+                    \cup (IF ~Skips(d.msg) /\ s < lastSeq
+                          THEN {"out-of-order-apply"} ELSE {})
+               /\ UNCHANGED aborted
        ELSE /\ aborted' = aborted \cup {d.msg.seq}
             /\ seen' = seen \cup {"owner-change-abort"}
-            /\ UNCHANGED <<inbox, applied, lastSeq>>
+            /\ UNCHANGED <<inbox, applied, dedupe>>
     /\ UNCHANGED <<aSeq, aDec, crashes, outbox, dups, keys, acked, epoch,
                    runs>>
 
@@ -278,7 +315,7 @@ OwnerChange ==
     /\ epoch < MaxEpoch
     /\ epoch' = epoch + 1
     /\ UNCHANGED <<aSeq, aDec, crashes, outbox, dups, keys, inbox, acked,
-                   lastSeq, applied, bDecs, runs, aborted, seen>>
+                   dedupe, applied, bDecs, runs, aborted, seen>>
 
 \* B continues as new. The new run carries the state and the waiting ops. A
 \* "run" dedupe keeps only the keys of the ops that it carries.
@@ -289,7 +326,7 @@ Checkpoint ==
     /\ keys' = IF EngineDedupe = "run" THEN Queued ELSE keys
     /\ seen' = IF Queued \cup {r.seq : r \in outbox} # {}
                THEN seen \cup {"checkpoint-in-flight"} ELSE seen
-    /\ UNCHANGED <<aSeq, aDec, crashes, outbox, dups, inbox, acked, lastSeq,
+    /\ UNCHANGED <<aSeq, aDec, crashes, outbox, dups, inbox, acked, dedupe,
                    applied, epoch, bDecs, aborted>>
 
 Next ==
@@ -341,8 +378,15 @@ ConsumesTheHead ==
     \A d \in bDecs :
         d.epoch = epoch => inbox # <<>> /\ Head(inbox) = d.msg
 
+\* floor and above encode the applied seqs exactly. The encoding is also
+\* compact: above holds no seq at floor + 1 or lower, so floor is as high
+\* as it can be.
+AppliedSetExact ==
+    /\ {k \in Seqs : k <= floor} \cup above = AppliedSeqs
+    /\ \A k \in above : k > floor + 1
+
 -----------------------------------------------------------------------------
-(* Liveness. AgentMesh.cfg checks it under LiveSpec.                       *)
+(* Liveness. The pass configs check it under LiveSpec.                     *)
 
 \* B applies each committed send. With AtMostOnce, B applies it exactly
 \* once.
@@ -358,6 +402,7 @@ EventuallyApplied == \A s \in Seqs : (s \in Committed) ~> (s \in AppliedSeqs)
 (*   owner-change-abort     The fence aborts a decision of an old owner.   *)
 (*   replay-after-abort     The new owner runs the message again.          *)
 (*   checkpoint-in-flight   B continues as new with a message in flight.   *)
+(*   out-of-order-apply     B applies a seq below one that it applied.     *)
 
 SomeNemesisUnseen == ~(WitnessTags \subseteq seen)
 
