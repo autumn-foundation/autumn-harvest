@@ -303,8 +303,71 @@ ignore = true
 # whose own transitive versions we don't control from this manifest; treating
 # every one as a hard failure would block CI on constraints this repo can't
 # resolve unilaterally. `croner` is the one duplicate where BOTH sides are in
-# reach (our own direct `croner = "2.2"` vs. autumn-web's `^3.0`) — a
-# candidate for a dedicated dedup PR, not bundled into this harness.
+# reach (our own direct `croner = "2.2"` vs. autumn-web's `^3.0`, resolving to
+# 3.0.1) — flagged as a dedup candidate, but NOT a safe drop-in, by Ballast's
+# 2026-10-12 rehearsal.
+#
+# Rehearsed: bumped autumn-harvest's `croner` to "3.0.1" and migrated the four
+# `Cron::new(expr).with_seconds_optional().parse()` call sites (policy.rs x2,
+# scheduler.rs x2) to the 3.x builder, `CronParser::builder()
+# .seconds(Seconds::Optional).build().parse(expr)` — confirmed via docs.rs as
+# 3.x's own documented equivalent, since `Cron::new`/`with_seconds_optional`
+# were removed from `Cron` itself. `cargo check -p autumn-harvest
+# --all-features` was clean and `Cargo.lock` collapsed to one `croner`
+# instance (3.0.1). But `cargo test -p autumn-harvest --lib --features tls`
+# found a real behavior change, not just an API rename: 3 of 98
+# `scheduler::tests` failed --
+# `plan_backfill_timestamps_hourly_cron_inclusive_bounds`,
+# `catchup_run_plan_window_cron_jump_starts_at_cutoff`, and
+# `plan_backfill_timestamps_7_day_hourly_cron_within_default_limit`.
+#
+# CORRECTED (a review on the PR that rehearsed this caught the original write-
+# up of this paragraph misattributing the path; this is the verified
+# mechanism). All three failing tests use a plain `Schedule::Cron`, never
+# `CronInTimezone` — so none of them go through `next_run_after`'s
+# `CronInTimezone` branch, the only branch that ever calls
+# `find_next_occurrence` with `inclusive = true`. They go through the plain
+# `Schedule::Cron` branch instead, which always calls
+# `find_next_occurrence(&reference, false)` (strict/exclusive). Both call
+# sites deliberately pass a `reference` that undercuts the real instant of
+# interest rather than the instant itself -- `plan_backfill_timestamps`
+# (scheduler.rs:219-221) uses `from - 1ms`, and the window-jump cron fallback
+# in `window_eligible_slots` (scheduler.rs:6205-6208) uses `cutoff - 1ns` --
+# on the documented assumption that a strict search from 1ms/1ns below a
+# whole-second boundary lands exactly on that boundary. Under 2.2.0 it does:
+# searching strictly after `09:59:59.999` for "0 * * * *" returns
+# `10:00:00.000`. Under 3.0.1 it instead returns an instant with the original
+# sub-second remainder still attached -- `10:00:00.999`, roughly a full
+# second later than 2.2.0's result, not milliseconds before it as this
+# comment first claimed -- and that drift drops one occurrence from each
+# multi-step walk (168 vs. 169; 2 vs. 3 elements). `policy::tests` (90 tests,
+# including the cron/timezone validation paths) were unaffected -- they only
+# parse expressions, never call `find_next_occurrence` at all.
+#
+# Reverted (Cargo.toml, Cargo.lock, policy.rs, scheduler.rs) rather than
+# shipped: both affected call sites' "undercut the boundary by a tiny
+# duration to turn a strict search into an effectively-inclusive one" trick
+# is load-bearing scheduling-correctness code (issue #484 / Codex #3069's
+# window-cutoff jump-start depends on the window-fallback instance of it),
+# and upstream's CHANGELOG.md documents 3.0.1 and 4.x but has no entry for
+# the 3.0.0 major itself, so this was undocumented going in and its exact
+# mechanism inside croner's own search algorithm is still unconfirmed.
+#
+# Migration sketch for the next attempt: isolate with a minimal croner-only
+# repro (no autumn-harvest scaffolding) comparing
+# `find_next_occurrence(&t, false)` on 2.2.0 vs. 3.0.1, for a `t` a tiny
+# duration below a whole-second instant matching "0 * * * *", to confirm this
+# is croner's own change and not an artifact of the builder migration. If
+# confirmed upstream, either wait for an upstream fix/clarification (file an
+# issue against hexagon/croner-rust if none exists) or stop relying on the
+# undercut-reference trick -- e.g. round `reference` itself down to the
+# second before the strict search, or switch the two call sites to
+# `inclusive = true` against the real boundary instant instead of `false`
+# against an undercut one -- which touches scheduling-correctness code and
+# needs its own rehearsal, not a one-line tweak bundled into the version
+# bump.
+# Revisit trigger: a croner release past 3.0.1 that changelogs a fix here, or
+# someone completes the migration sketch above and rehearses the fix.
 multiple-versions = "warn"
 wildcards = "deny"
 highlight = "all"
