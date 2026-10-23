@@ -186,6 +186,7 @@ Classification rule:
 | `decision_owner` | diesel, interval-sql, raw-pg-sql, raw-sql | (c) | Owner lease of each decision partition (#2251). The fence calls a PL/pgSQL function that takes the row `FOR KEY SHARE` with a bounded `lock_timeout`, and the drain is a `FOR UPDATE` wait. A single process has no second owner, so a SQLite port drops the lease and the fence. |
 | `dlq` | diesel, row-lock, raw-sql | (b) | Row lock on replay/redrive; subsumed by the single write lock. |
 | `durable_promise` | diesel | (b) | Settles through `signal::send_signal_idempotent`, so it has the `signal` row lock (issue #1985). |
+| `entity_state` | diesel, raw-pg-sql, raw-sql | (b) | Keyed-entity state projection (#2259). A PL/pgSQL `AFTER INSERT` trigger on `harvest_events` upserts the row, and the reads cast `$2::text`. SQLite has `AFTER INSERT` triggers and `ON CONFLICT DO UPDATE`, and its single writer gives the same atomicity. ADR 0006 records the port plan. |
 | `erase` | diesel, row-lock | (b) | Scrub holds a row lock; subsumed by the single write lock. |
 | `error` | diesel, skip-locked | (c) | **Comment-only consumer, like `concurrency` above and `store` below.** `SuspendedClaimAmbiguous` (issue #1182) represents the ambiguity a `SKIP LOCKED` claim probe can produce; a single-writer engine has no such ambiguity to represent, so the variant itself would not exist there. |
 | `event_batch` | diesel, skip-locked, to_regclass, raw-pg-sql, raw-sql | (c) | Scanner claim. |

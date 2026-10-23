@@ -24,9 +24,9 @@ use diesel::sql_types::{Bool, Integer, Jsonb, Text, Timestamptz, Uuid as SqlUuid
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde_json::Value;
 
-use crate::entity::{
-    ENTITY_SNAPSHOT_OMITTED_KEY, ENTITY_STATE_QUERY, ENTITY_STATS_QUERY, EntitySnapshot,
-};
+#[cfg(feature = "db")]
+use crate::entity::ENTITY_SNAPSHOT_OMITTED_KEY;
+use crate::entity::{ENTITY_STATE_QUERY, ENTITY_STATS_QUERY, EntitySnapshot};
 #[cfg(feature = "db")]
 use crate::error::{HarvestResult, database_error};
 #[cfg(feature = "db")]
