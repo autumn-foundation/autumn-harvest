@@ -430,6 +430,12 @@ impl OwnerDiskCache {
         lock(&self.index).contains_key(&exec)
     }
 
+    /// The partitions that hold an open file.
+    #[must_use]
+    pub fn cached_partitions(&self) -> Vec<OwnerKey> {
+        lock(&self.partitions).keys().copied().collect()
+    }
+
     /// The cached runs of `shard`.
     #[must_use]
     pub fn cached_runs(&self, shard: ShardId) -> Vec<Uuid> {
@@ -1045,6 +1051,19 @@ fn wipe_dir(dir: &Path) -> HarvestResult<()> {
         }
     }
     Ok(())
+}
+
+/// The partitions of `shard` in `cached` that `owns` does not hold.
+pub(crate) fn unowned_partitions(
+    cached: &[OwnerKey],
+    shard: ShardId,
+    owns: impl Fn(OwnerKey) -> bool,
+) -> Vec<OwnerKey> {
+    cached
+        .iter()
+        .copied()
+        .filter(|key| key.shard == shard && !owns(*key))
+        .collect()
 }
 
 /// Whether `tail`, read from event `anchor` on, starts with the cached last
@@ -1839,6 +1858,31 @@ mod tests {
         let mode = std::fs::metadata(&dir).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
         drop(cache);
+    }
+
+    #[test]
+    fn a_partition_without_a_live_tenure_is_unowned() {
+        let dir = private_dir();
+        let cache = OwnerDiskCache::open(dir.path()).expect("open");
+        for partition in [1, 2, 3] {
+            let _ = cache.store(&slot(partition), Uuid::new_v4(), &state(2), owned);
+        }
+        let mut cached = cache.cached_partitions();
+        cached.sort();
+        assert_eq!(cached, vec![key(1), key(2), key(3)]);
+        let other_shard = OwnerKey {
+            shard: ShardId::new(7),
+            partition: key(4).partition,
+        };
+        cached.push(other_shard);
+        let unowned = unowned_partitions(&cached, ShardId::UNENCODED, |k| k == key(2));
+        assert_eq!(
+            unowned,
+            vec![key(1), key(3)],
+            "only this shard, only lost tenures"
+        );
+        cache.drop_partitions(&unowned);
+        assert_eq!(cache.cached_partitions(), vec![key(2)]);
     }
 
     #[tokio::test]

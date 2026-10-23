@@ -22901,10 +22901,12 @@ async fn put_back_cache_entry(
     // Issue #2251: the partition tag, so a fenced owner can drop the entry.
     owner: CacheOwner<'_>,
 ) {
-    let may_cache = owner.may_cache();
-    let displaced = {
+    // The tenure check runs under the cache lock, so it cannot race the
+    // unload's eviction. The disk purge below reuses its result.
+    let (may_cache, displaced) = {
         let mut guard = workflow_cache.lock().await;
-        if may_cache {
+        let may_cache = owner.may_cache();
+        let displaced = if may_cache {
             guard.insert_resident_with_history_bytes(
                 exec_uuid,
                 state,
@@ -22914,7 +22916,8 @@ async fn put_back_cache_entry(
             )
         } else {
             guard.take(&exec_uuid)
-        }
+        };
+        (may_cache, displaced)
     };
     drop(displaced);
     // Issue #2258: a decision whose tenure ended keeps no disk entry.
@@ -35042,13 +35045,13 @@ async fn owner_scan(
         Ok(conn) => conn,
         Err(e) => {
             tracing::warn!(worker_id = %worker_id, error = %e, "owner loop: no connection");
-            // Issue #2258: a tenure past its local deadline keeps no disk
+            // Issue #2258: a partition without a live tenure keeps no disk
             // file, even when the database is out of reach.
             #[cfg(feature = "owner-disk-cache")]
             {
                 let shard = owner_loop.shard();
                 drop(owner_loop);
-                drop_expired_disk_partitions(cache, owned, shard).await;
+                drop_unowned_disk_partitions(cache, owned, shard).await;
             }
             return OWNER_SCAN_INTERVAL;
         }
@@ -35074,15 +35077,15 @@ async fn owner_scan(
         }
         Err(e) => {
             tracing::warn!(worker_id = %worker_id, error = %e, "owner loop scan failed");
-            // Issue #2258: a failed tick drops no expired tenure. Drop the
-            // disk files of those tenures here.
-            #[cfg(feature = "owner-disk-cache")]
-            drop_expired_disk_partitions(cache, owned, owner_loop.shard()).await;
         }
     }
     #[cfg(feature = "owner-disk-cache")]
     let shard = owner_loop.shard();
     drop(owner_loop);
+    // Issue #2258: a failed tick loses the keys that it already dropped. So
+    // each scan compares the disk partitions with the live tenures instead.
+    #[cfg(feature = "owner-disk-cache")]
+    drop_unowned_disk_partitions(cache, owned, shard).await;
     // Issue #2258: the backstop for a lost evict wake.
     #[cfg(feature = "owner-disk-cache")]
     reconcile_disk_cache(cache, pool, shard, worker_id).await;
@@ -35105,30 +35108,34 @@ async fn conn_then_loop_lock<C, S>(
     (conn, state.lock().await)
 }
 
-/// Delete the disk file of each tenure of `shard` whose local deadline has
-/// passed (issue #2258).
+/// Delete the disk file of each partition of `shard` that has no live
+/// tenure (issue #2258).
 ///
-/// The scan calls this when it cannot reach the database. Such a tenure can
-/// no longer decide, so its partition may now have another owner. No write
-/// can follow: a decision under an expired tenure fails closed.
+/// The scan calls this each time, also when the database is out of reach or
+/// the tick fails. A partition with no live tenure can no longer decide, so
+/// it may now have another owner. No write can follow: a store checks the
+/// tenure under the partition lock.
 #[cfg(feature = "owner-disk-cache")]
-async fn drop_expired_disk_partitions(
+async fn drop_unowned_disk_partitions(
     cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     owned: &crate::decision_owner::OwnedPartitions,
     shard: crate::types::ShardId,
 ) {
-    let expired: Vec<crate::decision_owner::OwnerKey> = owned
-        .tenures_of(shard)
-        .iter()
-        .map(crate::decision_owner::OwnerTenure::key)
-        .filter(|key| {
+    let disk = cache.lock().await.disk();
+    let Some(disk) = disk else {
+        return;
+    };
+    let unowned = crate::owner_disk_cache::unowned_partitions(
+        &disk.cache().cached_partitions(),
+        shard,
+        |key| {
             matches!(
-                owned.pin_for(*key),
-                crate::decision_owner::DecisionPin::Unowned
+                owned.pin_for(key),
+                crate::decision_owner::DecisionPin::Owned(_)
             )
-        })
-        .collect();
-    drop_disk_partitions(cache, &expired).await;
+        },
+    );
+    disk.drop_partitions(&unowned).await;
 }
 
 /// Reconcile the disk cache of `shard` when its interval is due (issue
