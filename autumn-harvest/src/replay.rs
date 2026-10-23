@@ -470,6 +470,27 @@ pub enum ContinueAsNewMatch {
     Frontier,
 }
 
+/// The replayed state of a keyed-entity snapshot (issue #2259).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntitySnapshotMatch {
+    /// The cursor held a snapshot of the expected name. It was consumed.
+    Matched {
+        /// The recorded snapshot value.
+        value: Value,
+    },
+    /// The cursor held another event. The history predates issue #2259, so
+    /// this position records no snapshot. The cursor is left in place.
+    NotRecorded,
+    /// The cursor held a snapshot of another name. The cursor is left in
+    /// place.
+    Diverged {
+        /// The name of the recorded snapshot.
+        actual: String,
+    },
+    /// The cursor is past the recorded history. The caller records live.
+    Frontier,
+}
+
 /// Marker name recorded by `ctx.patched(patch_id)` (issue #687).
 pub(crate) fn patch_marker_name(patch_id: &str) -> String {
     format!("patch:{patch_id}")
@@ -5950,6 +5971,40 @@ impl HistoryMatcher {
             // history-count-only for the recorded portion of a pre-#772 history,
             // and a user `Now` is left for its own strict read to consume.
             _ => SideEffectNowMatch::NotRecorded,
+        }
+    }
+
+    /// Replay a keyed-entity state snapshot named `name` (issue #2259).
+    ///
+    /// The matcher is tolerant, as the deadline probe is. A history from
+    /// before issue #2259 has another event here, so the call reads
+    /// [`EntitySnapshotMatch::NotRecorded`] and leaves the cursor in place.
+    /// The next real command still finds a true divergence.
+    ///
+    /// Only [`SideEffectKind::EntityState`] matches. A `Custom` side effect
+    /// with the same name is user data.
+    #[must_use]
+    pub fn match_entity_snapshot(&mut self, name: &str) -> EntitySnapshotMatch {
+        if !self.prepare_match() {
+            return EntitySnapshotMatch::Frontier;
+        }
+        match &self.events[self.cursor] {
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::EntityState,
+                name: recorded,
+                value,
+            } => {
+                if recorded.as_deref() != Some(name) {
+                    return EntitySnapshotMatch::Diverged {
+                        actual: recorded.clone().unwrap_or_default(),
+                    };
+                }
+                let value = value.clone();
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                EntitySnapshotMatch::Matched { value }
+            }
+            _ => EntitySnapshotMatch::NotRecorded,
         }
     }
 

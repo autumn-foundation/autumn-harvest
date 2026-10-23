@@ -166,6 +166,7 @@ mod durable_stream_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 #[cfg(feature = "db")]
+mod entity_state_db_tests;
 mod entity_tests;
 mod event_batch_tests;
 mod event_partitioning_tests;

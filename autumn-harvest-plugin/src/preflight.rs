@@ -455,6 +455,15 @@ const HARVEST_WRITE_PRIVILEGE_REQUIREMENTS: &[(&str, &[&str])] = &[
         "harvest_decision_owner_candidates",
         &["SELECT", "INSERT", "UPDATE", "DELETE"],
     ),
+    // The entity projection trigger upserts a row in each transaction that
+    // appends an entity snapshot (issue #2259). It runs as the inserting
+    // role, so a missing grant fails that append. Codec rotation and erasure
+    // update rows. Each shard-move cutover and staged-copy cleanup deletes
+    // from the table, and Postgres checks DELETE even when no row matches.
+    (
+        "harvest_entity_state",
+        &["SELECT", "INSERT", "UPDATE", "DELETE"],
+    ),
     // Every completion that recorded an LLM call inserts here, in the
     // completion transaction (issue #1996). A missing grant rolls back the
     // completion, and the activity runs and pays again. `GET /admin/usage`

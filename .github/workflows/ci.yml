@@ -880,9 +880,16 @@ jobs:
         run: bash .github/ci/run-suites.sh run allos
       # ── Individual crate/example steps carried over from `test`, round-robin
       # assigned one shard each (see the job comment above) ─────────────────
+      # The lib test target needs about 8 GB to compile, and `integration`
+      # needs about 11 GB. One `--tests` build compiles both at the same time.
+      # That fills the 16 GB runner, and the runner shuts down (issue #2259).
+      # Compile the lib tests first, so the two never overlap.
       - name: Compile db-backed tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
-        run: cargo test -p autumn-harvest --all-features --tests --no-run
+        shell: bash
+        run: |
+          cargo test -p autumn-harvest --all-features --lib --no-run
+          cargo test -p autumn-harvest --all-features --tests --no-run
       # Issue #786: the claim/enqueue benchmark shares its harness with the
       # CI-gated budget assertion (`claim_budget_tests`, run Docker-backed via
       # the manifest in `test-db-linux`). Compile-checking it here keeps the

@@ -329,6 +329,8 @@ pub mod effective_config;
 pub mod eligibility;
 /// Keyed entity: serialized handlers over durable state for each key (issue #1975).
 pub mod entity;
+/// The keyed-entity state projection (issue #2259).
+pub mod entity_state;
 /// Targeted PII erasure for completed workflow executions (issue #495).
 ///
 /// Provides [`erase::erase_workflow_payloads`] (DB-gated) plus the pure

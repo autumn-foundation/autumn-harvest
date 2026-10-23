@@ -1567,6 +1567,7 @@ a `JSONB` column has no row here. Each clear column has a reason.
 | `harvest_schedules.buffered_runs` | Clear | Fire times only. |
 | `harvest_schedules.retry_policy` | Clear | Engine configuration, not payload. |
 | `harvest_signals.payload` | Covered | The signal payload. Signal ingest decodes it before it records `SignalReceived`. |
+| `harvest_entity_state.snapshot` | Covered | The latest keyed-entity state (#2259). A trigger copies the encoded value of the snapshot event, so it holds the same envelope. Entity reads decode it. Erasure tombstones it. |
 | `harvest_stream_chunks.chunk` | Clear | Durable output chunks (#1974). The stream route sends them as stored. PII erasure deletes them. Do not put secrets in a chunk. |
 | `harvest_dead_letters.input` | Covered | The failed task input. A completion-callback entry carries the webhook body in the stored form, so it is encoded too. |
 | `harvest_workers.queues` | Clear | Worker registration, not payload. |
