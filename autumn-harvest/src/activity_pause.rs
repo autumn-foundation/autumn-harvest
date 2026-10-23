@@ -206,7 +206,9 @@ pub const fn activity_pause_suppresses_timeout(
 /// [`release_claim_if_activity_paused`]).
 ///
 /// Restores `attempt`: the task never ran, so a hold must not consume retry
-/// budget (AC3).
+/// budget (AC3). Shares that guard and restoration with its queue-pause and
+/// workflow-pause siblings via the identical
+/// [`crate::release_claim_prefix`] prefix.
 ///
 /// Carries `task_type = 'activity'` in the statement itself rather than relying
 /// on the caller to pre-filter. The caller in `queue::claim_task` does check it,
@@ -217,17 +219,12 @@ pub const fn activity_pause_suppresses_timeout(
 /// costs one conjunct on a primary-key lookup and removes the footgun entirely.
 #[must_use]
 pub const fn release_claim_if_activity_paused_query() -> &'static str {
-    "UPDATE harvest_task_queue \
-     SET state = 'PENDING', \
-         worker_id = NULL, \
-         started_at = NULL, \
-         attempt = GREATEST(attempt - 1, 0) \
-     WHERE id = $1 \
-       AND state = 'RUNNING' \
-       AND worker_id = $2 \
-       AND task_type = 'activity' \
-       AND EXISTS (SELECT 1 FROM harvest_activity_pauses ap \
-           WHERE ap.activity_name = harvest_task_queue.activity_name)"
+    concat!(
+        crate::release_claim_prefix!(),
+        " AND task_type = 'activity' \
+           AND EXISTS (SELECT 1 FROM harvest_activity_pauses ap \
+               WHERE ap.activity_name = harvest_task_queue.activity_name)"
+    )
 }
 
 /// Releases a just-claimed task back to `PENDING` when its activity turns out

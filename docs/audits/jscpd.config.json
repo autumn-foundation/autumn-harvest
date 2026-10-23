@@ -1,0 +1,11 @@
+{
+  "minTokens": 50,
+  "minLines": 5,
+  "format": ["rust"],
+  "reporters": ["json"],
+  "ignore": [
+    "**/target/**",
+    "**/node_modules/**"
+  ],
+  "absolute": true
+}

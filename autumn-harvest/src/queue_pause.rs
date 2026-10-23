@@ -317,26 +317,6 @@ pub async fn release_claim_if_queue_paused(
     .await
 }
 
-/// The shared prefix of both claim-release statements.
-///
-/// A macro rather than a `const` so the two `const fn`s below can `concat!` it
-/// with their own tail at compile time. Both releases must restore `attempt`
-/// and be guarded on `state = 'RUNNING' AND worker_id = $2` identically; keeping
-/// one copy makes that structural rather than a convention two sites must
-/// remember.
-macro_rules! release_claim_prefix {
-    () => {
-        "UPDATE harvest_task_queue \
-         SET state = 'PENDING', \
-             worker_id = NULL, \
-             started_at = NULL, \
-             attempt = GREATEST(attempt - 1, 0) \
-         WHERE id = $1 \
-           AND state = 'RUNNING' \
-           AND worker_id = $2"
-    };
-}
-
 /// SQL for [`release_claim_if_queue_paused`], exposed for shape tests.
 ///
 /// One statement, so it takes a fresh `READ COMMITTED` snapshot and therefore
@@ -345,7 +325,7 @@ macro_rules! release_claim_prefix {
 #[must_use]
 pub const fn release_claim_if_queue_paused_query() -> &'static str {
     concat!(
-        release_claim_prefix!(),
+        crate::release_claim_prefix!(),
         " AND EXISTS (SELECT 1 FROM harvest_queue_pauses qp \
            WHERE qp.queue_name = harvest_task_queue.queue_name)"
     )
@@ -354,7 +334,7 @@ pub const fn release_claim_if_queue_paused_query() -> &'static str {
 /// SQL for [`release_claim`], exposed for shape tests.
 #[must_use]
 pub const fn release_claim_query() -> &'static str {
-    release_claim_prefix!()
+    crate::release_claim_prefix!()
 }
 
 /// Release this worker's own just-made claim **unconditionally**.
