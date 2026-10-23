@@ -1,0 +1,111 @@
+-- after: execs=100, vacuumed=true, full lifetime replay of 10-chunk appends, cap 10000
+calls=3850 buffers=529064 wal_bytes=15127671 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=3937 buffers=28302 wal_bytes=0 | SELECT min("harvest_stream_chunks"."stream_offset"), max("harvest_stream_chunks"."stream_offset") FROM "harvest_stream_chunks" WHERE (("harv
+calls=3937 buffers=12237 wal_bytes=350407 | SELECT "harvest_workflow_executions"."state", "harvest_workflow_executions"."input" FROM "harvest_workflow_executions" WHERE ("harvest_workf
+calls=3937 buffers=8848 wal_bytes=0 | SELECT EXISTS (SELECT "harvest_stream_chunks"."id", "harvest_stream_chunks"."workflow_exec_id", "harvest_stream_chunks"."stream_offset", "ha
+calls=10 buffers=1878 wal_bytes=152292 | VACUUM harvest_stream_chunks
+calls=12 buffers=934 wal_bytes=45754 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=8 buffers=812 wal_bytes=25025 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=7 buffers=797 wal_bytes=45893 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=8 buffers=718 wal_bytes=32052 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=9 buffers=585 wal_bytes=20228 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=9 buffers=485 wal_bytes=15800 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9) ON CONFLI
+calls=7 buffers=352 wal_bytes=15191 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=2 buffers=303 wal_bytes=0 | SELECT COUNT(*) FROM "harvest_stream_chunks" WHERE ("harvest_stream_chunks"."workflow_exec_id" = $1)
+calls=19 buffers=250 wal_bytes=19750 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3) ON CONFLICT ("workflow_exec_id", "str
+calls=8 buffers=200 wal_bytes=12257 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6) ON CONFLICT ("workflow_
+calls=3937 buffers=0 wal_bytes=0 | BEGIN
+calls=3937 buffers=0 wal_bytes=0 | COMMIT
+calls=3937 buffers=0 wal_bytes=0 | SELECT pg_advisory_xact_lock(hashtextextended($1, $2))
+-- after: execs=300, vacuumed=true, full lifetime replay of 10-chunk appends, cap 10000
+calls=12366 buffers=1913056 wal_bytes=45483747 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=12641 buffers=102965 wal_bytes=0 | SELECT min("harvest_stream_chunks"."stream_offset"), max("harvest_stream_chunks"."stream_offset") FROM "harvest_stream_chunks" WHERE (("harv
+calls=12641 buffers=50564 wal_bytes=682614 | SELECT "harvest_workflow_executions"."state", "harvest_workflow_executions"."input" FROM "harvest_workflow_executions" WHERE ("harvest_workf
+calls=12641 buffers=34127 wal_bytes=0 | SELECT EXISTS (SELECT "harvest_stream_chunks"."id", "harvest_stream_chunks"."workflow_exec_id", "harvest_stream_chunks"."stream_offset", "ha
+calls=14 buffers=4393 wal_bytes=115610 | VACUUM harvest_stream_chunks
+calls=25 buffers=2834 wal_bytes=70050 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=21 buffers=2695 wal_bytes=74247 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=27 buffers=2675 wal_bytes=65991 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=29 buffers=2503 wal_bytes=66050 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=28 buffers=2065 wal_bytes=50736 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=40 buffers=1721 wal_bytes=43851 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9) ON CONFLI
+calls=28 buffers=1572 wal_bytes=44639 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=36 buffers=1039 wal_bytes=27403 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6) ON CONFLICT ("workflow_
+calls=6 buffers=943 wal_bytes=0 | SELECT COUNT(*) FROM "harvest_stream_chunks" WHERE ("harvest_stream_chunks"."workflow_exec_id" = $1)
+calls=41 buffers=594 wal_bytes=13706 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3) ON CONFLICT ("workflow_exec_id", "str
+calls=12641 buffers=0 wal_bytes=0 | BEGIN
+calls=12641 buffers=0 wal_bytes=0 | COMMIT
+calls=12641 buffers=0 wal_bytes=0 | SELECT pg_advisory_xact_lock(hashtextextended($1, $2))
+-- after: execs=1000, vacuumed=true, full lifetime replay of 10-chunk appends, cap 10000
+calls=44524 buffers=6760229 wal_bytes=163923013 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=45438 buffers=388229 wal_bytes=0 | SELECT min("harvest_stream_chunks"."stream_offset"), max("harvest_stream_chunks"."stream_offset") FROM "harvest_stream_chunks" WHERE (("harv
+calls=45438 buffers=181752 wal_bytes=2453712 | SELECT "harvest_workflow_executions"."state", "harvest_workflow_executions"."input" FROM "harvest_workflow_executions" WHERE ("harvest_workf
+calls=45438 buffers=131882 wal_bytes=0 | SELECT EXISTS (SELECT "harvest_stream_chunks"."id", "harvest_stream_chunks"."workflow_exec_id", "harvest_stream_chunks"."stream_offset", "ha
+calls=104 buffers=13303 wal_bytes=289450 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=15 buffers=11882 wal_bytes=335288 | VACUUM harvest_stream_chunks
+calls=80 buffers=11473 wal_bytes=250846 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=83 buffers=9271 wal_bytes=211341 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=92 buffers=8763 wal_bytes=190346 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=95 buffers=7549 wal_bytes=164838 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=20 buffers=7228 wal_bytes=0 | SELECT COUNT(*) FROM "harvest_stream_chunks" WHERE ("harvest_stream_chunks"."workflow_exec_id" = $1)
+calls=102 buffers=6520 wal_bytes=158076 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=104 buffers=4980 wal_bytes=116285 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9) ON CONFLI
+calls=124 buffers=3972 wal_bytes=90481 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6) ON CONFLICT ("workflow_
+calls=130 buffers=2065 wal_bytes=46040 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3) ON CONFLICT ("workflow_exec_id", "str
+calls=45438 buffers=0 wal_bytes=0 | BEGIN
+calls=45438 buffers=0 wal_bytes=0 | COMMIT
+calls=45438 buffers=0 wal_bytes=0 | SELECT pg_advisory_xact_lock(hashtextextended($1, $2))
+-- after: execs=100, vacuumed=false, full lifetime replay of 10-chunk appends, cap 10000
+calls=3937 buffers=678937 wal_bytes=0 | SELECT min("harvest_stream_chunks"."stream_offset"), max("harvest_stream_chunks"."stream_offset") FROM "harvest_stream_chunks" WHERE (("harv
+calls=3850 buffers=525914 wal_bytes=14142226 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=3937 buffers=12237 wal_bytes=212598 | SELECT "harvest_workflow_executions"."state", "harvest_workflow_executions"."input" FROM "harvest_workflow_executions" WHERE ("harvest_workf
+calls=3937 buffers=8848 wal_bytes=0 | SELECT EXISTS (SELECT "harvest_stream_chunks"."id", "harvest_stream_chunks"."workflow_exec_id", "harvest_stream_chunks"."stream_offset", "ha
+calls=2 buffers=986 wal_bytes=0 | SELECT COUNT(*) FROM "harvest_stream_chunks" WHERE ("harvest_stream_chunks"."workflow_exec_id" = $1)
+calls=12 buffers=934 wal_bytes=27919 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=8 buffers=812 wal_bytes=24827 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=7 buffers=797 wal_bytes=29071 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=8 buffers=718 wal_bytes=21728 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=9 buffers=585 wal_bytes=14913 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=7 buffers=352 wal_bytes=9354 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=9 buffers=348 wal_bytes=8928 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9) ON CONFLI
+calls=19 buffers=250 wal_bytes=6475 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3) ON CONFLICT ("workflow_exec_id", "str
+calls=8 buffers=200 wal_bytes=5232 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6) ON CONFLICT ("workflow_
+calls=3937 buffers=0 wal_bytes=0 | BEGIN
+calls=3937 buffers=0 wal_bytes=0 | COMMIT
+calls=3937 buffers=0 wal_bytes=0 | SELECT pg_advisory_xact_lock(hashtextextended($1, $2))
+-- after: execs=300, vacuumed=false, full lifetime replay of 10-chunk appends, cap 10000
+calls=12641 buffers=4375815 wal_bytes=0 | SELECT min("harvest_stream_chunks"."stream_offset"), max("harvest_stream_chunks"."stream_offset") FROM "harvest_stream_chunks" WHERE (("harv
+calls=12366 buffers=1912952 wal_bytes=45483747 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=12641 buffers=50564 wal_bytes=682614 | SELECT "harvest_workflow_executions"."state", "harvest_workflow_executions"."input" FROM "harvest_workflow_executions" WHERE ("harvest_workf
+calls=12641 buffers=34127 wal_bytes=0 | SELECT EXISTS (SELECT "harvest_stream_chunks"."id", "harvest_stream_chunks"."workflow_exec_id", "harvest_stream_chunks"."stream_offset", "ha
+calls=6 buffers=6808 wal_bytes=0 | SELECT COUNT(*) FROM "harvest_stream_chunks" WHERE ("harvest_stream_chunks"."workflow_exec_id" = $1)
+calls=25 buffers=2834 wal_bytes=70050 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=21 buffers=2695 wal_bytes=74247 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=27 buffers=2668 wal_bytes=65991 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=29 buffers=2503 wal_bytes=66050 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=28 buffers=2065 wal_bytes=50736 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=40 buffers=1721 wal_bytes=43851 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9) ON CONFLI
+calls=28 buffers=1572 wal_bytes=44639 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=36 buffers=1032 wal_bytes=27403 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6) ON CONFLICT ("workflow_
+calls=41 buffers=594 wal_bytes=13706 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3) ON CONFLICT ("workflow_exec_id", "str
+calls=12641 buffers=0 wal_bytes=0 | BEGIN
+calls=12641 buffers=0 wal_bytes=0 | COMMIT
+calls=12641 buffers=0 wal_bytes=0 | SELECT pg_advisory_xact_lock(hashtextextended($1, $2))
+-- after: execs=1000, vacuumed=false, full lifetime replay of 10-chunk appends, cap 10000
+calls=45438 buffers=16853503 wal_bytes=0 | SELECT min("harvest_stream_chunks"."stream_offset"), max("harvest_stream_chunks"."stream_offset") FROM "harvest_stream_chunks" WHERE (("harv
+calls=44524 buffers=6760073 wal_bytes=163923013 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=45438 buffers=181752 wal_bytes=2453712 | SELECT "harvest_workflow_executions"."state", "harvest_workflow_executions"."input" FROM "harvest_workflow_executions" WHERE ("harvest_workf
+calls=45438 buffers=131882 wal_bytes=0 | SELECT EXISTS (SELECT "harvest_stream_chunks"."id", "harvest_stream_chunks"."workflow_exec_id", "harvest_stream_chunks"."stream_offset", "ha
+calls=20 buffers=24466 wal_bytes=0 | SELECT COUNT(*) FROM "harvest_stream_chunks" WHERE ("harvest_stream_chunks"."workflow_exec_id" = $1)
+calls=104 buffers=13303 wal_bytes=289450 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=80 buffers=11473 wal_bytes=250846 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=83 buffers=9271 wal_bytes=211341 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=92 buffers=8763 wal_bytes=190346 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=95 buffers=7549 wal_bytes=164838 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=102 buffers=6520 wal_bytes=158076 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9), ($10, $1
+calls=104 buffers=4980 wal_bytes=116285 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6), ($7, $8, $9) ON CONFLI
+calls=124 buffers=3972 wal_bytes=90481 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3), ($4, $5, $6) ON CONFLICT ("workflow_
+calls=130 buffers=2065 wal_bytes=46040 | INSERT INTO "harvest_stream_chunks" ("workflow_exec_id", "stream_offset", "chunk") VALUES ($1, $2, $3) ON CONFLICT ("workflow_exec_id", "str
+calls=45438 buffers=0 wal_bytes=0 | BEGIN
+calls=45438 buffers=0 wal_bytes=0 | COMMIT
+calls=45438 buffers=0 wal_bytes=0 | SELECT pg_advisory_xact_lock(hashtextextended($1, $2))

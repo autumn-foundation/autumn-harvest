@@ -384,6 +384,8 @@ mod start_source_tests;
 #[cfg(feature = "db")]
 mod sticky_default_tests;
 mod sticky_routing_tests;
+#[cfg(feature = "db")]
+mod stream_append_count_perf;
 mod supply_chain_ci;
 mod telemetry_span_tests;
 #[cfg(feature = "db")]
