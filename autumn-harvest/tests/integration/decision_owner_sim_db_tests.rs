@@ -5,6 +5,8 @@
 //! `decision_owner::acquire`, `renew_all`, `release_all` and `fence`, and
 //! `store::append_single_event` inside a pinned decision. The sweep runs all
 //! four nemeses of `formal/tla/OwnerLease.tla` and checks every invariant.
+//! A second sweep acquires with `acquire_many`, as the owner loop does
+//! (issue #2296).
 //!
 //! The simulator drives the store from one thread. Each decision in flight
 //! keeps its own connection and its own open transaction, so a fence lock
@@ -41,9 +43,12 @@ const SHARD: ShardId = ShardId::new(0);
 /// The partition of the design sweep. No other test uses it.
 const PARTITION: u16 = 480;
 
-/// The partition of the mutant sweep. The two sweeps run in parallel, so
-/// each needs its own row.
+/// The partition of the mutant sweep. The sweeps run in parallel, so each
+/// needs its own row.
 const MUTANT_PARTITION: u16 = 481;
+
+/// The partition of the batched sweep.
+const BATCHED_PARTITION: u16 = 482;
 
 /// The signal name of each simulated signal.
 const SIGNAL: &str = "owner-sim";
@@ -90,6 +95,27 @@ struct EpochView {
     epoch: i64,
 }
 
+/// The store under test.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Variant {
+    /// The design: `acquire` and the commit fence.
+    Design,
+    /// The design, with `acquire_many` in place of `acquire`.
+    Batched,
+    /// The negative control: `lock` skips the fence (the `no-fence` defect).
+    NoFence,
+}
+
+impl Variant {
+    const fn partition(self) -> u16 {
+        match self {
+            Self::Design => PARTITION,
+            Self::Batched => BATCHED_PARTITION,
+            Self::NoFence => MUTANT_PARTITION,
+        }
+    }
+}
+
 /// One decision in flight: its key, its tenure and its open transaction.
 struct Open {
     decision: Decision,
@@ -114,17 +140,15 @@ struct PgOwnerStore {
     tenures: Vec<(WorkerId, Epoch, OwnerTenure)>,
     open: Vec<Open>,
     idle: Vec<AsyncPgConnection>,
-    /// The negative control: `lock` skips the fence (the `no-fence` defect).
+    /// `lock` skips the fence.
     skip_fence: bool,
+    /// `acquire` calls `acquire_many`.
+    batched: bool,
 }
 
 impl PgOwnerStore {
-    fn new(rt: Arc<Runtime>, url: &str, config: &OwnerConfig, skip_fence: bool) -> Self {
-        let raw = if skip_fence {
-            MUTANT_PARTITION
-        } else {
-            PARTITION
-        };
+    fn new(rt: Arc<Runtime>, url: &str, config: &OwnerConfig, variant: Variant) -> Self {
+        let raw = variant.partition();
         let partition = DecisionPartition::new(raw).expect("in range");
         let (admin, reader, exec_id, base) = rt.block_on(async {
             let mut admin = AsyncPgConnection::establish(url).await.expect("connect");
@@ -175,7 +199,8 @@ impl PgOwnerStore {
             tenures: Vec::new(),
             open: Vec::new(),
             idle: Vec::new(),
-            skip_fence,
+            skip_fence: variant == Variant::NoFence,
+            batched: variant == Variant::Batched,
         }
     }
 
@@ -215,21 +240,32 @@ impl OwnerStore for PgOwnerStore {
     fn acquire(&mut self, worker: WorkerId) -> Option<Epoch> {
         let holder = self.holders[worker.0].clone();
         let partition = self.partition;
-        let acquired = self.rt.block_on(decision_owner::acquire(
-            &mut self.admin,
-            SHARD,
-            &holder,
-            partition,
-            &config(),
-        ));
-        match acquired.expect("acquire") {
-            Acquisition::Acquired(tenure) => {
-                let epoch = self.sim_epoch(tenure.epoch().get());
-                self.tenures.push((worker, epoch, tenure));
-                Some(epoch)
+        let tenure = if self.batched {
+            let batch = self.rt.block_on(decision_owner::acquire_many(
+                &mut self.admin,
+                SHARD,
+                &holder,
+                &[partition],
+                &config(),
+            ));
+            batch.expect("acquire").acquired.pop()
+        } else {
+            let acquired = self.rt.block_on(decision_owner::acquire(
+                &mut self.admin,
+                SHARD,
+                &holder,
+                partition,
+                &config(),
+            ));
+            match acquired.expect("acquire") {
+                Acquisition::Acquired(tenure) => Some(tenure),
+                Acquisition::Held | Acquisition::Busy => None,
             }
-            Acquisition::Held | Acquisition::Busy => None,
-        }
+        };
+        let tenure = tenure?;
+        let epoch = self.sim_epoch(tenure.epoch().get());
+        self.tenures.push((worker, epoch, tenure));
+        Some(epoch)
     }
 
     fn release(&mut self, worker: WorkerId, epoch: Epoch) -> bool {
@@ -452,7 +488,7 @@ fn seed_count() -> u64 {
 fn sweep(
     url: String,
     plan: SeedPlan,
-    skip_fence: bool,
+    variant: Variant,
 ) -> Result<owner::OwnerSummary, Box<owner::OwnerFailure>> {
     std::thread::spawn(move || {
         let rt = Arc::new(
@@ -463,7 +499,7 @@ fn sweep(
                 .expect("a runtime"),
         );
         owner::sweep_with(&plan, OwnerConfig::new, |config| {
-            PgOwnerStore::new(Arc::clone(&rt), &url, config, skip_fence)
+            PgOwnerStore::new(Arc::clone(&rt), &url, config, variant)
         })
     })
     .join()
@@ -475,12 +511,24 @@ fn sweep(
 /// The default config runs all four nemeses and checks every invariant.
 #[tokio::test]
 async fn the_owner_simulator_passes_on_the_postgres_store() {
+    assert_the_design_passes(Variant::Design).await;
+}
+
+/// Issue #2296: the simulator passes when each acquisition is a batch, as
+/// in the owner loop.
+#[tokio::test]
+async fn the_owner_simulator_passes_with_batched_acquisitions() {
+    assert_the_design_passes(Variant::Batched).await;
+}
+
+/// Sweep `variant` with every nemesis, and check that each one fired.
+async fn assert_the_design_passes(variant: Variant) {
     let (url, _container) = setup_test_database_url_or_env().await;
     let plan = SeedPlan {
         first: 0,
         count: seed_count(),
     };
-    let summary = sweep(url, plan, false).unwrap_or_else(|failure| panic!("{failure}"));
+    let summary = sweep(url, plan, variant).unwrap_or_else(|failure| panic!("{failure}"));
     assert_eq!(summary.seeds, plan.count);
     let stats = summary.stats;
     assert!(stats.commits > 0, "{stats:?}");
@@ -513,7 +561,7 @@ async fn the_owner_simulator_rejects_a_store_with_no_fence() {
         first: 0,
         count: MUTANT_SEEDS,
     };
-    let failure = sweep(url, plan, true).expect_err("a store with no fence fails");
+    let failure = sweep(url, plan, Variant::NoFence).expect_err("a store with no fence fails");
     assert!(
         failure.reason.contains("OneOwnerPerEpoch")
             || failure.reason.contains("DecisionOnFreshHistory")

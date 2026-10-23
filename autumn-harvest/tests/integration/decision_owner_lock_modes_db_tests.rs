@@ -5,9 +5,11 @@
 //! * A decision commit takes the owner row `FOR KEY SHARE`.
 //! * A renewal updates `lease_until` only, so it takes `FOR NO KEY UPDATE`.
 //! * An acquisition takes the row `FOR UPDATE` before it bumps the epoch.
+//! * A batch acquisition takes it `FOR UPDATE SKIP LOCKED` (issue #2296).
 //!
 //! A renewal must not wait for a commit. An acquisition must wait for every
-//! commit in flight, because that wait is the drain. These tests prove each
+//! commit in flight, because that wait is the drain. A batch acquisition
+//! skips a row that a commit holds, so it never bumps that epoch. These tests prove each
 //! rule on a real database. One test proves the trap: an `UPDATE` of the
 //! epoch alone does not wait, so the explicit `FOR UPDATE` is required.
 //!
@@ -30,6 +32,9 @@ const RENEW: &str = "UPDATE {t} SET lease_until = clock_timestamp() + interval '
 
 /// The lock an acquisition takes before it writes the new epoch.
 const ACQUIRE_LOCK: &str = "SELECT epoch FROM {t} WHERE partition = 7 FOR UPDATE";
+
+/// The lock of a batch acquisition. It skips a locked row (issue #2296).
+const SKIP_ACQUIRE_LOCK: &str = "SELECT epoch FROM {t} WHERE partition = 7 FOR UPDATE SKIP LOCKED";
 
 /// An epoch bump with no explicit row lock first.
 const PLAIN_BUMP: &str = "UPDATE {t} SET epoch = epoch + 1, holder = 'w2' WHERE partition = 7";
@@ -131,12 +136,22 @@ async fn begin_on_the_row(conn: &mut AsyncPgConnection, statement: &str) {
 /// The lock timeout counts lock waits only, so a slow runner cannot turn a
 /// "ran" into a "waited".
 async fn contend(conn: &mut AsyncPgConnection, statement: &str) -> Outcome {
+    let (outcome, rows) = contend_rows(conn, statement).await;
+    if outcome == Outcome::Ran {
+        assert_eq!(rows, 1, "`{statement}` must touch the one owner row");
+    }
+    outcome
+}
+
+/// As [`contend`], but return the number of rows that the statement
+/// touched. A `SKIP LOCKED` statement can touch none.
+async fn contend_rows(conn: &mut AsyncPgConnection, statement: &str) -> (Outcome, usize) {
     conn.batch_execute("BEGIN; SET LOCAL lock_timeout = '300ms'")
         .await
         .expect("open the contender transaction");
-    match run_on_the_row(conn, statement).await {
-        Ok(()) => Outcome::Ran,
-        Err(err) if err.to_string().contains("lock timeout") => Outcome::Waited,
+    match diesel::sql_query(statement).execute(conn).await {
+        Ok(rows) => (Outcome::Ran, rows),
+        Err(err) if err.to_string().contains("lock timeout") => (Outcome::Waited, 0),
         Err(err) => panic!("the contender failed for another reason: {err}"),
     }
 }
@@ -368,4 +383,43 @@ async fn a_local_idle_timeout_frees_a_frozen_commit() {
         Outcome::Ran,
         "the idle timeout must end the frozen commit and free the owner row"
     );
+}
+
+/// A batch acquisition does not wait for a commit in flight (issue #2296).
+/// It skips the row, so it cannot bump the epoch under that commit. Once
+/// the commit ends, the same lock gets the row.
+#[tokio::test]
+async fn a_skip_locked_acquisition_skips_an_in_flight_commit() {
+    let table = probe_table("skip");
+    let (url, _container) = database_url().await;
+    let mut setup = connect(&url).await;
+    create_probe_table(&mut setup, &table).await;
+    let skip = with_table(SKIP_ACQUIRE_LOCK, &table);
+
+    let mut holder = connect(&url).await;
+    begin_on_the_row(&mut holder, &with_table(COMMIT_LOCK, &table)).await;
+    let mut acquirer = connect(&url).await;
+    let skipped = contend_rows(&mut acquirer, &skip).await;
+    acquirer
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("roll back the acquisition");
+
+    holder
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("roll back the commit");
+    let after = contend_rows(&mut acquirer, &skip).await;
+    acquirer
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("roll back the acquisition");
+    drop_probe_table(&mut setup, &table).await;
+
+    assert_eq!(
+        skipped,
+        (Outcome::Ran, 0),
+        "a batch acquisition must skip a row that a commit holds, with no wait"
+    );
+    assert_eq!(after, (Outcome::Ran, 1), "a free row is locked");
 }

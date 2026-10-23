@@ -489,6 +489,20 @@ pub enum Acquisition {
     Busy,
 }
 
+/// The result of a batched acquisition (issue #2296).
+///
+/// Each list is in ascending partition order, with no duplicate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Acquisitions {
+    /// The new tenures. The holder owns these rows now.
+    pub acquired: Vec<OwnerTenure>,
+    /// The partitions with a live lease. Nothing changed.
+    pub held: Vec<DecisionPartition>,
+    /// The partitions whose row another transaction locks. Nothing changed.
+    /// Try again later.
+    pub busy: Vec<DecisionPartition>,
+}
+
 /// The rows that a renewal or a release matched.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Matched {
@@ -1056,7 +1070,7 @@ pub struct EnableReport {
 
 #[cfg(feature = "db")]
 pub use db::{
-    OwnerLoop, OwnerTick, acquire, conn_id, disable_owner_mode, enable_owner_mode,
+    OwnerLoop, OwnerTick, acquire, acquire_many, conn_id, disable_owner_mode, enable_owner_mode,
     end_upload_allowance, expire_all, fence, fence_pinned, is_lock_miss, read_owner_mode,
     release_all, renew_all, start_upload_allowance,
 };
@@ -1070,9 +1084,9 @@ mod db {
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 
     use super::{
-        Acquisition, DECISION_PARTITIONS, DecisionPartition, EnableOwnerMode, EnableReport,
-        LeaseWrite, OWNER_MODE_CAPABILITY_VERSION, OwnerEpoch, OwnerHolder, OwnerLeaseConfig,
-        OwnerMode, OwnerTenure, fence_passes, next_epoch, pinned_decision,
+        Acquisition, Acquisitions, DECISION_PARTITIONS, DecisionPartition, EnableOwnerMode,
+        EnableReport, LeaseWrite, OWNER_MODE_CAPABILITY_VERSION, OwnerEpoch, OwnerHolder,
+        OwnerLeaseConfig, OwnerMode, OwnerTenure, fence_passes, next_epoch, pinned_decision,
     };
     use crate::error::{HarvestError, HarvestResult, database_error};
     use crate::types::ShardId;
@@ -1291,6 +1305,33 @@ mod db {
             Err(HarvestError::Database(msg)) if is_lock_miss(&msg) => Ok(Acquisition::Busy),
             other => other,
         }
+    }
+
+    /// Take each partition of `partitions` that is free or whose lease
+    /// ended, for `holder`.
+    ///
+    /// # Errors
+    ///
+    /// As [`acquire`].
+    pub async fn acquire_many(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+        holder: &OwnerHolder,
+        partitions: &[DecisionPartition],
+        config: &OwnerLeaseConfig,
+    ) -> HarvestResult<Acquisitions> {
+        let mut wanted = partitions.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut out = Acquisitions::default();
+        for p in wanted {
+            match acquire(conn, shard, holder, p, config).await? {
+                Acquisition::Acquired(t) => out.acquired.push(t),
+                Acquisition::Held => out.held.push(p),
+                Acquisition::Busy => out.busy.push(p),
+            }
+        }
+        Ok(out)
     }
 
     /// The keys of `tenures`, as three parallel arrays.
@@ -2394,20 +2435,26 @@ mod db {
                 .load(conn)
                 .await
                 .map_err(database_error)?;
-            let mut acquired = Vec::new();
-            for pick in picks {
-                let partition = partition_of(pick.partition)?;
-                let sent = std::time::Instant::now();
-                match acquire(conn, self.shard, &self.holder, partition, &self.config).await {
-                    Ok(Acquisition::Acquired(tenure)) => {
-                        let deadline = tenure.ttl().local_deadline(sent);
-                        acquired.push((tenure, deadline));
-                    }
-                    Ok(Acquisition::Held | Acquisition::Busy) => {}
-                    Err(HarvestError::ShardFenced { .. }) => break,
+            let partitions = picks
+                .iter()
+                .map(|pick| partition_of(pick.partition))
+                .collect::<HarvestResult<Vec<_>>>()?;
+            let sent = std::time::Instant::now();
+            let batch =
+                match acquire_many(conn, self.shard, &self.holder, &partitions, &self.config).await
+                {
+                    Ok(batch) => batch,
+                    Err(HarvestError::ShardFenced { .. }) => return Ok(()),
                     Err(e) => return Err(e),
-                }
-            }
+                };
+            let acquired: Vec<_> = batch
+                .acquired
+                .into_iter()
+                .map(|tenure| {
+                    let deadline = tenure.ttl().local_deadline(sent);
+                    (tenure, deadline)
+                })
+                .collect();
             if acquired.is_empty() {
                 return Ok(());
             }

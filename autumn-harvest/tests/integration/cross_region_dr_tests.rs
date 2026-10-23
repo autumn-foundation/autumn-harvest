@@ -312,6 +312,62 @@ async fn a_bump_expires_every_owner_lease_and_keeps_the_epochs() {
     }
 }
 
+/// Issue #2296: a batch acquisition takes the generation row first. A
+/// region that lost write authority takes no row of the batch.
+#[tokio::test]
+async fn a_fenced_region_takes_no_row_of_a_batch() {
+    use autumn_harvest::decision_owner::{self, DecisionPartition, OwnerHolder, OwnerLeaseConfig};
+    // The registry is global. A shard that no other test uses keeps this
+    // fence away from the acquisitions of other tests.
+    let fenced = ShardId::new(61);
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("owner_batch_fenced");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, fenced)
+        .await
+        .expect("provision");
+    FenceRegistry::clear();
+    FenceRegistry::register(fenced, ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    bump_generation(&mut conn, fenced, "promote", "oncall")
+        .await
+        .expect("bump");
+
+    let ps: Vec<DecisionPartition> = [5_u16, 6]
+        .into_iter()
+        .map(|n| DecisionPartition::new(n).expect("in range"))
+        .collect();
+    let result = decision_owner::acquire_many(
+        &mut conn,
+        fenced,
+        &OwnerHolder::for_worker("fenced-region"),
+        &ps,
+        &OwnerLeaseConfig::default(),
+    )
+    .await;
+    FenceRegistry::clear();
+    assert!(
+        matches!(
+            result,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "{result:?}"
+    );
+    #[derive(diesel::QueryableByName)]
+    struct Held {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let held: Held = diesel::sql_query(
+        "SELECT count(*) AS n FROM harvest_decision_owner \
+         WHERE partition IN (5, 6) AND holder IS NOT NULL",
+    )
+    .get_result(&mut conn)
+    .await
+    .expect("read the owner rows");
+    assert_eq!(held.n, 0, "the fenced batch took no row");
+}
+
 /// Issue #2248: with DR fencing on, an owner decision sends the owner fence
 /// once. Each append still takes the generation row, because a colocated
 /// shard can use another row. The start fence holds the owner row until the

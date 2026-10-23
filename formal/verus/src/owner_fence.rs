@@ -128,4 +128,55 @@ pub proof fn theorem_a_takeover_fences_the_old_tenure(
     lemma_run_counts_acquisitions(pinned, ops);
 }
 
+/// The epochs of the owner rows after one batched acquisition (issue
+/// #2296). `epochs[p]` is the epoch of row `p`. `locked` holds the rows that
+/// the batch locked `FOR UPDATE`. Each locked row takes one `Acquire` step.
+/// Each other row keeps its epoch.
+pub open spec fn batch(epochs: Seq<int>, locked: Set<int>) -> Seq<int> {
+    Seq::new(
+        epochs.len(),
+        |p: int|
+            if locked.contains(p) {
+                step(epochs[p], LeaseOp::Acquire)
+            } else {
+                epochs[p]
+            },
+    )
+}
+
+/// A batch acts on each row as one single acquisition, or as no statement.
+/// So each theorem above holds for each row of a batch.
+pub proof fn theorem_a_batch_is_one_acquisition_per_locked_row(
+    epochs: Seq<int>,
+    locked: Set<int>,
+    p: int,
+)
+    requires
+        0 <= p < epochs.len(),
+    ensures
+        batch(epochs, locked).len() == epochs.len(),
+        locked.contains(p) ==> batch(epochs, locked)[p] == run(epochs[p], seq![LeaseOp::Acquire]),
+        !locked.contains(p) ==> batch(epochs, locked)[p] == epochs[p],
+{
+    let one = seq![LeaseOp::Acquire];
+    assert(one.drop_first().len() == 0);
+    assert(run(epochs[p], one) == run(step(epochs[p], one[0]), one.drop_first()));
+}
+
+/// After a batch, the fence refuses each old tenure of a locked row, and
+/// each tenure of a row that the batch did not lock still passes.
+pub proof fn theorem_a_batch_fences_only_its_locked_rows(
+    epochs: Seq<int>,
+    locked: Set<int>,
+    p: int,
+    holder_matches: bool,
+)
+    requires
+        0 <= p < epochs.len(),
+    ensures
+        locked.contains(p) ==> !(holder_matches && epochs[p] == batch(epochs, locked)[p]),
+        !locked.contains(p) ==> epochs[p] == batch(epochs, locked)[p],
+{
+}
+
 } // verus!
