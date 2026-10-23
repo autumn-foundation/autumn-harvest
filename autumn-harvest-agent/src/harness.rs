@@ -557,19 +557,34 @@ impl AgentHarness {
     /// Record one model call in the agent cost ledger (issue #1996).
     ///
     /// A ledger refusal does not fail the turn, because the reply is already
-    /// paid for. The turn records its tokens even when the model metadata is
-    /// bad:
-    /// - no model id, or one that the ledger refuses, becomes
-    ///   [`UNKNOWN_MODEL_ID`];
-    /// - a cost that the ledger refuses is dropped, so the call is unpriced.
-    ///
-    /// Each refusal logs a warning.
+    /// paid for. [`ledger_call`](Self::ledger_call) builds the call.
     pub(crate) fn record_turn(
         &self,
         ctx: &autumn_harvest::context::ActivityContext,
         usage: &TokenUsage,
         latency: Duration,
     ) {
+        if let Err(err) = ctx.record_llm_call(self.ledger_call(usage, latency)) {
+            tracing::warn!(error = %err, "the agent cost ledger refused a model turn");
+        }
+    }
+
+    /// The cost ledger call of one model turn (issues #1996 and #2275).
+    ///
+    /// Both backends record this call: Postgres through the activity
+    /// context, SQLite through its ledger closure. So one script gives the
+    /// same rows on both. The call keeps its tokens even when the model
+    /// metadata is bad:
+    /// - no model id, or one that the ledger refuses, becomes
+    ///   [`UNKNOWN_MODEL_ID`];
+    /// - a cost that the ledger refuses is dropped, so the call is unpriced.
+    ///
+    /// Each refusal logs a warning.
+    pub(crate) fn ledger_call(
+        &self,
+        usage: &TokenUsage,
+        latency: Duration,
+    ) -> autumn_harvest::llm_ledger::LlmCall {
         use autumn_harvest::llm_ledger::LlmCall;
 
         let mut model = self.client.model_id().unwrap_or(UNKNOWN_MODEL_ID);
@@ -601,9 +616,7 @@ impl AgentHarness {
         if let Some(cost) = cost {
             call = call.with_cost_usd_micros(cost);
         }
-        if let Err(err) = ctx.record_llm_call(call) {
-            tracing::warn!(error = %err, "the agent cost ledger refused a model turn");
-        }
+        call
     }
 
     /// Ask the policy about each tool call of `turn`, in order.

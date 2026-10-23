@@ -5,12 +5,19 @@
 //! closure for `register_activity_with_body`. The closure
 //! runs the async body with `block_in_place` on the current Tokio runtime, so
 //! drive the runtime from a multi-thread Tokio runtime.
+//!
+//! The model turn registers with `register_activity_with_ledger` instead
+//! (issue #2275). Its closure returns the cost ledger call of the turn, which
+//! the Postgres activity records through its context. The runtime writes the
+//! row with the completion event, so a re-run after a crash counts once. Read
+//! the rows with `SqliteRuntime::llm_ledger`.
 
 use std::sync::Arc;
 
 use autumn_harvest::WorkflowIdReusePolicy;
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, ENTITY_STATE_QUERY};
 use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
+use autumn_harvest::llm_ledger::LlmCall;
 use autumn_harvest_sqlite::{
     ExecutionFilter, ExecutionId, RunState, SignalWithStart, SignalWithStartOutcome, SqliteResult,
     SqliteRuntime,
@@ -24,9 +31,9 @@ use crate::agent::{
     agent_profile_info,
 };
 use crate::approval::Approval;
-use crate::harness::AgentHarness;
+use crate::harness::{AgentHarness, CacheTenant};
 use crate::heartbeat::{HEARTBEAT_WORKFLOW_NAME, HeartbeatTask, agent_heartbeat_info};
-use crate::types::AgentTask;
+use crate::types::{AgentTask, ModelTurnRequest};
 use crate::workflow::{
     WORKFLOW_NAME, agent_deliver_info, agent_discover_peers_info, agent_loop_info,
     agent_memory_snapshot_info, agent_model_turn_info, agent_precheck_info, agent_tool_call_info,
@@ -51,8 +58,18 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
         call(input, |scope| h.memory_reset(scope))
     });
     let h = Arc::clone(&harness);
-    rt.register_activity_with_body(&agent_model_turn_info(), move |input| {
-        call(input, |request| h.model_turn(request))
+    rt.register_activity_with_ledger(&agent_model_turn_info(), move |input| {
+        call_with_ledger(input, |request: ModelTurnRequest| async {
+            // The tenant is the one `AgentHarness::model_turn` uses.
+            let tenant = CacheTenant::declared(request.tenant.as_deref());
+            let (turn, latency) = h.model_turn_timed_in(request, tenant, |_| {}).await?;
+            // A cache hit calls no model, so it has no latency and no call.
+            let calls = latency
+                .map(|latency| h.ledger_call(&turn.usage, latency))
+                .into_iter()
+                .collect();
+            Ok((turn, calls))
+        })
     });
     let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_tool_call_info(), move |input| {
@@ -237,11 +254,27 @@ where
     F: FnOnce(I) -> Fut,
     Fut: Future<Output = Result<O, String>>,
 {
+    call_with_ledger(input, |request| async move {
+        Ok((body(request).await?, Vec::new()))
+    })
+    .map(|(output, _calls)| output)
+}
+
+/// [`call`], for a body that also returns its LLM calls (issue #2275).
+fn call_with_ledger<I, O, F, Fut>(input: Value, body: F) -> Result<(Value, Vec<LlmCall>), String>
+where
+    I: DeserializeOwned,
+    O: Serialize,
+    F: FnOnce(I) -> Fut,
+    Fut: Future<Output = Result<(O, Vec<LlmCall>), String>>,
+{
     let request: I =
         serde_json::from_value(input).map_err(|e| format!("malformed activity input: {e}"))?;
     let handle = multi_thread_handle()?;
-    let output = tokio::task::block_in_place(|| handle.block_on(body(request)))?;
-    serde_json::to_value(output).map_err(|e| format!("activity output is not JSON: {e}"))
+    let (output, calls) = tokio::task::block_in_place(|| handle.block_on(body(request)))?;
+    let output =
+        serde_json::to_value(output).map_err(|e| format!("activity output is not JSON: {e}"))?;
+    Ok((output, calls))
 }
 
 /// The current Tokio runtime, when it can run a body with `block_in_place`.

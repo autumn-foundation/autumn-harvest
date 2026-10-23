@@ -1634,6 +1634,10 @@ Erasure (issue #495) keeps the rows, because they hold no payload.
 Retention deletes them with the run. The cross-region DR publication copies
 them to the standby. The history archive does not hold them.
 
+The SQLite backend keeps the same columns in its own `harvest_llm_ledger`
+(issue #2275). There, `exec_id` names the run and `event_seq` names the
+completion event. That backend has no codec, so its whole file is in clear.
+
 ### Key providers
 
 Load each data key once, at startup, through a `KeyProvider`:

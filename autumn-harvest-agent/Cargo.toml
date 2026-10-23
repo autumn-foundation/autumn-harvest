@@ -66,6 +66,10 @@ name = "response_cache"
 required-features = ["sqlite"]
 
 [[test]]
+name = "sqlite_ledger"
+required-features = ["sqlite"]
+
+[[test]]
 name = "eval"
 required-features = ["eval", "sqlite"]
 

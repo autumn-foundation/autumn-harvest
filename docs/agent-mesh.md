@@ -377,8 +377,8 @@ suffix alone counts delegations, so another peer can take the same `n`.
 
 A run with a mandate records the acting agent in each model-turn request, as
 `agent`. The model-turn span `agent_model_turn` carries
-`gen_ai.agent.name`. On Postgres, the cost ledger counts child turns in the
-run of the root agent. A `DelegationRecord` gives the tokens, rounds and
+`gen_ai.agent.name`. On both backends, the cost ledger counts child turns
+in the run of the root agent. A `DelegationRecord` gives the tokens, rounds and
 calls per subtree.
 
 ## 12. Limits

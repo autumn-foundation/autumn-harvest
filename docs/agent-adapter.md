@@ -176,7 +176,7 @@ cannot fail the run.
 
 ### The cost ledger
 
-On Postgres, each model turn writes one row to the
+Each model turn writes one row to the
 [agent cost ledger](llm-cost-ledger.md) (issue #1996). The row holds the
 model id, the tokens, the cost and the call latency. It is outside the
 encrypted turn output, so the usage report can sum it per tenant. Two
@@ -191,6 +191,14 @@ encrypted turn output, so the usage report can sum it per tenant. Two
 
 A response cache hit calls no model and spends no tokens, so it writes no
 ledger row.
+
+The SQLite backend writes the same rows (issue #2275). `sqlite::register`
+registers the model turn with `register_activity_with_ledger`, so the turn
+returns its call with its output. The runtime writes the row in the
+transaction that appends the turn, as Postgres does. A crash before that
+commit writes no row, so a resumed run counts each turn once. Read the rows
+with `SqliteRuntime::llm_ledger(exec)`, or `llm_ledger_between` for a time
+window.
 
 `AgentTask` sets the run. Its bounds are `max_steps` (default 8, per
 segment), `max_total_tokens` (per run), `max_output_tokens`,
@@ -416,8 +424,6 @@ strict replay compares each recorded input as it was written.
   it. Keep `max_chain` low, or start a new run from the report.
 - **All agents share the harness model.** A peer cannot choose its own
   model. See [the agent mesh guide](agent-mesh.md).
-- **The cost ledger needs Postgres.** The SQLite path calls the model
-  directly, with no activity context, so it writes no ledger rows.
 
 ## 10. Always-on agents
 
