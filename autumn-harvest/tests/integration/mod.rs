@@ -242,6 +242,7 @@ mod notify_post_commit_tests;
 mod notify_stage_probe_tests;
 mod otel_semconv_docs;
 mod otel_workflow_semconv_docs;
+mod owner_disk_cache_db_tests;
 mod owner_failover_tests;
 mod owner_wake_db_tests;
 mod owner_wake_worker_tests;

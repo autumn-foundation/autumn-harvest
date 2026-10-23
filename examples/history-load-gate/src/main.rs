@@ -18,6 +18,7 @@ use autumn_harvest::migrate;
 use autumn_harvest::types::ExecutionId;
 use diesel_async::{AsyncConnection, AsyncPgConnection};
 use history_load_gate::cache_model::{self, Pattern};
+use history_load_gate::disk_side::DiskSide;
 use history_load_gate::gate::{self, Observed, Thresholds, Trip, Verdict};
 use history_load_gate::sqlite_side::{SqliteReader, SqliteStore};
 use history_load_gate::stats::{self, Summary};
@@ -114,6 +115,12 @@ struct WarmupResult {
     pg_parallel: Duration,
     sqlite_serial: Duration,
     sqlite_parallel: Duration,
+    /// The first pass after a restart with the disk cache: a Postgres load
+    /// and a disk write per run.
+    disk_fill: Duration,
+    /// The next pass with the disk cache: a disk read, an anchor check and
+    /// a delta load per run.
+    disk_pass: Duration,
 }
 
 #[tokio::main]
@@ -282,13 +289,78 @@ async fn time_warmup(
     load_pg_serial(conn, &pg_runs, config.run_events).await?;
     load_sqlite_serial(sqlite, &lite_runs, config.run_events)?;
 
+    let pg_serial = load_pg_serial(conn, &pg_runs, config.run_events).await?;
+    let pg_parallel = load_pg_parallel(config, url, &pg_runs).await?;
+    let sqlite_serial = load_sqlite_serial(sqlite, &lite_runs, config.run_events)?;
+    let sqlite_parallel = load_sqlite_parallel(config, sqlite, &lite_runs)?;
+    // Issue #2258: a fresh disk cache, as after a restart.
+    let disk = Arc::new(DiskSide::open()?);
+    let disk_fill = disk_pass(config, url, &pg_runs, &disk, DiskStep::Fill).await?;
+    let disk_pass = disk_pass(config, url, &pg_runs, &disk, DiskStep::Read).await?;
     Ok(WarmupResult {
         runs,
-        pg_serial: load_pg_serial(conn, &pg_runs, config.run_events).await?,
-        pg_parallel: load_pg_parallel(config, url, &pg_runs).await?,
-        sqlite_serial: load_sqlite_serial(sqlite, &lite_runs, config.run_events)?,
-        sqlite_parallel: load_sqlite_parallel(config, sqlite, &lite_runs)?,
+        pg_serial,
+        pg_parallel,
+        sqlite_serial,
+        sqlite_parallel,
+        disk_fill,
+        disk_pass,
     })
+}
+
+/// One pass of the disk cache warm-up.
+#[derive(Clone, Copy)]
+enum DiskStep {
+    /// Load each run from Postgres and write it to the disk cache.
+    Fill,
+    /// Read each run from the disk cache and check its last event.
+    Read,
+}
+
+/// Runs one disk cache pass over `ids` on `config.concurrency` connections.
+/// Returns the wall time.
+async fn disk_pass(
+    config: &Config,
+    url: &str,
+    ids: &Arc<Vec<ExecutionId>>,
+    disk: &Arc<DiskSide>,
+    step: DiskStep,
+) -> Result<Duration, BoxError> {
+    let mut conns = Vec::with_capacity(config.concurrency);
+    for _ in 0..config.concurrency {
+        conns.push(AsyncPgConnection::establish(url).await?);
+    }
+    let next = Arc::new(AtomicUsize::new(0));
+    let events = config.run_events;
+    let started = Instant::now();
+    let mut tasks = Vec::with_capacity(conns.len());
+    for mut conn in conns {
+        let ids = Arc::clone(ids);
+        let next = Arc::clone(&next);
+        let disk = Arc::clone(disk);
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&id) = ids.get(index) else {
+                    return Ok::<(), BoxError>(());
+                };
+                match step {
+                    DiskStep::Fill => {
+                        let history = pg_side::load(&mut conn, id).await?.events;
+                        check_len(history.len(), events)?;
+                        let disk = Arc::clone(&disk);
+                        tokio::task::spawn_blocking(move || disk.store(index, id, history))
+                            .await??;
+                    }
+                    DiskStep::Read => check_len(disk.read(&mut conn, index, id).await?, events)?,
+                }
+            }
+        }));
+    }
+    for task in tasks {
+        task.await??;
+    }
+    Ok(started.elapsed())
 }
 
 /// Loads each run in `ids` on one connection. Returns the wall time.
@@ -466,6 +538,28 @@ fn print_warmups(warmups: &[WarmupResult], config: &Config) {
             ms(warmup.sqlite_serial),
             ms(warmup.sqlite_parallel),
             warmup.runs.saturating_sub(CACHE_ENTRIES),
+        );
+    }
+    println!();
+    println!("## Owner-restart warm-up with the disk cache (issue #2258)\n");
+    println!(
+        "{conns} connections and {conns} workers. The fill is the first decision of each run \
+         after a restart: a Postgres load and a sealed disk write. The next pass is the next \
+         decision of each run past the {CACHE_ENTRIES}-entry memory cache: a disk read, an \
+         anchor check and a delta load, against a Postgres load without the cache.\n"
+    );
+    println!(
+        "| Live runs | Fill, disk cache | Next pass, Postgres | Next pass, disk cache | Postgres / disk |"
+    );
+    println!("|---:|---:|---:|---:|---:|");
+    for warmup in warmups {
+        println!(
+            "| {} | {} ms | {} ms | {} ms | {} |",
+            warmup.runs,
+            ms(warmup.disk_fill),
+            ms(warmup.pg_parallel),
+            ms(warmup.disk_pass),
+            ratio(warmup.pg_parallel, warmup.disk_pass),
         );
     }
     println!();

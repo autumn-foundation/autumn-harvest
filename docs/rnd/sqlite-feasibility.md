@@ -205,6 +205,7 @@ Classification rule:
 | `models` | diesel | (c) | Postgres type layer (`Jsonb`/`Timestamptz`/`Interval`/`Uuid`); reimplemented wholesale. |
 | `mutex` | diesel, advisory-lock, to_regclass, interval-sql, raw-pg-sql, raw-sql | (b) | Advisory lock subsumed by the write lock; lease TTL as epoch ms. |
 | `notify` | diesel, listen/notify, raw-pg-sql, raw-sql | (c) | **The one mechanism with no SQLite equivalent at all.** Polling replaces it. |
+| `owner_disk_cache` | diesel | (c) | The owner-local disk cache (issue #2258, `owner-disk-cache` feature). It keeps decided histories in sealed local SQLite files, to save the Postgres history read of a cold decision. The diesel match is its reconcile lookup of `RUNNING` runs. The SQLite backend already reads history from a local file, so the module has nothing to save there and is unused, like `partition`. |
 | `partition_archive` | advisory-lock, diesel, raw-pg-sql, raw-sql, to_regclass | (c) | Export of aged `harvest_events` partitions before the drop (issue #2009). It exists only to feed `partition`'s drop path, which the SQLite backend does not have. The keyset read, the `to_jsonb` row lines, the `sha256` row checksum under `SHARE`, the export advisory lock and the marker probe all serve that path. Under the SQLite backend the module is unused, like `partition` itself. |
 | `partition` | diesel, raw-pg-sql, raw-sql | (c) | Native Postgres declarative partitioning of `harvest_events` (issue #958). Nothing to translate: SQLite has no partitioned tables, no `ATTACH PARTITION`, and no metadata-only `DROP TABLE`-as-reclamation — and it does not need them. The pain this module removes is dead-tuple bloat and autovacuum pressure from row-level retention deletes, neither of which a single-writer SQLite file exhibits in the same way (`DELETE` there is followed by an incremental vacuum the single writer already owns). The whole module is a no-op under the SQLite backend, which is why it is (c) rather than a port: it is Postgres-specific *relief for a Postgres-specific problem*. |
 | `pg_tls` | diesel | (c) | The transport for the connections Harvest opens itself: `sslmode`, TLS through rustls and the `tokio-postgres` connector. The diesel match is the `AsyncPgConnection` it returns. SQLite is a local file with no network transport, so there is nothing to port. |
@@ -419,8 +420,11 @@ second axis while testing nothing new.
 **Blast radius.** The companion crate's cost to the Postgres path is
 **zero, structurally**: the dependency edge points one way
 (`autumn-harvest-sqlite` → `autumn-harvest`, `default-features = false`), core
-has no `rusqlite` dependency, and `cargo build -p autumn-harvest` output is
-byte-unaffected. This is asserted by
+has no `rusqlite` dependency in any default build, and `cargo build -p
+autumn-harvest` output is byte-unaffected. The one exception is opt-in: the
+`owner-disk-cache` feature (issue #2258) adds `rusqlite` as an optional
+dependency for its local cache files. It is not in `default` and does not touch
+the SQLite backend. This is asserted by
 `zero_regression_to_the_postgres_path_is_structurally_true`, not by prose.
 
 ---

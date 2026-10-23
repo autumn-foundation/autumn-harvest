@@ -1376,6 +1376,9 @@ mod db {
         .execute(conn)
         .await
         .map_err(database_error)?;
+        // Issue #2258: send the owner of the run an evict wake after the
+        // commit. Its disk cache then purges any copy that a missed purge left.
+        crate::notify::notify_owner(conn, exec_id.as_uuid(), true).await?;
 
         // Durable per-execution workflow logs (issue #790). Author-emitted log
         // messages are free-form text that can carry personal data, so a

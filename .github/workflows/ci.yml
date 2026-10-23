@@ -1082,6 +1082,16 @@ jobs:
       - name: "Run history-load-gate example tests (issue #2257)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p history-load-gate --lib --bins
+      # Issue #2258. The module tests of the owner disk cache need its
+      # feature. The worker tests run from their `linux` manifest row.
+      - name: "Run owner disk cache module tests (issue #2258)"
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p autumn-harvest --features owner-disk-cache --lib owner_disk_cache
+      # The other OSes compile the feature: the file lock and the directory
+      # check have a path of their own there.
+      - name: "Check owner disk cache feature (issue #2258)"
+        if: runner.os != 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo check -p autumn-harvest --features owner-disk-cache --lib
       # The autoresearch capstone. Its suite is offline: a simulated
       # trainer, a scripted researcher, seeded simulation sweeps and SQLite
       # end-to-end runs. Linux only, because the tests drive `git` and `sh`.

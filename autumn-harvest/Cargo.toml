@@ -87,6 +87,10 @@ hot-code-swap = ["wasm-activities"]
 # const-check when this feature is off, so a non-chaos build has no hot-path
 # cost (AC2/AC6). Requires `db` (the reproducers drive real Postgres paths).
 chaos = ["db"]
+# The owner-local disk cache (issue #2258). Off by default. It needs owner
+# mode and a directory. Both crates are already in the lockfile through
+# `autumn-harvest-sqlite`. See docs/adr/0012-owner-disk-cache.md.
+owner-disk-cache = ["db", "dep:rusqlite", "dep:fs4"]
 
 [dependencies]
 autumn-harvest-macros = { version = "0.7.0", path = "../autumn-harvest-macros" }
@@ -171,6 +175,10 @@ libc = { version = "0.2", optional = true }
 # Publisher signatures on WASM modules (issue #1838). The lockfile already
 # holds this version through `jsonwebtoken`, so it adds no new crate.
 ed25519-dalek = { version = "3.0", optional = true }
+# The owner-local disk cache (issue #2258): one SQLite file per partition and
+# an exclusive lock on a sidecar file.
+rusqlite = { workspace = true, optional = true }
+fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
 
 [[test]]
 name = "integration"

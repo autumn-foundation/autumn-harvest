@@ -662,6 +662,13 @@ pub const METRIC_WORKFLOW_RESIDENT: &str = "harvest.workflow.resident";
 /// part that a disk cache does not save.
 pub const METRIC_WORKFLOW_RESIDENT_DURATION: &str = "harvest.workflow.resident.duration";
 
+/// Counter: one owner disk-cache read on a memory miss (issue #2258).
+///
+/// Labels: `workflow`, `queue` and `outcome`. The outcome is `hit`, `miss`,
+/// `stale` or `corrupt`. A `stale` or `corrupt` read purged the entry, and
+/// the decision loaded from Postgres.
+pub const METRIC_WORKFLOW_DISK_CACHE: &str = "harvest.workflow.disk_cache";
+
 /// Counter: incremented once per `signal_external_workflow` call after the
 /// terminal outcome is recorded in `harvest_events`.
 ///
@@ -4170,6 +4177,17 @@ pub trait MetricsRecorder: Send + Sync {
         let _ = (workflow_name, queue, outcome, seconds);
     }
 
+    /// An owner read its disk cache on a memory miss (issue #2258).
+    ///
+    /// `outcome` is `hit`, `miss`, `stale` or `corrupt`. A memory miss in
+    /// owner mode with a disk cache records one read.
+    ///
+    /// Maps to the counter [`METRIC_WORKFLOW_DISK_CACHE`] with labels
+    /// `workflow`, `queue` and `outcome`.
+    fn record_workflow_disk_cache(&self, workflow_name: &str, queue: &str, outcome: &str) {
+        let _ = (workflow_name, queue, outcome);
+    }
+
     /// A workflow execution was terminated because its `deadline_at` elapsed.
     ///
     /// Maps to the counter `harvest.workflow.timeout{workflow, queue}`.
@@ -5403,6 +5421,7 @@ mod tests {
             METRIC_WORKFLOW_RESIDENT_DURATION,
             "harvest.workflow.resident.duration"
         );
+        assert_eq!(METRIC_WORKFLOW_DISK_CACHE, "harvest.workflow.disk_cache");
         assert_eq!(ResidentOutcome::MultiAwait.to_string(), "multi_await");
         // An exhaustive match: a new variant must join `ALL`.
         for outcome in ResidentOutcome::ALL {

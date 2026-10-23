@@ -40,6 +40,7 @@ autumn-harvest/          <- workspace root
       heartbeat.rs       <- Phase 2: batched heartbeat flusher
       timeout.rs         <- Phase 2: timeout enforcement scanner
       cache.rs           <- Phase 2: LRU workflow state cache
+      owner_disk_cache.rs <- issue #2258: owner-local disk cache (feature)
       resident.rs        <- issue #1798: resident workflow state
       dlq.rs             <- Phase 2: dead letter queue
       pool.rs            <- Phase 2: separate pool config with shared ceiling
@@ -437,6 +438,7 @@ An agent loop can spend without limit. A budget caps the LLM tokens or the cost 
 | `scanner_lease.rs` | 5.x | Per-shard scanner election (issue #1795): `ScannerConfig`, `ScannerCoordination`, `ScannerLease` (`try_acquire`/`release` on `harvest_scanner_leases`), `ScannerRole`, `jittered_interval`, `effective_lease_ttl`. A load control, not a fence. A failed lease query fails open. |
 | `decision_owner.rs` | 5.x | Fenced owner lease of each decision partition (issue #2251, ADR 0009): `DecisionPartition` (512 per database, `seahash` of `workflow_id`), `OwnerEpoch`, `OwnerHolder`, `OwnerLeaseTtl`, `OwnerTenure`; `acquire`, `renew_all`, `release_all`, `fence`, `expire_all` on `harvest_decision_owner`; the task-local pin of a decision (`scope_decision`, `pin_decision`) and the worker's `OwnedPartitions`. `next_epoch` and `fence_passes` have Verus proofs. Issue #2252 adds owner mode: `enable_owner_mode`, `disable_owner_mode`, `read_owner_mode`, the per-database `OwnerLoop`, the balance policy `plan_balance` and the `OwnedClaim` that the claim splices in. |
 | `cache.rs` | 2 | LRU workflow state cache: bounded capacity, access-order eviction. `CachedWorkflowState` holds `events: Vec<WorkflowEvent>` + `next_event_id: i32` for delta-load support (issue #235). An entry can also hold a `ResidentWorkflow` (issue #1798). |
+| `owner_disk_cache.rs` | 5 | Owner-local disk cache (issue #2258, ADR 0012), behind the `owner-disk-cache` feature. One sealed SQLite file per partition, with validity stamps, purges, a reconcile pass and the wipe. |
 | `resident.rs` | 3.x | Resident workflow state (issue #1798): keeps a suspended handler future and its context between decisions. A warm decision sends the new results to the parked future instead of replaying history. A join of activities stays resident across partial results, and the open activities wait again (issue #2008). Accepts only suspensions and deltas that it resolves exactly as a cold replay would; anything else declines to a cold replay. The worker records the outcome of each decision in `harvest.workflow.resident` (issue #2007). |
 | `dlq.rs` | 2 | Dead letter queue: `DeadLetterEntry` builder, move-to-DLQ on retry exhaustion |
 | `durable_promise.rs` | 3.x | Durable promises (issue #1985): `PromiseId` (token `<execution-id>/<key>`), `PromiseSettlement`, `PromiseRejected`, `DurablePromise` (`wait`, `wait_timeout`); DB-gated `resolve`/`reject`. A promise is a signal named `harvest.promise:<key>`, with the same string as its idempotency key, so the first settlement wins. `ctx.promise`/`ctx.new_promise` record the token in a `SideEffectRecorded` event. No new event variant, no migration. See [`durable-promises.md`](durable-promises.md). |
@@ -1937,6 +1939,7 @@ Every replica runs the same scanners and serves the same requests. One bad row c
 | `heartbeat.rs` | Batched heartbeat flusher |
 | `timeout.rs` | Timeout enforcement scanner |
 | `cache.rs` | LRU workflow state cache |
+| `owner_disk_cache.rs` | Owner-local disk cache (feature `owner-disk-cache`) |
 | `dlq.rs` | Dead letter queue |
 | `pool.rs` | Separate pool configuration with shared ceiling |
 
