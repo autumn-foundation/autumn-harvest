@@ -58,7 +58,7 @@ diesel_migrations = "2"
 deadpool = { version = "0.13", features = ["rt_tokio_1"] }
 
 # Proc macro
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 quote = "1"
 proc-macro2 = "1"
 
