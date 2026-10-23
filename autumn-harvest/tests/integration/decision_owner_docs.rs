@@ -633,6 +633,42 @@ fn guards_run_on_docs_only_changes() {
     check_stanza(stanza, FILTER).unwrap_or_else(|reason| panic!("{reason}. Stanza:\n{stanza}"));
 }
 
+/// The failover page of issue #2254.
+const FAILOVER_PAGE: &str = "docs/performance-owner-failover.md";
+
+/// The suite that measures the failover page.
+const FAILOVER_SUITE: &str = "autumn-harvest/tests/integration/owner_failover_tests.rs";
+
+/// The failover tests that the page cites.
+const FAILOVER_TESTS: &[&str] = &[
+    "a_frozen_owner_is_fenced_after_a_takeover",
+    "a_frozen_commit_transaction_does_not_block_the_takeover",
+    "after_kill_9_the_next_decision_runs_within_ttl_plus_one_second",
+    "scale_out_from_4_to_8_workers_recovers_within_two_ttls",
+];
+
+/// The failover page cites each failover test, and each test exists. The
+/// ADR links the page (issue #2254).
+#[test]
+fn failover_page_cites_the_failover_tests() {
+    let page = read(FAILOVER_PAGE);
+    let suite = read(FAILOVER_SUITE);
+    for test in FAILOVER_TESTS {
+        assert!(
+            page.contains(&format!("`{test}`")),
+            "{FAILOVER_PAGE} must cite `{test}`"
+        );
+        assert!(
+            suite.contains(&format!("async fn {test}(")),
+            "{FAILOVER_SUITE} lacks `{test}`"
+        );
+    }
+    assert!(
+        read(ADR).contains("performance-owner-failover.md"),
+        "{ADR} must link {FAILOVER_PAGE}"
+    );
+}
+
 #[test]
 fn helpers_parse_their_inputs() {
     let table = "| Key | Question | Answer |\n|---|---|---|\n| A | q? | Answered. |\n";

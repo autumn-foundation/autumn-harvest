@@ -87,3 +87,16 @@ write must see the real count. No engine hook can place a write there. The \
 static flag makes the write fire once, and the row is a boundary, which \
 replay skips. Remove this entry if the engine gains a test hook between \
 replay and persist."""
+
+[[allow]]
+workflow = "integration::owner_failover_tests::failover_hold_flow"
+justification = """\
+A test fixture for issue #2254, nondeterministic on purpose. In the child \
+process of the frozen-owner test, the decision after the signal blocks once \
+on a marker file. The test then stops the child with SIGSTOP inside the \
+decision, after it pinned its owner tenure. No engine hook can freeze a \
+process at that point. The hold reads an environment variable and a marker \
+file, and it sleeps, but it never changes a command. Outside the child, and \
+after the first hold, it returns at once. So a replay on the standby issues \
+the same commands. Remove this entry if the engine gains a test hook between \
+the tenure pin and the commit."""

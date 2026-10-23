@@ -34484,6 +34484,12 @@ impl UnstartedClaim {
 /// How often the owner loop scans its database (ADR 0009 decision 8).
 const OWNER_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 
+/// The most partitions that one owner scan acquires (issue #2254).
+///
+/// The worker adopts each chunk before the next scan. So a takeover of
+/// 256 partitions decides after 32 acquisitions, not after 256.
+const OWNER_ACQUIRE_CHUNK: usize = 32;
+
 /// One database of a multi-shard worker (issue #2252).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OwnerGroup<P> {
@@ -34541,13 +34547,19 @@ struct OwnerLoopHandle {
 /// The cache entries of each dropped tenure go first. Then the entries of
 /// each new partition go, before the worker adopts its tenure. So a new
 /// tenure starts cold (rule R4 of ADR 0010).
+///
+/// After an acquisition, `woken` ends the idle wait of a claim loop. The
+/// new owner then claims the waiting tasks at once (issue #2254). Returns
+/// the sleep until the next scan. It is zero while free partitions remain
+/// beyond the acquisition chunk.
 async fn owner_scan(
     state: &tokio::sync::Mutex<crate::decision_owner::OwnerLoop>,
     pool: &DbPool,
     cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     owned: &crate::decision_owner::OwnedPartitions,
+    woken: &tokio::sync::Notify,
     worker_id: &str,
-) {
+) -> Duration {
     // The loop lock stays held until the adoption ends. A release then
     // never runs between an acquisition and its adoption.
     let (conn, mut owner_loop) = conn_then_loop_lock(pool.get(), state).await;
@@ -34555,18 +34567,26 @@ async fn owner_scan(
         Ok(conn) => conn,
         Err(e) => {
             tracing::warn!(worker_id = %worker_id, error = %e, "owner loop: no connection");
-            return;
+            return OWNER_SCAN_INTERVAL;
         }
     };
     let tick = owner_loop.tick(&mut conn).await;
     drop(conn);
+    let mut next_change = None;
+    let mut more = false;
     match tick {
         Ok(tick) => {
+            next_change = tick.next_change;
+            more = tick.more;
             evict_owner_keys(cache, &tick.dropped).await;
             let keys: Vec<_> = tick.acquired.iter().map(|(t, _)| t.key()).collect();
             evict_owner_keys(cache, &keys).await;
+            let acquired = !tick.acquired.is_empty();
             for (tenure, deadline) in tick.acquired {
                 owned.adopt_until(tenure, deadline);
+            }
+            if acquired {
+                woken.notify_one();
             }
         }
         Err(e) => {
@@ -34574,6 +34594,10 @@ async fn owner_scan(
         }
     }
     drop(owner_loop);
+    if more {
+        return Duration::ZERO;
+    }
+    crate::decision_owner::next_scan_wait(next_change, OWNER_SCAN_INTERVAL)
 }
 
 /// Take a pool connection, then the owner-loop lock (issue #2252).
@@ -36755,9 +36779,10 @@ impl Worker {
     ///
     /// `owner_shard` keys the tenures of the database. `refuse` keeps owner
     /// mode off for this worker there, for a split colocated group (ADR 0009
-    /// decision 10). The loop scans every [`OWNER_SCAN_INTERVAL`]. It stops
-    /// at shutdown. [`Self::release_owner_partitions`] then releases its
-    /// partitions after the drain.
+    /// decision 10). The loop scans every [`OWNER_SCAN_INTERVAL`], or sooner
+    /// when a foreign lease ends first (issue #2254). It stops at shutdown.
+    /// [`Self::release_owner_partitions`] then releases its partitions after
+    /// the drain.
     fn spawn_owner_loop(
         &self,
         pool: &DbPool,
@@ -36777,7 +36802,8 @@ impl Worker {
                 self.config.worker_heartbeat_interval,
             ))
             .unwrap_or(1),
-        ));
+        ))
+        .with_acquire_chunk(OWNER_ACQUIRE_CHUNK);
         // A worker that cannot run a workflow task must not own partitions.
         // It still claims in the owned form, so the guard never blocks its
         // activity claims.
@@ -36792,13 +36818,16 @@ impl Worker {
             let pool = pool.clone();
             let cache = Arc::clone(&self.workflow_cache);
             let owned = Arc::clone(&self.decision_owner);
+            let woken = Arc::clone(&self.owner_woken);
             let worker_id = self.config.worker_id.clone();
             AbortOnDrop::new(tokio::spawn(async move {
                 loop {
-                    owner_scan(&state, &pool, &cache, &owned, &worker_id).await;
+                    let wait = owner_scan(&state, &pool, &cache, &owned, &woken, &worker_id).await;
+                    // A zero wait is ready at once. The stop must still win.
                     tokio::select! {
+                        biased;
                         () = stop.cancelled() => return,
-                        () = tokio::time::sleep(OWNER_SCAN_INTERVAL) => {}
+                        () = tokio::time::sleep(wait) => {}
                     }
                 }
             }))

@@ -275,8 +275,16 @@ No task stays `RUNNING` with no worker to finish it:
 - The TTL range is 3 s to 300 s. The top is `MAX_SCANNER_LEASE_TTL`. The
   3 s floor is new: the scanner lease has none.
 - A standby scans for free and expired partitions every second.
-- After a crash, a partition gets a new owner within TTL + 1 s: 11 s by
-  default. A graceful stop hands over in about 1 s (decision 9).
+- It also scans just after the next foreign lease end, when that end
+  comes first (issue #2254). So a takeover follows a lease end by
+  milliseconds.
+- After a crash, a partition gets a new owner a few milliseconds after
+  its lease ends. That is about one TTL, 10 s by default. A graceful stop
+  hands over in about 1 s (decision 9).
+- A peer still counts as live for 3 s after its last scan. Near the 3 s
+  floor, that window can delay a takeover by up to 1 s more.
+- Issue #2254 measured the next decision 0.2 s to 0.3 s after the lease
+  end. See [`performance-owner-failover.md`](../performance-owner-failover.md).
 - A frozen owner can hold an open commit transaction. Its `FOR KEY SHARE`
   then blocks each acquisition.
 - So the owner-mode decision transaction sets
@@ -288,9 +296,9 @@ No task stays `RUNNING` with no worker to finish it:
 - At that deadline the holder stops new claims and new commits in the
   partition.
 - Safety does not depend on clocks, because the commit checks the epoch.
-- Harvest rejects a shorter TTL until issue #2254 measures the crash bound.
-  A missed renewal under load causes a takeover, cold decisions and fenced
-  commits.
+- Issue #2254 measured the crash bound at the default TTL only. So Harvest
+  still rejects a TTL below 3 s. A missed renewal under load causes a
+  takeover, cold decisions and fenced commits.
 
 ### 9. Drain: release all at once
 
@@ -319,11 +327,17 @@ Issue #2252 fixes the balance policy (`decision_owner::plan_balance`):
   a worker with no workflow slot or type, and a split colocated group.
   It still claims in the owned form, so the guard never blocks it.
 - A worker below the target acquires free partitions up to the target.
+- The worker acquires at most 32 partitions per scan. It adopts them,
+  then scans again at once while free partitions remain (issue #2254). So
+  its first decisions do not wait for its last acquisition.
 - A worker above target + 1 stops claiming the extra partitions at once.
-  It releases them on its next scan, so their decisions in flight can
-  commit. That is the drain.
+  It releases them one full scan interval later, so their decisions in
+  flight can commit. That is the drain.
 - Any worker acquires an orphan: a free partition whose lease ended more
-  than one renewal interval ago.
+  than one TTL ago.
+- Issue #2254 raised that wait from one renewal interval. A joiner under
+  load took more than 3.3 s for its share. Owners at their target then
+  took those partitions as orphans, and the fleet churned for 14 s to 16 s.
 
 ### 10. Tenant cells: partitions follow shard assignments
 
@@ -547,8 +561,8 @@ here.
 | Group commit | Do decisions of one partition share a commit? | Deferred to #2256. |
 | Serialization unit | Does the owner serialize per partition or per execution? | Answered. Per execution. A single-threaded owner caps throughput, as at Durable Objects. |
 | Model nemeses | Which nemeses do the TLA+ model and the simulator cover? | Deferred to #2250. Stale commit after takeover, lease flap during an append, renewal during commits, and a signal before an epoch bump. |
-| Frozen-owner test | Does Harvest port Golem's frozen-owner test? | Deferred to #2254. |
-| Pass conditions | Which measurements pass stage 1? | Deferred to #2254. It adopts the report's pass table. Issue #2248 records the baselines. |
+| Frozen-owner test | Does Harvest port Golem's frozen-owner test? | Answered. Yes. `owner_failover_tests.rs` stops an owner with `SIGSTOP` in a decision and in an open commit. See [`performance-owner-failover.md`](../performance-owner-failover.md). |
+| Pass conditions | Which measurements pass stage 1? | Deferred to #2248 for the throughput, claim, cold-decision, hit-rate and persist rows. Issue #2254 measured the kill -9 and scale-out rows, and both pass. |
 
 ## Options considered
 
@@ -573,9 +587,9 @@ here.
   expiry.
 - The drain is a Postgres lock wait, not a protocol step.
 - The lease fails over with the data.
-- A crash leaves a partition without an owner for up to 11 s. Today a
-  pending task pinned to a crashed worker waits up to the 5 s sticky
-  timeout.
+- A crash leaves a partition without an owner for about one TTL, 10 s by
+  default. Today a pending task pinned to a crashed worker waits up to the
+  5 s sticky timeout.
 - Each commit takes one more row lock. Issue #2248 measures the cost.
 - Each worker renews its partitions every TTL / 3.
 - Enabling owner mode is an operator step per database.
