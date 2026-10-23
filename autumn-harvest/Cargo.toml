@@ -692,3 +692,12 @@ harness = false
 name = "dag_tooling_profile"
 required-features = ["testing"]
 harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `HistoryMatcher::match_activity`, the non-strict activity matcher.
+# Drive it under `valgrind --tool=callgrind` / `--tool=dhat`. See
+# `benches/match_activity_profile.rs`.
+[[bench]]
+name = "match_activity_profile"
+required-features = ["testing"]
+harness = false
