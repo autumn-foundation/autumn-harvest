@@ -129,6 +129,11 @@ const CITED_CODE: &[(&str, &str, &str)] = &[
         "pub struct OwnerKey {",
     ),
     (
+        "acquire_many",
+        "autumn-harvest/src/decision_owner.rs",
+        "pub async fn acquire_many(",
+    ),
+    (
         "DEFAULT_SCANNER_LEASE_TTL",
         "autumn-harvest/src/scanner_lease.rs",
         "pub const DEFAULT_SCANNER_LEASE_TTL: Duration = Duration::from_secs(10);",
@@ -198,6 +203,7 @@ const LOCK_TESTS: &[&str] = &[
     "a_for_share_commit_blocks_a_renewal",
     "a_scanner_style_upsert_does_not_wait_for_a_commit",
     "a_local_idle_timeout_frees_a_frozen_commit",
+    "a_skip_locked_acquisition_skips_an_in_flight_commit",
 ];
 
 fn repo_root() -> PathBuf {

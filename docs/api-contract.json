@@ -3034,6 +3034,7 @@
           "signals_scrubbed",
           "logs_deleted",
           "stream_chunks_deleted",
+          "entity_states_scrubbed",
           "completion_deliveries_scrubbed",
           "dead_letters_scrubbed",
           "children",

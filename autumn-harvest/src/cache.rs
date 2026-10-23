@@ -104,6 +104,10 @@ impl ClosedEntries {
 pub struct WorkflowCache {
     inner: LruCache<Uuid, CacheEntry>,
     resident_enabled: bool,
+    /// The owner-local disk tier (issue #2258). The worker clones it under
+    /// the cache lock and does all disk work outside the lock.
+    #[cfg(feature = "owner-disk-cache")]
+    disk: Option<crate::owner_disk_cache::DiskTier>,
 }
 
 impl WorkflowCache {
@@ -134,7 +138,23 @@ impl WorkflowCache {
         Self {
             inner: LruCache::new(cap),
             resident_enabled: true,
+            #[cfg(feature = "owner-disk-cache")]
+            disk: None,
         }
+    }
+
+    /// Attach the owner-local disk tier (issue #2258).
+    #[cfg(feature = "owner-disk-cache")]
+    #[must_use]
+    pub(crate) fn with_disk(mut self, disk: Option<crate::owner_disk_cache::DiskTier>) -> Self {
+        self.disk = disk;
+        self
+    }
+
+    /// The owner-local disk tier, if any (issue #2258).
+    #[cfg(feature = "owner-disk-cache")]
+    pub(crate) fn disk(&self) -> Option<crate::owner_disk_cache::DiskTier> {
+        self.disk.clone()
     }
 
     /// Sets whether entries keep the suspended workflow resident (issue
@@ -422,11 +442,14 @@ impl WorkflowCache {
 
 impl std::fmt::Debug for WorkflowCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkflowCache")
-            .field("len", &self.inner.len())
+        let mut d = f.debug_struct("WorkflowCache");
+        d.field("len", &self.inner.len())
             .field("cap", &self.inner.cap())
-            .field("resident_enabled", &self.resident_enabled)
-            .finish()
+            .field("resident_enabled", &self.resident_enabled);
+        // Issue #2258: whether an owner disk tier is attached.
+        #[cfg(feature = "owner-disk-cache")]
+        d.field("disk", &self.disk.is_some());
+        d.finish()
     }
 }
 

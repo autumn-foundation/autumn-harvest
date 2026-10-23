@@ -2319,6 +2319,8 @@ fn mirror_event(event: &WorkflowEvent, armed_timer: bool) -> Option<Op> {
             SideEffectKind::Uuid => Some(Op::NewUuid),
             SideEffectKind::Random => Some(random_op(value)),
             SideEffectKind::Custom => name.clone().map(|name| Op::SideEffect { name }),
+            // Only the entity loop records a snapshot. No fuzz op makes one.
+            SideEffectKind::EntityState => None,
         },
         WorkflowEvent::MarkerRecorded { name, details } => marker_op(name, details),
         WorkflowEvent::WorkflowCompleted { output } => Some(Op::Complete {

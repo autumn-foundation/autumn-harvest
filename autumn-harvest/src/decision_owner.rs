@@ -490,6 +490,21 @@ pub enum Acquisition {
     Busy,
 }
 
+/// The result of a batched acquisition (issue #2296).
+///
+/// Each list is in ascending partition order, with no duplicate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Acquisitions {
+    /// The new tenures. The holder owns these rows now.
+    pub acquired: Vec<OwnerTenure>,
+    /// The partitions with a live lease. Nothing changed.
+    pub held: Vec<DecisionPartition>,
+    /// The partitions that the batch did not lock, and whose lease is not
+    /// live. Another transaction locks the row, or its lease ended during
+    /// the batch. Nothing changed. Try again later.
+    pub busy: Vec<DecisionPartition>,
+}
+
 /// The rows that a renewal or a release matched.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Matched {
@@ -1117,7 +1132,7 @@ pub struct EnableReport {
 
 #[cfg(feature = "db")]
 pub use db::{
-    OwnerLoop, OwnerTick, acquire, conn_id, disable_owner_mode, enable_owner_mode,
+    OwnerLoop, OwnerTick, acquire, acquire_many, conn_id, disable_owner_mode, enable_owner_mode,
     end_upload_allowance, expire_all, fence, fence_pinned, fence_with_generation, is_lock_miss,
     read_owner_mode, release_all, renew_all, start_upload_allowance,
 };
@@ -1131,9 +1146,9 @@ mod db {
     use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 
     use super::{
-        Acquisition, DECISION_PARTITIONS, DecisionPartition, EnableOwnerMode, EnableReport,
-        LeaseWrite, OWNER_MODE_CAPABILITY_VERSION, OwnerEpoch, OwnerHolder, OwnerLeaseConfig,
-        OwnerMode, OwnerTenure, fence_passes, next_epoch, pinned_decision,
+        Acquisition, Acquisitions, DECISION_PARTITIONS, DecisionPartition, EnableOwnerMode,
+        EnableReport, LeaseWrite, OWNER_MODE_CAPABILITY_VERSION, OwnerEpoch, OwnerHolder,
+        OwnerLeaseConfig, OwnerMode, OwnerTenure, fence_passes, next_epoch, pinned_decision,
     };
     use crate::error::{HarvestError, HarvestResult, database_error};
     use crate::types::ShardId;
@@ -1150,6 +1165,38 @@ mod db {
 
     /// Whether the row exists at all.
     const ROW_EXISTS_SQL: &str = "SELECT epoch FROM harvest_decision_owner WHERE partition = $1";
+
+    /// Lock the takeable rows of a batch, in ascending partition order
+    /// (issue #2296).
+    ///
+    /// `SKIP LOCKED` skips each row that another transaction locks. So a
+    /// batch never waits for an owner row. A commit holds its row
+    /// `FOR KEY SHARE`, so the batch never increments an epoch under a
+    /// commit.
+    ///
+    /// Postgres can keep the lock on a row that the recheck drops. That
+    /// lock lasts until the batch commits.
+    const ACQUIRE_MANY_LOCK_SQL: &str = "SELECT partition, epoch FROM harvest_decision_owner \
+         WHERE partition = ANY($1::int[]) \
+           AND (holder IS NULL OR lease_until <= clock_timestamp()) \
+         ORDER BY partition \
+         FOR UPDATE SKIP LOCKED";
+
+    /// Whether each row of a batch exists, and whether it is takeable.
+    const ACQUIRE_MANY_STATE_SQL: &str = "SELECT partition, \
+             (holder IS NULL OR lease_until <= clock_timestamp()) AS takeable \
+         FROM harvest_decision_owner WHERE partition = ANY($1::int[])";
+
+    /// Write the new holder and epoch of each locked row of a batch.
+    ///
+    /// The epoch check matches the locked epoch. Under the row lock, it
+    /// always matches.
+    const ACQUIRE_MANY_WRITE_SQL: &str = "UPDATE harvest_decision_owner o \
+         SET holder = $1, epoch = w.next, \
+             lease_until = clock_timestamp() + make_interval(secs => $2) \
+         FROM unnest($3::int[], $4::bigint[], $5::bigint[]) AS w(partition, prev, next) \
+         WHERE o.partition = w.partition AND o.epoch = w.prev \
+         RETURNING o.partition, o.epoch";
 
     /// Write the new holder and epoch under the row lock.
     ///
@@ -1235,6 +1282,22 @@ mod db {
     }
 
     #[derive(QueryableByName)]
+    struct LockedRow {
+        #[diesel(sql_type = Integer)]
+        partition: i32,
+        #[diesel(sql_type = BigInt)]
+        epoch: i64,
+    }
+
+    #[derive(QueryableByName)]
+    struct StateRow {
+        #[diesel(sql_type = Integer)]
+        partition: i32,
+        #[diesel(sql_type = Bool)]
+        takeable: bool,
+    }
+
+    #[derive(QueryableByName)]
     struct PartitionRow {
         #[diesel(sql_type = Integer)]
         partition: i32,
@@ -1289,6 +1352,25 @@ mod db {
         format!("SET LOCAL lock_timeout = '{ms}ms'")
     }
 
+    /// Open a lease write: bound each lock wait and the idle time, then take
+    /// the DR generation row (ADR 0009 decision 6).
+    ///
+    /// A frozen holder of owner row locks blocks every takeover. The
+    /// database ends the transaction after `idle` (issue #2254).
+    async fn open_lease_write(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+        lock_timeout: Duration,
+        idle: Duration,
+    ) -> HarvestResult<()> {
+        diesel::sql_query(lock_timeout_sql(lock_timeout))
+            .execute(conn)
+            .await
+            .map_err(database_error)?;
+        set_idle(conn, format!("{}ms", idle.as_millis())).await?;
+        crate::replication::assert_generation_fence(conn, shard).await
+    }
+
     fn partition_of(row: i32) -> HarvestResult<DecisionPartition> {
         u16::try_from(row)
             .ok()
@@ -1301,6 +1383,9 @@ mod db {
     ///
     /// The statement runs in its own transaction. It takes the DR
     /// generation row first, then the owner row (ADR 0009 decision 6).
+    ///
+    /// This form waits for a commit in flight on the row. The owner loop
+    /// uses [`acquire_many`], which skips that row.
     ///
     /// # Errors
     ///
@@ -1318,14 +1403,7 @@ mod db {
         let config = *config;
         let result = conn
             .transaction::<Acquisition, HarvestError, _>(async |conn| {
-                diesel::sql_query(lock_timeout_sql(config.lock_timeout))
-                    .execute(conn)
-                    .await
-                    .map_err(database_error)?;
-                // A frozen holder of this row lock blocks every takeover. The
-                // database ends the transaction after one TTL (issue #2254).
-                set_idle(conn, format!("{}ms", config.ttl.get().as_millis())).await?;
-                crate::replication::assert_generation_fence(conn, shard).await?;
+                open_lease_write(conn, shard, config.lock_timeout, config.ttl.get()).await?;
                 let p = i32::from(partition.get());
                 let locked: Option<EpochRow> = diesel::sql_query(ACQUIRE_LOCK_SQL)
                     .bind::<Integer, _>(p)
@@ -1376,6 +1454,131 @@ mod db {
         }
     }
 
+    /// Take each row of `partitions` that is free or whose lease ended, for
+    /// `holder`, in one transaction (issue #2296).
+    ///
+    /// The transaction takes the DR generation row first. Then it locks the
+    /// takeable rows `FOR UPDATE SKIP LOCKED`, in ascending partition order.
+    /// It adds 1 to the epoch of each locked row. The statement count does
+    /// not grow with the batch.
+    ///
+    /// The batch never waits for an owner row. [`acquire`] waits for a
+    /// commit in flight. The batch skips that row and lists it as busy.
+    /// Nothing changed on a busy row, so a later scan can take it.
+    ///
+    /// The generation row is the only lock wait. A wait that hits the lock
+    /// timeout lists each partition as busy.
+    ///
+    /// # Errors
+    ///
+    /// [`HarvestError::ShardFenced`] when this process lost DR write
+    /// authority. [`HarvestError::NotFound`] when a row does not exist.
+    /// [`HarvestError::Database`] on a query failure or an epoch overflow.
+    /// On an error, the batch takes no row.
+    pub async fn acquire_many(
+        conn: &mut AsyncPgConnection,
+        shard: ShardId,
+        holder: &OwnerHolder,
+        partitions: &[DecisionPartition],
+        config: &OwnerLeaseConfig,
+    ) -> HarvestResult<Acquisitions> {
+        let mut wanted = partitions.to_vec();
+        wanted.sort_unstable();
+        wanted.dedup();
+        if wanted.is_empty() {
+            return Ok(Acquisitions::default());
+        }
+        let keys: Vec<i32> = wanted.iter().map(|p| i32::from(p.get())).collect();
+        let holder = holder.clone();
+        let config = *config;
+        let result = conn
+            .transaction::<Acquisitions, HarvestError, _>(async |conn| {
+                open_lease_write(conn, shard, config.lock_timeout, config.ttl.get()).await?;
+                let locked: Vec<LockedRow> = diesel::sql_query(ACQUIRE_MANY_LOCK_SQL)
+                    .bind::<Array<Integer>, _>(&keys)
+                    .load(conn)
+                    .await
+                    .map_err(database_error)?;
+                let mut out = Acquisitions::default();
+                if locked.len() < keys.len() {
+                    let states: Vec<StateRow> = diesel::sql_query(ACQUIRE_MANY_STATE_SQL)
+                        .bind::<Array<Integer>, _>(&keys)
+                        .load(conn)
+                        .await
+                        .map_err(database_error)?;
+                    for (p, key) in wanted.iter().zip(&keys) {
+                        if locked.iter().any(|r| r.partition == *key) {
+                            continue;
+                        }
+                        // A takeable row that the lock skipped is busy. So
+                        // is a row whose lease ended after the lock.
+                        match states.iter().find(|r| r.partition == *key) {
+                            None => {
+                                return Err(HarvestError::NotFound(format!(
+                                    "no owner row for decision partition {p}"
+                                )));
+                            }
+                            Some(state) if state.takeable => out.busy.push(*p),
+                            Some(_) => out.held.push(*p),
+                        }
+                    }
+                }
+                if locked.is_empty() {
+                    return Ok(out);
+                }
+                let mut rows = Vec::with_capacity(locked.len());
+                let mut prev = Vec::with_capacity(locked.len());
+                let mut next = Vec::with_capacity(locked.len());
+                for row in &locked {
+                    let grown = next_epoch(row.epoch).ok_or_else(|| {
+                        HarvestError::Database(format!(
+                            "the epoch of decision partition {} cannot grow",
+                            row.partition
+                        ))
+                    })?;
+                    rows.push(row.partition);
+                    prev.push(row.epoch);
+                    next.push(grown);
+                }
+                let mut written: Vec<LockedRow> = diesel::sql_query(ACQUIRE_MANY_WRITE_SQL)
+                    .bind::<Text, _>(holder.as_str())
+                    .bind::<Double, _>(config.ttl.get().as_secs_f64())
+                    .bind::<Array<Integer>, _>(&rows)
+                    .bind::<Array<BigInt>, _>(&prev)
+                    .bind::<Array<BigInt>, _>(&next)
+                    .load(conn)
+                    .await
+                    .map_err(database_error)?;
+                if written.len() != locked.len() {
+                    // The error rolls the batch back, so it takes no row.
+                    return Err(HarvestError::Database(format!(
+                        "a batch acquisition wrote {} of {} locked owner rows",
+                        written.len(),
+                        locked.len()
+                    )));
+                }
+                written.sort_unstable_by_key(|r| r.partition);
+                for row in written {
+                    out.acquired.push(OwnerTenure::pinned(
+                        shard,
+                        partition_of(row.partition)?,
+                        holder.clone(),
+                        OwnerEpoch::new(row.epoch),
+                        config.ttl,
+                    ));
+                }
+                Ok(out)
+            })
+            .await;
+        match result {
+            Err(HarvestError::Database(msg)) if is_lock_miss(&msg) => Ok(Acquisitions {
+                busy: wanted,
+                ..Acquisitions::default()
+            }),
+            other => other,
+        }
+    }
+
     /// The keys of `tenures`, as three parallel arrays.
     fn keys(tenures: &[OwnerTenure]) -> (Vec<i32>, Vec<i64>, Vec<String>) {
         let partitions = tenures
@@ -1420,8 +1623,6 @@ mod db {
             RowsWrite::Renew => RENEW_LOCK_SQL,
             RowsWrite::Release => RELEASE_LOCK_SQL,
         };
-        // A frozen holder of these row locks blocks every takeover. The
-        // database ends the transaction after one TTL (issue #2254).
         let idle = tenures
             .iter()
             .map(|t| t.ttl().get())
@@ -1429,12 +1630,7 @@ mod db {
             .unwrap_or(super::OwnerLeaseTtl::DEFAULT.get());
         let result = conn
             .transaction::<Vec<i32>, HarvestError, _>(async |conn| {
-                diesel::sql_query(lock_timeout_sql(lock_timeout))
-                    .execute(conn)
-                    .await
-                    .map_err(database_error)?;
-                set_idle(conn, format!("{}ms", idle.as_millis())).await?;
-                crate::replication::assert_generation_fence(conn, shard).await?;
+                open_lease_write(conn, shard, lock_timeout, idle).await?;
                 let locked: Vec<PartitionRow> = diesel::sql_query(lock_sql)
                     .bind::<Array<Integer>, _>(&partitions)
                     .bind::<Array<BigInt>, _>(&epochs)
@@ -2285,10 +2481,11 @@ mod db {
 
         /// This loop with at most `chunk` acquisitions per tick (issue #2254).
         ///
-        /// Each acquisition is its own transaction. The worker adopts the
-        /// tenures of a tick only when the tick ends. So with a chunk, a
-        /// takeover decides after its first chunk, not after its last. The
-        /// tick sets [`OwnerTick::more`] when free partitions remain.
+        /// A tick takes its chunk in one transaction (issue #2296). The
+        /// worker adopts the tenures of a tick only when the tick ends. So
+        /// with a chunk, a takeover decides after its first chunk, not after
+        /// its last. The tick sets [`OwnerTick::more`] when free partitions
+        /// remain.
         #[must_use]
         pub const fn with_acquire_chunk(mut self, chunk: usize) -> Self {
             self.acquire_chunk = Some(chunk);
@@ -2533,20 +2730,28 @@ mod db {
                 .load(conn)
                 .await
                 .map_err(database_error)?;
-            let mut acquired = Vec::new();
-            for pick in picks {
-                let partition = partition_of(pick.partition)?;
-                let sent = std::time::Instant::now();
-                match acquire(conn, self.shard, &self.holder, partition, &self.config).await {
-                    Ok(Acquisition::Acquired(tenure)) => {
-                        let deadline = tenure.ttl().local_deadline(sent);
-                        acquired.push((tenure, deadline));
-                    }
-                    Ok(Acquisition::Held | Acquisition::Busy) => {}
-                    Err(HarvestError::ShardFenced { .. }) => break,
+            let partitions = picks
+                .iter()
+                .map(|pick| partition_of(pick.partition))
+                .collect::<HarvestResult<Vec<_>>>()?;
+            let sent = std::time::Instant::now();
+            // One transaction takes the whole chunk (issue #2296).
+            let batch =
+                match acquire_many(conn, self.shard, &self.holder, &partitions, &self.config).await
+                {
+                    Ok(batch) => batch,
+                    // A fenced batch takes no row, so there is nothing to adopt.
+                    Err(HarvestError::ShardFenced { .. }) => return Ok(()),
                     Err(e) => return Err(e),
-                }
-            }
+                };
+            let acquired: Vec<_> = batch
+                .acquired
+                .into_iter()
+                .map(|tenure| {
+                    let deadline = tenure.ttl().local_deadline(sent);
+                    (tenure, deadline)
+                })
+                .collect();
             if acquired.is_empty() {
                 return Ok(());
             }

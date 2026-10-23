@@ -880,15 +880,16 @@ jobs:
         run: bash .github/ci/run-suites.sh run allos
       # ── Individual crate/example steps carried over from `test`, round-robin
       # assigned one shard each (see the job comment above) ─────────────────
+      # The lib test target needs about 8 GB to compile, and `integration`
+      # needs about 11 GB. One `--tests` build compiles both at the same time.
+      # That fills the 16 GB runner, and the runner shuts down (issue #2259).
+      # Compile the lib tests first, so the two never overlap.
       - name: Compile db-backed tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
-        env:
-          # Each test target maps the large `autumn_harvest` rlib while it
-          # links. On the Linux runner, parallel links of the all-features
-          # targets ran out of memory, and the runner shut down mid-step.
-          # Two jobs keep the peak inside it, as on Windows above.
-          CARGO_BUILD_JOBS: ${{ runner.os == 'macOS' && 'default' || '2' }}
-        run: cargo test -p autumn-harvest --all-features --tests --no-run
+        shell: bash
+        run: |
+          cargo test -p autumn-harvest --all-features --lib --no-run
+          cargo test -p autumn-harvest --all-features --tests --no-run
       # Issue #786: the claim/enqueue benchmark shares its harness with the
       # CI-gated budget assertion (`claim_budget_tests`, run Docker-backed via
       # the manifest in `test-db-linux`). Compile-checking it here keeps the
@@ -1088,6 +1089,16 @@ jobs:
       - name: "Run history-load-gate example tests (issue #2257)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p history-load-gate --lib --bins
+      # Issue #2258. The module tests of the owner disk cache need its
+      # feature. The worker tests run from their `linux` manifest row.
+      - name: "Run owner disk cache module tests (issue #2258)"
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p autumn-harvest --features owner-disk-cache --lib owner_disk_cache
+      # The other OSes compile the feature: the file lock and the directory
+      # check have a path of their own there.
+      - name: "Check owner disk cache feature (issue #2258)"
+        if: runner.os != 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo check -p autumn-harvest --features owner-disk-cache --lib
       # The autoresearch capstone. Its suite is offline: a simulated
       # trainer, a scripted researcher, seeded simulation sweeps and SQLite
       # end-to-end runs. Linux only, because the tests drive `git` and `sh`.

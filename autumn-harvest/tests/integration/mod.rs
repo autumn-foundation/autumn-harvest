@@ -166,6 +166,7 @@ mod durable_stream_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 #[cfg(feature = "db")]
+mod entity_state_db_tests;
 mod entity_tests;
 mod event_batch_tests;
 mod event_partitioning_tests;
@@ -243,6 +244,7 @@ mod notify_stage_probe_tests;
 mod otel_semconv_docs;
 mod otel_workflow_semconv_docs;
 mod owner_decider_tests;
+mod owner_disk_cache_db_tests;
 mod owner_failover_tests;
 mod owner_wake_db_tests;
 mod owner_wake_worker_tests;

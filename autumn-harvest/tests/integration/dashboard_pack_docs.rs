@@ -77,6 +77,7 @@ const DASHBOARD_PROMETHEUS_SERIES: &[&str] = &[
     "harvest_workflow_cache_hit_total",
     "harvest_workflow_cache_miss_total",
     "harvest_workflow_resident_total",
+    "harvest_workflow_disk_cache_total",
     "harvest_workflow_external_signal_sent_total",
     "harvest_workflow_timeout_total",
     "harvest_workflow_chain_timeout_total",
@@ -313,6 +314,10 @@ const SERIES_LABELS: &[(&str, &[&str])] = &[
     ),
     (
         "harvest_workflow_resident_duration",
+        &["workflow", "queue", "outcome"],
+    ),
+    (
+        "harvest_workflow_disk_cache",
         &["workflow", "queue", "outcome"],
     ),
     (

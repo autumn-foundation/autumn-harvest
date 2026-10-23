@@ -145,6 +145,11 @@ The rotation sweep also rewrites `codec_rotation::CODEC_COLUMNS` (issue
 #1979). Those tables are not append-only, so that pass is not an exception.
 `the_column_sweep_loses_to_an_erasure` proves that it loses to an erasure.
 
+`harvest_entity_state` (issue #2259) is not an exception either. It is a
+projection of entity snapshot events. The trigger
+`harvest_entity_state_projection_trg` writes it on `INSERT` into
+`harvest_events`, so it never rewrites an event.
+
 If you add another exception, it belongs in this list, with its own scope
 guarantee and its own proof.
 
@@ -170,8 +175,8 @@ That order is load-bearing.
 
 The partition layout changes rebuild `harvest_events` with `LIKE`, which copies
 no triggers. `enable_sql`, `migration_plan_steps` and `disable_partitioning`
-reinstall the guard, and `operator_triggers` exempts it by its exact shape. A
-new layout path must do the same.
+reinstall the guard and the entity projection trigger. `operator_triggers`
+exempts both by their exact shape. A new layout path must do the same.
 
 A test fixture that must rewrite a row calls `append_only::with_guard_off`. It
 turns off every trigger for one transaction and needs a superuser. Production
@@ -203,6 +208,9 @@ builds it. Code for owner mode follows these rules:
 - An acquisition takes the owner row `FOR UPDATE`, then increments the
   epoch. Never change the epoch with a plain `UPDATE` or an upsert. Neither
   one drains in-flight commits.
+- A batch acquisition takes its rows `FOR UPDATE SKIP LOCKED`, in
+  ascending partition order. It increments the epoch only on the rows
+  that it locked (issue #2296).
 - A renewal changes the lease end only. Renewal, release and revoke match
   holder and epoch. A release keeps the epoch.
 - A statement on many owner rows locks them in ascending partition order.

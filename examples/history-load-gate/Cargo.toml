@@ -7,7 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
-autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", features = ["db"] }
+autumn-harvest = { version = "0.7.0", path = "../../autumn-harvest", features = ["db", "owner-disk-cache"] }
 autumn-harvest-sqlite = { version = "0.7.0", path = "../../autumn-harvest-sqlite" }
 chrono = { workspace = true }
 diesel = { workspace = true }

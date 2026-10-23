@@ -188,7 +188,8 @@ Accepted as is:
 - A take is a full claim transaction. It costs the same round trips as the
   old workflow claim. The gain is that no claim loop waits for it.
 - The scan orders by due time, not by priority. Hints come first in, first
-  out.
+  out. The Codex review raised it again, with the new-start handicap of
+  #1824. Issue #2308 tracks the fix.
 - The dispatch channel can still claim a workflow row by id in owner mode.
   It races the decider, and one of them takes the row.
 - No worker switch turns the decider off. Owner mode off is the fallback.
