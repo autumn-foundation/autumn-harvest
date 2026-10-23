@@ -370,6 +370,76 @@ async fn a_later_run_wins_and_an_older_event_loses() {
     assert!(keys.contains(&key.as_str()) && keys.contains(&other.as_str()));
 }
 
+/// A shard move that aborts gives the row back. The staged copy of a run
+/// moved the row of the key to that run. The abort removes the copy, and
+/// the row returns to the latest snapshot of the runs that stay.
+#[tokio::test]
+async fn an_aborted_copy_gives_the_row_back() {
+    let (url, _container) = setup_test_database_url_or_env().await;
+    let mut conn = connect(&url).await;
+    let codecs = PayloadCodecs::default();
+    let name = "entity_state_abort";
+    let key = unique("abort");
+    let kept = insert_run(&mut conn, name, &key, "COMPLETED").await;
+    store::append_events(
+        &mut conn,
+        kept,
+        &[started(), snapshot(ENTITY_DELETED_SIDE_EFFECT, 4, 1)],
+        0,
+    )
+    .await
+    .unwrap();
+    let staged = insert_run(&mut conn, name, &key, "MIGRATING").await;
+    store::append_events(
+        &mut conn,
+        staged,
+        &[started(), snapshot(ENTITY_STATE_SIDE_EFFECT, 8, 2)],
+        0,
+    )
+    .await
+    .unwrap();
+    let row = entity_state::read(&mut conn, &codecs, name, &key)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.execution_id, staged, "the copy took the row");
+
+    entity_state::rebuild_without_execution(&mut conn, staged)
+        .await
+        .unwrap();
+    let row = entity_state::read(&mut conn, &codecs, name, &key)
+        .await
+        .unwrap()
+        .expect("the row is back");
+    assert_eq!(row.execution_id, kept);
+    assert!(row.deleted);
+    assert_eq!(
+        row.snapshot.query_answer(ENTITY_STATE_QUERY),
+        Some(json!(4))
+    );
+
+    // With no other run, the key has no row.
+    let lone_key = unique("abort");
+    let lone = insert_run(&mut conn, name, &lone_key, "MIGRATING").await;
+    store::append_events(
+        &mut conn,
+        lone,
+        &[started(), snapshot(ENTITY_STATE_SIDE_EFFECT, 1, 1)],
+        0,
+    )
+    .await
+    .unwrap();
+    entity_state::rebuild_without_execution(&mut conn, lone)
+        .await
+        .unwrap();
+    assert!(
+        entity_state::read(&mut conn, &codecs, name, &lone_key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 // ── erasure and codec rotation ───────────────────────────────────────────────
 
 /// AC: erasure covers the state table. An erase of the run that wrote the row
@@ -495,7 +565,7 @@ async fn codec_rotation_sweeps_the_projection() {
     let before = stored_snapshot(&mut conn, &key).await;
     assert_eq!(codec_envelope_key_id(&before), Some("k1"), "{before}");
     assert!(
-        !before.to_string().contains("42"),
+        before.get("state").is_none() && !before.to_string().contains("\"state\""),
         "the projection holds ciphertext"
     );
 

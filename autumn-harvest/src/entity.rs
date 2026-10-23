@@ -131,6 +131,14 @@ pub const ENTITY_STATE_SIDE_EFFECT: &str = "harvest.entity.state";
 /// The projection reads this name and marks the key as deleted.
 pub const ENTITY_DELETED_SIDE_EFFECT: &str = "harvest.entity.deleted";
 
+/// The key of a snapshot that the loop did not store (issue #2259).
+///
+/// A state past the side-effect cap or the depth cap would make the history
+/// too large or unloadable. The loop then records
+/// `{"omitted": "too_large" | "too_deep", "stats": <EntityStats>}`. A query
+/// on such a run replays the body.
+pub const ENTITY_SNAPSHOT_OMITTED_KEY: &str = "omitted";
+
 /// The maximum size in bytes of [`EntityStats::last_error`], marker included.
 ///
 /// A longer error is cut at a `char` boundary and ends with `... [truncated]`.
@@ -503,8 +511,14 @@ struct SnapshotRef<'s, S> {
 /// A replay adopts the recorded state and stats, so replay rebuilds the state
 /// from the events. A recorded snapshot that does not decode as `S` is a
 /// non-determinism error, and the loop keeps its own state. A history from
-/// before issue #2259 records nothing here. The snapshot bytes count toward
-/// the byte budget of the run.
+/// before issue #2259 records nothing here.
+///
+/// A state past the side-effect cap or the depth cap is not stored. The loop
+/// records an [`ENTITY_SNAPSHOT_OMITTED_KEY`] marker instead, and replay keeps
+/// its own state at that marker.
+///
+/// Only a live snapshot counts toward the byte budget. The loaded history
+/// bytes already hold the recorded ones.
 fn record_snapshot<S: Serialize + DeserializeOwned>(
     ctx: &WorkflowContext,
     checkpoint: &mut EntityCheckpoint<S>,
@@ -515,9 +529,13 @@ fn record_snapshot<S: Serialize + DeserializeOwned>(
         state: &checkpoint.state,
         stats: &checkpoint.stats,
     })?;
-    match ctx.record_entity_snapshot(name, live) {
+    let stats = &checkpoint.stats;
+    let omitted = |reason: &'static str| serde_json::json!({ ENTITY_SNAPSHOT_OMITTED_KEY: reason, "stats": stats });
+    match ctx.record_entity_snapshot(name, live, omitted)? {
         crate::context::EntitySnapshot::Recorded(recorded) => {
-            run.op_bytes += json_len(&recorded)?;
+            if recorded.get(ENTITY_SNAPSHOT_OMITTED_KEY).is_some() {
+                return Ok(());
+            }
             match serde_json::from_value::<EntitySnapshot<S>>(recorded) {
                 Ok(snapshot) => {
                     checkpoint.state = snapshot.state;
@@ -2075,22 +2093,31 @@ mod tests {
     }
 
     /// A `Custom` side effect with the reserved name is user data. The loop
-    /// does not read it as a snapshot.
+    /// does not read it as a snapshot, so it is a divergence. The same value
+    /// with the `EntityState` kind is the start snapshot and replays clean.
     #[tokio::test]
     async fn a_custom_side_effect_is_not_a_snapshot() {
-        let forged_record = WorkflowEvent::SideEffectRecorded {
+        let record = WorkflowEvent::SideEffectRecorded {
             kind: SideEffectKind::Custom,
             name: Some(ENTITY_STATE_SIDE_EFFECT.to_string()),
-            value: snapshot(100, 0),
+            value: snapshot(0, 0),
         };
-        let events = vec![started(json!({})), forged_record];
-        let report = WorkflowReplayer::new()
+        let forged = WorkflowReplayer::new()
             .register_fn("counter", counter)
-            .replay_from_events(events)
+            .replay_from_events(vec![started(json!({})), record])
             .await;
         assert!(
-            !matches!(report.status, ReplayStatus::ReplaySucceeded),
-            "the forged record is a divergence: {report}"
+            matches!(forged.status, ReplayStatus::NonDeterminismDetected { .. }),
+            "the forged record is a divergence: {forged}"
+        );
+        let real = vec![
+            started(json!({})),
+            snapshot_record(ENTITY_STATE_SIDE_EFFECT, snapshot(0, 0)),
+        ];
+        assert_eq!(
+            replayed_state(real, json!({})),
+            json!(0),
+            "the real kind is the start snapshot"
         );
     }
 
@@ -2115,6 +2142,81 @@ mod tests {
             recorded <= bound,
             "the snapshots hold {recorded} bytes, over {bound}"
         );
+    }
+
+    /// A state past the side-effect cap records an omitted marker, not the
+    /// state. Replay keeps its own state at the marker.
+    #[tokio::test]
+    async fn an_oversized_state_records_an_omitted_marker() {
+        let messages: Vec<Value> = (0..3).map(|_| op(1)).collect();
+        let outcome = env_with(&messages).run(huge_state_counter, json!({})).await;
+        let recorded = snapshots(outcome.events());
+        let (_, last) = recorded.last().expect("a snapshot");
+        assert_eq!(last[ENTITY_SNAPSHOT_OMITTED_KEY], json!("too_large"));
+        assert_eq!(last["stats"]["applied"], json!(3));
+        assert!(last.get("state").is_none(), "the state is not stored");
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), outcome.events().to_vec());
+        let drive = crate::executor::drive_query_replay(
+            &ctx,
+            huge_state_counter,
+            json!({}),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            matches!(drive, crate::executor::QueryReplayOutcome::Suspended),
+            "{drive:?}"
+        );
+        let state = ctx.execute_query(ENTITY_STATE_QUERY).unwrap();
+        assert_eq!(
+            state.as_str().map(str::len),
+            Some(3 << 20),
+            "replay keeps its state"
+        );
+    }
+
+    /// A state nested past the depth cap records an omitted marker. The
+    /// history stays loadable.
+    #[tokio::test]
+    async fn a_deep_state_records_an_omitted_marker() {
+        let outcome = env_with(&[op(1)]).run(deep_counter, json!({})).await;
+        let recorded = snapshots(outcome.events());
+        let (_, last) = recorded.last().expect("a snapshot");
+        assert_eq!(last[ENTITY_SNAPSHOT_OMITTED_KEY], json!("too_deep"));
+        let text = serde_json::to_string(&outcome.events()).unwrap();
+        let back: Vec<WorkflowEvent> = serde_json::from_str(&text).expect("the history loads");
+        assert_eq!(back.len(), outcome.events().len());
+    }
+
+    /// An entity whose state becomes a 3 MiB string. It is past the cap.
+    fn huge_state_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let checkpoint: EntityCheckpoint<String> =
+                serde_json::from_value(input).map_err(|e| e.to_string())?;
+            let state = Entity::new(ctx, checkpoint)
+                .run(|_: String, _: CounterOp| async move { Ok("h".repeat(3 << 20)) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state.len()))
+        })
+    }
+
+    /// An entity whose state nests past the depth cap.
+    fn deep_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let checkpoint: EntityCheckpoint<Value> =
+                serde_json::from_value(input).map_err(|e| e.to_string())?;
+            let state = Entity::new(ctx, checkpoint)
+                .run(|_: Value, _: CounterOp| async move {
+                    let mut deep = json!(0);
+                    for _ in 0..crate::payload_depth::MAX_PAYLOAD_DEPTH + 10 {
+                        deep = json!([deep]);
+                    }
+                    Ok(deep)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state.is_array()))
+        })
     }
 
     /// An entity whose state grows by 64 KiB for each op.

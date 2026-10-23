@@ -195,17 +195,24 @@ fn checkpoint_record() -> WorkflowEvent {
     }
 }
 
-/// Seed a `RUNNING` run of [`counter`] with `events`.
-async fn seed(pool: &DbPool, events: &[WorkflowEvent]) -> ExecutionId {
+/// Seed a run of [`counter`] in `state` with `input` and `events`.
+async fn seed_run(
+    pool: &DbPool,
+    state: &str,
+    input: Value,
+    events: &[WorkflowEvent],
+) -> ExecutionId {
     let mut conn = pool.get().await.expect("conn");
     let exec_id = ExecutionId::new();
     diesel::sql_query(
         "INSERT INTO harvest_workflow_executions \
          (id, workflow_name, workflow_id, shard_id, input, queue_name, state) \
-         VALUES ($1, 'entity_projection_counter', $2, 0, '{}'::jsonb, 'default', 'RUNNING')",
+         VALUES ($1, 'entity_projection_counter', $2, 0, $3, 'default', $4)",
     )
     .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
     .bind::<diesel::sql_types::Text, _>(exec_id.to_string())
+    .bind::<diesel::sql_types::Jsonb, _>(input)
+    .bind::<diesel::sql_types::Text, _>(state)
     .execute(&mut conn)
     .await
     .expect("seed run");
@@ -215,9 +222,13 @@ async fn seed(pool: &DbPool, events: &[WorkflowEvent]) -> ExecutionId {
     exec_id
 }
 
+/// Seed a `RUNNING` run of [`counter`] with `events`.
+async fn seed(pool: &DbPool, events: &[WorkflowEvent]) -> ExecutionId {
+    seed_run(pool, "RUNNING", json!({}), events).await
+}
+
 /// AC: queries on entity state read the projection without replaying the
-/// body. The test runs the tests of this file one at a time, because they
-/// share [`BODY_RUNS`].
+/// body. This file holds one test, because [`BODY_RUNS`] is shared state.
 #[tokio::test]
 async fn entity_queries_read_the_projection() {
     let (url, _container) = setup_database().await;
@@ -298,4 +309,57 @@ async fn entity_queries_read_the_projection() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A terminal run keeps the replay path of issue #612: it replays, and it
+    // gives the final state.
+    let completed = seed_run(
+        &pool,
+        "COMPLETED",
+        json!({}),
+        &[
+            started(),
+            snapshot(0, 0),
+            signal(4),
+            snapshot(4, 1),
+            checkpoint_record(),
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::EntityState,
+                name: Some(autumn_harvest::entity::ENTITY_DELETED_SIDE_EFFECT.to_string()),
+                value: json!({"state": 4, "stats": {"applied": 1}}),
+            },
+            WorkflowEvent::WorkflowCompleted { output: json!(4) },
+        ],
+    )
+    .await;
+    BODY_RUNS.store(0, Ordering::SeqCst);
+    let (status, state) = send(
+        &app,
+        "GET",
+        &format!("/workflows/{completed}/query/{ENTITY_STATE_QUERY}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{state}");
+    assert_eq!(state, json!(4));
+    assert!(
+        BODY_RUNS.load(Ordering::SeqCst) > 0,
+        "a terminal run replays"
+    );
+
+    // An erased terminal run is still a 410, before any projection read.
+    let erased = seed_run(
+        &pool,
+        "COMPLETED",
+        autumn_harvest::erase::erasure_tombstone(),
+        &[started(), snapshot(0, 0)],
+    )
+    .await;
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/workflows/{erased}/query/{ENTITY_STATE_QUERY}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::GONE, "{body}");
 }

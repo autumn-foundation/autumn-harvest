@@ -72,7 +72,8 @@ BEGIN
          deleted, snapshot, updated_at)
     VALUES
         (run.workflow_name, run.workflow_id, NEW.workflow_exec_id, NEW.event_id,
-         NEW.id, (NEW.event_data -> 'data' ->> 'name') = 'harvest.entity.deleted',
+         NEW.id,
+         coalesce((NEW.event_data -> 'data' ->> 'name') = 'harvest.entity.deleted', false),
          coalesce(NEW.event_data -> 'data' -> 'value', 'null'::jsonb), now())
     ON CONFLICT (workflow_name, workflow_id) DO UPDATE
        SET execution_id = EXCLUDED.execution_id,

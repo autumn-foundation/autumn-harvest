@@ -75,6 +75,9 @@ keyed entity. Its amendment records this change.
 | R6 | Lose the trigger in a partition layout change. | Each layout path reinstalls it with the guard. The operator-trigger refusal exempts it by identity. |
 | R7 | Serve a query from a row that is not the queried run. | The fast path needs `execution_id` equal to the run and a `RUNNING` run. Otherwise it replays. |
 | R8 | Serve an offloaded or erased snapshot. | The fast path falls back to replay for an offload reference. A tombstone reads as erased. |
+| R11 | Store a state past the side-effect cap or the depth cap. A deep value makes the history unloadable. | The loop records an `omitted` marker instead. Replay keeps its own state there, and a query replays. |
+| R12 | Lose a snapshot that a cancelled scope captured. | The snapshot reads the scope capture at the frontier, as a side effect does. |
+| R13 | Leave a wrong row after a shard move aborts. | The abort rebuilds the row from the runs that stay. The cutover deletes the row of the sealed run. |
 | R9 | Grow history by the state size for each op. | The loop counts the snapshot bytes in its byte budget, so it checkpoints sooner. ADR text says to keep state small. |
 | R10 | Slow every event insert. | The `WHEN` clause. Only entity snapshots call the function. |
 
@@ -102,7 +105,8 @@ keyed entity. Its amendment records this change.
 - `name` is `harvest.entity.state`, or `harvest.entity.deleted` for the
   delete that ends the run.
 - `value` is `{"state": <S>, "stats": <EntityStats>}`. The codec encodes
-  it as one payload field.
+  it as one payload field. A state past a payload cap records
+  `{"omitted": <reason>, "stats": <EntityStats>}`.
 - The loop records one at the start of each run, one after each op, and one
   before a delete ends the run.
 - Replay consumes the record and adopts its state and stats.

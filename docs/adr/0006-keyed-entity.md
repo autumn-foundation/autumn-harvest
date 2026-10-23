@@ -241,9 +241,11 @@ The design record is [`DESIGN-2259.md`](../../DESIGN-2259.md).
 
 - `autumn_harvest::entity_state` reads a row by key, reads the row of a run
   and lists the rows of an entity type.
-- A `harvest.entity.state` or `harvest.entity.stats` query reads the row of
-  the queried run. It replays only when that run wrote no row, or when the
-  payload store holds the snapshot.
+- A `harvest.entity.state` or `harvest.entity.stats` query on a running run
+  reads the row of that run. It replays when the run wrote no row, when a
+  later run holds the row, and when the row holds no full snapshot: an
+  erased, an offloaded or an omitted one. A terminal run always replays, so
+  the checks of issue #612 still apply.
 
 ### Deadlocks
 
@@ -269,6 +271,15 @@ When it gains queries:
   bytes in its byte budget, so it checkpoints sooner. Keep state small.
 - A state that does not serialize fails the run at the first snapshot, not
   at a checkpoint.
+- A state past the side-effect cap or the depth cap is not stored. The loop
+  records `{"omitted": "too_large" | "too_deep", "stats": ...}` in its place,
+  so the history stays loadable. Replay keeps its own state at that marker,
+  and a query replays.
+- A cancelled scope captures a snapshot as it captures a side effect. Replay
+  of the scope reads the captured snapshot.
+- A shard move rebuilds the row on the target from the copied events. An
+  aborted move gives the row back to the runs that stay. The cutover deletes
+  the row of the sealed source run.
 - A recorded snapshot that does not decode as the state type is a
   non-determinism error. Change the state type as a versioned workflow
   change.

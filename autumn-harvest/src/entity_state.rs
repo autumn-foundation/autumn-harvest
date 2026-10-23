@@ -24,7 +24,9 @@ use diesel::sql_types::{Bool, Integer, Jsonb, Text, Timestamptz, Uuid as SqlUuid
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde_json::Value;
 
-use crate::entity::{ENTITY_STATE_QUERY, ENTITY_STATS_QUERY, EntitySnapshot};
+use crate::entity::{
+    ENTITY_SNAPSHOT_OMITTED_KEY, ENTITY_STATE_QUERY, ENTITY_STATS_QUERY, EntitySnapshot,
+};
 #[cfg(feature = "db")]
 use crate::error::{HarvestResult, database_error};
 #[cfg(feature = "db")]
@@ -72,6 +74,9 @@ pub enum ProjectedSnapshot {
     Erased,
     /// The payload store holds the snapshot. A read must replay the run.
     Offloaded,
+    /// The loop did not store the state, because it was past a payload cap.
+    /// A read must replay the run.
+    Omitted,
 }
 
 impl ProjectedSnapshot {
@@ -112,6 +117,9 @@ fn decode_snapshot(codecs: &PayloadCodecs, stored: &Value) -> HarvestResult<Proj
         return Ok(ProjectedSnapshot::Offloaded);
     }
     let decoded = codecs.decode_column(stored)?;
+    if decoded.get(ENTITY_SNAPSHOT_OMITTED_KEY).is_some() {
+        return Ok(ProjectedSnapshot::Omitted);
+    }
     Ok(ProjectedSnapshot::Current(serde_json::from_value(decoded)?))
 }
 
@@ -228,10 +236,15 @@ pub async fn read_for_execution(
         .transpose()
 }
 
+/// The largest page that [`list`] returns.
+pub const MAX_LIST_LIMIT: u32 = 1000;
+
 /// List the entities of type `workflow_name`, in key order.
 ///
-/// `after` is the last key of the previous page. A deleted entity is left out
-/// unless `include_deleted` is set. The unique key index serves the scan.
+/// `after` is the last key of the previous page, or `None` for the first
+/// page. A page holds at most `limit` rows, capped at [`MAX_LIST_LIMIT`]. A
+/// deleted entity is left out unless `include_deleted` is set. The unique key
+/// index serves the scan.
 ///
 /// # Errors
 ///
@@ -242,17 +255,17 @@ pub async fn list(
     codecs: &PayloadCodecs,
     workflow_name: &str,
     after: Option<&str>,
-    limit: i64,
+    limit: u32,
     include_deleted: bool,
 ) -> HarvestResult<Vec<EntityStateRow>> {
     let rows: Vec<RawRow> = diesel::sql_query(format!(
-        "{SELECT_ROW} WHERE workflow_name = $1 AND workflow_id > $2 AND ($3 OR NOT deleted) \
-         ORDER BY workflow_id LIMIT $4"
+        "{SELECT_ROW} WHERE workflow_name = $1 AND ($2::text IS NULL OR workflow_id > $2) \
+         AND ($3 OR NOT deleted) ORDER BY workflow_id LIMIT $4"
     ))
     .bind::<Text, _>(workflow_name)
-    .bind::<Text, _>(after.unwrap_or(""))
+    .bind::<diesel::sql_types::Nullable<Text>, _>(after)
     .bind::<Bool, _>(include_deleted)
-    .bind::<diesel::sql_types::BigInt, _>(limit.max(0))
+    .bind::<diesel::sql_types::BigInt, _>(i64::from(limit.min(MAX_LIST_LIMIT)))
     .load(conn)
     .await
     .map_err(database_error)?;
@@ -308,6 +321,64 @@ pub(crate) async fn erase_for_execution(
     .map_err(database_error)
 }
 
+/// Give the row of the key that `exec_id` holds back to the other runs of
+/// the key (issue #2259).
+///
+/// A shard move that aborts deletes the staged events of `exec_id`. Those
+/// events moved the row of the key to `exec_id`. This call deletes that row
+/// and rebuilds it from the latest snapshot event of the other runs of the
+/// key on this database. With no such event, the key has no row. Call it
+/// before the staged events go, in the same transaction.
+///
+/// # Errors
+///
+/// [`crate::error::HarvestError::Database`] on a query failure.
+#[cfg(feature = "db")]
+pub async fn rebuild_without_execution(
+    conn: &mut AsyncPgConnection,
+    exec_id: ExecutionId,
+) -> HarvestResult<()> {
+    #[derive(diesel::QueryableByName)]
+    struct Key {
+        #[diesel(sql_type = Text)]
+        workflow_name: String,
+        #[diesel(sql_type = Text)]
+        workflow_id: String,
+    }
+    let keys: Vec<Key> = diesel::sql_query(
+        "DELETE FROM harvest_entity_state WHERE execution_id = $1 \
+         RETURNING workflow_name, workflow_id",
+    )
+    .bind::<SqlUuid, _>(exec_id.as_uuid())
+    .load(conn)
+    .await
+    .map_err(database_error)?;
+    for key in keys {
+        diesel::sql_query(
+            "INSERT INTO harvest_entity_state \
+                 (workflow_name, workflow_id, execution_id, event_id, event_row_id, \
+                  deleted, snapshot) \
+             SELECT x.workflow_name, x.workflow_id, e.workflow_exec_id, e.event_id, e.id, \
+                    coalesce((e.event_data -> 'data' ->> 'name') = $4, false), \
+                    coalesce(e.event_data -> 'data' -> 'value', 'null'::jsonb) \
+               FROM harvest_workflow_executions x \
+               JOIN harvest_events e ON e.workflow_exec_id = x.id \
+              WHERE x.workflow_name = $1 AND x.workflow_id = $2 AND x.id <> $3 \
+                AND e.event_type = 'SideEffectRecorded' \
+                AND (e.event_data -> 'data' ->> 'kind') = 'EntityState' \
+              ORDER BY e.id DESC LIMIT 1",
+        )
+        .bind::<Text, _>(&key.workflow_name)
+        .bind::<Text, _>(&key.workflow_id)
+        .bind::<SqlUuid, _>(exec_id.as_uuid())
+        .bind::<Text, _>(crate::entity::ENTITY_DELETED_SIDE_EFFECT)
+        .execute(conn)
+        .await
+        .map_err(database_error)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -332,11 +403,9 @@ mod tests {
             up.contains(&format!("'{}'", crate::entity::ENTITY_DELETED_SIDE_EFFECT)),
             "the trigger reads the deleted name"
         );
+        let kind = serde_json::to_value(crate::event::SideEffectKind::EntityState).unwrap();
         assert!(
-            up.contains(&format!(
-                "'{:?}'",
-                crate::event::SideEffectKind::EntityState
-            )),
+            up.contains(&format!("'{}'", kind.as_str().unwrap())),
             "the trigger selects the serialized kind"
         );
     }
@@ -373,7 +442,35 @@ mod tests {
             ProjectedSnapshot::Offloaded.query_answer(ENTITY_STATE_QUERY),
             None
         );
+        assert_eq!(
+            ProjectedSnapshot::Omitted.query_answer(ENTITY_STATE_QUERY),
+            None
+        );
         assert!(is_projected_query(ENTITY_STATE_QUERY));
         assert!(!is_projected_query("progress"));
+    }
+
+    /// Each stored cell shape decodes to its variant. Only a full snapshot
+    /// answers a query.
+    #[cfg(feature = "db")]
+    #[test]
+    fn each_stored_cell_decodes_to_its_variant() {
+        let codecs = PayloadCodecs::default();
+        let decode = |cell: Value| decode_snapshot(&codecs, &cell).unwrap();
+        assert_eq!(
+            decode(crate::erase::erasure_tombstone()),
+            ProjectedSnapshot::Erased
+        );
+        assert_eq!(
+            decode(json!({ crate::payload_store::OFFLOAD_ENVELOPE_KEY: 1, "ref": "x" })),
+            ProjectedSnapshot::Offloaded
+        );
+        assert_eq!(
+            decode(json!({ ENTITY_SNAPSHOT_OMITTED_KEY: "too_large", "stats": {} })),
+            ProjectedSnapshot::Omitted
+        );
+        let current = decode(json!({"state": [1], "stats": {"applied": 1}}));
+        assert_eq!(current.query_answer(ENTITY_STATE_QUERY), Some(json!([1])));
+        assert!(decode_snapshot(&codecs, &json!({"stats": {}})).is_err());
     }
 }

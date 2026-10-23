@@ -1812,6 +1812,9 @@ mod db {
         if let Some(row) = row
             && row.state == "MIGRATING"
         {
+            // The staged events moved the entity state row of the key to this
+            // run (issue #2259). Give it back to the run that held it before.
+            crate::entity_state::rebuild_without_execution(&mut *conn, exec_id).await?;
             for sql in STAGED_CHILD_DELETES.iter().copied() {
                 diesel::sql_query(sql)
                     .bind::<SqlUuid, _>(exec_id.as_uuid())
@@ -1920,6 +1923,9 @@ mod db {
             }
         }
 
+        // The staged copy re-projects the key. Until then, the row of the
+        // key belongs to the runs that stay (issue #2259).
+        crate::entity_state::rebuild_without_execution(conn, exec_id).await?;
         for sql in STAGED_CHILD_DELETES
             .iter()
             .copied()
@@ -2845,6 +2851,10 @@ mod db {
         // always executes to completion whether or not the primary query reads
         // them; only the seal's row count is needed to answer "did the cutover
         // happen?".
+        //
+        // `forgotten` removes the entity state row of the sealed run (issue
+        // #2259). The target now holds the live row. A stale copy here would
+        // answer a read on this shard.
         let sql = format!(
             "WITH sealed AS ( \
                  UPDATE harvest_workflow_executions e \
@@ -2861,6 +2871,10 @@ mod db {
                     AND t.state IN ('PENDING', 'RUNNING') \
                     AND EXISTS (SELECT 1 FROM sealed) \
                  RETURNING t.id \
+             ), forgotten AS ( \
+                 DELETE FROM harvest_entity_state s \
+                  WHERE s.execution_id = $1 AND EXISTS (SELECT 1 FROM sealed) \
+                 RETURNING s.id \
              ) \
              SELECT (SELECT count(*) FROM sealed)::BIGINT AS sealed_rows"
         );

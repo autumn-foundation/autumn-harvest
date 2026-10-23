@@ -5225,26 +5225,65 @@ impl WorkflowContext {
     /// `value` is the live snapshot. A replay returns the recorded one. A
     /// history from before issue #2259 has no snapshot at this position, so
     /// the call records nothing.
-    pub(crate) fn record_entity_snapshot(&self, name: &str, value: Value) -> EntitySnapshot {
+    ///
+    /// A live value past the depth cap or the side-effect cap is not stored.
+    /// The call records `omitted(reason)` in its place, so the history stays
+    /// loadable. A cancelled scope replays the value it captured.
+    ///
+    /// # Errors
+    ///
+    /// A non-determinism error when a cancelled scope captured another record
+    /// here.
+    pub(crate) fn record_entity_snapshot(
+        &self,
+        name: &str,
+        value: Value,
+        omitted: impl FnOnce(&'static str) -> Value,
+    ) -> HarvestResult<EntitySnapshot> {
         match self.match_history(|m| m.match_entity_snapshot(name)) {
             crate::replay::EntitySnapshotMatch::Matched { value } => {
-                EntitySnapshot::Recorded(value)
+                Ok(EntitySnapshot::Recorded(value))
             }
-            crate::replay::EntitySnapshotMatch::NotRecorded => EntitySnapshot::Absent,
+            crate::replay::EntitySnapshotMatch::NotRecorded => Ok(EntitySnapshot::Absent),
             crate::replay::EntitySnapshotMatch::Diverged { actual } => {
                 self.record_deferred_nd(format!(
                     "side-effect drift mismatch: expected SideEffectRecorded(entity_state:{name}), \
                      got SideEffectRecorded(entity_state:{actual})"
                 ));
-                EntitySnapshot::Absent
+                Ok(EntitySnapshot::Absent)
             }
             crate::replay::EntitySnapshotMatch::Frontier => {
+                let kind = crate::event::SideEffectKind::EntityState;
+                let (stored, snapshot) = match self.captured_scope_record(kind, Some(name)) {
+                    crate::cancellation_scope::Captured::NotReplaying => {
+                        let size =
+                            serde_json::to_string(&value).map_or(u64::MAX, |s| s.len() as u64);
+                        let stored = if crate::payload_depth::nests_past_cap(&value) {
+                            omitted("too_deep")
+                        } else if size > self.payload_max_side_effect {
+                            omitted("too_large")
+                        } else {
+                            value
+                        };
+                        (stored.clone(), EntitySnapshot::Live(stored))
+                    }
+                    // A captured value replays as recorded, as a recorded one does.
+                    crate::cancellation_scope::Captured::Value(value) => {
+                        (value.clone(), EntitySnapshot::Recorded(value))
+                    }
+                    crate::cancellation_scope::Captured::Drift(drift) => {
+                        return Err(self.scope_nd_error(
+                            format!("non-deterministic replay: {drift}"),
+                            format!("SideEffectRecorded(entity_state:{name})"),
+                        ));
+                    }
+                };
                 self.push_command(WorkflowCommand::RecordSideEffect {
-                    kind: crate::event::SideEffectKind::EntityState,
+                    kind,
                     name: Some(name.to_string()),
-                    value: value.clone(),
+                    value: stored,
                 });
-                EntitySnapshot::Live(value)
+                Ok(snapshot)
             }
         }
     }

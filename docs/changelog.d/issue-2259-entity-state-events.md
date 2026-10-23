@@ -26,15 +26,25 @@ reinstall the new trigger with the guard.
 `harvest_entity_state.snapshot`. Erasure tombstones the row of each erased
 run and reports `entity_states_scrubbed`.
 
+**Caps.** A state past the side-effect cap or the depth cap records an
+`omitted` marker, not the state. The history stays loadable, and a query on
+that run replays.
+
+**Shard moves.** The target rebuilds the row from the copied events. An
+aborted move gives the row back to the runs that stay, and the cutover
+deletes the row of the sealed source run.
+
 **Reads.** `autumn_harvest::entity_state` reads a row by key, reads the row
 of a run, and lists the rows of an entity type. The HTTP query routes and
 `WorkflowHandle::execute_query_in_process` answer `harvest.entity.state` and
-`harvest.entity.stats` from the projection. They replay only when the
-queried run wrote no row.
+`harvest.entity.stats` for a running run from the projection. They replay
+when the run has no full snapshot in the row. A terminal run replays, as
+before.
 
 **Tests.** `entity::tests` cover the snapshots, replay from snapshots, old
-histories, continued and reset runs and the byte budget.
+histories, continued and reset runs, the payload caps and the byte budget.
 `entity_state_db_tests` covers a crash at every step, a worker crash, run
-ordering, a reset of a continued run, erasure, codec rotation and each
-partition layout change. `entity_state_query_integration` proves that the
-HTTP query does not run the workflow body.
+ordering, an aborted shard copy, a reset of a continued run, erasure, codec
+rotation and each partition layout change. `entity_state_query_integration`
+proves that the HTTP query on a running run does not run the workflow body,
+and that a terminal run still replays.
