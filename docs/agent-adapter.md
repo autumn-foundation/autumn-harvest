@@ -784,6 +784,7 @@ change.
 | `agent_memory_snapshot` | The recorded snapshot, or an empty one. |
 | `agent_deliver` | A stub. No report leaves the harness. |
 | `agent_discover_peers` | The recorded peers for the same names, or none. The candidate needs no roster. |
+| A child run of a fan-out | The recorded report of an unused child run with the same delegation chain and task text. With no match, the candidate run fails. No child runs live. |
 | Any other activity, such as `agent_precheck` | No mock. The candidate run fails. |
 
 A tool, snapshot or peer-lookup activity that failed the source fails the
@@ -1098,7 +1099,9 @@ let harness = AgentHarness::new(model)
 - **Per call.** A tool that opts in with `Tool::uses_workspace` gets the
   files in `ToolContext::workspace`. `SandboxTool` opts in: it mounts every
   file and asks for each one back, so a run keeps the files it changes. A
-  new file joins when the run names it in `outputs`. The tool-call activity
+  new file joins when the run names it in `outputs`. A file that the run
+  deletes leaves the workspace. So a file that the run moves joins only
+  when the run names its new path. The tool-call activity
   saves a changed workspace after a call that succeeds, and returns the new
   reference with the result. A read-only run reads the files, but its
   changes are not saved.

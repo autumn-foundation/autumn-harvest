@@ -518,8 +518,9 @@ let task = AgentTask::new("plan the trip")
 - A durable agent takes an interrupt only after the batch ends.
 - A single delegation, a gated one, or one to a durable peer runs inline,
   as before.
-- `eval::evaluate` answers each child run of a source with its recorded
-  report.
+- `eval::evaluate` answers each child run with the recorded report of the
+  child with the same delegation chain and task text. With no match, the
+  candidate fails.
 
 ## 16. Mesh-wide controls (issue #2272)
 

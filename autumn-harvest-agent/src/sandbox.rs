@@ -253,8 +253,15 @@ fn mount(request: &mut SandboxRequest, workspace: &WorkspaceHandle) {
 
 /// Keep each output file of `outcome` in the workspace (issue #2274). A
 /// file keeps its executable flag.
+///
+/// A file that the run deleted leaves the workspace, whatever the run
+/// status. A partial write stays in the same way. A file skipped for
+/// another reason, such as its size, keeps its old content.
 fn keep_outputs(workspace: &WorkspaceHandle, outcome: &SandboxOutcome) -> Result<(), AgentError> {
     workspace.with(|workspace| {
+        for skipped in outcome.skipped_outputs.iter().filter(|s| s.is_absent()) {
+            workspace.remove(&skipped.path);
+        }
         for output in &outcome.outputs {
             let executable = workspace
                 .get(&output.path)
@@ -419,7 +426,8 @@ mod tests {
 
     use autumn_harvest::sandbox::runtime::BoxFuture as SandboxFuture;
     use autumn_harvest::sandbox::{
-        OutputFile, RunStatus, SandboxBackend, SandboxJob, SandboxPolicy, SkippedOutput,
+        MISSING_OUTPUT_REASON, NOT_A_DIRECTORY_REASON, OutputFile, RunStatus, SandboxBackend,
+        SandboxJob, SandboxPolicy, SkippedOutput,
     };
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
@@ -882,6 +890,93 @@ mod tests {
             .unwrap();
         let after = workspace.snapshot();
         assert_eq!(after.read_text("notes.txt"), Some("hi!"));
+        assert!(after.is_dirty());
+    }
+
+    /// A backend that skips each asked output. `gone.txt` and each path
+    /// under `dir/` no longer exist. Each other path is too large.
+    struct GoneBackend;
+
+    impl SandboxBackend for GoneBackend {
+        fn isolation(&self) -> IsolationLevel {
+            IsolationLevel::MicroVm
+        }
+
+        fn supports_network(&self) -> bool {
+            false
+        }
+
+        fn execute(
+            &self,
+            job: SandboxJob,
+            _cancel: CancellationToken,
+        ) -> SandboxFuture<'_, Result<SandboxOutcome, SandboxError>> {
+            let skipped_outputs =
+                job.plan
+                    .outputs
+                    .iter()
+                    .map(|path| SkippedOutput {
+                        path: path.clone(),
+                        reason: match path.as_str() {
+                            "gone.txt" => MISSING_OUTPUT_REASON.to_owned(),
+                            p if p.starts_with("dir/") => NOT_A_DIRECTORY_REASON.to_owned(),
+                            _ => "the file holds 300000 bytes, over the limit of 262144 bytes"
+                                .to_owned(),
+                        },
+                    })
+                    .collect();
+            Box::pin(async move {
+                Ok(SandboxOutcome {
+                    status: RunStatus::Exited { code: 0 },
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                    outputs: Vec::new(),
+                    skipped_outputs,
+                    duration_ms: 1,
+                    isolation: IsolationLevel::MicroVm,
+                    image: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_that_deletes_a_file_removes_it_and_a_skipped_large_file_stays() {
+        let runtime = SandboxRuntime::new(Arc::new(GoneBackend), SandboxPolicy::default()).unwrap();
+        let tool = SandboxTool::new(Arc::new(runtime));
+        let mut files = crate::workspace::Workspace::default();
+        files.write("gone.txt", "hi").unwrap();
+        files.write("dir/x.txt", "x").unwrap();
+        files.write("big.txt", "old").unwrap();
+        let workspace = WorkspaceHandle::new(files);
+        let ctx = ToolContext {
+            workspace: Some(workspace.clone()),
+            ..ctx()
+        };
+        tool.execute(
+            json!({"runtime": "sh", "code": "rm -r gone.txt dir; touch dir"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let after = workspace.snapshot();
+        assert!(
+            after.get("gone.txt").is_none(),
+            "a deleted file leaves the workspace"
+        );
+        assert!(
+            after.get("dir/x.txt").is_none(),
+            "a file under a replaced directory leaves it"
+        );
+        assert_eq!(
+            after.read_text("big.txt"),
+            Some("old"),
+            "a size skip keeps the old content"
+        );
         assert!(after.is_dirty());
     }
 

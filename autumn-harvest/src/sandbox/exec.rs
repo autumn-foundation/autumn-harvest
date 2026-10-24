@@ -45,7 +45,10 @@ use tokio_util::sync::CancellationToken;
 use super::capture::StreamCapture;
 use super::error::SandboxError;
 use super::guest::PlanExecutor;
-use super::outcome::{MAX_SKIP_REASON_BYTES, OutputFile, RunStatus, SandboxOutcome, SkippedOutput};
+use super::outcome::{
+    MAX_SKIP_REASON_BYTES, MISSING_OUTPUT_REASON, NOT_A_DIRECTORY_REASON, OutputFile, RunStatus,
+    SandboxOutcome, SkippedOutput,
+};
 use super::policy::{IsolationLevel, NetworkPolicy, SandboxLimits};
 use super::request::ExecPlan;
 use super::runtime::BoxFuture;
@@ -1518,11 +1521,11 @@ fn collect_outputs_with(
 /// the path.
 fn read_output(root: &std::fs::File, path: &str, max: u64, cap: &str) -> Result<Vec<u8>, String> {
     let file = open_beneath(root, path).map_err(|e| match e.raw_os_error() {
-        Some(libc::ENOENT) => "the file does not exist".to_owned(),
+        Some(libc::ENOENT) => MISSING_OUTPUT_REASON.to_owned(),
         Some(libc::ELOOP | libc::EXDEV) => {
             "the path holds a symbolic link or leaves the work directory".to_owned()
         }
-        Some(libc::ENOTDIR) => "a parent of the path is not a directory".to_owned(),
+        Some(libc::ENOTDIR) => NOT_A_DIRECTORY_REASON.to_owned(),
         _ => format!("the file cannot be opened: {e}"),
     })?;
     let meta = file
@@ -2286,6 +2289,31 @@ mod tests {
         let out = run(sh("true").with_output("nope.txt")).await;
         assert_eq!(out.outputs, []);
         assert_eq!(out.skipped_outputs[0].path, "nope.txt");
+        // A workspace reads this skip as a deletion (issue #2274).
+        assert!(
+            out.skipped_outputs[0].is_absent(),
+            "{:?}",
+            out.skipped_outputs
+        );
+    }
+
+    #[tokio::test]
+    async fn an_output_under_a_file_is_absent_and_a_large_output_is_not() {
+        let request = sh("touch dir; head -c 300 /dev/zero > big.bin")
+            .with_output("dir/x.txt")
+            .with_output("big.bin");
+        let mut plan = plan(&request);
+        plan.max_output_file_bytes = 100;
+        let out = execute_plan(&plan, &options(), &CancellationToken::new())
+            .await
+            .expect("the run must reach an outcome");
+        assert_eq!(out.outputs, []);
+        let absent: Vec<_> = out
+            .skipped_outputs
+            .iter()
+            .map(SkippedOutput::is_absent)
+            .collect();
+        assert_eq!(absent, [true, false], "{:?}", out.skipped_outputs);
     }
 
     #[tokio::test]

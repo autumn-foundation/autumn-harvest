@@ -51,6 +51,10 @@
 //! its name. The lane alone is a delegation ordinal, so another peer can hold
 //! it.
 //!
+//! A child run of a fan-out takes the result of the first unused recorded
+//! child with the same delegation chain and task text. With no such child,
+//! the candidate fails with [`NO_CHILD_RUN`].
+//!
 //! A candidate call that equals the recorded call at the same turn and
 //! position, of the same agent, takes the recorded id. The ids change before
 //! the policy runs. Approval signal names hold the id, so the recorded
@@ -115,6 +119,11 @@ use crate::workflow::{
 /// outcome gets it.
 pub const NOT_RUN: &str =
     "not run: the evaluation has no recorded output for this call, and it runs no tool";
+
+/// The error of a child run of a fan-out that no recorded child answers
+/// (issue #2270). The candidate run fails with it.
+pub const NO_CHILD_RUN: &str =
+    "not run: the source has no child run with this delegation chain and task";
 
 /// The default number of live turns past the recorded turn count.
 pub const DEFAULT_EXTRA_TURNS: usize = 8;
@@ -458,15 +467,19 @@ pub async fn evaluate(
         move |names: Value| -> Result<Value, String> { encode(&lock(&session).lookup(&names)?) }
     };
 
-    // A child run of a fan-out takes the recorded result of the child at the
-    // same place. No child runs live.
+    // A child run of a fan-out takes the result of the first unused recorded
+    // child that it matches. No child runs live.
     let children = {
-        let recorded = Mutex::new(recording.children.clone().into_iter());
-        move |_task: Value| -> Result<Value, String> {
-            lock(&recorded)
-                .next()
-                .flatten()
-                .unwrap_or_else(|| Err("the source has no child run here".to_owned()))
+        let recorded = Mutex::new(recording.children.clone());
+        move |task: Value| -> Result<Value, String> {
+            let result = lock(&recorded)
+                .iter_mut()
+                .find(|child| !child.used && child.answers(&task))
+                .and_then(|child| {
+                    child.used = true;
+                    child.result.clone()
+                });
+            result.unwrap_or_else(|| Err(NO_CHILD_RUN.to_owned()))
         }
     };
 
@@ -602,9 +615,8 @@ struct Recording {
     peers: Vec<RecordedPeers>,
     /// The agent of each recorded model turn, in order.
     turn_agents: Vec<AgentKey>,
-    /// The result of each child run of a fan-out, in start order (issue
-    /// #2270). `None` for a child that has no result yet.
-    children: Vec<Option<Result<Value, String>>>,
+    /// The child runs of the fan-outs, in start order (issue #2270).
+    children: Vec<RecordedChild>,
     end: RunEnd,
 }
 
@@ -760,11 +772,36 @@ fn name_tool_agents(tools: &mut [RecordedTool], turn_agents: &[AgentKey]) {
     }
 }
 
+/// One child run of a fan-out of a source run (issue #2270).
+#[derive(Clone)]
+struct RecordedChild {
+    /// The child task, as history records it.
+    input: Value,
+    /// The result, or `None` for a child that has no result yet.
+    result: Option<Result<Value, String>>,
+    /// Whether a candidate child took the result. Each result answers one
+    /// child.
+    used: bool,
+}
+
+impl RecordedChild {
+    /// Whether this child answers the candidate child `task`.
+    ///
+    /// The two must have the same delegation chain and task text. The chain
+    /// names the delegating agents and the peer. The token share, the model
+    /// and the flow labels can differ.
+    fn answers(&self, task: &Value) -> bool {
+        ["/input", "/mandate/chain"]
+            .iter()
+            .all(|at| self.input.pointer(at) == task.pointer(at))
+    }
+}
+
 /// The child runs of the fan-outs of a source run (issue #2270).
 #[derive(Default)]
 struct Children {
-    /// The result of each child run, in start order.
-    results: Vec<Option<Result<Value, String>>>,
+    /// Each child run, in start order.
+    results: Vec<RecordedChild>,
     /// The place of each child run in `results`, by child id.
     index: HashMap<String, usize>,
 }
@@ -773,9 +810,15 @@ impl Children {
     /// Read one event. Returns `true` when it is a child-run event.
     fn read(&mut self, event: &WorkflowEvent) -> bool {
         let (child_id, result) = match event {
-            WorkflowEvent::ChildWorkflowStarted { child_id, .. } => {
+            WorkflowEvent::ChildWorkflowStarted {
+                child_id, input, ..
+            } => {
                 self.index.insert(child_id.to_string(), self.results.len());
-                self.results.push(None);
+                self.results.push(RecordedChild {
+                    input: input.clone(),
+                    result: None,
+                    used: false,
+                });
                 return true;
             }
             WorkflowEvent::ChildWorkflowCompleted { child_id, output } => {
@@ -787,7 +830,7 @@ impl Children {
             _ => return false,
         };
         if let Some(&at) = self.index.get(&child_id.to_string()) {
-            self.results[at] = Some(result);
+            self.results[at].result = Some(result);
         }
         true
     }

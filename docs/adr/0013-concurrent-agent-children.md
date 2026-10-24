@@ -64,8 +64,9 @@ sequenceDiagram
 - A child run starts with no released flow rules. An `UntilApproved` rule
   asks again in the child.
 - A durable agent takes an interrupt only after its batch ends.
-- `eval::evaluate` answers each child run of a source with its recorded
-  report. No child runs live.
+- `eval::evaluate` answers each child run with the recorded report of the
+  child with the same delegation chain and task text. With no match, the
+  candidate fails. No child runs live.
 - Each child run is a workflow, so it adds start and end events and a
   task row. Keep the bound low.
 - The engine limit stays. Two joined branches that each take many steps

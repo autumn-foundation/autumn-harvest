@@ -145,6 +145,16 @@ pub struct OutputFile {
     pub content: Vec<u8>,
 }
 
+/// The skip reason for an output path that has no file after the run.
+///
+/// A backend must give this exact text. A caller that keeps files across
+/// runs reads it as a deletion (issue #2274).
+pub const MISSING_OUTPUT_REASON: &str = "the file does not exist";
+
+/// The skip reason for an output path whose parent is not a directory after
+/// the run. No file exists at that path either.
+pub const NOT_A_DIRECTORY_REASON: &str = "a parent of the path is not a directory";
+
 /// One output file that the run does not return, and why.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedOutput {
@@ -152,6 +162,15 @@ pub struct SkippedOutput {
     pub path: String,
     /// Why the file is not in the outcome.
     pub reason: String,
+}
+
+impl SkippedOutput {
+    /// Whether no file exists at the path after the run. Each other skip,
+    /// such as a size limit, leaves a file that the outcome does not hold.
+    #[must_use]
+    pub fn is_absent(&self) -> bool {
+        self.reason == MISSING_OUTPUT_REASON || self.reason == NOT_A_DIRECTORY_REASON
+    }
 }
 
 /// The result of one sandbox run.

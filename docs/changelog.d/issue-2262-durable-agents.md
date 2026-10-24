@@ -640,6 +640,20 @@ A review from five angles found these. Each fix has a test.
   `a_reset_in_a_new_life_deletes_the_keys_of_an_old_life_on_a_fast_clock`
   cover it. A scratch name of `DirWorkspaceBlobs` holds a random UUID, so
   two hosts that share the folder never share one.
+- **Sandbox deletions.** A workspace file that a sandbox run deletes now
+  leaves the workspace. Before, the old content came back on the next call.
+  `SkippedOutput::is_absent` reads the skip reason. The constants
+  `MISSING_OUTPUT_REASON` and `NOT_A_DIRECTORY_REASON` fix its text. A file
+  over a size limit keeps its old content. The test
+  `a_run_that_deletes_a_file_removes_it_and_a_skipped_large_file_stays`
+  covers it.
+- **Eval fan-out.** `eval::evaluate` answers a child run of a fan-out with
+  the recorded child that has the same delegation chain and task text.
+  Before, it served the recorded results by start order, so a reordered or
+  changed fan-out read the answer of another peer. A child with no match
+  fails the candidate with `eval::NO_CHILD_RUN`. The tests
+  `a_reordered_fan_out_answers_each_child_from_its_own_recorded_run` and
+  `a_fan_out_child_with_no_recorded_run_fails_the_candidate` cover it.
 
 ### Advisory RUSTSEC-2026-0387 (crypto-bigint 0.5.5)
 
