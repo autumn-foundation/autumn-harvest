@@ -83,7 +83,7 @@ fails in these cases:
 | `OwnerLease` | Fenced owner lease of a decision partition (issue #2250) | design, six defects, reachability |
 | `AgentMesh` | Durable peer send between two agents (issue #2269) | design, three single-layer configs, four defects, reachability |
 | `AgentWorkspace` | Workspace head of a durable agent (issue #2274) | design, two defects, reachability |
-| `AgentWorkspaceRetention` | Workspace retention across the ops of a durable agent (issue #2274) | design, one defect, reachability |
+| `AgentWorkspaceRetention` | Workspace retention across the ops and lives of a durable agent (issue #2274) | design, three defects, reachability |
 
 **Ghost sequence numbers.** Each claim in the two claim models gets a ghost
 `seq`. The code has no such column. An invariant that compared
@@ -498,28 +498,40 @@ The model has one op, and the store never loses a blob on its own.
 
 #### `AgentWorkspaceRetention` — model (h)
 
-`formal/tla/AgentWorkspaceRetention.tla` models retention across ops. Each
-op commits a snapshot, which becomes the head, or resets the workspace. The
-op end schedules a retention activity with the head as its input, or a
-reset activity. An attempt of an activity can run at any later time. A
+`formal/tla/AgentWorkspaceRetention.tla` models retention across ops and
+lives. Each op commits a snapshot, which becomes the head, resets the
+workspace, or ends the life. The op end runs a retention activity with the
+head as its input, or a reset activity. The workflow waits for the first
+completed attempt. An older attempt can still run at any later time. A
 stale attempt whose lease the engine reclaimed is such a late attempt.
 
 | Action | Code |
 |---|---|
 | `Commit` | `WorkspaceStore::save` in the tool-call activity, then `adopt_workspace`. |
-| `Reset` | `Control::ResetWorkspace`, which schedules `agent_workspace_reset`. |
-| `Run` | One attempt of `agent_workspace_retain` or `agent_workspace_reset`. |
+| `Reset` | `Control::ResetWorkspace`, which runs `agent_workspace_reset`. |
+| `NewLife` | A delete, then a new run. `agent_workspace_floor` gives the floor. |
+| `Complete` | The first completed attempt of an activity. |
+| `Run` | A later attempt of `agent_workspace_retain` or `agent_workspace_reset`. |
 
 | Config | Switch | Result |
 |---|---|---|
-| `AgentWorkspaceRetention.cfg` | None: `KeyBy = "generation"`. | Pass. |
+| `AgentWorkspaceRetention.cfg` | None: `KeyBy = "generation"`, `FloorBy = "store"`, `MarkReset = TRUE`. | Pass. |
 | `AgentWorkspaceRetentionContentKeys.cfg` | `KeyBy = "content"` | Violates `HeadPresent`. |
+| `AgentWorkspaceRetentionClockFloor.cfg` | `FloorBy = "clock"` | Violates `HeadPresent`. |
+| `AgentWorkspaceRetentionNoMarker.cfg` | `MarkReset = FALSE` | Violates `HeadPresent`. |
 | `AgentWorkspaceRetentionReach.cfg` | None. | Violates `NoStaleRun`. |
 
 With content keys, a stale retention keeps its old input head and deletes
 every other key, the newer head too. A key that holds the generation of
-its op fixes it. Retention deletes only the keys of older generations, so
-a newer head survives, also when it has the same content as an old one.
+its op fixes it within one life. Retention deletes only the keys of the
+head generation or older, so a newer head survives, also when it has the
+same content as an old one.
+
+A new life starts with no state, so its generation needs a floor. A clock
+can read low, and the new life then reuses old generations. A late attempt
+of the old life deletes the new head. The design reads the floor from the
+store: the highest key, or the marker that a reset leaves at its bound.
+Without the marker, a reset that empties the store gives a floor of 0.
 
 ### Extend a model
 

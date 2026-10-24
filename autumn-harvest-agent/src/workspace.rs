@@ -24,10 +24,12 @@
 //! - **Retention.** The end of each op that changed the head deletes every
 //!   other snapshot of its generation or older, stale ones included.
 //!   `Control::ResetWorkspace` deletes every snapshot below its own
-//!   generation. A stale attempt of either activity can run after a newer
-//!   op. It then deletes only older keys, so it never deletes a newer head,
-//!   also when that head has old content. `formal/tla/AgentWorkspaceRetention.tla`
-//!   checks this.
+//!   generation and leaves an empty marker at it. A stale attempt of either
+//!   activity can run after a newer op. It then deletes only older keys, so
+//!   it never deletes a newer head, also when that head has old content.
+//! - **Lives.** A new life of an agent starts above the highest key or
+//!   marker in its scope. So no attempt of an old life deletes a key of the
+//!   new one. `formal/tla/AgentWorkspaceRetention.tla` checks both.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -81,13 +83,32 @@ impl WorkspaceRef {
 /// [`WorkspaceRef::key`].
 fn key_generation(key: &str) -> Option<u64> {
     let (generation, digest) = key.split_once('-')?;
-    let hex_digits = |text: &str, len: usize| {
-        text.len() == len && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    };
     if !hex_digits(generation, 16) || !hex_digits(digest, 64) {
         return None;
     }
     u64::from_str_radix(generation, 16).ok()
+}
+
+/// The suffix of the key of a reset marker.
+const RESET_MARKER: &str = "reset";
+
+/// The key of the marker that a reset below `below` leaves.
+fn reset_marker(below: u64) -> String {
+    format!("{below:016x}-{RESET_MARKER}")
+}
+
+/// The bound in `key`, when `key` is a reset marker.
+fn marker_generation(key: &str) -> Option<u64> {
+    let (generation, tag) = key.split_once('-')?;
+    if tag != RESET_MARKER || !hex_digits(generation, 16) {
+        return None;
+    }
+    u64::from_str_radix(generation, 16).ok()
+}
+
+/// `text` is `len` lowercase hex digits.
+fn hex_digits(text: &str, len: usize) -> bool {
+    text.len() == len && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The workspace that a tool call mounts.
@@ -394,11 +415,10 @@ impl DirWorkspaceBlobs {
         self.root.join(hex(&Sha256::digest(scope.as_bytes())))
     }
 
-    /// The file of `key`. A key that does not have the form of
-    /// [`WorkspaceRef::key`] is refused, so it can never name a path
-    /// outside the folder.
+    /// The file of `key`. A key that is not a snapshot key or a reset
+    /// marker is refused, so it can never name a path outside the folder.
     fn file(&self, scope: &str, key: &str) -> Result<PathBuf, AgentError> {
-        if key_generation(key).is_some() {
+        if key_generation(key).is_some() || marker_generation(key).is_some() {
             Ok(self.folder(scope).join(key))
         } else {
             Err(AgentError::new(
@@ -430,15 +450,15 @@ async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<
     file.flush().await
 }
 
-/// A scratch path next to `path` that no other put of this process uses.
+/// A scratch path next to `path` that no other put uses.
 ///
-/// Two attempts of one turn can save the same digest at the same time. A
-/// shared scratch file would mix their bytes.
+/// Two attempts of one turn can save the same key at the same time, also on
+/// two hosts that share the folder. A shared scratch file would mix their
+/// bytes. A process id is not enough, because each container can run as
+/// process 1, so the name holds a random UUID.
 fn scratch_path(path: &std::path::Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    path.with_extension(format!("tmp-{}-{n}", std::process::id()))
+    let tag = autumn_harvest::uuid::Uuid::new_v4().simple();
+    path.with_extension(format!("tmp-{tag}"))
 }
 
 impl WorkspaceBlobs for DirWorkspaceBlobs {
@@ -454,8 +474,6 @@ impl WorkspaceBlobs for DirWorkspaceBlobs {
                 .await
                 .map_err(|e| io_error(&e))?;
             let tmp = scratch_path(&path);
-            // A crashed process with the same id can leave this name behind.
-            let _ = tokio::fs::remove_file(&tmp).await;
             let written = match write_private(&tmp, &bytes).await {
                 Ok(()) => tokio::fs::rename(&tmp, &path).await,
                 Err(err) => Err(err),
@@ -707,17 +725,49 @@ impl WorkspaceStore {
         .await
     }
 
-    /// Delete every snapshot of `scope` below the generation `below`.
-    /// Returns the number deleted.
+    /// Delete every snapshot and reset marker of `scope` below the
+    /// generation `below`, and every key in another form. Then leave a
+    /// reset marker at `below`. Returns the number deleted.
+    ///
+    /// A key in another form is never a head, so an erasure removes it too.
+    /// The marker is empty. It keeps the bound for
+    /// [`Self::highest_generation`], so a new life starts above it.
     ///
     /// # Errors
     ///
     /// Returns an error when the store fails.
     pub async fn reset(&self, scope: &str, below: u64) -> Result<u64, AgentError> {
-        self.delete_where(scope, |key| {
-            key_generation(key).is_some_and(|generation| generation < below)
-        })
-        .await
+        let deleted = self
+            .delete_where(scope, |key| {
+                key_generation(key)
+                    .or_else(|| marker_generation(key))
+                    .is_none_or(|generation| generation < below)
+            })
+            .await?;
+        self.blobs
+            .put(scope, &reset_marker(below), Vec::new())
+            .await?;
+        Ok(deleted)
+    }
+
+    /// The highest generation of a snapshot or a reset marker in `scope`,
+    /// or 0 when it has none.
+    ///
+    /// A new life of an agent starts above it, so no attempt of an old life
+    /// deletes a key of the new one. The marker counts too: after a reset
+    /// empties the scope, a late attempt of that reset still deletes only
+    /// keys below its bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store fails.
+    pub async fn highest_generation(&self, scope: &str) -> Result<u64, AgentError> {
+        let keys = self.blobs.list(scope).await?;
+        Ok(keys
+            .iter()
+            .filter_map(|key| key_generation(key).or_else(|| marker_generation(key)))
+            .max()
+            .unwrap_or(0))
     }
 
     /// Delete every key of `scope`, of any generation. Returns the number
@@ -946,6 +996,39 @@ mod tests {
         assert_eq!(store.reset("s", 2).await.unwrap(), 0);
         assert!(blobs.get("s", &before.key()).await.unwrap().is_none());
         assert!(blobs.get("s", &after.key()).await.unwrap().is_some());
+        assert_eq!(store.highest_generation("s").await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn retain_keeps_a_foreign_key_and_reset_deletes_it() {
+        let blobs = Arc::new(InMemoryWorkspaceBlobs::default());
+        let store = store(&blobs);
+        let mut workspace = Workspace::default();
+        workspace.write("a", "one").unwrap();
+        let head = store.save("s", 1, &workspace).await.unwrap();
+        blobs.put("s", "foreign", b"x".to_vec()).await.unwrap();
+        store.retain("s", &head).await.unwrap();
+        assert!(blobs.get("s", "foreign").await.unwrap().is_some());
+        assert_eq!(store.reset("s", 2).await.unwrap(), 2);
+        assert_eq!(blobs.list("s").await.unwrap(), [reset_marker(2)]);
+    }
+
+    #[tokio::test]
+    async fn a_reset_marker_keeps_the_floor_of_an_empty_scope() {
+        let blobs = Arc::new(InMemoryWorkspaceBlobs::default());
+        let store = store(&blobs);
+        assert_eq!(store.highest_generation("s").await.unwrap(), 0);
+        let mut workspace = Workspace::default();
+        workspace.write("a", "one").unwrap();
+        store.save("s", 4, &workspace).await.unwrap();
+        store.reset("s", 9).await.unwrap();
+        // The scope holds no snapshot, but a new life still starts above 9.
+        assert_eq!(store.highest_generation("s").await.unwrap(), 9);
+        // A later reset replaces the marker. A late older one keeps both.
+        store.reset("s", 12).await.unwrap();
+        store.reset("s", 9).await.unwrap();
+        assert_eq!(store.highest_generation("s").await.unwrap(), 12);
+        assert_eq!(store.erase("s").await.unwrap(), 2, "erase deletes markers");
     }
 
     #[test]
@@ -961,6 +1044,9 @@ mod tests {
         assert_eq!(key_generation(&"ab".repeat(32)), None, "a bare digest");
         assert_eq!(key_generation(&format!("{}-x", "0".repeat(16))), None);
         assert_eq!(key_generation(&head.key().to_uppercase()), None);
+        assert_eq!(marker_generation(&reset_marker(0x1f)), Some(0x1f));
+        assert_eq!(marker_generation(&head.key()), None);
+        assert_eq!(key_generation(&reset_marker(0x1f)), None);
     }
 
     #[tokio::test]
@@ -1022,6 +1108,9 @@ mod tests {
         );
         assert!(blobs.get("agent:x/y", "../../etc/passwd").await.is_err());
         assert!(blobs.get("agent:x/y", &"a".repeat(64)).await.is_err());
+        let marker = reset_marker(7);
+        blobs.put("agent:x/y", &marker, Vec::new()).await.unwrap();
+        assert!(blobs.delete("agent:x/y", &marker).await.unwrap());
         assert!(blobs.delete("agent:x/y", &digest).await.unwrap());
         assert!(!blobs.delete("agent:x/y", &digest).await.unwrap());
     }

@@ -625,13 +625,21 @@ A review from five angles found these. Each fix has a test.
   newer head, because a key was the content digest only. The key now holds
   the generation of its segment, and `WorkspaceRef::generation` records it.
   Retention deletes only keys of the head generation or older, and a reset
-  only keys below its own generation. `next_generation` keeps it above the
-  last one and at least the recorded time. The model
-  `formal/tla/AgentWorkspaceRetention.tla` and the tests
+  only keys below its own generation, plus keys in another form. A reset
+  leaves an empty marker at its generation. The first generation of a life
+  is above every key and marker in the scope: the new activity
+  `agent_workspace_floor` reads it. A worker clock that reads low then
+  cannot put a new life below an old one. The model
+  `formal/tla/AgentWorkspaceRetention.tla` (lives, a clock floor and a
+  missing marker as counterexamples) and the tests
   `a_stale_retain_never_deletes_a_newer_head`,
   `a_newer_head_with_old_content_survives_a_stale_retain`,
-  `a_stale_reset_never_deletes_a_later_head` and
-  `a_late_retention_of_an_old_op_keeps_the_newest_head` cover it.
+  `a_stale_reset_never_deletes_a_later_head`,
+  `a_reset_marker_keeps_the_floor_of_an_empty_scope`,
+  `a_late_retention_of_an_old_op_keeps_the_newest_head` and
+  `a_reset_in_a_new_life_deletes_the_keys_of_an_old_life_on_a_fast_clock`
+  cover it. A scratch name of `DirWorkspaceBlobs` holds a random UUID, so
+  two hosts that share the folder never share one.
 
 ### Advisory RUSTSEC-2026-0387 (crypto-bigint 0.5.5)
 

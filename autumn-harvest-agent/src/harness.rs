@@ -1242,6 +1242,22 @@ impl AgentHarness {
         deleted.map_err(|err| model_failure(&err))
     }
 
+    /// The highest generation of a key in `scope` (issue #2274), or 0. With
+    /// no store installed it is 0.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error.
+    pub async fn workspace_floor(&self, scope: &str) -> Result<u64, String> {
+        let Some(store) = &self.workspace else {
+            return Ok(0);
+        };
+        store
+            .highest_generation(scope)
+            .await
+            .map_err(|err| model_failure(&err))
+    }
+
     /// Delete every snapshot of the scope of `mount` below its generation
     /// (issue #2274). Returns the number deleted. With no store installed
     /// it deletes nothing, so an erase of an agent with no workspace
@@ -1873,6 +1889,17 @@ mod tests {
         assert!(json_len(&fitted) <= 1_024);
     }
 
+    // harvest-verify reads a type name that stands alone in a `proptest!`
+    // body as one the macro can declare. It then counts the type, and each
+    // type that holds it, as writable. So the empty values are built here.
+    fn no_content() -> Vec<ContentPart> {
+        Vec::new()
+    }
+
+    fn no_decisions() -> Vec<ToolDecision> {
+        Vec::new()
+    }
+
     proptest::proptest! {
         #[test]
         fn a_fitted_turn_fits_or_is_the_typed_outcome(
@@ -1889,8 +1916,8 @@ mod tests {
             proptest::prop_assert_eq!(&fit_turn(turn.clone(), 0), &turn);
             let fitted = fit_turn(turn.clone(), cap);
             if fitted.oversized {
-                proptest::prop_assert_eq!(&fitted.content, &Vec::<ContentPart>::new());
-                proptest::prop_assert_eq!(&fitted.decisions, &Vec::<ToolDecision>::new());
+                proptest::prop_assert_eq!(&fitted.content, &no_content());
+                proptest::prop_assert_eq!(&fitted.decisions, &no_decisions());
                 proptest::prop_assert_eq!(fitted.usage, turn.usage);
             } else {
                 proptest::prop_assert!(json_len(&fitted) <= cap);

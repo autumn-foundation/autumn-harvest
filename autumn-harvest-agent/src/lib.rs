@@ -98,8 +98,8 @@ pub use agent::{
     AgentProfile, AgentState, AgentStatus, Control, HeartbeatSetting, INTERRUPT_SIGNAL, Interrupt,
     PeerEnvelope, PeerReply, STEER_SIGNAL, Steer, Urgency, UserMessage, agent, agent_info,
     agent_memory_reset, agent_memory_reset_info, agent_profile, agent_profile_info,
-    agent_workspace_reset, agent_workspace_reset_info, agent_workspace_retain,
-    agent_workspace_retain_info,
+    agent_workspace_floor, agent_workspace_floor_info, agent_workspace_reset,
+    agent_workspace_reset_info, agent_workspace_retain, agent_workspace_retain_info,
 };
 pub use approval::Approval;
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};

@@ -485,13 +485,18 @@ pub struct PeerReply {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
+// `PeerMessage` holds its envelope inline for harvest-verify. See there.
+#[allow(clippy::large_enum_variant)]
 pub enum AgentOp {
     /// A message from a person.
     UserMessage(UserMessage),
     /// A control op.
     Control(Control),
     /// A message from another agent (issue #2269).
-    PeerMessage(Box<PeerEnvelope>),
+    ///
+    /// The envelope is not boxed. A box deref is a raw pointer in MIR, and
+    /// `harvest-verify` cannot prove a workflow that reads one.
+    PeerMessage(PeerEnvelope),
     /// A heartbeat tick (issue #2266). Only the wake hook makes it, so it
     /// does not decode from a signal.
     #[serde(skip_deserializing)]
@@ -528,8 +533,8 @@ impl AgentOp {
 
     /// A message from another agent.
     #[must_use]
-    pub fn peer(envelope: PeerEnvelope) -> Self {
-        Self::PeerMessage(Box::new(envelope))
+    pub const fn peer(envelope: PeerEnvelope) -> Self {
+        Self::PeerMessage(envelope)
     }
 
     /// A message with an id and an urgency. See [`Urgency`].
@@ -1043,7 +1048,8 @@ pub struct AgentState {
     pub workspace_labels: BTreeSet<String>,
     /// The generation of the last segment or reset that mounted the
     /// workspace. Each one is above the last one and at least the recorded
-    /// time, so a new life after a delete also starts above the old keys.
+    /// time. The first one of a life is above every key in the scope, read
+    /// by the activity `agent_workspace_floor`.
     #[serde(skip_serializing_if = "is_zero")]
     pub workspace_generation: u64,
 }
@@ -1057,8 +1063,8 @@ const fn is_zero(value: &u64) -> bool {
 /// `now_ms`.
 ///
 /// It is above `last`, so it grows within one life of the agent. It is at
-/// least the time, so a new life after a delete also starts above the keys
-/// of the old life.
+/// least the time. A new life also starts above the store floor, see
+/// `AgentRun::workspace_floor`.
 fn next_generation(last: u64, now_ms: i64) -> u64 {
     last.saturating_add(1)
         .max(u64::try_from(now_ms).unwrap_or(0))
@@ -1160,6 +1166,20 @@ impl Agent {
     }
 }
 
+/// Handle one op of `run`.
+///
+/// The handler closure returns this future, not the future of
+/// [`AgentRun::handle`]. harvest-verify reads a future type that names a
+/// lifetime, as `AgentRun<'_>` does, as one that can write through its
+/// fields. The future also stays unboxed, so harvest-verify can follow it.
+async fn handle_op(
+    run: &AgentRun<'_>,
+    state: AgentState,
+    op: AgentOp,
+) -> Result<AgentState, String> {
+    run.handle(state, op).await
+}
+
 /// The parts of one run that every op reads.
 struct AgentRun<'a> {
     ctx: &'a WorkflowContext,
@@ -1180,8 +1200,13 @@ struct AgentRun<'a> {
 ///
 /// Returns an engine error of the entity loop, for example a cancel.
 #[workflow]
+// The entity future holds the op future inline. The engine keeps the
+// workflow future on the heap, so a box here adds only an allocation.
+#[allow(clippy::large_futures)]
 pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<AgentState, String> {
-    let id = AgentId::parse(ctx.workflow_id()).map_err(|err| err.to_string());
+    // `format!` and not `to_string`: harvest-verify trusts `format`, but not
+    // the blanket `ToString` impl on a type of this crate.
+    let id = AgentId::parse(ctx.workflow_id()).map_err(|err| format!("{err}"));
     // A failed lookup fails each work op of this run with a named error. The
     // run and its carried state stay, so the next run looks again.
     let mut profile = match &id {
@@ -1220,8 +1245,7 @@ pub async fn agent(ctx: &WorkflowContext, input: serde_json::Value) -> Result<Ag
     let profile = run.profile.as_ref().ok();
     entity
         .run_with_wakes(
-            // The op future is large, so it lives on the heap.
-            |state, op: AgentOp| Box::pin(run.handle(state, op)),
+            |state, op: AgentOp| handle_op(&run, state, op),
             |state: &AgentState| {
                 let (at, op) = state.next_wake(profile)?;
                 Some(Wake::new(
@@ -1450,18 +1474,70 @@ impl AgentRun<'_> {
         let Ok(id) = &self.id else {
             return Ok(());
         };
-        let now = self.ctx.system_now().timestamp_millis();
-        state.workspace_generation = next_generation(state.workspace_generation, now);
+        let scope = WorkspaceMount::agent_scope(id.as_str());
+        let generation = self.next_workspace_generation(state, &scope).await?;
         let mount = WorkspaceMount {
-            scope: WorkspaceMount::agent_scope(id.as_str()),
+            scope,
             head: None,
-            generation: state.workspace_generation,
+            generation,
         };
         self.ctx
             .execute_activity(&agent_workspace_reset_info(), mount)
             .await
             .map(|_deleted: u64| ())
             .map_err(|err| err.to_string())
+    }
+
+    /// Mount `head` in the workspace of `task`, at the next workspace
+    /// generation (issue #2274). A task with no workspace is left as it is.
+    ///
+    /// Each segment saves at a new generation, so retention never deletes a
+    /// snapshot of a newer segment.
+    async fn mount_workspace(
+        &self,
+        state: &mut AgentState,
+        task: &mut AgentTask,
+        head: Option<&WorkspaceRef>,
+    ) -> Result<(), String> {
+        let Some(mount) = task.workspace.as_mut() else {
+            return Ok(());
+        };
+        mount.head = head.cloned();
+        mount.generation = self.next_workspace_generation(state, &mount.scope).await?;
+        Ok(())
+    }
+
+    /// Take the next workspace generation of the agent (issue #2274). The
+    /// first one of a life is above the floor of `scope`.
+    async fn next_workspace_generation(
+        &self,
+        state: &mut AgentState,
+        scope: &str,
+    ) -> Result<u64, String> {
+        self.workspace_floor(state, scope).await?;
+        let now = self.ctx.system_now().timestamp_millis();
+        state.workspace_generation = next_generation(state.workspace_generation, now);
+        Ok(state.workspace_generation)
+    }
+
+    /// Lift the workspace generation of a new life above every key in
+    /// `scope` (issue #2274).
+    ///
+    /// A life starts at generation 0. The recorded floor puts its first
+    /// generation above the keys of an old life, whatever the clock of the
+    /// worker reads. So a reset in the new life deletes those keys, and a
+    /// late attempt of the old life deletes no key of the new one.
+    async fn workspace_floor(&self, state: &mut AgentState, scope: &str) -> Result<(), String> {
+        if state.workspace_generation > 0 {
+            return Ok(());
+        }
+        let floor: u64 = self
+            .ctx
+            .execute_activity(&agent_workspace_floor_info(), scope.to_owned())
+            .await
+            .map_err(|err| err.to_string())?;
+        state.workspace_generation = floor;
+        Ok(())
     }
 
     /// Delete the workspace snapshots older than the head of the agent,
@@ -1509,7 +1585,7 @@ impl AgentRun<'_> {
                 }
                 state
             }
-            AgentOp::PeerMessage(envelope) => self.peer_message(state, *envelope).await,
+            AgentOp::PeerMessage(envelope) => self.peer_message(state, envelope).await,
             AgentOp::HeartbeatTick => self.tick(state).await,
             AgentOp::FollowupDue => {
                 if state.followup_due_ms.take().is_none() {
@@ -1679,10 +1755,8 @@ impl AgentRun<'_> {
             }
         };
         if let Some(Err(err)) = profile.mandate.as_ref().map(Mandate::validate) {
-            fail(
-                &mut state,
-                &format!("the profile mandate is not valid: {err}"),
-            );
+            let reason = format!("the profile mandate is not valid: {err}");
+            fail(&mut state, &reason);
             return (state, None);
         }
         // An interrupt that arrived while no op ran is stale.
@@ -1698,13 +1772,12 @@ impl AgentRun<'_> {
             task.read_only |= mandate.read_only;
         }
         let head = state.workspace.clone();
-        if let Some(mount) = task.workspace.as_mut() {
-            mount.head.clone_from(&head);
-            // Each segment saves at a new generation, so retention never
-            // deletes a snapshot of a newer segment.
-            let now = self.ctx.system_now().timestamp_millis();
-            state.workspace_generation = next_generation(state.workspace_generation, now);
-            mount.generation = state.workspace_generation;
+        if let Err(err) = self
+            .mount_workspace(&mut state, &mut task, head.as_ref())
+            .await
+        {
+            fail(&mut state, &err);
+            return (state, None);
         }
         let run_id = format!("{}:s{}", state.incarnation, state.segments);
         state.segments = state.segments.saturating_add(1);
@@ -1751,9 +1824,8 @@ impl AgentRun<'_> {
                 }
                 state.last_stop = Some(stop);
                 state.last_answer = Some(answer.clone());
-                // A follow-up runs only after a segment that completed. Its
-                // delay counts from the end of the segment, so a long segment
-                // never books a follow-up that is already due.
+                // A follow-up runs only after a completed segment. Its delay
+                // counts from the segment end, so it is never due at once.
                 if let Some(planned) = progress.followup.take()
                     && stop == AgentStop::Completed
                 {
@@ -2029,6 +2101,20 @@ pub async fn agent_workspace_retain(
     mount: WorkspaceMount,
 ) -> Result<u64, String> {
     harness(ctx)?.workspace_retain(mount).await
+}
+
+/// The highest generation of a workspace key in `scope`, as an activity
+/// (issue #2274). A new life of an agent starts above it. It only reads.
+///
+/// # Errors
+///
+/// Returns an error when the store fails.
+#[activity(
+    start_to_close = "5m",
+    retry = RetryPolicy::exponential(3, Duration::from_secs(1))
+)]
+pub async fn agent_workspace_floor(ctx: &ActivityContext, scope: String) -> Result<u64, String> {
+    harness(ctx)?.workspace_floor(&scope).await
 }
 
 /// Delete every workspace snapshot of the scope of `mount` below its

@@ -44,4 +44,6 @@ AgentWorkspace     AgentWorkspaceRetainAnyTime.cfg     violation:HeadPresent
 AgentWorkspace     AgentWorkspaceReach.cfg             violation:SomeStaleWriteUnseen
 AgentWorkspaceRetention AgentWorkspaceRetention.cfg            pass
 AgentWorkspaceRetention AgentWorkspaceRetentionContentKeys.cfg violation:HeadPresent
+AgentWorkspaceRetention AgentWorkspaceRetentionClockFloor.cfg  violation:HeadPresent
+AgentWorkspaceRetention AgentWorkspaceRetentionNoMarker.cfg    violation:HeadPresent
 AgentWorkspaceRetention AgentWorkspaceRetentionReach.cfg       violation:NoStaleRun

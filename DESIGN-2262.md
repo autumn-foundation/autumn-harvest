@@ -384,9 +384,10 @@ Every steer and every op is a staged signal before it is acknowledged.
 - Retention keeps one snapshot, the head, after each op that moved it.
   `formal/tla/AgentWorkspace.tla` shows why it waits for the op end.
 - **Changed in review.** A key holds the generation of its segment, so a
-  late attempt of a retention or a reset deletes only older keys.
-  `formal/tla/AgentWorkspaceRetention.tla` shows that content keys let it
-  delete a newer head.
+  late attempt of a retention or a reset deletes only older keys. A new
+  life starts above every key and reset marker in the scope.
+  `formal/tla/AgentWorkspaceRetention.tla` shows that content keys, a clock
+  floor or a reset with no marker each let a late attempt delete a head.
 
 ---
 

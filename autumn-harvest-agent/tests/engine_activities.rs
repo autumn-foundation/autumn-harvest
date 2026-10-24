@@ -265,6 +265,7 @@ fn the_engine_registration_builds() {
             "agent_memory_reset",
             "agent_workspace_retain",
             "agent_workspace_reset",
+            "agent_workspace_floor",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();

@@ -29,8 +29,8 @@ use crate::agent::{
     Steer,
 };
 use crate::agent::{
-    agent_info, agent_memory_reset_info, agent_profile_info, agent_workspace_reset_info,
-    agent_workspace_retain_info,
+    agent_info, agent_memory_reset_info, agent_profile_info, agent_workspace_floor_info,
+    agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
 use crate::bounds::{RoundBudget, exceeds_bytes, json_len, sibling_cap};
@@ -1620,7 +1620,7 @@ fn state_memory_edit(
 ) -> ToolOutcome {
     let edit = serde_json::from_value::<MemoryOp>(call.arguments.clone())
         .map_err(|err| format!("not a valid memory edit: {err}"))
-        .and_then(|op| apply_to(blocks, &op, labels).map_err(|err| err.to_string()));
+        .and_then(|op| apply_to(blocks, &op, labels).map_err(|err| format!("{err}")));
     match edit {
         Ok(block) => ToolOutcome::ok(edit_result(&block).to_string()),
         Err(reason) => ToolOutcome::error(&reason),
@@ -1849,14 +1849,17 @@ async fn fan_out(
         }
         children.push((sibling.position, sibling.peer, child));
     }
-    // Each future sends its start command at its first poll, in order.
-    let started = children.iter().map(|(_, _, child)| async move {
+    // The engine fan-out records the children in order and waits for all
+    // of them, so the result order never depends on completion order.
+    let mut inputs = Vec::with_capacity(children.len());
+    for (_, _, child) in &children {
         let input = serde_json::to_value(child).map_err(|err| err.to_string())?;
-        ctx.spawn_child_workflow_raw(WORKFLOW_NAME, input)
-            .await
-            .map_err(|err| err.to_string())
-    });
-    let ended = futures::future::join_all(started).await;
+        inputs.push((WORKFLOW_NAME.to_owned(), input));
+    }
+    let ended = ctx
+        .spawn_child_workflow_fan_out_collect_raw(inputs)
+        .await
+        .map_err(|err| err.to_string())?;
     for ((position, peer, child), output) in children.into_iter().zip(ended) {
         let report: AgentReport = serde_json::from_value(output?).map_err(|err| err.to_string())?;
         outcomes[position] = Some(merge_child(progress, tree, peer, child, &report));
@@ -1979,7 +1982,7 @@ async fn durable_peer(
             AGENT_WORKFLOW_NAME,
             target_id,
             ENTITY_OP_SIGNAL,
-            EntityMessage::op(AgentOp::PeerMessage(Box::new(envelope))),
+            EntityMessage::op(AgentOp::PeerMessage(envelope)),
             key,
         )
         .await;
@@ -2459,6 +2462,7 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_memory_reset_info(),
         agent_workspace_retain_info(),
         agent_workspace_reset_info(),
+        agent_workspace_floor_info(),
     ]
 }
 

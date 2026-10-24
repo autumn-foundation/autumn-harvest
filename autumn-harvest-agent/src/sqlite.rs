@@ -28,8 +28,8 @@ use serde_json::Value;
 
 use crate::agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentId, AgentOp, AgentState, Control, INTERRUPT_SIGNAL, Interrupt,
-    agent_info, agent_memory_reset_info, agent_profile_info, agent_workspace_reset_info,
-    agent_workspace_retain_info,
+    agent_info, agent_memory_reset_info, agent_profile_info, agent_workspace_floor_info,
+    agent_workspace_reset_info, agent_workspace_retain_info,
 };
 use crate::approval::Approval;
 use crate::error::{AgentError, ErrorKind};
@@ -65,6 +65,13 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_workspace_retain_info(), move |input| {
         call(input, |mount| h.workspace_retain(mount))
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity_with_body(&agent_workspace_floor_info(), move |input| {
+        call(input, |scope: String| {
+            let h = Arc::clone(&h);
+            async move { h.workspace_floor(&scope).await }
+        })
     });
     let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_workspace_reset_info(), move |input| {

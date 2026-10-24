@@ -102,7 +102,8 @@ let built = HarvestBuilder::new()
 `agent` (section 15). `activities()` returns `agent_model_turn`,
 `agent_tool_call`, `agent_memory_snapshot`, `agent_deliver`,
 `agent_precheck`, `agent_discover_peers`, `agent_profile`,
-`agent_memory_reset`, `agent_workspace_retain` and `agent_workspace_reset`.
+`agent_memory_reset`, `agent_workspace_retain`, `agent_workspace_reset` and
+`agent_workspace_floor`.
 The test `the_engine_registration_builds` builds this
 exact registration.
 
@@ -1088,8 +1089,10 @@ let harness = AgentHarness::new(model)
   content. A load checks the digest, so a changed blob fails loudly.
 - **Generations.** The key of a snapshot is its generation and its digest.
   The agent gives each segment and each reset a generation above the last
-  one, and at least the recorded time. A new life after a delete therefore
-  also starts above the keys of the old life.
+  one, and at least the recorded time. The first generation of a life is
+  also above every key and reset marker in the scope. The recorded
+  activity `agent_workspace_floor` reads it. So a new life after a delete
+  starts above the old keys, whatever the clock of a worker reads.
 - **Encrypted.** The payload codecs of the engine encode each snapshot. An
   active AEAD key therefore encrypts it at rest.
 - **Per call.** A tool that opts in with `Tool::uses_workspace` gets the
@@ -1122,8 +1125,9 @@ larger than its files.
 **Retention.** A workspace keeps one snapshot: its head. The end of each op
 that moved the head deletes every other snapshot of the head generation or
 older, the blobs of stale attempts included. `Control::ResetWorkspace`
-deletes every snapshot below its own generation. `harvest agents erase`
-sends it before the delete. The engine can reclaim the lease of either
+deletes every snapshot below its own generation, and every key in another
+form. It leaves an empty marker at its generation, so a later life starts
+above it. `harvest agents erase` sends it before the delete. The engine can reclaim the lease of either
 activity and start a new attempt, and the old attempt can still run after a
 newer op. It then deletes only older keys, so it never deletes a newer head,
 also when that head has the content of an old one.

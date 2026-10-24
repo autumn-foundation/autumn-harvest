@@ -313,7 +313,20 @@ async fn a_reset_removes_every_snapshot_and_the_store_holds_only_ciphertext() {
     sqlite::drive(&mut rt, &agent).await.unwrap();
     let reset = state(&rt, &agent).await;
     assert_eq!(reset.workspace, None);
-    assert_eq!(blobs.list(&scope).await.unwrap(), Vec::<String>::new());
+    assert_eq!(held_keys(&blobs, &scope).await, Vec::<String>::new());
+}
+
+/// The keys of `scope` that hold bytes. A reset leaves only an empty
+/// marker, which keeps its bound.
+async fn held_keys(blobs: &InMemoryWorkspaceBlobs, scope: &str) -> Vec<String> {
+    let mut held = Vec::new();
+    for key in blobs.list(scope).await.unwrap() {
+        let bytes = blobs.get(scope, &key).await.unwrap().unwrap_or_default();
+        if !bytes.is_empty() {
+            held.push(key);
+        }
+    }
+    held
 }
 
 /// A store whose blobs live in memory, with no codec.
@@ -456,4 +469,43 @@ async fn a_late_retention_of_an_old_op_keeps_the_newest_head() {
     let loaded = store.load(&mount).await.unwrap();
     assert_eq!(loaded.read_text("a.txt"), Some("two"));
     assert_eq!(blobs.list(&scope).await.unwrap(), [second.key()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_in_a_new_life_deletes_the_keys_of_an_old_life_on_a_fast_clock() {
+    let (_dir, db) = fresh_db();
+    let blobs = Arc::new(InMemoryWorkspaceBlobs::default());
+    let store = WorkspaceStore::new(blobs.clone(), PayloadCodecs::default());
+    let agent = AgentId::new("coder", "skew").unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let model = ScriptedModel::new(vec![write("w1", "a.txt", "old"), answer("written", 1)]);
+    let mut rt = runtime(&db, harness(model, store, &runs));
+    let now = Utc::now();
+    // The first life runs on a clock that is an hour fast.
+    let fast = now + chrono::Duration::hours(1);
+    sqlite::send(&mut rt, &agent, &AgentOp::message("write it"), None).unwrap();
+    drive_at(&mut rt, &agent, fast).await;
+    let scope = WorkspaceMount::agent_scope(agent.as_str());
+    assert_eq!(
+        blobs.list(&scope).await.unwrap().len(),
+        1,
+        "the first life saved"
+    );
+    sqlite::delete(&mut rt, &agent, None).unwrap();
+    drive_at(&mut rt, &agent, fast).await;
+
+    // A second life starts on a correct clock and resets, as an erase does.
+    sqlite::send(
+        &mut rt,
+        &agent,
+        &AgentOp::Control(Control::ResetWorkspace),
+        None,
+    )
+    .unwrap();
+    drive_at(&mut rt, &agent, now).await;
+    assert_eq!(
+        held_keys(&blobs, &scope).await,
+        Vec::<String>::new(),
+        "the reset deleted the key of the first life"
+    );
 }
