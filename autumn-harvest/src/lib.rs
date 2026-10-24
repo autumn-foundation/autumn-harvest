@@ -952,6 +952,14 @@ pub use futures;
 /// assert_eq!(autumn_harvest::parse_byte_size("4MB"), Some(4_000_000));
 /// assert_eq!(autumn_harvest::parse_byte_size("invalid"), None);
 /// ```
+///
+/// Clone-class note: this suffix grammar repeats verbatim in
+/// `autumn_harvest_macros::parse_byte_size_macro`, which runs at macro
+/// expansion time. Apply any change to one copy to both. That proc-macro
+/// crate must not depend on this runtime crate, so no shared crate is
+/// available. Two instances only, introduced together by commit 2d903b05
+/// (issue #252), so the merge bar is not met. See the note on
+/// `parse_byte_size_macro`.
 #[must_use]
 #[allow(clippy::option_if_let_else)]
 pub fn parse_byte_size(s: &str) -> Option<u64> {
