@@ -1504,6 +1504,58 @@ async fn workflow_search_attr_predicate_comparison_uses_gin_index() {
     );
 }
 
+/// The list of the agents that are due to wake reads only the agents in the
+/// range (issue #2267). The SQL mirrors the bound shape that the `filter`
+/// grammar compiles for
+/// `workflow_name = 'agent' AND attrs.agent_status = 'idle' AND
+/// attrs.agent_next_wake_at < N`.
+#[tokio::test]
+async fn the_agent_wake_list_uses_the_agent_wake_index() {
+    let (database_url, _container) = setup_single_database().await;
+
+    let _seed = seed_workflow(
+        &database_url,
+        ShardId::new(0),
+        "agent",
+        "support/ada",
+        Some(json!({ "agent_status": "idle", "agent_next_wake_at": 1_730_000_000_000_i64 })),
+    )
+    .await;
+
+    let mut conn = <AsyncPgConnection as AsyncConnection>::establish(&database_url)
+        .await
+        .expect("failed to connect for EXPLAIN");
+    conn.batch_execute("SET enable_seqscan = off")
+        .await
+        .expect("disable seqscan should succeed");
+
+    let plans: Vec<ExplainRow> = diesel::sql_query(
+        "EXPLAIN SELECT id FROM harvest_workflow_executions \
+         WHERE (harvest_workflow_executions.workflow_name = $1 \
+           AND harvest_workflow_executions.search_attrs @> $2 \
+           AND (harvest_workflow_executions.search_attrs ? $3 \
+           AND jsonb_typeof(harvest_workflow_executions.search_attrs -> $3) = 'number' \
+           AND (harvest_workflow_executions.search_attrs ->> $3)::numeric < $4::numeric))",
+    )
+    .bind::<diesel::sql_types::Text, _>("agent")
+    .bind::<diesel::sql_types::Jsonb, _>(json!({ "agent_status": "idle" }))
+    .bind::<diesel::sql_types::Text, _>("agent_next_wake_at")
+    .bind::<diesel::sql_types::Text, _>("1730000000001")
+    .load(&mut conn)
+    .await
+    .expect("EXPLAIN should succeed");
+
+    let plan_text = plans
+        .into_iter()
+        .map(|row| row.plan)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan_text.contains("idx_harvest_we_agent_wake") && plan_text.contains("Index Cond"),
+        "expected a range read on idx_harvest_we_agent_wake, got:\n{plan_text}"
+    );
+}
+
 /// Predicates push down per shard and the k-way merge composes with keyset
 /// pagination — no row duplicated or skipped (issue #506 cross-shard AC).
 #[tokio::test]

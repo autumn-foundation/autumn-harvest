@@ -270,7 +270,7 @@ pub async fn drain_ready(
                     })
             }
             ActivityRunner::Ledger(body) => {
-                let (result, calls) = run_ledger_body(body, &task.input);
+                let (result, calls) = run_ledger_body(body, &task.input, claim_now);
                 llm_calls = calls;
                 result
             }
@@ -514,8 +514,10 @@ async fn run_handler(
 fn run_ledger_body(
     body: &LedgerActivityBody,
     input: &Value,
+    claim_ms: i64,
 ) -> (Result<Value, String>, Vec<LlmCall>) {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(input.clone())))
+    let at = DateTime::<Utc>::from_timestamp_millis(claim_ms).unwrap_or_else(Utc::now);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(input.clone(), at)))
         .unwrap_or_else(|payload| {
             Err(handler_panic_activity_envelope(
                 autumn_harvest::error::panic_message(payload),
@@ -1353,7 +1355,9 @@ impl LocalRun {
 /// size cap here. The history byte cap still bounds it.
 ///
 /// It also returns the LLM calls of the attempt (issue #2275). A failure
-/// returns none.
+/// returns none. `now_ms` is the clock of the runtime, which a ledger body
+/// gets (issue #2272).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_local_attempt(
     exec_id: ExecutionId,
     owner: &RunOwner<'_>,
@@ -1362,6 +1366,7 @@ pub async fn run_local_attempt(
     attempt: u32,
     previous_failure: Option<String>,
     deadline_left: Option<std::time::Duration>,
+    now_ms: i64,
 ) -> (Result<Value, String>, Vec<LlmCall>) {
     // The workflow deadline bounds the attempt too (issue #2029).
     let budget = deadline_left.map_or_else(|| run.budget(), |left| run.budget().min(left));
@@ -1377,7 +1382,7 @@ pub async fn run_local_attempt(
                 })
         }
         ActivityRunner::Ledger(body) => {
-            let (result, calls) = run_ledger_body(body, &run.input);
+            let (result, calls) = run_ledger_body(body, &run.input, now_ms);
             llm_calls = calls;
             result
         }

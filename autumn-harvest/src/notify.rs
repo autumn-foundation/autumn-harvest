@@ -197,6 +197,11 @@ pub struct ProgressNotifyPayload {
     /// The published chunk (JSON; possibly a truncation marker if the original
     /// exceeded the size cap).
     pub chunk: serde_json::Value,
+    /// True for a chunk from an activity (issue #2268). Its `seq` is the index
+    /// of the chunk in its attempt, not the workflow `seq` above. The stream
+    /// route sends it as an `activity` frame with no `id:`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub activity: bool,
 }
 
 /// Outcome of waiting on a queue listener.
@@ -2003,12 +2008,100 @@ pub async fn notify_workflow_progress(
     // Issue #2248: a progress wake inside a decision persist counts as the
     // notify phase.
     let _phase = crate::worker::PersistPhaseTimer::start(crate::telemetry::PersistPhase::Notify);
+    send_progress(
+        conn,
+        workflow_exec_id,
+        &ProgressNotifyPayload {
+            seq,
+            chunk: chunk.clone(),
+            activity: false,
+        },
+    )
+    .await
+}
+
+/// Send one live activity chunk on the progress channel of its run (issue
+/// #2268). `index` is the index of the chunk in its attempt.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if the payload does not serialize or
+/// `pg_notify` fails.
+pub async fn notify_activity_progress(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+    index: u64,
+    chunk: &serde_json::Value,
+) -> HarvestResult<()> {
+    send_progress(
+        conn,
+        workflow_exec_id,
+        &ProgressNotifyPayload {
+            seq: index,
+            chunk: chunk.clone(),
+            activity: true,
+        },
+    )
+    .await
+}
+
+/// Send live activity chunks on the progress channels of their runs, in one
+/// statement (issue #2268).
+///
+/// The statement is one transaction and one round trip. Postgres delivers the
+/// chunks when it commits, in the order of `chunks`. Each payload holds its
+/// index, so Postgres folds no two of them into one.
+///
+/// # Errors
+///
+/// Returns [`HarvestError::Database`] if a payload does not serialize or
+/// `pg_notify` fails. Then no chunk of the batch goes out.
+pub async fn notify_activity_progress_batch(
+    conn: &mut AsyncPgConnection,
+    chunks: &[crate::activity_progress::ActivityProgress],
+) -> HarvestResult<()> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let mut channels = Vec::with_capacity(chunks.len());
+    let mut payloads = Vec::with_capacity(chunks.len());
+    for progress in chunks {
+        channels.push(workflow_progress_channel(progress.execution_id.as_uuid()));
+        let payload = serde_json::to_string(&ProgressNotifyPayload {
+            seq: progress.index,
+            chunk: progress.wire_chunk(),
+            activity: true,
+        })
+        .map_err(|e| {
+            HarvestError::Database(format!("failed to serialize progress payload: {e}"))
+        })?;
+        payloads.push(payload);
+    }
+    // Postgres runs a volatile function of the select list after the sort.
+    // `ORDER BY n` thus sends the chunks in the order of the arrays.
+    diesel::sql_query(
+        "SELECT pg_notify(c, p) \
+           FROM unnest($1::text[], $2::text[]) WITH ORDINALITY AS t(c, p, n) \
+          ORDER BY n",
+    )
+    .bind::<diesel::sql_types::Array<Text>, _>(&channels)
+    .bind::<diesel::sql_types::Array<Text>, _>(&payloads)
+    .execute(conn)
+    .await
+    .map_err(crate::error::database_error)?;
+    Ok(())
+}
+
+/// Send one payload on the progress channel of `workflow_exec_id`.
+async fn send_progress(
+    conn: &mut AsyncPgConnection,
+    workflow_exec_id: Uuid,
+    payload: &ProgressNotifyPayload,
+) -> HarvestResult<()> {
     let channel = workflow_progress_channel(workflow_exec_id);
-    let payload = serde_json::to_string(&ProgressNotifyPayload {
-        seq,
-        chunk: chunk.clone(),
-    })
-    .map_err(|e| HarvestError::Database(format!("failed to serialize progress payload: {e}")))?;
+    let payload = serde_json::to_string(payload).map_err(|e| {
+        HarvestError::Database(format!("failed to serialize progress payload: {e}"))
+    })?;
 
     diesel::sql_query("SELECT pg_notify($1, $2)")
         .bind::<Text, _>(&channel)
@@ -2462,12 +2555,52 @@ pub enum DurableStreamWait {
     ChannelClosed,
 }
 
+/// Outcome of [`DurableStreamListener::wait_or_live_timeout`] (issue #2268).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableStreamLiveWait {
+    /// A stored-chunk wake arrived. New chunks can be in the table.
+    Stored,
+    /// Live activity chunks wait. Take them with
+    /// [`DurableStreamListener::take_live`].
+    Live,
+    /// No wake arrived before the timeout.
+    TimedOut,
+    /// The `LISTEN` connection closed.
+    ChannelClosed,
+}
+
 /// Wake state that the forwarder task shares with a [`DurableStreamListener`].
 struct DurableStreamWakes {
     /// Holds one permit after one or more wakes. Wakes merge into it.
     notify: tokio::sync::Notify,
     /// Set when the `LISTEN` connection closes.
     closed: std::sync::atomic::AtomicBool,
+    /// Set by a stored-chunk wake. A live wait clears it.
+    stored: std::sync::atomic::AtomicBool,
+    /// The live activity chunks that wait, oldest first (issue #2268). At
+    /// most [`ACTIVITY_PROGRESS_QUEUE`](crate::activity_progress::ACTIVITY_PROGRESS_QUEUE).
+    live: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+}
+
+impl DurableStreamWakes {
+    /// Keep one live activity chunk. A full queue drops it.
+    fn push_live(&self, chunk: serde_json::Value) {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if live.len() < crate::activity_progress::ACTIVITY_PROGRESS_QUEUE {
+            live.push_back(chunk);
+        }
+    }
+
+    fn has_live(&self) -> bool {
+        !self
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+    }
 }
 
 /// Listener for one execution's durable stream wakes (issue #1974).
@@ -2509,25 +2642,64 @@ impl DurableStreamListener {
     /// Returns [`HarvestError::Config`] if the URL or its TLS settings are
     /// not valid.
     pub async fn connect(database_url: &str, exec_id: Uuid) -> HarvestResult<Self> {
+        Self::open(database_url, exec_id, false).await
+    }
+
+    /// Connect as [`Self::connect`] does, and also `LISTEN` on the progress
+    /// channel of the run for live activity chunks (issue #2268).
+    ///
+    /// Wait with [`Self::wait_or_live_timeout`]. The listener keeps only the
+    /// activity chunks of the channel, and drops a chunk when its queue is
+    /// full.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect`].
+    pub async fn connect_live(database_url: &str, exec_id: Uuid) -> HarvestResult<Self> {
+        Self::open(database_url, exec_id, true).await
+    }
+
+    async fn open(database_url: &str, exec_id: Uuid, live: bool) -> HarvestResult<Self> {
         let ListenConnection {
             client,
             mut rx,
             driver,
         } = open_listen_connection(database_url, "postgres durable stream listener error").await?;
-        let channel = quote_pg_identifier(&durable_stream_channel(exec_id));
-        client
-            .batch_execute(&format!("LISTEN {channel}"))
-            .await
-            .map_err(|e| {
-                HarvestError::Database(format!("LISTEN {channel} failed: {}", error_chain(&e)))
-            })?;
+        let mut channels = vec![durable_stream_channel(exec_id)];
+        if live {
+            channels.push(workflow_progress_channel(exec_id));
+        }
+        for channel in &channels {
+            let channel = quote_pg_identifier(channel);
+            client
+                .batch_execute(&format!("LISTEN {channel}"))
+                .await
+                .map_err(|e| {
+                    HarvestError::Database(format!("LISTEN {channel} failed: {}", error_chain(&e)))
+                })?;
+        }
         let wakes = std::sync::Arc::new(DurableStreamWakes {
             notify: tokio::sync::Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
+            stored: std::sync::atomic::AtomicBool::new(false),
+            live: std::sync::Mutex::new(std::collections::VecDeque::new()),
         });
         let forwarder_wakes = std::sync::Arc::clone(&wakes);
+        let durable_channel = channels.swap_remove(0);
         let forwarder = tokio::spawn(async move {
-            while rx.recv().await.is_some() {
+            while let Some(notification) = rx.recv().await {
+                if notification.channel() == durable_channel {
+                    forwarder_wakes
+                        .stored
+                        .store(true, std::sync::atomic::Ordering::Release);
+                } else {
+                    // Only a live activity chunk counts. A workflow chunk
+                    // has a `seq` of its own stream.
+                    match serde_json::from_str::<ProgressNotifyPayload>(notification.payload()) {
+                        Ok(payload) if payload.activity => forwarder_wakes.push_live(payload.chunk),
+                        _ => continue,
+                    }
+                }
                 forwarder_wakes.notify.notify_one();
             }
             forwarder_wakes
@@ -2554,6 +2726,51 @@ impl DurableStreamListener {
             Ok(()) if self.is_closed() => DurableStreamWait::ChannelClosed,
             Ok(()) => DurableStreamWait::Woken,
         }
+    }
+
+    /// Wait up to `timeout` for a stored-chunk wake or a live activity
+    /// chunk (issue #2268). A stored-chunk wake comes first.
+    ///
+    /// So a stored chunk can go out before an older live chunk. Live chunks
+    /// are best-effort, and their order against stored chunks is not kept.
+    /// A reader drops a live chunk of a step after the stored text of that
+    /// step. See `docs/durable-routes.md#live-chunks`.
+    pub async fn wait_or_live_timeout(&self, timeout: Duration) -> DurableStreamLiveWait {
+        let until = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.is_closed() {
+                return DurableStreamLiveWait::ChannelClosed;
+            }
+            if self
+                .wakes
+                .stored
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                return DurableStreamLiveWait::Stored;
+            }
+            if self.wakes.has_live() {
+                return DurableStreamLiveWait::Live;
+            }
+            // A permit can be left from a wake that an earlier call read.
+            // The loop then checks again until `until`.
+            if tokio::time::timeout_at(until, self.wakes.notify.notified())
+                .await
+                .is_err()
+            {
+                return DurableStreamLiveWait::TimedOut;
+            }
+        }
+    }
+
+    /// Take the live activity chunks that wait, oldest first (issue #2268).
+    /// Each one is the activity envelope and the chunk.
+    pub fn take_live(&self) -> Vec<serde_json::Value> {
+        self.wakes
+            .live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect()
     }
 
     fn is_closed(&self) -> bool {
@@ -3348,10 +3565,29 @@ mod tests {
         let original = ProgressNotifyPayload {
             seq: 0x0000_0005_00FF_FFFF,
             chunk: serde_json::json!({"phase": "mid", "pct": 50}),
+            activity: false,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         let deserialized: ProgressNotifyPayload = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn only_an_activity_payload_carries_the_activity_flag() {
+        let workflow = ProgressNotifyPayload {
+            seq: 3,
+            chunk: serde_json::json!(1),
+            activity: false,
+        };
+        let json = serde_json::to_string(&workflow).expect("serialize");
+        assert!(!json.contains("activity"), "{json}");
+        let activity = ProgressNotifyPayload {
+            activity: true,
+            ..workflow
+        };
+        let json = serde_json::to_string(&activity).expect("serialize");
+        let back: ProgressNotifyPayload = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.activity, "{json}");
     }
 
     #[test]
@@ -3374,6 +3610,7 @@ mod tests {
         let payload = ProgressNotifyPayload {
             seq: u64::MAX,
             chunk: max_chunk,
+            activity: true,
         };
         let serialized = serde_json::to_string(&payload).expect("serialize");
         assert!(

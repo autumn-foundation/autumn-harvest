@@ -130,7 +130,7 @@ fn register(rt: &mut SqliteRuntime, runs: &Arc<AtomicU32>, fail_first: u32) {
     rt.register_activity(&ctx_fails_info());
     rt.register_activity(&local_think_info());
     let runs = Arc::clone(runs);
-    rt.register_activity_with_ledger(&think_info(), move |input: Value| {
+    rt.register_activity_with_ledger(&think_info(), move |input: Value, _at| {
         let n = input.as_i64().ok_or("the input is not a number")?;
         if runs.fetch_add(1, Ordering::SeqCst) < fail_first {
             return Err("the provider is down".to_string());
@@ -240,6 +240,32 @@ async fn a_window_read_returns_the_rows_inside_it() {
         rt.llm_ledger_between(at + second, at + second * 2).unwrap(),
         Vec::new()
     );
+}
+
+// A ledger closure gets the drive clock of its claim (issue #2272). Its rows
+// carry the same clock, so a budget window over the ledger can use it.
+#[tokio::test]
+async fn a_ledger_closure_gets_the_drive_clock_of_its_claim() {
+    let mut rt = SqliteRuntime::open_in_memory().unwrap();
+    rt.register_workflow(&one_thought_info());
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    rt.register_activity_with_ledger(&think_info(), move |input: Value, at| {
+        sink.lock().unwrap().push(at);
+        let n = input.as_i64().ok_or("the input is not a number")?;
+        Ok((json!(n), calls_for(n)))
+    });
+    let at = Utc.with_ymd_and_hms(2031, 2, 3, 4, 5, 6).unwrap();
+    let exec = rt.start_workflow("one_thought", json!(2)).unwrap();
+    assert!(matches!(
+        rt.run_until_blocked_as_of(exec, at).await.unwrap(),
+        RunState::Completed(_)
+    ));
+
+    assert_eq!(*seen.lock().unwrap(), [at]);
+    let rows = rt.llm_ledger(exec).unwrap();
+    assert_rows_for(&rows, &[2]);
+    assert!(rows.iter().all(|row| row.recorded_at == at), "{rows:?}");
 }
 
 // A failed attempt writes no row. The retry that completes writes its own

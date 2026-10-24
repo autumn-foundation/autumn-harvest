@@ -203,3 +203,38 @@ async fn public_run_until_blocked_refreshes_the_clock_per_cycle() {
         "timer fires at its true deadline, got {state:?}"
     );
 }
+
+/// Read the clock, then wait one second on a timer, then read it again.
+#[workflow]
+async fn two_clock_reads(ctx: &WorkflowContext, _n: i64) -> Result<Vec<i64>, String> {
+    let first = ctx.system_now().timestamp_millis();
+    ctx.timer("pause", 1).await.map_err(|e| e.to_string())?;
+    Ok(vec![first, ctx.system_now().timestamp_millis()])
+}
+
+// A clock read takes the clock of its cycle, as the timers do (issue #2276).
+// An `_as_of` drive therefore keeps one clock. Before the fix `system_now`
+// read the wall clock, so a durable agent that compared a deadline with it
+// could see the deadline pass while the drive clock had not reached it.
+#[tokio::test]
+async fn a_clock_read_takes_the_clock_of_its_cycle() {
+    let (_dir, path) = temp_db();
+    let mut rt = SqliteRuntime::open(&path).unwrap();
+    rt.register_workflow(&two_clock_reads_info());
+    let exec = rt.start_workflow("two_clock_reads", json!(0)).unwrap();
+    let t0: DateTime<Utc> = "2031-02-03T04:05:06Z".parse().unwrap();
+    let t1 = t0 + chrono::Duration::seconds(5);
+    assert!(matches!(
+        rt.run_until_blocked_as_of(exec, t0).await.unwrap(),
+        RunState::WaitingTimer
+    ));
+    let state = rt.run_until_blocked_as_of(exec, t1).await.unwrap();
+    let RunState::Completed(output) = state else {
+        panic!("the run completes after its timer: {state:?}");
+    };
+    assert_eq!(
+        output,
+        json!([t0.timestamp_millis(), t1.timestamp_millis()]),
+        "each read returns the clock of the cycle that made it"
+    );
+}

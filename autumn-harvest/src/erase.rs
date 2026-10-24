@@ -312,6 +312,11 @@ pub struct EraseOutcome {
     /// like log rows. Replay never reads them.
     #[serde(default)]
     pub stream_chunks_deleted: usize,
+    /// Number of agent cost ledger rows (issue #1996) deleted for this
+    /// execution (issue #2267). A row holds the model id and the counts of
+    /// one LLM call. The spend of an erased run leaves the LLM budget sums.
+    #[serde(default)]
+    pub ledger_rows_deleted: usize,
     /// Number of `harvest_entity_state` rows (issue #2259) whose `snapshot`
     /// was tombstoned. A row belongs to the run that wrote it last, so an
     /// erase of an older run of a live entity scrubs none.
@@ -758,6 +763,8 @@ mod db {
                 // rows cascade-deleted with it, so there is nothing to remove.
                 logs_deleted: 0,
                 stream_chunks_deleted: 0,
+                // The ledger rows cascade-deleted with the execution row.
+                ledger_rows_deleted: 0,
                 // The cascade from the execution row removed its projection
                 // row (issue #2259).
                 entity_states_scrubbed: 0,
@@ -1396,6 +1403,9 @@ mod db {
         let logs_deleted = crate::store::delete_workflow_logs(conn, exec_id).await?;
         // Durable stream chunks (issue #1974) are author output too.
         let stream_chunks_deleted = crate::store::delete_stream_chunks(conn, exec_id).await?;
+        // The cost ledger (issue #1996) names the run and its models
+        // (issue #2267).
+        let ledger_rows_deleted = crate::store::delete_llm_ledger(conn, exec_id).await?;
         // The entity state projection (issue #2259) copies the snapshot
         // payloads of this run.
         let entity_states_scrubbed =
@@ -1424,6 +1434,7 @@ mod db {
             signals_scrubbed,
             logs_deleted,
             stream_chunks_deleted,
+            ledger_rows_deleted,
             entity_states_scrubbed,
             completion_deliveries_scrubbed,
             dead_letters_scrubbed,
@@ -1665,6 +1676,7 @@ mod tests {
             signals_scrubbed: 2,
             logs_deleted: 4,
             stream_chunks_deleted: 6,
+            ledger_rows_deleted: 9,
             entity_states_scrubbed: 8,
             completion_deliveries_scrubbed: 3,
             dead_letters_scrubbed: 1,
@@ -1686,6 +1698,7 @@ mod tests {
         // Durable workflow logs deleted by the erase (issue #790).
         assert_eq!(v["logs_deleted"], 4);
         assert_eq!(v["stream_chunks_deleted"], 6);
+        assert_eq!(v["ledger_rows_deleted"], 9);
         assert_eq!(v["entity_states_scrubbed"], 8);
     }
 
@@ -1711,6 +1724,7 @@ mod tests {
             signals_scrubbed: 0,
             logs_deleted: 0,
             stream_chunks_deleted: 0,
+            ledger_rows_deleted: 0,
             entity_states_scrubbed: 0,
             completion_deliveries_scrubbed: 0,
             dead_letters_scrubbed: 0,

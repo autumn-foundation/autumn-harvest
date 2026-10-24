@@ -244,7 +244,8 @@ struct SuiteRow {
     /// `linux` | `linuxpart` | `allos` | `compileonly`.
     osclass: String,
     /// `autumn-harvest` | `autumn-harvest-conformance` | `autumn-harvest-plugin`
-    /// | `autumn-harvest-redis` | `standalone-runner`.
+    /// | `autumn-harvest-redis` | `agent-mesh` | `history-load-gate`
+    /// | `standalone-runner`.
     krate: String,
     /// The `--test <target>` binary (core suites use `integration`).
     target: String,
@@ -303,6 +304,8 @@ fn parse_manifest() -> Vec<SuiteRow> {
         "autumn-harvest-conformance",
         "autumn-harvest-plugin",
         "autumn-harvest-redis",
+        // Issue #2276: the capstone's Postgres suite.
+        "agent-mesh",
         // Issue #2257: the measurement crate's Postgres suite.
         "history-load-gate",
         // Issue #1615: the example's live-Postgres acceptance suite.
@@ -979,6 +982,76 @@ fn history_load_gate_postgres_suite_has_a_running_row() {
                 && r.filter == "-"),
             "examples/history-load-gate/tests/{target}.rs needs a `linux history-load-gate {target}` row"
         );
+    }
+}
+
+/// The name of the `ci.yml` step that runs the offline suites of the
+/// `agent-mesh` capstone (issue #2276).
+const AGENT_MESH_STEP: &str = "Run agent-mesh example tests (issue #2276)";
+
+/// The `run:` line of the `ci.yml` step named `name`, if the step has one.
+fn ci_step_run<'a>(name: &str) -> Option<&'a str> {
+    let mut lines = CI_YAML.lines().skip_while(|line| {
+        line.trim_start()
+            .strip_prefix("- name:")
+            .is_none_or(|rest| rest.trim().trim_matches('"') != name)
+    });
+    lines.next()?;
+    lines
+        .take_while(|line| !line.trim_start().starts_with("- name:"))
+        .find_map(|line| line.trim_start().strip_prefix("run:"))
+        .map(str::trim)
+}
+
+/// Issue #2276. Each test target of the `agent-mesh` capstone runs in CI.
+/// The Postgres suite runs from a `linux` manifest row. The offline suites
+/// run from one `ci.yml` step, which names each target by hand. A new
+/// target with neither would never run.
+#[test]
+fn agent_mesh_test_targets_each_have_a_runner() {
+    let rows = parse_manifest();
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../examples/agent-mesh/tests");
+    let mut targets: Vec<String> = std::fs::read_dir(&path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            (path.extension()? == "rs").then(|| path.file_stem()?.to_str().map(str::to_owned))?
+        })
+        .collect();
+    targets.sort();
+    assert!(
+        targets.iter().any(|target| target == "postgres"),
+        "the capstone has a Postgres suite: {targets:?}"
+    );
+    let run = ci_step_run(AGENT_MESH_STEP)
+        .unwrap_or_else(|| panic!("ci.yml needs a `{AGENT_MESH_STEP}` step with a `run:` line"));
+    let named: Vec<&str> = run
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .filter(|pair| pair[0] == "--test")
+        .map(|pair| pair[1])
+        .collect();
+    for target in &targets {
+        if target == "postgres" {
+            assert!(
+                rows.iter().any(|r| r.krate == "agent-mesh"
+                    && r.target == "postgres"
+                    && r.osclass == "linux"
+                    && r.filter == "-"),
+                "examples/agent-mesh/tests/postgres.rs needs a `linux agent-mesh postgres` row"
+            );
+            assert!(
+                !named.contains(&"postgres"),
+                "the `{AGENT_MESH_STEP}` step must not run the Postgres suite: it needs a database"
+            );
+        } else {
+            assert!(
+                named.contains(&target.as_str()),
+                "examples/agent-mesh/tests/{target}.rs needs `--test {target}` in the \
+                 `{AGENT_MESH_STEP}` step of ci.yml: {run}"
+            );
+        }
     }
 }
 

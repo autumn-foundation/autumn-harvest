@@ -55,7 +55,7 @@ pub type ActivityBody = Box<dyn Fn(Value) -> Result<Value, String> + Send + Sync
 /// (issue #2275). See
 /// [`register_activity_with_ledger`](SqliteRuntime::register_activity_with_ledger).
 pub type LedgerActivityBody =
-    Box<dyn Fn(Value) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync>;
+    Box<dyn Fn(Value, DateTime<Utc>) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync>;
 
 /// What runs for one registered activity (issue #2024).
 // Crate-internal like the `ActivitySpec` fields that hold it.
@@ -757,6 +757,10 @@ impl SqliteRuntime {
     /// once. A failed or timed-out attempt writes no row. Read the rows with
     /// [`llm_ledger`](Self::llm_ledger).
     ///
+    /// The closure also gets the clock of the runtime at the claim. A ledger
+    /// row carries the same clock, so a budget window over the ledger uses it.
+    /// A drive with `run_until_blocked_as_of` sets that clock (issue #2272).
+    ///
     /// The closure gets no `ActivityContext`. An `#[activity]` body that
     /// [`register_activity`](Self::register_activity) runs records its calls
     /// with `ActivityContext::record_llm_call` instead.
@@ -773,7 +777,10 @@ impl SqliteRuntime {
     pub fn register_activity_with_ledger(
         &mut self,
         info: &ActivityInfo,
-        body: impl Fn(Value) -> Result<(Value, Vec<LlmCall>), String> + Send + Sync + 'static,
+        body: impl Fn(Value, DateTime<Utc>) -> Result<(Value, Vec<LlmCall>), String>
+        + Send
+        + Sync
+        + 'static,
     ) {
         self.register_audited_activity(info, ActivityRunner::Ledger(Box::new(body)));
     }
@@ -3156,8 +3163,13 @@ impl SqliteRuntime {
         // `span_meta.workflow_id`, so build a minimal meta carrying it (see
         // [`drive_span_meta`]).
         let parent = store::parent_link(&self.conn, exec)?.map(|(parent, _)| parent);
-        let mut span_meta =
-            drive_span_meta(&workflow_name, &workflow_id, cancel_reason.clone(), parent);
+        let mut span_meta = drive_span_meta(
+            &workflow_name,
+            &workflow_id,
+            cancel_reason.clone(),
+            parent,
+            now,
+        );
         // Issue #2029: `ctx.deadline()` reports the stored deadline.
         (span_meta.execution_timeout, span_meta.deadline_at) = config.context_deadline();
         let declarative = self.declarative_updates(&workflow_name);
@@ -3846,9 +3858,17 @@ impl SqliteRuntime {
                 )),
                 None => None,
             };
-            let (result, llm_calls) =
-                worker::run_local_attempt(exec, owner, spec, &run, attempt, previous_failure, left)
-                    .await;
+            let (result, llm_calls) = worker::run_local_attempt(
+                exec,
+                owner,
+                spec,
+                &run,
+                attempt,
+                previous_failure,
+                left,
+                failure_now(),
+            )
+            .await;
             if let Some(at) = deadline.filter(|at| failure_now() >= *at) {
                 return self.seal_timed_out(exec, at, failure_now()).map(Some);
             }
@@ -5619,17 +5639,23 @@ fn duration_to_millis_ceil(d: std::time::Duration) -> i64 {
 /// It is `None` for a top-level run. The Postgres worker sets the same value,
 /// so `ctx.info().parent_execution_id` agrees on both backends. The recorded
 /// span fields are inert here (no `OTel` worker/subscriber on this backend).
+///
+/// `now` is the clock of the cycle. A live `system_now` reads it, so a clock
+/// read agrees with the timers and the activities of the cycle. A
+/// `run_until_blocked_as_of` drive then keeps one clock (issue #2276).
 fn drive_span_meta(
     workflow_name: &str,
     workflow_id: &str,
     cancel_reason: Option<String>,
     parent_execution_id: Option<ExecutionId>,
+    now: i64,
 ) -> WorkflowExecuteSpanMeta {
     WorkflowExecuteSpanMeta {
         workflow_name: workflow_name.to_string(),
         workflow_id: workflow_id.to_string(),
         shard_id: 0,
         queue_name: String::new(),
+        drive_clock: DateTime::<Utc>::from_timestamp_millis(now),
         is_replay: false,
         link_traceparent: None,
         build_id: None,

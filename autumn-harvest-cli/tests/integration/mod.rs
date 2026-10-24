@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod agents_cli;
 mod backup_verify_cli;
 mod batch_tests;
 mod contract_coverage;
