@@ -2664,6 +2664,10 @@ mod tests {
 
     /// Issue #2260: a file that left the directory reads as stale, for a run
     /// and for an entity. The next store makes a new file.
+    ///
+    /// Unix only. Windows refuses to delete an open file, so this case
+    /// cannot happen there.
+    #[cfg(unix)]
     #[test]
     fn a_deleted_file_reads_as_stale_and_a_store_rebuilds_it() {
         let dir = private_dir();
@@ -2698,6 +2702,9 @@ mod tests {
 
     /// Issue #2260: a store into a deleted file makes a new file, so the
     /// row is not lost in the deleted inode.
+    ///
+    /// Unix only, for the reason above.
+    #[cfg(unix)]
     #[test]
     fn a_store_after_a_deleted_file_makes_a_new_file() {
         let dir = private_dir();
