@@ -257,7 +257,7 @@ async fn a_stale_attempt_never_becomes_the_head() {
     let scope = WorkspaceMount::agent_scope(agent.as_str());
     assert_eq!(
         blobs.list(&scope).await.unwrap(),
-        std::slice::from_ref(&head.digest),
+        [head.key()],
         "the op end deleted the snapshot of the stale attempt"
     );
 
@@ -423,4 +423,37 @@ async fn clear_transcript_keeps_the_labels_of_the_workspace_files() {
         "the files keep the taint of the run that wrote them: {:?}",
         cleared.flow_labels
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_retention_of_an_old_op_keeps_the_newest_head() {
+    let (_dir, db) = fresh_db();
+    let blobs = Arc::new(InMemoryWorkspaceBlobs::default());
+    let store = WorkspaceStore::new(blobs.clone(), PayloadCodecs::default());
+    let agent = AgentId::new("coder", "late").unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let model = ScriptedModel::new(vec![
+        write("w1", "a.txt", "one"),
+        answer("written", 1),
+        write("w2", "a.txt", "two"),
+        answer("written again", 1),
+    ]);
+    let mut rt = runtime(&db, harness(model, store.clone(), &runs));
+    let first = say(&mut rt, &agent, "write one").await;
+    let first = first.workspace.expect("a head");
+    let second = say(&mut rt, &agent, "write two").await;
+    let second = second.workspace.expect("a head");
+    assert!(second.generation > first.generation);
+
+    // An attempt of the retention of the first op runs after the second op.
+    let scope = WorkspaceMount::agent_scope(agent.as_str());
+    store.retain(&scope, &first).await.unwrap();
+    let mount = WorkspaceMount {
+        scope: scope.clone(),
+        head: Some(second.clone()),
+        generation: 0,
+    };
+    let loaded = store.load(&mount).await.unwrap();
+    assert_eq!(loaded.read_text("a.txt"), Some("two"));
+    assert_eq!(blobs.list(&scope).await.unwrap(), [second.key()]);
 }

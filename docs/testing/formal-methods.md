@@ -83,6 +83,7 @@ fails in these cases:
 | `OwnerLease` | Fenced owner lease of a decision partition (issue #2250) | design, six defects, reachability |
 | `AgentMesh` | Durable peer send between two agents (issue #2269) | design, three single-layer configs, four defects, reachability |
 | `AgentWorkspace` | Workspace head of a durable agent (issue #2274) | design, two defects, reachability |
+| `AgentWorkspaceRetention` | Workspace retention across the ops of a durable agent (issue #2274) | design, one defect, reachability |
 
 **Ghost sequence numbers.** Each claim in the two claim models gets a ghost
 `seq`. The code has no such column. An invariant that compared
@@ -494,6 +495,31 @@ it. A retention that runs while a call runs can delete a snapshot that
 history then records. So retention runs only after the last call of an op.
 
 The model has one op, and the store never loses a blob on its own.
+
+#### `AgentWorkspaceRetention` — model (h)
+
+`formal/tla/AgentWorkspaceRetention.tla` models retention across ops. Each
+op commits a snapshot, which becomes the head, or resets the workspace. The
+op end schedules a retention activity with the head as its input, or a
+reset activity. An attempt of an activity can run at any later time. A
+stale attempt whose lease the engine reclaimed is such a late attempt.
+
+| Action | Code |
+|---|---|
+| `Commit` | `WorkspaceStore::save` in the tool-call activity, then `adopt_workspace`. |
+| `Reset` | `Control::ResetWorkspace`, which schedules `agent_workspace_reset`. |
+| `Run` | One attempt of `agent_workspace_retain` or `agent_workspace_reset`. |
+
+| Config | Switch | Result |
+|---|---|---|
+| `AgentWorkspaceRetention.cfg` | None: `KeyBy = "generation"`. | Pass. |
+| `AgentWorkspaceRetentionContentKeys.cfg` | `KeyBy = "content"` | Violates `HeadPresent`. |
+| `AgentWorkspaceRetentionReach.cfg` | None. | Violates `NoStaleRun`. |
+
+With content keys, a stale retention keeps its old input head and deletes
+every other key, the newer head too. A key that holds the generation of
+its op fixes it. Retention deletes only the keys of older generations, so
+a newer head survives, also when it has the same content as an old one.
 
 ### Extend a model
 

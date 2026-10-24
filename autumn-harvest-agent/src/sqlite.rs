@@ -68,9 +68,9 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
     });
     let h = Arc::clone(&harness);
     rt.register_activity_with_body(&agent_workspace_reset_info(), move |input| {
-        call(input, |scope: String| {
+        call(input, |mount: crate::workspace::WorkspaceMount| {
             let h = Arc::clone(&h);
-            async move { h.workspace_reset(&scope).await }
+            async move { h.workspace_reset(mount).await }
         })
     });
     let h = Arc::clone(&harness);

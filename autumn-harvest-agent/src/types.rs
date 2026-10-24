@@ -227,6 +227,7 @@ impl AgentTask {
         self.workspace = Some(WorkspaceMount {
             scope: scope.into(),
             head,
+            generation: 0,
         });
         self
     }

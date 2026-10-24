@@ -1083,9 +1083,13 @@ let harness = AgentHarness::new(model)
 
 - **Outside history.** A snapshot of the files lives in a `WorkspaceBlobs`
   store, the claim-check pattern. History records only its `WorkspaceRef`:
-  a SHA-256 digest, a size and a file count.
-- **Content-addressed.** The digest of the plain snapshot is its key. A
-  load checks the digest, so a changed blob fails loudly.
+  a SHA-256 digest, a size, a file count and a generation.
+- **Content-addressed.** The digest of the plain snapshot names its
+  content. A load checks the digest, so a changed blob fails loudly.
+- **Generations.** The key of a snapshot is its generation and its digest.
+  The agent gives each segment and each reset a generation above the last
+  one, and at least the recorded time. A new life after a delete therefore
+  also starts above the keys of the old life.
 - **Encrypted.** The payload codecs of the engine encode each snapshot. An
   active AEAD key therefore encrypts it at rest.
 - **Per call.** A tool that opts in with `Tool::uses_workspace` gets the
@@ -1116,11 +1120,16 @@ mount. A snapshot is JSON with base64 content, so a blob is about a third
 larger than its files.
 
 **Retention.** A workspace keeps one snapshot: its head. The end of each op
-that moved the head deletes every other snapshot of the agent, the blobs of
-stale attempts included. `Control::ResetWorkspace` deletes every snapshot.
-`harvest agents erase` sends it before the delete. Keep the blobs in a store
-for workspaces only, because retention deletes every blob of a scope that is
-not its head.
+that moved the head deletes every other snapshot of the head generation or
+older, the blobs of stale attempts included. `Control::ResetWorkspace`
+deletes every snapshot below its own generation. `harvest agents erase`
+sends it before the delete. The engine can reclaim the lease of either
+activity and start a new attempt, and the old attempt can still run after a
+newer op. It then deletes only older keys, so it never deletes a newer head,
+also when that head has the content of an old one.
+`formal/tla/AgentWorkspaceRetention.tla` checks this. Keep the blobs in a
+store for workspaces only, because retention deletes the blobs of a scope
+that are not newer than its head.
 
 ### Live tokens (issue #2268)
 

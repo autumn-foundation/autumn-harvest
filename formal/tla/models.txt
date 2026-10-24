@@ -42,3 +42,6 @@ AgentWorkspace     AgentWorkspace.cfg                  pass
 AgentWorkspace     AgentWorkspaceAdoptOnWrite.cfg      violation:HeadIsRecorded
 AgentWorkspace     AgentWorkspaceRetainAnyTime.cfg     violation:HeadPresent
 AgentWorkspace     AgentWorkspaceReach.cfg             violation:SomeStaleWriteUnseen
+AgentWorkspaceRetention AgentWorkspaceRetention.cfg            pass
+AgentWorkspaceRetention AgentWorkspaceRetentionContentKeys.cfg violation:HeadPresent
+AgentWorkspaceRetention AgentWorkspaceRetentionReach.cfg       violation:NoStaleRun

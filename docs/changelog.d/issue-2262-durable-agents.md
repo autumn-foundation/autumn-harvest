@@ -517,9 +517,9 @@ then rejects.
 - `ToolOutcome::workspace` carries the new head. Only a recorded result
   moves the head, so the snapshot of a stale attempt never becomes it.
 - The end of each op that moved the head keeps one snapshot. The activity
-  `agent_workspace_retain` deletes the others. `Control::ResetWorkspace`
-  and the activity `agent_workspace_reset` delete them all. `harvest agents
-  erase` sends the reset.
+  `agent_workspace_retain` deletes the others of its generation or older.
+  `Control::ResetWorkspace` and the activity `agent_workspace_reset` delete
+  them all. `harvest agents erase` sends the reset.
 - Caps: 64 MiB of file content and 10,000 files for each snapshot by
   default.
 
@@ -621,6 +621,17 @@ A review from five angles found these. Each fix has a test.
   long segment never books a follow-up that is already due. Each
   `DirWorkspaceBlobs` put writes its own scratch file. Two attempts that
   save one digest at once then never mix their bytes.
+- **Workspace generations.** A late attempt of a retention could delete a
+  newer head, because a key was the content digest only. The key now holds
+  the generation of its segment, and `WorkspaceRef::generation` records it.
+  Retention deletes only keys of the head generation or older, and a reset
+  only keys below its own generation. `next_generation` keeps it above the
+  last one and at least the recorded time. The model
+  `formal/tla/AgentWorkspaceRetention.tla` and the tests
+  `a_stale_retain_never_deletes_a_newer_head`,
+  `a_newer_head_with_old_content_survives_a_stale_retain`,
+  `a_stale_reset_never_deletes_a_later_head` and
+  `a_late_retention_of_an_old_op_keeps_the_newest_head` cover it.
 
 ### Advisory RUSTSEC-2026-0387 (crypto-bigint 0.5.5)
 

@@ -878,6 +878,7 @@ impl AgentProfile {
             task.workspace = Some(WorkspaceMount {
                 scope: WorkspaceMount::agent_scope(id.as_str()),
                 head: None,
+                generation: 0,
             });
         }
         if let Mode::Heartbeat(beat) = mode {
@@ -1040,6 +1041,27 @@ pub struct AgentState {
     /// files can hold what that run read, so they keep its labels.
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub workspace_labels: BTreeSet<String>,
+    /// The generation of the last segment or reset that mounted the
+    /// workspace. Each one is above the last one and at least the recorded
+    /// time, so a new life after a delete also starts above the old keys.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub workspace_generation: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// The next workspace generation after `last`, at the recorded time
+/// `now_ms`.
+///
+/// It is above `last`, so it grows within one life of the agent. It is at
+/// least the time, so a new life after a delete also starts above the keys
+/// of the old life.
+fn next_generation(last: u64, now_ms: i64) -> u64 {
+    last.saturating_add(1)
+        .max(u64::try_from(now_ms).unwrap_or(0))
 }
 
 impl AgentState {
@@ -1352,7 +1374,7 @@ impl AgentRun<'_> {
             Control::ResetWorkspace => {
                 state.workspace = None;
                 state.workspace_labels.clear();
-                if let Err(err) = self.reset_workspace().await {
+                if let Err(err) = self.reset_workspace(&mut state).await {
                     fail(&mut state, &err);
                 }
             }
@@ -1420,20 +1442,31 @@ impl AgentRun<'_> {
     }
 
     /// Delete every workspace snapshot of the agent (issue #2274).
-    async fn reset_workspace(&self) -> Result<(), String> {
+    ///
+    /// The reset takes a new generation and deletes each key below it. A
+    /// later segment saves above it, so a late attempt of the reset never
+    /// deletes a later head.
+    async fn reset_workspace(&self, state: &mut AgentState) -> Result<(), String> {
         let Ok(id) = &self.id else {
             return Ok(());
         };
-        let scope = WorkspaceMount::agent_scope(id.as_str());
+        let now = self.ctx.system_now().timestamp_millis();
+        state.workspace_generation = next_generation(state.workspace_generation, now);
+        let mount = WorkspaceMount {
+            scope: WorkspaceMount::agent_scope(id.as_str()),
+            head: None,
+            generation: state.workspace_generation,
+        };
         self.ctx
-            .execute_activity(&agent_workspace_reset_info(), scope)
+            .execute_activity(&agent_workspace_reset_info(), mount)
             .await
             .map(|_deleted: u64| ())
             .map_err(|err| err.to_string())
     }
 
-    /// Keep the workspace head of the agent and delete every other snapshot,
-    /// stale ones included (issue #2274).
+    /// Delete the workspace snapshots older than the head of the agent,
+    /// stale ones included (issue #2274). A late attempt deletes no newer
+    /// head, because a newer head has a newer generation.
     async fn retain_workspace(&self, state: &mut AgentState) {
         let Ok(id) = &self.id else {
             return;
@@ -1441,6 +1474,7 @@ impl AgentRun<'_> {
         let mount = WorkspaceMount {
             scope: WorkspaceMount::agent_scope(id.as_str()),
             head: state.workspace.clone(),
+            generation: state.workspace_generation,
         };
         let retained: Result<u64, _> = self
             .ctx
@@ -1666,6 +1700,11 @@ impl AgentRun<'_> {
         let head = state.workspace.clone();
         if let Some(mount) = task.workspace.as_mut() {
             mount.head.clone_from(&head);
+            // Each segment saves at a new generation, so retention never
+            // deletes a snapshot of a newer segment.
+            let now = self.ctx.system_now().timestamp_millis();
+            state.workspace_generation = next_generation(state.workspace_generation, now);
+            mount.generation = state.workspace_generation;
         }
         let run_id = format!("{}:s{}", state.incarnation, state.segments);
         state.segments = state.segments.saturating_add(1);
@@ -1975,8 +2014,8 @@ pub async fn agent_memory_reset(ctx: &ActivityContext, scope: MemoryScope) -> Re
     harness(ctx)?.memory_reset(scope).await
 }
 
-/// Keep the workspace head of `mount` and delete every other snapshot of
-/// its scope, as an activity (issue #2274). Returns the number deleted.
+/// Delete the snapshots of the scope of `mount` that are older than its
+/// head, as an activity (issue #2274). Returns the number deleted.
 ///
 /// # Errors
 ///
@@ -1992,9 +2031,9 @@ pub async fn agent_workspace_retain(
     harness(ctx)?.workspace_retain(mount).await
 }
 
-/// Delete every workspace snapshot of `scope`, as an activity (issue
-/// #2274). Returns the number deleted. With no store installed it deletes
-/// nothing.
+/// Delete every workspace snapshot of the scope of `mount` below its
+/// generation, as an activity (issue #2274). Returns the number deleted.
+/// With no store installed it deletes nothing.
 ///
 /// # Errors
 ///
@@ -2003,8 +2042,11 @@ pub async fn agent_workspace_retain(
     start_to_close = "5m",
     retry = RetryPolicy::exponential(3, Duration::from_secs(1))
 )]
-pub async fn agent_workspace_reset(ctx: &ActivityContext, scope: String) -> Result<u64, String> {
-    harness(ctx)?.workspace_reset(&scope).await
+pub async fn agent_workspace_reset(
+    ctx: &ActivityContext,
+    mount: WorkspaceMount,
+) -> Result<u64, String> {
+    harness(ctx)?.workspace_reset(mount).await
 }
 
 /// The signal name of an agent op.
@@ -2019,6 +2061,15 @@ mod tests {
 
     use super::*;
     use crate::message::ContentPart;
+
+    #[test]
+    fn a_workspace_generation_grows_and_follows_the_clock() {
+        assert_eq!(next_generation(0, 1_000), 1_000);
+        assert_eq!(next_generation(1_000, 1_000), 1_001, "one clock grows");
+        assert_eq!(next_generation(5_000, 1_000), 5_001, "a clock behind");
+        assert_eq!(next_generation(7, -1), 8, "a time before 1970");
+        assert_eq!(next_generation(u64::MAX, 0), u64::MAX);
+    }
 
     #[test]
     fn an_id_is_a_kind_and_a_name() {

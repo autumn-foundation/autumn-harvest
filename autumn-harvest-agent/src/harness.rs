@@ -1216,7 +1216,8 @@ impl AgentHarness {
             return Ok(Ok(None));
         }
         let store = self.workspace_store()?;
-        match tokio::time::timeout(self.tool_timeout, store.save(&mount.scope, &workspace)).await {
+        let save = store.save(&mount.scope, mount.generation, &workspace);
+        match tokio::time::timeout(self.tool_timeout, save).await {
             Err(_) => Err(workspace_timeout()),
             Ok(Ok(head)) => Ok(Ok(Some(head))),
             Ok(Err(err)) if err.kind() == ErrorKind::Tool => Ok(Err(err.message().to_owned())),
@@ -1224,32 +1225,39 @@ impl AgentHarness {
         }
     }
 
-    /// Keep the head of `mount` and delete every other snapshot of its
-    /// scope (issue #2274). Returns the number deleted.
+    /// Delete the snapshots of the scope of `mount` that are older than its
+    /// head (issue #2274). With no head, delete those below the generation
+    /// of `mount`. Returns the number deleted.
     ///
     /// # Errors
     ///
     /// Returns a non-retryable error when no store is installed, and the
     /// store error otherwise.
     pub async fn workspace_retain(&self, mount: WorkspaceMount) -> Result<u64, String> {
-        self.workspace_store()?
-            .retain(&mount.scope, mount.head.as_ref())
-            .await
-            .map_err(|err| model_failure(&err))
+        let store = self.workspace_store()?;
+        let deleted = match &mount.head {
+            Some(head) => store.retain(&mount.scope, head).await,
+            None => store.reset(&mount.scope, mount.generation).await,
+        };
+        deleted.map_err(|err| model_failure(&err))
     }
 
-    /// Delete every snapshot of `scope` (issue #2274). Returns the number
-    /// deleted. With no store installed it deletes nothing, so an erase of
-    /// an agent with no workspace succeeds.
+    /// Delete every snapshot of the scope of `mount` below its generation
+    /// (issue #2274). Returns the number deleted. With no store installed
+    /// it deletes nothing, so an erase of an agent with no workspace
+    /// succeeds.
     ///
     /// # Errors
     ///
     /// Returns the store error.
-    pub async fn workspace_reset(&self, scope: &str) -> Result<u64, String> {
+    pub async fn workspace_reset(&self, mount: WorkspaceMount) -> Result<u64, String> {
         let Some(store) = &self.workspace else {
             return Ok(0);
         };
-        store.erase(scope).await.map_err(|err| model_failure(&err))
+        store
+            .reset(&mount.scope, mount.generation)
+            .await
+            .map_err(|err| model_failure(&err))
     }
 
     /// An error result whose recorded outcome fits the result cap.

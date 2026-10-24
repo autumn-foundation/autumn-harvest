@@ -6,8 +6,11 @@
 //! claim-check pattern: history records only the [`WorkspaceRef`] of each
 //! snapshot that a tool call made.
 //!
-//! - **Content-addressed.** The key of a snapshot is the SHA-256 digest of
-//!   its plain bytes. A load checks the digest.
+//! - **Content-addressed.** The digest of a snapshot is the SHA-256 digest
+//!   of its plain bytes. A load checks the digest.
+//! - **Generations.** The key of a snapshot is its generation and its
+//!   digest. A durable agent gives each segment and each reset a higher
+//!   generation than the last.
 //! - **Encrypted.** The [`PayloadCodecs`] of the engine encode each
 //!   snapshot. An encrypting codec therefore encrypts it at rest.
 //! - **Per call.** A tool reads and writes the files through
@@ -18,9 +21,13 @@
 //! - **Fenced.** A reference becomes the head only when history records the
 //!   result that names it. A stale attempt can write a snapshot, but no
 //!   recorded result names that snapshot.
-//! - **Retention.** The end of each op that changed the head keeps the head
-//!   and deletes every other snapshot of the agent, stale ones included.
-//!   `Control::ResetWorkspace` deletes them all.
+//! - **Retention.** The end of each op that changed the head deletes every
+//!   other snapshot of its generation or older, stale ones included.
+//!   `Control::ResetWorkspace` deletes every snapshot below its own
+//!   generation. A stale attempt of either activity can run after a newer
+//!   op. It then deletes only older keys, so it never deletes a newer head,
+//!   also when that head has old content. `formal/tla/AgentWorkspaceRetention.tla`
+//!   checks this.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -55,6 +62,32 @@ pub struct WorkspaceRef {
     pub bytes: u64,
     /// The number of files.
     pub files: u32,
+    /// The generation of the op that saved the snapshot. Retention deletes
+    /// no key of a newer generation.
+    #[serde(default)]
+    pub generation: u64,
+}
+
+impl WorkspaceRef {
+    /// The key of the snapshot in its scope: the generation as 16 hex
+    /// digits, a dash and the digest.
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!("{:016x}-{}", self.generation, self.digest)
+    }
+}
+
+/// The generation in `key`, when `key` has the form of
+/// [`WorkspaceRef::key`].
+fn key_generation(key: &str) -> Option<u64> {
+    let (generation, digest) = key.split_once('-')?;
+    let hex_digits = |text: &str, len: usize| {
+        text.len() == len && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    if !hex_digits(generation, 16) || !hex_digits(digest, 64) {
+        return None;
+    }
+    u64::from_str_radix(generation, 16).ok()
 }
 
 /// The workspace that a tool call mounts.
@@ -65,6 +98,10 @@ pub struct WorkspaceMount {
     /// The head. `None` is an empty workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<WorkspaceRef>,
+    /// The generation of a snapshot that this mount saves. For a reset, the
+    /// bound below which it deletes.
+    #[serde(default)]
+    pub generation: u64,
 }
 
 impl WorkspaceMount {
@@ -223,11 +260,12 @@ impl Eq for WorkspaceHandle {}
 
 /// Where snapshots are kept: a blob store with one key space per scope.
 ///
-/// Use a store for workspaces only. Retention deletes every blob of a scope
-/// that is not its head.
+/// Use a store for workspaces only. Retention deletes the keys of a scope
+/// that are not newer than its head. It never deletes a key that does not
+/// have the form of [`WorkspaceRef::key`].
 pub trait WorkspaceBlobs: Send + Sync + std::fmt::Debug {
-    /// Store `bytes` under `digest` in `scope`. A put of an existing digest
-    /// replaces it.
+    /// Store `bytes` under the key `digest` in `scope`. A put of an existing
+    /// key replaces it.
     ///
     /// # Errors
     ///
@@ -239,7 +277,7 @@ pub trait WorkspaceBlobs: Send + Sync + std::fmt::Debug {
         bytes: Vec<u8>,
     ) -> BoxFuture<'a, Result<(), AgentError>>;
 
-    /// The bytes under `digest` in `scope`, if any.
+    /// The bytes under the key `digest` in `scope`, if any.
     ///
     /// # Errors
     ///
@@ -250,15 +288,15 @@ pub trait WorkspaceBlobs: Send + Sync + std::fmt::Debug {
         digest: &'a str,
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, AgentError>>;
 
-    /// Every digest in `scope`.
+    /// Every key in `scope`.
     ///
     /// # Errors
     ///
     /// Returns an error when the store cannot read.
     fn list<'a>(&'a self, scope: &'a str) -> BoxFuture<'a, Result<Vec<String>, AgentError>>;
 
-    /// Delete the blob under `digest` in `scope`. Returns whether it was
-    /// there.
+    /// Delete the blob under the key `digest` in `scope`. Returns whether
+    /// it was there.
     ///
     /// # Errors
     ///
@@ -356,15 +394,16 @@ impl DirWorkspaceBlobs {
         self.root.join(hex(&Sha256::digest(scope.as_bytes())))
     }
 
-    /// The file of `digest`. A digest that is not 64 hex digits is refused,
-    /// so it can never name a path outside the folder.
-    fn file(&self, scope: &str, digest: &str) -> Result<PathBuf, AgentError> {
-        if digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-            Ok(self.folder(scope).join(digest))
+    /// The file of `key`. A key that does not have the form of
+    /// [`WorkspaceRef::key`] is refused, so it can never name a path
+    /// outside the folder.
+    fn file(&self, scope: &str, key: &str) -> Result<PathBuf, AgentError> {
+        if key_generation(key).is_some() {
+            Ok(self.folder(scope).join(key))
         } else {
             Err(AgentError::new(
                 ErrorKind::Decode,
-                "a workspace digest must be 64 hex digits",
+                "a workspace key must be 16 hex digits, a dash and 64 hex digits",
             ))
         }
     }
@@ -566,7 +605,7 @@ impl WorkspaceStore {
         let Some(head) = &mount.head else {
             return Ok(Workspace::default());
         };
-        let Some(bytes) = self.blobs.get(&mount.scope, &head.digest).await? else {
+        let Some(bytes) = self.blobs.get(&mount.scope, &head.key()).await? else {
             return Err(AgentError::new(
                 ErrorKind::Decode,
                 "the workspace head is not in the store",
@@ -599,7 +638,8 @@ impl WorkspaceStore {
         })
     }
 
-    /// Save `workspace` in `scope` and return its reference.
+    /// Save `workspace` in `scope` at `generation`, and return its
+    /// reference.
     ///
     /// # Errors
     ///
@@ -608,6 +648,7 @@ impl WorkspaceStore {
     pub async fn save(
         &self,
         scope: &str,
+        generation: u64,
         workspace: &Workspace,
     ) -> Result<WorkspaceRef, AgentError> {
         let bytes = workspace.bytes();
@@ -638,44 +679,70 @@ impl WorkspaceStore {
         let plain = serde_json::to_vec(&stored).map_err(|_| shape_error())?;
         let digest = hex(&Sha256::digest(&plain));
         let encoded = self.encode(&plain)?;
-        self.blobs.put(scope, &digest, encoded).await?;
-        Ok(WorkspaceRef {
+        let head = WorkspaceRef {
             digest,
             bytes,
             files: u32::try_from(workspace.files.len()).unwrap_or(u32::MAX),
-        })
+            generation,
+        };
+        self.blobs.put(scope, &head.key(), encoded).await?;
+        Ok(head)
     }
 
-    /// Delete every snapshot of `scope` but `keep`. Returns the number
+    /// Delete every snapshot of `scope` but `keep`, of the generation of
+    /// `keep` or older. Returns the number deleted.
+    ///
+    /// A late attempt that runs after a newer op deletes no newer head,
+    /// because a newer head has a newer generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store fails.
+    pub async fn retain(&self, scope: &str, keep: &WorkspaceRef) -> Result<u64, AgentError> {
+        let head = keep.key();
+        self.delete_where(scope, |key| {
+            key != head
+                && key_generation(key).is_some_and(|generation| generation <= keep.generation)
+        })
+        .await
+    }
+
+    /// Delete every snapshot of `scope` below the generation `below`.
+    /// Returns the number deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store fails.
+    pub async fn reset(&self, scope: &str, below: u64) -> Result<u64, AgentError> {
+        self.delete_where(scope, |key| {
+            key_generation(key).is_some_and(|generation| generation < below)
+        })
+        .await
+    }
+
+    /// Delete every key of `scope`, of any generation. Returns the number
     /// deleted.
     ///
     /// # Errors
     ///
     /// Returns an error when the store fails.
-    pub async fn retain(
+    pub async fn erase(&self, scope: &str) -> Result<u64, AgentError> {
+        self.delete_where(scope, |_| true).await
+    }
+
+    /// Delete each key of `scope` that `doomed` selects.
+    async fn delete_where(
         &self,
         scope: &str,
-        keep: Option<&WorkspaceRef>,
+        doomed: impl Fn(&str) -> bool,
     ) -> Result<u64, AgentError> {
         let mut deleted = 0;
-        for digest in self.blobs.list(scope).await? {
-            if keep.is_some_and(|head| head.digest == digest) {
-                continue;
-            }
-            if self.blobs.delete(scope, &digest).await? {
+        for key in self.blobs.list(scope).await? {
+            if doomed(&key) && self.blobs.delete(scope, &key).await? {
                 deleted += 1;
             }
         }
         Ok(deleted)
-    }
-
-    /// Delete every snapshot of `scope`. Returns the number deleted.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the store fails.
-    pub async fn erase(&self, scope: &str) -> Result<u64, AgentError> {
-        self.retain(scope, None).await
     }
 
     /// The codec envelope of `plain`, as bytes.
@@ -758,13 +825,17 @@ mod tests {
                 },
             )
             .unwrap();
-        let head = store.save("agent:a", &workspace).await.unwrap();
+        let head = store.save("agent:a", 1, &workspace).await.unwrap();
         assert_eq!((head.files, head.bytes), (2, 15));
-        let again = store.save("agent:a", &workspace).await.unwrap();
+        let again = store.save("agent:a", 1, &workspace).await.unwrap();
         assert_eq!(head, again, "equal content gives an equal digest");
+        let later = store.save("agent:a", 2, &workspace).await.unwrap();
+        assert_eq!(later.digest, head.digest);
+        assert_ne!(later.key(), head.key(), "a generation gives its own key");
         let mount = WorkspaceMount {
             scope: "agent:a".to_owned(),
             head: Some(head),
+            generation: 0,
         };
         let loaded = store.load(&mount).await.unwrap();
         assert_eq!(loaded.read_text("notes/a.md"), Some("hello"));
@@ -778,34 +849,35 @@ mod tests {
         let store = store(&blobs);
         let mut workspace = Workspace::default();
         workspace.write("a", "one").unwrap();
-        let head = store.save("s", &workspace).await.unwrap();
+        let head = store.save("s", 1, &workspace).await.unwrap();
         workspace.write("a", "two").unwrap();
-        let other = store.save("s", &workspace).await.unwrap();
-        let swapped = blobs.get("s", &other.digest).await.unwrap().unwrap();
-        blobs.put("s", &head.digest, swapped).await.unwrap();
+        let other = store.save("s", 1, &workspace).await.unwrap();
+        let swapped = blobs.get("s", &other.key()).await.unwrap().unwrap();
+        blobs.put("s", &head.key(), swapped).await.unwrap();
         let mount = WorkspaceMount {
             scope: "s".to_owned(),
             head: Some(head),
+            generation: 0,
         };
         let err = store.load(&mount).await.unwrap_err();
         assert!(err.message().contains("digest"), "{err}");
     }
 
     #[tokio::test]
-    async fn retain_keeps_only_the_head_and_erase_keeps_nothing() {
+    async fn retain_keeps_the_head_generation_and_erase_keeps_nothing() {
         let blobs = Arc::new(InMemoryWorkspaceBlobs::default());
         let store = store(&blobs);
         let mut heads = Vec::new();
         for n in 0..3 {
             let mut workspace = Workspace::default();
             workspace.write("n", n.to_string()).unwrap();
-            heads.push(store.save("s", &workspace).await.unwrap());
+            heads.push(store.save("s", n, &workspace).await.unwrap());
         }
         let mut other = Workspace::default();
         other.write("x", "y").unwrap();
-        store.save("t", &other).await.unwrap();
-        assert_eq!(store.retain("s", heads.last()).await.unwrap(), 2);
-        assert_eq!(blobs.list("s").await.unwrap(), [heads[2].digest.clone()]);
+        store.save("t", 0, &other).await.unwrap();
+        assert_eq!(store.retain("s", &heads[2]).await.unwrap(), 2);
+        assert_eq!(blobs.list("s").await.unwrap(), [heads[2].key()]);
         assert_eq!(store.erase("s").await.unwrap(), 1);
         assert_eq!(blobs.list("s").await.unwrap(), Vec::<String>::new());
         assert_eq!(
@@ -816,12 +888,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stale_retain_never_deletes_a_newer_head() {
+        let blobs = Arc::new(InMemoryWorkspaceBlobs::default());
+        let store = store(&blobs);
+        let mut workspace = Workspace::default();
+        workspace.write("a", "one").unwrap();
+        let first = store.save("s", 1, &workspace).await.unwrap();
+        workspace.write("a", "two").unwrap();
+        let second = store.save("s", 2, &workspace).await.unwrap();
+        // The retention that the first op scheduled runs late.
+        store.retain("s", &first).await.unwrap();
+        let mount = WorkspaceMount {
+            scope: "s".to_owned(),
+            head: Some(second),
+            generation: 0,
+        };
+        let loaded = store.load(&mount).await.unwrap();
+        assert_eq!(loaded.read_text("a"), Some("two"));
+    }
+
+    #[tokio::test]
+    async fn a_newer_head_with_old_content_survives_a_stale_retain() {
+        let blobs = Arc::new(InMemoryWorkspaceBlobs::default());
+        let store = store(&blobs);
+        let mut workspace = Workspace::default();
+        workspace.write("a", "one").unwrap();
+        let old = store.save("s", 1, &workspace).await.unwrap();
+        workspace.write("a", "two").unwrap();
+        let middle = store.save("s", 2, &workspace).await.unwrap();
+        // The agent writes the old content back.
+        workspace.write("a", "one").unwrap();
+        let restored = store.save("s", 3, &workspace).await.unwrap();
+        assert_eq!(restored.digest, old.digest);
+        store.retain("s", &middle).await.unwrap();
+        let mount = WorkspaceMount {
+            scope: "s".to_owned(),
+            head: Some(restored),
+            generation: 0,
+        };
+        assert_eq!(
+            store.load(&mount).await.unwrap().read_text("a"),
+            Some("one")
+        );
+        assert!(blobs.get("s", &old.key()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stale_reset_never_deletes_a_later_head() {
+        let blobs = Arc::new(InMemoryWorkspaceBlobs::default());
+        let store = store(&blobs);
+        let mut workspace = Workspace::default();
+        workspace.write("a", "one").unwrap();
+        let before = store.save("s", 1, &workspace).await.unwrap();
+        assert_eq!(store.reset("s", 2).await.unwrap(), 1);
+        let after = store.save("s", 3, &workspace).await.unwrap();
+        // A late attempt of the reset runs again.
+        assert_eq!(store.reset("s", 2).await.unwrap(), 0);
+        assert!(blobs.get("s", &before.key()).await.unwrap().is_none());
+        assert!(blobs.get("s", &after.key()).await.unwrap().is_some());
+    }
+
+    #[test]
+    fn a_key_is_the_generation_and_the_digest() {
+        let head = WorkspaceRef {
+            digest: "ab".repeat(32),
+            bytes: 1,
+            files: 1,
+            generation: 0x1f,
+        };
+        assert_eq!(head.key(), format!("000000000000001f-{}", "ab".repeat(32)));
+        assert_eq!(key_generation(&head.key()), Some(0x1f));
+        assert_eq!(key_generation(&"ab".repeat(32)), None, "a bare digest");
+        assert_eq!(key_generation(&format!("{}-x", "0".repeat(16))), None);
+        assert_eq!(key_generation(&head.key().to_uppercase()), None);
+    }
+
+    #[tokio::test]
     async fn a_workspace_over_a_cap_is_a_tool_error() {
         let blobs = Arc::new(InMemoryWorkspaceBlobs::default());
         let store = store(&blobs).max_bytes(4).max_files(1);
         let mut workspace = Workspace::default();
         workspace.write("a", "12345").unwrap();
-        let err = store.save("s", &workspace).await.unwrap_err();
+        let err = store.save("s", 1, &workspace).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Tool);
         assert_eq!(blobs.raw(), Vec::<Vec<u8>>::new());
     }
@@ -852,10 +1000,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_dir_store_keeps_scopes_apart_and_refuses_odd_digests() {
+    async fn the_dir_store_keeps_scopes_apart_and_refuses_odd_keys() {
         let dir = tempfile::tempdir().unwrap();
         let blobs = DirWorkspaceBlobs::new(dir.path());
-        let digest = "a".repeat(64);
+        let digest = format!("{}-{}", "0".repeat(16), "a".repeat(64));
         blobs
             .put("agent:x/y", &digest, b"one".to_vec())
             .await
@@ -873,6 +1021,7 @@ mod tests {
             Vec::<String>::new()
         );
         assert!(blobs.get("agent:x/y", "../../etc/passwd").await.is_err());
+        assert!(blobs.get("agent:x/y", &"a".repeat(64)).await.is_err());
         assert!(blobs.delete("agent:x/y", &digest).await.unwrap());
         assert!(!blobs.delete("agent:x/y", &digest).await.unwrap());
     }
@@ -883,7 +1032,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let blobs = DirWorkspaceBlobs::new(dir.path());
-        let digest = "b".repeat(64);
+        let digest = format!("{}-{}", "0".repeat(16), "b".repeat(64));
         blobs
             .put("agent:x/y", &digest, b"two".to_vec())
             .await
@@ -897,7 +1046,7 @@ mod tests {
     async fn concurrent_puts_of_one_digest_each_write_a_whole_blob() {
         let dir = tempfile::tempdir().unwrap();
         let blobs = Arc::new(DirWorkspaceBlobs::new(dir.path()));
-        let digest = "c".repeat(64);
+        let digest = format!("{}-{}", "0".repeat(16), "c".repeat(64));
         // An AEAD codec gives each put of one snapshot different bytes.
         let bodies: Vec<Vec<u8>> = (0..16_u8).map(|n| vec![n; 256 * 1024]).collect();
         // Spawn every put before the first await, so the puts overlap.
