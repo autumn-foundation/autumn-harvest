@@ -76,8 +76,11 @@ fn hex(bytes: &[u8]) -> String {
 /// Where the model-turn activity keeps the windows that later turns name.
 ///
 /// A store may drop any window at any time. A shared store, such as one in
-/// Redis, lets a delta hit on every worker. A store holds transcript text
-/// outside history, so delete a run's windows when you erase the run.
+/// Redis, lets a delta hit on every worker. A read checks the digest of the
+/// window, so a changed window is a miss.
+///
+/// A store holds transcript text outside history and outside the payload
+/// codecs. Erasure does not reach it, so the app clears its own store.
 pub trait TranscriptStore: Send + Sync + std::fmt::Debug {
     /// The window with the digest `digest`, if the store holds it.
     fn get(&self, digest: &str) -> Option<Vec<ChatMessage>>;

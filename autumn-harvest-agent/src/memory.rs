@@ -995,6 +995,7 @@ mod tests {
             call_id: "c".into(),
             session_id: None,
             step: 3,
+            workspace: None,
         };
         assert_eq!(EditKey::for_call(&ctx).as_str(), "r:3:c");
     }

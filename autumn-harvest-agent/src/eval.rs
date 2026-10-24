@@ -1683,6 +1683,7 @@ mod tests {
                 delegations: Vec::new(),
                 flow_labels: std::collections::BTreeSet::new(),
                 run_id: None,
+                workspace: None,
             })
         };
         let done = report(crate::AgentStop::Completed);

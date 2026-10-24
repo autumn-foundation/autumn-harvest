@@ -556,6 +556,7 @@ async fn the_tool_call_activity_checks_the_mandate_again() {
             allowed_tools: Some(BTreeSet::from(["lookup".to_owned()])),
             labels: None,
             flow_labels: std::collections::BTreeSet::new(),
+            workspace: None,
         })
         .await
         .unwrap();
@@ -1098,6 +1099,7 @@ async fn a_turn_records_labels_only_with_flow_rules() {
         flow_released: autumn_harvest_agent::Released::new(),
         interruptible: false,
         model: None,
+        stream: false,
         mesh: None,
         prefix: None,
         remember: false,
@@ -1399,6 +1401,7 @@ fn turn_request() -> ModelTurnRequest {
         flow_released: autumn_harvest_agent::Released::new(),
         interruptible: false,
         model: None,
+        stream: false,
         mesh: None,
         prefix: None,
         remember: false,
@@ -2032,6 +2035,7 @@ async fn the_tool_call_activity_refuses_a_tool_whose_labels_grew() {
         allowed_tools: None,
         labels: Some(labels.iter().map(|label| (*label).to_owned()).collect()),
         flow_labels: std::collections::BTreeSet::new(),
+        workspace: None,
     };
     // The deciding worker saw a read-only tool.
     let grown = harness

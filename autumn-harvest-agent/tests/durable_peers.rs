@@ -10,17 +10,19 @@ mod common;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest_agent::agent::MAX_HELD_OPS;
 use autumn_harvest_agent::flow::labels;
 use autumn_harvest_agent::mesh::DELEGATE_TOOL;
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentId, AgentModel, AgentOp, AgentProfile, AgentState, BoxFuture,
-    ChatRequest, ChatResponse, ChatRole, ContentPart, Control, FlowRules, FnTool, Mandate, Peer,
-    PeerEnvelope, Rule, StopReason, TokenUsage, ToolEffect, sqlite,
+    ChatRequest, ChatResponse, ChatRole, ContentPart, Control, ErrorKind, FlowRules, FnTool,
+    Followups, Mandate, Peer, PeerEnvelope, Rule, StopReason, TokenUsage, ToolEffect, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
-use common::{Recorder, recorded_tool, runtime};
+use common::{Recorder, ScriptedModel, recorded_tool, runtime};
 use serde_json::{Value, json};
 
 fn fresh_db() -> (tempfile::TempDir, PathBuf) {
@@ -165,7 +167,7 @@ fn mesh_model() -> Arc<FnModel> {
     })
 }
 
-fn mesh_harness(model: Arc<FnModel>) -> AgentHarness {
+fn mesh_harness(model: Arc<dyn AgentModel>) -> AgentHarness {
     AgentHarness::new(model)
         .peer(Peer::agent("researcher", "Finds facts.", &research()))
         .agent(AgentProfile::new("triage").mandate(Mandate::new("triage").peers(["researcher"])))
@@ -655,4 +657,231 @@ async fn a_receiver_on_a_model_that_the_sender_forbids_refuses_the_message() {
         strong.requests().is_empty(),
         "the forbidden model never runs"
     );
+}
+
+/// The tool results of every request that answers a peer message.
+fn peer_tool_results(model: &FnModel) -> Vec<String> {
+    model
+        .requests()
+        .iter()
+        .filter(|request| from_peer(request))
+        .flat_map(tool_results)
+        .collect()
+}
+
+/// The timers that fired in the running run of `agent`.
+fn fired_timers(rt: &SqliteRuntime, agent: &AgentId) -> usize {
+    let exec = sqlite::current_run(rt, agent).unwrap().unwrap();
+    rt.load_history(exec)
+        .unwrap()
+        .iter()
+        .filter(|event| matches!(event, WorkflowEvent::TimerFired { .. }))
+        .count()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_inbound_mandate_makes_the_receiver_read_only() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = FnModel::new(|request| {
+        let results = tool_results(request);
+        if from_peer(request) {
+            return if results.is_empty() {
+                call("w1", "write", json!({}))
+            } else {
+                text(&format!("write said: {}", results[0]))
+            };
+        }
+        if results.is_empty() {
+            call(
+                "d1",
+                DELEGATE_TOOL,
+                json!({"agent": "researcher", "task": "write it"}),
+            )
+        } else {
+            text("done")
+        }
+    });
+    // The researcher may write on its own. Triage reaches it only through a
+    // read-only peer, so the inbound mandate is read-only.
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool("write", ToolEffect::Write, &recorder))
+        .peer(Peer::agent("researcher", "Writes.", &research()).read_only())
+        .agent(AgentProfile::new("triage").mandate(Mandate::new("triage").peers(["researcher"])))
+        .agent(AgentProfile::new("research").mandate(Mandate::new("researcher")));
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("go"), None).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    assert!(recorder.runs().is_empty(), "the write tool never runs");
+    let results = peer_tool_results(&model);
+    assert!(results[0].contains("only read"), "{results:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_peer_segment_sends_no_answer_of_an_earlier_op() {
+    let (_dir, db) = fresh_db();
+    // One model serves both agents, in the order that the test drives them.
+    let model = ScriptedModel::new(vec![
+        Ok(text("an old answer")),
+        Ok(call(
+            "d1",
+            DELEGATE_TOOL,
+            json!({"agent": "researcher", "task": "find it"}),
+        )),
+        Err(AgentError::new(ErrorKind::Provider, "the provider refused")),
+        Ok(text("done")),
+    ]);
+    let mut rt = runtime(&db, mesh_harness(model.clone()));
+    // An earlier op of the researcher leaves an answer in its state.
+    sqlite::send(&mut rt, &research(), &AgentOp::message("hello"), None).unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("what is it?"), None).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 4, "triage reads the reply");
+    let results = tool_results(&requests[3]);
+    let reply: Value = serde_json::from_str(&results[0]).unwrap();
+    assert_eq!(reply["stop"], Value::Null, "{reply}");
+    assert_eq!(reply["answer"], json!(""), "{reply}");
+    let error = reply["error"].as_str().unwrap_or_default();
+    assert!(error.contains("the provider refused"), "{reply}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_segment_books_no_followup() {
+    let (_dir, db) = fresh_db();
+    let model = FnModel::new(|request| {
+        let results = tool_results(request);
+        if from_peer(request) {
+            return if results.is_empty() {
+                call(
+                    "f1",
+                    "schedule_followup",
+                    json!({"prompt": "check again", "delay_minutes": 1}),
+                )
+            } else {
+                text(&format!("the booking said: {}", results[0]))
+            };
+        }
+        if results.is_empty() {
+            call(
+                "d1",
+                DELEGATE_TOOL,
+                json!({"agent": "researcher", "task": "check it later"}),
+            )
+        } else {
+            text("done")
+        }
+    });
+    // The researcher may book follow-ups on its own, but not for a peer.
+    let harness = AgentHarness::new(model.clone())
+        .peer(Peer::agent("researcher", "Finds facts.", &research()))
+        .agent(AgentProfile::new("triage").mandate(Mandate::new("triage").peers(["researcher"])))
+        .agent(
+            AgentProfile::new("research")
+                .mandate(Mandate::new("researcher"))
+                .followups(Followups::new(Duration::from_secs(3_600))),
+        );
+    let mut rt = runtime(&db, harness);
+    start(&mut rt, &research()).await;
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("go"), None).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    let receiver = state(&rt, &research()).await;
+    assert_eq!(receiver.followup_due_ms, None, "no follow-up is booked");
+    let results = peer_tool_results(&model);
+    assert!(!results[0].contains("scheduled"), "{results:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_held_queue_answers_a_waiting_peer_at_once() {
+    let (_dir, db) = fresh_db();
+    let model = mesh_model();
+    let mut rt = runtime(&db, mesh_harness(model.clone()));
+    // The researcher is paused, and its held queue is full.
+    let pause = AgentOp::Control(Control::Pause { reason: None });
+    sqlite::send(&mut rt, &research(), &pause, None).unwrap();
+    for n in 0..MAX_HELD_OPS {
+        let op = AgentOp::message(format!("m{n}"));
+        sqlite::send(&mut rt, &research(), &op, None).unwrap();
+    }
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    assert_eq!(state(&rt, &research()).await.held.len(), MAX_HELD_OPS);
+
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("what is it?"), None).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+    sqlite::drive(&mut rt, &research()).await.unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    let answer = state(&rt, &triage()).await.last_answer.unwrap();
+    assert!(answer.contains("the held queue is full"), "{answer}");
+    assert_eq!(fired_timers(&rt, &triage()), 0, "the reply came at once");
+    assert_eq!(
+        state(&rt, &research()).await.held.len(),
+        MAX_HELD_OPS,
+        "the refused message is not held"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fan_out_child_that_asks_its_waiting_parent_gets_a_deadlock_error_at_once() {
+    let (_dir, db) = fresh_db();
+    let model = FnModel::new(|request| {
+        let input = first_user(request);
+        let results = tool_results(request);
+        match input.as_str() {
+            // Two delegations in one turn run as two child runs.
+            "go" if results.is_empty() => ChatResponse {
+                content: vec![
+                    ContentPart::ToolCall {
+                        id: "d1".to_owned(),
+                        name: DELEGATE_TOOL.to_owned(),
+                        arguments: json!({"agent": "flights", "task": "ask the boss"}),
+                    },
+                    ContentPart::ToolCall {
+                        id: "d2".to_owned(),
+                        name: DELEGATE_TOOL.to_owned(),
+                        arguments: json!({"agent": "hotels", "task": "find hotels"}),
+                    },
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::new(1, 1),
+            },
+            "go" => text(&format!("children: {}", results.join(" | "))),
+            // The flights child asks the planner, which waits on the child.
+            "ask the boss" if results.is_empty() => call(
+                "b1",
+                DELEGATE_TOOL,
+                json!({"agent": "boss", "task": "what did you mean?"}),
+            ),
+            "ask the boss" => text(&format!("asking back failed: {}", results[0])),
+            _ => text("hotels found"),
+        }
+    });
+    let harness = AgentHarness::new(model.clone())
+        .peer(Peer::new("flights", "Finds flights.").peers(["boss"]))
+        .peer(Peer::new("hotels", "Finds hotels."))
+        .peer(Peer::agent("boss", "Plans the trip.", &triage()))
+        .agent(
+            AgentProfile::new("triage")
+                .mandate(Mandate::new("triage").peers(["flights", "hotels", "boss"]))
+                .parallel_children(2),
+        );
+    let mut rt = runtime(&db, harness);
+    sqlite::send(&mut rt, &triage(), &AgentOp::message("go"), None).unwrap();
+    sqlite::drive(&mut rt, &triage()).await.unwrap();
+
+    let planner = state(&rt, &triage()).await;
+    let answer = planner.last_answer.expect("the op ends");
+    assert!(answer.contains("deadlock"), "{answer}");
+    assert_eq!(fired_timers(&rt, &triage()), 0, "no reply deadline fired");
 }

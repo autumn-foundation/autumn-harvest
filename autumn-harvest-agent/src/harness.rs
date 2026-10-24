@@ -14,9 +14,10 @@ use tracing::Instrument;
 use crate::agent::AgentProfile;
 use crate::bounds::{exceeds_bytes, json_len};
 use crate::delivery::{Delivery, LogDelivery, Report};
-use crate::error::AgentError;
+use crate::error::{AgentError, ErrorKind};
 use crate::flow::{FlowRules, Released, call_labels};
 use crate::heartbeat::{HeartbeatTask, Precheck};
+use crate::live::{Coalescer, LiveEvent, LiveSink};
 use crate::memory::{MEMORY_TOOL, MemoryScope, MemorySnapshot, MemoryStore, MemoryTool};
 use crate::mesh::{DELEGATE_TOOL, Peer, delegate_definition, valid_name};
 use crate::mesh_control::{MESH_BUDGET_EXCEEDED, MeshBudget, MeshBudgetExceeded, MeshSpend};
@@ -30,6 +31,7 @@ use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 
 use crate::transcript::{InMemoryTranscriptStore, PREFIX_MISSING, TranscriptStore, chain};
 use crate::types::{ModelTurn, ModelTurnRequest, ToolCallRequest, ToolOutcome};
+use crate::workspace::{WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore};
 
 /// The default cap on one tool result, in characters.
 pub const DEFAULT_TOOL_OUTPUT_LIMIT: usize = 8_000;
@@ -118,6 +120,8 @@ pub struct AgentHarness {
     transcripts: Arc<dyn TranscriptStore>,
     mesh_budgets: Vec<MeshBudget>,
     mesh_spend: Option<Arc<dyn MeshSpend>>,
+    live: Option<Arc<dyn LiveSink>>,
+    workspace: Option<WorkspaceStore>,
 }
 
 impl AgentHarness {
@@ -130,6 +134,8 @@ impl AgentHarness {
             transcripts: Arc::new(InMemoryTranscriptStore::default()),
             mesh_budgets: Vec::new(),
             mesh_spend: None,
+            live: None,
+            workspace: None,
             tools: Vec::new(),
             policy: Arc::new(AllowAll),
             temperature: None,
@@ -311,6 +317,23 @@ impl AgentHarness {
         }
     }
 
+    /// Keep the workspaces of durable agents in `store` (issue #2274). A
+    /// profile turns a workspace on with `AgentProfile::workspace`.
+    #[must_use]
+    pub fn workspace(mut self, store: WorkspaceStore) -> Self {
+        self.workspace = Some(store);
+        self
+    }
+
+    /// Send the live text of every model turn to `sink`, on every backend
+    /// (issue #2268). Pass a model that implements
+    /// [`AgentModel::chat_stream`] to get text while the model writes.
+    #[must_use]
+    pub fn live_sink(mut self, sink: Arc<dyn LiveSink>) -> Self {
+        self.live = Some(sink);
+        self
+    }
+
     /// Cap the spend of a mesh in each period (issue #2272). A spent budget
     /// refuses the model turns of the mesh. Set the spend source with
     /// [`mesh_spend`](Self::mesh_spend).
@@ -334,7 +357,11 @@ impl AgentHarness {
     /// Returns a non-retryable [`MESH_BUDGET_EXCEEDED`] payload with the
     /// period end. A budget with no spend source fails closed as a config
     /// error. A failed read is retryable.
-    async fn check_mesh_budget(&self, mesh: Option<&str>) -> Result<(), String> {
+    async fn check_mesh_budget(
+        &self,
+        mesh: Option<&str>,
+        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+    ) -> Result<(), String> {
         let Some(mesh) = mesh else {
             return Ok(());
         };
@@ -350,7 +377,7 @@ impl AgentHarness {
                 )
                 .into_error_payload());
             };
-            let (since, until) = budget.period.window(autumn_harvest::chrono::Utc::now());
+            let (since, until) = budget.period.window(now);
             let spend = tokio::time::timeout(self.budget_timeout, source.spent(mesh, since))
                 .await
                 .map_err(|_| "the read took longer than the budget timeout".to_owned())
@@ -397,10 +424,13 @@ impl AgentHarness {
         let (digest, window) = match &request.prefix {
             None => (None, added.clone()),
             Some(prefix) => {
+                // The digest check makes a changed window a miss, so a
+                // shared store cannot put words into a turn.
                 let held = self
                     .transcripts
                     .get(&prefix.digest)
                     .filter(|held| u32::try_from(held.len()).is_ok_and(|len| len == prefix.len))
+                    .filter(|held| chain(None, held) == prefix.digest)
                     .ok_or_else(|| {
                         ActivityFailure::non_retryable(
                             PREFIX_MISSING,
@@ -583,9 +613,15 @@ impl AgentHarness {
         tenant: CacheTenant,
         prepare: impl FnMut(&mut Vec<ContentPart>),
     ) -> Result<ModelTurn, String> {
-        self.model_turn_timed_in(request, tenant, prepare)
-            .await
-            .map(|(turn, _latency)| turn)
+        self.model_turn_timed_in(
+            request,
+            tenant,
+            prepare,
+            None,
+            autumn_harvest::chrono::Utc::now(),
+        )
+        .await
+        .map(|(turn, _latency)| turn)
     }
 
     /// [`model_turn_in`](Self::model_turn_in), with the latency of the model
@@ -594,11 +630,19 @@ impl AgentHarness {
     /// The latency covers the model call only, not the cache or the policy.
     /// It is `None` when a cache hit answers the turn, because no model call
     /// ran.
+    ///
+    /// `publish` gets the live events of a turn whose request sets `stream`
+    /// (issue #2268). The live sink of the harness gets them for every turn.
+    ///
+    /// `now` is the clock of the runtime. The mesh budget window uses it, so
+    /// it agrees with the clock of the ledger rows (issue #2272).
     pub(crate) async fn model_turn_timed_in(
         &self,
         request: ModelTurnRequest,
         tenant: CacheTenant,
         prepare: impl FnMut(&mut Vec<ContentPart>),
+        publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
+        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
     ) -> Result<(ModelTurn, Option<Duration>), String> {
         let span = tracing::info_span!(
             "agent_model_turn",
@@ -607,27 +651,18 @@ impl AgentHarness {
         if let Some(agent) = &request.agent {
             span.record("gen_ai.agent.name", agent.as_str());
         }
-        self.model_turn_spanned(request, tenant, prepare)
+        self.model_turn_spanned(request, tenant, prepare, publish, now)
             .instrument(span)
             .await
     }
 
-    /// The body of [`model_turn_timed_in`](Self::model_turn_timed_in).
-    async fn model_turn_spanned(
-        &self,
-        request: ModelTurnRequest,
-        tenant: CacheTenant,
-        mut prepare: impl FnMut(&mut Vec<ContentPart>),
-    ) -> Result<(ModelTurn, Option<Duration>), String> {
-        let client = self.model(request.model.as_deref())?;
-        self.check_mesh_budget(request.mesh.as_deref()).await?;
-        let mut request = request;
-        let messages = self.window(&mut request)?;
+    /// The tools of one turn: the built-in tools that the decision checks,
+    /// and the definitions that the model sees.
+    fn turn_tools(&self, request: &ModelTurnRequest) -> (Vec<Arc<dyn Tool>>, Vec<ToolDefinition>) {
         let mut builtins = self.builtins(
             request.memory_scope.as_ref(),
             request.extra_tools.iter().cloned(),
         );
-        let allowed = request.allowed_tools.as_ref();
         // Only a run with a mandate names its acting agent.
         let mandate = request.agent.is_some();
         // Under a mandate with no peer to offer, a `delegate` call is still a
@@ -637,11 +672,35 @@ impl AgentHarness {
         if hidden_delegate {
             builtins.push(Arc::new(WorkflowTool(delegate_definition(&[]))));
         }
-        let tools: Vec<_> = self
-            .permitted(&builtins, allowed)
+        let tools = self
+            .permitted(&builtins, request.allowed_tools.as_ref())
             .filter(|tool| !(hidden_delegate && tool.name() == DELEGATE_TOOL))
             .map(Tool::definition)
             .collect();
+        (builtins, tools)
+    }
+
+    /// The body of [`model_turn_timed_in`](Self::model_turn_timed_in).
+    async fn model_turn_spanned(
+        &self,
+        request: ModelTurnRequest,
+        tenant: CacheTenant,
+        mut prepare: impl FnMut(&mut Vec<ContentPart>),
+        publish: Option<&(dyn Fn(&LiveEvent) + Send + Sync)>,
+        now: autumn_harvest::chrono::DateTime<autumn_harvest::chrono::Utc>,
+    ) -> Result<(ModelTurn, Option<Duration>), String> {
+        let live = Live {
+            run_id: request.run_id.clone(),
+            step: request.steps_used,
+            publish: publish.filter(|_| request.stream),
+            sink: self.live.as_deref(),
+        };
+        let client = self.model(request.model.as_deref())?;
+        self.check_mesh_budget(request.mesh.as_deref(), now).await?;
+        let mut request = request;
+        let messages = self.window(&mut request)?;
+        let (builtins, tools) = self.turn_tools(&request);
+        let allowed = request.allowed_tools.as_ref();
         let chat = ChatRequest {
             messages,
             tools,
@@ -672,7 +731,11 @@ impl AgentHarness {
                 }
             } else {
                 let started = std::time::Instant::now();
-                let response = self.call_model(client.as_ref(), &chat).await?;
+                let response = if live.is_on() {
+                    self.stream_model(client.as_ref(), &chat, &live).await?
+                } else {
+                    self.call_model(client.as_ref(), &chat).await?
+                };
                 latency = Some(started.elapsed());
                 fresh = key.as_ref().map(|key| (key, response.clone()));
                 response
@@ -900,6 +963,48 @@ impl AgentHarness {
             .collect()
     }
 
+    /// Send `chat` to `client` within the model time budget, and send each
+    /// piece of answer text to `live` while the model writes (issue #2268).
+    async fn stream_model(
+        &self,
+        client: &dyn AgentModel,
+        chat: &ChatRequest,
+        live: &Live<'_>,
+    ) -> Result<ChatResponse, String> {
+        live.send(&LiveEvent::Start {
+            run_id: live.run_id.clone(),
+            step: live.step,
+        });
+        let joined = std::sync::Mutex::new(Coalescer::new());
+        let on_delta = |text: &str| {
+            let ready = joined
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(text);
+            if let Some(text) = ready {
+                live.delta(text);
+            }
+        };
+        let result =
+            tokio::time::timeout(self.model_timeout, client.chat_stream(chat, &on_delta)).await;
+        let rest = joined
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush();
+        if let Some(text) = rest {
+            live.delta(text);
+        }
+        result
+            .map_err(|_| {
+                ActivityFailure::retryable(
+                    "ModelTimeout",
+                    format!("the model did not answer within {:?}", self.model_timeout),
+                )
+                .into_error_payload()
+            })?
+            .map_err(|err| model_failure(&err))
+    }
+
     /// Send `chat` to `client` within the model time budget.
     async fn call_model(
         &self,
@@ -1029,19 +1134,37 @@ impl AgentHarness {
             return Ok(self
                 .error_outcome("the tool labels changed after the decision; call the tool again"));
         }
+        // A read-only run can read the files but never moves the head.
+        let keep_files = !request.read_only;
+        // Only a tool that opts in loads the workspace (issue #2274).
+        let mount = request.workspace.filter(|_| tool.uses_workspace());
+        let handle = match &mount {
+            Some(mount) => Some(self.open_workspace(mount).await?),
+            None => None,
+        };
         let ctx = ToolContext {
             run_id: RunId::new(request.run_id),
             call_id: call.id,
             session_id: request.session_id,
             step: request.step,
+            workspace: handle.clone(),
         };
         let execution = tool.execute(call.arguments, &ctx);
         Ok(
             match tokio::time::timeout(self.tool_timeout, execution).await {
-                Ok(Ok(output)) => ToolOutcome::ok(fit_result(
-                    truncate(&output.to_string(), self.tool_output_limit),
-                    self.max_result_bytes,
-                )),
+                Ok(Ok(output)) => {
+                    let mut outcome = ToolOutcome::ok(fit_result(
+                        truncate(&output.to_string(), self.tool_output_limit),
+                        self.max_result_bytes,
+                    ));
+                    if let (Some(mount), Some(handle), true) = (&mount, &handle, keep_files) {
+                        match self.save_workspace(mount, handle).await? {
+                            Ok(head) => outcome.workspace = head,
+                            Err(cap) => outcome = self.error_outcome(&cap),
+                        }
+                    }
+                    outcome
+                }
                 Ok(Err(err)) => {
                     tracing::warn!(tool = %call.name, error = %err, "agent tool call failed");
                     self.error_outcome(err.message())
@@ -1052,6 +1175,81 @@ impl AgentHarness {
                 )),
             },
         )
+    }
+
+    /// The workspace store, or a non-retryable error.
+    fn workspace_store(&self) -> Result<&WorkspaceStore, String> {
+        self.workspace.as_ref().ok_or_else(|| {
+            ActivityFailure::non_retryable(
+                "WorkspaceStoreMissing",
+                "the agent has a workspace, but no workspace store is installed: call AgentHarness::workspace",
+            )
+            .into_error_payload()
+        })
+    }
+
+    /// Load the head of `mount` for one tool call (issue #2274).
+    ///
+    /// A store failure retries the activity. A missing or changed snapshot
+    /// fails it, because the head is lost.
+    async fn open_workspace(&self, mount: &WorkspaceMount) -> Result<WorkspaceHandle, String> {
+        let store = self.workspace_store()?;
+        let workspace = tokio::time::timeout(self.tool_timeout, store.load(mount))
+            .await
+            .map_err(|_| workspace_timeout())?
+            .map_err(|err| workspace_failure(&err))?;
+        Ok(WorkspaceHandle::new(workspace))
+    }
+
+    /// Save the workspace of a call that changed it (issue #2274).
+    ///
+    /// `Ok(Ok(None))` means no change. `Ok(Err(text))` is a cap, which the
+    /// model reads. `Err` retries the activity: a new attempt runs the tool
+    /// again from the same head.
+    async fn save_workspace(
+        &self,
+        mount: &WorkspaceMount,
+        handle: &WorkspaceHandle,
+    ) -> Result<Result<Option<WorkspaceRef>, String>, String> {
+        let workspace = handle.snapshot();
+        if !workspace.is_dirty() {
+            return Ok(Ok(None));
+        }
+        let store = self.workspace_store()?;
+        match tokio::time::timeout(self.tool_timeout, store.save(&mount.scope, &workspace)).await {
+            Err(_) => Err(workspace_timeout()),
+            Ok(Ok(head)) => Ok(Ok(Some(head))),
+            Ok(Err(err)) if err.kind() == ErrorKind::Tool => Ok(Err(err.message().to_owned())),
+            Ok(Err(err)) => Err(workspace_failure(&err)),
+        }
+    }
+
+    /// Keep the head of `mount` and delete every other snapshot of its
+    /// scope (issue #2274). Returns the number deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a non-retryable error when no store is installed, and the
+    /// store error otherwise.
+    pub async fn workspace_retain(&self, mount: WorkspaceMount) -> Result<u64, String> {
+        self.workspace_store()?
+            .retain(&mount.scope, mount.head.as_ref())
+            .await
+            .map_err(|err| model_failure(&err))
+    }
+
+    /// Delete every snapshot of `scope` (issue #2274). Returns the number
+    /// deleted. With no store installed it deletes nothing, so an erase of
+    /// an agent with no workspace succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store error.
+    pub async fn workspace_reset(&self, scope: &str) -> Result<u64, String> {
+        let Some(store) = &self.workspace else {
+            return Ok(0);
+        };
+        store.erase(scope).await.map_err(|err| model_failure(&err))
     }
 
     /// An error result whose recorded outcome fits the result cap.
@@ -1316,10 +1514,71 @@ impl Tool for WorkflowTool {
     }
 }
 
+/// The receivers of the live events of one model call (issue #2268).
+struct Live<'a> {
+    run_id: String,
+    step: u32,
+    /// The publisher of the activity, for a request that streams.
+    publish: Option<&'a (dyn Fn(&LiveEvent) + Send + Sync)>,
+    /// The live sink of the harness.
+    sink: Option<&'a dyn LiveSink>,
+}
+
+impl Live<'_> {
+    const fn is_on(&self) -> bool {
+        self.publish.is_some() || self.sink.is_some()
+    }
+
+    fn send(&self, event: &LiveEvent) {
+        if let Some(publish) = self.publish {
+            publish(event);
+        }
+        if let Some(sink) = self.sink {
+            sink.send(event);
+        }
+    }
+
+    fn delta(&self, text: String) {
+        self.send(&LiveEvent::Delta {
+            run_id: self.run_id.clone(),
+            step: self.step,
+            text,
+        });
+    }
+}
+
 /// Map a provider failure to an activity error payload.
 ///
 /// A rate limit, a transport fault, and a provider outage produced no answer.
 /// A retry can succeed, so they retry. Every other kind fails at once.
+/// The retryable failure of a workspace load or save over its time budget.
+/// The error type of a tool call whose workspace store timed out (issue
+/// #2274). The workflow runs the call again from the same head.
+pub(crate) const WORKSPACE_TIMEOUT: &str = "WorkspaceTimeout";
+
+/// The error type of a tool call whose workspace store failed with an error
+/// that a new try can fix (issue #2274). The workflow runs the call again.
+pub(crate) const WORKSPACE_STORE_FAILED: &str = "WorkspaceStoreFailed";
+
+/// The failure of a workspace store call. A retryable store error gets
+/// [`WORKSPACE_STORE_FAILED`]. Any other keeps its own kind, so the call
+/// does not run again.
+fn workspace_failure(err: &AgentError) -> String {
+    if err.kind().is_retryable() {
+        ActivityFailure::retryable(WORKSPACE_STORE_FAILED, err.to_string()).into_error_payload()
+    } else {
+        model_failure(err)
+    }
+}
+
+fn workspace_timeout() -> String {
+    ActivityFailure::retryable(
+        WORKSPACE_TIMEOUT,
+        "the workspace store did not answer within the tool time budget",
+    )
+    .into_error_payload()
+}
+
 fn model_failure(err: &AgentError) -> String {
     let kind = format!("{:?}", err.kind());
     let message = err.to_string();

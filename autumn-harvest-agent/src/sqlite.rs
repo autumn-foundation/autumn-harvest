@@ -28,7 +28,8 @@ use serde_json::Value;
 
 use crate::agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentId, AgentOp, AgentState, Control, INTERRUPT_SIGNAL, Interrupt,
-    agent_info, agent_memory_reset_info, agent_profile_info,
+    agent_info, agent_memory_reset_info, agent_profile_info, agent_workspace_reset_info,
+    agent_workspace_retain_info,
 };
 use crate::approval::Approval;
 use crate::error::{AgentError, ErrorKind};
@@ -62,12 +63,26 @@ pub fn register(rt: &mut SqliteRuntime, harness: Arc<AgentHarness>) {
         call(input, |scope| h.memory_reset(scope))
     });
     let h = Arc::clone(&harness);
-    rt.register_activity_with_ledger(&agent_model_turn_info(), move |input| {
+    rt.register_activity_with_body(&agent_workspace_retain_info(), move |input| {
+        call(input, |mount| h.workspace_retain(mount))
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity_with_body(&agent_workspace_reset_info(), move |input| {
+        call(input, |scope: String| {
+            let h = Arc::clone(&h);
+            async move { h.workspace_reset(&scope).await }
+        })
+    });
+    let h = Arc::clone(&harness);
+    rt.register_activity_with_ledger(&agent_model_turn_info(), move |input, at| {
         call_with_ledger(input, |request: ModelTurnRequest| async {
             // The tenant is the one `AgentHarness::model_turn` uses.
             let tenant = CacheTenant::declared(request.tenant.as_deref());
             let model = request.model.clone();
-            let (turn, latency) = h.model_turn_timed_in(request, tenant, |_| {}).await?;
+            // The budget window reads the drive clock, as the ledger rows do.
+            let (turn, latency) = h
+                .model_turn_timed_in(request, tenant, |_| {}, None, at)
+                .await?;
             // A cache hit calls no model, so it has no latency and no call.
             let calls = latency
                 .map(|latency| h.ledger_call(model.as_deref(), &turn.usage, latency))
@@ -290,7 +305,9 @@ impl LedgerSpend {
                 None => break,
             }
         }
-        let rows = reader.llm_ledger_between(since, Utc::now())?;
+        // A row of a simulated drive can be later than the wall clock, so the
+        // read has no upper bound (issue #2272).
+        let rows = reader.llm_ledger_between(since, DateTime::<Utc>::MAX_UTC)?;
         let spend = rows.iter().filter(|row| runs.contains(&row.exec_id)).fold(
             Spend::default(),
             |spend, row| Spend {

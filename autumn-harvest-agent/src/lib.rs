@@ -74,6 +74,7 @@ pub mod flow;
 pub mod followup;
 pub mod harness;
 pub mod heartbeat;
+pub mod live;
 pub mod loop_guard;
 pub mod memory;
 pub mod mesh;
@@ -90,12 +91,15 @@ pub mod tool;
 pub mod transcript;
 pub mod types;
 pub mod workflow;
+pub mod workspace;
 
 pub use agent::{
     AGENT_WORKFLOW_NAME, Agent, AgentHeartbeat, AgentId, AgentIdError, AgentMemory, AgentOp,
     AgentProfile, AgentState, AgentStatus, Control, HeartbeatSetting, INTERRUPT_SIGNAL, Interrupt,
     PeerEnvelope, PeerReply, STEER_SIGNAL, Steer, Urgency, UserMessage, agent, agent_info,
     agent_memory_reset, agent_memory_reset_info, agent_profile, agent_profile_info,
+    agent_workspace_reset, agent_workspace_reset_info, agent_workspace_retain,
+    agent_workspace_retain_info,
 };
 pub use approval::Approval;
 pub use delivery::{Delivery, LogDelivery, Report, ReportSource};
@@ -107,6 +111,7 @@ pub use heartbeat::{
     HEARTBEAT_WORKFLOW_NAME, HeartbeatReport, HeartbeatTask, Precheck, agent_heartbeat,
     agent_heartbeat_info,
 };
+pub use live::{LiveEvent, LiveSink, TurnText};
 pub use loop_guard::LoopGuard;
 pub use memory::{EditKey, InMemoryMemoryStore, MemoryBlock, MemoryScope, MemoryStore};
 pub use mesh::{DelegationRecord, MANDATE_META_KEY, Mandate, Peer, Refusal};
@@ -131,4 +136,8 @@ pub use workflow::{
     agent_discover_peers_info, agent_loop, agent_loop_info, agent_memory_snapshot,
     agent_memory_snapshot_info, agent_model_turn, agent_model_turn_info, agent_precheck,
     agent_precheck_info, agent_tool_call, agent_tool_call_info, workflows,
+};
+pub use workspace::{
+    DirWorkspaceBlobs, InMemoryWorkspaceBlobs, Workspace, WorkspaceBlobs, WorkspaceFile,
+    WorkspaceHandle, WorkspaceMount, WorkspaceRef, WorkspaceStore,
 };

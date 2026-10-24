@@ -2,7 +2,7 @@
 //!
 //! A mesh is a set of agents that share an id. [`AgentProfile::mesh`] names
 //! it. Each run, each model turn and each peer message of an agent carries
-//! the id, and a durable agent publishes it as the search attribute
+//! the id. A durable agent publishes it as the search attribute
 //! [`MESH_ATTR`].
 //!
 //! - A [`MeshBudget`] caps the tokens or the cost of a mesh in each period.

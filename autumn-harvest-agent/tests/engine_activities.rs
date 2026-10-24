@@ -69,6 +69,7 @@ fn turn_request() -> ModelTurnRequest {
         mesh: None,
         prefix: None,
         remember: false,
+        stream: false,
     }
 }
 
@@ -163,6 +164,7 @@ async fn the_tool_handler_runs_the_named_tool_with_its_context() {
             name: "read".into(),
             arguments: json!({"k": 1}),
         },
+        workspace: None,
     };
 
     let info = agent_tool_call_info();
@@ -261,6 +263,8 @@ fn the_engine_registration_builds() {
             "agent_discover_peers",
             "agent_profile",
             "agent_memory_reset",
+            "agent_workspace_retain",
+            "agent_workspace_reset",
         ]
     );
     let flows: Vec<&str> = workflows().iter().map(|w| w.name).collect();
@@ -378,6 +382,7 @@ async fn a_huge_tool_error_still_fits_the_result_cap() {
                 name: "fail".into(),
                 arguments: json!({}),
             },
+            workspace: None,
         })
         .await
         .unwrap();
@@ -606,6 +611,7 @@ async fn a_read_only_call_refuses_a_write_tool_at_run_time() {
                 name: "write".into(),
                 arguments: json!({}),
             },
+            workspace: None,
         })
         .await
         .unwrap();
@@ -737,6 +743,7 @@ async fn a_zero_result_cap_leaves_a_big_reply_and_a_big_tool_result_alone() {
                 name: "big".into(),
                 arguments: json!({}),
             },
+            workspace: None,
         })
         .await
         .unwrap();

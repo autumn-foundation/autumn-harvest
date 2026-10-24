@@ -458,3 +458,88 @@ async fn a_tick_waits_for_a_message_that_runs() {
         "the message turns all come before the tick turns: {turns:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_custom_heartbeat_is_stored_narrowed_to_the_profile() {
+    let (_dir, db) = fresh_db();
+    // The profile has no heartbeat, so it allows no tick actions and no
+    // memory writes.
+    let harness = AgentHarness::new(FixedModel::new("HEARTBEAT_OK"))
+        .agent(AgentProfile::new("watch").max_steps(4));
+    let mut rt = runtime(&db, harness);
+    let agent = id("narrow");
+    let mut wide = AgentHeartbeat::every(Duration::from_secs(1)).allow_actions();
+    wide.allow_memory_writes = true;
+    wide.max_steps = Some(50);
+    let setting = HeartbeatSetting::Custom { heartbeat: wide };
+    let op = AgentOp::Control(Control::SetHeartbeat { setting });
+    sqlite::send(&mut rt, &agent, &op, None).unwrap();
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+
+    let HeartbeatSetting::Custom { heartbeat } = state(&rt, &agent).await.heartbeat else {
+        panic!("the agent keeps a custom heartbeat");
+    };
+    assert!(!heartbeat.allow_actions, "{heartbeat:?}");
+    assert!(!heartbeat.allow_memory_writes, "{heartbeat:?}");
+    assert_eq!(
+        heartbeat.every_secs,
+        autumn_harvest_agent::agent::MIN_CUSTOM_HEARTBEAT_SECS
+    );
+    assert_eq!(heartbeat.max_steps, Some(4));
+}
+
+/// A model that takes `delay` to answer. It keeps the wall clock of its last
+/// answer, in epoch milliseconds.
+#[derive(Debug)]
+struct SlowModel {
+    delay: Duration,
+    answered_ms: std::sync::atomic::AtomicI64,
+}
+
+impl AgentModel for SlowModel {
+    fn chat<'a>(
+        &'a self,
+        _request: &'a ChatRequest,
+    ) -> BoxFuture<'a, Result<ChatResponse, AgentError>> {
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            let now = Utc::now().timestamp_millis();
+            self.answered_ms.store(now, Ordering::SeqCst);
+            Ok(ChatResponse {
+                content: vec![ContentPart::Text("HEARTBEAT_OK".to_owned())],
+                stop_reason: StopReason::EndTurn,
+                usage: TokenUsage::new(1, 1),
+            })
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tick_books_the_next_tick_one_interval_after_its_end() {
+    let (_dir, db) = fresh_db();
+    let model = Arc::new(SlowModel {
+        delay: Duration::from_millis(500),
+        answered_ms: std::sync::atomic::AtomicI64::new(0),
+    });
+    let every = Duration::from_secs(60);
+    let harness = AgentHarness::new(model.clone())
+        .agent(AgentProfile::new("watch").heartbeat(AgentHeartbeat::every(every)));
+    let mut rt = runtime(&db, harness);
+    let agent = id("slow");
+    let start = Utc::now();
+    sqlite::send(&mut rt, &agent, &AgentOp::Control(Control::Resume), None).unwrap();
+    drive_at(&mut rt, &agent, start).await;
+    drive_at(&mut rt, &agent, start + chrono::Duration::seconds(90)).await;
+
+    let state = state(&rt, &agent).await;
+    assert_eq!(state.ticks, 1);
+    let ended = model.answered_ms.load(Ordering::SeqCst);
+    let next = state.next_heartbeat_ms.expect("the next tick is booked");
+    // The tick ends after its model call. A booking from the start of the
+    // tick is due earlier than one interval after the model call.
+    assert!(
+        next >= ended + 60_000,
+        "the next tick is due {}ms after the model call",
+        next - ended
+    );
+}

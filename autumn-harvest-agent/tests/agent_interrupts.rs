@@ -240,6 +240,42 @@ async fn a_steer_joins_the_running_op_and_its_own_op_does_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_steer_taken_by_a_failed_op_runs_later_as_its_own_op() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        rate_limited(),
+        calls(&[("c1", "lookup", json!({}))], 1),
+        // The turn that holds the steer fails for good, so the op fails.
+        Err(AgentError::new(ErrorKind::Provider, "the provider refused")),
+        answer("checked the invoice", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool("lookup", ToolEffect::ReadOnly, &recorder))
+        .agent(AgentProfile::new("support"));
+    let mut rt = runtime(&db, harness);
+    let agent = id("steer-3");
+    sqlite::send(&mut rt, &agent, &AgentOp::message("check the order"), None).unwrap();
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+    let steer = AgentOp::urgent("also check the invoice", "s-3", Urgency::Steer);
+    sqlite::send(&mut rt, &agent, &steer, Some("s-3")).unwrap();
+    drive_later(&mut rt, &agent, 60).await;
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+
+    let requests = model.requests();
+    let failed = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(
+        failed.contains("also check the invoice"),
+        "the failed turn took the steer: {failed}"
+    );
+    let state = state(&rt, &agent).await;
+    assert_eq!(state.failures, 1);
+    assert_eq!(model.calls(), 4, "the steer op runs a segment of its own");
+    assert_eq!(user_texts(&state), ["also check the invoice"]);
+    assert_eq!(state.last_answer.as_deref(), Some("checked the invoice"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_steer_with_no_op_running_runs_once_as_a_message() {
     let (_dir, db) = fresh_db();
     let model = ScriptedModel::new(vec![answer("first", 1), answer("second", 1)]);

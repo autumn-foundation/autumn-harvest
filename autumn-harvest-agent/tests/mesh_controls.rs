@@ -108,6 +108,16 @@ async fn a_parked_agent_opens_when_its_period_ends() {
     let budget = MeshBudget::every("support", Duration::from_secs(2)).max_tokens(10);
     let mut rt = runtime(&db, budget_harness(&db, model.clone(), budget));
     let a = id("a");
+    // The windows start at each even second from the epoch. The test starts
+    // just after a boundary, so the spend and the refused turn share one
+    // window.
+    let into = autumn_harvest::chrono::Utc::now()
+        .timestamp_millis()
+        .rem_euclid(2_000);
+    tokio::time::sleep(Duration::from_millis(
+        u64::try_from(2_000 - into).unwrap() + 20,
+    ))
+    .await;
     say(&mut rt, &a, "spend").await;
     say(&mut rt, &a, "wait").await;
     assert!(matches!(

@@ -28,7 +28,10 @@ use crate::agent::{
     AGENT_WORKFLOW_NAME, AgentId, AgentOp, INTERRUPT_SIGNAL, PeerEnvelope, PeerReply, STEER_SIGNAL,
     Steer,
 };
-use crate::agent::{agent_info, agent_memory_reset_info, agent_profile_info};
+use crate::agent::{
+    agent_info, agent_memory_reset_info, agent_profile_info, agent_workspace_reset_info,
+    agent_workspace_retain_info,
+};
 use crate::approval::{Approval, Decision, approval_signal, await_decision, decode_decision};
 use crate::bounds::{RoundBudget, exceeds_bytes, json_len, sibling_cap};
 use crate::delivery::{Report, ReportSource, report_text};
@@ -55,6 +58,7 @@ use crate::types::{
     AgentReport, AgentStop, AgentTask, MAX_PARALLEL_CHILDREN, ModelTurn, ModelTurnRequest,
     RunIdSource, ToolCallRequest, ToolOutcome, without_system,
 };
+use crate::workspace::WorkspaceMount;
 use autumn_harvest::durable_promise::PromiseSettlement;
 use autumn_harvest::entity::{ENTITY_OP_SIGNAL, EntityMessage};
 
@@ -110,6 +114,9 @@ pub(crate) struct Progress {
     /// A mesh budget refused a turn. The period ends then, in epoch
     /// milliseconds (issue #2272).
     pub(crate) parked_until: Option<i64>,
+    /// The workspace of the run and its head (issue #2274). A tool call that
+    /// changes the workspace moves the head.
+    pub(crate) workspace: Option<WorkspaceMount>,
 }
 
 /// The steer messages of a durable agent (issue #2265).
@@ -171,6 +178,7 @@ impl Progress {
             sent: None,
             memory: None,
             parked_until: None,
+            workspace: None,
         }
     }
 
@@ -212,6 +220,7 @@ impl Progress {
             delegations: tree.records.clone(),
             flow_labels: tree.exercised.clone(),
             run_id: Some(self.run_id.clone()),
+            workspace: self.workspace.as_ref().and_then(|mount| mount.head.clone()),
         }
     }
 }
@@ -371,6 +380,7 @@ fn next_request(
         flow_released: tree.released.clone(),
         interruptible: run.live,
         mesh: task.mesh.clone(),
+        stream: task.stream,
         prefix: None,
         remember: false,
         model: task.model.clone(),
@@ -425,6 +435,7 @@ pub(crate) async fn drive(
     // A system message inside the history is dropped. Only `task.system`
     // reaches the model as the system prompt.
     let mut progress = Progress::new(run_id, without_system(&task.history));
+    progress.workspace.clone_from(&task.workspace);
     // Gate the final-turn rules. A run recorded before them replays as it ran.
     progress.final_turn_rules = ctx.patched(FINAL_TURN_PATCH);
     // A task recorded before the delta form has no flag, so it asks no gate.
@@ -537,7 +548,7 @@ fn root_tree(ctx: &WorkflowContext, task: &AgentTask, run_id: &str) -> Tree {
         outbox: Outbox {
             from: run_id.to_owned(),
             self_id: ctx.workflow_id().to_owned(),
-            waiting: Vec::new(),
+            waiting: task.waiting.clone(),
             sent: BTreeMap::new(),
             mesh: None,
         },
@@ -695,6 +706,7 @@ pub(crate) async fn run_segment(
         };
 
         progress.usage = progress.usage.saturating_add(turn.usage);
+        publish_turn_text(ctx, run, progress, &turn)?;
         // The activity drops a reply that does not fit the result cap. The
         // turn then holds no text and no calls, so the segment ends here.
         if turn.oversized {
@@ -837,6 +849,31 @@ async fn send_turn(
         progress.sent = Some(sent);
     }
     turn
+}
+
+/// Publish the text of a finished turn to the durable stream (issue #2268).
+///
+/// A reader that reconnects gets each whole answer once. The call claims its
+/// offset on replay too, so a replay publishes nothing twice.
+fn publish_turn_text(
+    ctx: &WorkflowContext,
+    run: Run<'_>,
+    progress: &Progress,
+    turn: &ModelTurn,
+) -> Result<(), String> {
+    let text = turn.text();
+    if !run.task.stream || text.is_empty() {
+        return Ok(());
+    }
+    let record = crate::live::TurnText {
+        kind: "turn".to_owned(),
+        run_id: progress.run_id.clone(),
+        step: progress.steps,
+        agent: run.agent.map(|agent| agent.mandate.holder().to_owned()),
+        text,
+    };
+    ctx.publish_durable_progress(record)
+        .map_err(|err| err.to_string())
 }
 
 /// The period end of a mesh budget refusal, from its recorded details.
@@ -1475,6 +1512,13 @@ async fn run_tool(
         && task.memory_in_state
         && let Some(blocks) = progress.memory.as_mut()
     {
+        // The tool is not offered to a segment that may not write memory. A
+        // call to it anyway gets an error, so no policy can let it through.
+        if !task.memory_writable() {
+            return Ok(ToolOutcome::error(
+                "the memory is read-only in this segment",
+            ));
+        }
         return Ok(state_memory_edit(blocks, &call, &tree.exercised));
     }
     // Under a mandate, the workflow owns the name `delegate`, even with no
@@ -1498,6 +1542,7 @@ async fn run_tool(
         allowed_tools: run.allowed_tools(),
         labels: slot.labels.cloned(),
         flow_labels,
+        workspace: progress.workspace.clone(),
     };
     // Only a tool that opts in races an interrupt. Any other call runs to
     // its end, because its side effect may be half done.
@@ -1510,14 +1555,61 @@ async fn run_tool(
             .await
             .map_err(|e| e.to_string())?;
         if winner.index == 0 {
-            return winner.decode().map_err(|e| e.to_string());
+            let outcome = winner.decode().map_err(|e| e.to_string())?;
+            return Ok(adopt_workspace(progress, outcome));
         }
         progress.interrupted = true;
         return Ok(ToolOutcome::error(INTERRUPTED_CALL));
     }
-    ctx.execute_activity(&agent_tool_call_info(), request)
-        .await
-        .map_err(|e| e.to_string())
+    let outcome = call_tool(ctx, request).await?;
+    Ok(adopt_workspace(progress, outcome))
+}
+
+/// The most runs of one tool call whose workspace store fails (issue
+/// #2274).
+const WORKSPACE_CALL_RUNS: u32 = 3;
+
+/// Run one tool-call activity.
+///
+/// The activity itself runs once, so a side effect never runs twice. A
+/// failed workspace store is the one exception: the call runs again from
+/// the same head, up to [`WORKSPACE_CALL_RUNS`] times. Only a tool that
+/// opts into the workspace touches the store, so no other tool runs again.
+/// Only a recorded result moves the head, so the snapshot of a failed run
+/// never becomes the head.
+async fn call_tool(ctx: &WorkflowContext, request: ToolCallRequest) -> Result<ToolOutcome, String> {
+    let mut runs = 1;
+    loop {
+        match ctx
+            .execute_activity(&agent_tool_call_info(), request.clone())
+            .await
+        {
+            Ok(outcome) => return Ok(outcome),
+            Err(err)
+                if runs < WORKSPACE_CALL_RUNS
+                    && matches!(
+                        err.activity_error_type(),
+                        Some(
+                            crate::harness::WORKSPACE_STORE_FAILED
+                                | crate::harness::WORKSPACE_TIMEOUT
+                        )
+                    ) =>
+            {
+                runs += 1;
+            }
+            Err(err) => return Err(err.to_string()),
+        }
+    }
+}
+
+/// Move the workspace head to the snapshot that a recorded call made (issue
+/// #2274). Only a recorded result moves it, so the snapshot of a stale
+/// attempt never becomes the head.
+fn adopt_workspace(progress: &mut Progress, outcome: ToolOutcome) -> ToolOutcome {
+    if let (Some(mount), Some(head)) = (progress.workspace.as_mut(), &outcome.workspace) {
+        mount.head = Some(head.clone());
+    }
+    outcome
 }
 
 /// Apply one `memory` call to state memory, with the labels of the tree.
@@ -1638,6 +1730,7 @@ async fn delegate(
     Ok(ToolOutcome {
         content: outcome,
         is_error: stop != AgentStop::Completed,
+        workspace: None,
     })
 }
 
@@ -1747,6 +1840,13 @@ async fn fan_out(
         let mut child = child_task(task, sibling.peer, sibling.input, mandate, cap);
         child.run_id_source = RunIdSource::ExecutionId;
         child.flow_labels.clone_from(&tree.exercised);
+        // The parent waits on the child run, so a send from the child back
+        // up the chain is a deadlock. Only a durable agent can get such a
+        // send, so only an agent id joins the chain.
+        child.waiting.clone_from(&tree.outbox.waiting);
+        if crate::agent::AgentId::parse(&tree.outbox.self_id).is_ok() {
+            child.waiting.push(tree.outbox.self_id.clone());
+        }
         children.push((sibling.position, sibling.peer, child));
     }
     // Each future sends its start command at its first poll, in order.
@@ -1824,6 +1924,7 @@ fn merge_child(
     ToolOutcome {
         content: outcome,
         is_error: report.stop != AgentStop::Completed,
+        workspace: None,
     }
 }
 
@@ -1935,6 +2036,7 @@ fn peer_outcome(
                 ToolOutcome {
                     content,
                     is_error: reply.stop != Some(AgentStop::Completed),
+                    workspace: None,
                 }
             }
         }
@@ -2049,11 +2151,16 @@ fn child_task(
         // The tree holds the labels, so the child task carries none.
         flow_labels: BTreeSet::new(),
         mesh: task.mesh.clone(),
+        stream: task.stream,
         // A child never edits the memory of its parent.
         memory_in_state: false,
         transcript_delta: task.transcript_delta,
         parallel_children: task.parallel_children,
         model: peer.model.clone().or_else(|| task.model.clone()),
+        // A child has no workspace, so siblings never race on one head
+        // (issue #2274).
+        workspace: None,
+        waiting: Vec::new(),
     }
 }
 
@@ -2112,6 +2219,7 @@ fn refused(refusal: Refusal, peer: &str) -> ToolOutcome {
         })
         .to_string(),
         is_error: true,
+        workspace: None,
     }
 }
 
@@ -2160,8 +2268,20 @@ pub async fn agent_model_turn(
     harness.check_budget(|| ctx.check_llm_budget()).await?;
     let tenant = cache_tenant(ctx, harness, &request).await;
     let model = request.model.clone();
+    // Live text goes to the progress channel of the run. Nothing is stored.
+    let publish = |event: &crate::live::LiveEvent| {
+        if let Err(err) = ctx.publish_progress(event) {
+            tracing::debug!(error = %err, "a live chunk was dropped");
+        }
+    };
     let (turn, latency) = harness
-        .model_turn_timed_in(request, tenant, |_content| {})
+        .model_turn_timed_in(
+            request,
+            tenant,
+            |_content| {},
+            Some(&publish),
+            autumn_harvest::chrono::Utc::now(),
+        )
         .await?;
     if let Some(latency) = latency {
         harness.record_turn(ctx, model.as_deref(), &turn.usage, latency);
@@ -2337,6 +2457,8 @@ pub fn activities() -> Vec<ActivityInfo> {
         agent_discover_peers_info(),
         agent_profile_info(),
         agent_memory_reset_info(),
+        agent_workspace_retain_info(),
+        agent_workspace_reset_info(),
     ]
 }
 

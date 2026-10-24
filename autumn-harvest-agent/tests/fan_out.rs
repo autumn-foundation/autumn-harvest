@@ -458,6 +458,7 @@ fn child_report(input: &Value) -> Value {
         delegations: Vec::new(),
         flow_labels: labels,
         run_id: Some(format!("child-{}", task.input.replace(' ', "-"))),
+        workspace: None,
     })
 }
 

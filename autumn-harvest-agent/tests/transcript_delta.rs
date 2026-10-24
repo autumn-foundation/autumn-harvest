@@ -17,7 +17,7 @@ use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_agent::eval::{Candidate, evaluate};
 use autumn_harvest_agent::workflow::agent_loop_info;
 use autumn_harvest_agent::{
-    AgentHarness, AgentId, AgentOp, AgentProfile, AgentStop, AgentTask, ChatMessage,
+    AgentHarness, AgentId, AgentOp, AgentProfile, AgentStop, AgentTask, ChatMessage, ChatRole,
     InMemoryTranscriptStore, ModelTurnRequest, ToolEffect, TranscriptStore, sqlite,
 };
 use autumn_harvest_sqlite::{ExecutionId, SqliteRuntime};
@@ -191,6 +191,51 @@ async fn a_cold_store_falls_back_to_the_full_form() {
     assert!(inputs[0].prefix.is_none());
     assert!(inputs[1].prefix.is_some() && inputs[2].prefix.is_none());
     assert!(inputs[3].prefix.is_some() && inputs[4].prefix.is_none());
+}
+
+/// A store that keeps each window but hands back a changed one of the same
+/// length, like a shared store that someone else can write.
+#[derive(Debug, Default)]
+struct PoisonedStore {
+    inner: InMemoryTranscriptStore,
+}
+
+impl TranscriptStore for PoisonedStore {
+    fn get(&self, digest: &str) -> Option<Vec<ChatMessage>> {
+        let mut window = self.inner.get(digest)?;
+        if let Some(first) = window.first_mut() {
+            *first = ChatMessage::text(ChatRole::User, "injected text");
+        }
+        Some(window)
+    }
+
+    fn put(&self, digest: &str, window: &[ChatMessage]) {
+        self.inner.put(digest, window);
+    }
+}
+
+// A read checks the digest of the window, so a changed window is a miss.
+// The turn then goes in the full form, and the model never reads the text.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_window_is_a_miss() {
+    let (_dir, db) = fresh_db();
+    let model = ScriptedModel::new(vec![
+        calls(&[("c1", "lookup", json!({"page": 1}))], 1),
+        answer("done", 1),
+    ]);
+    let store = Arc::new(PoisonedStore::default());
+    let poisoned = harness(model.clone()).transcript_store(store);
+    let mut rt = runtime(&db, poisoned);
+    let (exec, report, _) = run(&mut rt, &task(true)).await;
+
+    assert_eq!(report.text, "done");
+    let inputs = model_inputs(&rt, exec);
+    assert!(inputs[1].prefix.is_some() && inputs[2].prefix.is_none());
+    let seen = format!("{:?}", model.requests());
+    assert!(
+        !seen.contains("injected text"),
+        "the model read a changed window"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

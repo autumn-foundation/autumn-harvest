@@ -15,12 +15,14 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
+use autumn_harvest::chrono::Utc;
 use autumn_harvest::event::{SideEffectKind, WorkflowEvent};
 use autumn_harvest_agent::memory::MEMORY_TOOL;
 use autumn_harvest_agent::{
-    AgentError, AgentHarness, AgentId, AgentMemory, AgentModel, AgentOp, AgentProfile, AgentState,
-    ChatRequest, ChatResponse, ChatRole, ContentPart, Control, sqlite,
+    AgentError, AgentHarness, AgentHeartbeat, AgentId, AgentMemory, AgentModel, AgentOp,
+    AgentProfile, AgentState, ChatRequest, ChatResponse, ChatRole, ContentPart, Control, sqlite,
 };
 use autumn_harvest_sqlite::SqliteRuntime;
 use common::{Reply, ScriptedModel, answer, calls, runtime};
@@ -196,6 +198,43 @@ async fn reset_memory_clears_the_state_memory() {
         entries(&state_of(&rt, &agent()).await),
         Vec::<String>::new()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tick_without_memory_writes_cannot_edit_the_state_memory() {
+    for allow in [false, true] {
+        let (_dir, db) = fresh_db();
+        let model = ScriptedModel::new(vec![
+            remember("a note from a tick"),
+            answer("HEARTBEAT_OK", 1),
+        ]);
+        // The tick may act, so only the memory opt-in gates the edit.
+        let mut beat = AgentHeartbeat::every(Duration::from_secs(60)).allow_actions();
+        beat.allow_memory_writes = allow;
+        let profile = AgentProfile::new("desk")
+            .memory(AgentMemory::State)
+            .heartbeat(beat);
+        let mut rt = runtime(&db, AgentHarness::new(model.clone()).agent(profile));
+        let start = Utc::now();
+        sqlite::send(&mut rt, &agent(), &AgentOp::Control(Control::Resume), None).unwrap();
+        let exec = sqlite::current_run(&rt, &agent()).unwrap().unwrap();
+        rt.run_until_blocked_as_of(exec, start).await.unwrap();
+        let later = start + chrono::Duration::seconds(90);
+        rt.run_until_blocked_as_of(exec, later).await.unwrap();
+
+        let state = state_of(&rt, &agent()).await;
+        assert_eq!(state.ticks, 1);
+        let want: Vec<String> = if allow {
+            vec!["a note from a tick".to_owned()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(entries(&state), want, "allow_memory_writes = {allow}");
+        if !allow {
+            let result = serde_json::to_string(&model.requests()[1].messages).unwrap();
+            assert!(result.contains("read-only"), "{result}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

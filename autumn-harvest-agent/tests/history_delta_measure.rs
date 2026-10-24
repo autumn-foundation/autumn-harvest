@@ -97,6 +97,7 @@ fn agent_loop_history(filler: Filler) -> Vec<WorkflowEvent> {
             flow_released: autumn_harvest_agent::Released::new(),
             interruptible: false,
             model: None,
+            stream: false,
             mesh: None,
             prefix: None,
             remember: false,

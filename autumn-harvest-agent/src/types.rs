@@ -19,6 +19,7 @@ use crate::message::{
     ChatMessage, ChatRole, ContentPart, SessionId, StopReason, TokenUsage, ToolCall,
 };
 use crate::policy::ToolDecision;
+use crate::workspace::{WorkspaceMount, WorkspaceRef};
 use serde::{Deserialize, Serialize};
 
 /// The default bound on tool rounds.
@@ -128,6 +129,11 @@ pub struct AgentTask {
     /// the history. See [`flow`](crate::flow).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
+    /// Stream the text of each model turn (issue #2268): live chunks while
+    /// the model writes, and the durable text of each finished turn. See
+    /// [`live`](crate::live).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream: bool,
     /// The mesh of the run (issue #2272). Each model turn carries it, so a
     /// mesh budget applies to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -153,6 +159,16 @@ pub struct AgentTask {
     /// keeps it unless its peer names a model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The workspace of the run and its head (issue #2274). A tool that
+    /// opts in reads and writes its files. A delegated child has none. See
+    /// [`workspace`](crate::workspace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMount>,
+    /// The workflow ids that wait on this run (issue #2269). A fan-out
+    /// child gets the chain of its parent, so a send back up the chain
+    /// fails as a deadlock.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting: Vec<String>,
 }
 
 /// Where the run id of a task comes from.
@@ -193,12 +209,26 @@ impl AgentTask {
             tenant: None,
             mandate: None,
             flow_labels: BTreeSet::new(),
+            stream: false,
             mesh: None,
             memory_in_state: false,
             transcript_delta: true,
             parallel_children: 0,
             model: None,
+            workspace: None,
+            waiting: Vec::new(),
         }
+    }
+
+    /// Give the run the workspace `scope`, from its head `head` (issue
+    /// #2274).
+    #[must_use]
+    pub fn workspace(mut self, scope: impl Into<String>, head: Option<WorkspaceRef>) -> Self {
+        self.workspace = Some(WorkspaceMount {
+            scope: scope.into(),
+            head,
+        });
+        self
     }
 
     /// Record only the messages that each model turn adds, or the whole
@@ -206,6 +236,13 @@ impl AgentTask {
     #[must_use]
     pub const fn transcript_delta(mut self, on: bool) -> Self {
         self.transcript_delta = on;
+        self
+    }
+
+    /// Stream the text of each model turn. See [`stream`](Self::stream).
+    #[must_use]
+    pub const fn stream(mut self) -> Self {
+        self.stream = true;
         self
     }
 
@@ -392,6 +429,9 @@ impl AgentTask {
 }
 
 /// The input of one model-turn activity.
+// The flags are independent switches on a recorded payload, as in
+// `AgentTask`.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelTurnRequest {
     /// The execution id. Tools and the policy see it as the run id.
@@ -443,6 +483,9 @@ pub struct ModelTurnRequest {
     /// The mesh of the run (issue #2272). A mesh budget checks it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mesh: Option<String>,
+    /// Publish the live text of this turn from the activity (issue #2268).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stream: bool,
     /// The prefix of the window that `messages` follow (issue #2264). With
     /// a prefix, `messages` holds only the messages after it. The activity
     /// reads the prefix from the transcript store of the harness.
@@ -585,6 +628,9 @@ pub struct ToolCallRequest {
     /// them (issue #2272).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub flow_labels: BTreeSet<String>,
+    /// The workspace of the run, for a tool that opts in (issue #2274).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMount>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -604,6 +650,10 @@ pub struct ToolOutcome {
     pub content: String,
     /// `true` when the call failed, or was denied, rejected, or not decided.
     pub is_error: bool,
+    /// The new head of the workspace, when the call changed it (issue
+    /// #2274). History records it, so it becomes the head of the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceRef>,
 }
 
 impl ToolOutcome {
@@ -613,6 +663,7 @@ impl ToolOutcome {
         Self {
             content: content.into(),
             is_error: false,
+            workspace: None,
         }
     }
 
@@ -622,6 +673,7 @@ impl ToolOutcome {
         Self {
             content: serde_json::json!({ "error": message }).to_string(),
             is_error: true,
+            workspace: None,
         }
     }
 }
@@ -694,6 +746,9 @@ pub struct AgentReport {
     /// it from the report of a child run (issue #2270).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// The head of the workspace when the run ended (issue #2274).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceRef>,
 }
 
 /// The transcript without system messages.

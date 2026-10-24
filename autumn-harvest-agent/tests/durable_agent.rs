@@ -12,14 +12,18 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use autumn_harvest::chrono::{DateTime, Utc};
 use autumn_harvest::event::WorkflowEvent;
+use autumn_harvest::failure::{ActivityFailure, IntoActivityErrorString};
 use autumn_harvest::testing::{ReplayStatus, WorkflowReplayer};
 use autumn_harvest_agent::flow::labels;
 use autumn_harvest_agent::{
-    AgentHarness, AgentId, AgentMemory, AgentOp, AgentProfile, AgentState, AgentStatus, AgentStop,
-    Approval, ChatRole, Control, FlowRules, FnTool, InMemoryMemoryStore, MemoryScope, MemoryStore,
-    ModelTurnRequest, Rule, ToolEffect, agent_info, sqlite,
+    AgentError, AgentHarness, AgentId, AgentMemory, AgentOp, AgentProfile, AgentState, AgentStatus,
+    AgentStop, Approval, BoxFuture, ChatRole, Control, FlowRules, FnTool, InMemoryMemoryStore,
+    MemoryScope, MemoryStore, MeshBudget, MeshSpend, ModelTurnRequest, Rule, Spend, ToolEffect,
+    agent_info, agent_profile_info, sqlite,
 };
 use autumn_harvest_sqlite::{RunState, SqliteRuntime};
 use common::{Recorder, Reply, ScriptedModel, answer, calls, recorded_tool, runtime};
@@ -476,6 +480,136 @@ async fn a_recorded_agent_history_replays() {
         matches!(report.status, ReplayStatus::ReplaySucceeded),
         "{report}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_profile_lookup_keeps_the_run_and_its_state() {
+    let (_dir, db) = fresh_db();
+    let agent = id("acct-9");
+    // One op per run, so the next run starts from a checkpoint.
+    let profile = AgentProfile::new("support").max_ops_per_run(1);
+    let model = ScriptedModel::new(vec![answer("first", 1)]);
+    let mut rt = runtime(&db, AgentHarness::new(model).agent(profile.clone()));
+    say(&mut rt, &agent, "one");
+    let exec = sqlite::current_run(&rt, &agent).unwrap().unwrap();
+    let RunState::ContinuedAsNew(next) = rt.run_until_blocked(exec).await.unwrap() else {
+        panic!("the op ends its run");
+    };
+    drop(rt);
+
+    // A new process whose profile lookup fails, as with no harness.
+    let model = ScriptedModel::new(vec![]);
+    let mut rt = runtime(&db, AgentHarness::new(model.clone()).agent(profile));
+    rt.register_activity_with_body(&agent_profile_info(), |_| {
+        Err(
+            ActivityFailure::non_retryable("AgentHarnessMissing", "no AgentHarness is installed")
+                .into_error_payload(),
+        )
+    });
+    let blocked = rt.run_until_blocked(next).await.unwrap();
+    assert!(
+        matches!(blocked, RunState::WaitingSignal(_)),
+        "the run waits for work: {blocked:?}"
+    );
+    say(&mut rt, &agent, "two");
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+
+    let state = state(&rt, &agent).await;
+    assert_eq!(state.failures, 1);
+    let error = state.last_error.unwrap_or_default();
+    assert!(
+        error.contains("agent_profile") && error.contains("no AgentHarness"),
+        "the error names the lookup: {error}"
+    );
+    assert_eq!(model.calls(), 0);
+    assert_eq!(state.last_answer.as_deref(), Some("first"));
+    assert_eq!(
+        texts(&state.transcript).len(),
+        2,
+        "the carried transcript survives"
+    );
+}
+
+/// A spend source that reports a spent budget. A read past `max_reads`
+/// fails, so the turn waits on a retry backoff. An op that loops stops
+/// there, and the test can count its reads.
+#[derive(Debug)]
+struct SpentBudget {
+    reads: AtomicUsize,
+    max_reads: usize,
+}
+
+impl SpentBudget {
+    fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl MeshSpend for SpentBudget {
+    fn spent<'a>(
+        &'a self,
+        _mesh: &'a str,
+        _since: DateTime<Utc>,
+    ) -> BoxFuture<'a, Result<Spend, AgentError>> {
+        let read = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+        let spend = if read <= self.max_reads {
+            Ok(Spend {
+                tokens: 1_000,
+                cost_usd_micros: 0,
+            })
+        } else {
+            Err(AgentError::new(
+                autumn_harvest_agent::ErrorKind::Unavailable,
+                "the ledger is down",
+            ))
+        };
+        Box::pin(async move { spend })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_under_a_spent_budget_holds_the_message_and_does_not_loop() {
+    let (_dir, db) = fresh_db();
+    let spend = Arc::new(SpentBudget {
+        reads: AtomicUsize::new(0),
+        max_reads: 20,
+    });
+    let model = ScriptedModel::new(vec![answer("ran", 1)]);
+    let harness = AgentHarness::new(model.clone())
+        .agent(AgentProfile::new("support").mesh("help"))
+        .mesh_budget(MeshBudget::daily("help").max_tokens(10))
+        .mesh_spend(spend.clone());
+    let mut rt = runtime(&db, harness);
+    let agent = id("acct-10");
+    say(&mut rt, &agent, "hello");
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+    let parked = state(&rt, &agent).await;
+    assert!(
+        matches!(parked.status, AgentStatus::Parked { .. }),
+        "{:?}",
+        parked.status
+    );
+    assert_eq!(spend.reads(), 1);
+
+    control(&mut rt, &agent, Control::Resume);
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+    let state = state(&rt, &agent).await;
+    assert!(
+        matches!(state.status, AgentStatus::Parked { .. }),
+        "the budget is still spent: {:?}",
+        state.status
+    );
+    let held: Vec<String> = state
+        .held
+        .iter()
+        .filter_map(|op| match op {
+            AgentOp::UserMessage(message) => Some(message.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(held, ["hello"], "the message waits, first in line");
+    assert_eq!(spend.reads(), 2, "the resume tries the message once");
+    assert_eq!(model.calls(), 0);
 }
 
 // ---------------------------------------------------------------------------
