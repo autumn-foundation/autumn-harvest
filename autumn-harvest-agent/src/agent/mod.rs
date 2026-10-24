@@ -1240,8 +1240,8 @@ impl AgentRun<'_> {
         let mut ticked = false;
         match admit(state.status.inbox(), op.class()) {
             Admit::Apply => match op {
-                AgentOp::Control(control) => state = self.control(state, control, now).await,
-                AgentOp::Unpark => state = self.unpark(state, now).await,
+                AgentOp::Control(control) => state = self.control(state, control).await,
+                AgentOp::Unpark => state = self.unpark(state).await,
                 _ => {}
             },
             Admit::Hold => {
@@ -1251,7 +1251,7 @@ impl AgentRun<'_> {
             }
             Admit::Run => {
                 ticked = matches!(op, AgentOp::HeartbeatTick);
-                state = self.work(state, op, now).await;
+                state = self.work(state, op).await;
             }
             Admit::Skip => {}
         }
@@ -1326,12 +1326,12 @@ impl AgentRun<'_> {
     }
 
     /// Apply one control op.
-    async fn control(&self, mut state: AgentState, control: Control, now: i64) -> AgentState {
+    async fn control(&self, mut state: AgentState, control: Control) -> AgentState {
         match control {
             Control::Pause { reason } => state.status = AgentStatus::Paused { reason },
             Control::Resume => {
                 state.status = AgentStatus::Open;
-                state = self.run_held(state, now).await;
+                state = self.run_held(state).await;
             }
             Control::SetHeartbeat { setting } => {
                 state.heartbeat = match setting {
@@ -1371,10 +1371,10 @@ impl AgentRun<'_> {
     }
 
     /// Open a parked agent when its period ends, and run the held work.
-    async fn unpark(&self, mut state: AgentState, now: i64) -> AgentState {
+    async fn unpark(&self, mut state: AgentState) -> AgentState {
         if matches!(state.status, AgentStatus::Parked { .. }) {
             state.status = AgentStatus::Open;
-            state = self.run_held(state, now).await;
+            state = self.run_held(state).await;
         }
         state
     }
@@ -1383,12 +1383,12 @@ impl AgentRun<'_> {
     ///
     /// An op can park or pause the agent again. The rest then waits, first
     /// in line, so a spent budget never runs the same op in a loop.
-    async fn run_held(&self, mut state: AgentState, now: i64) -> AgentState {
+    async fn run_held(&self, mut state: AgentState) -> AgentState {
         while state.status == AgentStatus::Open {
             let Some(op) = state.held.pop_front() else {
                 break;
             };
-            state = self.work(state, op, now).await;
+            state = self.work(state, op).await;
         }
         state
     }
@@ -1452,7 +1452,7 @@ impl AgentRun<'_> {
     }
 
     /// Run one work op as a segment.
-    async fn work(&self, mut state: AgentState, op: AgentOp, now: i64) -> AgentState {
+    async fn work(&self, mut state: AgentState, op: AgentOp) -> AgentState {
         match op {
             AgentOp::UserMessage(message) => {
                 if let (Urgency::Steer, Some(id)) = (message.urgency, message.message_id.clone()) {
@@ -1467,9 +1467,7 @@ impl AgentRun<'_> {
                 state.chain = 0;
                 let rounds = state.rounds;
                 let retry = message.clone();
-                let mut state = self
-                    .segment(state, &message.text, Mode::Attended, now)
-                    .await;
+                let mut state = self.segment(state, &message.text, Mode::Attended).await;
                 // A mesh budget refused the first turn, so no tool ran. The
                 // message waits for the next period, first in line.
                 if matches!(state.status, AgentStatus::Parked { .. }) && state.rounds == rounds {
@@ -1477,14 +1475,14 @@ impl AgentRun<'_> {
                 }
                 state
             }
-            AgentOp::PeerMessage(envelope) => self.peer_message(state, *envelope, now).await,
-            AgentOp::HeartbeatTick => self.tick(state, now).await,
+            AgentOp::PeerMessage(envelope) => self.peer_message(state, *envelope).await,
+            AgentOp::HeartbeatTick => self.tick(state).await,
             AgentOp::FollowupDue => {
                 if state.followup_due_ms.take().is_none() {
                     return state;
                 }
                 state.chain = state.chain.saturating_add(1);
-                self.segment(state, WAKE_MESSAGE, Mode::Followup, now).await
+                self.segment(state, WAKE_MESSAGE, Mode::Followup).await
             }
             AgentOp::Control(_) | AgentOp::Unpark => state,
         }
@@ -1495,12 +1493,7 @@ impl AgentRun<'_> {
     /// A duplicate is a no-op. The receiver runs under the meet of its own
     /// mandate and the inbound one, and starts with the labels of the sender.
     /// Its answer settles the promise of the sender.
-    async fn peer_message(
-        &self,
-        mut state: AgentState,
-        envelope: PeerEnvelope,
-        now: i64,
-    ) -> AgentState {
+    async fn peer_message(&self, mut state: AgentState, envelope: PeerEnvelope) -> AgentState {
         if !state.inbound.apply(&envelope.from, envelope.seq) {
             return state;
         }
@@ -1543,7 +1536,7 @@ impl AgentRun<'_> {
                     waiting: &envelope.waiting,
                 };
                 let (next, outcome) = self
-                    .run_segment_as(state, &input, Mode::Peer, now, Some(peer))
+                    .run_segment_as(state, &input, Mode::Peer, Some(peer))
                     .await;
                 state = next;
                 // Only this segment answers. A failed segment sends no text,
@@ -1594,7 +1587,7 @@ impl AgentRun<'_> {
     ///
     /// The op end books the next tick, also after a failed tick, so a tick
     /// never runs again at once.
-    async fn tick(&self, mut state: AgentState, now: i64) -> AgentState {
+    async fn tick(&self, mut state: AgentState) -> AgentState {
         let Some(beat) = state
             .effective_heartbeat(self.profile.as_ref().ok())
             .cloned()
@@ -1612,7 +1605,7 @@ impl AgentRun<'_> {
                 }
             }
         }
-        self.segment(state, &beat.prompt, Mode::Heartbeat(&beat), now)
+        self.segment(state, &beat.prompt, Mode::Heartbeat(&beat))
             .await
     }
 
@@ -1629,14 +1622,8 @@ impl AgentRun<'_> {
     }
 
     /// Run one segment with `input` and fold it into `state`.
-    async fn segment(
-        &self,
-        state: AgentState,
-        input: &str,
-        mode: Mode<'_>,
-        now: i64,
-    ) -> AgentState {
-        self.run_segment_as(state, input, mode, now, None).await.0
+    async fn segment(&self, state: AgentState, input: &str, mode: Mode<'_>) -> AgentState {
+        self.run_segment_as(state, input, mode, None).await.0
     }
 
     /// Run one segment, as [`Self::segment`] does. A peer message passes
@@ -1648,7 +1635,6 @@ impl AgentRun<'_> {
         mut state: AgentState,
         input: &str,
         mode: Mode<'_>,
-        now: i64,
         peer: Option<PeerSegment<'_>>,
     ) -> (AgentState, Option<(AgentStop, String)>) {
         let (id, profile) = match (&self.id, &self.profile) {
@@ -1726,13 +1712,16 @@ impl AgentRun<'_> {
                 }
                 state.last_stop = Some(stop);
                 state.last_answer = Some(answer.clone());
-                // A follow-up runs only after a segment that completed.
+                // A follow-up runs only after a segment that completed. Its
+                // delay counts from the end of the segment, so a long segment
+                // never books a follow-up that is already due.
                 if let Some(planned) = progress.followup.take()
                     && stop == AgentStop::Completed
                 {
                     let delay =
                         i64::try_from(planned.delay_secs.saturating_mul(1_000)).unwrap_or(i64::MAX);
-                    state.followup_due_ms = Some(now.saturating_add(delay));
+                    let ended = self.ctx.system_now().timestamp_millis();
+                    state.followup_due_ms = Some(ended.saturating_add(delay));
                 }
                 if task.deliver {
                     let sent = Sent {

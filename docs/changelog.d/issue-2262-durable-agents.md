@@ -617,3 +617,7 @@ A review from five angles found these. Each fix has a test.
   asserts that each nemesis fires. A CI guard checks that each agent-mesh
   test target has a runner. A Postgres worker of the agents also polls the
   `default` queue, where the agent activities go.
+- **PR review.** A follow-up delay counts from the end of its segment, so a
+  long segment never books a follow-up that is already due. Each
+  `DirWorkspaceBlobs` put writes its own scratch file. Two attempts that
+  save one digest at once then never mix their bytes.

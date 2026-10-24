@@ -19,8 +19,9 @@ use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::delivery::{Delivery, Report};
 use autumn_harvest_agent::{
     AgentError, AgentHarness, AgentHeartbeat, AgentId, AgentModel, AgentOp, AgentProfile,
-    AgentState, BoxFuture, ChatRequest, ChatResponse, ContentPart, Control, Followups,
-    HeartbeatSetting, ModelTurnRequest, StopReason, TokenUsage, ToolEffect, sqlite,
+    AgentState, Approval, BoxFuture, ChatRequest, ChatResponse, ContentPart, Control, Followups,
+    HeartbeatSetting, ModelTurnRequest, Rule, StopReason, TokenUsage, ToolEffect, ToolRules,
+    sqlite,
 };
 use autumn_harvest_sqlite::{ExecutionFilter, RunState, SqliteRuntime};
 use common::{Recorder, ScriptedModel, answer, calls, recorded_tool, runtime};
@@ -542,4 +543,57 @@ async fn a_tick_books_the_next_tick_one_interval_after_its_end() {
         "the next tick is due {}ms after the model call",
         next - ended
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_followup_is_due_one_delay_after_its_segment_ends() {
+    let (_dir, db) = fresh_db();
+    let recorder = Arc::new(Recorder::default());
+    let model = ScriptedModel::new(vec![
+        calls(&[("w1", "write", json!({"n": 1}))], 1),
+        calls(
+            &[(
+                "f",
+                "schedule_followup",
+                json!({"prompt": "check again", "delay_minutes": 1}),
+            )],
+            1,
+        ),
+        answer("booked", 1),
+        answer("checked", 1),
+    ]);
+    let harness = AgentHarness::new(model.clone())
+        .tool(recorded_tool("write", ToolEffect::Write, &recorder))
+        .policy(Arc::new(
+            ToolRules::new().effect(ToolEffect::Write, Rule::Ask),
+        ))
+        .agent(AgentProfile::new("watch").followups(Followups::new(Duration::from_secs(3_600))));
+    let mut rt = runtime(&db, harness);
+    let agent = id("late");
+    let start = Utc::now();
+    sqlite::send(&mut rt, &agent, &AgentOp::message("save it"), None).unwrap();
+    let RunState::WaitingSignal(signal) = drive_at(&mut rt, &agent, start).await else {
+        panic!("the segment waits on its approval");
+    };
+
+    // The segment resumes two minutes after it started.
+    let resumed = start + chrono::Duration::minutes(2);
+    let exec = sqlite::current_run(&rt, &agent).unwrap().unwrap();
+    sqlite::decide(&mut rt, exec, &signal, &Approval::Approve).unwrap();
+    drive_at(&mut rt, &agent, resumed).await;
+
+    let booked = state(&rt, &agent).await;
+    assert_eq!(booked.last_answer.as_deref(), Some("booked"));
+    assert_eq!(booked.chain, 0, "the follow-up waits for its delay");
+    let due = booked.followup_due_ms.expect("the follow-up is booked");
+    assert!(
+        due >= resumed.timestamp_millis() + 60_000,
+        "the follow-up is due {}ms after the segment ended",
+        due - resumed.timestamp_millis()
+    );
+
+    drive_at(&mut rt, &agent, resumed + chrono::Duration::minutes(1)).await;
+    let ran = state(&rt, &agent).await;
+    assert_eq!(ran.chain, 1, "the follow-up runs at its delay");
+    assert_eq!(ran.last_answer.as_deref(), Some("checked"));
 }

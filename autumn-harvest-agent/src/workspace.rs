@@ -378,15 +378,28 @@ fn io_error(err: &std::io::Error) -> AgentError {
 }
 
 /// Write `bytes` to a new file at `path` that only its owner can read.
+///
+/// The file must not exist, so two writers never share one handle.
 async fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt as _;
     let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
     let mut file = options.open(path).await?;
     file.write_all(bytes).await?;
     file.flush().await
+}
+
+/// A scratch path next to `path` that no other put of this process uses.
+///
+/// Two attempts of one turn can save the same digest at the same time. A
+/// shared scratch file would mix their bytes.
+fn scratch_path(path: &std::path::Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    path.with_extension(format!("tmp-{}-{n}", std::process::id()))
 }
 
 impl WorkspaceBlobs for DirWorkspaceBlobs {
@@ -401,13 +414,18 @@ impl WorkspaceBlobs for DirWorkspaceBlobs {
             tokio::fs::create_dir_all(self.folder(scope))
                 .await
                 .map_err(|e| io_error(&e))?;
-            let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-            write_private(&tmp, &bytes)
-                .await
-                .map_err(|e| io_error(&e))?;
-            tokio::fs::rename(&tmp, &path)
-                .await
-                .map_err(|e| io_error(&e))
+            let tmp = scratch_path(&path);
+            // A crashed process with the same id can leave this name behind.
+            let _ = tokio::fs::remove_file(&tmp).await;
+            let written = match write_private(&tmp, &bytes).await {
+                Ok(()) => tokio::fs::rename(&tmp, &path).await,
+                Err(err) => Err(err),
+            };
+            if let Err(err) = written {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(io_error(&err));
+            }
+            Ok(())
         })
     }
 
@@ -873,5 +891,33 @@ mod tests {
         let path = blobs.file("agent:x/y", &digest).unwrap();
         let mode = std::fs::metadata(path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_puts_of_one_digest_each_write_a_whole_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = Arc::new(DirWorkspaceBlobs::new(dir.path()));
+        let digest = "c".repeat(64);
+        // An AEAD codec gives each put of one snapshot different bytes.
+        let bodies: Vec<Vec<u8>> = (0..16_u8).map(|n| vec![n; 256 * 1024]).collect();
+        // Spawn every put before the first await, so the puts overlap.
+        let mut puts = Vec::new();
+        for bytes in bodies.iter().cloned() {
+            let blobs = blobs.clone();
+            let digest = digest.clone();
+            puts.push(tokio::spawn(async move {
+                blobs.put("agent:race", &digest, bytes).await
+            }));
+        }
+        for put in puts {
+            put.await.unwrap().unwrap();
+        }
+        let stored = blobs.get("agent:race", &digest).await.unwrap().unwrap();
+        assert!(bodies.contains(&stored), "the blob is one whole put");
+        let names: Vec<_> = std::fs::read_dir(blobs.folder("agent:race"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "no scratch file is left: {names:?}");
     }
 }

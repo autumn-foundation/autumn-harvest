@@ -572,7 +572,8 @@ that call.
 - The prompt is at most 2 000 characters. The count includes white space,
   because the transcript keeps the prompt as the model wrote it.
 - The delay is at most the `max_delay` of `Followups::new`. The shortest
-  delay is one minute.
+  delay is one minute. A durable agent counts the delay from the end of the
+  segment, so a long segment never books a follow-up that is already due.
 - A chain cap (`Followups::max_chain`, 10 by default) stops an agent that
   wakes itself forever.
 - A segment that ends under any stop other than `completed` runs no
