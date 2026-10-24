@@ -187,6 +187,11 @@ send results: d1 ok, d2 its error, d3 ok
 - It runs on the batch task. It sees no task-local of its caller, and it
   must not pin a tenure.
 - It reads its own execution row first, as a decision does today.
+- It must not swallow a SQL error. Postgres answers `COMMIT` on an aborted
+  transaction with a silent rollback. A batch of two or more probes for
+  that after a failed stage. A batch of one sends no probe, so it costs the
+  same as a lone decision today. A best-effort statement runs in its own
+  nested `transaction`.
 
 ### 1.6 Failure table
 

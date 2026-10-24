@@ -214,6 +214,12 @@ mod db {
     /// that after [`GroupCommit::commit`] returns `Ok`. It runs on a task of
     /// its batch. So it sees no task-local of its caller, and it must not
     /// pin a tenure.
+    ///
+    /// It must not swallow a SQL error. A failed statement aborts the
+    /// transaction, and Postgres then answers `COMMIT` with a silent
+    /// rollback. A batch of two or more finds that with a probe. A batch of
+    /// one sends no probe, so that it costs the same as a lone decision
+    /// today. Run a best-effort statement in its own nested `transaction`.
     pub type Stage<T> = Box<
         dyn for<'c> FnOnce(&'c mut AsyncPgConnection) -> BoxFuture<'c, HarvestResult<T>> + Send,
     >;
