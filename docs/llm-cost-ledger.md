@@ -158,7 +158,9 @@ spends no tokens, so it records no call. See
   commits, both shards count the run. If the second commit fails, the
   window lasts until migration recovery ends it.
 - **Reset.** A fork copies events, not ledger rows. The cost counts once.
-- **Erasure.** Erasure keeps the rows. They hold no payload. The model id
+- **Erasure.** Erasure deletes the rows of the run (issue #2267). It
+  reports the count in `ledger_rows_deleted`. A row names the run and its
+  models. The spend of an erased run leaves the budget sums. The model id
   is the only free-form text, and it must not hold PII.
 - **Cross-region DR.** The `FOR ALL TABLES` publication copies the table to
   the standby.

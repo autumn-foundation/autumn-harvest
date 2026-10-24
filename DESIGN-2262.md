@@ -4,8 +4,9 @@ Issue #2262 joins the agent loop (#1973), the keyed entity (#1975) and the
 agent mesh into one durable `Agent`. Sub-issues #2263 to #2276 close the
 gaps. This note is the spec for all of them. Each section names its issue.
 
-**One migration (an index). One opt-in hook on `Entity`. One new
-`ActivityContext` method. No new `WorkflowEvent` variant.** An
+**One migration (an index). One opt-in hook on `Entity`. Two new
+`ActivityContext` methods: `publish_progress` and `with_progress_sink`. No
+new `WorkflowEvent` variant.** An
 `agent_loop` history recorded before this change replays with no change.
 
 ---
@@ -98,8 +99,8 @@ gaps. This note is the spec for all of them. Each section names its issue.
   small and opt-in, to stay clear of PR #2305.
 - **Yellow (benefits).** One address for an agent. Listing is an indexed
   query. A mesh keeps mandates, flow rules and budgets across agents and
-  over time, which Golem, Cloudflare and Restate do not ship as engine
-  guarantees.
+  over time. No cited Golem, Cloudflare or Restate doc shows these layers
+  (`docs/comparison.md` section 12).
 - **Green (alternatives).** Sections 0.2 and the rejected rows.
 - **Blue (process).** Spec first: this note, a TLA+ model of a peer send and
   Verus proofs of the pure kernels. Then red tests, the code, a review from
@@ -187,7 +188,7 @@ survive continue-as-new.
 - SQLite: `sqlite::send(rt, &id, op, key)` uses `signal_with_start` with
   `{}` as the input.
 - Postgres: the typed stub or `POST /workflows/agent/signal-with-start`.
-  `agent::signal_payload(op)` builds the payload.
+  `Agent::payload(&op)` builds the payload.
 
 ---
 
@@ -236,10 +237,10 @@ Every steer and every op is a staged signal before it is acknowledged.
 
 ## 4. Wakes (#2266)
 
-- `Entity::wakes(f)` is an opt-in hook. When it returns a deadline and an
-  op, the loop races the op signal against the deadline. A due wake runs
-  before a waiting op. An entity with no hook records the same commands as
-  before.
+- `Entity::run_with_wakes(handler, wake)` takes an opt-in hook. When the
+  hook returns a deadline and an op, the loop races the op signal against
+  the deadline. A due wake runs before a waiting op. An entity with no hook
+  records the same commands as before.
 - The heartbeat is profile config. `Control::SetHeartbeat` overrides it for
   one agent. After a tick, the next one is one interval after the tick.
 - A follow-up is a booked deadline in the state. The chain count is state,
@@ -260,6 +261,12 @@ Every steer and every op is a staged signal before it is acknowledged.
 - Erasure deletes the agent, erases each run, and removes its stream chunks,
   its ledger rows and its memory scope. It reports each count.
 - `harvest agents list | describe | pause | resume | erase` in the CLI.
+- **Changed in the build.** The index is a btree on
+  `(search_attrs ->> 'agent_next_wake_at')::numeric`, partial on a number
+  value. It matches the comparison that the `filter` grammar compiles. The
+  status test stays on the GIN index. The grammar gains `workflow_id`, so
+  `erase` finds every life of an agent. The CLI composes the generic
+  routes, so no agent route joins the API contract.
 
 ---
 
@@ -272,12 +279,17 @@ Every steer and every op is a staged signal before it is acknowledged.
   streaming adapter sends each token delta.
 - When a turn completes, the `agent` workflow publishes the final text with
   `publish_durable_progress`. A client that reconnects reads it once.
+- **Changed in the build.** The trait method is `AgentModel::chat_stream`.
+  An activity chunk goes out as an `activity` SSE frame with no `id:`, so
+  its index never moves the `seq` of the workflow chunks. `DurableCall::live`
+  adds those frames to a durable route stream, so one route gives both
+  layers. One `LISTEN` connection serves both channels.
 
 ---
 
 ## 7. Durable peers (#2269)
 
-- `Peer::agent(name, id)` names a durable peer. A `delegate` call to it
+- `Peer::agent(name, description, &id)` names a durable peer. A `delegate` call to it
   sends a `PeerMessage` to that agent and waits for the reply.
 - The send key is `<from>:<seq>`. `from` is `<agent id>@<incarnation>` for
   a durable sender, and the run id of an `agent_loop` sender. A new life of
@@ -362,6 +374,15 @@ Every steer and every op is a staged signal before it is acknowledged.
   codec.
 - The state holds the head reference. Only a recorded tool result moves it.
 - Erasure deletes every snapshot of the agent.
+- **Changed in the build.** The blobs live in a `WorkspaceBlobs` store with
+  one key space per scope, `agent:<id>`, not in the claim-check
+  `PayloadStore`. The orphan sweep of that store would delete a snapshot,
+  and a scope lets retention find the blobs of stale attempts.
+- A tool opts in with `Tool::uses_workspace`, so a call of another tool
+  loads nothing. Tool calls of one round run in order, so each call mounts
+  the head that the call before it recorded.
+- Retention keeps one snapshot, the head, after each op that moved it.
+  `formal/tla/AgentWorkspace.tla` shows why it waits for the op end.
 
 ---
 

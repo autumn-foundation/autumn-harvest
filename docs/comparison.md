@@ -209,11 +209,20 @@ features above cannot serve.
 
 ### 12. Durable agents
 
-Cloudflare's Agents SDK, Golem and Restate share one definition of a
-durable agent. It is a named, long-lived actor. It owns its state, handles
-one message at a time, wakes itself on timers and survives crashes. Issue
+This section uses one definition of a durable agent. It is a named,
+long-lived actor. It owns its state, handles one message at a time, wakes
+itself on timers and survives crashes. Issue
 [#2276](https://github.com/autumn-foundation/autumn-harvest/issues/2276)
 asks how Harvest compares on that definition, and on the mesh layer above it.
+
+The peers meet that definition only in part:
+
+- A Restate Virtual Object runs one exclusive handler for each key
+  ([services](https://docs.restate.dev/concepts/services)).
+- A Cloudflare Durable Object lets other requests interleave during a
+  `fetch()`
+  ([rules](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/)).
+- One invocation at a time on a Golem agent is **(unverified)**.
 
 This section compares a different set of peers from the tables above.
 Temporal stays, because it is in every table. DBOS, Inngest and Hatchet are out: the sources
@@ -223,28 +232,46 @@ release, unless a cell names an earlier issue.
 
 | Engine | Agent and inbox | Wakes | Crash recovery | Listing | Agent to agent | Authority across agents | Live tokens |
 |---|---|---|---|---|---|---|---|
-| **autumn-harvest** | An `Agent` is a keyed entity. Its id is `<kind>/<name>`, and it runs one op at a time ([#2263](https://github.com/autumn-foundation/autumn-harvest/issues/2263)). A paused agent holds its work in the inbox, in order. | Heartbeats with a precheck, and booked follow-ups ([#2266](https://github.com/autumn-foundation/autumn-harvest/issues/2266)). A wake races the op signal against a durable deadline, so a tick never overlaps a message. An unattended tick is read-only unless its heartbeat allows actions ([#1973](https://github.com/autumn-foundation/autumn-harvest/issues/1973)). | Replay of the recorded model turns and tool calls ([#1973](https://github.com/autumn-foundation/autumn-harvest/issues/1973)). A crash costs at most the step in flight. An idle agent holds no worker memory ([#2267](https://github.com/autumn-foundation/autumn-harvest/issues/2267)). | An indexed Postgres query over search attributes, such as `agent_status` and `agent_next_wake_at`. The CLI has `harvest agents list`, `describe`, `pause`, `resume` and `erase` ([#2267](https://github.com/autumn-foundation/autumn-harvest/issues/2267)). | A durable send by workflow id, with the key `<sender run id>:<seq>`. The engine dedupes the key across continue-as-new. The receiver also skips a sender seq that it applied ([#2269](https://github.com/autumn-foundation/autumn-harvest/issues/2269)). [`AgentMesh.tla`](../formal/tla/AgentMesh.tla) checks exactly-once delivery across a crash and an owner change. A send into a waiting cycle fails at once as a deadlock. | A [mandate](agent-mesh.md) only narrows, in a tree and across processes ([PR #2148](https://github.com/autumn-foundation/autumn-harvest/pull/2148), [#2269](https://github.com/autumn-foundation/autumn-harvest/issues/2269)). Flow rules gate a forbidden label set across the tree. Siblings split one token budget ([#2270](https://github.com/autumn-foundation/autumn-harvest/issues/2270)). `MeshBudget` caps a mesh for each period ([#2272](https://github.com/autumn-foundation/autumn-harvest/issues/2272)). | `publish_progress` sends each token delta over Postgres `pg_notify`. Nothing is stored ([#2268](https://github.com/autumn-foundation/autumn-harvest/issues/2268)). SQLite drops it. |
+| **autumn-harvest** | An `Agent` is a keyed entity. Its id is `<kind>/<name>`, and it runs one op at a time ([#2263](https://github.com/autumn-foundation/autumn-harvest/issues/2263)). A paused agent holds its work in the inbox, in order. | Heartbeats with a precheck, and booked follow-ups ([#2266](https://github.com/autumn-foundation/autumn-harvest/issues/2266)). A wake races the op signal against a durable deadline, so a tick never overlaps a message. An unattended tick is read-only unless its heartbeat allows actions ([#1973](https://github.com/autumn-foundation/autumn-harvest/issues/1973)). | Replay of the recorded model turns and tool calls ([#1973](https://github.com/autumn-foundation/autumn-harvest/issues/1973)). A crash costs at most the step in flight. An idle agent holds no worker memory ([#2267](https://github.com/autumn-foundation/autumn-harvest/issues/2267)). | An indexed Postgres query over search attributes, such as `agent_status` and `agent_next_wake_at`. The CLI has `harvest agents list`, `describe`, `pause`, `resume` and `erase` ([#2267](https://github.com/autumn-foundation/autumn-harvest/issues/2267)). | A durable send by workflow id, with the key `<from>:<seq>`. A durable sender sets `from` to `<agent id>@<incarnation>`, and an `agent_loop` sender to its run id. The engine dedupes the key across continue-as-new. The receiver also skips a sender seq that it applied ([#2269](https://github.com/autumn-foundation/autumn-harvest/issues/2269)). [`AgentMesh.tla`](../formal/tla/AgentMesh.tla) checks exactly-once delivery across a crash and an owner change. A send into a waiting cycle fails at once as a deadlock. | A [mandate](agent-mesh.md) only narrows, in a tree and across processes ([PR #2148](https://github.com/autumn-foundation/autumn-harvest/pull/2148), [#2269](https://github.com/autumn-foundation/autumn-harvest/issues/2269)). Flow rules gate a forbidden label set across the tree. Siblings split one token budget ([#2270](https://github.com/autumn-foundation/autumn-harvest/issues/2270)). `MeshBudget` caps a mesh for each period ([#2272](https://github.com/autumn-foundation/autumn-harvest/issues/2272)). | The model-call activity sends each token delta with `ActivityContext::publish_progress`, over Postgres `pg_notify`. Nothing is stored. A durable route with `.live()` streams the deltas and the stored text of each turn on one route ([#2268](https://github.com/autumn-foundation/autumn-harvest/issues/2268)). On SQLite, an in-process `LiveSink` gets them. |
 | Golem | A durable agent is "a stateful sandbox per identity" ([blog](https://golem.cloud/blog/the-rise-of-the-agent-runtime/)). Its id is the agent type and its constructor parameters ([1.5](https://golem.cloud/blog/golem-1-5-the-agent-runtime/)). One invocation at a time is **(unverified)**. | Scheduled agent calls are durable and can be cancelled ([post](https://golem.cloud/blog/whats-this-golem-cloud-thing-about/)). A heartbeat with a precheck is **(unverified)**. | Oplog replay from the latest snapshot ([docs](https://learn.golem.cloud/v1.5/how-to-guides/ts/golem-configure-durability-ts)). Since 1.6, an epoch fence stops a stale executor from writing the oplog ([PR #3845](https://github.com/golemcloud/golem/pull/3845)). | `golem agent list` pages through agents with filters ([docs](https://learn.golem.cloud/how-to-guides/common/golem-list-and-filter-agents)). The docs say that enumeration is slow and not for application logic ([API](https://learn.golem.cloud/v1.5/develop/additional)). | Agent-to-agent calls run exactly once, with one key across retries and replays. `get` creates the target if it is absent ([post](https://golem.cloud/blog/whats-this-golem-cloud-thing-about/)). | Capability cards with upper bounds, and host-enforced tool mediation, for each agent ([blog](https://golem.cloud/blog/the-rise-of-the-agent-runtime/)). Quotas cap rate, capacity and concurrency ([1.5](https://golem.cloud/blog/golem-1-5-the-agent-runtime/)). Narrowing across an agent call, flow rules and a token budget across agents are **(unverified)**. | 1.6 adds Durable Streams and streaming methods ([1.6](https://golem.cloud/blog/golem-1-6-agents-tools-and-artifacts/)). Their use for model tokens is **(unverified)**. |
 | Cloudflare Agents SDK (Durable Objects) | An agent is a Durable Object ([Agent class](https://developers.cloudflare.com/agents/concepts/agent-class/)), addressed by name ([API](https://developers.cloudflare.com/durable-objects/api/namespace/)). An input gate holds events only during a storage call. A `fetch()` lets other requests interleave ([rules](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/)). | One alarm for each object, run at least once ([alarms](https://developers.cloudflare.com/durable-objects/api/alarms/)). The SDK keeps many schedules in SQL behind that alarm. `keepAlive()` uses alarm heartbeats ([Agent class](https://developers.cloudflare.com/agents/concepts/agent-class/)). | Each write to the SQLite storage of the object is replicated before it is confirmed ([blog](https://blog.cloudflare.com/sqlite-in-durable-objects/)). An object can restart at any time, and no shutdown hook runs ([lifecycle](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/)). Long multi-step work goes to Workflows ([changelog](https://developers.cloudflare.com/changelog/post/2026-02-03-agents-workflows-integration)). | No in-Worker API lists objects. Keep an index, for example in a parent object or in D1 ([rules](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/)). | RPC between objects. The cited docs give no delivery guarantee. They advise a retry only for an idempotent call ([errors](https://developers.cloudflare.com/durable-objects/best-practices/error-handling/)). | Not in the cited docs **(unverified)**. | An agent broadcasts its state to clients over WebSockets ([Agent class](https://developers.cloudflare.com/agents/concepts/agent-class/)). Streaming of model tokens is **(unverified)**. |
 | Restate (Virtual Objects) | A Virtual Object has a key. One exclusive handler runs for each key. Later calls wait in a per-key inbox, in arrival order ([services](https://docs.restate.dev/concepts/services), [calls](https://docs.restate.dev/develop/ts/service-communication)). | Durable timers and delayed messages ([docs](https://docs.restate.dev/concepts/durable_building_blocks)). A heartbeat with a precheck is **(unverified)**. | Journal replay. State updates commit with the journal steps ([concepts](https://docs.restate.dev/foundations/key-concepts)). Leader epochs fence stale attempts ([architecture](https://docs.restate.dev/references/architecture)). | SQL over the `state`, `sys_inbox` and `sys_locks` tables ([introspection](https://docs.restate.dev/references/sql-introspection)). A query scans the live partition stores, and a heavy query can slow invocations ([#5170](https://github.com/restatedev/restate/issues/5170)). | Calls, one-way messages and delayed messages are exactly once ([docs](https://docs.restate.dev/concepts/durable_building_blocks)). Calls between exclusive handlers can deadlock. Restate does not detect it, and an operator cancels by hand ([calls](https://docs.restate.dev/develop/ts/service-communication)). | Concurrency limits for each scope, experimental in 1.7 ([notes](https://github.com/restatedev/restate/blob/main/release-notes/v1.7.0.md)). Restate frames them around inference calls ([blog](https://restate.dev/blog/announcing-restate-1-7)). Mandates and flow rules across objects are **(unverified)**. | Not in the cited docs **(unverified)**. The AI SDK middleware journals model calls ([AI docs](https://docs.restate.dev/ai/index)). |
 | Temporal | A workflow, addressed by its Workflow Id ([server](https://docs.temporal.io/temporal-service/temporal-server)). Agent SDK integrations run each model call as an activity ([OpenAI Agents](https://docs.temporal.io/develop/python/integrations/openai-agents)). One message at a time is **(unverified)**. | Durable timers and Schedules ([docs](https://docs.temporal.io/schedule)). A heartbeat with a precheck is **(unverified)**. | Replay of the event history ([docs](https://docs.temporal.io/develop/safe-deployments)). | Visibility, a search index that Temporal updates asynchronously. It is eventually consistent ([docs](https://docs.temporal.io/visibility)). | A Signal is fire-and-forget. An Update returns a result. Signal-with-Start starts a missing target ([messages](https://docs.temporal.io/encyclopedia/workflow-message-passing), [Go](https://docs.temporal.io/develop/go/message-passing)). Nexus calls cross namespaces ([Replay 2026](https://temporal.io/blog/replay-2026-product-announcements)). | Principal Attribution (pre-release) records the caller in history for audit ([Replay 2026](https://temporal.io/blog/replay-2026-product-announcements)). Mandates, flow rules and budgets across agents are **(unverified)**. | Workflow Streams (Public Preview) streams token batches over Signals and Updates ([Replay 2026](https://temporal.io/blog/replay-2026-product-announcements)). |
 
-**What differs.** Golem, Cloudflare and Restate each ship the core of the
-definition: a named actor that owns its state and survives a crash. No
+**What differs.** Golem, Cloudflare and Restate each ship a named actor
+that owns its state and survives a crash
+([Golem](https://learn.golem.cloud/v1.5/how-to-guides/ts/golem-configure-durability-ts),
+[Cloudflare](https://blog.cloudflare.com/sqlite-in-durable-objects/),
+[Restate](https://docs.restate.dev/foundations/key-concepts)). No
 cited peer doc shows a mandate that narrows across agents. None shows flow
 rules over a tree of agents, or a budget across a mesh. Golem comes
-closest, with a capability card for each agent. Harvest ships these layers
+closest, with a capability card for each agent
+([blog](https://golem.cloud/blog/the-rise-of-the-agent-runtime/)). Harvest ships these layers
 with the agent, and replay keeps them across a crash. The same holds for
 heartbeats with prechecks and for read-only unattended runs.
+
+**Workspaces.** Golem snapshots the filesystem of an agent to blob
+storage. An oplog entry confirms each snapshot, and a start uses only a
+confirmed one ([PR #4061](https://github.com/golemcloud/golem/pull/4061)).
+Those snapshots need XFS with reflink
+([PR #4061](https://github.com/golemcloud/golem/pull/4061)). A Harvest workspace is a set of files
+that the codec encrypts and that its digest names. History records the
+reference that a tool call made, so only a recorded result moves the head
+([#2274](https://github.com/autumn-foundation/autumn-harvest/issues/2274)).
+It needs no file system feature.
 
 **Harvest limits for agents.**
 
 - A peer send needs a running target. Start each agent of a mesh first.
-  A Golem `get` and a Temporal Signal-with-Start create a missing target.
+  A Golem `get`
+  ([post](https://golem.cloud/blog/whats-this-golem-cloud-thing-about/))
+  and a Temporal Signal-with-Start
+  ([messages](https://docs.temporal.io/encyclopedia/workflow-message-passing))
+  create a missing target.
 - Across shards, a send goes through the outbox. It lands up to one scanner
   poll interval later.
-- SQLite drops live progress. A client of a SQLite agent sees only the
-  final text.
+- On SQLite, live tokens reach only an in-process `LiveSink`. No HTTP
+  route serves them.
 - On SQLite, a running activity never sees a cancel. An interrupt ends the
   wait, but the model call runs to its end.
 - Live tokens are best effort, and nothing stores them. A client that
@@ -387,8 +414,8 @@ where one exists.
   an orchestration also returns one.
 - **Durable agents have backend limits.** A peer send needs a running target.
   A Golem agent call and a Temporal Signal-with-Start create a missing one.
-  On SQLite, an agent streams no live tokens, and a running model call never
-  sees an interrupt. See [durable agents](#12-durable-agents).
+  On SQLite, live tokens reach only an in-process `LiveSink`, and a running
+  model call never sees an interrupt. See [durable agents](#12-durable-agents).
 - **Behind Temporal on throughput, on one measured box.** harvest publishes
   its own reproducible end-to-end numbers and the harness that produces them
   ([`benchmarks.md`](benchmarks.md),

@@ -1630,7 +1630,9 @@ engine accepts only a token of 1 to 200 bytes: ASCII letters, digits and
 `._:/@+-`. A prompt or a sentence does not fit, but the engine cannot detect
 PII. Keep PII out of the model id.
 
-Erasure (issue #495) keeps the rows, because they hold no payload.
+Erasure (issue #495) deletes the rows of the run and reports
+`ledger_rows_deleted` (issue #2267). A row names the run and its models.
+The spend of an erased run then leaves the LLM budget sums.
 Retention deletes them with the run. The cross-region DR publication copies
 them to the standby. The history archive does not hold them.
 

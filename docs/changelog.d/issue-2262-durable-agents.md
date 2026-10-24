@@ -30,11 +30,21 @@ its own red tests.
 No migration. No `WorkflowEvent` variant. An `agent_loop` history replays as
 it ran: the refactor changes no command of `agent_loop`.
 
-Tests: `autumn-harvest-agent/tests/durable_agent.rs` (12 tests: order, a
-restart at an approval, a process crash inside a model call, labels across
-a checkpoint, pause and resume, a failed op, approval names, an unknown kind,
-delete and a new life, reset memory, replay). Each guarantee was checked by a
-mutation that turns its test red.
+**Tests.** `autumn-harvest-agent/tests/durable_agent.rs`:
+
+- Two messages run one at a time, in order.
+- A restart at an approval asks no recorded model call again.
+- A process crash inside a model call runs only that call again.
+- The flow labels survive a checkpoint.
+- A paused agent holds its work and runs it in order on resume.
+- A failed op keeps the transcript and the labels.
+- Approval names never repeat across ops.
+- An unknown kind fails each op and keeps the agent.
+- A delete ends the life, and a new send starts another.
+- `reset_memory` clears the scope of the agent.
+- A recorded agent history replays.
+
+A mutation of each guarantee turns its test red.
 
 ### Mid-turn messages: queue, steer and interrupt (issue #2265)
 
@@ -53,10 +63,19 @@ mutation that turns its test red.
 - A steer and its op dedupe through `AgentState::steer`, so each steer runs
   once.
 
-Tests: `autumn-harvest-agent/tests/agent_interrupts.rs` (9 tests). Two are
-simulator sweeps. In every seed a write tool is never cancelled halfway, and
-some seeds cancel an opted-in tool. Each guarantee was checked by a mutation
-that turns its test red.
+**Tests.** `autumn-harvest-agent/tests/agent_interrupts.rs`:
+
+- An interrupt during a model call cancels the call and records it.
+- An interrupted history replays.
+- An interrupt ends an approval wait as a rejection.
+- A stale interrupt does not stop the next op.
+- A steer joins the running op, and its own op does nothing.
+- A steer with no running op runs once, as a message.
+- A message acknowledged before a crash runs once.
+- Two simulator sweeps. No seed cancels a write tool halfway. Some seeds
+  cancel an opted-in tool.
+
+A mutation of each guarantee turns its test red.
 
 ### Per-agent heartbeats and follow-ups (issue #2266)
 
@@ -72,16 +91,21 @@ that turns its test red.
   next tick strictly after the time a tick ran.
 - Each op records one `system_now` side effect and upserts the search
   attributes, `agent_next_wake_at` and `agent_wake_reason` among them.
-- `docs/agent-adapter.md` §10 drops the "one heartbeat per deployment"
-  caveat.
+- `docs/agent-adapter.md` §10 narrows the "one heartbeat per deployment"
+  caveat. It still holds for `heartbeat::schedule`. A durable agent runs its
+  own heartbeat.
 
-Tests: `autumn-harvest-agent/tests/agent_wakes.rs`. 1,000 agents with
-distinct intervals tick on their own schedule. A tick and a message never
-overlap, in either order. An unattended tick cannot run a write tool without
-`allow_actions`. A restart during a wait ticks and reports once. A paused
-agent skips ticks and catches up once. The follow-up chain cap holds across
-checkpoints. The next wake is listed. Unit and property tests pin the wake
-kernel.
+**Tests.** `autumn-harvest-agent/tests/agent_wakes.rs`:
+
+- 1,000 agents with distinct intervals tick on their own schedule.
+- A tick and a message never overlap, in either order.
+- An unattended tick cannot run a write tool without `allow_actions`.
+- A restart during a wait ticks and reports once.
+- A paused agent skips ticks and catches up once.
+- The follow-up chain cap holds across checkpoints.
+- The next wake is listed.
+
+Unit and property tests pin the wake kernel.
 
 ### Durable peers with exactly-once messages that carry mandates (issue #2269)
 
@@ -103,12 +127,20 @@ kernel.
   agent with no run.
 - `ReportSource::Peer`.
 
-Tests: `autumn-harvest-agent/tests/durable_peers.rs` (8 tests): delivery once
-across a restart, a duplicate dropped and a late message kept, a mandate that
-cannot widen in either direction, labels that taint the receiver, an A→B→A
-request that ends as a deadlock with no timer, an agent with no run, and the
-reply deadline. Unit and property tests pin the applied set. Each guarantee
-was checked by a mutation that turns its test red.
+**Tests.** `autumn-harvest-agent/tests/durable_peers.rs`:
+
+- A peer message arrives once across a restart, and gets its answer.
+- Each receiver counts its own seqs.
+- The receiver does not take a new life of a sender for a duplicate.
+- The receiver drops a duplicate and keeps a late message.
+- A mandate cannot widen in either direction.
+- The labels of the sender taint the receiver.
+- An A→B→A request ends as a deadlock, with no timer.
+- A send to an agent with no run gets `peer_unavailable`.
+- The sender does not wait for a reply after its deadline.
+
+Unit and property tests pin the applied set. A mutation of each guarantee
+turns its test red.
 
 ### Keyed-entity wakes: run an op at a deadline (issue #2266, engine part)
 
@@ -144,12 +176,17 @@ state. A failed wake op keeps the old state, so the same wake is due again
 at once. The timer counts whole seconds, so a wake can run up to one second
 late.
 
-**Tests.** `entity::tests`: a wake fires with no op waiting; a queued op
-runs before a wake that is not due; a due wake runs before carried and
-signalled ops; a hook that returns `None` starts no further timer; `run`
-records the pinned event shape with no clock read and no timer, and a hook
-that never wakes records the same events; a checkpoint carries the state,
-and the next run computes its wake from it. Each wake run replays clean.
+**Tests.** `entity::tests`:
+
+- A wake fires with no op waiting.
+- A queued op runs before a wake that is not due.
+- A due wake runs before carried and signalled ops.
+- A hook that returns `None` starts no further timer.
+- `run` records the pinned event shape, with no clock read and no timer.
+- A hook that never wakes records the same events as `run`.
+- A checkpoint carries the state, and the next run computes its wake from
+  it.
+- Each wake run replays clean.
 
 ### The agent cost ledger on SQLite (issue #2275)
 
@@ -192,18 +229,20 @@ from `docs/agent-adapter.md`.
 
 **Tests.**
 
-- `autumn-harvest-agent/tests/sqlite_ledger.rs`: one row per model call of
-  a three-turn script; the same rows as the Postgres activity for the same
-  script; no row for a cache hit or a tool call; a crash inside a model
-  call and inside a tool call, each in a child process that aborts, then
-  resumes with exactly one row per turn.
-- `autumn-harvest-sqlite/tests/integration/llm_ledger.rs`: a ledger
-  closure, an `#[activity]` body and a local activity; a failed attempt
-  and its retry; a timeout; a restart; an older file; the reader; a window
-  read; retention.
-- Unit tests in the SQLite `llm_ledger.rs` and `worker.rs`: the CHECK
-  bounds match the core limits, the model id charset, the per-attempt cap,
-  and a rolled-back or failed finalize writes no row.
+- `autumn-harvest-agent/tests/sqlite_ledger.rs`:
+  - One row per model call of a three-turn script.
+  - The same rows as the Postgres activity for the same script.
+  - No row for a cache hit or a tool call.
+  - A crash inside a model call, and one inside a tool call. Each runs in a
+    child process that aborts. The resume writes exactly one row per turn.
+- `autumn-harvest-sqlite/tests/integration/llm_ledger.rs`:
+  - A ledger closure, an `#[activity]` body and a local activity.
+  - A failed attempt and its retry, a timeout and a restart.
+  - An older file, the reader, a window read and retention.
+- Unit tests in the SQLite `llm_ledger.rs` and `worker.rs`:
+  - The CHECK bounds match the core limits.
+  - The model id charset and the per-attempt cap.
+  - A rolled-back or failed finalize writes no row.
 
 ### A model per agent and per peer (issue #2271)
 
@@ -226,15 +265,20 @@ from `docs/agent-adapter.md`.
   `docs/agent-adapter.md`, and the matching §12 limit from
   `docs/agent-mesh.md`.
 
-**Tests.** `autumn-harvest-agent/tests/model_per_agent.rs`: a parent and a
-child on two models record both ids in the ledger; a child keeps the model
-of its parent; the cache never serves one model's answer to another; a
-mandate that forbids a model refuses the delegation; a root on a forbidden
-model fails before any call; an unknown model fails with no retry; a
-profile and its heartbeat name their models. `durable_peers.rs`: a receiver
-on a forbidden model refuses the message. `eval.rs`: two models compared on
-one source, and one agent of a tree on another model. Mandate property
-tests cover the allowlist.
+**Tests.**
+
+- `autumn-harvest-agent/tests/model_per_agent.rs`:
+  - A parent and a child on two models record both ids in the ledger.
+  - A child keeps the model of its parent.
+  - The cache never serves the answer of one model to another.
+  - A mandate that forbids a model refuses the delegation.
+  - A root on a forbidden model fails before any call.
+  - An unknown model fails with no retry.
+  - A profile and its heartbeat name their models.
+- `durable_peers.rs`: a receiver on a forbidden model refuses the message.
+- `eval.rs`: two models compared on one source, and one agent of a tree on
+  another model.
+- Mandate property tests cover the allowlist.
 
 ### Concurrent children (issue #2270)
 
@@ -253,13 +297,20 @@ tests cover the allowlist.
   each take many steps can swap results on replay. The §12 limit "children
   never run at the same time" in `docs/agent-mesh.md` is narrowed.
 
-**Tests.** `autumn-harvest-agent/tests/fan_out.rs`: three children as child
-runs with exact replay; no bound keeps the inline path; the bound splits a
-batch; the token split; the delegation split; the labels of every sibling
-reach the parent; a child starts with the labels of its parent; a durable
-agent fans out; a simulator sweep over completion orders. `eval.rs`: a
-fan-out source evaluates from its recorded children. The wall-time test
-runs on Postgres workers in the `examples/agent-mesh` suite.
+**Tests.**
+
+- `autumn-harvest-agent/tests/fan_out.rs`:
+  - Three children run as child runs, with exact replay.
+  - With no bound, the inline path stays.
+  - The bound splits a batch.
+  - The token split and the delegation split.
+  - The labels of every sibling reach the parent.
+  - A child starts with the labels of its parent.
+  - A durable agent fans out.
+  - A simulator sweep over completion orders.
+- `eval.rs`: a fan-out source evaluates from its recorded children.
+- The wall-time test runs on Postgres workers in the `examples/agent-mesh`
+  suite.
 
 ### Verus proofs of the agent kernels (epic #2262)
 
@@ -305,13 +356,18 @@ then rejects.
 - The §9 limit "The transcript rides in history" in `docs/agent-adapter.md`
   is revised.
 
-**Tests.** `autumn-harvest-agent/tests/transcript_delta.rs`: a 50-turn run
-stores at least 80% less history (86% measured); a full-form history
-replays; a delta history replays strictly; a cold store falls back to the
-full form; the cache key is the same in both forms; eval gives the same
-result; a durable agent sends deltas across ops; a trimmed transcript is
-sent in the full form; the request cap measures the whole window; the
-in-memory store has a byte bound.
+**Tests.** `autumn-harvest-agent/tests/transcript_delta.rs`:
+
+- A 50-turn run stores at least 80% less history (86% measured).
+- A full-form history replays.
+- A delta history replays strictly.
+- A cold store falls back to the full form.
+- The cache key is the same in both forms.
+- Eval gives the same result.
+- A durable agent sends deltas across ops.
+- A trimmed transcript goes in the full form.
+- The request cap measures the whole window.
+- The in-memory store has a byte bound.
 
 ### Mesh-wide controls (issue #2272)
 
@@ -339,14 +395,19 @@ in-memory store has a byte bound.
 - The §12 limit "A memory note carries no label" in `docs/agent-mesh.md` is
   removed.
 
-**Tests.** `autumn-harvest-agent/tests/mesh_controls.rs`: a mesh over its
-daily budget parks every agent's next turn; a parked agent opens when the
-period ends; another mesh keeps its own budget; a pause stops every agent
-of a mesh within one tick; a pause stops an agent that waits for an
-approval; a pause leaves other meshes alone; a note written under
-untrusted input taints the run that reads it, for a store and for state
-memory; a store that cannot keep labels refuses a labelled write. Unit
-tests in `mesh_control.rs` cover the period windows and the caps.
+**Tests.**
+
+- `autumn-harvest-agent/tests/mesh_controls.rs`:
+  - A mesh over its daily budget parks the next turn of every agent.
+  - A parked agent opens when the period ends.
+  - Another mesh keeps its own budget.
+  - A pause stops every agent of a mesh within one tick.
+  - A pause stops an agent that waits for an approval.
+  - A pause leaves other meshes alone.
+  - A note written under untrusted input taints the run that reads it. This
+    holds for a store and for state memory.
+  - A store that cannot keep labels refuses a labelled write.
+- Unit tests in `mesh_control.rs` cover the period windows and the caps.
 
 ### Agent memory as entity state (issue #2273)
 
@@ -359,8 +420,200 @@ tests in `mesh_control.rs` cover the period windows and the caps.
   `harvest_entity_state` projection, which erasure and codec rotation cover
   (issue #2259).
 
-**Tests.** `autumn-harvest-agent/tests/memory_state.rs`: an edit commits
-with the op and shows in the next op; memory reads are stable within a
-segment; the memory is in the entity snapshot; `ResetMemory` clears it; a
-crash in a child process after the memory call leaves memory and history
-consistent, with the edit applied once.
+**Tests.** `autumn-harvest-agent/tests/memory_state.rs`:
+
+- An edit commits with the op and shows in the next op.
+- Memory reads are stable within a segment.
+- The memory is in the entity snapshot.
+- `ResetMemory` clears it.
+- A crash in a child process after the memory call leaves memory and
+  history consistent. The edit applies once.
+
+### Live tokens from inside the model-call activity (issue #2268)
+
+- `ActivityContext::publish_progress` sends a live, best-effort chunk while
+  an activity runs. Nothing is stored: no event and no
+  `harvest_stream_chunks` row. Each chunk carries the activity, the attempt
+  and its index in the attempt, so a reader drops the text of a failed
+  attempt. `ActivityContext::with_progress_sink` and `CaptureProgressSink`
+  serve tests and embedded runtimes.
+- On Postgres a background task sends each chunk with `pg_notify` on the
+  progress channel of the run. A full queue of 256 drops a chunk, so a slow
+  database never slows the activity.
+- `GET /workflows/{id}/stream` sends an activity chunk as an `activity`
+  frame with no `id:`. `ProgressNotifyPayload::activity` marks it, so the
+  `seq` contract of the workflow chunks stays as it was.
+- `DurableCall::live` adds the `activity` frames to a durable route stream.
+  One route then gives both layers: live tokens, and the durable text that a
+  resume gets once. `DurableStreamListener::connect_live` listens on both
+  channels of a run with one connection.
+- Agent: `AgentModel::chat_stream`, `AgentTask::stream`,
+  `AgentProfile::stream`, `AgentHarness::live_sink`, `LiveEvent` and
+  `TurnText`. Small deltas join until 256 bytes wait, or until 50 ms pass
+  and the provider sends its next event. The workflow
+  publishes the text of each finished turn with `publish_durable_progress`.
+
+**Tests.**
+
+- `autumn-harvest/tests/integration/activity_progress_db_tests.rs`:
+  - A live chunk arrives before the activity completes, and nothing stores
+    it.
+  - A retried attempt tags its chunks with the new attempt.
+- `durable_stream_tests.rs`: a live listener keeps the activity chunks in
+  order, drops workflow chunks, and puts a stored wake first.
+- `autumn-harvest-plugin/tests/durable_stream_integration.rs`: one stream
+  gives the live chunks with no id and the stored text once.
+- The `durable_route::stream` unit tests prove that a live chunk costs no
+  table read and never moves the cursor.
+- `autumn-harvest-agent/tests/live_tokens.rs`:
+  - Tokens arrive before the turn completes.
+  - A retry starts the live text again.
+  - Live text never reaches history.
+  - A reconnect gets the durable text of each turn once.
+
+### Agent lifecycle: idle, list, pause and erase (issue #2267)
+
+- An idle agent is a row in the database. A fresh runtime serves its next
+  message and its next wake.
+- `agent_mesh` joins the agent search attributes, and `parked` joins the
+  statuses.
+- Migration `20261023202848_harvest_agent_wake_index` adds the partial
+  expression index `idx_harvest_we_agent_wake` on
+  `(search_attrs ->> 'agent_next_wake_at')::numeric`. A list of the agents
+  due to wake reads only those agents.
+- The `filter` grammar of `GET /workflows` takes `workflow_id` (`=`, `!=`,
+  `IN`), so a caller lists every run of one business id.
+- `EraseOutcome::ledger_rows_deleted`: an erasure deletes the agent cost
+  ledger rows of the run (issue #1996). The spend of an erased run leaves
+  the budget sums.
+- CLI: `harvest agents list | describe | pause | resume | erase`. `erase`
+  resets the memory and the workspace of a running agent, then deletes it.
+  It erases each run of each life and prints one report.
+
+**Tests.**
+
+- `autumn-harvest-agent/tests/agent_lifecycle.rs`:
+  - An idle agent needs no runtime and wakes on a message.
+  - It wakes on its timer in a fresh runtime.
+- `workflow_filter_integration.rs`: the agent wake list reads
+  `idx_harvest_we_agent_wake` with a range condition (`EXPLAIN`).
+- `llm_ledger_tests.rs`: an erase deletes the ledger rows of the run.
+- `autumn-harvest-cli`:
+  - The request mapping, the filter literal and the erase report.
+  - `agents erase` against a scripted server.
+
+### Persistent workspaces (issue #2274)
+
+- `autumn_harvest_agent::workspace`: `Workspace`, `WorkspaceRef`,
+  `WorkspaceMount`, `WorkspaceStore`, `WorkspaceBlobs`,
+  `InMemoryWorkspaceBlobs` and `DirWorkspaceBlobs`.
+- A snapshot is content-addressed by the SHA-256 digest of its plain bytes,
+  encoded by the payload codecs, and kept outside history. History records
+  only its reference.
+- `AgentProfile::workspace` and `AgentHarness::workspace` turn it on.
+  `Tool::uses_workspace` and `FnTool::uses_workspace` opt a tool in.
+  `ToolContext::workspace` holds the files of one call. `SandboxTool`
+  mounts the files and keeps its outputs.
+- `ToolOutcome::workspace` carries the new head. Only a recorded result
+  moves the head, so the snapshot of a stale attempt never becomes it.
+- The end of each op that moved the head keeps one snapshot. The activity
+  `agent_workspace_retain` deletes the others. `Control::ResetWorkspace`
+  and the activity `agent_workspace_reset` delete them all. `harvest agents
+  erase` sends the reset.
+- Caps: 64 MiB of file content and 10,000 files for each snapshot by
+  default.
+
+**Tests.**
+
+- `autumn-harvest-agent/tests/agent_workspace.rs`:
+  - A file from turn 1 is visible in turn 5 after a restart.
+  - A stale attempt never becomes the head, and the op end deletes its
+    snapshot.
+  - A reset removes every snapshot, an orphan included.
+  - The store holds only ciphertext.
+- Unit tests in `workspace.rs` and `sandbox.rs` cover the digest check, the
+  caps, the path rules, the directory store and the sandbox mount.
+
+### The agent-mesh capstone (issue #2276)
+
+- `examples/agent-mesh` runs an always-on support desk with three durable
+  agents in one SQLite file. The triage agent wakes on a heartbeat. It asks
+  the researcher and the critic as durable peers, under mandates that only
+  narrow. A write waits for a person. The mesh shares one daily budget.
+- `--model claude` runs the agents on `autoresearch::claude::ClaudeModel`,
+  which streams over Server-Sent Events. The offline model needs no key.
+- `docs/comparison.md` §12 compares durable agents, with each competitor
+  claim cited.
+
+**Tests.**
+
+- `tests/e2e.rs`:
+  - A check reports the inbox and files nothing.
+  - An answer asks each peer once, waits for approval across a restart and
+    files once.
+  - A rejected reply is never filed.
+  - A spent budget parks the mesh until the next day.
+- `tests/simulation.rs`: a seeded sweep with restarts, reordered steps,
+  duplicate ops, clock jumps and a reckless model. Four invariants hold on
+  every seed, and each nemesis fires on some seed.
+- `tests/postgres.rs`:
+  - Three children of one turn overlap on the wall clock.
+  - One slot runs them one after another.
+  - The live text of a turn reaches a progress listener while the turn
+    runs.
+  - A durable peer on another shard gets one message and answers once.
+  - An erased agent keeps no memory, stream chunk or transcript text in
+    any table.
+- CI runs the offline suites, the README demo and clippy. The Postgres
+  suite runs from its manifest row.
+
+### Review fixes (epic #2262)
+
+A review from five angles found these. Each fix has a test.
+
+- **Mandates.** A read-only inbound mandate makes a durable receiver
+  read-only. A peer segment books no follow-up. A `memory` call in a segment
+  that may not write memory gets an error, whatever the policy says.
+- **Peer replies.** Only the segment of a message answers it. A failed
+  segment sends an error and no text. A full held queue answers a waiting
+  sender at once.
+- **Heartbeats.** `Control::SetHeartbeat` only narrows the profile:
+  `AgentHeartbeat::narrowed` and `MIN_CUSTOM_HEARTBEAT_SECS`. A tick books
+  the next tick from its own end, so a long tick never starves messages.
+- **Durability.** `Control::Resume` stops when an op parks the agent again,
+  so a spent budget never loops. A steer that a failed or silent segment
+  took runs later as its own op. A failed profile lookup keeps the run and
+  its state. A fan-out child run gets the waiting chain of its parent, so a
+  send back up the chain is a deadlock.
+- **Clock.** A SQLite ledger body gets the drive clock of its claim, and the
+  mesh budget window uses it. `LedgerSpend` reads rows with no upper bound.
+  On SQLite, a live `system_now` returns the clock of its decision cycle,
+  through `WorkflowExecuteSpanMeta::drive_clock`. An `_as_of` drive then
+  keeps one clock, so a parked agent never wakes at once and parks again.
+- **Workspace.** A read-only run never moves the head. The state keeps the
+  flow labels of the run that last moved it, and `ClearTranscript` keeps
+  them. A store failure runs a workspace call again from the same head, up
+  to three times. `DirWorkspaceBlobs` writes files that only the owner
+  reads. A store with no keyed codec logs a warning.
+- **Transcript store.** A read checks the digest of the window, so a
+  changed window is a miss.
+- **Erase.** `harvest agents erase` reads the `execution` object of the
+  by-id answer. It pauses the agent first. It restarts an agent that ended,
+  so its memory and workspace reset too. `stores_reset` reflects the final
+  state, and `stores_error` names a failed reset.
+- **Live tokens.** The Postgres progress sink sends every chunk that waits
+  in one `pg_notify` statement, so a burst of tokens costs one transaction.
+  The sink gives its pool connection back when its queue is empty. When it
+  cannot get a connection, every chunk that waits drops.
+  `GET /workflows/{id}/stream` resolves the shard of a run at most once per
+  keepalive. The Claude adapter decodes complete lines only, so a character
+  or a `\r\n` pair split across network chunks stays whole. Upgrade every
+  API server before a worker sends activity chunks: an older server sends
+  an activity chunk as a `progress` frame.
+- **Capstone.** The offline desk model reads only the current op. A note
+  search puts the best match first. A reply waits one day of desk clock for
+  approval: `MeshConfig::approval_timeout`. The simulation checks the spend
+  of each day apart, checks that triage applies each op key once, and
+  asserts that each nemesis fires. A CI guard checks that each agent-mesh
+  test target has a runner. A Postgres worker of the agents also polls the
+  `default` queue, where the agent activities go.

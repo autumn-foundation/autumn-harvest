@@ -82,6 +82,7 @@ fails in these cases:
 | `CodecRotation` | Codec re-encryption against PII erasure (issues #948, #495) | CAS, blind write, reachability |
 | `OwnerLease` | Fenced owner lease of a decision partition (issue #2250) | design, six defects, reachability |
 | `AgentMesh` | Durable peer send between two agents (issue #2269) | design, three single-layer configs, four defects, reachability |
+| `AgentWorkspace` | Workspace head of a durable agent (issue #2274) | design, two defects, reachability |
 
 **Ghost sequence numbers.** Each claim in the two claim models gets a ghost
 `seq`. The code has no such column. An invariant that compared
@@ -315,9 +316,10 @@ See [`simulation.md`](simulation.md#the-owner-lease-simulation).
 The prose spec is section 7 of `DESIGN-2262.md`. Issue #2269 asks for this
 model before the code. Agent A sends `PeerMessage` ops to agent B by
 workflow id. Both agents are keyed entities. The send key is
-`<sender run id>:<seq>`. The seq is durable state of A. It moves only when
-the send commits with the decision of A. The model has one sender, so the
-seq is the key.
+`<from>:<seq>`. A durable sender sets `from` to
+`<agent id>@<incarnation>`. An `agent_loop` sender sets it to its run id.
+The seq is durable state of A. It moves only when the send commits with
+the decision of A. The model has one sender, so the seq is the key.
 
 A send takes one of two paths. On one shard, the decision of A inserts the
 signal row of B in its own transaction. Across shards, the decision writes
@@ -432,8 +434,9 @@ The code must keep two rules that the model has no room to show:
 - A seq counts the sends of one sender to one receiver. With one counter
   for all peers, each receiver sees gaps. Then `floor` stops, and `above`
   grows with each send.
-- B keys the applied set by the sender run id, which holds the
-  incarnation. A new incarnation of the sender starts its seq at 1 again.
+- B keys the applied set by `from`. For a durable sender, `from` is
+  `<agent id>@<incarnation>`. A new incarnation of the sender starts its
+  seq at 1 again, so the key holds the incarnation.
 
 `AgentMesh.cfg` checks 2 sends, 2 crashes of A, 3 epochs of B, one lost
 relay outcome and one checkpoint. TLC finds 60,603 distinct states and no
@@ -463,6 +466,34 @@ The model has these limits:
 - A crash of A drops only its decision in flight. A stale writer of A is
   the `OwnerLease` case.
 - The mandate is a set of tools. Flow labels and budgets are not modelled.
+
+#### `AgentWorkspace` — model (g)
+
+`formal/tla/AgentWorkspace.tla` models the head of a workspace (issue
+#2274). One op runs `Calls` tool calls in order. Each call can run as
+several attempts. An attempt writes a snapshot, and a stale attempt of an
+earlier call can still write. History records the result of one attempt of
+each call. Retention keeps the head and deletes every other snapshot.
+
+| Action | Code |
+|---|---|
+| `Write` | `WorkspaceStore::save` in the tool-call activity. |
+| `Record` | The engine records the result. `adopt_workspace` moves the head. |
+| `Retain` | The activity `agent_workspace_retain` at the end of the op. |
+
+| Config | Switch | Result |
+|---|---|---|
+| `AgentWorkspace.cfg` | None: `AdoptOn = "record"`, `RetainWhen = "op_end"`. | Pass. |
+| `AgentWorkspaceAdoptOnWrite.cfg` | `AdoptOn = "write"` | Violates `HeadIsRecorded`. |
+| `AgentWorkspaceRetainAnyTime.cfg` | `RetainWhen = "any_time"` | Violates `HeadPresent`. |
+| `AgentWorkspaceReach.cfg` | None. | Violates `SomeStaleWriteUnseen`. |
+
+`HeadIsRecorded` says that the head is the snapshot of a recorded result.
+`HeadPresent` says that the head is in the store, so the next call can load
+it. A retention that runs while a call runs can delete a snapshot that
+history then records. So retention runs only after the last call of an op.
+
+The model has one op, and the store never loses a blob on its own.
 
 ### Extend a model
 

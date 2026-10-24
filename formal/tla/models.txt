@@ -38,3 +38,7 @@ AgentMesh          AgentMeshRunScope.cfg               violation:AtMostOnce
 AgentMesh          AgentMeshLastSeq.cfg                violation:NoLostAck
 AgentMesh          AgentMeshWiden.cfg                  violation:MandateNarrows
 AgentMesh          AgentMeshReach.cfg                  violation:SomeNemesisUnseen
+AgentWorkspace     AgentWorkspace.cfg                  pass
+AgentWorkspace     AgentWorkspaceAdoptOnWrite.cfg      violation:HeadIsRecorded
+AgentWorkspace     AgentWorkspaceRetainAnyTime.cfg     violation:HeadPresent
+AgentWorkspace     AgentWorkspaceReach.cfg             violation:SomeStaleWriteUnseen

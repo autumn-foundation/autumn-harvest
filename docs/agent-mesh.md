@@ -146,11 +146,14 @@ verdict, and the report lists it:
 | `model_forbidden` | The mandate does not allow the model of the peer. |
 | `budget_exhausted` | The child would get a token cap of zero. |
 | `invalid_mandate` | `Mandate::accept` got a malformed mandate. |
+| `deadlock` | The durable peer waits on this agent, so it would never reply (section 13). |
+| `peer_unavailable` | The durable peer has no running run, or the roster names no valid agent id for it. |
 
 A delegation runs the first eight checks in the order of the table.
 `Mandate::accept` returns `invalid_mandate`, `cycle` or `depth_exceeded`. A
 durable receiver returns `model_forbidden` when the accepted mandate does
-not allow its own model.
+not allow its own model. Only a send to a durable peer returns `deadlock` or
+`peer_unavailable`.
 `Refusal` implements `std::error::Error`.
 
 The report keeps a peer name only when it is a valid agent name. Any other
@@ -167,8 +170,12 @@ The tree shares one token budget, the `max_total_tokens` of the root task:
 3. The parent adds the child usage. A parent over its cap makes no further
    model call. It stops with `tokens_exhausted`.
 
-The tree runs one step at a time inside one workflow. Two children never
-read the same remainder, so they cannot overspend together.
+Inline children run one after another, inside the workflow of the parent.
+Each one reads the remainder that the one before it left. The siblings of
+a fan-out (section 15) run at the same time, as child runs.
+`bounds::sibling_cap` gives each sibling a share of the remainder, and the
+shares sum to the remainder. So two children never spend the same tokens,
+and they cannot overspend together.
 
 `AgentReport::delegations` lists each delegation, refused ones too, in the
 order each ended:
@@ -383,9 +390,10 @@ suffix alone counts delegations, so another peer can take the same `n`.
 
 A run with a mandate records the acting agent in each model-turn request, as
 `agent`. The model-turn span `agent_model_turn` carries
-`gen_ai.agent.name`. On both backends, the cost ledger counts child turns
-in the run of the root agent. A `DelegationRecord` gives the tokens, rounds and
-calls per subtree.
+`gen_ai.agent.name`. On both backends, the cost ledger counts the turns of
+an inline child in the run of the root agent. A fan-out child (section 15)
+writes its rows under its own child run. A `DelegationRecord` gives the
+tokens, rounds and calls per subtree.
 
 ## 12. Limits
 
@@ -422,10 +430,10 @@ let harness = AgentHarness::new(model)
 |---|---|
 | Send | The sender signals the agent by workflow id with the key `<from>:<seq>`. A durable sender sends `from` as `<agent id>@<incarnation>`, so a new life never matches the keys of the old one. `seq` counts from 1 for each receiver, so a receiver sees no gaps. On one shard the send commits with the decision. Across shards it goes through the outbox. Replay does not send it again. |
 | Dedupe | The engine dedupes the key across the run chain of the receiver. The receiver also keeps the applied numbers of each sender, as a floor and a set above it. |
-| Mandate | The message carries `Mandate::outbound`. The receiver runs under `local.accept(inbound)`, so it can only narrow its own mandate. |
+| Mandate | The message carries `Mandate::outbound`. The receiver runs under `local.accept(inbound)`, so it can only narrow its own mandate. A read-only inbound mandate makes the receiver read-only. A peer segment books no follow-up, because a follow-up runs under the profile mandate. |
 | Labels | The message carries the labels of the sender. They taint the receiver. The reply carries the labels of the receiver back. |
-| Reply | A durable promise. The sender races it against the reply deadline, and a durable agent also against an interrupt. |
-| Deadlock | Each message carries the agents that wait on it. A send to one of them is refused at once as `deadlock`. |
+| Reply | A durable promise. The sender races it against the reply deadline, and a durable agent also against an interrupt. Only the segment of the message answers. A failed segment sends an error and no text. A full held queue refuses the message and answers at once. |
+| Deadlock | Each message carries the agents that wait on it. A send to one of them is refused at once as `deadlock`. A fan-out child run gets the chain of its parent, so the rule holds there too. |
 
 - The receiver never drops a number for being at or under the highest one
   it saw. The outbox can deliver message 2 before message 1. The TLA+ model
@@ -433,7 +441,9 @@ let harness = AgentHarness::new(model)
 - A send needs a running target. A send to an agent with no run is refused
   as `peer_unavailable`. Start each agent of a mesh first.
 - The reply deadline is `Peer::reply_timeout`, ten minutes by default. A
-  reply after the deadline is not read.
+  reply after the deadline is not read. The receiver still applies the
+  message once. When the sender asks again, the task runs twice, so give a
+  slow peer a longer deadline.
 - A durable peer runs on its own worker, in its own history, under its own
   profile budget. Its tokens are not added to the budget of the sender.
 

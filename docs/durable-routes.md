@@ -186,6 +186,7 @@ connection loses no chunk.
 | `event: result` | none | The workflow output. The stream then ends. |
 | `event: problem` | none | The problem body that `.send()` answers, with its `status`. `.failure_status(..)` sets that `status`. The stream then ends. |
 | `event: pending` | none | `{"state":"pending"}`, with `retry: 1000`. The stream budget is spent. Resume. |
+| `event: activity` | none | A live chunk of an activity, with `.live()` only. See [Live chunks](#live-chunks). |
 
 The stream also sends a `: ping` comment every 5 s.
 
@@ -197,6 +198,32 @@ text of the previous attempt. The id never holds the execution id.
 A run that stores more than 10,000 chunks ends its chunks with a marker at
 offset `9223372036854775807`. Its id is `<attempt>.9223372036854775807`. See
 [durable streams](streaming-progress.md#limits).
+
+### Live chunks
+
+`.live()` adds the live layer to the same stream (issue #2268). An activity
+of the run sends live chunks with `ActivityContext::publish_progress`, for
+example the tokens of a model call. Each one goes out as an `activity`
+frame:
+
+```text
+event: activity
+data: {"_harvest_activity":{"activity_id":"…","activity_type":"agent_model_turn","attempt":1,"index":0},"data":{"type":"delta","run_id":"…","step":0,"text":"Hel"}}
+```
+
+- An `activity` frame has no `id:`, so it never moves the resume cursor.
+- It is not stored. A resume does not send it again. The durable chunks
+  hold the answer.
+- A higher `attempt` means a retry of the activity. Drop the live text of
+  the earlier attempt.
+- It is best-effort. A slow client or a full queue drops a frame.
+- Its order against the stored chunks is not kept. A stored chunk can go
+  out before an older live chunk. So a reader drops a live `delta` for a
+  (`run_id`, `step`) after the stored `turn` text of that step arrives.
+- Turn it on only when the caller may see every live chunk of the run.
+
+A durable agent sends its live tokens and the durable text of each turn
+this way. See [`agent-adapter.md`](agent-adapter.md#live-tokens-issue-2268).
 
 ### Resume
 

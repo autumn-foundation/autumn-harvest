@@ -376,6 +376,11 @@ Timers use the real wall clock (read once per decision cycle), so a run blocked
 on a `ctx.timer(...)` that is not yet due returns `WaitingTimer`; drive it again
 after the deadline passes and it proceeds.
 
+A live `ctx.system_now()` returns the clock of its decision cycle, as the
+timers do (issue #2276). A `run_until_blocked_as_of` drive therefore keeps one
+clock: the timers, the activities, the ledger rows and the clock reads all use
+the time that the call names.
+
 ### Cancel and terminate
 
 Stop a run with `cancel` (cooperative) or `terminate` (at once). Both take a
