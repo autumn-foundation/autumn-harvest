@@ -15,10 +15,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use autumn_harvest::chrono::{DateTime, Utc};
+use autumn_harvest::entity::ENTITY_OP_SIGNAL;
 use autumn_harvest::event::WorkflowEvent;
 use autumn_harvest_agent::delivery::{Delivery, Report};
 use autumn_harvest_agent::{
-    AgentError, AgentHarness, AgentHeartbeat, AgentId, AgentModel, AgentOp, AgentProfile,
+    Agent, AgentError, AgentHarness, AgentHeartbeat, AgentId, AgentModel, AgentOp, AgentProfile,
     AgentState, Approval, BoxFuture, ChatRequest, ChatResponse, ContentPart, Control, Followups,
     HeartbeatSetting, ModelTurnRequest, Rule, StopReason, TokenUsage, ToolEffect, ToolRules,
     sqlite,
@@ -403,8 +404,9 @@ fn look() -> common::Reply {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_message_waits_for_a_tick_that_runs() {
-    // A wake is due by the recorded wall clock, so the test lets real time
-    // pass.
+    // Each drive keeps one clock, and the message arrives at a fixed time
+    // after the tick is due. A slow runner then cannot make the next tick
+    // due while the message runs.
     let (_dir, mut rt, _model) = overlap_agent(vec![
         answer("ready", 1),
         look(),
@@ -413,12 +415,16 @@ async fn a_message_waits_for_a_tick_that_runs() {
         answer("the reply", 1),
     ]);
     let agent = id("overlap-1");
+    let start = Utc::now();
     sqlite::send(&mut rt, &agent, &AgentOp::message("start"), None).unwrap();
-    sqlite::drive(&mut rt, &agent).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    drive_at(&mut rt, &agent, start).await;
     // The tick is due, and a message waits. The tick runs first and whole.
-    sqlite::send(&mut rt, &agent, &AgentOp::message("hello"), None).unwrap();
-    sqlite::drive(&mut rt, &agent).await.unwrap();
+    let later = start + chrono::Duration::milliseconds(1_500);
+    let exec = sqlite::current_run(&rt, &agent).unwrap().unwrap();
+    let hello = Agent::payload(&AgentOp::message("hello"));
+    rt.send_signal_as_of(exec, ENTITY_OP_SIGNAL, hello, later)
+        .unwrap();
+    drive_at(&mut rt, &agent, later).await;
     let turns = turn_segments(&rt, &agent);
     assert_eq!(
         turns,
