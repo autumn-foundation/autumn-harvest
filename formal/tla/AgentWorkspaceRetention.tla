@@ -32,6 +32,11 @@
 (*            "clock" starts it at the clock alone, which can read low.    *)
 (*   MarkReset TRUE is the design: a reset leaves a marker at its bound,   *)
 (*            so the store floor still holds after a reset empties it.     *)
+(*                                                                         *)
+(* A put is atomic here. The directory store writes a scratch file         *)
+(* first. Retention and a reset delete a scratch file by the generation    *)
+(* of its key, with the rule of this model. The unit tests in              *)
+(* workspace.rs prove that (issue #2315).                                  *)
 (***************************************************************************)
 EXTENDS Naturals
 

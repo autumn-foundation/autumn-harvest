@@ -1203,8 +1203,8 @@ impl AgentHarness {
 
     /// Save the workspace of a call that changed it (issue #2274).
     ///
-    /// `Ok(Ok(None))` means no change. `Ok(Err(text))` is a cap, which the
-    /// model reads. `Err` retries the activity: a new attempt runs the tool
+    /// `Ok(Ok(None))` means no change. `Ok(Err(text))` is a cap, or a later
+    /// reset that cleared the scope, which the model reads. `Err` retries the activity: a new attempt runs the tool
     /// again from the same head.
     async fn save_workspace(
         &self,

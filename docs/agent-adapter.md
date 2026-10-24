@@ -1003,7 +1003,9 @@ app must clear those stores itself.
 1. The agent gets `pause`, `reset_memory` and `reset_workspace`, then a
    delete. The pause holds new work and stops the ticks, so nothing writes
    the stores after the resets. The resets clear a `MemoryStore` scope and
-   every workspace snapshot. An agent that ended gets a new run for them,
+   every workspace snapshot, with the scratch files of stopped puts. See
+   "Scratch files" and "A save after a reset" below for the two windows
+   that stay. An agent that ended gets a new run for them,
    through `POST /workflows/agent/signal-with-start` on the queue of its
    last run. The command waits for the run to end.
 2. The command compares the failure count of the final state with the
@@ -1122,8 +1124,9 @@ let harness = AgentHarness::new(model)
 by default. Set the caps with `WorkspaceStore::max_bytes` and `max_files`. A
 call that grows the workspace past a cap gets a tool error, and the head
 stays as it was. The sandbox policy also bounds the files that a run can
-mount. A snapshot is JSON with base64 content, so a blob is about a third
-larger than its files.
+mount. A snapshot is JSON with base64 content, and the store base64-encodes
+that JSON again inside the codec envelope. A blob is therefore about 1.8
+times the size of its files. A 64 MiB snapshot takes about 114 MiB.
 
 **Retention.** A workspace keeps one snapshot: its head. The end of each op
 that moved the head deletes every other snapshot of the head generation or
@@ -1137,6 +1140,34 @@ also when that head has the content of an old one.
 `formal/tla/AgentWorkspaceRetention.tla` checks this. Keep the blobs in a
 store for workspaces only, because retention deletes the blobs of a scope
 that are not newer than its head.
+
+**Scratch files (issue #2315).** `DirWorkspaceBlobs` writes each blob to a
+scratch file, `<key>.tmp-<32 hex>`, then renames it. A crash, a save timeout
+or a cancel can stop a put before the rename and leave that file. The store
+lists scratch names. Retention and a reset delete one by the generation of
+its key, with the same rule as for keys. So a late attempt never deletes the
+scratch file of a live put of a newer op. No operation deletes a scratch
+file by its age.
+
+**A save after a reset.** A reset puts its marker before it lists the
+scope. After a put, a save at a generation above 0 lists the scope. When it
+finds a marker above its own generation, it deletes its own key and returns
+a tool error. So a stale attempt that saves after the reset of an erase
+deletes its own snapshot. This holds when each store call is atomic and
+visible when it returns, as on a local folder. A save at generation 0, as
+in a plain `AgentTask` workspace, has no order and skips the check. Each
+save costs one more `list` call.
+
+Two windows stay. Each needs a stale attempt that a crash, a timeout or a
+cancel also stops:
+
+- The put opens its scratch file after the reset lists the scope, and
+  stops before its rename. The scratch file stays.
+- The put renames its key after the reset lists the scope, and the save
+  stops before its own check deletes that key. The whole snapshot stays.
+
+What stays is deleted by a later reset or retention of the scope. After an
+erase, no later op runs, so it stays on disk.
 
 ### Live tokens (issue #2268)
 

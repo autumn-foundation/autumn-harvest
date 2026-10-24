@@ -660,6 +660,16 @@ A review from five angles found these. Each fix has a test.
   copy. A refused first turn now keeps the transcript as it was, and a steer
   that it took runs later as its own op. The test
   `a_refused_message_leaves_the_transcript_as_it_was` covers it.
+- **Scratch files (issue #2315).** A `DirWorkspaceBlobs` put that stopped
+  before its rename left a `.tmp-<uuid>` file that no operation could
+  find, so `harvest agents erase` reported success over it. The store now
+  lists scratch names, and retention and a reset delete one by the
+  generation of its key. `erase` and the floor count them too. A reset
+  puts its marker first, and a save above generation 0 that finds a later
+  marker deletes its own key. `docs/agent-adapter.md` names the two
+  windows that stay. Seven tests cover it, among them
+  `a_reset_deletes_scratch_files_below_its_bound_and_keeps_a_newer_one`
+  and `a_reset_on_the_dir_store_leaves_no_bytes_of_a_dropped_save`.
 
 ### Advisory RUSTSEC-2026-0387 (crypto-bigint 0.5.5)
 

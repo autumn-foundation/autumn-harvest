@@ -106,6 +106,32 @@ fn marker_generation(key: &str) -> Option<u64> {
     u64::from_str_radix(generation, 16).ok()
 }
 
+/// The infix between a key and the tag of its scratch name.
+const SCRATCH_INFIX: &str = ".tmp-";
+
+/// The key that the scratch name `name` belongs to (issue #2315).
+///
+/// [`DirWorkspaceBlobs`] writes a scratch name as a key or a reset marker,
+/// then `.tmp-` and 32 lowercase hex digits. Each other form is `None`.
+fn scratch_owner(name: &str) -> Option<&str> {
+    let (owner, tag) = name.split_once(SCRATCH_INFIX)?;
+    let known = key_generation(owner).is_some() || marker_generation(owner).is_some();
+    (known && hex_digits(tag, 32)).then_some(owner)
+}
+
+/// The generation of the key that the scratch name `name` belongs to.
+fn scratch_generation(name: &str) -> Option<u64> {
+    scratch_owner(name).and_then(|owner| key_generation(owner).or_else(|| marker_generation(owner)))
+}
+
+/// The generation of `name`: a snapshot key, a reset marker or a scratch
+/// name.
+fn name_generation(name: &str) -> Option<u64> {
+    key_generation(name)
+        .or_else(|| marker_generation(name))
+        .or_else(|| scratch_generation(name))
+}
+
 /// `text` is `len` lowercase hex digits.
 fn hex_digits(text: &str, len: usize) -> bool {
     text.len() == len && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
@@ -284,6 +310,11 @@ impl Eq for WorkspaceHandle {}
 /// Use a store for workspaces only. Retention deletes the keys of a scope
 /// that are not newer than its head. It never deletes a key that does not
 /// have the form of [`WorkspaceRef::key`].
+///
+/// A store that writes through scratch names can list them too. Each
+/// scratch name starts with the key it belongs to, so retention and reset
+/// read its generation (issue #2315). `delete` must accept each listed
+/// name.
 pub trait WorkspaceBlobs: Send + Sync + std::fmt::Debug {
     /// Store `bytes` under the key `digest` in `scope`. A put of an existing
     /// key replaces it.
@@ -309,7 +340,7 @@ pub trait WorkspaceBlobs: Send + Sync + std::fmt::Debug {
         digest: &'a str,
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, AgentError>>;
 
-    /// Every key in `scope`.
+    /// Every key in `scope`, and every scratch name that a put left there.
     ///
     /// # Errors
     ///
@@ -397,8 +428,13 @@ impl WorkspaceBlobs for InMemoryWorkspaceBlobs {
 /// Blobs in a directory: one folder per scope, one file per digest.
 ///
 /// The folder name is the SHA-256 digest of the scope, so any agent id is a
-/// safe name. A write goes to a temporary file first, then a rename makes
-/// it visible, so a crash never leaves half a blob.
+/// safe name. A write goes to a scratch file first, then a rename makes it
+/// visible, so a key never holds half a blob.
+///
+/// A put that stops before its rename leaves its scratch file. A crash, a
+/// timeout or a cancel can cause that. The store lists the scratch name, so
+/// retention, reset and erase delete it by the generation of its key (issue
+/// #2315).
 #[derive(Debug, Clone)]
 pub struct DirWorkspaceBlobs {
     root: PathBuf,
@@ -415,8 +451,20 @@ impl DirWorkspaceBlobs {
         self.root.join(hex(&Sha256::digest(scope.as_bytes())))
     }
 
-    /// The file of `key`. A key that is not a snapshot key or a reset
-    /// marker is refused, so it can never name a path outside the folder.
+    /// The file of `name` for a read, a list or a delete: a key, a reset
+    /// marker or a scratch name. Each other name is refused, so it can never
+    /// name a path outside the folder.
+    fn entry(&self, scope: &str, name: &str) -> Result<PathBuf, AgentError> {
+        if scratch_owner(name).is_some() {
+            Ok(self.folder(scope).join(name))
+        } else {
+            self.file(scope, name)
+        }
+    }
+
+    /// The file of `key` for a put. The method refuses a key that is not a
+    /// snapshot key or a reset marker. So a key never names a path outside
+    /// the folder, and no put writes a scratch name.
     fn file(&self, scope: &str, key: &str) -> Result<PathBuf, AgentError> {
         if key_generation(key).is_some() || marker_generation(key).is_some() {
             Ok(self.folder(scope).join(key))
@@ -492,7 +540,7 @@ impl WorkspaceBlobs for DirWorkspaceBlobs {
         digest: &'a str,
     ) -> BoxFuture<'a, Result<Option<Vec<u8>>, AgentError>> {
         Box::pin(async move {
-            match tokio::fs::read(self.file(scope, digest)?).await {
+            match tokio::fs::read(self.entry(scope, digest)?).await {
                 Ok(bytes) => Ok(Some(bytes)),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(err) => Err(io_error(&err)),
@@ -510,7 +558,7 @@ impl WorkspaceBlobs for DirWorkspaceBlobs {
             let mut digests = Vec::new();
             while let Some(entry) = entries.next_entry().await.map_err(|e| io_error(&e))? {
                 if let Some(name) = entry.file_name().to_str()
-                    && self.file(scope, name).is_ok()
+                    && self.entry(scope, name).is_ok()
                 {
                     digests.push(name.to_owned());
                 }
@@ -525,7 +573,7 @@ impl WorkspaceBlobs for DirWorkspaceBlobs {
         digest: &'a str,
     ) -> BoxFuture<'a, Result<bool, AgentError>> {
         Box::pin(async move {
-            match tokio::fs::remove_file(self.file(scope, digest)?).await {
+            match tokio::fs::remove_file(self.entry(scope, digest)?).await {
                 Ok(()) => Ok(true),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Err(err) => Err(io_error(&err)),
@@ -659,10 +707,16 @@ impl WorkspaceStore {
     /// Save `workspace` in `scope` at `generation`, and return its
     /// reference.
     ///
+    /// A save at a generation above 0 also checks for a reset marker above
+    /// that generation after its put. It then deletes its own key, because
+    /// a later reset cleared the scope (issue #2315). Generation 0 has no
+    /// order, so a save at 0 skips the check.
+    ///
     /// # Errors
     ///
-    /// Returns a [`ErrorKind::Tool`] error when the workspace is over a
-    /// cap, and an error when the codec or the store fails.
+    /// Returns a [`ErrorKind::Tool`] error when the workspace is over a cap
+    /// or a later reset cleared the scope. Returns an error when the codec
+    /// or the store fails.
     pub async fn save(
         &self,
         scope: &str,
@@ -704,54 +758,73 @@ impl WorkspaceStore {
             generation,
         };
         self.blobs.put(scope, &head.key(), encoded).await?;
+        // A stale attempt can save after a reset of a later op (issue
+        // #2315). The reset puts its marker before it lists. So either the
+        // reset lists this key and deletes it, or this save sees the marker.
+        if generation > 0
+            && self
+                .blobs
+                .list(scope)
+                .await?
+                .iter()
+                .filter_map(|key| marker_generation(key))
+                .any(|bound| bound > generation)
+        {
+            self.blobs.delete(scope, &head.key()).await?;
+            return Err(AgentError::new(
+                ErrorKind::Tool,
+                "a reset of the workspace ran after this call started, so the call saved nothing",
+            ));
+        }
         Ok(head)
     }
 
     /// Delete every snapshot of `scope` but `keep`, of the generation of
-    /// `keep` or older. Returns the number deleted.
+    /// `keep` or older. Delete each scratch name of that generation or
+    /// older too, also one of `keep`. Returns the number deleted.
     ///
     /// A late attempt that runs after a newer op deletes no newer head,
-    /// because a newer head has a newer generation.
+    /// because a newer head has a newer generation. For the same reason it
+    /// deletes no scratch file of a live put of a newer op.
     ///
     /// # Errors
     ///
     /// Returns an error when the store fails.
     pub async fn retain(&self, scope: &str, keep: &WorkspaceRef) -> Result<u64, AgentError> {
         let head = keep.key();
+        let old = |generation: u64| generation <= keep.generation;
         self.delete_where(scope, |key| {
-            key != head
-                && key_generation(key).is_some_and(|generation| generation <= keep.generation)
+            (key != head && key_generation(key).is_some_and(old))
+                || scratch_generation(key).is_some_and(old)
         })
         .await
     }
 
-    /// Delete every snapshot and reset marker of `scope` below the
-    /// generation `below`, and every key in another form. Then leave a
-    /// reset marker at `below`. Returns the number deleted.
+    /// Leave a reset marker at the generation `below`. Then delete every
+    /// snapshot, reset marker and scratch name of `scope` below `below`, and
+    /// every listed name in another form. Returns the number deleted.
     ///
-    /// A key in another form is never a head, so an erasure removes it too.
+    /// A name in another form is never a head, so an erasure removes it too.
     /// The marker is empty. It keeps the bound for
-    /// [`Self::highest_generation`], so a new life starts above it.
+    /// [`Self::highest_generation`], so a new life starts above it. The
+    /// marker comes first, so a stale save that lands later sees it and
+    /// deletes its own key (issue #2315).
     ///
     /// # Errors
     ///
     /// Returns an error when the store fails.
     pub async fn reset(&self, scope: &str, below: u64) -> Result<u64, AgentError> {
-        let deleted = self
-            .delete_where(scope, |key| {
-                key_generation(key)
-                    .or_else(|| marker_generation(key))
-                    .is_none_or(|generation| generation < below)
-            })
-            .await?;
         self.blobs
             .put(scope, &reset_marker(below), Vec::new())
             .await?;
-        Ok(deleted)
+        self.delete_where(scope, |key| {
+            name_generation(key).is_none_or(|generation| generation < below)
+        })
+        .await
     }
 
-    /// The highest generation of a snapshot or a reset marker in `scope`,
-    /// or 0 when it has none.
+    /// The highest generation of a snapshot, a reset marker or a scratch name
+    /// in `scope`, or 0 when it has none.
     ///
     /// A new life of an agent starts above it, so no attempt of an old life
     /// deletes a key of the new one. The marker counts too: after a reset
@@ -765,13 +838,16 @@ impl WorkspaceStore {
         let keys = self.blobs.list(scope).await?;
         Ok(keys
             .iter()
-            .filter_map(|key| key_generation(key).or_else(|| marker_generation(key)))
+            .filter_map(|key| name_generation(key))
             .max()
             .unwrap_or(0))
     }
 
-    /// Delete every key of `scope`, of any generation. Returns the number
-    /// deleted.
+    /// Delete every key and scratch name of `scope`, of any generation.
+    /// Returns the number deleted.
+    ///
+    /// Call it only when no run uses the scope. It can delete the scratch
+    /// file of a live put.
     ///
     /// # Errors
     ///
@@ -858,6 +934,166 @@ mod tests {
 
     fn store(blobs: &Arc<InMemoryWorkspaceBlobs>) -> WorkspaceStore {
         WorkspaceStore::new(blobs.clone(), PayloadCodecs::default())
+    }
+
+    /// A snapshot key of `generation` whose digest repeats `fill`.
+    fn key_at(generation: u64, fill: &str) -> String {
+        format!("{generation:016x}-{}", fill.repeat(64))
+    }
+
+    /// The file that a put of `key` leaves when its future drops.
+    fn plant_scratch(blobs: &DirWorkspaceBlobs, scope: &str, key: &str, bytes: &[u8]) -> PathBuf {
+        std::fs::create_dir_all(blobs.folder(scope)).unwrap();
+        let path = scratch_path(&blobs.file(scope, key).unwrap());
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn dir_store(dir: &tempfile::TempDir) -> (DirWorkspaceBlobs, WorkspaceStore) {
+        let blobs = DirWorkspaceBlobs::new(dir.path());
+        let store = WorkspaceStore::new(Arc::new(blobs.clone()), PayloadCodecs::default());
+        (blobs, store)
+    }
+
+    fn one_file(text: &str) -> Workspace {
+        let mut workspace = Workspace::default();
+        workspace.write("a", text).unwrap();
+        workspace
+    }
+
+    /// Blobs in memory that record each call, in order.
+    #[derive(Debug, Default)]
+    struct Logged {
+        inner: InMemoryWorkspaceBlobs,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Logged {
+        fn log(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    impl WorkspaceBlobs for Logged {
+        fn put<'a>(
+            &'a self,
+            scope: &'a str,
+            digest: &'a str,
+            bytes: Vec<u8>,
+        ) -> BoxFuture<'a, Result<(), AgentError>> {
+            self.log(format!("put {digest}"));
+            self.inner.put(scope, digest, bytes)
+        }
+
+        fn get<'a>(
+            &'a self,
+            scope: &'a str,
+            digest: &'a str,
+        ) -> BoxFuture<'a, Result<Option<Vec<u8>>, AgentError>> {
+            self.inner.get(scope, digest)
+        }
+
+        fn list<'a>(&'a self, scope: &'a str) -> BoxFuture<'a, Result<Vec<String>, AgentError>> {
+            self.log("list".to_owned());
+            self.inner.list(scope)
+        }
+
+        fn delete<'a>(
+            &'a self,
+            scope: &'a str,
+            digest: &'a str,
+        ) -> BoxFuture<'a, Result<bool, AgentError>> {
+            self.log(format!("delete {digest}"));
+            self.inner.delete(scope, digest)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reset_deletes_scratch_files_below_its_bound_and_keeps_a_newer_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (blobs, store) = dir_store(&dir);
+        let head = store.save("s", 1, &one_file("secret")).await.unwrap();
+        let dropped = plant_scratch(&blobs, "s", &head.key(), b"secret");
+        let marker = plant_scratch(&blobs, "s", &reset_marker(2), b"");
+        let live = plant_scratch(&blobs, "s", &key_at(5, "e"), b"newer");
+        assert_eq!(store.reset("s", 3).await.unwrap(), 3);
+        assert!(!dropped.exists() && !marker.exists());
+        assert!(live.exists(), "a put of a newer op keeps its scratch file");
+    }
+
+    #[tokio::test]
+    async fn a_retain_deletes_scratch_files_up_to_the_head_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (blobs, store) = dir_store(&dir);
+        let head = store.save("s", 2, &one_file("x")).await.unwrap();
+        let older = plant_scratch(&blobs, "s", &key_at(1, "d"), b"x");
+        let stale = plant_scratch(&blobs, "s", &key_at(2, "d"), b"x");
+        let newer = plant_scratch(&blobs, "s", &key_at(3, "d"), b"x");
+        assert_eq!(store.retain("s", &head).await.unwrap(), 2);
+        assert!(!older.exists() && !stale.exists());
+        assert!(newer.exists());
+        assert!(blobs.get("s", &head.key()).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn the_floor_counts_a_scratch_file_and_erase_deletes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (blobs, store) = dir_store(&dir);
+        let path = plant_scratch(&blobs, "s", &key_at(9, "d"), b"x");
+        assert_eq!(store.highest_generation("s").await.unwrap(), 9);
+        assert_eq!(store.erase("s").await.unwrap(), 1);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn the_dir_store_deletes_a_scratch_name_but_never_puts_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = DirWorkspaceBlobs::new(dir.path());
+        let path = plant_scratch(&blobs, "s", &key_at(1, "d"), b"x");
+        let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+        assert_eq!(blobs.list("s").await.unwrap(), std::slice::from_ref(&name));
+        assert!(blobs.get("s", &name).await.unwrap().is_some());
+        assert!(blobs.put("s", &name, Vec::new()).await.is_err());
+        let key = key_at(1, "d");
+        for bad in [
+            format!("{key}.tmp-../../x"),
+            format!("{key}.tmp-{}", "A".repeat(32)),
+            format!("{key}.tmp-{}", "a".repeat(31)),
+            format!("{}.tmp-{}", "a".repeat(64), "a".repeat(32)),
+            format!("{name}.tmp-{}", "a".repeat(32)),
+        ] {
+            assert!(blobs.delete("s", &bad).await.is_err(), "{bad}");
+        }
+        assert!(blobs.delete("s", &name).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_save_below_a_reset_marker_deletes_its_own_key() {
+        let blobs = Arc::new(InMemoryWorkspaceBlobs::default());
+        let store = store(&blobs);
+        store.reset("s", 5).await.unwrap();
+        let late = store.save("s", 3, &one_file("late")).await;
+        assert_eq!(late.map_err(|err| err.kind()), Err(ErrorKind::Tool));
+        assert_eq!(blobs.list("s").await.unwrap(), [reset_marker(5)]);
+        assert!(
+            store.save("s", 6, &one_file("late")).await.is_ok(),
+            "a later segment saves"
+        );
+        // A plain task saves at generation 0, which has no order.
+        assert!(store.save("s", 0, &one_file("plain")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_reset_puts_its_marker_before_it_lists() {
+        let blobs = Arc::new(Logged::default());
+        let store = WorkspaceStore::new(blobs.clone(), PayloadCodecs::default());
+        store.reset("s", 4).await.unwrap();
+        let calls = blobs.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.first(),
+            Some(&format!("put {}", reset_marker(4))),
+            "{calls:?}"
+        );
     }
 
     #[tokio::test]

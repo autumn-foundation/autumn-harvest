@@ -316,6 +316,55 @@ async fn a_reset_removes_every_snapshot_and_the_store_holds_only_ciphertext() {
     assert_eq!(held_keys(&blobs, &scope).await, Vec::<String>::new());
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_on_the_dir_store_leaves_no_bytes_of_a_dropped_save() {
+    let (dir, db) = fresh_db();
+    let root = dir.path().join("workspaces");
+    let store = WorkspaceStore::new(
+        Arc::new(DirWorkspaceBlobs::new(&root)),
+        PayloadCodecs::default(),
+    );
+    let agent = AgentId::new("coder", "drop").unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let model = ScriptedModel::new(vec![write("w1", "a.txt", "secret-alpha"), answer("one", 1)]);
+    let mut rt = runtime(&db, harness(model, store, &runs));
+    let head = say(&mut rt, &agent, "one").await.workspace.expect("a head");
+    // A save that timed out leaves the scratch name of its key.
+    let folder = std::fs::read_dir(&root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let name = format!("{}.tmp-{}", head.key(), "a".repeat(32));
+    std::fs::write(folder.join(name), b"secret-orphan").unwrap();
+
+    sqlite::send(
+        &mut rt,
+        &agent,
+        &AgentOp::Control(Control::ResetWorkspace),
+        None,
+    )
+    .unwrap();
+    sqlite::drive(&mut rt, &agent).await.unwrap();
+    assert_eq!(held_files(&root), Vec::<PathBuf>::new());
+}
+
+/// Every file under `root` that holds bytes. A reset leaves only an empty
+/// marker.
+fn held_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let mut held = Vec::new();
+    for folder in std::fs::read_dir(root).unwrap() {
+        for file in std::fs::read_dir(folder.unwrap().path()).unwrap() {
+            let path = file.unwrap().path();
+            if std::fs::metadata(&path).unwrap().len() > 0 {
+                held.push(path);
+            }
+        }
+    }
+    held
+}
+
 /// The keys of `scope` that hold bytes. A reset leaves only an empty
 /// marker, which keeps its bound.
 async fn held_keys(blobs: &InMemoryWorkspaceBlobs, scope: &str) -> Vec<String> {
