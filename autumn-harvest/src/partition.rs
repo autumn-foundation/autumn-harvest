@@ -238,15 +238,18 @@ const EXEC_FK_TRIGGER: &str = "harvest_events_exec_fk_trg";
 const EXEC_FK_TRIGGER_TGTYPE: i16 = 7;
 
 /// A SQL predicate that is true unless `tg` is harvest's own append-only
-/// guard (issue #1817). Expects the aliases `tg` (`pg_trigger`), `p`
-/// (`pg_proc`) and `c` (`pg_class`).
+/// guard (issue #1817) or entity projection trigger (issue #2259). Expects
+/// the aliases `tg` (`pg_trigger`), `p` (`pg_proc`) and `c` (`pg_class`).
 ///
-/// Each conversion reinstalls the guard, so it is not an operator trigger.
-/// The exemption checks the whole identity, as for [`EXEC_FK_TRIGGER`]:
-/// name, function, schema, shape, no arguments, no `WHEN` clause, and the
-/// plain enabled state.
+/// Each conversion reinstalls both, so neither is an operator trigger.
+/// The exemption checks the identity, as for [`EXEC_FK_TRIGGER`]: name,
+/// function, schema, shape, no arguments, and the plain enabled state. The
+/// guard has no `WHEN` clause. The projection trigger must have one. Its text
+/// is not compared, because Postgres versions print it differently. A
+/// conversion replaces it with the canonical clause.
 fn not_the_append_only_guard_sql() -> String {
     use crate::append_only::{GUARD_FUNCTION, GUARD_TRIGGER, GUARD_TRIGGER_TGTYPE};
+    use crate::entity_state::{PROJECTION_FUNCTION, PROJECTION_TRIGGER, PROJECTION_TRIGGER_TGTYPE};
     format!(
         "NOT (tg.tgname = '{GUARD_TRIGGER}' \
          AND p.proname = '{GUARD_FUNCTION}' \
@@ -254,6 +257,13 @@ fn not_the_append_only_guard_sql() -> String {
          AND tg.tgtype = {GUARD_TRIGGER_TGTYPE} \
          AND tg.tgnargs = 0 \
          AND tg.tgqual IS NULL \
+         AND tg.tgenabled = 'O') \
+         AND NOT (tg.tgname = '{PROJECTION_TRIGGER}' \
+         AND p.proname = '{PROJECTION_FUNCTION}' \
+         AND p.pronamespace = c.relnamespace \
+         AND tg.tgtype = {PROJECTION_TRIGGER_TGTYPE} \
+         AND tg.tgnargs = 0 \
+         AND tg.tgqual IS NOT NULL \
          AND tg.tgenabled = 'O')"
     )
 }
@@ -2383,22 +2393,28 @@ async fn refuse_if_operator_triggers(
             "triggers are"
         },
         triggers.join(", "),
-        // Issue #1817: the conversion reinstalls harvest's own guard, so
-        // recreating it by hand afterward fails with "already exists".
-        if triggers
-            .iter()
-            .any(|t| t == crate::append_only::GUARD_TRIGGER)
-        {
-            format!(
-                " {} is harvest's append-only guard in a changed state. Re-enable it \
-                 (`ALTER TABLE harvest_events ENABLE TRIGGER {}`) or drop it. The \
-                 conversion reinstalls it, so do not recreate it.",
-                crate::append_only::GUARD_TRIGGER,
-                crate::append_only::GUARD_TRIGGER
-            )
-        } else {
-            String::new()
-        }
+        // Issue #1817, issue #2259: the conversion reinstalls harvest's own
+        // triggers, so recreating one by hand afterward fails with "already
+        // exists".
+        [
+            (crate::append_only::GUARD_TRIGGER, "append-only guard"),
+            (
+                crate::entity_state::PROJECTION_TRIGGER,
+                "entity projection trigger"
+            ),
+        ]
+        .into_iter()
+        .filter(|(name, _)| triggers.iter().any(|t| t == name))
+        .fold(String::new(), |mut hint, (name, what)| {
+            use std::fmt::Write as _;
+            let _ = write!(
+                hint,
+                " {name} is harvest's {what} in a changed state. Re-enable it \
+                 (`ALTER TABLE harvest_events ENABLE TRIGGER {name}`) or drop it. The \
+                 conversion reinstalls it, so do not recreate it."
+            );
+            hint
+        })
     )))
 }
 
@@ -2588,6 +2604,8 @@ pub fn enable_sql(opts: &EnableOptions) -> String {
     let not_the_guard = not_the_append_only_guard_sql();
     let create_guard = crate::append_only::create_guard_trigger_sql();
     let guard = crate::append_only::GUARD_TRIGGER;
+    let create_projection = crate::entity_state::create_projection_trigger_sql();
+    let projection = crate::entity_state::PROJECTION_TRIGGER;
     // Review finding: the view, trigger and unique-index rechecks below
     // all close the same preflight-to-lock gap for a publication too.
     // See `incompatible_publications` for why a leaf-publishing
@@ -2999,6 +3017,9 @@ harvest_events afterward, if it is still needed), then re-run.', bad_con;
     -- Issue #1817: `LIKE` copies no triggers, so install the append-only
     -- guard on the new parent. Postgres clones it onto each partition.
     EXECUTE '{create_guard}';
+    -- Issue #2259: the entity projection trigger too. Its `WHEN` clause has
+    -- quotes, so a dollar quote holds it.
+    EXECUTE $harvest_projection_2259${create_projection}$harvest_projection_2259$;
 
     -- The sweeper's tier-1 drop gate reads
     -- `harvest_workflow_executions (created_at)`; without this index that probe
@@ -3083,6 +3104,7 @@ harvest_events afterward, if it is still needed), then re-run.', bad_con;
         -- partition already has a trigger of that name, so drop the old copy
         -- first. The lock this block holds closes the gap between the two.
         EXECUTE 'DROP TRIGGER IF EXISTS {guard} ON {LEGACY_PARTITION}';
+        EXECUTE 'DROP TRIGGER IF EXISTS {projection} ON {LEGACY_PARTITION}';
         EXECUTE format(
             'ALTER TABLE harvest_events ATTACH PARTITION {LEGACY_PARTITION} '
             || 'FOR VALUES FROM (MINVALUE) TO (%L)', cutover);
@@ -3970,6 +3992,9 @@ pub async fn disable_partitioning(
             // append-only guard on the flat table. Keep it after the `cohort`
             // reset above: the guard rejects a `cohort` change.
             exec(conn, &crate::append_only::create_guard_trigger_sql()).await?;
+            // Issue #2259: the entity projection trigger. The rows are
+            // already copied, so it fires for no old row.
+            exec(conn, &crate::entity_state::create_projection_trigger_sql()).await?;
             exec(
                 conn,
                 "ALTER TABLE harvest_events ADD CONSTRAINT harvest_events_pkey PRIMARY KEY (id)",
@@ -6882,6 +6907,8 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
         // Issue #1817: `LIKE` copies no triggers. Install the append-only
         // guard on the new parent. Postgres clones it onto each partition.
         step(4, crate::append_only::create_guard_trigger_sql()),
+        // Issue #2259: and the entity projection trigger.
+        step(4, crate::entity_state::create_projection_trigger_sql()),
         step(
             4,
             format!("CREATE TABLE {DEFAULT_PARTITION} PARTITION OF harvest_events DEFAULT"),
@@ -6893,6 +6920,13 @@ rename it) by hand, then re-run this plan.', idx.n, idx.tbl;\n        \
             format!(
                 "DROP TRIGGER IF EXISTS {} ON {LEGACY_PARTITION}",
                 crate::append_only::GUARD_TRIGGER
+            ),
+        ),
+        step(
+            4,
+            format!(
+                "DROP TRIGGER IF EXISTS {} ON {LEGACY_PARTITION}",
+                crate::entity_state::PROJECTION_TRIGGER
             ),
         ),
         step(
@@ -7041,6 +7075,42 @@ pub fn migration_plan(opts: &EnableOptions, now: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each layout path installs the entity projection trigger next to the
+    /// guard, and drops the old copy before the legacy table attaches (issue
+    /// #2259).
+    #[test]
+    fn every_layout_path_reinstalls_the_projection_trigger() {
+        use crate::entity_state::{PROJECTION_TRIGGER, create_projection_trigger_sql};
+        let create = create_projection_trigger_sql();
+        let steps = migration_plan_steps(&EnableOptions::default(), Utc::now());
+        let position = |needle: &str| {
+            steps
+                .iter()
+                .position(|step| step.sql.contains(needle))
+                .unwrap_or_else(|| panic!("no plan step holds {needle}"))
+        };
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.phase == 4 && step.sql == create)
+        );
+        let drop = format!("DROP TRIGGER IF EXISTS {PROJECTION_TRIGGER} ON {LEGACY_PARTITION}");
+        assert!(position(&drop) < position("ALTER TABLE harvest_events ATTACH PARTITION"));
+
+        let script = enable_sql(&EnableOptions::default());
+        assert!(script.contains(&format!(
+            "$harvest_projection_2259${create}$harvest_projection_2259$"
+        )));
+        let drop_in_script = script
+            .find(&drop)
+            .expect("the script drops the legacy copy");
+        assert!(drop_in_script < script.rfind("ATTACH PARTITION").expect("attach"));
+
+        let exempt = not_the_append_only_guard_sql();
+        assert!(exempt.contains(PROJECTION_TRIGGER));
+        assert!(exempt.contains(crate::append_only::GUARD_TRIGGER));
+    }
 
     #[test]
     fn failed_reports_the_layout_as_unknown_not_unpartitioned() {

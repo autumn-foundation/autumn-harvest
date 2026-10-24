@@ -87,6 +87,10 @@ hot-code-swap = ["wasm-activities"]
 # const-check when this feature is off, so a non-chaos build has no hot-path
 # cost (AC2/AC6). Requires `db` (the reproducers drive real Postgres paths).
 chaos = ["db"]
+# The owner-local disk cache (issue #2258). Off by default. It needs owner
+# mode and a directory. Both crates are already in the lockfile through
+# `autumn-harvest-sqlite`. See docs/adr/0012-owner-disk-cache.md.
+owner-disk-cache = ["db", "dep:rusqlite", "dep:fs4"]
 
 [dependencies]
 autumn-harvest-macros = { version = "0.7.0", path = "../autumn-harvest-macros" }
@@ -171,6 +175,10 @@ libc = { version = "0.2", optional = true }
 # Publisher signatures on WASM modules (issue #1838). The lockfile already
 # holds this version through `jsonwebtoken`, so it adds no new crate.
 ed25519-dalek = { version = "3.0", optional = true }
+# The owner-local disk cache (issue #2258): one SQLite file per partition and
+# an exclusive lock on a sidecar file.
+rusqlite = { workspace = true, optional = true }
+fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
 
 [[test]]
 name = "integration"
@@ -433,6 +441,13 @@ name = "history_fingerprint_profile"
 required-features = ["testing"]
 harness = false
 
+# Deterministic profiling harness for `debugger::diff_traces`, the engine
+# behind `harvest debug diff`. See `benches/debugger_diff_profile.rs`.
+[[bench]]
+name = "debugger_diff_profile"
+required-features = ["debugger"]
+harness = false
+
 # Isolates build_history's own inclusive cost (see the doc comment) so
 # history_fingerprint_profile.rs's workload-share claim in
 # docs/performance-history-fingerprint.md rests on a real measurement, not a
@@ -454,6 +469,13 @@ required-features = ["db"]
 harness = false
 [[bench]]
 name = "notify_commit_bench"
+required-features = ["db"]
+harness = false
+
+# Decision persist latency with zero, one and two fence rows (issue #2248).
+# Criterion repeats an append safely: each run adds rows and drains nothing.
+[[bench]]
+name = "decision_fence_bench"
 required-features = ["db"]
 harness = false
 
@@ -615,6 +637,13 @@ harness = false
 name = "history_export_profile"
 harness = false
 
+# Deterministic instruction/allocation-count harness for the recorded-fork
+# activity resolution (issue #2000). Drive it under valgrind.
+[[bench]]
+name = "fork_resolve_profile"
+required-features = ["db"]
+harness = false
+
 # Deterministic (non-criterion) instruction/allocation-count profiling harness
 # for `queue_fairness::{effective_queue_weights, weighted_queue_order}` --
 # the weighted-random queue-selection step `Worker::poll_once` runs on every
@@ -669,5 +698,14 @@ harness = false
 # static DAG tooling: `DagLinter`, `DagProfiler` and `export_chrome_trace`.
 [[bench]]
 name = "dag_tooling_profile"
+required-features = ["testing"]
+harness = false
+
+# Deterministic (non-criterion) instruction/allocation-count profiling harness
+# for `HistoryMatcher::match_activity`, the non-strict activity matcher.
+# Drive it under `valgrind --tool=callgrind` / `--tool=dhat`. See
+# `benches/match_activity_profile.rs`.
+[[bench]]
+name = "match_activity_profile"
 required-features = ["testing"]
 harness = false

@@ -145,6 +145,11 @@ The rotation sweep also rewrites `codec_rotation::CODEC_COLUMNS` (issue
 #1979). Those tables are not append-only, so that pass is not an exception.
 `the_column_sweep_loses_to_an_erasure` proves that it loses to an erasure.
 
+`harvest_entity_state` (issue #2259) is not an exception either. It is a
+projection of entity snapshot events. The trigger
+`harvest_entity_state_projection_trg` writes it on `INSERT` into
+`harvest_events`, so it never rewrites an event.
+
 If you add another exception, it belongs in this list, with its own scope
 guarantee and its own proof.
 
@@ -170,8 +175,8 @@ That order is load-bearing.
 
 The partition layout changes rebuild `harvest_events` with `LIKE`, which copies
 no triggers. `enable_sql`, `migration_plan_steps` and `disable_partitioning`
-reinstall the guard, and `operator_triggers` exempts it by its exact shape. A
-new layout path must do the same.
+reinstall the guard and the entity projection trigger. `operator_triggers`
+exempts both by their exact shape. A new layout path must do the same.
 
 A test fixture that must rewrite a row calls `append_only::with_guard_off`. It
 turns off every trigger for one transaction and needs a superuser. Production
@@ -192,14 +197,20 @@ test fixture calls `autumn_harvest_sqlite::append_only::with_guard_off`.
 [ADR 0009](docs/adr/0009-decision-owner.md) defines owner mode. Issue #2251
 builds it. Code for owner mode follows these rules:
 
-- A decision commit or an owned claim takes the generation row, then its
-  owner row `FOR KEY SHARE`. It takes the owner row before any execution
-  row, task row or advisory lock.
+- A decision commit takes the generation row, then its owner row
+  `FOR KEY SHARE`. It takes the owner row before any execution row, task
+  row or advisory lock.
+- An owned claim takes its owner row `FOR KEY SHARE SKIP LOCKED` in the
+  claim guard, after its task row. It never waits for that row (issue
+  #2252).
 - The commit compares holder and epoch. A mismatch aborts the whole
   transaction. The commit never checks the lease end.
 - An acquisition takes the owner row `FOR UPDATE`, then increments the
   epoch. Never change the epoch with a plain `UPDATE` or an upsert. Neither
   one drains in-flight commits.
+- A batch acquisition takes its rows `FOR UPDATE SKIP LOCKED`, in
+  ascending partition order. It increments the epoch only on the rows
+  that it locked (issue #2296).
 - A renewal changes the lease end only. Renewal, release and revoke match
   holder and epoch. A release keeps the epoch.
 - A statement on many owner rows locks them in ascending partition order.
@@ -207,8 +218,18 @@ builds it. Code for owner mode follows these rules:
   epoch.
 - A commit or an owned claim takes one owner row only. A foreign writer
   takes none.
+- A decision transaction fences once. `decision_owner::fenced_scope` marks
+  the rest of that transaction as fenced. Wrap only the body after a passed
+  fence. A nested fence of the same connection then sends no query (issue
+  #2252).
 - An acknowledgement never comes from owner memory. It follows a durable
   write.
+- The owner decider (issue #2255) takes a workflow task with the owned
+  by-execution claim, so no claim gate is skipped. It keeps execution ids as
+  hints only. A lost hint costs latency. Its scan finds the row.
+- With a DR pin, one statement fences the generation row, then the owner
+  row. An append in the fenced scope checks neither row again only when the
+  start fence took the same generation row.
 - List, search and describe read Postgres, never an owner cache.
 
 `decision_owner_lock_modes_db_tests.rs` proves the lock modes.

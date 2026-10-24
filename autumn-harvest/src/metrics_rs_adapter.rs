@@ -98,20 +98,21 @@ use crate::telemetry::{
     METRIC_WORKER_EMPTY_BUILD_POLICY, METRIC_WORKER_SLOT_TARGET, METRIC_WORKER_SLOTS_AVAILABLE,
     METRIC_WORKER_SLOTS_IN_USE, METRIC_WORKER_TUNER_DECISIONS, METRIC_WORKFLOW_ACTIVE,
     METRIC_WORKFLOW_CACHE_HIT, METRIC_WORKFLOW_CACHE_MISS, METRIC_WORKFLOW_CHAIN_TIMEOUT,
-    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DURATION,
-    METRIC_WORKFLOW_HISTORY_BLOAT, METRIC_WORKFLOW_HISTORY_OVERSIZED, METRIC_WORKFLOW_HISTORY_SIZE,
-    METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM, METRIC_WORKFLOW_PANIC,
-    METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED, METRIC_WORKFLOW_RESIDENT,
-    METRIC_WORKFLOW_RETRIES, METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED,
-    METRIC_WORKFLOW_STARTED, METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL,
-    METRIC_WORKFLOW_TIMEOUT, METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, PoisonReason,
-    ResidentOutcome, SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome,
-    WorkflowStatus,
+    METRIC_WORKFLOW_CONTINUE_AS_NEW, METRIC_WORKFLOW_DEBOUNCED, METRIC_WORKFLOW_DISK_CACHE,
+    METRIC_WORKFLOW_DURATION, METRIC_WORKFLOW_HISTORY_BLOAT, METRIC_WORKFLOW_HISTORY_OVERSIZED,
+    METRIC_WORKFLOW_HISTORY_SIZE, METRIC_WORKFLOW_ND_BLOCKED, METRIC_WORKFLOW_NON_DETERMINISM,
+    METRIC_WORKFLOW_PANIC, METRIC_WORKFLOW_PAUSE_DURATION, METRIC_WORKFLOW_PAUSED,
+    METRIC_WORKFLOW_RESIDENT, METRIC_WORKFLOW_RESIDENT_DURATION, METRIC_WORKFLOW_RETRIES,
+    METRIC_WORKFLOW_SLA_BREACHED, METRIC_WORKFLOW_START_THROTTLED, METRIC_WORKFLOW_STARTED,
+    METRIC_WORKFLOW_TASK_TIMEOUT, METRIC_WORKFLOW_TERMINAL, METRIC_WORKFLOW_TIMEOUT,
+    METRIC_WORKFLOW_UNFINISHED_HANDLERS, MetricsRecorder, PoisonReason, ResidentOutcome,
+    SessionAcquisitionOutcome, SlotType, TunerDecision, WebhookOutcome, WorkflowStatus,
 };
 use crate::telemetry::{
-    DbOp, METRIC_DB_POOL_IDLE, METRIC_DB_POOL_IN_USE, METRIC_DB_POOL_WAIT,
-    METRIC_DB_QUERY_DURATION, METRIC_LABEL_DIMENSION, METRIC_LABEL_OP, METRIC_WORKER_OUTLIER,
-    METRIC_WORKER_POLLERS,
+    ClaimKind, DB_OP_TAKE, DbOp, METRIC_DB_PERSIST_PHASE_DURATION, METRIC_DB_POOL_IDLE,
+    METRIC_DB_POOL_IN_USE, METRIC_DB_POOL_WAIT, METRIC_DB_QUERY_DURATION, METRIC_LABEL_DIMENSION,
+    METRIC_LABEL_OP, METRIC_LABEL_PHASE, METRIC_WORKER_OUTLIER, METRIC_WORKER_POLLERS,
+    PersistPhase,
 };
 
 /// [`MetricsRecorder`] implementation that forwards every sample to the
@@ -596,6 +597,35 @@ impl MetricsRecorder for MetricsRsRecorder {
         .record(seconds);
     }
 
+    fn record_claim_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+        histogram!(
+            METRIC_DB_QUERY_DURATION,
+            METRIC_LABEL_OP => DbOp::Claim.as_str(),
+            METRIC_LABEL_KIND => kind.as_str(),
+            METRIC_LABEL_SHARD => shard.to_string()
+        )
+        .record(seconds);
+    }
+
+    fn record_owner_take_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+        histogram!(
+            METRIC_DB_QUERY_DURATION,
+            METRIC_LABEL_OP => DB_OP_TAKE,
+            METRIC_LABEL_KIND => kind.as_str(),
+            METRIC_LABEL_SHARD => shard.to_string()
+        )
+        .record(seconds);
+    }
+
+    fn record_persist_phase(&self, phase: PersistPhase, shard: u16, seconds: f64) {
+        histogram!(
+            METRIC_DB_PERSIST_PHASE_DURATION,
+            METRIC_LABEL_PHASE => phase.as_str(),
+            METRIC_LABEL_SHARD => shard.to_string()
+        )
+        .record(seconds);
+    }
+
     #[allow(clippy::cast_precision_loss)]
     fn record_worker_pollers(&self, queue: &str, pollers: u64) {
         gauge!(METRIC_WORKER_POLLERS, METRIC_LABEL_QUEUE => queue.to_owned()).set(pollers as f64);
@@ -1030,6 +1060,32 @@ impl MetricsRecorder for MetricsRsRecorder {
             METRIC_LABEL_OUTCOME => outcome.as_str(),
         )
         .increment(1);
+    }
+
+    fn record_workflow_disk_cache(&self, workflow_name: &str, queue: &str, outcome: &str) {
+        counter!(
+            METRIC_WORKFLOW_DISK_CACHE,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_OUTCOME => outcome.to_owned(),
+        )
+        .increment(1);
+    }
+
+    fn record_workflow_resident_duration(
+        &self,
+        workflow_name: &str,
+        queue: &str,
+        outcome: ResidentOutcome,
+        seconds: f64,
+    ) {
+        histogram!(
+            METRIC_WORKFLOW_RESIDENT_DURATION,
+            METRIC_LABEL_WORKFLOW => workflow_name.to_owned(),
+            METRIC_LABEL_QUEUE => queue.to_owned(),
+            METRIC_LABEL_OUTCOME => outcome.as_str(),
+        )
+        .record(seconds);
     }
 
     fn record_external_signal_sent(&self, outcome: &str, reason_code: Option<&str>) {
@@ -1805,6 +1861,8 @@ mod tests {
         rec.record_workflow_cache_hit("wf", "q");
         rec.record_workflow_cache_miss("wf", "q");
         rec.record_workflow_resident("wf", "q", ResidentOutcome::Hit);
+        rec.record_workflow_resident_duration("wf", "q", ResidentOutcome::Hit, 0.001);
+        rec.record_workflow_disk_cache("wf", "q", "hit");
         rec.record_rate_limit_tokens_available("rl", 10.0);
         rec.record_rate_limit_refill_rate("rl", 2.0);
         rec.record_rate_limit_throttled("rl");
@@ -1871,6 +1929,7 @@ mod tests {
     #[derive(Default)]
     struct CapturingRecorder {
         counters: std::sync::Mutex<Vec<CounterKey>>,
+        histograms: std::sync::Mutex<Vec<CounterKey>>,
     }
 
     /// Every `Scanner` variant's expected `harvest.scanner.tick` counter key.
@@ -1932,11 +1991,60 @@ mod tests {
         }
         fn register_histogram(
             &self,
-            _: &metrics::Key,
+            key: &metrics::Key,
             _: &metrics::Metadata<'_>,
         ) -> metrics::Histogram {
+            self.histograms.lock().unwrap().push((
+                key.name().to_owned(),
+                key.labels()
+                    .map(|l| (l.key().to_owned(), l.value().to_owned()))
+                    .collect(),
+            ));
             metrics::Histogram::noop()
         }
+    }
+
+    /// Issue #2257: the duration takes the labels of the resident counter.
+    #[test]
+    fn bridges_workflow_resident_duration_with_outcome_labels() {
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            MetricsRsRecorder.record_workflow_resident_duration(
+                "wf",
+                "q",
+                ResidentOutcome::Cold,
+                0.012,
+            );
+        });
+        let expected: Vec<CounterKey> = vec![(
+            METRIC_WORKFLOW_RESIDENT_DURATION.to_owned(),
+            vec![
+                (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
+                (METRIC_LABEL_QUEUE.to_owned(), "q".to_owned()),
+                (METRIC_LABEL_OUTCOME.to_owned(), "cold".to_owned()),
+            ],
+        )];
+        assert_eq!(*capture.histograms.lock().unwrap(), expected);
+        assert!(capture.counters.lock().unwrap().is_empty());
+    }
+
+    /// Issue #2258: the disk cache counter takes the workflow, the queue
+    /// and the outcome.
+    #[test]
+    fn bridges_workflow_disk_cache_with_outcome_labels() {
+        let capture = CapturingRecorder::default();
+        metrics::with_local_recorder(&&capture, || {
+            MetricsRsRecorder.record_workflow_disk_cache("wf", "q", "corrupt");
+        });
+        let expected: Vec<CounterKey> = vec![(
+            METRIC_WORKFLOW_DISK_CACHE.to_owned(),
+            vec![
+                (METRIC_LABEL_WORKFLOW.to_owned(), "wf".to_owned()),
+                (METRIC_LABEL_QUEUE.to_owned(), "q".to_owned()),
+                (METRIC_LABEL_OUTCOME.to_owned(), "corrupt".to_owned()),
+            ],
+        )];
+        assert_eq!(*capture.counters.lock().unwrap(), expected);
     }
 
     #[test]
@@ -2885,6 +2993,8 @@ mod tests {
             rec.record_db_pool(3, 4, 6);
             rec.record_db_pool_wait(3, 0.25);
             rec.record_db_query_duration(DbOp::Claim, 3, 0.5);
+            rec.record_claim_duration(ClaimKind::Activity, 3, 0.75);
+            rec.record_persist_phase(PersistPhase::Commit, 3, 0.125);
             rec.record_worker_pollers("email", 1);
             rec.record_worker_outlier(OutlierDimension::FailureRatio, true);
             rec.record_worker_outlier(OutlierDimension::LatencyP99, false);
@@ -2917,6 +3027,23 @@ mod tests {
                         (METRIC_LABEL_SHARD.to_owned(), "3".to_owned()),
                     ],
                     0.5
+                ),
+                (
+                    METRIC_DB_QUERY_DURATION.to_owned(),
+                    vec![
+                        (METRIC_LABEL_OP.to_owned(), "claim".to_owned()),
+                        (METRIC_LABEL_KIND.to_owned(), "activity".to_owned()),
+                        (METRIC_LABEL_SHARD.to_owned(), "3".to_owned()),
+                    ],
+                    0.75
+                ),
+                (
+                    METRIC_DB_PERSIST_PHASE_DURATION.to_owned(),
+                    vec![
+                        (METRIC_LABEL_PHASE.to_owned(), "commit".to_owned()),
+                        (METRIC_LABEL_SHARD.to_owned(), "3".to_owned()),
+                    ],
+                    0.125
                 ),
                 (
                     METRIC_WORKER_POLLERS.to_owned(),

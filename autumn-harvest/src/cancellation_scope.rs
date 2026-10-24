@@ -2158,6 +2158,38 @@ mod tests {
         assert!(replay.take_nd_details().is_none());
     }
 
+    /// An entity snapshot is captured as the other records are (issue
+    /// #2259). Replay reads it in order, so the next record is no drift.
+    #[tokio::test]
+    async fn replay_reads_a_captured_entity_snapshot() {
+        fn record(ctx: &WorkflowContext, state: i64) -> Value {
+            let snapshot = ctx
+                .record_entity_snapshot("harvest.entity.state", json!({"state": state}), |_| {
+                    json!({})
+                })
+                .expect("snapshot");
+            let next = ctx.side_effect("after", || 1_i32).expect("side effect");
+            json!([format!("{snapshot:?}"), next])
+        }
+        let live = WorkflowContext::new_test();
+        let seen = std::sync::Mutex::new(None);
+        record_then_cancel(&live, &seen, |ctx| record(ctx, 3)).await;
+        let details = marker(&live.drain_commands(), "cancel_scope:1").expect("recorded");
+
+        let replay = replay_of(details);
+        let replayed = std::sync::Mutex::new(None);
+        record_then_cancel(&replay, &replayed, |ctx| record(ctx, 99)).await;
+
+        assert!(replay.take_nd_details().is_none(), "no drift");
+        let replayed = replayed.lock().expect("replayed lock").take().expect("ran");
+        assert!(
+            replayed[0]
+                .as_str()
+                .is_some_and(|s| s.contains("Recorded") && s.contains('3')),
+            "replay reads the captured snapshot: {replayed}"
+        );
+    }
+
     /// A replayed marker that differs from the captured one is drift.
     #[tokio::test]
     async fn a_replayed_marker_that_differs_from_the_capture_is_drift() {

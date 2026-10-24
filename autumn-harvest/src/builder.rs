@@ -1447,7 +1447,11 @@ impl BuiltHarvest {
         )
         .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
         .with_retry_budget(self.worker_config.retry_budget.clone())
-        .with_adaptive_limit(self.worker_config.adaptive_limit.clone());
+        .with_adaptive_limit(self.worker_config.adaptive_limit.clone())
+        .with_owner_disk_cache(
+            self.worker_config.owner_disk_cache.clone(),
+            self.worker_config.owner_disk_cache_min_events,
+        );
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -1549,7 +1553,11 @@ impl BuiltHarvest {
         )
         .with_retry_after_ceiling(self.worker_config.retry_after_ceiling)
         .with_retry_budget(self.worker_config.retry_budget.clone())
-        .with_adaptive_limit(self.worker_config.adaptive_limit.clone());
+        .with_adaptive_limit(self.worker_config.adaptive_limit.clone())
+        .with_owner_disk_cache(
+            self.worker_config.owner_disk_cache.clone(),
+            self.worker_config.owner_disk_cache_min_events,
+        );
         #[cfg(feature = "wasm-activities")]
         if let Some(store) = self.wasm_store {
             registry = registry.with_wasm_activities(
@@ -3883,6 +3891,10 @@ pub struct StickyRoutingConfig {
     pub lease_ttl: Duration,
 }
 
+/// The default of [`WorkerConfig::owner_disk_cache_min_events`] (issue
+/// #2258).
+pub const DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS: usize = 100;
+
 /// Worker concurrency and queue configuration.
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
@@ -3952,6 +3964,17 @@ pub struct WorkerConfig {
     /// Default: `true`. It has no effect when sticky routing is off. See
     /// [`Self::with_resident_workflows`].
     pub resident_workflows: bool,
+    /// The directory of the owner-local disk cache (issue #2258).
+    ///
+    /// Default: `None`, no disk cache. It needs the `owner-disk-cache`
+    /// feature and owner mode. See [`Self::with_owner_disk_cache`].
+    pub owner_disk_cache: Option<std::path::PathBuf>,
+    /// The fewest events that a run needs before the owner disk cache keeps
+    /// it (issue #2258).
+    ///
+    /// Default: [`DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS`]. A shorter history
+    /// loads faster from Postgres than from the disk and the anchor check.
+    pub owner_disk_cache_min_events: usize,
     /// How long to offer sticky tasks to the sticky worker before fallback.
     ///
     /// Default: [`DEFAULT_STICKY_TIMEOUT`] (5 s). Zero disables sticky
@@ -4492,6 +4515,8 @@ impl Default for WorkerConfig {
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             workflow_cache_size: 1000,
             resident_workflows: true,
+            owner_disk_cache: None,
+            owner_disk_cache_min_events: DEFAULT_OWNER_DISK_CACHE_MIN_EVENTS,
             sticky_timeout: DEFAULT_STICKY_TIMEOUT,
             cancellation_grace_period: Duration::from_secs(5),
             shard_assignments: Vec::new(),
@@ -5032,6 +5057,53 @@ impl WorkerConfig {
     #[must_use]
     pub const fn with_resident_workflows(mut self, enabled: bool) -> Self {
         self.resident_workflows = enabled;
+        self
+    }
+
+    /// Keep the decided history of each owned run in `dir` (issue #2258).
+    ///
+    /// A cold decision then reads a local file and the Postgres delta. The
+    /// cache acts only in owner mode, on the partitions that this worker
+    /// owns. Each row is sealed under a key that lives in memory only. The
+    /// worker deletes every cache file in `dir` at start. A lost tenure
+    /// deletes the file of its partition. Give each process its own private
+    /// directory.
+    ///
+    /// The worker fails to start when the crate lacks the
+    /// `owner-disk-cache` feature. See `docs/adr/0012-owner-disk-cache.md`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_owner_disk_cache("/var/cache/harvest");
+    /// assert!(config.owner_disk_cache.is_some());
+    /// ```
+    #[must_use]
+    pub fn with_owner_disk_cache(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.owner_disk_cache = Some(dir.into());
+        self
+    }
+
+    /// Set the fewest events that a run needs before the owner disk cache
+    /// keeps it (issue #2258).
+    ///
+    /// The bench in `docs/rnd/2026-10-23-owner-disk-cache.md` finds the
+    /// disk faster from about 100 events. Below that, one Postgres read
+    /// wins.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use autumn_harvest::builder::WorkerConfig;
+    ///
+    /// let config = WorkerConfig::default().with_owner_disk_cache_min_events(500);
+    /// assert_eq!(config.owner_disk_cache_min_events, 500);
+    /// ```
+    #[must_use]
+    pub const fn with_owner_disk_cache_min_events(mut self, events: usize) -> Self {
+        self.owner_disk_cache_min_events = events;
         self
     }
 

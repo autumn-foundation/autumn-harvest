@@ -3881,6 +3881,139 @@
           "description": "Share of workflow decisions by resident outcome. `hit` resumed the parked workflow. Each other series names why a decision replayed history (issues #1798, #2007, #2008)."
         },
         {
+          "id": 414569,
+          "type": "timeseries",
+          "title": "Stage 2 gate: cold share and cold p99 (issue #2257)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 116
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "cold share"
+                },
+                "properties": [
+                  {
+                    "id": "unit",
+                    "value": "percentunit"
+                  },
+                  {
+                    "id": "custom.axisPlacement",
+                    "value": "right"
+                  }
+                ]
+              }
+            ]
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum (rate(harvest_workflow_resident_total{outcome=\"cold\",workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])) / sum (rate(harvest_workflow_resident_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "cold share",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "B",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(harvest_workflow_resident_duration_bucket{outcome=\"cold\",workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])))",
+              "legendFormat": "cold p99",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "refId": "C",
+              "expr": "sum (rate(harvest_workflow_resident_duration_sum{outcome=\"cold\",workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval])) / sum (rate(harvest_workflow_resident_duration_count{outcome=\"cold\",workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "cold avg (bucket-less fallback)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "The stage 2 gate of epic #2247. A disk cache (#2258) goes ahead when the 7-day cold share passes 0.2, or the 7-day cold p99 passes 0.05 s. This panel shows rates. The record doc gives the 7-day queries (docs/rnd/2026-10-22-stage-2-gate.md). The p99 and the average are seconds from the history load to the end of the first drive. The p99 needs a bucket bound at 0.05 s. The average works without buckets."
+        },
+        {
+          "id": 930258,
+          "type": "timeseries",
+          "title": "Owner disk cache reads by outcome (issue #2258)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 124
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (outcome) (rate(harvest_workflow_disk_cache_total{workflow=~\"$workflow\",queue=~\"$queue\"}[$__rate_interval]))",
+              "legendFormat": "{{outcome}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Disk reads of the owner-local cache on a memory miss. `hit` served the history from the local file and the Postgres delta. `stale` and `corrupt` purged the entry and loaded from Postgres. A rising `corrupt` rate points at the disk. Empty unless the worker has the `owner-disk-cache` feature, a cache directory and owner mode."
+        },
+        {
           "id": 63,
           "type": "timeseries",
           "title": "Retention deletions by workflow type",
@@ -8033,6 +8166,104 @@
             }
           ],
           "description": "1 when a worker fails a far higher share of tasks, or has a far higher p99 task latency, than the median of its live peers on the same queues (issue #1815). The worker is alive and passes the heartbeat check, so worker health alone misses it. GET /admin/status lists the same workers under workers.outliers. Alert: harvest_worker_gray_failure (docs/runbooks/harvest-alerts.md#harvest_worker_gray_failure)."
+        },
+        {
+          "id": 261089,
+          "type": "timeseries",
+          "title": "Claim latency by kind (mean)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 249
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (instance, op, kind, shard) (rate(harvest_db_query_duration_sum{op=~\"claim|take\"}[$__rate_interval])) / sum by (instance, op, kind, shard) (rate(harvest_db_query_duration_count{op=~\"claim|take\"}[$__rate_interval]))",
+              "legendFormat": "{{op}} {{kind}} shard {{shard}} @ {{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Mean seconds of one claim, by what it returned: workflow, activity, empty or error (issue #2248). Workflow and activity tasks share one claim statement. A rise in one kind only points at its own rows. In owner mode, the take series times the claim by execution of an owner decider (issue #2255). See docs/performance-decision-owner-baseline.md."
+        },
+        {
+          "id": 258100,
+          "type": "timeseries",
+          "title": "Decision persist time by phase (mean)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 249
+          },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "fillOpacity": 10,
+                "showPoints": "never",
+                "lineWidth": 1
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": {
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "refId": "A",
+              "expr": "sum by (instance, phase, shard) (rate(harvest_db_persist_phase_duration_sum[$__rate_interval])) / sum by (instance, phase, shard) (rate(harvest_db_persist_phase_duration_count[$__rate_interval]))",
+              "legendFormat": "{{phase}} shard {{shard}} @ {{instance}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "description": "Mean seconds of each phase of one decision persist: fence, events, tasks, notify, commit and other (issue #2248). The phases of one persist add up to its persist sample on harvest_db_query_duration. A terminal failure write records no phase."
         }
       ]
     }

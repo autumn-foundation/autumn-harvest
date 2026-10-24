@@ -1562,6 +1562,12 @@ without a capped key pay nothing.
   head makes each claim read the whole run. Live pins last one sticky
   timeout, so they follow the claim rate. Session pins and paused
   activities do not.
+- **Workflow rows of other owners.** In owner mode (issue #2252), the
+  owned claim skips each workflow row of another owner's partition. With N
+  owners, a workflow head reads about 32 × N rows. A dead owner's rows wait
+  at the head until a peer acquires its partitions, so each claim reads
+  them until then. A review run on PG16 read 381 buffers against 119 for
+  the legacy claim, with 4,900 foreign rows ahead of 100 owned ones.
 - **A large live pin set.** The pin head reads every live pin of this
   worker. More than 32 of them that pass the gates also make every rank-0
   row wait for the fallback.
@@ -1732,8 +1738,9 @@ What the tables show:
 
 The default is 2. It clears the measured ceiling at the cost of one
 connection. Raise it to 4 when the pool and the database have room. Watch
-`rate(harvest_db_query_duration_sum{op="claim"}[5m])` per worker: it is the
-mean claims in flight. Divide it by `max_concurrent_claims` for the
+`sum without (kind) (rate(harvest_db_query_duration_sum{op="claim"}[5m]))`
+per worker: it is the mean claims in flight. Each claim kind has its own
+series since issue #2248, so the sum over `kind` is needed. Divide it by `max_concurrent_claims` for the
 occupancy of each loop.
 
 ### What the measurement does not establish
@@ -2570,3 +2577,19 @@ standalone note rather than part of the claim-path attribution table above:
   — `LargePayloadRule` measured each payload with `Value::to_string().len()`,
   which built and dropped a `String`. It now counts bytes through a writer
   (instructions -77.5%, allocated bytes -97.6%).
+* [`docs/performance-sla-breach-scan.md`](performance-sla-breach-scan.md)
+  — the soft-SLA breach scan read the whole executions table on every timeout
+  tick, because the planner could not prove its predicate implies the partial
+  index's. It now repeats the index clause and uses the index (buffers
+  19,887 → 1 at 1,000,000 executions, `EXPLAIN (ANALYZE, BUFFERS)`).
+* [`docs/performance-decision-owner-baseline.md`](performance-decision-owner-baseline.md)
+  — the baseline for the decision owner (issue #2248): claim latency by
+  task kind on the assay #14 shape, the phases of the decision persist, and
+  a criterion bench of the second fence row. Owner mode with DR on adds
+  two statements and about 20% to the persist at one writer, so it fails
+  the stage 1b bar of 10%.
+* [`docs/performance-owner-decider.md`](performance-owner-decider.md)
+  — stage 1b of the decision owner (issue #2255). The owner decider takes
+  workflow tasks by execution, so the claim loops claim 3 tasks per
+  3-activity workflow instead of 7. On a 4-CPU host the CPU limits the gain
+  to 1.27x at one claim loop. The fused fence result is on the page.

@@ -1,7 +1,8 @@
 //! Keyed entity: serialized handlers over durable state for each key (issue #1975).
 //!
-//! An entity is sugar over a workflow. It adds no event variant and no
-//! migration. See `docs/adr/0006-keyed-entity.md`.
+//! An entity is sugar over a workflow. See `docs/adr/0006-keyed-entity.md`.
+//! Issue #2259 records each state change as a history event, and a Postgres
+//! table holds the latest one. See [`crate::entity_state`].
 //!
 //! | Entity concept | Harvest part |
 //! |---|---|
@@ -10,14 +11,21 @@
 //! | Operation | A signal named [`ENTITY_OP_SIGNAL`](crate::entity::ENTITY_OP_SIGNAL) |
 //! | Send an operation | `signal_with_start` |
 //! | Read state | The query [`ENTITY_STATE_QUERY`](crate::entity::ENTITY_STATE_QUERY) |
+//! | State change | A snapshot event, [`ENTITY_STATE_SIDE_EFFECT`](crate::entity::ENTITY_STATE_SIDE_EFFECT) |
+//! | Read state without replay | The projection, [`crate::entity_state`] |
 //!
 //! # Guarantees
 //!
 //! - **One handler at a time for each key.** One active run exists for each
 //!   `(workflow_name, workflow_id)`. The loop awaits each handler to the end
 //!   before it takes the next operation.
-//! - **State survives a crash.** Replay rebuilds the state from the input,
-//!   the recorded operations and the recorded activity results.
+//! - **State survives a crash.** The loop records a state snapshot at the
+//!   start of each run and after each operation. Replay adopts the recorded
+//!   snapshots, so it rebuilds the state from the events. A history from
+//!   before issue #2259 has no snapshot. It replays from the input, the
+//!   recorded operations and the recorded activity results.
+//! - **The projection agrees with history.** A trigger writes each snapshot
+//!   to `harvest_entity_state` in the transaction that appends it.
 //! - **No lost operations at a checkpoint.** The loop carries waiting
 //!   operations in the continue-as-new input while the input fits the
 //!   workflow input cap. It runs the operations that do not fit first.
@@ -107,6 +115,29 @@ pub const ENTITY_CHECKPOINT_SIDE_EFFECT: &str = "harvest.entity.checkpoint";
 /// records it. Replay of an earlier attempt reads the recorded budget, not
 /// the current cap. A later attempt reads the current cap.
 pub const ENTITY_CHECKPOINT_BUDGET_SIDE_EFFECT: &str = "harvest.entity.checkpoint_budget";
+
+/// The side-effect name of a state snapshot (issue #2259).
+///
+/// The loop records a snapshot at the start of each run and after each op.
+/// Its kind is [`SideEffectKind::EntityState`]. Its value is an
+/// [`EntitySnapshot`].
+///
+/// [`SideEffectKind::EntityState`]: crate::event::SideEffectKind::EntityState
+pub const ENTITY_STATE_SIDE_EFFECT: &str = "harvest.entity.state";
+
+/// The side-effect name of the snapshot that a delete records before the run
+/// ends (issue #2259).
+///
+/// The projection reads this name and marks the key as deleted.
+pub const ENTITY_DELETED_SIDE_EFFECT: &str = "harvest.entity.deleted";
+
+/// The key of a snapshot that the loop did not store (issue #2259).
+///
+/// A state past the side-effect cap or the depth cap would make the history
+/// too large or unloadable. The loop then records
+/// `{"omitted": "too_large" | "too_deep", "stats": <EntityStats>}`. A query
+/// on such a run replays the body.
+pub const ENTITY_SNAPSHOT_OMITTED_KEY: &str = "omitted";
 
 /// The maximum size in bytes of [`EntityStats::last_error`], marker included.
 ///
@@ -247,6 +278,20 @@ impl<S: Default> EntityCheckpoint<S> {
     }
 }
 
+/// The value of one state snapshot event (issue #2259).
+///
+/// The wire form is `{"state": <S>, "stats": <EntityStats>}`. Replay reads
+/// it back, and `harvest_entity_state.snapshot` holds a copy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(bound(serialize = "S: Serialize", deserialize = "S: DeserializeOwned"))]
+pub struct EntitySnapshot<S> {
+    /// The committed state.
+    pub state: S,
+    /// The counters at the time of the snapshot.
+    #[serde(default)]
+    pub stats: EntityStats,
+}
+
 /// The handler loop of one entity run.
 pub struct Entity<'a, S> {
     ctx: &'a WorkflowContext,
@@ -343,7 +388,7 @@ where
     /// Returns [`HarvestError::PayloadTooLarge`] when the state alone is
     /// larger than the workflow input cap at a checkpoint.
     /// Returns [`HarvestError::Serialization`] if the state does not
-    /// serialize at a checkpoint.
+    /// serialize at a snapshot or a checkpoint.
     ///
     /// # Panics
     ///
@@ -380,10 +425,12 @@ where
         // A kept input is trusted, but its error must obey the bound too.
         checkpoint.stats.last_error = checkpoint.stats.last_error.take().map(bound_error);
         let mut waiting: VecDeque<Value> = std::mem::take(&mut checkpoint.pending).into();
+        let mut run = RunCounters::default();
+        // The first snapshot moves the projection to this run (issue #2259).
+        record_snapshot(ctx, &mut checkpoint, ENTITY_STATE_SIDE_EFFECT, &mut run)?;
         let published = Arc::new(Mutex::new(Published::of(&checkpoint)));
         register_queries(ctx, &published);
 
-        let mut run = RunCounters::default();
         loop {
             let raw = match waiting.pop_front() {
                 Some(raw) => raw,
@@ -401,6 +448,12 @@ where
                 Ok(EntityMessage::Delete) => {
                     waiting.extend(ctx.drain_signals_raw(ENTITY_OP_SIGNAL)?);
                     if waiting.is_empty() {
+                        record_snapshot(
+                            ctx,
+                            &mut checkpoint,
+                            ENTITY_DELETED_SIDE_EFFECT,
+                            &mut run,
+                        )?;
                         return Ok(checkpoint.state);
                     }
                     checkpoint.state = S::default();
@@ -411,6 +464,7 @@ where
                 ),
             }
             run.ops += 1;
+            record_snapshot(ctx, &mut checkpoint, ENTITY_STATE_SIDE_EFFECT, &mut run)?;
             *lock(&published) = Published::of(&checkpoint);
 
             if checkpoint_due(ctx, &mut run, max_ops_per_run)? {
@@ -438,11 +492,65 @@ where
 struct RunCounters {
     /// Messages taken in this run.
     ops: u64,
-    /// Serialized bytes of those messages.
+    /// Serialized bytes of those messages and of this run's snapshots.
     op_bytes: u64,
     /// The loaded history size, as `(event count, bytes)`. A new task loads
     /// more events, so a new count means a new measure.
     loaded: Option<(u64, u64)>,
+}
+
+/// The borrowed write form of an [`EntitySnapshot`].
+#[derive(Serialize)]
+struct SnapshotRef<'s, S> {
+    state: &'s S,
+    stats: &'s EntityStats,
+}
+
+/// Record or replay the snapshot `name` of `checkpoint` (issue #2259).
+///
+/// A replay adopts the recorded state and stats, so replay rebuilds the state
+/// from the events. A recorded snapshot that does not decode as `S` is a
+/// non-determinism error, and the loop keeps its own state. A history from
+/// before issue #2259 records nothing here.
+///
+/// A state past the side-effect cap or the depth cap is not stored. The loop
+/// records an [`ENTITY_SNAPSHOT_OMITTED_KEY`] marker instead, and replay keeps
+/// its own state at that marker.
+///
+/// Only a live snapshot counts toward the byte budget. The loaded history
+/// bytes already hold the recorded ones.
+fn record_snapshot<S: Serialize + DeserializeOwned>(
+    ctx: &WorkflowContext,
+    checkpoint: &mut EntityCheckpoint<S>,
+    name: &str,
+    run: &mut RunCounters,
+) -> HarvestResult<()> {
+    let live = serde_json::to_value(SnapshotRef {
+        state: &checkpoint.state,
+        stats: &checkpoint.stats,
+    })?;
+    let stats = &checkpoint.stats;
+    let omitted = |reason: &'static str| serde_json::json!({ ENTITY_SNAPSHOT_OMITTED_KEY: reason, "stats": stats });
+    match ctx.record_entity_snapshot(name, live, omitted)? {
+        crate::context::EntitySnapshot::Recorded(recorded) => {
+            if recorded.get(ENTITY_SNAPSHOT_OMITTED_KEY).is_some() {
+                return Ok(());
+            }
+            match serde_json::from_value::<EntitySnapshot<S>>(recorded) {
+                Ok(snapshot) => {
+                    checkpoint.state = snapshot.state;
+                    checkpoint.stats = snapshot.stats;
+                }
+                Err(error) => ctx.record_entity_drift(format!(
+                    "side-effect drift mismatch: the recorded entity snapshot {name} \
+                     does not decode ({error})"
+                )),
+            }
+        }
+        crate::context::EntitySnapshot::Live(live) => run.op_bytes += json_len(&live)?,
+        crate::context::EntitySnapshot::Absent => {}
+    }
+    Ok(())
 }
 
 /// The committed view that the queries read.
@@ -1688,6 +1796,443 @@ mod tests {
             matches!(report.status, ReplayStatus::ReplaySucceeded),
             "{report}"
         );
+    }
+
+    /// The state snapshots in `events`, as `(name, value)` (issue #2259).
+    fn snapshots(events: &[WorkflowEvent]) -> Vec<(String, Value)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::SideEffectRecorded {
+                    kind: SideEffectKind::EntityState,
+                    name: Some(name),
+                    value,
+                } => Some((name.clone(), value.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn snapshot(state: i64, applied: u64) -> Value {
+        json!({
+            "state": state,
+            "stats": EntityStats { applied, ..EntityStats::default() },
+        })
+    }
+
+    fn state_snapshot(state: i64, applied: u64) -> (String, Value) {
+        (
+            ENTITY_STATE_SIDE_EFFECT.to_string(),
+            snapshot(state, applied),
+        )
+    }
+
+    fn checkpoint_record(due: bool) -> WorkflowEvent {
+        WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Custom,
+            name: Some(ENTITY_CHECKPOINT_SIDE_EFFECT.to_string()),
+            value: json!(due),
+        }
+    }
+
+    fn snapshot_record(name: &str, value: Value) -> WorkflowEvent {
+        WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::EntityState,
+            name: Some(name.to_string()),
+            value,
+        }
+    }
+
+    /// The state that a query reads after a replay of `events`.
+    fn replayed_state(events: Vec<WorkflowEvent>, input: Value) -> Value {
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), events);
+        let drive = crate::executor::drive_query_replay(
+            &ctx,
+            counter,
+            input,
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            matches!(drive, crate::executor::QueryReplayOutcome::Suspended),
+            "{drive:?}"
+        );
+        ctx.execute_query(ENTITY_STATE_QUERY).expect("state query")
+    }
+
+    /// The snapshot value has a stable wire form.
+    #[test]
+    fn the_snapshot_wire_form_is_state_and_stats() {
+        let value = serde_json::to_value(EntitySnapshot {
+            state: 3_i64,
+            stats: EntityStats::default(),
+        })
+        .unwrap();
+        assert_eq!(value, snapshot(3, 0));
+        let back: EntitySnapshot<i64> = serde_json::from_value(json!({"state": 4})).unwrap();
+        assert_eq!(back.state, 4);
+        assert_eq!(back.stats, EntityStats::default());
+        assert_eq!(ENTITY_STATE_SIDE_EFFECT, "harvest.entity.state");
+        assert_eq!(ENTITY_DELETED_SIDE_EFFECT, "harvest.entity.deleted");
+        assert_eq!(SideEffectKind::EntityState.as_str(), "entity_state");
+    }
+
+    /// A run records a snapshot at its start, after each op, and before a
+    /// delete ends it (issue #2259).
+    #[tokio::test]
+    async fn each_step_records_a_state_snapshot() {
+        let outcome = env_with(&[op(1), op(2), delete()])
+            .run(counter, json!({}))
+            .await;
+        assert_eq!(outcome.result, Ok(json!(3)));
+        assert_eq!(
+            snapshots(outcome.events()),
+            vec![
+                state_snapshot(0, 0),
+                state_snapshot(1, 1),
+                state_snapshot(3, 2),
+                (ENTITY_DELETED_SIDE_EFFECT.to_string(), snapshot(3, 2)),
+            ]
+        );
+        let report = outcome.replay_check(counter).await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    /// A failed op keeps the state but changes the stats, so it records a
+    /// snapshot too.
+    #[tokio::test]
+    async fn a_failed_op_records_its_stats() {
+        let fail = json!(EntityMessage::op(CounterOp::Fail));
+        let outcome = env_with(&[fail]).run(counter, json!({})).await;
+        let recorded = snapshots(outcome.events());
+        let (name, last) = recorded.last().expect("a snapshot after the op");
+        assert_eq!(name, ENTITY_STATE_SIDE_EFFECT);
+        let last: EntitySnapshot<i64> = serde_json::from_value(last.clone()).unwrap();
+        assert_eq!(last.state, 0);
+        assert_eq!(last.stats.failed, 1);
+        assert_eq!(last.stats.last_error.as_deref(), Some("op refused"));
+    }
+
+    /// Each snapshot comes before the checkpoint decision of its op.
+    #[tokio::test]
+    async fn the_snapshot_precedes_the_checkpoint_decision() {
+        let outcome = env_with(&[op(1)]).run(counter, json!({})).await;
+        let order: Vec<&str> = outcome
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::SideEffectRecorded { name, .. } => name.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ENTITY_STATE_SIDE_EFFECT,
+                ENTITY_STATE_SIDE_EFFECT,
+                ENTITY_CHECKPOINT_SIDE_EFFECT
+            ]
+        );
+    }
+
+    /// Replay rebuilds the state from the recorded snapshots, not from the
+    /// handler. A changed snapshot changes the replayed state.
+    #[tokio::test]
+    async fn replay_rebuilds_the_state_from_the_snapshots() {
+        let outcome = env_with(&[op(1), op(2)]).run(counter, json!({})).await;
+        let mut events = outcome.events().to_vec();
+        assert_eq!(replayed_state(events.clone(), json!({})), json!(3));
+        let first_op = events
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                matches!(
+                    e,
+                    WorkflowEvent::SideEffectRecorded {
+                        kind: SideEffectKind::EntityState,
+                        ..
+                    }
+                )
+            })
+            .nth(1)
+            .map(|(index, _)| index)
+            .expect("a snapshot after the first op");
+        events[first_op] = snapshot_record(ENTITY_STATE_SIDE_EFFECT, snapshot(100, 1));
+        // Keep the checkpoint record of the first op. The second op then runs
+        // live, on top of the recorded state.
+        events.truncate(first_op + 2);
+        assert_eq!(
+            replayed_state(events, json!({})),
+            json!(102),
+            "replay adopts the recorded state, then applies the next op"
+        );
+    }
+
+    /// A history from before issue #2259 has no snapshot. It replays clean
+    /// under the new loop.
+    #[tokio::test]
+    async fn a_history_without_snapshots_replays_clean() {
+        let events = vec![
+            started(json!({})),
+            signal(op(1)),
+            checkpoint_record(false),
+            signal(op(2)),
+            checkpoint_record(false),
+            signal(delete()),
+            WorkflowEvent::WorkflowCompleted { output: json!(3) },
+        ];
+        let report = WorkflowReplayer::new()
+            .register_fn("counter", counter)
+            .replay_from_events(events)
+            .await;
+        assert!(
+            matches!(report.status, ReplayStatus::ReplaySucceeded),
+            "{report}"
+        );
+    }
+
+    /// A run from before issue #2259 records snapshots from its live
+    /// frontier on. Its recorded part stays as it was.
+    #[tokio::test]
+    async fn an_old_run_records_snapshots_from_its_frontier() {
+        let history = vec![
+            started(json!({})),
+            signal(op(1)),
+            checkpoint_record(false),
+            signal(op(2)),
+        ];
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history);
+        let (cycle, ..) = drive_workflow(ctx, counter, json!({}), None).await;
+        let WorkflowOutcome::Suspended { commands } = cycle else {
+            panic!("the entity waits for the next op: {cycle:?}");
+        };
+        let recorded: Vec<&Value> = commands
+            .iter()
+            .filter_map(|c| match c {
+                WorkflowCommand::RecordSideEffect {
+                    kind: SideEffectKind::EntityState,
+                    value,
+                    ..
+                } => Some(value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded, [&snapshot(3, 2)], "only the live op records");
+    }
+
+    /// A continued run starts from its checkpoint, records it as its first
+    /// snapshot, and replays to it.
+    #[tokio::test]
+    async fn a_continued_run_records_its_starting_state_first() {
+        let continued = StartProvenance::continued_from(ExecutionId::new());
+        let outcome = WorkflowTestEnv::new()
+            .with_start_provenance(continued)
+            .run(counter, forged())
+            .await;
+        let recorded = snapshots(outcome.events());
+        assert_eq!(
+            recorded.first(),
+            Some(&state_snapshot(50, 9)),
+            "the first snapshot is the carried state"
+        );
+        let history = outcome.events().to_vec();
+        let start = history
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    WorkflowEvent::SideEffectRecorded {
+                        kind: SideEffectKind::EntityState,
+                        ..
+                    }
+                )
+            })
+            .expect("a start snapshot");
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), history[..=start].to_vec())
+            .with_start_provenance(continued);
+        let drive = crate::executor::drive_query_replay(
+            &ctx,
+            counter,
+            forged(),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            matches!(drive, crate::executor::QueryReplayOutcome::Suspended),
+            "{drive:?}"
+        );
+        assert_eq!(
+            ctx.execute_query(ENTITY_STATE_QUERY).unwrap(),
+            json!(57),
+            "replay rebuilds the carried state and runs the carried op"
+        );
+    }
+
+    /// A reset of a continued run keeps the checkpoint input. Its first
+    /// snapshot is the starting state of the continued run.
+    #[tokio::test]
+    async fn a_reset_of_a_continued_run_rebuilds_its_starting_state() {
+        for source in [StartSource::Reset, StartSource::Rerun] {
+            let outcome = env_with(&[delete()])
+                .with_start_provenance(fresh(source))
+                .run(counter, forged())
+                .await;
+            assert_eq!(outcome.result, Ok(json!(57)), "{source:?}");
+            assert_eq!(
+                snapshots(outcome.events()).first(),
+                Some(&state_snapshot(50, 9)),
+                "{source:?}"
+            );
+            let report = outcome.replay_check(counter).await;
+            assert!(
+                matches!(report.status, ReplayStatus::ReplaySucceeded),
+                "{source:?}: {report}"
+            );
+        }
+    }
+
+    /// A `Custom` side effect with the reserved name is user data. The loop
+    /// does not read it as a snapshot, so it is a divergence. The same value
+    /// with the `EntityState` kind is the start snapshot and replays clean.
+    #[tokio::test]
+    async fn a_custom_side_effect_is_not_a_snapshot() {
+        let record = WorkflowEvent::SideEffectRecorded {
+            kind: SideEffectKind::Custom,
+            name: Some(ENTITY_STATE_SIDE_EFFECT.to_string()),
+            value: snapshot(0, 0),
+        };
+        let forged = WorkflowReplayer::new()
+            .register_fn("counter", counter)
+            .replay_from_events(vec![started(json!({})), record])
+            .await;
+        assert!(
+            matches!(forged.status, ReplayStatus::NonDeterminismDetected { .. }),
+            "the forged record is a divergence: {forged}"
+        );
+        let real = vec![
+            started(json!({})),
+            snapshot_record(ENTITY_STATE_SIDE_EFFECT, snapshot(0, 0)),
+        ];
+        assert_eq!(
+            replayed_state(real, json!({})),
+            json!(0),
+            "the real kind is the start snapshot"
+        );
+    }
+
+    /// A large state makes large snapshots. The loop counts their bytes, so
+    /// it checkpoints before the history reaches half the byte cap.
+    #[tokio::test]
+    async fn snapshot_bytes_count_toward_the_byte_budget() {
+        let messages: Vec<Value> = (0..64).map(|_| op(1)).collect();
+        let outcome = env_with(&messages).run(wide_counter, json!({})).await;
+        let carried: EntityCheckpoint<String> =
+            serde_json::from_value(outcome.result.clone().expect("checkpoint")).unwrap();
+        assert_eq!(carried.stats.checkpoints, 1, "the run checkpoints");
+        let recorded: u64 = snapshots(outcome.events())
+            .iter()
+            .map(|(_, value)| json_len(value).unwrap())
+            .sum();
+        // The check trips after the op that crosses half the cap. One
+        // snapshot is at most the input cap.
+        let bound = crate::context::DEFAULT_HISTORY_BYTE_HARD_CAP / 2
+            + crate::builder::DEFAULT_MAX_WORKFLOW_INPUT_BYTES;
+        assert!(
+            recorded <= bound,
+            "the snapshots hold {recorded} bytes, over {bound}"
+        );
+    }
+
+    /// A state past the side-effect cap records an omitted marker, not the
+    /// state. Replay keeps its own state at the marker.
+    #[tokio::test]
+    async fn an_oversized_state_records_an_omitted_marker() {
+        let messages: Vec<Value> = (0..3).map(|_| op(1)).collect();
+        let outcome = env_with(&messages).run(huge_state_counter, json!({})).await;
+        let recorded = snapshots(outcome.events());
+        let (_, last) = recorded.last().expect("a snapshot");
+        assert_eq!(last[ENTITY_SNAPSHOT_OMITTED_KEY], json!("too_large"));
+        assert_eq!(last["stats"]["applied"], json!(3));
+        assert!(last.get("state").is_none(), "the state is not stored");
+        let ctx = WorkflowContext::for_replay(ExecutionId::new(), outcome.events().to_vec());
+        let drive = crate::executor::drive_query_replay(
+            &ctx,
+            huge_state_counter,
+            json!({}),
+            std::time::Duration::from_secs(5),
+        );
+        assert!(
+            matches!(drive, crate::executor::QueryReplayOutcome::Suspended),
+            "{drive:?}"
+        );
+        let state = ctx.execute_query(ENTITY_STATE_QUERY).unwrap();
+        assert_eq!(
+            state.as_str().map(str::len),
+            Some(3 << 20),
+            "replay keeps its state"
+        );
+    }
+
+    /// A state nested past the depth cap records an omitted marker. The
+    /// history stays loadable.
+    #[tokio::test]
+    async fn a_deep_state_records_an_omitted_marker() {
+        let outcome = env_with(&[op(1)]).run(deep_counter, json!({})).await;
+        let recorded = snapshots(outcome.events());
+        let (_, last) = recorded.last().expect("a snapshot");
+        assert_eq!(last[ENTITY_SNAPSHOT_OMITTED_KEY], json!("too_deep"));
+        let text = serde_json::to_string(&outcome.events()).unwrap();
+        let back: Vec<WorkflowEvent> = serde_json::from_str(&text).expect("the history loads");
+        assert_eq!(back.len(), outcome.events().len());
+    }
+
+    /// An entity whose state becomes a 3 MiB string. It is past the cap.
+    fn huge_state_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let checkpoint: EntityCheckpoint<String> =
+                serde_json::from_value(input).map_err(|e| e.to_string())?;
+            let state = Entity::new(ctx, checkpoint)
+                .run(|_: String, _: CounterOp| async move { Ok("h".repeat(3 << 20)) })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state.len()))
+        })
+    }
+
+    /// An entity whose state nests past the depth cap.
+    fn deep_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let checkpoint: EntityCheckpoint<Value> =
+                serde_json::from_value(input).map_err(|e| e.to_string())?;
+            let state = Entity::new(ctx, checkpoint)
+                .run(|_: Value, _: CounterOp| async move {
+                    let mut deep = json!(0);
+                    for _ in 0..crate::payload_depth::MAX_PAYLOAD_DEPTH + 10 {
+                        deep = json!([deep]);
+                    }
+                    Ok(deep)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state.is_array()))
+        })
+    }
+
+    /// An entity whose state grows by 64 KiB for each op.
+    fn wide_counter(ctx: &WorkflowContext, input: Value) -> BoxedRun<'_> {
+        Box::pin(async move {
+            let checkpoint: EntityCheckpoint<String> =
+                serde_json::from_value(input).map_err(|e| e.to_string())?;
+            let state = Entity::new(ctx, checkpoint)
+                .run(|mut wide: String, _: CounterOp| async move {
+                    wide.push_str(&"w".repeat(64 * 1024));
+                    Ok(wide)
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!(state.len()))
+        })
     }
 
     fn started(input: Value) -> WorkflowEvent {

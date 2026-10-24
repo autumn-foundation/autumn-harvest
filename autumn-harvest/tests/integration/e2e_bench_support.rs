@@ -270,6 +270,18 @@ pub fn claim_loops_override(raw: Option<&str>) -> Option<usize> {
         .filter(|v| *v > 0)
 }
 
+/// Set to `1` to run the throughput scenario in owner mode (issue #2252).
+///
+/// The bench turns owner mode on in each shard database before the fleet
+/// starts, and waits until the workers own every partition.
+pub const OWNER_MODE_ENV_VAR: &str = "HARVEST_BENCH_OWNER_MODE";
+
+/// Whether the [`OWNER_MODE_ENV_VAR`] value turns owner mode on.
+#[must_use]
+pub fn owner_mode_enabled(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| value.trim() == "1")
+}
+
 /// Read a positive-integer override from the environment, falling back to
 /// `default`.
 ///
@@ -354,6 +366,87 @@ pub fn commit_probe_notes(persist: &[f64], claim: &[f64], workflows: usize) -> V
         ));
     }
     notes
+}
+
+/// The claim notes of one cell, one per claim kind with samples (issue
+/// #2248).
+///
+/// Each pair is a kind and a duration in seconds.
+#[must_use]
+pub fn claim_kind_notes(claims: &[(autumn_harvest::telemetry::ClaimKind, f64)]) -> Vec<String> {
+    autumn_harvest::telemetry::ClaimKind::ALL
+        .iter()
+        .filter_map(|kind| {
+            let mut samples: Vec<f64> = claims
+                .iter()
+                .filter(|(k, _)| k == kind)
+                .map(|(_, s)| *s)
+                .collect();
+            if samples.is_empty() {
+                return None;
+            }
+            samples.sort_by(f64::total_cmp);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "sample counts here are far below 2^53"
+            )]
+            let mean = samples.iter().sum::<f64>() / samples.len() as f64 * 1e3;
+            Some(format!(
+                "commit probe: {} {} claims, mean {mean:.2} ms, p50 {:.2} ms, p99 {:.2} ms",
+                samples.len(),
+                kind.as_str(),
+                percentile_ms(&samples, 50),
+                percentile_ms(&samples, 99)
+            ))
+        })
+        .collect()
+}
+
+/// The persist-phase note of one cell (issue #2248).
+///
+/// Each pair is a phase and a duration in seconds. Each decision persist
+/// records every phase once, so the commit count is the persist count.
+#[must_use]
+pub fn persist_phase_notes(
+    phases: &[(autumn_harvest::telemetry::PersistPhase, f64)],
+) -> Vec<String> {
+    use autumn_harvest::telemetry::PersistPhase;
+    let persists = phases
+        .iter()
+        .filter(|(p, _)| *p == PersistPhase::Commit)
+        .count();
+    if persists == 0 {
+        return Vec::new();
+    }
+    let sum_of = |phase: PersistPhase| -> f64 {
+        phases
+            .iter()
+            .filter(|(p, _)| *p == phase)
+            .map(|(_, s)| s)
+            .sum()
+    };
+    let total: f64 = phases.iter().map(|(_, s)| s).sum();
+    let parts: Vec<String> = PersistPhase::ALL
+        .iter()
+        .map(|phase| {
+            let sum = sum_of(*phase);
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "persist counts here are far below 2^53"
+            )]
+            let mean = sum / persists as f64 * 1e3;
+            let share = if total > 0.0 {
+                sum / total * 100.0
+            } else {
+                0.0
+            };
+            format!("{} {mean:.2} ms ({share:.1}%)", phase.as_str())
+        })
+        .collect();
+    vec![format!(
+        "commit probe: {persists} decision persists, mean per phase: {}",
+        parts.join(", ")
+    )]
 }
 
 /// What a teardown with stats left undone, by kind.
@@ -1810,6 +1903,41 @@ mod tests {
         assert!(commit_probe_notes(&[], &[], 0)[0].contains("no samples"));
     }
 
+    /// Issue #2248: the claim note splits the samples by claim kind.
+    #[test]
+    fn claim_kind_notes_report_each_kind_apart() {
+        use autumn_harvest::telemetry::ClaimKind;
+        let claims = [
+            (ClaimKind::Workflow, 0.004),
+            (ClaimKind::Workflow, 0.006),
+            (ClaimKind::Activity, 0.002),
+            (ClaimKind::Empty, 0.001),
+        ];
+        let notes = claim_kind_notes(&claims);
+        assert_eq!(notes.len(), 3, "kinds with no sample stay out: {notes:?}");
+        assert!(notes[0].contains("2 workflow claims"), "{notes:?}");
+        assert!(notes[0].contains("mean 5.00 ms"), "{notes:?}");
+        assert!(notes[1].contains("1 activity claims"), "{notes:?}");
+        assert!(notes[2].contains("1 empty claims"), "{notes:?}");
+        assert_eq!(claim_kind_notes(&[]), Vec::<String>::new());
+    }
+
+    /// Issue #2248: the phase note gives the mean of each phase per persist
+    /// and its share of the mean persist.
+    #[test]
+    fn persist_phase_notes_give_mean_and_share() {
+        use autumn_harvest::telemetry::PersistPhase;
+        let phases: Vec<(PersistPhase, f64)> = PersistPhase::ALL
+            .iter()
+            .flat_map(|p| [(*p, 0.001), (*p, 0.003)])
+            .collect();
+        let notes = persist_phase_notes(&phases);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("2 decision persists"), "{notes:?}");
+        assert!(notes[0].contains("commit 2.00 ms (16.7%)"), "{notes:?}");
+        assert_eq!(persist_phase_notes(&[]), Vec::<String>::new());
+    }
+
     #[test]
     fn a_failed_snapshot_is_not_reported_as_a_leaked_database() {
         let snapshot_only = TeardownReport {
@@ -2686,7 +2814,8 @@ pub mod db {
     use autumn_harvest::info::{ActivityInfo, WorkflowInfo};
     use autumn_harvest::shard::{ShardRouter, ShardedDbPool};
     use autumn_harvest::telemetry::{
-        DbOp, MetricsRecorder, NoOpMetrics, ResidentOutcome, TelemetryConfig,
+        ClaimKind, DbOp, MetricsRecorder, NoOpMetrics, PersistPhase, ResidentOutcome,
+        TelemetryConfig,
     };
     use autumn_harvest::types::{ExecutionId, ShardId};
     use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
@@ -3487,15 +3616,32 @@ pub mod db {
     pub struct CommitProbe {
         persist: Mutex<Vec<f64>>,
         claim: Mutex<Vec<f64>>,
+        /// Issue #2248: each claim with its kind.
+        claim_kinds: Mutex<Vec<(ClaimKind, f64)>>,
+        /// Issue #2248: each phase of each decision persist.
+        phases: Mutex<Vec<(PersistPhase, f64)>>,
+    }
+
+    /// The samples that [`CommitProbe::take`] returns.
+    pub struct ProbeSamples {
+        pub persist: Vec<f64>,
+        pub claim: Vec<f64>,
+        pub claim_kinds: Vec<(ClaimKind, f64)>,
+        pub phases: Vec<(PersistPhase, f64)>,
     }
 
     impl CommitProbe {
         /// Return the samples and clear them.
-        pub fn take(&self) -> (Vec<f64>, Vec<f64>) {
-            let take = |samples: &Mutex<Vec<f64>>| {
+        pub fn take(&self) -> ProbeSamples {
+            fn take<T>(samples: &Mutex<Vec<T>>) -> Vec<T> {
                 std::mem::take(&mut *samples.lock().unwrap_or_else(PoisonError::into_inner))
-            };
-            (take(&self.persist), take(&self.claim))
+            }
+            ProbeSamples {
+                persist: take(&self.persist),
+                claim: take(&self.claim),
+                claim_kinds: take(&self.claim_kinds),
+                phases: take(&self.phases),
+            }
         }
     }
 
@@ -3517,6 +3663,21 @@ pub mod db {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(seconds);
+        }
+
+        fn record_claim_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+            self.record_db_query_duration(DbOp::Claim, shard, seconds);
+            self.claim_kinds
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((kind, seconds));
+        }
+
+        fn record_persist_phase(&self, phase: PersistPhase, _shard: u16, seconds: f64) {
+            self.phases
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((phase, seconds));
         }
     }
 
@@ -3544,13 +3705,16 @@ pub mod db {
         let Some(probe) = commit_probe() else {
             return Vec::new();
         };
-        let (persist, claim) = probe.take();
+        let samples = probe.take();
         let mut latencies = Vec::new();
         for shard in cluster.shard_ids() {
             let mut conn = cluster.connect(shard).await;
             latencies.extend(run_latencies(&mut conn, prefix).await);
         }
-        let mut notes = super::commit_probe_notes(&persist, &claim, latencies.len());
+        let mut notes =
+            super::commit_probe_notes(&samples.persist, &samples.claim, latencies.len());
+        notes.extend(super::claim_kind_notes(&samples.claim_kinds));
+        notes.extend(super::persist_phase_notes(&samples.phases));
         if !latencies.is_empty() {
             latencies.sort_by(f64::total_cmp);
             notes.push(format!(
@@ -3644,6 +3808,18 @@ pub mod db {
             }
         }
 
+        fn record_claim_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+            if let Some(probe) = commit_probe() {
+                probe.record_claim_duration(kind, shard, seconds);
+            }
+        }
+
+        fn record_persist_phase(&self, phase: PersistPhase, shard: u16, seconds: f64) {
+            if let Some(probe) = commit_probe() {
+                probe.record_persist_phase(phase, shard, seconds);
+            }
+        }
+
         fn record_workflow_resident(
             &self,
             _workflow_name: &str,
@@ -3689,6 +3865,63 @@ pub mod db {
              hit rate {rate}; replays: {}",
             if replays.is_empty() { "none" } else { &replays }
         )
+    }
+
+    /// The decision counts of the measured loop (issue #2252).
+    ///
+    /// Each run of the canonical workflow makes `per_run` decisions, and its
+    /// first decision has no resident state. The note gives the extra
+    /// decisions, and the hit rate over the decisions after the first.
+    #[must_use]
+    pub fn decision_note(
+        before: &BTreeMap<String, u64>,
+        after: &BTreeMap<String, u64>,
+        runs: u64,
+        per_run: u64,
+    ) -> String {
+        let delta = |key: &str| {
+            after.get(key).copied().unwrap_or(0) - before.get(key).copied().unwrap_or(0)
+        };
+        let total: u64 = after.keys().map(|key| delta(key)).sum();
+        let hits = delta("hit");
+        let extra = i128::from(total) - i128::from(runs * per_run);
+        let extra_cold = i128::from(delta("cold")) - i128::from(runs);
+        let continuations = total.saturating_sub(runs);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "decision counts here are far below 2^53"
+        )]
+        let rate = if continuations == 0 {
+            "n/a".to_owned()
+        } else {
+            format!("{:.1}%", hits as f64 * 100.0 / continuations as f64)
+        };
+        format!(
+            "decisions (issue #2252, measured loop): {total} for {runs} runs, {extra} extra, \
+             {extra_cold} extra cold; continuation hit rate {rate}"
+        )
+    }
+
+    #[test]
+    fn the_decision_note_counts_extra_decisions_and_continuation_hits() {
+        let counts = ResidentCounts::default();
+        let before = counts.snapshot();
+        for _ in 0..2 {
+            counts.record_workflow_resident("wf", "q", ResidentOutcome::Cold);
+            for _ in 0..3 {
+                counts.record_workflow_resident("wf", "q", ResidentOutcome::Hit);
+            }
+        }
+        assert_eq!(
+            decision_note(&before, &counts.snapshot(), 2, 4),
+            "decisions (issue #2252, measured loop): 8 for 2 runs, 0 extra, 0 extra cold; \
+             continuation hit rate 100.0%"
+        );
+        counts.record_workflow_resident("wf", "q", ResidentOutcome::Cold);
+        assert!(
+            decision_note(&before, &counts.snapshot(), 2, 4)
+                .ends_with("9 for 2 runs, 1 extra, 1 extra cold; continuation hit rate 85.7%")
+        );
     }
 
     #[test]
@@ -3739,6 +3972,30 @@ pub mod db {
             telemetry,
         ));
         (registry, observations)
+    }
+
+    /// Wait until owners hold every partition of the database (issue #2252).
+    async fn wait_for_every_partition_owned(conn: &mut AsyncPgConnection) {
+        #[derive(diesel::QueryableByName)]
+        struct Held {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let held: Held = diesel::sql_query(
+                "SELECT count(*)::bigint AS n FROM harvest_decision_owner \
+                 WHERE holder IS NOT NULL AND lease_until > clock_timestamp()",
+            )
+            .get_result(conn)
+            .await
+            .expect("count owned partitions");
+            if held.n == 512 {
+                return;
+            }
+            assert!(Instant::now() < deadline, "owners hold {} of 512", held.n);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// A running worker fleet: one worker pinned per shard.
@@ -4380,9 +4637,31 @@ pub mod db {
         let resident = Arc::new(ResidentCounts::default());
         let (registry, _observations) =
             build_registry_with_metrics(Arc::clone(&resident) as Arc<dyn MetricsRecorder>);
+        let owner_mode =
+            super::owner_mode_enabled(std::env::var(super::OWNER_MODE_ENV_VAR).ok().as_deref());
+        if owner_mode {
+            for shard in cluster.shard_ids() {
+                let mut conn = cluster.connect(shard).await;
+                autumn_harvest::decision_owner::enable_owner_mode(
+                    &mut conn,
+                    &autumn_harvest::decision_owner::EnableOwnerMode {
+                        force: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("turn owner mode on");
+            }
+        }
         let fleet = start_fleet(&cluster, &sharded, &registry, &census);
         let deadline = scenario_deadline();
         let shards = cluster.shard_ids();
+        if owner_mode {
+            for shard in &shards {
+                let mut conn = cluster.connect(*shard).await;
+                wait_for_every_partition_owned(&mut conn).await;
+            }
+        }
 
         // Warmup: the same closed loop, at a fraction of the population, with
         // every completion discarded. Pools fill, statements are planned, the
@@ -4483,7 +4762,14 @@ pub mod db {
         let probe_notes = commit_probe_report(&cluster, "meas").await;
         // The settling wait comes after the probe report, so the probe holds
         // no idle polls from it.
-        let resident_note = resident_note(&resident_before, &resident.settled_snapshot().await);
+        let resident_after = resident.settled_snapshot().await;
+        let resident_note = resident_note(&resident_before, &resident_after);
+        let decision_note = decision_note(
+            &resident_before,
+            &resident_after,
+            u64::try_from(completed).unwrap_or(0),
+            u64::try_from(super::BENCH_ACTIVITIES.len() + 1).unwrap_or(0),
+        );
         fleet.stop().await;
         let topology = cluster.topology;
         drop(sharded);
@@ -4512,6 +4798,8 @@ pub mod db {
                     shard_note(&per_shard),
                     format!("topology: {}", topology.as_str()),
                     resident_note,
+                    decision_note,
+                    format!("owner mode: {}", if owner_mode { "on" } else { "off" }),
                     format!(
                         "closed loop: {inflight} workflows in flight per shard, {requested} \
                          measured completions, warmup population {}",

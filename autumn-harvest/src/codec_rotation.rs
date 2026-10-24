@@ -173,7 +173,8 @@ const ALL_ROWS: &str = "TRUE";
 /// `harvest_workflow_executions.output`, so it holds the same ciphertext.
 /// A workflow task row and an activity task row both hold encoded cells. A
 /// completion-callback dead letter copies the stored delivery body, so it
-/// holds an envelope too.
+/// holds an envelope too. A trigger copies an entity snapshot event field into
+/// `harvest_entity_state.snapshot`, so that cell holds the event ciphertext.
 ///
 /// A row written before issue #2043 can hold a clear value. A clear value
 /// that has the shape of an envelope reads as one. The security posture
@@ -355,6 +356,14 @@ pub const CODEC_COLUMNS: &[CodecColumn] = &[
         table: "harvest_task_queue",
         id_column: "id",
         column: "context_headers",
+        rows: ALL_ROWS,
+        shape: CellShape::Cell,
+    },
+    // A trigger copies the snapshot ciphertext of the event (issue #2259).
+    CodecColumn {
+        table: "harvest_entity_state",
+        id_column: "id",
+        column: "snapshot",
         rows: ALL_ROWS,
         shape: CellShape::Cell,
     },

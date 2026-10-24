@@ -381,8 +381,8 @@ no fence must fail the sweep.
   by `Decision`.
 
 The store applies `no-fence`, `unlocked-fence`, `holder-fence` and
-`renew-bumps`. The simulator applies `keep-cache`, `pipeline` and
-`memory-ack`, because they are owner behaviour. So the seam makes only the
+`renew-bumps`. The simulator applies `keep-cache`, `pipeline`,
+`memory-ack` and `unload-on-any-fence`, because they are owner behaviour. So the seam makes only the
 store side real.
 
 `stage_1a_owner_store_gets_a_simulator_run` fails when a migration adds
@@ -402,6 +402,39 @@ nemeses bias the scheduler. Each one acts when its trigger holds:
 | `renew-in-flight` | The holder holds the fence lock. | The holder renews. | `renew-in-flight` |
 | `ack-before-bump` | An acked signal is pending. | End the lease, so the epoch bumps first. | `ack-before-bump` |
 
+A run has two phases, as a world run has. The fault phase runs the nemeses
+for 400 steps. Issue #2294 did not change it, so a run that ends in it has
+the same trace as before. The drain then runs for at most 400 steps. It
+injects no fault: no nemesis, no expiry, no release and no stall. A
+stalled worker wakes when the drain starts. The trace marks the start with
+`drain starts, N decisions in flight`.
+
+The drain is weakly fair. An action that stays enabled for
+`owner::FAIR_STEPS` (8) steps without a run is overdue. Each step runs the
+overdue action that waited longest. With no overdue action, a uniform draw
+picks the step.
+
+Issue #2294 adds the drain. Before it, the run had to consume every signal
+while the faults went on. In a few seeds per million, the faults ended the
+lease every few steps for all 400 steps. No owner makes progress then. So
+the nightly failed, but the engine was not at fault.
+
+`OwnerConfig::drain_bound` gives the step bound of a drain. A live row
+stays with its holder. Otherwise a worker takes the free row. Then each
+signal needs a begin, a lock and a commit. The bound grows with the
+decisions in flight at the drain start, and 400 steps cover 103 of them.
+
+Two checks back the drain:
+
+- `LiveRowHasAPinnedHolder` is an invariant of TLC, Stateright and the
+  simulator. The holder of a live row is pinned at the epoch of the row.
+  So a store that loses its holder fails on that name, not as a stuck
+  drain.
+- Stateright checks `DrainCanProgress` within its bound. Each state that
+  is not quiescent has a step that is not a fault.
+
+See [`stateright.md`](stateright.md).
+
 ### The tests
 
 - `every_tla_defect_fails_here_on_the_same_invariant` reads the
@@ -413,9 +446,25 @@ nemeses bias the scheduler. Each one acts when its trigger holds:
   design reaches each nemesis and never fences itself.
 - `each_nemesis_fires_and_adds_its_fault` runs each nemesis alone. It must
   fire, and its fault counter must be above the run with no nemesis.
-- A sweep fails a seed that does not consume every signal within the
-  step limit. So a store that makes no progress cannot pass.
+- A sweep fails a seed that does not consume every signal before the
+  drain ends. So a store that makes no progress cannot pass.
   `a_store_that_makes_no_progress_fails_the_sweep` checks this.
+- `the_seeds_of_issue_2294_converge_in_the_drain` runs the four nightly
+  seeds of issue #2294. Each one fails with no drain and passes with it.
+- `the_drain_leaves_the_fault_phase_unchanged` checks that the trace with
+  no drain is a prefix of the full trace.
+- `the_drain_converges_fairly_within_its_bound` starts the drain at every
+  third step from 0 to 400, over 12 seeds. No wait is longer than
+  `FAIR_STEPS + k - 1` steps, with `k` enabled actions. No drain is longer
+  than `drain_bound`.
+- `the_drain_injects_no_fault` checks that no drain step ends the lease,
+  releases the row or stalls a worker.
+- `the_drain_ends_every_stall` checks that a stalled worker acts in the
+  drain before its stall would end.
+- `a_worker_that_unloads_on_any_fence_stops_the_drain` runs the
+  `unload-on-any-fence` mutant with no invariant check. A drain stops with
+  work left. The 400 fault steps hide that stop, because the lease churn
+  frees the row.
 
 With every check on, a defect can fail first on another invariant. For
 example, `memory-ack` fails first on `AckAfterDurableWrite`. Set
@@ -438,7 +487,9 @@ HARVEST_DST_OWNER_SEEDS=100000 \
 ```
 
 A failure prints the replay command. It runs `owner::replay_one_owner_seed`
-and prints the trace.
+and prints the trace. The sweep and the replay use the same verdict,
+`OwnerReport::failure`. So the replay also fails a run that does not
+consume every signal. Before issue #2294, it failed on an invariant only.
 
 ## The speculation model
 

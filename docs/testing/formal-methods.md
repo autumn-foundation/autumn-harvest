@@ -255,6 +255,9 @@ fields:
   memory of the worker that holds the row at its epoch. A stale owner can
   never commit from memory, so its memory does not count.
 - `OwnerNeverFencesItself`: only a takeover fences a commit.
+- `LiveRowHasAPinnedHolder`: the holder of a live row is pinned at the
+  epoch of the row. Without it, a drain with no fault can stop with work
+  left (issue #2294).
 
 In the design, `AckAfterDurableWrite` restates the guard of `Ack`. It
 matters only for the `memory-ack` mutant. `OneOwnerPerEpoch`,
@@ -274,6 +277,7 @@ ADR. Its config lists only the invariant that it must break:
 | `OwnerLeaseRenewBumps.cfg` | `renew-bumps`: a renewal adds 1 to the epoch | R5 | 3 | `OwnerNeverFencesItself` |
 | `OwnerLeaseMemoryAck.cfg` | `memory-ack`: an ack from memory (restate#4566) | R6 | 4 | `NoAckedSignalLost` |
 | `OwnerLeasePipeline.cfg` | `pipeline`: two decisions in one tenure | R7 | — | `DecisionOnFreshHistory` |
+| `OwnerLeaseUnloadOnAnyFence.cfg` | `unload-on-any-fence`: a fence unloads a newer tenure | R8 | 2 | `LiveRowHasAPinnedHolder` |
 
 `OwnerLeaseNoFence.cfg` gives this trace:
 
@@ -693,7 +697,7 @@ copy matches. Port the change, then run the script.
 | `mixers.rs` | `mix64` in `policy.rs` and `dlq.rs`, `splitmix64` in `chaos.rs` | Each mixer is a bijection on `u64`. An explicit inverse undoes it. |
 | `jitter.rs` | `uniform_inclusive`, `full_jitter_nanos`, `equal_jitter_nanos` in `policy.rs` | The jitter stays in its range for every input, with the real mixer. |
 | `dlq_spread.rs` | `spread_offset_nanos` in `dlq.rs` | No step overflows. The jitter is exact and below one slot. Row `index` of `count` stays in its slot and in the window. |
-| `owner_fence.rs` | `next_epoch` and `fence_passes` in `decision_owner.rs` | The next epoch is the epoch + 1 and never wraps. The fence passes a commit only at the epoch of the row, so never at an older one. Only an acquisition moves the epoch, so after a takeover the fence refuses every commit of the old tenure (issue #2251). |
+| `owner_fence.rs` | `next_epoch` and `fence_passes` in `decision_owner.rs` | The next epoch is the epoch + 1 and never wraps. The fence passes a commit only at the epoch of the row, so never at an older one. Only an acquisition moves the epoch, so after a takeover the fence refuses every commit of the old tenure (issue #2251). A batch acquisition moves each locked row by one acquisition and leaves each other row (issue #2296). |
 
 **The mixer inverse.** Each step of the `SplitMix64` finalizer has an
 inverse. A right xor-shift by `s` bits is undone by shifts of `s` and

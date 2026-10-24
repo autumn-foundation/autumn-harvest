@@ -7,6 +7,11 @@ Accepted (issue #1975). The plan is
 follow-up plan for the checkpoint budget and the error bound (issue #2049) is
 [`2026-10-15-entity-checkpoint-hardening.md`](../plans/2026-10-15-entity-checkpoint-hardening.md).
 
+Amended by issue #2259: state changes are history events with a Postgres
+projection. See [the amendment](#amendment-state-as-history-events-issue-2259).
+The amendment replaces decision 1's "no event variant, no migration" and the
+first alternative below.
+
 ## Context
 
 - Restate virtual objects and Azure durable entities give each key
@@ -29,7 +34,9 @@ follow-up plan for the checkpoint budget and the error bound (issue #2049) is
 ### 1. Sugar, not a new primitive
 
 `autumn_harvest::entity` builds an entity from parts that exist today. It
-adds no `WorkflowEvent` variant, no migration and no worker path.
+adds no `WorkflowEvent` variant, no migration and no worker path. Issue
+#2259 later added one `SideEffectKind` variant and one migration. See the
+amendment.
 
 | Entity concept | Harvest part |
 |---|---|
@@ -39,6 +46,7 @@ adds no `WorkflowEvent` variant, no migration and no worker path.
 | Send an operation | `signal_with_start` (stub, HTTP or core function) |
 | Read state | The queries `harvest.entity.state` and `harvest.entity.stats` |
 | Durable state | The workflow input, rebuilt by replay |
+| State events and projection | `SideEffectKind::EntityState` and `harvest_entity_state` (issue #2259) |
 
 ### 2. How state is stored and replayed
 
@@ -162,3 +170,126 @@ A native primitive stays at rank 13, behind customer pull.
   rebuild the state.
 - **One workflow for each op with a concurrency limit of 1.** Rejected: no
   state survives between runs.
+
+## Amendment: state as history events (issue #2259)
+
+The design record is [`DESIGN-2259.md`](../../DESIGN-2259.md).
+
+### Context
+
+- A state query replays the body. A list of entities needs a replay of
+  each one.
+- A store outside Postgres cannot commit with the decision. That is the
+  in-doubt commit problem of Golem (golemcloud/golem#1514).
+- Restate writes each state change as a journal entry and applies its table
+  in the same step. This amendment follows that model.
+
+### The new event variant
+
+- The new variant is `SideEffectKind::EntityState`. It is a kind of
+  `SideEffectRecorded`, so the whole side-effect path applies: the codec,
+  erasure, positional replay, fork, export and the SQLite runtime.
+- The loop records a snapshot at the start of each run, after each op, and
+  before a delete ends the run. The name is `harvest.entity.state`, or
+  `harvest.entity.deleted` for the last one. The value is
+  `{"state": <S>, "stats": <EntityStats>}`.
+- Replay consumes each snapshot and adopts its state and stats. So replay
+  rebuilds the state from the events.
+- The matcher is tolerant, as the deadline probe is. A history from before
+  this amendment has another event at each snapshot position, so it records
+  and reads nothing there. An old run records snapshots from its live
+  frontier on.
+- Only the entity loop records the kind. A `Custom` side effect with the
+  same name is user data.
+- An older worker cannot decode the kind. Upgrade every worker before entity
+  runs move to the new release.
+
+### The projection and the trigger change
+
+- Table `harvest_entity_state` holds one row for each
+  `(workflow_name, workflow_id)`: the run, the event position, a deleted
+  flag and the snapshot value, byte for byte.
+- A new trigger on `harvest_events`, `harvest_entity_state_projection_trg`,
+  runs `AFTER INSERT`. Its `WHEN` clause selects entity snapshots, so other
+  events skip it. It writes the row in the transaction that inserts the
+  event. A decision, a reset, a fork and a shard move all insert events, so
+  each one keeps the row and history in step.
+- A row of the same run moves forward by event id. A row of another run
+  moves when the new `harvest_events.id` is larger. Worker clocks set
+  `created_at`, so that column cannot order runs.
+- A foreign key removes the row with its run.
+- The append-only guard does not change. The projection is not
+  `harvest_events`, so it is not a sanctioned rewrite.
+- The partition layout changes reinstall the new trigger with the guard.
+  The operator-trigger refusal exempts it by its whole identity.
+
+### Continue-as-new
+
+- The checkpoint input still carries the state itself. A version number of
+  the table cannot rebuild the start state on replay or reset.
+- The first snapshot of a run is its start state. It moves the projection to
+  the new run at its first decision. A reset or a re-run keeps the input, so
+  its first snapshot is the start state of its source run.
+
+### Invariants
+
+- `codec_rotation::CODEC_COLUMNS` lists `harvest_entity_state.snapshot`.
+- Erasure tombstones the snapshot of each row that the erased run wrote.
+  The row of a live run does not change when an older run is erased.
+
+### Reads
+
+- `autumn_harvest::entity_state` reads a row by key, reads the row of a run
+  and lists the rows of an entity type.
+- A `harvest.entity.state` or `harvest.entity.stats` query on a running run
+  reads the row of that run. It replays when the run wrote no row, when a
+  later run holds the row, and when the row holds no full snapshot: an
+  erased, an offloaded or an omitted one. A terminal run always replays, so
+  the checks of issue #612 still apply.
+
+### Deadlocks
+
+Ops have no replies. A handler never waits for another entity, so the
+A→B→A deadlock class of Restate cannot occur. A future reply must not let a
+handler wait on a key that can wait on it.
+
+### SQLite-backend parity plan
+
+The SQLite backend cannot run an entity today, because it has no queries.
+When it gains queries:
+
+1. Add `harvest_entity_state` to `autumn-harvest-sqlite/src/schema.rs`.
+2. Write the row in the transaction that appends the snapshot event. SQLite
+   has one writer, so an `AFTER INSERT` trigger there gives the same
+   atomicity.
+3. Keep the SQLite append-only guard as it is. It refuses every `UPDATE`.
+4. Port the crash-at-every-step test and the reset test.
+
+### Consequences
+
+- Each op adds one event of the state size. The loop counts the snapshot
+  bytes in its byte budget, so it checkpoints sooner. Keep state small.
+- A state that does not serialize fails the run at the first snapshot, not
+  at a checkpoint.
+- A state past the side-effect cap or the depth cap is not stored. The loop
+  records `{"omitted": "too_large" | "too_deep", "stats": ...}` in its place,
+  so the history stays loadable. Replay keeps its own state at that marker,
+  and a query replays.
+- A cancelled scope captures a snapshot as it captures a side effect. Replay
+  of the scope reads the captured snapshot.
+- A shard move rebuilds the row on the target from the copied events. An
+  aborted move gives the row back to the runs that stay. The cutover deletes
+  the row of the sealed source run.
+- A recorded snapshot that does not decode as the state type is a
+  non-determinism error. Change the state type as a versioned workflow
+  change.
+
+### Alternatives considered
+
+- **A new top-level `WorkflowEvent` variant.** Rejected: a new command and
+  parallel arms in about 30 files. A missed arm is a silent replay bug.
+- **`ctx.patched` as the gate.** Rejected: a run with a signal at the gate
+  reads the old branch, and every signal-with-start run has one.
+- **An upsert in Rust at each insert site.** Rejected: a new insert path can
+  forget it. The shard move inserts with raw SQL.
+

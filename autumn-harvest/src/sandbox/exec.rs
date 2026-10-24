@@ -292,7 +292,10 @@ fn open_pidfd(pid: i32) -> Option<tokio::io::unix::AsyncFd<OwnedFd>> {
     let fd = i32::try_from(fd).ok().filter(|fd| *fd >= 0)?;
     // SAFETY: the descriptor is new, and nothing else owns it.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    tokio::io::unix::AsyncFd::with_interest(fd, tokio::io::Interest::READABLE).ok()
+    // SAFETY: the `AsyncFd` owns the descriptor. Nothing else closes it or
+    // replaces it while the `AsyncFd` lives.
+    unsafe { tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE) }
+        .ok()
 }
 
 /// Wait until the main process `pid` exits, and do not reap it.

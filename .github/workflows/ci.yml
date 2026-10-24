@@ -880,9 +880,16 @@ jobs:
         run: bash .github/ci/run-suites.sh run allos
       # ── Individual crate/example steps carried over from `test`, round-robin
       # assigned one shard each (see the job comment above) ─────────────────
+      # The lib test target needs about 8 GB to compile, and `integration`
+      # needs about 11 GB. One `--tests` build compiles both at the same time.
+      # That fills the 16 GB runner, and the runner shuts down (issue #2259).
+      # Compile the lib tests first, so the two never overlap.
       - name: Compile db-backed tests
         if: needs.changes.outputs.code == 'true' && matrix.shard == 0
-        run: cargo test -p autumn-harvest --all-features --tests --no-run
+        shell: bash
+        run: |
+          cargo test -p autumn-harvest --all-features --lib --no-run
+          cargo test -p autumn-harvest --all-features --tests --no-run
       # Issue #786: the claim/enqueue benchmark shares its harness with the
       # CI-gated budget assertion (`claim_budget_tests`, run Docker-backed via
       # the manifest in `test-db-linux`). Compile-checking it here keeps the
@@ -896,11 +903,14 @@ jobs:
       # restricting this one costs no coverage.
       # The task-queue hygiene bench (issue #1811) shares the claim harness
       # and includes the hygiene migration by path, so it rots with either.
+      # The decision fence bench (issue #2248) calls the fence and append
+      # APIs, so it rots with them.
       - name: Compile claim/enqueue benchmark (issue #786)
         if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 1
         run: |
           cargo bench -p autumn-harvest --features db --bench claim_bench --no-run
           cargo bench -p autumn-harvest --features db --bench task_queue_hygiene_bench --no-run
+          cargo bench -p autumn-harvest --features db --bench decision_fence_bench --no-run
       # Same bit-rot protection for the end-to-end suite (issue #941), and for
       # the same reason: nothing else compiles a bench TARGET. `--tests` above
       # covers the shared harness module, but not `e2e_bench.rs` itself -- and
@@ -1073,6 +1083,22 @@ jobs:
       - name: "Run agent-loop-hit-rate example tests (issue #2007)"
         if: needs.changes.outputs.code == 'true' && matrix.shard == 2
         run: cargo test -p agent-loop-hit-rate --bins
+      # Issue #2257. The unit tests and the SQLite tests run offline. The
+      # Postgres target runs from its `linux` manifest row, and the
+      # measurement runs by hand (see the crate README).
+      - name: "Run history-load-gate example tests (issue #2257)"
+        if: needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p history-load-gate --lib --bins
+      # Issue #2258. The module tests of the owner disk cache need its
+      # feature. The worker tests run from their `linux` manifest row.
+      - name: "Run owner disk cache module tests (issue #2258)"
+        if: runner.os == 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo test -p autumn-harvest --features owner-disk-cache --lib owner_disk_cache
+      # The other OSes compile the feature: the file lock and the directory
+      # check have a path of their own there.
+      - name: "Check owner disk cache feature (issue #2258)"
+        if: runner.os != 'Linux' && needs.changes.outputs.code == 'true' && matrix.shard == 2
+        run: cargo check -p autumn-harvest --features owner-disk-cache --lib
       # The autoresearch capstone. Its suite is offline: a simulated
       # trainer, a scripted researcher, seeded simulation sweeps and SQLite
       # end-to-end runs. Linux only, because the tests drive `git` and `sh`.
@@ -2160,6 +2186,10 @@ jobs:
         run: cargo clippy -p standalone-quickstart --all-targets -- -D warnings
       - name: "Clippy agent-loop-hit-rate example (issue #2007)"
         run: cargo clippy -p agent-loop-hit-rate --all-targets -- -D warnings
+      # `--no-deps` scopes the deny to the example. Without the `testing`
+      # feature, the core crate carries a pre-existing dead-code warning.
+      - name: "Clippy history-load-gate example (issue #2257)"
+        run: cargo clippy -p history-load-gate --all-targets --no-deps -- -D warnings
       # Same issue #962 rule as the verify and redis crates in `clippy-crates`:
       # a new workspace member gets NO clippy coverage without its own step.
       # `--no-deps` scopes the deny to the example, because it depends on
@@ -2308,6 +2338,11 @@ jobs:
         # in a `HarvestResult` function (E0277; no `From<String>`).
         # See scripts/check-child-idempotency-examples.sh.
         run: ./scripts/check-child-idempotency-examples.sh
+      - name: Check chapter 3 flagship examples compile
+        # Chapter 3 shows three timer workflows a reader pastes verbatim.
+        # Nothing compiled them. The guard keeps them in step with the API.
+        # See scripts/check-durable-timers-examples.sh.
+        run: ./scripts/check-durable-timers-examples.sh
 
   # One check for branch protection to require in place of every leg above.
   # A skipped leg (a draft PR) counts as a pass, as a skipped job does

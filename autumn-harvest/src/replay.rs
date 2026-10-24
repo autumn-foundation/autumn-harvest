@@ -11,6 +11,7 @@
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::error::TimeoutType;
 use crate::event::{SideEffectKind, WorkflowEvent};
@@ -18,6 +19,39 @@ use crate::types::{
     ActivityExecId, ExecutionId, ExternalActivityToken, ExternalAwaitId, ExternalCancelId,
     ExternalSignalId, ParentClosePolicy, UpdateId,
 };
+
+/// Hasher for event indices.
+///
+/// An event index is a position in the recorded history, not attacker-chosen
+/// data, so the default `SipHash` `DoS` resistance buys nothing here. The
+/// activity scan calls [`HistoryMatcher::is_consumed`] once per scanned event,
+/// so hashing cost multiplies with the width of a fan-out. A multiplicative
+/// hash spreads sequential indices over the table.
+#[derive(Default)]
+struct EventIndexHasher(u64);
+
+impl Hasher for EventIndexHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.write_u64(u64::from(*byte));
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0 ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+}
+
+/// A set of event indices, hashed with [`EventIndexHasher`].
+type EventIndexSet = HashSet<usize, BuildHasherDefault<EventIndexHasher>>;
 
 /// Result of matching a workflow command against the event history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,6 +504,27 @@ pub enum ContinueAsNewMatch {
     Frontier,
 }
 
+/// The replayed state of a keyed-entity snapshot (issue #2259).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntitySnapshotMatch {
+    /// The cursor held a snapshot of the expected name. It was consumed.
+    Matched {
+        /// The recorded snapshot value.
+        value: Value,
+    },
+    /// The cursor held another event. The history predates issue #2259, so
+    /// this position records no snapshot. The cursor is left in place.
+    NotRecorded,
+    /// The cursor held a snapshot of another name. The cursor is left in
+    /// place.
+    Diverged {
+        /// The name of the recorded snapshot.
+        actual: String,
+    },
+    /// The cursor is past the recorded history. The caller records live.
+    Frontier,
+}
+
 /// Marker name recorded by `ctx.patched(patch_id)` (issue #687).
 pub(crate) fn patch_marker_name(patch_id: &str) -> String {
     format!("patch:{patch_id}")
@@ -664,8 +719,8 @@ pub(crate) struct ViewCut {
 pub struct HistoryMatcher {
     events: Vec<WorkflowEvent>,
     cursor: usize,
-    consumed_out_of_order_events: HashSet<usize>,
-    consumed_signal_events: HashSet<usize>,
+    consumed_out_of_order_events: EventIndexSet,
+    consumed_signal_events: EventIndexSet,
     pending_signals: VecDeque<(String, Value, usize)>,
     /// External signals drained before their natural cursor position,
     /// e.g. when signal events appear before `ActivityScheduled` or
@@ -680,7 +735,7 @@ pub struct HistoryMatcher {
     /// `WorkflowExecutionResumed`). These are pure operator-lifecycle no-ops:
     /// they have no workflow-command counterpart and must never flag
     /// non-determinism, so every scan loop skips them via [`Self::is_consumed`].
-    transparent_events: HashSet<usize>,
+    transparent_events: EventIndexSet,
     /// Event indices of the exact `SignalReceived` events that lost a
     /// signal-or-deadline race (issue #476): for each race whose `TimerFired`
     /// precedes a matching signal, the **first** such signal event is the
@@ -834,7 +889,7 @@ impl HistoryMatcher {
         // A decision boundary (issue #1833) is transparent too. It carries
         // no command, so replay must read a history the same way with or
         // without boundaries.
-        let mut transparent_events: HashSet<usize> = events
+        let mut transparent_events: EventIndexSet = events
             .iter()
             .enumerate()
             .filter(|(_, e)| Self::is_command_free_bookkeeping(e))
@@ -929,8 +984,8 @@ impl HistoryMatcher {
         Self {
             events,
             cursor: 0,
-            consumed_out_of_order_events: HashSet::new(),
-            consumed_signal_events: HashSet::new(),
+            consumed_out_of_order_events: EventIndexSet::default(),
+            consumed_signal_events: EventIndexSet::default(),
             pending_signals: VecDeque::new(),
             pending_external_signals: Vec::new(),
             pending_external_cancels: Vec::new(),
@@ -1190,7 +1245,7 @@ impl HistoryMatcher {
     /// recognize; it leaves that event opaque.
     fn superseded_cycle_tail_indices(
         events: &[WorkflowEvent],
-        transparent_events: &HashSet<usize>,
+        transparent_events: &EventIndexSet,
     ) -> Vec<usize> {
         let mut indices = Vec::new();
         let mut idx = events.len();
@@ -5950,6 +6005,40 @@ impl HistoryMatcher {
             // history-count-only for the recorded portion of a pre-#772 history,
             // and a user `Now` is left for its own strict read to consume.
             _ => SideEffectNowMatch::NotRecorded,
+        }
+    }
+
+    /// Replay a keyed-entity state snapshot named `name` (issue #2259).
+    ///
+    /// The matcher is tolerant, as the deadline probe is. A history from
+    /// before issue #2259 has another event here, so the call reads
+    /// [`EntitySnapshotMatch::NotRecorded`] and leaves the cursor in place.
+    /// The next real command still finds a true divergence.
+    ///
+    /// Only [`SideEffectKind::EntityState`] matches. A `Custom` side effect
+    /// with the same name is user data.
+    #[must_use]
+    pub fn match_entity_snapshot(&mut self, name: &str) -> EntitySnapshotMatch {
+        if !self.prepare_match() {
+            return EntitySnapshotMatch::Frontier;
+        }
+        match &self.events[self.cursor] {
+            WorkflowEvent::SideEffectRecorded {
+                kind: SideEffectKind::EntityState,
+                name: recorded,
+                value,
+            } => {
+                if recorded.as_deref() != Some(name) {
+                    return EntitySnapshotMatch::Diverged {
+                        actual: recorded.clone().unwrap_or_default(),
+                    };
+                }
+                let value = value.clone();
+                self.cursor += 1;
+                self.advance_to_next_unconsumed_event();
+                EntitySnapshotMatch::Matched { value }
+            }
+            _ => EntitySnapshotMatch::NotRecorded,
         }
     }
 

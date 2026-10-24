@@ -241,6 +241,9 @@ async fn a_bump_expires_every_owner_lease_and_keeps_the_epochs() {
     use autumn_harvest::decision_owner::{
         self, Acquisition, DecisionPartition, OwnerHolder, OwnerLeaseConfig,
     };
+    // The registry is global. A pin of shard 0 by a parallel test would
+    // fence this test's lease writes.
+    let _serial = registry_guard().await;
     let (url, _db) = require_db!("owner_bump");
     let mut conn = connect(&url).await;
     ensure_generation_row(&mut conn, ShardId::new(0))
@@ -310,6 +313,688 @@ async fn a_bump_expires_every_owner_lease_and_keeps_the_epochs() {
             other => panic!("the bump frees {}: {other:?}", t.partition()),
         }
     }
+}
+
+/// The shard of the DR batch tests (issue #2296). The registry is global.
+/// A shard that no other test uses keeps their pins away from the
+/// acquisitions of other tests.
+const BATCH_SHARD: ShardId = ShardId::new(61);
+
+/// The number of owner rows of `ps` that have a holder.
+async fn held_rows(conn: &mut AsyncPgConnection, ps: &[i32]) -> i64 {
+    #[derive(diesel::QueryableByName)]
+    struct Held {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    diesel::sql_query(
+        "SELECT count(*) AS n FROM harvest_decision_owner \
+         WHERE partition = ANY($1) AND holder IS NOT NULL",
+    )
+    .bind::<diesel::sql_types::Array<diesel::sql_types::Integer>, _>(ps)
+    .get_result::<Held>(conn)
+    .await
+    .expect("read the owner rows")
+    .n
+}
+
+/// Issue #2296: a batch acquisition takes the generation row first. A
+/// region that lost write authority takes no row of the batch. Its owner
+/// loop adopts nothing and asks for no rescan.
+#[tokio::test]
+async fn a_fenced_region_takes_no_row_of_a_batch() {
+    use autumn_harvest::decision_owner::{
+        self, DecisionPartition, EnableOwnerMode, OwnedPartitions, OwnerHolder, OwnerLeaseConfig,
+        OwnerLoop,
+    };
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("owner_batch_fenced");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, BATCH_SHARD)
+        .await
+        .expect("provision");
+    FenceRegistry::clear();
+    FenceRegistry::register(BATCH_SHARD, ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    let holder = OwnerHolder::for_worker("fenced-region");
+    let config = OwnerLeaseConfig::default();
+    let p = |n: u16| DecisionPartition::new(n).expect("in range");
+
+    // The control: at the pinned generation, the batch takes its row.
+    let before =
+        decision_owner::acquire_many(&mut conn, BATCH_SHARD, &holder, &[p(4)], &config).await;
+    bump_generation(&mut conn, BATCH_SHARD, "promote", "oncall")
+        .await
+        .expect("bump");
+    let after =
+        decision_owner::acquire_many(&mut conn, BATCH_SHARD, &holder, &[p(5), p(6)], &config).await;
+    decision_owner::enable_owner_mode(
+        &mut conn,
+        &EnableOwnerMode {
+            force: true,
+            ..EnableOwnerMode::default()
+        },
+    )
+    .await
+    .expect("enable owner mode");
+    let mut owner_loop = OwnerLoop::new(
+        BATCH_SHARD,
+        "fenced-loop",
+        config,
+        std::sync::Arc::new(OwnedPartitions::default()),
+    );
+    let tick = owner_loop.tick(&mut conn).await;
+    FenceRegistry::clear();
+
+    let before = before.expect("the pinned generation passes");
+    assert_eq!(before.acquired.len(), 1, "{before:?}");
+    assert!(
+        matches!(
+            after,
+            Err(autumn_harvest::error::HarvestError::ShardFenced { .. })
+        ),
+        "{after:?}"
+    );
+    assert_eq!(
+        held_rows(&mut conn, &[5, 6]).await,
+        0,
+        "the fenced batch took no row"
+    );
+    let tick = tick.expect("a fenced tick is no error");
+    assert!(tick.acquired.is_empty(), "{:?}", tick.acquired);
+    assert!(!tick.more, "a fenced tick asks for no rescan");
+}
+
+/// Issue #2296: the generation row is the one lock wait of a batch. A
+/// bump holds it, so a batch that waits past its lock timeout lists each
+/// partition as busy and takes no row.
+#[tokio::test]
+async fn a_batch_that_waits_out_a_bump_is_busy() {
+    use autumn_harvest::decision_owner::{self, DecisionPartition, OwnerHolder, OwnerLeaseConfig};
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("owner_batch_busy");
+    let mut conn = connect(&url).await;
+    let generation = ensure_generation_row(&mut conn, BATCH_SHARD)
+        .await
+        .expect("provision");
+    FenceRegistry::clear();
+    FenceRegistry::register(BATCH_SHARD, generation).expect("no conflicting pin in this test");
+
+    let mut bump = connect(&url).await;
+    bump.batch_execute(&format!(
+        "BEGIN; SELECT 1 FROM harvest_shard_generation WHERE shard_id = {} FOR UPDATE",
+        BATCH_SHARD.as_i32()
+    ))
+    .await
+    .expect("hold the generation row");
+    let ps: Vec<DecisionPartition> = [7_u16, 8]
+        .into_iter()
+        .map(|n| DecisionPartition::new(n).expect("in range"))
+        .collect();
+    let config =
+        OwnerLeaseConfig::default().with_lock_timeout(std::time::Duration::from_millis(300));
+    let result = decision_owner::acquire_many(
+        &mut conn,
+        BATCH_SHARD,
+        &OwnerHolder::for_worker("busy-region"),
+        &ps,
+        &config,
+    )
+    .await;
+    bump.batch_execute("ROLLBACK").await.expect("release");
+    FenceRegistry::clear();
+
+    let got = result.expect("a lock miss is no error");
+    assert_eq!(got.busy, ps, "{got:?}");
+    assert!(got.acquired.is_empty() && got.held.is_empty(), "{got:?}");
+    assert_eq!(
+        held_rows(&mut conn, &[7, 8]).await,
+        0,
+        "the batch took no row"
+    );
+}
+
+/// Issue #2248: with DR fencing on, an owner decision sends the owner fence
+/// once. The start fence holds the owner row until the commit, so a second
+/// owner fence cannot fail (issue #2252). Since issue #2255 the fence is the
+/// fused function, so the test counts both fence functions.
+#[tokio::test]
+async fn a_dr_fenced_owner_decision_sends_one_owner_fence() {
+    use autumn_harvest::decision_owner::{
+        self, Acquisition, DecisionPartition, OwnerHolder, OwnerLeaseConfig,
+    };
+    use autumn_harvest::error::HarvestError;
+    #[derive(diesel::QueryableByName)]
+    struct Calls {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    async fn fence_calls(conn: &mut AsyncPgConnection) -> Result<i64, HarvestError> {
+        let calls: Calls = diesel::sql_query(
+            "SELECT COALESCE(SUM(calls), 0)::bigint AS n FROM pg_stat_xact_user_functions \
+             WHERE funcname IN ('harvest_decision_owner_fence', 'harvest_decision_fence')",
+        )
+        .get_result(conn)
+        .await
+        .map_err(autumn_harvest::error::database_error)?;
+        Ok(calls.n)
+    }
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("owner_once");
+    let mut conn = connect(&url).await;
+    conn.batch_execute("SET track_functions = 'all'")
+        .await
+        .expect("count function calls");
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .expect("provision");
+    let p = DecisionPartition::new(17).expect("in range");
+    let owner = match decision_owner::acquire(
+        &mut conn,
+        ShardId::new(0),
+        &OwnerHolder::for_worker("once"),
+        p,
+        &OwnerLeaseConfig::default(),
+    )
+    .await
+    .expect("acquire")
+    {
+        Acquisition::Acquired(t) => t,
+        other => panic!("acquire {p}: {other:?}"),
+    };
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, run_id, shard_id, input, queue_name, state) \
+         VALUES ($1, 'once', $2, gen_random_uuid(), 0, '{}'::jsonb, 'once', 'RUNNING')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(format!("once-{}", uuid::Uuid::new_v4()))
+    .execute(&mut conn)
+    .await
+    .expect("seed an execution");
+
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    let calls = decision_owner::scope_decision(async {
+        let _ = decision_owner::pin_decision(Some(owner.clone()));
+        conn.transaction::<_, HarvestError, _>(async |conn| {
+            let before = fence_calls(conn).await?;
+            autumn_harvest::replication::assert_decision_fence(conn).await?;
+            let id = decision_owner::conn_id(conn);
+            decision_owner::fenced_scope(id, async {
+                for n in 0..2 {
+                    let next = autumn_harvest::store::next_event_id_for(conn, exec_id).await?;
+                    let event = autumn_harvest::event::WorkflowEvent::SignalReceived {
+                        signal_name: "once".to_string(),
+                        payload: serde_json::json!(n),
+                    };
+                    autumn_harvest::store::append_events(conn, exec_id, &[event], next).await?;
+                }
+                Ok::<_, HarvestError>(())
+            })
+            .await?;
+            Ok(fence_calls(conn).await? - before)
+        })
+        .await
+    })
+    .await;
+    FenceRegistry::clear();
+    assert_eq!(
+        calls.expect("the owner commits"),
+        1,
+        "the start fence covers both appends"
+    );
+}
+
+/// Issue #2255: with DR fencing on, an owner decision fences the generation
+/// row and the owner row in one statement. Its appends then check neither
+/// row again, because the start fence holds both locks until the commit.
+#[tokio::test]
+async fn a_dr_fenced_owner_decision_sends_one_fence_statement() {
+    use autumn_harvest::decision_owner::{
+        self, Acquisition, DecisionPartition, OwnerHolder, OwnerLeaseConfig,
+    };
+    use autumn_harvest::error::HarvestError;
+    #[derive(diesel::QueryableByName)]
+    struct Counts {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        fused: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        owner_only: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        generation_reads: i64,
+    }
+    async fn counts(conn: &mut AsyncPgConnection) -> Result<(i64, i64, i64), HarvestError> {
+        let c: Counts = diesel::sql_query(
+            "SELECT \
+               (SELECT COALESCE(SUM(calls), 0) FROM pg_stat_xact_user_functions \
+                 WHERE funcname = 'harvest_decision_fence')::bigint AS fused, \
+               (SELECT COALESCE(SUM(calls), 0) FROM pg_stat_xact_user_functions \
+                 WHERE funcname = 'harvest_decision_owner_fence')::bigint AS owner_only, \
+               (SELECT COALESCE(SUM(COALESCE(idx_scan, 0) + COALESCE(seq_scan, 0)), 0) \
+                  FROM pg_stat_xact_user_tables \
+                 WHERE relname = 'harvest_shard_generation')::bigint AS generation_reads",
+        )
+        .get_result(conn)
+        .await
+        .map_err(autumn_harvest::error::database_error)?;
+        Ok((c.fused, c.owner_only, c.generation_reads))
+    }
+
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("fused_fence");
+    let mut conn = connect(&url).await;
+    conn.batch_execute("SET track_functions = 'all'")
+        .await
+        .expect("count function calls");
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .expect("provision");
+    let p = DecisionPartition::new(19).expect("in range");
+    let owner = match decision_owner::acquire(
+        &mut conn,
+        ShardId::new(0),
+        &OwnerHolder::for_worker("fused"),
+        p,
+        &OwnerLeaseConfig::default(),
+    )
+    .await
+    .expect("acquire")
+    {
+        Acquisition::Acquired(t) => t,
+        other => panic!("acquire {p}: {other:?}"),
+    };
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, run_id, shard_id, input, queue_name, state) \
+         VALUES ($1, 'fused', $2, gen_random_uuid(), 0, '{}'::jsonb, 'fused', 'RUNNING')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(format!("fused-{}", uuid::Uuid::new_v4()))
+    .execute(&mut conn)
+    .await
+    .expect("seed an execution");
+
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    let deltas = decision_owner::scope_decision(async {
+        let _ = decision_owner::pin_decision(Some(owner.clone()));
+        conn.transaction::<_, HarvestError, _>(async |conn| {
+            let before = counts(conn).await?;
+            autumn_harvest::replication::assert_decision_fence(conn).await?;
+            let id = decision_owner::conn_id(conn);
+            decision_owner::fenced_scope(id, async {
+                for n in 0..2 {
+                    let next = autumn_harvest::store::next_event_id_for(conn, exec_id).await?;
+                    let event = autumn_harvest::event::WorkflowEvent::SignalReceived {
+                        signal_name: "fused".to_string(),
+                        payload: serde_json::json!(n),
+                    };
+                    autumn_harvest::store::append_events(conn, exec_id, &[event], next).await?;
+                }
+                Ok::<_, HarvestError>(())
+            })
+            .await?;
+            let after = counts(conn).await?;
+            Ok((after.0 - before.0, after.1 - before.1, after.2 - before.2))
+        })
+        .await
+    })
+    .await;
+    FenceRegistry::clear();
+    let (fused, owner_only, generation_reads) = deltas.expect("the owner commits");
+    assert_eq!(fused, 1, "one fused fence statement");
+    assert_eq!(owner_only, 0, "no separate owner fence");
+    assert_eq!(generation_reads, 1, "the appends do not read the row again");
+}
+
+/// Acquire partition `n` for a new holder, and seed one `RUNNING` execution
+/// on `shard` (issue #2255).
+async fn fused_fixture(
+    conn: &mut AsyncPgConnection,
+    n: u16,
+    shard: ShardId,
+) -> (autumn_harvest::decision_owner::OwnerTenure, ExecutionId) {
+    use autumn_harvest::decision_owner::{
+        self, Acquisition, DecisionPartition, OwnerHolder, OwnerLeaseConfig,
+    };
+    let p = DecisionPartition::new(n).expect("in range");
+    let tenure = match decision_owner::acquire(
+        conn,
+        ShardId::new(0),
+        &OwnerHolder::for_worker(&format!("fused-{n}")),
+        p,
+        &OwnerLeaseConfig::default(),
+    )
+    .await
+    .expect("acquire")
+    {
+        Acquisition::Acquired(t) => t,
+        other => panic!("acquire {p}: {other:?}"),
+    };
+    let exec_id = ExecutionId::new_for_shard(shard);
+    diesel::sql_query(
+        "INSERT INTO harvest_workflow_executions \
+             (id, workflow_name, workflow_id, run_id, shard_id, input, queue_name, state) \
+         VALUES ($1, 'fused', $2, gen_random_uuid(), $3, '{}'::jsonb, 'fused', 'RUNNING')",
+    )
+    .bind::<diesel::sql_types::Uuid, _>(exec_id.as_uuid())
+    .bind::<diesel::sql_types::Text, _>(format!("fused-{}", uuid::Uuid::new_v4()))
+    .bind::<diesel::sql_types::Integer, _>(shard.as_i32())
+    .execute(conn)
+    .await
+    .expect("seed an execution");
+    (tenure, exec_id)
+}
+
+/// Issue #2255: the fused fence still fails a stale generation closed with
+/// `ShardFenced`, not with `OwnershipLost`.
+#[tokio::test]
+async fn a_fused_fence_reports_a_bumped_generation_as_shard_fenced() {
+    use autumn_harvest::decision_owner;
+    use autumn_harvest::error::HarvestError;
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("fused_bumped");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .expect("provision");
+    let (tenure, _) = fused_fixture(&mut conn, 23, ShardId::new(0)).await;
+    autumn_harvest::replication::bump_generation(&mut conn, ShardId::new(0), "test", "test")
+        .await
+        .expect("bump");
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    let outcome = decision_owner::scope_decision(async {
+        let _ = decision_owner::pin_decision(Some(tenure.clone()));
+        conn.transaction::<_, HarvestError, _>(async |conn| {
+            autumn_harvest::replication::assert_decision_fence(conn).await
+        })
+        .await
+    })
+    .await;
+    FenceRegistry::clear();
+    assert!(
+        matches!(
+            outcome,
+            Err(HarvestError::ShardFenced {
+                pinned: 0,
+                current: Some(1),
+                ..
+            })
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// Issue #2255: the fused fence waits for the generation row with no bound,
+/// as the separate DR check did. A DR bump that queues behind a long
+/// transaction then fences no healthy owner.
+#[tokio::test]
+async fn a_fused_fence_waits_for_a_held_generation_row() {
+    use autumn_harvest::decision_owner;
+    use autumn_harvest::error::HarvestError;
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("fused_wait");
+    let mut conn = connect(&url).await;
+    ensure_generation_row(&mut conn, ShardId::new(0))
+        .await
+        .expect("provision");
+    let (tenure, _) = fused_fixture(&mut conn, 29, ShardId::new(0)).await;
+    let mut holder = connect(&url).await;
+    holder.batch_execute("BEGIN").await.expect("begin");
+    holder
+        .batch_execute(
+            "SELECT generation FROM harvest_shard_generation WHERE shard_id = 0 FOR UPDATE",
+        )
+        .await
+        .expect("hold the generation row");
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        holder.batch_execute("COMMIT").await.expect("release");
+    });
+    FenceRegistry::clear();
+    FenceRegistry::register(ShardId::new(0), ShardGeneration::new(0))
+        .expect("no conflicting pin in this test");
+    let started = std::time::Instant::now();
+    let outcome = decision_owner::scope_decision(async {
+        let _ = decision_owner::pin_decision(Some(tenure.clone()));
+        conn.transaction::<_, HarvestError, _>(async |conn| {
+            autumn_harvest::replication::assert_decision_fence(conn).await
+        })
+        .await
+    })
+    .await;
+    let waited = started.elapsed();
+    FenceRegistry::clear();
+    release.await.expect("the holder commits");
+    outcome.expect("a healthy owner passes after the wait");
+    assert!(
+        waited >= std::time::Duration::from_millis(500),
+        "the fence waited for the row: {waited:?}"
+    );
+}
+
+/// Issue #2255: an append skips its generation check only for the row that
+/// the start fence locked. A colocated shard with its own pinned row still
+/// checks that row at each append.
+#[tokio::test]
+async fn a_colocated_shard_with_its_own_generation_row_still_checks_it() {
+    use autumn_harvest::decision_owner;
+    use autumn_harvest::error::HarvestError;
+    #[derive(diesel::QueryableByName)]
+    struct Reads {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    async fn reads(conn: &mut AsyncPgConnection) -> Result<i64, HarvestError> {
+        let r: Reads = diesel::sql_query(
+            "SELECT COALESCE(SUM(COALESCE(idx_scan, 0) + COALESCE(seq_scan, 0)), 0)::bigint AS n \
+             FROM pg_stat_xact_user_tables WHERE relname = 'harvest_shard_generation'",
+        )
+        .get_result(conn)
+        .await
+        .map_err(autumn_harvest::error::database_error)?;
+        Ok(r.n)
+    }
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("fused_colocated");
+    let mut conn = connect(&url).await;
+    let (zero, five) = (ShardId::new(0), ShardId::new(5));
+    for shard in [zero, five] {
+        ensure_generation_row(&mut conn, shard)
+            .await
+            .expect("provision");
+    }
+    let (tenure, exec_id) = fused_fixture(&mut conn, 31, five).await;
+    FenceRegistry::clear();
+    FenceRegistry::register(zero, ShardGeneration::new(0)).expect("pin zero");
+    FenceRegistry::register(five, ShardGeneration::new(0)).expect("pin five");
+    FenceRegistry::colocate(&[zero, five]);
+    let delta = decision_owner::scope_decision(async {
+        let _ = decision_owner::pin_decision(Some(tenure.clone()));
+        conn.transaction::<_, HarvestError, _>(async |conn| {
+            let before = reads(conn).await?;
+            autumn_harvest::replication::assert_decision_fence(conn).await?;
+            let id = decision_owner::conn_id(conn);
+            decision_owner::fenced_scope(id, async {
+                for n in 0..2 {
+                    let next = autumn_harvest::store::next_event_id_for(conn, exec_id).await?;
+                    let event = autumn_harvest::event::WorkflowEvent::SignalReceived {
+                        signal_name: "fused".to_string(),
+                        payload: serde_json::json!(n),
+                    };
+                    autumn_harvest::store::append_events(conn, exec_id, &[event], next).await?;
+                }
+                Ok::<_, HarvestError>(())
+            })
+            .await?;
+            Ok(reads(conn).await? - before)
+        })
+        .await
+    })
+    .await;
+    FenceRegistry::clear();
+    assert_eq!(
+        delta.expect("the owner commits"),
+        3,
+        "the start fence reads row 0, and each append reads row 5"
+    );
+}
+
+/// Keeps the persist phases of a worker (issue #2248).
+#[derive(Default)]
+struct PhaseRecorder {
+    phases: std::sync::Mutex<Vec<(autumn_harvest::telemetry::PersistPhase, f64)>>,
+}
+
+impl autumn_harvest::telemetry::MetricsRecorder for PhaseRecorder {
+    fn record_persist_phase(
+        &self,
+        phase: autumn_harvest::telemetry::PersistPhase,
+        _shard: u16,
+        seconds: f64,
+    ) {
+        self.phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((phase, seconds));
+    }
+}
+
+fn completes_at_once(
+    _ctx: &autumn_harvest::WorkflowContext,
+    _input: serde_json::Value,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + '_>,
+> {
+    Box::pin(async { Ok(serde_json::json!({ "ok": true })) })
+}
+
+/// Issue #2248: with DR fencing on, the decision persist of a real worker
+/// takes the generation row, and that time counts as the `fence` phase.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dr_fenced_decision_persist_records_its_fence_phase() {
+    use autumn_harvest::telemetry::PersistPhase;
+    let _serial = registry_guard().await;
+    let (url, _db) = require_db!("fencephase");
+    FenceRegistry::clear();
+    autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig {
+        fencing: DrFencing::Enabled,
+        sample_interval: std::time::Duration::from_millis(300),
+        watermark_retain: std::time::Duration::from_secs(3600),
+        slot_prefix: DR_PREFIX.to_string(),
+    });
+    let queue = "fence-phase";
+    let recorder = std::sync::Arc::new(PhaseRecorder::default());
+    let workflow = autumn_harvest::info::WorkflowInfo {
+        quota: None,
+        declared_activities: None,
+        declared_children: None,
+        mcp: false,
+        name: "fence_phase_wf",
+        module: "cross_region_dr_tests",
+        handler: completes_at_once,
+        execution_timeout: None,
+        chain_execution_timeout: None,
+        sla: None,
+        concurrency: None,
+        debounce: None,
+        batch: None,
+        throttle: None,
+        max_input_bytes: None,
+        owner: None,
+        runbook_url: None,
+        severity: None,
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        error_schema: None,
+        retry_policy: None,
+    };
+    let built = autumn_harvest::HarvestBuilder::new()
+        .workflows(vec![workflow])
+        .telemetry(autumn_harvest::telemetry::TelemetryConfig {
+            service_name: std::sync::Arc::from("cross_region_dr_tests"),
+            propagator: std::sync::Arc::new(autumn_harvest::telemetry::NoOpPropagator),
+            metrics: std::sync::Arc::clone(&recorder)
+                as std::sync::Arc<dyn autumn_harvest::telemetry::MetricsRecorder>,
+        })
+        .worker(
+            autumn_harvest::WorkerConfig::default()
+                .with_queues([queue])
+                .with_dr_fencing(true)
+                .with_replication_sample_interval(std::time::Duration::from_millis(300)),
+        )
+        .build();
+    let (registry, _dags, _schedules, worker_config) = built.into_worker_parts();
+    let mut config: autumn_harvest::worker::WorkerRuntimeConfig = worker_config.into();
+    config.poll_interval = std::time::Duration::from_millis(50);
+    config.shutdown_timeout = std::time::Duration::from_secs(5);
+    config.shard_assignments = vec![ShardId::new(0)];
+    let worker = std::sync::Arc::new(
+        autumn_harvest::worker::Worker::new(config, std::sync::Arc::new(registry))
+            .expect("worker builds"),
+    );
+    {
+        let mut conn = connect(&url).await;
+        ensure_generation_row(&mut conn, ShardId::new(0))
+            .await
+            .expect("provision");
+    }
+    let pool = dr_pool(&url);
+    let runner = std::sync::Arc::clone(&worker);
+    let run_pool = pool.clone();
+    let run = tokio::spawn(async move { runner.run(&run_pool).await });
+    eventually(
+        "the worker to pin its generation",
+        std::time::Duration::from_secs(30),
+        || async {
+            assert!(!run.is_finished(), "the worker stopped before it pinned");
+            FenceRegistry::expected(ShardId::new(0)).is_some()
+        },
+    )
+    .await;
+
+    let exec_id = ExecutionId::new_for_shard(ShardId::new(0));
+    let mut conn = connect(&url).await;
+    autumn_harvest::start_or_load_workflow_execution(
+        &mut conn,
+        autumn_harvest::StartWorkflowParams::new(
+            "fence_phase_wf",
+            "fence-phase-1",
+            exec_id,
+            serde_json::json!({}),
+            queue,
+        ),
+        None,
+    )
+    .await
+    .expect("start the workflow");
+    let fence_seen = || {
+        recorder
+            .phases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(phase, seconds)| *phase == PersistPhase::Fence && *seconds > 0.0)
+    };
+    eventually(
+        "a decision persist with a fence phase",
+        std::time::Duration::from_secs(30),
+        || async { fence_seen() },
+    )
+    .await;
+    worker.shutdown();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), run).await;
+    FenceRegistry::clear();
+    autumn_harvest::replication::set_dr_config(autumn_harvest::replication::DrConfig::default());
 }
 
 // ── AC2 / AC6(a): the fence ────────────────────────────────────────────────

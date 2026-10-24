@@ -141,6 +141,7 @@ mod debugger_tests;
 mod decision_boundary_db_tests;
 #[cfg(feature = "testing")]
 mod decision_boundary_replay_tests;
+mod decision_owner_claim_tests;
 mod decision_owner_db_tests;
 mod decision_owner_docs;
 #[cfg(feature = "db")]
@@ -165,6 +166,7 @@ mod durable_stream_tests;
 mod e2e_bench_cell_timeout_tests;
 mod e2e_bench_support;
 #[cfg(feature = "db")]
+mod entity_state_db_tests;
 mod entity_tests;
 mod event_batch_tests;
 mod event_partitioning_tests;
@@ -241,6 +243,9 @@ mod notify_post_commit_tests;
 mod notify_stage_probe_tests;
 mod otel_semconv_docs;
 mod otel_workflow_semconv_docs;
+mod owner_decider_tests;
+mod owner_disk_cache_db_tests;
+mod owner_failover_tests;
 mod owner_wake_db_tests;
 mod owner_wake_worker_tests;
 mod panic_containment_tests;

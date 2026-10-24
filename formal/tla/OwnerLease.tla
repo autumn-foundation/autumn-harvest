@@ -21,6 +21,8 @@
 (*   renew-bumps     A renewal adds 1 to the epoch.                        *)
 (*   memory-ack      The owner acknowledges a signal from memory.          *)
 (*                   This is restate#4566.                                 *)
+(*   unload-on-any-fence  A fenced commit unloads its worker, even when    *)
+(*                   the worker pins a newer epoch (issue #2294).          *)
 (*                                                                         *)
 (* The four nemeses of the issue are always on. Expire is a pause or a     *)
 (* clock jump: the lease ends while its holder still runs. An unloaded     *)
@@ -41,7 +43,8 @@ CONSTANTS
     Defect     \* "none", or the rule that the model breaks.
 
 Defects == {"none", "no-fence", "unlocked-fence", "holder-fence",
-            "keep-cache", "pipeline", "renew-bumps", "memory-ack"}
+            "keep-cache", "pipeline", "renew-bumps", "memory-ack",
+            "unload-on-any-fence"}
 
 ASSUME Defect \in Defects
 ASSUME MaxEpoch \in Nat
@@ -246,7 +249,8 @@ FenceTag(d) ==
 
 \* The commit reads the owner row FOR KEY SHARE and checks the fence. A
 \* fenced decision appends nothing. It unloads the worker only when the
-\* worker still pins the fenced epoch.
+\* worker still pins the fenced epoch. The unload-on-any-fence defect
+\* always unloads it.
 Lock(d) ==
     /\ d.phase = "read"
     /\ IF Passes(d)
@@ -254,7 +258,8 @@ Lock(d) ==
             /\ UNCHANGED <<pinned, cache, mem, seen>>
        ELSE /\ decs' = decs \ {d}
             /\ seen' = seen \cup {FenceTag(d)}
-            /\ IF d.epoch = pinned[d.by] THEN Unload(d.by)
+            /\ IF d.epoch = pinned[d.by] \/ Defect = "unload-on-any-fence"
+               THEN Unload(d.by)
                ELSE UNCHANGED <<pinned, cache, mem>>
     /\ UNCHANGED <<lease, owners, held, history, inbox, written, acked>>
 
@@ -323,6 +328,14 @@ NoAckedSignalLost == acked \subseteq inbox \cup Consumed \cup LiveMemory
 
 \* Only a takeover fences a commit. The holder never fences itself.
 OwnerNeverFencesItself == "self-fence" \notin seen
+
+\* The holder of a live row is pinned at the epoch of the row. A drain with
+\* no fault thus has a holder that can commit, or a row that a worker can
+\* take (issue #2294). It holds because only Acquire moves the epoch, and
+\* Acquire sets the holder and its pin together. A lost Renew needs a dead
+\* or moved row. A fenced Lock of an older tenure keeps the pin (R8).
+LiveRowHasAPinnedHolder ==
+    lease.live => lease.holder # NoWorker /\ pinned[lease.holder] = lease.epoch
 
 -----------------------------------------------------------------------------
 (* Reachability witness. OwnerLeaseReach.cfg expects TLC to violate it.    *)

@@ -322,6 +322,8 @@ pub async fn register_worker<S: std::hash::BuildHasher + Send + Sync>(
     // worker cannot read a keyed envelope, or lacks the target key.
     let labels_json =
         crate::payload_codec::advertise_codec_capability(&labels_json, registered_codec_key_ids);
+    // Issue #2252: the enable step of owner mode reads this label.
+    let labels_json = crate::decision_owner::advertise_owner_capability(&labels_json);
 
     let row = NewHarvestWorker {
         worker_id,
@@ -581,6 +583,7 @@ pub async fn heartbeat_worker_status(
     registered_codec_key_ids: &[String],
 ) -> HarvestResult<Option<String>> {
     let labels = crate::payload_codec::advertise_codec_capability(labels, registered_codec_key_ids);
+    let labels = crate::decision_owner::advertise_owner_capability(&labels);
     diesel::update(harvest_workers::table.find(worker_id))
         .set((
             // The shard database's own clock, never this host's

@@ -35,6 +35,8 @@ A waiting `ACCESS EXCLUSIVE` lock on any of them stalls the fleet.
 - `harvest_audit_log`: each operator action writes it.
 - `harvest_decision_owner`: in owner mode, each decision commit locks a row
   of it (issue #2251).
+- `harvest_decision_owner_mode`: in owner mode, each claim reads it (issue
+  #2252).
 - `harvest_workflow_outbox`: the application writes it in its own
   transactions, in the application database.
 

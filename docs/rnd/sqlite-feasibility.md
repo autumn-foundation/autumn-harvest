@@ -183,9 +183,10 @@ Classification rule:
 | `context` | diesel, listen/notify | (c) | Wakeup path; no push primitive exists. |
 | `cross_shard_child` | diesel, interval-sql, raw-pg-sql, raw-sql, row-lock, to_regclass | (c) | The cross-shard child relay (#956). Not a translation problem — the module exists **because** there is more than one database. A single-file SQLite deployment has exactly one shard, so the whole capability (placement, the relay, the outbox row) has nothing to do and would be dropped wholesale, exactly like the per-key fleet limits in `concurrency`. Its own mechanisms are mild (Diesel, one `FOR UPDATE` on the parent row before the terminal append — subsumed by the single write lock — a raw `INTERVAL` retry-backoff predicate that would become integer epoch ms exactly as `build_routing` does, and a `to_regclass('…')::text` probe that lets the relay skip quietly on a database whose migrations have not run — `sqlite_master` answers the same question); the coupling is architectural, not syntactic. |
 | `debounce` | diesel, skip-locked, to_regclass, raw-pg-sql, raw-sql | (c) | Scanner claim; `sqlite_master` probe for the table check. The upsert merges completion callbacks with JSONB `\|\|` over `'[]'::jsonb` defaults (JSON1 `json_patch`, as `batch` does). The pre-fire lock ordering lives in `quota_lock_order`. |
-| `decision_owner` | diesel, interval-sql, raw-pg-sql, raw-sql | (c) | Owner lease of each decision partition (#2251). The fence calls a PL/pgSQL function that takes the row `FOR KEY SHARE` with a bounded `lock_timeout`, and the drain is a `FOR UPDATE` wait. A single process has no second owner, so a SQLite port drops the lease and the fence. |
+| `decision_owner` | diesel, interval-sql, raw-pg-sql, raw-sql, skip-locked | (c) | Owner lease of each decision partition (#2251). The fence calls a PL/pgSQL function that takes the row `FOR KEY SHARE` with a bounded `lock_timeout`, and the drain is a `FOR UPDATE` wait. A batch acquisition skips locked rows with `SKIP LOCKED` (#2296). A single process has no second owner, so a SQLite port drops the lease and the fence. |
 | `dlq` | diesel, row-lock, raw-sql | (b) | Row lock on replay/redrive; subsumed by the single write lock. |
 | `durable_promise` | diesel | (b) | Settles through `signal::send_signal_idempotent`, so it has the `signal` row lock (issue #1985). |
+| `entity_state` | diesel, raw-pg-sql, raw-sql | (b) | Keyed-entity state projection (#2259). A PL/pgSQL `AFTER INSERT` trigger on `harvest_events` upserts the row, and the reads cast `$2::text`. SQLite has `AFTER INSERT` triggers and `ON CONFLICT DO UPDATE`, and its single writer gives the same atomicity. ADR 0006 records the port plan. |
 | `erase` | diesel, row-lock | (b) | Scrub holds a row lock; subsumed by the single write lock. |
 | `error` | diesel, skip-locked | (c) | **Comment-only consumer, like `concurrency` above and `store` below.** `SuspendedClaimAmbiguous` (issue #1182) represents the ambiguity a `SKIP LOCKED` claim probe can produce; a single-writer engine has no such ambiguity to represent, so the variant itself would not exist there. |
 | `event_batch` | diesel, skip-locked, to_regclass, raw-pg-sql, raw-sql | (c) | Scanner claim. |
@@ -205,6 +206,7 @@ Classification rule:
 | `models` | diesel | (c) | Postgres type layer (`Jsonb`/`Timestamptz`/`Interval`/`Uuid`); reimplemented wholesale. |
 | `mutex` | diesel, advisory-lock, to_regclass, interval-sql, raw-pg-sql, raw-sql | (b) | Advisory lock subsumed by the write lock; lease TTL as epoch ms. |
 | `notify` | diesel, listen/notify, raw-pg-sql, raw-sql | (c) | **The one mechanism with no SQLite equivalent at all.** Polling replaces it. |
+| `owner_disk_cache` | diesel | (c) | The owner-local disk cache (issue #2258, `owner-disk-cache` feature). It keeps decided histories in sealed local SQLite files, to save the Postgres history read of a cold decision. The diesel match is its reconcile lookup of `RUNNING` runs. The SQLite backend already reads history from a local file, so the module has nothing to save there and is unused, like `partition`. |
 | `partition_archive` | advisory-lock, diesel, raw-pg-sql, raw-sql, to_regclass | (c) | Export of aged `harvest_events` partitions before the drop (issue #2009). It exists only to feed `partition`'s drop path, which the SQLite backend does not have. The keyset read, the `to_jsonb` row lines, the `sha256` row checksum under `SHARE`, the export advisory lock and the marker probe all serve that path. Under the SQLite backend the module is unused, like `partition` itself. |
 | `partition` | diesel, raw-pg-sql, raw-sql | (c) | Native Postgres declarative partitioning of `harvest_events` (issue #958). Nothing to translate: SQLite has no partitioned tables, no `ATTACH PARTITION`, and no metadata-only `DROP TABLE`-as-reclamation — and it does not need them. The pain this module removes is dead-tuple bloat and autovacuum pressure from row-level retention deletes, neither of which a single-writer SQLite file exhibits in the same way (`DELETE` there is followed by an incremental vacuum the single writer already owns). The whole module is a no-op under the SQLite backend, which is why it is (c) rather than a port: it is Postgres-specific *relief for a Postgres-specific problem*. |
 | `pg_tls` | diesel | (c) | The transport for the connections Harvest opens itself: `sslmode`, TLS through rustls and the `tokio-postgres` connector. The diesel match is the `AsyncPgConnection` it returns. SQLite is a local file with no network transport, so there is nothing to port. |
@@ -419,8 +421,11 @@ second axis while testing nothing new.
 **Blast radius.** The companion crate's cost to the Postgres path is
 **zero, structurally**: the dependency edge points one way
 (`autumn-harvest-sqlite` → `autumn-harvest`, `default-features = false`), core
-has no `rusqlite` dependency, and `cargo build -p autumn-harvest` output is
-byte-unaffected. This is asserted by
+has no `rusqlite` dependency in any default build, and `cargo build -p
+autumn-harvest` output is byte-unaffected. The one exception is opt-in: the
+`owner-disk-cache` feature (issue #2258) adds `rusqlite` as an optional
+dependency for its local cache files. It is not in `default` and does not touch
+the SQLite backend. This is asserted by
 `zero_regression_to_the_postgres_path_is_structurally_true`, not by prose.
 
 ---

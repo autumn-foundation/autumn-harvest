@@ -104,6 +104,10 @@ impl ClosedEntries {
 pub struct WorkflowCache {
     inner: LruCache<Uuid, CacheEntry>,
     resident_enabled: bool,
+    /// The owner-local disk tier (issue #2258). The worker clones it under
+    /// the cache lock and does all disk work outside the lock.
+    #[cfg(feature = "owner-disk-cache")]
+    disk: Option<crate::owner_disk_cache::DiskTier>,
 }
 
 impl WorkflowCache {
@@ -134,7 +138,23 @@ impl WorkflowCache {
         Self {
             inner: LruCache::new(cap),
             resident_enabled: true,
+            #[cfg(feature = "owner-disk-cache")]
+            disk: None,
         }
+    }
+
+    /// Attach the owner-local disk tier (issue #2258).
+    #[cfg(feature = "owner-disk-cache")]
+    #[must_use]
+    pub(crate) fn with_disk(mut self, disk: Option<crate::owner_disk_cache::DiskTier>) -> Self {
+        self.disk = disk;
+        self
+    }
+
+    /// The owner-local disk tier, if any (issue #2258).
+    #[cfg(feature = "owner-disk-cache")]
+    pub(crate) fn disk(&self) -> Option<crate::owner_disk_cache::DiskTier> {
+        self.disk.clone()
     }
 
     /// Sets whether entries keep the suspended workflow resident (issue
@@ -313,6 +333,31 @@ impl WorkflowCache {
         ClosedEntries(evicted)
     }
 
+    /// Drop every entry of each partition in `keys`, in one pass (issue
+    /// #2252).
+    ///
+    /// The owner loop drops many partitions at once on a release or a
+    /// switch-off. One pass keeps the cache lock short.
+    #[must_use = "drop the evicted entries outside the cache lock"]
+    #[cfg_attr(not(feature = "db"), allow(dead_code))] // Only the db-gated worker unloads a partition.
+    pub(crate) fn evict_partitions(&mut self, keys: &[OwnerKey]) -> ClosedEntries {
+        let keys: std::collections::HashSet<OwnerKey> = keys.iter().copied().collect();
+        let doomed: Vec<Uuid> = self
+            .inner
+            .iter()
+            .filter(|(_, entry)| entry.owner_key.is_some_and(|k| keys.contains(&k)))
+            .map(|(id, _)| *id)
+            .collect();
+        let cap = NonZeroUsize::new(doomed.len()).unwrap_or(NonZeroUsize::MIN);
+        let mut evicted = LruCache::new(cap);
+        for id in doomed {
+            if let Some(entry) = self.inner.pop(&id) {
+                evicted.push(id, entry);
+            }
+        }
+        ClosedEntries(evicted)
+    }
+
     /// Look up a cached workflow state, marking it as recently used.
     ///
     /// Returns `None` if the execution ID is not in the cache.
@@ -397,11 +442,14 @@ impl WorkflowCache {
 
 impl std::fmt::Debug for WorkflowCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WorkflowCache")
-            .field("len", &self.inner.len())
+        let mut d = f.debug_struct("WorkflowCache");
+        d.field("len", &self.inner.len())
             .field("cap", &self.inner.cap())
-            .field("resident_enabled", &self.resident_enabled)
-            .finish()
+            .field("resident_enabled", &self.resident_enabled);
+        // Issue #2258: whether an owner disk tier is attached.
+        #[cfg(feature = "owner-disk-cache")]
+        d.field("disk", &self.disk.is_some());
+        d.finish()
     }
 }
 
@@ -530,6 +578,33 @@ mod tests {
         let (_, _, _, taken) = cache.take_entry(&id).expect("entry");
         assert_eq!(taken, Some(key));
         assert!(!cache.contains(&id), "a take removes the entry");
+    }
+
+    #[test]
+    fn evict_partitions_drops_each_listed_partition_in_one_pass() {
+        use crate::decision_owner::DecisionPartition;
+        use crate::types::ShardId;
+        let key = |p| OwnerKey {
+            shard: ShardId::new(0),
+            partition: DecisionPartition::new(p).expect("in range"),
+        };
+        let mut cache = WorkflowCache::new(8);
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+        for (id, p) in ids.iter().zip([1, 2, 3]) {
+            let _ = cache.insert_resident_with_history_bytes(
+                *id,
+                make_state(1),
+                Residency::Unknown,
+                None,
+                Some(key(p)),
+            );
+        }
+        let evicted = cache.evict_partitions(&[key(1), key(3)]);
+        assert_eq!(evicted.len(), 2);
+        drop(evicted);
+        assert!(cache.get(&ids[0]).is_none());
+        assert!(cache.get(&ids[1]).is_some());
+        assert!(cache.get(&ids[2]).is_none());
     }
 
     #[test]

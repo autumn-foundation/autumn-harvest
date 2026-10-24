@@ -36,6 +36,7 @@
 #[macro_use]
 mod named;
 
+mod fair;
 mod invariant;
 pub mod owner;
 mod rng;

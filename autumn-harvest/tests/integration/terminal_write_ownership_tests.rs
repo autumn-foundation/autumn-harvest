@@ -667,9 +667,9 @@ async fn persist_workflow_continue_as_new_makes_no_terminal_decision_when_the_cl
 // ---------------------------------------------------------------------------
 // SKIP LOCKED false-positive recovery -- the sibling of #1182's
 // `a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_a_false_positive`.
-// `claim_still_held_for_update`'s `SKIP LOCKED` guard never blocks, so a
-// claim that merely lost a race against an unrelated, transient lock holder
-// (not a genuine transfer) reads identically to a real loss. The standalone
+// `claim_still_held_for_update` waits at most its bound (issue #2252). So a
+// lock held past that bound by an unrelated holder (not a genuine transfer)
+// reads identically to a real loss. The standalone
 // release this drives into (`queue::release_terminal_workflow_claim`, wired
 // through `handle_ambiguous_terminal_write_claim` in production) is a plain
 // blocking UPDATE specifically so it waits out that contention and recovers
@@ -728,7 +728,7 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
                 &mut Vec::new(),
             )
             .await
-            .expect_err("SKIP LOCKED never waits, so the row reads as contended immediately")
+            .expect_err("the guard waits at most its bound, so the held row reads as contended")
             .terminal_write_claim_ambiguous()
             .expect("must be the ambiguous-claim sentinel");
             let probe_elapsed = probe_started.elapsed();
@@ -765,9 +765,9 @@ async fn a_dispatcher_that_still_owns_the_claim_is_released_when_skip_locked_is_
         .expect("the guarded write and its release fallback must not error");
     assert!(
         probe_elapsed < Duration::from_millis(250),
-        "the ambiguity probe must never wait on the row's lock -- it took \
+        "the ambiguity probe must wait no longer than its bound -- it took \
          {probe_elapsed:?}, but the lock was held for 300ms before this test even \
-         released it, so a probe that blocked would exceed that bound"
+         released it, so a probe that blocked until the commit would exceed 250ms"
     );
     assert!(
         released,
@@ -1164,7 +1164,8 @@ async fn the_guard_matches_only_the_current_attempt_1806() {
     }
 }
 
-/// The guard must hold the row lock and must never wait for another lock.
+/// The guard must hold the row lock. It waits for a locked row only up to its
+/// bound (issue #2252).
 #[tokio::test]
 async fn the_guard_locks_the_row_and_skips_a_locked_row_1806() {
     let (url, _container) = setup_db().await;
@@ -1187,12 +1188,141 @@ async fn the_guard_locks_the_row_and_skips_a_locked_row_1806() {
                 ),
             )
             .await
-            .expect("the guard must not wait for a locked row")?;
+            .expect("the guard must not wait past its bound")?;
             assert!(!skipped, "a locked row reads as not held");
             Ok(())
         })
         .await
         .expect("transaction");
+}
+
+/// Lock the claimed row in a new transaction. Commit after `hold`.
+///
+/// `transfer` also moves the claim to another worker before the commit.
+async fn hold_row_lock(
+    url: &str,
+    task_id: Uuid,
+    hold: Duration,
+    transfer: bool,
+) -> tokio::task::JoinHandle<()> {
+    let mut holder = connect(url).await;
+    holder.batch_execute("BEGIN").await.expect("begin");
+    let sql = if transfer {
+        "UPDATE harvest_task_queue SET worker_id = 'thief' WHERE id = $1"
+    } else {
+        "SELECT 1 FROM harvest_task_queue WHERE id = $1 FOR UPDATE"
+    };
+    diesel::sql_query(sql)
+        .bind::<diesel::sql_types::Uuid, _>(task_id)
+        .execute(&mut holder)
+        .await
+        .expect("lock the row");
+    tokio::spawn(async move {
+        tokio::time::sleep(hold).await;
+        holder.batch_execute("COMMIT").await.expect("commit");
+    })
+}
+
+/// Run the guard in a transaction on `conn`. Return the answer and the time.
+///
+/// The caller opens `conn` before it takes the lock. So the guard runs while
+/// the lock is still held.
+async fn timed_guard(
+    conn: &mut AsyncPgConnection,
+    task: &TaskQueueItem,
+    worker_id: &str,
+) -> (bool, Duration) {
+    let (task_id, strikes, attempt) = (task.id, task.crash_strikes, task.attempt);
+    conn.transaction::<_, autumn_harvest::error::HarvestError, _>(async |tx| {
+        let started = std::time::Instant::now();
+        let held =
+            queue::claim_still_held_for_update(tx, task_id, worker_id, strikes, attempt).await?;
+        Ok((held, started.elapsed()))
+    })
+    .await
+    .expect("guard transaction")
+}
+
+/// A peer claim can hold the row lock for a moment and change nothing. The
+/// guard waits for that lock, so the owner keeps its claim (issue #2252).
+#[tokio::test]
+async fn the_guard_waits_out_a_transient_lock_and_keeps_the_claim_2252() {
+    let (url, _container) = setup_db().await;
+    let worker_id = format!("dispatcher-{}", Uuid::new_v4());
+    let (_exec_id, task) = seed_claimed_task(&url, "q2252-transient", &worker_id).await;
+
+    let mut conn = connect(&url).await;
+    let release = hold_row_lock(&url, task.id, Duration::from_millis(50), false).await;
+    let (held, waited) = timed_guard(&mut conn, &task, &worker_id).await;
+    release.await.expect("holder");
+
+    assert!(held, "a transient lock is not a lost claim");
+    assert!(
+        waited >= Duration::from_millis(20),
+        "the guard ran while the lock was held; waited {waited:?}"
+    );
+}
+
+/// A transfer that commits while the guard waits reads as a lost claim.
+#[tokio::test]
+async fn the_guard_sees_a_transfer_that_commits_while_it_waits_2252() {
+    let (url, _container) = setup_db().await;
+    let worker_id = format!("dispatcher-{}", Uuid::new_v4());
+    let (_exec_id, task) = seed_claimed_task(&url, "q2252-transfer", &worker_id).await;
+
+    let mut conn = connect(&url).await;
+    let release = hold_row_lock(&url, task.id, Duration::from_millis(50), true).await;
+    let (held, _) = timed_guard(&mut conn, &task, &worker_id).await;
+    release.await.expect("holder");
+
+    assert!(!held, "the claim moved to another worker");
+}
+
+/// The session `lock_timeout`, as `current_setting` reports it.
+#[derive(diesel::QueryableByName)]
+struct LockTimeout {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    lock_timeout: String,
+}
+
+/// The wait has a bound. After it, the guard reads the row as not held. The
+/// caller's transaction stays usable, and its `lock_timeout` is unchanged.
+#[tokio::test]
+async fn the_guard_wait_is_bounded_and_restores_the_lock_timeout_2252() {
+    let (url, _container) = setup_db().await;
+    let worker_id = format!("dispatcher-{}", Uuid::new_v4());
+    let (_exec_id, task) = seed_claimed_task(&url, "q2252-bounded", &worker_id).await;
+    let release = hold_row_lock(&url, task.id, Duration::from_secs(5), false).await;
+
+    let mut conn = connect(&url).await;
+    let (task_id, strikes, attempt) = (task.id, task.crash_strikes, task.attempt);
+    let (held, waited, after) = conn
+        .transaction::<_, autumn_harvest::error::HarvestError, _>(async |tx| {
+            tx.batch_execute("SET LOCAL lock_timeout = '7s'")
+                .await
+                .map_err(autumn_harvest::error::database_error)?;
+            let started = std::time::Instant::now();
+            let held =
+                queue::claim_still_held_for_update(tx, task_id, &worker_id, strikes, attempt)
+                    .await?;
+            let waited = started.elapsed();
+            let after: LockTimeout =
+                diesel::sql_query("SELECT current_setting('lock_timeout') AS lock_timeout")
+                    .get_result(tx)
+                    .await
+                    .map_err(autumn_harvest::error::database_error)?;
+            Ok((held, waited, after.lock_timeout))
+        })
+        .await
+        .expect("the caller's transaction survives the bounded wait");
+    release.await.expect("holder");
+
+    assert!(!held, "a lock held past the bound reads as not held");
+    assert!(
+        waited < Duration::from_secs(2),
+        "the wait stays far below the 5 s hold; waited {waited:?}"
+    );
+    assert_eq!(after, "7s", "the guard restores the caller's lock_timeout");
 }
 
 /// The ambiguous-claim release is a plain `UPDATE`. It must not free a later

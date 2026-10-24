@@ -1,0 +1,434 @@
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ CTE Scan on claimed  (cost=10805.01..10805.03 rows=1 width=902) (actual time=1.467..1.499 rows=1 loops=1)
+   Output: claimed.id, claimed.queue_name, claimed.task_type, claimed.workflow_exec_id, claimed.activity_name, claimed.activity_id, claimed.input, claimed.state, claimed.priority, claimed.worker_id, claimed.attempt, claimed.max_attempts, claimed.scheduled_at, claimed.started_at, claimed.completed_at, claimed.last_heartbeat_at, claimed.heartbeat_details, claimed.heartbeat_timeout, claimed.start_to_close, claimed.schedule_to_start, claimed.retry_policy, claimed.output, claimed.error, claimed.sticky_worker_id, claimed.sticky_until, claimed.sticky_timeout, claimed.trace_context, claimed.concurrency_key, claimed.concurrency_cap, claimed.required_build_id, claimed.rate_limit_key, claimed.crash_strikes, claimed.schedule_to_close_at, claimed.required_capabilities, claimed.context_headers, claimed.created_at, claimed.wake_requested, claimed.session_id, claimed.capability_misses, claimed.capability_miss_workers, claimed.capability_miss_handler, claimed.timer_fires_at, claimed.handler_started_attempt, claimed.timed_out_claims, claimed.handler_started_at, claimed.new_start, claimed.fairness_key
+   Buffers: shared hit=201 dirtied=4 written=4
+   I/O Timings: shared write=0.034
+   CTE worker_info
+     ->  Result  (cost=8.16..8.17 rows=1 width=32) (actual time=0.009..0.009 rows=1 loops=1)
+           Output: COALESCE($0, '{}'::jsonb)
+           Buffers: shared hit=2
+           InitPlan 1 (returns $0)
+             ->  Index Scan using harvest_workers_pkey on public.harvest_workers  (cost=0.14..8.16 rows=1 width=32) (actual time=0.007..0.007 rows=0 loops=1)
+                   Output: harvest_workers.labels
+                   Index Cond: (harvest_workers.worker_id = 'w0'::text)
+                   Buffers: shared hit=2
+   CTE paused_queues
+     ->  Aggregate  (cost=8.17..8.18 rows=1 width=32) (actual time=0.011..0.012 rows=1 loops=1)
+           Output: COALESCE(array_agg(harvest_queue_pauses.queue_name), '{}'::text[])
+           Buffers: shared hit=2
+           ->  Index Only Scan using harvest_queue_pauses_pkey on public.harvest_queue_pauses  (cost=0.15..8.17 rows=1 width=32) (actual time=0.009..0.009 rows=0 loops=1)
+                 Output: harvest_queue_pauses.queue_name
+                 Index Cond: (harvest_queue_pauses.queue_name = ANY ('{default}'::text[]))
+                 Heap Fetches: 0
+                 Buffers: shared hit=2
+   CTE paused_activities
+     ->  Aggregate  (cost=17.50..17.51 rows=1 width=32) (actual time=0.004..0.004 rows=1 loops=1)
+           Output: COALESCE(array_agg(harvest_activity_pauses.activity_name), '{}'::text[])
+           ->  Seq Scan on public.harvest_activity_pauses  (cost=0.00..16.00 rows=600 width=32) (actual time=0.002..0.003 rows=0 loops=1)
+                 Output: harvest_activity_pauses.activity_name, harvest_activity_pauses.reason, harvest_activity_pauses.paused_by, harvest_activity_pauses.paused_at, harvest_activity_pauses.scope_shard_id
+   CTE concurrency_pending_keys
+     ->  Unique  (cost=197.63..197.64 rows=1 width=41) (never executed)
+           Output: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
+           ->  Sort  (cost=197.63..197.63 rows=1 width=41) (never executed)
+                 Output: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
+                 Sort Key: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
+                 ->  Bitmap Heap Scan on public.harvest_task_queue  (cost=47.93..197.62 rows=1 width=41) (never executed)
+                       Output: harvest_task_queue.concurrency_key, harvest_task_queue.task_type
+                       Recheck Cond: (harvest_task_queue.state = ANY ('{PENDING,RUNNING}'::text[]))
+                       Filter: ((harvest_task_queue.concurrency_key IS NOT NULL) AND (harvest_task_queue.concurrency_cap IS NOT NULL) AND (harvest_task_queue.queue_name = ANY ('{default}'::text[])) AND (harvest_task_queue.state = 'PENDING'::text) AND (harvest_task_queue.scheduled_at <= now()))
+                       ->  Bitmap Index Scan on idx_harvest_tq_live_created  (cost=0.00..47.93 rows=1530 width=0) (never executed)
+   CTE concurrency_running_counts
+     ->  GroupAggregate  (cost=8.18..8.25 rows=1 width=49) (never executed)
+           Output: t.concurrency_key, t.task_type, count(*)
+           Group Key: t.concurrency_key, t.task_type
+           ->  Incremental Sort  (cost=8.18..8.23 rows=2 width=41) (never executed)
+                 Output: t.concurrency_key, t.task_type
+                 Sort Key: t.concurrency_key, t.task_type
+                 Presorted Key: t.concurrency_key
+                 ->  Nested Loop Semi Join  (cost=0.12..8.17 rows=1 width=41) (never executed)
+                       Output: t.concurrency_key, t.task_type
+                       Join Filter: (concurrency_pending_keys.concurrency_key = t.concurrency_key)
+                       ->  Index Scan using harvest_task_queue_concurrency_key_running on public.harvest_task_queue t  (cost=0.12..8.14 rows=1 width=41) (never executed)
+                             Output: t.concurrency_key, t.task_type
+                             Filter: (t.worker_id IS NOT NULL)
+                       ->  CTE Scan on concurrency_pending_keys  (cost=0.00..0.02 rows=1 width=32) (never executed)
+                             Output: concurrency_pending_keys.concurrency_key, concurrency_pending_keys.task_type
+   CTE expired_runs
+     ->  Append  (cost=0.13..16.30 rows=2 width=16) (actual time=0.013..0.013 rows=0 loops=1)
+           Buffers: shared hit=2
+           ->  Index Scan using idx_harvest_executions_deadline on public.harvest_workflow_executions  (cost=0.13..8.14 rows=1 width=16) (actual time=0.006..0.006 rows=0 loops=1)
+                 Output: harvest_workflow_executions.id
+                 Index Cond: (harvest_workflow_executions.deadline_at < now())
+                 Buffers: shared hit=1
+           ->  Index Scan using idx_harvest_executions_chain_deadline on public.harvest_workflow_executions harvest_workflow_executions_1  (cost=0.13..8.14 rows=1 width=16) (actual time=0.006..0.006 rows=0 loops=1)
+                 Output: harvest_workflow_executions_1.id
+                 Index Cond: (harvest_workflow_executions_1.chain_deadline_at < now())
+                 Buffers: shared hit=1
+   CTE seek_heads
+     ->  WindowAgg  (cost=198.09..201.64 rows=129 width=151) (actual time=0.264..0.293 rows=52 loops=1)
+           Output: "*SELECT* 1_1".seek_id, "*SELECT* 1_1".seek_rank, "*SELECT* 1_1".seek_priority, "*SELECT* 1_1".seek_due, "*SELECT* 1_1".seek_pinned, "*SELECT* 1_1".seek_concurrency_key, "*SELECT* 1_1".seek_concurrency_cap, "*SELECT* 1_1".seek_task_type, row_number() OVER (?), "*SELECT* 1_1".head_queue, "*SELECT* 1_1".head_kind, "*SELECT* 1_1".head_new_start
+           Buffers: shared hit=23
+           ->  Sort  (cost=198.09..198.41 rows=129 width=143) (actual time=0.256..0.266 rows=52 loops=1)
+                 Output: "*SELECT* 1_1".seek_priority, "*SELECT* 1_1".seek_due, "*SELECT* 1_1".head_queue, "*SELECT* 1_1".head_kind, "*SELECT* 1_1".head_new_start, "*SELECT* 1_1".seek_id, "*SELECT* 1_1".seek_rank, "*SELECT* 1_1".seek_pinned, "*SELECT* 1_1".seek_concurrency_key, "*SELECT* 1_1".seek_concurrency_cap, "*SELECT* 1_1".seek_task_type
+                 Sort Key: "*SELECT* 1_1".head_queue, "*SELECT* 1_1".head_kind, "*SELECT* 1_1".head_new_start, "*SELECT* 1_1".seek_priority DESC, "*SELECT* 1_1".seek_due
+                 Sort Method: quicksort  Memory: 30kB
+                 Buffers: shared hit=23
+                 ->  Result  (cost=0.32..193.57 rows=129 width=143) (actual time=0.076..0.175 rows=52 loops=1)
+                       Output: "*SELECT* 1_1".seek_priority, "*SELECT* 1_1".seek_due, "*SELECT* 1_1".head_queue, "*SELECT* 1_1".head_kind, "*SELECT* 1_1".head_new_start, "*SELECT* 1_1".seek_id, "*SELECT* 1_1".seek_rank, "*SELECT* 1_1".seek_pinned, "*SELECT* 1_1".seek_concurrency_key, "*SELECT* 1_1".seek_concurrency_cap, "*SELECT* 1_1".seek_task_type
+                       Buffers: shared hit=15
+                       ->  Append  (cost=0.32..192.28 rows=129 width=143) (actual time=0.076..0.168 rows=52 loops=1)
+                             Buffers: shared hit=15
+                             ->  Subquery Scan on "*SELECT* 1_1"  (cost=0.32..183.30 rows=128 width=143) (actual time=0.075..0.143 rows=52 loops=1)
+                                   Output: "*SELECT* 1_1".seek_id, "*SELECT* 1_1".seek_rank, "*SELECT* 1_1".seek_priority, "*SELECT* 1_1".seek_due, "*SELECT* 1_1".seek_pinned, "*SELECT* 1_1".seek_concurrency_key, "*SELECT* 1_1".seek_concurrency_cap, "*SELECT* 1_1".seek_task_type, "*SELECT* 1_1".head_queue, "*SELECT* 1_1".head_kind, "*SELECT* 1_1".head_new_start
+                                   Buffers: shared hit=13
+                                   ->  Nested Loop  (cost=0.32..182.02 rows=128 width=143) (actual time=0.074..0.136 rows=52 loops=1)
+                                         Output: harvest_task_queue_1.id, (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_1.priority, ((harvest_task_queue_1.scheduled_at + CASE WHEN (harvest_task_queue_1.new_start AND (harvest_task_queue_1.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END)), harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.task_type, false, u.name, "*VALUES*".column1, "*VALUES*".column2
+                                         Buffers: shared hit=13
+                                         ->  Nested Loop  (cost=0.02..0.19 rows=4 width=97) (actual time=0.037..0.043 rows=4 loops=1)
+                                               Output: u.name, paused_activities.names, "*VALUES*".column1, "*VALUES*".column2
+                                               Buffers: shared hit=2
+                                               ->  Nested Loop  (cost=0.02..0.10 rows=1 width=64) (actual time=0.035..0.038 rows=1 loops=1)
+                                                     Output: u.name, paused_activities.names
+                                                     Buffers: shared hit=2
+                                                     ->  Nested Loop  (cost=0.02..0.07 rows=1 width=32) (actual time=0.030..0.032 rows=1 loops=1)
+                                                           Output: u.name
+                                                           Join Filter: (u.name <> ALL (paused_queues.names))
+                                                           Buffers: shared hit=2
+                                                           ->  HashAggregate  (cost=0.02..0.03 rows=1 width=32) (actual time=0.015..0.017 rows=1 loops=1)
+                                                                 Output: u.name
+                                                                 Group Key: u.name
+                                                                 Batches: 1  Memory Usage: 24kB
+                                                                 ->  Function Scan on pg_catalog.unnest u  (cost=0.00..0.01 rows=1 width=32) (actual time=0.009..0.009 rows=1 loops=1)
+                                                                       Output: u.name
+                                                                       Function Call: unnest('{default}'::text[])
+                                                           ->  CTE Scan on paused_queues  (cost=0.00..0.02 rows=1 width=32) (actual time=0.012..0.013 rows=1 loops=1)
+                                                                 Output: paused_queues.names
+                                                                 Buffers: shared hit=2
+                                                     ->  CTE Scan on paused_activities  (cost=0.00..0.02 rows=1 width=32) (actual time=0.004..0.005 rows=1 loops=1)
+                                                           Output: paused_activities.names
+                                               ->  Values Scan on "*VALUES*"  (cost=0.00..0.05 rows=4 width=33) (actual time=0.001..0.002 rows=4 loops=1)
+                                                     Output: "*VALUES*".column1, "*VALUES*".column2
+                                         ->  Limit  (cost=0.30..44.82 rows=32 width=85) (actual time=0.014..0.021 rows=13 loops=4)
+                                               Output: harvest_task_queue_1.id, (CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_1.priority, ((harvest_task_queue_1.scheduled_at + CASE WHEN (harvest_task_queue_1.new_start AND (harvest_task_queue_1.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END)), harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.task_type, harvest_task_queue_1.scheduled_at
+                                               Buffers: shared hit=11
+                                               InitPlan 8 (returns $7)
+                                                 ->  Function Scan on pg_catalog.unnest marked  (cost=0.00..0.02 rows=1 width=32) (actual time=0.005..0.005 rows=0 loops=1)
+                                                       Output: substr(marked.marked, 2)
+                                                       Function Call: unnest('{}'::text[])
+                                                       Filter: ("left"(marked.marked, 1) = '\x01'::text)
+                                               ->  Index Scan using idx_harvest_tq_claim_seek on public.harvest_task_queue harvest_task_queue_1  (cost=0.28..266.00 rows=191 width=85) (actual time=0.014..0.019 rows=13 loops=4)
+                                                     Output: harvest_task_queue_1.id, CASE WHEN ((harvest_task_queue_1.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_1.sticky_until > now())) THEN 1 ELSE 0 END, harvest_task_queue_1.priority, (harvest_task_queue_1.scheduled_at + CASE WHEN (harvest_task_queue_1.new_start AND (harvest_task_queue_1.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END), harvest_task_queue_1.concurrency_key, harvest_task_queue_1.concurrency_cap, harvest_task_queue_1.task_type, harvest_task_queue_1.scheduled_at
+                                                     Index Cond: ((harvest_task_queue_1.queue_name = u.name) AND (harvest_task_queue_1.task_type = "*VALUES*".column1) AND ((harvest_task_queue_1.new_start AND (harvest_task_queue_1.attempt = 0)) = "*VALUES*".column2) AND (harvest_task_queue_1.scheduled_at <= now()))
+                                                     Filter: (((harvest_task_queue_1.session_id IS NULL) OR (harvest_task_queue_1.sticky_worker_id = 'w0'::text)) AND ((harvest_task_queue_1.schedule_to_close_at IS NULL) OR (harvest_task_queue_1.schedule_to_close_at > now())) AND ((harvest_task_queue_1.sticky_worker_id IS NULL) OR (harvest_task_queue_1.sticky_worker_id = 'w0'::text) OR (harvest_task_queue_1.sticky_until IS NULL) OR (harvest_task_queue_1.sticky_until <= now())) AND CASE WHEN ((harvest_task_queue_1.task_type = 'activity'::text) AND (harvest_task_queue_1.activity_name = ANY (paused_activities.names))) THEN false WHEN ((harvest_task_queue_1.task_type = 'activity'::text) AND (harvest_task_queue_1.required_capabilities IS NULL) AND (harvest_task_queue_1.activity_name = ANY ('{}'::text[]))) THEN false WHEN ((harvest_task_queue_1.task_type = 'activity'::text) AND (harvest_task_queue_1.activity_name = ANY ($7))) THEN false ELSE true END)
+                                                     Buffers: shared hit=11
+                             ->  Subquery Scan on "*SELECT* 2"  (cost=8.26..8.33 rows=1 width=143) (actual time=0.017..0.019 rows=0 loops=1)
+                                   Output: "*SELECT* 2".seek_id, "*SELECT* 2".seek_rank, "*SELECT* 2".seek_priority, "*SELECT* 2".seek_due, "*SELECT* 2"."?column?", "*SELECT* 2".seek_concurrency_key, "*SELECT* 2".seek_concurrency_cap, "*SELECT* 2".seek_task_type, "*SELECT* 2"."?column?_1", "*SELECT* 2"."?column?_2", "*SELECT* 2"."?column?_3"
+                                   Buffers: shared hit=2
+                                   ->  Nested Loop  (cost=8.26..8.32 rows=1 width=143) (actual time=0.017..0.018 rows=0 loops=1)
+                                         Output: harvest_task_queue_2.id, (CASE WHEN ((harvest_task_queue_2.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_2.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_2.priority, ((harvest_task_queue_2.scheduled_at + CASE WHEN (harvest_task_queue_2.new_start AND (harvest_task_queue_2.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END)), harvest_task_queue_2.concurrency_key, harvest_task_queue_2.concurrency_cap, harvest_task_queue_2.task_type, true, NULL::text, NULL::text, NULL::boolean
+                                         Buffers: shared hit=2
+                                         ->  CTE Scan on paused_activities paused_activities_1  (cost=0.00..0.02 rows=1 width=32) (actual time=0.000..0.000 rows=1 loops=1)
+                                               Output: paused_activities_1.names
+                                         ->  Nested Loop  (cost=8.26..8.29 rows=1 width=77) (actual time=0.015..0.016 rows=0 loops=1)
+                                               Output: harvest_task_queue_2.id, (CASE WHEN ((harvest_task_queue_2.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_2.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_2.priority, ((harvest_task_queue_2.scheduled_at + CASE WHEN (harvest_task_queue_2.new_start AND (harvest_task_queue_2.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END)), harvest_task_queue_2.concurrency_key, harvest_task_queue_2.concurrency_cap, harvest_task_queue_2.task_type
+                                               Buffers: shared hit=2
+                                               ->  CTE Scan on paused_queues paused_queues_1  (cost=0.00..0.02 rows=1 width=32) (actual time=0.000..0.000 rows=1 loops=1)
+                                                     Output: paused_queues_1.names
+                                               ->  Limit  (cost=8.26..8.26 rows=1 width=77) (actual time=0.014..0.015 rows=0 loops=1)
+                                                     Output: harvest_task_queue_2.id, (CASE WHEN ((harvest_task_queue_2.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_2.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_2.priority, ((harvest_task_queue_2.scheduled_at + CASE WHEN (harvest_task_queue_2.new_start AND (harvest_task_queue_2.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END)), harvest_task_queue_2.concurrency_key, harvest_task_queue_2.concurrency_cap, harvest_task_queue_2.task_type
+                                                     Buffers: shared hit=2
+                                                     InitPlan 9 (returns $12)
+                                                       ->  Function Scan on pg_catalog.unnest marked_1  (cost=0.00..0.02 rows=1 width=32) (never executed)
+                                                             Output: substr(marked_1.marked, 2)
+                                                             Function Call: unnest('{}'::text[])
+                                                             Filter: ("left"(marked_1.marked, 1) = '\x01'::text)
+                                                     ->  Sort  (cost=8.24..8.24 rows=1 width=77) (actual time=0.013..0.014 rows=0 loops=1)
+                                                           Output: harvest_task_queue_2.id, (CASE WHEN ((harvest_task_queue_2.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_2.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_2.priority, ((harvest_task_queue_2.scheduled_at + CASE WHEN (harvest_task_queue_2.new_start AND (harvest_task_queue_2.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END)), harvest_task_queue_2.concurrency_key, harvest_task_queue_2.concurrency_cap, harvest_task_queue_2.task_type
+                                                           Sort Key: harvest_task_queue_2.priority DESC, ((harvest_task_queue_2.scheduled_at + CASE WHEN (harvest_task_queue_2.new_start AND (harvest_task_queue_2.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END))
+                                                           Sort Method: quicksort  Memory: 25kB
+                                                           Buffers: shared hit=2
+                                                           ->  Index Scan using idx_harvest_tq_sticky_poll on public.harvest_task_queue harvest_task_queue_2  (cost=0.13..8.23 rows=1 width=77) (actual time=0.005..0.006 rows=0 loops=1)
+                                                                 Output: harvest_task_queue_2.id, CASE WHEN ((harvest_task_queue_2.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_2.sticky_until > now())) THEN 1 ELSE 0 END, harvest_task_queue_2.priority, (harvest_task_queue_2.scheduled_at + CASE WHEN (harvest_task_queue_2.new_start AND (harvest_task_queue_2.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END), harvest_task_queue_2.concurrency_key, harvest_task_queue_2.concurrency_cap, harvest_task_queue_2.task_type
+                                                                 Index Cond: ((harvest_task_queue_2.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_2.scheduled_at <= now()))
+                                                                 Filter: ((harvest_task_queue_2.queue_name = ANY ('{default}'::text[])) AND (harvest_task_queue_2.sticky_until > now()) AND ((harvest_task_queue_2.schedule_to_close_at IS NULL) OR (harvest_task_queue_2.schedule_to_close_at > now())) AND ((harvest_task_queue_2.sticky_worker_id IS NULL) OR (harvest_task_queue_2.sticky_worker_id = 'w0'::text) OR (harvest_task_queue_2.sticky_until IS NULL) OR (harvest_task_queue_2.sticky_until <= now())) AND (harvest_task_queue_2.queue_name <> ALL (paused_queues_1.names)) AND CASE WHEN ((harvest_task_queue_2.task_type = 'activity'::text) AND (harvest_task_queue_2.activity_name = ANY (paused_activities_1.names))) THEN false WHEN ((harvest_task_queue_2.task_type = 'activity'::text) AND (harvest_task_queue_2.required_capabilities IS NULL) AND (harvest_task_queue_2.activity_name = ANY ('{}'::text[]))) THEN false WHEN ((harvest_task_queue_2.task_type = 'activity'::text) AND (harvest_task_queue_2.activity_name = ANY ($12))) THEN false ELSE true END)
+                                                                 Buffers: shared hit=2
+   CTE seek_bounds
+     ->  CTE Scan on seek_heads  (cost=0.00..2.90 rows=1 width=13) (actual time=0.047..0.048 rows=1 loops=1)
+           Output: seek_heads.seek_pinned, seek_heads.seek_priority, seek_heads.seek_due
+           Filter: (seek_heads.seek_rn = 32)
+           Rows Removed by Filter: 51
+   CTE seek_pending_keys
+     ->  HashAggregate  (cost=3.22..4.50 rows=128 width=64) (never executed)
+           Output: seek_heads_1.seek_concurrency_key, seek_heads_1.seek_task_type
+           Group Key: seek_heads_1.seek_concurrency_key, seek_heads_1.seek_task_type
+           ->  CTE Scan on seek_heads seek_heads_1  (cost=0.00..2.58 rows=128 width=64) (never executed)
+                 Output: seek_heads_1.seek_id, seek_heads_1.seek_rank, seek_heads_1.seek_priority, seek_heads_1.seek_due, seek_heads_1.seek_pinned, seek_heads_1.seek_concurrency_key, seek_heads_1.seek_concurrency_cap, seek_heads_1.seek_task_type, seek_heads_1.seek_rn
+                 Filter: ((seek_heads_1.seek_concurrency_key IS NOT NULL) AND (seek_heads_1.seek_concurrency_cap IS NOT NULL))
+   CTE seek_running_counts
+     ->  GroupAggregate  (cost=12.31..12.38 rows=1 width=49) (never executed)
+           Output: t_1.concurrency_key, t_1.task_type, count(*)
+           Group Key: t_1.concurrency_key, t_1.task_type
+           ->  Incremental Sort  (cost=12.31..12.35 rows=2 width=41) (never executed)
+                 Output: t_1.concurrency_key, t_1.task_type
+                 Sort Key: t_1.concurrency_key, t_1.task_type
+                 Presorted Key: t_1.concurrency_key
+                 ->  Nested Loop Semi Join  (cost=0.12..12.30 rows=1 width=41) (never executed)
+                       Output: t_1.concurrency_key, t_1.task_type
+                       Join Filter: (seek_pending_keys.concurrency_key = t_1.concurrency_key)
+                       ->  Index Scan using harvest_task_queue_concurrency_key_running on public.harvest_task_queue t_1  (cost=0.12..8.14 rows=1 width=41) (never executed)
+                             Output: t_1.concurrency_key, t_1.task_type
+                             Filter: (t_1.worker_id IS NOT NULL)
+                       ->  CTE Scan on seek_pending_keys  (cost=0.00..2.56 rows=128 width=32) (never executed)
+                             Output: seek_pending_keys.concurrency_key, seek_pending_keys.task_type
+   CTE seek_candidate
+     ->  Limit  (cost=246.86..246.87 rows=1 width=301) (actual time=0.956..0.962 rows=1 loops=1)
+           Output: harvest_task_queue_3.id, harvest_task_queue_3.task_type, harvest_task_queue_3.concurrency_key, harvest_task_queue_3.concurrency_cap, harvest_task_queue_3.rate_limit_key, harvest_task_queue_3.activity_name, harvest_task_queue_3.workflow_exec_id, (CASE WHEN ((harvest_task_queue_3.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_3.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_3.priority, ((harvest_task_queue_3.scheduled_at + CASE WHEN (harvest_task_queue_3.new_start AND (harvest_task_queue_3.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END)), harvest_task_queue_3.ctid, worker_info.*, paused_queues_2.*, paused_activities_2.*
+           Buffers: shared hit=177
+           InitPlan 14 (returns $19)
+             ->  Result  (cost=0.00..0.01 rows=1 width=32) (actual time=0.001..0.001 rows=1 loops=1)
+                   Output: 'PENDING'::text
+           InitPlan 15 (returns $20)
+             ->  Nested Loop Anti Join  (cost=0.00..6.78 rows=107 width=16) (actual time=0.327..0.341 rows=32 loops=1)
+                   Output: w.seek_id
+                   Join Filter: ((b.bound_pinned OR (w.seek_rank = 0)) AND ((b.bound_pinned AND (w.seek_rank = 0)) OR (w.seek_priority < b.bound_priority) OR ((w.seek_priority = b.bound_priority) AND (w.seek_due > b.bound_due))))
+                   Rows Removed by Join Filter: 32
+                   Buffers: shared hit=23
+                   ->  CTE Scan on seek_heads w  (cost=0.00..2.58 rows=129 width=32) (actual time=0.268..0.274 rows=52 loops=1)
+                         Output: w.seek_id, w.seek_rank, w.seek_priority, w.seek_due, w.seek_pinned, w.seek_concurrency_key, w.seek_concurrency_cap, w.seek_task_type, w.seek_rn
+                         Buffers: shared hit=23
+                   ->  CTE Scan on seek_bounds b  (cost=0.00..0.02 rows=1 width=13) (actual time=0.001..0.001 rows=1 loops=52)
+                         Output: b.bound_pinned, b.bound_priority, b.bound_due
+           InitPlan 16 (returns $21)
+             ->  Function Scan on pg_catalog.unnest marked_2  (cost=0.00..0.02 rows=1 width=32) (never executed)
+                   Output: substr(marked_2.marked, 2)
+                   Function Call: unnest('{}'::text[])
+                   Filter: ("left"(marked_2.marked, 1) = '\x01'::text)
+           ->  LockRows  (cost=240.04..240.06 rows=1 width=301) (actual time=0.955..0.958 rows=1 loops=1)
+                 Output: harvest_task_queue_3.id, harvest_task_queue_3.task_type, harvest_task_queue_3.concurrency_key, harvest_task_queue_3.concurrency_cap, harvest_task_queue_3.rate_limit_key, harvest_task_queue_3.activity_name, harvest_task_queue_3.workflow_exec_id, (CASE WHEN ((harvest_task_queue_3.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_3.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_3.priority, ((harvest_task_queue_3.scheduled_at + CASE WHEN (harvest_task_queue_3.new_start AND (harvest_task_queue_3.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END)), harvest_task_queue_3.ctid, worker_info.*, paused_queues_2.*, paused_activities_2.*
+                 Buffers: shared hit=177
+                 ->  Sort  (cost=240.04..240.05 rows=1 width=301) (actual time=0.943..0.946 rows=1 loops=1)
+                       Output: harvest_task_queue_3.id, harvest_task_queue_3.task_type, harvest_task_queue_3.concurrency_key, harvest_task_queue_3.concurrency_cap, harvest_task_queue_3.rate_limit_key, harvest_task_queue_3.activity_name, harvest_task_queue_3.workflow_exec_id, (CASE WHEN ((harvest_task_queue_3.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_3.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_3.priority, ((harvest_task_queue_3.scheduled_at + CASE WHEN (harvest_task_queue_3.new_start AND (harvest_task_queue_3.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END)), harvest_task_queue_3.ctid, worker_info.*, paused_queues_2.*, paused_activities_2.*
+                       Sort Key: (CASE WHEN ((harvest_task_queue_3.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_3.sticky_until > now())) THEN 1 ELSE 0 END) DESC, harvest_task_queue_3.priority DESC, ((harvest_task_queue_3.scheduled_at + CASE WHEN (harvest_task_queue_3.new_start AND (harvest_task_queue_3.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END))
+                       Sort Method: quicksort  Memory: 29kB
+                       Buffers: shared hit=176
+                       ->  Nested Loop  (cost=38.90..240.03 rows=1 width=301) (actual time=0.706..0.906 rows=22 loops=1)
+                             Output: harvest_task_queue_3.id, harvest_task_queue_3.task_type, harvest_task_queue_3.concurrency_key, harvest_task_queue_3.concurrency_cap, harvest_task_queue_3.rate_limit_key, harvest_task_queue_3.activity_name, harvest_task_queue_3.workflow_exec_id, CASE WHEN ((harvest_task_queue_3.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_3.sticky_until > now())) THEN 1 ELSE 0 END, harvest_task_queue_3.priority, (harvest_task_queue_3.scheduled_at + CASE WHEN (harvest_task_queue_3.new_start AND (harvest_task_queue_3.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END), harvest_task_queue_3.ctid, worker_info.*, paused_queues_2.*, paused_activities_2.*
+                             Join Filter: ((harvest_task_queue_3.task_type <> 'activity'::text) OR (harvest_task_queue_3.activity_name IS NULL) OR (harvest_task_queue_3.activity_name <> ALL (paused_activities_2.names)))
+                             Buffers: shared hit=170
+                             ->  Nested Loop  (cost=38.90..239.98 rows=1 width=286) (actual time=0.701..0.758 rows=22 loops=1)
+                                   Output: harvest_task_queue_3.id, harvest_task_queue_3.task_type, harvest_task_queue_3.concurrency_key, harvest_task_queue_3.concurrency_cap, harvest_task_queue_3.rate_limit_key, harvest_task_queue_3.activity_name, harvest_task_queue_3.workflow_exec_id, harvest_task_queue_3.sticky_worker_id, harvest_task_queue_3.sticky_until, harvest_task_queue_3.priority, harvest_task_queue_3.scheduled_at, harvest_task_queue_3.new_start, harvest_task_queue_3.attempt, harvest_task_queue_3.ctid, worker_info.*, paused_queues_2.*
+                                   Join Filter: (harvest_task_queue_3.queue_name <> ALL (paused_queues_2.names))
+                                   Buffers: shared hit=170
+                                   ->  Nested Loop  (cost=38.90..239.93 rows=1 width=238) (actual time=0.695..0.738 rows=22 loops=1)
+                                         Output: harvest_task_queue_3.id, harvest_task_queue_3.task_type, harvest_task_queue_3.concurrency_key, harvest_task_queue_3.concurrency_cap, harvest_task_queue_3.rate_limit_key, harvest_task_queue_3.activity_name, harvest_task_queue_3.workflow_exec_id, harvest_task_queue_3.sticky_worker_id, harvest_task_queue_3.sticky_until, harvest_task_queue_3.priority, harvest_task_queue_3.scheduled_at, harvest_task_queue_3.new_start, harvest_task_queue_3.attempt, harvest_task_queue_3.ctid, harvest_task_queue_3.queue_name, worker_info.*
+                                         Join Filter: ((harvest_task_queue_3.required_capabilities IS NULL) OR (NOT (SubPlan 22)))
+                                         Buffers: shared hit=170
+                                         ->  Bitmap Heap Scan on public.harvest_task_queue harvest_task_queue_3  (cost=38.90..236.78 rows=1 width=214) (actual time=0.662..0.692 rows=22 loops=1)
+                                               Output: harvest_task_queue_3.id, harvest_task_queue_3.task_type, harvest_task_queue_3.concurrency_key, harvest_task_queue_3.concurrency_cap, harvest_task_queue_3.rate_limit_key, harvest_task_queue_3.activity_name, harvest_task_queue_3.workflow_exec_id, harvest_task_queue_3.sticky_worker_id, harvest_task_queue_3.sticky_until, harvest_task_queue_3.priority, harvest_task_queue_3.scheduled_at, harvest_task_queue_3.new_start, harvest_task_queue_3.attempt, harvest_task_queue_3.ctid, harvest_task_queue_3.queue_name, harvest_task_queue_3.required_capabilities
+                                               Recheck Cond: (harvest_task_queue_3.id = ANY ($20))
+                                               Filter: ((harvest_task_queue_3.required_build_id IS NULL) AND ((harvest_task_queue_3.session_id IS NULL) OR (harvest_task_queue_3.sticky_worker_id = 'w0'::text)) AND (harvest_task_queue_3.state = $19) AND (harvest_task_queue_3.scheduled_at <= now()) AND ((harvest_task_queue_3.schedule_to_close_at IS NULL) OR (harvest_task_queue_3.schedule_to_close_at > now())) AND ((harvest_task_queue_3.sticky_worker_id IS NULL) OR (harvest_task_queue_3.sticky_worker_id = 'w0'::text) OR (harvest_task_queue_3.sticky_until IS NULL) OR (harvest_task_queue_3.sticky_until <= now())) AND ((harvest_task_queue_3.task_type <> 'activity'::text) OR (harvest_task_queue_3.activity_name IS NULL) OR (harvest_task_queue_3.activity_name <> ALL ($21))) AND ((harvest_task_queue_3.concurrency_key IS NULL) OR (harvest_task_queue_3.concurrency_cap IS NULL) OR (COALESCE((SubPlan 17), '0'::bigint) < harvest_task_queue_3.concurrency_cap)) AND ((harvest_task_queue_3.workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 21))) AND ((harvest_task_queue_3.rate_limit_key IS NULL) OR (harvest_task_queue_3.activity_name = ANY ('{}'::text[])) OR (SubPlan 23)) AND ((harvest_task_queue_3.task_type <> 'workflow'::text) OR (harvest_task_queue_3.workflow_exec_id IS NULL) OR (NOT (SubPlan 18))))
+                                               Rows Removed by Filter: 10
+                                               Heap Blocks: exact=1
+                                               Buffers: shared hit=168
+                                               ->  Bitmap Index Scan on harvest_task_queue_pkey  (cost=0.00..38.90 rows=10 width=0) (actual time=0.478..0.478 rows=32 loops=1)
+                                                     Index Cond: (harvest_task_queue_3.id = ANY ($20))
+                                                     Buffers: shared hit=90
+                                               SubPlan 17
+                                                 ->  CTE Scan on seek_running_counts rc  (cost=0.00..0.03 rows=1 width=8) (never executed)
+                                                       Output: rc.running_count
+                                                       Filter: ((rc.concurrency_key = harvest_task_queue_3.concurrency_key) AND (rc.task_type = harvest_task_queue_3.task_type))
+                                               SubPlan 21
+                                                 ->  CTE Scan on expired_runs x  (cost=0.00..0.04 rows=2 width=16) (actual time=0.013..0.013 rows=0 loops=1)
+                                                       Output: x.id
+                                                       Buffers: shared hit=2
+                                               SubPlan 23
+                                                 ->  Index Scan using harvest_rate_limit_buckets_pkey on public.harvest_rate_limit_buckets b_1  (cost=0.15..8.22 rows=1 width=0) (never executed)
+                                                       Index Cond: ((b_1.key)::text = (harvest_task_queue_3.rate_limit_key)::text)
+                                                       Filter: (LEAST(COALESCE(CASE WHEN (b_1.override_expires_at > now()) THEN b_1.override_burst ELSE NULL::double precision END, b_1.burst), ((b_1.tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(b_1.override_expires_at, b_1.last_refilled_at), now()) - b_1.last_refilled_at))))::double precision * COALESCE(b_1.override_refill_rate, b_1.refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(b_1.override_expires_at, b_1.last_refilled_at), b_1.last_refilled_at)))))::double precision * b_1.refill_rate))) >= '1'::double precision)
+                                               SubPlan 18
+                                                 ->  Index Only Scan using idx_harvest_we_paused on public.harvest_workflow_executions e  (cost=0.28..8.29 rows=1 width=0) (actual time=0.003..0.003 rows=0 loops=32)
+                                                       Index Cond: (e.id = harvest_task_queue_3.workflow_exec_id)
+                                                       Heap Fetches: 10
+                                                       Buffers: shared hit=75
+                                         ->  CTE Scan on worker_info  (cost=0.00..0.02 rows=1 width=88) (actual time=0.002..0.002 rows=1 loops=22)
+                                               Output: worker_info.*, worker_info.labels
+                                               Buffers: shared hit=2
+                                         SubPlan 22
+                                           ->  Function Scan on pg_catalog.jsonb_array_elements r  (cost=0.00..6.25 rows=2 width=0) (never executed)
+                                                 Function Call: jsonb_array_elements(harvest_task_queue_3.required_capabilities)
+                                                 Filter: (((r.value ? 'Exact'::text) AND (((worker_info.labels ->> ((r.value -> 'Exact'::text) ->> 'key'::text)) IS NULL) OR ((worker_info.labels ->> ((r.value -> 'Exact'::text) ->> 'key'::text)) <> ((r.value -> 'Exact'::text) ->> 'value'::text)))) OR ((r.value ? 'In'::text) AND (((worker_info.labels ->> ((r.value -> 'In'::text) ->> 'key'::text)) IS NULL) OR (NOT (((r.value -> 'In'::text) -> 'values'::text) @> jsonb_build_array((worker_info.labels ->> ((r.value -> 'In'::text) ->> 'key'::text))))))))
+                                   ->  CTE Scan on paused_queues paused_queues_2  (cost=0.00..0.02 rows=1 width=88) (actual time=0.000..0.000 rows=1 loops=22)
+                                         Output: paused_queues_2.*, paused_queues_2.names
+                             ->  CTE Scan on paused_activities paused_activities_2  (cost=0.00..0.02 rows=1 width=88) (actual time=0.006..0.006 rows=1 loops=22)
+                                   Output: paused_activities_2.*, paused_activities_2.names
+   CTE legacy_candidate
+     ->  Limit  (cost=10013.78..10013.79 rows=1 width=301) (actual time=0.020..0.024 rows=0 loops=1)
+           Output: harvest_task_queue_4.id, harvest_task_queue_4.task_type, harvest_task_queue_4.concurrency_key, harvest_task_queue_4.concurrency_cap, harvest_task_queue_4.rate_limit_key, harvest_task_queue_4.activity_name, harvest_task_queue_4.workflow_exec_id, (CASE WHEN ((harvest_task_queue_4.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_4.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_4.priority, ((harvest_task_queue_4.scheduled_at + CASE WHEN (harvest_task_queue_4.new_start AND (harvest_task_queue_4.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END)), harvest_task_queue_4.ctid, worker_info_1.*, paused_queues_3.*, paused_activities_3.*
+           InitPlan 26 (returns $34)
+             ->  CTE Scan on seek_candidate  (cost=0.00..0.02 rows=1 width=0) (actual time=0.001..0.001 rows=1 loops=1)
+           InitPlan 27 (returns $35)
+             ->  CTE Scan on seek_bounds  (cost=0.00..0.02 rows=1 width=0) (never executed)
+           InitPlan 28 (returns $36)
+             ->  Function Scan on pg_catalog.unnest marked_3  (cost=0.00..0.02 rows=1 width=32) (never executed)
+                   Output: substr(marked_3.marked, 2)
+                   Function Call: unnest('{}'::text[])
+                   Filter: ("left"(marked_3.marked, 1) = '\x01'::text)
+           ->  LockRows  (cost=10013.72..10018.33 rows=369 width=301) (actual time=0.019..0.022 rows=0 loops=1)
+                 Output: harvest_task_queue_4.id, harvest_task_queue_4.task_type, harvest_task_queue_4.concurrency_key, harvest_task_queue_4.concurrency_cap, harvest_task_queue_4.rate_limit_key, harvest_task_queue_4.activity_name, harvest_task_queue_4.workflow_exec_id, (CASE WHEN ((harvest_task_queue_4.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_4.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_4.priority, ((harvest_task_queue_4.scheduled_at + CASE WHEN (harvest_task_queue_4.new_start AND (harvest_task_queue_4.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END)), harvest_task_queue_4.ctid, worker_info_1.*, paused_queues_3.*, paused_activities_3.*
+                 ->  Sort  (cost=10013.72..10014.64 rows=369 width=301) (actual time=0.018..0.021 rows=0 loops=1)
+                       Output: harvest_task_queue_4.id, harvest_task_queue_4.task_type, harvest_task_queue_4.concurrency_key, harvest_task_queue_4.concurrency_cap, harvest_task_queue_4.rate_limit_key, harvest_task_queue_4.activity_name, harvest_task_queue_4.workflow_exec_id, (CASE WHEN ((harvest_task_queue_4.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_4.sticky_until > now())) THEN 1 ELSE 0 END), harvest_task_queue_4.priority, ((harvest_task_queue_4.scheduled_at + CASE WHEN (harvest_task_queue_4.new_start AND (harvest_task_queue_4.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END)), harvest_task_queue_4.ctid, worker_info_1.*, paused_queues_3.*, paused_activities_3.*
+                       Sort Key: (CASE WHEN ((harvest_task_queue_4.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_4.sticky_until > now())) THEN 1 ELSE 0 END) DESC, harvest_task_queue_4.priority DESC, ((harvest_task_queue_4.scheduled_at + CASE WHEN (harvest_task_queue_4.new_start AND (harvest_task_queue_4.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END))
+                       Sort Method: quicksort  Memory: 25kB
+                       ->  Result  (cost=111.95..10011.87 rows=369 width=301) (actual time=0.002..0.005 rows=0 loops=1)
+                             Output: harvest_task_queue_4.id, harvest_task_queue_4.task_type, harvest_task_queue_4.concurrency_key, harvest_task_queue_4.concurrency_cap, harvest_task_queue_4.rate_limit_key, harvest_task_queue_4.activity_name, harvest_task_queue_4.workflow_exec_id, CASE WHEN ((harvest_task_queue_4.sticky_worker_id = 'w0'::text) AND (harvest_task_queue_4.sticky_until > now())) THEN 1 ELSE 0 END, harvest_task_queue_4.priority, (harvest_task_queue_4.scheduled_at + CASE WHEN (harvest_task_queue_4.new_start AND (harvest_task_queue_4.attempt = 0)) THEN '00:00:30'::interval ELSE '00:00:00'::interval END), harvest_task_queue_4.ctid, worker_info_1.*, paused_queues_3.*, paused_activities_3.*
+                             One-Time Filter: ((NOT $34) AND $35)
+                             ->  Nested Loop  (cost=111.95..10007.26 rows=369 width=342) (never executed)
+                                   Output: harvest_task_queue_4.id, harvest_task_queue_4.task_type, harvest_task_queue_4.concurrency_key, harvest_task_queue_4.concurrency_cap, harvest_task_queue_4.rate_limit_key, harvest_task_queue_4.activity_name, harvest_task_queue_4.workflow_exec_id, harvest_task_queue_4.sticky_worker_id, harvest_task_queue_4.sticky_until, harvest_task_queue_4.priority, harvest_task_queue_4.scheduled_at, harvest_task_queue_4.new_start, harvest_task_queue_4.attempt, harvest_task_queue_4.ctid, worker_info_1.*, paused_queues_3.*, paused_activities_3.*
+                                   Join Filter: (((harvest_task_queue_4.task_type <> 'activity'::text) OR (harvest_task_queue_4.activity_name IS NULL) OR (harvest_task_queue_4.activity_name <> ALL (paused_activities_3.names))) AND ((harvest_task_queue_4.required_capabilities IS NULL) OR (NOT (SubPlan 34))))
+                                   ->  Nested Loop  (cost=0.00..0.05 rows=1 width=176) (never executed)
+                                         Output: worker_info_1.*, worker_info_1.labels, paused_activities_3.*, paused_activities_3.names
+                                         ->  CTE Scan on worker_info worker_info_1  (cost=0.00..0.02 rows=1 width=88) (never executed)
+                                               Output: worker_info_1.*, worker_info_1.labels
+                                         ->  CTE Scan on paused_activities paused_activities_3  (cost=0.00..0.02 rows=1 width=88) (never executed)
+                                               Output: paused_activities_3.*, paused_activities_3.names
+                                   ->  Nested Loop  (cost=111.95..8843.94 rows=369 width=262) (never executed)
+                                         Output: harvest_task_queue_4.id, harvest_task_queue_4.task_type, harvest_task_queue_4.concurrency_key, harvest_task_queue_4.concurrency_cap, harvest_task_queue_4.rate_limit_key, harvest_task_queue_4.activity_name, harvest_task_queue_4.workflow_exec_id, harvest_task_queue_4.sticky_worker_id, harvest_task_queue_4.sticky_until, harvest_task_queue_4.priority, harvest_task_queue_4.scheduled_at, harvest_task_queue_4.new_start, harvest_task_queue_4.attempt, harvest_task_queue_4.ctid, harvest_task_queue_4.required_capabilities, paused_queues_3.*
+                                         Join Filter: (harvest_task_queue_4.queue_name <> ALL (paused_queues_3.names))
+                                         ->  CTE Scan on paused_queues paused_queues_3  (cost=0.00..0.02 rows=1 width=88) (never executed)
+                                               Output: paused_queues_3.*, paused_queues_3.names
+                                         ->  Bitmap Heap Scan on public.harvest_task_queue harvest_task_queue_4  (cost=111.95..8835.19 rows=388 width=214) (never executed)
+                                               Output: harvest_task_queue_4.id, harvest_task_queue_4.task_type, harvest_task_queue_4.concurrency_key, harvest_task_queue_4.concurrency_cap, harvest_task_queue_4.rate_limit_key, harvest_task_queue_4.activity_name, harvest_task_queue_4.workflow_exec_id, harvest_task_queue_4.sticky_worker_id, harvest_task_queue_4.sticky_until, harvest_task_queue_4.priority, harvest_task_queue_4.scheduled_at, harvest_task_queue_4.new_start, harvest_task_queue_4.attempt, harvest_task_queue_4.ctid, harvest_task_queue_4.queue_name, harvest_task_queue_4.required_capabilities
+                                               Recheck Cond: ((harvest_task_queue_4.state = ANY ('{PENDING,RUNNING}'::text[])) AND (harvest_task_queue_4.queue_name = ANY ('{default}'::text[])) AND (harvest_task_queue_4.scheduled_at <= now()) AND (harvest_task_queue_4.state = 'PENDING'::text))
+                                               Filter: ((harvest_task_queue_4.required_build_id IS NULL) AND ((harvest_task_queue_4.session_id IS NULL) OR (harvest_task_queue_4.sticky_worker_id = 'w0'::text)) AND ((harvest_task_queue_4.schedule_to_close_at IS NULL) OR (harvest_task_queue_4.schedule_to_close_at > now())) AND ((harvest_task_queue_4.sticky_worker_id IS NULL) OR (harvest_task_queue_4.sticky_worker_id = 'w0'::text) OR (harvest_task_queue_4.sticky_until IS NULL) OR (harvest_task_queue_4.sticky_until <= now())) AND ((harvest_task_queue_4.task_type <> 'activity'::text) OR (harvest_task_queue_4.activity_name IS NULL) OR (harvest_task_queue_4.activity_name <> ALL ($36))) AND ((harvest_task_queue_4.concurrency_key IS NULL) OR (harvest_task_queue_4.concurrency_cap IS NULL) OR (COALESCE((SubPlan 29), '0'::bigint) < harvest_task_queue_4.concurrency_cap)) AND ((harvest_task_queue_4.workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 33))) AND ((harvest_task_queue_4.rate_limit_key IS NULL) OR (harvest_task_queue_4.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 36)) AND ((harvest_task_queue_4.task_type <> 'workflow'::text) OR (harvest_task_queue_4.workflow_exec_id IS NULL) OR (NOT (hashed SubPlan 31))))
+                                               ->  BitmapAnd  (cost=111.95..111.95 rows=517 width=0) (never executed)
+                                                     ->  Bitmap Index Scan on idx_harvest_tq_live_created  (cost=0.00..47.93 rows=1530 width=0) (never executed)
+                                                     ->  Bitmap Index Scan on idx_harvest_tq_claim_seek  (cost=0.00..63.58 rows=1530 width=0) (never executed)
+                                                           Index Cond: ((harvest_task_queue_4.queue_name = ANY ('{default}'::text[])) AND (harvest_task_queue_4.scheduled_at <= now()))
+                                               SubPlan 29
+                                                 ->  CTE Scan on concurrency_running_counts rc_1  (cost=0.00..0.03 rows=1 width=8) (never executed)
+                                                       Output: rc_1.running_count
+                                                       Filter: ((rc_1.concurrency_key = harvest_task_queue_4.concurrency_key) AND (rc_1.task_type = harvest_task_queue_4.task_type))
+                                               SubPlan 33
+                                                 ->  CTE Scan on expired_runs x_1  (cost=0.00..0.04 rows=2 width=16) (never executed)
+                                                       Output: x_1.id
+                                               SubPlan 36
+                                                 ->  Seq Scan on public.harvest_rate_limit_buckets b_2  (cost=0.00..43.00 rows=183 width=32) (never executed)
+                                                       Output: b_2.key
+                                                       Filter: (LEAST(COALESCE(CASE WHEN (b_2.override_expires_at > now()) THEN b_2.override_burst ELSE NULL::double precision END, b_2.burst), ((b_2.tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(b_2.override_expires_at, b_2.last_refilled_at), now()) - b_2.last_refilled_at))))::double precision * COALESCE(b_2.override_refill_rate, b_2.refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(b_2.override_expires_at, b_2.last_refilled_at), b_2.last_refilled_at)))))::double precision * b_2.refill_rate))) >= '1'::double precision)
+                                               SubPlan 31
+                                                 ->  Bitmap Heap Scan on public.harvest_workflow_executions e_1  (cost=33.70..3355.93 rows=1033 width=16) (never executed)
+                                                       Output: e_1.id
+                                                       Recheck Cond: (e_1.state = 'PAUSED'::text)
+                                                       ->  Bitmap Index Scan on idx_harvest_we_paused  (cost=0.00..33.44 rows=1033 width=0) (never executed)
+                                   SubPlan 34
+                                     ->  Function Scan on pg_catalog.jsonb_array_elements r_1  (cost=0.00..6.25 rows=2 width=0) (never executed)
+                                           Function Call: jsonb_array_elements(harvest_task_queue_4.required_capabilities)
+                                           Filter: (((r_1.value ? 'Exact'::text) AND (((worker_info_1.labels ->> ((r_1.value -> 'Exact'::text) ->> 'key'::text)) IS NULL) OR ((worker_info_1.labels ->> ((r_1.value -> 'Exact'::text) ->> 'key'::text)) <> ((r_1.value -> 'Exact'::text) ->> 'value'::text)))) OR ((r_1.value ? 'In'::text) AND (((worker_info_1.labels ->> ((r_1.value -> 'In'::text) ->> 'key'::text)) IS NULL) OR (NOT (((r_1.value -> 'In'::text) -> 'values'::text) @> jsonb_build_array((worker_info_1.labels ->> ((r_1.value -> 'In'::text) ->> 'key'::text))))))))
+   CTE candidate
+     ->  Append  (cost=0.00..0.05 rows=2 width=164) (actual time=0.958..0.991 rows=1 loops=1)
+           Buffers: shared hit=177
+           ->  CTE Scan on seek_candidate seek_candidate_1  (cost=0.00..0.02 rows=1 width=164) (actual time=0.957..0.958 rows=1 loops=1)
+                 Output: seek_candidate_1.id, seek_candidate_1.task_type, seek_candidate_1.concurrency_key, seek_candidate_1.concurrency_cap, seek_candidate_1.rate_limit_key, seek_candidate_1.activity_name, seek_candidate_1.workflow_exec_id
+                 Buffers: shared hit=177
+           ->  CTE Scan on legacy_candidate  (cost=0.00..0.02 rows=1 width=164) (actual time=0.031..0.031 rows=0 loops=1)
+                 Output: legacy_candidate.id, legacy_candidate.task_type, legacy_candidate.concurrency_key, legacy_candidate.concurrency_cap, legacy_candidate.rate_limit_key, legacy_candidate.activity_name, legacy_candidate.workflow_exec_id
+   CTE fresh_now
+     ->  Nested Loop Left Join  (cost=0.15..12.47 rows=2 width=8) (actual time=0.046..0.047 rows=1 loops=1)
+           Output: clock_timestamp()
+           ->  Result  (cost=0.00..0.01 rows=1 width=0) (actual time=0.000..0.001 rows=1 loops=1)
+           ->  Subquery Scan on locked  (cost=0.15..12.44 rows=2 width=0) (actual time=0.043..0.044 rows=0 loops=1)
+                 Output: locked.x
+                 ->  LockRows  (cost=0.15..12.42 rows=2 width=66) (actual time=0.043..0.043 rows=0 loops=1)
+                       Output: NULL::integer, b_3.ctid, c.*
+                       ->  Nested Loop  (cost=0.15..12.40 rows=2 width=66) (actual time=0.042..0.043 rows=0 loops=1)
+                             Output: NULL::integer, b_3.ctid, c.*
+                             Inner Unique: true
+                             ->  CTE Scan on candidate c  (cost=0.00..0.04 rows=2 width=88) (actual time=0.003..0.036 rows=1 loops=1)
+                                   Output: c.*, c.rate_limit_key
+                                   Filter: (c.activity_name <> ALL ('{}'::text[]))
+                             ->  Index Scan using harvest_rate_limit_buckets_pkey on public.harvest_rate_limit_buckets b_3  (cost=0.15..6.17 rows=1 width=38) (actual time=0.005..0.005 rows=0 loops=1)
+                                   Output: b_3.ctid, b_3.key
+                                   Index Cond: ((b_3.key)::text = (c.rate_limit_key)::text)
+   CTE run_expired_now
+     ->  Result  (cost=17.02..17.03 rows=1 width=1) (actual time=1.108..1.110 rows=1 loops=1)
+           Output: $56
+           Buffers: shared hit=181
+           InitPlan 42 (returns $56)
+             ->  Nested Loop  (cost=0.51..17.02 rows=1 width=0) (actual time=1.108..1.109 rows=0 loops=1)
+                   Inner Unique: true
+                   Buffers: shared hit=181
+                   InitPlan 40 (returns $53)
+                     ->  CTE Scan on fresh_now  (cost=0.00..0.04 rows=2 width=8) (actual time=0.048..0.048 rows=1 loops=1)
+                           Output: fresh_now.ts
+                   InitPlan 41 (returns $54)
+                     ->  CTE Scan on fresh_now fresh_now_1  (cost=0.00..0.04 rows=2 width=8) (actual time=0.000..0.000 rows=1 loops=1)
+                           Output: fresh_now_1.ts
+                   ->  CTE Scan on candidate c_1  (cost=0.00..0.04 rows=2 width=16) (actual time=0.959..0.960 rows=1 loops=1)
+                         Output: c_1.id, c_1.task_type, c_1.concurrency_key, c_1.concurrency_cap, c_1.rate_limit_key, c_1.activity_name, c_1.workflow_exec_id
+                         Buffers: shared hit=177
+                   ->  Index Scan using harvest_workflow_executions_pkey on public.harvest_workflow_executions e_2  (cost=0.42..8.45 rows=1 width=16) (actual time=0.146..0.146 rows=0 loops=1)
+                         Output: e_2.id
+                         Index Cond: (e_2.id = c_1.workflow_exec_id)
+                         Filter: ((e_2.state = 'RUNNING'::text) AND ((e_2.deadline_at < $53) OR (e_2.chain_deadline_at < $54)))
+                         Rows Removed by Filter: 1
+                         Buffers: shared hit=4
+   CTE rate_limit_debit
+     ->  Update on public.harvest_rate_limit_buckets b_4  (cost=0.17..12.57 rows=1 width=78) (actual time=0.012..0.012 rows=0 loops=1)
+           Output: b_4.key
+           InitPlan 44 (returns $58)
+             ->  CTE Scan on run_expired_now  (cost=0.00..0.02 rows=1 width=1) (actual time=0.000..0.000 rows=1 loops=1)
+                   Output: run_expired_now.expired
+           ->  Result  (cost=0.15..12.55 rows=1 width=78) (actual time=0.012..0.012 rows=0 loops=1)
+                 Output: (LEAST(COALESCE(CASE WHEN (b_4.override_expires_at > now()) THEN b_4.override_burst ELSE NULL::double precision END, b_4.burst), ((b_4.tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(b_4.override_expires_at, b_4.last_refilled_at), now()) - b_4.last_refilled_at))))::double precision * COALESCE(b_4.override_refill_rate, b_4.refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(b_4.override_expires_at, b_4.last_refilled_at), b_4.last_refilled_at)))))::double precision * b_4.refill_rate))) - '1'::double precision), now(), b_4.ctid, candidate.*
+                 One-Time Filter: (NOT $58)
+                 ->  Nested Loop  (cost=0.15..12.49 rows=1 width=118) (actual time=0.010..0.010 rows=0 loops=1)
+                       Output: b_4.override_expires_at, b_4.override_burst, b_4.burst, b_4.tokens, b_4.last_refilled_at, b_4.override_refill_rate, b_4.refill_rate, b_4.ctid, candidate.*
+                       Inner Unique: true
+                       ->  CTE Scan on candidate  (cost=0.00..0.04 rows=2 width=88) (actual time=0.005..0.005 rows=1 loops=1)
+                             Output: candidate.*, candidate.rate_limit_key
+                             Filter: (candidate.activity_name <> ALL ('{}'::text[]))
+                       ->  Index Scan using harvest_rate_limit_buckets_pkey on public.harvest_rate_limit_buckets b_4  (cost=0.15..6.22 rows=1 width=94) (actual time=0.004..0.004 rows=0 loops=1)
+                             Output: b_4.override_expires_at, b_4.override_burst, b_4.burst, b_4.tokens, b_4.last_refilled_at, b_4.override_refill_rate, b_4.refill_rate, b_4.ctid, b_4.key
+                             Index Cond: ((b_4.key)::text = (candidate.rate_limit_key)::text)
+                             Filter: (LEAST(COALESCE(CASE WHEN (b_4.override_expires_at > now()) THEN b_4.override_burst ELSE NULL::double precision END, b_4.burst), ((b_4.tokens + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (LEAST(COALESCE(b_4.override_expires_at, b_4.last_refilled_at), now()) - b_4.last_refilled_at))))::double precision * COALESCE(b_4.override_refill_rate, b_4.refill_rate))) + ((GREATEST('0'::numeric, EXTRACT(epoch FROM (now() - GREATEST(COALESCE(b_4.override_expires_at, b_4.last_refilled_at), b_4.last_refilled_at)))))::double precision * b_4.refill_rate))) >= '1'::double precision)
+   CTE claimed
+     ->  Update on public.harvest_task_queue harvest_task_queue_5  (cost=0.30..24.75 rows=1 width=123) (actual time=1.461..1.464 rows=1 loops=1)
+           Output: harvest_task_queue_5.id, harvest_task_queue_5.queue_name, harvest_task_queue_5.task_type, harvest_task_queue_5.workflow_exec_id, harvest_task_queue_5.activity_name, harvest_task_queue_5.input, harvest_task_queue_5.state, harvest_task_queue_5.priority, harvest_task_queue_5.worker_id, harvest_task_queue_5.attempt, harvest_task_queue_5.max_attempts, harvest_task_queue_5.scheduled_at, harvest_task_queue_5.started_at, harvest_task_queue_5.completed_at, harvest_task_queue_5.last_heartbeat_at, harvest_task_queue_5.heartbeat_timeout, harvest_task_queue_5.start_to_close, harvest_task_queue_5.schedule_to_start, harvest_task_queue_5.retry_policy, harvest_task_queue_5.output, harvest_task_queue_5.error, harvest_task_queue_5.sticky_worker_id, harvest_task_queue_5.sticky_until, harvest_task_queue_5.sticky_timeout, harvest_task_queue_5.trace_context, harvest_task_queue_5.concurrency_key, harvest_task_queue_5.concurrency_cap, harvest_task_queue_5.heartbeat_details, harvest_task_queue_5.required_build_id, harvest_task_queue_5.activity_id, harvest_task_queue_5.rate_limit_key, harvest_task_queue_5.crash_strikes, harvest_task_queue_5.schedule_to_close_at, harvest_task_queue_5.required_capabilities, harvest_task_queue_5.context_headers, harvest_task_queue_5.created_at, harvest_task_queue_5.wake_requested, harvest_task_queue_5.session_id, harvest_task_queue_5.capability_misses, harvest_task_queue_5.capability_miss_workers, harvest_task_queue_5.capability_miss_handler, harvest_task_queue_5.timer_fires_at, harvest_task_queue_5.handler_started_attempt, harvest_task_queue_5.timed_out_claims, harvest_task_queue_5.handler_started_at, harvest_task_queue_5.new_start, harvest_task_queue_5.fairness_key
+           Buffers: shared hit=201 dirtied=4 written=4
+           I/O Timings: shared write=0.034
+           InitPlan 49 (returns $66)
+             ->  CTE Scan on run_expired_now run_expired_now_1  (cost=0.00..0.02 rows=1 width=1) (actual time=1.109..1.110 rows=1 loops=1)
+                   Output: run_expired_now_1.expired
+                   Buffers: shared hit=181
+           ->  Result  (cost=0.28..24.73 rows=1 width=123) (actual time=1.128..1.130 rows=1 loops=1)
+                 Output: 'RUNNING'::text, 'w0'::text, (harvest_task_queue_5.attempt + 1), now(), false, harvest_task_queue_5.ctid, candidate_1.*
+                 One-Time Filter: (NOT $66)
+                 Buffers: shared hit=184
+                 ->  Nested Loop  (cost=0.28..24.73 rows=1 width=50) (actual time=0.014..0.015 rows=1 loops=1)
+                       Output: harvest_task_queue_5.attempt, harvest_task_queue_5.ctid, candidate_1.*
+                       Inner Unique: true
+                       Buffers: shared hit=3
+                       ->  CTE Scan on candidate candidate_1  (cost=0.00..16.42 rows=1 width=56) (actual time=0.004..0.005 rows=1 loops=1)
+                             Output: candidate_1.*, candidate_1.id
+                             Filter: (((candidate_1.rate_limit_key IS NULL) OR (candidate_1.activity_name = ANY ('{}'::text[])) OR (hashed SubPlan 48)) AND ((candidate_1.concurrency_key IS NULL) OR (pg_try_advisory_xact_lock((hashtext(candidate_1.concurrency_key))::bigint) AND ((candidate_1.concurrency_cap IS NULL) OR ((SubPlan 46) < candidate_1.concurrency_cap)))))
+                             SubPlan 48
+                               ->  CTE Scan on rate_limit_debit  (cost=0.00..0.02 rows=1 width=32) (never executed)
+                                     Output: rate_limit_debit.debited_key
+                             SubPlan 46
+                               ->  Aggregate  (cost=8.15..8.16 rows=1 width=8) (never executed)
+                                     Output: count(*)
+                                     ->  Index Scan using idx_harvest_tq_running_started on public.harvest_task_queue recheck  (cost=0.12..8.14 rows=1 width=0) (never executed)
+                                           Filter: ((recheck.worker_id IS NOT NULL) AND (recheck.concurrency_key = candidate_1.concurrency_key) AND (recheck.task_type = candidate_1.task_type))
+                       ->  Index Scan using harvest_task_queue_pkey on public.harvest_task_queue harvest_task_queue_5  (cost=0.28..8.30 rows=1 width=26) (actual time=0.008..0.008 rows=1 loops=1)
+                             Output: harvest_task_queue_5.attempt, harvest_task_queue_5.ctid, harvest_task_queue_5.id
+                             Index Cond: (harvest_task_queue_5.id = candidate_1.id)
+                             Buffers: shared hit=3
+ Query Identifier: 5647479137613713630
+ Planning:
+   Buffers: shared hit=1700 read=42 written=31
+   I/O Timings: shared read=0.204 write=0.117
+ Planning Time: 9.802 ms
+ Execution Time: 3.101 ms
+(430 rows)
+

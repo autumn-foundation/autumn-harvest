@@ -129,6 +129,11 @@ const CITED_CODE: &[(&str, &str, &str)] = &[
         "pub struct OwnerKey {",
     ),
     (
+        "acquire_many",
+        "autumn-harvest/src/decision_owner.rs",
+        "pub async fn acquire_many(",
+    ),
+    (
         "DEFAULT_SCANNER_LEASE_TTL",
         "autumn-harvest/src/scanner_lease.rs",
         "pub const DEFAULT_SCANNER_LEASE_TTL: Duration = Duration::from_secs(10);",
@@ -198,6 +203,7 @@ const LOCK_TESTS: &[&str] = &[
     "a_for_share_commit_blocks_a_renewal",
     "a_scanner_style_upsert_does_not_wait_for_a_commit",
     "a_local_idle_timeout_frees_a_frozen_commit",
+    "a_skip_locked_acquisition_skips_an_in_flight_commit",
 ];
 
 fn repo_root() -> PathBuf {
@@ -631,6 +637,94 @@ fn guards_run_on_docs_only_changes() {
         )
     });
     check_stanza(stanza, FILTER).unwrap_or_else(|reason| panic!("{reason}. Stanza:\n{stanza}"));
+}
+
+/// The failover page of issue #2254.
+const FAILOVER_PAGE: &str = "docs/performance-owner-failover.md";
+
+/// The suite that measures the failover page.
+const FAILOVER_SUITE: &str = "autumn-harvest/tests/integration/owner_failover_tests.rs";
+
+/// The failover tests that the page cites.
+const FAILOVER_TESTS: &[&str] = &[
+    "a_frozen_owner_is_fenced_after_a_takeover",
+    "a_frozen_commit_transaction_does_not_block_the_takeover",
+    "after_kill_9_the_next_decision_runs_within_ttl_plus_one_second",
+    "scale_out_from_4_to_8_workers_recovers_within_two_ttls",
+];
+
+/// The failover page cites each failover test, and each test exists. The
+/// ADR links the page (issue #2254).
+#[test]
+fn failover_page_cites_the_failover_tests() {
+    let page = read(FAILOVER_PAGE);
+    let suite = read(FAILOVER_SUITE);
+    for test in FAILOVER_TESTS {
+        assert!(
+            page.contains(&format!("`{test}`")),
+            "{FAILOVER_PAGE} must cite `{test}`"
+        );
+        assert!(
+            suite.contains(&format!("async fn {test}(")),
+            "{FAILOVER_SUITE} lacks `{test}`"
+        );
+    }
+    assert!(
+        read(ADR).contains("performance-owner-failover.md"),
+        "{ADR} must link {FAILOVER_PAGE}"
+    );
+}
+
+/// The decider page of issue #2255.
+const DECIDER_PAGE: &str = "docs/performance-owner-decider.md";
+
+/// The suite that proves the decider.
+const DECIDER_SUITE: &str = "autumn-harvest/tests/integration/owner_decider_tests.rs";
+
+/// The decider tests that the page cites.
+const DECIDER_TESTS: &[&str] = &[
+    "a_signal_acknowledged_just_before_an_epoch_bump_is_never_lost",
+    "a_signal_hinted_to_an_owner_that_loses_its_epoch_is_never_lost",
+    "an_owner_takes_workflow_tasks_off_the_claim_path",
+];
+
+/// The fused fence that decision 13 cites.
+const FUSED_FENCE: (&str, &str) = (
+    "autumn-harvest/migrations/20261023015935_harvest_owner_decider/up.sql",
+    "CREATE OR REPLACE FUNCTION harvest_decision_fence(",
+);
+
+/// The decider page cites each decider test, and each test exists.
+/// Decision 13 names the suite, links the page and cites the fused fence,
+/// which its migration declares (issue #2255).
+#[test]
+fn decider_page_and_decision_13_cite_real_tests() {
+    let page = read(DECIDER_PAGE);
+    let suite = read(DECIDER_SUITE);
+    let adr = read(ADR);
+    let decision = section(&adr, "\n### 13. Owner decider", "\n## ")
+        .unwrap_or_else(|| panic!("{ADR} has no decision 13"));
+    for test in DECIDER_TESTS {
+        assert!(
+            page.contains(&format!("`{test}`")),
+            "{DECIDER_PAGE} must cite `{test}`"
+        );
+        assert!(
+            suite.contains(&format!("async fn {test}(")),
+            "{DECIDER_SUITE} lacks `{test}`"
+        );
+    }
+    for link in ["owner_decider_tests.rs", "performance-owner-decider.md"] {
+        assert!(
+            decision.contains(link),
+            "{ADR} decision 13 must cite {link}"
+        );
+    }
+    let (migration, declaration) = FUSED_FENCE;
+    assert!(
+        decision.contains("`harvest_decision_fence`") && read(migration).contains(declaration),
+        "{ADR} decision 13 cites `harvest_decision_fence`, and {migration} declares it"
+    );
 }
 
 #[test]
