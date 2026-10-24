@@ -24,15 +24,20 @@
 //! - **No file.** The database lives in memory. `ATTACH` is refused, and
 //!   temporary data stays in memory. So no plaintext reaches the disk.
 //! - **Bounded.** A query stops after [`MAX_STEPS`] virtual machine steps,
-//!   or past [`MAX_ROWS`] rows.
+//!   after [`MAX_QUERY_TIME`], or when SQLite memory grows by more than
+//!   [`MAX_QUERY_MEMORY`]. A result stops past [`MAX_ROWS`] rows or
+//!   [`MAX_RESULT_BYTES`] bytes. A string or blob holds at most
+//!   [`MAX_VALUE_BYTES`] bytes.
 //! - **One statement.** A second statement is refused.
+//! - **Blobs as hex.** A blob result is a lowercase hex string.
 //!
 //! The owner-local projection file of
 //! [ADR 0012](../../docs/adr/0012-owner-disk-cache.md) holds the snapshot
 //! sealed. This module never reads or writes that file.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::limits::Limit;
@@ -57,7 +62,27 @@ pub const MAX_STEPS: u64 = 50_000_000;
 pub const MAX_SQL_BYTES: i32 = 100_000;
 
 /// The longest string or blob that a query makes, in bytes.
-pub const MAX_VALUE_BYTES: i32 = 16 * 1024 * 1024;
+pub const MAX_VALUE_BYTES: i32 = 1024 * 1024;
+
+/// The most bytes of text and blobs that one result holds.
+pub const MAX_RESULT_BYTES: usize = 16 * 1024 * 1024;
+
+/// The most time that one query runs.
+pub const MAX_QUERY_TIME: Duration = Duration::from_secs(5);
+
+/// The most that SQLite memory grows while one query runs, in bytes.
+///
+/// SQLite counts its memory for the whole process. So concurrent queries
+/// share this budget, and [`MAX_CONCURRENT_QUERIES`] bounds their number.
+pub const MAX_QUERY_MEMORY: i64 = 64 * 1024 * 1024;
+
+/// The most queries that one process runs at a time.
+pub const MAX_CONCURRENT_QUERIES: usize = 4;
+
+/// The query slots of this process. A permit lives as long as its query
+/// thread, also after the caller drops the future.
+pub(crate) static QUERY_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_CONCURRENT_QUERIES);
 
 /// The snapshot of one entity that a query reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,8 +177,15 @@ pub enum EntitySqlError {
         /// The row cap.
         limit: usize,
     },
-    /// The query ran past [`MAX_STEPS`].
-    #[error("the query ran past its step budget")]
+    /// The result holds more than [`MAX_RESULT_BYTES`] bytes.
+    #[error("the result holds more than {limit} bytes")]
+    TooLarge {
+        /// The byte cap.
+        limit: usize,
+    },
+    /// The query ran past [`MAX_STEPS`], [`MAX_QUERY_TIME`] or
+    /// [`MAX_QUERY_MEMORY`], or its caller went away.
+    #[error("the query ran past its step, time or memory budget")]
     TooCostly,
     /// A database, codec or runtime error.
     #[error(transparent)]
@@ -165,23 +197,52 @@ pub enum EntitySqlError {
 /// # Errors
 ///
 /// [`EntitySqlError::Refused`] for SQL that is not one read-only statement,
-/// [`EntitySqlError::TooManyRows`], [`EntitySqlError::TooCostly`] and
-/// [`EntitySqlError::Sql`] for any other SQLite error.
+/// [`EntitySqlError::TooManyRows`], [`EntitySqlError::TooLarge`],
+/// [`EntitySqlError::TooCostly`] and [`EntitySqlError::Sql`] for any other
+/// SQLite error.
 pub fn run(
     record: &EntityRecord,
     sql: &str,
     params: &[Value],
     source: EntitySqlSource,
 ) -> Result<EntitySqlRows, EntitySqlError> {
+    run_cancellable(
+        record,
+        sql,
+        params,
+        source,
+        &Arc::new(AtomicBool::new(false)),
+    )
+}
+
+/// [`run`] that also stops when `cancel` turns `true`.
+///
+/// The worker sets `cancel` when the caller drops its future. A blocking
+/// thread then does not run on for nothing.
+pub(crate) fn run_cancellable(
+    record: &EntityRecord,
+    sql: &str,
+    params: &[Value],
+    source: EntitySqlSource,
+    cancel: &Arc<AtomicBool>,
+) -> Result<EntitySqlRows, EntitySqlError> {
     let conn = open(record)?;
-    let ticks = Arc::new(AtomicU64::new(0));
-    let counted = Arc::clone(&ticks);
+    let deadline = Instant::now() + MAX_QUERY_TIME;
+    let memory_at_start = sqlite_memory_used();
+    let cancel = Arc::clone(cancel);
+    let mut ticks: u64 = 0;
     conn.progress_handler(
         STEP_INTERVAL,
-        Some(move || counted.fetch_add(1, Ordering::Relaxed) + 1 > MAX_TICKS),
+        Some(move || {
+            ticks += 1;
+            ticks > MAX_TICKS
+                || Instant::now() >= deadline
+                || cancel.load(Ordering::Relaxed)
+                || sqlite_memory_used().saturating_sub(memory_at_start) > MAX_QUERY_MEMORY
+        }),
     )
-    .map_err(sql_error)?;
-    let mut stmt = conn.prepare(sql).map_err(prepare_error)?;
+    .map_err(|e| sql_error(&e))?;
+    let mut stmt = conn.prepare(sql).map_err(|e| prepare_error(&e))?;
     if !stmt.readonly() {
         return Err(EntitySqlError::Refused(
             "the statement is not read-only".to_string(),
@@ -200,15 +261,25 @@ pub fn run(
     let bound: Vec<rusqlite::types::Value> = params.iter().map(to_sql).collect();
     let mut rows = stmt
         .query(rusqlite::params_from_iter(bound))
-        .map_err(step_error)?;
+        .map_err(|e| step_error(&e))?;
     let mut out = Vec::new();
-    while let Some(row) = rows.next().map_err(step_error)? {
+    let mut bytes: usize = 0;
+    while let Some(row) = rows.next().map_err(|e| step_error(&e))? {
         if out.len() == MAX_ROWS {
             return Err(EntitySqlError::TooManyRows { limit: MAX_ROWS });
         }
         let mut values = Vec::with_capacity(columns.len());
         for index in 0..columns.len() {
-            values.push(to_json(row.get_ref(index).map_err(sql_error)?));
+            let value = row.get_ref(index).map_err(|e| sql_error(&e))?;
+            // Count each value before it turns into JSON, so a large result
+            // never reaches the heap of the worker.
+            bytes = bytes.saturating_add(result_bytes(value));
+            if bytes > MAX_RESULT_BYTES {
+                return Err(EntitySqlError::TooLarge {
+                    limit: MAX_RESULT_BYTES,
+                });
+            }
+            values.push(to_json(value));
         }
         out.push(values);
     }
@@ -220,11 +291,36 @@ pub fn run(
 }
 
 /// How often the progress handler runs, in virtual machine steps.
-const STEP_INTERVAL: i32 = 10_000;
+///
+/// One step can make a value of [`MAX_VALUE_BYTES`]. A short interval keeps
+/// the memory growth between two checks small.
+const STEP_INTERVAL: i32 = 100;
 
 /// The progress handler calls that [`MAX_STEPS`] allows. The divisor is
 /// [`STEP_INTERVAL`]. A unit test checks that the two agree.
-const MAX_TICKS: u64 = MAX_STEPS / 10_000;
+const MAX_TICKS: u64 = MAX_STEPS / 100;
+
+/// The bytes that every value costs in the result budget, on top of its
+/// text or blob.
+const VALUE_OVERHEAD_BYTES: usize = 16;
+
+/// The memory that SQLite holds in this process, in bytes.
+fn sqlite_memory_used() -> i64 {
+    // SAFETY: `sqlite3_memory_used` reads a global counter under its own
+    // mutex. It takes no pointer and is safe to call from any thread.
+    unsafe { rusqlite::ffi::sqlite3_memory_used() }
+}
+
+/// The bytes that `value` costs in the result budget. A blob counts as its
+/// hex text.
+const fn result_bytes(value: ValueRef<'_>) -> usize {
+    let payload = match value {
+        ValueRef::Text(bytes) => bytes.len(),
+        ValueRef::Blob(bytes) => bytes.len().saturating_mul(2),
+        ValueRef::Null | ValueRef::Integer(_) | ValueRef::Real(_) => 0,
+    };
+    payload.saturating_add(VALUE_OVERHEAD_BYTES)
+}
 
 /// The schema of the in-memory database.
 const SCHEMA: &str = "
@@ -247,12 +343,13 @@ const DENIED_FUNCTIONS: &[&str] = &["load_extension", "fts3_tokenizer"];
 /// The setup runs before the authorizer. After it, only reads and functions
 /// pass.
 fn open(record: &EntityRecord) -> Result<Connection, EntitySqlError> {
-    let conn = Connection::open_in_memory().map_err(sql_error)?;
+    let conn = Connection::open_in_memory().map_err(|e| sql_error(&e))?;
     conn.execute_batch("PRAGMA temp_store = MEMORY;")
-        .map_err(sql_error)?;
-    conn.execute_batch(SCHEMA).map_err(sql_error)?;
-    let state = serde_json::to_string(&record.snapshot.state).map_err(HarvestError::from)?;
-    let stats = serde_json::to_string(&record.snapshot.stats).map_err(HarvestError::from)?;
+        .map_err(|e| sql_error(&e))?;
+    conn.execute_batch(SCHEMA).map_err(|e| sql_error(&e))?;
+    let state_json = serde_json::to_string(&record.snapshot.state).map_err(HarvestError::from)?;
+    let counters_json =
+        serde_json::to_string(&record.snapshot.stats).map_err(HarvestError::from)?;
     conn.execute(
         "INSERT INTO entity VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
@@ -261,21 +358,22 @@ fn open(record: &EntityRecord) -> Result<Connection, EntitySqlError> {
             record.execution_id.as_uuid().to_string(),
             record.event_id,
             record.deleted,
-            state,
-            stats
+            state_json,
+            counters_json
         ],
     )
-    .map_err(sql_error)?;
+    .map_err(|e| sql_error(&e))?;
     conn.execute_batch("PRAGMA query_only = ON;")
-        .map_err(sql_error)?;
+        .map_err(|e| sql_error(&e))?;
     for (limit, value) in [
         (Limit::SQLITE_LIMIT_ATTACHED, 0),
         (Limit::SQLITE_LIMIT_SQL_LENGTH, MAX_SQL_BYTES),
         (Limit::SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES),
     ] {
-        conn.set_limit(limit, value).map_err(sql_error)?;
+        conn.set_limit(limit, value).map_err(|e| sql_error(&e))?;
     }
-    conn.authorizer(Some(authorize)).map_err(sql_error)?;
+    conn.authorizer(Some(authorize))
+        .map_err(|e| sql_error(&e))?;
     Ok(conn)
 }
 
@@ -296,14 +394,14 @@ fn authorize(ctx: AuthContext<'_>) -> Authorization {
     }
 }
 
-fn sql_error(err: rusqlite::Error) -> EntitySqlError {
+fn sql_error(err: &rusqlite::Error) -> EntitySqlError {
     EntitySqlError::Sql(err.to_string())
 }
 
 /// Map a prepare error. A denied action or a second statement is a
 /// refusal.
-fn prepare_error(err: rusqlite::Error) -> EntitySqlError {
-    match &err {
+fn prepare_error(err: &rusqlite::Error) -> EntitySqlError {
+    match err {
         rusqlite::Error::MultipleStatement => {
             EntitySqlError::Refused("the SQL holds more than one statement".to_string())
         }
@@ -316,13 +414,19 @@ fn prepare_error(err: rusqlite::Error) -> EntitySqlError {
     }
 }
 
-/// Map a step error. An interrupt from the progress handler is a stop.
-fn step_error(err: rusqlite::Error) -> EntitySqlError {
-    match &err {
+/// Map a step error. An interrupt from the progress handler is a stop. A
+/// denied action at run time, such as a pragma function, is a refusal.
+fn step_error(err: &rusqlite::Error) -> EntitySqlError {
+    match err {
         rusqlite::Error::SqliteFailure(failure, _)
             if failure.code == ErrorCode::OperationInterrupted =>
         {
             EntitySqlError::TooCostly
+        }
+        rusqlite::Error::SqliteFailure(failure, _)
+            if failure.code == ErrorCode::AuthorizationForStatementDenied =>
+        {
+            EntitySqlError::Refused(err.to_string())
         }
         _ => sql_error(err),
     }
@@ -343,8 +447,8 @@ fn to_sql(value: &Value) -> rusqlite::types::Value {
     }
 }
 
-/// Map one result value. A blob is an array of bytes. A real that JSON
-/// cannot hold, such as infinity, is `null`.
+/// Map one result value. A blob is a lowercase hex string. A real that
+/// JSON cannot hold, such as infinity, is `null`.
 fn to_json(value: ValueRef<'_>) -> Value {
     match value {
         ValueRef::Null => Value::Null,
@@ -353,7 +457,14 @@ fn to_json(value: ValueRef<'_>) -> Value {
             serde_json::Number::from_f64(number).map_or(Value::Null, Value::Number)
         }
         ValueRef::Text(bytes) => Value::String(String::from_utf8_lossy(bytes).into_owned()),
-        ValueRef::Blob(bytes) => Value::from(bytes.to_vec()),
+        ValueRef::Blob(bytes) => Value::String(bytes.iter().fold(
+            String::with_capacity(bytes.len() * 2),
+            |mut hex, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            },
+        )),
     }
 }
 
@@ -365,8 +476,10 @@ mod tests {
     use crate::entity::EntityStats;
 
     fn record() -> EntityRecord {
-        let mut stats = EntityStats::default();
-        stats.applied = 3;
+        let stats = EntityStats {
+            applied: 3,
+            ..EntityStats::default()
+        };
         EntityRecord::new(
             "cart",
             "cart-7",
@@ -475,7 +588,7 @@ mod tests {
 
     #[test]
     fn values_map_to_json() {
-        let rows = query("SELECT NULL, 2, 0.25, 'text', x'0102', 1e999", &[]).expect("query");
+        let rows = query("SELECT NULL, 2, 0.25, 'text', x'01ff', 1e999", &[]).expect("query");
         assert_eq!(
             rows.rows,
             vec![vec![
@@ -483,7 +596,7 @@ mod tests {
                 json!(2),
                 json!(0.25),
                 json!("text"),
-                json!([1, 2]),
+                json!("01ff"),
                 Value::Null
             ]]
         );
@@ -493,7 +606,7 @@ mod tests {
     fn a_query_with_no_rows_keeps_its_columns() {
         let rows = query("SELECT event_id AS id FROM entity WHERE deleted", &[]).expect("q");
         assert_eq!(rows.columns, ["id"]);
-        assert!(rows.rows.is_empty());
+        assert_eq!(rows.rows.len(), 0);
     }
 
     #[test]
@@ -622,6 +735,71 @@ mod tests {
             Err(EntitySqlError::Sql(text)) => assert!(text.contains("nope"), "{text}"),
             other => panic!("expected a SQL error, got {other:?}"),
         }
+    }
+
+    /// Issue #2260 review: a result past the byte cap stops before it turns
+    /// into JSON.
+    #[test]
+    fn a_large_result_stops_at_the_byte_cap() {
+        let sql = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+                   WHERE i < 20) SELECT printf('%.*c', 1000000, 'x') FROM n";
+        match query(sql, &[]) {
+            Err(EntitySqlError::TooLarge { limit }) => assert_eq!(limit, MAX_RESULT_BYTES),
+            other => panic!("expected the byte cap, got {other:?}"),
+        }
+        let blobs = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+                     WHERE i < 10) SELECT zeroblob(1000000) FROM n";
+        assert!(matches!(
+            query(blobs, &[]),
+            Err(EntitySqlError::TooLarge { .. })
+        ));
+    }
+
+    /// Issue #2260 review: a query that grows SQLite memory past its budget
+    /// stops.
+    #[test]
+    fn a_memory_hungry_query_stops() {
+        let sql = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+                   WHERE i < 2000) \
+                   SELECT count(DISTINCT printf('%.*c', 1000000, 'x') || i) FROM n";
+        match query(sql, &[]) {
+            Err(EntitySqlError::TooCostly) => {}
+            other => panic!("expected a stop, got {other:?}"),
+        }
+    }
+
+    /// Issue #2260 review: a slow query with a small step count stops at its
+    /// deadline.
+    #[test]
+    fn a_slow_query_stops_at_its_deadline() {
+        let started = Instant::now();
+        let sql = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n \
+                   WHERE i < 1000000) \
+                   SELECT count(length(replace(printf('%.*c', 1000000 - i % 7, 'x'), 'x', 'y'))) \
+                   FROM n";
+        match query(sql, &[]) {
+            Err(EntitySqlError::TooCostly) => {}
+            other => panic!("expected a stop, got {other:?}"),
+        }
+        assert!(started.elapsed() < MAX_QUERY_TIME * 4, "the deadline holds");
+    }
+
+    /// Issue #2260 review: a cancelled query stops.
+    #[test]
+    fn a_cancelled_query_stops() {
+        let cancel = Arc::new(AtomicBool::new(true));
+        let sql = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) \
+                   SELECT count(*) FROM n";
+        match run_cancellable(&record(), sql, &[], EntitySqlSource::File, &cancel) {
+            Err(EntitySqlError::TooCostly) => {}
+            other => panic!("expected a stop, got {other:?}"),
+        }
+    }
+
+    /// Issue #2260 review: a pragma function is a refusal at run time.
+    #[test]
+    fn a_pragma_function_is_refused() {
+        refused("SELECT * FROM pragma_table_info('entity')");
     }
 
     #[test]

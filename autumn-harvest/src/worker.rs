@@ -22789,6 +22789,19 @@ const fn final_miss(hot_swapped: bool, reason: ResidentOutcome) -> crate::reside
     })
 }
 
+/// Sets its flag when it drops (issue #2260). An entity query holds one, so
+/// a dropped caller stops the query thread.
+#[cfg(feature = "owner-disk-cache")]
+#[derive(Default)]
+struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+#[cfg(feature = "owner-disk-cache")]
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// The cache entry of a disk hit (issue #2258): the state, no resident
 /// workflow, the byte mark and the owner key.
 #[cfg(feature = "owner-disk-cache")]
@@ -22848,6 +22861,7 @@ async fn read_disk_entry(
 /// the state for the memory cache, or `None` when the write task died.
 #[cfg(feature = "owner-disk-cache")]
 async fn write_disk_entry(
+    conn: &mut AsyncPgConnection,
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
     suspended: bool,
@@ -22860,9 +22874,9 @@ async fn write_disk_entry(
     };
     match owner.pinned {
         Some(epoch) if suspended && owner.may_cache() => {
-            // Issue #2260: the entity projection first. It reads the events
-            // before the write takes the state.
-            disk.apply_entity(owner.key, epoch, exec_uuid, &state, Arc::clone(owner.owned))
+            // Issue #2260: the entity projection first. The commit wrote its
+            // Postgres row, so one read finds the new snapshot.
+            disk.apply_entity(conn, owner.key, epoch, exec_uuid, Arc::clone(owner.owned))
                 .await;
             disk.write(
                 owner.key,
@@ -29227,6 +29241,7 @@ async fn process_workflow_task(
             // snapshot moves into the cache; nothing reads `history_events`
             // after this point.
             store_cache_entry(
+                conn,
                 &workflow_cache,
                 prepared.exec_id.as_uuid(),
                 cache_update_after_persist(pending_cache_update, deferred_cancel_ended_run),
@@ -29478,7 +29493,11 @@ const fn cache_update_after_persist(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn store_cache_entry(
+    // Issue #2260: the entity projection reads the committed row with it.
+    #[cfg_attr(not(feature = "owner-disk-cache"), allow(unused_variables))]
+    conn: &mut AsyncPgConnection,
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
     suspended: Option<bool>,
@@ -29496,6 +29515,7 @@ async fn store_cache_entry(
     // A terminal run, or an ended tenure, purges the disk entry.
     #[cfg(feature = "owner-disk-cache")]
     let Some(state) = write_disk_entry(
+        conn,
         workflow_cache,
         exec_uuid,
         suspended,
@@ -36457,6 +36477,18 @@ impl Worker {
             .is_some_and(|disk| disk.cache().contains_entity(exec_id.as_uuid()))
     }
 
+    /// The event id of the entity projection row of `exec_id`, if any
+    /// (issue #2260). Tests use it to see the apply after a commit.
+    #[cfg(feature = "owner-disk-cache")]
+    #[doc(hidden)]
+    pub async fn entity_projection_event(&self, exec_id: ExecutionId) -> Option<i32> {
+        self.workflow_cache
+            .lock()
+            .await
+            .disk()
+            .and_then(|disk| disk.cache().entity_event_id(exec_id.as_uuid()))
+    }
+
     /// Run read-only SQL over the state of one keyed entity (issue #2260).
     ///
     /// The query reads the last state snapshot of the entity
@@ -36491,6 +36523,7 @@ impl Worker {
         let (record, source) = crate::owner_disk_cache::entity_record(
             disk.as_ref(),
             &mut conn,
+            self.entity_sql_owner_shard(),
             self.registry.decision_owner(),
             self.registry.payload_codecs(),
             self.registry.payload_offloader(),
@@ -36499,13 +36532,45 @@ impl Worker {
         )
         .await?;
         drop(conn);
+        // A permit bounds the queries of this process. It moves into the
+        // thread, so it lives until the query stops.
+        let permit = crate::entity_sql::QUERY_SLOTS
+            .acquire()
+            .await
+            .map_err(|e| crate::entity_sql::EntitySqlError::Sql(e.to_string()))?;
+        // A dropped caller cancels the query at its next progress check.
+        let cancel = CancelOnDrop::default();
+        let flag = Arc::clone(&cancel.0);
         let sql = sql.to_string();
         let params = params.to_vec();
-        tokio::task::spawn_blocking(move || crate::entity_sql::run(&record, &sql, &params, source))
-            .await
-            .map_err(|e| {
-                crate::entity_sql::EntitySqlError::Sql(format!("the query task died: {e}"))
-            })?
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            crate::entity_sql::run_cancellable(&record, &sql, &params, source, &flag)
+        })
+        .await
+        .map_err(|e| crate::entity_sql::EntitySqlError::Sql(format!("the query task died: {e}")))?;
+        drop(cancel);
+        result
+    }
+
+    /// The owner shard of the database that an entity query reads (issue
+    /// #2260).
+    ///
+    /// A worker with one claim target knows it. A worker with several
+    /// cannot tell which one a pool serves, so it returns `None`. A query
+    /// then reads history and writes no file.
+    #[cfg(feature = "owner-disk-cache")]
+    fn entity_sql_owner_shard(&self) -> Option<crate::types::ShardId> {
+        let targets = self
+            .claim_targets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match targets.as_slice() {
+            [] => Some(self.owner_shard_of(None)),
+            [only] => Some(self.owner_shard_of(*only)),
+            _ => None,
+        }
     }
 
     /// Drop the memory entry of `exec_id` and keep its disk entry (issue

@@ -124,8 +124,9 @@ let rows = worker
 - **Opt-in.** It needs the disk cache, owner mode and the switch. The switch with no directory fails the worker start.
 - **A projection only.** A query reads the sealed row only when its run and event id match `harvest_entity_state` in Postgres. Otherwise it reads the snapshot event from history, and the owner writes the row again. `rows.source` says which one it read.
 - **Same hygiene.** The row lives in the partition file of the disk cache, so every rule above applies to it. A file that left the directory reads as stale.
-- **Read-only.** Each query runs in a fresh in-memory SQLite database with one table, `entity`. Writes, `ATTACH`, `VACUUM INTO` and pragmas are refused. A query stops after 50 million steps or past 10,000 rows. The `entity_sql` module docs list the columns.
-- **Any worker.** A worker with no tenure for the entity reads history and writes no file.
+- **Read-only.** Each query runs in a fresh in-memory SQLite database with one table, `entity`. Writes, `ATTACH`, `VACUUM INTO` and pragmas are refused. The `entity_sql` module docs list the columns.
+- **Bounded.** A query stops after 50 million steps, after 5 s, or when SQLite memory grows by 64 MiB. A result stops past 10,000 rows or 16 MiB. At most four queries run at a time in a process.
+- **Any worker.** A worker with no tenure for the entity reads history and writes no file. A worker with several claim targets also writes no file.
 - **Effective config.** The view reports `owner_entity_sql`.
 
 ## Configuration
