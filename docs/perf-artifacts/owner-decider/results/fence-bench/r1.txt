@@ -1,0 +1,66 @@
+warning: function `run_workflow_canary` is never used
+    --> autumn-harvest/src/executor.rs:1617:21
+     |
+1617 | pub(crate) async fn run_workflow_canary(
+     |                     ^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `autumn-harvest` (lib) generated 1 warning
+    Finished `bench` profile [optimized] target(s) in 0.34s
+     Running benches/decision_fence_bench.rs (target/odc/tgt/release/deps/decision_fence_bench-eb7f596798764e38)
+Gnuplot not found, using plotters backend
+Benchmarking decision_persist/owner/writers/1
+Benchmarking decision_persist/owner/writers/1: Warming up for 2.0000 s
+Benchmarking decision_persist/owner/writers/1: Collecting 100 samples in estimated 6.0311 s (1900 iterations)
+Benchmarking decision_persist/owner/writers/1: Analyzing
+decision_persist/owner/writers/1
+                        time:   [3.5395 ms 3.6107 ms 3.6841 ms]
+                        change: [−3.5305% −0.4781% +2.6477%] (p = 0.76 > 0.05)
+                        No change in performance detected.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+
+Benchmarking decision_persist/generation_owner_split/writers/1
+Benchmarking decision_persist/generation_owner_split/writers/1: Warming up for 2.0000 s
+Benchmarking decision_persist/generation_owner_split/writers/1: Collecting 100 samples in estimated 6.2782 s (1200 iterations)
+Benchmarking decision_persist/generation_owner_split/writers/1: Analyzing
+decision_persist/generation_owner_split/writers/1
+                        time:   [5.5195 ms 5.6566 ms 5.7985 ms]
+                        change: [−0.9684% +2.3407% +5.9042%] (p = 0.18 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking decision_persist/generation_owner/writers/1
+Benchmarking decision_persist/generation_owner/writers/1: Warming up for 2.0000 s
+Benchmarking decision_persist/generation_owner/writers/1: Collecting 100 samples in estimated 6.2909 s (1600 iterations)
+Benchmarking decision_persist/generation_owner/writers/1: Analyzing
+decision_persist/generation_owner/writers/1
+                        time:   [3.7397 ms 3.8618 ms 3.9891 ms]
+                        change: [−1.4844% +2.2716% +6.1924%] (p = 0.26 > 0.05)
+                        No change in performance detected.
+Found 3 outliers among 100 measurements (3.00%)
+  3 (3.00%) high mild
+
+Benchmarking decision_persist/generation/writers/1
+Benchmarking decision_persist/generation/writers/1: Warming up for 2.0000 s
+Benchmarking decision_persist/generation/writers/1: Collecting 100 samples in estimated 6.1592 s (1700 iterations)
+Benchmarking decision_persist/generation/writers/1: Analyzing
+decision_persist/generation/writers/1
+                        time:   [4.3392 ms 4.5385 ms 4.7540 ms]
+                        change: [+8.5608% +13.809% +19.398%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 5 outliers among 100 measurements (5.00%)
+  4 (4.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking decision_persist/none/writers/1
+Benchmarking decision_persist/none/writers/1: Warming up for 2.0000 s
+Benchmarking decision_persist/none/writers/1: Collecting 100 samples in estimated 6.1369 s (1400 iterations)
+Benchmarking decision_persist/none/writers/1: Analyzing
+decision_persist/none/writers/1
+                        time:   [4.1767 ms 4.3168 ms 4.4603 ms]
+                        change: [+6.7758% +12.161% +17.607%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+

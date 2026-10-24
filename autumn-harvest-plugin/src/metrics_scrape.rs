@@ -48,12 +48,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use autumn_harvest::telemetry::{
-    ActivityStatus, BUILD_ID_LABEL_NONE, ClaimKind, ConnectorOutcome, DbOp, METRIC_LABEL_ACTIVITY,
-    METRIC_LABEL_BUILD_ID, METRIC_LABEL_CLIENT_KIND, METRIC_LABEL_DIMENSION, METRIC_LABEL_KIND,
-    METRIC_LABEL_NAME, METRIC_LABEL_OP, METRIC_LABEL_OUTCOME, METRIC_LABEL_PHASE,
-    METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_ROUTE_CLASS, METRIC_LABEL_SHARD,
-    METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS, METRIC_LABEL_WORKFLOW,
-    MetricsRecorder, PersistPhase, PoisonReason, SlotType, WorkflowStatus,
+    ActivityStatus, BUILD_ID_LABEL_NONE, ClaimKind, ConnectorOutcome, DB_OP_TAKE, DbOp,
+    METRIC_LABEL_ACTIVITY, METRIC_LABEL_BUILD_ID, METRIC_LABEL_CLIENT_KIND, METRIC_LABEL_DIMENSION,
+    METRIC_LABEL_KIND, METRIC_LABEL_NAME, METRIC_LABEL_OP, METRIC_LABEL_OUTCOME,
+    METRIC_LABEL_PHASE, METRIC_LABEL_QUEUE, METRIC_LABEL_REASON, METRIC_LABEL_ROUTE_CLASS,
+    METRIC_LABEL_SHARD, METRIC_LABEL_SLOT_TYPE, METRIC_LABEL_SOURCE, METRIC_LABEL_STATUS,
+    METRIC_LABEL_WORKFLOW, MetricsRecorder, PersistPhase, PoisonReason, SlotType, WorkflowStatus,
 };
 use autumn_harvest::worker_outlier::OutlierDimension;
 use autumn_web::actuator::{MetricFamily, MetricKind, MetricSample, MetricsSource};
@@ -205,6 +205,8 @@ struct Inner {
     // Issue #2248: claim samples keep their kind. They render in the
     // `harvest_db_query_duration` family as `op="claim"` with a `kind` label.
     db_claim_duration: Histogram,
+    // Issue #2255: owner takes render as `op="take"` with a `kind` label.
+    db_take_duration: Histogram,
     db_persist_phase: Histogram,
     worker_pollers: Gauge,
     worker_outlier: Gauge,
@@ -527,6 +529,12 @@ impl MetricsRecorder for HarvestMetricsRecorder {
     fn record_claim_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
         self.0
             .db_claim_duration
+            .observe(vec![kind.as_str().to_owned(), shard.to_string()], seconds);
+    }
+
+    fn record_owner_take_duration(&self, kind: ClaimKind, shard: u16, seconds: f64) {
+        self.0
+            .db_take_duration
             .observe(vec![kind.as_str().to_owned(), shard.to_string()], seconds);
     }
 
@@ -929,6 +937,17 @@ fn push_saturation_metrics(families: &mut Vec<MetricFamily>, inner: &Inner) {
                 (labels, stats)
             }),
     );
+    query_rows.extend(
+        inner
+            .db_take_duration
+            .snapshot()
+            .into_iter()
+            .map(|(vals, stats)| {
+                let mut labels = vec![(METRIC_LABEL_OP.to_owned(), DB_OP_TAKE.to_owned())];
+                labels.extend(zip_labels(&[METRIC_LABEL_KIND, METRIC_LABEL_SHARD], vals));
+                (labels, stats)
+            }),
+    );
     push_histogram_rows(
         families,
         "harvest_db_query_duration",
@@ -1238,6 +1257,7 @@ mod tests {
         recorder.record_db_pool_wait(2, 0.25);
         recorder.record_db_query_duration(DbOp::Claim, 2, 0.125);
         recorder.record_claim_duration(ClaimKind::Activity, 2, 0.25);
+        recorder.record_owner_take_duration(ClaimKind::Workflow, 2, 0.5);
         recorder.record_persist_phase(PersistPhase::Commit, 2, 0.0625);
         recorder.record_worker_pollers("email", 1);
         recorder.record_worker_outlier(OutlierDimension::FailureRatio, true);
@@ -1262,6 +1282,13 @@ mod tests {
                 &[("op", "claim"), ("kind", "activity"), ("shard", "2")]
             ),
             0.25
+        );
+        assert_eq!(
+            sample_value(
+                query_sum,
+                &[("op", "take"), ("kind", "workflow"), ("shard", "2")]
+            ),
+            0.5
         );
         let phase = family(&families, "harvest_db_persist_phase_duration_sum");
         assert_eq!(
