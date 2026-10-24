@@ -35571,6 +35571,12 @@ impl DeciderState {
         }
     }
 
+    /// Whether a hint waits for its key. A take must wait too. Else a ready
+    /// row of lower rank would take the permit that the hint should have.
+    fn ranking(&self) -> bool {
+        !self.unkeyed.is_empty() || !self.keying_execs.is_empty()
+    }
+
     /// Queue `exec` with the key of a row that is due now at normal
     /// priority.
     fn insert_unranked(&mut self, exec: uuid::Uuid) {
@@ -41110,7 +41116,9 @@ impl Worker {
                         }));
                     }
                 }
-                while !state.ready.is_empty() {
+                // A lookup in flight can name a row that outranks the ready
+                // ones, so no take starts until the hints have keys.
+                while !state.ready.is_empty() && !state.ranking() {
                     if Self::free_permits(
                         &self.workflow_semaphore,
                         &self.dispatch_reserved_workflow,
@@ -57974,6 +57982,35 @@ mod tests {
         state.rank_unkeyed_unranked();
         assert!(state.unkeyed.is_empty() && state.begin_keying().is_empty());
         assert!(state.pop(now).is_some() && state.pop(now).is_some());
+    }
+
+    /// A take waits while a hint has no key. Else a ready row of lower rank
+    /// would take the permit that the hint should have (issue #2308).
+    #[test]
+    fn decider_state_defers_takes_while_hints_wait_for_a_key() {
+        let now = std::time::Instant::now();
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(now);
+        state.queue(row(0, 10, false));
+        assert!(!state.ranking(), "a ranked set may take");
+        let exec = uuid::Uuid::new_v4();
+        state.hint(exec);
+        assert!(state.ranking(), "an unkeyed hint blocks a take");
+        let requested = state.begin_keying();
+        assert!(state.ranking(), "a lookup in flight blocks a take");
+        state.keyed(
+            &requested,
+            Some(vec![crate::queue::OwnerRow {
+                exec_id: exec,
+                ..row(5, 1, false)
+            }]),
+        );
+        assert!(!state.ranking(), "a ranked hint ends the wait");
+        assert_eq!(
+            state.pop(now).map(|(e, _)| e),
+            Some(exec),
+            "the best goes first"
+        );
     }
 
     /// A miss doubles the backoff up to its cap (issue #2255).

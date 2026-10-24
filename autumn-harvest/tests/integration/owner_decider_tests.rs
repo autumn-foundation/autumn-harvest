@@ -917,8 +917,8 @@ async fn a_saturated_owner_takes_a_high_priority_run_first() {
         normal.push(start_instant(&mut conn, &client, &queue, None).await);
     }
     let high = start_instant(&mut conn, &client, &queue, Some(Priority::High)).await;
-    // The lookups run while the permit is held. Give the hints time to arrive.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Free the permit at once, while the key lookups of the hints may still
+    // run. A ready row of lower rank must not take the permit first.
     SLOW_GATE.notify_one();
     wait_for_execution_state_with_timeout(&db.url, slow, "COMPLETED", WAIT).await;
     for exec in normal.iter().copied().chain([high]) {
