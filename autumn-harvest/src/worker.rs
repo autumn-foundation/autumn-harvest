@@ -35571,6 +35571,13 @@ impl DeciderState {
         }
     }
 
+    /// Whether `free` permits cover every ready row, every hint and every
+    /// execution of the lookup in flight. Only then can the take order not
+    /// matter, so the lookup is skipped.
+    fn permits_cover_all(&self, free: usize) -> bool {
+        free >= self.ready.len() + self.unkeyed.len() + self.keying_execs.len()
+    }
+
     /// Whether a hint waits for its key. A take must wait too. Else a ready
     /// row of lower rank would take the permit that the hint should have.
     fn ranking(&self) -> bool {
@@ -41105,7 +41112,7 @@ impl Worker {
                 // enough free permits, take them at once and skip the lookup.
                 let free =
                     Self::free_permits(&self.workflow_semaphore, &self.dispatch_reserved_workflow);
-                if free >= state.ready.len() + state.unkeyed.len() {
+                if state.permits_cover_all(free) {
                     state.rank_unkeyed_unranked();
                 } else {
                     let execs = state.begin_keying();
@@ -58010,6 +58017,25 @@ mod tests {
             state.pop(now).map(|(e, _)| e),
             Some(exec),
             "the best goes first"
+        );
+    }
+
+    /// Free permits cover the ready rows, the hints and the lookup in flight.
+    /// Only then does the take order not matter (issue #2308).
+    #[test]
+    fn decider_state_counts_a_lookup_in_flight_against_free_permits() {
+        let mut state = DeciderState::new(Duration::from_millis(25));
+        state.activate(std::time::Instant::now());
+        let first = uuid::Uuid::new_v4();
+        state.hint(first);
+        let requested = state.begin_keying();
+        state.hint(uuid::Uuid::new_v4());
+        assert!(!state.permits_cover_all(1), "one permit, two executions");
+        assert!(state.permits_cover_all(2));
+        state.keyed(&requested, Some(Vec::new()));
+        assert!(
+            state.permits_cover_all(1),
+            "the lookup ended; one hint is left"
         );
     }
 
