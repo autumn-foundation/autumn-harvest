@@ -36514,6 +36514,13 @@ impl Worker {
         sql: &str,
         params: &[serde_json::Value],
     ) -> Result<crate::entity_sql::EntitySqlRows, crate::entity_sql::EntitySqlError> {
+        // A permit bounds the queries of this process, the snapshot load
+        // included. It moves into the query thread, so it lives until the
+        // query stops.
+        let permit = crate::entity_sql::QUERY_SLOTS
+            .acquire()
+            .await
+            .map_err(|e| crate::entity_sql::EntitySqlError::Sql(e.to_string()))?;
         let mut conn = pool
             .get()
             .await
@@ -36524,7 +36531,9 @@ impl Worker {
             disk.as_ref(),
             &mut conn,
             self.entity_sql_owner_shard(),
-            self.registry.decision_owner(),
+            // The tenures of this worker. Workers that share a registry each
+            // hold their own set.
+            Arc::clone(&self.decision_owner),
             self.registry.payload_codecs(),
             self.registry.payload_offloader(),
             workflow_name,
@@ -36532,12 +36541,6 @@ impl Worker {
         )
         .await?;
         drop(conn);
-        // A permit bounds the queries of this process. It moves into the
-        // thread, so it lives until the query stops.
-        let permit = crate::entity_sql::QUERY_SLOTS
-            .acquire()
-            .await
-            .map_err(|e| crate::entity_sql::EntitySqlError::Sql(e.to_string()))?;
         // A dropped caller cancels the query at its next progress check.
         let cancel = CancelOnDrop::default();
         let flag = Arc::clone(&cancel.0);

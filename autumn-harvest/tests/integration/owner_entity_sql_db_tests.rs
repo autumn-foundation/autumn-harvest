@@ -35,7 +35,7 @@ use autumn_harvest::payload_codec::PayloadCodecs;
 use autumn_harvest::prelude::*;
 use autumn_harvest::telemetry::{MetricsRecorder, NoOpMetrics, TelemetryConfig};
 use autumn_harvest::types::{ExecutionId, ShardId};
-use autumn_harvest::worker::{DbPool, Worker, WorkerRuntimeConfig};
+use autumn_harvest::worker::{DbPool, HandlerRegistry, Worker, WorkerRuntimeConfig};
 use diesel::QueryableByName;
 use diesel::sql_types::Integer;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
@@ -46,8 +46,8 @@ use crate::integration_e2e::{
     wait_for_execution_state_with_timeout,
 };
 
-/// This suite owns partitions 486 to 495. Each test takes its own slot.
-const BASE: u16 = 486;
+/// This suite owns partitions 485 to 495. Each test takes its own slot.
+const BASE: u16 = 485;
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -123,6 +123,8 @@ impl MetricsRecorder for EvictWakes {
 struct Node {
     id: String,
     worker: Arc<Worker>,
+    registry: Arc<HandlerRegistry>,
+    runtime_config: WorkerRuntimeConfig,
     owned: Arc<OwnedPartitions>,
     codecs: PayloadCodecs,
     evicts: EvictWakes,
@@ -229,10 +231,14 @@ impl Fixture {
         runtime_config.worker_id.clone_from(&id);
         runtime_config.poll_interval = Duration::from_millis(100);
         runtime_config.notification_database_url = options.listen.then(|| self.url.clone());
-        let worker = Arc::new(Worker::new(runtime_config, Arc::new(registry)).expect("worker"));
+        let registry = Arc::new(registry);
+        let worker =
+            Arc::new(Worker::new(runtime_config.clone(), Arc::clone(&registry)).expect("worker"));
         Node {
             id,
             worker,
+            registry,
+            runtime_config,
             owned,
             codecs,
             evicts,
@@ -825,6 +831,34 @@ async fn a_query_off_the_owner_reads_history() {
     assert!(!peer.worker.has_entity_projection(exec).await);
     assert!(!peer.file(partition).exists(), "the peer writes no file");
     assert_eq!(dir_bytes(peer.dir.path()).len(), 0);
+    let _ = owner.stop().await;
+}
+
+/// A second worker on the owner's registry checks its own tenures. It
+/// holds none, so it reads history and writes no file.
+#[tokio::test]
+async fn a_second_worker_on_the_registry_checks_its_own_tenures() {
+    let (mut fx, _container) = Fixture::new().await;
+    let (key, partition, owner) = fx.owner(10, NodeOptions::default()).await;
+    let exec = fx.add(&key, "date").await;
+    fx.applied(&owner, &key, exec, 1).await;
+    // A query that took the first worker's tenures would write it back.
+    std::fs::remove_file(owner.file(partition)).expect("delete the file");
+
+    let mut config = owner.runtime_config.clone();
+    config.worker_id = unique("entity-sql-second");
+    let second = Worker::new(config, Arc::clone(&owner.registry)).expect("second worker");
+    let rows = second
+        .query_entity_sql(&fx.pool, workflow_name(), &key, ITEMS_SQL, &[])
+        .await
+        .expect("history");
+    assert_eq!(rows.source, EntitySqlSource::History);
+    assert_eq!(rows.rows[0][1], json!("date"));
+    assert!(
+        !owner.file(partition).exists(),
+        "the second worker writes no file"
+    );
+    drop(second);
     let _ = owner.stop().await;
 }
 
