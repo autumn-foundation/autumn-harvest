@@ -328,8 +328,8 @@ async fn a_child_terminal_wakes_the_parent_owner() {
 }
 
 /// A pinned decision of the child's owner writes into the parent. The wake
-/// goes to the parent's owner. A plain write to the pinned partition sends
-/// no wake: its writer is the owner.
+/// goes to the parent's owner. The append to the pinned partition stages no
+/// owner note, so it sends no wake.
 #[tokio::test]
 async fn a_pinned_writer_wakes_other_partitions_only() {
     let (mut fx, _container) = Fixture::new().await;

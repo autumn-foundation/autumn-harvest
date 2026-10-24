@@ -150,7 +150,13 @@ issue #2251, so it needs no prototype row.
 | `generation_owner_refence` | `generation_owner`, and the owner fence again after each append: the code before this issue |
 
 So `generation_owner` adds two statements to `generation`, and
-`generation_plain_owner_row` adds one. The owner row takes `FOR KEY SHARE`,
+`generation_plain_owner_row` adds one.
+
+**Since issue #2255 the labels measure new code.** `generation_owner` is now
+the fused fence: one statement, and no generation check at an append. The
+shape that this page measured is `generation_owner_split`.
+`generation_owner_refence` still adds the owner fence at each append. See
+[`performance-owner-decider.md`](performance-owner-decider.md). The owner row takes `FOR KEY SHARE`,
 not the `FOR SHARE` that the issue names.
 
 With 8 writers, `shared` makes every writer lock one owner row. `spread`

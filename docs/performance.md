@@ -2594,3 +2594,8 @@ standalone note rather than part of the claim-path attribution table above:
   snapshot file, parsed the whole file to read one top-level key. It now
   probes that key without building the document (instructions -23.7%,
   allocations -16.5%, PR #2292).
+* [`docs/performance-owner-decider.md`](performance-owner-decider.md)
+  — stage 1b of the decision owner (issue #2255). The owner decider takes
+  workflow tasks by execution, so the claim loops claim 3 tasks per
+  3-activity workflow instead of 7. On a 4-CPU host the CPU limits the gain
+  to 1.27x at one claim loop. The fused fence result is on the page.
