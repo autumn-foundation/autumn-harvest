@@ -29494,9 +29494,13 @@ const fn cache_update_after_persist(
 }
 
 #[allow(clippy::too_many_arguments)]
+// Only the disk tier uses `conn`, and it needs it mutably.
+#[cfg_attr(
+    not(feature = "owner-disk-cache"),
+    allow(unused_variables, clippy::needless_pass_by_ref_mut)
+)]
 async fn store_cache_entry(
     // Issue #2260: the entity projection reads the committed row with it.
-    #[cfg_attr(not(feature = "owner-disk-cache"), allow(unused_variables))]
     conn: &mut AsyncPgConnection,
     workflow_cache: &tokio::sync::Mutex<crate::cache::WorkflowCache>,
     exec_uuid: uuid::Uuid,
